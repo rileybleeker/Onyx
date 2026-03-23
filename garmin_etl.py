@@ -388,26 +388,104 @@ def sync_training_status(garmin: Garmin, sb: Client, target_date: date) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Sync: Workout Definitions (target paces from Workout Builder)
+# ---------------------------------------------------------------------------
+
+def parse_interval_targets(workout: dict) -> dict:
+    """Extract interval target pace and structure from a workout definition."""
+    result = {
+        "interval_target_pace_low_mps": None,
+        "interval_target_pace_high_mps": None,
+        "interval_distance_meters": None,
+        "interval_count": None,
+    }
+    for seg in workout.get("workoutSegments", []):
+        for step in seg.get("workoutSteps", []):
+            # Look for RepeatGroupDTO (interval blocks)
+            if step.get("type") == "RepeatGroupDTO":
+                result["interval_count"] = step.get("numberOfIterations")
+                for sub in step.get("workoutSteps", []):
+                    step_key = safe_get(sub, "stepType", "stepTypeKey")
+                    target_key = safe_get(sub, "targetType", "workoutTargetTypeKey")
+                    if step_key == "interval" and target_key and "pace" in target_key:
+                        result["interval_target_pace_low_mps"] = sub.get("targetValueOne")
+                        result["interval_target_pace_high_mps"] = sub.get("targetValueTwo")
+                        # Distance from end condition
+                        cond_key = safe_get(sub, "endCondition", "conditionTypeKey")
+                        if cond_key == "distance":
+                            result["interval_distance_meters"] = sub.get("endConditionValue")
+                        break
+                if result["interval_target_pace_low_mps"]:
+                    break
+    return result
+
+
+def sync_workout_definitions(garmin: Garmin, sb: Client, activity_workout_ids: list[str]) -> int:
+    """Sync workout definitions for activities that have workoutIds."""
+    if not activity_workout_ids:
+        return 0
+
+    # Deduplicate
+    unique_ids = list(set(activity_workout_ids))
+    total = 0
+
+    for wid in unique_ids:
+        try:
+            workout = garmin.get_workout_by_id(int(wid))
+        except Exception:
+            log.debug(f"  workout {wid}: not found (likely deleted)")
+            continue
+
+        targets = parse_interval_targets(workout)
+        row = {
+            "workout_id": int(wid),
+            "workout_name": workout.get("workoutName"),
+            "sport_type": safe_get(workout, "sportType", "sportTypeKey"),
+            "description": workout.get("description"),
+            "interval_target_pace_low_mps": targets["interval_target_pace_low_mps"],
+            "interval_target_pace_high_mps": targets["interval_target_pace_high_mps"],
+            "interval_distance_meters": targets["interval_distance_meters"],
+            "interval_count": targets["interval_count"],
+            "raw_json": json.dumps(workout, default=str),
+        }
+
+        count = upsert_to_supabase(sb, "garmin_workouts", [row], "workout_id")
+        total += count
+        time.sleep(0.5)  # Rate limit
+
+    log.info(f"  Workouts: {total} synced out of {len(unique_ids)} unique IDs")
+    return total
+
+
+# ---------------------------------------------------------------------------
 # Sync: Activities + Laps
 # ---------------------------------------------------------------------------
 
-def sync_activities(garmin: Garmin, sb: Client, start_date: date, end_date: date) -> int:
-    """Sync all activities in a date range, including laps."""
+def sync_activities(garmin: Garmin, sb: Client, start_date: date, end_date: date) -> tuple[int, list[str]]:
+    """Sync all activities in a date range, including laps.
+    Returns (record_count, list_of_workout_ids)."""
     try:
         activities = garmin.get_activities_by_date(
             start_date.isoformat(), end_date.isoformat()
         )
     except Exception as e:
         log.warning(f"  activities {start_date} to {end_date}: error ({e})")
-        return 0
+        return 0, []
 
     if not activities:
-        return 0
+        return 0, []
 
     total = 0
+    workout_ids = []
+
     for act in activities:
         activity_id = act.get("activityId")
         start_ts = act.get("startTimeGMT") or act.get("startTimeLocal")
+
+        # Collect workout IDs for later sync
+        wid = act.get("workoutId")
+        if wid:
+            workout_ids.append(str(wid))
 
         row = {
             "ts": start_ts,
@@ -454,48 +532,92 @@ def sync_activities(garmin: Garmin, sb: Client, start_date: date, end_date: date
 
         # Sync laps for this activity
         if act.get("hasSplits"):
-            try:
-                splits = garmin.get_activity_splits(activity_id)
-                if splits and splits.get("lapDTOs"):
-                    lap_rows = []
-                    for i, lap in enumerate(splits["lapDTOs"]):
-                        lap_start = lap.get("startTimeGMT", start_ts)
-                        lap_rows.append({
-                            "ts": lap_start,
-                            "activity_id": activity_id,
-                            "lap_index": i,
-                            "start_time_gmt": lap_start,
-                            "duration_seconds": lap.get("duration"),
-                            "elapsed_duration_seconds": lap.get("elapsedDuration"),
-                            "moving_duration_seconds": lap.get("movingDuration"),
-                            "distance_meters": lap.get("distance"),
-                            "avg_speed_mps": lap.get("averageSpeed"),
-                            "max_speed_mps": lap.get("maxSpeed"),
-                            "avg_heart_rate": lap.get("averageHR"),
-                            "max_heart_rate": lap.get("maxHR"),
-                            "avg_running_cadence": lap.get("averageRunCadence"),
-                            "max_running_cadence": lap.get("maxRunCadence"),
-                            "elevation_gain_meters": lap.get("elevationGain"),
-                            "elevation_loss_meters": lap.get("elevationLoss"),
-                            "start_elevation_meters": lap.get("startElevation"),
-                            "end_elevation_meters": lap.get("endElevation"),
-                            "calories": lap.get("calories"),
-                            "start_latitude": lap.get("startLatitude"),
-                            "start_longitude": lap.get("startLongitude"),
-                            "end_latitude": lap.get("endLatitude"),
-                            "end_longitude": lap.get("endLongitude"),
-                            "lap_trigger": lap.get("lapTrigger"),
-                            "intensity": lap.get("intensity"),
-                            "raw_json": json.dumps(lap),
-                        })
-                    upsert_to_supabase(sb, "garmin_activity_laps", lap_rows,
-                                       "activity_id,lap_index,ts")
-                # Rate limit: be gentle with Garmin's API
-                time.sleep(0.5)
-            except Exception as e:
-                log.debug(f"  laps for activity {activity_id}: error ({e})")
+            _sync_laps_for_activity(garmin, sb, activity_id, start_ts)
 
-    return total
+    return total, workout_ids
+
+
+def _sync_laps_for_activity(garmin: Garmin, sb: Client, activity_id, start_ts) -> int:
+    """Fetch and upsert laps for a single activity."""
+    try:
+        splits = garmin.get_activity_splits(activity_id)
+        if splits and splits.get("lapDTOs"):
+            lap_rows = []
+            for i, lap in enumerate(splits["lapDTOs"]):
+                lap_start = lap.get("startTimeGMT", start_ts)
+                lap_rows.append({
+                    "ts": lap_start,
+                    "activity_id": activity_id,
+                    "lap_index": i,
+                    "start_time_gmt": lap_start,
+                    "duration_seconds": lap.get("duration"),
+                    "elapsed_duration_seconds": lap.get("elapsedDuration"),
+                    "moving_duration_seconds": lap.get("movingDuration"),
+                    "distance_meters": lap.get("distance"),
+                    "avg_speed_mps": lap.get("averageSpeed"),
+                    "max_speed_mps": lap.get("maxSpeed"),
+                    "avg_heart_rate": to_int(lap.get("averageHR")),
+                    "max_heart_rate": to_int(lap.get("maxHR")),
+                    "avg_running_cadence": to_int(lap.get("averageRunCadence")),
+                    "max_running_cadence": to_int(lap.get("maxRunCadence")),
+                    "elevation_gain_meters": lap.get("elevationGain"),
+                    "elevation_loss_meters": lap.get("elevationLoss"),
+                    "start_elevation_meters": lap.get("startElevation"),
+                    "end_elevation_meters": lap.get("endElevation"),
+                    "calories": lap.get("calories"),
+                    "start_latitude": lap.get("startLatitude"),
+                    "start_longitude": lap.get("startLongitude"),
+                    "end_latitude": lap.get("endLatitude"),
+                    "end_longitude": lap.get("endLongitude"),
+                    "lap_trigger": lap.get("lapTrigger"),
+                    "intensity": lap.get("intensity"),
+                    "raw_json": json.dumps(lap),
+                })
+            upsert_to_supabase(sb, "garmin_activity_laps", lap_rows,
+                               "activity_id,lap_index,ts")
+        time.sleep(0.5)
+    except Exception as e:
+        log.debug(f"  laps for activity {activity_id}: error ({e})")
+    return 0
+
+
+def backfill_laps(garmin: Garmin, sb: Client) -> int:
+    """Backfill laps for all activities that have splits but no laps in DB."""
+    # Get all activity IDs with splits
+    result = (
+        sb.schema("pds")
+        .table("garmin_activities")
+        .select("activity_id,start_time_gmt")
+        .eq("has_splits", True)
+        .order("start_time_local", desc=False)
+        .execute()
+    )
+    all_activities = result.data or []
+
+    # Get activity IDs that already have laps
+    try:
+        existing_result = (
+            sb.schema("pds")
+            .table("garmin_activity_laps")
+            .select("activity_id")
+            .execute()
+        )
+        existing_ids = set(r["activity_id"] for r in (existing_result.data or []))
+    except Exception:
+        existing_ids = set()
+
+    missing = [a for a in all_activities if a["activity_id"] not in existing_ids]
+    log.info(f"Backfilling laps: {len(missing)} activities missing laps out of {len(all_activities)} total")
+
+    count = 0
+    for i, act in enumerate(missing):
+        _sync_laps_for_activity(garmin, sb, act["activity_id"], act["start_time_gmt"])
+        count += 1
+        if (i + 1) % 50 == 0:
+            log.info(f"  Laps backfill progress: {i+1}/{len(missing)}")
+
+    log.info(f"  Laps backfill complete: {count} activities processed")
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +690,10 @@ def main():
                         help="Number of recent days to sync (default: 7)")
     parser.add_argument("--date", type=str, default=None,
                         help="Sync a specific date (YYYY-MM-DD)")
+    parser.add_argument("--backfill-laps", action="store_true",
+                        help="Backfill laps for all activities missing lap data")
+    parser.add_argument("--sync-workouts", action="store_true",
+                        help="Sync workout definitions for all activities with workout IDs")
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -577,6 +703,35 @@ def main():
     # Connect
     garmin = get_garmin_client()
     sb = get_supabase_client()
+
+    # Handle standalone backfill-laps mode
+    if args.backfill_laps:
+        t0 = time.time()
+        count = backfill_laps(garmin, sb)
+        duration = time.time() - t0
+        log.info(f"Lap backfill done: {count} activities | {duration:.1f}s")
+        return
+
+    # Handle standalone sync-workouts mode
+    if args.sync_workouts:
+        t0 = time.time()
+        # Get all unique workout IDs from activities
+        result = sb.schema("pds").from_("garmin_activities").select(
+            "raw_json"
+        ).neq("raw_json", "null").execute()
+        workout_ids = []
+        for row in (result.data or []):
+            try:
+                raw = json.loads(row["raw_json"]) if isinstance(row["raw_json"], str) else row["raw_json"]
+                wid = raw.get("workoutId")
+                if wid:
+                    workout_ids.append(str(wid))
+            except Exception:
+                continue
+        count = sync_workout_definitions(garmin, sb, workout_ids)
+        duration = time.time() - t0
+        log.info(f"Workout sync done: {count} definitions | {duration:.1f}s")
+        return
 
     # Determine date range
     today = date.today()
@@ -620,13 +775,22 @@ def main():
     log.info("Syncing activities...")
     act_start = dates[0]
     act_end = dates[-1]
+    workout_ids = []
     try:
-        act_count = sync_activities(garmin, sb, act_start, act_end)
+        act_count, workout_ids = sync_activities(garmin, sb, act_start, act_end)
         total_records += act_count
         log.info(f"  Activities: {act_count} synced ({act_start} — {act_end})")
     except Exception as e:
         errors += 1
         log.error(f"  Activities: ERROR - {e}")
+
+    # Sync workout definitions for any activities with workout IDs
+    if workout_ids:
+        log.info("Syncing workout definitions...")
+        try:
+            sync_workout_definitions(garmin, sb, workout_ids)
+        except Exception as e:
+            log.warning(f"  Workout sync failed: {e}")
 
     # Refresh materialized views
     log.info("Refreshing materialized views...")

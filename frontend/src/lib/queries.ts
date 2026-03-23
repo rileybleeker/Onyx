@@ -181,6 +181,25 @@ export async function getEightSleepTrends(days: number = 30, side: string = "lef
 }
 
 // ---------------------------------------------------------------------------
+// Recovery vs Pace Correlation
+// ---------------------------------------------------------------------------
+
+export async function getRecoveryVsPace(days: number = 365) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("recovery_vs_pace")
+    .select("*")
+    .gte("activity_date", since.toISOString().split("T")[0])
+    .not("whoop_recovery", "is", null)
+    .order("activity_date", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+// ---------------------------------------------------------------------------
 // Unified Health Matrix view
 // ---------------------------------------------------------------------------
 

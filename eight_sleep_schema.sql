@@ -85,17 +85,21 @@ SELECT
     gs.sleep_duration_seconds AS garmin_sleep_duration_sec,
     gs.deep_sleep_seconds   AS garmin_deep_sleep_sec,
     gs.avg_hrv              AS garmin_hrv,
-    -- WHOOP recovery (source of truth)
+    -- WHOOP recovery (source of truth for RHR, HRV, SpO2)
     wr.recovery_score       AS whoop_recovery_score,
     wr.resting_heart_rate   AS whoop_rhr,
     wr.hrv_rmssd_milli      AS whoop_hrv_rmssd,
     wr.spo2_percentage      AS whoop_spo2,
     wr.skin_temp_celsius    AS whoop_skin_temp,
-    -- WHOOP sleep (source of truth)
+    -- WHOOP sleep (source of truth for all sleep metrics)
+    ws.total_in_bed_time_milli      AS whoop_sleep_duration_milli,
     ws.sleep_performance_percentage AS whoop_sleep_performance,
     ws.sleep_efficiency_percentage  AS whoop_sleep_efficiency,
+    ws.sleep_consistency_percentage AS whoop_sleep_consistency,
     ws.total_slow_wave_sleep_time_milli AS whoop_deep_sleep_milli,
     ws.total_rem_sleep_time_milli   AS whoop_rem_sleep_milli,
+    ws.total_light_sleep_time_milli AS whoop_light_sleep_milli,
+    ws.total_awake_time_milli       AS whoop_awake_milli,
     ws.disturbance_count    AS whoop_disturbances,
     ws.respiratory_rate     AS whoop_respiratory_rate,
     -- WHOOP strain

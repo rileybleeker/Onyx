@@ -222,13 +222,21 @@ User message
 
 | Domain | Source | Reason |
 |--------|--------|--------|
-| Activities & workouts | Garmin | GPS, cadence, power, training effect, VO2 max |
+| Resting heart rate | WHOOP | Continuous overnight measurement |
+| HRV | WHOOP | All-night RMSSD measurement |
+| Sleep duration | WHOOP | Recovery-integrated tracking |
+| Sleep scoring | WHOOP | Sleep performance percentage |
+| Deep sleep | WHOOP | Slow-wave sleep detection |
+| REM sleep | WHOOP | REM stage tracking |
+| SpO2 | WHOOP | Continuous overnight pulse oximetry |
+| Respiratory rate | WHOOP | Continuous overnight measurement |
 | Recovery & readiness | WHOOP | Purpose-built recovery algorithm |
-| HRV | WHOOP | Continuous overnight measurement |
-| Sleep scoring | WHOOP | Recovery-integrated sleep score |
-| Sleep environment | Eight Sleep | Bed temperature, thermal comfort |
-| Daily wellness | Garmin | Steps, stress, body battery, SpO2 |
+| Activities & workouts | Garmin | GPS, cadence, power, training effect, VO2 max |
+| Daily wellness (steps, stress, body battery) | Garmin | Wrist-based all-day tracking |
 | Body composition | Garmin | Scale integration (Index S2) |
+| Training readiness | Garmin | Training load & recovery factors |
+| Sleep environment | Eight Sleep | Bed/room temperature, thermal comfort |
+| Toss & turns | Eight Sleep | Mattress-based movement detection |
 
 Where sources overlap, both are stored for cross-validation.
 
