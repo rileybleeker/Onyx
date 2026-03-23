@@ -94,6 +94,7 @@ Configured in `.claude/settings.local.json`. Two layers of control:
 ## Conventions
 
 - After making frontend changes, always start the dev server (`cd frontend && npm run dev`) so the user can see updates immediately in the browser
+- After completing a task, always commit and push to git so Vercel deploys automatically
 - ETL scripts are standalone Python files at the project root (not in a package)
 - Frontend follows Next.js App Router conventions (page.tsx per route)
 - Supabase queries go in `frontend/src/lib/queries.ts`
