@@ -5,7 +5,7 @@ import {
   AreaChart, Area, LineChart, Line,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
 } from "recharts";
-import { getWhoopRecovery, getHeartRateData, getStressData } from "@/lib/queries";
+import { getWhoopRecovery, getHeartRateData, getDailySummaries } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -21,12 +21,12 @@ const tt = {
 export default function HeartPage() {
   const [recovery, setRecovery] = useState<any[]>([]);
   const [hr, setHr] = useState<any[]>([]);
-  const [stress, setStress] = useState<any[]>([]);
+  const [summaries, setSummaries] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    Promise.all([getWhoopRecovery(30), getHeartRateData(30), getStressData(30)])
-      .then(([rec, h, s]) => { setRecovery(rec); setHr(h); setStress(s); })
+    Promise.all([getWhoopRecovery(30), getHeartRateData(30), getDailySummaries(30)])
+      .then(([rec, h, s]) => { setRecovery(rec); setHr(h); setSummaries(s); })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
@@ -37,7 +37,7 @@ export default function HeartPage() {
 
   const latestRecovery = recovery[recovery.length - 1];
   const latestHr = hr[hr.length - 1];
-  const latestStress = stress[stress.length - 1];
+  const latestSummary = summaries[summaries.length - 1];
 
   const hrData = hr.map((d) => ({
     date: formatDate(d.calendar_date),
@@ -52,9 +52,9 @@ export default function HeartPage() {
     hrv: d.hrv_rmssd_milli ? +Number(d.hrv_rmssd_milli).toFixed(1) : null,
   }));
 
-  const stressData = stress.map((d) => ({
+  const stressData = summaries.map((d) => ({
     date: formatDate(d.calendar_date),
-    overall: d.overall_stress_level,
+    overall: d.avg_stress_level,
   }));
 
   return (
@@ -65,7 +65,7 @@ export default function HeartPage() {
         <StatCard label="Resting HR" value={latestRecovery?.resting_heart_rate} unit="bpm" />
         <StatCard label="Max HR" value={latestHr?.max_heart_rate} unit="bpm" />
         <StatCard label="HRV (RMSSD)" value={latestRecovery?.hrv_rmssd_milli ? +Number(latestRecovery.hrv_rmssd_milli).toFixed(1) : null} unit="ms" />
-        <StatCard label="Stress" value={latestStress?.overall_stress_level} sublabel={latestStress?.stress_qualifier} />
+        <StatCard label="Stress" value={latestSummary?.avg_stress_level} sublabel={latestSummary?.stress_qualifier} />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

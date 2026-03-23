@@ -121,8 +121,12 @@ SELECT
     gts.training_readiness_score,
     gts.training_readiness_level
 FROM pds.garmin_daily_summary gds
-LEFT JOIN pds.garmin_sleep gs
-    ON gds.calendar_date = gs.calendar_date AND gs.is_nap = FALSE
+LEFT JOIN LATERAL (
+    SELECT * FROM pds.garmin_sleep gs2
+    WHERE gs2.calendar_date = gds.calendar_date AND gs2.is_nap = FALSE
+    ORDER BY gs2.overall_sleep_score DESC NULLS LAST
+    LIMIT 1
+) gs ON true
 LEFT JOIN pds.garmin_training_status gts
     ON gds.calendar_date = gts.calendar_date
 -- WHOOP joins
