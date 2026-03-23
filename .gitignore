@@ -16,6 +16,10 @@ frontend/out/
 # Claude Code
 .claude/
 
+# Journal CSV data (keep folders, ignore data files)
+journal_inbox/*.csv
+journal_archive/*.csv
+
 # OS
 .DS_Store
 Thumbs.db

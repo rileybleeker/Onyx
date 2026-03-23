@@ -11,6 +11,9 @@ Onyx/
 ├── garmin_etl.py            # Garmin Connect → Supabase (9 tables)
 ├── whoop_etl.py             # WHOOP API v2 → Supabase (5 tables)
 ├── whoop_journal_import.py  # WHOOP Journal CSV export → Supabase
+├── whoop_journal_watcher.py # Watches journal_inbox/ for auto-import
+├── journal_inbox/           # Drop WHOOP journal CSVs here
+├── journal_archive/         # Processed CSVs moved here
 ├── eight_sleep_etl.py       # Eight Sleep API → Supabase (1 table)
 ├── whoop_schema.sql         # WHOOP table DDL
 ├── eight_sleep_schema.sql   # Eight Sleep DDL + daily_health_matrix view
@@ -40,6 +43,7 @@ Onyx/
 python garmin_etl.py                    # Sync last 7 days
 python whoop_etl.py                     # Sync last 30 days
 python whoop_journal_import.py <csv>    # Import WHOOP journal CSV export
+python whoop_journal_watcher.py        # Watch inbox folder for auto-import
 python eight_sleep_etl.py               # Sync last 7 days
 python <etl>.py --backfill N            # Backfill N days
 
