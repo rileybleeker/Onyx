@@ -58,12 +58,6 @@ export default function Dashboard() {
     score: d.sleep_performance_percentage,
   }));
 
-  const bbData = summaries.map((d) => ({
-    date: formatDate(d.calendar_date),
-    highest: d.body_battery_highest,
-    lowest: d.body_battery_lowest,
-  }));
-
   return (
     <>
       <h2 className="text-2xl font-bold mb-6">Dashboard</h2>
@@ -104,18 +98,6 @@ export default function Dashboard() {
               <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={30} domain={[0, 10]} />
               <Tooltip {...chartTooltipStyle} />
               <Area type="monotone" dataKey="hours" stroke="#8b5cf6" fill="#8b5cf680" strokeWidth={2} />
-            </AreaChart>
-          </ResponsiveContainer>
-        </ChartCard>
-
-        <ChartCard title="Body Battery">
-          <ResponsiveContainer width="100%" height={220}>
-            <AreaChart data={bbData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={30} domain={[0, 100]} />
-              <Tooltip {...chartTooltipStyle} />
-              <Area type="monotone" dataKey="highest" stroke="#22c55e" fill="#22c55e40" strokeWidth={2} />
-              <Area type="monotone" dataKey="lowest" stroke="#ef4444" fill="#ef444440" strokeWidth={2} />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
