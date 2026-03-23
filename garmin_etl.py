@@ -392,7 +392,12 @@ def sync_training_status(garmin: Garmin, sb: Client, target_date: date) -> int:
 # ---------------------------------------------------------------------------
 
 def parse_interval_targets(workout: dict) -> dict:
-    """Extract interval target pace and structure from a workout definition."""
+    """Extract interval target pace and structure from a workout definition.
+
+    Handles two patterns:
+    1. RepeatGroupDTO containing interval steps (e.g., 5x1600m)
+    2. Standalone ExecutableStepDTO with stepType=interval (e.g., 10k tempo)
+    """
     result = {
         "interval_target_pace_low_mps": None,
         "interval_target_pace_high_mps": None,
@@ -401,7 +406,7 @@ def parse_interval_targets(workout: dict) -> dict:
     }
     for seg in workout.get("workoutSegments", []):
         for step in seg.get("workoutSteps", []):
-            # Look for RepeatGroupDTO (interval blocks)
+            # Pattern 1: RepeatGroupDTO (interval blocks like 5x1600m)
             if step.get("type") == "RepeatGroupDTO":
                 result["interval_count"] = step.get("numberOfIterations")
                 for sub in step.get("workoutSteps", []):
@@ -410,13 +415,28 @@ def parse_interval_targets(workout: dict) -> dict:
                     if step_key == "interval" and target_key and "pace" in target_key:
                         result["interval_target_pace_low_mps"] = sub.get("targetValueOne")
                         result["interval_target_pace_high_mps"] = sub.get("targetValueTwo")
-                        # Distance from end condition
                         cond_key = safe_get(sub, "endCondition", "conditionTypeKey")
                         if cond_key == "distance":
                             result["interval_distance_meters"] = sub.get("endConditionValue")
                         break
                 if result["interval_target_pace_low_mps"]:
                     break
+
+            # Pattern 2: Standalone interval step (e.g., tempo runs, marathon pace)
+            elif step.get("type") == "ExecutableStepDTO":
+                step_key = safe_get(step, "stepType", "stepTypeKey")
+                target_key = safe_get(step, "targetType", "workoutTargetTypeKey")
+                if step_key == "interval" and target_key and "pace" in target_key:
+                    result["interval_target_pace_low_mps"] = step.get("targetValueOne")
+                    result["interval_target_pace_high_mps"] = step.get("targetValueTwo")
+                    result["interval_count"] = 1
+                    cond_key = safe_get(step, "endCondition", "conditionTypeKey")
+                    if cond_key == "distance":
+                        result["interval_distance_meters"] = step.get("endConditionValue")
+                    break
+
+        if result["interval_target_pace_low_mps"]:
+            break
     return result
 
 
