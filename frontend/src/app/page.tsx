@@ -5,7 +5,7 @@ import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   BarChart, Bar,
 } from "recharts";
-import { getDailySummaries, getTrainingStatus, getWhoopRecovery, getWhoopSleep } from "@/lib/queries";
+import { getDailySummaries, getWhoopRecovery, getWhoopSleep } from "@/lib/queries";
 import { formatDate, formatDuration } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -22,16 +22,14 @@ export default function Dashboard() {
   const [summaries, setSummaries] = useState<any[]>([]);
   const [sleep, setSleep] = useState<any[]>([]);
   const [recovery, setRecovery] = useState<any[]>([]);
-  const [training, setTraining] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    Promise.all([getDailySummaries(30), getWhoopSleep(30), getWhoopRecovery(30), getTrainingStatus(30)])
-      .then(([s, sl, rec, tr]) => {
+    Promise.all([getDailySummaries(30), getWhoopSleep(30), getWhoopRecovery(30)])
+      .then(([s, sl, rec]) => {
         setSummaries(s);
         setSleep(sl);
         setRecovery(rec);
-        setTraining(tr);
       })
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -48,7 +46,6 @@ export default function Dashboard() {
   const latest = summaries[summaries.length - 1];
   const latestSleep = sleep[sleep.length - 1];
   const latestRecovery = recovery[recovery.length - 1];
-  const latestTraining = training[training.length - 1];
 
   const stepsData = summaries.map((d) => ({
     date: formatDate(d.calendar_date),
@@ -81,9 +78,9 @@ export default function Dashboard() {
           sublabel={latestSleep ? `Score: ${latestSleep.sleep_performance_percentage ?? "—"}%` : undefined}
         />
         <StatCard
-          label="Training Readiness"
-          value={latestTraining?.training_readiness_score}
-          sublabel={latestTraining?.training_readiness_level}
+          label="Recovery"
+          value={latestRecovery?.recovery_score}
+          unit="%"
         />
       </div>
 
