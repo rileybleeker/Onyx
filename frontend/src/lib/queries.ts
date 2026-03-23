@@ -97,3 +97,103 @@ export async function getTrainingStatus(days: number = 30) {
   if (error) throw error;
   return data ?? [];
 }
+
+// ---------------------------------------------------------------------------
+// WHOOP
+// ---------------------------------------------------------------------------
+
+export async function getWhoopCycles(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("whoop_cycles")
+    .select("*")
+    .gte("start_time", since.toISOString())
+    .order("start_time", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+export async function getWhoopRecovery(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("whoop_recovery")
+    .select("*")
+    .gte("created_at", since.toISOString())
+    .eq("score_state", "SCORED")
+    .order("created_at", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+export async function getWhoopSleep(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("whoop_sleep")
+    .select("*")
+    .gte("start_time", since.toISOString())
+    .eq("is_nap", false)
+    .eq("score_state", "SCORED")
+    .order("start_time", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+export async function getWhoopWorkouts(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("whoop_workouts")
+    .select("*")
+    .gte("start_time", since.toISOString())
+    .order("start_time", { ascending: false });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Eight Sleep
+// ---------------------------------------------------------------------------
+
+export async function getEightSleepTrends(days: number = 30, side: string = "left") {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("eight_sleep_trends")
+    .select("*")
+    .eq("bed_side", side)
+    .gte("calendar_date", since.toISOString().split("T")[0])
+    .order("calendar_date", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Unified Health Matrix view
+// ---------------------------------------------------------------------------
+
+export async function getHealthMatrix(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("daily_health_matrix")
+    .select("*")
+    .gte("calendar_date", since.toISOString().split("T")[0])
+    .order("calendar_date", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
