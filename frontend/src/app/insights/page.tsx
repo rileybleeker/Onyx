@@ -495,8 +495,11 @@ export default function InsightsPage() {
   return (
     <>
       <h2 className="text-2xl font-bold mb-1">Health Insights</h2>
-      <p className="text-zinc-500 text-sm mb-4">
+      <p className="text-zinc-500 text-sm mb-2">
         Cross-device correlations — {enrichedRuns.length} runs, {matrixClean.length} matrix days
+      </p>
+      <p className="text-zinc-600 text-xs mb-4 max-w-3xl">
+        This page correlates data across your Garmin (pace/workouts), WHOOP (recovery/strain/sleep), and Eight Sleep (temperature/sleep stages) to find patterns that predict good performance days. &quot;Pace Delta&quot; is how much faster or slower you ran vs your target — negative means faster. &quot;r&quot; is correlation strength (-1 to 1). &quot;R²&quot; is how much variance one metric explains in another (0 to 1).
       </p>
 
       {/* Section nav pills */}
@@ -516,7 +519,10 @@ export default function InsightsPage() {
       {/* Section 1: Recovery ↔ Performance */}
       {/* ============================================================= */}
       <section ref={(el) => { sectionRefs.current["recovery-perf"] = el; }} className="mb-12">
-        <h3 className="text-lg font-semibold mb-4 text-zinc-200">Recovery ↔ Performance</h3>
+        <h3 className="text-lg font-semibold mb-1 text-zinc-200">Recovery ↔ Performance</h3>
+        <p className="text-zinc-500 text-xs mb-4 max-w-2xl">
+          Does higher WHOOP recovery predict faster running? These charts compare your recovery score on the day of each run against how close you hit your target pace. The slope tells you how much pace improves per 10% recovery gain. The hit rate shows what % of runs met target at each recovery level.
+        </p>
 
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
           <StatCard
@@ -545,6 +551,7 @@ export default function InsightsPage() {
           {/* Q1 — Scatter with trend */}
           {withTarget.length >= 5 && (
             <ChartCard title={`Recovery vs Pace Delta (N = ${withTarget.length})`}>
+              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is a run. X = WHOOP recovery %, Y = how far off target pace (negative = faster). Dashed line = best-fit trend. Color = workout type.</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -581,6 +588,7 @@ export default function InsightsPage() {
 
           {/* Q2 — Hit rate by recovery bin */}
           <ChartCard title="Target Hit Rate by Recovery Bin">
+            <p className="px-4 pb-2 text-xs text-zinc-600">Runs grouped into 10% recovery bins. Bar height = % of runs in that bin where you ran at or faster than target pace. Dashed line at 50%.</p>
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={q2Bins} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -604,6 +612,7 @@ export default function InsightsPage() {
 
           {/* Q3 — Rolling window correlation */}
           <ChartCard title="Recovery Window vs Performance Correlation">
+            <p className="px-4 pb-2 text-xs text-zinc-600">Is today&apos;s recovery or a multi-day average a better predictor? Each bar shows |r| (correlation strength) between a rolling average of recovery over N days and your pace delta. The green bar is the strongest predictor.</p>
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={q3Windows} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -625,7 +634,10 @@ export default function InsightsPage() {
       {/* Section 2: Sleep ↔ Recovery */}
       {/* ============================================================= */}
       <section ref={(el) => { sectionRefs.current["sleep-recovery"] = el; }} className="mb-12">
-        <h3 className="text-lg font-semibold mb-4 text-zinc-200">Sleep ↔ Recovery</h3>
+        <h3 className="text-lg font-semibold mb-1 text-zinc-200">Sleep ↔ Recovery</h3>
+        <p className="text-zinc-500 text-xs mb-4 max-w-2xl">
+          Which Eight Sleep metrics best predict next-day WHOOP recovery? The correlation chart ranks every Eight Sleep metric by how strongly it correlates with recovery. Bed temp and sleep duration charts dig deeper into the two most actionable levers.
+        </p>
 
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
           <StatCard
@@ -654,6 +666,7 @@ export default function InsightsPage() {
           {/* Q4 — Eight Sleep correlations (horizontal bar) */}
           {q4Metrics.length > 0 && (
             <ChartCard title={`Eight Sleep vs WHOOP Recovery Correlations`}>
+              <p className="px-4 pb-2 text-xs text-zinc-600">Pearson r for each Eight Sleep metric vs WHOOP recovery, sorted by strength. Green = positive (higher metric = higher recovery), red = negative (higher metric = lower recovery).</p>
               <ResponsiveContainer width="100%" height={300}>
                 <BarChart data={q4Metrics} layout="vertical" margin={{ top: 10, right: 10, bottom: 10, left: 80 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -674,6 +687,7 @@ export default function InsightsPage() {
           {/* Q5 — Bed temp vs HRV scatter */}
           {q5Data.length >= 5 ? (
             <ChartCard title={`Bed Temperature vs HRV (N = ${q5Data.length})`}>
+              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is one night. X = Eight Sleep bed temp, Y = WHOOP HRV. Diamonds = binned averages (1° bins). Higher HRV generally means better recovery readiness.</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -712,6 +726,7 @@ export default function InsightsPage() {
           {/* Q6 — Sleep duration vs recovery */}
           {q6Data.length >= 5 ? (
             <ChartCard title={`Sleep Duration vs Recovery (N = ${q6Data.length})`}>
+              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is one night. X = hours slept (Eight Sleep), Y = WHOOP recovery %. Green line = 67% (green zone threshold). Blue line = minimum sleep where &gt;50% of nights yield green recovery.</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -744,7 +759,10 @@ export default function InsightsPage() {
       {/* Section 3: Sleep ↔ Performance */}
       {/* ============================================================= */}
       <section ref={(el) => { sectionRefs.current["sleep-perf"] = el; }} className="mb-12">
-        <h3 className="text-lg font-semibold mb-4 text-zinc-200">Sleep ↔ Performance</h3>
+        <h3 className="text-lg font-semibold mb-1 text-zinc-200">Sleep ↔ Performance</h3>
+        <p className="text-zinc-500 text-xs mb-4 max-w-2xl">
+          Does last night&apos;s sleep quality directly affect running performance? These charts skip the recovery middleman and look at raw sleep metrics vs pace and heart rate during runs.
+        </p>
 
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
           <StatCard
@@ -763,6 +781,7 @@ export default function InsightsPage() {
           {/* Q7 — Deep sleep vs pace */}
           {q7Data.length >= 5 ? (
             <ChartCard title={`Deep Sleep vs Pace Adherence (N = ${q7Data.length})`}>
+              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is a run. X = hours of deep sleep the night before (WHOOP, falling back to Eight Sleep), Y = pace delta %. More deep sleep should push dots below zero (faster than target).</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -802,6 +821,7 @@ export default function InsightsPage() {
           {/* Q8 — Bed temp vs HR */}
           {q8Data.length >= 5 ? (
             <ChartCard title={`Bed Temperature vs HR at Pace (N = ${q8Data.length})`}>
+              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is a run. X = Eight Sleep bed temp the night before, Y = average heart rate during the run. Lower HR at the same pace suggests better cardiovascular efficiency.</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -840,7 +860,10 @@ export default function InsightsPage() {
       {/* Section 4: Training Load ↔ Recovery */}
       {/* ============================================================= */}
       <section ref={(el) => { sectionRefs.current["training-load"] = el; }} className="mb-12">
-        <h3 className="text-lg font-semibold mb-4 text-zinc-200">Training Load ↔ Recovery</h3>
+        <h3 className="text-lg font-semibold mb-1 text-zinc-200">Training Load ↔ Recovery</h3>
+        <p className="text-zinc-500 text-xs mb-4 max-w-2xl">
+          How does training load affect recovery over time? The bounce-back chart shows how many days it takes recovery to return to normal after high-strain days. The ratio chart explores whether there&apos;s a sweet spot for strain relative to recovery.
+        </p>
 
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
           <StatCard
@@ -859,6 +882,7 @@ export default function InsightsPage() {
           {/* Q9 — Recovery bounce-back */}
           {q9Data ? (
             <ChartCard title="Recovery After Strain (by Strain Level)">
+              <p className="px-4 pb-2 text-xs text-zinc-600">Days are split into Low/Medium/High strain (25th/75th percentile). Each line shows average recovery on that day and the following 5 days. When the lines converge, recovery has normalized.</p>
               <ResponsiveContainer width="100%" height={300}>
                 <LineChart data={q9Data} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -883,6 +907,7 @@ export default function InsightsPage() {
           {/* Q10 — Strain/recovery ratio vs pace */}
           {q10Data.length >= 5 ? (
             <ChartCard title={`Strain:Recovery Ratio vs Pace Delta (N = ${q10Data.length})`}>
+              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is a run. X = strain divided by recovery (higher = more fatigued). Y = pace delta. Diamonds = binned averages. The optimal ratio zone is where binned pace delta is most negative (fastest).</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -928,7 +953,10 @@ export default function InsightsPage() {
       {/* Section 5: Green Light Conditions */}
       {/* ============================================================= */}
       <section ref={(el) => { sectionRefs.current["green-light"] = el; }} className="mb-12">
-        <h3 className="text-lg font-semibold mb-4 text-zinc-200">Green Light Conditions</h3>
+        <h3 className="text-lg font-semibold mb-1 text-zinc-200">Green Light Conditions</h3>
+        <p className="text-zinc-500 text-xs mb-4 max-w-2xl">
+          What conditions predict a great run? The heatmap shows average pace delta for every combination of recovery zone and sleep score. The profile table compares the average biometrics of &quot;hit&quot; runs (met or beat target) vs &quot;miss&quot; runs. Threshold cards show the minimum values to aim for — the 25th percentile of successful runs.
+        </p>
 
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
           {q12Data.thresholds.map((t) => (
@@ -945,6 +973,7 @@ export default function InsightsPage() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Q11 — Heatmap */}
           <ChartCard title={`Sleep Score × Recovery Zone → Pace Delta (N = ${q11Grid.total})`}>
+            <p className="px-4 pb-2 text-xs text-zinc-600">3x3 grid: rows = WHOOP recovery zone (Red &lt;34%, Yellow 34-66%, Green 67%+), columns = Eight Sleep score (Low &lt;60, Med 60-79, High 80+). Cell value = average pace delta for runs in that bucket. Green cells = faster than target.</p>
             {q11Grid.total >= 5 ? (
               <div className="px-4 pb-4">
                 <div className="grid grid-cols-4 gap-1 text-xs">
@@ -990,6 +1019,7 @@ export default function InsightsPage() {
 
           {/* Q12 — Hit vs Miss comparison table */}
           <ChartCard title={`Green Light Profile: Hit (${q12Data.hitCount}) vs Miss (${q12Data.missCount})`}>
+            <p className="px-4 pb-2 text-xs text-zinc-600">Runs split into Hit (met/beat target) and Miss (slower than target). Each row shows the average for that metric in each group. Positive diff (green) = hits had higher values. Use this to see what separates good days from bad.</p>
             <div className="px-4 pb-4">
               <table className="w-full text-xs">
                 <thead>
