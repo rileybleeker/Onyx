@@ -65,7 +65,8 @@ GRANT SELECT ON pds.eight_sleep_trends TO anon;
 -- ---------------------------------------------------------------------------
 -- 3. Update daily_health_matrix view to include Eight Sleep
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE VIEW pds.daily_health_matrix AS
+DROP VIEW IF EXISTS pds.daily_health_matrix;
+CREATE VIEW pds.daily_health_matrix AS
 SELECT
     gds.calendar_date,
     -- Garmin daily wellness

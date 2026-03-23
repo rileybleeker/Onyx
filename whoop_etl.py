@@ -239,13 +239,13 @@ class WhoopClient:
         return self.get_paginated("/v1/cycle", start=start, end=end)
 
     def get_recovery(self, start: str, end: str) -> list:
-        return self.get_paginated("/v1/recovery", start=start, end=end)
+        return self.get_paginated("/v2/recovery", start=start, end=end)
 
     def get_sleep(self, start: str, end: str) -> list:
-        return self.get_paginated("/v1/activity/sleep", start=start, end=end)
+        return self.get_paginated("/v2/activity/sleep", start=start, end=end)
 
     def get_workouts(self, start: str, end: str) -> list:
-        return self.get_paginated("/v1/activity/workout", start=start, end=end)
+        return self.get_paginated("/v2/activity/workout", start=start, end=end)
 
 
 # ---------------------------------------------------------------------------
