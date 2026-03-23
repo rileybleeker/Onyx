@@ -54,7 +54,7 @@ export default function Dashboard() {
 
   const sleepData = sleep.map((d) => ({
     date: formatDate(d.start_time?.split("T")[0]),
-    hours: d.total_in_bed_time_milli ? +(d.total_in_bed_time_milli / 3600000).toFixed(1) : null,
+    hours: d.total_in_bed_time_milli ? +((d.total_in_bed_time_milli - (d.total_awake_time_milli ?? 0)) / 3600000).toFixed(1) : null,
     score: d.sleep_performance_percentage,
   }));
 
@@ -74,7 +74,7 @@ export default function Dashboard() {
         <StatCard label="Resting HR" value={latestRecovery?.resting_heart_rate} unit="bpm" />
         <StatCard
           label="Sleep"
-          value={latestSleep?.total_in_bed_time_milli ? formatDuration(Math.round(latestSleep.total_in_bed_time_milli / 1000)) : null}
+          value={latestSleep?.total_in_bed_time_milli ? formatDuration(Math.round((latestSleep.total_in_bed_time_milli - (latestSleep.total_awake_time_milli ?? 0)) / 1000)) : null}
           sublabel={latestSleep ? `Score: ${latestSleep.sleep_performance_percentage ?? "—"}%` : undefined}
         />
         <StatCard
