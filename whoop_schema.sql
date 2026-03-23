@@ -162,6 +162,24 @@ CREATE TABLE IF NOT EXISTS pds.whoop_body_measurements (
 );
 
 -- ---------------------------------------------------------------------------
+-- 6. WHOOP Journal Entries (from CSV export — one row per behavior per day)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pds.whoop_journal (
+    cycle_date      DATE NOT NULL,
+    question        TEXT NOT NULL,              -- behavior name (e.g., "Caffeine", "Melatonin")
+    category        TEXT,                       -- e.g., Supplements, Lifestyle, Nutrition
+    answer          TEXT,                       -- "Yes"/"No", quantity, time, or free text
+    notes           TEXT,                       -- optional user notes
+
+    synced_at       TIMESTAMPTZ DEFAULT NOW(),
+
+    PRIMARY KEY (cycle_date, question)
+);
+
+CREATE INDEX IF NOT EXISTS idx_whoop_journal_date ON pds.whoop_journal (cycle_date);
+CREATE INDEX IF NOT EXISTS idx_whoop_journal_category ON pds.whoop_journal (category);
+
+-- ---------------------------------------------------------------------------
 -- Enable RLS on all WHOOP tables
 -- ---------------------------------------------------------------------------
 ALTER TABLE pds.whoop_cycles ENABLE ROW LEVEL SECURITY;
@@ -169,6 +187,7 @@ ALTER TABLE pds.whoop_recovery ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.whoop_sleep ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.whoop_workouts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.whoop_body_measurements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pds.whoop_journal ENABLE ROW LEVEL SECURITY;
 
 -- ---------------------------------------------------------------------------
 -- Update daily_health_matrix to pull HRV/recovery from WHOOP

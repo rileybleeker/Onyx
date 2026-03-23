@@ -128,6 +128,19 @@ const tools: Anthropic.Tool[] = [
     },
   },
   {
+    name: "query_whoop_journal",
+    description: "Get WHOOP Journal entries — self-reported behaviors like caffeine, alcohol, supplements, sleep habits, recovery activities, and more. Each entry has a date, question/behavior name, category, and answer (Yes/No or a value).",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        days: { type: "number", description: "Number of past days to query (default 30)" },
+        question: { type: "string", description: "Optional: filter by specific behavior name (e.g., 'Caffeine', 'Melatonin')" },
+        category: { type: "string", description: "Optional: filter by category (e.g., 'Supplements', 'Lifestyle', 'Sleep')" },
+      },
+      required: [],
+    },
+  },
+  {
     name: "query_eight_sleep",
     description: "Get Eight Sleep mattress data including sleep score, fitness score, HRV, heart rate, breath rate, bed/room temperature, sleep stages, and toss & turns.",
     input_schema: {
@@ -184,6 +197,22 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     query_whoop_sleep: { table: "whoop_sleep", timeCol: "start_time", extra: { is_nap: false, score_state: "SCORED" } },
     query_whoop_workouts: { table: "whoop_workouts", timeCol: "start_time" },
   };
+
+  // Handle whoop journal (special: calendar_date + optional filters)
+  if (name === "query_whoop_journal") {
+    const journalDays = (input.days as number) || 30;
+    const jSince = new Date();
+    jSince.setDate(jSince.getDate() - journalDays);
+    let query = supabase.from("whoop_journal").select("*")
+      .gte("cycle_date", jSince.toISOString().split("T")[0])
+      .order("cycle_date", { ascending: true })
+      .limit(200);
+    if (input.question) query = query.ilike("question", `%${input.question}%`);
+    if (input.category) query = query.ilike("category", `%${input.category}%`);
+    const { data, error } = await query;
+    if (error) return JSON.stringify({ error: error.message });
+    return JSON.stringify(data ?? []);
+  }
 
   // Handle timestamp-based tables
   if (name in timestampTables) {

@@ -161,6 +161,20 @@ export async function getWhoopWorkouts(days: number = 30) {
   return data ?? [];
 }
 
+export async function getWhoopJournal(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("whoop_journal")
+    .select("*")
+    .gte("cycle_date", since.toISOString().split("T")[0])
+    .order("cycle_date", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
 // ---------------------------------------------------------------------------
 // Eight Sleep
 // ---------------------------------------------------------------------------

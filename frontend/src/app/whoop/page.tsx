@@ -5,7 +5,7 @@ import {
   AreaChart, Area, BarChart, Bar, LineChart, Line,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
 } from "recharts";
-import { getWhoopRecovery, getWhoopCycles, getWhoopSleep } from "@/lib/queries";
+import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getWhoopJournal } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -29,11 +29,12 @@ export default function WhoopPage() {
   const [recovery, setRecovery] = useState<any[]>([]);
   const [cycles, setCycles] = useState<any[]>([]);
   const [sleep, setSleep] = useState<any[]>([]);
+  const [journal, setJournal] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    Promise.all([getWhoopRecovery(30), getWhoopCycles(30), getWhoopSleep(30)])
-      .then(([r, c, s]) => { setRecovery(r); setCycles(c); setSleep(s); })
+    Promise.all([getWhoopRecovery(30), getWhoopCycles(30), getWhoopSleep(30), getWhoopJournal(30)])
+      .then(([r, c, s, j]) => { setRecovery(r); setCycles(c); setSleep(s); setJournal(j); })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
@@ -178,6 +179,88 @@ export default function WhoopPage() {
           </ResponsiveContainer>
         </ChartCard>
       </div>
+
+      {/* Journal Section */}
+      {journal.length > 0 && (() => {
+        // Build a heatmap: for each behavior, show which days it was logged as "Yes" or had a value
+        const behaviors = [...new Set(journal.map((j: any) => j.question))].sort();
+        const dates = [...new Set(journal.map((j: any) => j.cycle_date))].sort();
+        const journalMap = new Map<string, string>();
+        journal.forEach((j: any) => {
+          journalMap.set(`${j.cycle_date}|${j.question}`, j.answer);
+        });
+
+        // Group by category
+        const categoryMap = new Map<string, string[]>();
+        journal.forEach((j: any) => {
+          const cat = j.category || "Other";
+          if (!categoryMap.has(cat)) categoryMap.set(cat, []);
+          const list = categoryMap.get(cat)!;
+          if (!list.includes(j.question)) list.push(j.question);
+        });
+
+        const isPositive = (answer: string | undefined) => {
+          if (!answer) return false;
+          const a = answer.toLowerCase();
+          return a === "yes" || a === "true" || (parseFloat(a) > 0 && !isNaN(parseFloat(a)));
+        };
+
+        return (
+          <>
+            <h3 className="text-xl font-bold mt-10 mb-4">Journal</h3>
+
+            {/* Category summary cards */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+              {[...categoryMap.entries()].map(([cat, qs]) => (
+                <div key={cat} className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+                  <p className="text-xs text-zinc-500 uppercase tracking-wider">{cat}</p>
+                  <p className="text-lg font-semibold text-zinc-100 mt-1">{qs.length} behavior{qs.length !== 1 ? "s" : ""}</p>
+                  <p className="text-xs text-zinc-500 mt-1">{qs.slice(0, 3).join(", ")}{qs.length > 3 ? "…" : ""}</p>
+                </div>
+              ))}
+            </div>
+
+            {/* Heatmap grid */}
+            <ChartCard title="Journal Heatmap">
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr>
+                      <th className="text-left text-zinc-500 font-normal pr-3 py-1 sticky left-0 bg-zinc-900 min-w-[140px]">Behavior</th>
+                      {dates.map((d) => (
+                        <th key={d} className="text-zinc-500 font-normal px-0.5 py-1 min-w-[24px]">
+                          <span className="block rotate-[-45deg] origin-bottom-left translate-x-2 whitespace-nowrap">
+                            {formatDate(d)}
+                          </span>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {behaviors.map((b) => (
+                      <tr key={b} className="border-t border-zinc-800/50">
+                        <td className="text-zinc-300 pr-3 py-1 sticky left-0 bg-zinc-900 truncate max-w-[160px]" title={b}>{b}</td>
+                        {dates.map((d) => {
+                          const answer = journalMap.get(`${d}|${b}`);
+                          const active = isPositive(answer);
+                          return (
+                            <td key={d} className="px-0.5 py-1 text-center">
+                              <div
+                                className={`w-5 h-5 rounded-sm mx-auto ${active ? "bg-green-500/80" : "bg-zinc-800/40"}`}
+                                title={answer ? `${b}: ${answer}` : `${b}: —`}
+                              />
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </ChartCard>
+          </>
+        );
+      })()}
     </>
   );
 }
