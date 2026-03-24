@@ -88,7 +88,7 @@ function BAPlot({
           </YAxis>
           <Tooltip
             {...tt}
-            formatter={(value: number, name: string) => [value.toFixed(1), name]}
+            formatter={(value: any, name: any) => [(+value).toFixed(1), name]}
           />
           {/* Bias line */}
           <ReferenceLine y={result.bias} stroke="#f59e0b" strokeDasharray="6 3" strokeWidth={2}>
