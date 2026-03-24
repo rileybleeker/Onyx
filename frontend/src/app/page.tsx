@@ -83,8 +83,8 @@ export default function Dashboard() {
         <ChartCard title="Daily Steps (30 days)">
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={stepsData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={45} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={45} label={{ value: "Steps", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...chartTooltipStyle} />
               <Bar dataKey="steps" fill="#3b82f6" radius={[3, 3, 0, 0]} />
             </BarChart>
@@ -94,8 +94,8 @@ export default function Dashboard() {
         <ChartCard title="Sleep Duration (hours)">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={sleepData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={30} domain={[0, 10]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 10]} label={{ value: "Hours", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...chartTooltipStyle} />
               <Area type="monotone" dataKey="hours" stroke="#8b5cf6" fill="#8b5cf680" strokeWidth={2} />
             </AreaChart>
@@ -105,8 +105,8 @@ export default function Dashboard() {
         <ChartCard title="Sleep Score">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={sleepData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={30} domain={[0, 100]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 100]} label={{ value: "Score (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...chartTooltipStyle} />
               <Area type="monotone" dataKey="score" stroke="#f59e0b" fill="#f59e0b40" strokeWidth={2} />
             </AreaChart>
