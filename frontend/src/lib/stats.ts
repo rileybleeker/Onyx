@@ -193,6 +193,47 @@ export function icc(
   return { value: (msR - msE) / denom, n, k };
 }
 
+/**
+ * Bland-Altman analysis for method comparison.
+ * Returns bias (mean difference), SD of differences, and limits of agreement
+ * (±1.96 SD), plus the individual (mean, diff) points for plotting.
+ */
+export function blandAltman(
+  rawA: (number | null | undefined)[],
+  rawB: (number | null | undefined)[],
+  minPairs = 5
+): {
+  bias: number;
+  sd: number;
+  lowerLoA: number;
+  upperLoA: number;
+  points: { mean: number; diff: number }[];
+  n: number;
+} | null {
+  const [a, b] = cleanPairs(rawA, rawB);
+  if (a.length < minPairs) return null;
+
+  const points: { mean: number; diff: number }[] = [];
+  for (let i = 0; i < a.length; i++) {
+    points.push({ mean: (a[i] + b[i]) / 2, diff: a[i] - b[i] });
+  }
+
+  const diffs = points.map((p) => p.diff);
+  const bias = mean(diffs);
+  const sd = Math.sqrt(
+    diffs.reduce((s, d) => s + (d - bias) ** 2, 0) / (diffs.length - 1)
+  );
+
+  return {
+    bias,
+    sd,
+    lowerLoA: bias - 1.96 * sd,
+    upperLoA: bias + 1.96 * sd,
+    points,
+    n: a.length,
+  };
+}
+
 /** Linear interpolation quantile (expects sorted ascending array) */
 export function quantile(sorted: number[], q: number): number {
   if (sorted.length === 0) return 0;
