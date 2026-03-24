@@ -72,8 +72,8 @@ export default function HeartPage() {
         <ChartCard title="Heart Rate Trends">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={hrData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Heart Rate (bpm)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Area type="monotone" dataKey="max" stroke="#ef4444" fill="#ef444420" strokeWidth={1.5} name="Max" />
@@ -85,9 +85,9 @@ export default function HeartPage() {
         <ChartCard title="Resting HR & HRV (WHOOP)">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={hrvData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis yAxisId="rhr" tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
-              <YAxis yAxisId="hrv" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis yAxisId="rhr" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "RHR (bpm)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+              <YAxis yAxisId="hrv" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke="#3b82f6" strokeWidth={2} dot={false} name="RHR (bpm)" />
@@ -99,8 +99,8 @@ export default function HeartPage() {
         <ChartCard title="Stress Level">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={stressData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={30} domain={[0, 100]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Stress (0-100)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Area type="monotone" dataKey="overall" stroke="#f97316" fill="#f9731640" strokeWidth={2} name="Stress Level" />
             </AreaChart>
