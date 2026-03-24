@@ -161,8 +161,8 @@ export default function RecoveryPage() {
             <ResponsiveContainer width="100%" height={300}>
               <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} />
-                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} />
+                <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                 <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                 <Tooltip content={<ScatterTooltip />} />
                 <Scatter data={withTarget} shape="circle">
@@ -192,8 +192,8 @@ export default function RecoveryPage() {
           <ResponsiveContainer width="100%" height={300}>
             <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-              <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} />
-              <YAxis type="number" dataKey="overallPace" name="Pace" unit=" min/mi" tick={{ fill: "#71717a", fontSize: 11 }} reversed />
+              <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis type="number" dataKey="overallPace" name="Pace" unit=" min/mi" tick={{ fill: "#71717a", fontSize: 11 }} reversed label={{ value: "Pace (min/mi)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip content={<ScatterTooltip />} />
               <Scatter data={scatterAll} shape="circle">
                 {scatterAll.map((d, i) => (
@@ -209,8 +209,8 @@ export default function RecoveryPage() {
           <ResponsiveContainer width="100%" height={280}>
             <BarChart data={bins} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-              <XAxis dataKey="label" tick={{ fill: "#71717a", fontSize: 11 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} />
+              <XAxis dataKey="label" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Recovery Zone", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={45} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <ReferenceLine y={0} stroke="#71717a" />
               <Tooltip {...tt} formatter={(value: any) => [`${value}%`, "Avg Pace Delta"]} />
               <Bar dataKey="avgPaceDelta" name="Avg Pace Delta %" radius={[4, 4, 0, 0]}>
@@ -272,8 +272,8 @@ export default function RecoveryPage() {
             <ResponsiveContainer width="100%" height={300}>
               <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                <XAxis type="number" dataKey="hrv" name="HRV" unit=" ms" tick={{ fill: "#71717a", fontSize: 11 }} />
-                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} />
+                <XAxis type="number" dataKey="hrv" name="HRV" unit=" ms" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                 <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                 <Tooltip content={<ScatterTooltip />} />
                 <Scatter data={withTarget.filter((d) => d.hrv != null)} shape="circle">
@@ -292,8 +292,8 @@ export default function RecoveryPage() {
             <ResponsiveContainer width="100%" height={300}>
               <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                <XAxis type="number" dataKey="sleepPerf" name="Sleep Performance" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[50, 100]} />
-                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} />
+                <XAxis type="number" dataKey="sleepPerf" name="Sleep Performance" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[50, 100]} label={{ value: "Sleep Performance (%)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                 <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                 <Tooltip content={<ScatterTooltip />} />
                 <Scatter data={withTarget.filter((d) => d.sleepPerf != null)} shape="circle">
