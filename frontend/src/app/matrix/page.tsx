@@ -76,8 +76,8 @@ export default function MatrixPage() {
         <ChartCard title="Recovery & Readiness">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={chartData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 100]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Score (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="whoopRecovery" stroke="#22c55e" strokeWidth={2} dot={false} name="WHOOP Recovery" />
@@ -89,8 +89,8 @@ export default function MatrixPage() {
         <ChartCard title="Sleep Scores (3 Sources)">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={chartData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 100]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Score (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="garminSleep" stroke="#3b82f6" strokeWidth={2} dot={false} name="Garmin" />
@@ -103,8 +103,8 @@ export default function MatrixPage() {
         <ChartCard title="HRV Comparison (ms)">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={chartData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="garminHrv" stroke="#3b82f6" strokeWidth={2} dot={false} name="Garmin" />
@@ -117,8 +117,8 @@ export default function MatrixPage() {
         <ChartCard title="Resting Heart Rate (bpm)">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={chartData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Heart Rate (bpm)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="garminRhr" stroke="#3b82f6" strokeWidth={2} dot={false} name="Garmin" />
@@ -131,9 +131,9 @@ export default function MatrixPage() {
         <ChartCard title="Steps & Strain">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={chartData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis yAxisId="steps" tick={{ fill: "#71717a", fontSize: 11 }} width={45} />
-              <YAxis yAxisId="strain" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 21]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis yAxisId="steps" tick={{ fill: "#71717a", fontSize: 11 }} width={50} label={{ value: "Steps", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+              <YAxis yAxisId="strain" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 21]} label={{ value: "Strain (0-21)", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Bar yAxisId="steps" dataKey="steps" fill="#3b82f640" stroke="#3b82f6" name="Steps" radius={[3, 3, 0, 0]} />
@@ -145,8 +145,8 @@ export default function MatrixPage() {
         <ChartCard title="Stress & Body Battery">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={chartData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 100]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Level (0-100)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="bbHigh" stroke="#22c55e" strokeWidth={2} dot={false} name="BB High" />
