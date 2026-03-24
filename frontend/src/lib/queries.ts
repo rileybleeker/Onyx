@@ -70,6 +70,15 @@ export async function getActivities(days: number = 30) {
   return data ?? [];
 }
 
+export async function getWorkouts() {
+  const { data, error } = await supabase
+    .from("garmin_workouts")
+    .select("workout_id,workout_name,interval_target_pace_low_mps,interval_target_pace_high_mps");
+
+  if (error) throw error;
+  return data ?? [];
+}
+
 export async function getStressData(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);

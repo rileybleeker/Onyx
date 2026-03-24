@@ -1,18 +1,24 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getActivities } from "@/lib/queries";
+import { getActivities, getWorkouts } from "@/lib/queries";
 import { formatDuration, formatDistance, formatPace } from "@/lib/format";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 export default function ActivitiesPage() {
   const [activities, setActivities] = useState<any[]>([]);
+  const [workoutMap, setWorkoutMap] = useState<Record<string, any>>({});
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    getActivities(60)
-      .then(setActivities)
+    Promise.all([getActivities(60), getWorkouts()])
+      .then(([acts, wkts]) => {
+        setActivities(acts);
+        const map: Record<string, any> = {};
+        for (const w of wkts) map[String(w.workout_id)] = w;
+        setWorkoutMap(map);
+      })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
@@ -29,7 +35,19 @@ export default function ActivitiesPage() {
         <p className="text-zinc-500">No activities found in the last 60 days.</p>
       ) : (
         <div className="space-y-3">
-          {activities.map((act) => (
+          {activities.map((act) => {
+            let workout: any = null;
+            try {
+              const raw = typeof act.raw_json === "string" ? JSON.parse(act.raw_json) : act.raw_json;
+              const wid = raw?.workoutId;
+              if (wid) workout = workoutMap[String(wid)];
+            } catch { /* ignore */ }
+
+            const targetLow = workout?.interval_target_pace_low_mps;
+            const targetHigh = workout?.interval_target_pace_high_mps;
+            const hasTarget = targetLow && targetHigh && Number(targetLow) > 0 && Number(targetHigh) > 0;
+
+            return (
             <div key={act.activity_id} className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center gap-3">
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
@@ -56,6 +74,14 @@ export default function ActivitiesPage() {
                   <span className="text-zinc-500">Pace </span>
                   <span className="text-zinc-200">{formatPace(act.avg_speed_mps)}</span>
                 </div>
+                {hasTarget && (
+                  <div>
+                    <span className="text-zinc-500">Target </span>
+                    <span className="text-zinc-200">{formatPace(Number(targetLow))}</span>
+                    <span className="text-zinc-500"> – </span>
+                    <span className="text-zinc-200">{formatPace(Number(targetHigh))}</span>
+                  </div>
+                )}
                 <div>
                   <span className="text-zinc-500">HR </span>
                   <span className="text-zinc-200">{act.avg_heart_rate ?? "—"}</span>
@@ -71,7 +97,8 @@ export default function ActivitiesPage() {
                 )}
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </>

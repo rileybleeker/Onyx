@@ -13,15 +13,16 @@ export function formatDuration(seconds: number | null): string {
 
 export function formatDistance(meters: number | null): string {
   if (!meters) return "—";
-  const km = meters / 1000;
-  if (km >= 1) return `${km.toFixed(1)} km`;
+  const miles = meters / 1609.344;
+  if (miles >= 0.5) return `${miles.toFixed(1)} mi`;
   return `${Math.round(meters)} m`;
 }
 
 export function formatPace(speedMps: number | null): string {
   if (!speedMps || speedMps === 0) return "—";
-  const minPerKm = 1000 / speedMps / 60;
-  const mins = Math.floor(minPerKm);
-  const secs = Math.round((minPerKm - mins) * 60);
-  return `${mins}:${secs.toString().padStart(2, "0")} /km`;
+  const minPerMile = 1609.344 / speedMps / 60;
+  const mins = Math.floor(minPerMile);
+  const secs = Math.round((minPerMile - mins) * 60);
+  if (secs === 60) return `${mins + 1}:00 /mi`;
+  return `${mins}:${secs.toString().padStart(2, "0")} /mi`;
 }
