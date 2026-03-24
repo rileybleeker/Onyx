@@ -80,8 +80,8 @@ export default function EightSleepPage() {
         <ChartCard title="Sleep Scores">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={scoreData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 100]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Score (0-100)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="sleep" stroke="#8b5cf6" strokeWidth={2} dot={false} name="Sleep" />
@@ -94,8 +94,8 @@ export default function EightSleepPage() {
         <ChartCard title="Sleep Stages (hours)">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={stagesData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={30} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Duration (hrs)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
@@ -109,9 +109,9 @@ export default function EightSleepPage() {
         <ChartCard title="Heart Rate & HRV">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={biometricsData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis yAxisId="hr" tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
-              <YAxis yAxisId="hrv" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis yAxisId="hr" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Heart Rate (bpm)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+              <YAxis yAxisId="hrv" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line yAxisId="hr" type="monotone" dataKey="hr" stroke="#ef4444" strokeWidth={2} dot={false} name="Avg HR (bpm)" />
@@ -123,9 +123,9 @@ export default function EightSleepPage() {
         <ChartCard title="Bed & Room Temperature">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={envData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis yAxisId="temp" tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
-              <YAxis yAxisId="toss" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis yAxisId="temp" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Temp (\u00b0F)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+              <YAxis yAxisId="toss" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Toss & Turns", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line yAxisId="temp" type="monotone" dataKey="bedTemp" stroke="#f97316" strokeWidth={2} dot={false} name="Bed Temp" />
