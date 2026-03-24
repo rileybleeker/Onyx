@@ -1,1 +1,80 @@
 @import "tailwindcss";
+
+@theme {
+  /* Backgrounds */
+  --color-surface: #0A0A0B;
+  --color-surface-card: #111113;
+  --color-surface-raised: #1A1A1D;
+
+  /* Borders */
+  --color-border-subtle: rgba(255, 255, 255, 0.06);
+  --color-border-hover: rgba(255, 255, 255, 0.10);
+
+  /* Accent */
+  --color-accent: #06B6D4;
+  --color-accent-muted: rgba(6, 182, 212, 0.15);
+
+  /* Text */
+  --color-text-primary: #F4F4F5;
+  --color-text-secondary: #A1A1AA;
+  --color-text-tertiary: #71717A;
+
+  /* Source colors */
+  --color-source-garmin: #3B82F6;
+  --color-source-whoop: #F59E0B;
+  --color-source-eightsleep: #8B5CF6;
+
+  /* Shadows */
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-elevated: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --shadow-floating: 0 8px 30px rgba(0, 0, 0, 0.6);
+
+  /* Fonts — CSS vars set by next/font via geist package */
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+
+  /* Animation */
+  --animate-fade-in: fade-in 150ms ease-out both;
+  --animate-fade-in-up: fade-in-up 150ms ease-out both;
+  --animate-stagger-1: fade-in-up 150ms ease-out 50ms both;
+  --animate-stagger-2: fade-in-up 150ms ease-out 100ms both;
+  --animate-stagger-3: fade-in-up 150ms ease-out 150ms both;
+  --animate-stagger-4: fade-in-up 150ms ease-out 200ms both;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Chart tooltip override */
+.recharts-tooltip-wrapper {
+  outline: none !important;
+}
+
+/* Skeleton loader base */
+.skeleton {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.15);
+}

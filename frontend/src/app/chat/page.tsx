@@ -54,18 +54,23 @@ export default function ChatPage() {
 
   return (
     <div className="flex flex-col h-[calc(100vh-4rem)] max-md:h-[calc(100vh-8rem)]">
-      <h2 className="text-2xl font-bold mb-4">Chat with Onyx</h2>
+      <div className="flex items-baseline justify-between mb-8">
+        <div>
+          <h2 className="text-[28px] font-medium text-text-primary">Chat with Onyx</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">Ask questions about your health data</p>
+        </div>
+      </div>
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto space-y-4 mb-4">
         {messages.length === 0 && (
-          <div className="text-center text-zinc-500 mt-20">
-            <p className="text-lg font-medium">Ask about your health data</p>
+          <div className="text-center mt-20">
+            <p className="text-lg font-medium text-text-tertiary">Ask about your health data</p>
             <div className="mt-4 space-y-2 text-sm">
-              <p className="text-zinc-600">&quot;How did I sleep this week?&quot;</p>
-              <p className="text-zinc-600">&quot;What&apos;s my HRV trend looking like?&quot;</p>
-              <p className="text-zinc-600">&quot;Summarize my training load this month&quot;</p>
-              <p className="text-zinc-600">&quot;Am I overtraining?&quot;</p>
+              <p className="text-text-tertiary/60">&quot;How did I sleep this week?&quot;</p>
+              <p className="text-text-tertiary/60">&quot;What&apos;s my HRV trend looking like?&quot;</p>
+              <p className="text-text-tertiary/60">&quot;Summarize my training load this month&quot;</p>
+              <p className="text-text-tertiary/60">&quot;Am I overtraining?&quot;</p>
             </div>
           </div>
         )}
@@ -75,8 +80,8 @@ export default function ChatPage() {
             <div
               className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap ${
                 msg.role === "user"
-                  ? "bg-blue-600 text-white"
-                  : "bg-zinc-800 text-zinc-200 border border-zinc-700"
+                  ? "bg-accent text-white"
+                  : "bg-surface-raised text-text-secondary border border-border-subtle"
               }`}
             >
               {msg.content}
@@ -86,7 +91,7 @@ export default function ChatPage() {
 
         {loading && (
           <div className="flex justify-start">
-            <div className="bg-zinc-800 border border-zinc-700 rounded-2xl px-4 py-3 text-sm text-zinc-400">
+            <div className="bg-surface-raised border border-border-subtle rounded-[6px] px-4 py-3 text-sm text-text-tertiary">
               <span className="animate-pulse">Thinking...</span>
             </div>
           </div>
@@ -103,13 +108,13 @@ export default function ChatPage() {
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && send()}
           placeholder="Ask about your health data..."
-          className="flex-1 bg-zinc-900 border border-zinc-700 rounded-xl px-4 py-3 text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+          className="flex-1 bg-surface-card border border-border-subtle rounded-[4px] px-4 py-3 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent focus:border-accent"
           disabled={loading}
         />
         <button
           onClick={send}
           disabled={loading || !input.trim()}
-          className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:hover:bg-blue-600 text-white px-5 py-3 rounded-xl text-sm font-medium transition-colors"
+          className="bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:hover:bg-accent text-white px-5 py-3 rounded-[4px] text-sm font-medium transition-colors"
         >
           Send
         </button>

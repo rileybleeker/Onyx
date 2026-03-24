@@ -2,21 +2,16 @@
 
 import { useEffect, useState } from "react";
 import {
-  AreaChart, Area, BarChart, Bar,
+  AreaChart, Area, BarChart, Bar, CartesianGrid,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
 } from "recharts";
 import { getWhoopSleep, getWhoopRecovery } from "@/lib/queries";
 import { formatDate, formatDuration } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-
-const tt = {
-  contentStyle: { backgroundColor: "#18181b", border: "1px solid #27272a", borderRadius: 8 },
-  labelStyle: { color: "#a1a1aa" },
-  itemStyle: { color: "#e4e4e7" },
-};
 
 export default function SleepPage() {
   const [data, setData] = useState<any[]>([]);
@@ -31,7 +26,19 @@ export default function SleepPage() {
   }, []);
 
   if (loading) {
-    return <div className="flex items-center justify-center h-64"><div className="animate-pulse text-zinc-500">Loading sleep data...</div></div>;
+    return (
+      <div className="space-y-6">
+        <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          {[...Array(4)].map((_, i) => (
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+              <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
+              <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
   }
 
   const latest = data[data.length - 1];
@@ -67,23 +74,29 @@ export default function SleepPage() {
 
   return (
     <>
-      <h2 className="text-2xl font-bold mb-6">Sleep</h2>
-
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <StatCard label="Duration" value={latest?.total_in_bed_time_milli ? formatDuration(Math.round(latest.total_in_bed_time_milli / 1000)) : null} />
-        <StatCard label="Sleep Performance" value={latest?.sleep_performance_percentage != null ? `${latest.sleep_performance_percentage}%` : null} sublabel={`Efficiency: ${latest?.sleep_efficiency_percentage ?? "—"}%`} />
-        <StatCard label="Deep Sleep" value={latest?.total_slow_wave_sleep_time_milli ? formatDuration(Math.round(latest.total_slow_wave_sleep_time_milli / 1000)) : null} />
-        <StatCard label="REM Sleep" value={latest?.total_rem_sleep_time_milli ? formatDuration(Math.round(latest.total_rem_sleep_time_milli / 1000)) : null} />
+      <div className="flex items-baseline justify-between mb-8">
+        <div>
+          <h2 className="text-[28px] font-medium text-text-primary">Sleep</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">30-day sleep trends from WHOOP</p>
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <ChartCard title="Sleep Stages (hours)">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+        <StatCard label="Duration" value={latest?.total_in_bed_time_milli ? formatDuration(Math.round(latest.total_in_bed_time_milli / 1000)) : null} source="WHOOP" />
+        <StatCard label="Sleep Performance" value={latest?.sleep_performance_percentage != null ? `${latest.sleep_performance_percentage}%` : null} sublabel={`Efficiency: ${latest?.sleep_efficiency_percentage ?? "\u2014"}%`} source="WHOOP" />
+        <StatCard label="Deep Sleep" value={latest?.total_slow_wave_sleep_time_milli ? formatDuration(Math.round(latest.total_slow_wave_sleep_time_milli / 1000)) : null} source="WHOOP" />
+        <StatCard label="REM Sleep" value={latest?.total_rem_sleep_time_milli ? formatDuration(Math.round(latest.total_rem_sleep_time_milli / 1000)) : null} source="WHOOP" />
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        <ChartCard title="Sleep Stages (hours)" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={durationData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} label={{ value: "Duration (hrs)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <Tooltip {...tt} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={35} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
               <Bar dataKey="light" stackId="a" fill="#60a5fa" name="Light" />
               <Bar dataKey="rem" stackId="a" fill="#a78bfa" name="REM" />
@@ -92,30 +105,56 @@ export default function SleepPage() {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Sleep Scores">
+        <ChartCard title="Sleep Scores" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={scoreData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 100]} label={{ value: "Score (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <Tooltip {...tt} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
-              <Area type="monotone" dataKey="performance" stroke="#f59e0b" fill="#f59e0b30" strokeWidth={2} name="Performance" />
-              <Area type="monotone" dataKey="efficiency" stroke="#22c55e" fill="transparent" strokeWidth={1.5} name="Efficiency" />
-              <Area type="monotone" dataKey="consistency" stroke="#3b82f6" fill="transparent" strokeWidth={1.5} name="Consistency" />
+              <defs>
+                <linearGradient id="sleepPerfGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#f59e0b" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#f59e0b" stopOpacity={0} />
+                </linearGradient>
+                <linearGradient id="sleepEffGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#22c55e" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#22c55e" stopOpacity={0} />
+                </linearGradient>
+                <linearGradient id="sleepConsGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#3b82f6" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={35} domain={[0, 100]} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
+              <Area type="monotone" dataKey="performance" stroke="#f59e0b" fill="url(#sleepPerfGrad)" strokeWidth={2} name="Performance" />
+              <Area type="monotone" dataKey="efficiency" stroke="#22c55e" fill="url(#sleepEffGrad)" strokeWidth={1.5} name="Efficiency" />
+              <Area type="monotone" dataKey="consistency" stroke="#3b82f6" fill="url(#sleepConsGrad)" strokeWidth={1.5} name="Consistency" />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Resting HR, HRV & Respiratory Rate">
+        <ChartCard title="Resting HR, HRV & Respiratory Rate" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={hrData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis yAxisId="hr" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "bpm / breaths", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <YAxis yAxisId="hrv" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
-              <Tooltip {...tt} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
-              <Area yAxisId="hr" type="monotone" dataKey="hr" stroke="#ef4444" fill="#ef444430" strokeWidth={2} name="RHR (bpm)" />
-              <Area yAxisId="hrv" type="monotone" dataKey="hrv" stroke="#22c55e" fill="#22c55e30" strokeWidth={2} name="HRV (ms)" />
+              <defs>
+                <linearGradient id="sleepRhrGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#ef4444" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#ef4444" stopOpacity={0} />
+                </linearGradient>
+                <linearGradient id="sleepHrvGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#22c55e" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#22c55e" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis yAxisId="hr" tick={axisTick} width={40} />
+              <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
+              <Area yAxisId="hr" type="monotone" dataKey="hr" stroke="#ef4444" fill="url(#sleepRhrGrad)" strokeWidth={2} name="RHR (bpm)" />
+              <Area yAxisId="hrv" type="monotone" dataKey="hrv" stroke="#22c55e" fill="url(#sleepHrvGrad)" strokeWidth={2} name="HRV (ms)" />
               <Area yAxisId="hr" type="monotone" dataKey="respRate" stroke="#8b5cf6" fill="transparent" strokeWidth={1.5} name="Resp Rate" />
             </AreaChart>
           </ResponsiveContainer>

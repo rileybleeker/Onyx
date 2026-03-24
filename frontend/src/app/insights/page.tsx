@@ -12,14 +12,9 @@ import ChartCard from "@/components/ChartCard";
 import {
   pearsonR, linearRegression, trendLine, binBy, rollingAvg, quantile, mean,
 } from "@/lib/stats";
+import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-
-const tt = {
-  contentStyle: { backgroundColor: "#18181b", border: "1px solid #27272a", borderRadius: 8 },
-  labelStyle: { color: "#a1a1aa" },
-  itemStyle: { color: "#e4e4e7" },
-};
 
 const WORKOUT_COLORS: Record<string, string> = {
   AEROBIC_BASE: "#3b82f6",
@@ -133,17 +128,17 @@ export default function InsightsPage() {
   const withTarget = useMemo(() => enrichedRuns.filter((d) => d.paceDelta != null), [enrichedRuns]);
 
   // =====================================================================
-  // Section 1: Recovery ↔ Performance
+  // Section 1: Recovery <-> Performance
   // =====================================================================
 
-  // Q1 — Recovery vs Pace Delta scatter + trend
+  // Q1 -- Recovery vs Pace Delta scatter + trend
   const q1Reg = useMemo(() =>
     linearRegression(withTarget.map((d) => d.recovery), withTarget.map((d) => d.paceDelta)),
     [withTarget]
   );
   const q1Trend = useMemo(() => trendLine(q1Reg, 0, 100), [q1Reg]);
 
-  // Q2 — Target hit rate by recovery bin
+  // Q2 -- Target hit rate by recovery bin
   const q2Bins = useMemo(() => {
     const bins = binBy(withTarget, (d) => d.recovery, 10, 0, 100);
     return bins.map((b) => {
@@ -164,7 +159,7 @@ export default function InsightsPage() {
     return null;
   }, [q2Bins]);
 
-  // Q3 — Rolling recovery window vs performance correlation
+  // Q3 -- Rolling recovery window vs performance correlation
   const q3Windows = useMemo(() => {
     const windows = [1, 2, 3, 5, 7];
     const matrixRecoveries = matrixClean.map((d) => d.whoopRecovery);
@@ -193,10 +188,10 @@ export default function InsightsPage() {
   }, [q3Windows]);
 
   // =====================================================================
-  // Section 2: Sleep ↔ Recovery
+  // Section 2: Sleep <-> Recovery
   // =====================================================================
 
-  // Q4 — Eight Sleep metric correlations with WHOOP recovery
+  // Q4 -- Eight Sleep metric correlations with WHOOP recovery
   const q4Metrics = useMemo(() => {
     const metrics: { key: string; label: string; accessor: (d: any) => number | null }[] = [
       { key: "eightSleepScore", label: "Sleep Score", accessor: (d) => d.eightSleepScore },
@@ -228,7 +223,7 @@ export default function InsightsPage() {
 
   const q4Best = q4Metrics.length > 0 ? q4Metrics[0] : null;
 
-  // Q5 — Bed temperature vs HRV
+  // Q5 -- Bed temperature vs HRV
   const q5Data = useMemo(() =>
     matrixClean.filter((d) => d.eightBedTemp != null && d.whoopHrv != null),
     [matrixClean]
@@ -259,7 +254,7 @@ export default function InsightsPage() {
     return q5Bins.reduce((best, b) => b.avgHrv > best.avgHrv ? b : best);
   }, [q5Bins]);
 
-  // Q6 — Sleep duration vs recovery
+  // Q6 -- Sleep duration vs recovery
   const q6Data = useMemo(() =>
     matrixClean.filter((d) => d.eightDurationHrs != null && d.whoopRecovery != null),
     [matrixClean]
@@ -277,10 +272,10 @@ export default function InsightsPage() {
   }, [q6Data]);
 
   // =====================================================================
-  // Section 3: Sleep ↔ Performance
+  // Section 3: Sleep <-> Performance
   // =====================================================================
 
-  // Q7 — Deep sleep vs pace adherence
+  // Q7 -- Deep sleep vs pace adherence
   const q7Data = useMemo(() =>
     withTarget.filter((d) => (d.whoopDeepSleepHrs != null || d.eightDeepSleepHrs != null)),
     [withTarget]
@@ -298,7 +293,7 @@ export default function InsightsPage() {
     [q7DeepSleep, q7Data]
   );
 
-  // Q8 — Bed temperature vs next-day HR at pace
+  // Q8 -- Bed temperature vs next-day HR at pace
   const q8Data = useMemo(() =>
     withTarget.filter((d) => d.eightBedTemp != null && d.avgHr != null),
     [withTarget]
@@ -313,10 +308,10 @@ export default function InsightsPage() {
   );
 
   // =====================================================================
-  // Section 4: Training Load ↔ Recovery
+  // Section 4: Training Load <-> Recovery
   // =====================================================================
 
-  // Q9 — Recovery bounce-back after high strain
+  // Q9 -- Recovery bounce-back after high strain
   const q9Data = useMemo(() => {
     const withStrain = matrixClean.filter((d) => d.whoopStrain != null && d.whoopRecovery != null);
     if (withStrain.length < 20) return null;
@@ -365,7 +360,7 @@ export default function InsightsPage() {
     return null;
   }, [q9Data]);
 
-  // Q10 — Strain-to-recovery ratio vs pace delta
+  // Q10 -- Strain-to-recovery ratio vs pace delta
   const q10Data = useMemo(() =>
     withTarget
       .filter((d) => d.whoopStrain != null && d.recovery! > 0)
@@ -398,7 +393,7 @@ export default function InsightsPage() {
   // Section 5: Green Light Conditions
   // =====================================================================
 
-  // Q11 — Sleep × Recovery heatmap
+  // Q11 -- Sleep x Recovery heatmap
   const q11Grid = useMemo(() => {
     const zones = ["Red", "Yellow", "Green"] as const;
     const sleepBins = ["Low", "Med", "High"] as const;
@@ -427,7 +422,7 @@ export default function InsightsPage() {
     return { grid, zones, sleepBins, total: runsWithBoth.length };
   }, [withTarget]);
 
-  // Q12 — Green light profile
+  // Q12 -- Green light profile
   const q12Data = useMemo(() => {
     const hits = withTarget.filter((d) => d.paceDelta! <= 0);
     const misses = withTarget.filter((d) => d.paceDelta! > 0);
@@ -478,15 +473,44 @@ export default function InsightsPage() {
   // =====================================================================
 
   if (loading) {
-    return <div className="flex items-center justify-center h-64"><div className="animate-pulse text-zinc-500">Loading insights...</div></div>;
+    return (
+      <div className="space-y-6">
+        <div className="flex items-baseline justify-between mb-8">
+          <div>
+            <div className="h-7 w-48 bg-white/5 animate-pulse rounded-[4px]" />
+            <div className="h-4 w-80 bg-white/5 animate-pulse rounded-[4px] mt-2" />
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2 mb-8">
+          {[1, 2, 3, 4, 5].map((i) => (
+            <div key={i} className="h-8 w-32 bg-white/5 animate-pulse rounded-[2px]" />
+          ))}
+        </div>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+          {[1, 2, 3, 4].map((i) => (
+            <div key={i} className="h-24 bg-white/5 animate-pulse rounded-[6px]" />
+          ))}
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {[1, 2, 3, 4].map((i) => (
+            <div key={i} className="h-[360px] bg-white/5 animate-pulse rounded-[6px]" />
+          ))}
+        </div>
+      </div>
+    );
   }
 
   if (enrichedRuns.length < 10) {
     return (
       <>
-        <h2 className="text-2xl font-bold mb-2">Health Insights</h2>
-        <div className="bg-amber-900/30 border border-amber-700 rounded-xl p-4 text-amber-200 text-sm">
-          Insufficient data — need at least 10 runs with recovery data to generate insights. Currently have {enrichedRuns.length}.
+        <div className="flex items-baseline justify-between mb-8">
+          <div>
+            <h2 className="text-[28px] font-medium text-text-primary">Health Insights</h2>
+            <p className="text-sm text-text-tertiary mt-0.5">Cross-device correlations</p>
+          </div>
+        </div>
+        <div className="bg-amber-900/30 border border-amber-700 rounded-[6px] p-4 text-amber-200 text-sm">
+          Insufficient data -- need at least 10 runs with recovery data to generate insights. Currently have {enrichedRuns.length}.
         </div>
       </>
     );
@@ -494,12 +518,16 @@ export default function InsightsPage() {
 
   return (
     <>
-      <h2 className="text-2xl font-bold mb-1">Health Insights</h2>
-      <p className="text-zinc-500 text-sm mb-2">
-        Cross-device correlations — {enrichedRuns.length} runs, {matrixClean.length} matrix days
-      </p>
-      <p className="text-zinc-600 text-xs mb-4 max-w-3xl">
-        This page correlates data across your Garmin (pace/workouts), WHOOP (recovery/strain/sleep), and Eight Sleep (temperature/sleep stages) to find patterns that predict good performance days. &quot;Pace Delta&quot; is how much faster or slower you ran vs your target — negative means faster. &quot;r&quot; is correlation strength (-1 to 1). &quot;R²&quot; is how much variance one metric explains in another (0 to 1).
+      <div className="flex items-baseline justify-between mb-8">
+        <div>
+          <h2 className="text-[28px] font-medium text-text-primary">Health Insights</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">
+            Cross-device correlations -- {enrichedRuns.length} runs, {matrixClean.length} matrix days
+          </p>
+        </div>
+      </div>
+      <p className="text-text-tertiary text-xs mb-4 max-w-3xl">
+        This page correlates data across your Garmin (pace/workouts), WHOOP (recovery/strain/sleep), and Eight Sleep (temperature/sleep stages) to find patterns that predict good performance days. &quot;Pace Delta&quot; is how much faster or slower you ran vs your target -- negative means faster. &quot;r&quot; is correlation strength (-1 to 1). &quot;R&#178;&quot; is how much variance one metric explains in another (0 to 1).
       </p>
 
       {/* Section nav pills */}
@@ -508,7 +536,7 @@ export default function InsightsPage() {
           <button
             key={s.id}
             onClick={() => sectionRefs.current[s.id]?.scrollIntoView({ behavior: "smooth", block: "start" })}
-            className="px-3 py-1.5 rounded-full text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 transition-colors"
+            className="bg-surface-raised text-text-secondary hover:bg-white/10 text-[11px] font-mono px-3 py-1.5 rounded-[2px] transition-colors"
           >
             {s.label}
           </button>
@@ -516,28 +544,28 @@ export default function InsightsPage() {
       </div>
 
       {/* ============================================================= */}
-      {/* Section 1: Recovery ↔ Performance */}
+      {/* Section 1: Recovery <-> Performance */}
       {/* ============================================================= */}
       <section ref={(el) => { sectionRefs.current["recovery-perf"] = el; }} className="mb-12">
-        <h3 className="text-lg font-semibold mb-1 text-zinc-200">Recovery ↔ Performance</h3>
-        <p className="text-zinc-500 text-xs mb-4 max-w-2xl">
+        <h3 className="text-lg font-semibold mb-1 text-text-primary">Recovery &#8596; Performance</h3>
+        <p className="text-text-tertiary text-xs mb-4 max-w-2xl">
           Does higher WHOOP recovery predict faster running? These charts compare your recovery score on the day of each run against how close you hit your target pace. The slope tells you how much pace improves per 10% recovery gain. The hit rate shows what % of runs met target at each recovery level.
         </p>
 
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
           <StatCard
-            label="R² (Recovery → Pace)"
+            label="R&#178; (Recovery -> Pace)"
             value={q1Reg ? fmt(q1Reg.r2) : null}
             sublabel={q1Reg ? `N = ${q1Reg.n} runs` : "Insufficient data"}
           />
           <StatCard
             label="Slope Interpretation"
             value={q1Reg ? `${fmt(q1Reg.slope * 10, 1)}%` : null}
-            sublabel="pace Δ per 10% recovery"
+            sublabel="pace delta per 10% recovery"
           />
           <StatCard
             label="Hit Rate Threshold"
-            value={q2Threshold != null ? `${q2Threshold}%` : "—"}
+            value={q2Threshold != null ? `${q2Threshold}%` : "\u2014"}
             sublabel="recovery where hit rate < 50%"
           />
           <StatCard
@@ -548,17 +576,17 @@ export default function InsightsPage() {
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Q1 — Scatter with trend */}
+          {/* Q1 -- Scatter with trend */}
           {withTarget.length >= 5 && (
             <ChartCard title={`Recovery vs Pace Delta (N = ${withTarget.length})`}>
-              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is a run. X = WHOOP recovery %, Y = how far off target pace (negative = faster). Dashed line = best-fit trend. Color = workout type.</p>
+              <p className="px-4 pb-2 text-xs text-text-tertiary">Each dot is a run. X = WHOOP recovery %, Y = how far off target pace (negative = faster). Dashed line = best-fit trend. Color = workout type.</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                  <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={axisTick} domain={[0, 100]} />
+                  <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={axisTick} />
                   <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
-                  <Tooltip {...tt} />
+                  <Tooltip {...chartTooltip} />
                   <Scatter data={withTarget} shape="circle">
                     {withTarget.map((d, i) => (
                       <Cell key={i} fill={WORKOUT_COLORS[d.type] || "#71717a"} fillOpacity={0.8} r={5} />
@@ -576,7 +604,7 @@ export default function InsightsPage() {
                   const count = withTarget.filter((d) => d.type === type).length;
                   if (count === 0) return null;
                   return (
-                    <span key={type} className="flex items-center gap-1.5 text-xs text-zinc-400">
+                    <span key={type} className="flex items-center gap-1.5 text-xs text-text-secondary">
                       <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: color }} />
                       {type.replace(/_/g, " ")} ({count})
                     </span>
@@ -586,16 +614,16 @@ export default function InsightsPage() {
             </ChartCard>
           )}
 
-          {/* Q2 — Hit rate by recovery bin */}
+          {/* Q2 -- Hit rate by recovery bin */}
           <ChartCard title="Target Hit Rate by Recovery Bin">
-            <p className="px-4 pb-2 text-xs text-zinc-600">Runs grouped into 10% recovery bins. Bar height = % of runs in that bin where you ran at or faster than target pace. Dashed line at 50%.</p>
+            <p className="px-4 pb-2 text-xs text-text-tertiary">Runs grouped into 10% recovery bins. Bar height = % of runs in that bin where you ran at or faster than target pace. Dashed line at 50%.</p>
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={q2Bins} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                <XAxis dataKey="label" tick={{ fill: "#71717a", fontSize: 10 }} interval={0} angle={-45} textAnchor="end" height={50} label={{ value: "Recovery Bin", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} unit="%" label={{ value: "Hit Rate (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="label" tick={{ ...axisTick, fontSize: 10 }} interval={0} angle={-45} textAnchor="end" height={50} />
+                <YAxis tick={axisTick} width={40} domain={[0, 100]} unit="%" />
                 <ReferenceLine y={50} stroke="#71717a" strokeDasharray="3 3" />
-                <Tooltip {...tt} formatter={(value: any, name: any) => [`${(+value).toFixed(0)}%`, name]} />
+                <Tooltip {...chartTooltip} formatter={(value: any, name: any) => [`${(+value).toFixed(0)}%`, name]} />
                 <Bar dataKey="hitRate" name="Hit Rate" radius={[4, 4, 0, 0]}>
                   {q2Bins.map((b, i) => (
                     <Cell key={i} fill={b.min >= 67 ? "#22c55e" : b.min >= 34 ? "#f59e0b" : "#ef4444"} fillOpacity={0.8} />
@@ -603,22 +631,22 @@ export default function InsightsPage() {
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
-            <div className="px-4 pb-3 text-xs text-zinc-500">
+            <div className="px-4 pb-3 text-xs text-text-tertiary">
               {q2Bins.filter((b) => b.count > 0).map((b) => (
                 <span key={b.label} className="mr-3">{b.label}: {b.count} runs</span>
               ))}
             </div>
           </ChartCard>
 
-          {/* Q3 — Rolling window correlation */}
+          {/* Q3 -- Rolling window correlation */}
           <ChartCard title="Recovery Window vs Performance Correlation">
-            <p className="px-4 pb-2 text-xs text-zinc-600">Is today&apos;s recovery or a multi-day average a better predictor? Each bar shows |r| (correlation strength) between a rolling average of recovery over N days and your pace delta. The green bar is the strongest predictor.</p>
+            <p className="px-4 pb-2 text-xs text-text-tertiary">Is today&apos;s recovery or a multi-day average a better predictor? Each bar shows |r| (correlation strength) between a rolling average of recovery over N days and your pace delta. The green bar is the strongest predictor.</p>
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={q3Windows} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                <XAxis dataKey="label" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Window", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 1]} label={{ value: "|r|", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-                <Tooltip {...tt} formatter={(value: any) => [fmt(+value), "|r|"]} />
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="label" tick={axisTick} />
+                <YAxis tick={axisTick} width={40} domain={[0, 1]} />
+                <Tooltip {...chartTooltip} formatter={(value: any) => [fmt(+value), "|r|"]} />
                 <Bar dataKey="absR" name="|r|" fill="#3b82f6" radius={[4, 4, 0, 0]}>
                   {q3Windows.map((w, i) => (
                     <Cell key={i} fill={q3Best && w.window === q3Best.window ? "#22c55e" : "#3b82f6"} />
@@ -631,49 +659,49 @@ export default function InsightsPage() {
       </section>
 
       {/* ============================================================= */}
-      {/* Section 2: Sleep ↔ Recovery */}
+      {/* Section 2: Sleep <-> Recovery */}
       {/* ============================================================= */}
       <section ref={(el) => { sectionRefs.current["sleep-recovery"] = el; }} className="mb-12">
-        <h3 className="text-lg font-semibold mb-1 text-zinc-200">Sleep ↔ Recovery</h3>
-        <p className="text-zinc-500 text-xs mb-4 max-w-2xl">
+        <h3 className="text-lg font-semibold mb-1 text-text-primary">Sleep &#8596; Recovery</h3>
+        <p className="text-text-tertiary text-xs mb-4 max-w-2xl">
           Which Eight Sleep metrics best predict next-day WHOOP recovery? The correlation chart ranks every Eight Sleep metric by how strongly it correlates with recovery. Bed temp and sleep duration charts dig deeper into the two most actionable levers.
         </p>
 
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
           <StatCard
             label="Strongest Predictor"
-            value={q4Best ? q4Best.label : "—"}
+            value={q4Best ? q4Best.label : "\u2014"}
             sublabel={q4Best ? `r = ${fmt(q4Best.r)}, N = ${q4Best.n}` : undefined}
           />
           <StatCard
             label="Bed Temp vs HRV"
-            value={q5R != null ? fmt(q5R) : "—"}
+            value={q5R != null ? fmt(q5R) : "\u2014"}
             sublabel={`r, N = ${q5Data.length}`}
           />
           <StatCard
             label="Optimal Bed Temp"
-            value={q5OptimalBin ? `${fmt(q5OptimalBin.temp, 1)}°` : "—"}
+            value={q5OptimalBin ? `${fmt(q5OptimalBin.temp, 1)}\u00B0` : "\u2014"}
             sublabel={q5OptimalBin ? `avg HRV ${fmt(q5OptimalBin.avgHrv, 0)} ms` : undefined}
           />
           <StatCard
             label="Min Sleep for Green"
-            value={q6Threshold != null ? `${q6Threshold.toFixed(1)} hrs` : "—"}
+            value={q6Threshold != null ? `${q6Threshold.toFixed(1)} hrs` : "\u2014"}
             sublabel=">50% green recovery"
           />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Q4 — Eight Sleep correlations (horizontal bar) */}
+          {/* Q4 -- Eight Sleep correlations (horizontal bar) */}
           {q4Metrics.length > 0 && (
-            <ChartCard title={`Eight Sleep vs WHOOP Recovery Correlations`}>
-              <p className="px-4 pb-2 text-xs text-zinc-600">Pearson r for each Eight Sleep metric vs WHOOP recovery, sorted by strength. Green = positive (higher metric = higher recovery), red = negative (higher metric = lower recovery).</p>
+            <ChartCard title="Eight Sleep vs WHOOP Recovery Correlations">
+              <p className="px-4 pb-2 text-xs text-text-tertiary">Pearson r for each Eight Sleep metric vs WHOOP recovery, sorted by strength. Green = positive (higher metric = higher recovery), red = negative (higher metric = lower recovery).</p>
               <ResponsiveContainer width="100%" height={300}>
                 <BarChart data={q4Metrics} layout="vertical" margin={{ top: 10, right: 10, bottom: 10, left: 80 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" tick={{ fill: "#71717a", fontSize: 11 }} domain={[-1, 1]} label={{ value: "Correlation (r)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                  <YAxis type="category" dataKey="label" tick={{ fill: "#71717a", fontSize: 11 }} width={80} label={{ value: "Metric", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis type="number" tick={axisTick} domain={[-1, 1]} />
+                  <YAxis type="category" dataKey="label" tick={axisTick} width={80} />
                   <ReferenceLine x={0} stroke="#71717a" />
-                  <Tooltip {...tt} formatter={(value: any) => [fmt(+value), "r"]} />
+                  <Tooltip {...chartTooltip} formatter={(value: any) => [fmt(+value), "r"]} />
                   <Bar dataKey="r" name="Correlation (r)" radius={[0, 4, 4, 0]}>
                     {q4Metrics.map((m, i) => (
                       <Cell key={i} fill={m.r != null && m.r >= 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.8} />
@@ -684,16 +712,16 @@ export default function InsightsPage() {
             </ChartCard>
           )}
 
-          {/* Q5 — Bed temp vs HRV scatter */}
+          {/* Q5 -- Bed temp vs HRV scatter */}
           {q5Data.length >= 5 ? (
             <ChartCard title={`Bed Temperature vs HRV (N = ${q5Data.length})`}>
-              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is one night. X = Eight Sleep bed temp, Y = WHOOP HRV. Diamonds = binned averages (1° bins). Higher HRV generally means better recovery readiness.</p>
+              <p className="px-4 pb-2 text-xs text-text-tertiary">Each dot is one night. X = Eight Sleep bed temp, Y = WHOOP HRV. Diamonds = binned averages (1 degree bins). Higher HRV generally means better recovery readiness.</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="eightBedTemp" name="Bed Temp" unit="°" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Bed Temp (°F)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                  <YAxis type="number" dataKey="whoopHrv" name="HRV" unit=" ms" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-                  <Tooltip {...tt} />
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis type="number" dataKey="eightBedTemp" name="Bed Temp" unit="\u00B0" tick={axisTick} />
+                  <YAxis type="number" dataKey="whoopHrv" name="HRV" unit=" ms" tick={axisTick} />
+                  <Tooltip {...chartTooltip} />
                   <Scatter data={q5Data} shape="circle" fill="#8b5cf6" fillOpacity={0.6} r={4} />
                   {q5Bins.length >= 2 && (
                     <Scatter data={q5Bins.map((b) => ({ eightBedTemp: b.temp, whoopHrv: b.avgHrv }))} shape="diamond" fill="#f59e0b" r={6} />
@@ -717,26 +745,26 @@ export default function InsightsPage() {
             </ChartCard>
           ) : (
             <ChartCard title="Bed Temperature vs HRV">
-              <div className="flex items-center justify-center h-[300px] text-zinc-500 text-sm">
-                Insufficient Eight Sleep data (N = {q5Data.length}, need ≥ 5)
+              <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
+                Insufficient Eight Sleep data (N = {q5Data.length}, need >= 5)
               </div>
             </ChartCard>
           )}
 
-          {/* Q6 — Sleep duration vs recovery */}
+          {/* Q6 -- Sleep duration vs recovery */}
           {q6Data.length >= 5 ? (
             <ChartCard title={`Sleep Duration vs Recovery (N = ${q6Data.length})`}>
-              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is one night. X = hours slept (Eight Sleep), Y = WHOOP recovery %. Green line = 67% (green zone threshold). Blue line = minimum sleep where &gt;50% of nights yield green recovery.</p>
+              <p className="px-4 pb-2 text-xs text-text-tertiary">Each dot is one night. X = hours slept (Eight Sleep), Y = WHOOP recovery %. Green line = 67% (green zone threshold). Blue line = minimum sleep where &gt;50% of nights yield green recovery.</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="eightDurationHrs" name="Sleep" unit=" hrs" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Sleep (hrs)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                  <YAxis type="number" dataKey="whoopRecovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis type="number" dataKey="eightDurationHrs" name="Sleep" unit=" hrs" tick={axisTick} />
+                  <YAxis type="number" dataKey="whoopRecovery" name="Recovery" unit="%" tick={axisTick} domain={[0, 100]} />
                   <ReferenceLine y={67} stroke="#22c55e" strokeDasharray="3 3" label={{ value: "Green", fill: "#22c55e", fontSize: 10 }} />
                   {q6Threshold != null && (
                     <ReferenceLine x={q6Threshold} stroke="#3b82f6" strokeDasharray="3 3" label={{ value: `${q6Threshold.toFixed(1)}h`, fill: "#3b82f6", fontSize: 10 }} />
                   )}
-                  <Tooltip {...tt} />
+                  <Tooltip {...chartTooltip} />
                   <Scatter data={q6Data} shape="circle">
                     {q6Data.map((d, i) => (
                       <Cell key={i} fill={recoveryColor(d.whoopRecovery!)} fillOpacity={0.7} r={4} />
@@ -747,8 +775,8 @@ export default function InsightsPage() {
             </ChartCard>
           ) : (
             <ChartCard title="Sleep Duration vs Recovery">
-              <div className="flex items-center justify-center h-[300px] text-zinc-500 text-sm">
-                Insufficient Eight Sleep data (N = {q6Data.length}, need ≥ 5)
+              <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
+                Insufficient Eight Sleep data (N = {q6Data.length}, need >= 5)
               </div>
             </ChartCard>
           )}
@@ -756,39 +784,39 @@ export default function InsightsPage() {
       </section>
 
       {/* ============================================================= */}
-      {/* Section 3: Sleep ↔ Performance */}
+      {/* Section 3: Sleep <-> Performance */}
       {/* ============================================================= */}
       <section ref={(el) => { sectionRefs.current["sleep-perf"] = el; }} className="mb-12">
-        <h3 className="text-lg font-semibold mb-1 text-zinc-200">Sleep ↔ Performance</h3>
-        <p className="text-zinc-500 text-xs mb-4 max-w-2xl">
+        <h3 className="text-lg font-semibold mb-1 text-text-primary">Sleep &#8596; Performance</h3>
+        <p className="text-text-tertiary text-xs mb-4 max-w-2xl">
           Does last night&apos;s sleep quality directly affect running performance? These charts skip the recovery middleman and look at raw sleep metrics vs pace and heart rate during runs.
         </p>
 
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
           <StatCard
-            label="Deep Sleep → Pace"
-            value={q7R != null ? fmt(q7R) : "—"}
+            label="Deep Sleep -> Pace"
+            value={q7R != null ? fmt(q7R) : "\u2014"}
             sublabel={`r, N = ${q7Data.length} runs`}
           />
           <StatCard
-            label="Bed Temp → HR"
-            value={q8R != null ? fmt(q8R) : "—"}
+            label="Bed Temp -> HR"
+            value={q8R != null ? fmt(q8R) : "\u2014"}
             sublabel={`r, N = ${q8Data.length} runs`}
           />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Q7 — Deep sleep vs pace */}
+          {/* Q7 -- Deep sleep vs pace */}
           {q7Data.length >= 5 ? (
             <ChartCard title={`Deep Sleep vs Pace Adherence (N = ${q7Data.length})`}>
-              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is a run. X = hours of deep sleep the night before (WHOOP, falling back to Eight Sleep), Y = pace delta %. More deep sleep should push dots below zero (faster than target).</p>
+              <p className="px-4 pb-2 text-xs text-text-tertiary">Each dot is a run. X = hours of deep sleep the night before (WHOOP, falling back to Eight Sleep), Y = pace delta %. More deep sleep should push dots below zero (faster than target).</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="x" name="Deep Sleep" unit=" hrs" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Deep Sleep (hrs)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                  <YAxis type="number" dataKey="y" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis type="number" dataKey="x" name="Deep Sleep" unit=" hrs" tick={axisTick} />
+                  <YAxis type="number" dataKey="y" name="Pace Delta" unit="%" tick={axisTick} />
                   <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
-                  <Tooltip {...tt} />
+                  <Tooltip {...chartTooltip} />
                   <Scatter
                     data={q7Data.map((d, i) => ({ x: q7DeepSleep[i], y: d.paceDelta }))}
                     shape="circle" fill="#8b5cf6" fillOpacity={0.7} r={5}
@@ -812,22 +840,22 @@ export default function InsightsPage() {
             </ChartCard>
           ) : (
             <ChartCard title="Deep Sleep vs Pace Adherence">
-              <div className="flex items-center justify-center h-[300px] text-zinc-500 text-sm">
-                Insufficient data (N = {q7Data.length}, need ≥ 5)
+              <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
+                Insufficient data (N = {q7Data.length}, need >= 5)
               </div>
             </ChartCard>
           )}
 
-          {/* Q8 — Bed temp vs HR */}
+          {/* Q8 -- Bed temp vs HR */}
           {q8Data.length >= 5 ? (
             <ChartCard title={`Bed Temperature vs HR at Pace (N = ${q8Data.length})`}>
-              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is a run. X = Eight Sleep bed temp the night before, Y = average heart rate during the run. Lower HR at the same pace suggests better cardiovascular efficiency.</p>
+              <p className="px-4 pb-2 text-xs text-text-tertiary">Each dot is a run. X = Eight Sleep bed temp the night before, Y = average heart rate during the run. Lower HR at the same pace suggests better cardiovascular efficiency.</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="eightBedTemp" name="Bed Temp" unit="°" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Bed Temp (°F)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                  <YAxis type="number" dataKey="avgHr" name="Avg HR" unit=" bpm" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Avg HR (bpm)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-                  <Tooltip {...tt} />
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis type="number" dataKey="eightBedTemp" name="Bed Temp" unit="\u00B0" tick={axisTick} />
+                  <YAxis type="number" dataKey="avgHr" name="Avg HR" unit=" bpm" tick={axisTick} />
+                  <Tooltip {...chartTooltip} />
                   <Scatter data={q8Data} shape="circle" fill="#06b6d4" fillOpacity={0.7} r={5} />
                   {q8Reg && (() => {
                     const temps = q8Data.map((d) => d.eightBedTemp!);
@@ -848,8 +876,8 @@ export default function InsightsPage() {
             </ChartCard>
           ) : (
             <ChartCard title="Bed Temperature vs HR at Pace">
-              <div className="flex items-center justify-center h-[300px] text-zinc-500 text-sm">
-                Insufficient Eight Sleep data (N = {q8Data.length}, need ≥ 5)
+              <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
+                Insufficient Eight Sleep data (N = {q8Data.length}, need >= 5)
               </div>
             </ChartCard>
           )}
@@ -857,64 +885,64 @@ export default function InsightsPage() {
       </section>
 
       {/* ============================================================= */}
-      {/* Section 4: Training Load ↔ Recovery */}
+      {/* Section 4: Training Load <-> Recovery */}
       {/* ============================================================= */}
       <section ref={(el) => { sectionRefs.current["training-load"] = el; }} className="mb-12">
-        <h3 className="text-lg font-semibold mb-1 text-zinc-200">Training Load ↔ Recovery</h3>
-        <p className="text-zinc-500 text-xs mb-4 max-w-2xl">
+        <h3 className="text-lg font-semibold mb-1 text-text-primary">Training Load &#8596; Recovery</h3>
+        <p className="text-text-tertiary text-xs mb-4 max-w-2xl">
           How does training load affect recovery over time? The bounce-back chart shows how many days it takes recovery to return to normal after high-strain days. The ratio chart explores whether there&apos;s a sweet spot for strain relative to recovery.
         </p>
 
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
           <StatCard
             label="Recovery Normalizes"
-            value={q9NormalizeDay != null ? `~${q9NormalizeDay} days` : "—"}
+            value={q9NormalizeDay != null ? `~${q9NormalizeDay} days` : "\u2014"}
             sublabel="after high strain"
           />
           <StatCard
             label="Optimal Strain:Recovery"
-            value={q10Best ? fmt(q10Best.ratio) : "—"}
+            value={q10Best ? fmt(q10Best.ratio) : "\u2014"}
             sublabel={q10Best ? `avg delta ${fmt(q10Best.avgDelta, 1)}%` : undefined}
           />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Q9 — Recovery bounce-back */}
+          {/* Q9 -- Recovery bounce-back */}
           {q9Data ? (
             <ChartCard title="Recovery After Strain (by Strain Level)">
-              <p className="px-4 pb-2 text-xs text-zinc-600">Days are split into Low/Medium/High strain (25th/75th percentile). Each line shows average recovery on that day and the following 5 days. When the lines converge, recovery has normalized.</p>
+              <p className="px-4 pb-2 text-xs text-text-tertiary">Days are split into Low/Medium/High strain (25th/75th percentile). Each line shows average recovery on that day and the following 5 days. When the lines converge, recovery has normalized.</p>
               <ResponsiveContainer width="100%" height={300}>
                 <LineChart data={q9Data} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis dataKey="day" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Days After", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                  <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-                  <Tooltip {...tt} formatter={(value: any) => [`${fmt(+value, 0)}%`, undefined]} />
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis dataKey="day" tick={axisTick} />
+                  <YAxis tick={axisTick} width={40} domain={[0, 100]} />
+                  <Tooltip {...chartTooltip} formatter={(value: any) => [`${fmt(+value, 0)}%`, undefined]} />
                   <Line type="monotone" dataKey="Low" stroke="#22c55e" strokeWidth={2} dot={{ r: 3 }} name="Low Strain" />
                   <Line type="monotone" dataKey="Medium" stroke="#f59e0b" strokeWidth={2} dot={{ r: 3 }} name="Medium Strain" />
                   <Line type="monotone" dataKey="High" stroke="#ef4444" strokeWidth={2} dot={{ r: 3 }} name="High Strain" />
                 </LineChart>
               </ResponsiveContainer>
-              <p className="px-4 pb-3 text-xs text-zinc-600">Uses consecutive available data points, not strict calendar days.</p>
+              <p className="px-4 pb-3 text-xs text-text-tertiary">Uses consecutive available data points, not strict calendar days.</p>
             </ChartCard>
           ) : (
             <ChartCard title="Recovery After Strain">
-              <div className="flex items-center justify-center h-[300px] text-zinc-500 text-sm">
-                Insufficient strain data (need ≥ 20 days)
+              <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
+                Insufficient strain data (need >= 20 days)
               </div>
             </ChartCard>
           )}
 
-          {/* Q10 — Strain/recovery ratio vs pace */}
+          {/* Q10 -- Strain/recovery ratio vs pace */}
           {q10Data.length >= 5 ? (
             <ChartCard title={`Strain:Recovery Ratio vs Pace Delta (N = ${q10Data.length})`}>
-              <p className="px-4 pb-2 text-xs text-zinc-600">Each dot is a run. X = strain divided by recovery (higher = more fatigued). Y = pace delta. Diamonds = binned averages. The optimal ratio zone is where binned pace delta is most negative (fastest).</p>
+              <p className="px-4 pb-2 text-xs text-text-tertiary">Each dot is a run. X = strain divided by recovery (higher = more fatigued). Y = pace delta. Diamonds = binned averages. The optimal ratio zone is where binned pace delta is most negative (fastest).</p>
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="ratio" name="Strain/Recovery" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Strain / Recovery", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                  <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis type="number" dataKey="ratio" name="Strain/Recovery" tick={axisTick} />
+                  <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={axisTick} />
                   <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
-                  <Tooltip {...tt} />
+                  <Tooltip {...chartTooltip} />
                   <Scatter data={q10Data} shape="circle" fill="#06b6d4" fillOpacity={0.6} r={4} />
                   {q10Bins.length >= 2 && (
                     <Scatter
@@ -941,8 +969,8 @@ export default function InsightsPage() {
             </ChartCard>
           ) : (
             <ChartCard title="Strain:Recovery Ratio vs Pace Delta">
-              <div className="flex items-center justify-center h-[300px] text-zinc-500 text-sm">
-                Insufficient data (N = {q10Data.length}, need ≥ 5)
+              <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
+                Insufficient data (N = {q10Data.length}, need >= 5)
               </div>
             </ChartCard>
           )}
@@ -953,9 +981,9 @@ export default function InsightsPage() {
       {/* Section 5: Green Light Conditions */}
       {/* ============================================================= */}
       <section ref={(el) => { sectionRefs.current["green-light"] = el; }} className="mb-12">
-        <h3 className="text-lg font-semibold mb-1 text-zinc-200">Green Light Conditions</h3>
-        <p className="text-zinc-500 text-xs mb-4 max-w-2xl">
-          What conditions predict a great run? The heatmap shows average pace delta for every combination of recovery zone and sleep score. The profile table compares the average biometrics of &quot;hit&quot; runs (met or beat target) vs &quot;miss&quot; runs. Threshold cards show the minimum values to aim for — the 25th percentile of successful runs.
+        <h3 className="text-lg font-semibold mb-1 text-text-primary">Green Light Conditions</h3>
+        <p className="text-text-tertiary text-xs mb-4 max-w-2xl">
+          What conditions predict a great run? The heatmap shows average pace delta for every combination of recovery zone and sleep score. The profile table compares the average biometrics of &quot;hit&quot; runs (met or beat target) vs &quot;miss&quot; runs. Threshold cards show the minimum values to aim for -- the 25th percentile of successful runs.
         </p>
 
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
@@ -963,7 +991,7 @@ export default function InsightsPage() {
             <StatCard
               key={t.label}
               label={`Min ${t.label}`}
-              value={t.value != null ? `${fmt(t.value, t.unit === "hrs" ? 1 : 0)}` : "—"}
+              value={t.value != null ? `${fmt(t.value, t.unit === "hrs" ? 1 : 0)}` : "\u2014"}
               unit={t.unit}
               sublabel="25th pctl of hits"
             />
@@ -971,59 +999,59 @@ export default function InsightsPage() {
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Q11 — Heatmap */}
-          <ChartCard title={`Sleep Score × Recovery Zone → Pace Delta (N = ${q11Grid.total})`}>
-            <p className="px-4 pb-2 text-xs text-zinc-600">3x3 grid: rows = WHOOP recovery zone (Red &lt;34%, Yellow 34-66%, Green 67%+), columns = Eight Sleep score (Low &lt;60, Med 60-79, High 80+). Cell value = average pace delta for runs in that bucket. Green cells = faster than target.</p>
+          {/* Q11 -- Heatmap */}
+          <ChartCard title={`Sleep Score x Recovery Zone -> Pace Delta (N = ${q11Grid.total})`}>
+            <p className="px-4 pb-2 text-xs text-text-tertiary">3x3 grid: rows = WHOOP recovery zone (Red &lt;34%, Yellow 34-66%, Green 67%+), columns = Eight Sleep score (Low &lt;60, Med 60-79, High 80+). Cell value = average pace delta for runs in that bucket. Green cells = faster than target.</p>
             {q11Grid.total >= 5 ? (
               <div className="px-4 pb-4">
                 <div className="grid grid-cols-4 gap-1 text-xs">
                   <div />
                   {q11Grid.sleepBins.map((sb) => (
-                    <div key={sb} className="text-center text-zinc-500 font-medium py-1">
+                    <div key={sb} className="text-center text-text-tertiary uppercase text-[10px] font-mono tracking-wider py-1">
                       Sleep {sb}
                     </div>
                   ))}
                   {q11Grid.zones.map((rz) => (
                     <>
-                      <div key={`label-${rz}`} className="flex items-center text-zinc-400 font-medium pr-2 justify-end">
+                      <div key={`label-${rz}`} className="flex items-center text-text-secondary font-medium pr-2 justify-end font-mono text-[11px]">
                         {rz}
                       </div>
                       {q11Grid.sleepBins.map((sb) => {
                         const cell = q11Grid.grid[`${rz}-${sb}`];
                         const delta = cell?.avgDelta;
-                        const bg = delta == null ? "bg-zinc-800"
+                        const bg = delta == null ? "bg-surface-raised"
                           : delta <= -3 ? "bg-green-900/60"
                           : delta <= 0 ? "bg-green-900/30"
                           : delta <= 3 ? "bg-red-900/30"
                           : "bg-red-900/60";
                         return (
-                          <div key={`${rz}-${sb}`} className={`${bg} rounded-lg p-2 text-center min-h-[48px] flex flex-col justify-center`}>
-                            <span className="text-white text-sm font-medium">
-                              {delta != null ? `${delta > 0 ? "+" : ""}${fmt(delta, 1)}%` : "—"}
+                          <div key={`${rz}-${sb}`} className={`${bg} rounded-[4px] p-2 text-center min-h-[48px] flex flex-col justify-center`}>
+                            <span className="text-text-primary text-sm font-medium font-mono">
+                              {delta != null ? `${delta > 0 ? "+" : ""}${fmt(delta, 1)}%` : "\u2014"}
                             </span>
-                            <span className="text-zinc-500 text-[10px]">n={cell?.count ?? 0}</span>
+                            <span className="text-text-tertiary text-[10px] font-mono">n={cell?.count ?? 0}</span>
                           </div>
                         );
                       })}
                     </>
                   ))}
                 </div>
-                <p className="text-xs text-zinc-600 mt-2">Sleep bins: Low &lt;60, Med 60-79, High 80+</p>
+                <p className="text-xs text-text-tertiary mt-2">Sleep bins: Low &lt;60, Med 60-79, High 80+</p>
               </div>
             ) : (
-              <div className="flex items-center justify-center h-[200px] text-zinc-500 text-sm">
+              <div className="flex items-center justify-center h-[200px] text-text-tertiary text-sm">
                 Insufficient data with both sleep score and recovery (N = {q11Grid.total})
               </div>
             )}
           </ChartCard>
 
-          {/* Q12 — Hit vs Miss comparison table */}
+          {/* Q12 -- Hit vs Miss comparison table */}
           <ChartCard title={`Green Light Profile: Hit (${q12Data.hitCount}) vs Miss (${q12Data.missCount})`}>
-            <p className="px-4 pb-2 text-xs text-zinc-600">Runs split into Hit (met/beat target) and Miss (slower than target). Each row shows the average for that metric in each group. Positive diff (green) = hits had higher values. Use this to see what separates good days from bad.</p>
+            <p className="px-4 pb-2 text-xs text-text-tertiary">Runs split into Hit (met/beat target) and Miss (slower than target). Each row shows the average for that metric in each group. Positive diff (green) = hits had higher values. Use this to see what separates good days from bad.</p>
             <div className="px-4 pb-4">
               <table className="w-full text-xs">
                 <thead>
-                  <tr className="text-zinc-500 border-b border-zinc-800">
+                  <tr className="text-text-tertiary uppercase text-[10px] font-mono tracking-wider border-b border-border-subtle">
                     <th className="text-left py-2 font-medium">Metric</th>
                     <th className="text-right py-2 font-medium">Hit Avg</th>
                     <th className="text-right py-2 font-medium">Miss Avg</th>
@@ -1032,16 +1060,16 @@ export default function InsightsPage() {
                 </thead>
                 <tbody>
                   {q12Data.rows.map((row) => (
-                    <tr key={row.label} className="border-b border-zinc-800/50">
-                      <td className="py-2 text-zinc-300">{row.label}</td>
-                      <td className="text-right text-white">{row.hitAvg != null ? fmt(row.hitAvg, 1) : "—"}</td>
-                      <td className="text-right text-zinc-400">{row.missAvg != null ? fmt(row.missAvg, 1) : "—"}</td>
-                      <td className="text-right">
+                    <tr key={row.label} className="border-b border-white/5 hover:bg-white/[0.02]">
+                      <td className="py-2 text-text-secondary">{row.label}</td>
+                      <td className="text-right text-text-primary font-mono">{row.hitAvg != null ? fmt(row.hitAvg, 1) : "\u2014"}</td>
+                      <td className="text-right text-text-secondary font-mono">{row.missAvg != null ? fmt(row.missAvg, 1) : "\u2014"}</td>
+                      <td className="text-right font-mono">
                         {row.diff != null ? (
-                          <span className={row.diff > 0 ? "text-green-400" : row.diff < 0 ? "text-red-400" : "text-zinc-400"}>
+                          <span className={row.diff > 0 ? "text-green-400" : row.diff < 0 ? "text-red-400" : "text-text-secondary"}>
                             {row.diff > 0 ? "+" : ""}{fmt(row.diff, 1)}
                           </span>
-                        ) : "—"}
+                        ) : "\u2014"}
                       </td>
                     </tr>
                   ))}

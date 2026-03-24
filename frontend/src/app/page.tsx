@@ -3,20 +3,15 @@
 import { useEffect, useState } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  BarChart, Bar,
+  BarChart, Bar, CartesianGrid,
 } from "recharts";
 import { getDailySummaries, getWhoopRecovery, getWhoopSleep } from "@/lib/queries";
 import { formatDate, formatDuration } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { chartTooltip, axisTick, gridStyle, accentColor } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-
-const chartTooltipStyle = {
-  contentStyle: { backgroundColor: "#18181b", border: "1px solid #27272a", borderRadius: 8 },
-  labelStyle: { color: "#a1a1aa" },
-  itemStyle: { color: "#e4e4e7" },
-};
 
 export default function Dashboard() {
   const [summaries, setSummaries] = useState<any[]>([]);
@@ -37,8 +32,24 @@ export default function Dashboard() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="animate-pulse text-zinc-500">Loading your data...</div>
+      <div className="space-y-6">
+        <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          {[...Array(4)].map((_, i) => (
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+              <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
+              <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
+            </div>
+          ))}
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {[...Array(3)].map((_, i) => (
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-5 h-[300px]">
+              <div className="h-4 w-40 bg-white/5 animate-pulse rounded mb-4" />
+              <div className="h-[220px] bg-white/5 animate-pulse rounded" />
+            </div>
+          ))}
+        </div>
       </div>
     );
   }
@@ -60,55 +71,85 @@ export default function Dashboard() {
 
   return (
     <>
-      <h2 className="text-2xl font-bold mb-6">Dashboard</h2>
+      <div className="flex items-baseline justify-between mb-8">
+        <div>
+          <h2 className="text-[28px] font-medium text-text-primary">Dashboard</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">30-day overview across all sources</p>
+        </div>
+      </div>
 
       {/* KPI row */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <StatCard label="Steps" value={latest?.total_steps?.toLocaleString()} sublabel={latest?.calendar_date} />
-        <StatCard label="Resting HR" value={latestRecovery?.resting_heart_rate} unit="bpm" />
-        <StatCard
-          label="Sleep"
-          value={latestSleep?.total_in_bed_time_milli ? formatDuration(Math.round((latestSleep.total_in_bed_time_milli - (latestSleep.total_awake_time_milli ?? 0)) / 1000)) : null}
-          sublabel={latestSleep ? `Score: ${latestSleep.sleep_performance_percentage ?? "—"}%` : undefined}
-        />
-        <StatCard
-          label="Recovery"
-          value={latestRecovery?.recovery_score}
-          unit="%"
-        />
+        <div className="animate-stagger-1">
+          <StatCard label="Steps" value={latest?.total_steps?.toLocaleString()} sublabel={latest?.calendar_date} source="GARMIN" />
+        </div>
+        <div className="animate-stagger-2">
+          <StatCard label="Resting HR" value={latestRecovery?.resting_heart_rate} unit="bpm" source="WHOOP" />
+        </div>
+        <div className="animate-stagger-3">
+          <StatCard
+            label="Sleep"
+            value={latestSleep?.total_in_bed_time_milli ? formatDuration(Math.round((latestSleep.total_in_bed_time_milli - (latestSleep.total_awake_time_milli ?? 0)) / 1000)) : null}
+            sublabel={latestSleep ? `Score: ${latestSleep.sleep_performance_percentage ?? "\u2014"}%` : undefined}
+            source="WHOOP"
+          />
+        </div>
+        <div className="animate-stagger-4">
+          <StatCard
+            label="Recovery"
+            value={latestRecovery?.recovery_score}
+            unit="%"
+            source="WHOOP"
+          />
+        </div>
       </div>
 
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <ChartCard title="Daily Steps (30 days)">
+        <ChartCard title="Daily Steps" subtitle="30 days" source="GARMIN">
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={stepsData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={45} label={{ value: "Steps", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <Tooltip {...chartTooltipStyle} />
-              <Bar dataKey="steps" fill="#3b82f6" radius={[3, 3, 0, 0]} />
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={45} />
+              <Tooltip {...chartTooltip} />
+              <Bar dataKey="steps" fill={accentColor} radius={[2, 2, 0, 0]} fillOpacity={0.85} />
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Sleep Duration (hours)">
+        <ChartCard title="Sleep Duration" subtitle="Hours per night" source="WHOOP">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={sleepData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 10]} label={{ value: "Hours", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <Tooltip {...chartTooltipStyle} />
-              <Area type="monotone" dataKey="hours" stroke="#8b5cf6" fill="#8b5cf680" strokeWidth={2} />
+              <defs>
+                <linearGradient id="sleepFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={accentColor} stopOpacity={0.15} />
+                  <stop offset="100%" stopColor={accentColor} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={35} domain={[0, 10]} />
+              <Tooltip {...chartTooltip} />
+              <Area type="monotone" dataKey="hours" stroke={accentColor} fill="url(#sleepFill)" strokeWidth={2} />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Sleep Score">
+        <ChartCard title="Sleep Score" source="WHOOP">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={sleepData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 100]} label={{ value: "Score (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <Tooltip {...chartTooltipStyle} />
-              <Area type="monotone" dataKey="score" stroke="#f59e0b" fill="#f59e0b40" strokeWidth={2} />
+              <defs>
+                <linearGradient id="scoreFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#F59E0B" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#F59E0B" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={35} domain={[0, 100]} />
+              <Tooltip {...chartTooltip} />
+              <Area type="monotone" dataKey="score" stroke="#F59E0B" fill="url(#scoreFill)" strokeWidth={2} />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>

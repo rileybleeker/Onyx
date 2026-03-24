@@ -31,24 +31,24 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-zinc-950 px-4">
+    <div className="min-h-screen flex items-center justify-center bg-surface px-4">
       <div className="w-full max-w-sm">
         <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-white">Onyx</h1>
-          <p className="text-zinc-500 mt-1">Personal Data Scientist</p>
+          <h1 className="text-3xl font-semibold text-text-primary">Onyx</h1>
+          <p className="text-text-tertiary mt-1">Personal Data Scientist</p>
         </div>
 
         {sent ? (
-          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 text-center">
-            <p className="text-white font-medium">Check your email</p>
-            <p className="text-zinc-400 text-sm mt-2">
-              We sent a magic link to <span className="text-white">{email}</span>
+          <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 text-center">
+            <p className="text-text-primary font-medium">Check your email</p>
+            <p className="text-text-secondary text-sm mt-2">
+              We sent a magic link to <span className="text-text-primary">{email}</span>
             </p>
           </div>
         ) : (
-          <form onSubmit={handleLogin} className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 space-y-4">
+          <form onSubmit={handleLogin} className="bg-surface-card border border-border-subtle rounded-[6px] p-6 space-y-4">
             <div>
-              <label htmlFor="email" className="block text-sm font-medium text-zinc-400 mb-1.5">
+              <label htmlFor="email" className="block text-sm font-medium text-text-secondary mb-1.5">
                 Email
               </label>
               <input
@@ -58,7 +58,7 @@ export default function LoginPage() {
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="you@example.com"
                 required
-                className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                className="w-full bg-surface-raised border border-border-subtle rounded-[4px] px-3 py-2.5 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent"
               />
             </div>
 
@@ -67,7 +67,7 @@ export default function LoginPage() {
             <button
               type="submit"
               disabled={loading}
-              className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-medium py-2.5 rounded-lg text-sm transition-colors"
+              className="w-full bg-accent hover:bg-accent/90 disabled:opacity-50 text-white font-medium py-2.5 rounded-[4px] text-sm transition-colors"
             >
               {loading ? "Sending..." : "Send magic link"}
             </button>

@@ -3,20 +3,17 @@
 import { useEffect, useState } from "react";
 import {
   AreaChart, Area, BarChart, Bar, LineChart, Line,
-  XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
+  XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
 import { getEightSleepTrends } from "@/lib/queries";
 import { formatDate, formatDuration } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-const tt = {
-  contentStyle: { backgroundColor: "#18181b", border: "1px solid #27272a", borderRadius: 8 },
-  labelStyle: { color: "#a1a1aa" },
-  itemStyle: { color: "#e4e4e7" },
-};
+const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
 
 export default function EightSleepPage() {
   const [data, setData] = useState<any[]>([]);
@@ -30,7 +27,19 @@ export default function EightSleepPage() {
   }, []);
 
   if (loading) {
-    return <div className="flex items-center justify-center h-64"><div className="animate-pulse text-zinc-500">Loading Eight Sleep data...</div></div>;
+    return (
+      <div className="space-y-6">
+        <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          {[...Array(4)].map((_, i) => (
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+              <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
+              <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
   }
 
   const latest = data[data.length - 1];
@@ -67,23 +76,29 @@ export default function EightSleepPage() {
 
   return (
     <>
-      <h2 className="text-2xl font-bold mb-6">Eight Sleep</h2>
+      <div className="flex items-baseline justify-between mb-8">
+        <div>
+          <h2 className="text-[28px] font-medium text-text-primary">Eight Sleep</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">Sleep tracking and bed environment data</p>
+        </div>
+      </div>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <StatCard label="Sleep Score" value={latest?.sleep_score} />
-        <StatCard label="Fitness Score" value={latest?.sleep_fitness_score} />
-        <StatCard label="Duration" value={formatDuration(latest?.time_slept_seconds)} />
-        <StatCard label="HRV" value={latest?.avg_hrv ? Number(latest.avg_hrv).toFixed(0) : null} unit="ms" />
+        <StatCard label="Sleep Score" value={latest?.sleep_score} source="8SLP" />
+        <StatCard label="Fitness Score" value={latest?.sleep_fitness_score} source="8SLP" />
+        <StatCard label="Duration" value={formatDuration(latest?.time_slept_seconds)} source="8SLP" />
+        <StatCard label="HRV" value={latest?.avg_hrv ? Number(latest.avg_hrv).toFixed(0) : null} unit="ms" source="8SLP" />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <ChartCard title="Sleep Scores">
+        <ChartCard title="Sleep Scores" source="8SLP">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={scoreData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Score (0-100)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <Tooltip {...tt} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} domain={[0, 100]} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
               <Line type="monotone" dataKey="sleep" stroke="#8b5cf6" strokeWidth={2} dot={false} name="Sleep" />
               <Line type="monotone" dataKey="fitness" stroke="#22c55e" strokeWidth={1.5} dot={false} name="Fitness" />
               <Line type="monotone" dataKey="quality" stroke="#3b82f6" strokeWidth={1.5} dot={false} name="Quality" />
@@ -91,13 +106,14 @@ export default function EightSleepPage() {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Sleep Stages (hours)">
+        <ChartCard title="Sleep Stages (hours)" source="8SLP">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={stagesData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Duration (hrs)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <Tooltip {...tt} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
               <Bar dataKey="light" stackId="a" fill="#60a5fa" name="Light" />
               <Bar dataKey="rem" stackId="a" fill="#a78bfa" name="REM" />
@@ -106,28 +122,30 @@ export default function EightSleepPage() {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Heart Rate & HRV">
+        <ChartCard title="Heart Rate & HRV" source="8SLP">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={biometricsData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis yAxisId="hr" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Heart Rate (bpm)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <YAxis yAxisId="hrv" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
-              <Tooltip {...tt} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis yAxisId="hr" tick={axisTick} width={40} />
+              <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
               <Line yAxisId="hr" type="monotone" dataKey="hr" stroke="#ef4444" strokeWidth={2} dot={false} name="Avg HR (bpm)" />
               <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={2} dot={false} name="Avg HRV (ms)" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Bed & Room Temperature">
+        <ChartCard title="Bed & Room Temperature" source="8SLP">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={envData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis yAxisId="temp" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Temp (\u00b0F)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <YAxis yAxisId="toss" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Toss & Turns", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
-              <Tooltip {...tt} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis yAxisId="temp" tick={axisTick} width={40} />
+              <YAxis yAxisId="toss" orientation="right" tick={axisTick} width={40} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
               <Line yAxisId="temp" type="monotone" dataKey="bedTemp" stroke="#f97316" strokeWidth={2} dot={false} name="Bed Temp" />
               <Line yAxisId="temp" type="monotone" dataKey="roomTemp" stroke="#06b6d4" strokeWidth={2} dot={false} name="Room Temp" />
               <Line yAxisId="toss" type="monotone" dataKey="tossTurns" stroke="#a1a1aa" strokeWidth={1.5} dot={false} name="Toss & Turns" />

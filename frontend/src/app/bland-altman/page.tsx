@@ -3,19 +3,14 @@
 import { useEffect, useState } from "react";
 import {
   ScatterChart, Scatter, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  ReferenceLine, Label,
+  ReferenceLine, CartesianGrid, Label,
 } from "recharts";
 import { getHealthMatrix } from "@/lib/queries";
 import { blandAltman } from "@/lib/stats";
 import ChartCard from "@/components/ChartCard";
+import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-
-const tt = {
-  contentStyle: { backgroundColor: "#18181b", border: "1px solid #27272a", borderRadius: 8 },
-  labelStyle: { color: "#a1a1aa" },
-  itemStyle: { color: "#e4e4e7" },
-};
 
 interface BAResult {
   bias: number;
@@ -53,7 +48,7 @@ function BAPlot({
   if (!result) {
     return (
       <ChartCard title={title} subtitle="Insufficient overlapping data">
-        <div className="flex items-center justify-center h-[260px] text-zinc-600 text-sm">
+        <div className="flex items-center justify-center h-[260px] text-text-tertiary text-sm">
           Not enough paired observations
         </div>
       </ChartCard>
@@ -68,26 +63,23 @@ function BAPlot({
     <ChartCard title={title} subtitle={subtitle}>
       <ResponsiveContainer width="100%" height={280}>
         <ScatterChart margin={{ top: 10, right: 20, bottom: 20, left: 10 }}>
+          <CartesianGrid {...gridStyle} />
           <XAxis
             dataKey="mean"
             type="number"
             domain={[xMin - pad, xMax + pad]}
-            tick={{ fill: "#71717a", fontSize: 11 }}
+            tick={axisTick}
             name="Mean"
-          >
-            <Label value={`Mean of both (${unit})`} fill="#71717a" fontSize={11} position="insideBottom" offset={-10} />
-          </XAxis>
+          />
           <YAxis
             dataKey="diff"
             type="number"
-            tick={{ fill: "#71717a", fontSize: 11 }}
+            tick={axisTick}
             width={50}
             name="Difference"
-          >
-            <Label value={`Difference (${unit})`} fill="#71717a" fontSize={11} angle={-90} position="insideLeft" />
-          </YAxis>
+          />
           <Tooltip
-            {...tt}
+            {...chartTooltip}
             formatter={(value: any, name: any) => [(+value).toFixed(1), name]}
           />
           {/* Bias line */}
@@ -124,8 +116,19 @@ export default function BlandAltmanPage() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="animate-pulse text-zinc-500">Loading Bland-Altman analysis...</div>
+      <div className="space-y-6">
+        <div className="flex items-baseline justify-between mb-8">
+          <div>
+            <div className="h-7 w-64 bg-white/5 animate-pulse rounded-[4px]" />
+            <div className="h-4 w-96 bg-white/5 animate-pulse rounded-[4px] mt-2" />
+          </div>
+        </div>
+        <div className="h-40 bg-white/5 animate-pulse rounded-[6px]" />
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {[1, 2, 3].map((i) => (
+            <div key={i} className="h-[320px] bg-white/5 animate-pulse rounded-[6px]" />
+          ))}
+        </div>
       </div>
     );
   }
@@ -133,8 +136,13 @@ export default function BlandAltmanPage() {
   if (data.length === 0) {
     return (
       <>
-        <h2 className="text-2xl font-bold mb-6">Bland-Altman Analysis</h2>
-        <p className="text-zinc-500">No data available. Make sure your ETL pipelines have synced data.</p>
+        <div className="flex items-baseline justify-between mb-8">
+          <div>
+            <h2 className="text-[28px] font-medium text-text-primary">Bland-Altman Analysis</h2>
+            <p className="text-sm text-text-tertiary mt-0.5">Method agreement analysis</p>
+          </div>
+        </div>
+        <p className="text-text-tertiary">No data available. Make sure your ETL pipelines have synced data.</p>
       </>
     );
   }
@@ -177,18 +185,22 @@ export default function BlandAltmanPage() {
 
   return (
     <>
-      <h2 className="text-2xl font-bold mb-2">Bland-Altman Analysis</h2>
-      <p className="text-zinc-500 text-sm mb-4">
-        Method agreement between Garmin, WHOOP, and Eight Sleep — last 90 days, pairwise.
-      </p>
+      <div className="flex items-baseline justify-between mb-8">
+        <div>
+          <h2 className="text-[28px] font-medium text-text-primary">Bland-Altman Analysis</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">
+            Method agreement between Garmin, WHOOP, and Eight Sleep — last 90 days, pairwise.
+          </p>
+        </div>
+      </div>
 
-      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 mb-8 text-sm text-zinc-400 space-y-3 max-w-3xl">
+      <div className="bg-surface-card border border-border-subtle rounded-[6px] p-5 mb-8 text-sm text-text-secondary space-y-3 max-w-3xl">
         <p>
-          <span className="text-zinc-200 font-medium">What is Bland-Altman?</span>{" "}
+          <span className="text-text-primary font-medium">What is Bland-Altman?</span>{" "}
           A Bland-Altman plot tests whether two devices <em>agree</em> on the same measurement — not just whether they correlate.
           Two devices can be perfectly correlated (r = 1.0) yet still disagree if one consistently reads higher.
-          Each dot plots <span className="text-zinc-300">the difference</span> (Device A − Device B) against{" "}
-          <span className="text-zinc-300">the mean</span> of both readings for that day.
+          Each dot plots <span className="text-text-primary">the difference</span> (Device A − Device B) against{" "}
+          <span className="text-text-primary">the mean</span> of both readings for that day.
         </p>
         <p>
           <span className="text-amber-400 font-medium">Bias</span> (amber line) is the average difference between two devices.
@@ -201,16 +213,16 @@ export default function BlandAltmanPage() {
           Wide LoA = even if the average bias is small, individual readings can differ substantially.
         </p>
         <p>
-          <span className="text-zinc-200 font-medium">What to look for:</span>{" "}
+          <span className="text-text-primary font-medium">What to look for:</span>{" "}
           Dots should be randomly scattered with no pattern. A fan/funnel shape means the devices diverge more at higher or lower values (proportional bias).
           If most dots cluster near the zero line with narrow LoA, the devices are effectively interchangeable for that metric.
         </p>
 
-        <div className="border-t border-zinc-800 pt-3">
-          <p className="text-zinc-200 font-medium mb-2">Interpretation guide</p>
+        <div className="border-t border-border-subtle pt-3">
+          <p className="text-text-primary font-medium mb-2">Interpretation guide</p>
           <table className="w-full text-xs">
             <thead>
-              <tr className="text-zinc-500">
+              <tr className="text-text-tertiary uppercase text-[10px] font-mono tracking-wider">
                 <th className="text-left py-1 font-medium">Metric</th>
                 <th className="text-center py-1 font-medium">Excellent bias</th>
                 <th className="text-center py-1 font-medium">Moderate bias</th>
@@ -218,27 +230,27 @@ export default function BlandAltmanPage() {
                 <th className="text-center py-1 font-medium">Tight LoA width</th>
               </tr>
             </thead>
-            <tbody className="text-zinc-400">
-              <tr className="border-t border-zinc-800/50">
+            <tbody className="text-text-secondary">
+              <tr className="border-t border-white/5">
                 <td className="py-1.5">Sleep Score (%)</td>
-                <td className="text-center text-green-400">&lt; 5 pts</td>
-                <td className="text-center text-amber-400">5 – 10 pts</td>
-                <td className="text-center text-red-400">&gt; 10 pts</td>
-                <td className="text-center">± 10 pts</td>
+                <td className="text-center text-green-400 font-mono">&lt; 5 pts</td>
+                <td className="text-center text-amber-400 font-mono">5 – 10 pts</td>
+                <td className="text-center text-red-400 font-mono">&gt; 10 pts</td>
+                <td className="text-center font-mono">± 10 pts</td>
               </tr>
-              <tr className="border-t border-zinc-800/50">
+              <tr className="border-t border-white/5">
                 <td className="py-1.5">HRV (ms)</td>
-                <td className="text-center text-green-400">&lt; 5 ms</td>
-                <td className="text-center text-amber-400">5 – 15 ms</td>
-                <td className="text-center text-red-400">&gt; 15 ms</td>
-                <td className="text-center">± 15 ms</td>
+                <td className="text-center text-green-400 font-mono">&lt; 5 ms</td>
+                <td className="text-center text-amber-400 font-mono">5 – 15 ms</td>
+                <td className="text-center text-red-400 font-mono">&gt; 15 ms</td>
+                <td className="text-center font-mono">± 15 ms</td>
               </tr>
-              <tr className="border-t border-zinc-800/50">
+              <tr className="border-t border-white/5">
                 <td className="py-1.5">Resting HR (bpm)</td>
-                <td className="text-center text-green-400">&lt; 2 bpm</td>
-                <td className="text-center text-amber-400">2 – 5 bpm</td>
-                <td className="text-center text-red-400">&gt; 5 bpm</td>
-                <td className="text-center">± 5 bpm</td>
+                <td className="text-center text-green-400 font-mono">&lt; 2 bpm</td>
+                <td className="text-center text-amber-400 font-mono">2 – 5 bpm</td>
+                <td className="text-center text-red-400 font-mono">&gt; 5 bpm</td>
+                <td className="text-center font-mono">± 5 bpm</td>
               </tr>
             </tbody>
           </table>
@@ -247,7 +259,7 @@ export default function BlandAltmanPage() {
 
       {metrics.map((metric) => (
         <div key={metric.label} className="mb-8">
-          <h3 className="text-lg font-semibold text-zinc-200 mb-4">{metric.label}</h3>
+          <h3 className="text-lg font-semibold text-text-primary mb-4">{metric.label}</h3>
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             {PAIRS.map(([a, b, color], i) => (
               <BAPlot

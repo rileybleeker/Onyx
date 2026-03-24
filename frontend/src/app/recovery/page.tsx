@@ -9,14 +9,9 @@ import {
 import { getRecoveryVsPace } from "@/lib/queries";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-
-const tt = {
-  contentStyle: { backgroundColor: "#18181b", border: "1px solid #27272a", borderRadius: 8 },
-  labelStyle: { color: "#a1a1aa" },
-  itemStyle: { color: "#e4e4e7" },
-};
 
 const WORKOUT_COLORS: Record<string, string> = {
   AEROBIC_BASE: "#3b82f6",
@@ -37,15 +32,15 @@ function ScatterTooltip({ active, payload }: any) {
   if (!active || !payload?.length) return null;
   const d = payload[0].payload;
   return (
-    <div className="bg-zinc-900 border border-zinc-700 rounded-lg p-3 text-xs space-y-1">
+    <div className="bg-surface-raised border border-border-hover rounded-[6px] p-3 shadow-floating text-xs space-y-1">
       <p className="font-medium text-white">{d.name}</p>
-      <p className="text-zinc-400">{d.date}</p>
-      <p>Recovery: <span className="text-white">{d.recovery}%</span></p>
-      {d.paceDelta != null && <p>Pace Delta: <span className={d.paceDelta <= 0 ? "text-green-400" : "text-red-400"}>{d.paceDelta > 0 ? "+" : ""}{d.paceDelta}%</span></p>}
-      <p>Actual: <span className="text-white">{d.actualPace} min/mi</span></p>
-      {d.targetPace && <p>Target: <span className="text-zinc-300">{d.targetPace} min/mi</span></p>}
-      <p>HRV: <span className="text-white">{d.hrv} ms</span></p>
-      <p className="text-zinc-500">{d.type}</p>
+      <p className="text-text-tertiary">{d.date}</p>
+      <p className="text-text-secondary">Recovery: <span className="text-white">{d.recovery}%</span></p>
+      {d.paceDelta != null && <p className="text-text-secondary">Pace Delta: <span className={d.paceDelta <= 0 ? "text-green-400" : "text-red-400"}>{d.paceDelta > 0 ? "+" : ""}{d.paceDelta}%</span></p>}
+      <p className="text-text-secondary">Actual: <span className="text-white">{d.actualPace} min/mi</span></p>
+      {d.targetPace && <p className="text-text-secondary">Target: <span className="text-text-secondary">{d.targetPace} min/mi</span></p>}
+      <p className="text-text-secondary">HRV: <span className="text-white">{d.hrv} ms</span></p>
+      <p className="text-text-tertiary">{d.type}</p>
     </div>
   );
 }
@@ -135,7 +130,19 @@ export default function RecoveryPage() {
   const scatterAll = useMemo(() => allRuns.filter((d) => d.overallPace != null), [allRuns]);
 
   if (loading) {
-    return <div className="flex items-center justify-center h-64"><div className="animate-pulse text-zinc-500">Loading recovery data...</div></div>;
+    return (
+      <div className="space-y-6">
+        <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          {[...Array(4)].map((_, i) => (
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+              <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
+              <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
   }
 
   const totalWithDelta = withTarget.length;
@@ -143,8 +150,12 @@ export default function RecoveryPage() {
 
   return (
     <>
-      <h2 className="text-2xl font-bold mb-2">Recovery vs Performance</h2>
-      <p className="text-zinc-500 text-sm mb-6">How WHOOP recovery correlates with running pace performance</p>
+      <div className="flex items-baseline justify-between mb-8">
+        <div>
+          <h2 className="text-[28px] font-medium text-text-primary">Recovery vs Performance</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">How WHOOP recovery correlates with running pace performance</p>
+        </div>
+      </div>
 
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
@@ -160,9 +171,9 @@ export default function RecoveryPage() {
           <ChartCard title={`Recovery % vs Pace Delta (${totalWithDelta} workouts)`}>
             <ResponsiveContainer width="100%" height={300}>
               <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+                <CartesianGrid strokeDasharray="3 3" {...gridStyle} />
+                <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={axisTick} domain={[0, 100]} />
+                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={axisTick} />
                 <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                 <Tooltip content={<ScatterTooltip />} />
                 <Scatter data={withTarget} shape="circle">
@@ -177,7 +188,7 @@ export default function RecoveryPage() {
                 const count = withTarget.filter((d) => d.type === type).length;
                 if (count === 0) return null;
                 return (
-                  <span key={type} className="flex items-center gap-1.5 text-xs text-zinc-400">
+                  <span key={type} className="flex items-center gap-1.5 text-text-tertiary text-[11px] font-mono">
                     <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: color }} />
                     {type.replace(/_/g, " ")} ({count})
                   </span>
@@ -191,9 +202,9 @@ export default function RecoveryPage() {
         <ChartCard title={`Recovery % vs Overall Pace (${scatterAll.length} runs)`}>
           <ResponsiveContainer width="100%" height={300}>
             <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-              <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis type="number" dataKey="overallPace" name="Pace" unit=" min/mi" tick={{ fill: "#71717a", fontSize: 11 }} reversed label={{ value: "Pace (min/mi)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+              <CartesianGrid strokeDasharray="3 3" {...gridStyle} />
+              <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={axisTick} domain={[0, 100]} />
+              <YAxis type="number" dataKey="overallPace" name="Pace" unit=" min/mi" tick={axisTick} reversed />
               <Tooltip content={<ScatterTooltip />} />
               <Scatter data={scatterAll} shape="circle">
                 {scatterAll.map((d, i) => (
@@ -208,11 +219,11 @@ export default function RecoveryPage() {
         <ChartCard title="Avg Pace Delta by Recovery Zone">
           <ResponsiveContainer width="100%" height={280}>
             <BarChart data={bins} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-              <XAxis dataKey="label" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Recovery Zone", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={45} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+              <CartesianGrid strokeDasharray="3 3" {...gridStyle} />
+              <XAxis dataKey="label" tick={axisTick} />
+              <YAxis tick={axisTick} width={45} />
               <ReferenceLine y={0} stroke="#71717a" />
-              <Tooltip {...tt} formatter={(value: any) => [`${value}%`, "Avg Pace Delta"]} />
+              <Tooltip {...chartTooltip} formatter={(value: any) => [`${value}%`, "Avg Pace Delta"]} />
               <Bar dataKey="avgPaceDelta" name="Avg Pace Delta %" radius={[4, 4, 0, 0]}>
                 {bins.map((b, i) => (
                   <Cell key={i} fill={b.color} />
@@ -220,7 +231,7 @@ export default function RecoveryPage() {
               </Bar>
             </BarChart>
           </ResponsiveContainer>
-          <div className="px-4 pb-3 text-xs text-zinc-500">
+          <div className="px-4 pb-3 text-[11px] text-text-tertiary font-mono">
             {bins.map((b) => (
               <span key={b.label} className="mr-4">{b.label}: {b.count} runs, avg HRV {b.avgHrv}ms</span>
             ))}
@@ -232,7 +243,7 @@ export default function RecoveryPage() {
           <div className="px-4 pb-2">
             <table className="w-full text-xs">
               <thead>
-                <tr className="text-zinc-500 border-b border-zinc-800">
+                <tr className="bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider border-b border-border-subtle">
                   <th className="text-left py-2 font-medium">Type</th>
                   <th className="text-right py-2 font-medium">Runs</th>
                   <th className="text-right py-2 font-medium">Avg Recovery</th>
@@ -242,22 +253,22 @@ export default function RecoveryPage() {
               </thead>
               <tbody>
                 {byType.map((t) => (
-                  <tr key={t.type} className="border-b border-zinc-800/50">
+                  <tr key={t.type} className="border-b border-white/5 hover:bg-white/[0.02]">
                     <td className="py-2.5 flex items-center gap-2">
                       <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: t.color }} />
-                      <span className="text-zinc-300">{t.type.replace(/_/g, " ")}</span>
+                      <span className="text-text-secondary">{t.type.replace(/_/g, " ")}</span>
                     </td>
-                    <td className="text-right text-zinc-400">{t.count}</td>
-                    <td className="text-right">
+                    <td className="text-right text-text-secondary font-mono">{t.count}</td>
+                    <td className="text-right font-mono">
                       <span style={{ color: recoveryColor(t.avgRecovery) }}>{t.avgRecovery}%</span>
                     </td>
-                    <td className="text-right text-zinc-300">{t.avgPace ?? "—"} min/mi</td>
-                    <td className="text-right">
+                    <td className="text-right text-text-secondary font-mono">{t.avgPace ?? "\u2014"} min/mi</td>
+                    <td className="text-right font-mono">
                       {t.avgPaceDelta != null ? (
                         <span className={t.avgPaceDelta <= 0 ? "text-green-400" : "text-red-400"}>
-                          {t.avgPaceDelta > 0 ? "+" : ""}{t.avgPaceDelta}% <span className="text-zinc-600">({t.deltaCount})</span>
+                          {t.avgPaceDelta > 0 ? "+" : ""}{t.avgPaceDelta}% <span className="text-text-tertiary">({t.deltaCount})</span>
                         </span>
-                      ) : <span className="text-zinc-600">—</span>}
+                      ) : <span className="text-text-tertiary">{"\u2014"}</span>}
                     </td>
                   </tr>
                 ))}
@@ -271,9 +282,9 @@ export default function RecoveryPage() {
           <ChartCard title={`HRV vs Pace Delta (${totalWithDelta} workouts)`}>
             <ResponsiveContainer width="100%" height={300}>
               <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                <XAxis type="number" dataKey="hrv" name="HRV" unit=" ms" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+                <CartesianGrid strokeDasharray="3 3" {...gridStyle} />
+                <XAxis type="number" dataKey="hrv" name="HRV" unit=" ms" tick={axisTick} />
+                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={axisTick} />
                 <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                 <Tooltip content={<ScatterTooltip />} />
                 <Scatter data={withTarget.filter((d) => d.hrv != null)} shape="circle">
@@ -291,9 +302,9 @@ export default function RecoveryPage() {
           <ChartCard title={`Sleep Performance vs Pace Delta`}>
             <ResponsiveContainer width="100%" height={300}>
               <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                <XAxis type="number" dataKey="sleepPerf" name="Sleep Performance" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[50, 100]} label={{ value: "Sleep Performance (%)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+                <CartesianGrid strokeDasharray="3 3" {...gridStyle} />
+                <XAxis type="number" dataKey="sleepPerf" name="Sleep Performance" unit="%" tick={axisTick} domain={[50, 100]} />
+                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={axisTick} />
                 <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                 <Tooltip content={<ScatterTooltip />} />
                 <Scatter data={withTarget.filter((d) => d.sleepPerf != null)} shape="circle">

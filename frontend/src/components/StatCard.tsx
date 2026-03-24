@@ -1,19 +1,52 @@
+import clsx from "clsx";
+
 interface StatCardProps {
   label: string;
   value: string | number | null;
   unit?: string;
   sublabel?: string;
+  trend?: { delta: number; favorable: "up" | "down" };
+  source?: "GARMIN" | "WHOOP" | "8SLP";
+  className?: string;
 }
 
-export default function StatCard({ label, value, unit, sublabel }: StatCardProps) {
+const sourceColors: Record<string, string> = {
+  GARMIN: "text-source-garmin",
+  WHOOP: "text-source-whoop",
+  "8SLP": "text-source-eightsleep",
+};
+
+export default function StatCard({ label, value, unit, sublabel, trend, source, className }: StatCardProps) {
+  const trendColor = trend
+    ? (trend.delta > 0 && trend.favorable === "up") || (trend.delta < 0 && trend.favorable === "down")
+      ? "text-green-400"
+      : "text-red-400"
+    : "";
+
   return (
-    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
-      <p className="text-xs text-zinc-500 font-medium uppercase tracking-wider">{label}</p>
-      <p className="text-2xl font-bold text-white mt-1">
-        {value ?? "—"}
-        {unit && <span className="text-sm font-normal text-zinc-400 ml-1">{unit}</span>}
-      </p>
-      {sublabel && <p className="text-xs text-zinc-500 mt-1">{sublabel}</p>}
+    <div className={clsx(
+      "bg-surface-card border border-border-subtle rounded-[6px] p-4 relative transition-colors hover:border-border-hover shadow-card",
+      className
+    )}>
+      {source && (
+        <span className={clsx("absolute top-3 right-3 text-[9px] font-mono font-medium tracking-wider", sourceColors[source] || "text-text-tertiary")}>
+          {source}
+        </span>
+      )}
+      <p className="text-[10px] text-text-tertiary font-medium uppercase tracking-[0.1em]">{label}</p>
+      <div className="flex items-baseline gap-1.5 mt-1.5">
+        <p className="text-[28px] leading-none font-medium text-text-primary font-mono tabular-nums">
+          {value ?? "\u2014"}
+        </p>
+        {unit && <span className="text-xs font-normal text-text-secondary">{unit}</span>}
+        {trend && (
+          <span className={clsx("text-xs font-mono font-medium flex items-center gap-0.5 ml-1", trendColor)}>
+            <span>{trend.delta > 0 ? "\u2191" : "\u2193"}</span>
+            {Math.abs(trend.delta).toFixed(1)}
+          </span>
+        )}
+      </div>
+      {sublabel && <p className="text-[11px] text-text-tertiary mt-1.5">{sublabel}</p>}
     </div>
   );
 }

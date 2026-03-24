@@ -18,16 +18,16 @@ export default function MobileNav() {
   const pathname = usePathname();
 
   return (
-    <nav className="fixed bottom-0 inset-x-0 z-50 bg-zinc-950 border-t border-zinc-800 md:hidden">
-      <div className="flex justify-around py-2">
+    <nav className="fixed bottom-0 inset-x-0 z-50 bg-surface-card border-t border-border-subtle md:hidden">
+      <div className="flex justify-around py-1.5">
         {nav.map((item) => {
           const active = pathname === item.href;
           return (
             <Link
               key={item.href}
               href={item.href}
-              className={`flex flex-col items-center gap-1 px-3 py-1.5 text-xs font-medium transition-colors ${
-                active ? "text-white" : "text-zinc-500"
+              className={`flex flex-col items-center gap-0.5 px-2 py-1 text-[10px] font-medium transition-colors ${
+                active ? "text-accent" : "text-text-tertiary"
               }`}
             >
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>

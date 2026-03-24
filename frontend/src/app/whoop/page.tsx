@@ -3,20 +3,17 @@
 import { useEffect, useState } from "react";
 import {
   AreaChart, Area, BarChart, Bar, LineChart, Line,
-  XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
+  XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
 import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getWhoopJournal } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-const tt = {
-  contentStyle: { backgroundColor: "#18181b", border: "1px solid #27272a", borderRadius: 8 },
-  labelStyle: { color: "#a1a1aa" },
-  itemStyle: { color: "#e4e4e7" },
-};
+const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
 
 function recoveryColor(score: number | null): string {
   if (!score) return "#71717a";
@@ -40,7 +37,19 @@ export default function WhoopPage() {
   }, []);
 
   if (loading) {
-    return <div className="flex items-center justify-center h-64"><div className="animate-pulse text-zinc-500">Loading WHOOP data...</div></div>;
+    return (
+      <div className="space-y-6">
+        <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          {[...Array(4)].map((_, i) => (
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+              <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
+              <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
   }
 
   const latestRecovery = recovery[recovery.length - 1];
@@ -78,7 +87,12 @@ export default function WhoopPage() {
 
   return (
     <>
-      <h2 className="text-2xl font-bold mb-6">WHOOP</h2>
+      <div className="flex items-baseline justify-between mb-8">
+        <div>
+          <h2 className="text-[28px] font-medium text-text-primary">WHOOP</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">Recovery, strain, and sleep analytics</p>
+        </div>
+      </div>
 
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
@@ -86,23 +100,24 @@ export default function WhoopPage() {
           label="Recovery"
           value={latestRecovery?.recovery_score != null ? `${latestRecovery.recovery_score}%` : null}
           sublabel={latestRecovery?.recovery_score != null ? (latestRecovery.recovery_score >= 67 ? "Green" : latestRecovery.recovery_score >= 34 ? "Yellow" : "Red") : undefined}
+          source="WHOOP"
         />
-        <StatCard label="HRV" value={latestRecovery?.hrv_rmssd_milli ? Number(latestRecovery.hrv_rmssd_milli).toFixed(0) : null} unit="ms" />
-        <StatCard label="Day Strain" value={latestCycle?.strain ? Number(latestCycle.strain).toFixed(1) : null} />
-        <StatCard label="Sleep Performance" value={latestSleep?.sleep_performance_percentage != null ? `${latestSleep.sleep_performance_percentage}%` : null} />
+        <StatCard label="HRV" value={latestRecovery?.hrv_rmssd_milli ? Number(latestRecovery.hrv_rmssd_milli).toFixed(0) : null} unit="ms" source="WHOOP" />
+        <StatCard label="Day Strain" value={latestCycle?.strain ? Number(latestCycle.strain).toFixed(1) : null} source="WHOOP" />
+        <StatCard label="Sleep Performance" value={latestSleep?.sleep_performance_percentage != null ? `${latestSleep.sleep_performance_percentage}%` : null} source="WHOOP" />
       </div>
 
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <ChartCard title="Recovery Score">
+        <ChartCard title="Recovery Score" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={recoveryData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <Tooltip {...tt} />
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} domain={[0, 100]} />
+              <Tooltip {...chartTooltip} />
               <Bar dataKey="recovery" name="Recovery %" radius={[3, 3, 0, 0]}
                 fill="#22c55e"
-                // Color each bar by recovery zone
                 shape={(props: any) => {
                   const { x, y, width, height, payload } = props;
                   return <rect x={x} y={y} width={width} height={height} rx={3} fill={recoveryColor(payload.recovery)} />;
@@ -112,38 +127,47 @@ export default function WhoopPage() {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="HRV & Resting HR">
+        <ChartCard title="HRV & Resting HR" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={recoveryData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis yAxisId="hrv" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <YAxis yAxisId="rhr" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "RHR (bpm)", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
-              <Tooltip {...tt} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis yAxisId="hrv" tick={axisTick} width={40} />
+              <YAxis yAxisId="rhr" orientation="right" tick={axisTick} width={40} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
               <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={2} dot={false} name="HRV (ms)" />
               <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke="#ef4444" strokeWidth={2} dot={false} name="RHR (bpm)" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Daily Strain">
+        <ChartCard title="Daily Strain" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={strainData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 21]} label={{ value: "Strain (0-21)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <Tooltip {...tt} />
-              <Area type="monotone" dataKey="strain" stroke="#3b82f6" fill="#3b82f640" strokeWidth={2} name="Strain" />
+              <defs>
+                <linearGradient id="whoopStrainGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#3b82f6" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} domain={[0, 21]} />
+              <Tooltip {...chartTooltip} />
+              <Area type="monotone" dataKey="strain" stroke="#3b82f6" fill="url(#whoopStrainGrad)" strokeWidth={2} name="Strain" />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Sleep Stages (hours)">
+        <ChartCard title="Sleep Stages (hours)" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={sleepData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Duration (hrs)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <Tooltip {...tt} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
               <Bar dataKey="light" stackId="a" fill="#60a5fa" name="Light" />
               <Bar dataKey="rem" stackId="a" fill="#a78bfa" name="REM" />
@@ -152,29 +176,31 @@ export default function WhoopPage() {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Sleep Performance & Efficiency">
+        <ChartCard title="Sleep Performance & Efficiency" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={sleepData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Score (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <Tooltip {...tt} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} domain={[0, 100]} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
               <Line type="monotone" dataKey="performance" stroke="#8b5cf6" strokeWidth={2} dot={false} name="Performance %" />
               <Line type="monotone" dataKey="efficiency" stroke="#f59e0b" strokeWidth={2} dot={false} name="Efficiency %" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="SpO2 & Skin Temp">
+        <ChartCard title="SpO2 & Skin Temp" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={recoveryData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-              <YAxis yAxisId="spo2" tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[90, 100]} label={{ value: "SpO2 (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
-              <YAxis yAxisId="temp" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Temp (\u00b0C)", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
-              <Tooltip {...tt} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis yAxisId="spo2" tick={axisTick} width={40} domain={[90, 100]} />
+              <YAxis yAxisId="temp" orientation="right" tick={axisTick} width={40} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
               <Line yAxisId="spo2" type="monotone" dataKey="spo2" stroke="#06b6d4" strokeWidth={2} dot={false} name="SpO2 %" />
-              <Line yAxisId="temp" type="monotone" dataKey="skinTemp" stroke="#f97316" strokeWidth={2} dot={false} name="Skin Temp (°C)" />
+              <Line yAxisId="temp" type="monotone" dataKey="skinTemp" stroke="#f97316" strokeWidth={2} dot={false} name="Skin Temp (\u00b0C)" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -207,28 +233,28 @@ export default function WhoopPage() {
 
         return (
           <>
-            <h3 className="text-xl font-bold mt-10 mb-4">Journal</h3>
+            <h3 className="text-xl font-medium text-text-primary mt-10 mb-4">Journal</h3>
 
             {/* Category summary cards */}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
               {[...categoryMap.entries()].map(([cat, qs]) => (
-                <div key={cat} className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
-                  <p className="text-xs text-zinc-500 uppercase tracking-wider">{cat}</p>
-                  <p className="text-lg font-semibold text-zinc-100 mt-1">{qs.length} behavior{qs.length !== 1 ? "s" : ""}</p>
-                  <p className="text-xs text-zinc-500 mt-1">{qs.slice(0, 3).join(", ")}{qs.length > 3 ? "…" : ""}</p>
+                <div key={cat} className="bg-surface-card border border-border-subtle rounded-[6px] p-4">
+                  <p className="text-[10px] text-text-tertiary font-mono font-medium uppercase tracking-wider">{cat}</p>
+                  <p className="text-lg font-semibold text-text-primary mt-1">{qs.length} behavior{qs.length !== 1 ? "s" : ""}</p>
+                  <p className="text-xs text-text-tertiary mt-1">{qs.slice(0, 3).join(", ")}{qs.length > 3 ? "\u2026" : ""}</p>
                 </div>
               ))}
             </div>
 
             {/* Heatmap grid */}
-            <ChartCard title="Journal Heatmap">
+            <ChartCard title="Journal Heatmap" source="WHOOP">
               <div className="overflow-x-auto">
                 <table className="w-full text-xs">
                   <thead>
                     <tr>
-                      <th className="text-left text-zinc-500 font-normal pr-3 py-1 sticky left-0 bg-zinc-900 min-w-[140px]">Behavior</th>
+                      <th className="text-left bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal pr-3 py-1 sticky left-0 bg-surface-card min-w-[140px]">Behavior</th>
                       {dates.map((d) => (
-                        <th key={d} className="text-zinc-500 font-normal px-0.5 py-1 min-w-[24px]">
+                        <th key={d} className="bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal px-0.5 py-1 min-w-[24px]">
                           <span className="block rotate-[-45deg] origin-bottom-left translate-x-2 whitespace-nowrap">
                             {formatDate(d)}
                           </span>
@@ -238,16 +264,16 @@ export default function WhoopPage() {
                   </thead>
                   <tbody>
                     {behaviors.map((b) => (
-                      <tr key={b} className="border-t border-zinc-800/50">
-                        <td className="text-zinc-300 pr-3 py-1 sticky left-0 bg-zinc-900 truncate max-w-[160px]" title={b}>{b}</td>
+                      <tr key={b} className="border-b border-white/5 hover:bg-white/[0.02]">
+                        <td className="text-text-secondary pr-3 py-1 sticky left-0 bg-surface-card truncate max-w-[160px]" title={b}>{b}</td>
                         {dates.map((d) => {
                           const answer = journalMap.get(`${d}|${b}`);
                           const active = isPositive(answer);
                           return (
                             <td key={d} className="px-0.5 py-1 text-center">
                               <div
-                                className={`w-5 h-5 rounded-sm mx-auto ${active ? "bg-green-500/80" : "bg-zinc-800/40"}`}
-                                title={answer ? `${b}: ${answer}` : `${b}: —`}
+                                className={`w-5 h-5 rounded-sm mx-auto ${active ? "bg-green-500/80" : "bg-white/5"}`}
+                                title={answer ? `${b}: ${answer}` : `${b}: \u2014`}
                               />
                             </td>
                           );
