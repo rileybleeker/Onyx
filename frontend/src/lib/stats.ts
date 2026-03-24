@@ -130,6 +130,69 @@ export function rollingAvg(
   return result;
 }
 
+/**
+ * Intraclass Correlation Coefficient — ICC(3,1) two-way mixed, consistency.
+ * Takes an array of "rater" arrays (one per source/device), all same length,
+ * aligned by index (e.g. day). Only rows where ALL raters have a finite value
+ * are included. Returns null if fewer than minRows complete rows.
+ */
+export function icc(
+  raters: (number | null | undefined)[][],
+  minRows = 5
+): { value: number; n: number; k: number } | null {
+  const k = raters.length;
+  if (k < 2) return null;
+  const len = Math.min(...raters.map((r) => r.length));
+
+  const rows: number[][] = [];
+  for (let i = 0; i < len; i++) {
+    const row: number[] = [];
+    let valid = true;
+    for (let j = 0; j < k; j++) {
+      const v = raters[j][i];
+      if (v == null || !isFinite(v)) { valid = false; break; }
+      row.push(v);
+    }
+    if (valid) rows.push(row);
+  }
+
+  const n = rows.length;
+  if (n < minRows) return null;
+
+  let grandSum = 0;
+  for (const row of rows) for (const v of row) grandSum += v;
+  const grandMean = grandSum / (n * k);
+
+  const rowMeans = rows.map((row) => row.reduce((s, v) => s + v, 0) / k);
+
+  const colMeans: number[] = [];
+  for (let j = 0; j < k; j++) {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += rows[i][j];
+    colMeans.push(s / n);
+  }
+
+  let ssRows = 0;
+  for (const rm of rowMeans) ssRows += (rm - grandMean) ** 2;
+  ssRows *= k;
+
+  let ssError = 0;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < k; j++) {
+      const residual = rows[i][j] - rowMeans[i] - colMeans[j] + grandMean;
+      ssError += residual ** 2;
+    }
+  }
+
+  const msR = ssRows / (n - 1);
+  const msE = ssError / ((n - 1) * (k - 1));
+
+  const denom = msR + (k - 1) * msE;
+  if (denom === 0) return null;
+
+  return { value: (msR - msE) / denom, n, k };
+}
+
 /** Linear interpolation quantile (expects sorted ascending array) */
 export function quantile(sorted: number[], q: number): number {
   if (sorted.length === 0) return 0;

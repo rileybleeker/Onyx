@@ -7,6 +7,7 @@ import {
 } from "recharts";
 import { getHealthMatrix } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
+import { icc } from "@/lib/stats";
 import ChartCard from "@/components/ChartCard";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -67,6 +68,25 @@ export default function MatrixPage() {
     bbLow: d.body_battery_lowest,
   }));
 
+  const sleepIcc = icc([
+    data.map((d) => d.garmin_sleep_score),
+    data.map((d) => d.whoop_sleep_performance),
+    data.map((d) => d.eight_sleep_score),
+  ]);
+  const hrvIcc = icc([
+    data.map((d) => d.garmin_hrv ? +d.garmin_hrv : null),
+    data.map((d) => d.whoop_hrv_rmssd ? +d.whoop_hrv_rmssd : null),
+    data.map((d) => d.eight_sleep_hrv ? +d.eight_sleep_hrv : null),
+  ]);
+  const rhrIcc = icc([
+    data.map((d) => d.garmin_rhr),
+    data.map((d) => d.whoop_rhr),
+    data.map((d) => d.eight_sleep_hr ? +d.eight_sleep_hr : null),
+  ]);
+
+  const fmtIcc = (result: ReturnType<typeof icc>) =>
+    result ? `ICC(3,1) = ${result.value.toFixed(2)}  (n = ${result.n} days, k = ${result.k} sources)` : "ICC: insufficient overlapping data";
+
   return (
     <>
       <h2 className="text-2xl font-bold mb-2">Health Matrix</h2>
@@ -86,7 +106,7 @@ export default function MatrixPage() {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Sleep Scores (3 Sources)">
+        <ChartCard title="Sleep Scores (3 Sources)" subtitle={fmtIcc(sleepIcc)}>
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={chartData}>
               <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
@@ -100,7 +120,7 @@ export default function MatrixPage() {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="HRV Comparison (ms)">
+        <ChartCard title="HRV Comparison (ms)" subtitle={fmtIcc(hrvIcc)}>
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={chartData}>
               <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
@@ -114,7 +134,7 @@ export default function MatrixPage() {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Resting Heart Rate (bpm)">
+        <ChartCard title="Resting Heart Rate (bpm)" subtitle={fmtIcc(rhrIcc)}>
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={chartData}>
               <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
