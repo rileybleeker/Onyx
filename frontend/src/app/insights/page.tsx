@@ -555,8 +555,8 @@ export default function InsightsPage() {
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} />
-                  <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} />
+                  <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                  <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                   <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                   <Tooltip {...tt} />
                   <Scatter data={withTarget} shape="circle">
@@ -592,8 +592,8 @@ export default function InsightsPage() {
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={q2Bins} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                <XAxis dataKey="label" tick={{ fill: "#71717a", fontSize: 10 }} interval={0} angle={-45} textAnchor="end" height={50} />
-                <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} unit="%" />
+                <XAxis dataKey="label" tick={{ fill: "#71717a", fontSize: 10 }} interval={0} angle={-45} textAnchor="end" height={50} label={{ value: "Recovery Bin", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} unit="%" label={{ value: "Hit Rate (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                 <ReferenceLine y={50} stroke="#71717a" strokeDasharray="3 3" />
                 <Tooltip {...tt} formatter={(value: any, name: any) => [`${(+value).toFixed(0)}%`, name]} />
                 <Bar dataKey="hitRate" name="Hit Rate" radius={[4, 4, 0, 0]}>
@@ -616,8 +616,8 @@ export default function InsightsPage() {
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={q3Windows} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                <XAxis dataKey="label" tick={{ fill: "#71717a", fontSize: 11 }} />
-                <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 1]} />
+                <XAxis dataKey="label" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Window", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 1]} label={{ value: "|r|", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                 <Tooltip {...tt} formatter={(value: any) => [fmt(+value), "|r|"]} />
                 <Bar dataKey="absR" name="|r|" fill="#3b82f6" radius={[4, 4, 0, 0]}>
                   {q3Windows.map((w, i) => (
@@ -670,8 +670,8 @@ export default function InsightsPage() {
               <ResponsiveContainer width="100%" height={300}>
                 <BarChart data={q4Metrics} layout="vertical" margin={{ top: 10, right: 10, bottom: 10, left: 80 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" tick={{ fill: "#71717a", fontSize: 11 }} domain={[-1, 1]} />
-                  <YAxis type="category" dataKey="label" tick={{ fill: "#71717a", fontSize: 11 }} width={80} />
+                  <XAxis type="number" tick={{ fill: "#71717a", fontSize: 11 }} domain={[-1, 1]} label={{ value: "Correlation (r)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                  <YAxis type="category" dataKey="label" tick={{ fill: "#71717a", fontSize: 11 }} width={80} label={{ value: "Metric", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                   <ReferenceLine x={0} stroke="#71717a" />
                   <Tooltip {...tt} formatter={(value: any) => [fmt(+value), "r"]} />
                   <Bar dataKey="r" name="Correlation (r)" radius={[0, 4, 4, 0]}>
@@ -691,8 +691,8 @@ export default function InsightsPage() {
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="eightBedTemp" name="Bed Temp" unit="°" tick={{ fill: "#71717a", fontSize: 11 }} />
-                  <YAxis type="number" dataKey="whoopHrv" name="HRV" unit=" ms" tick={{ fill: "#71717a", fontSize: 11 }} />
+                  <XAxis type="number" dataKey="eightBedTemp" name="Bed Temp" unit="°" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Bed Temp (°F)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                  <YAxis type="number" dataKey="whoopHrv" name="HRV" unit=" ms" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                   <Tooltip {...tt} />
                   <Scatter data={q5Data} shape="circle" fill="#8b5cf6" fillOpacity={0.6} r={4} />
                   {q5Bins.length >= 2 && (
@@ -730,8 +730,8 @@ export default function InsightsPage() {
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="eightDurationHrs" name="Sleep" unit=" hrs" tick={{ fill: "#71717a", fontSize: 11 }} />
-                  <YAxis type="number" dataKey="whoopRecovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} />
+                  <XAxis type="number" dataKey="eightDurationHrs" name="Sleep" unit=" hrs" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Sleep (hrs)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                  <YAxis type="number" dataKey="whoopRecovery" name="Recovery" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                   <ReferenceLine y={67} stroke="#22c55e" strokeDasharray="3 3" label={{ value: "Green", fill: "#22c55e", fontSize: 10 }} />
                   {q6Threshold != null && (
                     <ReferenceLine x={q6Threshold} stroke="#3b82f6" strokeDasharray="3 3" label={{ value: `${q6Threshold.toFixed(1)}h`, fill: "#3b82f6", fontSize: 10 }} />
@@ -785,8 +785,8 @@ export default function InsightsPage() {
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="x" name="Deep Sleep" unit=" hrs" tick={{ fill: "#71717a", fontSize: 11 }} />
-                  <YAxis type="number" dataKey="y" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} />
+                  <XAxis type="number" dataKey="x" name="Deep Sleep" unit=" hrs" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Deep Sleep (hrs)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                  <YAxis type="number" dataKey="y" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                   <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                   <Tooltip {...tt} />
                   <Scatter
@@ -825,8 +825,8 @@ export default function InsightsPage() {
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="eightBedTemp" name="Bed Temp" unit="°" tick={{ fill: "#71717a", fontSize: 11 }} />
-                  <YAxis type="number" dataKey="avgHr" name="Avg HR" unit=" bpm" tick={{ fill: "#71717a", fontSize: 11 }} />
+                  <XAxis type="number" dataKey="eightBedTemp" name="Bed Temp" unit="°" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Bed Temp (°F)", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                  <YAxis type="number" dataKey="avgHr" name="Avg HR" unit=" bpm" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Avg HR (bpm)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                   <Tooltip {...tt} />
                   <Scatter data={q8Data} shape="circle" fill="#06b6d4" fillOpacity={0.7} r={5} />
                   {q8Reg && (() => {
@@ -887,7 +887,7 @@ export default function InsightsPage() {
                 <LineChart data={q9Data} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
                   <XAxis dataKey="day" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Days After", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
-                  <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} />
+                  <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                   <Tooltip {...tt} formatter={(value: any) => [`${fmt(+value, 0)}%`, undefined]} />
                   <Line type="monotone" dataKey="Low" stroke="#22c55e" strokeWidth={2} dot={{ r: 3 }} name="Low Strain" />
                   <Line type="monotone" dataKey="Medium" stroke="#f59e0b" strokeWidth={2} dot={{ r: 3 }} name="Medium Strain" />
@@ -911,8 +911,8 @@ export default function InsightsPage() {
               <ResponsiveContainer width="100%" height={300}>
                 <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis type="number" dataKey="ratio" name="Strain/Recovery" tick={{ fill: "#71717a", fontSize: 11 }} />
-                  <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} />
+                  <XAxis type="number" dataKey="ratio" name="Strain/Recovery" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Strain / Recovery", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+                  <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={{ fill: "#71717a", fontSize: 11 }} label={{ value: "Pace Delta (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
                   <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                   <Tooltip {...tt} />
                   <Scatter data={q10Data} shape="circle" fill="#06b6d4" fillOpacity={0.6} r={4} />
