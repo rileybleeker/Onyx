@@ -80,8 +80,8 @@ export default function SleepPage() {
         <ChartCard title="Sleep Stages (hours)">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={durationData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={30} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} label={{ value: "Duration (hrs)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
@@ -95,8 +95,8 @@ export default function SleepPage() {
         <ChartCard title="Sleep Scores">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={scoreData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={30} domain={[0, 100]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 100]} label={{ value: "Score (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Area type="monotone" dataKey="performance" stroke="#f59e0b" fill="#f59e0b30" strokeWidth={2} name="Performance" />
@@ -109,9 +109,9 @@ export default function SleepPage() {
         <ChartCard title="Resting HR, HRV & Respiratory Rate">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={hrData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis yAxisId="hr" tick={{ fill: "#71717a", fontSize: 11 }} width={30} />
-              <YAxis yAxisId="hrv" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={30} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis yAxisId="hr" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "bpm / breaths", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+              <YAxis yAxisId="hrv" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Area yAxisId="hr" type="monotone" dataKey="hr" stroke="#ef4444" fill="#ef444430" strokeWidth={2} name="RHR (bpm)" />
