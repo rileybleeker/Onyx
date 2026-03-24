@@ -97,8 +97,8 @@ export default function WhoopPage() {
         <ChartCard title="Recovery Score">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={recoveryData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 100]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Recovery (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Bar dataKey="recovery" name="Recovery %" radius={[3, 3, 0, 0]}
                 fill="#22c55e"
@@ -115,9 +115,9 @@ export default function WhoopPage() {
         <ChartCard title="HRV & Resting HR">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={recoveryData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis yAxisId="hrv" tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
-              <YAxis yAxisId="rhr" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis yAxisId="hrv" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "HRV (ms)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+              <YAxis yAxisId="rhr" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "RHR (bpm)", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={2} dot={false} name="HRV (ms)" />
@@ -129,8 +129,8 @@ export default function WhoopPage() {
         <ChartCard title="Daily Strain">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={strainData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 21]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 21]} label={{ value: "Strain (0-21)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Area type="monotone" dataKey="strain" stroke="#3b82f6" fill="#3b82f640" strokeWidth={2} name="Strain" />
             </AreaChart>
@@ -140,8 +140,8 @@ export default function WhoopPage() {
         <ChartCard title="Sleep Stages (hours)">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={sleepData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={30} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Duration (hrs)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
@@ -155,8 +155,8 @@ export default function WhoopPage() {
         <ChartCard title="Sleep Performance & Efficiency">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={sleepData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[0, 100]} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[0, 100]} label={{ value: "Score (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="performance" stroke="#8b5cf6" strokeWidth={2} dot={false} name="Performance %" />
@@ -168,9 +168,9 @@ export default function WhoopPage() {
         <ChartCard title="SpO2 & Skin Temp">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={recoveryData}>
-              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis yAxisId="spo2" tick={{ fill: "#71717a", fontSize: 11 }} width={35} domain={[90, 100]} />
-              <YAxis yAxisId="temp" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={35} />
+              <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} interval="preserveStartEnd" label={{ value: "Date", fill: "#71717a", fontSize: 11, position: "insideBottom", offset: -5 }} />
+              <YAxis yAxisId="spo2" tick={{ fill: "#71717a", fontSize: 11 }} width={40} domain={[90, 100]} label={{ value: "SpO2 (%)", fill: "#71717a", fontSize: 11, angle: -90, position: "insideLeft" }} />
+              <YAxis yAxisId="temp" orientation="right" tick={{ fill: "#71717a", fontSize: 11 }} width={40} label={{ value: "Temp (\u00b0C)", fill: "#71717a", fontSize: 11, angle: 90, position: "insideRight" }} />
               <Tooltip {...tt} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line yAxisId="spo2" type="monotone" dataKey="spo2" stroke="#06b6d4" strokeWidth={2} dot={false} name="SpO2 %" />
