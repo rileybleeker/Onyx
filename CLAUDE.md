@@ -15,9 +15,14 @@ Onyx/
 ├── journal_inbox/           # Drop WHOOP journal CSVs here
 ├── journal_archive/         # Processed CSVs moved here
 ├── eight_sleep_etl.py       # Eight Sleep API → Supabase (1 table)
+├── ci_token_helper.py       # Download/upload OAuth tokens for CI
+├── .github/workflows/
+│   └── daily-etl.yml        # GitHub Actions daily ETL cron
 ├── whoop_schema.sql         # WHOOP table DDL
 ├── eight_sleep_schema.sql   # Eight Sleep DDL + daily_health_matrix view
-├── sql/rls_policies.sql     # Row-Level Security policies
+├── sql/
+│   ├── rls_policies.sql     # Row-Level Security policies
+│   └── ci_tokens.sql        # CI token storage table
 ├── ARCHITECTURE.md          # Full system architecture reference
 ├── .env                     # Secrets (NEVER commit)
 └── frontend/                # Next.js 15 app
@@ -39,13 +44,22 @@ Onyx/
 ## Commands
 
 ```bash
-# ETL
+# ETL (runs automatically via GitHub Actions daily at 5-6 AM ET)
 python garmin_etl.py                    # Sync last 7 days
 python whoop_etl.py                     # Sync last 30 days
 python whoop_journal_import.py <csv>    # Import WHOOP journal CSV export
 python whoop_journal_watcher.py        # Watch inbox folder for auto-import
 python eight_sleep_etl.py               # Sync last 7 days
 python <etl>.py --backfill N            # Backfill N days
+
+# CI Token Management
+python ci_token_helper.py upload garmin   # Seed/update Garmin tokens in Supabase
+python ci_token_helper.py upload whoop    # Seed/update WHOOP tokens in Supabase
+python ci_token_helper.py download garmin # Restore Garmin tokens from Supabase
+python ci_token_helper.py download whoop  # Restore WHOOP tokens from Supabase
+
+# GitHub Actions
+gh workflow run daily-etl.yml           # Manually trigger ETL workflow
 
 # Frontend
 cd frontend && npm run dev              # Dev server on :3000
@@ -62,6 +76,7 @@ cd frontend && npm install
 - Schema: `pds`
 - All tables use upsert with conflict resolution (idempotent ETL)
 - `daily_health_matrix` view joins all three sources by `calendar_date` (~40 columns)
+- `ci_tokens` table stores rotating OAuth tokens for GitHub Actions (Garmin + WHOOP)
 - RLS enabled: anon key = read-only, service role key = full access
 - Sync operations logged to `pds.sync_log`
 
@@ -96,6 +111,15 @@ Configured in `.claude/settings.local.json`. Two layers of control:
 - `guard_bash.sh` — validates commands before Bash execution
 
 **Not pre-approved** (always prompts): `rm`, `kill`, destructive commands, Supabase project lifecycle ops
+
+## GitHub Actions ETL
+
+All three ETLs run daily via `.github/workflows/daily-etl.yml`:
+- **Schedule**: `0 10 * * *` (10:00 UTC = 5-6 AM ET)
+- **Manual trigger**: `gh workflow run daily-etl.yml`
+- **Token persistence**: Garmin/WHOOP tokens stored in `pds.ci_tokens`, managed by `ci_token_helper.py`
+- **Token recovery**: If Garmin tokens expire in CI, re-run ETL locally then `python ci_token_helper.py upload garmin`
+- **GitHub Secrets**: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GARMIN_EMAIL, GARMIN_PASSWORD, WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET, EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD, EIGHTSLEEP_CLIENT_ID, EIGHTSLEEP_CLIENT_SECRET
 
 ## Conventions
 

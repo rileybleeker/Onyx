@@ -19,6 +19,10 @@
          │                  │                     │
          ▼                  ▼                     ▼
 ┌─────────────────────────────────────────────────────────────┐
+│               GITHUB ACTIONS (daily cron)                   │
+│  Schedule: 10:00 UTC (5-6 AM ET) + manual dispatch          │
+│  Three parallel jobs, token persistence via Supabase         │
+├─────────────────────────────────────────────────────────────┤
 │                   PYTHON ETL PIPELINES                      │
 │  garmin_etl.py (9 tables) │ whoop_etl.py (5) │ eight_sleep │
 │  Token refresh + retry    │ Paginated + 429   │ Multi-side  │
@@ -56,11 +60,16 @@ Onyx/
 ├── garmin_etl.py                # Garmin Connect → Supabase
 ├── whoop_etl.py                 # WHOOP API v2 → Supabase
 ├── eight_sleep_etl.py           # Eight Sleep API → Supabase
+├── ci_token_helper.py           # Download/upload OAuth tokens for CI
+│
+├── .github/workflows/
+│   └── daily-etl.yml            # GitHub Actions daily ETL cron
 │
 ├── whoop_schema.sql             # WHOOP tables + indexes
 ├── eight_sleep_schema.sql       # Eight Sleep table + daily_health_matrix view
 ├── sql/
-│   └── rls_policies.sql         # Row-Level Security policies
+│   ├── rls_policies.sql         # Row-Level Security policies
+│   └── ci_tokens.sql            # CI token storage table
 │
 └── frontend/
     ├── package.json
@@ -148,6 +157,21 @@ python garmin_etl.py                # Last 7 days
 python whoop_etl.py --backfill 730  # 2-year backfill
 python eight_sleep_etl.py --side left  # Single side
 ```
+
+### Automated Scheduling (GitHub Actions)
+
+All three ETLs run daily via GitHub Actions (`.github/workflows/daily-etl.yml`):
+- **Schedule**: `0 10 * * *` (10:00 UTC = 5-6 AM ET)
+- **Manual trigger**: `workflow_dispatch` for on-demand runs
+- **Three parallel jobs**: Each ETL runs independently — one failure doesn't block others
+- **Concurrency group**: Prevents overlapping runs from corrupting tokens
+
+**Token persistence**: Garmin and WHOOP require rotating OAuth tokens. Since CI runners
+are ephemeral, tokens are stored in `pds.ci_tokens` (Supabase). The `ci_token_helper.py`
+script downloads tokens before each run and uploads (potentially refreshed) tokens after.
+Upload uses `if: always()` so tokens are saved even if the ETL fails partway through.
+
+**Secrets**: All credentials stored as GitHub Actions secrets (10 total). See CLAUDE.md for the full list.
 
 ---
 
@@ -247,6 +271,7 @@ Where sources overlap, both are stored for cross-validation.
 | Layer | Technology |
 |-------|-----------|
 | ETL | Python 3, httpx, garminconnect, python-dotenv |
+| Scheduling | GitHub Actions (daily cron), ci_token_helper.py |
 | Database | Supabase, Postgres 17 |
 | Frontend | Next.js 15, React 19, Tailwind CSS 4, Recharts |
 | AI | Claude Sonnet 4 (@anthropic-ai/sdk) |
