@@ -204,11 +204,13 @@ def parse_long_format(reader, headers: list[str]) -> list[dict]:
 
         if not cycle_date or not question or not answer:
             continue
-        if answer.lower() in ("n/a", "nan", "none", "false"):
+        if answer.lower() in ("n/a", "nan", "none"):
             continue
         # Normalize boolean answers from WHOOP export
         if answer.lower() == "true":
             answer = "Yes"
+        elif answer.lower() == "false":
+            answer = "No"
 
         category = None
         if category_idx is not None and category_idx < len(line):
