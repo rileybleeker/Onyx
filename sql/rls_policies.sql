@@ -20,6 +20,7 @@ ALTER TABLE pds.whoop_sleep ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.whoop_recovery ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.whoop_cycles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.whoop_workouts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pds.whoop_journal ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.sync_log ENABLE ROW LEVEL SECURITY;
 
 -- Read-only policies for anon role
@@ -36,6 +37,7 @@ CREATE POLICY "anon_read" ON pds.whoop_sleep FOR SELECT TO anon USING (true);
 CREATE POLICY "anon_read" ON pds.whoop_recovery FOR SELECT TO anon USING (true);
 CREATE POLICY "anon_read" ON pds.whoop_cycles FOR SELECT TO anon USING (true);
 CREATE POLICY "anon_read" ON pds.whoop_workouts FOR SELECT TO anon USING (true);
+CREATE POLICY "anon_read" ON pds.whoop_journal FOR SELECT TO anon USING (true);
 CREATE POLICY "anon_read" ON pds.sync_log FOR SELECT TO anon USING (true);
 
 -- Grant usage on the pds schema to anon
