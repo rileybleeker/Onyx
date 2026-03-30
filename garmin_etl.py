@@ -828,6 +828,9 @@ def main():
              duration=duration,
              error=f"{errors} date(s) failed" if errors else None)
 
+    # Persist any refreshed tokens to disk (needed for CI token upload)
+    garmin.garth.dump(TOKEN_DIR)
+
     log.info("=" * 60)
     log.info(f"Done! {total_records} total records | {errors} errors | {duration:.1f}s")
     log.info("=" * 60)

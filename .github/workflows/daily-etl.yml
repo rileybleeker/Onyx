@@ -1,0 +1,74 @@
+name: Daily Health ETL
+
+on:
+  schedule:
+    # 10:00 UTC = 5:00 AM EST / 6:00 AM EDT
+    - cron: '0 10 * * *'
+  workflow_dispatch: # Manual trigger for testing
+
+concurrency:
+  group: daily-etl
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  garmin-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install garminconnect supabase python-dotenv garth
+      - name: Download Garmin tokens
+        run: python ci_token_helper.py download garmin
+      - name: Run Garmin ETL
+        run: python garmin_etl.py --days 7
+        env:
+          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+      - name: Upload Garmin tokens
+        if: always()
+        run: python ci_token_helper.py upload garmin
+
+  whoop-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests supabase python-dotenv
+      - name: Download WHOOP tokens
+        run: python ci_token_helper.py download whoop
+      - name: Run WHOOP ETL
+        run: python whoop_etl.py --days 7
+        env:
+          WHOOP_CLIENT_ID: ${{ secrets.WHOOP_CLIENT_ID }}
+          WHOOP_CLIENT_SECRET: ${{ secrets.WHOOP_CLIENT_SECRET }}
+      - name: Upload WHOOP tokens
+        if: always()
+        run: python ci_token_helper.py upload whoop
+
+  eight-sleep-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install httpx supabase python-dotenv
+      - name: Run Eight Sleep ETL
+        run: python eight_sleep_etl.py --days 7
+        env:
+          EIGHTSLEEP_EMAIL: ${{ secrets.EIGHTSLEEP_EMAIL }}
+          EIGHTSLEEP_PASSWORD: ${{ secrets.EIGHTSLEEP_PASSWORD }}
+          EIGHTSLEEP_TIMEZONE: America/New_York
+          EIGHTSLEEP_CLIENT_ID: ${{ secrets.EIGHTSLEEP_CLIENT_ID }}
+          EIGHTSLEEP_CLIENT_SECRET: ${{ secrets.EIGHTSLEEP_CLIENT_SECRET }}
