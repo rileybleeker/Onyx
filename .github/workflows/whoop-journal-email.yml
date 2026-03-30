@@ -1,0 +1,30 @@
+name: WHOOP Journal Email Check
+
+on:
+  schedule:
+    # Every 4 hours at :30
+    - cron: '30 */4 * * *'
+  workflow_dispatch: # Manual trigger
+
+concurrency:
+  group: whoop-journal-email
+  cancel-in-progress: false
+
+jobs:
+  whoop-journal-email:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests supabase python-dotenv
+      - name: Check WHOOP journal email
+        run: python whoop_journal_email.py --once
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          IMAP_HOST: ${{ secrets.IMAP_HOST }}
+          IMAP_EMAIL: ${{ secrets.IMAP_EMAIL }}
+          IMAP_APP_PASSWORD: ${{ secrets.IMAP_APP_PASSWORD }}
