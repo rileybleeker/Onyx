@@ -83,6 +83,7 @@ cd frontend && npm install
 - `ci_tokens` table stores rotating OAuth tokens for GitHub Actions (Garmin + WHOOP)
 - RLS enabled: anon key = read-only, service role key = full access
 - Sync operations logged to `pds.sync_log`
+- `whoop_journal` data is boolean-only (Yes/No) — WHOOP's CSV export does not include quantity values entered in the app (e.g., "3 drinks", "200mg caffeine"). This is a WHOOP platform limitation.
 
 ## Environment Variables
 
