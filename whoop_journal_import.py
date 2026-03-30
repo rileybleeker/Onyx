@@ -108,6 +108,10 @@ def detect_format(headers: list[str]) -> str:
     if "question" in lower and "answer" in lower:
         return "long"
 
+    # Long format: WHOOP data export uses "question text" + "answered yes"
+    if any("question" in h for h in lower) and any("answer" in h for h in lower):
+        return "long"
+
     # Wide format: has a date column + many behavior columns
     date_cols = {"date", "cycle start time", "cycle_start", "cycle date",
                  "cycle_date", "created at", "created_at"}
@@ -173,9 +177,10 @@ def parse_long_format(reader, headers: list[str]) -> list[dict]:
     for i, h in enumerate(lower):
         if h in ("date", "cycle_date", "cycle date", "cycle start time"):
             date_idx = i
-        elif h in ("question", "behavior", "behaviour", "journal_question"):
+        elif h in ("question", "behavior", "behaviour", "journal_question",
+                    "question text"):
             question_idx = i
-        elif h in ("answer", "response", "value"):
+        elif h in ("answer", "response", "value", "answered yes"):
             answer_idx = i
         elif h in ("category", "group", "type"):
             category_idx = i
@@ -199,8 +204,11 @@ def parse_long_format(reader, headers: list[str]) -> list[dict]:
 
         if not cycle_date or not question or not answer:
             continue
-        if answer.lower() in ("n/a", "nan", "none"):
+        if answer.lower() in ("n/a", "nan", "none", "false"):
             continue
+        # Normalize boolean answers from WHOOP export
+        if answer.lower() == "true":
+            answer = "Yes"
 
         category = None
         if category_idx is not None and category_idx < len(line):
@@ -237,6 +245,12 @@ def import_journal(csv_path: str, dry_run: bool = False) -> int:
             rows = parse_wide_format(reader, headers)
         else:
             rows = parse_long_format(reader, headers)
+
+    # Deduplicate by (cycle_date, question), keeping last occurrence
+    seen = {}
+    for row in rows:
+        seen[(row["cycle_date"], row["question"])] = row
+    rows = list(seen.values())
 
     log.info(f"Parsed {len(rows)} journal entries")
 

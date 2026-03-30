@@ -68,20 +68,33 @@ from whoop_journal_import import import_journal
 # HTML link extraction (stdlib only — no BeautifulSoup needed)
 # ---------------------------------------------------------------------------
 class LinkExtractor(HTMLParser):
-    """Extract all href values from <a> tags."""
+    """Extract href values and link text from <a> tags."""
 
     def __init__(self):
         super().__init__()
-        self.links: list[str] = []
+        self.links: list[tuple[str, str]] = []  # (href, link_text)
+        self._current_href: str | None = None
+        self._current_text: str = ""
 
     def handle_starttag(self, tag, attrs):
         if tag == "a":
             for name, value in attrs:
                 if name == "href" and value:
-                    self.links.append(value)
+                    self._current_href = value
+                    self._current_text = ""
+
+    def handle_data(self, data):
+        if self._current_href is not None:
+            self._current_text += data
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._current_href:
+            self.links.append((self._current_href, self._current_text.strip()))
+            self._current_href = None
+            self._current_text = ""
 
 
-def extract_links_from_html(html: str) -> list[str]:
+def extract_links_from_html(html: str) -> list[tuple[str, str]]:
     parser = LinkExtractor()
     parser.feed(html)
     return parser.links
@@ -181,20 +194,19 @@ def extract_download_url(msg: email.message.Message) -> str | None:
                 charset = part.get_content_charset() or "utf-8"
                 plain_body = payload.decode(charset, errors="replace")
 
-    # Extract links from HTML
+    # Extract links from HTML (returns list of (href, link_text) tuples)
     if html_body:
         links = extract_links_from_html(html_body)
-        for link in links:
-            # Look for the download link — typically contains export/download keywords
-            # or points to a WHOOP domain with a file path
-            if any(kw in link.lower() for kw in ("export", "download", ".zip")):
-                log.info(f"Found download URL from HTML: {link[:80]}...")
-                return link
-        # Fallback: if only one https link, it's probably the download
-        https_links = [l for l in links if l.startswith("https://")]
-        if len(https_links) == 1:
-            log.info(f"Found single HTTPS link from HTML: {https_links[0][:80]}...")
-            return https_links[0]
+        # Primary: match on link text (e.g. "DOWNLOAD YOUR DATA")
+        for href, text in links:
+            if "download" in text.lower():
+                log.info(f"Found download URL via link text \"{text}\": {href[:80]}...")
+                return href
+        # Secondary: match on URL keywords
+        for href, text in links:
+            if any(kw in href.lower() for kw in ("export", "download", ".zip")):
+                log.info(f"Found download URL via href keyword: {href[:80]}...")
+                return href
 
     # Fallback: extract URLs from plain text
     if plain_body:
