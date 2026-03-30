@@ -746,7 +746,7 @@ export default function InsightsPage() {
           ) : (
             <ChartCard title="Bed Temperature vs HRV">
               <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
-                Insufficient Eight Sleep data (N = {q5Data.length}, need >= 5)
+                Insufficient Eight Sleep data (N = {q5Data.length}, need {">="} 5)
               </div>
             </ChartCard>
           )}
@@ -776,7 +776,7 @@ export default function InsightsPage() {
           ) : (
             <ChartCard title="Sleep Duration vs Recovery">
               <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
-                Insufficient Eight Sleep data (N = {q6Data.length}, need >= 5)
+                Insufficient Eight Sleep data (N = {q6Data.length}, need {">="} 5)
               </div>
             </ChartCard>
           )}
@@ -841,7 +841,7 @@ export default function InsightsPage() {
           ) : (
             <ChartCard title="Deep Sleep vs Pace Adherence">
               <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
-                Insufficient data (N = {q7Data.length}, need >= 5)
+                Insufficient data (N = {q7Data.length}, need {">="} 5)
               </div>
             </ChartCard>
           )}
@@ -877,7 +877,7 @@ export default function InsightsPage() {
           ) : (
             <ChartCard title="Bed Temperature vs HR at Pace">
               <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
-                Insufficient Eight Sleep data (N = {q8Data.length}, need >= 5)
+                Insufficient Eight Sleep data (N = {q8Data.length}, need {">="} 5)
               </div>
             </ChartCard>
           )}
@@ -927,7 +927,7 @@ export default function InsightsPage() {
           ) : (
             <ChartCard title="Recovery After Strain">
               <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
-                Insufficient strain data (need >= 20 days)
+                Insufficient strain data (need {">="} 20 days)
               </div>
             </ChartCard>
           )}
@@ -970,7 +970,7 @@ export default function InsightsPage() {
           ) : (
             <ChartCard title="Strain:Recovery Ratio vs Pace Delta">
               <div className="flex items-center justify-center h-[300px] text-text-tertiary text-sm">
-                Insufficient data (N = {q10Data.length}, need >= 5)
+                Insufficient data (N = {q10Data.length}, need {">="} 5)
               </div>
             </ChartCard>
           )}

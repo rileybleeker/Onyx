@@ -18,7 +18,7 @@ export default function MobileNav() {
   const pathname = usePathname();
 
   return (
-    <nav className="fixed bottom-0 inset-x-0 z-50 bg-surface-card border-t border-border-subtle md:hidden">
+    <nav className="fixed bottom-0 inset-x-0 z-50 bg-surface-card border-t border-border-subtle pb-[env(safe-area-inset-bottom)] md:hidden">
       <div className="flex justify-around py-1.5">
         {nav.map((item) => {
           const active = pathname === item.href;
