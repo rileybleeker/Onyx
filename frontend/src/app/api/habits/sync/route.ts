@@ -10,17 +10,20 @@ const supabase = createClient(
   { db: { schema: "pds" } }
 );
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
 /**
  * POST /api/habits/sync
- * Reads "Last Completed" dates from the Notion Habits DB and upserts
- * matching entries into pds.habit_journal. Returns which habits were synced.
+ * 1. Detects renamed habits (via habit_name_map) and updates old entries in habit_journal
+ * 2. Syncs "Last Completed" dates from Notion into habit_journal
+ * 3. Updates the name map for future rename detection
  */
 export async function POST() {
   if (!NOTION_API_KEY) {
     return NextResponse.json({ error: "NOTION_API_KEY not configured" }, { status: 500 });
   }
 
-  // Fetch all active habits with a Last Completed date
+  // Fetch ALL active habits (not just ones with Last Completed)
   const res = await fetch(`https://api.notion.com/v1/databases/${NOTION_HABITS_DB}/query`, {
     method: "POST",
     headers: {
@@ -29,12 +32,7 @@ export async function POST() {
       "Notion-Version": "2022-06-28",
     },
     body: JSON.stringify({
-      filter: {
-        and: [
-          { property: "Active", checkbox: { equals: true } },
-          { property: "Last Completed", date: { is_not_empty: true } },
-        ],
-      },
+      filter: { property: "Active", checkbox: { equals: true } },
     }),
   });
 
@@ -44,30 +42,51 @@ export async function POST() {
 
   const data = await res.json();
   const synced: string[] = [];
+  const renamed: string[] = [];
 
-  /* eslint-disable @typescript-eslint/no-explicit-any */
+  // Load existing name map
+  const { data: nameMap } = await supabase.from("habit_name_map").select("*");
+  const mapByPageId = new Map<string, string>();
+  (nameMap || []).forEach((row: any) => mapByPageId.set(row.notion_page_id, row.habit_name));
+
   for (const page of data.results) {
+    const pageId = page.id;
     const name = page.properties.Habit?.title?.[0]?.plain_text;
     const category = page.properties.Category?.select?.name || null;
     const lastCompleted = page.properties["Last Completed"]?.date?.start;
 
-    if (!name || !lastCompleted) continue;
+    if (!name) continue;
 
-    const { error } = await supabase
-      .from("habit_journal")
+    // Check for rename
+    const oldName = mapByPageId.get(pageId);
+    if (oldName && oldName !== name) {
+      // Rename detected — update all old entries in habit_journal
+      const { count } = await supabase
+        .from("habit_journal")
+        .update({ question: name, category })
+        .eq("question", oldName);
+      renamed.push(`"${oldName}" → "${name}" (${count ?? 0} entries updated)`);
+    }
+
+    // Update name map
+    await supabase
+      .from("habit_name_map")
       .upsert(
-        {
-          cycle_date: lastCompleted,
-          question: name,
-          category,
-          answer: "Yes",
-          notes: "Completed via Notion",
-        },
-        { onConflict: "cycle_date,question" }
+        { notion_page_id: pageId, habit_name: name, updated_at: new Date().toISOString() },
+        { onConflict: "notion_page_id" }
       );
 
-    if (!error) synced.push(`${name} (${lastCompleted})`);
+    // Sync Last Completed to habit_journal
+    if (lastCompleted) {
+      const { error } = await supabase
+        .from("habit_journal")
+        .upsert(
+          { cycle_date: lastCompleted, question: name, category, answer: "Yes", notes: "Completed via Notion" },
+          { onConflict: "cycle_date,question" }
+        );
+      if (!error) synced.push(`${name} (${lastCompleted})`);
+    }
   }
 
-  return NextResponse.json({ synced, count: synced.length });
+  return NextResponse.json({ synced, renamed, count: synced.length });
 }
