@@ -84,6 +84,7 @@ cd frontend && npm install
 - `journal` view UNIONs `whoop_journal` + `habit_journal` with a `source` column for unified analysis
 - Habit definitions are managed in Notion (Habits DB under Project Onyx, ID: `29cc936fd5e14ae8b10a4fe5c5f7a6cd`)
 - Bidirectional sync: completions from Onyx/Chat update both Supabase and Notion; Notion "Last Completed" syncs to Supabase on page load
+- `habit_name_map` tracks Notion page ID → name; renaming a habit in Notion auto-updates all historical `habit_journal` entries
 - `ci_tokens` table stores rotating OAuth tokens for GitHub Actions (Garmin + WHOOP)
 - RLS enabled: anon key = read-only, service role key = full access
 - Sync operations logged to `pds.sync_log`
