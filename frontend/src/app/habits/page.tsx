@@ -2,7 +2,6 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { getHabitJournal } from "@/lib/queries";
-import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -127,35 +126,28 @@ export default function HabitsPage() {
     const isCompleted = completionSet.has(key);
     setToggling((prev) => new Set(prev).add(habit.name));
 
-    const sb = createSupabaseBrowser();
     try {
-      if (isCompleted) {
-        await sb
-          .from("habit_journal")
-          .delete()
-          .eq("question", habit.name)
-          .eq("cycle_date", today);
-        setJournal((prev) =>
-          prev.filter((j) => !(j.question === habit.name && j.cycle_date === today))
-        );
-      } else {
-        const { data } = await sb
-          .from("habit_journal")
-          .upsert(
-            {
-              cycle_date: today,
-              question: habit.name,
-              category: habit.category,
-              answer: "Yes",
-            },
-            { onConflict: "cycle_date,question" }
-          )
-          .select()
-          .single();
-        if (data) {
+      const res = await fetch("/api/habits/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          habit: habit.name,
+          date: today,
+          category: habit.category,
+          notionPageId: habit.id,
+          undo: isCompleted,
+        }),
+      });
+
+      if (res.ok) {
+        if (isCompleted) {
+          setJournal((prev) =>
+            prev.filter((j) => !(j.question === habit.name && j.cycle_date === today))
+          );
+        } else {
           setJournal((prev) => [
             ...prev.filter((j) => !(j.question === habit.name && j.cycle_date === today)),
-            data,
+            { cycle_date: today, question: habit.name, category: habit.category, answer: "Yes" },
           ]);
         }
       }

@@ -258,7 +258,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     return JSON.stringify(data ?? []);
   }
 
-  // Mark a habit as complete
+  // Mark a habit as complete (writes to both Supabase and Notion)
   if (name === "mark_habit_complete") {
     const habit = input.habit as string;
     const date = (input.date as string) || new Date().toISOString().split("T")[0];
@@ -272,6 +272,32 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       .select()
       .single();
     if (error) return JSON.stringify({ error: error.message });
+
+    // Also update Notion "Last Completed"
+    const notionKey = process.env.NOTION_API_KEY;
+    const notionDb = process.env.NOTION_HABITS_DB || "29cc936fd5e14ae8b10a4fe5c5f7a6cd";
+    if (notionKey) {
+      try {
+        const searchRes = await fetch(`https://api.notion.com/v1/databases/${notionDb}/query`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${notionKey}`, "Content-Type": "application/json", "Notion-Version": "2022-06-28" },
+          body: JSON.stringify({ filter: { property: "Habit", title: { equals: habit } } }),
+        });
+        if (searchRes.ok) {
+          const searchData = await searchRes.json();
+          if (searchData.results.length > 0) {
+            await fetch(`https://api.notion.com/v1/pages/${searchData.results[0].id}`, {
+              method: "PATCH",
+              headers: { Authorization: `Bearer ${notionKey}`, "Content-Type": "application/json", "Notion-Version": "2022-06-28" },
+              body: JSON.stringify({ properties: { "Last Completed": { date: { start: date } } } }),
+            });
+          }
+        }
+      } catch (e) {
+        console.error("Notion sync from chat failed:", e);
+      }
+    }
+
     return JSON.stringify({ success: true, entry: data });
   }
 
