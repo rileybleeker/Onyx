@@ -239,3 +239,29 @@ export async function getHealthMatrix(days: number = 30) {
   if (error) throw error;
   return data ?? [];
 }
+
+// ---------------------------------------------------------------------------
+// Habits
+// ---------------------------------------------------------------------------
+
+export async function getHabits(activeOnly: boolean = true) {
+  let query = supabase.from("habits").select("*").order("sort_order", { ascending: true });
+  if (activeOnly) query = query.eq("active", true);
+  const { data, error } = await query;
+  if (error) throw error;
+  return data ?? [];
+}
+
+export async function getHabitCompletions(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("habit_completions")
+    .select("*")
+    .gte("completed_date", since.toISOString().split("T")[0])
+    .order("completed_date", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
