@@ -39,7 +39,7 @@ Onyx/
 - **ETL**: Python 3, httpx, garminconnect, supabase-py, python-dotenv
 - **Database**: Supabase (Postgres 17), schema `pds`, 16 tables + `daily_health_matrix` view + `journal` unified view
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
-- **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 15 tools (12 query + mark_habit_complete + query_journal + query_health_matrix)
+- **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 15 tools (12 query + mark_habit_complete + query_journal + query_health_matrix). Habit completion via chat syncs to both Supabase and Notion.
 - **Auth**: Supabase Auth (magic link), RLS on all tables
 - **Hosting**: Vercel (frontend), Supabase Cloud (database)
 
@@ -83,6 +83,7 @@ cd frontend && npm install
 - `habit_journal` table stores habit completions (same schema as `whoop_journal`)
 - `journal` view UNIONs `whoop_journal` + `habit_journal` with a `source` column for unified analysis
 - Habit definitions are managed in Notion (Habits DB under Project Onyx, ID: `29cc936fd5e14ae8b10a4fe5c5f7a6cd`)
+- Bidirectional sync: completions from Onyx/Chat update both Supabase and Notion; Notion "Last Completed" syncs to Supabase on page load
 - `ci_tokens` table stores rotating OAuth tokens for GitHub Actions (Garmin + WHOOP)
 - RLS enabled: anon key = read-only, service role key = full access
 - Sync operations logged to `pds.sync_log`
