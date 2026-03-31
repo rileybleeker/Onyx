@@ -10,9 +10,11 @@ const supabase = createClient(
   { db: { schema: "pds" } }
 );
 
-const SYSTEM_PROMPT = `You are Onyx, a personal data scientist assistant. You help the user understand their health and fitness data from three devices: Garmin watch, WHOOP band, and Eight Sleep mattress.
+const SYSTEM_PROMPT = `You are Onyx, a personal data scientist assistant. You help the user understand their health and fitness data from three devices: Garmin watch, WHOOP band, and Eight Sleep mattress. You also help them track daily habits.
 
 You have access to the user's data via function calls. When the user asks about their health metrics, use the appropriate function to fetch real data before answering. You can call multiple tools to cross-reference data across devices. Be concise and insightful — highlight trends, anomalies, and actionable takeaways.
+
+When the user mentions completing a habit (e.g., "I meditated today", "I took my vitamins"), use mark_habit_complete to log it. The habit name should match what's defined in their habits list. Use query_journal to see both WHOOP journal behaviors and habit completions together.
 
 Format numbers clearly. Use relative comparisons (e.g., "your HRV is 15% above your weekly average"). When comparing across devices, note any discrepancies. When you don't have enough data, say so.`;
 
@@ -141,6 +143,32 @@ const tools: Anthropic.Tool[] = [
     },
   },
   {
+    name: "query_journal",
+    description: "Get the unified journal view combining both WHOOP journal behaviors AND habit completions. Each entry has a date, question/behavior name, category, answer, and source ('whoop' or 'habit'). Use this for cross-analysis of habits and self-reported behaviors.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        days: { type: "number", description: "Number of past days to query (default 30)" },
+        source: { type: "string", description: "Optional: filter by source — 'whoop' or 'habit'" },
+        question: { type: "string", description: "Optional: filter by specific behavior/habit name" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "mark_habit_complete",
+    description: "Mark a habit as completed for a given date. The habit name must match one defined in the user's Notion Habits database (e.g., 'Meditated', 'Exercised', 'Read'). Defaults to today.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        habit: { type: "string", description: "The habit name exactly as defined in Notion (e.g., 'Meditated', 'Exercised')" },
+        date: { type: "string", description: "Date in YYYY-MM-DD format (defaults to today)" },
+        category: { type: "string", description: "Optional: habit category (e.g., 'mindfulness', 'fitness')" },
+      },
+      required: ["habit"],
+    },
+  },
+  {
     name: "query_eight_sleep",
     description: "Get Eight Sleep mattress data including sleep score, fitness score, HRV, heart rate, breath rate, bed/room temperature, sleep stages, and toss & turns.",
     input_schema: {
@@ -212,6 +240,39 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     const { data, error } = await query;
     if (error) return JSON.stringify({ error: error.message });
     return JSON.stringify(data ?? []);
+  }
+
+  // Unified journal view (WHOOP + habits)
+  if (name === "query_journal") {
+    const journalDays = (input.days as number) || 30;
+    const jSince = new Date();
+    jSince.setDate(jSince.getDate() - journalDays);
+    let query = supabase.from("journal").select("*")
+      .gte("cycle_date", jSince.toISOString().split("T")[0])
+      .order("cycle_date", { ascending: true })
+      .limit(500);
+    if (input.source) query = query.eq("source", input.source as string);
+    if (input.question) query = query.ilike("question", `%${input.question}%`);
+    const { data, error } = await query;
+    if (error) return JSON.stringify({ error: error.message });
+    return JSON.stringify(data ?? []);
+  }
+
+  // Mark a habit as complete
+  if (name === "mark_habit_complete") {
+    const habit = input.habit as string;
+    const date = (input.date as string) || new Date().toISOString().split("T")[0];
+    const category = (input.category as string) || null;
+    const { data, error } = await supabase
+      .from("habit_journal")
+      .upsert(
+        { cycle_date: date, question: habit, category, answer: "Yes", notes: "Completed via Claude chat" },
+        { onConflict: "cycle_date,question" }
+      )
+      .select()
+      .single();
+    if (error) return JSON.stringify({ error: error.message });
+    return JSON.stringify({ success: true, entry: data });
   }
 
   // Handle timestamp-based tables

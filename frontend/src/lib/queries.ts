@@ -241,26 +241,36 @@ export async function getHealthMatrix(days: number = 30) {
 }
 
 // ---------------------------------------------------------------------------
-// Habits
+// Habits (stored in habit_journal, same schema as whoop_journal)
 // ---------------------------------------------------------------------------
 
-export async function getHabits(activeOnly: boolean = true) {
-  let query = supabase.from("habits").select("*").order("sort_order", { ascending: true });
-  if (activeOnly) query = query.eq("active", true);
-  const { data, error } = await query;
-  if (error) throw error;
-  return data ?? [];
-}
-
-export async function getHabitCompletions(days: number = 30) {
+export async function getHabitJournal(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
   const { data, error } = await supabase
-    .from("habit_completions")
+    .from("habit_journal")
     .select("*")
-    .gte("completed_date", since.toISOString().split("T")[0])
-    .order("completed_date", { ascending: true });
+    .gte("cycle_date", since.toISOString().split("T")[0])
+    .order("cycle_date", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Unified Journal (WHOOP + Habits via view)
+// ---------------------------------------------------------------------------
+
+export async function getJournal(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("journal")
+    .select("*")
+    .gte("cycle_date", since.toISOString().split("T")[0])
+    .order("cycle_date", { ascending: true });
 
   if (error) throw error;
   return data ?? [];

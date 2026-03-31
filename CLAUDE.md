@@ -25,13 +25,11 @@ Onyx/
 ├── sql/
 │   ├── rls_policies.sql     # Row-Level Security policies
 │   └── ci_tokens.sql        # CI token storage table
-├── sql/
-│   └── habits.sql           # Habits + habit_completions DDL (applied via Supabase migration)
 ├── ARCHITECTURE.md          # Full system architecture reference
 ├── .env                     # Secrets (NEVER commit)
 └── frontend/                # Next.js 15 app
     └── src/
-        ├── app/             # Pages (10 routes) + API routes
+        ├── app/             # Pages (11 routes) + API routes
         ├── components/      # AppShell, Sidebar, MobileNav, ChartCard, StatCard
         └── lib/             # Supabase clients, queries.ts (19 functions), format.ts
 ```
@@ -39,9 +37,9 @@ Onyx/
 ## Tech Stack
 
 - **ETL**: Python 3, httpx, garminconnect, supabase-py, python-dotenv
-- **Database**: Supabase (Postgres 17), schema `pds`, 15 tables + `daily_health_matrix` view
+- **Database**: Supabase (Postgres 17), schema `pds`, 16 tables + `daily_health_matrix` view + `journal` unified view
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
-- **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 12 query tools
+- **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 15 tools (12 query + mark_habit_complete + query_journal + query_health_matrix)
 - **Auth**: Supabase Auth (magic link), RLS on all tables
 - **Hosting**: Vercel (frontend), Supabase Cloud (database)
 
@@ -82,7 +80,9 @@ cd frontend && npm install
 - Schema: `pds`
 - All tables use upsert with conflict resolution (idempotent ETL)
 - `daily_health_matrix` view joins all three sources by `calendar_date` (~40 columns)
-- `habits` + `habit_completions` tables store user-defined habits and daily check-ins
+- `habit_journal` table stores habit completions (same schema as `whoop_journal`)
+- `journal` view UNIONs `whoop_journal` + `habit_journal` with a `source` column for unified analysis
+- Habit definitions are managed in Notion (Habits DB under Project Onyx, ID: `29cc936fd5e14ae8b10a4fe5c5f7a6cd`)
 - `ci_tokens` table stores rotating OAuth tokens for GitHub Actions (Garmin + WHOOP)
 - RLS enabled: anon key = read-only, service role key = full access
 - Sync operations logged to `pds.sync_log`
@@ -95,7 +95,7 @@ GARMIN_EMAIL, GARMIN_PASSWORD, WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET,
 EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD, IMAP_HOST, IMAP_EMAIL, IMAP_APP_PASSWORD
 
 `frontend/.env.local`: NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
-SUPABASE_SERVICE_ROLE_KEY, ANTHROPIC_API_KEY, NOTION_API_KEY, NOTION_REMINDERS_DB
+SUPABASE_SERVICE_ROLE_KEY, ANTHROPIC_API_KEY, NOTION_API_KEY, NOTION_HABITS_DB
 
 ## Claude Code Permissions
 
