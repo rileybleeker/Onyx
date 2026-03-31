@@ -36,8 +36,8 @@ export async function GET() {
 
   if (!res.ok) {
     const text = await res.text();
-    console.error("Notion query error:", text);
-    return NextResponse.json({ error: "Failed to fetch habits from Notion" }, { status: 500 });
+    console.error("Notion query error:", res.status, text);
+    return NextResponse.json({ error: "Failed to fetch habits from Notion", status: res.status, detail: text }, { status: 500 });
   }
 
   const data = await res.json();

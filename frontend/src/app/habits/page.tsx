@@ -84,7 +84,7 @@ export default function HabitsPage() {
   const load = useCallback(async () => {
     try {
       const [habitsRes, journalData] = await Promise.all([
-        fetch("/api/habits").then((r) => r.json()),
+        fetch("/api/habits/list").then((r) => r.json()),
         getHabitJournal(90),
       ]);
       setHabits(habitsRes.habits || []);
