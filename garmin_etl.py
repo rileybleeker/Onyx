@@ -49,17 +49,31 @@ log = logging.getLogger("garmin_etl")
 # ---------------------------------------------------------------------------
 
 def get_garmin_client() -> Garmin:
-    """Authenticate with Garmin Connect, reusing saved tokens when possible."""
+    """Authenticate with Garmin Connect, reusing saved tokens when possible.
+
+    Retries fresh login up to 3 times with exponential backoff to handle
+    Garmin's 429 rate limiting on the SSO endpoint.
+    """
     client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
     try:
         client.login(TOKEN_DIR)
         log.info("Garmin: logged in with saved tokens")
+        return client
     except Exception:
         log.info("Garmin: saved tokens expired, performing fresh login...")
-        client.login()
-        client.garth.dump(TOKEN_DIR)
-        log.info("Garmin: fresh login successful, tokens saved")
-    return client
+
+    for attempt in range(1, 4):
+        try:
+            client.login()
+            client.garth.dump(TOKEN_DIR)
+            log.info("Garmin: fresh login successful, tokens saved")
+            return client
+        except Exception as e:
+            if attempt == 3:
+                raise
+            wait = 60 * attempt
+            log.warning("Garmin: login attempt %d failed (%s), retrying in %ds...", attempt, e, wait)
+            time.sleep(wait)
 
 
 def get_supabase_client() -> Client:
