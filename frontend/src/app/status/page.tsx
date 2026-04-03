@@ -12,6 +12,7 @@ const SOURCE_BADGE: Record<string, string> = {
   whoop: "WHOOP",
   eight_sleep: "8SLP",
   whoop_journal: "WHOOP",
+  habits: "NOTION",
 };
 
 const SOURCE_BADGE_COLOR: Record<string, string> = {
@@ -19,6 +20,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   whoop: "text-source-whoop",
   eight_sleep: "text-source-eightsleep",
   whoop_journal: "text-source-whoop",
+  habits: "text-text-tertiary",
 };
 
 const STATUS_DOT: Record<string, string> = {
@@ -42,7 +44,7 @@ const STATUS_TEXT: Record<string, string> = {
   unknown: "text-text-tertiary",
 };
 
-const SOURCE_ORDER = ["garmin", "whoop", "eight_sleep", "whoop_journal"];
+const SOURCE_ORDER = ["garmin", "whoop", "eight_sleep", "whoop_journal", "habits"];
 
 function formatRelativeTime(isoStr: string | null): string {
   if (!isoStr) return "Never";
@@ -268,7 +270,7 @@ export default function StatusPage() {
       </div>
 
       {/* Source cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4 mb-8">
         {sourceList.map(({ key, info }) => (
           <SourceCard key={key} sourceKey={key} info={info} />
         ))}

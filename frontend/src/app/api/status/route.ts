@@ -45,9 +45,9 @@ function deriveStatus(
   syncEntry: Record<string, unknown> | null,
   lag: number
 ): "success" | "partial" | "failed" | "unknown" {
-  if (!syncEntry) return "unknown";
-  if (syncEntry.status === "failed" || lag > 3) return "failed";
-  if (syncEntry.status === "partial" || lag > 1) return "partial";
+  if (!syncEntry && lag === 999) return "unknown";
+  if (syncEntry?.status === "failed" || lag > 3) return "failed";
+  if (syncEntry?.status === "partial" || lag > 1) return "partial";
   return "success";
 }
 
@@ -63,11 +63,12 @@ export async function GET() {
     if (syncErr) throw syncErr;
 
     // Fetch latest data dates per source in parallel
-    const [garminRes, whoopRes, eightSleepRes, journalRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
+      supabase.from("habit_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -83,6 +84,7 @@ export async function GET() {
     const whoopDate = whoopRes.data?.[0]?.start_time?.split("T")[0] ?? null;
     const eightSleepDate = eightSleepRes.data?.[0]?.calendar_date ?? null;
     const journalDate = journalRes.data?.[0]?.cycle_date ?? null;
+    const habitsDate = habitsRes.data?.[0]?.cycle_date ?? null;
 
     const garminEntry = latestBySrcType["garmin|full_sync"] ?? null;
     const whoopEntry = latestBySrcType["whoop|full_sync"] ?? null;
@@ -93,6 +95,7 @@ export async function GET() {
     const whoopLag = daysLag(whoopDate);
     const eightSleepLag = daysLag(eightSleepDate);
     const journalLag = daysLag(journalDate);
+    const habitsLag = daysLag(habitsDate);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -134,6 +137,16 @@ export async function GET() {
         recordsSynced: (journalEntry?.records_synced as number) ?? 0,
         durationSeconds: (journalEntry?.duration_seconds as number) ?? null,
         errorMessage: (journalEntry?.error_message as string) ?? null,
+      },
+      habits: {
+        label: "Habits",
+        lastSync: habitsDate,
+        status: deriveStatus(null, habitsLag),
+        latestDataDate: habitsDate,
+        daysLag: habitsLag,
+        recordsSynced: 0,
+        durationSeconds: null,
+        errorMessage: null,
       },
     };
 
