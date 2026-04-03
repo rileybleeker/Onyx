@@ -16,6 +16,7 @@ Onyx/
 ├── journal_inbox/           # Drop WHOOP journal CSVs here
 ├── journal_archive/         # Processed CSVs moved here
 ├── eight_sleep_etl.py       # Eight Sleep API → Supabase (1 table)
+├── myfitnesspal_etl.py      # MyFitnessPal → Supabase (nutrition table)
 ├── ci_token_helper.py       # Download/upload OAuth tokens for CI
 ├── .github/workflows/
 │   ├── daily-etl.yml        # GitHub Actions daily ETL cron
@@ -37,10 +38,10 @@ Onyx/
 ## Tech Stack
 
 - **ETL**: Python 3, httpx, garminconnect, supabase-py, python-dotenv
-- **Database**: Supabase (Postgres 17), schema `pds`, 16 tables + `daily_health_matrix` view + `journal` unified view
+- **Database**: Supabase (Postgres 17), schema `pds`, 17 tables + `daily_health_matrix` view + `journal` unified view
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
 - **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 15 tools (12 query + mark_habit_complete + query_journal + query_health_matrix). Habit completion via chat syncs to both Supabase and Notion.
-- **System Status**: `/status` page — 5 source cards (Garmin, WHOOP, Eight Sleep, WHOOP Journal, Habits), KPI summary, 20-entry sync history. `GET /api/status` queries `pds.sync_log` by `(source, data_type)` key + `MAX()` date per data table. Auto-refreshes every 60s.
+- **System Status**: `/status` page — 6 source cards (Garmin, WHOOP, Eight Sleep, WHOOP Journal, Habits, MyFitnessPal), KPI summary, 20-entry sync history. `GET /api/status` queries `pds.sync_log` by `(source, data_type)` key + `MAX()` date per data table. Auto-refreshes every 60s.
 - **Auth**: Supabase Auth (magic link), RLS on all tables
 - **Hosting**: Vercel (frontend), Supabase Cloud (database)
 
@@ -54,6 +55,7 @@ python whoop_journal_import.py <csv>    # Import WHOOP journal CSV export
 python whoop_journal_email.py --once   # Check email for WHOOP export, import journal
 python whoop_journal_watcher.py        # Watch inbox folder for auto-import
 python eight_sleep_etl.py               # Sync last 7 days
+python myfitnesspal_etl.py              # Sync last 7 days
 python <etl>.py --backfill N            # Backfill N days
 
 # CI Token Management
@@ -86,6 +88,7 @@ cd frontend && npm install
 - Habit definitions are managed in Notion (Habits DB under Project Onyx, ID: `29cc936fd5e14ae8b10a4fe5c5f7a6cd`)
 - Bidirectional sync: completions from Onyx/Chat update both Supabase and Notion; Notion "Last Completed" syncs to Supabase on page load
 - `habit_name_map` tracks Notion page ID → name; renaming a habit in Notion auto-updates all historical `habit_journal` entries
+- `myfitnesspal_nutrition` stores daily nutrition totals (calories, macros, fiber, sugar, sodium, water, exercise_kcal) + `meals_json` JSONB for per-meal breakdown. ETL uses `python-myfitnesspal` library (web scraping with username/password — no OAuth token persistence needed). GitHub Secrets: `MFP_USERNAME`, `MFP_PASSWORD`.
 - `ci_tokens` table stores rotating OAuth tokens for GitHub Actions (Garmin + WHOOP)
 - RLS enabled: anon key = read-only, service role key = full access
 - Sync operations logged to `pds.sync_log`
@@ -95,7 +98,8 @@ cd frontend && npm install
 
 Root `.env` (Python ETL): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY,
 GARMIN_EMAIL, GARMIN_PASSWORD, WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET,
-EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD, IMAP_HOST, IMAP_EMAIL, IMAP_APP_PASSWORD
+EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD, IMAP_HOST, IMAP_EMAIL, IMAP_APP_PASSWORD,
+MFP_USERNAME, MFP_PASSWORD
 
 `frontend/.env.local`: NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
 SUPABASE_SERVICE_ROLE_KEY, ANTHROPIC_API_KEY, NOTION_API_KEY, NOTION_HABITS_DB
