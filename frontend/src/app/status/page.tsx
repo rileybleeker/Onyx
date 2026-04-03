@@ -13,6 +13,7 @@ const SOURCE_BADGE: Record<string, string> = {
   eight_sleep: "8SLP",
   whoop_journal: "WHOOP",
   habits: "NOTION",
+  myfitnesspal: "MFP",
 };
 
 const SOURCE_BADGE_COLOR: Record<string, string> = {
@@ -21,6 +22,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   eight_sleep: "text-source-eightsleep",
   whoop_journal: "text-source-whoop",
   habits: "text-text-tertiary",
+  myfitnesspal: "text-text-tertiary",
 };
 
 const STATUS_DOT: Record<string, string> = {
@@ -44,7 +46,7 @@ const STATUS_TEXT: Record<string, string> = {
   unknown: "text-text-tertiary",
 };
 
-const SOURCE_ORDER = ["garmin", "whoop", "eight_sleep", "whoop_journal", "habits"];
+const SOURCE_ORDER = ["garmin", "whoop", "eight_sleep", "whoop_journal", "habits", "myfitnesspal"];
 
 function formatRelativeTime(isoStr: string | null): string {
   if (!isoStr) return "Never";
@@ -143,12 +145,14 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   garmin: "Garmin",
   whoop: "WHOOP",
   eight_sleep: "8Sleep",
+  myfitnesspal: "MFP",
 };
 
 const HISTORY_TYPE_LABELS: Record<string, string> = {
   full_sync: "Full Sync",
   trends: "Trends",
   journal_email: "Journal Email",
+  nutrition: "Nutrition",
 };
 
 export default function StatusPage() {

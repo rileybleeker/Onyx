@@ -63,12 +63,13 @@ export async function GET() {
     if (syncErr) throw syncErr;
 
     // Fetch latest data dates per source in parallel
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
       supabase.from("habit_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
+      supabase.from("myfitnesspal_nutrition").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -85,17 +86,20 @@ export async function GET() {
     const eightSleepDate = eightSleepRes.data?.[0]?.calendar_date ?? null;
     const journalDate = journalRes.data?.[0]?.cycle_date ?? null;
     const habitsDate = habitsRes.data?.[0]?.cycle_date ?? null;
+    const mfpDate = mfpRes.data?.[0]?.calendar_date ?? null;
 
     const garminEntry = latestBySrcType["garmin|full_sync"] ?? null;
     const whoopEntry = latestBySrcType["whoop|full_sync"] ?? null;
     const eightSleepEntry = latestBySrcType["eight_sleep|trends"] ?? null;
     const journalEntry = latestBySrcType["whoop|journal_email"] ?? null;
+    const mfpEntry = latestBySrcType["myfitnesspal|nutrition"] ?? null;
 
     const garminLag = daysLag(garminDate);
     const whoopLag = daysLag(whoopDate);
     const eightSleepLag = daysLag(eightSleepDate);
     const journalLag = daysLag(journalDate);
     const habitsLag = daysLag(habitsDate);
+    const mfpLag = daysLag(mfpDate);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -147,6 +151,16 @@ export async function GET() {
         recordsSynced: 0,
         durationSeconds: null,
         errorMessage: null,
+      },
+      myfitnesspal: {
+        label: "MyFitnessPal",
+        lastSync: (mfpEntry?.sync_start as string) ?? null,
+        status: deriveStatus(mfpEntry, mfpLag),
+        latestDataDate: mfpDate,
+        daysLag: mfpLag,
+        recordsSynced: (mfpEntry?.records_synced as number) ?? 0,
+        durationSeconds: (mfpEntry?.duration_seconds as number) ?? null,
+        errorMessage: (mfpEntry?.error_message as string) ?? null,
       },
     };
 

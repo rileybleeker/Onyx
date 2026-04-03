@@ -204,6 +204,24 @@ export async function getEightSleepTrends(days: number = 30, side: string = "lef
 }
 
 // ---------------------------------------------------------------------------
+// MyFitnessPal
+// ---------------------------------------------------------------------------
+
+export async function getMfpNutrition(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("myfitnesspal_nutrition")
+    .select("*")
+    .gte("calendar_date", since.toISOString().split("T")[0])
+    .order("calendar_date", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+// ---------------------------------------------------------------------------
 // Recovery vs Pace Correlation
 // ---------------------------------------------------------------------------
 
