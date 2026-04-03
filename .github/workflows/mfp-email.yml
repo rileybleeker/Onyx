@@ -1,0 +1,30 @@
+name: MyFitnessPal Email Check
+
+on:
+  schedule:
+    # Every 4 hours at :00
+    - cron: '0 */4 * * *'
+  workflow_dispatch: # Manual trigger
+
+concurrency:
+  group: mfp-email
+  cancel-in-progress: false
+
+jobs:
+  mfp-email:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests supabase python-dotenv
+      - name: Check MFP export email
+        run: python myfitnesspal_email.py --once
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          IMAP_HOST: ${{ secrets.IMAP_HOST }}
+          IMAP_EMAIL: ${{ secrets.IMAP_EMAIL }}
+          IMAP_APP_PASSWORD: ${{ secrets.IMAP_APP_PASSWORD }}

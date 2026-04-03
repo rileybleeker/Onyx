@@ -73,17 +73,3 @@ jobs:
           EIGHTSLEEP_CLIENT_ID: ${{ secrets.EIGHTSLEEP_CLIENT_ID }}
           EIGHTSLEEP_CLIENT_SECRET: ${{ secrets.EIGHTSLEEP_CLIENT_SECRET }}
 
-  myfitnesspal-etl:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install dependencies
-        run: pip install myfitnesspal supabase python-dotenv
-      - name: Run MyFitnessPal ETL
-        run: python myfitnesspal_etl.py --days 7
-        env:
-          MFP_USERNAME: ${{ secrets.MFP_USERNAME }}
-          MFP_PASSWORD: ${{ secrets.MFP_PASSWORD }}
