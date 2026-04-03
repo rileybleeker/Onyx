@@ -29,7 +29,7 @@ Onyx/
 ├── .env                     # Secrets (NEVER commit)
 └── frontend/                # Next.js 15 app
     └── src/
-        ├── app/             # Pages (11 routes) + API routes
+        ├── app/             # Pages (12 routes) + API routes
         ├── components/      # AppShell, Sidebar, MobileNav, ChartCard, StatCard
         └── lib/             # Supabase clients, queries.ts (19 functions), format.ts
 ```
@@ -40,6 +40,7 @@ Onyx/
 - **Database**: Supabase (Postgres 17), schema `pds`, 16 tables + `daily_health_matrix` view + `journal` unified view
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
 - **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 15 tools (12 query + mark_habit_complete + query_journal + query_health_matrix). Habit completion via chat syncs to both Supabase and Notion.
+- **System Status**: `/status` page — 5 source cards (Garmin, WHOOP, Eight Sleep, WHOOP Journal, Habits), KPI summary, 20-entry sync history. `GET /api/status` queries `pds.sync_log` by `(source, data_type)` key + `MAX()` date per data table. Auto-refreshes every 60s.
 - **Auth**: Supabase Auth (magic link), RLS on all tables
 - **Hosting**: Vercel (frontend), Supabase Cloud (database)
 
@@ -129,6 +130,7 @@ All three ETLs run daily via `.github/workflows/daily-etl.yml`:
 - **Manual trigger**: `gh workflow run daily-etl.yml`
 - **Token persistence**: Garmin/WHOOP tokens stored in `pds.ci_tokens`, managed by `ci_token_helper.py`
 - **Token recovery**: If Garmin tokens expire in CI, re-run ETL locally then `python ci_token_helper.py upload garmin`
+- **WHOOP token recovery**: If WHOOP refresh token expires (400 on token refresh), re-run `python whoop_etl.py --days 7` locally then `python ci_token_helper.py upload whoop`. WHOOP tokens can expire after several days of failed refreshes — check `/status` page for silent failures.
 - **GitHub Secrets**: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GARMIN_EMAIL, GARMIN_PASSWORD, WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET, EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD, EIGHTSLEEP_CLIENT_ID, EIGHTSLEEP_CLIENT_SECRET
 
 WHOOP journal email check runs separately via `.github/workflows/whoop-journal-email.yml`:
@@ -139,7 +141,7 @@ WHOOP journal email check runs separately via `.github/workflows/whoop-journal-e
 ## Conventions
 
 - After making frontend changes, always start the dev server (`cd frontend && npm run dev`) so the user can see updates immediately in the browser
-- After completing a task, always commit and push to git so Vercel deploys automatically
+- After completing a task, always commit and push to git, then run `cd frontend && npx vercel --prod` to deploy (GitHub auto-deploy is disconnected)
 - ETL scripts are standalone Python files at the project root (not in a package)
 - Frontend follows Next.js App Router conventions (page.tsx per route)
 - Supabase queries go in `frontend/src/lib/queries.ts`
