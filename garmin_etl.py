@@ -65,7 +65,8 @@ def get_garmin_client() -> Garmin:
     for attempt in range(1, 4):
         try:
             client.login()
-            client.garth.dump(TOKEN_DIR)
+            if hasattr(client, 'garth'):
+                client.garth.dump(TOKEN_DIR)
             log.info("Garmin: fresh login successful, tokens saved")
             return client
         except Exception as e:
@@ -843,7 +844,9 @@ def main():
              error=f"{errors} date(s) failed" if errors else None)
 
     # Persist any refreshed tokens to disk (needed for CI token upload)
-    garmin.garth.dump(TOKEN_DIR)
+    # garth attribute removed in newer garminconnect versions; login(TOKEN_DIR) handles persistence
+    if hasattr(garmin, 'garth'):
+        garmin.garth.dump(TOKEN_DIR)
 
     log.info("=" * 60)
     log.info(f"Done! {total_records} total records | {errors} errors | {duration:.1f}s")
