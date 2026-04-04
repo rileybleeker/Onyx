@@ -338,6 +338,9 @@ export default function HrvAnalysisPage() {
           ) : (
             <p className="text-[28px] font-mono text-text-tertiary mt-2">—</p>
           )}
+          <p className="text-[10px] text-text-tertiary mt-2 leading-relaxed">
+            XGBoost predicts tomorrow&apos;s HRV from today&apos;s training load, sleep, and behavior data. The 90% CI is the range it expects your HRV to fall within 9 out of 10 nights.
+          </p>
           <span className="absolute top-3 right-3 text-[9px] font-mono text-text-tertiary">XGBOOST</span>
         </div>
 
@@ -360,6 +363,9 @@ export default function HrvAnalysisPage() {
                   </span>)
                 </p>
               )}
+              <p className="text-[10px] text-text-tertiary mt-2 leading-relaxed">
+                MAE = average miss in ms. Directional accuracy = how often the model correctly predicted whether HRV would rise or fall vs the previous night.
+              </p>
             </>
           ) : (
             <p className="text-[28px] font-mono text-text-tertiary mt-2">—</p>
@@ -389,7 +395,8 @@ export default function HrvAnalysisPage() {
 
       {/* ── Row 2: Key Drivers ── */}
       {topDrivers.length > 0 && (
-        <ChartCard title="Top 10 Prediction Drivers" subtitle="SHAP values — contribution to tomorrow's HRV prediction">
+        <ChartCard title="Top 10 Prediction Drivers" subtitle="SHAP values — contribution to tomorrow's HRV prediction"
+          info="SHAP (SHapley Additive exPlanations) measures each factor's contribution to tomorrow's predicted HRV in milliseconds. Green bars pushed the prediction higher; red bars lowered it. The total of all bars equals the difference between the forecast and your historical average.">
           <ResponsiveContainer width="100%" height={280}>
             <BarChart data={topDrivers.slice(0, 10)} layout="vertical"
                       margin={{ left: 140, right: 20, top: 4, bottom: 4 }}>
@@ -417,7 +424,8 @@ export default function HrvAnalysisPage() {
       {/* ── Row 3: 30-Day Forecast + Journal Impact ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* 30-Day Prophet Forecast */}
-        <ChartCard title="30-Day HRV Forecast" source="Prophet">
+        <ChartCard title="30-Day HRV Forecast" source="Prophet"
+          info="Prophet learns your weekly rhythms and long-term HRV trend to project the next 30 days. The dashed line is its forecast; the shaded band is the 80% confidence interval — your HRV should land inside it about 4 out of 5 nights. Wider bands mean more uncertainty.">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={prophetData}>
               <defs>
@@ -449,7 +457,8 @@ export default function HrvAnalysisPage() {
         </ChartCard>
 
         {/* Journal Impact */}
-        <ChartCard title="Journal Behavior Impact" subtitle="Mean HRV difference: Yes vs No">
+        <ChartCard title="Journal Behavior Impact" subtitle="Mean HRV difference: Yes vs No"
+          info="Average HRV difference on nights after logging 'Yes' vs 'No' for each behavior. A +15ms bar means your next-morning HRV averaged 15ms higher on nights following that behavior. All comparisons target the next night's HRV — today's behaviors drive tomorrow's recovery.">
           {journalImpact.length > 0 ? (
             <ResponsiveContainer width="100%" height={260}>
               <BarChart data={journalImpact.slice(0, 12)} layout="vertical"
@@ -480,7 +489,8 @@ export default function HrvAnalysisPage() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Prediction vs Actual */}
         <ChartCard title="Prediction vs Actual (last 60 days)"
-                   subtitle="Red dots = miss > 15ms">
+                   subtitle="Red dots = miss > 15ms"
+                   info="The XGBoost model's day-ahead predictions (blue dashed) vs your actual measured HRV (green). Red dots mark nights where the model was off by more than 15ms. A well-calibrated model tracks the green line closely and has few red dots.">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={predActualData}>
               <CartesianGrid {...gridStyle} />
@@ -501,7 +511,8 @@ export default function HrvAnalysisPage() {
 
         {/* Accuracy by Horizon */}
         <ChartCard title="Accuracy by Forecast Horizon"
-                   subtitle="MAE (ms) — lower is better">
+                   subtitle="MAE (ms) — lower is better"
+                   info="How prediction error grows the further ahead you look. MAE (Mean Absolute Error) is the average miss in milliseconds — lower is better. The Naive baseline simply repeats yesterday's HRV as the prediction; beating it confirms the model is learning real patterns, not just copying recent values.">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={horizonData}>
               <CartesianGrid {...gridStyle} />
@@ -528,7 +539,8 @@ export default function HrvAnalysisPage() {
       {/* ── Row 5: Correlation Heatmap + HRV Trend ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Top-15 Correlations */}
-        <ChartCard title="HRV Correlates" subtitle="Top 15 features — Spearman r with WHOOP HRV">
+        <ChartCard title="HRV Correlates" subtitle="Top 15 features — Spearman r with WHOOP HRV"
+          info="Spearman r measures how consistently a factor moves with your next-night HRV — from −1.0 (strong negative) to +1.0 (strong positive). For example, r = −0.33 for Cycle Avg HR means: on higher-exertion days, your next-night HRV reliably trends lower. All correlations target the following night's HRV, since yesterday's behaviors drive tonight's recovery.">
           {correlations.length > 0 ? (
             <ResponsiveContainer width="100%" height={340}>
               <BarChart data={correlations} layout="vertical"
@@ -555,7 +567,8 @@ export default function HrvAnalysisPage() {
 
         {/* HRV Trend */}
         <ChartCard title="HRV Trend (180 days)"
-                   subtitle="7-day rolling average + Garmin baseline">
+                   subtitle="7-day rolling average + Garmin baseline"
+                   info="Raw daily HRV (faint line) fluctuates heavily with training load and life stress. The 7-day rolling average (bright line) smooths out that noise to reveal your true underlying trend. The blue dashed reference lines are your Garmin personal baseline — the healthy HRV range Garmin has learned for you over time.">
           <ResponsiveContainer width="100%" height={340}>
             <LineChart data={trendData}>
               <CartesianGrid {...gridStyle} />
@@ -615,7 +628,10 @@ export default function HrvAnalysisPage() {
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               {/* Residual histogram */}
               <div>
-                <h4 className="text-[12px] font-medium text-text-secondary mb-3">Residual Distribution (XGBoost)</h4>
+                <h4 className="text-[12px] font-medium text-text-secondary mb-1">Residual Distribution (XGBoost)</h4>
+                <p className="text-[11px] text-text-tertiary leading-relaxed mb-3">
+                  A residual is the difference between predicted and actual HRV. A well-behaved model produces residuals clustered symmetrically around zero (the red line), meaning errors are random rather than consistently over- or under-predicting.
+                </p>
                 {residualData.length > 0 && residualData.some(d => d.count > 0) ? (
                   <ResponsiveContainer width="100%" height={200}>
                     <BarChart data={residualData}>
@@ -636,7 +652,10 @@ export default function HrvAnalysisPage() {
 
               {/* CI Calibration + rolling MAE stat */}
               <div className="space-y-4">
-                <h4 className="text-[12px] font-medium text-text-secondary">CI Calibration</h4>
+                <h4 className="text-[12px] font-medium text-text-secondary mb-1">CI Calibration</h4>
+                <p className="text-[11px] text-text-tertiary leading-relaxed">
+                  A 90% confidence interval should contain the actual value 90% of the time. If coverage is too low, the model is overconfident (intervals too narrow). If too high, it is underconfident (intervals too wide). 85–95% is the well-calibrated range.
+                </p>
                 {xgbMetrics?.ci_coverage ? (
                   <div className="flex items-center gap-4">
                     <span className="text-[36px] font-mono font-medium tabular-nums"
@@ -673,7 +692,10 @@ export default function HrvAnalysisPage() {
 
             {/* Model comparison table */}
             <div>
-              <h4 className="text-[12px] font-medium text-text-secondary mb-3">Model Comparison</h4>
+              <h4 className="text-[12px] font-medium text-text-secondary mb-1">Model Comparison</h4>
+              <p className="text-[11px] text-text-tertiary leading-relaxed mb-3">
+                MAE = average miss in ms (lower is better). RMSE penalizes large errors more heavily. R² = how much of the HRV variance the model explains (1.0 = perfect; 0 = no better than guessing the mean). Dir % = % of nights the model correctly predicted the direction of change. CI Cov = % of actuals inside the confidence interval. Baseline Naive repeats yesterday&apos;s HRV; 7d Avg uses a 7-day mean — beating both confirms the model is learning real structure.
+              </p>
               <div className="overflow-x-auto">
                 <table className="w-full text-xs">
                   <thead>

@@ -5,11 +5,12 @@ interface ChartCardProps {
   title: string;
   subtitle?: string;
   source?: string;
+  info?: string;
   children: ReactNode;
   className?: string;
 }
 
-export default function ChartCard({ title, subtitle, source, children, className }: ChartCardProps) {
+export default function ChartCard({ title, subtitle, source, info, children, className }: ChartCardProps) {
   return (
     <div className={clsx(
       "bg-surface-card border border-border-subtle rounded-[6px] p-5 shadow-card transition-colors hover:border-border-hover",
@@ -28,6 +29,11 @@ export default function ChartCard({ title, subtitle, source, children, className
           </span>
         )}
       </div>
+      {info && (
+        <p className="text-[11px] text-text-tertiary leading-relaxed mb-4 pb-3 border-b border-border-subtle">
+          {info}
+        </p>
+      )}
       {children}
     </div>
   );
