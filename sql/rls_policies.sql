@@ -40,6 +40,11 @@ CREATE POLICY "anon_read" ON pds.whoop_workouts FOR SELECT TO anon USING (true);
 CREATE POLICY "anon_read" ON pds.whoop_journal FOR SELECT TO anon USING (true);
 CREATE POLICY "anon_read" ON pds.sync_log FOR SELECT TO anon USING (true);
 
--- Grant usage on the pds schema to anon
-GRANT USAGE ON SCHEMA pds TO anon;
-GRANT SELECT ON ALL TABLES IN SCHEMA pds TO anon;
+-- Grant usage on the pds schema to anon and authenticated
+GRANT USAGE ON SCHEMA pds TO anon, authenticated;
+GRANT SELECT ON ALL TABLES IN SCHEMA pds TO anon, authenticated;
+
+-- Auto-grant SELECT on any future tables created in pds schema
+-- (GRANT SELECT ON ALL TABLES only covers tables that exist at run time;
+--  new tables need this default privilege or they'll get 401 from PostgREST)
+ALTER DEFAULT PRIVILEGES IN SCHEMA pds GRANT SELECT ON TABLES TO anon, authenticated;
