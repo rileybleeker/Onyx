@@ -5,7 +5,7 @@ import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   BarChart, Bar, CartesianGrid,
 } from "recharts";
-import { getDailySummaries, getWhoopRecovery, getWhoopSleep } from "@/lib/queries";
+import { getDailySummaries, getWhoopRecovery, getWhoopSleep, getHrvData } from "@/lib/queries";
 import { formatDate, formatDuration } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -17,14 +17,16 @@ export default function Dashboard() {
   const [summaries, setSummaries] = useState<any[]>([]);
   const [sleep, setSleep] = useState<any[]>([]);
   const [recovery, setRecovery] = useState<any[]>([]);
+  const [hrv, setHrv] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    Promise.all([getDailySummaries(30), getWhoopSleep(30), getWhoopRecovery(30)])
-      .then(([s, sl, rec]) => {
+    Promise.all([getDailySummaries(30), getWhoopSleep(30), getWhoopRecovery(30), getHrvData(30)])
+      .then(([s, sl, rec, h]) => {
         setSummaries(s);
         setSleep(sl);
         setRecovery(rec);
+        setHrv(h);
       })
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -43,7 +45,7 @@ export default function Dashboard() {
           ))}
         </div>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {[...Array(3)].map((_, i) => (
+          {[...Array(4)].map((_, i) => (
             <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-5 h-[300px]">
               <div className="h-4 w-40 bg-white/5 animate-pulse rounded mb-4" />
               <div className="h-[220px] bg-white/5 animate-pulse rounded" />
@@ -67,6 +69,12 @@ export default function Dashboard() {
     date: formatDate(d.start_time?.split("T")[0]),
     hours: d.total_in_bed_time_milli ? +((d.total_in_bed_time_milli - (d.total_awake_time_milli ?? 0)) / 3600000).toFixed(1) : null,
     score: d.sleep_performance_percentage,
+  }));
+
+  const hrvData = hrv.map((d) => ({
+    date: formatDate(d.calendar_date),
+    hrv: d.last_night_avg_ms,
+    weeklyAvg: d.weekly_avg_ms,
   }));
 
   return (
@@ -150,6 +158,25 @@ export default function Dashboard() {
               <YAxis tick={axisTick} width={35} domain={[0, 100]} />
               <Tooltip {...chartTooltip} />
               <Area type="monotone" dataKey="score" stroke="#F59E0B" fill="url(#scoreFill)" strokeWidth={2} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard title="HRV Trend" subtitle="Nightly avg · 7-day avg" source="GARMIN">
+          <ResponsiveContainer width="100%" height={220}>
+            <AreaChart data={hrvData}>
+              <defs>
+                <linearGradient id="hrvFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#22C55E" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#22C55E" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} unit=" ms" />
+              <Tooltip {...chartTooltip} formatter={(v: number) => [`${v} ms`]} />
+              <Area type="monotone" dataKey="hrv" name="Nightly Avg" stroke="#22C55E" fill="url(#hrvFill)" strokeWidth={2} dot={false} />
+              <Area type="monotone" dataKey="weeklyAvg" name="7-Day Avg" stroke="#86EFAC" fill="transparent" strokeWidth={1.5} strokeDasharray="4 2" dot={false} />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
