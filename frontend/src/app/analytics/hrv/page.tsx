@@ -339,7 +339,7 @@ export default function HrvAnalysisPage() {
             <p className="text-[28px] font-mono text-text-tertiary mt-2">—</p>
           )}
           <p className="text-[10px] text-text-tertiary mt-2 leading-relaxed">
-            XGBoost predicts tomorrow&apos;s HRV from today&apos;s training load, sleep, and behavior data. The 90% CI is the range it expects your HRV to fall within 9 out of 10 nights.
+            XGBoost is a machine learning model that learns patterns by building hundreds of small decision trees and combining their predictions. It was trained on your personal data — training load, sleep, behavior logs — and figured out on its own which combinations of factors predict your next-night HRV. The 90% CI is the range it expects your HRV to fall within 9 out of 10 nights.
           </p>
           <span className="absolute top-3 right-3 text-[9px] font-mono text-text-tertiary">XGBOOST</span>
         </div>
