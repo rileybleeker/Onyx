@@ -1923,10 +1923,6 @@ def store_metrics(eval_results: dict) -> None:
 
 def store_analysis_results(stat_results: dict, feature_importance: dict) -> None:
     """Store pre-computed analysis results for the frontend."""
-    # Clear old results
-    for result_type in ["correlation", "journal_impact", "model_comparison", "feature_labels"]:
-        supa.schema("pds").from_("hrv_analysis_results").delete().eq("result_type", result_type).execute()
-
     rows: list[dict] = []
 
     # Spearman correlations (top 50)
@@ -1966,8 +1962,12 @@ def store_analysis_results(stat_results: dict, feature_importance: dict) -> None
 
     if rows:
         log.info(f"  Storing {len(rows)} analysis result rows…")
-        supa.schema("pds").from_("hrv_analysis_results").delete().neq("result_type", "nonexistent").execute()
-        supa.schema("pds").from_("hrv_analysis_results").insert(rows).execute()
+        # Upsert each row individually to avoid bulk insert dropping rows
+        for row in rows:
+            supa.schema("pds").from_("hrv_analysis_results").upsert(
+                row, on_conflict="result_type,result_key"
+            ).execute()
+            log.info(f"    Upserted: {row['result_type']}/{row['result_key']}")
 
 
 # ===========================================================================
