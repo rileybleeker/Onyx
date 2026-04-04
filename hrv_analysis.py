@@ -1272,6 +1272,7 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
     # SHAP analysis
     shap_df = pd.DataFrame()
     feature_importance_dict: dict = {}
+    feature_importance_full: dict = {}
     if HAS_SHAP:
         try:
             explainer = shap.TreeExplainer(final_model)
@@ -1279,6 +1280,8 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
             shap_mean_abs = np.abs(shap_vals.values).mean(axis=0)
             fi = sorted(zip(feat_cols, shap_mean_abs), key=lambda x: x[1], reverse=True)
             feature_importance_dict = {f: float(v) for f, v in fi[:30]}
+            # Keep full dict so journal features (ranked outside top 30) can be stored separately
+            feature_importance_full = {f: float(v) for f, v in fi}
 
             # Save SHAP plots
             try:
@@ -1337,6 +1340,7 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
         "test_upper": test_upper,
         "test_metrics": test_metrics | ci_metrics,
         "feature_importance": feature_importance_dict,
+        "feature_importance_full": feature_importance_full if HAS_SHAP else feature_importance_dict,
         "top_drivers": top_drivers,
         "tomorrow_pred": tomorrow_pred,
         "today_hrv": today_hrv,
@@ -1921,11 +1925,11 @@ def store_metrics(eval_results: dict) -> None:
         upsert_batch("hrv_model_metrics", rows, "eval_date,model,horizon_days")
 
 
-def store_analysis_results(stat_results: dict, feature_importance: dict) -> None:
+def store_analysis_results(stat_results: dict, feature_importance: dict, feature_importance_full: dict | None = None) -> None:
     """Store pre-computed analysis results for the frontend."""
     rows: list[dict] = []
 
-    # Spearman correlations (top 50)
+    # Spearman correlations (top 50, all features)
     if "correlations" in stat_results:
         corr_df = stat_results["correlations"]
         corr_list = corr_df.head(50).to_dict(orient="records")
@@ -1935,6 +1939,16 @@ def store_analysis_results(stat_results: dict, feature_importance: dict) -> None
             "result_json": json.dumps(corr_list),
         })
 
+        # Journal-specific correlations (all journal_ features, sorted by abs r)
+        journal_corr = corr_df[corr_df["feature"].str.startswith("journal_")].copy()
+        if not journal_corr.empty:
+            journal_corr_list = journal_corr.to_dict(orient="records")
+            rows.append({
+                "result_type": "correlation",
+                "result_key": "spearman_journal",
+                "result_json": json.dumps(journal_corr_list),
+            })
+
     # Journal impact
     if "journal_impact" in stat_results:
         rows.append({
@@ -1943,7 +1957,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict) -> None
             "result_json": json.dumps(stat_results["journal_impact"]),
         })
 
-    # Feature importance (SHAP or XGB)
+    # Feature importance (SHAP or XGB, top 30, all features)
     if feature_importance:
         fi_list = [{"feature": k, "label": FEATURE_LABELS.get(k, k), "importance": v}
                    for k, v in feature_importance.items()]
@@ -1952,6 +1966,18 @@ def store_analysis_results(stat_results: dict, feature_importance: dict) -> None
             "result_key": "shap_mean_abs",
             "result_json": json.dumps(fi_list),
         })
+
+        # Journal-specific SHAP importance — use full dict so features outside top-30 are included
+        fi_source = feature_importance_full if feature_importance_full else feature_importance
+        journal_fi = [(k, v) for k, v in fi_source.items() if k.startswith("journal_")]
+        if journal_fi:
+            journal_fi_list = [{"feature": k, "label": FEATURE_LABELS.get(k, k), "importance": v}
+                                for k, v in sorted(journal_fi, key=lambda x: x[1], reverse=True)]
+            rows.append({
+                "result_type": "feature_importance",
+                "result_key": "shap_journal",
+                "result_json": json.dumps(journal_fi_list),
+            })
 
     # Feature label map
     rows.append({
@@ -2108,7 +2134,7 @@ def main() -> None:
     log.info("=== STORING RESULTS IN SUPABASE ===")
     store_predictions(xgb_results, sarimax_results, prophet_results, eval_results)
     store_metrics(eval_results)
-    store_analysis_results(stat_results, xgb_results.get("feature_importance", {}))
+    store_analysis_results(stat_results, xgb_results.get("feature_importance", {}), xgb_results.get("feature_importance_full", {}))
 
     # ---------- Summary ----------
     print_summary(df, xgb_results, sarimax_results, prophet_results, eval_results, stat_results)

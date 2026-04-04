@@ -52,13 +52,13 @@ async function getHrvModelMetrics() {
   return data ?? [];
 }
 
-async function getHrvAnalysisResults(resultType: string) {
-  const { data } = await supabase
+async function getHrvAnalysisResults(resultType: string, resultKey?: string) {
+  let query = supabase
     .from("hrv_analysis_results")
     .select("result_type,result_key,result_json,computed_at")
-    .eq("result_type", resultType)
-    .order("computed_at", { ascending: false })
-    .limit(1);
+    .eq("result_type", resultType);
+  if (resultKey) query = query.eq("result_key", resultKey);
+  const { data } = await query.order("computed_at", { ascending: false }).limit(1);
   return data?.[0] ?? null;
 }
 
@@ -166,6 +166,8 @@ export default function HrvAnalysisPage() {
   const [featureImportance, setFeatureImportance] = useState<any[]>([]);
   const [residuals, setResiduals] = useState<any[]>([]);
   const [prophetForecast, setProphetForecast] = useState<any[]>([]);
+  const [journalCorrelations, setJournalCorrelations] = useState<any[]>([]);
+  const [journalShap, setJournalShap] = useState<any[]>([]);
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
 
@@ -176,12 +178,14 @@ export default function HrvAnalysisPage() {
       getHrvModelMetrics(),
       getHistoricalHrv(180),
       getGarminHrvBaseline(30),
-      getHrvAnalysisResults("correlation"),
+      getHrvAnalysisResults("correlation", "spearman_top50"),
       getHrvAnalysisResults("journal_impact"),
-      getHrvAnalysisResults("feature_importance"),
+      getHrvAnalysisResults("feature_importance", "shap_mean_abs"),
       getHrvResiduals(),
       getProphetForecast(),
-    ]).then(([preds, acc, m, hist, baseline, corr, ji, fi, res, prophet]) => {
+      getHrvAnalysisResults("correlation", "spearman_journal"),
+      getHrvAnalysisResults("feature_importance", "shap_journal"),
+    ]).then(([preds, acc, m, hist, baseline, corr, ji, fi, res, prophet, jCorr, jShap]) => {
       setPredictions(preds);
       setAccuracy(acc);
       setMetrics(m);
@@ -195,6 +199,12 @@ export default function HrvAnalysisPage() {
       }
       if (fi?.result_json) {
         try { setFeatureImportance(JSON.parse(fi.result_json).slice(0, 10)); } catch {}
+      }
+      if (jCorr?.result_json) {
+        try { setJournalCorrelations(JSON.parse(jCorr.result_json)); } catch {}
+      }
+      if (jShap?.result_json) {
+        try { setJournalShap(JSON.parse(jShap.result_json)); } catch {}
       }
       setResiduals(res);
       setProphetForecast(prophet);
@@ -539,13 +549,14 @@ export default function HrvAnalysisPage() {
           </div>
           <p className="text-[10px] text-text-tertiary mt-3 pt-3 border-t border-border-subtle">
             When both charts agree on a factor, you can be confident it genuinely matters. When they disagree, the model has learned something more nuanced than the simple historical pattern alone suggests.
+            Your journal behaviors (alcohol, meditation, caffeine, etc.) are included in both analyses as Yes/No features — they appear in a dedicated sub-section at the bottom of each chart, separated because their scores are on a different scale to continuous metrics like heart rate.
           </p>
         </div>
 
         {/* Side-by-side charts */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <ChartCard title="Prediction Drivers (Today)" subtitle="What's driving tomorrow's forecast right now"
-            info="Shows what's pushing tomorrow's prediction up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes.">
+            info="Shows what's pushing tomorrow's prediction up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes. Journal behaviors appear in a separate section below because they're Yes/No entries — they have smaller numerical impact than continuous metrics like heart rate, but they're still part of the model.">
             {topDrivers.length > 0 ? (
               <ResponsiveContainer width="100%" height={300}>
                 <BarChart data={topDrivers.slice(0, 10)} layout="vertical"
@@ -573,10 +584,44 @@ export default function HrvAnalysisPage() {
                 <p className="text-[11px] text-text-tertiary">No prediction data — run hrv_analysis.py</p>
               </div>
             )}
+
+            {/* Journal behavior SHAP sub-section */}
+            <div className="mt-4 pt-4 border-t border-border-subtle">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Journal Behaviors</span>
+                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">MODEL IMPACT</span>
+              </div>
+              <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
+                Your logged Yes/No behaviors are included in the model as features. Because they&apos;re binary (on/off), their average impact in ms is smaller than continuous metrics — but they&apos;re still real. A positive bar means that behavior tends to push HRV predictions higher; negative means lower.
+              </p>
+              {journalShap.length > 0 ? (
+                <ResponsiveContainer width="100%" height={Math.max(120, journalShap.length * 22)}>
+                  <BarChart data={journalShap} layout="vertical"
+                            margin={{ left: 160, right: 20, top: 2, bottom: 2 }}>
+                    <CartesianGrid {...gridStyle} horizontal={false} />
+                    <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(2)}`} />
+                    <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160}
+                           tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
+                    <Tooltip {...chartTooltip}
+                             formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(3)} ms`, "Avg Impact"]} />
+                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                    <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
+                      {journalShap.map((d, i) => (
+                        <Cell key={i} fill="#8b5cf6" fillOpacity={0.75} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <p className="text-[11px] text-text-tertiary italic">
+                  Journal behavior impacts not yet computed — re-run hrv_analysis.py to generate.
+                </p>
+              )}
+            </div>
           </ChartCard>
 
           <ChartCard title="HRV Correlates (Historical)" subtitle="What has historically moved with your HRV"
-            info="How strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises. A bar near −1.0 means the opposite. This doesn't change day to day — it's a long-term pattern.">
+            info="How strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises. A bar near −1.0 means the opposite. This doesn't change day to day — it's a long-term pattern. Journal behaviors appear in a separate section below because Yes/No features have a narrower correlation range than continuous metrics.">
             {correlations.length > 0 ? (
               <ResponsiveContainer width="100%" height={300}>
                 <BarChart data={correlations} layout="vertical"
@@ -599,6 +644,40 @@ export default function HrvAnalysisPage() {
                 <p className="text-[11px] text-text-tertiary">Run hrv_analysis.py to compute correlations</p>
               </div>
             )}
+
+            {/* Journal behavior correlation sub-section */}
+            <div className="mt-4 pt-4 border-t border-border-subtle">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Journal Behaviors</span>
+                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">HISTORICAL CORRELATION</span>
+              </div>
+              <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
+                Correlation between each logged behavior and the following night&apos;s HRV, across your entire history. Yes/No features naturally produce smaller correlation scores than continuous metrics — but a consistent +0.10 or −0.10 is still meaningful over hundreds of nights.
+              </p>
+              {journalCorrelations.length > 0 ? (
+                <ResponsiveContainer width="100%" height={Math.max(120, journalCorrelations.length * 22)}>
+                  <BarChart data={journalCorrelations} layout="vertical"
+                            margin={{ left: 160, right: 20, top: 2, bottom: 2 }}>
+                    <CartesianGrid {...gridStyle} horizontal={false} />
+                    <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
+                    <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160}
+                           tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
+                    <Tooltip {...chartTooltip}
+                             formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
+                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                    <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                      {journalCorrelations.map((d, i) => (
+                        <Cell key={i} fill={d.spearman_r > 0 ? "#8b5cf6" : "#a855f7"} fillOpacity={0.75} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <p className="text-[11px] text-text-tertiary italic">
+                  Journal behavior correlations not yet computed — re-run hrv_analysis.py to generate.
+                </p>
+              )}
+            </div>
           </ChartCard>
         </div>
       </div>
