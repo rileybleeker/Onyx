@@ -1,0 +1,60 @@
+name: HRV Daily Prediction
+
+on:
+  workflow_run:
+    workflows: ["Daily Health ETL"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: hrv-prediction
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  hrv-predict:
+    runs-on: ubuntu-latest
+    # Only run if triggered by ETL success, or manually
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-hrv-${{ hashFiles('requirements-analysis.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-hrv-
+
+      - name: Install analysis dependencies
+        run: |
+          pip install -r requirements-analysis.txt
+          pip install supabase python-dotenv
+
+      - name: Download model artifact
+        # Try to restore the trained model from cache
+        uses: actions/cache@v4
+        with:
+          path: analysis_output/xgboost_hrv_model.pkl
+          key: hrv-model-${{ runner.os }}-v1
+          restore-keys: |
+            hrv-model-${{ runner.os }}-
+
+      - name: Backfill actuals & predict tomorrow
+        run: python hrv_predict.py --predict
+
+      - name: Upload model artifact
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: analysis_output/xgboost_hrv_model.pkl
+          key: hrv-model-${{ runner.os }}-v1

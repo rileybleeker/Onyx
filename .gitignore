@@ -16,6 +16,12 @@ frontend/out/
 # Claude Code
 .claude/
 
+# HRV analysis outputs (models, plots - not committed; model cached via GH Actions)
+analysis_output/
+
+# Misc
+task_result.txt
+
 # Journal CSV data (keep folders, ignore data files)
 journal_inbox/*.csv
 journal_archive/*.csv

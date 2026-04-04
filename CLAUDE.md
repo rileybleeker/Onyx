@@ -21,9 +21,17 @@ Onyx/
 ├── mfp_inbox/               # Drop MFP nutrition CSVs here for auto-import
 ├── mfp_archive/             # Processed CSVs moved here
 ├── ci_token_helper.py       # Download/upload OAuth tokens for CI
+├── hrv_analysis.py          # HRV deep analysis pipeline (Phases 1-3.5): data loading,
+│                            #   268-feature matrix, stat analysis, XGBoost/SARIMAX/Prophet,
+│                            #   walk-forward backtest, stores results to Supabase
+├── hrv_predict.py           # Daily HRV prediction: loads saved model, predicts tomorrow,
+│                            #   backfills actuals, recomputes rolling metrics, drift check
+├── requirements-analysis.txt # Python deps for HRV analysis (xgboost, statsmodels, prophet, etc.)
+├── analysis_output/         # Generated plots + xgboost_hrv_model.pkl (gitignored)
 ├── .github/workflows/
 │   ├── daily-etl.yml        # GitHub Actions daily ETL cron
-│   └── whoop-journal-email.yml  # WHOOP journal email check (every 4h)
+│   ├── whoop-journal-email.yml  # WHOOP journal email check (every 4h)
+│   └── hrv-prediction.yml   # Daily HRV prediction (runs after ETL, caches model)
 ├── whoop_schema.sql         # WHOOP table DDL
 ├── eight_sleep_schema.sql   # Eight Sleep DDL + daily_health_matrix view
 ├── sql/
@@ -33,7 +41,8 @@ Onyx/
 ├── .env                     # Secrets (NEVER commit)
 └── frontend/                # Next.js 15 app
     └── src/
-        ├── app/             # Pages (12 routes) + API routes
+        ├── app/             # Pages (13 routes) + API routes
+        │   └── analytics/hrv/  # HRV Analysis dashboard (predictions, SHAP, models)
         ├── components/      # AppShell, Sidebar, MobileNav, ChartCard, StatCard
         └── lib/             # Supabase clients, queries.ts (19 functions), format.ts
 ```
@@ -41,7 +50,7 @@ Onyx/
 ## Tech Stack
 
 - **ETL**: Python 3, httpx, garminconnect, supabase-py, python-dotenv
-- **Database**: Supabase (Postgres 17), schema `pds`, 17 tables + `journal` unified view
+- **Database**: Supabase (Postgres 17), schema `pds`, 17 tables + `journal` unified view + 3 HRV analysis tables (`hrv_predictions`, `hrv_model_metrics`, `hrv_analysis_results`)
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
 - **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 14 tools (11 query + mark_habit_complete + query_journal + query_eight_sleep). Habit completion via chat syncs to both Supabase and Notion.
 - **System Status**: `/status` page — 6 source cards (Garmin, WHOOP, Eight Sleep, WHOOP Journal, Habits, MyFitnessPal), KPI summary, 20-entry sync history. `GET /api/status` queries `pds.sync_log` by `(source, data_type)` key + `MAX()` date per data table. Auto-refreshes every 60s.
@@ -79,7 +88,15 @@ cd frontend && npm run lint             # ESLint
 
 # Install
 pip install garminconnect supabase python-dotenv httpx requests
+pip install -r requirements-analysis.txt  # HRV analysis deps
 cd frontend && npm install
+
+# HRV Analysis Pipeline (run once or after major data changes)
+python hrv_analysis.py                  # Full pipeline: data + stats + models + store
+python hrv_analysis.py --skip-analysis  # Skip stat plots (faster retraining)
+python hrv_predict.py --predict         # Daily prediction (run after ETL)
+python hrv_predict.py --backfill-only   # Just backfill actuals + recompute metrics
+gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in CI
 ```
 
 ## Database
@@ -96,6 +113,9 @@ cd frontend && npm install
 - RLS enabled: anon key = read-only, service role key = full access
 - Sync operations logged to `pds.sync_log`
 - `whoop_journal` data is boolean-only (Yes/No) — WHOOP's CSV export does not include quantity values entered in the app (e.g., "3 drinks", "200mg caffeine"). This is a WHOOP platform limitation.
+- HRV analysis tables: `hrv_predictions` (model forecasts + actuals), `hrv_model_metrics` (rolling eval), `hrv_analysis_results` (correlations, journal impact, model comparison as JSON)
+- `supabase-py` schema access: always use `supa.schema("pds").from_(table)` — NOT `supa.table()` which defaults to `public`
+- `whoop_workouts` has no `cycle_id` column; use `workout_id` + derive `calendar_date` from UTC `start_time`
 
 ## Environment Variables
 
