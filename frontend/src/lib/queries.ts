@@ -241,6 +241,24 @@ export async function getRecoveryVsPace(days: number = 365) {
 }
 
 // ---------------------------------------------------------------------------
+// Unified Health Matrix view
+// ---------------------------------------------------------------------------
+
+export async function getHealthMatrix(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("daily_health_matrix")
+    .select("*")
+    .gte("calendar_date", since.toISOString().split("T")[0])
+    .order("calendar_date", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+// ---------------------------------------------------------------------------
 // Habits (stored in habit_journal, same schema as whoop_journal)
 // ---------------------------------------------------------------------------
 
