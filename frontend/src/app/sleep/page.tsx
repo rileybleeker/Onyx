@@ -5,7 +5,10 @@ import {
   AreaChart, Area, BarChart, Bar, LineChart, Line, CartesianGrid,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
 } from "recharts";
-import { getWhoopSleep, getWhoopRecovery, getEightSleepTrends } from "@/lib/queries";
+import {
+  getWhoopSleep, getWhoopRecovery, getWhoopCycles, getWhoopJournal,
+  getEightSleepTrends, getHeartRateData, getDailySummaries,
+} from "@/lib/queries";
 import { formatDate, formatDuration } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -15,15 +18,42 @@ import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
 
+function recoveryColor(score: number | null): string {
+  if (!score) return "#71717a";
+  if (score >= 67) return "#22c55e";
+  if (score >= 34) return "#f59e0b";
+  return "#ef4444";
+}
+
 export default function SleepPage() {
-  const [whoopSleep, setWhoopSleep] = useState<any[]>([]);
+  const [whoopSleep, setWhoopSleep]     = useState<any[]>([]);
   const [whoopRecovery, setWhoopRecovery] = useState<any[]>([]);
-  const [eightSleep, setEightSleep] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [whoopCycles, setWhoopCycles]   = useState<any[]>([]);
+  const [journal, setJournal]           = useState<any[]>([]);
+  const [eightSleep, setEightSleep]     = useState<any[]>([]);
+  const [hr, setHr]                     = useState<any[]>([]);
+  const [summaries, setSummaries]       = useState<any[]>([]);
+  const [loading, setLoading]           = useState(true);
 
   useEffect(() => {
-    Promise.all([getWhoopSleep(30), getWhoopRecovery(30), getEightSleepTrends(30)])
-      .then(([s, r, e]) => { setWhoopSleep(s); setWhoopRecovery(r); setEightSleep(e); })
+    Promise.all([
+      getWhoopSleep(30),
+      getWhoopRecovery(30),
+      getWhoopCycles(30),
+      getWhoopJournal(30),
+      getEightSleepTrends(30),
+      getHeartRateData(30),
+      getDailySummaries(30),
+    ])
+      .then(([s, r, c, j, e, h, sum]) => {
+        setWhoopSleep(s);
+        setWhoopRecovery(r);
+        setWhoopCycles(c);
+        setJournal(j);
+        setEightSleep(e);
+        setHr(h);
+        setSummaries(sum);
+      })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
@@ -44,65 +74,95 @@ export default function SleepPage() {
     );
   }
 
-  // WHOOP data
-  const latestWhoop = whoopSleep[whoopSleep.length - 1];
+  // ── WHOOP ────────────────────────────────────────────────────────────────────
   const latestRecovery = whoopRecovery[whoopRecovery.length - 1];
+  const latestCycle    = whoopCycles[whoopCycles.length - 1];
+  const latestSleep    = whoopSleep[whoopSleep.length - 1];
   const recoveryByCycle = new Map(whoopRecovery.map((r) => [r.cycle_id, r]));
 
+  const recoveryData = whoopRecovery.map((d) => ({
+    date:     formatDate(new Date(d.created_at).toISOString().split("T")[0]),
+    recovery: d.recovery_score,
+    rhr:      d.resting_heart_rate,
+    hrv:      d.hrv_rmssd_milli ? +Number(d.hrv_rmssd_milli).toFixed(1) : null,
+    spo2:     d.spo2_percentage  ? +Number(d.spo2_percentage).toFixed(1)  : null,
+    skinTemp: d.skin_temp_celsius ? +Number(d.skin_temp_celsius).toFixed(1) : null,
+  }));
+
+  const strainData = whoopCycles.map((d) => ({
+    date:   formatDate(new Date(d.start_time).toISOString().split("T")[0]),
+    strain: d.strain ? +Number(d.strain).toFixed(1) : null,
+  }));
+
   const whoopDurationData = whoopSleep.map((d) => ({
-    date: formatDate(d.start_time?.split("T")[0]),
-    deep: d.total_slow_wave_sleep_time_milli ? +(d.total_slow_wave_sleep_time_milli / 3600000).toFixed(2) : 0,
-    light: d.total_light_sleep_time_milli ? +(d.total_light_sleep_time_milli / 3600000).toFixed(2) : 0,
-    rem: d.total_rem_sleep_time_milli ? +(d.total_rem_sleep_time_milli / 3600000).toFixed(2) : 0,
-    awake: d.total_awake_time_milli ? +(d.total_awake_time_milli / 3600000).toFixed(2) : 0,
+    date:  formatDate(d.start_time?.split("T")[0]),
+    deep:  d.total_slow_wave_sleep_time_milli ? +(d.total_slow_wave_sleep_time_milli / 3600000).toFixed(2) : 0,
+    light: d.total_light_sleep_time_milli     ? +(d.total_light_sleep_time_milli / 3600000).toFixed(2)     : 0,
+    rem:   d.total_rem_sleep_time_milli       ? +(d.total_rem_sleep_time_milli / 3600000).toFixed(2)       : 0,
+    awake: d.total_awake_time_milli           ? +(d.total_awake_time_milli / 3600000).toFixed(2)           : 0,
   }));
 
   const whoopScoreData = whoopSleep.map((d) => ({
-    date: formatDate(d.start_time?.split("T")[0]),
+    date:        formatDate(d.start_time?.split("T")[0]),
     performance: d.sleep_performance_percentage,
-    efficiency: d.sleep_efficiency_percentage,
+    efficiency:  d.sleep_efficiency_percentage,
     consistency: d.sleep_consistency_percentage,
   }));
 
   const whoopHrData = whoopSleep.map((d) => {
     const rec = recoveryByCycle.get(d.cycle_id);
     return {
-      date: formatDate(d.start_time?.split("T")[0]),
-      hr: rec?.resting_heart_rate,
-      hrv: rec?.hrv_rmssd_milli ? +Number(rec.hrv_rmssd_milli).toFixed(1) : null,
-      respRate: d.respiratory_rate ? +Number(d.respiratory_rate).toFixed(1) : null,
+      date:     formatDate(d.start_time?.split("T")[0]),
+      hr:       rec?.resting_heart_rate,
+      hrv:      rec?.hrv_rmssd_milli ? +Number(rec.hrv_rmssd_milli).toFixed(1) : null,
+      respRate: d.respiratory_rate   ? +Number(d.respiratory_rate).toFixed(1)  : null,
     };
   });
 
-  // Eight Sleep data
+  // ── Garmin ───────────────────────────────────────────────────────────────────
+  const latestSummary = summaries[summaries.length - 1];
+  const latestHr      = hr[hr.length - 1];
+
+  const hrData = hr.map((d) => ({
+    date: formatDate(d.calendar_date),
+    min:  d.min_heart_rate,
+    max:  d.max_heart_rate,
+  }));
+
+  const stressData = summaries.map((d) => ({
+    date:    formatDate(d.calendar_date),
+    overall: d.avg_stress_level,
+  }));
+
+  // ── Eight Sleep ───────────────────────────────────────────────────────────────
   const latestEight = eightSleep[eightSleep.length - 1];
 
   const eightScoreData = eightSleep.map((d) => ({
-    date: formatDate(d.calendar_date),
-    sleep: d.sleep_score,
+    date:    formatDate(d.calendar_date),
+    sleep:   d.sleep_score,
     fitness: d.sleep_fitness_score,
     quality: d.sleep_quality_score,
   }));
 
   const eightStagesData = eightSleep.map((d) => ({
-    date: formatDate(d.calendar_date),
-    deep: d.deep_sleep_seconds ? +(d.deep_sleep_seconds / 3600).toFixed(2) : 0,
+    date:  formatDate(d.calendar_date),
+    deep:  d.deep_sleep_seconds  ? +(d.deep_sleep_seconds / 3600).toFixed(2)  : 0,
     light: d.light_sleep_seconds ? +(d.light_sleep_seconds / 3600).toFixed(2) : 0,
-    rem: d.rem_sleep_seconds ? +(d.rem_sleep_seconds / 3600).toFixed(2) : 0,
-    awake: d.awake_seconds ? +(d.awake_seconds / 3600).toFixed(2) : 0,
+    rem:   d.rem_sleep_seconds   ? +(d.rem_sleep_seconds / 3600).toFixed(2)   : 0,
+    awake: d.awake_seconds       ? +(d.awake_seconds / 3600).toFixed(2)       : 0,
   }));
 
   const eightBiometricsData = eightSleep.map((d) => ({
-    date: formatDate(d.calendar_date),
-    hr: d.avg_heart_rate ? +Number(d.avg_heart_rate).toFixed(0) : null,
-    hrv: d.avg_hrv ? +Number(d.avg_hrv).toFixed(0) : null,
+    date:       formatDate(d.calendar_date),
+    hr:         d.avg_heart_rate ? +Number(d.avg_heart_rate).toFixed(0) : null,
+    hrv:        d.avg_hrv        ? +Number(d.avg_hrv).toFixed(0)        : null,
     breathRate: d.avg_breath_rate ? +Number(d.avg_breath_rate).toFixed(1) : null,
   }));
 
   const eightEnvData = eightSleep.map((d) => ({
-    date: formatDate(d.calendar_date),
-    bedTemp: d.avg_bed_temp ? +Number(d.avg_bed_temp).toFixed(1) : null,
-    roomTemp: d.avg_room_temp ? +Number(d.avg_room_temp).toFixed(1) : null,
+    date:      formatDate(d.calendar_date),
+    bedTemp:   d.avg_bed_temp  ? +Number(d.avg_bed_temp).toFixed(1)  : null,
+    roomTemp:  d.avg_room_temp ? +Number(d.avg_room_temp).toFixed(1) : null,
     tossTurns: d.toss_and_turns,
   }));
 
@@ -110,18 +170,157 @@ export default function SleepPage() {
     <>
       <div className="flex items-baseline justify-between mb-8">
         <div>
-          <h2 className="text-[28px] font-medium text-text-primary">Sleep</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">30-day sleep trends from WHOOP &amp; Eight Sleep</p>
+          <h2 className="text-[28px] font-medium text-text-primary">Sleep &amp; Recovery</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">30-day sleep, recovery, and cardiac trends</p>
         </div>
       </div>
 
-      {/* WHOOP Section */}
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP</p>
+      {/* ── WHOOP Recovery ──────────────────────────────────────────────────── */}
+      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Recovery</p>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <StatCard label="Duration" value={latestWhoop?.total_in_bed_time_milli ? formatDuration(Math.round(latestWhoop.total_in_bed_time_milli / 1000)) : null} source="WHOOP" />
-        <StatCard label="Sleep Performance" value={latestWhoop?.sleep_performance_percentage != null ? `${latestWhoop.sleep_performance_percentage}%` : null} sublabel={`Efficiency: ${latestWhoop?.sleep_efficiency_percentage ?? "\u2014"}%`} source="WHOOP" />
-        <StatCard label="Deep Sleep" value={latestWhoop?.total_slow_wave_sleep_time_milli ? formatDuration(Math.round(latestWhoop.total_slow_wave_sleep_time_milli / 1000)) : null} source="WHOOP" />
-        <StatCard label="REM Sleep" value={latestWhoop?.total_rem_sleep_time_milli ? formatDuration(Math.round(latestWhoop.total_rem_sleep_time_milli / 1000)) : null} source="WHOOP" />
+        <StatCard
+          label="Recovery"
+          value={latestRecovery?.recovery_score != null ? `${latestRecovery.recovery_score}%` : null}
+          sublabel={latestRecovery?.recovery_score != null ? (latestRecovery.recovery_score >= 67 ? "Green" : latestRecovery.recovery_score >= 34 ? "Yellow" : "Red") : undefined}
+          source="WHOOP"
+        />
+        <StatCard label="HRV" value={latestRecovery?.hrv_rmssd_milli ? Number(latestRecovery.hrv_rmssd_milli).toFixed(0) : null} unit="ms" source="WHOOP" />
+        <StatCard label="Day Strain" value={latestCycle?.strain ? Number(latestCycle.strain).toFixed(1) : null} source="WHOOP" />
+        <StatCard label="Resting HR" value={latestRecovery?.resting_heart_rate} unit="bpm" source="WHOOP" />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
+        <ChartCard title="Recovery Score" source="WHOOP">
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={recoveryData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} domain={[0, 100]} />
+              <Tooltip {...chartTooltip} />
+              <Bar dataKey="recovery" name="Recovery %" radius={[3, 3, 0, 0]}
+                fill="#22c55e"
+                shape={(props: any) => {
+                  const { x, y, width, height, payload } = props;
+                  return <rect x={x} y={y} width={width} height={height} rx={3} fill={recoveryColor(payload.recovery)} />;
+                }}
+              />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard title="HRV & Resting HR" source="WHOOP">
+          <ResponsiveContainer width="100%" height={260}>
+            <LineChart data={recoveryData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis yAxisId="hrv" tick={axisTick} width={40} />
+              <YAxis yAxisId="rhr" orientation="right" tick={axisTick} width={40} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
+              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={2} dot={false} name="HRV (ms)" />
+              <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke="#ef4444" strokeWidth={2} dot={false} name="RHR (bpm)" />
+            </LineChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard title="Daily Strain" source="WHOOP">
+          <ResponsiveContainer width="100%" height={260}>
+            <AreaChart data={strainData}>
+              <defs>
+                <linearGradient id="recStrainGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#3b82f6" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} domain={[0, 21]} />
+              <Tooltip {...chartTooltip} />
+              <Area type="monotone" dataKey="strain" stroke="#3b82f6" fill="url(#recStrainGrad)" strokeWidth={2} name="Strain" />
+            </AreaChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard title="SpO2 & Skin Temperature" source="WHOOP">
+          <ResponsiveContainer width="100%" height={260}>
+            <LineChart data={recoveryData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis yAxisId="spo2" tick={axisTick} width={40} domain={[90, 100]} />
+              <YAxis yAxisId="temp" orientation="right" tick={axisTick} width={40} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
+              <Line yAxisId="spo2" type="monotone" dataKey="spo2" stroke="#06b6d4" strokeWidth={2} dot={false} name="SpO2 %" />
+              <Line yAxisId="temp" type="monotone" dataKey="skinTemp" stroke="#f97316" strokeWidth={2} dot={false} name="Skin Temp (°C)" />
+            </LineChart>
+          </ResponsiveContainer>
+        </ChartCard>
+      </div>
+
+      <div className="border-t border-border-subtle mb-8" />
+
+      {/* ── Garmin Cardiac ──────────────────────────────────────────────────── */}
+      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">GARMIN · Cardiac</p>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <StatCard label="Max HR" value={latestHr?.max_heart_rate} unit="bpm" source="GARMIN" />
+        <StatCard label="Min HR" value={latestHr?.min_heart_rate} unit="bpm" source="GARMIN" />
+        <StatCard label="Stress Level" value={latestSummary?.avg_stress_level} sublabel={latestSummary?.stress_qualifier} source="GARMIN" />
+        <StatCard label="Avg RHR (7d)" value={latestSummary?.last_seven_days_avg_rhr} unit="bpm" source="GARMIN" />
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-10">
+        <ChartCard title="Heart Rate Range" source="GARMIN">
+          <ResponsiveContainer width="100%" height={260}>
+            <AreaChart data={hrData}>
+              <defs>
+                <linearGradient id="heartMaxGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#ef4444" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#ef4444" stopOpacity={0} />
+                </linearGradient>
+                <linearGradient id="heartMinGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#22c55e" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#22c55e" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
+              <Area type="monotone" dataKey="max" stroke="#ef4444" fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max HR" />
+              <Area type="monotone" dataKey="min" stroke="#22c55e" fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min HR" />
+            </AreaChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard title="Stress Level" source="GARMIN">
+          <ResponsiveContainer width="100%" height={260}>
+            <AreaChart data={stressData}>
+              <defs>
+                <linearGradient id="heartStressGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#f97316" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#f97316" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} domain={[0, 100]} />
+              <Tooltip {...chartTooltip} />
+              <Area type="monotone" dataKey="overall" stroke="#f97316" fill="url(#heartStressGrad)" strokeWidth={2} name="Stress Level" />
+            </AreaChart>
+          </ResponsiveContainer>
+        </ChartCard>
+      </div>
+
+      <div className="border-t border-border-subtle mb-8" />
+
+      {/* ── WHOOP Sleep ─────────────────────────────────────────────────────── */}
+      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Sleep</p>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <StatCard label="Duration" value={latestSleep?.total_in_bed_time_milli ? formatDuration(Math.round(latestSleep.total_in_bed_time_milli / 1000)) : null} source="WHOOP" />
+        <StatCard label="Sleep Performance" value={latestSleep?.sleep_performance_percentage != null ? `${latestSleep.sleep_performance_percentage}%` : null} sublabel={`Efficiency: ${latestSleep?.sleep_efficiency_percentage ?? "—"}%`} source="WHOOP" />
+        <StatCard label="Deep Sleep" value={latestSleep?.total_slow_wave_sleep_time_milli ? formatDuration(Math.round(latestSleep.total_slow_wave_sleep_time_milli / 1000)) : null} source="WHOOP" />
+        <StatCard label="REM Sleep" value={latestSleep?.total_rem_sleep_time_milli ? formatDuration(Math.round(latestSleep.total_rem_sleep_time_milli / 1000)) : null} source="WHOOP" />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-10">
@@ -197,10 +396,9 @@ export default function SleepPage() {
         </ChartCard>
       </div>
 
-      {/* Divider */}
       <div className="border-t border-border-subtle mb-8" />
 
-      {/* Eight Sleep Section */}
+      {/* ── Eight Sleep ─────────────────────────────────────────────────────── */}
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Eight Sleep</p>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <StatCard label="Sleep Score" value={latestEight?.sleep_score} source="8SLP" />
@@ -209,7 +407,7 @@ export default function SleepPage() {
         <StatCard label="HRV" value={latestEight?.avg_hrv ? Number(latestEight.avg_hrv).toFixed(0) : null} unit="ms" source="8SLP" />
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
         <ChartCard title="Sleep Scores" source="8SLP">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={eightScoreData}>
@@ -272,6 +470,85 @@ export default function SleepPage() {
           </ResponsiveContainer>
         </ChartCard>
       </div>
+
+      {/* ── Journal ─────────────────────────────────────────────────────────── */}
+      {journal.length > 0 && (() => {
+        const behaviors = [...new Set(journal.map((j: any) => j.question))].sort();
+        const dates     = [...new Set(journal.map((j: any) => j.cycle_date))].sort();
+        const journalMap = new Map<string, string>();
+        journal.forEach((j: any) => {
+          journalMap.set(`${j.cycle_date}|${j.question}`, j.answer);
+        });
+
+        const categoryMap = new Map<string, string[]>();
+        journal.forEach((j: any) => {
+          const cat = j.category || "Other";
+          if (!categoryMap.has(cat)) categoryMap.set(cat, []);
+          const list = categoryMap.get(cat)!;
+          if (!list.includes(j.question)) list.push(j.question);
+        });
+
+        const isPositive = (answer: string | undefined) => {
+          if (!answer) return false;
+          const a = answer.toLowerCase();
+          return a === "yes" || a === "true" || (parseFloat(a) > 0 && !isNaN(parseFloat(a)));
+        };
+
+        return (
+          <>
+            <div className="border-t border-border-subtle mb-8" />
+            <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-4">WHOOP · Journal</p>
+
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+              {[...categoryMap.entries()].map(([cat, qs]) => (
+                <div key={cat} className="bg-surface-card border border-border-subtle rounded-[6px] p-4">
+                  <p className="text-[10px] text-text-tertiary font-mono font-medium uppercase tracking-wider">{cat}</p>
+                  <p className="text-lg font-semibold text-text-primary mt-1">{qs.length} behavior{qs.length !== 1 ? "s" : ""}</p>
+                  <p className="text-xs text-text-tertiary mt-1">{qs.slice(0, 3).join(", ")}{qs.length > 3 ? "…" : ""}</p>
+                </div>
+              ))}
+            </div>
+
+            <ChartCard title="Journal Heatmap" source="WHOOP">
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr>
+                      <th className="text-left bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal pr-3 py-1 sticky left-0 bg-surface-card min-w-[140px]">Behavior</th>
+                      {dates.map((d) => (
+                        <th key={d} className="bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal px-0.5 py-1 min-w-[24px]">
+                          <span className="block rotate-[-45deg] origin-bottom-left translate-x-2 whitespace-nowrap">
+                            {formatDate(d)}
+                          </span>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {behaviors.map((b) => (
+                      <tr key={b} className="border-b border-white/5 hover:bg-white/[0.02]">
+                        <td className="text-text-secondary pr-3 py-1 sticky left-0 bg-surface-card truncate max-w-[160px]" title={b}>{b}</td>
+                        {dates.map((d) => {
+                          const answer = journalMap.get(`${d}|${b}`);
+                          const active = isPositive(answer);
+                          return (
+                            <td key={d} className="px-0.5 py-1 text-center">
+                              <div
+                                className={`w-5 h-5 rounded-sm mx-auto ${active ? "bg-green-500/80" : "bg-white/5"}`}
+                                title={answer ? `${b}: ${answer}` : `${b}: —`}
+                              />
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </ChartCard>
+          </>
+        );
+      })()}
     </>
   );
 }
