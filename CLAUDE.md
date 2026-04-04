@@ -149,7 +149,7 @@ WHOOP journal email check runs separately via `.github/workflows/whoop-journal-e
 ## Conventions
 
 - After making frontend changes, always start the dev server (`cd frontend && npm run dev`) so the user can see updates immediately in the browser
-- After completing a task, always commit and push to git, then run `cd frontend && npx vercel --prod` to deploy (GitHub auto-deploy is disconnected)
+- After completing a task, always commit and push to git — Vercel auto-deploys from `master` (root directory: `frontend`)
 - ETL scripts are standalone Python files at the project root (not in a package)
 - Frontend follows Next.js App Router conventions (page.tsx per route)
 - Supabase queries go in `frontend/src/lib/queries.ts`
