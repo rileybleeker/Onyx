@@ -14,6 +14,7 @@ const SOURCE_BADGE: Record<string, string> = {
   whoop_journal: "WHOOP",
   habits: "NOTION",
   myfitnesspal: "MFP",
+  hrv_analysis: "ML",
 };
 
 const SOURCE_BADGE_COLOR: Record<string, string> = {
@@ -23,6 +24,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   whoop_journal: "text-source-whoop",
   habits: "text-text-tertiary",
   myfitnesspal: "text-text-tertiary",
+  hrv_analysis: "text-blue-400",
 };
 
 const STATUS_DOT: Record<string, string> = {
@@ -46,7 +48,7 @@ const STATUS_TEXT: Record<string, string> = {
   unknown: "text-text-tertiary",
 };
 
-const SOURCE_ORDER = ["garmin", "whoop", "eight_sleep", "whoop_journal", "habits", "myfitnesspal"];
+const SOURCE_ORDER = ["garmin", "whoop", "eight_sleep", "whoop_journal", "habits", "myfitnesspal", "hrv_analysis"];
 
 function formatRelativeTime(isoStr: string | null): string {
   if (!isoStr) return "Never";

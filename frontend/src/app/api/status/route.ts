@@ -63,13 +63,14 @@ export async function GET() {
     if (syncErr) throw syncErr;
 
     // Fetch latest data dates per source in parallel
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
       supabase.from("habit_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
       supabase.from("myfitnesspal_nutrition").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
+      supabase.from("hrv_predictions").select("prediction_date").eq("model", "xgboost").eq("horizon_days", 1).not("model_version", "like", "backtest%").order("prediction_date", { ascending: false }).limit(1),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -87,6 +88,7 @@ export async function GET() {
     const journalDate = journalRes.data?.[0]?.cycle_date ?? null;
     const habitsDate = habitsRes.data?.[0]?.cycle_date ?? null;
     const mfpDate = mfpRes.data?.[0]?.calendar_date ?? null;
+    const hrvDate = hrvRes.data?.[0]?.prediction_date ?? null;
 
     const garminEntry = latestBySrcType["garmin|full_sync"] ?? null;
     const whoopEntry = latestBySrcType["whoop|full_sync"] ?? null;
@@ -100,6 +102,7 @@ export async function GET() {
     const journalLag = daysLag(journalDate);
     const habitsLag = daysLag(habitsDate);
     const mfpLag = daysLag(mfpDate);
+    const hrvLag = daysLag(hrvDate);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -161,6 +164,16 @@ export async function GET() {
         recordsSynced: (mfpEntry?.records_synced as number) ?? 0,
         durationSeconds: (mfpEntry?.duration_seconds as number) ?? null,
         errorMessage: (mfpEntry?.error_message as string) ?? null,
+      },
+      hrv_analysis: {
+        label: "HRV Analysis",
+        lastSync: hrvDate,
+        status: deriveStatus(null, hrvLag),
+        latestDataDate: hrvDate,
+        daysLag: hrvLag,
+        recordsSynced: 0,
+        durationSeconds: null,
+        errorMessage: null,
       },
     };
 
