@@ -735,7 +735,9 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         df = df.merge(mfp, on="calendar_date", how="left", suffixes=("", "_mfp"))
 
     # --- Journal pivot ---
-    if not data["journal"].empty:
+    # Skip if daily_health_matrix already includes journal_ columns (view-level pivot)
+    existing_journal = [c for c in df.columns if c.startswith("journal_")]
+    if not existing_journal and not data["journal"].empty:
         jdf = pivot_journal(data["journal"])
         if not jdf.empty:
             df = df.merge(jdf, on="calendar_date", how="left")
@@ -913,7 +915,7 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
 
     hrv_valid = df.dropna(subset=[STAT_TARGET])
     numeric_cols = [c for c in hrv_valid.columns
-                    if c not in ("calendar_date", STAT_TARGET) and hrv_valid[c].nunique() > 2
+                    if c not in ("calendar_date", STAT_TARGET) and hrv_valid[c].nunique() >= 2
                     and hrv_valid[c].notna().sum() >= 30]
 
     log.info(f"Statistical analysis: {len(numeric_cols)} numeric features, {len(hrv_valid)} rows")
