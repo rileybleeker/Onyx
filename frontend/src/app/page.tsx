@@ -63,6 +63,11 @@ export default function Dashboard() {
     steps: d.total_steps,
   }));
 
+  const hrvData = recovery.map((d) => ({
+    date: formatDate(d.created_at?.split("T")[0]),
+    hrv: d.hrv_rmssd_milli != null ? Math.round(d.hrv_rmssd_milli) : null,
+  }));
+
   const sleepData = sleep.map((d) => ({
     date: formatDate(d.start_time?.split("T")[0]),
     hours: d.total_in_bed_time_milli ? +((d.total_in_bed_time_milli - (d.total_awake_time_milli ?? 0)) / 3600000).toFixed(1) : null,
@@ -150,6 +155,24 @@ export default function Dashboard() {
               <YAxis tick={axisTick} width={35} domain={[0, 100]} />
               <Tooltip {...chartTooltip} />
               <Area type="monotone" dataKey="score" stroke="#F59E0B" fill="url(#scoreFill)" strokeWidth={2} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard title="HRV" subtitle="RMSSD (ms)" source="WHOOP">
+          <ResponsiveContainer width="100%" height={220}>
+            <AreaChart data={hrvData}>
+              <defs>
+                <linearGradient id="hrvFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#34D399" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#34D399" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} />
+              <Tooltip {...chartTooltip} />
+              <Area type="monotone" dataKey="hrv" stroke="#34D399" fill="url(#hrvFill)" strokeWidth={2} connectNulls />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
