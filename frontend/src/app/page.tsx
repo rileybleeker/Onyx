@@ -174,7 +174,7 @@ export default function Dashboard() {
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={40} unit=" ms" />
-              <Tooltip {...chartTooltip} formatter={(v: number) => [`${v} ms`]} />
+              <Tooltip {...chartTooltip} formatter={(v) => [v != null ? `${v} ms` : '—']} />
               <Area type="monotone" dataKey="hrv" name="Nightly Avg" stroke="#22C55E" fill="url(#hrvFill)" strokeWidth={2} dot={false} />
               <Area type="monotone" dataKey="weeklyAvg" name="7-Day Avg" stroke="#86EFAC" fill="transparent" strokeWidth={1.5} strokeDasharray="4 2" dot={false} />
             </AreaChart>
