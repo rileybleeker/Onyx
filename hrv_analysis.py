@@ -903,9 +903,17 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
     """Correlation analysis, journal impact, Granger tests. Returns result dict."""
     results: dict = {}
 
-    hrv_valid = df.dropna(subset=[TARGET])
+    # Use next-night HRV as the analysis target.
+    # WHOOP cycles start ~1 AM (after midnight), so calendar_date N = sleep on morning of N.
+    # The behaviors that drove that HRV happened on day N-1. By shifting the target forward
+    # by one day we correctly ask: "do today's behaviors predict tonight's HRV?"
+    df = df.copy()
+    df["hrv_next"] = df[TARGET].shift(-1)
+    STAT_TARGET = "hrv_next"
+
+    hrv_valid = df.dropna(subset=[STAT_TARGET])
     numeric_cols = [c for c in hrv_valid.columns
-                    if c not in ("calendar_date",) and hrv_valid[c].nunique() > 2
+                    if c not in ("calendar_date", STAT_TARGET) and hrv_valid[c].nunique() > 2
                     and hrv_valid[c].notna().sum() >= 30]
 
     log.info(f"Statistical analysis: {len(numeric_cols)} numeric features, {len(hrv_valid)} rows")
@@ -913,11 +921,11 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
     # --- Spearman correlations ---
     corr_rows = []
     for c in numeric_cols:
-        sub = hrv_valid[[TARGET, c]].dropna()
+        sub = hrv_valid[[STAT_TARGET, c]].dropna()
         if len(sub) < 20:
             continue
         try:
-            res = stats.spearmanr(sub[TARGET], sub[c])
+            res = stats.spearmanr(sub[STAT_TARGET], sub[c])
             r = float(res.statistic if hasattr(res, "statistic") else res[0])
             p = float(res.pvalue if hasattr(res, "pvalue") else res[1])
             corr_rows.append({"feature": c, "spearman_r": r, "p_value": p,
@@ -937,7 +945,7 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
     # --- Correlation heatmap (top 20 by abs correlation) ---
     try:
         top20 = corr_df.head(20)["feature"].tolist()
-        heat_df = hrv_valid[[TARGET] + [c for c in top20 if c in hrv_valid.columns]].dropna(how="all")
+        heat_df = hrv_valid[[STAT_TARGET] + [c for c in top20 if c in hrv_valid.columns]].dropna(how="all")
         pearson_mat = heat_df.corr(method="pearson")
         fig, ax = plt.subplots(figsize=(12, 10))
         sns.heatmap(pearson_mat, cmap="RdBu_r", center=0, vmin=-1, vmax=1,
@@ -961,8 +969,8 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
         colors = ["#22c55e" if r > 0 else "#ef4444" for r in top25["spearman_r"]]
         ax.barh(top25["label"][::-1], top25["spearman_r"][::-1], color=colors[::-1])
         ax.axvline(0, color="#ffffff", linewidth=0.5, alpha=0.4)
-        ax.set_xlabel("Spearman r with WHOOP HRV")
-        ax.set_title("Top 25 HRV Drivers — Spearman Correlation")
+        ax.set_xlabel("Spearman r with next-night WHOOP HRV")
+        ax.set_title("Top 25 HRV Drivers — Spearman Correlation (behaviors -> next night)")
         ax.set_facecolor("#1a1a1d")
         fig.patch.set_facecolor("#0a0a0b")
         ax.tick_params(colors="#a1a1aa")
@@ -985,12 +993,12 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
             for feat in top15_feats:
                 if feat in controls:
                     continue
-                cols_needed = [TARGET, feat] + controls
+                cols_needed = [STAT_TARGET, feat] + controls
                 sub = hrv_valid[cols_needed].dropna()
                 if len(sub) < 30:
                     continue
                 try:
-                    r_partial = pg.partial_corr(data=sub, x=feat, y=TARGET, covar=controls)
+                    r_partial = pg.partial_corr(data=sub, x=feat, y=STAT_TARGET, covar=controls)
                     partial_results.append({
                         "feature": feat, "label": FEATURE_LABELS.get(feat, feat),
                         "partial_r": float(r_partial["r"].iloc[0]),
@@ -1010,9 +1018,9 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
     if journal_cols:
         try:
             for jc in journal_cols:
-                sub = hrv_valid[[TARGET, jc]].dropna()
-                yes = sub.loc[sub[jc] == 1, TARGET]
-                no = sub.loc[sub[jc] == 0, TARGET]
+                sub = hrv_valid[[STAT_TARGET, jc]].dropna()
+                yes = sub.loc[sub[jc] == 1, STAT_TARGET]
+                no = sub.loc[sub[jc] == 0, STAT_TARGET]
                 if len(yes) < 5 or len(no) < 5:
                     continue
                 t_stat, p_val = stats.ttest_ind(yes, no, equal_var=False)
@@ -1063,7 +1071,7 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
     # --- ACF / PACF ---
     if HAS_STATSMODELS:
         try:
-            hrv_series = hrv_valid[TARGET].dropna().values
+            hrv_series = hrv_valid[STAT_TARGET].dropna().values
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
             plot_acf(hrv_series, lags=30, ax=ax1)
             plot_pacf(hrv_series, lags=30, ax=ax2)
@@ -1082,11 +1090,11 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
             top10 = corr_df.head(10)["feature"].tolist()
             granger_results = []
             for feat in top10:
-                sub = hrv_valid[[TARGET, feat]].dropna()
+                sub = hrv_valid[[STAT_TARGET, feat]].dropna()
                 if len(sub) < 50:
                     continue
                 try:
-                    gc = grangercausalitytests(sub[[TARGET, feat]], maxlag=3, verbose=False)
+                    gc = grangercausalitytests(sub[[STAT_TARGET, feat]], maxlag=3, verbose=False)
                     for lag in range(1, 4):
                         f_stat = gc[lag][0]["ssr_ftest"][0]
                         p_val = gc[lag][0]["ssr_ftest"][1]
@@ -1110,10 +1118,10 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
             for feat in top5:
                 if feat not in hrv_valid.columns:
                     continue
-                roll = hrv_valid[[TARGET, feat]].dropna().copy()
+                roll = hrv_valid[[STAT_TARGET, feat]].dropna().copy()
                 if len(roll) < 70:
                     continue
-                roll_corr = roll[feat].rolling(60).corr(roll[TARGET])
+                roll_corr = roll[feat].rolling(60).corr(roll[STAT_TARGET])
                 ax.plot(range(len(roll_corr)), roll_corr.values,
                         label=FEATURE_LABELS.get(feat, feat), linewidth=1.5)
             ax.axhline(0, color="#ffffff", linewidth=0.5, alpha=0.4)
@@ -1148,9 +1156,15 @@ def prepare_ml_data(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], pd.Serie
     # Filter to rows with a valid target
     model_df = df.dropna(subset=["hrv_target_t1", "hrv_lag1"])
 
-    # Feature columns: all numeric except target, date, and future-leaking columns
-    exclude = {"calendar_date", TARGET, "hrv_target_t1",
-               "whoop_recovery_score",  # circular (WHOOP computes it from HRV)
+    # Feature columns: all numeric except the training target, date, and future-leaking columns.
+    # NOTE: TARGET (whoop_hrv_rmssd) is intentionally kept as a feature — it represents
+    # this morning's HRV score, which is known at prediction time and is the strongest
+    # same-day predictor of tonight's HRV.
+    # whoop_recovery_score is excluded because it is derived from the same sleep's HRV
+    # (circular leak). Other same-night WHOOP/Garmin sleep metrics are kept — they represent
+    # yesterday's sleep quality, valid context for tonight's prediction.
+    exclude = {"calendar_date", "hrv_target_t1", "hrv_next",
+               "whoop_recovery_score",  # derived from same sleep's HRV — circular
                }
     feat_cols = [c for c in model_df.columns
                  if c not in exclude and pd.api.types.is_numeric_dtype(model_df[c])]
@@ -1352,10 +1366,17 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
         hrv_valid = df.dropna(subset=[TARGET]).set_index("calendar_date")
         hrv_series = hrv_valid[TARGET].copy().astype(float)
 
-        # Exogenous: top features with sufficient coverage, ffill gaps
-        exog_feats = [f for f in top_features if f in hrv_valid.columns
+        # Exogenous: top features with sufficient coverage.
+        # Shift by 1 day so that HRV[N] is modelled using features[N-1].
+        # This corrects the causal alignment: behaviors on day N-1 drive HRV on night N.
+        # Exclude whoop_hrv_rmssd from exog (it's the endogenous variable itself).
+        exog_feats = [f for f in top_features
+                      if f in hrv_valid.columns
+                      and f != TARGET
                       and hrv_valid[f].notna().mean() >= 0.5][:5]
-        exog = hrv_valid[exog_feats].copy().ffill().bfill() if exog_feats else None
+        original_exog = hrv_valid[exog_feats].copy().ffill().bfill() if exog_feats else None
+        # Shift forward 1 row: exog for row N = original feature values from row N-1
+        exog = original_exog.shift(1).ffill().bfill() if original_exog is not None else None
 
         n = len(hrv_series)
         split = int(n * 0.85)
@@ -1407,7 +1428,9 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                              seasonal_order=(1, 0, 1, 7),
                              enforce_stationarity=False, enforce_invertibility=False)
         full_fit = full_model.fit(disp=False, maxiter=200)
-        fut_exog_all = exog.iloc[-7:] if exog is not None else None
+        # For the h-step-ahead forecast, the shifted exog at step h uses original_exog[N+h-1].
+        # We use the last 7 days of original_exog as a proxy for unknown future values.
+        fut_exog_all = original_exog.iloc[-7:] if original_exog is not None else None
         fc_full = full_fit.get_forecast(steps=7, exog=fut_exog_all)
         fc_mean = fc_full.predicted_mean
         fc_ci = fc_full.conf_int(alpha=0.10)  # 90% CI
@@ -1453,17 +1476,22 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
         return {}
     log.info("Training Prophet model…")
     try:
-        hrv_df = df[["calendar_date", TARGET]].dropna(subset=[TARGET]).copy()
-        hrv_df = hrv_df.rename(columns={"calendar_date": "ds", TARGET: "y"})
+        # Use next-night HRV as y (causal alignment: today's behaviors -> tonight's HRV)
+        df_p = df.copy()
+        df_p["hrv_target_t1"] = df_p[TARGET].shift(-1)
+        hrv_df = df_p[["calendar_date", "hrv_target_t1"]].dropna(subset=["hrv_target_t1"]).copy()
+        hrv_df = hrv_df.rename(columns={"calendar_date": "ds", "hrv_target_t1": "y"})
         hrv_df["ds"] = pd.to_datetime(hrv_df["ds"])
         hrv_df["y"] = hrv_df["y"].astype(float)
 
-        # Regressor columns from df
-        reg_feats = [f for f in top_features if f in df.columns
-                     and df.dropna(subset=[TARGET])[f].notna().mean() >= 0.6][:3]
+        # Regressor columns: exclude TARGET itself (it would be a perfect predictor of hrv_target_t1
+        # in the holdout since both come from the same dataset — circular leakage)
+        reg_feats = [f for f in top_features if f in df_p.columns
+                     and f != TARGET
+                     and df_p.dropna(subset=["hrv_target_t1"])[f].notna().mean() >= 0.6][:3]
 
         if reg_feats:
-            feat_df = df[["calendar_date"] + reg_feats].copy()
+            feat_df = df_p[["calendar_date"] + reg_feats].copy()
             feat_df["calendar_date"] = pd.to_datetime(feat_df["calendar_date"])
             feat_df = feat_df.rename(columns={"calendar_date": "ds"})
             hrv_df = hrv_df.merge(feat_df, on="ds", how="left")
