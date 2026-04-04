@@ -364,7 +364,7 @@ export default function HrvAnalysisPage() {
                 </p>
               )}
               <p className="text-[10px] text-text-tertiary mt-2 leading-relaxed">
-                MAE = average miss in ms. Directional accuracy = how often the model correctly predicted whether HRV would rise or fall vs the previous night.
+                MAE = average miss in ms. Directional accuracy = how often the model correctly predicted whether HRV would rise or fall vs the previous night. The &ldquo;naive&rdquo; baseline is the simplest possible forecast: just repeat yesterday&apos;s HRV. If XGBoost can&apos;t beat that, it isn&apos;t learning anything useful.
               </p>
             </>
           ) : (
