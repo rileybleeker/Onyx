@@ -167,6 +167,7 @@ export default function HrvAnalysisPage() {
   const [residuals, setResiduals] = useState<any[]>([]);
   const [prophetForecast, setProphetForecast] = useState<any[]>([]);
   const [expandedEval, setExpandedEval] = useState(false);
+  const [expandedModels, setExpandedModels] = useState(false);
 
   useEffect(() => {
     Promise.all([
@@ -391,6 +392,130 @@ export default function HrvAnalysisPage() {
             <p className="text-[28px] font-mono text-text-tertiary mt-2">—</p>
           )}
         </div>
+      </div>
+
+      {/* ── Models & Methods ── */}
+      <div className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card overflow-hidden">
+        <button
+          onClick={() => setExpandedModels(!expandedModels)}
+          className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-white/[0.02] transition-colors"
+        >
+          <div>
+            <h3 className="text-[13px] font-medium text-text-secondary">Models &amp; Methods</h3>
+            <p className="text-[11px] text-text-tertiary mt-0.5">How the predictions and statistical analysis work — click to expand</p>
+          </div>
+          <svg className={`w-4 h-4 text-text-tertiary transition-transform ${expandedModels ? "rotate-180" : ""}`}
+               fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+
+        {expandedModels && (
+          <div className="px-5 pb-6 border-t border-border-subtle pt-5 space-y-6">
+
+            {/* Primary models */}
+            <div>
+              <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Prediction Models</p>
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">XGBoost</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">DAY-AHEAD</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A machine learning model that builds hundreds of small decision trees, each one correcting the mistakes of the last. The final prediction is all of them voting together.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Excellent at finding non-obvious patterns across many variables at once — like &ldquo;high strain + poor sleep + high stress = low HRV&rdquo; — which simpler methods miss.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it predicts:</strong> Tomorrow&apos;s HRV, using today&apos;s 268 features (training load, sleep quality, behaviors, recent HRV trend, etc.).
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">Prophet</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">30-DAY FORECAST</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A forecasting model developed by Meta that splits your HRV history into three layers: a long-term trend, a weekly rhythm, and random noise — then adds them back together to project forward.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Great at capturing repeating cycles — like &ldquo;HRV tends to dip on Mondays after heavy weekend training&rdquo; — and extending them into the future.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it predicts:</strong> Your likely HRV range over the next 30 days, including an uncertainty band.
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">SARIMAX</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">SEASONAL</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A classical statistics model that predicts tomorrow&apos;s HRV using your own past HRV values (today&apos;s HRV predicts tomorrow&apos;s to some degree), while also factoring in external variables like training load.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Provides a transparent, interpretable baseline alongside XGBoost. If both models agree, the prediction is more reliable.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it predicts:</strong> Day-ahead HRV using recent HRV history + seasonal patterns + external inputs.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Analysis methods */}
+            <div>
+              <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Analysis Methods</p>
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">SHAP Values</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">EXPLAINABILITY</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A method for opening up the &ldquo;black box&rdquo; of XGBoost to show why it made a specific prediction. Rooted in game theory — each feature gets credit proportional to how much it actually contributed.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> XGBoost alone can&apos;t tell you <em>why</em> it predicted a number. SHAP translates each prediction into a plain breakdown: &ldquo;your resting HR added +8ms, your sleep duration added +4ms, your strain subtracted −12ms.&rdquo;
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">Spearman Correlation</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">HISTORICAL PATTERNS</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A statistical measure of how consistently two things move together. Instead of comparing raw numbers, it converts both to ranks (1st highest, 2nd highest, etc.) and checks how well those ranks agree.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> More reliable than standard correlation for health data because it&apos;s not thrown off by outliers or skewed distributions. Scores range from −1.0 to +1.0.
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">Naive &amp; 7d Avg Baselines</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">BENCHMARKS</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What they are:</strong> The simplest possible &ldquo;models&rdquo; — no machine learning involved. Naive predicts tomorrow&apos;s HRV will equal today&apos;s. 7d Avg predicts it will equal the last 7-day mean.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why they&apos;re used:</strong> Every real model must beat these to prove it&apos;s actually learning something. If XGBoost can&apos;t outperform &ldquo;just copy yesterday,&rdquo; it isn&apos;t useful.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        )}
       </div>
 
       {/* ── Row 2: Prediction Drivers + HRV Correlates ── */}
