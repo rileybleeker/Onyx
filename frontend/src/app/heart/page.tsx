@@ -5,7 +5,7 @@ import {
   AreaChart, Area, LineChart, Line, CartesianGrid,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
 } from "recharts";
-import { getWhoopRecovery, getHeartRateData, getDailySummaries } from "@/lib/queries";
+import { getWhoopRecovery, getWhoopCycles, getHeartRateData, getDailySummaries } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -15,13 +15,14 @@ import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
 
 export default function HeartPage() {
   const [recovery, setRecovery] = useState<any[]>([]);
+  const [cycles, setCycles] = useState<any[]>([]);
   const [hr, setHr] = useState<any[]>([]);
   const [summaries, setSummaries] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    Promise.all([getWhoopRecovery(30), getHeartRateData(30), getDailySummaries(30)])
-      .then(([rec, h, s]) => { setRecovery(rec); setHr(h); setSummaries(s); })
+    Promise.all([getWhoopRecovery(30), getWhoopCycles(30), getHeartRateData(30), getDailySummaries(30)])
+      .then(([rec, cyc, h, s]) => { setRecovery(rec); setCycles(cyc); setHr(h); setSummaries(s); })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
@@ -43,6 +44,7 @@ export default function HeartPage() {
   }
 
   const latestRecovery = recovery[recovery.length - 1];
+  const latestCycle = cycles[cycles.length - 1];
   const latestHr = hr[hr.length - 1];
   const latestSummary = summaries[summaries.length - 1];
 
@@ -75,7 +77,7 @@ export default function HeartPage() {
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <StatCard label="Resting HR" value={latestRecovery?.resting_heart_rate} unit="bpm" source="WHOOP" />
-        <StatCard label="Max HR" value={latestHr?.max_heart_rate} unit="bpm" source="GARMIN" />
+        <StatCard label="Max HR" value={latestCycle?.max_heart_rate} unit="bpm" source="WHOOP" />
         <StatCard label="HRV (RMSSD)" value={latestRecovery?.hrv_rmssd_milli ? +Number(latestRecovery.hrv_rmssd_milli).toFixed(1) : null} unit="ms" source="WHOOP" />
         <StatCard label="Stress" value={latestSummary?.avg_stress_level} sublabel={latestSummary?.stress_qualifier} source="GARMIN" />
       </div>
