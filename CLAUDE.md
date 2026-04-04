@@ -41,9 +41,9 @@ Onyx/
 ## Tech Stack
 
 - **ETL**: Python 3, httpx, garminconnect, supabase-py, python-dotenv
-- **Database**: Supabase (Postgres 17), schema `pds`, 17 tables + `daily_health_matrix` view + `journal` unified view
+- **Database**: Supabase (Postgres 17), schema `pds`, 17 tables + `journal` unified view
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
-- **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 15 tools (12 query + mark_habit_complete + query_journal + query_health_matrix). Habit completion via chat syncs to both Supabase and Notion.
+- **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 14 tools (11 query + mark_habit_complete + query_journal + query_eight_sleep). Habit completion via chat syncs to both Supabase and Notion.
 - **System Status**: `/status` page — 6 source cards (Garmin, WHOOP, Eight Sleep, WHOOP Journal, Habits, MyFitnessPal), KPI summary, 20-entry sync history. `GET /api/status` queries `pds.sync_log` by `(source, data_type)` key + `MAX()` date per data table. Auto-refreshes every 60s.
 - **Auth**: Supabase Auth (magic link), RLS on all tables
 - **Hosting**: Vercel (frontend), Supabase Cloud (database)
@@ -86,7 +86,6 @@ cd frontend && npm install
 
 - Schema: `pds`
 - All tables use upsert with conflict resolution (idempotent ETL)
-- `daily_health_matrix` view joins all three sources by `calendar_date` (~40 columns)
 - `habit_journal` table stores habit completions (same schema as `whoop_journal`)
 - `journal` view UNIONs `whoop_journal` + `habit_journal` with a `source` column for unified analysis
 - Habit definitions are managed in Notion (Habits DB under Project Onyx, ID: `29cc936fd5e14ae8b10a4fe5c5f7a6cd`)

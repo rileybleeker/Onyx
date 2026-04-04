@@ -179,17 +179,6 @@ const tools: Anthropic.Tool[] = [
       required: [],
     },
   },
-  {
-    name: "query_health_matrix",
-    description: "Get the unified daily health matrix view that combines data from all three devices (Garmin, WHOOP, Eight Sleep) into a single row per day. Best for cross-device comparisons.",
-    input_schema: {
-      type: "object" as const,
-      properties: {
-        days: { type: "number", description: "Number of past days to query (default 7)" },
-      },
-      required: [],
-    },
-  },
 ];
 
 function stripRawFields(rows: Record<string, unknown>[]): Record<string, unknown>[] {
@@ -214,7 +203,6 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     query_stress: "garmin_stress",
     query_training_status: "garmin_training_status",
     query_eight_sleep: "eight_sleep_trends",
-    query_health_matrix: "daily_health_matrix",
   };
 
   // Tables queried by timestamp columns
