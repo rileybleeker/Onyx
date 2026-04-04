@@ -393,33 +393,90 @@ export default function HrvAnalysisPage() {
         </div>
       </div>
 
-      {/* ── Row 2: Key Drivers ── */}
-      {topDrivers.length > 0 && (
-        <ChartCard title="Top 10 Prediction Drivers" subtitle="SHAP values — contribution to tomorrow's HRV prediction"
-          info="Shows what's driving tomorrow's prediction. Green bars are factors that pushed the forecast up; red bars pulled it down. The longer the bar, the bigger the impact on tonight's number.">
-          <ResponsiveContainer width="100%" height={280}>
-            <BarChart data={topDrivers.slice(0, 10)} layout="vertical"
-                      margin={{ left: 140, right: 20, top: 4, bottom: 4 }}>
-              <CartesianGrid {...gridStyle} horizontal={false} />
-              <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(1)}`} />
-              <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 11 }} width={140} />
-              <Tooltip
-                {...chartTooltip}
-                formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)} ms`, "SHAP"]}
-              />
-              <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-              <Bar dataKey="shap_value" radius={[0, 3, 3, 0]}>
-                {topDrivers.slice(0, 10).map((d, i) => (
-                  <Cell key={i}
-                    fill={(d.shap_value ?? d.importance) > 0 ? "#22c55e" : "#ef4444"}
-                    fillOpacity={0.85}
+      {/* ── Row 2: Prediction Drivers + HRV Correlates ── */}
+      <div className="space-y-4">
+        {/* Explanation banner */}
+        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card">
+          <h3 className="text-[13px] font-medium text-text-secondary mb-3">Two ways to understand what drives your HRV</h3>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <p className="text-[11px] font-medium text-text-primary mb-1">Prediction Drivers <span className="text-text-tertiary font-normal">(left chart)</span></p>
+              <p className="text-[11px] text-text-tertiary leading-relaxed">
+                What&apos;s pushing <em>tomorrow&apos;s specific forecast</em> up or down, right now. Recalculated every day. Based on what the AI model learned matters from your data.
+              </p>
+            </div>
+            <div>
+              <p className="text-[11px] font-medium text-text-primary mb-1">HRV Correlates <span className="text-text-tertiary font-normal">(right chart)</span></p>
+              <p className="text-[11px] text-text-tertiary leading-relaxed">
+                What has <em>historically</em> moved with your HRV across all your data. Doesn&apos;t change day to day. No model involved — just a statistical pattern across your entire history.
+              </p>
+            </div>
+          </div>
+          <p className="text-[10px] text-text-tertiary mt-3 pt-3 border-t border-border-subtle">
+            When both charts agree on a factor, you can be confident it genuinely matters. When they disagree, the model has learned something more nuanced than the simple historical pattern alone suggests.
+          </p>
+        </div>
+
+        {/* Side-by-side charts */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <ChartCard title="Prediction Drivers (Today)" subtitle="What's driving tomorrow's forecast right now"
+            info="Shows what's pushing tomorrow's prediction up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes.">
+            {topDrivers.length > 0 ? (
+              <ResponsiveContainer width="100%" height={300}>
+                <BarChart data={topDrivers.slice(0, 10)} layout="vertical"
+                          margin={{ left: 140, right: 20, top: 4, bottom: 4 }}>
+                  <CartesianGrid {...gridStyle} horizontal={false} />
+                  <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(1)}`} />
+                  <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 11 }} width={140} />
+                  <Tooltip
+                    {...chartTooltip}
+                    formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)} ms`, "Impact"]}
                   />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
-      )}
+                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                  <Bar dataKey="shap_value" radius={[0, 3, 3, 0]}>
+                    {topDrivers.slice(0, 10).map((d, i) => (
+                      <Cell key={i}
+                        fill={(d.shap_value ?? d.importance) > 0 ? "#22c55e" : "#ef4444"}
+                        fillOpacity={0.85}
+                      />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="h-[300px] flex items-center justify-center">
+                <p className="text-[11px] text-text-tertiary">No prediction data — run hrv_analysis.py</p>
+              </div>
+            )}
+          </ChartCard>
+
+          <ChartCard title="HRV Correlates (Historical)" subtitle="What has historically moved with your HRV"
+            info="How strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises. A bar near −1.0 means the opposite. This doesn't change day to day — it's a long-term pattern.">
+            {correlations.length > 0 ? (
+              <ResponsiveContainer width="100%" height={300}>
+                <BarChart data={correlations} layout="vertical"
+                          margin={{ left: 160, right: 20, top: 4, bottom: 4 }}>
+                  <CartesianGrid {...gridStyle} horizontal={false} />
+                  <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
+                  <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160} />
+                  <Tooltip {...chartTooltip}
+                           formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
+                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                  <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                    {correlations.map((d, i) => (
+                      <Cell key={i} fill={d.spearman_r > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.8} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="h-[300px] flex items-center justify-center">
+                <p className="text-[11px] text-text-tertiary">Run hrv_analysis.py to compute correlations</p>
+              </div>
+            )}
+          </ChartCard>
+        </div>
+      </div>
 
       {/* ── Row 3: 30-Day Forecast + Journal Impact ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -536,72 +593,42 @@ export default function HrvAnalysisPage() {
         </ChartCard>
       </div>
 
-      {/* ── Row 5: Correlation Heatmap + HRV Trend ── */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Top-15 Correlations */}
-        <ChartCard title="HRV Correlates" subtitle="Top 15 features — Spearman r with WHOOP HRV"
-          info="How strongly each factor is linked to your next-night HRV. A bar near +1.0 means that factor almost always rises when your HRV rises. A bar near −1.0 means the opposite — more of it today, lower HRV tonight. A longer bar means a stronger, more reliable relationship.">
-          {correlations.length > 0 ? (
-            <ResponsiveContainer width="100%" height={340}>
-              <BarChart data={correlations} layout="vertical"
-                        margin={{ left: 160, right: 20, top: 4, bottom: 4 }}>
-                <CartesianGrid {...gridStyle} horizontal={false} />
-                <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
-                <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160} />
-                <Tooltip {...chartTooltip}
-                         formatter={(v: any) => [Number(v).toFixed(3), "Spearman r"]} />
-                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-                <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
-                  {correlations.map((d, i) => (
-                    <Cell key={i} fill={d.spearman_r > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.8} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="h-[340px] flex items-center justify-center">
-              <p className="text-[11px] text-text-tertiary">Run hrv_analysis.py to compute correlations</p>
-            </div>
-          )}
-        </ChartCard>
-
-        {/* HRV Trend */}
-        <ChartCard title="HRV Trend (180 days)"
-                   subtitle="7-day rolling average + Garmin baseline"
-                   info="Your daily HRV (faint line) swings a lot day-to-day — that's normal. The brighter line averages the last 7 days to show your real trend. The dashed blue lines are your Garmin personal baseline: the healthy range Garmin has learned for your body over time.">
-          <ResponsiveContainer width="100%" height={340}>
-            <LineChart data={trendData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={40} domain={["auto", "auto"]} />
-              <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={legendStyle} />
-              {garminBaseline?.baseline_balanced_low_ms && (
-                <ReferenceLine
-                  y={Number(garminBaseline.baseline_balanced_low_ms)}
-                  stroke="#3b82f6" strokeDasharray="4 4" strokeOpacity={0.5}
-                  label={{ value: "Baseline Low", fill: "#71717a", fontSize: 9 }}
-                />
-              )}
-              {garminBaseline?.baseline_balanced_upper_ms && (
-                <ReferenceLine
-                  y={Number(garminBaseline.baseline_balanced_upper_ms)}
-                  stroke="#22c55e" strokeDasharray="4 4" strokeOpacity={0.5}
-                  label={{ value: "Baseline High", fill: "#71717a", fontSize: 9 }}
-                />
-              )}
-              <Line type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={1.5}
-                    dot={false} name="WHOOP HRV" strokeOpacity={0.5} />
-              <Line type="monotone" dataKey="rolling7" stroke="#22c55e" strokeWidth={2.5}
-                    dot={false} name="7-Day Avg" />
-              {trendData.some(d => d.garminHrv) && (
-                <Line type="monotone" dataKey="garminHrv" stroke="#3b82f6" strokeWidth={1.5}
-                      dot={false} name="Garmin HRV" strokeOpacity={0.7} />
-              )}
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartCard>
-      </div>
+      {/* ── Row 5: HRV Trend ── */}
+      <ChartCard title="HRV Trend (180 days)"
+                 subtitle="7-day rolling average + Garmin baseline"
+                 info="Your daily HRV (faint line) swings a lot day-to-day — that's normal. The brighter line averages the last 7 days to show your real trend. The dashed blue lines are your Garmin personal baseline: the healthy range Garmin has learned for your body over time.">
+        <ResponsiveContainer width="100%" height={280}>
+          <LineChart data={trendData}>
+            <CartesianGrid {...gridStyle} />
+            <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+            <YAxis tick={axisTick} width={40} domain={["auto", "auto"]} />
+            <Tooltip {...chartTooltip} />
+            <Legend wrapperStyle={legendStyle} />
+            {garminBaseline?.baseline_balanced_low_ms && (
+              <ReferenceLine
+                y={Number(garminBaseline.baseline_balanced_low_ms)}
+                stroke="#3b82f6" strokeDasharray="4 4" strokeOpacity={0.5}
+                label={{ value: "Baseline Low", fill: "#71717a", fontSize: 9 }}
+              />
+            )}
+            {garminBaseline?.baseline_balanced_upper_ms && (
+              <ReferenceLine
+                y={Number(garminBaseline.baseline_balanced_upper_ms)}
+                stroke="#22c55e" strokeDasharray="4 4" strokeOpacity={0.5}
+                label={{ value: "Baseline High", fill: "#71717a", fontSize: 9 }}
+              />
+            )}
+            <Line type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={1.5}
+                  dot={false} name="WHOOP HRV" strokeOpacity={0.5} />
+            <Line type="monotone" dataKey="rolling7" stroke="#22c55e" strokeWidth={2.5}
+                  dot={false} name="7-Day Avg" />
+            {trendData.some(d => d.garminHrv) && (
+              <Line type="monotone" dataKey="garminHrv" stroke="#3b82f6" strokeWidth={1.5}
+                    dot={false} name="Garmin HRV" strokeOpacity={0.7} />
+            )}
+          </LineChart>
+        </ResponsiveContainer>
+      </ChartCard>
 
       {/* ── Row 6: Model Evaluation (collapsible) ── */}
       <div className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card overflow-hidden">
