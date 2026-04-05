@@ -487,7 +487,7 @@ export default function HrvAnalysisPage() {
             {/* Analysis methods */}
             <div>
               <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Analysis Methods</p>
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
 
                 <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
                   <div className="flex items-center justify-between">
@@ -512,6 +512,19 @@ export default function HrvAnalysisPage() {
                   </p>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
                     <strong className="text-text-secondary">Why it&apos;s used:</strong> More reliable than standard correlation for health data because it&apos;s not thrown off by outliers or skewed distributions. Scores range from −1.0 to +1.0.
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">Welch&apos;s T-Test</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">JOURNAL IMPACT</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A statistical test that compares the average HRV on nights you logged a behavior as <em>Yes</em> vs nights you logged <em>No</em>, and tells you whether the gap is real or just random noise. &ldquo;Welch&apos;s&rdquo; means it doesn&apos;t assume the two groups have the same variance — which matters because Yes/No nights are usually unbalanced.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Correlation tells you strength on a −1 to +1 scale; the t-test tells you the <em>actual HRV difference in ms</em> and whether it&apos;s statistically significant. That&apos;s why it drives the Journal Behavior Impact chart — the bars are mean HRV differences, with Cohen&apos;s d and a 95% confidence interval computed per behavior.
                   </p>
                 </div>
 
