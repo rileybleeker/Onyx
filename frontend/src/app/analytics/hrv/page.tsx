@@ -591,7 +591,7 @@ export default function HrvAnalysisPage() {
             <div className="mt-4 pt-4 border-t border-border-subtle">
               <div className="flex items-center gap-2 mb-2">
                 <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Journal Behaviors</span>
-                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">MODEL IMPACT</span>
+                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">XGBOOST · SHAP</span>
               </div>
               <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
                 Your logged Yes/No behaviors are included in the model as features. Because they&apos;re binary (on/off), their average impact in ms is smaller than continuous metrics — but they&apos;re still real. A positive bar means that behavior tends to push HRV predictions higher; negative means lower.
@@ -652,7 +652,7 @@ export default function HrvAnalysisPage() {
             <div className="mt-4 pt-4 border-t border-border-subtle">
               <div className="flex items-center gap-2 mb-2">
                 <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Journal Behaviors</span>
-                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">HISTORICAL CORRELATION</span>
+                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">SPEARMAN ρ</span>
               </div>
               <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
                 Correlation between each logged behavior and the following night&apos;s HRV, across your entire history. Yes/No features naturally produce smaller correlation scores than continuous metrics — but a consistent +0.10 or −0.10 is still meaningful over hundreds of nights.
