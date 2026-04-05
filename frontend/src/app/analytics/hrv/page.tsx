@@ -557,6 +557,7 @@ export default function HrvAnalysisPage() {
         {/* Side-by-side charts */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <ChartCard title="Prediction Drivers (Today)" subtitle="What's driving tomorrow's forecast right now"
+            source="XGBOOST · SHAP"
             info="Shows what's pushing tomorrow's prediction up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes. Journal behaviors appear in a separate section below because they're Yes/No entries — they have smaller numerical impact than continuous metrics like heart rate, but they're still part of the model.">
             {topDrivers.length > 0 ? (
               <ResponsiveContainer width="100%" height={300}>
@@ -622,6 +623,7 @@ export default function HrvAnalysisPage() {
           </ChartCard>
 
           <ChartCard title="HRV Correlates (Historical)" subtitle="What has historically moved with your HRV"
+            source="SPEARMAN ρ"
             info="How strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises. A bar near −1.0 means the opposite. This doesn't change day to day — it's a long-term pattern. Journal behaviors appear in a separate section below because Yes/No features have a narrower correlation range than continuous metrics.">
             {correlations.length > 0 ? (
               <ResponsiveContainer width="100%" height={300}>
