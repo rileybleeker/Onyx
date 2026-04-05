@@ -67,23 +67,11 @@ async function getHistoricalHrv(days = 180) {
   since.setDate(since.getDate() - days);
   const { data } = await supabase
     .from("daily_health_matrix")
-    .select("calendar_date,whoop_hrv_rmssd,garmin_hrv")
+    .select("calendar_date,whoop_hrv_rmssd")
     .gte("calendar_date", since.toISOString().split("T")[0])
     .not("whoop_hrv_rmssd", "is", null)
     .order("calendar_date", { ascending: true });
   return data ?? [];
-}
-
-async function getGarminHrvBaseline(days = 30) {
-  const since = new Date();
-  since.setDate(since.getDate() - days);
-  const { data } = await supabase
-    .from("garmin_hrv")
-    .select("calendar_date,last_night_avg_ms,baseline_balanced_low_ms,baseline_balanced_upper_ms,weekly_avg_ms")
-    .gte("calendar_date", since.toISOString().split("T")[0])
-    .order("calendar_date", { ascending: false })
-    .limit(1);
-  return data?.[0] ?? null;
 }
 
 async function getHrvResiduals() {
@@ -107,6 +95,18 @@ async function getProphetForecast() {
     .eq("model_version", await getLatestModelVersion())
     .order("prediction_date", { ascending: true })
     .limit(30);
+  return data ?? [];
+}
+
+async function getSarimaxForecast() {
+  const today = new Date().toISOString().split("T")[0];
+  const { data } = await supabase
+    .from("hrv_predictions")
+    .select("prediction_date,predicted_hrv,prediction_lower,prediction_upper")
+    .eq("model", "sarimax")
+    .gte("prediction_date", today)
+    .order("prediction_date", { ascending: true })
+    .limit(7);
   return data ?? [];
 }
 
@@ -160,12 +160,12 @@ export default function HrvAnalysisPage() {
   const [accuracy, setAccuracy] = useState<any[]>([]);
   const [metrics, setMetrics] = useState<any[]>([]);
   const [historicalHrv, setHistoricalHrv] = useState<any[]>([]);
-  const [garminBaseline, setGarminBaseline] = useState<any>(null);
   const [correlations, setCorrelations] = useState<any[]>([]);
   const [journalImpact, setJournalImpact] = useState<any[]>([]);
   const [featureImportance, setFeatureImportance] = useState<any[]>([]);
   const [residuals, setResiduals] = useState<any[]>([]);
   const [prophetForecast, setProphetForecast] = useState<any[]>([]);
+  const [sarimaxForecast, setSarimaxForecast] = useState<any[]>([]);
   const [journalCorrelations, setJournalCorrelations] = useState<any[]>([]);
   const [journalShap, setJournalShap] = useState<any[]>([]);
   const [expandedEval, setExpandedEval] = useState(false);
@@ -177,7 +177,6 @@ export default function HrvAnalysisPage() {
       getHrvPredictionAccuracy(),
       getHrvModelMetrics(),
       getHistoricalHrv(180),
-      getGarminHrvBaseline(30),
       getHrvAnalysisResults("correlation", "spearman_top50"),
       getHrvAnalysisResults("journal_impact"),
       getHrvAnalysisResults("feature_importance", "shap_mean_abs"),
@@ -185,12 +184,12 @@ export default function HrvAnalysisPage() {
       getProphetForecast(),
       getHrvAnalysisResults("correlation", "spearman_journal"),
       getHrvAnalysisResults("feature_importance", "shap_journal"),
-    ]).then(([preds, acc, m, hist, baseline, corr, ji, fi, res, prophet, jCorr, jShap]) => {
+      getSarimaxForecast(),
+    ]).then(([preds, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax]) => {
       setPredictions(preds);
       setAccuracy(acc);
       setMetrics(m);
       setHistoricalHrv(hist);
-      setGarminBaseline(baseline);
       if (corr?.result_json) {
         try { setCorrelations(JSON.parse(corr.result_json).slice(0, 15)); } catch {}
       }
@@ -208,6 +207,7 @@ export default function HrvAnalysisPage() {
       }
       setResiduals(res);
       setProphetForecast(prophet);
+      setSarimaxForecast(sarimax);
     }).catch(console.error).finally(() => setLoading(false));
   }, []);
 
@@ -231,7 +231,6 @@ export default function HrvAnalysisPage() {
     date: fmtDate(d.calendar_date),
     hrv: Number(d.whoop_hrv_rmssd),
     rolling7: rolling7(hrvValues, i),
-    garminHrv: d.garmin_hrv ? Number(d.garmin_hrv) : null,
   }));
 
   // Prediction vs actual overlay (last 60 days)
@@ -243,12 +242,15 @@ export default function HrvAnalysisPage() {
     upper: d.prediction_upper ? Number(d.prediction_upper) : null,
   }));
 
-  // Prophet 30-day forecast
+  // Prophet 30-day forecast + SARIMAX 7-day short-term overlay
+  const sarimaxByDate = new Map(
+    sarimaxForecast.map(d => [d.prediction_date, Number(d.predicted_hrv)])
+  );
   const prophetData = [
     ...historicalHrv.slice(-30).map(d => ({
       date: fmtDate(d.calendar_date),
       actual: Number(d.whoop_hrv_rmssd),
-      forecast: null, lower: null, upper: null,
+      forecast: null, lower: null, upper: null, sarimax: null,
     })),
     ...prophetForecast.map(d => ({
       date: fmtDate(d.prediction_date),
@@ -256,6 +258,9 @@ export default function HrvAnalysisPage() {
       forecast: Number(d.predicted_hrv),
       lower: d.prediction_lower ? Number(d.prediction_lower) : null,
       upper: d.prediction_upper ? Number(d.prediction_upper) : null,
+      sarimax: sarimaxByDate.has(d.prediction_date)
+        ? sarimaxByDate.get(d.prediction_date)
+        : null,
     })),
   ];
 
@@ -688,8 +693,8 @@ export default function HrvAnalysisPage() {
       {/* ── Row 3: 30-Day Forecast + Journal Impact ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* 30-Day Prophet Forecast */}
-        <ChartCard title="30-Day HRV Forecast" source="Prophet"
-          info="A forecast model that learns your weekly patterns and long-term trend. The dashed line is the prediction; the shaded band is the uncertainty range — your HRV should land inside it about 4 out of 5 nights. A wider band means the model is less certain.">
+        <ChartCard title="30-Day HRV Forecast" source="PROPHET + SARIMAX"
+          info="Prophet projects the next 30 days using your weekly patterns and long-term trend (orange dashed line + shaded uncertainty band — your HRV should land inside it about 4 out of 5 nights). The purple dotted line overlays SARIMAX's independent 7-day short-term forecast as a cross-check: when both models agree on the near-term, confidence is higher; when they diverge, recent dynamics look unusual.">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={prophetData}>
               <defs>
@@ -710,7 +715,9 @@ export default function HrvAnalysisPage() {
               <Line type="monotone" dataKey="actual" stroke="#22c55e" strokeWidth={2}
                     dot={false} name="Actual HRV" connectNulls />
               <Line type="monotone" dataKey="forecast" stroke="#f59e0b" strokeWidth={2}
-                    strokeDasharray="5 3" dot={false} name="Forecast" connectNulls />
+                    strokeDasharray="5 3" dot={false} name="Prophet" connectNulls />
+              <Line type="monotone" dataKey="sarimax" stroke="#8b5cf6" strokeWidth={2}
+                    strokeDasharray="2 3" dot={false} name="SARIMAX (7d)" connectNulls />
             </AreaChart>
           </ResponsiveContainer>
           {prophetForecast.length === 0 && (
@@ -722,7 +729,8 @@ export default function HrvAnalysisPage() {
 
         {/* Journal Impact */}
         <ChartCard title="Journal Behavior Impact" subtitle="Mean HRV difference: Yes vs No"
-          info="How each logged behavior affects your HRV the following night. A +15ms bar means your HRV was 15ms higher, on average, on nights after you did that thing. Green = helps recovery; red = hurts it.">
+          source="WELCH'S T-TEST"
+          info="How each logged behavior affects your HRV the following night. A +15ms bar means your HRV was 15ms higher, on average, on nights after you did that thing. Green = helps recovery; red = hurts it. Method: Welch's two-sample t-test (unequal variance) on HRV distributions for Yes vs No nights, with Cohen's d and 95% CI computed per behavior.">
           {journalImpact.length > 0 ? (
             <ResponsiveContainer width="100%" height={260}>
               <BarChart data={journalImpact.slice(0, 12)} layout="vertical"
@@ -802,8 +810,8 @@ export default function HrvAnalysisPage() {
 
       {/* ── Row 5: HRV Trend ── */}
       <ChartCard title="HRV Trend (180 days)"
-                 subtitle="7-day rolling average + Garmin baseline"
-                 info="Your daily HRV (faint line) swings a lot day-to-day — that's normal. The brighter line averages the last 7 days to show your real trend. The dashed blue lines are your Garmin personal baseline: the healthy range Garmin has learned for your body over time.">
+                 subtitle="WHOOP HRV + 7-day rolling average"
+                 info="Your daily WHOOP HRV (faint line) swings a lot day-to-day — that's normal. The brighter line averages the last 7 days to show your real trend.">
         <ResponsiveContainer width="100%" height={280}>
           <LineChart data={trendData}>
             <CartesianGrid {...gridStyle} />
@@ -811,28 +819,10 @@ export default function HrvAnalysisPage() {
             <YAxis tick={axisTick} width={40} domain={["auto", "auto"]} />
             <Tooltip {...chartTooltip} />
             <Legend wrapperStyle={legendStyle} />
-            {garminBaseline?.baseline_balanced_low_ms && (
-              <ReferenceLine
-                y={Number(garminBaseline.baseline_balanced_low_ms)}
-                stroke="#3b82f6" strokeDasharray="4 4" strokeOpacity={0.5}
-                label={{ value: "Baseline Low", fill: "#71717a", fontSize: 9 }}
-              />
-            )}
-            {garminBaseline?.baseline_balanced_upper_ms && (
-              <ReferenceLine
-                y={Number(garminBaseline.baseline_balanced_upper_ms)}
-                stroke="#22c55e" strokeDasharray="4 4" strokeOpacity={0.5}
-                label={{ value: "Baseline High", fill: "#71717a", fontSize: 9 }}
-              />
-            )}
             <Line type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={1.5}
                   dot={false} name="WHOOP HRV" strokeOpacity={0.5} />
             <Line type="monotone" dataKey="rolling7" stroke="#22c55e" strokeWidth={2.5}
                   dot={false} name="7-Day Avg" />
-            {trendData.some(d => d.garminHrv) && (
-              <Line type="monotone" dataKey="garminHrv" stroke="#3b82f6" strokeWidth={1.5}
-                    dot={false} name="Garmin HRV" strokeOpacity={0.7} />
-            )}
           </LineChart>
         </ResponsiveContainer>
       </ChartCard>

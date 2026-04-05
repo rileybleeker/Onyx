@@ -1427,6 +1427,7 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                     np.array(actuals_by_horizon[h]),
                     np.array(preds_by_horizon[h])
                 )
+                sarimax_metrics[h]["n"] = len(preds_by_horizon[h])
                 log.info(f"  SARIMAX h={h}: MAE={sarimax_metrics[h].get('mae', '?'):.2f}")
 
         # Full-data forecast for next 7 days
@@ -2131,6 +2132,23 @@ def main() -> None:
     # ---------- Phase 3.5: Evaluation ----------
     log.info("=== PHASE 3.5: EVALUATION ===")
     eval_results = run_evaluation(df, xgb_model, xgb_results)
+
+    # Append SARIMAX per-horizon metrics so the frontend horizon chart can render them
+    sarimax_horizon_metrics = sarimax_results.get("metrics_by_horizon", {}) if sarimax_results else {}
+    if sarimax_horizon_metrics:
+        today_str = str(date.today())
+        for h, m in sarimax_horizon_metrics.items():
+            eval_results.setdefault("model_metrics_rows", []).append({
+                "eval_date": today_str, "model": "sarimax", "horizon_days": int(h),
+                "mae": m.get("mae"), "rmse": m.get("rmse"),
+                "mape": m.get("mape"), "r_squared": m.get("r2"),
+                "directional_accuracy": m.get("directional_accuracy"),
+                "ci_coverage": m.get("ci_coverage"),
+                "ci_avg_width": m.get("ci_avg_width"),
+                "n_predictions": m.get("n"),
+                "model_version": "backtest_initial",
+            })
+        log.info(f"  Added {len(sarimax_horizon_metrics)} SARIMAX horizon metric rows")
 
     # ---------- Store Results ----------
     log.info("=== STORING RESULTS IN SUPABASE ===")
