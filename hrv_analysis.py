@@ -1617,7 +1617,13 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
             X_tr, y_tr = X.iloc[:start], y.iloc[:start]
             X_pred_block = X.iloc[start:end]
             y_actual_block = y.iloc[start:end]
-            dates_block = model_df["calendar_date"].iloc[start:end].values
+            # Target dates = feature dates + 1 (y is shifted(-1), so y.iloc[i] is
+            # the HRV of the day AFTER model_df.calendar_date.iloc[i]). The row
+            # stored in hrv_predictions represents "the date being predicted".
+            dates_block = (
+                pd.to_datetime(model_df["calendar_date"].iloc[start:end])
+                + pd.Timedelta(days=1)
+            ).dt.strftime("%Y-%m-%d").values
             train_start_d = model_df["calendar_date"].iloc[0]
             train_end_d = model_df["calendar_date"].iloc[start - 1]
 
