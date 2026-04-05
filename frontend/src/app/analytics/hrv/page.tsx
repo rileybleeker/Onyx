@@ -466,10 +466,10 @@ export default function HrvAnalysisPage() {
                   </p>
                 </div>
 
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                <div className="bg-red-500/10 border border-red-500/40 rounded-[6px] p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">SARIMAX</span>
-                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">SEASONAL</span>
+                    <span className="text-[9px] font-mono text-red-400 bg-red-500/20 px-1.5 py-0.5 rounded-[2px]">NEEDS FIX</span>
                   </div>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
                     <strong className="text-text-secondary">What it is:</strong> A classical statistics model that predicts tomorrow&apos;s HRV using your own past HRV values (today&apos;s HRV predicts tomorrow&apos;s to some degree), while also factoring in external variables like training load.
@@ -774,8 +774,8 @@ export default function HrvAnalysisPage() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Prediction vs Actual */}
         <ChartCard title="Prediction vs Actual (last 60 days)"
-                   subtitle="Red dots = miss > 15ms"
-                   info="What the model predicted each night (blue dashed) vs what your HRV actually was (green). Red dots are nights where it missed by more than 15ms. Fewer red dots = more accurate model.">
+                   subtitle="⚠ DATA INACCURATE — NEEDS FIX"
+                   info="What the model predicted each night (dashed) vs what your HRV actually was. Chart is styled red as a reminder that the underlying data is inaccurate and needs to be fixed.">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={predActualData}>
               <CartesianGrid {...gridStyle} />
@@ -783,9 +783,9 @@ export default function HrvAnalysisPage() {
               <YAxis tick={axisTick} width={40} domain={["auto", "auto"]} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line type="monotone" dataKey="actual" stroke="#22c55e" strokeWidth={2}
+              <Line type="monotone" dataKey="actual" stroke="#ef4444" strokeWidth={2}
                     dot={false} name="Actual HRV" />
-              <Line type="monotone" dataKey="predicted" stroke="#3b82f6" strokeWidth={2}
+              <Line type="monotone" dataKey="predicted" stroke="#b91c1c" strokeWidth={2}
                     dot={<HrvDot />} name="XGBoost Pred" strokeDasharray="4 2" />
             </LineChart>
           </ResponsiveContainer>
