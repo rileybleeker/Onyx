@@ -356,7 +356,7 @@ export default function HrvAnalysisPage() {
         </div>
 
         {/* Model Accuracy */}
-        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card">
+        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card relative">
           <p className="text-[10px] text-text-tertiary font-medium uppercase tracking-[0.1em]">Model Accuracy (30d)</p>
           {xgbMetrics ? (
             <>
@@ -381,6 +381,7 @@ export default function HrvAnalysisPage() {
           ) : (
             <p className="text-[28px] font-mono text-text-tertiary mt-2">—</p>
           )}
+          <span className="absolute top-3 right-3 text-[9px] font-mono text-text-tertiary">XGBOOST</span>
         </div>
 
         {/* Top Driver Today */}
