@@ -54,22 +54,3 @@ jobs:
       - name: Upload WHOOP tokens
         if: always()
         run: python ci_token_helper.py upload whoop
-
-  eight-sleep-etl:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install dependencies
-        run: pip install httpx supabase python-dotenv
-      - name: Run Eight Sleep ETL
-        run: python eight_sleep_etl.py --days 7
-        env:
-          EIGHTSLEEP_EMAIL: ${{ secrets.EIGHTSLEEP_EMAIL }}
-          EIGHTSLEEP_PASSWORD: ${{ secrets.EIGHTSLEEP_PASSWORD }}
-          EIGHTSLEEP_TIMEZONE: America/New_York
-          EIGHTSLEEP_CLIENT_ID: ${{ secrets.EIGHTSLEEP_CLIENT_ID }}
-          EIGHTSLEEP_CLIENT_SECRET: ${{ secrets.EIGHTSLEEP_CLIENT_SECRET }}
-

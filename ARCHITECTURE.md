@@ -63,7 +63,8 @@ Onyx/
 ├── ci_token_helper.py           # Download/upload OAuth tokens for CI
 │
 ├── .github/workflows/
-│   ├── daily-etl.yml            # Hourly Health ETL: Garmin + WHOOP + Eight Sleep (`0 * * * *`)
+│   ├── daily-etl.yml            # Hourly Health ETL: Garmin + WHOOP (`0 * * * *`)
+│   ├── eight-sleep-etl.yml      # Eight Sleep ETL — daily at noon ET (`0 16 * * *`)
 │   ├── mfp-email.yml            # MyFitnessPal email check (`15 * * * *`)
 │   ├── whoop-journal-email.yml  # WHOOP journal email check (`30 * * * *`)
 │   ├── habits-sync.yml          # Habits sync from Notion (`45 * * * *`)
@@ -165,11 +166,12 @@ python eight_sleep_etl.py --side left  # Single side
 ### Automated Scheduling (GitHub Actions)
 
 All data sources run **hourly** on a staggered schedule:
-- **Hourly Health ETL** (`daily-etl.yml`, `0 * * * *`): Garmin + WHOOP + Eight Sleep, 3 parallel jobs
+- **Hourly Health ETL** (`daily-etl.yml`, `0 * * * *`): Garmin + WHOOP, 2 parallel jobs
+- **Eight Sleep ETL** (`eight-sleep-etl.yml`, `0 16 * * *`): daily at noon ET — Eight Sleep data only updates post-sleep
 - **MyFitnessPal email** (`mfp-email.yml`, `15 * * * *`): IMAP check → nutrition import
 - **WHOOP journal email** (`whoop-journal-email.yml`, `30 * * * *`): IMAP check → journal import
 - **Habits sync** (`habits-sync.yml`, `45 * * * *`): curls `POST /api/habits/sync`
-- **HRV prediction** (`hrv-prediction.yml`, `workflow_run`): auto-runs after each ETL
+- **HRV prediction** (`hrv-prediction.yml`, `workflow_run`): auto-runs after each hourly ETL
 
 Every workflow also supports `workflow_dispatch` for on-demand runs. Concurrency groups prevent overlapping runs from corrupting tokens.
 
