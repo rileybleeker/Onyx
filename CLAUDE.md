@@ -30,7 +30,7 @@ Onyx/
 ├── analysis_output/         # Generated plots + xgboost_hrv_model.pkl (gitignored)
 ├── .github/workflows/
 │   ├── daily-etl.yml            # Hourly Health ETL: Garmin + WHOOP (`0 * * * *`)
-│   ├── eight-sleep-etl.yml      # Eight Sleep ETL — daily at noon ET (`0 16 * * *`)
+│   ├── eight-sleep-etl.yml      # Eight Sleep ETL — daily at 3 PM ET (`0 19 * * *`)
 │   ├── mfp-email.yml            # MyFitnessPal email check (`15 * * * *`)
 │   ├── whoop-journal-email.yml  # WHOOP journal email check (`30 * * * *`)
 │   ├── habits-sync.yml          # Habits sync from Notion (`45 * * * *`)
@@ -160,7 +160,7 @@ All data sources run **hourly** on a staggered schedule to spread load and avoid
 | Workflow | File | Cron | What it does |
 |---|---|---|---|
 | Hourly Health ETL | `daily-etl.yml` | `0 * * * *` | Garmin + WHOOP (2 parallel jobs) |
-| Eight Sleep ETL | `eight-sleep-etl.yml` | `0 16 * * *` | Eight Sleep — daily at noon ET (data only updates post-sleep) |
+| Eight Sleep ETL | `eight-sleep-etl.yml` | `0 19 * * *` | Eight Sleep — daily at 3 PM ET (data only updates post-sleep) |
 | MyFitnessPal email | `mfp-email.yml` | `15 * * * *` | IMAP check → import MFP nutrition CSV |
 | WHOOP journal email | `whoop-journal-email.yml` | `30 * * * *` | IMAP check → import WHOOP journal CSV |
 | Habits sync | `habits-sync.yml` | `45 * * * *` | Curls `POST /api/habits/sync` on Vercel |

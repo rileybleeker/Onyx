@@ -64,7 +64,7 @@ Onyx/
 │
 ├── .github/workflows/
 │   ├── daily-etl.yml            # Hourly Health ETL: Garmin + WHOOP (`0 * * * *`)
-│   ├── eight-sleep-etl.yml      # Eight Sleep ETL — daily at noon ET (`0 16 * * *`)
+│   ├── eight-sleep-etl.yml      # Eight Sleep ETL — daily at 3 PM ET (`0 19 * * *`)
 │   ├── mfp-email.yml            # MyFitnessPal email check (`15 * * * *`)
 │   ├── whoop-journal-email.yml  # WHOOP journal email check (`30 * * * *`)
 │   ├── habits-sync.yml          # Habits sync from Notion (`45 * * * *`)
@@ -167,7 +167,7 @@ python eight_sleep_etl.py --side left  # Single side
 
 All data sources run **hourly** on a staggered schedule:
 - **Hourly Health ETL** (`daily-etl.yml`, `0 * * * *`): Garmin + WHOOP, 2 parallel jobs
-- **Eight Sleep ETL** (`eight-sleep-etl.yml`, `0 16 * * *`): daily at noon ET — Eight Sleep data only updates post-sleep
+- **Eight Sleep ETL** (`eight-sleep-etl.yml`, `0 19 * * *`): daily at 3 PM ET — Eight Sleep data only updates post-sleep
 - **MyFitnessPal email** (`mfp-email.yml`, `15 * * * *`): IMAP check → nutrition import
 - **WHOOP journal email** (`whoop-journal-email.yml`, `30 * * * *`): IMAP check → journal import
 - **Habits sync** (`habits-sync.yml`, `45 * * * *`): curls `POST /api/habits/sync`

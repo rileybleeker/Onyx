@@ -2,8 +2,8 @@ name: Eight Sleep ETL
 
 on:
   schedule:
-    # 16:00 UTC = 12:00 PM EDT (noon Eastern during DST, 11 AM EST in winter)
-    - cron: '0 16 * * *'
+    # 19:00 UTC = 3:00 PM EDT (3 PM Eastern during DST, 2 PM EST in winter)
+    - cron: '0 19 * * *'
   workflow_dispatch: # Manual trigger for testing
 
 concurrency:
