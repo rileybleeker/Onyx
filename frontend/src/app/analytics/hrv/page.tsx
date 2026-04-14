@@ -214,8 +214,23 @@ export default function HrvAnalysisPage() {
   // ---------------------------------------------------------------------------
   // Derived state
   // ---------------------------------------------------------------------------
-  const tomorrowPred = predictions.find(p => p.model === "xgboost" && p.horizon_days === 1 &&
+  // "Tomorrow" is the user's LOCAL tomorrow, not UTC. CI runs in UTC, so during
+  // CDT evenings a CI-written row can sit a day ahead of local tomorrow — we
+  // filter it out so the card matches what the CLI says when run locally.
+  const localTomorrowStr = (() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  })();
+  const xgbFutureCandidates = predictions.filter(p =>
+    p.model === "xgboost" && p.horizon_days === 1 &&
     !p.model_version?.startsWith("backtest") && !p.actual_hrv);
+  const tomorrowPred =
+    xgbFutureCandidates.find(p => p.prediction_date === localTomorrowStr) ??
+    // Fallback: earliest unscored future prediction ≥ local tomorrow.
+    xgbFutureCandidates
+      .filter(p => p.prediction_date >= localTomorrowStr)
+      .sort((a, b) => a.prediction_date.localeCompare(b.prediction_date))[0];
   const todayActualHrv = historicalHrv.length ? Number(historicalHrv[historicalHrv.length - 1]?.whoop_hrv_rmssd) : null;
   const xgbMetrics = metrics.filter(m => m.model === "xgboost").sort((a, b) =>
     new Date(b.eval_date).getTime() - new Date(a.eval_date).getTime())[0];
