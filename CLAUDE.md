@@ -29,9 +29,11 @@ Onyx/
 ├── requirements-analysis.txt # Python deps for HRV analysis (xgboost, statsmodels, prophet, etc.)
 ├── analysis_output/         # Generated plots + xgboost_hrv_model.pkl (gitignored)
 ├── .github/workflows/
-│   ├── daily-etl.yml        # GitHub Actions daily ETL cron
-│   ├── whoop-journal-email.yml  # WHOOP journal email check (every 4h)
-│   └── hrv-prediction.yml   # Daily HRV prediction (runs after ETL, caches model)
+│   ├── daily-etl.yml            # Hourly Health ETL: Garmin + WHOOP + Eight Sleep (`0 * * * *`)
+│   ├── mfp-email.yml            # MyFitnessPal email check (`15 * * * *`)
+│   ├── whoop-journal-email.yml  # WHOOP journal email check (`30 * * * *`)
+│   ├── habits-sync.yml          # Habits sync from Notion (`45 * * * *`)
+│   └── hrv-prediction.yml       # HRV prediction — auto-runs after each ETL via workflow_run
 ├── whoop_schema.sql         # WHOOP table DDL
 ├── eight_sleep_schema.sql   # Eight Sleep DDL + daily_health_matrix view
 ├── sql/
@@ -60,7 +62,7 @@ Onyx/
 ## Commands
 
 ```bash
-# ETL (runs automatically via GitHub Actions daily at 5-6 AM ET)
+# ETL (runs automatically via GitHub Actions every hour on :00)
 python garmin_etl.py                    # Sync last 7 days
 python whoop_etl.py                     # Sync last 30 days
 python whoop_journal_import.py <csv>    # Import WHOOP journal CSV export
@@ -152,18 +154,24 @@ Configured in `.claude/settings.local.json`. Two layers of control:
 
 ## GitHub Actions ETL
 
-All three ETLs run daily via `.github/workflows/daily-etl.yml`:
-- **Schedule**: `0 10 * * *` (10:00 UTC = 5-6 AM ET)
-- **Manual trigger**: `gh workflow run daily-etl.yml`
-- **Token persistence**: Garmin/WHOOP tokens stored in `pds.ci_tokens`, managed by `ci_token_helper.py`
-- **Token recovery**: If Garmin tokens expire in CI, re-run ETL locally then `python ci_token_helper.py upload garmin`
-- **WHOOP token recovery**: If WHOOP refresh token expires (400 on token refresh), re-run `python whoop_etl.py --days 7` locally then `python ci_token_helper.py upload whoop`. WHOOP tokens can expire after several days of failed refreshes — check `/status` page for silent failures.
-- **GitHub Secrets**: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GARMIN_EMAIL, GARMIN_PASSWORD, WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET, EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD, EIGHTSLEEP_CLIENT_ID, EIGHTSLEEP_CLIENT_SECRET
+All data sources run **hourly** on a staggered schedule to spread load and avoid thundering herds:
 
-WHOOP journal email check runs separately via `.github/workflows/whoop-journal-email.yml`:
-- **Schedule**: `30 */4 * * *` (every 4 hours at :30)
-- **Manual trigger**: `gh workflow run whoop-journal-email.yml`
-- **Additional GitHub Secrets**: IMAP_HOST, IMAP_EMAIL, IMAP_APP_PASSWORD
+| Workflow | File | Cron | What it does |
+|---|---|---|---|
+| Hourly Health ETL | `daily-etl.yml` | `0 * * * *` | Garmin + WHOOP + Eight Sleep (3 parallel jobs) |
+| MyFitnessPal email | `mfp-email.yml` | `15 * * * *` | IMAP check → import MFP nutrition CSV |
+| WHOOP journal email | `whoop-journal-email.yml` | `30 * * * *` | IMAP check → import WHOOP journal CSV |
+| Habits sync | `habits-sync.yml` | `45 * * * *` | Curls `POST /api/habits/sync` on Vercel |
+| HRV prediction | `hrv-prediction.yml` | `workflow_run` after ETL | Backfills actuals + predicts next day |
+
+Notes:
+- **Filename vs. display name**: `daily-etl.yml` kept for git history; workflow display name is **"Hourly Health ETL"**. The `hrv-prediction.yml` `workflow_run` trigger references the display name.
+- **Manual trigger**: `gh workflow run <workflow-file>.yml` for any of them.
+- **Token persistence**: Garmin/WHOOP tokens stored in `pds.ci_tokens`, managed by `ci_token_helper.py`.
+- **Token recovery (Garmin)**: If Garmin tokens expire in CI, re-run ETL locally then `python ci_token_helper.py upload garmin`.
+- **Token recovery (WHOOP)**: If WHOOP refresh token expires (400 on token refresh), re-run `python whoop_etl.py --days 7` locally then `python ci_token_helper.py upload whoop`. WHOOP tokens can expire after several days of failed refreshes — check `/status` page for silent failures. Hourly cadence increases risk here — monitor closely.
+- **GitHub Secrets**: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GARMIN_EMAIL, GARMIN_PASSWORD, WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET, EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD, EIGHTSLEEP_CLIENT_ID, EIGHTSLEEP_CLIENT_SECRET, IMAP_HOST, IMAP_EMAIL, IMAP_APP_PASSWORD.
+- **Actions minutes**: Repo is private; hourly schedule is estimated to use ~3000–6000 min/month, likely over the 2000-min free tier. Monitor usage under GitHub → Settings → Billing.
 
 ## Conventions
 

@@ -1,0 +1,22 @@
+name: Habits Sync
+
+on:
+  schedule:
+    # Every hour at :45
+    - cron: '45 * * * *'
+  workflow_dispatch: # Manual trigger
+
+concurrency:
+  group: habits-sync
+  cancel-in-progress: false
+
+jobs:
+  habits-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call habits sync endpoint
+        run: |
+          curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            --fail-with-body \
+            "https://frontend-six-alpha-69.vercel.app/api/habits/sync"

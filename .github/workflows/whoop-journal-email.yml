@@ -2,8 +2,8 @@ name: WHOOP Journal Email Check
 
 on:
   schedule:
-    # Every 4 hours at :30
-    - cron: '30 */4 * * *'
+    # Every hour at :30
+    - cron: '30 * * * *'
   workflow_dispatch: # Manual trigger
 
 concurrency:

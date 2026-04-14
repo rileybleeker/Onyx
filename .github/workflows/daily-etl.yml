@@ -1,13 +1,13 @@
-name: Daily Health ETL
+name: Hourly Health ETL
 
 on:
   schedule:
-    # 10:00 UTC = 5:00 AM EST / 6:00 AM EDT
-    - cron: '0 10 * * *'
+    # Every hour at :00
+    - cron: '0 * * * *'
   workflow_dispatch: # Manual trigger for testing
 
 concurrency:
-  group: daily-etl
+  group: hourly-etl
   cancel-in-progress: false
 
 env:

@@ -1,8 +1,8 @@
-name: HRV Daily Prediction
+name: HRV Prediction
 
 on:
   workflow_run:
-    workflows: ["Daily Health ETL"]
+    workflows: ["Hourly Health ETL"]
     types: [completed]
   workflow_dispatch:
 
