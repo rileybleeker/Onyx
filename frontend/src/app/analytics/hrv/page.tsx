@@ -221,9 +221,17 @@ export default function HrvAnalysisPage() {
     new Date(b.eval_date).getTime() - new Date(a.eval_date).getTime())[0];
   const naiveMetrics = metrics.find(m => m.model === "baseline_naive");
 
-  const topDrivers: any[] = tomorrowPred?.top_drivers
-    ? (() => { try { return JSON.parse(tomorrowPred.top_drivers); } catch { return []; } })()
-    : featureImportance.map(f => ({ label: f.label, shap_value: f.importance }));
+  const rawDrivers: any = tomorrowPred?.top_drivers
+    ? (() => { try { return JSON.parse(tomorrowPred.top_drivers); } catch { return null; } })()
+    : null;
+  const topDrivers: any[] = Array.isArray(rawDrivers)
+    ? rawDrivers
+    : (rawDrivers?.top ?? featureImportance.map(f => ({ label: f.label, shap_value: f.importance })));
+  // Today-specific signed SHAP values for journal features. Falls back to
+  // historical mean-abs (unsigned) if the new payload shape isn't present.
+  const journalDriversToday: any[] = Array.isArray(rawDrivers)
+    ? []
+    : (rawDrivers?.journal ?? []);
 
   // HRV trend data with 7-day rolling avg
   const hrvValues = historicalHrv.map(d => Number(d.whoop_hrv_rmssd));
@@ -612,26 +620,49 @@ export default function HrvAnalysisPage() {
                 <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">XGBOOST · SHAP</span>
               </div>
               <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
-                Your logged Yes/No behaviors are included in the model as features. Because they&apos;re binary (on/off), their average impact in ms is smaller than continuous metrics — but they&apos;re still real. A positive bar means that behavior tends to push HRV predictions higher; negative means lower.
+                Your logged Yes/No behaviors are part of the model. A <span className="text-[#22c55e]">green</span> bar means that behavior <em>raised</em> tomorrow&apos;s predicted HRV today; a <span className="text-[#ef4444]">red</span> bar means it <em>lowered</em> it. Binary features have smaller ms impact than continuous metrics but still shift the forecast.
               </p>
-              {journalShap.length > 0 ? (
-                <ResponsiveContainer width="100%" height={Math.max(120, journalShap.length * 22)}>
-                  <BarChart data={journalShap} layout="vertical"
+              {journalDriversToday.length > 0 ? (
+                <ResponsiveContainer width="100%" height={Math.max(120, journalDriversToday.length * 22)}>
+                  <BarChart data={journalDriversToday} layout="vertical"
                             margin={{ left: 160, right: 20, top: 2, bottom: 2 }}>
                     <CartesianGrid {...gridStyle} horizontal={false} />
                     <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(2)}`} />
                     <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160}
                            tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
                     <Tooltip {...chartTooltip}
-                             formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(3)} ms`, "Avg Impact"]} />
+                             formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(3)} ms`, Number(v) > 0 ? "Raised forecast" : "Lowered forecast"]} />
                     <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-                    <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
-                      {journalShap.map((d, i) => (
-                        <Cell key={i} fill="#8b5cf6" fillOpacity={0.75} />
+                    <Bar dataKey="shap_value" radius={[0, 3, 3, 0]}>
+                      {journalDriversToday.map((d, i) => (
+                        <Cell key={i} fill={d.shap_value > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.85} />
                       ))}
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
+              ) : journalShap.length > 0 ? (
+                <>
+                  <p className="text-[10px] text-amber-400/80 italic mb-2">
+                    Showing historical average direction — re-run hrv_predict.py for today-specific signed values.
+                  </p>
+                  <ResponsiveContainer width="100%" height={Math.max(120, journalShap.length * 22)}>
+                    <BarChart data={journalShap} layout="vertical"
+                              margin={{ left: 160, right: 20, top: 2, bottom: 2 }}>
+                      <CartesianGrid {...gridStyle} horizontal={false} />
+                      <XAxis type="number" tick={axisTick} tickFormatter={v => v.toFixed(2)} />
+                      <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160}
+                             tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
+                      <Tooltip {...chartTooltip}
+                               formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
+                      <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                      <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
+                        {journalShap.map((d, i) => (
+                          <Cell key={i} fill="#8b5cf6" fillOpacity={0.75} />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </>
               ) : (
                 <p className="text-[11px] text-text-tertiary italic">
                   Journal behavior impacts not yet computed — re-run hrv_analysis.py to generate.

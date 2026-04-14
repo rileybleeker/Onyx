@@ -154,7 +154,7 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
     upper = pred_val + 1.645 * pred_std
 
     # SHAP top drivers if available
-    top_drivers = []
+    top_drivers_payload: dict | list = []
     try:
         import shap
         explainer = shap.TreeExplainer(model)
@@ -165,7 +165,16 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
             for i, f in enumerate(feat_cols)
             if not np.isnan(shap_vals.values[0, i])
         ]
-        top_drivers = sorted(drivers, key=lambda x: abs(x["shap_value"]), reverse=True)[:10]
+        drivers_sorted = sorted(drivers, key=lambda x: abs(x["shap_value"]), reverse=True)
+        journal_drivers = sorted(
+            [d for d in drivers if d["feature"].startswith("journal_")],
+            key=lambda x: abs(x["shap_value"]),
+            reverse=True,
+        )
+        top_drivers_payload = {
+            "top": drivers_sorted[:15],
+            "journal": journal_drivers,
+        }
     except Exception:
         pass
 
@@ -180,7 +189,7 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
         "prediction_upper": round(upper, 2),
         "actual_hrv": None,
         "horizon_days": 1,
-        "top_drivers": json.dumps(top_drivers),
+        "top_drivers": json.dumps(top_drivers_payload),
         "model_version": MODEL_VERSION,
         "training_window_start": model_bundle.get("model_version", "").split("_")[0],
         "training_window_end": train_end,
