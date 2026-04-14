@@ -42,12 +42,21 @@ jobs:
 
       - name: Download model artifact
         # Try to restore the trained model from cache
+        id: model-cache
         uses: actions/cache@v4
         with:
           path: analysis_output/xgboost_hrv_model.pkl
           key: hrv-model-${{ runner.os }}-v1
           restore-keys: |
             hrv-model-${{ runner.os }}-
+
+      - name: Train model if missing
+        # Self-heal: if cache was empty or the pickle is gone, retrain from scratch
+        # so hrv_predict.py always has a model to load.
+        if: hashFiles('analysis_output/xgboost_hrv_model.pkl') == ''
+        run: |
+          echo "Model pickle missing - running hrv_analysis.py to retrain"
+          python hrv_analysis.py --skip-analysis
 
       - name: Backfill actuals & predict tomorrow
         run: python hrv_predict.py --predict
