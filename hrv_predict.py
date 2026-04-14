@@ -46,6 +46,33 @@ MODEL_VERSION = f"{date.today().isoformat()}_v1"
 DRIFT_THRESHOLD = 1.5
 
 
+def _clean_for_json(obj):
+    """Recursively replace NaN / NaT / numpy scalars with JSON-safe Python types.
+
+    Applied at the Supabase boundary so no code downstream of this function can
+    crash httpx.json_dumps with non-compliant floats.
+    """
+    if isinstance(obj, dict):
+        return {k: _clean_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean_for_json(v) for v in obj]
+    if obj is None:
+        return None
+    try:
+        if pd.isna(obj):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        v = float(obj)
+        return None if v != v else v
+    if isinstance(obj, (pd.Timestamp, np.datetime64, date, datetime)):
+        return str(obj)
+    return obj
+
+
 def fetch_all(table: str, select: str = "*", filters: list | None = None,
               chunk: int = 1000) -> pd.DataFrame:
     rows = []
@@ -162,10 +189,14 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
 
 
 def backfill_actuals() -> int:
-    """Fill actual_hrv and residual for past predictions where actual is NULL."""
+    """Fill actual_hrv and residual for past predictions where actual is NULL.
+
+    Only predictions whose prediction_date is strictly before today are eligible:
+    today's WHOOP cycle is still in progress or unscored, so the actual is not
+    yet observable.
+    """
     log.info("Backfilling actuals…")
 
-    # Fetch predictions missing actuals
     past_preds = fetch_all(
         "hrv_predictions",
         select="prediction_date,model,horizon_days,predicted_hrv",
@@ -176,12 +207,12 @@ def backfill_actuals() -> int:
         return 0
 
     today = str(date.today())
-    past_preds = past_preds[past_preds["prediction_date"] <= today]
+    past_preds = past_preds[past_preds["prediction_date"] < today]
 
     if past_preds.empty:
+        log.info("  No observable predictions to backfill.")
         return 0
 
-    # Fetch actual HRV for those dates from daily_health_matrix
     min_date = past_preds["prediction_date"].min()
     actuals_raw = fetch_all(
         "daily_health_matrix",
@@ -196,9 +227,11 @@ def backfill_actuals() -> int:
     updates = []
     for _, row in past_preds.iterrows():
         actual = actuals_map.get(row["prediction_date"])
-        if actual is None or str(actual).lower() == "none":
+        if actual is None or pd.isna(actual):
             continue
         actual_f = float(actual)
+        if actual_f != actual_f:  # NaN survivors
+            continue
         pred_f = float(row["predicted_hrv"])
         updates.append({
             "prediction_date": str(row["prediction_date"]),
@@ -210,7 +243,7 @@ def backfill_actuals() -> int:
 
     if updates:
         supa.schema("pds").from_("hrv_predictions").upsert(
-            updates, on_conflict="prediction_date,model,horizon_days"
+            _clean_for_json(updates), on_conflict="prediction_date,model,horizon_days"
         ).execute()
         log.info(f"  Backfilled actuals for {len(updates)} predictions.")
 
@@ -262,7 +295,7 @@ def recompute_rolling_metrics() -> None:
 
     if rows:
         supa.schema("pds").from_("hrv_model_metrics").upsert(
-            rows, on_conflict="eval_date,model,horizon_days"
+            _clean_for_json(rows), on_conflict="eval_date,model,horizon_days"
         ).execute()
         log.info(f"  Updated metrics for {len(rows)} models.")
 
@@ -284,13 +317,13 @@ def check_drift(current_mae: float | None) -> None:
             f"backtest MAE={baseline_mae:.1f}ms (threshold ×{DRIFT_THRESHOLD}). "
             "Consider retraining."
         )
-        supa.schema("pds").from_("sync_log").insert({
+        supa.schema("pds").from_("sync_log").insert(_clean_for_json({
             "source": "hrv_predict",
             "data_type": "drift_alert",
             "status": "warning",
             "records_synced": 0,
             "error_message": f"HRV model drift: current MAE={current_mae:.1f}ms vs backtest {baseline_mae:.1f}ms",
-        }).execute()
+        })).execute()
 
 
 def main() -> None:
@@ -303,42 +336,66 @@ def main() -> None:
         parser.print_help()
         sys.exit(0)
 
-    # Always backfill actuals first
-    backfill_actuals()
-    recompute_rolling_metrics()
+    # Each stage runs independently — a failure in one must not block the others.
+    # Historically, a NaN in backfill killed the whole script and stalled predictions
+    # for 9 days before anyone noticed.
+    stage_errors: list[str] = []
+
+    try:
+        backfill_actuals()
+    except Exception as e:
+        stage_errors.append("backfill_actuals")
+        log.exception(f"backfill_actuals failed: {e}")
+
+    try:
+        recompute_rolling_metrics()
+    except Exception as e:
+        stage_errors.append("recompute_rolling_metrics")
+        log.exception(f"recompute_rolling_metrics failed: {e}")
 
     if args.predict:
-        model_bundle = load_model()
-        if model_bundle is None:
-            sys.exit(1)
+        try:
+            model_bundle = load_model()
+            if model_bundle is None:
+                stage_errors.append("load_model")
+            else:
+                prediction = predict_tomorrow(model_bundle)
+                if prediction is None:
+                    stage_errors.append("predict_tomorrow")
+                    log.error("Failed to generate prediction.")
+                else:
+                    today_hrv = prediction.pop("today_hrv", None)
 
-        prediction = predict_tomorrow(model_bundle)
-        if prediction is None:
-            log.error("Failed to generate prediction.")
-            sys.exit(1)
+                    payload = [{k: v for k, v in prediction.items() if v is not None}]
+                    supa.schema("pds").from_("hrv_predictions").upsert(
+                        _clean_for_json(payload),
+                        on_conflict="prediction_date,model,horizon_days",
+                    ).execute()
 
-        today_hrv = prediction.pop("today_hrv", None)
+                    log.info(
+                        f"Tomorrow ({prediction['prediction_date']}): "
+                        f"predicted HRV = {prediction['predicted_hrv']} ms  "
+                        f"(90% CI: {prediction['prediction_lower']} - {prediction['prediction_upper']})"
+                    )
+                    if today_hrv:
+                        log.info(f"Today's actual HRV: {today_hrv:.1f} ms")
 
-        # Upsert tomorrow's prediction
-        supa.schema("pds").from_("hrv_predictions").upsert(
-            [{k: v for k, v in prediction.items() if v is not None}],
-            on_conflict="prediction_date,model,horizon_days",
-        ).execute()
+                    try:
+                        metrics = supa.schema("pds").from_("hrv_model_metrics").select("mae").eq(
+                            "model", "xgboost"
+                        ).order("eval_date", desc=True).limit(1).execute()
+                        current_mae = float(metrics.data[0]["mae"]) if metrics.data else None
+                        check_drift(current_mae)
+                    except Exception as e:
+                        stage_errors.append("check_drift")
+                        log.exception(f"check_drift failed: {e}")
+        except Exception as e:
+            stage_errors.append("predict")
+            log.exception(f"predict stage failed: {e}")
 
-        log.info(
-            f"Tomorrow ({prediction['prediction_date']}): "
-            f"predicted HRV = {prediction['predicted_hrv']} ms  "
-            f"(90% CI: {prediction['prediction_lower']} – {prediction['prediction_upper']})"
-        )
-        if today_hrv:
-            log.info(f"Today's actual HRV: {today_hrv:.1f} ms")
-
-        # Drift check
-        metrics = supa.schema("pds").from_("hrv_model_metrics").select("mae").eq(
-            "model", "xgboost"
-        ).order("eval_date", desc=True).limit(1).execute()
-        current_mae = float(metrics.data[0]["mae"]) if metrics.data else None
-        check_drift(current_mae)
+    if stage_errors:
+        log.error(f"{len(stage_errors)} stage(s) failed: {', '.join(stage_errors)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
