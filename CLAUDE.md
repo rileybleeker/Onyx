@@ -39,7 +39,7 @@ Onyx/
 │   ├── whoop-journal-email.yml  # WHOOP journal email check (`30 * * * *`)
 │   ├── habits-sync.yml          # Habits sync from Notion (`45 * * * *`)
 │   ├── hrv-prediction.yml       # HRV prediction — auto-runs after each ETL via workflow_run
-│   └── hrv-retrain-on-backfill.yml  # Hourly: detects historical backfill → runs hrv_analysis.py
+│   └── hrv-retrain-on-backfill.yml  # HRV Analysis Retrain — hourly backfill check + daily 12:00 UTC safety-net
 ├── whoop_schema.sql         # WHOOP table DDL
 ├── eight_sleep_schema.sql   # Eight Sleep DDL + daily_health_matrix view
 ├── sql/
@@ -170,7 +170,7 @@ All data sources run **hourly** on a staggered schedule to spread load and avoid
 | WHOOP journal email | `whoop-journal-email.yml` | `30 * * * *` | IMAP check → import WHOOP journal CSV |
 | Habits sync | `habits-sync.yml` | `45 * * * *` | Curls `POST /api/habits/sync` on Vercel |
 | HRV prediction | `hrv-prediction.yml` | `workflow_run` after hourly ETL | Backfills actuals + predicts next day |
-| HRV retrain on backfill | `hrv-retrain-on-backfill.yml` | `20 * * * *` | Checks for historical backfill via `hrv_backfill_check.py`; if any row with `calendar_date < today-2` was updated since last `hrv_analysis_results.computed_at`, runs full `hrv_analysis.py` to refresh correlations + retrain model |
+| HRV Analysis Retrain | `hrv-retrain-on-backfill.yml` | `20 * * * *` + `0 12 * * *` | Two triggers: (1) hourly backfill check via `hrv_backfill_check.py` — runs full `hrv_analysis.py` only if any row with `calendar_date < today-2` was updated since last `hrv_analysis_results.computed_at`. (2) Daily unconditional retrain at 12:00 UTC (~8am ET) — safety net so correlations stay fresh even if no backfill ever fires. The decision is made by the "Decide whether to retrain" step that branches on `github.event.schedule` / `github.event_name`. |
 
 Notes:
 - **Filename vs. display name**: `daily-etl.yml` kept for git history; workflow display name is **"Hourly Health ETL"**. The `hrv-prediction.yml` `workflow_run` trigger references the display name.
