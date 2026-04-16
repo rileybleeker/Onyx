@@ -1,0 +1,55 @@
+name: HRV Retrain on Backfill
+
+on:
+  schedule:
+    # Hourly at :20 — between mfp-email (:15) and whoop-journal-email (:30).
+    - cron: '20 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: hrv-retrain-on-backfill
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  check-and-retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install detection dependencies
+        run: pip install supabase python-dotenv
+
+      - name: Check for backfilled historical data
+        id: check
+        run: python hrv_backfill_check.py
+
+      - name: Cache pip (analysis deps)
+        if: steps.check.outputs.backfill_detected == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-hrv-${{ hashFiles('requirements-analysis.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-hrv-
+
+      - name: Install analysis dependencies
+        if: steps.check.outputs.backfill_detected == 'true'
+        run: pip install -r requirements-analysis.txt
+
+      - name: Run full HRV analysis (refresh correlations + retrain model)
+        if: steps.check.outputs.backfill_detected == 'true'
+        run: python hrv_analysis.py
+
+      - name: Save refreshed model to cache
+        if: steps.check.outputs.backfill_detected == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: analysis_output/xgboost_hrv_model.pkl
+          key: hrv-model-${{ runner.os }}-v1

@@ -21,7 +21,7 @@ import os
 import pickle
 import sys
 import warnings
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import matplotlib
@@ -1996,6 +1996,12 @@ def store_analysis_results(stat_results: dict, feature_importance: dict, feature
     })
 
     if rows:
+        # Stamp computed_at so backfill-detection jobs can tell when the last
+        # full analysis ran (Postgres default now() only fires on INSERT, not UPSERT).
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for row in rows:
+            row["computed_at"] = now_iso
+
         log.info(f"  Storing {len(rows)} analysis result rows…")
         # Upsert each row individually to avoid bulk insert dropping rows
         for row in rows:
