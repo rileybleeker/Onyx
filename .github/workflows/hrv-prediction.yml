@@ -41,13 +41,16 @@ jobs:
           pip install supabase python-dotenv
 
       - name: Download model artifact
-        # Try to restore the trained model from cache
+        # Try to restore the trained model from cache. Key is per-run so
+        # retrain workflows can save a new cache without "already exists"
+        # collisions; restore-keys matches the most recently saved model.
         id: model-cache
         uses: actions/cache@v4
         with:
           path: analysis_output/xgboost_hrv_model.pkl
-          key: hrv-model-${{ runner.os }}-v1
+          key: hrv-model-${{ runner.os }}-v1-${{ github.run_id }}
           restore-keys: |
+            hrv-model-${{ runner.os }}-v1-
             hrv-model-${{ runner.os }}-
 
       - name: Train model if missing
@@ -66,4 +69,4 @@ jobs:
         if: always()
         with:
           path: analysis_output/xgboost_hrv_model.pkl
-          key: hrv-model-${{ runner.os }}-v1
+          key: hrv-model-${{ runner.os }}-v1-${{ github.run_id }}

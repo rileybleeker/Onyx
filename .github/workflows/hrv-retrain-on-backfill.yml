@@ -48,8 +48,11 @@ jobs:
         run: python hrv_analysis.py
 
       - name: Save refreshed model to cache
+        # Per-run key so this save never collides with an existing cache; the
+        # companion restore step in hrv-prediction.yml uses restore-keys to
+        # find the most recently saved pickle regardless of exact key.
         if: steps.check.outputs.backfill_detected == 'true'
         uses: actions/cache/save@v4
         with:
           path: analysis_output/xgboost_hrv_model.pkl
-          key: hrv-model-${{ runner.os }}-v1
+          key: hrv-model-${{ runner.os }}-v1-${{ github.run_id }}
