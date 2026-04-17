@@ -321,8 +321,10 @@ def recompute_rolling_metrics() -> None:
                 actual_change = np.diff(actuals)
                 pred_change_from_prev_actual = preds_arr[1:] - actuals[:-1]
                 dir_acc = float(np.mean(np.sign(actual_change) == np.sign(pred_change_from_prev_actual)) * 100)
+                dir_acc_legacy = float(np.mean(np.sign(actual_change) == np.sign(np.diff(preds_arr))) * 100)
             else:
                 dir_acc = None
+                dir_acc_legacy = None
             rows.append({
                 "eval_date": today_str,
                 "model": model_name,
@@ -331,6 +333,7 @@ def recompute_rolling_metrics() -> None:
                 "rmse": rmse,
                 "n_predictions": len(sub),
                 "directional_accuracy": dir_acc,
+                "directional_accuracy_legacy": dir_acc_legacy,
                 "model_version": MODEL_VERSION,
             })
 

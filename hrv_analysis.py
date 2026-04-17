@@ -1176,15 +1176,27 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
     # report standardized beta + f² so we can compare effect sizes on a
     # comparable scale. Newey-West HAC SEs handle the autocorrelation we know
     # exists in HRV residuals (audit Phase 2 DW = 2.91 on persistence).
+    #
+    # Predictor cap (self-review fix): the audit's own finding 1.A said this
+    # dataset is 5-10× under-powered for OLS without dimensionality reduction.
+    # The previous version capped k=30 anyway, giving ~3 obs/predictor on the
+    # joint-non-null subset (n=98) — severely overfit. Now we enforce the
+    # 20-obs/predictor floor explicitly, and surface a warning row in the
+    # stored JSON so consumers know how reliable the betas are.
     try:
         if HAS_STATSMODELS and "passes_fdr" in corr_df.columns:
             from sklearn.preprocessing import StandardScaler
             import statsmodels.api as sm
 
             survivors = corr_df[corr_df["passes_fdr"]]["feature"].tolist()
-            # Cap predictor count so OLS stays well-conditioned at our N≈530.
-            survivors = survivors[:30]
             survivors = [c for c in survivors if c in hrv_valid.columns]
+            # Probe the joint-non-null sample size for the top 30 candidates,
+            # then pick the largest k satisfying n / k >= 20.
+            probe = hrv_valid[[STAT_TARGET] + survivors[:30]].dropna()
+            n_probe = len(probe)
+            k_max_for_n = max(2, n_probe // 20)
+            k = min(len(survivors), k_max_for_n, 15)
+            survivors = survivors[:k]
             stage3_df = hrv_valid[[STAT_TARGET] + survivors].dropna()
             if len(stage3_df) >= 60 and len(survivors) >= 2:
                 X_full = stage3_df[survivors].astype(float).values
@@ -1213,12 +1225,19 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
                         "cohens_f2": float(f2),
                         "r2_full": r2_full,
                         "r2_reduced": r2_red,
+                        "n": int(len(stage3_df)),
+                        "k": int(len(survivors)),
+                        "obs_per_predictor": round(len(stage3_df) / max(len(survivors), 1), 1),
                     })
                 if stage3_rows:
                     s3 = pd.DataFrame(stage3_rows)
                     s3 = s3.iloc[np.argsort(np.abs(s3["beta_std"].values))[::-1]].reset_index(drop=True)
                     s3.to_csv(OUTPUT_DIR / "stage3_standardized_ols.csv", index=False)
-                    log.info(f"  Stage 3 OLS (HAC SE): n={len(stage3_df)}, k={len(survivors)}, R²={r2_full:.3f}")
+                    obs_pp = len(stage3_df) / max(len(survivors), 1)
+                    log.info(f"  Stage 3 OLS (HAC SE): n={len(stage3_df)}, k={len(survivors)}, "
+                             f"obs/predictor={obs_pp:.1f}, R²={r2_full:.3f}")
+                    if obs_pp < 20:
+                        log.warning(f"  Stage 3 obs/predictor={obs_pp:.1f} < 20 — betas may be unstable")
                     log.info("  Saved: stage3_standardized_ols.csv")
                     results["stage3_ols"] = stage3_rows
     except Exception as e:
@@ -1381,17 +1400,17 @@ def prepare_ml_data(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], pd.Serie
     feat_cols = [c for c in model_df.columns
                  if c not in exclude and pd.api.types.is_numeric_dtype(model_df[c])]
 
-    # Drop features with <5% non-null (too sparse for meaningful prediction).
-    # Exception: `HIGH_VALUE_SPARSE_FEATURES` is whitelisted at >=2% because these
-    # are canonical HRV predictors (acute/chronic load, training readiness, HRV
-    # factor) whose NULLs are concentrated in the early dataset (audit finding
-    # 6.A). XGBoost handles missingness natively via NaN-aware splits.
-    def _keep(c: str) -> bool:
-        nn = model_df[c].notna().mean()
-        if c in HIGH_VALUE_SPARSE_FEATURES:
-            return nn >= 0.02
-        return nn >= 0.05
-    feat_cols = [c for c in feat_cols if _keep(c)]
+    # Forward-fill HIGH_VALUE_SPARSE_FEATURES within a 7-day window (audit
+    # finding 6.A + self-review fix). Garmin training-state metrics (ATL/CTL,
+    # hrv_factor, etc.) are stable over short windows, so a 7-day ffill is
+    # physiologically defensible. After ffill we apply the standard 5%
+    # threshold — the previous "lower threshold to 2% (= 10 obs)" rescue
+    # produced too-noisy SHAP attributions on those columns.
+    for col in HIGH_VALUE_SPARSE_FEATURES:
+        if col in model_df.columns:
+            model_df[col] = model_df[col].ffill(limit=7)
+
+    feat_cols = [c for c in feat_cols if model_df[c].notna().mean() >= 0.05]
 
     X = model_df[feat_cols].copy()
     y = model_df["hrv_target_t1"].copy()
@@ -1413,17 +1432,20 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
     rmse = float(np.sqrt(mean_squared_error(yt, yp)))
     mape = float(np.mean(np.abs((yt - yp) / np.where(yt != 0, yt, 1))) * 100)
     r2 = float(r2_score(yt, yp))
-    # Directional accuracy (standard definition): did the forecast for day t,
-    # relative to *yesterday's actual*, point in the same direction as the actual
-    # change from yesterday to today? `pred(t) - actual(t-1)` vs `actual(t) - actual(t-1)`.
-    # The previous version compared diffs of the prediction sequence vs. the actual
-    # sequence, which understates accuracy when consecutive predictions hover near
-    # the mean (sign(0) = 0 never matches sign(±1)).
+    # Directional accuracy — emit BOTH definitions:
+    #   directional_accuracy        : pred(t) − actual(t−1) vs actual(t) − actual(t−1)
+    #     (standard "next-step direction from known yesterday")
+    #   directional_accuracy_legacy : sign(diff(pred)) == sign(diff(actual))
+    #     (the original metric — kept for chart continuity since dashboards built
+    #     before 2026-04-16 use this number; the two answer different questions
+    #     and shouldn't be compared across the changeover boundary)
     dir_acc = np.nan
+    dir_acc_legacy = np.nan
     if len(yt) > 1:
         actual_change = np.diff(yt)
         pred_change_from_prev_actual = yp[1:] - yt[:-1]
         dir_acc = float(np.mean(np.sign(actual_change) == np.sign(pred_change_from_prev_actual)) * 100)
+        dir_acc_legacy = float(np.mean(np.sign(actual_change) == np.sign(np.diff(yp))) * 100)
     # CI coverage
     ci_cov = np.nan
     ci_width = np.nan
@@ -1433,7 +1455,9 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
         ci_cov = float(np.mean((yt >= yl) & (yt <= yu)) * 100)
         ci_width = float(np.nanmean(yu - yl))
     return {"mae": mae, "rmse": rmse, "mape": mape, "r2": r2,
-            "directional_accuracy": dir_acc, "ci_coverage": ci_cov, "ci_avg_width": ci_width}
+            "directional_accuracy": dir_acc,
+            "directional_accuracy_legacy": dir_acc_legacy,
+            "ci_coverage": ci_cov, "ci_avg_width": ci_width}
 
 
 def train_xgboost(df: pd.DataFrame) -> tuple:
@@ -1538,18 +1562,48 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
     else:
         top_drivers = _fallback_feature_importance(final_model, feat_cols)
 
-    # Prediction intervals: σ from VALIDATION-set residuals, NOT test (audit
-    # finding 7.D). Using test residuals to define a test-set CI was a tautology
-    # that made the in-sample coverage metric meaningless and produced live
-    # intervals that achieved only 24.7% actual coverage at a claimed 90% target.
-    val_pred = final_model.predict(X_val)
-    val_residuals = y_val.values - val_pred
-    pred_std = float(np.std(val_residuals))
-    test_lower = test_pred - 1.645 * pred_std  # ~90% CI from val-fit σ
+    # Prediction intervals: σ from out-of-fold residuals across the training
+    # window (audit finding 7.D + self-review fix). Tier 2 #2 switched from
+    # test-set σ to val-set σ — eliminated the tautology but a single 15% val
+    # slice can still over- or under-estimate σ if it falls on an unusually
+    # quiet/volatile period. Using TimeSeriesSplit out-of-fold residuals
+    # across the entire training window gives a much more representative σ
+    # and is what production-grade conformal prediction does.
+    pred_std = None
+    try:
+        from sklearn.model_selection import TimeSeriesSplit
+        tscv = TimeSeriesSplit(n_splits=5)
+        oof_residuals = []
+        for tr_idx, va_idx in tscv.split(X_train):
+            if len(tr_idx) < 30 or len(va_idx) < 5:
+                continue
+            X_tr_fold = X_train.iloc[tr_idx]
+            y_tr_fold = y_train.iloc[tr_idx]
+            X_va_fold = X_train.iloc[va_idx]
+            y_va_fold = y_train.iloc[va_idx]
+            fold_model = XGBRegressor(
+                **{k: v for k, v in best_params.items() if k != "n_estimators"},
+                n_estimators=200,
+            )
+            fold_model.fit(X_tr_fold, y_tr_fold, verbose=False)
+            oof_residuals.extend((y_va_fold.values - fold_model.predict(X_va_fold)).tolist())
+        if len(oof_residuals) >= 30:
+            pred_std = float(np.std(oof_residuals))
+            log.info(f"  pred_std (TimeSeries 5-fold OOF, n_resid={len(oof_residuals)}): {pred_std:.2f} ms")
+    except Exception as e:
+        log.warning(f"  TimeSeriesSplit pred_std failed: {e}")
+
+    if pred_std is None:
+        # Fallback to val-set σ if K-fold path failed
+        val_pred = final_model.predict(X_val)
+        pred_std = float(np.std(y_val.values - val_pred))
+        log.info(f"  pred_std (val-fit fallback): {pred_std:.2f} ms")
+
+    test_lower = test_pred - 1.645 * pred_std  # ~90% CI
     test_upper = test_pred + 1.645 * pred_std
     ci_metrics = compute_metrics(y_test.values, test_pred, test_lower, test_upper)
-    log.info(f"  pred_std (val-fit): {pred_std:.2f} ms; test CI coverage: "
-             f"{ci_metrics.get('ci_coverage', float('nan')):.1f}%")
+    log.info(f"  test CI coverage at ±1.645·σ: {ci_metrics.get('ci_coverage', float('nan')):.1f}% "
+             f"(target: 90%)")
 
     # Permutation importance as an independent cross-check on SHAP (audit 7.L).
     # SHAP can over-credit features the model overfits; permutation importance
@@ -1893,11 +1947,13 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     n = len(X)
     min_train = min(200, int(n * 0.5))
     step = 7  # retrain every 7 days
-    # Embargo gap (audit finding 7.A): the largest feature lag in the matrix is
-    # 7 days (rolling-7 means / sleep_debt_7d). Without a gap the first GAP test
-    # rows partially overlap the train tail. Trade ~7 test points per fold for
-    # leakage-free generalization.
-    GAP_DAYS = 7
+    # Embargo gap (audit finding 7.A + follow-up self-review): the largest
+    # feature lag is 28 days (hrv_28d_mean/std + the personal z-score block
+    # added in Tier 3 #26). 7 days only covered the rolling-7 features and
+    # was a real leakage bug — the first ~21 test rows still overlapped the
+    # train tail via the 28d windows. Trade ~28 test points per fold for
+    # genuinely leakage-free generalization.
+    GAP_DAYS = 28
 
     all_preds: list[dict] = []
 
@@ -2018,6 +2074,7 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
             "mae": m_metrics.get("mae"), "rmse": m_metrics.get("rmse"),
             "mape": m_metrics.get("mape"), "r_squared": m_metrics.get("r2"),
             "directional_accuracy": m_metrics.get("directional_accuracy"),
+            "directional_accuracy_legacy": m_metrics.get("directional_accuracy_legacy"),
             "ci_coverage": m_metrics.get("ci_coverage"),
             "ci_avg_width": m_metrics.get("ci_avg_width"),
             "n_predictions": m_metrics.get("n"),

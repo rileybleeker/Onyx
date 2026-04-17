@@ -162,8 +162,18 @@ def sync_daily_summary(garmin: Garmin, sb: Client, target_date: date) -> int:
     # all metric columns NULL. Storing those breaks "latest data date" queries
     # in /status and seeds garbage forward-edges into the daily_health_matrix view
     # (audit finding 1.F).
-    if target_date > date.today():
-        log.debug(f"  daily_summary {ds}: future date, skipping")
+    #
+    # Self-review fix: previously used `date.today()` which on the GHA runner is
+    # UTC-local. For a user in ET (UTC-4/-5), UTC may have already rolled into
+    # tomorrow while the user's local "today" is yesterday — making the guard
+    # accept a real-world-future row. Compare against ET-local date instead.
+    try:
+        from zoneinfo import ZoneInfo
+        local_today = datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        local_today = date.today()
+    if target_date > local_today:
+        log.debug(f"  daily_summary {ds}: future date (local {local_today}), skipping")
         return 0
     try:
         stats = garmin.get_stats(ds)
@@ -251,8 +261,18 @@ def sync_sleep(garmin: Garmin, sb: Client, target_date: date) -> int:
     # and sleepStartTimestampLocal (local-clock epoch ms — wall-clock value re-encoded as
     # if it were UTC). We must use the GMT field; the Local field decoded with tz=UTC
     # silently shifts every stored timestamp by Riley's TZ offset (~4-5h).
-    sleep_start = dto.get("sleepStartTimestampGMT") or dto.get("sleepStartTimestampLocal")
-    sleep_end = dto.get("sleepEndTimestampGMT") or dto.get("sleepEndTimestampLocal")
+    sleep_start_gmt = dto.get("sleepStartTimestampGMT")
+    sleep_end_gmt = dto.get("sleepEndTimestampGMT")
+    if sleep_start_gmt is None or sleep_end_gmt is None:
+        # Loud warning rather than silent fallback. The whole reason for this
+        # fix is the Local field encodes local-as-UTC; a silent fallback would
+        # silently re-introduce the bug audit finding 4.A described.
+        log.warning(
+            f"  sleep {ds}: Garmin response missing sleepStart/EndTimestampGMT "
+            f"— falling back to *Local with TZ offset bug. Inspect dailySleepDTO keys."
+        )
+    sleep_start = sleep_start_gmt or dto.get("sleepStartTimestampLocal")
+    sleep_end = sleep_end_gmt or dto.get("sleepEndTimestampLocal")
 
     row = {
         "ts": date_to_ts(target_date),
