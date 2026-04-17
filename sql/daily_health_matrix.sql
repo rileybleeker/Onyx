@@ -240,9 +240,15 @@ LEFT JOIN LATERAL (
   LIMIT 1
 ) gbc ON true
 
--- WHOOP Cycles
+-- WHOOP Cycles — tag each cycle to its "wake day" ET date.
+-- WHOOP cycles run bedtime-to-bedtime, so start_time is the previous evening.
+-- Using (start_time + 12h) in ET lands on midday of the day the cycle represents
+-- (the day whose sleep ended the morning after start, whose day-strain accumulates
+-- during, and whose next bedtime closes the cycle). This is stable across bedtime
+-- shifts, unlike a plain UTC cast or ET-of-start. Workouts below, by contrast, are
+-- point-in-time events, so they use plain ET-of-start.
 LEFT JOIN pds.whoop_cycles wc
-  ON (wc.start_time AT TIME ZONE 'UTC')::date = gds.calendar_date
+  ON ((wc.start_time + INTERVAL '12 hours') AT TIME ZONE 'America/New_York')::date = gds.calendar_date
 
 -- WHOOP Recovery
 LEFT JOIN pds.whoop_recovery wr
@@ -259,7 +265,7 @@ LEFT JOIN LATERAL (
     SUM(strain)         AS whoop_workout_strain,
     SUM(zone_two_milli) AS whoop_zone2_milli
   FROM pds.whoop_workouts ww
-  WHERE (ww.start_time AT TIME ZONE 'UTC')::date = gds.calendar_date
+  WHERE (ww.start_time AT TIME ZONE 'America/New_York')::date = gds.calendar_date
     AND ww.score_state = 'SCORED'
 ) wkts ON true
 

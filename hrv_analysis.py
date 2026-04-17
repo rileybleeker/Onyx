@@ -245,6 +245,11 @@ FEATURE_LABELS: dict[str, str] = {
     "chronic_training_load": "Chronic Training Load",
     "atl_ctl_ratio": "Training Load Ratio (ATL/CTL)",
     "rolling_7d_training_load": "7-Day Rolling Training Load",
+    "last_workout_end_to_sleep_min": "Minutes from Last Workout to Bedtime",
+    "last_workout_whoop_strain": "Last Workout's WHOOP Strain (0-21)",
+    "last_workout_garmin_load": "Last Workout's Garmin Training Load",
+    "had_evening_workout": "Had Evening Workout (after 6pm)",
+    "whoop_strain_per_hour_to_bed": "WHOOP Strain ÷ Hours-to-Bed",
     "recovery_time_hours": "Recovery Time (hours)",
     "vo2_max_running": "VO2 Max (Running)",
     "is_run_day": "Running Day",
@@ -342,8 +347,42 @@ def fetch_all(table: str, select: str = "*", filters: list | None = None,
 
 
 def to_date_str(s: pd.Series) -> pd.Series:
-    """Coerce a series to 'YYYY-MM-DD' string dates."""
+    """Coerce a series to 'YYYY-MM-DD' string dates.
+
+    Use for Garmin `start_time_local`, which is stored as a local-wall-clock
+    value labeled +00 — strftime against the parsed UTC value yields the ET
+    calendar date directly.
+    """
     return pd.to_datetime(s, utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
+
+
+def to_et_date_str(s: pd.Series) -> pd.Series:
+    """Coerce a true-UTC timestamp series to ET (America/New_York) 'YYYY-MM-DD'.
+
+    Use for point-in-time events (WHOOP workouts `start_time`, body measurements
+    `measured_at`). Matches the view's `(... AT TIME ZONE 'America/New_York')::date`.
+    Do NOT use for WHOOP cycles — see `to_cycle_et_date_str`.
+    """
+    return (
+        pd.to_datetime(s, utc=True, errors="coerce")
+        .dt.tz_convert("America/New_York")
+        .dt.strftime("%Y-%m-%d")
+    )
+
+
+def to_cycle_et_date_str(s: pd.Series) -> pd.Series:
+    """Canonical ET calendar date for a WHOOP cycle from its `start_time`.
+
+    WHOOP cycles span bedtime-to-bedtime; `start_time` is the previous evening.
+    Shifting by +12h before casting to ET date lands on midday of the cycle's
+    "wake day" — the day whose recovery/HRV/strain the cycle represents.
+    Matches the view's `((start_time + 12h) AT TIME ZONE 'America/New_York')::date`.
+    """
+    return (
+        (pd.to_datetime(s, utc=True, errors="coerce") + pd.Timedelta(hours=12))
+        .dt.tz_convert("America/New_York")
+        .dt.strftime("%Y-%m-%d")
+    )
 
 
 def load_all_data() -> dict[str, pd.DataFrame]:
@@ -428,9 +467,11 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["garmin_ts"]["calendar_date"] = data["garmin_ts"]["calendar_date"].astype(str)
 
     log.info("  Loading garmin_activities…")
+    # start_time_gmt added (true UTC) so we can derive end_time = start + duration
+    # for the workout-to-sleep gap feature; start_time_local stays for date binning.
     data["garmin_acts"] = fetch_all(
         "garmin_activities",
-        select="activity_id,start_time_local,activity_type,duration_seconds,distance_meters,"
+        select="activity_id,start_time_local,start_time_gmt,activity_type,duration_seconds,distance_meters,"
                "avg_heart_rate,max_heart_rate,calories,elevation_gain_meters,"
                "aerobic_training_effect,anaerobic_training_effect,training_load,vo2_max,"
                "avg_speed_mps",
@@ -452,30 +493,33 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         select="cycle_id,start_time,strain,kilojoule,average_heart_rate,max_heart_rate",
     )
     if not data["whoop_cycles"].empty:
-        # Match matrix view join: (start_time AT TIME ZONE 'UTC')::date
-        data["whoop_cycles"]["calendar_date"] = to_date_str(
+        # Match view join: ((start_time + 12h) AT TIME ZONE 'America/New_York')::date
+        data["whoop_cycles"]["calendar_date"] = to_cycle_et_date_str(
             data["whoop_cycles"]["start_time"]
         )
 
     log.info("  Loading whoop_sleep…")
+    # start_time / end_time added for the workout-to-sleep gap feature.
     data["whoop_sleep"] = fetch_all(
         "whoop_sleep",
-        select="cycle_id,sleep_cycle_count,baseline_milli,need_from_sleep_debt_milli,"
-               "need_from_recent_strain_milli,need_from_recent_nap_milli,total_no_data_time_milli,is_nap,score_state",
+        select="cycle_id,start_time,end_time,sleep_cycle_count,baseline_milli,"
+               "need_from_sleep_debt_milli,need_from_recent_strain_milli,"
+               "need_from_recent_nap_milli,total_no_data_time_milli,is_nap,score_state",
         filters=[("is_nap", "eq", False), ("score_state", "eq", "SCORED")],
     )
 
     log.info("  Loading whoop_workouts…")
+    # end_time added for the workout-to-sleep gap feature (true UTC; 100% populated).
     data["whoop_wk"] = fetch_all(
         "whoop_workouts",
-        select="workout_id,start_time,sport_name,strain,kilojoule,average_heart_rate,max_heart_rate,"
+        select="workout_id,start_time,end_time,sport_name,strain,kilojoule,average_heart_rate,max_heart_rate,"
                "zone_zero_milli,zone_one_milli,zone_two_milli,zone_three_milli,"
                "zone_four_milli,zone_five_milli,score_state",
         filters=[("score_state", "eq", "SCORED")],
     )
     if not data["whoop_wk"].empty:
-        # Derive calendar_date from start_time (UTC date matching view logic)
-        data["whoop_wk"]["calendar_date"] = to_date_str(data["whoop_wk"]["start_time"])
+        # Derive ET calendar_date from true-UTC start_time, matching view logic
+        data["whoop_wk"]["calendar_date"] = to_et_date_str(data["whoop_wk"]["start_time"])
 
     log.info("  Loading whoop_body_measurements…")
     data["whoop_body"] = fetch_all(
@@ -780,7 +824,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # --- Join whoop_body_measurements (forward-fill) ---
     if not data["whoop_body"].empty:
         bm = data["whoop_body"].copy()
-        bm["calendar_date"] = to_date_str(bm["measured_at"])
+        bm["calendar_date"] = to_et_date_str(bm["measured_at"])
         bm = bm.dropna(subset=["calendar_date"])
         bm = bm.sort_values("calendar_date").drop_duplicates("calendar_date", keep="last")
         bm = bm.rename(columns={"weight_kilogram": "weight_kg", "height_meter": "height_m",
@@ -964,6 +1008,16 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
             )
             df[f"pct_zone_{i}"] = df[c] / total_zones.replace(0, np.nan)
 
+    # Workout-to-sleep timing — distance from last workout end to bedtime
+    # (Riley's question, 2026-04-16). Late-evening workouts are known to delay
+    # sleep onset and depress overnight HRV.
+    try:
+        wts = workout_to_sleep_gap(data)
+        if not wts.empty:
+            df = df.merge(wts, on="calendar_date", how="left", suffixes=("", "_wts"))
+    except Exception as e:
+        log.warning(f"  workout_to_sleep_gap failed: {e}")
+
     # Interaction terms (audit finding 6.F) — domain priors: alcohol amplified
     # by short sleep, late caffeine blunts post-strain recovery, hot bedroom
     # shortens deep sleep, ATL/CTL ratio matters more when HRV baseline is low.
@@ -984,6 +1038,13 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         df["room_temp_x_sleep_eff"] = df["eight_sleep_room_temp"] * df["whoop_sleep_efficiency"]
     if _has("mfp_sodium_mg", "mfp_water_ml"):
         df["sodium_per_water"] = df["mfp_sodium_mg"] / df["mfp_water_ml"].replace(0, np.nan)
+    # Workout timing × intensity: a hard workout 30 min before bed should
+    # depress HRV more than a hard workout 4 hours before bed.
+    if _has("last_workout_end_to_sleep_min", "last_workout_whoop_strain"):
+        df["whoop_strain_per_hour_to_bed"] = (
+            df["last_workout_whoop_strain"]
+            / (df["last_workout_end_to_sleep_min"].clip(lower=15) / 60)
+        )
 
     # Drop duplicate columns from suffix merges
     dup_cols = [c for c in df.columns if c.endswith(("_gds", "_gs", "_ghr", "_garminhrv",
@@ -1004,6 +1065,125 @@ def _days_since(flag: pd.Series) -> pd.Series:
             last = i
         result.iloc[i] = i - last if not np.isnan(last) else np.nan
     return result
+
+
+def workout_to_sleep_gap(data: dict) -> pd.DataFrame:
+    """Compute time between last workout end and sleep onset, per calendar_date.
+
+    For row N (calendar_date = N), the gap measures: (sleep onset of the cycle
+    that ends on the morning of N+1, i.e. the night sleep covering N→N+1)
+    minus (end_time of the latest workout that finished within 18 hours
+    before that sleep onset). The HRV pipeline uses N to predict HRV at the
+    end of that sleep, so this feature describes "how late was your last
+    workout relative to bedtime on day N".
+
+    Returns a DataFrame keyed on calendar_date (str) with:
+      last_workout_end_to_sleep_min : float, NULL if no workout in prior 18h
+      last_workout_whoop_strain     : float, only set if last workout was WHOOP
+      last_workout_garmin_load      : float, only set if last workout was Garmin
+      had_evening_workout           : 1.0 if last workout ended after 18:00 ET
+    Strain is split by source because WHOOP strain (0-21) and Garmin
+    training_load (50-1000+) are not on comparable scales — a single mixed
+    column would feed apples-to-oranges values into the model.
+    """
+    sleep = data.get("whoop_sleep", pd.DataFrame())
+    cycles = data.get("whoop_cycles", pd.DataFrame())
+    whoop_wk = data.get("whoop_wk", pd.DataFrame())
+    gact = data.get("garmin_acts", pd.DataFrame())
+
+    EMPTY_COLS = ["calendar_date", "last_workout_end_to_sleep_min",
+                  "last_workout_whoop_strain", "last_workout_garmin_load",
+                  "had_evening_workout"]
+    if sleep.empty or "start_time" not in sleep.columns or cycles.empty:
+        return pd.DataFrame(columns=EMPTY_COLS)
+
+    # Sleep onset per cycle. cycles.calendar_date is ET wake date — i.e. the
+    # cycle that BEGINS sleep on night N-1 has cycle.calendar_date = N. To put
+    # the sleep_onset on the row for the day whose behaviors caused that sleep
+    # (= day N-1 in the audit's verified semantics), we shift by -1.
+    sleep_with_date = sleep.merge(
+        cycles[["cycle_id", "calendar_date"]], on="cycle_id", how="inner"
+    )
+    sleep_with_date["sleep_onset"] = pd.to_datetime(sleep_with_date["start_time"], utc=True, format="ISO8601")
+    sleep_with_date = sleep_with_date.dropna(subset=["sleep_onset", "calendar_date"])
+    sleep_with_date["pred_date"] = (
+        pd.to_datetime(sleep_with_date["calendar_date"]) - pd.Timedelta(days=1)
+    ).dt.strftime("%Y-%m-%d")
+    # Earliest sleep onset per pred_date (in case of multiple sleeps in a cycle)
+    sleep_per_date = (
+        sleep_with_date.sort_values("sleep_onset")
+        .drop_duplicates("pred_date", keep="first")[["pred_date", "sleep_onset"]]
+        .reset_index(drop=True)
+    )
+
+    # All workouts with a usable end_time, in true UTC. Tag source so we keep
+    # WHOOP strain (0-21 scale) and Garmin training_load (50-1000+ scale)
+    # in separate columns — never mix them.
+    workouts = []
+    if not whoop_wk.empty and "end_time" in whoop_wk.columns:
+        w = whoop_wk[["start_time", "end_time", "strain"]].copy()
+        w["start_time"] = pd.to_datetime(w["start_time"], utc=True, format="ISO8601")
+        w["end_time"] = pd.to_datetime(w["end_time"], utc=True, format="ISO8601")
+        w["whoop_strain"] = pd.to_numeric(w["strain"], errors="coerce")
+        w["garmin_load"] = float("nan")
+        w["src_priority"] = 1  # WHOOP wins ties on de-dup
+        workouts.append(w[["start_time", "end_time", "whoop_strain",
+                            "garmin_load", "src_priority"]]
+                        .dropna(subset=["end_time"]))
+    if not gact.empty and "start_time_gmt" in gact.columns and "duration_seconds" in gact.columns:
+        g = gact[["start_time_gmt", "duration_seconds", "training_load"]].copy()
+        g["start_time"] = pd.to_datetime(g["start_time_gmt"], utc=True, format="ISO8601")
+        g["end_time"] = g["start_time"] + pd.to_timedelta(
+            pd.to_numeric(g["duration_seconds"], errors="coerce"), unit="s"
+        )
+        g["whoop_strain"] = float("nan")
+        g["garmin_load"] = pd.to_numeric(g["training_load"], errors="coerce")
+        g["src_priority"] = 0
+        workouts.append(g[["start_time", "end_time", "whoop_strain",
+                            "garmin_load", "src_priority"]]
+                        .dropna(subset=["end_time"]))
+    if not workouts:
+        return pd.DataFrame(columns=EMPTY_COLS)
+    all_w = pd.concat(workouts, ignore_index=True).dropna(subset=["end_time"])
+
+    # WHOOP↔Garmin de-dup: collapse workouts whose end_time is within 5
+    # minutes of another (= same session recorded twice). Prefer WHOOP since
+    # its strain metric is the more validated signal for HRV impact.
+    all_w = all_w.sort_values("end_time").reset_index(drop=True)
+    all_w["dedup_key"] = (all_w["end_time"].astype("int64") // (5 * 60 * 10**9))
+    all_w = (all_w.sort_values(["dedup_key", "src_priority"], ascending=[True, False])
+                  .drop_duplicates("dedup_key", keep="first")
+                  .sort_values("end_time")
+                  .reset_index(drop=True))
+
+    # asof-join: latest workout end <= sleep_onset, within 18h. merge_asof
+    # requires identical datetime resolutions, so coerce both sides to ns.
+    sleep_per_date = sleep_per_date.sort_values("sleep_onset")
+    sleep_per_date["sleep_onset"] = sleep_per_date["sleep_onset"].astype("datetime64[ns, UTC]")
+    all_w["end_time"] = all_w["end_time"].astype("datetime64[ns, UTC]")
+    merged = pd.merge_asof(
+        sleep_per_date,
+        all_w[["end_time", "whoop_strain", "garmin_load"]]
+            .rename(columns={"end_time": "last_wk_end"}),
+        left_on="sleep_onset", right_on="last_wk_end",
+        direction="backward",
+        tolerance=pd.Timedelta(hours=18),
+    )
+    merged["last_workout_end_to_sleep_min"] = (
+        (merged["sleep_onset"] - merged["last_wk_end"]).dt.total_seconds() / 60.0
+    )
+    et_hour = merged["last_wk_end"].dt.tz_convert("America/New_York").dt.hour
+    merged["had_evening_workout"] = ((et_hour >= 18) & merged["last_wk_end"].notna()).astype(float)
+    merged = merged.rename(columns={
+        "pred_date": "calendar_date",
+        "whoop_strain": "last_workout_whoop_strain",
+        "garmin_load": "last_workout_garmin_load",
+    })
+    return merged[[
+        "calendar_date", "last_workout_end_to_sleep_min",
+        "last_workout_whoop_strain", "last_workout_garmin_load",
+        "had_evening_workout",
+    ]]
 
 
 def _consecutive_days(flag: pd.Series) -> pd.Series:
