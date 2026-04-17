@@ -122,12 +122,21 @@ TARGET = "whoop_hrv_rmssd"
 # Stage-1 BH-FDR threshold for promoting features to Stage 2 partial correlations.
 FDR_Q_THRESHOLD = 0.05
 
-# WHOOP morning-journal lag in days. WHOOP tags journal entries with the cycle
-# they end on, but the questions describe the prior day. Shifting `cycle_date`
-# back by 1 puts the answer on the day the behavior occurred, aligning it with
-# the rest of the pipeline (target = HRV measured on wake of N+1, predictors
-# describe day N behaviors). Set to 0 to revert.
-WHOOP_JOURNAL_LAG_DAYS = 1
+# WHOOP journal date-semantics shift, in days.
+#
+# IMPORTANT — this defaults to 0 (no shift) because the underlying assumption
+# about WHOOP's `cycle_date` semantics is **unverified**. The audit flagged
+# this as "Critical (verify)" — i.e., the *direction* of the lag depends on:
+#   (a) whether WHOOP's `cycle_date` is the cycle-start date (sleep onset)
+#       or cycle-end date (wake morning), and
+#   (b) whether the journal questions are filled at the start, end, or
+#       arbitrarily during the cycle.
+#
+# Don't flip this constant until verifying against a known-behavior date —
+# e.g., pick a date you know you drank alcohol, find which cycle_date row
+# carries `Have any alcoholic drinks? = Yes`, and confirm whether that row is
+# the calendar date of the drinking or the morning after.
+WHOOP_JOURNAL_LAG_DAYS = 0
 
 # Features whose 5%-non-null filter is too strict — these are canonical HRV
 # predictors and their NULLs are concentrated in the early dataset where Garmin
