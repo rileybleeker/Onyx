@@ -123,7 +123,12 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
 - `whoop_journal` data is boolean-only (Yes/No) — WHOOP's CSV export does not include quantity values entered in the app (e.g., "3 drinks", "200mg caffeine"). This is a WHOOP platform limitation.
 - HRV analysis tables: `hrv_predictions` (model forecasts + actuals), `hrv_model_metrics` (rolling eval), `hrv_analysis_results` (correlations, journal impact, model comparison as JSON)
 - `supabase-py` schema access: always use `supa.schema("pds").from_(table)` — NOT `supa.table()` which defaults to `public`
-- `whoop_workouts` has no `cycle_id` column; use `workout_id` + derive `calendar_date` from UTC `start_time`
+- `whoop_workouts` has no `cycle_id` column; use `workout_id` + derive `calendar_date` from `start_time` via ET-of-start (see TZ convention below)
+- **Timezone convention: `America/New_York` (ET) is canonical for all calendar_date joins.** Raw timestamps are stored as true UTC instants (WHOOP `start_time`, WHOOP `measured_at`, Garmin `sleepStartTimestampGMT`). Date-only columns (MFP, Eight Sleep, WHOOP journal, habits) are already ET-aligned. Derived calendar_dates follow these rules in `daily_health_matrix`:
+  - **Point-in-time events** (workouts, weigh-ins): `(start_time AT TIME ZONE 'America/New_York')::date`
+  - **WHOOP cycles** (bedtime-to-bedtime spans): `((start_time + INTERVAL '12 hours') AT TIME ZONE 'America/New_York')::date` — lands at midday of the wake day, the canonical "day" the cycle represents. The `+12h` is required because `start_time` is the previous evening's bedtime; a naive ET-of-start would mis-tag the cycle to the day before. Robust to any bedtime drift.
+  - **Garmin `start_time_local`**: stored as local wall-clock labeled as UTC (+00); `::date` yields ET date directly.
+  - The `hrv_analysis.py` pipeline mirrors these rules via `to_date_str()`, `to_et_date_str()`, and `to_cycle_et_date_str()` helpers.
 - **HRV columns are not interchangeable across sources.** `whoop_recovery.hrv_rmssd_milli` is RMSSD in milliseconds, measured during the WHOOP-detected sleep cycle. `garmin_hrv.last_night_avg_ms` is Garmin's proprietary time-weighted average of 5-minute HRV samples during sleep — *not* RMSSD; the unit is ms but the algorithm is different. `eight_sleep_trends.avg_hrv` is undocumented by Eight Sleep. Treat each as its own variable; never average or substitute.
 - **Garmin sleep timestamps:** `garmin_sleep.sleep_start` / `sleep_end` are stored as true UTC instants (`sleepStartTimestampGMT` from the API). The previously-used `*Local` field encoded the local clock as UTC, shifting timestamps by ~4-5h.
 
