@@ -1097,14 +1097,18 @@ def workout_to_sleep_gap(data: dict) -> pd.DataFrame:
     if sleep.empty or "start_time" not in sleep.columns or cycles.empty:
         return pd.DataFrame(columns=EMPTY_COLS)
 
-    # Sleep onset per cycle. cycles.calendar_date is ET wake date — i.e. the
-    # cycle that BEGINS sleep on night N-1 has cycle.calendar_date = N. To put
-    # the sleep_onset on the row for the day whose behaviors caused that sleep
-    # (= day N-1 in the audit's verified semantics), we shift by -1.
+    # Sleep onset per cycle. cycles.calendar_date is the canonical ET "wake
+    # day" already (computed via to_cycle_et_date_str at load time = midday
+    # ET of the day the cycle represents). The sleep that BEGINS that cycle
+    # is the night of cycle_date-1 → cycle_date, so behaviors causing it are
+    # on cycle_date-1. Shift back by 1 to put sleep_onset on the row for the
+    # day whose behaviors caused it.
     sleep_with_date = sleep.merge(
         cycles[["cycle_id", "calendar_date"]], on="cycle_id", how="inner"
     )
-    sleep_with_date["sleep_onset"] = pd.to_datetime(sleep_with_date["start_time"], utc=True, format="ISO8601")
+    sleep_with_date["sleep_onset"] = pd.to_datetime(
+        sleep_with_date["start_time"], utc=True, errors="coerce", format="ISO8601"
+    )
     sleep_with_date = sleep_with_date.dropna(subset=["sleep_onset", "calendar_date"])
     sleep_with_date["pred_date"] = (
         pd.to_datetime(sleep_with_date["calendar_date"]) - pd.Timedelta(days=1)
@@ -1119,11 +1123,20 @@ def workout_to_sleep_gap(data: dict) -> pd.DataFrame:
     # All workouts with a usable end_time, in true UTC. Tag source so we keep
     # WHOOP strain (0-21 scale) and Garmin training_load (50-1000+ scale)
     # in separate columns — never mix them.
+    #
+    # Both source timestamps are *true UTC* (WHOOP start_time/end_time directly,
+    # Garmin start_time_gmt). We don't use to_et_date_str here because the
+    # asof-merge against sleep_onset operates in raw UTC instants — only the
+    # `had_evening_workout` boolean below converts to ET, matching the canonical
+    # convention for point-in-time events.
+    def _utc(s):
+        return pd.to_datetime(s, utc=True, errors="coerce", format="ISO8601")
+
     workouts = []
     if not whoop_wk.empty and "end_time" in whoop_wk.columns:
         w = whoop_wk[["start_time", "end_time", "strain"]].copy()
-        w["start_time"] = pd.to_datetime(w["start_time"], utc=True, format="ISO8601")
-        w["end_time"] = pd.to_datetime(w["end_time"], utc=True, format="ISO8601")
+        w["start_time"] = _utc(w["start_time"])
+        w["end_time"] = _utc(w["end_time"])
         w["whoop_strain"] = pd.to_numeric(w["strain"], errors="coerce")
         w["garmin_load"] = float("nan")
         w["src_priority"] = 1  # WHOOP wins ties on de-dup
@@ -1132,7 +1145,7 @@ def workout_to_sleep_gap(data: dict) -> pd.DataFrame:
                         .dropna(subset=["end_time"]))
     if not gact.empty and "start_time_gmt" in gact.columns and "duration_seconds" in gact.columns:
         g = gact[["start_time_gmt", "duration_seconds", "training_load"]].copy()
-        g["start_time"] = pd.to_datetime(g["start_time_gmt"], utc=True, format="ISO8601")
+        g["start_time"] = _utc(g["start_time_gmt"])
         g["end_time"] = g["start_time"] + pd.to_timedelta(
             pd.to_numeric(g["duration_seconds"], errors="coerce"), unit="s"
         )

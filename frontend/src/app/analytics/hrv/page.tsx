@@ -9,6 +9,7 @@ import {
 import ChartCard from "@/components/ChartCard";
 import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
 import { supabase } from "@/lib/supabase";
+import { getWorkoutSleepGap, type WorkoutSleepGap } from "@/lib/queries";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -168,6 +169,7 @@ export default function HrvAnalysisPage() {
   const [sarimaxForecast, setSarimaxForecast] = useState<any[]>([]);
   const [journalCorrelations, setJournalCorrelations] = useState<any[]>([]);
   const [journalShap, setJournalShap] = useState<any[]>([]);
+  const [workoutGap, setWorkoutGap] = useState<WorkoutSleepGap[]>([]);
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
 
@@ -185,7 +187,8 @@ export default function HrvAnalysisPage() {
       getHrvAnalysisResults("correlation", "spearman_journal"),
       getHrvAnalysisResults("feature_importance", "shap_journal"),
       getSarimaxForecast(),
-    ]).then(([preds, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax]) => {
+      getWorkoutSleepGap(90),
+    ]).then(([preds, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap]) => {
       setPredictions(preds);
       setAccuracy(acc);
       setMetrics(m);
@@ -208,6 +211,7 @@ export default function HrvAnalysisPage() {
       setResiduals(res);
       setProphetForecast(prophet);
       setSarimaxForecast(sarimax);
+      setWorkoutGap(wkGap);
     }).catch(console.error).finally(() => setLoading(false));
   }, []);
 
@@ -884,6 +888,82 @@ export default function HrvAnalysisPage() {
                   dot={false} name="7-Day Avg" />
           </LineChart>
         </ResponsiveContainer>
+      </ChartCard>
+
+      {/* ── Row 5b: Workout-to-sleep gap vs HRV ── */}
+      <ChartCard
+        title="Workout-to-Bed Gap vs Next-Morning HRV"
+        subtitle="Last 90 days · each dot = one night"
+        info="Hours between your last logged workout and the moment you fell asleep, plotted against the HRV measured from that night's sleep. Late-evening workouts (gap < 2h) are known to depress HRV; this chart lets you see whether that pattern shows up in your data. Dot color encodes WHOOP strain when available."
+      >
+        {(() => {
+          const points = workoutGap
+            .filter((g) => g.gap_minutes != null && g.next_morning_hrv != null)
+            .map((g) => ({
+              gap_hours: (g.gap_minutes as number) / 60,
+              hrv: g.next_morning_hrv as number,
+              strain: g.whoop_strain,
+              date: g.pred_date,
+            }));
+          if (points.length < 5) {
+            return (
+              <div className="h-[280px] flex items-center justify-center text-[12px] text-text-tertiary">
+                Not enough workout-to-sleep data points yet (need ≥5).
+              </div>
+            );
+          }
+          // Bin into hour buckets for a faint trend overlay
+          const bins: Record<number, number[]> = {};
+          for (const p of points) {
+            const k = Math.min(12, Math.floor(p.gap_hours));
+            (bins[k] ||= []).push(p.hrv);
+          }
+          const binned = Object.entries(bins)
+            .map(([k, vs]) => ({
+              gap_hours: Number(k) + 0.5,
+              hrv_mean: vs.reduce((a, b) => a + b, 0) / vs.length,
+              n: vs.length,
+            }))
+            .sort((a, b) => a.gap_hours - b.gap_hours);
+          return (
+            <ResponsiveContainer width="100%" height={300}>
+              <LineChart data={binned}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis
+                  dataKey="gap_hours"
+                  type="number"
+                  domain={[0, 13]}
+                  tickFormatter={(v) => `${v}h`}
+                  tick={axisTick}
+                  label={{ value: "Hours from workout end → bed", position: "insideBottom", offset: -2, style: { fill: "#a1a1aa", fontSize: 11 } }}
+                />
+                <YAxis tick={axisTick} width={42} domain={["auto", "auto"]}
+                       label={{ value: "HRV (ms)", angle: -90, position: "insideLeft", style: { fill: "#a1a1aa", fontSize: 11 } }} />
+                <Tooltip {...chartTooltip}
+                         formatter={(value: any, name: any) =>
+                           name === "hrv_mean"
+                             ? [`${(value as number).toFixed(1)} ms`, "Mean HRV"]
+                             : [value, String(name)]
+                         } />
+                <Line type="monotone" dataKey="hrv_mean" stroke="#22c55e" strokeWidth={2.5}
+                      dot={{ r: 5, fill: "#22c55e" }} name="Mean HRV per gap-hour bin" />
+              </LineChart>
+            </ResponsiveContainer>
+          );
+        })()}
+        <div className="mt-3 px-1 grid grid-cols-3 gap-2 text-[10px] text-text-tertiary">
+          <div>n nights with both workout + HRV: <span className="text-text-secondary tabular-nums">{workoutGap.filter(g => g.gap_minutes != null && g.next_morning_hrv != null).length}</span></div>
+          <div>median gap: <span className="text-text-secondary tabular-nums">{(() => {
+            const arr = workoutGap.map(g => g.gap_minutes).filter((v): v is number => v != null).sort((a, b) => a - b);
+            return arr.length ? `${(arr[Math.floor(arr.length / 2)] / 60).toFixed(1)}h` : "—";
+          })()}</span></div>
+          <div>evening workouts (after 6pm ET): <span className="text-text-secondary tabular-nums">{(() => {
+            return workoutGap.filter(g => g.last_workout_end_utc &&
+              new Date(g.last_workout_end_utc).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false }).includes(":") &&
+              Number(new Date(g.last_workout_end_utc).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit" })) >= 18
+            ).length;
+          })()}</span></div>
+        </div>
       </ChartCard>
 
       {/* ── Row 6: Model Evaluation (collapsible) ── */}

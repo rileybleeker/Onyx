@@ -1,0 +1,108 @@
+name: Monthly GH Actions Audit
+
+# Audit Tier 4 #36: dump 30+ days of GH Actions runs into a JSON artifact
+# and a sync_log entry, so we can monitor workflow health beyond the
+# 30-run window the live `gh run list` returns.
+
+on:
+  schedule:
+    - cron: "0 13 1 * *"  # 1st of every month, 13:00 UTC (~9am ET)
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install supabase python-dotenv requests
+
+      - name: Paginate workflow runs (last 60 days)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p audit
+          since=$(date -u -d '60 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          page=1
+          : > audit/all_runs.jsonl
+          while : ; do
+            resp=$(gh api "repos/${{ github.repository }}/actions/runs?per_page=100&created=>${since}&page=${page}")
+            n=$(echo "$resp" | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('workflow_runs', [])))")
+            if [ "$n" -eq 0 ]; then break; fi
+            echo "$resp" | python -c "
+            import sys, json
+            for r in json.load(sys.stdin)['workflow_runs']:
+                print(json.dumps({'name': r['name'], 'conclusion': r['conclusion'],
+                                  'event': r['event'], 'created_at': r['created_at'],
+                                  'run_started_at': r.get('run_started_at'),
+                                  'updated_at': r['updated_at'],
+                                  'workflow_id': r['workflow_id']}))
+            " >> audit/all_runs.jsonl
+            page=$((page + 1))
+            if [ "$page" -gt 30 ]; then break; fi  # safety cap
+          done
+          wc -l audit/all_runs.jsonl
+
+      - name: Summarize per workflow
+        run: |
+          python <<'PY'
+          import json
+          from collections import Counter, defaultdict
+          rows = [json.loads(l) for l in open("audit/all_runs.jsonl")]
+          by_wf = defaultdict(Counter)
+          for r in rows:
+              by_wf[r["name"]][r["conclusion"]] += 1
+          summary = []
+          for wf, cnts in sorted(by_wf.items()):
+              total = sum(cnts.values())
+              succ = cnts.get("success", 0)
+              summary.append({
+                  "workflow": wf, "total": total,
+                  "success": succ, "failed": cnts.get("failure", 0),
+                  "cancelled": cnts.get("cancelled", 0), "other": total - succ - cnts.get("failure", 0) - cnts.get("cancelled", 0),
+                  "success_rate_pct": round(100 * succ / total, 1) if total else None,
+              })
+          with open("audit/summary.json", "w") as f:
+              json.dump(summary, f, indent=2)
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Log to Supabase sync_log
+        run: |
+          python <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from supabase import create_client
+          summary = json.load(open("audit/summary.json"))
+          msg = "; ".join(
+              f"{s['workflow']}: {s['success']}/{s['total']} ({s['success_rate_pct']}%)"
+              for s in summary
+          )[:1000]
+          supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+          supa.schema("pds").from_("sync_log").insert({
+              "source": "ci_audit", "data_type": "monthly_workflow_audit",
+              "status": "success",
+              "records_synced": sum(s["total"] for s in summary),
+              "error_message": msg,
+              "sync_start": datetime.now(timezone.utc).isoformat(),
+              "sync_end": datetime.now(timezone.utc).isoformat(),
+          }).execute()
+          PY
+
+      - name: Upload audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: monthly-gh-audit-${{ github.run_id }}
+          path: audit/
+          retention-days: 90

@@ -170,6 +170,97 @@ export async function getWhoopWorkouts(days: number = 30) {
   return data ?? [];
 }
 
+// Workout-to-sleep gap chart data (added 2026-04-16). Joins each WHOOP sleep
+// onset to the latest workout (WHOOP or Garmin) ending within 18h before it,
+// and pairs the gap with the HRV scored from that sleep so we can see whether
+// late-evening exercise depresses next-morning HRV.
+export interface WorkoutSleepGap {
+  pred_date: string;
+  sleep_onset_utc: string;
+  last_workout_end_utc: string | null;
+  gap_minutes: number | null;
+  whoop_strain: number | null;
+  next_morning_hrv: number | null;
+}
+
+export async function getWorkoutSleepGap(days: number = 60): Promise<WorkoutSleepGap[]> {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+  const sinceISO = since.toISOString();
+
+  // Fetch WHOOP sleep starts + cycles + recovery + workouts, plus Garmin
+  // activities. Compute the join client-side so we don't add a server view
+  // for a single chart.
+  const [sleepRes, cyclesRes, recRes, wkRes, gactRes] = await Promise.all([
+    supabase.from("whoop_sleep").select("cycle_id,start_time")
+      .eq("is_nap", false).eq("score_state", "SCORED")
+      .gte("start_time", sinceISO).order("start_time", { ascending: true }),
+    supabase.from("whoop_cycles").select("cycle_id,start_time").gte("start_time", sinceISO),
+    supabase.from("whoop_recovery").select("cycle_id,hrv_rmssd_milli").eq("score_state", "SCORED"),
+    supabase.from("whoop_workouts").select("end_time,strain")
+      .eq("score_state", "SCORED").gte("end_time", sinceISO),
+    supabase.from("garmin_activities").select("start_time_gmt,duration_seconds,training_load")
+      .gte("start_time_gmt", sinceISO),
+  ]);
+
+  if (sleepRes.error) throw sleepRes.error;
+  const sleeps = (sleepRes.data ?? []).filter((s) => s.start_time);
+  const cycleHrv = new Map<number, number>();
+  for (const r of recRes.data ?? []) {
+    if (r.hrv_rmssd_milli != null) cycleHrv.set(r.cycle_id as number, Number(r.hrv_rmssd_milli));
+  }
+  const cycleStartByCycle = new Map<number, string>();
+  for (const c of cyclesRes.data ?? []) cycleStartByCycle.set(c.cycle_id as number, c.start_time as string);
+
+  // Combined workout list with end-time and source-tagged strain
+  type W = { end: number; whoop_strain: number | null };
+  const workouts: W[] = [];
+  for (const w of wkRes.data ?? []) {
+    if (w.end_time) workouts.push({
+      end: new Date(w.end_time as string).getTime(),
+      whoop_strain: w.strain != null ? Number(w.strain) : null,
+    });
+  }
+  for (const g of gactRes.data ?? []) {
+    if (g.start_time_gmt && g.duration_seconds != null) {
+      const start = new Date(g.start_time_gmt as string).getTime();
+      const end = start + Number(g.duration_seconds) * 1000;
+      workouts.push({ end, whoop_strain: null });
+    }
+  }
+  workouts.sort((a, b) => a.end - b.end);
+
+  const eighteenHrMs = 18 * 60 * 60 * 1000;
+  const out: WorkoutSleepGap[] = [];
+  for (const s of sleeps) {
+    const sleepMs = new Date(s.start_time as string).getTime();
+    // Binary-search-ish: find the latest workout with end <= sleepMs
+    let last: W | null = null;
+    for (let i = workouts.length - 1; i >= 0; i--) {
+      if (workouts[i].end <= sleepMs && sleepMs - workouts[i].end <= eighteenHrMs) {
+        last = workouts[i]; break;
+      }
+      if (workouts[i].end < sleepMs - eighteenHrMs) break;
+    }
+    // pred_date = ET date of (cycle_start - 1 day), matching pipeline attribution
+    const cycleStart = cycleStartByCycle.get(s.cycle_id as number);
+    const cycleStartMs = cycleStart ? new Date(cycleStart).getTime() : sleepMs;
+    const predDateMs = cycleStartMs - 24 * 60 * 60 * 1000;
+    const predDate = new Date(predDateMs).toLocaleDateString("en-CA", {
+      timeZone: "America/New_York",
+    });
+    out.push({
+      pred_date: predDate,
+      sleep_onset_utc: s.start_time as string,
+      last_workout_end_utc: last ? new Date(last.end).toISOString() : null,
+      gap_minutes: last ? (sleepMs - last.end) / 60000 : null,
+      whoop_strain: last?.whoop_strain ?? null,
+      next_morning_hrv: cycleHrv.get(s.cycle_id as number) ?? null,
+    });
+  }
+  return out;
+}
+
 export async function getWhoopJournal(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
