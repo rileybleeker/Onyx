@@ -54,6 +54,14 @@ SELECT
   gds.highly_active_seconds,
   gds.active_seconds,
   gds.sedentary_seconds,
+  gds.sleeping_seconds            AS garmin_sleeping_seconds,
+
+  -- ── Garmin Stress Buckets (granular, not just average) ───────────────────
+  gstr.overall_stress_level       AS garmin_stress_overall,
+  gstr.rest_stress_duration_sec   AS garmin_rest_stress_sec,
+  gstr.low_stress_duration_sec    AS garmin_low_stress_sec,
+  gstr.medium_stress_duration_sec AS garmin_medium_stress_sec,
+  gstr.high_stress_duration_sec   AS garmin_high_stress_sec,
 
   -- ── Garmin Sleep ─────────────────────────────────────────────────────────
   -- Best non-nap sleep per day (lateral join below)
@@ -88,6 +96,21 @@ SELECT
   -- ── Garmin Training Status ────────────────────────────────────────────────
   gts.training_readiness_score,
   gts.training_readiness_level,
+  gts.acute_training_load         AS garmin_acute_training_load,
+  gts.chronic_training_load       AS garmin_chronic_training_load,
+  gts.training_load_balance       AS garmin_training_load_balance,
+  gts.training_load_factor        AS garmin_training_load_factor,
+  gts.training_status             AS garmin_training_status,
+  gts.recovery_time_hours         AS garmin_recovery_time_hours,
+  gts.recovery_time_factor        AS garmin_recovery_time_factor,
+  gts.recovery_heart_rate         AS garmin_recovery_hr,
+  gts.hrv_factor                  AS garmin_hrv_factor,
+  gts.sleep_score_factor          AS garmin_sleep_score_factor,
+  gts.sleep_history_factor        AS garmin_sleep_history_factor,
+  gts.stress_history_factor       AS garmin_stress_history_factor,
+  gts.vo2_max_running             AS garmin_vo2_max_running,
+  gts.vo2_max_cycling             AS garmin_vo2_max_cycling,
+  gts.fitness_age                 AS garmin_fitness_age,
 
   -- ── Garmin Activities (aggregated per day) ────────────────────────────────
   acts.activity_count             AS garmin_activity_count,
@@ -185,6 +208,10 @@ LEFT JOIN pds.garmin_hrv ghrv
 -- Garmin Heart Rate Zones
 LEFT JOIN pds.garmin_heart_rate ghr
   ON ghr.calendar_date = gds.calendar_date
+
+-- Garmin Stress (granular buckets — daily summary only stores the average)
+LEFT JOIN pds.garmin_stress gstr
+  ON gstr.calendar_date = gds.calendar_date
 
 -- Garmin Training Status
 LEFT JOIN pds.garmin_training_status gts

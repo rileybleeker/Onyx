@@ -272,6 +272,8 @@ def upsert_to_supabase(sb: Client, table: str, rows: list[dict],
 def log_sync(sb: Client, source: str, data_type: str, status: str,
              records: int = 0, date_start=None, date_end=None,
              error: str = None, duration: float = None):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(seconds=duration) if duration is not None else end
     try:
         sb.schema("pds").table("sync_log").insert({
             "source": source,
@@ -282,6 +284,8 @@ def log_sync(sb: Client, source: str, data_type: str, status: str,
             "date_range_end": date_end.isoformat() if date_end else None,
             "error_message": error,
             "duration_seconds": duration,
+            "sync_start": start.isoformat(),
+            "sync_end": end.isoformat(),
         }).execute()
     except Exception as e:
         log.warning(f"Failed to write sync log: {e}")

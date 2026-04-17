@@ -469,7 +469,7 @@ export default function HrvAnalysisPage() {
                     <strong className="text-text-secondary">Why it&apos;s used:</strong> Excellent at finding non-obvious patterns across many variables at once — like &ldquo;high strain + poor sleep + high stress = low HRV&rdquo; — which simpler methods miss.
                   </p>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it predicts:</strong> Tomorrow&apos;s HRV, using today&apos;s 268 features (training load, sleep quality, behaviors, recent HRV trend, etc.).
+                    <strong className="text-text-secondary">What it predicts:</strong> Tomorrow&apos;s HRV, using today&apos;s ~250-feature matrix (training load, sleep quality, behaviors, recent HRV trend, etc.).
                   </p>
                 </div>
 
@@ -574,12 +574,12 @@ export default function HrvAnalysisPage() {
       <div className="space-y-4">
         {/* Explanation banner */}
         <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card">
-          <h3 className="text-[13px] font-medium text-text-secondary mb-3">Two ways to understand what drives your HRV</h3>
+          <h3 className="text-[13px] font-medium text-text-secondary mb-3">Two ways to understand what is associated with your HRV</h3>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <p className="text-[11px] font-medium text-text-primary mb-1">Prediction Drivers <span className="text-text-tertiary font-normal">(left chart)</span></p>
               <p className="text-[11px] text-text-tertiary leading-relaxed">
-                What&apos;s pushing <em>tomorrow&apos;s specific forecast</em> up or down, right now. Recalculated every day. Based on what the AI model learned matters from your data.
+                What the model is using to push <em>tomorrow&apos;s specific forecast</em> up or down, right now. Recalculated every day. These are statistical associations the model has learned, not proven causes.
               </p>
             </div>
             <div>

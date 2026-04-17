@@ -110,7 +110,15 @@ def to_int(val):
 def log_sync(sb: Client, source: str, data_type: str, status: str,
              records: int = 0, date_start: date = None, date_end: date = None,
              error: str = None, duration: float = None):
-    """Write a sync log entry to pds.sync_log."""
+    """Write a sync log entry to pds.sync_log.
+
+    Both `sync_start` and `sync_end` are populated explicitly. Postgres has a
+    default for `sync_start` so it would fill in even if omitted, but `sync_end`
+    has no default — leaving it NULL broke /status freshness queries (audit
+    finding 3.A).
+    """
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(seconds=duration) if duration is not None else end
     try:
         sb.schema("pds").table("sync_log").insert({
             "source": source,
@@ -121,6 +129,8 @@ def log_sync(sb: Client, source: str, data_type: str, status: str,
             "date_range_end": date_end.isoformat() if date_end else None,
             "error_message": error,
             "duration_seconds": duration,
+            "sync_start": start.isoformat(),
+            "sync_end": end.isoformat(),
         }).execute()
     except Exception as e:
         log.warning(f"Failed to write sync log: {e}")
@@ -148,6 +158,13 @@ def upsert_to_supabase(sb: Client, table: str, rows: list[dict],
 def sync_daily_summary(garmin: Garmin, sb: Client, target_date: date) -> int:
     """Sync one day of daily summary stats."""
     ds = target_date.isoformat()
+    # Skip future dates: Garmin's API returns a stub row for today+1 onwards with
+    # all metric columns NULL. Storing those breaks "latest data date" queries
+    # in /status and seeds garbage forward-edges into the daily_health_matrix view
+    # (audit finding 1.F).
+    if target_date > date.today():
+        log.debug(f"  daily_summary {ds}: future date, skipping")
+        return 0
     try:
         stats = garmin.get_stats(ds)
     except Exception as e:
@@ -222,6 +239,13 @@ def sync_sleep(garmin: Garmin, sb: Client, target_date: date) -> int:
 
     dto = sleep["dailySleepDTO"]
     sleep_id = dto.get("id", 0)
+    # Skip placeholder rows where Garmin returned a DTO but no real sleep id.
+    # The PK includes sleep_id, but Postgres treats NULLs as distinct in unique
+    # constraints, so empty placeholders previously duplicated ~24×/day per
+    # missing date (audit finding 5.A / 4.C).
+    if not sleep_id:
+        log.debug(f"  sleep {ds}: no sleep_id, skipping placeholder")
+        return 0
 
     # Parse timestamps. Garmin returns *both* sleepStartTimestampGMT (true UTC epoch ms)
     # and sleepStartTimestampLocal (local-clock epoch ms — wall-clock value re-encoded as

@@ -122,6 +122,43 @@ TARGET = "whoop_hrv_rmssd"
 # Stage-1 BH-FDR threshold for promoting features to Stage 2 partial correlations.
 FDR_Q_THRESHOLD = 0.05
 
+# WHOOP morning-journal lag in days. WHOOP tags journal entries with the cycle
+# they end on, but the questions describe the prior day. Shifting `cycle_date`
+# back by 1 puts the answer on the day the behavior occurred, aligning it with
+# the rest of the pipeline (target = HRV measured on wake of N+1, predictors
+# describe day N behaviors). Set to 0 to revert.
+WHOOP_JOURNAL_LAG_DAYS = 1
+
+# Features whose 5%-non-null filter is too strict — these are canonical HRV
+# predictors and their NULLs are concentrated in the early dataset where Garmin
+# hadn't yet populated baselines. Lower threshold to 2% so we can still feed
+# them to the model with NaN-aware splits (XGBoost handles missingness).
+HIGH_VALUE_SPARSE_FEATURES = {
+    "garmin_acute_training_load", "garmin_chronic_training_load",
+    "garmin_training_load_factor", "garmin_training_load_balance",
+    "garmin_recovery_time_hours", "garmin_recovery_time_factor",
+    "garmin_recovery_hr", "garmin_hrv_factor", "garmin_sleep_score_factor",
+    "garmin_sleep_history_factor", "garmin_stress_history_factor",
+    "garmin_vo2_max_running", "garmin_vo2_max_cycling", "garmin_fitness_age",
+    "training_readiness_score",
+    "atl_ctl_ratio",
+    # Garmin HRV baselines — sparse in 2024 but populated continuously since
+    "garmin_hrv_baseline_low", "garmin_hrv_baseline_high",
+    "garmin_hrv_5min_high", "garmin_hrv_weekly_avg",
+}
+
+# Controllable / behavioral features for the actionable-only SHAP ranking
+# (audit finding 7.K). Anything here is something Riley can change tomorrow.
+CONTROLLABLE_FEATURE_PREFIXES = (
+    "journal_", "mfp_", "whoop_sleep_", "garmin_sleep_", "eight_sleep_",
+    "whoop_workout_", "whoop_day_strain", "garmin_activity_",
+    "rolling_3d_training_load", "rolling_7d_training_load", "sleep_debt",
+    "moderate_intensity_minutes", "vigorous_intensity_minutes",
+    "active_seconds", "highly_active_seconds", "sedentary_seconds",
+    "total_steps", "protein_pct", "carb_pct", "fat_pct", "net_calories",
+    "days_since_alcohol", "days_since_sauna", "days_since_hard_workout",
+)
+
 # Computed once per run from the post-prepare_ml_data (X, y) and stamped onto every
 # row written to pds.hrv_predictions / hrv_model_metrics / hrv_analysis_results so
 # we can detect when a stored result was produced from a different snapshot of the
@@ -575,11 +612,27 @@ def aggregate_whoop_workouts(wk: pd.DataFrame, cycles: pd.DataFrame) -> pd.DataF
 
 
 def pivot_journal(journal: pd.DataFrame) -> pd.DataFrame:
-    """Pivot journal rows into boolean columns per question per day."""
+    """Pivot journal rows into boolean columns per question per day.
+
+    Date-semantics shift (audit finding 4.B): WHOOP asks journal questions on
+    the morning the cycle ends, but the questions cover the *previous day's*
+    behaviors (e.g., "did you drink alcohol [yesterday]?"). We subtract one day
+    from cycle_date so the resulting `journal_*` column on calendar_date=N
+    actually describes behaviors-on-day-N — which is the lag the rest of the
+    pipeline assumes (target = HRV at wake on N+1).
+
+    `WHOOP_JOURNAL_LAG_DAYS = 0` reverts to the prior, off-by-one behavior.
+    """
     if journal.empty:
         return pd.DataFrame()
     journal = journal.copy()
-    journal["cycle_date"] = journal["cycle_date"].astype(str)
+    if WHOOP_JOURNAL_LAG_DAYS:
+        journal["cycle_date"] = (
+            pd.to_datetime(journal["cycle_date"], errors="coerce")
+            - pd.Timedelta(days=WHOOP_JOURNAL_LAG_DAYS)
+        ).dt.date.astype(str)
+    else:
+        journal["cycle_date"] = journal["cycle_date"].astype(str)
     journal["is_yes"] = journal["answer"].str.lower().isin(["yes", "true", "1"]).astype(float)
     pivot = (
         journal.pivot_table(index="cycle_date", columns="question", values="is_yes", aggfunc="max")
@@ -786,9 +839,43 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     df["hrv_lag3"] = df[TARGET].shift(3)
     df["hrv_7d_mean"] = df[TARGET].shift(1).rolling(7, min_periods=3).mean()
     df["hrv_7d_std"] = df[TARGET].shift(1).rolling(7, min_periods=3).std()
+    # 28-day rolling baseline + personal z-score (audit findings 6.C, 6.D).
+    # All windows shifted by 1 so row i only sees data from i-1 and earlier — no leakage.
+    df["hrv_28d_mean"] = df[TARGET].shift(1).rolling(28, min_periods=10).mean()
+    df["hrv_28d_std"] = df[TARGET].shift(1).rolling(28, min_periods=10).std()
+    df["hrv_z_28d"] = (df[TARGET] - df["hrv_28d_mean"]) / df["hrv_28d_std"].replace(0, np.nan)
     df["delta_hrv"] = df[TARGET] - df["hrv_lag1"]
     df["delta_rhr"] = df.get("whoop_rhr", pd.Series(dtype=float)) - \
                        df.get("whoop_rhr", pd.Series(dtype=float)).shift(1)
+
+    # Personal z-scores against a 28-day rolling baseline for non-HRV vitals
+    # (audit finding 6.D). Unitless, comparable across subjects/devices.
+    def _personal_z(col: str) -> pd.Series:
+        if col not in df.columns:
+            return None
+        prior = df[col].shift(1)
+        m = prior.rolling(28, min_periods=10).mean()
+        s = prior.rolling(28, min_periods=10).std()
+        return (df[col] - m) / s.replace(0, np.nan)
+
+    for c in ("whoop_rhr", "whoop_sleep_duration_milli", "whoop_day_strain",
+              "garmin_rhr", "whoop_recovery_score"):
+        z = _personal_z(c)
+        if z is not None:
+            df[f"{c}_z28d"] = z
+
+    # Behavior lags (audit finding 6.E) — only HRV had t-1/t-2/t-3 lags before;
+    # cumulative effects of alcohol / caffeine / strain across multiple days
+    # were invisible to the model.
+    for col in ("whoop_day_strain", "rolling_7d_training_load",
+                "whoop_sleep_duration_milli", "whoop_sleep_efficiency"):
+        if col in df.columns:
+            df[f"{col}_lag1"] = df[col].shift(1)
+            df[f"{col}_lag2"] = df[col].shift(2)
+    for jcol in ("journal_have_any_alcoholic_drinks", "journal_consumed_caffeine",
+                 "journal_ate_food_close_to_bedtime"):
+        if jcol in df.columns:
+            df[f"{jcol}_lag1"] = df[jcol].shift(1)
 
     # Day-of-week
     dt = pd.to_datetime(df["calendar_date"], errors="coerce")
@@ -867,6 +954,27 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
                 df.get(f"zone_{j}_seconds", pd.Series(0, index=df.index)) for j in range(1, 6)
             )
             df[f"pct_zone_{i}"] = df[c] / total_zones.replace(0, np.nan)
+
+    # Interaction terms (audit finding 6.F) — domain priors: alcohol amplified
+    # by short sleep, late caffeine blunts post-strain recovery, hot bedroom
+    # shortens deep sleep, ATL/CTL ratio matters more when HRV baseline is low.
+    def _has(*cols): return all(c in df.columns for c in cols)
+    if _has("journal_have_any_alcoholic_drinks", "whoop_sleep_duration_milli"):
+        df["alcohol_x_sleep_duration"] = (
+            df["journal_have_any_alcoholic_drinks"].fillna(0) *
+            df["whoop_sleep_duration_milli"]
+        )
+    if _has("whoop_day_strain", "journal_consumed_caffeine"):
+        df["strain_x_caffeine"] = (
+            df["whoop_day_strain"] *
+            df["journal_consumed_caffeine"].fillna(0)
+        )
+    if _has("rolling_7d_training_load", "hrv_lag1"):
+        df["load_x_hrv_lag1"] = df["rolling_7d_training_load"] * df["hrv_lag1"]
+    if _has("eight_sleep_room_temp", "whoop_sleep_efficiency"):
+        df["room_temp_x_sleep_eff"] = df["eight_sleep_room_temp"] * df["whoop_sleep_efficiency"]
+    if _has("mfp_sodium_mg", "mfp_water_ml"):
+        df["sodium_per_water"] = df["mfp_sodium_mg"] / df["mfp_water_ml"].replace(0, np.nan)
 
     # Drop duplicate columns from suffix merges
     dup_cols = [c for c in df.columns if c.endswith(("_gds", "_gs", "_ghr", "_garminhrv",
@@ -1054,6 +1162,59 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
         except Exception as e:
             log.warning(f"  Partial correlations failed: {e}")
 
+    # --- Stage 3: standardized OLS with Cohen's f² (audit finding 2.C) ---
+    # For every BH-FDR survivor, fit y ~ all_survivors and y ~ all_survivors\{feat},
+    # report standardized beta + f² so we can compare effect sizes on a
+    # comparable scale. Newey-West HAC SEs handle the autocorrelation we know
+    # exists in HRV residuals (audit Phase 2 DW = 2.91 on persistence).
+    try:
+        if HAS_STATSMODELS and "passes_fdr" in corr_df.columns:
+            from sklearn.preprocessing import StandardScaler
+            import statsmodels.api as sm
+
+            survivors = corr_df[corr_df["passes_fdr"]]["feature"].tolist()
+            # Cap predictor count so OLS stays well-conditioned at our N≈530.
+            survivors = survivors[:30]
+            survivors = [c for c in survivors if c in hrv_valid.columns]
+            stage3_df = hrv_valid[[STAT_TARGET] + survivors].dropna()
+            if len(stage3_df) >= 60 and len(survivors) >= 2:
+                X_full = stage3_df[survivors].astype(float).values
+                y = stage3_df[STAT_TARGET].astype(float).values
+                X_full_std = StandardScaler().fit_transform(X_full)
+                X_full_const = sm.add_constant(X_full_std)
+                full_fit = sm.OLS(y, X_full_const).fit(
+                    cov_type="HAC", cov_kwds={"maxlags": 7}
+                )
+                r2_full = float(full_fit.rsquared)
+                stage3_rows = []
+                for i, feat in enumerate(survivors):
+                    # Reduced model omits predictor i
+                    X_red = np.delete(X_full_std, i, axis=1)
+                    X_red_const = sm.add_constant(X_red)
+                    red_fit = sm.OLS(y, X_red_const).fit()
+                    r2_red = float(red_fit.rsquared)
+                    f2 = (r2_full - r2_red) / max(1.0 - r2_full, 1e-9)
+                    stage3_rows.append({
+                        "feature": feat,
+                        "label": FEATURE_LABELS.get(feat, feat),
+                        # +1 because const is at index 0
+                        "beta_std": float(full_fit.params[i + 1]),
+                        "se_hac": float(full_fit.bse[i + 1]),
+                        "p_value": float(full_fit.pvalues[i + 1]),
+                        "cohens_f2": float(f2),
+                        "r2_full": r2_full,
+                        "r2_reduced": r2_red,
+                    })
+                if stage3_rows:
+                    s3 = pd.DataFrame(stage3_rows)
+                    s3 = s3.iloc[np.argsort(np.abs(s3["beta_std"].values))[::-1]].reset_index(drop=True)
+                    s3.to_csv(OUTPUT_DIR / "stage3_standardized_ols.csv", index=False)
+                    log.info(f"  Stage 3 OLS (HAC SE): n={len(stage3_df)}, k={len(survivors)}, R²={r2_full:.3f}")
+                    log.info("  Saved: stage3_standardized_ols.csv")
+                    results["stage3_ols"] = stage3_rows
+    except Exception as e:
+        log.warning(f"  Stage 3 OLS failed: {e}")
+
     # --- Journal conditional analysis ---
     journal_cols = [c for c in hrv_valid.columns if c.startswith("journal_")]
     journal_impact = []
@@ -1211,8 +1372,17 @@ def prepare_ml_data(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], pd.Serie
     feat_cols = [c for c in model_df.columns
                  if c not in exclude and pd.api.types.is_numeric_dtype(model_df[c])]
 
-    # Drop features with <5% non-null (too sparse for meaningful prediction)
-    feat_cols = [c for c in feat_cols if model_df[c].notna().mean() >= 0.05]
+    # Drop features with <5% non-null (too sparse for meaningful prediction).
+    # Exception: `HIGH_VALUE_SPARSE_FEATURES` is whitelisted at >=2% because these
+    # are canonical HRV predictors (acute/chronic load, training readiness, HRV
+    # factor) whose NULLs are concentrated in the early dataset (audit finding
+    # 6.A). XGBoost handles missingness natively via NaN-aware splits.
+    def _keep(c: str) -> bool:
+        nn = model_df[c].notna().mean()
+        if c in HIGH_VALUE_SPARSE_FEATURES:
+            return nn >= 0.02
+        return nn >= 0.05
+    feat_cols = [c for c in feat_cols if _keep(c)]
 
     X = model_df[feat_cols].copy()
     y = model_df["hrv_target_t1"].copy()
@@ -1359,12 +1529,45 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
     else:
         top_drivers = _fallback_feature_importance(final_model, feat_cols)
 
-    # Prediction intervals via quantile regression (approximate via ± residual std)
-    residuals = y_test.values - test_pred
-    pred_std = np.std(residuals)
-    test_lower = test_pred - 1.645 * pred_std  # ~90% CI
+    # Prediction intervals: σ from VALIDATION-set residuals, NOT test (audit
+    # finding 7.D). Using test residuals to define a test-set CI was a tautology
+    # that made the in-sample coverage metric meaningless and produced live
+    # intervals that achieved only 24.7% actual coverage at a claimed 90% target.
+    val_pred = final_model.predict(X_val)
+    val_residuals = y_val.values - val_pred
+    pred_std = float(np.std(val_residuals))
+    test_lower = test_pred - 1.645 * pred_std  # ~90% CI from val-fit σ
     test_upper = test_pred + 1.645 * pred_std
     ci_metrics = compute_metrics(y_test.values, test_pred, test_lower, test_upper)
+    log.info(f"  pred_std (val-fit): {pred_std:.2f} ms; test CI coverage: "
+             f"{ci_metrics.get('ci_coverage', float('nan')):.1f}%")
+
+    # Permutation importance as an independent cross-check on SHAP (audit 7.L).
+    # SHAP can over-credit features the model overfits; permutation importance
+    # measures actual loss change when each column is shuffled.
+    permutation_importance: dict = {}
+    try:
+        from sklearn.inspection import permutation_importance as _perm
+        perm = _perm(final_model, X_test, y_test, n_repeats=5,
+                     scoring="neg_mean_absolute_error", random_state=42, n_jobs=1)
+        order = np.argsort(perm.importances_mean)[::-1]
+        for idx in order[:30]:
+            permutation_importance[feat_cols[idx]] = float(perm.importances_mean[idx])
+    except Exception as e:
+        log.debug(f"  Permutation importance failed: {e}")
+
+    # Controllable-only SHAP ranking (audit finding 7.K). For recovery
+    # recommendations, only rank features Riley can actually change tomorrow.
+    controllable_importance: dict = {}
+    if HAS_SHAP and feature_importance_full:
+        controllable_importance = {
+            f: v for f, v in feature_importance_full.items()
+            if any(f.startswith(p) for p in CONTROLLABLE_FEATURE_PREFIXES)
+        }
+        # Keep top 20
+        controllable_importance = dict(
+            sorted(controllable_importance.items(), key=lambda kv: kv[1], reverse=True)[:20]
+        )
 
     # Tomorrow's prediction (latest available data)
     tomorrow_pred = float(final_model.predict(X.iloc[[-1]])[0])
@@ -1388,6 +1591,8 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
         "test_metrics": test_metrics | ci_metrics,
         "feature_importance": feature_importance_dict,
         "feature_importance_full": feature_importance_full if HAS_SHAP else feature_importance_dict,
+        "permutation_importance": permutation_importance,
+        "controllable_importance": controllable_importance,
         "top_drivers": top_drivers,
         "tomorrow_pred": tomorrow_pred,
         "today_hrv": today_hrv,
@@ -1440,6 +1645,36 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                         seasonal_order=(1, 0, 1, 7),
                         enforce_stationarity=False, enforce_invertibility=False)
         fit = model.fit(disp=False, maxiter=200)
+
+        # Residual diagnostics (audit finding 7.H): Ljung-Box on residuals — if p<0.05
+        # at lag 7 there is unexploited structure (the model is under-specified).
+        # ADF on the differenced series confirms stationarity assumption holds.
+        try:
+            from statsmodels.stats.diagnostic import acorr_ljungbox
+            from statsmodels.tsa.stattools import adfuller as _adf
+            resid = fit.resid.dropna().values
+            if len(resid) > 20:
+                lb = acorr_ljungbox(resid, lags=[7, 14], return_df=True)
+                lb_p7 = float(lb.iloc[0, 1])
+                lb_p14 = float(lb.iloc[1, 1])
+                log.info(f"  SARIMAX Ljung-Box residuals: p(lag7)={lb_p7:.3g}, p(lag14)={lb_p14:.3g}")
+                if lb_p7 < 0.05:
+                    log.warning("  SARIMAX residual autocorrelation present (p<0.05) — "
+                                "model under-specified; consider re-tuning order")
+            adf = _adf(np.diff(train_endog.values), autolag="AIC")
+            log.info(f"  ADF on differenced HRV: stat={adf[0]:.2f}, p={adf[1]:.3g}")
+            # ACF of residuals chart
+            try:
+                fig, ax = plt.subplots(figsize=(10, 3.5))
+                plot_acf(resid, lags=min(30, len(resid) // 4), ax=ax)
+                ax.set_title("ACF — SARIMAX Residuals")
+                plt.tight_layout()
+                fig.savefig(OUTPUT_DIR / "sarimax_residual_acf.png", dpi=120)
+                plt.close(fig)
+            except Exception:
+                pass
+        except Exception as _e:
+            log.debug(f"  SARIMAX residual diagnostics failed: {_e}")
 
         # 7-step-ahead walk-forward predictions
         preds_by_horizon: dict[int, list] = {h: [] for h in range(1, 8)}
@@ -1649,6 +1884,11 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     n = len(X)
     min_train = min(200, int(n * 0.5))
     step = 7  # retrain every 7 days
+    # Embargo gap (audit finding 7.A): the largest feature lag in the matrix is
+    # 7 days (rolling-7 means / sleep_debt_7d). Without a gap the first GAP test
+    # rows partially overlap the train tail. Trade ~7 test points per fold for
+    # leakage-free generalization.
+    GAP_DAYS = 7
 
     all_preds: list[dict] = []
 
@@ -1656,17 +1896,20 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     # XGBoost walk-forward backtest
     # -----------------------------------------------------------------------
     if HAS_XGB and xgb_model is not None:
-        log.info(f"  XGBoost expanding-window backtest (step={step})…")
+        log.info(f"  XGBoost expanding-window backtest (step={step}, gap={GAP_DAYS}d)…")
         for start in range(min_train, n - 1, step):
-            end = min(start + step, n - 1)
+            test_start = start + GAP_DAYS
+            if test_start >= n - 1:
+                break
+            end = min(test_start + step, n - 1)
             X_tr, y_tr = X.iloc[:start], y.iloc[:start]
-            X_pred_block = X.iloc[start:end]
-            y_actual_block = y.iloc[start:end]
+            X_pred_block = X.iloc[test_start:end]
+            y_actual_block = y.iloc[test_start:end]
             # Target dates = feature dates + 1 (y is shifted(-1), so y.iloc[i] is
             # the HRV of the day AFTER model_df.calendar_date.iloc[i]). The row
             # stored in hrv_predictions represents "the date being predicted".
             dates_block = (
-                pd.to_datetime(model_df["calendar_date"].iloc[start:end])
+                pd.to_datetime(model_df["calendar_date"].iloc[test_start:end])
                 + pd.Timedelta(days=1)
             ).dt.strftime("%Y-%m-%d").values
             train_start_d = model_df["calendar_date"].iloc[0]
@@ -1773,6 +2016,108 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
         })
 
     eval_results["model_metrics_rows"] = model_metrics_rows
+
+    # -----------------------------------------------------------------------
+    # Diebold-Mariano test (audit finding 7.I): pairwise MAE comparison
+    # between models on the matched test set. p<0.05 means the difference in
+    # accuracy is statistically meaningful, not noise.
+    # -----------------------------------------------------------------------
+    try:
+        dm_rows = []
+        models_present = [m for m in
+                          ["xgboost", "baseline_7d_avg", "baseline_naive", "baseline_dow"]
+                          if m in bt_df["model"].unique()]
+        for i, a in enumerate(models_present):
+            for b in models_present[i + 1:]:
+                sa = bt_df[bt_df["model"] == a].set_index("prediction_date")
+                sb = bt_df[bt_df["model"] == b].set_index("prediction_date")
+                joined = sa[["actual_hrv", "predicted_hrv"]].rename(
+                    columns={"predicted_hrv": "pred_a"}
+                ).join(
+                    sb[["predicted_hrv"]].rename(columns={"predicted_hrv": "pred_b"}),
+                    how="inner",
+                ).dropna()
+                if len(joined) < 30:
+                    continue
+                # Loss differential under absolute loss
+                loss_a = (joined["actual_hrv"] - joined["pred_a"]).abs().values
+                loss_b = (joined["actual_hrv"] - joined["pred_b"]).abs().values
+                d = loss_a - loss_b
+                d_mean = float(np.mean(d))
+                # Newey-West variance with h-1 lags (h=1 step ahead -> lag 0,
+                # but allow up to 7 for weekly autocorrelation in residuals)
+                n_d = len(d)
+                gamma0 = float(np.var(d, ddof=1))
+                long_run = gamma0
+                for k in range(1, min(7, n_d - 1)):
+                    cov_k = float(np.mean((d[:-k] - d_mean) * (d[k:] - d_mean)))
+                    long_run += 2 * (1 - k / 7) * cov_k
+                if long_run <= 0:
+                    continue
+                dm_stat = d_mean / np.sqrt(long_run / n_d)
+                # Two-sided p via standard normal
+                from scipy.stats import norm as _norm
+                p = float(2 * (1 - _norm.cdf(abs(dm_stat))))
+                dm_rows.append({
+                    "model_a": a, "model_b": b,
+                    "n_paired": int(n_d),
+                    "mae_a": float(np.mean(loss_a)),
+                    "mae_b": float(np.mean(loss_b)),
+                    "mean_loss_diff": d_mean,
+                    "dm_stat": float(dm_stat),
+                    "p_value": p,
+                })
+        if dm_rows:
+            pd.DataFrame(dm_rows).to_csv(OUTPUT_DIR / "evaluation" / "diebold_mariano.csv",
+                                          index=False)
+            log.info(f"  Diebold-Mariano: {len(dm_rows)} pairwise comparisons saved")
+            eval_results["dm_test"] = dm_rows
+    except Exception as e:
+        log.warning(f"  Diebold-Mariano failed: {e}")
+
+    # -----------------------------------------------------------------------
+    # Error-mode analysis (audit finding 7.J): cluster XGBoost residuals by
+    # journal flags so we know where the model struggles. Saves a CSV per
+    # behavior with sample sizes + mean absolute residual.
+    # -----------------------------------------------------------------------
+    try:
+        xgb_bt = bt_df[bt_df["model"] == "xgboost"].dropna(subset=["residual"]).copy()
+        if not xgb_bt.empty:
+            xgb_bt["pred_date"] = pd.to_datetime(xgb_bt["prediction_date"]).dt.strftime("%Y-%m-%d")
+            jcols = [c for c in df.columns if c.startswith("journal_")]
+            if jcols:
+                # Lookup table: calendar_date -> journal flags. Recall journal cycle_date
+                # was already shifted -1 in pivot_journal so journal_*[N] = behaviors on N.
+                jdf = df[["calendar_date"] + jcols].copy()
+                jdf["calendar_date"] = jdf["calendar_date"].astype(str)
+                joined = xgb_bt.merge(
+                    jdf, left_on="pred_date", right_on="calendar_date", how="left",
+                )
+                em_rows = []
+                for jc in jcols:
+                    yes = joined.loc[joined[jc] == 1, "residual"]
+                    no = joined.loc[joined[jc] == 0, "residual"]
+                    if len(yes) < 5 or len(no) < 5:
+                        continue
+                    em_rows.append({
+                        "behavior": jc.replace("journal_", ""),
+                        "n_yes": int(len(yes)), "n_no": int(len(no)),
+                        "mae_yes": float(yes.abs().mean()),
+                        "mae_no": float(no.abs().mean()),
+                        "mean_residual_yes": float(yes.mean()),
+                        "mean_residual_no": float(no.mean()),
+                        "mae_diff_yes_minus_no": float(yes.abs().mean() - no.abs().mean()),
+                    })
+                if em_rows:
+                    em_df = pd.DataFrame(em_rows)
+                    em_df = em_df.iloc[
+                        np.argsort(np.abs(em_df["mae_diff_yes_minus_no"].values))[::-1]
+                    ].reset_index(drop=True)
+                    em_df.to_csv(OUTPUT_DIR / "evaluation" / "error_modes.csv", index=False)
+                    log.info(f"  Error modes: {len(em_df)} behaviors saved")
+                    eval_results["error_modes"] = em_rows
+    except Exception as e:
+        log.warning(f"  Error-mode analysis failed: {e}")
 
     # -----------------------------------------------------------------------
     # Residual plots
@@ -1986,7 +2331,12 @@ def store_metrics(eval_results: dict) -> None:
         upsert_batch("hrv_model_metrics", rows, "eval_date,model,horizon_days")
 
 
-def store_analysis_results(stat_results: dict, feature_importance: dict, feature_importance_full: dict | None = None) -> None:
+def store_analysis_results(stat_results: dict, feature_importance: dict,
+                           feature_importance_full: dict | None = None,
+                           controllable_importance: dict | None = None,
+                           permutation_importance: dict | None = None,
+                           dm_test: list | None = None,
+                           error_modes: list | None = None) -> None:
     """Store pre-computed analysis results for the frontend."""
     rows: list[dict] = []
 
@@ -2039,6 +2389,52 @@ def store_analysis_results(stat_results: dict, feature_importance: dict, feature
                 "result_key": "shap_journal",
                 "result_json": json.dumps(journal_fi_list),
             })
+
+    # Stage 3 standardized OLS results (audit fix 2.C)
+    if "stage3_ols" in stat_results:
+        rows.append({
+            "result_type": "regression",
+            "result_key": "stage3_standardized_ols",
+            "result_json": json.dumps(stat_results["stage3_ols"]),
+        })
+
+    # Controllable-only SHAP ranking (audit fix 7.K) — what's actionable
+    if controllable_importance:
+        rows.append({
+            "result_type": "feature_importance",
+            "result_key": "shap_controllable",
+            "result_json": json.dumps([
+                {"feature": k, "label": FEATURE_LABELS.get(k, k), "importance": v}
+                for k, v in controllable_importance.items()
+            ]),
+        })
+
+    # Permutation importance cross-check (audit fix 7.L)
+    if permutation_importance:
+        rows.append({
+            "result_type": "feature_importance",
+            "result_key": "permutation",
+            "result_json": json.dumps([
+                {"feature": k, "label": FEATURE_LABELS.get(k, k), "importance": v}
+                for k, v in permutation_importance.items()
+            ]),
+        })
+
+    # Diebold-Mariano pairwise model comparison (audit fix 7.I)
+    if dm_test:
+        rows.append({
+            "result_type": "model_comparison",
+            "result_key": "diebold_mariano",
+            "result_json": json.dumps(dm_test),
+        })
+
+    # Error-mode analysis (audit fix 7.J): per-behavior MAE
+    if error_modes:
+        rows.append({
+            "result_type": "model_comparison",
+            "result_key": "error_modes_by_journal",
+            "result_json": json.dumps(error_modes),
+        })
 
     # Feature label map
     rows.append({
@@ -2238,7 +2634,40 @@ def main() -> None:
     log.info("=== STORING RESULTS IN SUPABASE ===")
     store_predictions(xgb_results, sarimax_results, prophet_results, eval_results)
     store_metrics(eval_results)
-    store_analysis_results(stat_results, xgb_results.get("feature_importance", {}), xgb_results.get("feature_importance_full", {}))
+    store_analysis_results(
+        stat_results,
+        xgb_results.get("feature_importance", {}),
+        xgb_results.get("feature_importance_full", {}),
+        controllable_importance=xgb_results.get("controllable_importance"),
+        permutation_importance=xgb_results.get("permutation_importance"),
+        dm_test=eval_results.get("dm_test"),
+        error_modes=eval_results.get("error_modes"),
+    )
+
+    # ---------- Run-Manifest Artifact (audit fix 4#38) ----------
+    # Dump the full feature list + top-20 SHAP / permutation / controllable lists
+    # alongside the run, so that "what did this model see + value" is reproducible
+    # without re-loading Supabase JSON columns. Pairs with input_data_hash.
+    try:
+        manifest = {
+            "model_version": MODEL_VERSION,
+            "input_data_hash": INPUT_DATA_HASH,
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+            "feat_cols": xgb_results.get("feat_cols", []),
+            "n_feat_cols": len(xgb_results.get("feat_cols", [])),
+            "n_rows_target": int(df[TARGET].notna().sum()),
+            "n_fdr_survivors": stat_results.get("n_fdr_survivors"),
+            "shap_top20": list(xgb_results.get("feature_importance", {}).items())[:20],
+            "permutation_top20": list(xgb_results.get("permutation_importance", {}).items())[:20],
+            "controllable_top20": list(xgb_results.get("controllable_importance", {}).items())[:20],
+            "test_metrics": xgb_results.get("test_metrics", {}),
+        }
+        manifest_path = OUTPUT_DIR / f"run_manifest_{MODEL_VERSION}.json"
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2, default=str)
+        log.info(f"  Run manifest: {manifest_path}")
+    except Exception as e:
+        log.warning(f"  Run-manifest dump failed: {e}")
 
     # ---------- Summary ----------
     print_summary(df, xgb_results, sarimax_results, prophet_results, eval_results, stat_results)

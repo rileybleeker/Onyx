@@ -22,7 +22,7 @@ Onyx/
 ├── mfp_archive/             # Processed CSVs moved here
 ├── ci_token_helper.py       # Download/upload OAuth tokens for CI
 ├── hrv_analysis.py          # HRV deep analysis pipeline (Phases 1-3.5): data loading,
-│                            #   268-feature matrix, stat analysis, XGBoost/SARIMAX/Prophet,
+│                            #   ~350-column / ~250-feature matrix, stat analysis, XGBoost/SARIMAX (Prophet opt-in),
 │                            #   walk-forward backtest, stores results to Supabase
 ├── hrv_predict.py           # Daily HRV prediction: loads saved model, predicts tomorrow,
 │                            #   backfills actuals, recomputes rolling metrics, drift check
@@ -124,6 +124,8 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
 - HRV analysis tables: `hrv_predictions` (model forecasts + actuals), `hrv_model_metrics` (rolling eval), `hrv_analysis_results` (correlations, journal impact, model comparison as JSON)
 - `supabase-py` schema access: always use `supa.schema("pds").from_(table)` — NOT `supa.table()` which defaults to `public`
 - `whoop_workouts` has no `cycle_id` column; use `workout_id` + derive `calendar_date` from UTC `start_time`
+- **HRV columns are not interchangeable across sources.** `whoop_recovery.hrv_rmssd_milli` is RMSSD in milliseconds, measured during the WHOOP-detected sleep cycle. `garmin_hrv.last_night_avg_ms` is Garmin's proprietary time-weighted average of 5-minute HRV samples during sleep — *not* RMSSD; the unit is ms but the algorithm is different. `eight_sleep_trends.avg_hrv` is undocumented by Eight Sleep. Treat each as its own variable; never average or substitute.
+- **Garmin sleep timestamps:** `garmin_sleep.sleep_start` / `sleep_end` are stored as true UTC instants (`sleepStartTimestampGMT` from the API). The previously-used `*Local` field encoded the local clock as UTC, shifting timestamps by ~4-5h.
 
 ## Environment Variables
 

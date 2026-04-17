@@ -1,0 +1,27 @@
+# Pinned dependency snapshot for hrv_analysis.py / hrv_predict.py.
+# Generated 2026-04-16 (post Tier-1+2 audit fixes). Use with:
+#   pip install -r requirements-analysis.lock
+# Audit finding 4#39: requirements-analysis.txt only constrains lower bounds
+# (e.g. statsmodels>=0.14), so silent breakage from upstream releases is
+# possible. This lock captures the verified-working set.
+
+# Core data + ML
+pandas==3.0.2
+numpy==2.4.4
+scipy==1.17.1
+scikit-learn==1.8.0
+xgboost==3.2.0
+statsmodels==0.14.6
+shap==0.51.0
+pingouin==0.6.1
+optuna==4.8.0
+prophet==1.3.0
+
+# Plotting
+matplotlib==3.10.8
+seaborn==0.13.2
+
+# Supabase / IO
+supabase==2.19.0
+httpx==0.28.1
+python-dotenv  # any
