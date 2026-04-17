@@ -18,6 +18,12 @@ export interface SourceStatus {
   errorMessage: string | null;
 }
 
+export interface DriftAlert {
+  id: string | null;
+  raisedAt: string;
+  message: string;
+}
+
 export interface StatusResponse {
   sources: Record<string, SourceStatus>;
   recentHistory: Array<{
@@ -29,6 +35,7 @@ export interface StatusResponse {
     duration_seconds: number | null;
     error_message: string | null;
   }>;
+  driftAlerts: DriftAlert[];
   fetchedAt: string;
 }
 
@@ -62,8 +69,9 @@ export async function GET() {
 
     if (syncErr) throw syncErr;
 
-    // Fetch latest data dates per source in parallel
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes] = await Promise.all([
+    // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
+    const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, driftRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -71,6 +79,13 @@ export async function GET() {
       supabase.from("habit_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
       supabase.from("myfitnesspal_nutrition").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("hrv_predictions").select("prediction_date").eq("model", "xgboost").eq("horizon_days", 1).not("model_version", "like", "backtest%").order("prediction_date", { ascending: false }).limit(1),
+      supabase
+        .from("sync_log")
+        .select("id, created_at, sync_start, error_message, source, data_type")
+        .eq("data_type", "drift_alert")
+        .gte("created_at", sevenDaysAgo)
+        .order("created_at", { ascending: false })
+        .limit(10),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -187,7 +202,13 @@ export async function GET() {
       error_message: r.error_message,
     }));
 
-    return NextResponse.json({ sources, recentHistory, fetchedAt: new Date().toISOString() } satisfies StatusResponse);
+    const driftAlerts: DriftAlert[] = (driftRes.data ?? []).map((r) => ({
+      id: (r.id as string | null) ?? null,
+      raisedAt: (r.created_at as string) ?? (r.sync_start as string) ?? new Date().toISOString(),
+      message: (r.error_message as string) ?? "HRV model drift detected",
+    }));
+
+    return NextResponse.json({ sources, recentHistory, driftAlerts, fetchedAt: new Date().toISOString() } satisfies StatusResponse);
   } catch (err) {
     console.error("Status API error:", err);
     return NextResponse.json({ error: "Failed to fetch status" }, { status: 500 });

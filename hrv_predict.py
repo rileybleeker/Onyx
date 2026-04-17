@@ -44,6 +44,9 @@ MODEL_VERSION = f"{date.today().isoformat()}_v1"
 
 # Drift threshold: alert if rolling 30-day MAE exceeds 1.5x backtest MAE
 DRIFT_THRESHOLD = 1.5
+# Window for "rolling" metrics. Previously the function aggregated *all* history,
+# desensitizing the metric over time. 30 days matches the function name.
+ROLLING_WINDOW_DAYS = 30
 
 
 def _clean_for_json(obj):
@@ -136,7 +139,7 @@ def get_latest_features(feat_cols: list) -> pd.DataFrame | None:
 
 def predict_tomorrow(model_bundle: dict) -> dict | None:
     """Generate tomorrow's prediction using the loaded model."""
-    from hrv_analysis import FEATURE_LABELS
+    from hrv_analysis import FEATURE_LABELS, compute_input_data_hash, TARGET
 
     model = model_bundle["model"]
     feat_cols = model_bundle["feat_cols"]
@@ -146,6 +149,15 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
     if result is None or result[0] is None:
         return None
     df, X = result
+
+    # Stamp this prediction with a hash of the input data it was derived from so
+    # backfill-driven retrains can detect when a stored row went stale.
+    try:
+        y_for_hash = pd.to_numeric(df.get(TARGET, pd.Series(dtype=float)), errors="coerce")
+        input_data_hash = compute_input_data_hash(X.fillna(0), y_for_hash.fillna(0))
+    except Exception as e:
+        log.warning(f"  input_data_hash compute failed: {e}")
+        input_data_hash = None
 
     # Predict on latest row
     latest_X = X.iloc[[-1]]
@@ -194,6 +206,7 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
         "training_window_start": model_bundle.get("model_version", "").split("_")[0],
         "training_window_end": train_end,
         "today_hrv": today_hrv,
+        "input_data_hash": input_data_hash,
     }
 
 
@@ -260,14 +273,22 @@ def backfill_actuals() -> int:
 
 
 def recompute_rolling_metrics() -> None:
-    """Recompute rolling 30-day metrics and upsert into hrv_model_metrics."""
-    log.info("Recomputing rolling metrics…")
+    """Recompute rolling N-day metrics and upsert into hrv_model_metrics.
+
+    The function name promises a rolling window; the previous implementation read
+    every historical row, which desensitized the metric as the dataset grew. We
+    now restrict to predictions whose prediction_date is within the last
+    ROLLING_WINDOW_DAYS days, so a recent regression actually moves the number.
+    """
+    log.info(f"Recomputing rolling {ROLLING_WINDOW_DAYS}-day metrics…")
     today_str = str(date.today())
+    window_start = (date.today() - timedelta(days=ROLLING_WINDOW_DAYS)).isoformat()
 
     preds = fetch_all(
         "hrv_predictions",
         select="prediction_date,model,horizon_days,predicted_hrv,actual_hrv,"
                "prediction_lower,prediction_upper",
+        filters=[("prediction_date", "gte", window_start)],
     )
     if preds.empty:
         return
@@ -288,9 +309,20 @@ def recompute_rolling_metrics() -> None:
         if len(sub) >= 5:
             mae = float(sub["abs_err"].mean())
             rmse = float(np.sqrt((sub["actual_hrv"] - sub["predicted_hrv"]).pow(2).mean()))
-            dir_changes = np.sign(np.diff(sub["actual_hrv"].values))
-            pred_changes = np.sign(np.diff(sub["predicted_hrv"].values))
-            dir_acc = float(np.mean(dir_changes == pred_changes) * 100) if len(dir_changes) > 0 else None
+            # Standard directional accuracy: did the forecast for day t, relative
+            # to *yesterday's actual*, point in the same direction as the actual
+            # change from yesterday to today? Compares pred(t) - actual(t-1)
+            # against actual(t) - actual(t-1). The previous version compared
+            # diff(predictions) vs diff(actuals), which understates accuracy when
+            # successive predictions are both close to the mean.
+            actuals = sub["actual_hrv"].values
+            preds_arr = sub["predicted_hrv"].values
+            if len(actuals) > 1:
+                actual_change = np.diff(actuals)
+                pred_change_from_prev_actual = preds_arr[1:] - actuals[:-1]
+                dir_acc = float(np.mean(np.sign(actual_change) == np.sign(pred_change_from_prev_actual)) * 100)
+            else:
+                dir_acc = None
             rows.append({
                 "eval_date": today_str,
                 "model": model_name,
@@ -306,17 +338,27 @@ def recompute_rolling_metrics() -> None:
         supa.schema("pds").from_("hrv_model_metrics").upsert(
             _clean_for_json(rows), on_conflict="eval_date,model,horizon_days"
         ).execute()
-        log.info(f"  Updated metrics for {len(rows)} models.")
+        log.info(f"  Updated metrics for {len(rows)} models (last {ROLLING_WINDOW_DAYS} days).")
 
 
 def check_drift(current_mae: float | None) -> None:
     """Compare current 30-day MAE against backtest MAE; log warning if drifting."""
     if current_mae is None:
         return
-    # Fetch backtest baseline MAE
-    baseline_rows = supa.schema("pds").from_("hrv_model_metrics").select("mae").eq(
-        "model", "xgboost"
-    ).eq("model_version", "backtest_initial").execute()
+    # Fetch backtest baseline MAE. Order by eval_date ASC + horizon_days ASC so we
+    # always anchor against the *first* recorded backtest at horizon=1, rather
+    # than whichever row happens to come back first from the unordered query.
+    baseline_rows = (
+        supa.schema("pds")
+        .from_("hrv_model_metrics")
+        .select("mae,eval_date,horizon_days")
+        .eq("model", "xgboost")
+        .eq("model_version", "backtest_initial")
+        .eq("horizon_days", 1)
+        .order("eval_date", desc=False)
+        .limit(1)
+        .execute()
+    )
     if not baseline_rows.data:
         return
     baseline_mae = float(baseline_rows.data[0].get("mae", 999))

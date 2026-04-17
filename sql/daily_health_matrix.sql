@@ -63,10 +63,12 @@ SELECT
   gs.light_sleep_seconds          AS garmin_light_sleep_sec,
   gs.rem_sleep_seconds            AS garmin_rem_sleep_sec,
   gs.awake_seconds                AS garmin_awake_sec,
-  gs.avg_hrv                      AS garmin_hrv,
   gs.avg_sleep_heart_rate         AS garmin_sleep_hr,
   gs.avg_respiration_rate         AS garmin_sleep_respiration,
   gs.avg_sleep_stress             AS garmin_sleep_stress,
+  -- NOTE: gs.avg_hrv was previously aliased here as `garmin_hrv` but is 100% NULL
+  -- across history (Garmin's sleep DTO does not populate hrvAverage in our data).
+  -- Use `garmin_hrv_last_night` (from the dedicated garmin_hrv table) below instead.
 
   -- ── Garmin HRV ───────────────────────────────────────────────────────────
   ghrv.weekly_avg_ms              AS garmin_hrv_weekly_avg,
@@ -163,11 +165,15 @@ SELECT
 
 FROM pds.garmin_daily_summary gds
 
--- Garmin Sleep: best non-nap sleep per day
+-- Garmin Sleep: best non-nap sleep per day. Filter out placeholder rows where the
+-- ETL wrote an empty record (sleep_id IS NULL) — Postgres treats NULLs as distinct
+-- in unique constraints, so hourly runs accumulated ~70 placeholders per empty day.
 LEFT JOIN LATERAL (
   SELECT *
   FROM pds.garmin_sleep gs2
-  WHERE gs2.calendar_date = gds.calendar_date AND gs2.is_nap = false
+  WHERE gs2.calendar_date = gds.calendar_date
+    AND gs2.is_nap = false
+    AND gs2.sleep_id IS NOT NULL
   ORDER BY gs2.overall_sleep_score DESC NULLS LAST
   LIMIT 1
 ) gs ON true

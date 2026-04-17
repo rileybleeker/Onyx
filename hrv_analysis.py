@@ -86,6 +86,14 @@ try:
 except ImportError:
     HAS_PINGOUIN = False
 
+try:
+    from statsmodels.stats.multitest import fdrcorrection
+    HAS_FDR = True
+except ImportError:
+    HAS_FDR = False
+
+import hashlib
+
 warnings.filterwarnings("ignore")
 
 # ---------------------------------------------------------------------------
@@ -110,6 +118,23 @@ supa = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 MODEL_VERSION = f"{date.today().isoformat()}_v1"
 TARGET = "whoop_hrv_rmssd"
+
+# Stage-1 BH-FDR threshold for promoting features to Stage 2 partial correlations.
+FDR_Q_THRESHOLD = 0.05
+
+# Computed once per run from the post-prepare_ml_data (X, y) and stamped onto every
+# row written to pds.hrv_predictions / hrv_model_metrics / hrv_analysis_results so
+# we can detect when a stored result was produced from a different snapshot of the
+# input data (backfills, revisions, schema changes).
+INPUT_DATA_HASH: str | None = None
+
+
+def compute_input_data_hash(X: pd.DataFrame, y: pd.Series) -> str:
+    """SHA-256 of the sorted feature matrix + target. Stable across pandas dtypes."""
+    payload = pd.concat([X.reset_index(drop=True), y.reset_index(drop=True).rename("__target__")], axis=1)
+    payload = payload.reindex(sorted(payload.columns), axis=1)
+    csv_bytes = payload.to_csv(index=False, float_format="%.6f").encode("utf-8")
+    return hashlib.sha256(csv_bytes).hexdigest()
 
 # ---------------------------------------------------------------------------
 # Human-readable feature labels (used in charts & stored in DB)
@@ -937,9 +962,21 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
 
     if corr_rows:
         corr_df = pd.DataFrame(corr_rows)
+        # Apply Benjamini-Hochberg FDR correction across the full candidate set.
+        # Without this, ~10 of the top-25 by raw p-value are expected false positives at alpha=0.05.
+        if HAS_FDR and len(corr_df) > 1:
+            passes, q_values = fdrcorrection(corr_df["p_value"].values, alpha=FDR_Q_THRESHOLD)
+            corr_df["q_value"] = q_values
+            corr_df["passes_fdr"] = passes
+        else:
+            corr_df["q_value"] = corr_df["p_value"]
+            corr_df["passes_fdr"] = corr_df["p_value"] < FDR_Q_THRESHOLD
+        n_survivors = int(corr_df["passes_fdr"].sum())
+        log.info(f"  BH-FDR (q<={FDR_Q_THRESHOLD}): {n_survivors}/{len(corr_df)} features survive")
         order = np.argsort(np.abs(corr_df["spearman_r"].values))[::-1]
         corr_df = corr_df.iloc[order].reset_index(drop=True)
         results["correlations"] = corr_df
+        results["n_fdr_survivors"] = n_survivors
 
     if skip:
         return results
@@ -986,12 +1023,15 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
         log.warning(f"  Top-25 chart failed: {e}")
 
     # --- Partial correlations (pingouin) ---
+    # Restrict to BH-FDR survivors so we don't waste partial-correlation power on
+    # features that already failed the multiple-comparison gate.
     if HAS_PINGOUIN:
         try:
             partial_results = []
             controls = [c for c in ["hrv_lag1", "whoop_sleep_duration_milli"]
                         if c in hrv_valid.columns]
-            top15_feats = corr_df.head(15)["feature"].tolist()
+            survivors_df = corr_df[corr_df["passes_fdr"]] if "passes_fdr" in corr_df.columns else corr_df
+            top15_feats = survivors_df.head(15)["feature"].tolist()
             for feat in top15_feats:
                 if feat in controls:
                     continue
@@ -1194,12 +1234,17 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
     rmse = float(np.sqrt(mean_squared_error(yt, yp)))
     mape = float(np.mean(np.abs((yt - yp) / np.where(yt != 0, yt, 1))) * 100)
     r2 = float(r2_score(yt, yp))
-    # Directional accuracy: did predicted direction (vs yesterday) match actual?
+    # Directional accuracy (standard definition): did the forecast for day t,
+    # relative to *yesterday's actual*, point in the same direction as the actual
+    # change from yesterday to today? `pred(t) - actual(t-1)` vs `actual(t) - actual(t-1)`.
+    # The previous version compared diffs of the prediction sequence vs. the actual
+    # sequence, which understates accuracy when consecutive predictions hover near
+    # the mean (sign(0) = 0 never matches sign(±1)).
     dir_acc = np.nan
     if len(yt) > 1:
-        actual_dir = np.sign(np.diff(yt))
-        pred_dir = np.sign(np.diff(yp))
-        dir_acc = float(np.mean(actual_dir == pred_dir) * 100)
+        actual_change = np.diff(yt)
+        pred_change_from_prev_actual = yp[1:] - yt[:-1]
+        dir_acc = float(np.mean(np.sign(actual_change) == np.sign(pred_change_from_prev_actual)) * 100)
     # CI coverage
     ci_cov = np.nan
     ci_width = np.nan
@@ -1864,6 +1909,7 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
             "model_version": MODEL_VERSION,
             "training_window_start": xgb_results.get("train_start"),
             "training_window_end": xgb_results.get("train_end"),
+            "input_data_hash": INPUT_DATA_HASH,
         })
 
     # SARIMAX 1–7 day forecasts
@@ -1882,9 +1928,11 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
                 "prediction_upper": float(hi),
                 "horizon_days": i,
                 "model_version": MODEL_VERSION,
+                "input_data_hash": INPUT_DATA_HASH,
             })
 
-    # Prophet 30-day forecast
+    # Prophet 30-day forecast — disabled in production ensemble (see Phase 7 audit:
+    # MAE 42 ms ≫ persistence 33 ms). Block remains for diagnostic re-runs only.
     if prophet_results:
         for i, (d, pred, lo, hi) in enumerate(zip(
             prophet_results.get("forecast_dates", []),
@@ -1900,6 +1948,7 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
                 "prediction_upper": float(hi),
                 "horizon_days": i,
                 "model_version": MODEL_VERSION,
+                "input_data_hash": INPUT_DATA_HASH,
             })
 
     # Backtest predictions
@@ -1920,6 +1969,7 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
                 "model_version": str(row.get("model_version", "backtest_initial")),
                 "training_window_start": str(row["training_window_start"]) if not pd.isna(row.get("training_window_start", float("nan"))) else None,
                 "training_window_end": str(row["training_window_end"]) if not pd.isna(row.get("training_window_end", float("nan"))) else None,
+                "input_data_hash": INPUT_DATA_HASH,
             })
 
     log.info(f"  Upserting {len(rows)} prediction rows…")
@@ -1930,6 +1980,8 @@ def store_metrics(eval_results: dict) -> None:
     """Upsert model metrics into pds.hrv_model_metrics."""
     rows = eval_results.get("model_metrics_rows", [])
     if rows:
+        for r in rows:
+            r.setdefault("input_data_hash", INPUT_DATA_HASH)
         log.info(f"  Upserting {len(rows)} metric rows…")
         upsert_batch("hrv_model_metrics", rows, "eval_date,model,horizon_days")
 
@@ -2001,6 +2053,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict, feature
         now_iso = datetime.now(timezone.utc).isoformat()
         for row in rows:
             row["computed_at"] = now_iso
+            row["input_data_hash"] = INPUT_DATA_HASH
 
         log.info(f"  Storing {len(rows)} analysis result rows…")
         # Upsert each row individually to avoid bulk insert dropping rows
@@ -2108,11 +2161,16 @@ def print_summary(df: pd.DataFrame, xgb_results: dict,
 # ===========================================================================
 
 def main() -> None:
+    global INPUT_DATA_HASH
+
     parser = argparse.ArgumentParser(description="Onyx HRV Deep Analysis Pipeline")
     parser.add_argument("--skip-analysis", action="store_true",
                         help="Skip statistical analysis plots")
     parser.add_argument("--skip-models", action="store_true",
                         help="Skip ML models entirely")
+    parser.add_argument("--enable-prophet", action="store_true",
+                        help="Train Prophet (disabled by default — MAE 42 ms > persistence 33 ms; "
+                             "see docs/hrv_audit_2026-04-16.md finding 7.B)")
     args = parser.parse_args()
 
     # ---------- Phase 1: Data Pipeline ----------
@@ -2120,6 +2178,16 @@ def main() -> None:
     data = load_all_data()
     df = build_feature_matrix(data)
     print_completeness(df)
+
+    # Compute the input-data hash once for the run so every Supabase write
+    # (predictions, metrics, analysis results) carries the same fingerprint.
+    try:
+        _, _, X_hash, y_hash = prepare_ml_data(df)
+        INPUT_DATA_HASH = compute_input_data_hash(X_hash, y_hash)
+        log.info(f"  input_data_hash = {INPUT_DATA_HASH[:12]}…")
+    except Exception as e:
+        log.warning(f"  input_data_hash compute failed: {e}")
+        INPUT_DATA_HASH = None
 
     # ---------- Phase 2: Statistical Analysis ----------
     log.info("=== PHASE 2: STATISTICAL ANALYSIS ===")
@@ -2139,7 +2207,11 @@ def main() -> None:
         top_features = stat_results["correlations"].head(10)["feature"].tolist()
 
     sarimax_results = train_sarimax(df, top_features)
-    prophet_results = train_prophet(df, top_features)
+    if args.enable_prophet:
+        prophet_results = train_prophet(df, top_features)
+    else:
+        log.info("  Prophet disabled (use --enable-prophet to opt in)")
+        prophet_results = {}
 
     # ---------- Phase 3.5: Evaluation ----------
     log.info("=== PHASE 3.5: EVALUATION ===")

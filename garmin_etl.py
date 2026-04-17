@@ -223,9 +223,12 @@ def sync_sleep(garmin: Garmin, sb: Client, target_date: date) -> int:
     dto = sleep["dailySleepDTO"]
     sleep_id = dto.get("id", 0)
 
-    # Parse timestamps
-    sleep_start = dto.get("sleepStartTimestampLocal")
-    sleep_end = dto.get("sleepEndTimestampLocal")
+    # Parse timestamps. Garmin returns *both* sleepStartTimestampGMT (true UTC epoch ms)
+    # and sleepStartTimestampLocal (local-clock epoch ms — wall-clock value re-encoded as
+    # if it were UTC). We must use the GMT field; the Local field decoded with tz=UTC
+    # silently shifts every stored timestamp by Riley's TZ offset (~4-5h).
+    sleep_start = dto.get("sleepStartTimestampGMT") or dto.get("sleepStartTimestampLocal")
+    sleep_end = dto.get("sleepEndTimestampGMT") or dto.get("sleepEndTimestampLocal")
 
     row = {
         "ts": date_to_ts(target_date),

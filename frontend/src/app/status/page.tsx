@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
-import type { SourceStatus, StatusResponse } from "@/app/api/status/route";
+import type { DriftAlert, SourceStatus, StatusResponse } from "@/app/api/status/route";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -213,6 +213,7 @@ export default function StatusPage() {
 
   const sources = data?.sources ?? {};
   const history = data?.recentHistory ?? [];
+  const driftAlerts: DriftAlert[] = data?.driftAlerts ?? [];
 
   // KPI calculations
   const sourceList = SOURCE_ORDER.map((k) => ({ key: k, info: sources[k] })).filter((s) => !!s.info);
@@ -250,6 +251,26 @@ export default function StatusPage() {
           Refresh
         </button>
       </div>
+
+      {/* Drift alerts banner */}
+      {driftAlerts.length > 0 && (
+        <div className="mb-6 border border-red-500/30 bg-red-500/10 rounded-[6px] p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="w-2 h-2 rounded-full bg-red-400" />
+            <p className="text-[13px] font-medium text-red-300">
+              HRV Model Drift{driftAlerts.length > 1 ? ` — ${driftAlerts.length} alerts` : ""}
+            </p>
+          </div>
+          <ul className="space-y-1.5">
+            {driftAlerts.slice(0, 5).map((a, i) => (
+              <li key={a.id ?? i} className="text-[12px] text-red-300/90 font-mono">
+                <span className="text-red-300/60 mr-2">{formatRelativeTime(a.raisedAt)}</span>
+                {a.message}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* KPI row */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
