@@ -2535,8 +2535,7 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
                 "input_data_hash": INPUT_DATA_HASH,
             })
 
-    # Prophet 30-day forecast — disabled in production ensemble (see Phase 7 audit:
-    # MAE 42 ms ≫ persistence 33 ms). Block remains for diagnostic re-runs only.
+    # Prophet 30-day forecast
     if prophet_results:
         for i, (d, pred, lo, hi) in enumerate(zip(
             prophet_results.get("forecast_dates", []),
@@ -2823,9 +2822,6 @@ def main() -> None:
                         help="Skip statistical analysis plots")
     parser.add_argument("--skip-models", action="store_true",
                         help="Skip ML models entirely")
-    parser.add_argument("--enable-prophet", action="store_true",
-                        help="Train Prophet (disabled by default — MAE 42 ms > persistence 33 ms; "
-                             "see docs/hrv_audit_2026-04-16.md finding 7.B)")
     args = parser.parse_args()
 
     # ---------- Phase 1: Data Pipeline ----------
@@ -2862,11 +2858,7 @@ def main() -> None:
         top_features = stat_results["correlations"].head(10)["feature"].tolist()
 
     sarimax_results = train_sarimax(df, top_features)
-    if args.enable_prophet:
-        prophet_results = train_prophet(df, top_features)
-    else:
-        log.info("  Prophet disabled (use --enable-prophet to opt in)")
-        prophet_results = {}
+    prophet_results = train_prophet(df, top_features)
 
     # ---------- Phase 3.5: Evaluation ----------
     log.info("=== PHASE 3.5: EVALUATION ===")

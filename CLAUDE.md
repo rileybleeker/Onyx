@@ -22,7 +22,7 @@ Onyx/
 ├── mfp_archive/             # Processed CSVs moved here
 ├── ci_token_helper.py       # Download/upload OAuth tokens for CI
 ├── hrv_analysis.py          # HRV deep analysis pipeline (Phases 1-3.5): data loading,
-│                            #   ~350-column / ~250-feature matrix, stat analysis, XGBoost/SARIMAX (Prophet opt-in),
+│                            #   ~350-column / ~250-feature matrix, stat analysis, XGBoost/SARIMAX/Prophet,
 │                            #   walk-forward backtest, stores results to Supabase
 ├── hrv_predict.py           # Daily HRV prediction: loads saved model, predicts tomorrow,
 │                            #   backfills actuals, recomputes rolling metrics, drift check
