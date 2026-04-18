@@ -20,6 +20,7 @@ import pickle
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -39,8 +40,19 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 supa = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ET is the canonical timezone for Onyx (see CLAUDE.md). Using UTC date.today()
+# on the GitHub runner would mis-tag any prediction fired between 00:00 UTC and
+# ET midnight (~04:00-05:00 UTC) — the run would predict the day-after-next
+# instead of tomorrow, silently skipping the ET day the user actually cares about.
+ET_TZ = ZoneInfo("America/New_York")
+
+
+def et_today() -> date:
+    return datetime.now(ET_TZ).date()
+
+
 MODEL_PATH = Path("analysis_output") / "xgboost_hrv_model.pkl"
-MODEL_VERSION = f"{date.today().isoformat()}_v1"
+MODEL_VERSION = f"{et_today().isoformat()}_v1"
 
 # Drift threshold: alert if rolling 30-day MAE exceeds 1.5x backtest MAE
 DRIFT_THRESHOLD = 1.5
@@ -194,7 +206,7 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
     train_end = str(df["calendar_date"].iloc[-1])
 
     return {
-        "prediction_date": str(date.today() + timedelta(days=1)),
+        "prediction_date": str(et_today() + timedelta(days=1)),
         "model": "xgboost",
         "predicted_hrv": round(pred_val, 2),
         "prediction_lower": round(lower, 2),
@@ -228,7 +240,7 @@ def backfill_actuals() -> int:
         log.info("  No predictions to backfill.")
         return 0
 
-    today = str(date.today())
+    today = str(et_today())
     past_preds = past_preds[past_preds["prediction_date"] < today]
 
     if past_preds.empty:
@@ -281,8 +293,8 @@ def recompute_rolling_metrics() -> None:
     ROLLING_WINDOW_DAYS days, so a recent regression actually moves the number.
     """
     log.info(f"Recomputing rolling {ROLLING_WINDOW_DAYS}-day metrics…")
-    today_str = str(date.today())
-    window_start = (date.today() - timedelta(days=ROLLING_WINDOW_DAYS)).isoformat()
+    today_str = str(et_today())
+    window_start = (et_today() - timedelta(days=ROLLING_WINDOW_DAYS)).isoformat()
 
     preds = fetch_all(
         "hrv_predictions",
