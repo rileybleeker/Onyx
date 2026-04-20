@@ -122,6 +122,7 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
 - Sync operations logged to `pds.sync_log`
 - `whoop_journal` data is boolean-only (Yes/No) — WHOOP's CSV export does not include quantity values entered in the app (e.g., "3 drinks", "200mg caffeine"). This is a WHOOP platform limitation.
 - HRV analysis tables: `hrv_predictions` (model forecasts + actuals), `hrv_model_metrics` (rolling eval), `hrv_analysis_results` (correlations, journal impact, model comparison as JSON)
+- `pds.hrv_predictions_latest` view — DISTINCT ON (prediction_date, model, horizon_days) returning freshest row per forecast, excludes backtest. **All UI/analytics reads should go through the view**; the raw table accumulates multiple runs per day and generic fetches hit row limits fast. DDL in `sql/hrv_predictions_latest.sql`.
 - `supabase-py` schema access: always use `supa.schema("pds").from_(table)` — NOT `supa.table()` which defaults to `public`
 - `whoop_workouts` has no `cycle_id` column; use `workout_id` + derive `calendar_date` from `start_time` via ET-of-start (see TZ convention below)
 - **Timezone convention: `America/New_York` (ET) is canonical for all calendar_date joins.** Raw timestamps are stored as true UTC instants (WHOOP `start_time`, WHOOP `measured_at`, Garmin `sleepStartTimestampGMT`). Date-only columns (MFP, Eight Sleep, WHOOP journal, habits) are already ET-aligned. Derived calendar_dates follow these rules in `daily_health_matrix`:

@@ -17,24 +17,58 @@ const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospa
 
 // ---------------------------------------------------------------------------
 // Data fetching
+//
+// All forecast queries read from pds.hrv_predictions_latest — a DISTINCT ON
+// view that returns one row per (prediction_date, model, horizon_days), always
+// the freshest and excluding backtest rows. Readers do not reason about
+// run-history or model_version freshness.
 // ---------------------------------------------------------------------------
-async function getHrvPredictions() {
-  const since = new Date();
-  since.setDate(since.getDate() - 7);
-  const { data } = await supabase
-    .from("hrv_predictions")
-    .select("prediction_date,model,predicted_hrv,prediction_lower,prediction_upper,actual_hrv,residual,horizon_days,top_drivers,model_version")
-    .in("model", ["xgboost", "prophet", "sarimax"])
-    .order("prediction_date", { ascending: false })
-    .limit(120);
-  return data ?? [];
+
+// ET tomorrow as YYYY-MM-DD. ET is canonical for all calendar_date joins in
+// this pipeline; browser-local would drift for users outside ET.
+function etTomorrowStr(): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date());
+  const y = parts.find(p => p.type === "year")!.value;
+  const m = parts.find(p => p.type === "month")!.value;
+  const d = parts.find(p => p.type === "day")!.value;
+  const t = new Date(`${y}-${m}-${d}T00:00:00Z`);
+  t.setUTCDate(t.getUTCDate() + 1);
+  return t.toISOString().split("T")[0];
+}
+
+async function getTomorrowPrediction() {
+  const tomorrow = etTomorrowStr();
+  const cols = "prediction_date,model,predicted_hrv,prediction_lower,prediction_upper,actual_hrv,horizon_days,top_drivers,model_version";
+  const primary = await supabase
+    .from("hrv_predictions_latest")
+    .select(cols)
+    .eq("model", "xgboost")
+    .eq("horizon_days", 1)
+    .eq("prediction_date", tomorrow)
+    .is("actual_hrv", null)
+    .limit(1);
+  if (primary.data?.[0]) return primary.data[0];
+  // Fallback: earliest unscored XGBoost h=1 on or after ET tomorrow.
+  const fb = await supabase
+    .from("hrv_predictions_latest")
+    .select(cols)
+    .eq("model", "xgboost")
+    .eq("horizon_days", 1)
+    .gte("prediction_date", tomorrow)
+    .is("actual_hrv", null)
+    .order("prediction_date", { ascending: true })
+    .limit(1);
+  return fb.data?.[0] ?? null;
 }
 
 async function getHrvPredictionAccuracy() {
   const since = new Date();
   since.setDate(since.getDate() - 60);
   const { data } = await supabase
-    .from("hrv_predictions")
+    .from("hrv_predictions_latest")
     .select("prediction_date,model,predicted_hrv,actual_hrv,residual,prediction_lower,prediction_upper")
     .eq("model", "xgboost")
     .eq("horizon_days", 1)
@@ -77,7 +111,7 @@ async function getHistoricalHrv(days = 180) {
 
 async function getHrvResiduals() {
   const { data } = await supabase
-    .from("hrv_predictions")
+    .from("hrv_predictions_latest")
     .select("prediction_date,model,predicted_hrv,actual_hrv,residual")
     .in("model", ["xgboost", "baseline_naive", "baseline_7d_avg"])
     .not("residual", "is", null)
@@ -89,11 +123,10 @@ async function getHrvResiduals() {
 async function getProphetForecast() {
   const today = new Date().toISOString().split("T")[0];
   const { data } = await supabase
-    .from("hrv_predictions")
+    .from("hrv_predictions_latest")
     .select("prediction_date,predicted_hrv,prediction_lower,prediction_upper,actual_hrv")
     .eq("model", "prophet")
     .gte("prediction_date", today)
-    .eq("model_version", await getLatestModelVersion())
     .order("prediction_date", { ascending: true })
     .limit(30);
   return data ?? [];
@@ -102,25 +135,13 @@ async function getProphetForecast() {
 async function getSarimaxForecast() {
   const today = new Date().toISOString().split("T")[0];
   const { data } = await supabase
-    .from("hrv_predictions")
+    .from("hrv_predictions_latest")
     .select("prediction_date,predicted_hrv,prediction_lower,prediction_upper")
     .eq("model", "sarimax")
     .gte("prediction_date", today)
     .order("prediction_date", { ascending: true })
     .limit(7);
   return data ?? [];
-}
-
-async function getLatestModelVersion(): Promise<string> {
-  const { data } = await supabase
-    .from("hrv_predictions")
-    .select("model_version")
-    .eq("model", "prophet")
-    .not("model_version", "is", null)
-    .not("model_version", "like", "backtest%")
-    .order("created_at", { ascending: false })
-    .limit(1);
-  return data?.[0]?.model_version ?? "";
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +178,7 @@ const HrvDot = (props: any) => {
 // ---------------------------------------------------------------------------
 export default function HrvAnalysisPage() {
   const [loading, setLoading] = useState(true);
-  const [predictions, setPredictions] = useState<any[]>([]);
+  const [tomorrowPred, setTomorrowPred] = useState<any | null>(null);
   const [accuracy, setAccuracy] = useState<any[]>([]);
   const [metrics, setMetrics] = useState<any[]>([]);
   const [historicalHrv, setHistoricalHrv] = useState<any[]>([]);
@@ -175,7 +196,7 @@ export default function HrvAnalysisPage() {
 
   useEffect(() => {
     Promise.all([
-      getHrvPredictions(),
+      getTomorrowPrediction(),
       getHrvPredictionAccuracy(),
       getHrvModelMetrics(),
       getHistoricalHrv(180),
@@ -188,8 +209,8 @@ export default function HrvAnalysisPage() {
       getHrvAnalysisResults("feature_importance", "shap_journal"),
       getSarimaxForecast(),
       getWorkoutSleepGap(90),
-    ]).then(([preds, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap]) => {
-      setPredictions(preds);
+    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap]) => {
+      setTomorrowPred(tomorrow);
       setAccuracy(acc);
       setMetrics(m);
       setHistoricalHrv(hist);
@@ -218,23 +239,6 @@ export default function HrvAnalysisPage() {
   // ---------------------------------------------------------------------------
   // Derived state
   // ---------------------------------------------------------------------------
-  // "Tomorrow" is the user's LOCAL tomorrow, not UTC. CI runs in UTC, so during
-  // CDT evenings a CI-written row can sit a day ahead of local tomorrow — we
-  // filter it out so the card matches what the CLI says when run locally.
-  const localTomorrowStr = (() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 1);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  })();
-  const xgbFutureCandidates = predictions.filter(p =>
-    p.model === "xgboost" && p.horizon_days === 1 &&
-    !p.model_version?.startsWith("backtest") && !p.actual_hrv);
-  const tomorrowPred =
-    xgbFutureCandidates.find(p => p.prediction_date === localTomorrowStr) ??
-    // Fallback: earliest unscored future prediction ≥ local tomorrow.
-    xgbFutureCandidates
-      .filter(p => p.prediction_date >= localTomorrowStr)
-      .sort((a, b) => a.prediction_date.localeCompare(b.prediction_date))[0];
   const todayActualHrv = historicalHrv.length ? Number(historicalHrv[historicalHrv.length - 1]?.whoop_hrv_rmssd) : null;
   const xgbMetrics = metrics.filter(m => m.model === "xgboost").sort((a, b) =>
     new Date(b.eval_date).getTime() - new Date(a.eval_date).getTime())[0];
