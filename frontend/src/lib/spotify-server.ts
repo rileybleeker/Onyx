@@ -193,16 +193,10 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
 
   const accessToken = await getSpotifyAccessToken();
 
-  // 1. Get current user
-  const meResp = await spotifyFetch(`/me`, { accessToken });
-  if (!meResp.ok) {
-    throw new Error(`Spotify /me failed (${meResp.status}): ${await meResp.text()}`);
-  }
-  const me = await meResp.json();
-  const userId = me.id as string;
-
-  // 2. Create the playlist
-  const createResp = await spotifyFetch(`/users/${userId}/playlists`, {
+  // 1. Create the playlist for the current user.
+  //    Spotify's Feb 2026 migration removed POST /users/{user_id}/playlists;
+  //    use POST /me/playlists instead (creates under the authorized user).
+  const createResp = await spotifyFetch(`/me/playlists`, {
     accessToken,
     method: "POST",
     body: JSON.stringify({
@@ -218,11 +212,12 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
   const playlistId = playlist.id as string;
   const spotifyUrl = (playlist.external_urls?.spotify as string) ?? `https://open.spotify.com/playlist/${playlistId}`;
 
-  // 3. Add tracks in chunks of 100
+  // 2. Add tracks in chunks of 100.
+  //    Feb 2026 migration: /playlists/{id}/tracks → /playlists/{id}/items
   const uris = trackIds.map((id) => `spotify:track:${id}`);
   for (let i = 0; i < uris.length; i += 100) {
     const batch = uris.slice(i, i + 100);
-    const addResp = await spotifyFetch(`/playlists/${playlistId}/tracks`, {
+    const addResp = await spotifyFetch(`/playlists/${playlistId}/items`, {
       accessToken,
       method: "POST",
       body: JSON.stringify({ uris: batch }),
