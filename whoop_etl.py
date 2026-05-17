@@ -548,7 +548,7 @@ def main():
     # Refresh materialized views
     log.info("Refreshing materialized views...")
     try:
-        sb.rpc("refresh_materialized_views", {}).execute()
+        sb.schema("pds").rpc("refresh_materialized_views").execute()
         log.info("  Materialized views refreshed")
     except Exception as e:
         log.warning(f"  Materialized view refresh failed: {e}")

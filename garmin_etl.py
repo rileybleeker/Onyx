@@ -286,14 +286,16 @@ def sync_sleep(garmin: Garmin, sb: Client, target_date: date) -> int:
         "light_sleep_seconds": dto.get("lightSleepSeconds"),
         "rem_sleep_seconds": dto.get("remSleepSeconds"),
         "awake_seconds": dto.get("awakeSleepSeconds"),
-        "overall_sleep_score": safe_get(sleep, "sleepScores", "overall", "value"),
-        "quality_score": safe_get(sleep, "sleepScores", "quality", "qualifierKey"),
-        "duration_score": safe_get(sleep, "sleepScores", "duration", "value"),
-        "recovery_score": safe_get(sleep, "sleepScores", "recovery", "value"),
-        "rem_score": safe_get(sleep, "sleepScores", "rem", "value"),
-        "light_score": safe_get(sleep, "sleepScores", "light", "value"),
-        "deep_score": safe_get(sleep, "sleepScores", "deep", "value"),
-        "restlessness_score": safe_get(sleep, "sleepScores", "restlessness", "value"),
+        # sleepScores lives inside dailySleepDTO (dto), NOT at the top of the
+        # response. Previous code read from `sleep` and got NULL on every row.
+        "overall_sleep_score": safe_get(dto, "sleepScores", "overall", "value"),
+        "quality_score": safe_get(dto, "sleepScores", "quality", "qualifierKey"),
+        "duration_score": safe_get(dto, "sleepScores", "duration", "value"),
+        "recovery_score": safe_get(dto, "sleepScores", "recovery", "value"),
+        "rem_score": safe_get(dto, "sleepScores", "rem", "value"),
+        "light_score": safe_get(dto, "sleepScores", "light", "value"),
+        "deep_score": safe_get(dto, "sleepScores", "deep", "value"),
+        "restlessness_score": safe_get(dto, "sleepScores", "restlessness", "value"),
         "avg_sleep_heart_rate": dto.get("averageHeartRate"),
         "avg_respiration_rate": dto.get("averageRespirationValue"),
         "avg_spo2": dto.get("averageSpO2Value"),
@@ -839,7 +841,7 @@ def main():
     # Refresh materialized views
     log.info("Refreshing materialized views...")
     try:
-        sb.rpc("refresh_materialized_views", {}).execute()
+        sb.schema("pds").rpc("refresh_materialized_views").execute()
         log.info("  Materialized views refreshed")
     except Exception as e:
         log.warning(f"  Materialized view refresh failed: {e}")
