@@ -16,6 +16,9 @@ env:
 
 jobs:
   garmin-etl:
+    # Temporarily disabled: Garmin SSO rate-limiting CI IPs (HTTP 403 / CAPTCHA_REQUIRED).
+    # Re-enable by removing the `if: false` line below once auth is unstuck.
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
