@@ -8,7 +8,7 @@ visualized via a Next.js frontend with AI-powered analysis through Claude.
 
 ```
 Onyx/
-├── garmin_etl.py            # Garmin Connect → Supabase (9 tables)
+├── garmin_etl.py            # Garmin Connect → Supabase (8 tables)
 ├── whoop_etl.py             # WHOOP API v2 → Supabase (5 tables)
 ├── whoop_journal_import.py  # WHOOP Journal CSV export → Supabase
 ├── whoop_journal_email.py   # IMAP monitor: auto-downloads WHOOP export → Supabase
@@ -63,7 +63,7 @@ Onyx/
 ## Tech Stack
 
 - **ETL**: Python 3, httpx, garminconnect, supabase-py, python-dotenv
-- **Database**: Supabase (Postgres 17), schema `pds`, 20 tables + `journal` unified view + 3 HRV analysis tables (`hrv_predictions`, `hrv_model_metrics`, `hrv_analysis_results`) + Spotify (`spotify_plays`, `spotify_tracks`, `spotify_playlists`, `spotify_daily_signature` view)
+- **Database**: Supabase (Postgres 17), schema `pds`, 19 tables + `journal` unified view + 3 HRV analysis tables (`hrv_predictions`, `hrv_model_metrics`, `hrv_analysis_results`) + Spotify (`spotify_plays`, `spotify_tracks`, `spotify_playlists`, `spotify_daily_signature` view)
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
 - **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 17 tools (11 query + mark_habit_complete + query_journal + query_eight_sleep + search_spotify_catalog + query_spotify_tracks_by_features + create_spotify_playlist). Habit completion via chat syncs to both Supabase and Notion. Playlist creation goes via `lib/spotify-server.ts` which refreshes the access token on every call against `pds.ci_tokens` and writes any rotated refresh token back so the Python ETL stays in sync.
 - **System Status**: `/status` page — 7 source cards (Garmin, WHOOP, Eight Sleep, WHOOP Journal, Habits, MyFitnessPal, Spotify), KPI summary, 20-entry sync history. `GET /api/status` queries `pds.sync_log` by `(source, data_type)` key + `MAX()` date per data table. Auto-refreshes every 60s.

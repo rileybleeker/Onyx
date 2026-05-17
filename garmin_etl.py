@@ -703,43 +703,6 @@ def backfill_laps(garmin: Garmin, sb: Client) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Sync: Body Composition
-# ---------------------------------------------------------------------------
-
-def sync_body_composition(garmin: Garmin, sb: Client, target_date: date) -> int:
-    """Sync one day of body composition data."""
-    ds = target_date.isoformat()
-    try:
-        bc = garmin.get_body_composition(ds)
-    except Exception as e:
-        log.debug(f"  body_composition {ds}: no data ({e})")
-        return 0
-
-    if not bc or not bc.get("totalAverage"):
-        return 0
-
-    avg = bc["totalAverage"]
-    row = {
-        "ts": date_to_ts(target_date),
-        "weight_grams": avg.get("weight"),
-        "bmi": avg.get("bmi"),
-        "body_fat_pct": avg.get("bodyFat"),
-        "body_water_pct": avg.get("bodyWater"),
-        "bone_mass_grams": avg.get("boneMass"),
-        "muscle_mass_grams": avg.get("muscleMass"),
-        "visceral_fat": avg.get("visceralFat"),
-        "physique_rating": avg.get("physiqueRating"),
-        "metabolic_age": avg.get("metabolicAge"),
-        "basal_met_rate": avg.get("basalMet"),
-        "source_type": avg.get("sourceType"),
-        "calendar_date": ds,
-        "raw_json": json.dumps(bc),
-    }
-
-    return upsert_to_supabase(sb, "garmin_body_composition", [row], "ts")
-
-
-# ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
@@ -752,7 +715,6 @@ def sync_date(garmin: Garmin, sb: Client, target_date: date) -> dict:
         "hrv": sync_hrv,
         "stress": sync_stress,
         "training_status": sync_training_status,
-        "body_composition": sync_body_composition,
     }
     counts = {}
     for name, func in syncs.items():

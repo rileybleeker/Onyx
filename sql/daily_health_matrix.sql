@@ -8,7 +8,7 @@
 --
 -- Sources included:
 --   Garmin  : daily_summary, sleep, hrv, heart_rate (zones), training_status,
---             activities (aggregated), body_composition (LVCF)
+--             activities (aggregated)
 --   WHOOP   : cycles (avg/max HR), recovery, sleep, workouts (aggregated)
 --   Eight Sleep : trends (left side)
 --   MyFitnessPal: nutrition
@@ -121,17 +121,6 @@ SELECT
   acts.activity_max_hr            AS garmin_activity_max_hr,
   acts.activity_avg_hr            AS garmin_activity_avg_hr,
 
-  -- ── Garmin Body Composition (most recent on or before date) ──────────────
-  -- Last-value-carried-forward: fills days without a weigh-in
-  gbc.weight_kg,
-  gbc.bmi,
-  gbc.body_fat_pct,
-  gbc.body_water_pct,
-  gbc.muscle_mass_grams,
-  gbc.bone_mass_grams,
-  gbc.visceral_fat,
-  gbc.metabolic_age,
-
   -- ── WHOOP Cycles ─────────────────────────────────────────────────────────
   wc.strain                       AS whoop_day_strain,
   wc.kilojoule                    AS whoop_kilojoule,
@@ -230,15 +219,6 @@ LEFT JOIN LATERAL (
   FROM pds.garmin_activities ga
   WHERE ga.start_time_local::date = gds.calendar_date
 ) acts ON true
-
--- Garmin Body Composition: last known measurement on or before this date (LVCF)
-LEFT JOIN LATERAL (
-  SELECT *
-  FROM pds.garmin_body_composition gbc2
-  WHERE gbc2.calendar_date <= gds.calendar_date
-  ORDER BY gbc2.calendar_date DESC
-  LIMIT 1
-) gbc ON true
 
 -- WHOOP Cycles — tag each cycle to its "wake day" ET date.
 -- WHOOP cycles run bedtime-to-bedtime, so start_time is the previous evening.

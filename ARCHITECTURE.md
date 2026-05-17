@@ -125,7 +125,6 @@ Onyx/
 | `garmin_training_status` | Readiness score, contributing factors |
 | `garmin_activities` | Type, distance, duration, HR zones, VO2 max |
 | `garmin_activity_laps` | Lap-level splits |
-| `garmin_body_composition` | Weight, BMI, body fat %, muscle mass |
 
 **Auth**: Email/password + saved token refresh via `garminconnect` library.
 
