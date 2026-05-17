@@ -22,6 +22,7 @@ Onyx/
 ├── mfp_archive/             # Processed CSVs moved here
 ├── spotify_etl.py           # Spotify recently-played → Supabase (plays + tracks)
 ├── spotify_schema.sql       # Spotify table DDL + spotify_daily_signature view
+├── spotify_playlists_schema.sql  # Spotify playlists audit table DDL
 ├── ci_token_helper.py       # Download/upload OAuth tokens for CI
 ├── hrv_analysis.py          # HRV deep analysis pipeline (Phases 1-3.5): data loading,
 │                            #   ~350-column / ~250-feature matrix, stat analysis, XGBoost/SARIMAX/Prophet,
@@ -62,9 +63,9 @@ Onyx/
 ## Tech Stack
 
 - **ETL**: Python 3, httpx, garminconnect, supabase-py, python-dotenv
-- **Database**: Supabase (Postgres 17), schema `pds`, 19 tables + `journal` unified view + 3 HRV analysis tables (`hrv_predictions`, `hrv_model_metrics`, `hrv_analysis_results`) + Spotify (`spotify_plays`, `spotify_tracks`, `spotify_daily_signature` view)
+- **Database**: Supabase (Postgres 17), schema `pds`, 20 tables + `journal` unified view + 3 HRV analysis tables (`hrv_predictions`, `hrv_model_metrics`, `hrv_analysis_results`) + Spotify (`spotify_plays`, `spotify_tracks`, `spotify_playlists`, `spotify_daily_signature` view)
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
-- **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 14 tools (11 query + mark_habit_complete + query_journal + query_eight_sleep). Habit completion via chat syncs to both Supabase and Notion.
+- **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 17 tools (11 query + mark_habit_complete + query_journal + query_eight_sleep + search_spotify_catalog + query_spotify_tracks_by_features + create_spotify_playlist). Habit completion via chat syncs to both Supabase and Notion. Playlist creation goes via `lib/spotify-server.ts` which refreshes the access token on every call against `pds.ci_tokens` and writes any rotated refresh token back so the Python ETL stays in sync.
 - **System Status**: `/status` page — 7 source cards (Garmin, WHOOP, Eight Sleep, WHOOP Journal, Habits, MyFitnessPal, Spotify), KPI summary, 20-entry sync history. `GET /api/status` queries `pds.sync_log` by `(source, data_type)` key + `MAX()` date per data table. Auto-refreshes every 60s.
 - **Auth**: Supabase Auth — email + password (primary) with magic link fallback. RLS on all tables. `/account` page exposes `supabase.auth.updateUser({ password })` for self-service password changes.
 - **Hosting**: Vercel (frontend), Supabase Cloud (database)
@@ -143,6 +144,8 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
 - **Garmin sleep timestamps:** `garmin_sleep.sleep_start` / `sleep_end` are stored as true UTC instants (`sleepStartTimestampGMT` from the API). The previously-used `*Local` field encoded the local clock as UTC, shifting timestamps by ~4-5h.
 - **Spotify tables are isolated from health data by design.** `spotify_plays` + `spotify_tracks` are NOT joined into `daily_health_matrix`. Listening behavior stands on its own; any health correlation happens at view/query time only. `spotify_daily_signature` is a per-ET-date aggregate view (play counts, unique tracks/artists, mean audio features) — frontend reads go through it where possible. PK on `spotify_plays` is `(played_at, track_id)` for idempotent upserts. `played_date_et` is a stored generated column matching the ET-canonical TZ convention.
 - **Spotify audio features come from ReccoBeats, not Spotify.** Spotify deprecated `/v1/audio-features` for apps registered after 2024-11-27 (this app is post-cutoff). `spotify_tracks.features_source` records provenance (`'reccobeats'` or null when unresolved). The `spotify_daily_signature` view only computes feature means over plays with non-null valence so partial coverage doesn't bias the signal.
+- **Spotify OAuth scope is `user-read-recently-played playlist-modify-private`** — both ingestion (ETL) and write (playlist creation from chat or `/spotify` button) use the same refresh token in `pds.ci_tokens`. If the scope changes, re-run `python spotify_etl.py --auth` then `python ci_token_helper.py upload spotify`; old refresh tokens still work but only carry their original scope claim. The Next.js client (`lib/spotify-server.ts`) writes any rotated refresh token back to `ci_tokens` so the Python ETL stays in sync (rare race: last-write-wins, acceptable for personal scale).
+- **`pds.spotify_playlists`** logs every playlist Onyx creates (one row per `playlist_id`) with `track_ids` JSONB, `created_via` (`'chat'` | `'button'`), and the originating `prompt` if from chat. Audit + UI history. Not joined to other tables.
 
 ## Environment Variables
 

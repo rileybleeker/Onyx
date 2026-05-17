@@ -502,10 +502,11 @@ export async function getSpotifyTopTracks(days: number = 30, limit: number = 10)
     .select("track_id,track_name,artist_name,duration_ms")
     .gte("played_date_et", since);
   if (error) throw error;
-  const agg = new Map<string, { name: string; artist: string; plays: number; minutes: number }>();
+  const agg = new Map<string, { track_id: string; name: string; artist: string; plays: number; minutes: number }>();
   for (const r of data ?? []) {
     if (!r.track_id) continue;
     const entry = agg.get(r.track_id) ?? {
+      track_id: r.track_id,
       name: r.track_name ?? "—",
       artist: r.artist_name ?? "—",
       plays: 0,

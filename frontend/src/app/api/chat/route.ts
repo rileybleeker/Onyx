@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
+import { searchTracks, createPlaylist } from "@/lib/spotify-server";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
@@ -15,6 +16,12 @@ const SYSTEM_PROMPT = `You are Onyx, a personal data scientist assistant. You he
 You have access to the user's data via function calls. When the user asks about their health metrics, use the appropriate function to fetch real data before answering. You can call multiple tools to cross-reference data across devices. Be concise and insightful — highlight trends, anomalies, and actionable takeaways.
 
 When the user mentions completing a habit (e.g., "I meditated today", "I took my vitamins"), use mark_habit_complete to log it. The habit name should match what's defined in their habits list. Use query_journal to see both WHOOP journal behaviors and habit completions together.
+
+You can also create Spotify playlists. The user has private-playlist write access enabled. When asked to make a playlist:
+- Use query_spotify_tracks_by_features to pick tracks from their listening history (filter by audio-feature ranges like valence, energy, tempo).
+- Use search_spotify_catalog when they want tracks they haven't listened to before, or when filling out a playlist beyond what their history covers.
+- Once you have track IDs (mix sources freely), call create_spotify_playlist directly — playlists are private and easily deleted, so don't ask for confirmation.
+- Default to ~25–40 tracks unless the user specifies otherwise. Give the playlist a descriptive name that reflects the user's request.
 
 Format numbers clearly. Use relative comparisons (e.g., "your HRV is 15% above your weekly average"). When comparing across devices, note any discrepancies. When you don't have enough data, say so.`;
 
@@ -179,6 +186,50 @@ const tools: Anthropic.Tool[] = [
       required: [],
     },
   },
+  {
+    name: "search_spotify_catalog",
+    description: "Search Spotify's full catalog for tracks (not just the user's listening history). Use this when the user wants tracks they haven't played before, or to fill out a playlist beyond what their history covers. Returns track ID, name, artists, album, duration, and popularity. Query syntax supports filters like 'genre:ambient', 'year:2020-2024', 'artist:Tycho'.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        query: { type: "string", description: "Spotify search query (supports field filters: artist:, album:, genre:, year:, etc.)" },
+        limit: { type: "number", description: "Max tracks to return (default 20, max 50)" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "query_spotify_tracks_by_features",
+    description: "Query the user's listening-history track library by audio features (valence, energy, danceability, tempo). Use this to curate playlists from tracks they already know. Audio features are normalized 0–1 except tempo (BPM, ~50–200). Only returns tracks with audio features attached (~78% of plays).",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        min_valence: { type: "number", description: "Minimum valence 0–1 (positivity)" },
+        max_valence: { type: "number", description: "Maximum valence 0–1" },
+        min_energy: { type: "number", description: "Minimum energy 0–1" },
+        max_energy: { type: "number", description: "Maximum energy 0–1" },
+        min_danceability: { type: "number", description: "Minimum danceability 0–1" },
+        max_danceability: { type: "number", description: "Maximum danceability 0–1" },
+        min_tempo: { type: "number", description: "Minimum tempo in BPM" },
+        max_tempo: { type: "number", description: "Maximum tempo in BPM" },
+        limit: { type: "number", description: "Max tracks to return (default 50, max 200)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "create_spotify_playlist",
+    description: "Create a private Spotify playlist with the given tracks. Playlists are added to the user's Spotify account and a link is returned. Always private — do not ask for confirmation, just create it (easy to delete in Spotify if not wanted).",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        name: { type: "string", description: "Playlist name (e.g., 'Onyx — High-energy workout')" },
+        description: { type: "string", description: "Optional playlist description shown in Spotify" },
+        track_ids: { type: "array", items: { type: "string" }, description: "Ordered array of Spotify track IDs (just the ID portion, not full URIs)" },
+      },
+      required: ["name", "track_ids"],
+    },
+  },
 ];
 
 function stripRawFields(rows: Record<string, unknown>[]): Record<string, unknown>[] {
@@ -213,6 +264,84 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     query_whoop_sleep: { table: "whoop_sleep", timeCol: "start_time", extra: { is_nap: false, score_state: "SCORED" } },
     query_whoop_workouts: { table: "whoop_workouts", timeCol: "start_time" },
   };
+
+  // Spotify: search the full catalog
+  if (name === "search_spotify_catalog") {
+    try {
+      const query = (input.query as string) ?? "";
+      const limit = (input.limit as number) ?? 20;
+      const tracks = await searchTracks(query, limit);
+      return JSON.stringify(tracks);
+    } catch (e) {
+      return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  // Spotify: query the user's track library by audio-feature ranges
+  if (name === "query_spotify_tracks_by_features") {
+    const limit = Math.min((input.limit as number) ?? 50, 200);
+    let q = supabase
+      .from("spotify_tracks")
+      .select("track_id,name,artists,album,valence,energy,danceability,tempo,duration_ms")
+      .not("features_source", "is", null)
+      .limit(limit);
+    const pairs: Array<[string, string, unknown]> = [
+      ["min_valence", "gte", input.min_valence],
+      ["max_valence", "lte", input.max_valence],
+      ["min_energy", "gte", input.min_energy],
+      ["max_energy", "lte", input.max_energy],
+      ["min_danceability", "gte", input.min_danceability],
+      ["max_danceability", "lte", input.max_danceability],
+      ["min_tempo", "gte", input.min_tempo],
+      ["max_tempo", "lte", input.max_tempo],
+    ];
+    const colMap: Record<string, string> = {
+      min_valence: "valence", max_valence: "valence",
+      min_energy: "energy", max_energy: "energy",
+      min_danceability: "danceability", max_danceability: "danceability",
+      min_tempo: "tempo", max_tempo: "tempo",
+    };
+    for (const [key, op, val] of pairs) {
+      if (typeof val !== "number") continue;
+      const col = colMap[key];
+      if (op === "gte") q = q.gte(col, val);
+      else q = q.lte(col, val);
+    }
+    const { data, error } = await q;
+    if (error) return JSON.stringify({ error: error.message });
+    // Flatten artists JSONB to a readable string for Claude
+    const out = (data ?? []).map((r) => ({
+      track_id: r.track_id,
+      name: r.name,
+      artists: Array.isArray(r.artists)
+        ? r.artists.map((a: { name?: string }) => a?.name).filter(Boolean).join(", ")
+        : null,
+      album: (r.album as { name?: string } | null)?.name ?? null,
+      valence: r.valence,
+      energy: r.energy,
+      danceability: r.danceability,
+      tempo: r.tempo,
+      duration_ms: r.duration_ms,
+    }));
+    return JSON.stringify(out);
+  }
+
+  // Spotify: create a private playlist
+  if (name === "create_spotify_playlist") {
+    try {
+      const trackIds = input.track_ids as string[];
+      const result = await createPlaylist({
+        name: input.name as string,
+        description: input.description as string | undefined,
+        trackIds,
+        isPublic: false,
+        createdVia: "chat",
+      });
+      return JSON.stringify(result);
+    } catch (e) {
+      return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+    }
+  }
 
   // Handle whoop journal (special: calendar_date + optional filters)
   if (name === "query_whoop_journal") {
