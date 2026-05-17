@@ -20,6 +20,8 @@ Onyx/
 ├── myfitnesspal_email.py    # IMAP monitor: auto-imports MFP CSV export emails
 ├── mfp_inbox/               # Drop MFP nutrition CSVs here for auto-import
 ├── mfp_archive/             # Processed CSVs moved here
+├── spotify_etl.py           # Spotify recently-played → Supabase (plays + tracks)
+├── spotify_schema.sql       # Spotify table DDL + spotify_daily_signature view
 ├── ci_token_helper.py       # Download/upload OAuth tokens for CI
 ├── hrv_analysis.py          # HRV deep analysis pipeline (Phases 1-3.5): data loading,
 │                            #   ~350-column / ~250-feature matrix, stat analysis, XGBoost/SARIMAX/Prophet,
@@ -38,6 +40,7 @@ Onyx/
 │   ├── mfp-email.yml            # MyFitnessPal email check (`15 * * * *`)
 │   ├── whoop-journal-email.yml  # WHOOP journal email check (`30 * * * *`)
 │   ├── habits-sync.yml          # Habits sync from Notion (`45 * * * *`)
+│   ├── spotify-etl.yml          # Spotify recently-played (`50 */2 * * *`)
 │   ├── hrv-prediction.yml       # HRV prediction — auto-runs after each ETL via workflow_run, plus guaranteed 23:50 ET finalization (DST-safe)
 │   └── hrv-retrain-on-backfill.yml  # HRV Analysis Retrain — hourly backfill check + daily 12:00 UTC safety-net
 ├── whoop_schema.sql         # WHOOP table DDL
@@ -49,19 +52,20 @@ Onyx/
 ├── .env                     # Secrets (NEVER commit)
 └── frontend/                # Next.js 15 app
     └── src/
-        ├── app/             # Pages (13 routes) + API routes
-        │   └── analytics/hrv/  # HRV Analysis dashboard (predictions, SHAP, models)
+        ├── app/             # Pages (14 routes) + API routes
+        │   ├── analytics/hrv/  # HRV Analysis dashboard (predictions, SHAP, models)
+        │   └── spotify/        # Spotify listening dashboard (volume, mood signature, top artists/tracks)
         ├── components/      # AppShell, Sidebar, MobileNav, ChartCard, StatCard
-        └── lib/             # Supabase clients, queries.ts (19 functions), format.ts
+        └── lib/             # Supabase clients, queries.ts, format.ts
 ```
 
 ## Tech Stack
 
 - **ETL**: Python 3, httpx, garminconnect, supabase-py, python-dotenv
-- **Database**: Supabase (Postgres 17), schema `pds`, 17 tables + `journal` unified view + 3 HRV analysis tables (`hrv_predictions`, `hrv_model_metrics`, `hrv_analysis_results`)
+- **Database**: Supabase (Postgres 17), schema `pds`, 19 tables + `journal` unified view + 3 HRV analysis tables (`hrv_predictions`, `hrv_model_metrics`, `hrv_analysis_results`) + Spotify (`spotify_plays`, `spotify_tracks`, `spotify_daily_signature` view)
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
 - **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 14 tools (11 query + mark_habit_complete + query_journal + query_eight_sleep). Habit completion via chat syncs to both Supabase and Notion.
-- **System Status**: `/status` page — 6 source cards (Garmin, WHOOP, Eight Sleep, WHOOP Journal, Habits, MyFitnessPal), KPI summary, 20-entry sync history. `GET /api/status` queries `pds.sync_log` by `(source, data_type)` key + `MAX()` date per data table. Auto-refreshes every 60s.
+- **System Status**: `/status` page — 7 source cards (Garmin, WHOOP, Eight Sleep, WHOOP Journal, Habits, MyFitnessPal, Spotify), KPI summary, 20-entry sync history. `GET /api/status` queries `pds.sync_log` by `(source, data_type)` key + `MAX()` date per data table. Auto-refreshes every 60s.
 - **Auth**: Supabase Auth (magic link), RLS on all tables
 - **Hosting**: Vercel (frontend), Supabase Cloud (database)
 
@@ -78,12 +82,17 @@ python eight_sleep_etl.py               # Sync last 7 days
 python myfitnesspal_import.py <csv>     # Import MFP nutrition CSV export
 python myfitnesspal_email.py --once    # Check email for MFP export, import
 python <etl>.py --backfill N            # Backfill N days
+python spotify_etl.py --auth            # One-time Spotify OAuth bootstrap (local)
+python spotify_etl.py                   # Sync recently-played (last 50 since high-water mark)
+python spotify_etl.py --refeaturize     # Backfill audio features for tracks with NULL valence
 
 # CI Token Management
 python ci_token_helper.py upload garmin   # Seed/update Garmin tokens in Supabase
 python ci_token_helper.py upload whoop    # Seed/update WHOOP tokens in Supabase
+python ci_token_helper.py upload spotify  # Seed/update Spotify tokens in Supabase
 python ci_token_helper.py download garmin # Restore Garmin tokens from Supabase
 python ci_token_helper.py download whoop  # Restore WHOOP tokens from Supabase
+python ci_token_helper.py download spotify # Restore Spotify tokens from Supabase
 
 # GitHub Actions
 gh workflow run daily-etl.yml           # Manually trigger ETL workflow
@@ -132,13 +141,15 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
   - The `hrv_analysis.py` pipeline mirrors these rules via `to_date_str()`, `to_et_date_str()`, and `to_cycle_et_date_str()` helpers.
 - **HRV columns are not interchangeable across sources.** `whoop_recovery.hrv_rmssd_milli` is RMSSD in milliseconds, measured during the WHOOP-detected sleep cycle. `garmin_hrv.last_night_avg_ms` is Garmin's proprietary time-weighted average of 5-minute HRV samples during sleep — *not* RMSSD; the unit is ms but the algorithm is different. `eight_sleep_trends.avg_hrv` is undocumented by Eight Sleep. Treat each as its own variable; never average or substitute.
 - **Garmin sleep timestamps:** `garmin_sleep.sleep_start` / `sleep_end` are stored as true UTC instants (`sleepStartTimestampGMT` from the API). The previously-used `*Local` field encoded the local clock as UTC, shifting timestamps by ~4-5h.
+- **Spotify tables are isolated from health data by design.** `spotify_plays` + `spotify_tracks` are NOT joined into `daily_health_matrix`. Listening behavior stands on its own; any health correlation happens at view/query time only. `spotify_daily_signature` is a per-ET-date aggregate view (play counts, unique tracks/artists, mean audio features) — frontend reads go through it where possible. PK on `spotify_plays` is `(played_at, track_id)` for idempotent upserts. `played_date_et` is a stored generated column matching the ET-canonical TZ convention.
+- **Spotify audio features come from ReccoBeats, not Spotify.** Spotify deprecated `/v1/audio-features` for apps registered after 2024-11-27 (this app is post-cutoff). `spotify_tracks.features_source` records provenance (`'reccobeats'` or null when unresolved). The `spotify_daily_signature` view only computes feature means over plays with non-null valence so partial coverage doesn't bias the signal.
 
 ## Environment Variables
 
 Root `.env` (Python ETL): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY,
 GARMIN_EMAIL, GARMIN_PASSWORD, WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET,
 EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD, IMAP_HOST, IMAP_EMAIL, IMAP_APP_PASSWORD,
-MFP_USERNAME, MFP_PASSWORD
+MFP_USERNAME, MFP_PASSWORD, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI
 
 `frontend/.env.local`: NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
 SUPABASE_SERVICE_ROLE_KEY, ANTHROPIC_API_KEY, NOTION_API_KEY, NOTION_HABITS_DB
@@ -177,6 +188,7 @@ All data sources run **hourly** on a staggered schedule to spread load and avoid
 | MyFitnessPal email | `mfp-email.yml` | `15 * * * *` | IMAP check → import MFP nutrition CSV |
 | WHOOP journal email | `whoop-journal-email.yml` | `30 * * * *` | IMAP check → import WHOOP journal CSV |
 | Habits sync | `habits-sync.yml` | `45 * * * *` | Curls `POST /api/habits/sync` on Vercel |
+| Spotify ETL | `spotify-etl.yml` | `50 */2 * * *` | Pulls recently-played; upserts plays + tracks; featurizes new tracks via ReccoBeats |
 | HRV prediction | `hrv-prediction.yml` | `workflow_run` after hourly ETL + `50 3 * * *` + `50 4 * * *` | Backfills actuals + predicts next day. Hourly workflow_run runs give intra-day monitoring; the two scheduled crons land on 23:50 ET year-round (one per DST state — the `dst-gate` job skips the wrong-season run by checking `TZ=America/New_York date +%H == 23`). The 23:50 ET run captures the final day's imports (Habits at :45, journal at :30, MFP at :15) before ET midnight closes the day. **`hrv_predict.py` uses `et_today()` (`zoneinfo.ZoneInfo("America/New_York")`) for all date arithmetic** — a UTC `date.today()` on the runner would mis-tag the late-ET-evening run as the day-after-next. |
 | HRV Analysis Retrain | `hrv-retrain-on-backfill.yml` | `20 * * * *` + `0 12 * * *` | Two triggers: (1) hourly backfill check via `hrv_backfill_check.py` — runs full `hrv_analysis.py` only if any row with `calendar_date < today-2` was updated since last `hrv_analysis_results.computed_at`. (2) Daily unconditional retrain at 12:00 UTC (~8am ET) — safety net so correlations stay fresh even if no backfill ever fires. The decision is made by the "Decide whether to retrain" step that branches on `github.event.schedule` / `github.event_name`. |
 
@@ -186,7 +198,8 @@ Notes:
 - **Token persistence**: Garmin/WHOOP tokens stored in `pds.ci_tokens`, managed by `ci_token_helper.py`.
 - **Token recovery (Garmin)**: If Garmin tokens expire in CI, re-run ETL locally then `python ci_token_helper.py upload garmin`.
 - **Token recovery (WHOOP)**: If WHOOP refresh token expires (400 on token refresh), re-run `python whoop_etl.py --days 7` locally then `python ci_token_helper.py upload whoop`. WHOOP tokens can expire after several days of failed refreshes — check `/status` page for silent failures. Hourly cadence increases risk here — monitor closely.
-- **GitHub Secrets**: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GARMIN_EMAIL, GARMIN_PASSWORD, WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET, EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD, EIGHTSLEEP_CLIENT_ID, EIGHTSLEEP_CLIENT_SECRET, IMAP_HOST, IMAP_EMAIL, IMAP_APP_PASSWORD.
+- **GitHub Secrets**: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GARMIN_EMAIL, GARMIN_PASSWORD, WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET, EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD, EIGHTSLEEP_CLIENT_ID, EIGHTSLEEP_CLIENT_SECRET, IMAP_HOST, IMAP_EMAIL, IMAP_APP_PASSWORD, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET.
+- **Spotify bootstrap (one-time, local)**: register app at developer.spotify.com → set redirect URI to `http://127.0.0.1:8888/callback` → put `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` in `.env` → run `python spotify_etl.py --auth` (opens browser) → `python ci_token_helper.py upload spotify`. CI uses `ci_token_helper.py download spotify` at the start of each run and re-uploads after (refresh tokens occasionally rotate).
 - **Actions minutes**: Repo is private; hourly schedule is estimated to use ~3000–6000 min/month, likely over the 2000-min free tier. Monitor usage under GitHub → Settings → Billing.
 
 ## Conventions

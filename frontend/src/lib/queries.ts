@@ -384,3 +384,158 @@ export async function getJournal(days: number = 30) {
   if (error) throw error;
   return data ?? [];
 }
+
+// ---------------------------------------------------------------------------
+// Spotify (separate domain — no joins to health tables; see CLAUDE.md)
+// ---------------------------------------------------------------------------
+
+export interface SpotifyPlayRow {
+  played_at: string;
+  played_date_et: string;
+  track_id: string;
+  track_name: string | null;
+  artist_id: string | null;
+  artist_name: string | null;
+  duration_ms: number | null;
+}
+
+export interface SpotifyDailySignatureRow {
+  calendar_date: string;
+  play_count: number;
+  unique_tracks: number;
+  unique_artists: number;
+  total_minutes: number | null;
+  avg_valence: number | null;
+  avg_energy: number | null;
+  avg_tempo: number | null;
+  avg_danceability: number | null;
+  featurized_plays: number;
+}
+
+function dateNDaysAgo(days: number): string {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+  return since.toISOString().split("T")[0];
+}
+
+export async function getSpotifyKpis(days: number = 30) {
+  const since = dateNDaysAgo(days);
+  const { data, error } = await supabase
+    .from("spotify_plays")
+    .select("track_id,artist_id,duration_ms,track_name,artist_name")
+    .gte("played_date_et", since);
+  if (error) throw error;
+  const rows = data ?? [];
+  const uniqueTracks = new Set(rows.map((r) => r.track_id).filter(Boolean)).size;
+  const uniqueArtists = new Set(rows.map((r) => r.artist_id).filter(Boolean)).size;
+  const totalMs = rows.reduce((s, r) => s + (r.duration_ms ?? 0), 0);
+
+  // Top track of the period (by play count)
+  const trackCounts = new Map<string, { name: string | null; artist: string | null; count: number }>();
+  for (const r of rows) {
+    if (!r.track_id) continue;
+    const entry = trackCounts.get(r.track_id) ?? { name: r.track_name, artist: r.artist_name, count: 0 };
+    entry.count++;
+    trackCounts.set(r.track_id, entry);
+  }
+  let topTrack: { name: string | null; artist: string | null; count: number } | null = null;
+  for (const v of trackCounts.values()) {
+    if (!topTrack || v.count > topTrack.count) topTrack = v;
+  }
+
+  return {
+    totalPlays: rows.length,
+    totalHours: totalMs / 3_600_000,
+    uniqueTracks,
+    uniqueArtists,
+    topTrack,
+  };
+}
+
+export async function getSpotifyDailyVolume(days: number = 90): Promise<SpotifyDailySignatureRow[]> {
+  const since = dateNDaysAgo(days);
+  const { data, error } = await supabase
+    .from("spotify_daily_signature")
+    .select("calendar_date,play_count,unique_tracks,unique_artists,total_minutes,featurized_plays")
+    .gte("calendar_date", since)
+    .order("calendar_date", { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as SpotifyDailySignatureRow[];
+}
+
+export async function getSpotifyDailyAudioFeatures(days: number = 60): Promise<SpotifyDailySignatureRow[]> {
+  const since = dateNDaysAgo(days);
+  const { data, error } = await supabase
+    .from("spotify_daily_signature")
+    .select("calendar_date,avg_valence,avg_energy,avg_tempo,avg_danceability,featurized_plays,play_count")
+    .gte("calendar_date", since)
+    .gt("featurized_plays", 0)
+    .order("calendar_date", { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as SpotifyDailySignatureRow[];
+}
+
+export async function getSpotifyTopArtists(days: number = 30, limit: number = 10) {
+  const since = dateNDaysAgo(days);
+  const { data, error } = await supabase
+    .from("spotify_plays")
+    .select("artist_id,artist_name,duration_ms")
+    .gte("played_date_et", since);
+  if (error) throw error;
+  const agg = new Map<string, { name: string; plays: number; minutes: number }>();
+  for (const r of data ?? []) {
+    const key = r.artist_id ?? r.artist_name ?? "—";
+    const entry = agg.get(key) ?? { name: r.artist_name ?? "—", plays: 0, minutes: 0 };
+    entry.plays++;
+    entry.minutes += (r.duration_ms ?? 0) / 60000;
+    agg.set(key, entry);
+  }
+  return Array.from(agg.values())
+    .sort((a, b) => b.plays - a.plays)
+    .slice(0, limit);
+}
+
+export async function getSpotifyTopTracks(days: number = 30, limit: number = 10) {
+  const since = dateNDaysAgo(days);
+  const { data, error } = await supabase
+    .from("spotify_plays")
+    .select("track_id,track_name,artist_name,duration_ms")
+    .gte("played_date_et", since);
+  if (error) throw error;
+  const agg = new Map<string, { name: string; artist: string; plays: number; minutes: number }>();
+  for (const r of data ?? []) {
+    if (!r.track_id) continue;
+    const entry = agg.get(r.track_id) ?? {
+      name: r.track_name ?? "—",
+      artist: r.artist_name ?? "—",
+      plays: 0,
+      minutes: 0,
+    };
+    entry.plays++;
+    entry.minutes += (r.duration_ms ?? 0) / 60000;
+    agg.set(r.track_id, entry);
+  }
+  return Array.from(agg.values())
+    .sort((a, b) => b.plays - a.plays)
+    .slice(0, limit);
+}
+
+export async function getSpotifyHourOfDay(days: number = 30) {
+  const since = dateNDaysAgo(days);
+  const { data, error } = await supabase
+    .from("spotify_plays")
+    .select("played_at")
+    .gte("played_date_et", since);
+  if (error) throw error;
+  const buckets = Array.from({ length: 24 }, (_, h) => ({ hour: h, plays: 0 }));
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "2-digit",
+    hour12: false,
+  });
+  for (const r of data ?? []) {
+    const h = parseInt(fmt.format(new Date(r.played_at)), 10);
+    if (!Number.isNaN(h) && h >= 0 && h < 24) buckets[h].plays++;
+  }
+  return buckets;
+}

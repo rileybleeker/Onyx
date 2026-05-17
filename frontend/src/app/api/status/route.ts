@@ -71,7 +71,7 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, driftRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, driftRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -79,6 +79,7 @@ export async function GET() {
       supabase.from("habit_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
       supabase.from("myfitnesspal_nutrition").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("hrv_predictions").select("prediction_date").eq("model", "xgboost").eq("horizon_days", 1).not("model_version", "like", "backtest%").order("prediction_date", { ascending: false }).limit(1),
+      supabase.from("spotify_plays").select("played_date_et").order("played_date_et", { ascending: false }).limit(1),
       supabase
         .from("sync_log")
         .select("id, created_at, sync_start, error_message, source, data_type")
@@ -104,12 +105,14 @@ export async function GET() {
     const habitsDate = habitsRes.data?.[0]?.cycle_date ?? null;
     const mfpDate = mfpRes.data?.[0]?.calendar_date ?? null;
     const hrvDate = hrvRes.data?.[0]?.prediction_date ?? null;
+    const spotifyDate = spotifyRes.data?.[0]?.played_date_et ?? null;
 
     const garminEntry = latestBySrcType["garmin|full_sync"] ?? null;
     const whoopEntry = latestBySrcType["whoop|full_sync"] ?? null;
     const eightSleepEntry = latestBySrcType["eight_sleep|trends"] ?? null;
     const journalEntry = latestBySrcType["whoop|journal_email"] ?? null;
     const mfpEntry = latestBySrcType["myfitnesspal|nutrition"] ?? null;
+    const spotifyEntry = latestBySrcType["spotify|plays"] ?? null;
 
     const garminLag = daysLag(garminDate);
     const whoopLag = daysLag(whoopDate);
@@ -118,6 +121,7 @@ export async function GET() {
     const habitsLag = daysLag(habitsDate);
     const mfpLag = daysLag(mfpDate);
     const hrvLag = daysLag(hrvDate);
+    const spotifyLag = daysLag(spotifyDate);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -189,6 +193,16 @@ export async function GET() {
         recordsSynced: 0,
         durationSeconds: null,
         errorMessage: null,
+      },
+      spotify: {
+        label: "Spotify",
+        lastSync: (spotifyEntry?.sync_start as string) ?? null,
+        status: deriveStatus(spotifyEntry, spotifyLag),
+        latestDataDate: spotifyDate,
+        daysLag: spotifyLag,
+        recordsSynced: (spotifyEntry?.records_synced as number) ?? 0,
+        durationSeconds: (spotifyEntry?.duration_seconds as number) ?? null,
+        errorMessage: (spotifyEntry?.error_message as string) ?? null,
       },
     };
 
