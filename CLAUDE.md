@@ -210,6 +210,7 @@ Notes:
 - Frontend follows Next.js App Router conventions (page.tsx per route)
 - Supabase queries go in `frontend/src/lib/queries.ts`
 - Reusable UI components go in `frontend/src/components/`
+- **Sidebar and MobileNav must stay in sync.** `Sidebar.tsx` (desktop) and `MobileNav.tsx` (mobile PWA drawer) maintain independent `nav` arrays — they do not share a source. Any nav change (new route, label, icon, ordering, shortcut) must be applied to **both files** in the same commit, or the mobile app silently falls out of sync. When adding a new route, grep both files (`grep -l "nav = \[" frontend/src/components/`) and update each.
 - SQL schema changes: create a .sql file, then apply via Supabase MCP or dashboard
 - Always upsert (never raw insert) to keep ETL idempotent
 - Never commit secrets (.env files are gitignored)
