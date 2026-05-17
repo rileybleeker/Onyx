@@ -212,6 +212,22 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
   const playlistId = playlist.id as string;
   const spotifyUrl = (playlist.external_urls?.spotify as string) ?? `https://open.spotify.com/playlist/${playlistId}`;
 
+  // 1a. Enforce visibility via PUT /playlists/{id}.
+  //     Spotify's POST /me/playlists silently ignores the `public` field and
+  //     creates the playlist as public regardless; a follow-up PUT is the only
+  //     way to actually set the flag. Belt-and-suspenders.
+  const visResp = await spotifyFetch(`/playlists/${playlistId}`, {
+    accessToken,
+    method: "PUT",
+    body: JSON.stringify({ public: isPublic }),
+  });
+  if (!visResp.ok) {
+    console.error(
+      `Spotify visibility PUT failed (${visResp.status}) for ${playlistId}: ${await visResp.text()} ` +
+        `(playlist exists but may be public)`
+    );
+  }
+
   // 2. Add tracks in chunks of 100.
   //    Feb 2026 migration: /playlists/{id}/tracks → /playlists/{id}/items
   const uris = trackIds.map((id) => `spotify:track:${id}`);
