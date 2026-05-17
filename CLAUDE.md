@@ -66,7 +66,7 @@ Onyx/
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
 - **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 14 tools (11 query + mark_habit_complete + query_journal + query_eight_sleep). Habit completion via chat syncs to both Supabase and Notion.
 - **System Status**: `/status` page — 7 source cards (Garmin, WHOOP, Eight Sleep, WHOOP Journal, Habits, MyFitnessPal, Spotify), KPI summary, 20-entry sync history. `GET /api/status` queries `pds.sync_log` by `(source, data_type)` key + `MAX()` date per data table. Auto-refreshes every 60s.
-- **Auth**: Supabase Auth (magic link), RLS on all tables
+- **Auth**: Supabase Auth — email + password (primary) with magic link fallback. RLS on all tables. `/account` page exposes `supabase.auth.updateUser({ password })` for self-service password changes.
 - **Hosting**: Vercel (frontend), Supabase Cloud (database)
 
 ## Commands
