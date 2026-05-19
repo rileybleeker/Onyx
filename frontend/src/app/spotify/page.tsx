@@ -18,6 +18,7 @@ import {
   getSpotifyHourOfDay,
   getSpotifySonicProfile,
   getSpotifyLedger,
+  getSpotifyTopGenres,
   rangeLabel,
   type SpotifyDailySignatureRow,
   type SpotifyLedgerRow,
@@ -45,6 +46,7 @@ type TopArtists = Awaited<ReturnType<typeof getSpotifyTopArtists>>;
 type TopTracks = Awaited<ReturnType<typeof getSpotifyTopTracks>>;
 type HourBuckets = Awaited<ReturnType<typeof getSpotifyHourOfDay>>;
 type SonicProfile = Awaited<ReturnType<typeof getSpotifySonicProfile>>;
+type TopGenres = Awaited<ReturnType<typeof getSpotifyTopGenres>>;
 
 function defaultPlaylistName(): string {
   const fmt = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" });
@@ -59,6 +61,7 @@ export default function SpotifyPage() {
   const [topTracks, setTopTracks] = useState<TopTracks>([]);
   const [hours, setHours] = useState<HourBuckets>([]);
   const [sonic, setSonic] = useState<SonicProfile>(null);
+  const [genres, setGenres] = useState<TopGenres>([]);
   const [loading, setLoading] = useState(true);
   const [range, setRange] = useState<SpotifyRange>("30d");
 
@@ -121,8 +124,9 @@ export default function SpotifyPage() {
       getSpotifyTopTracks(range, 10),
       getSpotifyHourOfDay(range),
       getSpotifySonicProfile(range),
+      getSpotifyTopGenres(range, 10),
     ])
-      .then(([k, v, f, ta, tt, h, sp]) => {
+      .then(([k, v, f, ta, tt, h, sp, g]) => {
         setKpis(k);
         setVolume(v);
         setFeatures(f);
@@ -130,6 +134,7 @@ export default function SpotifyPage() {
         setTopTracks(tt);
         setHours(h);
         setSonic(sp);
+        setGenres(g);
       })
       .catch((err) => console.error("Spotify page load:", err))
       .finally(() => setLoading(false));
@@ -416,8 +421,32 @@ export default function SpotifyPage() {
             )}
           </ChartCard>
 
-          {/* Top artists + top tracks side by side */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {/* Top genres + top artists + top tracks side by side */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <ChartCard
+              title="Top genres"
+              subtitle={`${rangeLabel(range)}, by play count`}
+              source="MUSICBRAINZ"
+              info="Each play counts once toward every genre tag MusicBrainz has for that artist, so heavy-rotation artists weight their genres more. Genres come from MusicBrainz (Spotify Dev Mode strips genres post-Feb 2026)."
+            >
+              <ol className="space-y-1.5">
+                {genres.map((g, i) => (
+                  <li key={`${g.genre}-${i}`} className="flex items-baseline justify-between text-[12px] font-mono">
+                    <span className="text-text-secondary truncate pr-3">
+                      <span className="text-text-tertiary mr-2">{String(i + 1).padStart(2, "0")}</span>
+                      {g.genre}
+                    </span>
+                    <span className="text-text-primary tabular-nums">
+                      {g.plays} <span className="text-text-tertiary text-[10px]">plays</span>
+                    </span>
+                  </li>
+                ))}
+                {genres.length === 0 && (
+                  <li className="text-[11px] text-text-tertiary">No genres yet.</li>
+                )}
+              </ol>
+            </ChartCard>
+
             <ChartCard title="Top artists" subtitle={`${rangeLabel(range)}, by play count`} source="SPOTIFY">
               <ol className="space-y-1.5">
                 {topArtists.map((a, i) => (

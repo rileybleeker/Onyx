@@ -59,6 +59,11 @@ SPOTIFY_API = "https://api.spotify.com/v1"
 
 RECCOBEATS_API = "https://api.reccobeats.com/v1"
 
+# MusicBrainz — used for genre tags because Spotify's Dev Mode strips `genres`,
+# `popularity`, and `followers` from artist responses post-Feb 2026.
+MUSICBRAINZ_API = "https://musicbrainz.org/ws/2"
+MUSICBRAINZ_USER_AGENT = "Onyx-PersonalDataScientist/1.0 (https://github.com/rileybleeker/Onyx)"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -229,6 +234,29 @@ class SpotifyClient:
         resp = self._request("GET", f"{SPOTIFY_API}/tracks/{track_id}")
         return resp.json()
 
+    def artists(self, artist_ids: list[str]) -> list[dict]:
+        """
+        Fetch artist objects one at a time.
+
+        Spotify's Feb 2026 migration removed the batch GET /v1/artists?ids=...
+        endpoint for Development Mode apps (bare 403 Forbidden, no scope hint —
+        matching the playlist-endpoint symptom documented in CLAUDE.md). The
+        replacement is per-id GET /v1/artists/{id}. Rate limits are generous
+        for this endpoint; a tiny sleep keeps us polite without slowing things.
+        """
+        out: list[dict] = []
+        for aid in artist_ids:
+            try:
+                resp = self._request("GET", f"{SPOTIFY_API}/artists/{aid}")
+                out.append(resp.json())
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    log.warning(f"Artist {aid} returned 404 — skipping.")
+                    continue
+                raise
+            time.sleep(0.05)
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Audio features (ReccoBeats — Spotify endpoint is dead for post-Nov-2024 apps)
@@ -390,6 +418,116 @@ def upsert_tracks(sb: Client, tracks: list[dict], features_by_id: dict[str, dict
     return len(rows)
 
 
+def fetch_musicbrainz_tags(artist_name: str) -> list[str]:
+    """
+    Look up an artist by name on MusicBrainz, take the top-scored match, return its
+    top tags (highest user-applied counts first) as a list of strings.
+
+    Why MusicBrainz: Spotify's Dev Mode strips `genres` from the artist endpoint
+    post-Feb 2026, so we use MusicBrainz's crowdsourced tag data as the genre
+    source. No API key required — just a polite User-Agent.
+
+    Returns [] if no match, no tags, or any error. Caller is responsible for the
+    1-req/sec rate limit between calls.
+    """
+    if not artist_name:
+        return []
+    try:
+        resp = httpx.get(
+            f"{MUSICBRAINZ_API}/artist",
+            params={"query": artist_name, "fmt": "json", "limit": 1},
+            headers={"User-Agent": MUSICBRAINZ_USER_AGENT},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log.warning(f"MusicBrainz returned {resp.status_code} for {artist_name!r}")
+            return []
+        results = resp.json().get("artists") or []
+        if not results:
+            return []
+        tags = results[0].get("tags") or []
+        tags.sort(key=lambda t: t.get("count", 0), reverse=True)
+        return [t["name"] for t in tags[:8] if t.get("name")]
+    except (httpx.HTTPError, KeyError, ValueError) as e:
+        log.warning(f"MusicBrainz lookup failed for {artist_name!r}: {e}")
+        return []
+
+
+def enrich_genres_via_musicbrainz(sb: Client, pairs: list[dict]) -> int:
+    """
+    For each {artist_id, name} pair, fetch MusicBrainz tags and UPDATE the
+    spotify_artists row in place. Respects MusicBrainz's 1 req/sec ceiling.
+    Returns count of rows actually updated (matches found with non-empty tags).
+    """
+    updated = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for p in pairs:
+        aid = p.get("artist_id")
+        name = p.get("name")
+        if not (aid and name):
+            continue
+        tags = fetch_musicbrainz_tags(name)
+        if tags:
+            sb.schema("pds").table("spotify_artists").update({
+                "genres": tags,
+                "synced_at": now,
+            }).eq("artist_id", aid).execute()
+            updated += 1
+        time.sleep(1.05)  # 1 req/sec ceiling, small margin
+    return updated
+
+
+def upsert_artists(sb: Client, artists: list[dict]) -> int:
+    """Upsert artist enrichment (genres, popularity, followers) into pds.spotify_artists."""
+    if not artists:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for a in artists:
+        if not a:  # Spotify returns nulls in the array for unknown ids
+            continue
+        aid = a.get("id")
+        if not aid:
+            continue
+        images = a.get("images") or []
+        rows.append({
+            "artist_id": aid,
+            "name": a.get("name"),
+            "genres": a.get("genres") or [],
+            "popularity": a.get("popularity"),
+            "followers": (a.get("followers") or {}).get("total"),
+            "image_url": images[0].get("url") if images else None,
+            "raw_json": a,
+            "fetched_at": now,
+            "synced_at": now,
+        })
+    if not rows:
+        return 0
+    sb.schema("pds").table("spotify_artists").upsert(
+        rows, on_conflict="artist_id"
+    ).execute()
+    return len(rows)
+
+
+def existing_artist_ids(sb: Client, artist_ids: list[str]) -> set[str]:
+    """Return the subset of artist_ids already in pds.spotify_artists."""
+    if not artist_ids:
+        return set()
+    out: set[str] = set()
+    CHUNK = 100
+    for i in range(0, len(artist_ids), CHUNK):
+        batch = artist_ids[i:i + CHUNK]
+        row = (
+            sb.schema("pds")
+            .table("spotify_artists")
+            .select("artist_id")
+            .in_("artist_id", batch)
+            .execute()
+        )
+        out.update(r["artist_id"] for r in (row.data or []))
+    return out
+
+
 def existing_track_ids(sb: Client, track_ids: list[str]) -> set[str]:
     """Return the subset of track_ids already in pds.spotify_tracks."""
     if not track_ids:
@@ -430,6 +568,73 @@ def log_sync(sb: Client, status: str, records: int, started_at: float, error: st
 # Main flows
 # ---------------------------------------------------------------------------
 
+def run_backfill_artists():
+    """One-shot: enrich every distinct artist in spotify_plays not already in spotify_artists."""
+    started = time.time()
+    sb = get_supabase()
+
+    tokens = load_tokens()
+    tokens = refresh_access_token(tokens)
+    client = SpotifyClient(tokens)
+
+    # Pull distinct artist_ids from spotify_plays in pages (Supabase row limit is 1000/req)
+    all_ids: set[str] = set()
+    page_size = 1000
+    offset = 0
+    while True:
+        resp = (
+            sb.schema("pds").table("spotify_plays")
+            .select("artist_id")
+            .not_.is_("artist_id", "null")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            break
+        all_ids.update(r["artist_id"] for r in rows if r.get("artist_id"))
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
+    log.info(f"Found {len(all_ids)} distinct artists in spotify_plays")
+
+    already = existing_artist_ids(sb, list(all_ids))
+    to_fetch = [aid for aid in all_ids if aid not in already]
+    log.info(f"Need to enrich {len(to_fetch)} artists (skipping {len(already)} already in dim)")
+
+    if not to_fetch:
+        log.info("Nothing to backfill — exiting.")
+        return
+
+    artists = client.artists(to_fetch)
+    count = upsert_artists(sb, artists)
+    log.info(f"Backfilled {count} artists in {int(time.time() - started)}s")
+
+
+def run_refresh_genres():
+    """Re-fetch MusicBrainz tags for every spotify_artists row whose genres are empty/null."""
+    started = time.time()
+    sb = get_supabase()
+    resp = (
+        sb.schema("pds").table("spotify_artists")
+        .select("artist_id,name,genres")
+        .execute()
+    )
+    rows = resp.data or []
+    needs = [
+        {"artist_id": r["artist_id"], "name": r["name"]}
+        for r in rows
+        if not r.get("genres") or len(r["genres"]) == 0
+    ]
+    log.info(f"Refreshing genres for {len(needs)} artists with empty genres")
+    if not needs:
+        log.info("Nothing to refresh — exiting.")
+        return
+    count = enrich_genres_via_musicbrainz(sb, needs)
+    log.info(f"Updated {count}/{len(needs)} artists with MusicBrainz tags in {int(time.time()-started)}s")
+
+
 def run_etl(refeaturize: bool = False):
     started = time.time()
     sb = get_supabase()
@@ -464,6 +669,31 @@ def run_etl(refeaturize: bool = False):
         features = fetch_audio_features_reccobeats(to_fetch) if to_fetch else {}
         tracks_count = upsert_tracks(sb, track_objs, features)
         log.info(f"Upserted {tracks_count} tracks")
+
+        # Resolve new artists (not yet in spotify_artists) and enrich them
+        new_artist_ids = list({
+            (it.get("track") or {}).get("artists", [{}])[0].get("id")
+            for it in items
+            if (it.get("track") or {}).get("artists")
+        })
+        new_artist_ids = [a for a in new_artist_ids if a]
+        already_artists = existing_artist_ids(sb, new_artist_ids)
+        artists_to_fetch = [aid for aid in new_artist_ids if aid not in already_artists]
+        if artists_to_fetch:
+            try:
+                artist_objs = client.artists(artists_to_fetch)
+                artists_count = upsert_artists(sb, artist_objs)
+                log.info(f"Upserted {artists_count} artists (Spotify: name + images)")
+                # Genres come from MusicBrainz — Spotify's Dev Mode strips them.
+                pairs = [
+                    {"artist_id": a.get("id"), "name": a.get("name")}
+                    for a in artist_objs if a and a.get("id")
+                ]
+                if pairs:
+                    g = enrich_genres_via_musicbrainz(sb, pairs)
+                    log.info(f"Resolved genres via MusicBrainz for {g}/{len(pairs)} artists")
+            except httpx.HTTPError as e:
+                log.warning(f"Artist enrichment failed (non-fatal): {e}")
 
         # Optional: backfill features for previously-stored tracks that lack them
         if refeaturize:
@@ -512,11 +742,21 @@ def main():
     parser = argparse.ArgumentParser(description="Spotify ETL Pipeline")
     parser.add_argument("--auth", action="store_true", help="One-time OAuth bootstrap (run locally)")
     parser.add_argument("--refeaturize", action="store_true", help="Backfill audio features for tracks with NULL valence")
+    parser.add_argument("--backfill-artists", action="store_true", help="Enrich every distinct artist in spotify_plays not yet in spotify_artists")
+    parser.add_argument("--refresh-genres", action="store_true", help="Re-fetch MusicBrainz tags for spotify_artists rows with empty genres")
     parser.add_argument("--backfill", type=int, help="(no-op past 50 — Spotify hard ceiling)")
     args = parser.parse_args()
 
     if args.auth:
         run_auth_flow()
+        return
+
+    if args.backfill_artists:
+        run_backfill_artists()
+        return
+
+    if args.refresh_genres:
+        run_refresh_genres()
         return
 
     if args.backfill and args.backfill > 50:

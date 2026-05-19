@@ -529,6 +529,52 @@ export async function getSpotifyTopArtists(range: SpotifyRange = "30d", limit: n
     .slice(0, limit);
 }
 
+export async function getSpotifyTopGenres(range: SpotifyRange = "30d", limit: number = 10) {
+  let pq = supabase.from("spotify_plays").select("artist_id");
+  const since = sinceFor(range);
+  if (since) pq = pq.gte("played_date_et", since);
+  const { data: plays, error: pErr } = await pq;
+  if (pErr) throw pErr;
+
+  const playsByArtist = new Map<string, number>();
+  for (const p of plays ?? []) {
+    if (!p.artist_id) continue;
+    playsByArtist.set(p.artist_id, (playsByArtist.get(p.artist_id) ?? 0) + 1);
+  }
+  if (playsByArtist.size === 0) return [];
+
+  const ids = Array.from(playsByArtist.keys());
+  type ArtistGenresRow = { artist_id: string; genres: string[] | null };
+  const artists: ArtistGenresRow[] = [];
+  const CHUNK = 200;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const batch = ids.slice(i, i + CHUNK);
+    const { data, error } = await supabase
+      .from("spotify_artists")
+      .select("artist_id,genres")
+      .in("artist_id", batch);
+    if (error) throw error;
+    artists.push(...((data ?? []) as ArtistGenresRow[]));
+  }
+
+  // Each play contributes one tally to every genre the artist has.
+  // Heavy-rotation artists naturally weight their genres more.
+  const counts = new Map<string, number>();
+  for (const a of artists) {
+    const w = playsByArtist.get(a.artist_id) ?? 0;
+    if (!w || !a.genres) continue;
+    for (const g of a.genres) {
+      if (!g) continue;
+      counts.set(g, (counts.get(g) ?? 0) + w);
+    }
+  }
+
+  return Array.from(counts.entries())
+    .map(([genre, plays]) => ({ genre, plays }))
+    .sort((a, b) => b.plays - a.plays)
+    .slice(0, limit);
+}
+
 export async function getSpotifyTopTracks(range: SpotifyRange = "30d", limit: number = 10) {
   let q = supabase
     .from("spotify_plays")
