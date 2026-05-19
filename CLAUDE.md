@@ -55,7 +55,7 @@ Onyx/
     └── src/
         ├── app/             # Pages (14 routes) + API routes
         │   ├── analytics/hrv/  # HRV Analysis dashboard (predictions, SHAP, models)
-        │   └── spotify/        # Spotify listening dashboard (volume, mood signature, top artists/tracks)
+        │   └── spotify/        # Spotify listening dashboard (volume, mood signature, sonic profile radar, top artists/tracks)
         ├── components/      # AppShell, Sidebar, MobileNav, ChartCard, StatCard
         └── lib/             # Supabase clients, queries.ts, format.ts
 ```
