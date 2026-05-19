@@ -112,7 +112,7 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, driftRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, driftRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -121,6 +121,7 @@ export async function GET() {
       supabase.from("myfitnesspal_nutrition").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("hrv_predictions").select("prediction_date").eq("model", "xgboost").eq("horizon_days", 1).not("model_version", "like", "backtest%").order("prediction_date", { ascending: false }).limit(1),
       supabase.from("spotify_plays").select("played_date_et").order("played_date_et", { ascending: false }).limit(1),
+      supabase.from("supplement_intake").select("intake_date").order("intake_date", { ascending: false }).limit(1),
       supabase
         .from("sync_log")
         .select("id, created_at, sync_start, error_message, source, data_type")
@@ -147,6 +148,7 @@ export async function GET() {
     const mfpDate = mfpRes.data?.[0]?.calendar_date ?? null;
     const hrvDate = hrvRes.data?.[0]?.prediction_date ?? null;
     const spotifyDate = spotifyRes.data?.[0]?.played_date_et ?? null;
+    const supplementsDate = supplementsRes.data?.[0]?.intake_date ?? null;
 
     const garminEntry = latestBySrcType["garmin|full_sync"] ?? null;
     const whoopEntry = latestBySrcType["whoop|full_sync"] ?? null;
@@ -165,6 +167,7 @@ export async function GET() {
     const mfpLag = daysLag(mfpDate);
     const hrvLag = daysLag(hrvDate);
     const spotifyLag = daysLag(spotifyDate);
+    const supplementsLag = daysLag(supplementsDate);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -255,6 +258,19 @@ export async function GET() {
         label: "MusicBrainz",
         entry: musicbrainzEntry,
       }),
+      // Supplements is user-driven (no ETL); status derives purely from the
+      // most-recent intake_date. Same pattern as Habits — see deriveStatus's
+      // null-syncEntry branch.
+      supplements: {
+        label: "Supplements",
+        lastSync: supplementsDate,
+        status: deriveStatus(null, supplementsLag),
+        latestDataDate: supplementsDate,
+        daysLag: supplementsLag,
+        recordsSynced: 0,
+        durationSeconds: null,
+        errorMessage: null,
+      },
     };
 
     const recentHistory = (syncRows ?? []).slice(0, 20).map((r) => ({
