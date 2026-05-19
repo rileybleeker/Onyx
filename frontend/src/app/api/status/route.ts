@@ -16,7 +16,25 @@ export interface SourceStatus {
   recordsSynced: number;
   durationSeconds: number | null;
   errorMessage: string | null;
+  cadence: string;
 }
+
+// Human-readable sync cadence per source. "Manual" means user-triggered;
+// everything else is a GitHub Actions cron or workflow_run trigger.
+const CADENCE: Record<string, string> = {
+  garmin: "Hourly :00",
+  whoop: "Hourly :00",
+  eight_sleep: "Daily 3pm ET",
+  whoop_journal: "Hourly :30 (IMAP)",
+  habits: "Hourly :45",
+  myfitnesspal: "Hourly :15 (IMAP)",
+  hrv_analysis: "After each ETL + 23:50 ET",
+  spotify: "Every 2h :50",
+  reccobeats: "With Spotify ETL",
+  musicbrainz: "With Spotify ETL",
+  supplements: "Manual",
+  notion_journal: "Hourly :35",
+};
 
 export interface DriftAlert {
   id: string | null;
@@ -96,6 +114,7 @@ function enrichmentSource({
     recordsSynced: (entry?.records_synced as number) ?? 0,
     durationSeconds: (entry?.duration_seconds as number) ?? null,
     errorMessage: (entry?.error_message as string) ?? null,
+    cadence: "",  // overwritten in the sources map below
   };
 }
 
@@ -112,7 +131,7 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, driftRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, driftRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -122,6 +141,7 @@ export async function GET() {
       supabase.from("hrv_predictions").select("prediction_date").eq("model", "xgboost").eq("horizon_days", 1).not("model_version", "like", "backtest%").order("prediction_date", { ascending: false }).limit(1),
       supabase.from("spotify_plays").select("played_date_et").order("played_date_et", { ascending: false }).limit(1),
       supabase.from("supplement_intake").select("intake_date").order("intake_date", { ascending: false }).limit(1),
+      supabase.from("journal_entries").select("entry_date").eq("archived", false).order("entry_date", { ascending: false }).limit(1),
       supabase
         .from("sync_log")
         .select("id, created_at, sync_start, error_message, source, data_type")
@@ -149,6 +169,7 @@ export async function GET() {
     const hrvDate = hrvRes.data?.[0]?.prediction_date ?? null;
     const spotifyDate = spotifyRes.data?.[0]?.played_date_et ?? null;
     const supplementsDate = supplementsRes.data?.[0]?.intake_date ?? null;
+    const notionJournalDate = notionJournalRes.data?.[0]?.entry_date ?? null;
 
     const garminEntry = latestBySrcType["garmin|full_sync"] ?? null;
     const whoopEntry = latestBySrcType["whoop|full_sync"] ?? null;
@@ -158,6 +179,7 @@ export async function GET() {
     const spotifyEntry = latestBySrcType["spotify|plays"] ?? null;
     const reccobeatsEntry = latestBySrcType["reccobeats|audio_features"] ?? null;
     const musicbrainzEntry = latestBySrcType["musicbrainz|artist_tags"] ?? null;
+    const notionJournalEntry = latestBySrcType["notion_journal|entries"] ?? null;
 
     const garminLag = daysLag(garminDate);
     const whoopLag = daysLag(whoopDate);
@@ -168,6 +190,7 @@ export async function GET() {
     const hrvLag = daysLag(hrvDate);
     const spotifyLag = daysLag(spotifyDate);
     const supplementsLag = daysLag(supplementsDate);
+    const notionJournalLag = daysLag(notionJournalDate);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -179,6 +202,7 @@ export async function GET() {
         recordsSynced: (garminEntry?.records_synced as number) ?? 0,
         durationSeconds: (garminEntry?.duration_seconds as number) ?? null,
         errorMessage: (garminEntry?.error_message as string) ?? null,
+        cadence: CADENCE.garmin,
       },
       whoop: {
         label: "WHOOP",
@@ -189,6 +213,7 @@ export async function GET() {
         recordsSynced: (whoopEntry?.records_synced as number) ?? 0,
         durationSeconds: (whoopEntry?.duration_seconds as number) ?? null,
         errorMessage: (whoopEntry?.error_message as string) ?? null,
+        cadence: CADENCE.whoop,
       },
       eight_sleep: {
         label: "Eight Sleep",
@@ -199,6 +224,7 @@ export async function GET() {
         recordsSynced: (eightSleepEntry?.records_synced as number) ?? 0,
         durationSeconds: (eightSleepEntry?.duration_seconds as number) ?? null,
         errorMessage: (eightSleepEntry?.error_message as string) ?? null,
+        cadence: CADENCE.eight_sleep,
       },
       whoop_journal: {
         label: "WHOOP Journal",
@@ -209,6 +235,7 @@ export async function GET() {
         recordsSynced: (journalEntry?.records_synced as number) ?? 0,
         durationSeconds: (journalEntry?.duration_seconds as number) ?? null,
         errorMessage: (journalEntry?.error_message as string) ?? null,
+        cadence: CADENCE.whoop_journal,
       },
       habits: {
         label: "Habits",
@@ -219,6 +246,18 @@ export async function GET() {
         recordsSynced: 0,
         durationSeconds: null,
         errorMessage: null,
+        cadence: CADENCE.habits,
+      },
+      notion_journal: {
+        label: "Notion Journal",
+        lastSync: (notionJournalEntry?.sync_start as string) ?? null,
+        status: deriveStatus(notionJournalEntry, notionJournalLag),
+        latestDataDate: notionJournalDate,
+        daysLag: notionJournalLag,
+        recordsSynced: (notionJournalEntry?.records_synced as number) ?? 0,
+        durationSeconds: (notionJournalEntry?.duration_seconds as number) ?? null,
+        errorMessage: (notionJournalEntry?.error_message as string) ?? null,
+        cadence: CADENCE.notion_journal,
       },
       myfitnesspal: {
         label: "MyFitnessPal",
@@ -229,6 +268,7 @@ export async function GET() {
         recordsSynced: (mfpEntry?.records_synced as number) ?? 0,
         durationSeconds: (mfpEntry?.duration_seconds as number) ?? null,
         errorMessage: (mfpEntry?.error_message as string) ?? null,
+        cadence: CADENCE.myfitnesspal,
       },
       hrv_analysis: {
         label: "HRV Analysis",
@@ -239,6 +279,7 @@ export async function GET() {
         recordsSynced: 0,
         durationSeconds: null,
         errorMessage: null,
+        cadence: CADENCE.hrv_analysis,
       },
       spotify: {
         label: "Spotify",
@@ -249,15 +290,16 @@ export async function GET() {
         recordsSynced: (spotifyEntry?.records_synced as number) ?? 0,
         durationSeconds: (spotifyEntry?.duration_seconds as number) ?? null,
         errorMessage: (spotifyEntry?.error_message as string) ?? null,
+        cadence: CADENCE.spotify,
       },
-      reccobeats: enrichmentSource({
-        label: "ReccoBeats",
-        entry: reccobeatsEntry,
-      }),
-      musicbrainz: enrichmentSource({
-        label: "MusicBrainz",
-        entry: musicbrainzEntry,
-      }),
+      reccobeats: {
+        ...enrichmentSource({ label: "ReccoBeats", entry: reccobeatsEntry }),
+        cadence: CADENCE.reccobeats,
+      },
+      musicbrainz: {
+        ...enrichmentSource({ label: "MusicBrainz", entry: musicbrainzEntry }),
+        cadence: CADENCE.musicbrainz,
+      },
       // Supplements is user-driven (no ETL); status derives purely from the
       // most-recent intake_date. Same pattern as Habits — see deriveStatus's
       // null-syncEntry branch.
@@ -270,6 +312,7 @@ export async function GET() {
         recordsSynced: 0,
         durationSeconds: null,
         errorMessage: null,
+        cadence: CADENCE.supplements,
       },
     };
 

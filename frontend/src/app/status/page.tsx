@@ -13,6 +13,7 @@ const SOURCE_BADGE: Record<string, string> = {
   eight_sleep: "8SLP",
   whoop_journal: "WHOOP",
   habits: "NOTION",
+  notion_journal: "NOTION",
   myfitnesspal: "MFP",
   hrv_analysis: "ML",
   spotify: "SPOTIFY",
@@ -27,6 +28,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   eight_sleep: "text-source-eightsleep",
   whoop_journal: "text-source-whoop",
   habits: "text-text-tertiary",
+  notion_journal: "text-text-tertiary",
   myfitnesspal: "text-text-tertiary",
   hrv_analysis: "text-blue-400",
   spotify: "text-[#1DB954]",
@@ -62,6 +64,7 @@ const SOURCE_ORDER = [
   "eight_sleep",
   "whoop_journal",
   "habits",
+  "notion_journal",
   "myfitnesspal",
   "hrv_analysis",
   "spotify",
@@ -116,6 +119,7 @@ function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus
 
       {/* Detail rows */}
       <div className="space-y-2">
+        {info.cadence && <DetailRow label="Cadence" value={info.cadence} />}
         <DetailRow label="Last Sync" value={formatRelativeTime(info.lastSync)} sub={info.lastSync ? formatSyncTime(info.lastSync) : undefined} />
         <DetailRow label="Latest Data" value={info.latestDataDate ? formatDateShort(info.latestDataDate) : "—"} />
         <DetailRow
@@ -171,6 +175,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   spotify: "Spotify",
   reccobeats: "ReccoBeats",
   musicbrainz: "MusicBrainz",
+  notion_journal: "Notion Journal",
 };
 
 const HISTORY_TYPE_LABELS: Record<string, string> = {
@@ -181,6 +186,7 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   plays: "Plays",
   audio_features: "Audio Features",
   artist_tags: "Artist Tags",
+  entries: "Entries",
 };
 
 export default function StatusPage() {
