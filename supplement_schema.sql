@@ -148,7 +148,26 @@ GROUP BY calendar_date
 ORDER BY calendar_date DESC;
 
 -- ---------------------------------------------------------------------------
--- 5. RLS + grants
+-- 5. daily_health_matrix integration (MFP pattern)
+-- ---------------------------------------------------------------------------
+-- Supplements join into daily_health_matrix the same way MFP does — one
+-- LEFT JOIN, three new columns at the end. JSONB rather than hardcoded
+-- per-compound columns because a stack can carry 50+ distinct compounds
+-- and the set changes over time; locking schema would be wrong.
+--
+-- Applied via the `daily_health_matrix_add_supplements` migration.
+-- The full view definition lives in Supabase — to inspect:
+--   SELECT pg_get_viewdef('pds.daily_health_matrix', true);
+--
+-- Query pattern for correlation analysis:
+--   SELECT calendar_date,
+--          whoop_recovery_score,
+--          (supplements_jsonb->'Vitamin D'->>'amount')::numeric AS vitamin_d_iu
+--   FROM pds.daily_health_matrix
+--   WHERE calendar_date >= CURRENT_DATE - INTERVAL '90 days';
+
+-- ---------------------------------------------------------------------------
+-- 6. RLS + grants
 -- ---------------------------------------------------------------------------
 ALTER TABLE pds.supplement_products ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.supplement_intake   ENABLE ROW LEVEL SECURITY;

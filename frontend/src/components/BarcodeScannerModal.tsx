@@ -38,8 +38,17 @@ export default function BarcodeScannerModal({
         if (!navigator.mediaDevices?.getUserMedia) {
           throw new Error("Camera API not available in this browser.");
         }
-        const controls = await reader.decodeFromVideoDevice(
-          undefined, // null = let zxing pick; constraint below routes to rear cam
+        // Force the rear camera on phones — front-cam can't focus on a
+        // barcode held in front of the user. `ideal` (not `exact`) so the
+        // call still succeeds on desktops with only a webcam.
+        const controls = await reader.decodeFromConstraints(
+          {
+            video: {
+              facingMode: { ideal: "environment" },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
+          },
           videoRef.current!,
           (result, err) => {
             if (cancelled) return;
@@ -48,8 +57,8 @@ export default function BarcodeScannerModal({
               controls.stop();
               onDetected(result.getText());
             }
-            // Ignore frame-by-frame "no barcode this frame" errors — they're
-            // expected. Only surface fatal exceptions via the outer catch.
+            // Frame-by-frame "no barcode this frame" errors are normal —
+            // ignore. Fatal init errors surface via the outer catch.
             void err;
           },
         );
