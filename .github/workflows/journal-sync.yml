@@ -1,0 +1,33 @@
+name: Notion Journal Sync
+
+on:
+  schedule:
+    # Every hour at :35 — slots between mfp-email (:15), whoop-journal-email (:30),
+    # and habits-sync (:45) on the staggered cadence.
+    - cron: '35 * * * *'
+  workflow_dispatch: # Manual trigger for testing
+
+concurrency:
+  group: journal-sync
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+  NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+  NOTION_JOURNAL_DB: ${{ secrets.NOTION_JOURNAL_DB }}
+  VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+
+jobs:
+  journal-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install httpx supabase python-dotenv
+
+      - name: Run Journal ETL
+        run: python journal_etl.py

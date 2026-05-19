@@ -25,6 +25,8 @@ Onyx/
 ├── supplement_schema.sql    # supplement_products + supplement_intake + compound rollup views
 ├── spotify_schema.sql       # Spotify table DDL + spotify_daily_signature view
 ├── spotify_playlists_schema.sql  # Spotify playlists audit table DDL
+├── journal_etl.py           # Notion personal Journal → Supabase (entries + Voyage embeddings)
+├── journal_schema.sql       # pds.journal_entries table + search_journal_entries RPC
 ├── ci_token_helper.py       # Download/upload OAuth tokens for CI
 ├── hrv_analysis.py          # HRV deep analysis pipeline (Phases 1-3.5): data loading,
 │                            #   ~350-column / ~250-feature matrix, stat analysis, XGBoost/SARIMAX/Prophet,
@@ -42,6 +44,7 @@ Onyx/
 │   ├── eight-sleep-etl.yml      # Eight Sleep ETL — daily at 3 PM ET (`0 19 * * *`)
 │   ├── mfp-email.yml            # MyFitnessPal email check (`15 * * * *`)
 │   ├── whoop-journal-email.yml  # WHOOP journal email check (`30 * * * *`)
+│   ├── journal-sync.yml         # Notion personal Journal sync (`35 * * * *`)
 │   ├── habits-sync.yml          # Habits sync from Notion (`45 * * * *`)
 │   ├── spotify-etl.yml          # Spotify recently-played (`50 */2 * * *`)
 │   ├── hrv-prediction.yml       # HRV prediction — auto-runs after each ETL via workflow_run, plus guaranteed 23:50 ET finalization (DST-safe)
@@ -65,9 +68,9 @@ Onyx/
 ## Tech Stack
 
 - **ETL**: Python 3, httpx, garminconnect, supabase-py, python-dotenv
-- **Database**: Supabase (Postgres 17), schema `pds`, 19 tables + `journal` unified view + 3 HRV analysis tables (`hrv_predictions`, `hrv_model_metrics`, `hrv_analysis_results`) + Spotify (`spotify_plays`, `spotify_tracks`, `spotify_artists`, `spotify_playlists`, `spotify_daily_signature` view) + Supplements (`supplement_products`, `supplement_intake`, `supplement_intake_by_compound` view, `daily_supplement_matrix` view)
+- **Database**: Supabase (Postgres 17), schema `pds`, 19 tables + `journal` unified view + 3 HRV analysis tables (`hrv_predictions`, `hrv_model_metrics`, `hrv_analysis_results`) + Spotify (`spotify_plays`, `spotify_tracks`, `spotify_artists`, `spotify_playlists`, `spotify_daily_signature` view) + Supplements (`supplement_products`, `supplement_intake`, `supplement_intake_by_compound` view, `daily_supplement_matrix` view) + Notion personal Journal (`journal_entries` with pgvector embeddings, `search_journal_entries` RPC)
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
-- **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 17 tools (11 query + mark_habit_complete + query_journal + query_eight_sleep + search_spotify_catalog + query_spotify_tracks_by_features + create_spotify_playlist). Habit completion via chat syncs to both Supabase and Notion. Playlist creation goes via `lib/spotify-server.ts` which refreshes the access token on every call against `pds.ci_tokens` and writes any rotated refresh token back so the Python ETL stays in sync.
+- **AI Chat**: Claude Sonnet 4, agentic tool-use loop with 18 tools (11 query + mark_habit_complete + query_journal + query_journal_entries + query_eight_sleep + search_spotify_catalog + query_spotify_tracks_by_features + create_spotify_playlist). Habit completion via chat syncs to both Supabase and Notion. Playlist creation goes via `lib/spotify-server.ts` which refreshes the access token on every call against `pds.ci_tokens` and writes any rotated refresh token back so the Python ETL stays in sync. `query_journal_entries` supports semantic search via Voyage AI embeddings (voyage-3-large) — frontend embeds the user's query at request time, then RPC runs cosine similarity against pre-computed entry embeddings.
 - **System Status**: `/status` page — 10 source cards (Garmin, WHOOP, Eight Sleep, WHOOP Journal, Habits, MyFitnessPal, HRV Analysis, Spotify, **ReccoBeats**, **MusicBrainz**), KPI summary, 20-entry sync history. `GET /api/status` queries `pds.sync_log` by `(source, data_type)` key + `MAX()` date per data table. Auto-refreshes every 60s. ReccoBeats + MusicBrainz are *enrichment* subsystems (not ingestion) — their freshness is based on `sync_start` recency (heartbeat) rather than data age, because "no new items to enrich today" is healthy, not stale. `enrichmentSource()` helper in `api/status/route.ts` encodes that semantics: >12h since last heartbeat = failed, >4h = partial, otherwise success. `spotify_etl.py` writes a sync_log row for each subsystem every run (even with `records_synced=0`).
 - **Auth**: Supabase Auth — email + password (primary) with magic link fallback. RLS on all tables. `/account` page exposes `supabase.auth.updateUser({ password })` for self-service password changes.
 - **Hosting**: Vercel (frontend), Supabase Cloud (database)
@@ -155,16 +158,18 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
 - **Supplements follow the MFP pattern — merged into `daily_health_matrix`.** `pds.supplement_products` (dim, JSONB ingredients) + `pds.supplement_intake` (fact, one row per intake event). The matrix view LEFT JOINs `pds.daily_supplement_matrix` and exposes three new columns: `supplements_jsonb` (a `{compound_name: {amount, unit, category}}` map — query specific compounds with `(supplements_jsonb->'Vitamin D'->>'amount')::numeric`), `supplement_distinct_compounds`, `supplement_total_doses`. JSONB rather than hardcoded columns because the compound space is open-ended (50+ across a stack) and a user's supplement list changes — locking schema would be wrong. The underlying `pds.supplement_intake_by_compound` view explodes ingredient JSONB × dose and groups by FDA **UNII** code (when present) so cross-product summation just works: Vitamin C from a multivitamin and a standalone Vitamin C tablet roll up into one row. Product data comes from the **NIH DSLD** (Dietary Supplement Label Database) — public API at `https://api.ods.od.nih.gov/dsld/v9/`, no auth, covers vitamins/minerals/botanicals/nootropics with full ingredient lists. Seed paths: `python supplement_lookup.py search "<query>"` → `seed <dsld_id>`, or `seed-from-upc <upc>`, or the `/supplements` page's search/barcode-scan UI. The Next.js `/api/supplements/*` routes and the Python CLI share parsing logic (`frontend/src/lib/dsld.ts` mirrors `supplement_lookup.py:normalize_label`) so both produce identical rows.
 - **Barcode scanning is built-in.** `BarcodeScannerModal` (`@zxing/browser`) opens the rear camera, detects UPC-A/UPC-E/EAN-13, calls back with the digit string. The `/supplements` Add Product flow uses this: scan a bottle → `/api/supplements/search?q=<upc>` → if exactly one hit, single-click seed; else show candidates. Camera resources are torn down on close/detect/unmount to avoid stale streams. Works in any HTTPS browser context — including the PWA standalone shell.
 - **Spotify play coverage is incomplete by design.** `recently-played` only contains plays that Spotify's backend received — offline playback from Spotify-licensed partner devices (Garmin watches with downloaded playlists, some car head units, older standalone wearables) does **not** report per-track telemetry back to the account, so those plays are invisible to our ETL, to Wrapped, and to Spotify-generated personalization playlists. Phone/desktop/web app plays are reported in real time and *are* captured. The `/spotify` page surfaces this as a coverage note under the page header so users interpreting the sonic profile / volume / ledger understand the dashboard under-counts Garmin-heavy workout listening. No code-level fix is possible — Spotify's partner SDK simply doesn't pipe the data.
+- **`pds.journal_entries` is the personal Notion journal — distinct from `pds.journal` (the WHOOP+habit *behavior* view).** Notion DB "Entries" (ID `96541038264d45aba2a9601d9b175a7e`, parent page "Journal"). One row per Notion page; PK = `notion_page_id`. Properties: `entry_date` (ET-naive — Notion's Date property has no time component), `title`, `mood` (low/neutral/good/great), `source` (voice/remarkable/typed), `confidence` (high/medium/low), `topics` (JSONB array), `content_md` (page body as markdown), `word_count`, `embedding` vector(1024) from Voyage `voyage-3-large`, `archived` (soft-delete). Skip-if-unchanged guard: `notion_edited_at` — ETL only re-fetches blocks / re-embeds when Notion's `last_edited_time` advances. Indexes: B-tree on `entry_date` + `mood`, GIN on `topics`, HNSW (cosine) on `embedding`. RPC `pds.search_journal_entries(query_embedding, date_from, date_to, mood_filter, topic_filters, result_limit)` exposes filtered + similarity-ordered search to the chat tool. **Not auto-joined into `daily_health_matrix`** — same isolation principle as Spotify; cross-analysis happens at query time only. Notion is single write surface (read-only direction, unlike habits which is bidirectional). Sync via `journal_etl.py` hourly at `:35`. Journal DB must be shared with the "SMS Reminders" Notion integration (same blocker as initial habits deployment — `project_onyx_habits.md` memory).
 
 ## Environment Variables
 
 Root `.env` (Python ETL): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY,
 GARMIN_EMAIL, GARMIN_PASSWORD, WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET,
 EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD, IMAP_HOST, IMAP_EMAIL, IMAP_APP_PASSWORD,
-MFP_USERNAME, MFP_PASSWORD, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI
+MFP_USERNAME, MFP_PASSWORD, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI,
+NOTION_API_KEY, NOTION_JOURNAL_DB, VOYAGE_API_KEY
 
 `frontend/.env.local`: NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
-SUPABASE_SERVICE_ROLE_KEY, ANTHROPIC_API_KEY, NOTION_API_KEY, NOTION_HABITS_DB
+SUPABASE_SERVICE_ROLE_KEY, ANTHROPIC_API_KEY, NOTION_API_KEY, NOTION_HABITS_DB, VOYAGE_API_KEY
 
 ## Claude Code Permissions
 
@@ -199,6 +204,7 @@ All data sources run **hourly** on a staggered schedule to spread load and avoid
 | Eight Sleep ETL | `eight-sleep-etl.yml` | `0 19 * * *` | Eight Sleep — daily at 3 PM ET (data only updates post-sleep) |
 | MyFitnessPal email | `mfp-email.yml` | `15 * * * *` | IMAP check → import MFP nutrition CSV |
 | WHOOP journal email | `whoop-journal-email.yml` | `30 * * * *` | IMAP check → import WHOOP journal CSV |
+| Notion Journal Sync | `journal-sync.yml` | `35 * * * *` | Notion DB query → upsert + Voyage embed → `pds.journal_entries` |
 | Habits sync | `habits-sync.yml` | `45 * * * *` | Curls `POST /api/habits/sync` on Vercel |
 | Spotify ETL | `spotify-etl.yml` | `50 */2 * * *` | Pulls recently-played; upserts plays + tracks; featurizes new tracks via ReccoBeats |
 | HRV prediction | `hrv-prediction.yml` | `workflow_run` after hourly ETL + `50 3 * * *` + `50 4 * * *` | Backfills actuals + predicts next day. Hourly workflow_run runs give intra-day monitoring; the two scheduled crons land on 23:50 ET year-round (one per DST state — the `dst-gate` job skips the wrong-season run by checking `TZ=America/New_York date +%H == 23`). The 23:50 ET run captures the final day's imports (Habits at :45, journal at :30, MFP at :15) before ET midnight closes the day. **`hrv_predict.py` uses `et_today()` (`zoneinfo.ZoneInfo("America/New_York")`) for all date arithmetic** — a UTC `date.today()` on the runner would mis-tag the late-ET-evening run as the day-after-next. |

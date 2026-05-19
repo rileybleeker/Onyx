@@ -17,6 +17,8 @@ You have access to the user's data via function calls. When the user asks about 
 
 When the user mentions completing a habit (e.g., "I meditated today", "I took my vitamins"), use mark_habit_complete to log it. The habit name should match what's defined in their habits list. Use query_journal to see both WHOOP journal behaviors and habit completions together.
 
+The user also keeps a free-form *personal* journal in Notion (prose entries about life, mood, relationships, training, mental health). Use query_journal_entries when they ask about what they wrote, how they were feeling, or to find context behind biometric trends — combine it with biometric tools to answer questions like "what was my HRV on days I logged a 'low' mood?". When a question is thematic rather than date-specific, set semantic_query to do similarity search.
+
 You can also create Spotify playlists. The user has private-playlist write access enabled. When asked to make a playlist:
 - Use query_spotify_tracks_by_features to pick tracks from their listening history (filter by audio-feature ranges like valence, energy, tempo).
 - Use search_spotify_catalog when they want tracks they haven't listened to before, or when filling out a playlist beyond what their history covers.
@@ -218,6 +220,22 @@ const tools: Anthropic.Tool[] = [
     },
   },
   {
+    name: "query_journal_entries",
+    description: "Search the user's personal Notion journal (free-form prose entries about their life — relationships, mental health, work, training, etc., distinct from the WHOOP/habit behavior journal). Use this when the user asks about how they were feeling, what they wrote about, or to find context behind health data. Supports filters and optional semantic search via 'semantic_query'. Returns entries sorted by similarity (when semantic_query given) or by date desc.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        date_from: { type: "string", description: "ISO date (YYYY-MM-DD), inclusive" },
+        date_to: { type: "string", description: "ISO date (YYYY-MM-DD), inclusive" },
+        mood: { type: "string", description: "Filter by mood: 'low' | 'neutral' | 'good' | 'great'" },
+        topics: { type: "array", items: { type: "string" }, description: "ANY-match against Notion Topics (e.g., ['gym','mental-health']). Empty/omit for no topic filter." },
+        semantic_query: { type: "string", description: "Optional free-text query for embedding-based similarity (e.g., 'feeling unmotivated about training'). When provided, results are ordered by similarity." },
+        limit: { type: "number", description: "Max entries to return (default 10, max 25)" },
+      },
+      required: [],
+    },
+  },
+  {
     name: "create_spotify_playlist",
     description: "Create a private Spotify playlist with the given tracks. Playlists are added to the user's Spotify account and a link is returned. Always private — do not ask for confirmation, just create it (easy to delete in Spotify if not wanted).",
     input_schema: {
@@ -373,6 +391,77 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     const { data, error } = await query;
     if (error) return JSON.stringify({ error: error.message });
     return JSON.stringify(data ?? []);
+  }
+
+  // Personal Notion journal — metadata filters + optional semantic search
+  if (name === "query_journal_entries") {
+    const limit = Math.min((input.limit as number) ?? 10, 25);
+    const semantic = (input.semantic_query as string | undefined)?.trim();
+
+    let queryEmbedding: number[] | null = null;
+    if (semantic) {
+      const voyageKey = process.env.VOYAGE_API_KEY;
+      if (!voyageKey) {
+        return JSON.stringify({ error: "VOYAGE_API_KEY not configured; semantic_query unavailable" });
+      }
+      try {
+        const r = await fetch("https://api.voyageai.com/v1/embeddings", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${voyageKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            input: [semantic],
+            model: "voyage-3-large",
+            input_type: "query",
+            output_dimension: 1024,
+          }),
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          return JSON.stringify({ error: `Voyage embed failed: ${r.status} ${t.slice(0, 200)}` });
+        }
+        const data = await r.json();
+        queryEmbedding = data.data?.[0]?.embedding ?? null;
+      } catch (e) {
+        return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
+    const topics = Array.isArray(input.topics) ? (input.topics as string[]) : null;
+    const { data, error } = await supabase.rpc("search_journal_entries", {
+      query_embedding: queryEmbedding,
+      date_from: (input.date_from as string) ?? null,
+      date_to: (input.date_to as string) ?? null,
+      mood_filter: (input.mood as string) ?? null,
+      topic_filters: topics && topics.length > 0 ? topics : null,
+      result_limit: limit,
+    });
+    if (error) return JSON.stringify({ error: error.message });
+
+    type JournalRow = {
+      notion_page_id: string;
+      entry_date: string;
+      title: string | null;
+      mood: string | null;
+      source: string | null;
+      topics: string[] | null;
+      content_md: string | null;
+      word_count: number | null;
+      similarity: number | null;
+    };
+
+    const out = (data ?? []).map((r: JournalRow) => ({
+      notion_page_id: r.notion_page_id,
+      entry_date: r.entry_date,
+      title: r.title,
+      mood: r.mood,
+      source: r.source,
+      topics: r.topics,
+      word_count: r.word_count,
+      similarity: r.similarity != null ? Number(r.similarity.toFixed(4)) : undefined,
+      snippet: (r.content_md ?? "").slice(0, 600),
+      truncated: (r.content_md ?? "").length > 600,
+    }));
+    return JSON.stringify(out);
   }
 
   // Mark a habit as complete (writes to both Supabase and Notion)
