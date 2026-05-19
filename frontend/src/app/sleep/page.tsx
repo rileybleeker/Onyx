@@ -12,7 +12,7 @@ import {
 import { formatDate, formatDuration } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
-import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -234,7 +234,7 @@ export default function SleepPage() {
               </defs>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={40} domain={[0, 21]} />
+              <YAxis tick={axisTick} width={55} domain={[0, 21]} label={axisLabel("strain", "y")} />
               <Tooltip {...chartTooltip} />
               <Area type="monotone" dataKey="strain" stroke="#3b82f6" fill="url(#recStrainGrad)" strokeWidth={2} name="Strain" />
             </AreaChart>
@@ -284,7 +284,7 @@ export default function SleepPage() {
               </defs>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={40} />
+              <YAxis tick={axisTick} width={55} label={axisLabel("bpm", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Area type="monotone" dataKey="max" stroke="#ef4444" fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max HR" />
@@ -304,7 +304,7 @@ export default function SleepPage() {
               </defs>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={40} domain={[0, 100]} />
+              <YAxis tick={axisTick} width={55} domain={[0, 100]} label={axisLabel("stress (0–100)", "y")} />
               <Tooltip {...chartTooltip} />
               <Area type="monotone" dataKey="overall" stroke="#f97316" fill="url(#heartStressGrad)" strokeWidth={2} name="Stress Level" />
             </AreaChart>
@@ -329,7 +329,7 @@ export default function SleepPage() {
             <BarChart data={whoopDurationData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={35} />
+              <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
@@ -413,7 +413,7 @@ export default function SleepPage() {
             <LineChart data={eightScoreData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={40} domain={[0, 100]} />
+              <YAxis tick={axisTick} width={55} domain={[0, 100]} label={axisLabel("score (0–100)", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Line type="monotone" dataKey="sleep" stroke="#8b5cf6" strokeWidth={2} dot={false} name="Sleep" />
@@ -428,7 +428,7 @@ export default function SleepPage() {
             <BarChart data={eightStagesData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={40} />
+              <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />

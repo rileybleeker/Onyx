@@ -9,7 +9,7 @@ import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getWhoopJournal } from
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
-import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -153,7 +153,7 @@ export default function WhoopPage() {
               </defs>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={40} domain={[0, 21]} />
+              <YAxis tick={axisTick} width={55} domain={[0, 21]} label={axisLabel("strain", "y")} />
               <Tooltip {...chartTooltip} />
               <Area type="monotone" dataKey="strain" stroke="#3b82f6" fill="url(#whoopStrainGrad)" strokeWidth={2} name="Strain" />
             </AreaChart>
@@ -165,7 +165,7 @@ export default function WhoopPage() {
             <BarChart data={sleepData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={40} />
+              <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />

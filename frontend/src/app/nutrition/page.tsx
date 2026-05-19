@@ -11,7 +11,7 @@ import { getMfpNutrition } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
-import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -123,7 +123,7 @@ export default function NutritionPage() {
               </defs>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={48} />
+              <YAxis tick={axisTick} width={60} label={axisLabel("kcal", "y")} />
               <Tooltip {...chartTooltip} />
               <Area
                 type="monotone"

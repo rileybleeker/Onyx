@@ -8,7 +8,7 @@ import {
 } from "recharts";
 import ChartCard from "@/components/ChartCard";
 import StatCard from "@/components/StatCard";
-import { chartTooltip, axisTick, gridStyle, accentColor } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel } from "@/lib/chart-theme";
 import {
   getSpotifyKpis,
   getSpotifyDailyVolume,
@@ -378,10 +378,10 @@ export default function SpotifyPage() {
             source="SPOTIFY"
           >
             <ResponsiveContainer width="100%" height={260}>
-              <LineChart data={volume} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+              <LineChart data={volume} margin={{ top: 8, right: 8, left: 4, bottom: 0 }}>
                 <CartesianGrid {...gridStyle} />
                 <XAxis dataKey="calendar_date" tick={axisTick} tickFormatter={(v) => v.slice(5)} />
-                <YAxis tick={axisTick} />
+                <YAxis tick={axisTick} width={50} label={axisLabel("plays", "y")} />
                 <Tooltip {...chartTooltip} />
                 <Line
                   type="monotone"
@@ -461,10 +461,10 @@ export default function SpotifyPage() {
                 </p>
               ) : (
                 <ResponsiveContainer width="100%" height={300}>
-                  <AreaChart data={genreRotation.rows} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+                  <AreaChart data={genreRotation.rows} margin={{ top: 8, right: 8, left: 4, bottom: 0 }}>
                     <CartesianGrid {...gridStyle} />
                     <XAxis dataKey="calendar_date" tick={axisTick} tickFormatter={(v: string) => v.slice(5)} />
-                    <YAxis tick={axisTick} />
+                    <YAxis tick={axisTick} width={50} label={axisLabel("plays", "y")} />
                     <Tooltip {...chartTooltip} />
                     <Legend wrapperStyle={legendStyle} />
                     {genreRotation.topGenres.map((g, i) => (
@@ -656,10 +656,10 @@ export default function SpotifyPage() {
             info="Bars are play counts grouped by hour-of-day (America/New_York). Reveals chronotype patterns — heavy late-night listening shows up here."
           >
             <ResponsiveContainer width="100%" height={220}>
-              <BarChart data={hours} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+              <BarChart data={hours} margin={{ top: 8, right: 8, left: 4, bottom: 20 }}>
                 <CartesianGrid {...gridStyle} />
-                <XAxis dataKey="hour" tick={axisTick} />
-                <YAxis tick={axisTick} />
+                <XAxis dataKey="hour" tick={axisTick} height={45} label={axisLabel("hour of day (ET)", "x")} />
+                <YAxis tick={axisTick} width={50} label={axisLabel("plays", "y")} />
                 <Tooltip {...chartTooltip} />
                 <Bar dataKey="plays" fill={spotifyGreen} radius={[2, 2, 0, 0]} />
               </BarChart>

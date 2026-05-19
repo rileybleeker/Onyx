@@ -9,7 +9,7 @@ import {
 import { getRecoveryVsPace } from "@/lib/queries";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
-import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -170,10 +170,12 @@ export default function RecoveryPage() {
         {totalWithDelta > 0 && (
           <ChartCard title={`Recovery % vs Pace Delta (${totalWithDelta} workouts)`}>
             <ResponsiveContainer width="100%" height={300}>
-              <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
+              <ScatterChart margin={{ top: 10, right: 10, bottom: 30, left: 10 }}>
                 <CartesianGrid strokeDasharray="3 3" {...gridStyle} />
-                <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={axisTick} domain={[0, 100]} />
-                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={axisTick} />
+                <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={axisTick} domain={[0, 100]}
+                       height={50} label={axisLabel("recovery (%)", "x")} />
+                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={axisTick} width={60}
+                       label={axisLabel("pace delta (%)", "y")} />
                 <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                 <Tooltip content={<ScatterTooltip />} />
                 <Scatter data={withTarget} shape="circle">
@@ -201,10 +203,12 @@ export default function RecoveryPage() {
         {/* Scatter: Recovery vs Overall Pace (all runs) */}
         <ChartCard title={`Recovery % vs Overall Pace (${scatterAll.length} runs)`}>
           <ResponsiveContainer width="100%" height={300}>
-            <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
+            <ScatterChart margin={{ top: 10, right: 10, bottom: 30, left: 10 }}>
               <CartesianGrid strokeDasharray="3 3" {...gridStyle} />
-              <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={axisTick} domain={[0, 100]} />
-              <YAxis type="number" dataKey="overallPace" name="Pace" unit=" min/mi" tick={axisTick} reversed />
+              <XAxis type="number" dataKey="recovery" name="Recovery" unit="%" tick={axisTick} domain={[0, 100]}
+                     height={50} label={axisLabel("recovery (%)", "x")} />
+              <YAxis type="number" dataKey="overallPace" name="Pace" unit=" min/mi" tick={axisTick} reversed width={65}
+                     label={axisLabel("pace (min/mi)", "y")} />
               <Tooltip content={<ScatterTooltip />} />
               <Scatter data={scatterAll} shape="circle">
                 {scatterAll.map((d, i) => (
@@ -218,10 +222,10 @@ export default function RecoveryPage() {
         {/* Binned Analysis */}
         <ChartCard title="Avg Pace Delta by Recovery Zone">
           <ResponsiveContainer width="100%" height={280}>
-            <BarChart data={bins} margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
+            <BarChart data={bins} margin={{ top: 10, right: 10, bottom: 10, left: 10 }}>
               <CartesianGrid strokeDasharray="3 3" {...gridStyle} />
               <XAxis dataKey="label" tick={axisTick} />
-              <YAxis tick={axisTick} width={45} />
+              <YAxis tick={axisTick} width={60} label={axisLabel("avg pace delta (%)", "y")} />
               <ReferenceLine y={0} stroke="#71717a" />
               <Tooltip {...chartTooltip} formatter={(value: any) => [`${value}%`, "Avg Pace Delta"]} />
               <Bar dataKey="avgPaceDelta" name="Avg Pace Delta %" radius={[4, 4, 0, 0]}>
@@ -281,10 +285,12 @@ export default function RecoveryPage() {
         {totalWithDelta > 0 && (
           <ChartCard title={`HRV vs Pace Delta (${totalWithDelta} workouts)`}>
             <ResponsiveContainer width="100%" height={300}>
-              <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
+              <ScatterChart margin={{ top: 10, right: 10, bottom: 30, left: 10 }}>
                 <CartesianGrid strokeDasharray="3 3" {...gridStyle} />
-                <XAxis type="number" dataKey="hrv" name="HRV" unit=" ms" tick={axisTick} />
-                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={axisTick} />
+                <XAxis type="number" dataKey="hrv" name="HRV" unit=" ms" tick={axisTick}
+                       height={50} label={axisLabel("HRV (ms)", "x")} />
+                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={axisTick} width={60}
+                       label={axisLabel("pace delta (%)", "y")} />
                 <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                 <Tooltip content={<ScatterTooltip />} />
                 <Scatter data={withTarget.filter((d) => d.hrv != null)} shape="circle">
@@ -301,10 +307,12 @@ export default function RecoveryPage() {
         {totalWithDelta > 0 && (
           <ChartCard title={`Sleep Performance vs Pace Delta`}>
             <ResponsiveContainer width="100%" height={300}>
-              <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 0 }}>
+              <ScatterChart margin={{ top: 10, right: 10, bottom: 30, left: 10 }}>
                 <CartesianGrid strokeDasharray="3 3" {...gridStyle} />
-                <XAxis type="number" dataKey="sleepPerf" name="Sleep Performance" unit="%" tick={axisTick} domain={[50, 100]} />
-                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={axisTick} />
+                <XAxis type="number" dataKey="sleepPerf" name="Sleep Performance" unit="%" tick={axisTick} domain={[50, 100]}
+                       height={50} label={axisLabel("sleep performance (%)", "x")} />
+                <YAxis type="number" dataKey="paceDelta" name="Pace Delta" unit="%" tick={axisTick} width={60}
+                       label={axisLabel("pace delta (%)", "y")} />
                 <ReferenceLine y={0} stroke="#71717a" strokeDasharray="3 3" />
                 <Tooltip content={<ScatterTooltip />} />
                 <Scatter data={withTarget.filter((d) => d.sleepPerf != null)} shape="circle">

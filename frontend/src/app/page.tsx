@@ -9,7 +9,7 @@ import { getDailySummaries, getWhoopRecovery, getWhoopSleep } from "@/lib/querie
 import { formatDate, formatDuration } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
-import { chartTooltip, axisTick, gridStyle, accentColor } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -116,7 +116,7 @@ export default function Dashboard() {
             <BarChart data={stepsData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={45} />
+              <YAxis tick={axisTick} width={55} label={axisLabel("steps", "y")} />
               <Tooltip {...chartTooltip} />
               <Bar dataKey="steps" fill={accentColor} radius={[2, 2, 0, 0]} fillOpacity={0.85} />
             </BarChart>
@@ -134,7 +134,7 @@ export default function Dashboard() {
               </defs>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={35} domain={[0, 10]} />
+              <YAxis tick={axisTick} width={50} domain={[0, 10]} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} />
               <Area type="monotone" dataKey="hours" stroke={accentColor} fill="url(#sleepFill)" strokeWidth={2} />
             </AreaChart>
@@ -170,7 +170,7 @@ export default function Dashboard() {
               </defs>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={40} />
+              <YAxis tick={axisTick} width={55} label={axisLabel("ms", "y")} />
               <Tooltip {...chartTooltip} />
               <Area type="monotone" dataKey="hrv" stroke="#34D399" fill="url(#hrvFill)" strokeWidth={2} connectNulls />
             </AreaChart>

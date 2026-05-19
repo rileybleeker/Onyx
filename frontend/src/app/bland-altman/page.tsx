@@ -8,7 +8,7 @@ import {
 import { getHealthMatrix } from "@/lib/queries";
 import { blandAltman } from "@/lib/stats";
 import ChartCard from "@/components/ChartCard";
-import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -62,7 +62,7 @@ function BAPlot({
   return (
     <ChartCard title={title} subtitle={subtitle}>
       <ResponsiveContainer width="100%" height={280}>
-        <ScatterChart margin={{ top: 10, right: 20, bottom: 20, left: 10 }}>
+        <ScatterChart margin={{ top: 10, right: 20, bottom: 30, left: 20 }}>
           <CartesianGrid {...gridStyle} />
           <XAxis
             dataKey="mean"
@@ -70,13 +70,16 @@ function BAPlot({
             domain={[xMin - pad, xMax + pad]}
             tick={axisTick}
             name="Mean"
+            height={50}
+            label={axisLabel(`mean of both devices (${unit})`, "x")}
           />
           <YAxis
             dataKey="diff"
             type="number"
             tick={axisTick}
-            width={50}
+            width={65}
             name="Difference"
+            label={axisLabel(`difference (${unit})`, "y")}
           />
           <Tooltip
             {...chartTooltip}

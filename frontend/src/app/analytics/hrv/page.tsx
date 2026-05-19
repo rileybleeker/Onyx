@@ -7,7 +7,7 @@ import {
   CartesianGrid, ReferenceLine, Cell,
 } from "recharts";
 import ChartCard from "@/components/ChartCard";
-import { chartTooltip, axisTick, gridStyle } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 import { supabase } from "@/lib/supabase";
 import { getWorkoutSleepGap, type WorkoutSleepGap } from "@/lib/queries";
 
@@ -611,9 +611,10 @@ export default function HrvAnalysisPage() {
             {topDrivers.length > 0 ? (
               <ResponsiveContainer width="100%" height={300}>
                 <BarChart data={topDrivers.slice(0, 10)} layout="vertical"
-                          margin={{ left: 140, right: 20, top: 4, bottom: 4 }}>
+                          margin={{ left: 140, right: 20, top: 4, bottom: 20 }}>
                   <CartesianGrid {...gridStyle} horizontal={false} />
-                  <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(1)}`} />
+                  <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(1)}`}
+                         label={axisLabel("HRV impact (ms)", "x")} />
                   <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 11 }} width={140} />
                   <Tooltip
                     {...chartTooltip}
@@ -648,9 +649,10 @@ export default function HrvAnalysisPage() {
               {journalDriversToday.length > 0 ? (
                 <ResponsiveContainer width="100%" height={Math.max(120, journalDriversToday.length * 22)}>
                   <BarChart data={journalDriversToday} layout="vertical"
-                            margin={{ left: 160, right: 20, top: 2, bottom: 2 }}>
+                            margin={{ left: 160, right: 20, top: 2, bottom: 20 }}>
                     <CartesianGrid {...gridStyle} horizontal={false} />
-                    <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(2)}`} />
+                    <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(2)}`}
+                           label={axisLabel("HRV impact (ms)", "x")} />
                     <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160}
                            tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
                     <Tooltip {...chartTooltip}
@@ -772,7 +774,7 @@ export default function HrvAnalysisPage() {
               </defs>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={40} domain={["auto", "auto"]} />
+              <YAxis tick={axisTick} width={55} domain={["auto", "auto"]} label={axisLabel("HRV (ms)", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Area type="monotone" dataKey="upper" name="Upper CI" stroke="none"
@@ -801,10 +803,11 @@ export default function HrvAnalysisPage() {
           {journalImpact.length > 0 ? (
             <ResponsiveContainer width="100%" height={260}>
               <BarChart data={journalImpact.slice(0, 12)} layout="vertical"
-                        margin={{ left: 120, right: 20, top: 4, bottom: 4 }}>
+                        margin={{ left: 120, right: 20, top: 4, bottom: 20 }}>
                 <CartesianGrid {...gridStyle} horizontal={false} />
                 <XAxis type="number" tick={axisTick}
-                       tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`} />
+                       tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
+                       label={axisLabel("HRV Δ (ms)", "x")} />
                 <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={120} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, n: any) => [`${Number(v).toFixed(1)} ms`, "HRV Δ"]} />
@@ -834,7 +837,7 @@ export default function HrvAnalysisPage() {
             <LineChart data={predActualData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={40} domain={["auto", "auto"]} />
+              <YAxis tick={axisTick} width={55} domain={["auto", "auto"]} label={axisLabel("HRV (ms)", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Line type="monotone" dataKey="actual" stroke="#ef4444" strokeWidth={2}
@@ -855,11 +858,8 @@ export default function HrvAnalysisPage() {
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={horizonData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="horizon" tick={axisTick} />
-              <YAxis tick={axisTick} width={40} label={{
-                value: "MAE (ms)", angle: -90, position: "insideLeft",
-                style: { fill: "#71717a", fontSize: 10 }
-              }} />
+              <XAxis dataKey="horizon" tick={axisTick} label={axisLabel("forecast horizon (days)", "x")} height={50} />
+              <YAxis tick={axisTick} width={55} label={axisLabel("MAE (ms)", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Bar dataKey="xgboost" name="XGBoost" fill="#3b82f6" radius={[3, 3, 0, 0]} />
@@ -883,7 +883,7 @@ export default function HrvAnalysisPage() {
           <LineChart data={trendData}>
             <CartesianGrid {...gridStyle} />
             <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-            <YAxis tick={axisTick} width={40} domain={["auto", "auto"]} />
+            <YAxis tick={axisTick} width={55} domain={["auto", "auto"]} label={axisLabel("HRV (ms)", "y")} />
             <Tooltip {...chartTooltip} />
             <Legend wrapperStyle={legendStyle} />
             <Line type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={1.5}
@@ -939,10 +939,11 @@ export default function HrvAnalysisPage() {
                   domain={[0, 13]}
                   tickFormatter={(v) => `${v}h`}
                   tick={axisTick}
-                  label={{ value: "Hours from workout end → bed", position: "insideBottom", offset: -2, style: { fill: "#a1a1aa", fontSize: 11 } }}
+                  height={50}
+                  label={axisLabel("hours from workout end → bed", "x")}
                 />
-                <YAxis tick={axisTick} width={42} domain={["auto", "auto"]}
-                       label={{ value: "HRV (ms)", angle: -90, position: "insideLeft", style: { fill: "#a1a1aa", fontSize: 11 } }} />
+                <YAxis tick={axisTick} width={55} domain={["auto", "auto"]}
+                       label={axisLabel("HRV (ms)", "y")} />
                 <Tooltip {...chartTooltip}
                          formatter={(value: any, name: any) =>
                            name === "hrv_mean"
@@ -1001,10 +1002,11 @@ export default function HrvAnalysisPage() {
                 </p>
                 {residualData.length > 0 && residualData.some(d => d.count > 0) ? (
                   <ResponsiveContainer width="100%" height={200}>
-                    <BarChart data={residualData}>
+                    <BarChart data={residualData} margin={{ top: 4, right: 8, left: 0, bottom: 20 }}>
                       <CartesianGrid {...gridStyle} />
-                      <XAxis dataKey="bin" tick={{ ...axisTick, fontSize: 9 }} interval={3} />
-                      <YAxis tick={axisTick} width={30} />
+                      <XAxis dataKey="bin" tick={{ ...axisTick, fontSize: 9 }} interval={3}
+                             height={45} label={axisLabel("residual (ms)", "x")} />
+                      <YAxis tick={axisTick} width={45} label={axisLabel("nights", "y")} />
                       <Tooltip {...chartTooltip} />
                       <ReferenceLine x="0" stroke="#ef4444" strokeWidth={1.5} />
                       <Bar dataKey="count" fill="#3b82f6" fillOpacity={0.8} />
