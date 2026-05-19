@@ -7,6 +7,8 @@ const supabase = createClient(
   { db: { schema: "pds" } }
 );
 
+export type IntegrationMethod = "automated" | "semi-automated" | "manual";
+
 export interface SourceStatus {
   label: string;
   lastSync: string | null;
@@ -17,6 +19,8 @@ export interface SourceStatus {
   durationSeconds: number | null;
   errorMessage: string | null;
   cadence: string;
+  integrationMethod: IntegrationMethod;
+  methodLabel: string;
 }
 
 // Human-readable sync cadence per source. "Manual" means user-triggered;
@@ -34,6 +38,27 @@ const CADENCE: Record<string, string> = {
   musicbrainz: "With Spotify ETL",
   supplements: "Manual",
   notion_journal: "Hourly :35",
+};
+
+// Integration method per source.
+// - "automated":      cron pulls data autonomously from an API or third-party sync (no user step).
+// - "semi-automated": cron import that depends on a user-triggered export from the source app
+//                     (WHOOP and MFP have no API export — user must request CSV via web UI;
+//                     IMAP cron then picks up the email and imports).
+// - "manual":         data is entered directly by the user via the Onyx UI.
+const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
+  garmin:         { method: "automated",      label: "API ETL" },
+  whoop:          { method: "automated",      label: "API ETL" },
+  eight_sleep:    { method: "automated",      label: "API ETL" },
+  whoop_journal:  { method: "semi-automated", label: "Email import" },
+  habits:         { method: "automated",      label: "Notion sync" },
+  myfitnesspal:   { method: "semi-automated", label: "Email import" },
+  hrv_analysis:   { method: "automated",      label: "Computed" },
+  spotify:        { method: "automated",      label: "API ETL" },
+  reccobeats:     { method: "automated",      label: "Enrichment" },
+  musicbrainz:    { method: "automated",      label: "Enrichment" },
+  supplements:    { method: "manual",         label: "Manual entry" },
+  notion_journal: { method: "automated",      label: "Notion sync" },
 };
 
 export interface DriftAlert {
@@ -114,7 +139,9 @@ function enrichmentSource({
     recordsSynced: (entry?.records_synced as number) ?? 0,
     durationSeconds: (entry?.duration_seconds as number) ?? null,
     errorMessage: (entry?.error_message as string) ?? null,
-    cadence: "",  // overwritten in the sources map below
+    cadence: "",                                          // overwritten in the sources map below
+    integrationMethod: "automated",                       // overwritten in the merge step
+    methodLabel: "",                                      // overwritten in the merge step
   };
 }
 
@@ -203,6 +230,8 @@ export async function GET() {
         durationSeconds: (garminEntry?.duration_seconds as number) ?? null,
         errorMessage: (garminEntry?.error_message as string) ?? null,
         cadence: CADENCE.garmin,
+        integrationMethod: METHOD.garmin.method,
+        methodLabel: METHOD.garmin.label,
       },
       whoop: {
         label: "WHOOP",
@@ -214,6 +243,8 @@ export async function GET() {
         durationSeconds: (whoopEntry?.duration_seconds as number) ?? null,
         errorMessage: (whoopEntry?.error_message as string) ?? null,
         cadence: CADENCE.whoop,
+        integrationMethod: METHOD.whoop.method,
+        methodLabel: METHOD.whoop.label,
       },
       eight_sleep: {
         label: "Eight Sleep",
@@ -225,6 +256,8 @@ export async function GET() {
         durationSeconds: (eightSleepEntry?.duration_seconds as number) ?? null,
         errorMessage: (eightSleepEntry?.error_message as string) ?? null,
         cadence: CADENCE.eight_sleep,
+        integrationMethod: METHOD.eight_sleep.method,
+        methodLabel: METHOD.eight_sleep.label,
       },
       whoop_journal: {
         label: "WHOOP Journal",
@@ -236,6 +269,8 @@ export async function GET() {
         durationSeconds: (journalEntry?.duration_seconds as number) ?? null,
         errorMessage: (journalEntry?.error_message as string) ?? null,
         cadence: CADENCE.whoop_journal,
+        integrationMethod: METHOD.whoop_journal.method,
+        methodLabel: METHOD.whoop_journal.label,
       },
       habits: {
         label: "Habits",
@@ -247,6 +282,8 @@ export async function GET() {
         durationSeconds: null,
         errorMessage: null,
         cadence: CADENCE.habits,
+        integrationMethod: METHOD.habits.method,
+        methodLabel: METHOD.habits.label,
       },
       notion_journal: {
         label: "Notion Journal",
@@ -258,6 +295,8 @@ export async function GET() {
         durationSeconds: (notionJournalEntry?.duration_seconds as number) ?? null,
         errorMessage: (notionJournalEntry?.error_message as string) ?? null,
         cadence: CADENCE.notion_journal,
+        integrationMethod: METHOD.notion_journal.method,
+        methodLabel: METHOD.notion_journal.label,
       },
       myfitnesspal: {
         label: "MyFitnessPal",
@@ -269,6 +308,8 @@ export async function GET() {
         durationSeconds: (mfpEntry?.duration_seconds as number) ?? null,
         errorMessage: (mfpEntry?.error_message as string) ?? null,
         cadence: CADENCE.myfitnesspal,
+        integrationMethod: METHOD.myfitnesspal.method,
+        methodLabel: METHOD.myfitnesspal.label,
       },
       hrv_analysis: {
         label: "HRV Analysis",
@@ -280,6 +321,8 @@ export async function GET() {
         durationSeconds: null,
         errorMessage: null,
         cadence: CADENCE.hrv_analysis,
+        integrationMethod: METHOD.hrv_analysis.method,
+        methodLabel: METHOD.hrv_analysis.label,
       },
       spotify: {
         label: "Spotify",
@@ -291,14 +334,20 @@ export async function GET() {
         durationSeconds: (spotifyEntry?.duration_seconds as number) ?? null,
         errorMessage: (spotifyEntry?.error_message as string) ?? null,
         cadence: CADENCE.spotify,
+        integrationMethod: METHOD.spotify.method,
+        methodLabel: METHOD.spotify.label,
       },
       reccobeats: {
         ...enrichmentSource({ label: "ReccoBeats", entry: reccobeatsEntry }),
         cadence: CADENCE.reccobeats,
+        integrationMethod: METHOD.reccobeats.method,
+        methodLabel: METHOD.reccobeats.label,
       },
       musicbrainz: {
         ...enrichmentSource({ label: "MusicBrainz", entry: musicbrainzEntry }),
         cadence: CADENCE.musicbrainz,
+        integrationMethod: METHOD.musicbrainz.method,
+        methodLabel: METHOD.musicbrainz.label,
       },
       // Supplements is user-driven (no ETL); status derives purely from the
       // most-recent intake_date. Same pattern as Habits — see deriveStatus's
@@ -313,6 +362,8 @@ export async function GET() {
         durationSeconds: null,
         errorMessage: null,
         cadence: CADENCE.supplements,
+        integrationMethod: METHOD.supplements.method,
+        methodLabel: METHOD.supplements.label,
       },
     };
 

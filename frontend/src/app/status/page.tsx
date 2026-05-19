@@ -58,6 +58,16 @@ const STATUS_TEXT: Record<string, string> = {
   unknown: "text-text-tertiary",
 };
 
+// Color coding for the Method row:
+// - automated:      blue/cyan — runs on its own, no action needed
+// - semi-automated: amber-300 — requires periodic user export (WHOOP / MFP)
+// - manual:         amber-500 — user enters data directly via the UI
+const METHOD_COLOR: Record<string, string> = {
+  automated: "text-cyan-400",
+  "semi-automated": "text-amber-300",
+  manual: "text-amber-500",
+};
+
 const SOURCE_ORDER = [
   "garmin",
   "whoop",
@@ -119,6 +129,14 @@ function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus
 
       {/* Detail rows */}
       <div className="space-y-2">
+        {info.methodLabel && (
+          <DetailRow
+            label="Method"
+            value={info.methodLabel}
+            sub={info.integrationMethod === "semi-automated" ? "Requires manual export" : undefined}
+            valueClass={METHOD_COLOR[info.integrationMethod] ?? "text-text-secondary"}
+          />
+        )}
         {info.cadence && <DetailRow label="Cadence" value={info.cadence} />}
         <DetailRow label="Last Sync" value={formatRelativeTime(info.lastSync)} sub={info.lastSync ? formatSyncTime(info.lastSync) : undefined} />
         <DetailRow label="Latest Data" value={info.latestDataDate ? formatDateShort(info.latestDataDate) : "—"} />
