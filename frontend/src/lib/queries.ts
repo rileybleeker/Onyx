@@ -418,12 +418,44 @@ function dateNDaysAgo(days: number): string {
   return since.toISOString().split("T")[0];
 }
 
-export async function getSpotifyKpis(days: number = 30) {
-  const since = dateNDaysAgo(days);
-  const { data, error } = await supabase
+export type SpotifyRange = "all" | "1d" | "7d" | "30d" | "60d" | "90d" | "365d";
+
+export function rangeToDays(range: SpotifyRange): number | null {
+  switch (range) {
+    case "all": return null;
+    case "1d": return 1;
+    case "7d": return 7;
+    case "30d": return 30;
+    case "60d": return 60;
+    case "90d": return 90;
+    case "365d": return 365;
+  }
+}
+
+export function rangeLabel(range: SpotifyRange): string {
+  switch (range) {
+    case "all": return "all time";
+    case "1d": return "last 24h";
+    case "7d": return "last 7 days";
+    case "30d": return "last 30 days";
+    case "60d": return "last 60 days";
+    case "90d": return "last 90 days";
+    case "365d": return "last year";
+  }
+}
+
+function sinceFor(range: SpotifyRange): string | null {
+  const days = rangeToDays(range);
+  return days == null ? null : dateNDaysAgo(days);
+}
+
+export async function getSpotifyKpis(range: SpotifyRange = "30d") {
+  let q = supabase
     .from("spotify_plays")
-    .select("track_id,artist_id,duration_ms,track_name,artist_name")
-    .gte("played_date_et", since);
+    .select("track_id,artist_id,duration_ms,track_name,artist_name");
+  const since = sinceFor(range);
+  if (since) q = q.gte("played_date_et", since);
+  const { data, error } = await q;
   if (error) throw error;
   const rows = data ?? [];
   const uniqueTracks = new Set(rows.map((r) => r.track_id).filter(Boolean)).size;
@@ -452,35 +484,37 @@ export async function getSpotifyKpis(days: number = 30) {
   };
 }
 
-export async function getSpotifyDailyVolume(days: number = 90): Promise<SpotifyDailySignatureRow[]> {
-  const since = dateNDaysAgo(days);
-  const { data, error } = await supabase
+export async function getSpotifyDailyVolume(range: SpotifyRange = "90d"): Promise<SpotifyDailySignatureRow[]> {
+  let q = supabase
     .from("spotify_daily_signature")
-    .select("calendar_date,play_count,unique_tracks,unique_artists,total_minutes,featurized_plays")
-    .gte("calendar_date", since)
-    .order("calendar_date", { ascending: true });
+    .select("calendar_date,play_count,unique_tracks,unique_artists,total_minutes,featurized_plays");
+  const since = sinceFor(range);
+  if (since) q = q.gte("calendar_date", since);
+  const { data, error } = await q.order("calendar_date", { ascending: true });
   if (error) throw error;
   return (data ?? []) as SpotifyDailySignatureRow[];
 }
 
-export async function getSpotifyDailyAudioFeatures(days: number = 60): Promise<SpotifyDailySignatureRow[]> {
-  const since = dateNDaysAgo(days);
-  const { data, error } = await supabase
+export async function getSpotifyDailyAudioFeatures(range: SpotifyRange = "60d"): Promise<SpotifyDailySignatureRow[]> {
+  let q = supabase
     .from("spotify_daily_signature")
-    .select("calendar_date,avg_valence,avg_energy,avg_tempo,avg_danceability,featurized_plays,play_count")
-    .gte("calendar_date", since)
+    .select("calendar_date,avg_valence,avg_energy,avg_tempo,avg_danceability,featurized_plays,play_count");
+  const since = sinceFor(range);
+  if (since) q = q.gte("calendar_date", since);
+  const { data, error } = await q
     .gt("featurized_plays", 0)
     .order("calendar_date", { ascending: true });
   if (error) throw error;
   return (data ?? []) as SpotifyDailySignatureRow[];
 }
 
-export async function getSpotifyTopArtists(days: number = 30, limit: number = 10) {
-  const since = dateNDaysAgo(days);
-  const { data, error } = await supabase
+export async function getSpotifyTopArtists(range: SpotifyRange = "30d", limit: number = 10) {
+  let q = supabase
     .from("spotify_plays")
-    .select("artist_id,artist_name,duration_ms")
-    .gte("played_date_et", since);
+    .select("artist_id,artist_name,duration_ms");
+  const since = sinceFor(range);
+  if (since) q = q.gte("played_date_et", since);
+  const { data, error } = await q;
   if (error) throw error;
   const agg = new Map<string, { name: string; plays: number; minutes: number }>();
   for (const r of data ?? []) {
@@ -495,12 +529,13 @@ export async function getSpotifyTopArtists(days: number = 30, limit: number = 10
     .slice(0, limit);
 }
 
-export async function getSpotifyTopTracks(days: number = 30, limit: number = 10) {
-  const since = dateNDaysAgo(days);
-  const { data, error } = await supabase
+export async function getSpotifyTopTracks(range: SpotifyRange = "30d", limit: number = 10) {
+  let q = supabase
     .from("spotify_plays")
-    .select("track_id,track_name,artist_name,duration_ms")
-    .gte("played_date_et", since);
+    .select("track_id,track_name,artist_name,duration_ms");
+  const since = sinceFor(range);
+  if (since) q = q.gte("played_date_et", since);
+  const { data, error } = await q;
   if (error) throw error;
   const agg = new Map<string, { track_id: string; name: string; artist: string; plays: number; minutes: number }>();
   for (const r of data ?? []) {
@@ -526,17 +561,15 @@ export interface SonicProfileRow {
   value: number;
 }
 
-export async function getSpotifySonicProfile(days: number = 30): Promise<{
+export async function getSpotifySonicProfile(range: SpotifyRange = "30d"): Promise<{
   profile: SonicProfileRow[];
   totalPlays: number;
   featurizedPlays: number;
 } | null> {
-  const since = dateNDaysAgo(days);
-
-  const { data: plays, error: pErr } = await supabase
-    .from("spotify_plays")
-    .select("track_id")
-    .gte("played_date_et", since);
+  let pq = supabase.from("spotify_plays").select("track_id");
+  const since = sinceFor(range);
+  if (since) pq = pq.gte("played_date_et", since);
+  const { data: plays, error: pErr } = await pq;
   if (pErr) throw pErr;
 
   const playCounts = new Map<string, number>();
@@ -605,12 +638,11 @@ export async function getSpotifySonicProfile(days: number = 30): Promise<{
   return { profile, totalPlays, featurizedPlays };
 }
 
-export async function getSpotifyHourOfDay(days: number = 30) {
-  const since = dateNDaysAgo(days);
-  const { data, error } = await supabase
-    .from("spotify_plays")
-    .select("played_at")
-    .gte("played_date_et", since);
+export async function getSpotifyHourOfDay(range: SpotifyRange = "30d") {
+  let q = supabase.from("spotify_plays").select("played_at");
+  const since = sinceFor(range);
+  if (since) q = q.gte("played_date_et", since);
+  const { data, error } = await q;
   if (error) throw error;
   const buckets = Array.from({ length: 24 }, (_, h) => ({ hour: h, plays: 0 }));
   const fmt = new Intl.DateTimeFormat("en-US", {

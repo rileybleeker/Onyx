@@ -17,8 +17,20 @@ import {
   getSpotifyTopTracks,
   getSpotifyHourOfDay,
   getSpotifySonicProfile,
+  rangeLabel,
   type SpotifyDailySignatureRow,
+  type SpotifyRange,
 } from "@/lib/queries";
+
+const RANGE_OPTIONS: { value: SpotifyRange; label: string }[] = [
+  { value: "1d",   label: "1D" },
+  { value: "7d",   label: "1W" },
+  { value: "30d",  label: "30D" },
+  { value: "60d",  label: "60D" },
+  { value: "90d",  label: "90D" },
+  { value: "365d", label: "1Y" },
+  { value: "all",  label: "ALL" },
+];
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
 
@@ -44,6 +56,7 @@ export default function SpotifyPage() {
   const [hours, setHours] = useState<HourBuckets>([]);
   const [sonic, setSonic] = useState<SonicProfile>(null);
   const [loading, setLoading] = useState(true);
+  const [range, setRange] = useState<SpotifyRange>("30d");
 
   // Create-playlist modal state
   const [modalOpen, setModalOpen] = useState(false);
@@ -88,14 +101,15 @@ export default function SpotifyPage() {
   }
 
   useEffect(() => {
+    setLoading(true);
     Promise.all([
-      getSpotifyKpis(30),
-      getSpotifyDailyVolume(90),
-      getSpotifyDailyAudioFeatures(60),
-      getSpotifyTopArtists(30, 10),
-      getSpotifyTopTracks(30, 10),
-      getSpotifyHourOfDay(30),
-      getSpotifySonicProfile(30),
+      getSpotifyKpis(range),
+      getSpotifyDailyVolume(range),
+      getSpotifyDailyAudioFeatures(range),
+      getSpotifyTopArtists(range, 10),
+      getSpotifyTopTracks(range, 10),
+      getSpotifyHourOfDay(range),
+      getSpotifySonicProfile(range),
     ])
       .then(([k, v, f, ta, tt, h, sp]) => {
         setKpis(k);
@@ -108,17 +122,43 @@ export default function SpotifyPage() {
       })
       .catch((err) => console.error("Spotify page load:", err))
       .finally(() => setLoading(false));
-  }, []);
+  }, [range]);
 
   const hasData = (kpis?.totalPlays ?? 0) > 0;
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-[20px] font-medium text-text-primary tracking-tight">Spotify</h1>
-        <p className="text-[12px] text-text-tertiary mt-0.5">
-          Listening behavior — last 30 days (charts cover 60–90)
-        </p>
+      <header className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-[20px] font-medium text-text-primary tracking-tight">Spotify</h1>
+          <p className="text-[12px] text-text-tertiary mt-0.5">
+            Listening behavior — {rangeLabel(range)}
+          </p>
+        </div>
+        <div
+          role="radiogroup"
+          aria-label="Time range"
+          className="inline-flex rounded-[6px] border border-border-subtle bg-black/30 p-0.5 overflow-x-auto"
+        >
+          {RANGE_OPTIONS.map((opt) => {
+            const active = opt.value === range;
+            return (
+              <button
+                key={opt.value}
+                role="radio"
+                aria-checked={active}
+                onClick={() => setRange(opt.value)}
+                className={`px-2.5 py-1 text-[10px] font-mono tracking-wide rounded-[4px] transition-colors ${
+                  active
+                    ? "bg-[#1DB954]/20 text-text-primary border border-[#1DB954]/40"
+                    : "text-text-tertiary hover:text-text-secondary border border-transparent"
+                }`}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
       </header>
 
       {modalOpen && (
@@ -222,12 +262,12 @@ export default function SpotifyPage() {
         <>
           {/* KPI Row */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            <StatCard label="Plays" value={kpis!.totalPlays} sublabel="last 30 days" />
+            <StatCard label="Plays" value={kpis!.totalPlays} sublabel={rangeLabel(range)} />
             <StatCard
               label="Listening"
               value={kpis!.totalHours.toFixed(1)}
               unit="hrs"
-              sublabel="last 30 days"
+              sublabel={rangeLabel(range)}
             />
             <StatCard
               label="Unique Tracks"
@@ -248,7 +288,7 @@ export default function SpotifyPage() {
           {/* Listening volume over time */}
           <ChartCard
             title="Listening volume"
-            subtitle="plays per day, last 90 days"
+            subtitle={`plays per day, ${rangeLabel(range)}`}
             source="SPOTIFY"
           >
             <ResponsiveContainer width="100%" height={260}>
@@ -272,7 +312,7 @@ export default function SpotifyPage() {
           {/* Audio mood signature */}
           <ChartCard
             title="Audio mood signature"
-            subtitle="daily mean of valence, energy, danceability — last 60 days"
+            subtitle={`daily mean of valence, energy, danceability — ${rangeLabel(range)}`}
             source="RECCOBEATS"
             info="Valence = positivity. Energy = intensity. Danceability = rhythmic regularity. Days with no featurized plays are omitted, so the line isn't biased by gaps."
           >
@@ -293,7 +333,7 @@ export default function SpotifyPage() {
           {/* Current sonic profile */}
           <ChartCard
             title="Current sonic profile"
-            subtitle="play-weighted mean of 7 audio features — last 30 days"
+            subtitle={`play-weighted mean of 7 audio features — ${rangeLabel(range)}`}
             source="RECCOBEATS"
             info="All values normalized 0–1. Valence = positivity. Energy = intensity. Danceability = rhythmic regularity. Acousticness = acoustic vs. electronic. Instrumentalness = lack of vocals. Liveness = live-recording probability. Speechiness = spoken-word content. Weighted by play count so heavy rotation moves the shape."
           >
@@ -339,14 +379,14 @@ export default function SpotifyPage() {
             )}
             {sonic && (
               <p className="text-[10px] text-text-tertiary font-mono mt-2 text-center">
-                {sonic.featurizedPlays} / {sonic.totalPlays} plays featurized
+                {sonic.featurizedPlays} / {sonic.totalPlays} plays featurized · {rangeLabel(range)}
               </p>
             )}
           </ChartCard>
 
           {/* Top artists + top tracks side by side */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <ChartCard title="Top artists" subtitle="last 30 days, by play count" source="SPOTIFY">
+            <ChartCard title="Top artists" subtitle={`${rangeLabel(range)}, by play count`} source="SPOTIFY">
               <ol className="space-y-1.5">
                 {topArtists.map((a, i) => (
                   <li key={`${a.name}-${i}`} className="flex items-baseline justify-between text-[12px] font-mono">
@@ -365,7 +405,7 @@ export default function SpotifyPage() {
               </ol>
             </ChartCard>
 
-            <ChartCard title="Top tracks" subtitle="last 30 days, by play count" source="SPOTIFY">
+            <ChartCard title="Top tracks" subtitle={`${rangeLabel(range)}, by play count`} source="SPOTIFY">
               <button
                 onClick={() => setModalOpen(true)}
                 disabled={topTracks.length === 0}
@@ -396,7 +436,7 @@ export default function SpotifyPage() {
           {/* Hour of day */}
           <ChartCard
             title="Listening by hour of day"
-            subtitle="ET, last 30 days"
+            subtitle={`ET, ${rangeLabel(range)}`}
             source="SPOTIFY"
             info="Bars are play counts grouped by hour-of-day (America/New_York). Reveals chronotype patterns — heavy late-night listening shows up here."
           >
