@@ -185,6 +185,14 @@ export default function SpotifyPage() {
         </div>
       </header>
 
+      <p className="text-[11px] text-text-tertiary leading-relaxed border-l-2 border-[#1DB954]/30 pl-3">
+        <span className="text-text-secondary">Coverage note:</span> Only plays that Spotify&apos;s
+        backend knows about appear here. Offline playback from Spotify-licensed partner devices
+        (Garmin watches, some car head units, older standalone wearables) isn&apos;t reported to
+        the API and won&apos;t show up — even after the device reconnects. If you listen heavily
+        on Garmin during workouts, this dashboard under-counts that listening.
+      </p>
+
       {modalOpen && (
         <div
           className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
