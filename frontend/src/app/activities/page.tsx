@@ -1,20 +1,106 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getActivities, getWorkouts } from "@/lib/queries";
+import { getActivities, getWorkouts, getWhoopWorkouts } from "@/lib/queries";
 import { formatDuration, formatDistance, formatPace } from "@/lib/format";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+type ActivityRow = {
+  source: "garmin" | "whoop";
+  id: string;
+  type: string;
+  name: string;
+  display_time: string;
+  utc_ms: number;
+  duration_seconds: number | null;
+  distance_meters: number | null;
+  avg_speed_mps: number | null;
+  avg_heart_rate: number | null;
+  max_heart_rate: number | null;
+  calories: number | null;
+  raw_json?: any;
+};
+
+const DEDUP_WINDOW_MS = 5 * 60 * 1000;
+
+function shiftToLocalIso(utcIso: string, tzOffset: string | null): string {
+  if (!tzOffset) return utcIso;
+  const d = new Date(utcIso);
+  const sign = tzOffset[0] === "-" ? -1 : 1;
+  const [hh, mm] = tzOffset.slice(1).split(":").map(Number);
+  d.setUTCMinutes(d.getUTCMinutes() + sign * (hh * 60 + (mm || 0)));
+  return d.toISOString().replace("Z", "");
+}
+
+function normalizeGarmin(a: any): ActivityRow {
+  return {
+    source: "garmin",
+    id: `garmin:${a.activity_id}`,
+    type: a.activity_type ?? "unknown",
+    name: a.activity_name ?? "Untitled",
+    display_time: a.start_time_local,
+    utc_ms: a.start_time_gmt ? new Date(a.start_time_gmt).getTime() : NaN,
+    duration_seconds: a.duration_seconds ?? null,
+    distance_meters: a.distance_meters ?? null,
+    avg_speed_mps: a.avg_speed_mps ?? null,
+    avg_heart_rate: a.avg_heart_rate ?? null,
+    max_heart_rate: a.max_heart_rate ?? null,
+    calories: a.calories ?? null,
+    raw_json: a.raw_json,
+  };
+}
+
+function normalizeWhoop(w: any): ActivityRow {
+  const startMs = new Date(w.start_time).getTime();
+  const endMs = w.end_time ? new Date(w.end_time).getTime() : null;
+  const durationSec = endMs ? Math.round((endMs - startMs) / 1000) : null;
+  const distance = w.distance_meter && w.distance_meter > 0 ? w.distance_meter : null;
+  const avgSpeed = distance && durationSec ? distance / durationSec : null;
+  const kcal = w.kilojoule ? Math.round(w.kilojoule / 4.184) : null;
+  const sportName = w.sport_name ?? "workout";
+
+  return {
+    source: "whoop",
+    id: `whoop:${w.workout_id}`,
+    type: sportName.toLowerCase().replace(/_/g, " "),
+    name: sportName,
+    display_time: shiftToLocalIso(w.start_time, w.timezone_offset),
+    utc_ms: startMs,
+    duration_seconds: durationSec,
+    distance_meters: distance,
+    avg_speed_mps: avgSpeed,
+    avg_heart_rate: w.average_heart_rate ?? null,
+    max_heart_rate: w.max_heart_rate ?? null,
+    calories: kcal,
+  };
+}
+
+function mergeAndDedup(garmin: ActivityRow[], whoop: ActivityRow[]): ActivityRow[] {
+  const garminTimes = garmin.map((g) => g.utc_ms).filter((t) => !Number.isNaN(t));
+  const whoopKept = whoop.filter(
+    (w) => !garminTimes.some((gt) => Math.abs(gt - w.utc_ms) <= DEDUP_WINDOW_MS),
+  );
+  return [...garmin, ...whoopKept].sort((a, b) => {
+    const aT = new Date(a.display_time).getTime();
+    const bT = new Date(b.display_time).getTime();
+    return bT - aT;
+  });
+}
+
 export default function ActivitiesPage() {
-  const [activities, setActivities] = useState<any[]>([]);
+  const [rows, setRows] = useState<ActivityRow[]>([]);
   const [workoutMap, setWorkoutMap] = useState<Record<string, any>>({});
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    Promise.all([getActivities(60), getWorkouts()])
-      .then(([acts, wkts]) => {
-        setActivities(acts);
+    Promise.all([getActivities(60), getWhoopWorkouts(60), getWorkouts()])
+      .then(([garmin, whoop, wkts]) => {
+        const merged = mergeAndDedup(
+          garmin.map(normalizeGarmin),
+          whoop.map(normalizeWhoop),
+        );
+        setRows(merged);
         const map: Record<string, any> = {};
         for (const w of wkts) map[String(w.workout_id)] = w;
         setWorkoutMap(map);
@@ -45,7 +131,7 @@ export default function ActivitiesPage() {
         </div>
       </div>
 
-      {activities.length === 0 ? (
+      {rows.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-center">
           <svg className="w-10 h-10 text-text-tertiary mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
@@ -55,30 +141,38 @@ export default function ActivitiesPage() {
         </div>
       ) : (
         <div className="space-y-3">
-          {activities.map((act) => {
+          {rows.map((act) => {
             let workout: any = null;
-            try {
-              const raw = typeof act.raw_json === "string" ? JSON.parse(act.raw_json) : act.raw_json;
-              const wid = raw?.workoutId;
-              if (wid) workout = workoutMap[String(wid)];
-            } catch { /* ignore */ }
+            if (act.source === "garmin") {
+              try {
+                const raw = typeof act.raw_json === "string" ? JSON.parse(act.raw_json) : act.raw_json;
+                const wid = raw?.workoutId;
+                if (wid) workout = workoutMap[String(wid)];
+              } catch { /* ignore */ }
+            }
 
             const targetLow = workout?.interval_target_pace_low_mps;
             const targetHigh = workout?.interval_target_pace_high_mps;
             const hasTarget = targetLow && targetHigh && Number(targetLow) > 0 && Number(targetHigh) > 0;
+            const sourceBadge = act.source === "whoop"
+              ? "bg-emerald-500/10 text-emerald-300"
+              : "bg-sky-500/10 text-sky-300";
 
             return (
-            <div key={act.activity_id} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 hover:border-border-hover transition-colors flex flex-col sm:flex-row sm:items-center gap-3">
+            <div key={act.id} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 hover:border-border-hover transition-colors flex flex-col sm:flex-row sm:items-center gap-3">
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
+                  <span className={`${sourceBadge} text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px]`}>
+                    {act.source}
+                  </span>
                   <span className="bg-white/5 text-text-secondary text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px]">
-                    {act.activity_type ?? "unknown"}
+                    {act.type}
                   </span>
                   <span className="text-[11px] text-text-tertiary">
-                    {act.start_time_local ? new Date(act.start_time_local).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }) : ""}
+                    {act.display_time ? new Date(act.display_time).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }) : ""}
                   </span>
                 </div>
-                <p className="text-text-primary font-medium mt-1 truncate">{act.activity_name ?? "Untitled"}</p>
+                <p className="text-text-primary font-medium mt-1 truncate">{act.name}</p>
               </div>
 
               <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm">
