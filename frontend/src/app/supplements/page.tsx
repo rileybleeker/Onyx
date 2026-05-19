@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import BarcodeScannerModal from "@/components/BarcodeScannerModal";
+import EditIntakeModal, { type EditableIntake } from "@/components/EditIntakeModal";
 
 interface Product {
   product_id: string;
@@ -81,6 +82,14 @@ export default function SupplementsPage() {
   const [loading, setLoading] = useState(true);
   const [busyProductId, setBusyProductId] = useState<string | null>(null);
 
+  // History (older intakes, paginated)
+  const [history, setHistory] = useState<Intake[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyDays, setHistoryDays] = useState(14);
+
+  // Edit-intake modal
+  const [editing, setEditing] = useState<EditableIntake | null>(null);
+
   // Add product flow
   const [addOpen, setAddOpen] = useState(false);
   const [searchQ, setSearchQ] = useState("");
@@ -110,9 +119,36 @@ export default function SupplementsPage() {
     }
   }, []);
 
+  const loadHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    try {
+      const res = await fetch(
+        `/api/supplements/history?days=${historyDays}&perPage=100`,
+      );
+      const json = await res.json();
+      const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+      // Exclude today's rows (already shown in "Today's intakes" above).
+      setHistory((json.rows ?? []).filter((r: Intake) => r.intake_date !== todayStr));
+    } catch (e) {
+      console.error("Supplements history:", e);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [historyDays]);
+
   useEffect(() => {
     loadAll();
   }, [loadAll]);
+
+  useEffect(() => {
+    loadHistory();
+  }, [loadHistory]);
+
+  // After any mutation (log, edit, delete, archive) refresh both panes so the
+  // history section stays in sync with today's view.
+  const refreshAll = useCallback(async () => {
+    await Promise.all([loadAll(), loadHistory()]);
+  }, [loadAll, loadHistory]);
 
   async function logIntake(product_id: string) {
     setBusyProductId(product_id);
@@ -123,7 +159,7 @@ export default function SupplementsPage() {
         body: JSON.stringify({ product_id, intake_time: new Date().toISOString() }),
       });
       if (!res.ok) throw new Error(await res.text());
-      await loadAll();
+      await refreshAll();
     } catch (e) {
       console.error("Log intake:", e);
     } finally {
@@ -135,7 +171,7 @@ export default function SupplementsPage() {
     setBusyProductId(`undo-${intake_id}`);
     try {
       await fetch(`/api/supplements/log-intake?intake_id=${intake_id}`, { method: "DELETE" });
-      await loadAll();
+      await refreshAll();
     } finally {
       setBusyProductId(null);
     }
@@ -185,7 +221,7 @@ export default function SupplementsPage() {
         });
         if (!logRes.ok) throw new Error(await logRes.text());
       }
-      await loadAll();
+      await refreshAll();
       setAddOpen(false);
       setSearchQ("");
       setSearchHits([]);
@@ -209,7 +245,7 @@ export default function SupplementsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ product_id, is_active: false }),
       });
-      await loadAll();
+      await refreshAll();
     } finally {
       setBusyProductId(null);
     }
@@ -345,11 +381,25 @@ export default function SupplementsPage() {
                         {i.doses}× dose
                       </span>
                       <button
+                        onClick={() => setEditing({
+                          intake_id: i.intake_id,
+                          intake_date: i.intake_date,
+                          intake_time: i.intake_time,
+                          doses: Number(i.doses),
+                          notes: i.notes,
+                          brand_name: i.brand_name,
+                          full_name: i.full_name,
+                        })}
+                        className="text-[10px] text-text-tertiary hover:text-text-primary transition-colors"
+                      >
+                        edit
+                      </button>
+                      <button
                         onClick={() => undoIntake(i.intake_id)}
                         disabled={busyProductId === `undo-${i.intake_id}`}
                         className="text-[10px] text-text-tertiary hover:text-red-400 transition-colors disabled:opacity-40"
                       >
-                        undo
+                        delete
                       </button>
                     </div>
                   </div>
@@ -406,8 +456,93 @@ export default function SupplementsPage() {
               </div>
             )}
           </ChartCard>
+
+          {/* Recent intakes (prior days) — edit/delete any row */}
+          <ChartCard
+            title="Recent intakes"
+            subtitle={`prior days · last ${historyDays} days · ${history.length} entries`}
+            source="DSLD"
+            info="Every intake before today, newest first. Tap edit on any row to change doses, time, date, or notes. Tap delete to remove an entry entirely. Edits propagate to the daily_supplement_matrix view automatically."
+          >
+            <div className="flex items-center gap-2 mb-3 text-[11px] font-mono">
+              <span className="text-text-tertiary uppercase tracking-wide">window:</span>
+              {[7, 14, 30, 90].map((d) => (
+                <button
+                  key={d}
+                  onClick={() => setHistoryDays(d)}
+                  className={`px-2 py-0.5 rounded-[3px] border transition-colors ${
+                    historyDays === d
+                      ? "bg-[#1DB954]/15 text-text-primary border-[#1DB954]/40"
+                      : "text-text-tertiary hover:text-text-secondary border-border-subtle"
+                  }`}
+                >
+                  {d}d
+                </button>
+              ))}
+            </div>
+            {historyLoading && history.length === 0 ? (
+              <p className="text-[11px] text-text-tertiary font-mono py-4 text-center">Loading…</p>
+            ) : history.length === 0 ? (
+              <p className="text-[11px] text-text-tertiary font-mono py-4 text-center">
+                No prior intakes in this window.
+              </p>
+            ) : (
+              <div className="space-y-1">
+                {history.map((i) => (
+                  <div
+                    key={i.intake_id}
+                    className="flex items-center justify-between gap-3 py-1.5 border-b border-border-subtle/40 last:border-b-0 text-[12px] font-mono"
+                  >
+                    <div className="flex items-baseline gap-2 min-w-0">
+                      <span className="text-text-tertiary tabular-nums shrink-0 w-[90px]">
+                        {i.intake_date.slice(5)} {formatDoseTime(i.intake_time)}
+                      </span>
+                      <span className="text-text-primary truncate">{i.full_name ?? "—"}</span>
+                      <span className="text-text-tertiary truncate">· {i.brand_name ?? "—"}</span>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-text-secondary tabular-nums">
+                        {i.doses}× dose
+                      </span>
+                      <button
+                        onClick={() => setEditing({
+                          intake_id: i.intake_id,
+                          intake_date: i.intake_date,
+                          intake_time: i.intake_time,
+                          doses: Number(i.doses),
+                          notes: i.notes,
+                          brand_name: i.brand_name,
+                          full_name: i.full_name,
+                        })}
+                        className="text-[10px] text-text-tertiary hover:text-text-primary transition-colors"
+                      >
+                        edit
+                      </button>
+                      <button
+                        onClick={() => undoIntake(i.intake_id)}
+                        disabled={busyProductId === `undo-${i.intake_id}`}
+                        className="text-[10px] text-text-tertiary hover:text-red-400 transition-colors disabled:opacity-40"
+                      >
+                        delete
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </ChartCard>
         </>
       )}
+
+      {/* Edit-intake modal */}
+      <EditIntakeModal
+        intake={editing}
+        onClose={() => setEditing(null)}
+        onSaved={async () => {
+          setEditing(null);
+          await refreshAll();
+        }}
+      />
 
       {/* Add Product modal */}
       {addOpen && (

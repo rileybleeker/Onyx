@@ -47,6 +47,49 @@ export async function POST(req: NextRequest) {
 }
 
 /**
+ * PATCH /api/supplements/log-intake
+ * Body: { intake_id, doses?, intake_time?, notes?, intake_date? }
+ *
+ * Mutate a previously-logged intake. Only fields that are explicitly present
+ * in the body are touched — undefined fields are left alone so partial edits
+ * don't clobber unrelated columns. intake_time can be sent as `null` to
+ * explicitly clear it ("took it today, time unspecified").
+ */
+export async function PATCH(req: NextRequest) {
+  const body = (await req.json()) as {
+    intake_id?: number;
+    doses?: number;
+    intake_time?: string | null;
+    intake_date?: string;
+    notes?: string | null;
+  };
+  if (!body.intake_id || !Number.isFinite(body.intake_id)) {
+    return NextResponse.json({ error: "intake_id is required" }, { status: 400 });
+  }
+  const patch: Record<string, unknown> = {};
+  if (body.doses !== undefined) {
+    if (!Number.isFinite(body.doses) || body.doses < 0) {
+      return NextResponse.json({ error: "doses must be a non-negative number" }, { status: 400 });
+    }
+    patch.doses = body.doses;
+  }
+  if (body.intake_time !== undefined) patch.intake_time = body.intake_time;
+  if (body.intake_date !== undefined) patch.intake_date = body.intake_date;
+  if (body.notes !== undefined) patch.notes = body.notes;
+  if (Object.keys(patch).length === 0) {
+    return NextResponse.json({ error: "no fields to update" }, { status: 400 });
+  }
+  const { data, error } = await supabase
+    .from("supplement_intake")
+    .update(patch)
+    .eq("intake_id", body.intake_id)
+    .select()
+    .single();
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  return NextResponse.json(data);
+}
+
+/**
  * DELETE /api/supplements/log-intake?intake_id=...
  * For undoing a misclick on the log button.
  */
