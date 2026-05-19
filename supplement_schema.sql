@@ -46,12 +46,15 @@ CREATE TABLE IF NOT EXISTS pds.supplement_products (
     target_groups       JSONB,                      -- e.g. ["Adult (18 - 50 Years)"]
     ingredients         JSONB NOT NULL,             -- see shape above
     off_market          BOOLEAN DEFAULT FALSE,
+    is_active           BOOLEAN NOT NULL DEFAULT TRUE,  -- soft-delete: archived products hidden from picker; intake_history preserved
 
     raw_json            JSONB,                      -- full DSLD response for replay
     fetched_at          TIMESTAMPTZ DEFAULT NOW(),
     synced_at           TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_supplement_products_active
+    ON pds.supplement_products (is_active) WHERE is_active = TRUE;
 CREATE INDEX IF NOT EXISTS idx_supplement_products_upc
     ON pds.supplement_products (upc_sku) WHERE upc_sku IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_supplement_products_brand

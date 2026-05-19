@@ -51,6 +51,7 @@ export interface NormalizedProduct {
   target_groups: string[];
   ingredients: NormalizedIngredient[];
   off_market: boolean;
+  is_active: boolean;
   raw_json: unknown;
 }
 
@@ -140,6 +141,9 @@ export function normalizeLabel(label: Record<string, unknown>): NormalizedProduc
     target_groups: (label.targetGroups as string[] | undefined) ?? [],
     ingredients,
     off_market: (label.offMarket as boolean | undefined) ?? false,
+    // Re-seeding an archived product should un-archive it — the user is
+    // explicitly re-adding it via search/scan.
+    is_active: true,
     raw_json: label,
   };
 }

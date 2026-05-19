@@ -137,6 +137,8 @@ def normalize_label(label: dict) -> dict:
         "target_groups": label.get("targetGroups") or [],
         "ingredients": ingredients,
         "off_market": label.get("offMarket", False),
+        # Re-seeding an archived product un-archives it.
+        "is_active": True,
         "raw_json": label,
     }
 

@@ -89,6 +89,9 @@ export default function SupplementsPage() {
   const [searchError, setSearchError] = useState<string | null>(null);
   const [seedingId, setSeedingId] = useState<string | null>(null);
   const [scannerOpen, setScannerOpen] = useState(false);
+  // After picking a hit, hold it here while the user enters a dose count.
+  const [confirmHit, setConfirmHit] = useState<DsldHit | null>(null);
+  const [confirmDoses, setConfirmDoses] = useState<string>("1");
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -155,23 +158,60 @@ export default function SupplementsPage() {
     }
   }
 
-  async function seedProduct(dsld_id: number) {
+  /**
+   * Seed a DSLD product into the library, optionally logging one intake event
+   * at the same dose count. Both routes already exist; this just chains them
+   * so the post-scan UX is "scan → pick → enter dose → done."
+   */
+  async function seedAndOptionallyLog(dsld_id: number, doses: number | null) {
     setSeedingId(String(dsld_id));
     try {
-      const res = await fetch("/api/supplements/seed", {
+      const seedRes = await fetch("/api/supplements/seed", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ dsld_id }),
       });
-      if (!res.ok) throw new Error(await res.text());
+      if (!seedRes.ok) throw new Error(await seedRes.text());
+      const seeded = (await seedRes.json()) as { product_id: string };
+      if (doses !== null && doses > 0) {
+        const logRes = await fetch("/api/supplements/log-intake", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            product_id: seeded.product_id,
+            doses,
+            intake_time: new Date().toISOString(),
+          }),
+        });
+        if (!logRes.ok) throw new Error(await logRes.text());
+      }
       await loadAll();
       setAddOpen(false);
       setSearchQ("");
       setSearchHits([]);
+      setConfirmHit(null);
+      setConfirmDoses("1");
     } catch (e) {
       setSearchError(e instanceof Error ? e.message : String(e));
     } finally {
       setSeedingId(null);
+    }
+  }
+
+  async function archiveProduct(product_id: string, full_name: string | null) {
+    if (!confirm(`Remove "${full_name ?? product_id}" from the picker?\n\nYour intake history for this product is kept; the product just stops showing up here. Re-add it later via search if you want it back.`)) {
+      return;
+    }
+    setBusyProductId(product_id);
+    try {
+      await fetch("/api/supplements/products", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ product_id, is_active: false }),
+      });
+      await loadAll();
+    } finally {
+      setBusyProductId(null);
     }
   }
 
@@ -245,23 +285,36 @@ export default function SupplementsPage() {
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                 {products.map((p) => (
-                  <button
+                  <div
                     key={p.product_id}
-                    onClick={() => logIntake(p.product_id)}
-                    disabled={busyProductId === p.product_id}
-                    className="flex items-center justify-between gap-3 px-3 py-2 text-left bg-black/30 hover:bg-white/[0.03] border border-border-subtle hover:border-border-hover rounded-[4px] transition-colors disabled:opacity-50"
+                    className="flex items-center gap-2 bg-black/30 hover:bg-white/[0.03] border border-border-subtle hover:border-border-hover rounded-[4px] transition-colors"
                   >
-                    <div className="min-w-0">
-                      <p className="text-[12px] text-text-primary truncate">{p.full_name ?? "—"}</p>
-                      <p className="text-[10px] text-text-tertiary font-mono truncate">
-                        {p.brand_name ?? "—"} · {p.ingredient_count} ingredients
-                        {p.serving_size && p.serving_unit
-                          ? ` · ${p.serving_size} ${p.serving_unit}`
-                          : ""}
-                      </p>
-                    </div>
-                    <span className="text-[16px] text-[#1DB954]/80 font-mono shrink-0">+</span>
-                  </button>
+                    <button
+                      onClick={() => logIntake(p.product_id)}
+                      disabled={busyProductId === p.product_id}
+                      className="flex-1 flex items-center justify-between gap-3 px-3 py-2 text-left disabled:opacity-50"
+                    >
+                      <div className="min-w-0">
+                        <p className="text-[12px] text-text-primary truncate">{p.full_name ?? "—"}</p>
+                        <p className="text-[10px] text-text-tertiary font-mono truncate">
+                          {p.brand_name ?? "—"} · {p.ingredient_count} ingredients
+                          {p.serving_size && p.serving_unit
+                            ? ` · ${p.serving_size} ${p.serving_unit}`
+                            : ""}
+                        </p>
+                      </div>
+                      <span className="text-[16px] text-[#1DB954]/80 font-mono shrink-0">+</span>
+                    </button>
+                    <button
+                      onClick={() => archiveProduct(p.product_id, p.full_name)}
+                      disabled={busyProductId === p.product_id}
+                      className="px-2 py-2 text-[14px] text-text-tertiary/60 hover:text-red-400 disabled:opacity-40 transition-colors"
+                      title="Remove from picker (history is kept)"
+                      aria-label="Remove product"
+                    >
+                      ✕
+                    </button>
+                  </div>
                 ))}
               </div>
             )}
@@ -360,7 +413,11 @@ export default function SupplementsPage() {
       {addOpen && (
         <div
           className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-start justify-center p-4 overflow-y-auto"
-          onClick={() => setAddOpen(false)}
+          onClick={() => {
+            setAddOpen(false);
+            setConfirmHit(null);
+            setConfirmDoses("1");
+          }}
         >
           <div
             className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card p-5 w-full max-w-lg mt-12"
@@ -369,7 +426,11 @@ export default function SupplementsPage() {
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-[14px] font-medium text-text-primary">Add a product to your library</h2>
               <button
-                onClick={() => setAddOpen(false)}
+                onClick={() => {
+                  setAddOpen(false);
+                  setConfirmHit(null);
+                  setConfirmDoses("1");
+                }}
                 className="text-[11px] text-text-tertiary hover:text-text-secondary font-mono"
               >
                 Close
@@ -410,33 +471,95 @@ export default function SupplementsPage() {
               <p className="text-[11px] font-mono text-red-400 mb-2 break-words">{searchError}</p>
             )}
 
-            <div className="space-y-1.5 max-h-[50vh] overflow-y-auto">
-              {searchHits.map((h) => (
-                <button
-                  key={h.id}
-                  onClick={() => seedProduct(Number(h.id))}
-                  disabled={seedingId === h.id}
-                  className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left bg-black/30 hover:bg-white/[0.04] border border-border-subtle hover:border-border-hover rounded-[4px] transition-colors disabled:opacity-50"
-                >
-                  <div className="min-w-0">
-                    <p className="text-[12px] text-text-primary truncate">{h.full_name ?? "—"}</p>
-                    <p className="text-[10px] text-text-tertiary font-mono truncate">
-                      {h.brand_name ?? "—"}
-                      {h.upc_sku ? ` · UPC ${h.upc_sku}` : ""}
-                      {h.physical_state ? ` · ${h.physical_state}` : ""}
-                    </p>
-                  </div>
-                  <span className="text-[10px] text-text-tertiary font-mono shrink-0">
-                    {seedingId === h.id ? "seeding…" : "+ add"}
-                  </span>
-                </button>
-              ))}
-              {!searching && searchHits.length === 0 && searchQ && !searchError && (
-                <p className="text-[11px] text-text-tertiary font-mono py-3 text-center">
-                  No matches. Try a different brand or product name.
+            {!confirmHit && (
+              <div className="space-y-1.5 max-h-[50vh] overflow-y-auto">
+                {searchHits.map((h) => (
+                  <button
+                    key={h.id}
+                    onClick={() => {
+                      setConfirmHit(h);
+                      setConfirmDoses("1");
+                    }}
+                    className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left bg-black/30 hover:bg-white/[0.04] border border-border-subtle hover:border-border-hover rounded-[4px] transition-colors"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-[12px] text-text-primary truncate">{h.full_name ?? "—"}</p>
+                      <p className="text-[10px] text-text-tertiary font-mono truncate">
+                        {h.brand_name ?? "—"}
+                        {h.upc_sku ? ` · UPC ${h.upc_sku}` : ""}
+                        {h.physical_state ? ` · ${h.physical_state}` : ""}
+                      </p>
+                    </div>
+                    <span className="text-[10px] text-text-tertiary font-mono shrink-0">pick →</span>
+                  </button>
+                ))}
+                {!searching && searchHits.length === 0 && searchQ && !searchError && (
+                  <p className="text-[11px] text-text-tertiary font-mono py-3 text-center">
+                    No matches. Try a different brand or product name.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {confirmHit && (
+              <div className="bg-black/40 border border-[#1DB954]/30 rounded-[4px] p-4">
+                <p className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono mb-2">
+                  Confirm + log
                 </p>
-              )}
-            </div>
+                <p className="text-[13px] text-text-primary mb-0.5">{confirmHit.full_name ?? "—"}</p>
+                <p className="text-[11px] text-text-tertiary font-mono mb-4">
+                  {confirmHit.brand_name ?? "—"}
+                  {confirmHit.upc_sku ? ` · UPC ${confirmHit.upc_sku}` : ""}
+                  {confirmHit.physical_state ? ` · ${confirmHit.physical_state}` : ""}
+                </p>
+
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
+                  How many doses did you take?
+                </label>
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  min="0"
+                  step="0.5"
+                  value={confirmDoses}
+                  onChange={(e) => setConfirmDoses(e.target.value)}
+                  className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none"
+                  autoFocus
+                />
+                <p className="text-[10px] text-text-tertiary mb-3 leading-relaxed">
+                  One dose = one serving as the label defines it (typically 1 tablet/capsule).
+                  Set to <span className="text-text-secondary">0</span> to add the product to your library without logging an intake right now.
+                </p>
+
+                <div className="flex gap-2 justify-end">
+                  <button
+                    onClick={() => {
+                      setConfirmHit(null);
+                      setConfirmDoses("1");
+                    }}
+                    disabled={seedingId !== null}
+                    className="px-3 py-2 text-[12px] text-text-secondary hover:text-text-primary disabled:opacity-40 transition-colors"
+                  >
+                    Back
+                  </button>
+                  <button
+                    onClick={() => {
+                      const doses = Number(confirmDoses);
+                      if (!Number.isFinite(doses) || doses < 0) return;
+                      seedAndOptionallyLog(Number(confirmHit.id), doses > 0 ? doses : null);
+                    }}
+                    disabled={seedingId !== null}
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 disabled:opacity-40 disabled:cursor-not-allowed border border-[#1DB954]/40 rounded-[4px] transition-colors"
+                  >
+                    {seedingId !== null
+                      ? "Saving…"
+                      : Number(confirmDoses) > 0
+                      ? `Add + log ${confirmDoses} dose${Number(confirmDoses) === 1 ? "" : "s"}`
+                      : "Add to library only"}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
