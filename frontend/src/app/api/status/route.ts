@@ -55,8 +55,8 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   myfitnesspal:   { method: "semi-automated", label: "Email import" },
   hrv_analysis:   { method: "automated",      label: "Computed" },
   spotify:        { method: "automated",      label: "API ETL" },
-  reccobeats:     { method: "automated",      label: "Enrichment" },
-  musicbrainz:    { method: "automated",      label: "Enrichment" },
+  reccobeats:     { method: "automated",      label: "API ETL" },
+  musicbrainz:    { method: "automated",      label: "API ETL" },
   supplements:    { method: "manual",         label: "Manual entry" },
   notion_journal: { method: "automated",      label: "Notion sync" },
 };
