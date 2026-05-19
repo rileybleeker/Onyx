@@ -6,9 +6,10 @@ import {
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, Cell,
   CartesianGrid, ReferenceLine,
 } from "recharts";
-import { getRecoveryVsPace } from "@/lib/queries";
+import { getRecoveryVsPace, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -48,13 +49,15 @@ function ScatterTooltip({ active, payload }: any) {
 export default function RecoveryPage() {
   const [raw, setRaw] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [range, setRange] = useState<Range>("30d");
 
   useEffect(() => {
-    getRecoveryVsPace(730)
+    setLoading(true);
+    getRecoveryVsPace(rangeDays(range))
       .then(setRaw)
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, []);
+  }, [range]);
 
   // All runs with recovery data
   const allRuns = useMemo(() => raw.map((d) => ({
@@ -150,11 +153,12 @@ export default function RecoveryPage() {
 
   return (
     <>
-      <div className="flex items-baseline justify-between mb-8">
+      <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Recovery vs Performance</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">How WHOOP recovery correlates with running pace performance</p>
+          <p className="text-sm text-text-tertiary mt-0.5">How WHOOP recovery correlates with running pace — {rangeLabel(range)}</p>
         </div>
+        <RangeFilter value={range} onChange={setRange} />
       </div>
 
       {/* KPIs */}

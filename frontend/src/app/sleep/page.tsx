@@ -8,10 +8,12 @@ import {
 import {
   getWhoopSleep, getWhoopRecovery, getWhoopCycles, getWhoopJournal,
   getEightSleepTrends, getHeartRateData, getDailySummaries,
+  rangeDays, rangeLabel, type Range,
 } from "@/lib/queries";
 import { formatDate, formatDuration } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -34,16 +36,19 @@ export default function SleepPage() {
   const [hr, setHr]                     = useState<any[]>([]);
   const [summaries, setSummaries]       = useState<any[]>([]);
   const [loading, setLoading]           = useState(true);
+  const [range, setRange]               = useState<Range>("30d");
 
   useEffect(() => {
+    setLoading(true);
+    const days = rangeDays(range);
     Promise.all([
-      getWhoopSleep(30),
-      getWhoopRecovery(30),
-      getWhoopCycles(30),
-      getWhoopJournal(30),
-      getEightSleepTrends(30),
-      getHeartRateData(30),
-      getDailySummaries(30),
+      getWhoopSleep(days),
+      getWhoopRecovery(days),
+      getWhoopCycles(days),
+      getWhoopJournal(days),
+      getEightSleepTrends(days),
+      getHeartRateData(days),
+      getDailySummaries(days),
     ])
       .then(([s, r, c, j, e, h, sum]) => {
         setWhoopSleep(s);
@@ -56,7 +61,7 @@ export default function SleepPage() {
       })
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, []);
+  }, [range]);
 
   if (loading) {
     return (
@@ -168,11 +173,12 @@ export default function SleepPage() {
 
   return (
     <>
-      <div className="flex items-baseline justify-between mb-8">
+      <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Sleep &amp; Recovery</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">30-day sleep, recovery, and cardiac trends</p>
+          <p className="text-sm text-text-tertiary mt-0.5">Sleep, recovery, and cardiac trends — {rangeLabel(range)}</p>
         </div>
+        <RangeFilter value={range} onChange={setRange} />
       </div>
 
       {/* ── WHOOP Recovery ──────────────────────────────────────────────────── */}

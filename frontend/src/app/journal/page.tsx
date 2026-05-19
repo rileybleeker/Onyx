@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useState, useMemo } from "react";
+import { rangeToDays, rangeLabel, type Range } from "@/lib/queries";
+import RangeFilter from "@/components/RangeFilter";
 
 interface JournalEntryListItem {
   notion_page_id: string;
@@ -47,8 +49,7 @@ export default function JournalPage() {
 
   const [moodFilter, setMoodFilter] = useState<Mood | null>(null);
   const [topicFilter, setTopicFilter] = useState<string | null>(null);
-  const [from, setFrom] = useState<string>("");
-  const [to, setTo] = useState<string>("");
+  const [range, setRange] = useState<Range>("30d");
 
   const [expanded, setExpanded] = useState<string | null>(null);
   const [fullEntry, setFullEntry] = useState<JournalEntryFull | null>(null);
@@ -58,8 +59,12 @@ export default function JournalPage() {
     const params = new URLSearchParams();
     if (moodFilter) params.set("mood", moodFilter);
     if (topicFilter) params.set("topic", topicFilter);
-    if (from) params.set("from", from);
-    if (to) params.set("to", to);
+    const days = rangeToDays(range);
+    if (days != null) {
+      const since = new Date();
+      since.setDate(since.getDate() - days);
+      params.set("from", since.toISOString().split("T")[0]);
+    }
     params.set("limit", "200");
 
     setLoading(true);
@@ -76,7 +81,7 @@ export default function JournalPage() {
       })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
-  }, [moodFilter, topicFilter, from, to]);
+  }, [moodFilter, topicFilter, range]);
 
   // Unique topics from currently loaded entries (chip palette).
   const allTopics = useMemo(() => {
@@ -107,13 +112,16 @@ export default function JournalPage() {
 
   return (
     <div className="px-4 md:px-6 py-4 md:py-6 max-w-4xl mx-auto pt-[max(1rem,env(safe-area-inset-top))] md:pt-6">
-      <header className="mb-6 ml-12 md:ml-0">
-        <h1 className="text-xl md:text-2xl font-semibold text-text-primary tracking-tight">
-          Journal
-        </h1>
-        <p className="text-xs md:text-sm text-text-tertiary mt-1">
-          Personal entries synced from Notion. {entries.length} {entries.length === 1 ? "entry" : "entries"}.
-        </p>
+      <header className="mb-6 ml-12 md:ml-0 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-xl md:text-2xl font-semibold text-text-primary tracking-tight">
+            Journal
+          </h1>
+          <p className="text-xs md:text-sm text-text-tertiary mt-1">
+            Personal entries synced from Notion — {rangeLabel(range)}. {entries.length} {entries.length === 1 ? "entry" : "entries"}.
+          </p>
+        </div>
+        <RangeFilter value={range} onChange={setRange} />
       </header>
 
       {/* Filter bar */}
@@ -174,32 +182,6 @@ export default function JournalPage() {
           </div>
         )}
 
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-[11px] text-text-tertiary uppercase tracking-wider">Date</span>
-          <input
-            type="date"
-            value={from}
-            onChange={(e) => setFrom(e.target.value)}
-            className="text-[12px] bg-surface-base border border-border-subtle rounded px-2 py-1 text-text-primary"
-            aria-label="from"
-          />
-          <span className="text-[12px] text-text-tertiary">→</span>
-          <input
-            type="date"
-            value={to}
-            onChange={(e) => setTo(e.target.value)}
-            className="text-[12px] bg-surface-base border border-border-subtle rounded px-2 py-1 text-text-primary"
-            aria-label="to"
-          />
-          {(from || to) && (
-            <button
-              onClick={() => { setFrom(""); setTo(""); }}
-              className="text-[12px] text-text-tertiary hover:text-text-primary px-2 py-1"
-            >
-              clear
-            </button>
-          )}
-        </div>
       </div>
 
       {/* Entry list */}

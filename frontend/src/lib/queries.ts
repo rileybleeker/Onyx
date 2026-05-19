@@ -422,9 +422,14 @@ function dateNDaysAgo(days: number): string {
   return since.toISOString().split("T")[0];
 }
 
-export type SpotifyRange = "all" | "1d" | "7d" | "30d" | "60d" | "90d" | "365d";
+export type Range = "all" | "1d" | "7d" | "30d" | "60d" | "90d" | "365d";
 
-export function rangeToDays(range: SpotifyRange): number | null {
+/** @deprecated Use Range. Kept as an alias for older Spotify-specific call sites. */
+export type SpotifyRange = Range;
+
+const ALL_TIME_DAYS = 36500;
+
+export function rangeToDays(range: Range): number | null {
   switch (range) {
     case "all": return null;
     case "1d": return 1;
@@ -436,7 +441,12 @@ export function rangeToDays(range: SpotifyRange): number | null {
   }
 }
 
-export function rangeLabel(range: SpotifyRange): string {
+/** Like rangeToDays but maps "all" to a very large window so it can feed `days: number` query signatures. */
+export function rangeDays(range: Range): number {
+  return rangeToDays(range) ?? ALL_TIME_DAYS;
+}
+
+export function rangeLabel(range: Range): string {
   switch (range) {
     case "all": return "all time";
     case "1d": return "last 24h";
@@ -448,7 +458,7 @@ export function rangeLabel(range: SpotifyRange): string {
   }
 }
 
-function sinceFor(range: SpotifyRange): string | null {
+function sinceFor(range: Range): string | null {
   const days = rangeToDays(range);
   return days == null ? null : dateNDaysAgo(days);
 }

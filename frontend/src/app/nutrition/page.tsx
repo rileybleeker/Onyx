@@ -7,10 +7,11 @@ import {
   LineChart, Line,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
-import { getMfpNutrition } from "@/lib/queries";
+import { getMfpNutrition, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -25,13 +26,15 @@ function avg(arr: any[], key: string): number {
 export default function NutritionPage() {
   const [data, setData] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [range, setRange] = useState<Range>("30d");
 
   useEffect(() => {
-    getMfpNutrition(30)
+    setLoading(true);
+    getMfpNutrition(rangeDays(range))
       .then(setData)
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, []);
+  }, [range]);
 
   if (loading) {
     return (
@@ -77,11 +80,12 @@ export default function NutritionPage() {
 
   return (
     <>
-      <div className="flex items-baseline justify-between mb-8">
+      <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Nutrition</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">30-day nutrition data from MyFitnessPal</p>
+          <p className="text-sm text-text-tertiary mt-0.5">Nutrition data from MyFitnessPal — {rangeLabel(range)}</p>
         </div>
+        <RangeFilter value={range} onChange={setRange} />
       </div>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">

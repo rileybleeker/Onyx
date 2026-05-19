@@ -5,9 +5,10 @@ import {
   ScatterChart, Scatter, XAxis, YAxis, Tooltip, ResponsiveContainer,
   ReferenceLine, CartesianGrid, Label,
 } from "recharts";
-import { getHealthMatrix } from "@/lib/queries";
+import { getHealthMatrix, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { blandAltman } from "@/lib/stats";
 import ChartCard from "@/components/ChartCard";
+import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -109,13 +110,15 @@ function BAPlot({
 export default function BlandAltmanPage() {
   const [data, setData] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [range, setRange] = useState<Range>("30d");
 
   useEffect(() => {
-    getHealthMatrix(90)
+    setLoading(true);
+    getHealthMatrix(rangeDays(range))
       .then(setData)
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, []);
+  }, [range]);
 
   if (loading) {
     return (
@@ -139,11 +142,12 @@ export default function BlandAltmanPage() {
   if (data.length === 0) {
     return (
       <>
-        <div className="flex items-baseline justify-between mb-8">
+        <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
           <div>
             <h2 className="text-[28px] font-medium text-text-primary">Bland-Altman Analysis</h2>
-            <p className="text-sm text-text-tertiary mt-0.5">Method agreement analysis</p>
+            <p className="text-sm text-text-tertiary mt-0.5">Method agreement analysis — {rangeLabel(range)}</p>
           </div>
+          <RangeFilter value={range} onChange={setRange} />
         </div>
         <p className="text-text-tertiary">No data available. Make sure your ETL pipelines have synced data.</p>
       </>
@@ -188,13 +192,14 @@ export default function BlandAltmanPage() {
 
   return (
     <>
-      <div className="flex items-baseline justify-between mb-8">
+      <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Bland-Altman Analysis</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Method agreement between Garmin, WHOOP, and Eight Sleep — last 90 days, pairwise.
+            Method agreement between Garmin, WHOOP, and Eight Sleep — {rangeLabel(range)}, pairwise.
           </p>
         </div>
+        <RangeFilter value={range} onChange={setRange} />
       </div>
 
       <div className="bg-surface-card border border-border-subtle rounded-[6px] p-5 mb-8 text-sm text-text-secondary space-y-3 max-w-3xl">

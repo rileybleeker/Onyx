@@ -8,6 +8,7 @@ import {
 } from "recharts";
 import ChartCard from "@/components/ChartCard";
 import StatCard from "@/components/StatCard";
+import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel } from "@/lib/chart-theme";
 import {
   getSpotifyKpis,
@@ -66,16 +67,6 @@ function applyRollingMean<T extends object>(
     return smoothed as T;
   });
 }
-
-const RANGE_OPTIONS: { value: SpotifyRange; label: string }[] = [
-  { value: "1d",   label: "1D" },
-  { value: "7d",   label: "1W" },
-  { value: "30d",  label: "30D" },
-  { value: "60d",  label: "60D" },
-  { value: "90d",  label: "90D" },
-  { value: "365d", label: "1Y" },
-  { value: "all",  label: "ALL" },
-];
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
 
@@ -213,30 +204,7 @@ export default function SpotifyPage() {
             Listening behavior — {rangeLabel(range)}
           </p>
         </div>
-        <div
-          role="radiogroup"
-          aria-label="Time range"
-          className="inline-flex rounded-[6px] border border-border-subtle bg-black/30 p-0.5 overflow-x-auto"
-        >
-          {RANGE_OPTIONS.map((opt) => {
-            const active = opt.value === range;
-            return (
-              <button
-                key={opt.value}
-                role="radio"
-                aria-checked={active}
-                onClick={() => setRange(opt.value)}
-                className={`px-2.5 py-1 text-[10px] font-mono tracking-wide rounded-[4px] transition-colors ${
-                  active
-                    ? "bg-[#1DB954]/20 text-text-primary border border-[#1DB954]/40"
-                    : "text-text-tertiary hover:text-text-secondary border border-transparent"
-                }`}
-              >
-                {opt.label}
-              </button>
-            );
-          })}
-        </div>
+        <RangeFilter value={range} onChange={setRange} accent={spotifyGreen} />
       </header>
 
       <p className="text-[11px] text-text-tertiary leading-relaxed border-l-2 border-[#1DB954]/30 pl-3">

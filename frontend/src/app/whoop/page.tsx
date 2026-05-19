@@ -5,10 +5,11 @@ import {
   AreaChart, Area, BarChart, Bar, LineChart, Line,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
-import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getWhoopJournal } from "@/lib/queries";
+import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getWhoopJournal, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -28,13 +29,16 @@ export default function WhoopPage() {
   const [sleep, setSleep] = useState<any[]>([]);
   const [journal, setJournal] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [range, setRange] = useState<Range>("30d");
 
   useEffect(() => {
-    Promise.all([getWhoopRecovery(30), getWhoopCycles(30), getWhoopSleep(30), getWhoopJournal(30)])
+    setLoading(true);
+    const days = rangeDays(range);
+    Promise.all([getWhoopRecovery(days), getWhoopCycles(days), getWhoopSleep(days), getWhoopJournal(days)])
       .then(([r, c, s, j]) => { setRecovery(r); setCycles(c); setSleep(s); setJournal(j); })
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, []);
+  }, [range]);
 
   if (loading) {
     return (
@@ -87,11 +91,12 @@ export default function WhoopPage() {
 
   return (
     <>
-      <div className="flex items-baseline justify-between mb-8">
+      <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">WHOOP</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">Recovery, strain, and sleep analytics</p>
+          <p className="text-sm text-text-tertiary mt-0.5">Recovery, strain, and sleep analytics — {rangeLabel(range)}</p>
         </div>
+        <RangeFilter value={range} onChange={setRange} />
       </div>
 
       {/* KPIs */}

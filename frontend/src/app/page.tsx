@@ -5,10 +5,11 @@ import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   BarChart, Bar, CartesianGrid,
 } from "recharts";
-import { getDailySummaries, getWhoopRecovery, getWhoopSleep } from "@/lib/queries";
+import { getDailySummaries, getWhoopRecovery, getWhoopSleep, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDate, formatDuration } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -18,9 +19,12 @@ export default function Dashboard() {
   const [sleep, setSleep] = useState<any[]>([]);
   const [recovery, setRecovery] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [range, setRange] = useState<Range>("30d");
 
   useEffect(() => {
-    Promise.all([getDailySummaries(30), getWhoopSleep(30), getWhoopRecovery(30)])
+    setLoading(true);
+    const days = rangeDays(range);
+    Promise.all([getDailySummaries(days), getWhoopSleep(days), getWhoopRecovery(days)])
       .then(([s, sl, rec]) => {
         setSummaries(s);
         setSleep(sl);
@@ -28,7 +32,7 @@ export default function Dashboard() {
       })
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, []);
+  }, [range]);
 
   if (loading) {
     return (
@@ -76,11 +80,12 @@ export default function Dashboard() {
 
   return (
     <>
-      <div className="flex items-baseline justify-between mb-8">
+      <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Dashboard</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">30-day overview across all sources</p>
+          <p className="text-sm text-text-tertiary mt-0.5">Overview across all sources — {rangeLabel(range)}</p>
         </div>
+        <RangeFilter value={range} onChange={setRange} />
       </div>
 
       {/* KPI row */}
@@ -111,7 +116,7 @@ export default function Dashboard() {
 
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <ChartCard title="Daily Steps" subtitle="30 days" source="GARMIN">
+        <ChartCard title="Daily Steps" subtitle={rangeLabel(range)} source="GARMIN">
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={stepsData}>
               <CartesianGrid {...gridStyle} />

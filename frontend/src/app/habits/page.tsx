@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { getHabitJournal } from "@/lib/queries";
+import { getHabitJournal, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import RangeFilter from "@/components/RangeFilter";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -79,12 +80,14 @@ export default function HabitsPage() {
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [toggling, setToggling] = useState<Set<string>>(new Set());
+  const [range, setRange] = useState<Range>("30d");
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (days: number) => {
+    setLoading(true);
     try {
       const [habitsRes, journalData] = await Promise.all([
         fetch("/api/habits/list").then((r) => r.json()),
-        getHabitJournal(90),
+        getHabitJournal(days),
       ]);
       setHabits(habitsRes.habits || []);
       setJournal(journalData);
@@ -96,7 +99,7 @@ export default function HabitsPage() {
         const { count } = await syncRes.json();
         if (count > 0) {
           // Reload journal data to pick up synced entries
-          const updated = await getHabitJournal(90);
+          const updated = await getHabitJournal(days);
           setJournal(updated);
         }
       }
@@ -109,7 +112,7 @@ export default function HabitsPage() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(rangeDays(range)); }, [load, range]);
 
   // Build a set of "habitName|date" for completed entries
   const completionSet = new Set<string>();
@@ -186,7 +189,7 @@ export default function HabitsPage() {
   const longestStreak = streaks.length > 0 ? Math.max(...streaks.map((s) => s.streak)) : 0;
   const bestHabit = streaks.find((s) => s.streak === longestStreak)?.habit;
 
-  const heatmapDates = getDatesArray(30);
+  const heatmapDates = getDatesArray(Math.min(rangeDays(range), 365));
 
   const last7 = getDatesArray(7);
   const possibleLast7 = habits.length * 7;
@@ -197,22 +200,25 @@ export default function HabitsPage() {
 
   return (
     <>
-      <div className="flex items-baseline justify-between mb-8">
+      <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Habits</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Track daily behaviors and build streaks
+            Track daily behaviors and build streaks — {rangeLabel(range)}
             {syncing && <span className="ml-2 text-accent animate-pulse">syncing from Notion...</span>}
           </p>
         </div>
-        <a
-          href="https://www.notion.so/29cc936fd5e14ae8b10a4fe5c5f7a6cd"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-[6px] hover:bg-white/10 transition-colors"
-        >
-          Manage in Notion
-        </a>
+        <div className="flex items-center gap-3">
+          <RangeFilter value={range} onChange={setRange} />
+          <a
+            href="https://www.notion.so/29cc936fd5e14ae8b10a4fe5c5f7a6cd"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-[6px] hover:bg-white/10 transition-colors"
+          >
+            Manage in Notion
+          </a>
+        </div>
       </div>
 
       {/* KPIs */}
@@ -282,7 +288,7 @@ export default function HabitsPage() {
 
       {/* Heatmap */}
       {habits.length > 0 && (
-        <ChartCard title="30-Day Heatmap" className="mt-6">
+        <ChartCard title={`Heatmap — ${rangeLabel(range)}`} className="mt-6">
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead>

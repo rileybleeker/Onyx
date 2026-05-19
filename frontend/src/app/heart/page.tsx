@@ -5,10 +5,11 @@ import {
   AreaChart, Area, LineChart, Line, CartesianGrid,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
 } from "recharts";
-import { getWhoopRecovery, getWhoopCycles, getHeartRateData, getDailySummaries } from "@/lib/queries";
+import { getWhoopRecovery, getWhoopCycles, getHeartRateData, getDailySummaries, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -19,13 +20,16 @@ export default function HeartPage() {
   const [hr, setHr] = useState<any[]>([]);
   const [summaries, setSummaries] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [range, setRange] = useState<Range>("30d");
 
   useEffect(() => {
-    Promise.all([getWhoopRecovery(30), getWhoopCycles(30), getHeartRateData(30), getDailySummaries(30)])
+    setLoading(true);
+    const days = rangeDays(range);
+    Promise.all([getWhoopRecovery(days), getWhoopCycles(days), getHeartRateData(days), getDailySummaries(days)])
       .then(([rec, cyc, h, s]) => { setRecovery(rec); setCycles(cyc); setHr(h); setSummaries(s); })
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, []);
+  }, [range]);
 
   if (loading) {
     return (
@@ -68,11 +72,12 @@ export default function HeartPage() {
 
   return (
     <>
-      <div className="flex items-baseline justify-between mb-8">
+      <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Heart & HRV</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">30-day heart rate and variability trends</p>
+          <p className="text-sm text-text-tertiary mt-0.5">Heart rate and variability trends — {rangeLabel(range)}</p>
         </div>
+        <RangeFilter value={range} onChange={setRange} />
       </div>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">

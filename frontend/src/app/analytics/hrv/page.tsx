@@ -7,9 +7,10 @@ import {
   CartesianGrid, ReferenceLine, Cell,
 } from "recharts";
 import ChartCard from "@/components/ChartCard";
+import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 import { supabase } from "@/lib/supabase";
-import { getWorkoutSleepGap, type WorkoutSleepGap } from "@/lib/queries";
+import { getWorkoutSleepGap, rangeDays, rangeLabel, type Range, type WorkoutSleepGap } from "@/lib/queries";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -64,9 +65,9 @@ async function getTomorrowPrediction() {
   return fb.data?.[0] ?? null;
 }
 
-async function getHrvPredictionAccuracy() {
+async function getHrvPredictionAccuracy(days: number = 60) {
   const since = new Date();
-  since.setDate(since.getDate() - 60);
+  since.setDate(since.getDate() - days);
   const { data } = await supabase
     .from("hrv_predictions_latest")
     .select("prediction_date,model,predicted_hrv,actual_hrv,residual,prediction_lower,prediction_upper")
@@ -193,13 +194,16 @@ export default function HrvAnalysisPage() {
   const [workoutGap, setWorkoutGap] = useState<WorkoutSleepGap[]>([]);
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
+  const [range, setRange] = useState<Range>("30d");
 
   useEffect(() => {
+    setLoading(true);
+    const days = rangeDays(range);
     Promise.all([
       getTomorrowPrediction(),
-      getHrvPredictionAccuracy(),
+      getHrvPredictionAccuracy(days),
       getHrvModelMetrics(),
-      getHistoricalHrv(180),
+      getHistoricalHrv(days),
       getHrvAnalysisResults("correlation", "spearman_top50"),
       getHrvAnalysisResults("journal_impact"),
       getHrvAnalysisResults("feature_importance", "shap_mean_abs"),
@@ -208,7 +212,7 @@ export default function HrvAnalysisPage() {
       getHrvAnalysisResults("correlation", "spearman_journal"),
       getHrvAnalysisResults("feature_importance", "shap_journal"),
       getSarimaxForecast(),
-      getWorkoutSleepGap(90),
+      getWorkoutSleepGap(days),
     ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap]) => {
       setTomorrowPred(tomorrow);
       setAccuracy(acc);
@@ -234,7 +238,7 @@ export default function HrvAnalysisPage() {
       setSarimaxForecast(sarimax);
       setWorkoutGap(wkGap);
     }).catch(console.error).finally(() => setLoading(false));
-  }, []);
+  }, [range]);
 
   // ---------------------------------------------------------------------------
   // Derived state
@@ -344,18 +348,21 @@ export default function HrvAnalysisPage() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-baseline justify-between">
+      <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">HRV Deep Analysis</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Predictive modeling · Statistical drivers · {historicalHrv.length} days of data
+            Predictive modeling · Statistical drivers · {rangeLabel(range)} · {historicalHrv.length} days of data
           </p>
         </div>
-        {!hasData && (
-          <div className="text-sm text-text-tertiary bg-amber-500/10 border border-amber-500/20 rounded px-3 py-1.5">
-            Run <code className="font-mono text-amber-400">python hrv_analysis.py</code> to generate predictions
-          </div>
-        )}
+        <div className="flex items-center gap-3">
+          <RangeFilter value={range} onChange={setRange} />
+          {!hasData && (
+            <div className="text-sm text-text-tertiary bg-amber-500/10 border border-amber-500/20 rounded px-3 py-1.5">
+              Run <code className="font-mono text-amber-400">python hrv_analysis.py</code> to generate predictions
+            </div>
+          )}
+        </div>
       </div>
 
       {/* ── Row 1: Hero Cards ── */}
@@ -830,7 +837,7 @@ export default function HrvAnalysisPage() {
       {/* ── Row 4: Prediction vs Actual + Accuracy by Horizon ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Prediction vs Actual */}
-        <ChartCard title="Prediction vs Actual (last 60 days)"
+        <ChartCard title={`Prediction vs Actual (${rangeLabel(range)})`}
                    subtitle="⚠ DATA INACCURATE — NEEDS FIX"
                    info="What the model predicted each night (dashed) vs what your HRV actually was. Chart is styled red as a reminder that the underlying data is inaccurate and needs to be fixed.">
           <ResponsiveContainer width="100%" height={260}>
@@ -876,7 +883,7 @@ export default function HrvAnalysisPage() {
       </div>
 
       {/* ── Row 5: HRV Trend ── */}
-      <ChartCard title="HRV Trend (180 days)"
+      <ChartCard title={`HRV Trend (${rangeLabel(range)})`}
                  subtitle="WHOOP HRV + 7-day rolling average"
                  info="Your daily WHOOP HRV (faint line) swings a lot day-to-day — that's normal. The brighter line averages the last 7 days to show your real trend.">
         <ResponsiveContainer width="100%" height={280}>
@@ -897,7 +904,7 @@ export default function HrvAnalysisPage() {
       {/* ── Row 5b: Workout-to-sleep gap vs HRV ── */}
       <ChartCard
         title="Workout-to-Bed Gap vs Next-Morning HRV"
-        subtitle="Last 90 days · each dot = one night"
+        subtitle={`${rangeLabel(range)} · each dot = one night`}
         info="Hours between your last logged workout and the moment you fell asleep, plotted against the HRV measured from that night's sleep. Late-evening workouts (gap < 2h) are known to depress HRV; this chart lets you see whether that pattern shows up in your data. Dot color encodes WHOOP strain when available."
       >
         {(() => {

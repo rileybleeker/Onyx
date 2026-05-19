@@ -3,8 +3,10 @@
 import { useCallback, useEffect, useState } from "react";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import RangeFilter from "@/components/RangeFilter";
 import BarcodeScannerModal from "@/components/BarcodeScannerModal";
 import EditIntakeModal, { type EditableIntake } from "@/components/EditIntakeModal";
+import { rangeDays, rangeLabel, type Range } from "@/lib/queries";
 
 interface Product {
   product_id: string;
@@ -82,10 +84,11 @@ export default function SupplementsPage() {
   const [loading, setLoading] = useState(true);
   const [busyProductId, setBusyProductId] = useState<string | null>(null);
 
-  // History (older intakes, paginated)
+  // History (older intakes, paginated). Window driven by the global range filter.
   const [history, setHistory] = useState<Intake[]>([]);
   const [historyLoading, setHistoryLoading] = useState(true);
-  const [historyDays, setHistoryDays] = useState(14);
+  const [range, setRange] = useState<Range>("30d");
+  const historyDays = rangeDays(range);
 
   // Edit-intake modal
   const [editing, setEditing] = useState<EditableIntake | null>(null);
@@ -271,10 +274,11 @@ export default function SupplementsPage() {
         <div>
           <h1 className="text-[20px] font-medium text-text-primary tracking-tight">Supplements</h1>
           <p className="text-[12px] text-text-tertiary mt-0.5">
-            DSLD-backed library · ingredient-level intake tracking with UNII rollups
+            DSLD-backed library · ingredient-level intake tracking — {rangeLabel(range)}
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <RangeFilter value={range} onChange={setRange} />
           <button
             onClick={() => setScannerOpen(true)}
             className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-text-primary bg-[#1DB954]/15 hover:bg-[#1DB954]/25 border border-[#1DB954]/30 rounded-[4px] transition-colors"
@@ -460,26 +464,10 @@ export default function SupplementsPage() {
           {/* Recent intakes (prior days) — edit/delete any row */}
           <ChartCard
             title="Recent intakes"
-            subtitle={`prior days · last ${historyDays} days · ${history.length} entries`}
+            subtitle={`prior days · ${rangeLabel(range)} · ${history.length} entries`}
             source="DSLD"
             info="Every intake before today, newest first. Tap edit on any row to change doses, time, date, or notes. Tap delete to remove an entry entirely. Edits propagate to the daily_supplement_matrix view automatically."
           >
-            <div className="flex items-center gap-2 mb-3 text-[11px] font-mono">
-              <span className="text-text-tertiary uppercase tracking-wide">window:</span>
-              {[7, 14, 30, 90].map((d) => (
-                <button
-                  key={d}
-                  onClick={() => setHistoryDays(d)}
-                  className={`px-2 py-0.5 rounded-[3px] border transition-colors ${
-                    historyDays === d
-                      ? "bg-[#1DB954]/15 text-text-primary border-[#1DB954]/40"
-                      : "text-text-tertiary hover:text-text-secondary border-border-subtle"
-                  }`}
-                >
-                  {d}d
-                </button>
-              ))}
-            </div>
             {historyLoading && history.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-4 text-center">Loading…</p>
             ) : history.length === 0 ? (

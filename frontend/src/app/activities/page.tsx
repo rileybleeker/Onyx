@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getActivities, getWorkouts, getWhoopWorkouts } from "@/lib/queries";
+import { getActivities, getWorkouts, getWhoopWorkouts, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDuration, formatDistance, formatPace } from "@/lib/format";
+import RangeFilter from "@/components/RangeFilter";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -92,9 +93,12 @@ export default function ActivitiesPage() {
   const [rows, setRows] = useState<ActivityRow[]>([]);
   const [workoutMap, setWorkoutMap] = useState<Record<string, any>>({});
   const [loading, setLoading] = useState(true);
+  const [range, setRange] = useState<Range>("30d");
 
   useEffect(() => {
-    Promise.all([getActivities(60), getWhoopWorkouts(60), getWorkouts()])
+    setLoading(true);
+    const days = rangeDays(range);
+    Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts()])
       .then(([garmin, whoop, wkts]) => {
         const merged = mergeAndDedup(
           garmin.map(normalizeGarmin),
@@ -107,7 +111,7 @@ export default function ActivitiesPage() {
       })
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, []);
+  }, [range]);
 
   if (loading) {
     return (
@@ -124,11 +128,12 @@ export default function ActivitiesPage() {
 
   return (
     <>
-      <div className="flex items-baseline justify-between mb-8">
+      <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Activities</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">Last 60 days of training</p>
+          <p className="text-sm text-text-tertiary mt-0.5">Training — {rangeLabel(range)}</p>
         </div>
+        <RangeFilter value={range} onChange={setRange} />
       </div>
 
       {rows.length === 0 ? (
@@ -137,7 +142,7 @@ export default function ActivitiesPage() {
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
           </svg>
           <p className="text-text-secondary font-medium">No activities found</p>
-          <p className="text-text-tertiary text-sm mt-1">No activities recorded in the last 60 days.</p>
+          <p className="text-text-tertiary text-sm mt-1">No activities recorded in this range.</p>
         </div>
       ) : (
         <div className="space-y-3">
