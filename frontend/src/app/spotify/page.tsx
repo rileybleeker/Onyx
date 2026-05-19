@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import {
   LineChart, Line, BarChart, Bar,
+  RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
 import ChartCard from "@/components/ChartCard";
@@ -15,6 +16,7 @@ import {
   getSpotifyTopArtists,
   getSpotifyTopTracks,
   getSpotifyHourOfDay,
+  getSpotifySonicProfile,
   type SpotifyDailySignatureRow,
 } from "@/lib/queries";
 
@@ -26,6 +28,7 @@ type Kpis = Awaited<ReturnType<typeof getSpotifyKpis>>;
 type TopArtists = Awaited<ReturnType<typeof getSpotifyTopArtists>>;
 type TopTracks = Awaited<ReturnType<typeof getSpotifyTopTracks>>;
 type HourBuckets = Awaited<ReturnType<typeof getSpotifyHourOfDay>>;
+type SonicProfile = Awaited<ReturnType<typeof getSpotifySonicProfile>>;
 
 function defaultPlaylistName(): string {
   const fmt = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" });
@@ -39,6 +42,7 @@ export default function SpotifyPage() {
   const [topArtists, setTopArtists] = useState<TopArtists>([]);
   const [topTracks, setTopTracks] = useState<TopTracks>([]);
   const [hours, setHours] = useState<HourBuckets>([]);
+  const [sonic, setSonic] = useState<SonicProfile>(null);
   const [loading, setLoading] = useState(true);
 
   // Create-playlist modal state
@@ -91,14 +95,16 @@ export default function SpotifyPage() {
       getSpotifyTopArtists(30, 10),
       getSpotifyTopTracks(30, 10),
       getSpotifyHourOfDay(30),
+      getSpotifySonicProfile(30),
     ])
-      .then(([k, v, f, ta, tt, h]) => {
+      .then(([k, v, f, ta, tt, h, sp]) => {
         setKpis(k);
         setVolume(v);
         setFeatures(f);
         setTopArtists(ta);
         setTopTracks(tt);
         setHours(h);
+        setSonic(sp);
       })
       .catch((err) => console.error("Spotify page load:", err))
       .finally(() => setLoading(false));
@@ -282,6 +288,60 @@ export default function SpotifyPage() {
                 <Line type="monotone" dataKey="avg_danceability" stroke="#8B5CF6" strokeWidth={1.4} dot={false} name="danceability" />
               </LineChart>
             </ResponsiveContainer>
+          </ChartCard>
+
+          {/* Current sonic profile */}
+          <ChartCard
+            title="Current sonic profile"
+            subtitle="play-weighted mean of 7 audio features — last 30 days"
+            source="RECCOBEATS"
+            info="All values normalized 0–1. Valence = positivity. Energy = intensity. Danceability = rhythmic regularity. Acousticness = acoustic vs. electronic. Instrumentalness = lack of vocals. Liveness = live-recording probability. Speechiness = spoken-word content. Weighted by play count so heavy rotation moves the shape."
+          >
+            {sonic ? (
+              <ResponsiveContainer width="100%" height={320}>
+                <RadarChart
+                  data={sonic.profile}
+                  margin={{ top: 12, right: 24, left: 24, bottom: 12 }}
+                >
+                  <PolarGrid stroke="#ffffff" strokeOpacity={0.08} />
+                  <PolarAngleAxis
+                    dataKey="feature"
+                    tick={{ ...axisTick, fontSize: 11 }}
+                    tickFormatter={(v: string) => v.charAt(0).toUpperCase() + v.slice(1)}
+                  />
+                  <PolarRadiusAxis
+                    angle={90}
+                    domain={[0, 1]}
+                    tick={{ ...axisTick, fontSize: 9 }}
+                    tickCount={5}
+                    stroke="#ffffff"
+                    strokeOpacity={0.1}
+                  />
+                  <Radar
+                    name="profile"
+                    dataKey="value"
+                    stroke={spotifyGreen}
+                    fill={spotifyGreen}
+                    fillOpacity={0.25}
+                    strokeWidth={1.5}
+                    isAnimationActive={false}
+                  />
+                  <Tooltip
+                    {...chartTooltip}
+                    formatter={(value) => (typeof value === "number" ? value.toFixed(3) : String(value))}
+                  />
+                </RadarChart>
+              </ResponsiveContainer>
+            ) : (
+              <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
+                No featurized plays in the last 30 days.
+              </p>
+            )}
+            {sonic && (
+              <p className="text-[10px] text-text-tertiary font-mono mt-2 text-center">
+                {sonic.featurizedPlays} / {sonic.totalPlays} plays featurized
+              </p>
+            )}
           </ChartCard>
 
           {/* Top artists + top tracks side by side */}

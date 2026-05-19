@@ -521,6 +521,90 @@ export async function getSpotifyTopTracks(days: number = 30, limit: number = 10)
     .slice(0, limit);
 }
 
+export interface SonicProfileRow {
+  feature: "valence" | "energy" | "danceability" | "acousticness" | "instrumentalness" | "liveness" | "speechiness";
+  value: number;
+}
+
+export async function getSpotifySonicProfile(days: number = 30): Promise<{
+  profile: SonicProfileRow[];
+  totalPlays: number;
+  featurizedPlays: number;
+} | null> {
+  const since = dateNDaysAgo(days);
+
+  const { data: plays, error: pErr } = await supabase
+    .from("spotify_plays")
+    .select("track_id")
+    .gte("played_date_et", since);
+  if (pErr) throw pErr;
+
+  const playCounts = new Map<string, number>();
+  for (const p of plays ?? []) {
+    if (!p.track_id) continue;
+    playCounts.set(p.track_id, (playCounts.get(p.track_id) ?? 0) + 1);
+  }
+  if (playCounts.size === 0) return null;
+
+  const uniqueIds = Array.from(playCounts.keys());
+  type FeatureRow = {
+    track_id: string;
+    valence: number | null;
+    energy: number | null;
+    danceability: number | null;
+    acousticness: number | null;
+    instrumentalness: number | null;
+    liveness: number | null;
+    speechiness: number | null;
+  };
+  const features: FeatureRow[] = [];
+  const CHUNK = 200;
+  for (let i = 0; i < uniqueIds.length; i += CHUNK) {
+    const batch = uniqueIds.slice(i, i + CHUNK);
+    const { data, error } = await supabase
+      .from("spotify_tracks")
+      .select("track_id,valence,energy,danceability,acousticness,instrumentalness,liveness,speechiness")
+      .in("track_id", batch);
+    if (error) throw error;
+    features.push(...((data ?? []) as FeatureRow[]));
+  }
+
+  const featureNames = [
+    "valence",
+    "energy",
+    "danceability",
+    "acousticness",
+    "instrumentalness",
+    "liveness",
+    "speechiness",
+  ] as const;
+  const sums: Record<string, number> = Object.fromEntries(featureNames.map((f) => [f, 0]));
+  const weights: Record<string, number> = Object.fromEntries(featureNames.map((f) => [f, 0]));
+  let featurizedPlays = 0;
+
+  for (const t of features) {
+    const w = playCounts.get(t.track_id) ?? 0;
+    let counted = false;
+    for (const f of featureNames) {
+      const v = t[f];
+      if (v != null) {
+        sums[f] += Number(v) * w;
+        weights[f] += w;
+        counted = true;
+      }
+    }
+    if (counted) featurizedPlays += w;
+  }
+
+  const totalPlays = Array.from(playCounts.values()).reduce((a, b) => a + b, 0);
+  const profile: SonicProfileRow[] = featureNames.map((f) => ({
+    feature: f,
+    value: weights[f] > 0 ? sums[f] / weights[f] : 0,
+  }));
+
+  return { profile, totalPlays, featurizedPlays };
+}
+
 export async function getSpotifyHourOfDay(days: number = 30) {
   const since = dateNDaysAgo(days);
   const { data, error } = await supabase
