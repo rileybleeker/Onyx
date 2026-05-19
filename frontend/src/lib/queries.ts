@@ -409,6 +409,10 @@ export interface SpotifyDailySignatureRow {
   avg_energy: number | null;
   avg_tempo: number | null;
   avg_danceability: number | null;
+  avg_acousticness: number | null;
+  avg_instrumentalness: number | null;
+  avg_liveness: number | null;
+  avg_speechiness: number | null;
   featurized_plays: number;
 }
 
@@ -495,10 +499,12 @@ export async function getSpotifyDailyVolume(range: SpotifyRange = "90d"): Promis
   return (data ?? []) as SpotifyDailySignatureRow[];
 }
 
-export async function getSpotifyDailyAudioFeatures(range: SpotifyRange = "60d"): Promise<SpotifyDailySignatureRow[]> {
+export async function getSpotifyAudioFeatureDrift(range: SpotifyRange = "60d"): Promise<SpotifyDailySignatureRow[]> {
   let q = supabase
     .from("spotify_daily_signature")
-    .select("calendar_date,avg_valence,avg_energy,avg_tempo,avg_danceability,featurized_plays,play_count");
+    .select(
+      "calendar_date,avg_valence,avg_energy,avg_danceability,avg_acousticness,avg_instrumentalness,avg_liveness,avg_speechiness,featurized_plays,play_count",
+    );
   const since = sinceFor(range);
   if (since) q = q.gte("calendar_date", since);
   const { data, error } = await q
@@ -506,6 +512,168 @@ export async function getSpotifyDailyAudioFeatures(range: SpotifyRange = "60d"):
     .order("calendar_date", { ascending: true });
   if (error) throw error;
   return (data ?? []) as SpotifyDailySignatureRow[];
+}
+
+export interface SpotifyGenreRotationRow {
+  calendar_date: string;
+  // Open-ended: each top-N genre becomes a key plus an "other" bucket.
+  [genre: string]: string | number;
+}
+
+export async function getSpotifyGenreRotation(
+  range: SpotifyRange = "30d",
+  topN: number = 8,
+): Promise<{ rows: SpotifyGenreRotationRow[]; topGenres: string[] }> {
+  let pq = supabase
+    .from("spotify_plays")
+    .select("played_date_et,artist_id");
+  const since = sinceFor(range);
+  if (since) pq = pq.gte("played_date_et", since);
+  const { data: plays, error: pErr } = await pq.order("played_date_et", { ascending: true });
+  if (pErr) throw pErr;
+  if (!plays || plays.length === 0) return { rows: [], topGenres: [] };
+
+  const artistIds = Array.from(
+    new Set(plays.map((p) => p.artist_id).filter(Boolean) as string[]),
+  );
+  type ArtistGenresRow = { artist_id: string; genres: string[] | null };
+  const artists: ArtistGenresRow[] = [];
+  const CHUNK = 200;
+  for (let i = 0; i < artistIds.length; i += CHUNK) {
+    const batch = artistIds.slice(i, i + CHUNK);
+    const { data, error } = await supabase
+      .from("spotify_artists")
+      .select("artist_id,genres")
+      .in("artist_id", batch);
+    if (error) throw error;
+    artists.push(...((data ?? []) as ArtistGenresRow[]));
+  }
+  const genresByArtist = new Map<string, string[]>();
+  for (const a of artists) {
+    if (a.genres && a.genres.length > 0) {
+      genresByArtist.set(a.artist_id, a.genres);
+    }
+  }
+
+  // First pass: compute global genre totals so we can decide top-N.
+  const totals = new Map<string, number>();
+  for (const p of plays) {
+    if (!p.artist_id) continue;
+    const gs = genresByArtist.get(p.artist_id);
+    if (!gs) continue;
+    for (const g of gs) totals.set(g, (totals.get(g) ?? 0) + 1);
+  }
+  const topGenres = Array.from(totals.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, topN)
+    .map(([g]) => g);
+  const topSet = new Set(topGenres);
+
+  // Second pass: build per-date buckets.
+  const byDate = new Map<string, Record<string, number>>();
+  for (const p of plays) {
+    const date = p.played_date_et as string;
+    if (!date) continue;
+    const bucket = byDate.get(date) ?? {};
+    if (!p.artist_id) {
+      byDate.set(date, bucket);
+      continue;
+    }
+    const gs = genresByArtist.get(p.artist_id);
+    if (!gs || gs.length === 0) {
+      bucket["other"] = (bucket["other"] ?? 0) + 1;
+      byDate.set(date, bucket);
+      continue;
+    }
+    let countedTop = false;
+    for (const g of gs) {
+      if (topSet.has(g)) {
+        bucket[g] = (bucket[g] ?? 0) + 1;
+        countedTop = true;
+      }
+    }
+    if (!countedTop) bucket["other"] = (bucket["other"] ?? 0) + 1;
+    byDate.set(date, bucket);
+  }
+
+  const rows: SpotifyGenreRotationRow[] = Array.from(byDate.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, counts]) => {
+      const row: SpotifyGenreRotationRow = { calendar_date: date };
+      for (const g of topGenres) row[g] = counts[g] ?? 0;
+      row["other"] = counts["other"] ?? 0;
+      return row;
+    });
+
+  return { rows, topGenres };
+}
+
+export interface SpotifyDiscoveryRow {
+  calendar_date: string;
+  new_tracks: number;
+  total_plays: number;
+  pct_new: number;
+}
+
+export async function getSpotifyDiscoveryRate(
+  range: SpotifyRange = "30d",
+): Promise<SpotifyDiscoveryRow[]> {
+  // For each play in the range, "new" = track_id not seen in any previous play
+  // (across all-time, not just the range — otherwise picking a wider range would
+  // flip familiar tracks back to "new"). Two queries: all prior track_ids, plus
+  // the range's plays in chronological order.
+  const since = sinceFor(range);
+
+  let prior: Set<string> = new Set();
+  if (since) {
+    // Fetch every track_id played before `since`. This can be large, so we page.
+    let from = 0;
+    const PAGE = 1000;
+    while (true) {
+      const { data, error } = await supabase
+        .from("spotify_plays")
+        .select("track_id")
+        .lt("played_date_et", since)
+        .range(from, from + PAGE - 1);
+      if (error) throw error;
+      const rows = data ?? [];
+      for (const r of rows) if (r.track_id) prior.add(r.track_id);
+      if (rows.length < PAGE) break;
+      from += PAGE;
+    }
+  }
+  // else: "all time" — nothing prior, every first occurrence is "new"
+
+  let q = supabase
+    .from("spotify_plays")
+    .select("played_date_et,track_id,played_at")
+    .order("played_at", { ascending: true });
+  if (since) q = q.gte("played_date_et", since);
+  const { data: rangePlays, error: rErr } = await q;
+  if (rErr) throw rErr;
+
+  const buckets = new Map<string, { new_tracks: number; total_plays: number }>();
+  const seenInRange = new Set<string>();
+  for (const p of rangePlays ?? []) {
+    const date = p.played_date_et as string;
+    if (!date) continue;
+    const b = buckets.get(date) ?? { new_tracks: 0, total_plays: 0 };
+    b.total_plays += 1;
+    const tid = p.track_id;
+    if (tid && !prior.has(tid) && !seenInRange.has(tid)) {
+      b.new_tracks += 1;
+      seenInRange.add(tid);
+    }
+    buckets.set(date, b);
+  }
+  return Array.from(buckets.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([calendar_date, b]) => ({
+      calendar_date,
+      new_tracks: b.new_tracks,
+      total_plays: b.total_plays,
+      pct_new: b.total_plays > 0 ? (b.new_tracks / b.total_plays) * 100 : 0,
+    }));
 }
 
 export async function getSpotifyTopArtists(range: SpotifyRange = "30d", limit: number = 10) {

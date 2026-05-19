@@ -98,6 +98,7 @@ SELECT
     AVG(t.danceability)                 AS avg_danceability,
     AVG(t.acousticness)                 AS avg_acousticness,
     AVG(t.instrumentalness)             AS avg_instrumentalness,
+    AVG(t.liveness)                     AS avg_liveness,
     AVG(t.speechiness)                  AS avg_speechiness,
     AVG(t.loudness)                     AS avg_loudness,
     COUNT(t.valence)                    AS featurized_plays    -- denominator for the feature means

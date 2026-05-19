@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import {
-  LineChart, Line, BarChart, Bar,
+  LineChart, Line, BarChart, Bar, AreaChart, Area,
   RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
@@ -12,7 +12,9 @@ import { chartTooltip, axisTick, gridStyle, accentColor } from "@/lib/chart-them
 import {
   getSpotifyKpis,
   getSpotifyDailyVolume,
-  getSpotifyDailyAudioFeatures,
+  getSpotifyAudioFeatureDrift,
+  getSpotifyGenreRotation,
+  getSpotifyDiscoveryRate,
   getSpotifyTopArtists,
   getSpotifyTopTracks,
   getSpotifyHourOfDay,
@@ -26,6 +28,44 @@ import {
 } from "@/lib/queries";
 
 const LEDGER_PER_PAGE = 50;
+
+const GENRE_PALETTE = [
+  "#1DB954", // spotify green
+  "#F59E0B", // amber (valence)
+  "#06B6D4", // cyan (energy)
+  "#8B5CF6", // purple (danceability)
+  "#EC4899", // pink
+  "#10B981", // emerald
+  "#F97316", // orange
+  "#3B82F6", // blue
+];
+
+function applyRollingMean<T extends object>(
+  rows: T[],
+  keys: (keyof T & string)[],
+  window: number = 7,
+): T[] {
+  if (rows.length < 2) return rows;
+  const w = Math.min(window, rows.length);
+  return rows.map((row, i) => {
+    const start = Math.max(0, i - w + 1);
+    const slice = rows.slice(start, i + 1);
+    const smoothed = { ...row } as Record<string, unknown>;
+    for (const k of keys) {
+      let sum = 0;
+      let n = 0;
+      for (const r of slice) {
+        const v = (r as Record<string, unknown>)[k];
+        if (typeof v === "number" && !Number.isNaN(v)) {
+          sum += v;
+          n += 1;
+        }
+      }
+      smoothed[k] = n > 0 ? sum / n : null;
+    }
+    return smoothed as T;
+  });
+}
 
 const RANGE_OPTIONS: { value: SpotifyRange; label: string }[] = [
   { value: "1d",   label: "1D" },
@@ -47,6 +87,9 @@ type TopTracks = Awaited<ReturnType<typeof getSpotifyTopTracks>>;
 type HourBuckets = Awaited<ReturnType<typeof getSpotifyHourOfDay>>;
 type SonicProfile = Awaited<ReturnType<typeof getSpotifySonicProfile>>;
 type TopGenres = Awaited<ReturnType<typeof getSpotifyTopGenres>>;
+type FeatureDrift = Awaited<ReturnType<typeof getSpotifyAudioFeatureDrift>>;
+type GenreRotation = Awaited<ReturnType<typeof getSpotifyGenreRotation>>;
+type DiscoveryRate = Awaited<ReturnType<typeof getSpotifyDiscoveryRate>>;
 
 function defaultPlaylistName(): string {
   const fmt = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" });
@@ -56,7 +99,9 @@ function defaultPlaylistName(): string {
 export default function SpotifyPage() {
   const [kpis, setKpis] = useState<Kpis | null>(null);
   const [volume, setVolume] = useState<SpotifyDailySignatureRow[]>([]);
-  const [features, setFeatures] = useState<SpotifyDailySignatureRow[]>([]);
+  const [drift, setDrift] = useState<FeatureDrift>([]);
+  const [genreRotation, setGenreRotation] = useState<GenreRotation>({ rows: [], topGenres: [] });
+  const [discovery, setDiscovery] = useState<DiscoveryRate>([]);
   const [topArtists, setTopArtists] = useState<TopArtists>([]);
   const [topTracks, setTopTracks] = useState<TopTracks>([]);
   const [hours, setHours] = useState<HourBuckets>([]);
@@ -119,17 +164,21 @@ export default function SpotifyPage() {
     Promise.all([
       getSpotifyKpis(range),
       getSpotifyDailyVolume(range),
-      getSpotifyDailyAudioFeatures(range),
+      getSpotifyAudioFeatureDrift(range),
+      getSpotifyGenreRotation(range, 8),
+      getSpotifyDiscoveryRate(range),
       getSpotifyTopArtists(range, 10),
       getSpotifyTopTracks(range, 10),
       getSpotifyHourOfDay(range),
       getSpotifySonicProfile(range),
       getSpotifyTopGenres(range, 10),
     ])
-      .then(([k, v, f, ta, tt, h, sp, g]) => {
+      .then(([k, v, d, gr, disc, ta, tt, h, sp, g]) => {
         setKpis(k);
         setVolume(v);
-        setFeatures(f);
+        setDrift(d);
+        setGenreRotation(gr);
+        setDiscovery(disc);
         setTopArtists(ta);
         setTopTracks(tt);
         setHours(h);
@@ -346,26 +395,131 @@ export default function SpotifyPage() {
             </ResponsiveContainer>
           </ChartCard>
 
-          {/* Audio mood signature */}
-          <ChartCard
-            title="Audio mood signature"
-            subtitle={`daily mean of valence, energy, danceability — ${rangeLabel(range)}`}
-            source="RECCOBEATS"
-            info="Valence = positivity. Energy = intensity. Danceability = rhythmic regularity. Days with no featurized plays are omitted, so the line isn't biased by gaps."
-          >
-            <ResponsiveContainer width="100%" height={280}>
-              <LineChart data={features} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
-                <CartesianGrid {...gridStyle} />
-                <XAxis dataKey="calendar_date" tick={axisTick} tickFormatter={(v) => v.slice(5)} />
-                <YAxis tick={axisTick} domain={[0, 1]} />
-                <Tooltip {...chartTooltip} />
-                <Legend wrapperStyle={legendStyle} />
-                <Line type="monotone" dataKey="avg_valence" stroke="#F59E0B" strokeWidth={1.4} dot={false} name="valence" />
-                <Line type="monotone" dataKey="avg_energy" stroke={accentColor} strokeWidth={1.4} dot={false} name="energy" />
-                <Line type="monotone" dataKey="avg_danceability" stroke="#8B5CF6" strokeWidth={1.4} dot={false} name="danceability" />
-              </LineChart>
-            </ResponsiveContainer>
-          </ChartCard>
+          {/* Taste evolution — three trend charts */}
+          <section className="space-y-4">
+            <div className="border-l-2 border-[#1DB954]/40 pl-3">
+              <h2 className="text-[14px] font-medium text-text-primary">Taste evolution</h2>
+              <p className="text-[11px] text-text-tertiary mt-0.5">
+                How your listening has changed across {rangeLabel(range)}. Each chart is smoothed
+                with a 7-day rolling mean (where the range is long enough) so daily noise doesn&apos;t
+                drown out the trend.
+              </p>
+            </div>
+
+            {/* Sound evolution — audio feature drift */}
+            <ChartCard
+              title="Sound evolution"
+              subtitle={`7 audio features over time — ${rangeLabel(range)}`}
+              source="RECCOBEATS"
+              info="Daily mean of each feature, smoothed with a 7-day right-aligned rolling mean. All features are normalized 0–1. Days with no featurized plays are dropped before smoothing so gaps don't pull the line. Rising acousticness + falling energy is the classic 'going introspective' signature; rising danceability + speechiness leans into hip-hop / dance territory."
+            >
+              {drift.length === 0 ? (
+                <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
+                  No featurized plays in this range.
+                </p>
+              ) : (
+                <ResponsiveContainer width="100%" height={300}>
+                  <LineChart
+                    data={applyRollingMean(drift, [
+                      "avg_valence",
+                      "avg_energy",
+                      "avg_danceability",
+                      "avg_acousticness",
+                      "avg_instrumentalness",
+                      "avg_liveness",
+                      "avg_speechiness",
+                    ])}
+                    margin={{ top: 8, right: 8, left: -16, bottom: 0 }}
+                  >
+                    <CartesianGrid {...gridStyle} />
+                    <XAxis dataKey="calendar_date" tick={axisTick} tickFormatter={(v) => v.slice(5)} />
+                    <YAxis tick={axisTick} domain={[0, 1]} />
+                    <Tooltip {...chartTooltip} formatter={(v) => (typeof v === "number" ? v.toFixed(3) : String(v))} />
+                    <Legend wrapperStyle={legendStyle} />
+                    <Line type="monotone" dataKey="avg_valence" stroke="#F59E0B" strokeWidth={1.3} dot={false} name="valence" />
+                    <Line type="monotone" dataKey="avg_energy" stroke={accentColor} strokeWidth={1.3} dot={false} name="energy" />
+                    <Line type="monotone" dataKey="avg_danceability" stroke="#8B5CF6" strokeWidth={1.3} dot={false} name="danceability" />
+                    <Line type="monotone" dataKey="avg_acousticness" stroke="#10B981" strokeWidth={1.3} dot={false} name="acousticness" />
+                    <Line type="monotone" dataKey="avg_instrumentalness" stroke="#EC4899" strokeWidth={1.3} dot={false} name="instrumentalness" />
+                    <Line type="monotone" dataKey="avg_liveness" stroke="#F97316" strokeWidth={1.3} dot={false} name="liveness" />
+                    <Line type="monotone" dataKey="avg_speechiness" stroke="#A1A1AA" strokeWidth={1.3} dot={false} name="speechiness" />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </ChartCard>
+
+            {/* Genre rotation — stacked area */}
+            <ChartCard
+              title="Genre rotation"
+              subtitle={`daily play composition, top ${genreRotation.topGenres.length} genres + other — ${rangeLabel(range)}`}
+              source="MUSICBRAINZ"
+              info="Stacked area shows how many plays each day came from each top genre. Each artist's full tag set contributes — heavy-rotation artists weight their genres more. Tracks whose artist had no MusicBrainz match fall into 'other'."
+            >
+              {genreRotation.rows.length === 0 ? (
+                <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
+                  No plays in this range.
+                </p>
+              ) : (
+                <ResponsiveContainer width="100%" height={300}>
+                  <AreaChart data={genreRotation.rows} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+                    <CartesianGrid {...gridStyle} />
+                    <XAxis dataKey="calendar_date" tick={axisTick} tickFormatter={(v: string) => v.slice(5)} />
+                    <YAxis tick={axisTick} />
+                    <Tooltip {...chartTooltip} />
+                    <Legend wrapperStyle={legendStyle} />
+                    {genreRotation.topGenres.map((g, i) => (
+                      <Area
+                        key={g}
+                        type="monotone"
+                        dataKey={g}
+                        stackId="1"
+                        stroke={GENRE_PALETTE[i % GENRE_PALETTE.length]}
+                        fill={GENRE_PALETTE[i % GENRE_PALETTE.length]}
+                        fillOpacity={0.6}
+                        name={g}
+                      />
+                    ))}
+                    <Area
+                      type="monotone"
+                      dataKey="other"
+                      stackId="1"
+                      stroke="#52525B"
+                      fill="#52525B"
+                      fillOpacity={0.4}
+                      name="other"
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
+              )}
+            </ChartCard>
+
+            {/* Discovery rate */}
+            <ChartCard
+              title="Discovery rate"
+              subtitle={`% of plays that were brand-new tracks — ${rangeLabel(range)}`}
+              source="SPOTIFY"
+              info="For each day, the % of plays that were tracks you'd never played before (across all-time history, not just this range). The 7-day rolling mean smooths the daily spikes. Sustained high = exploration mode; sustained low = comfort-zone listening."
+            >
+              {discovery.length === 0 ? (
+                <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
+                  No plays in this range.
+                </p>
+              ) : (
+                <ResponsiveContainer width="100%" height={260}>
+                  <LineChart
+                    data={applyRollingMean(discovery, ["pct_new"])}
+                    margin={{ top: 8, right: 8, left: -16, bottom: 0 }}
+                  >
+                    <CartesianGrid {...gridStyle} />
+                    <XAxis dataKey="calendar_date" tick={axisTick} tickFormatter={(v) => v.slice(5)} />
+                    <YAxis tick={axisTick} domain={[0, 100]} tickFormatter={(v) => `${v}%`} />
+                    <Tooltip {...chartTooltip} formatter={(v) => (typeof v === "number" ? `${v.toFixed(1)}%` : String(v))} />
+                    <Line type="monotone" dataKey="pct_new" stroke={spotifyGreen} strokeWidth={1.6} dot={false} name="% new tracks" />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </ChartCard>
+          </section>
 
           {/* Current sonic profile */}
           <ChartCard
