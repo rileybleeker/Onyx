@@ -48,6 +48,15 @@ function daysLag(dateStr: string | null): number {
   return Math.round((today.getTime() - d.getTime()) / 86400000);
 }
 
+// Hours since a timestamp — used for enrichment cards (ReccoBeats, MusicBrainz)
+// where the right "freshness" metric is when we last *ran* the enrichment,
+// not when the data was last produced (no new tracks today = nothing to enrich,
+// which is healthy, not stale).
+function hoursSince(isoStr: string | null): number {
+  if (!isoStr) return 9999;
+  return Math.round((Date.now() - new Date(isoStr).getTime()) / 3_600_000);
+}
+
 function deriveStatus(
   syncEntry: Record<string, unknown> | null,
   lag: number
@@ -56,6 +65,38 @@ function deriveStatus(
   if (syncEntry?.status === "failed" || lag > 3) return "failed";
   if (syncEntry?.status === "partial" || lag > 1) return "partial";
   return "success";
+}
+
+// Enrichment subsystems (ReccoBeats audio features, MusicBrainz tags) are
+// passive: they only do work when there's something new to enrich. If your
+// listening was quiet for 3 days, the ETL still ran but enriched zero items —
+// that's healthy, not stale. So freshness here is "when did the ETL last
+// touch this subsystem" (sync_start), not data age.
+function enrichmentSource({
+  label,
+  entry,
+}: {
+  label: string;
+  entry: Record<string, unknown> | null;
+}): SourceStatus {
+  const lastSync = (entry?.sync_start as string) ?? null;
+  const ageHours = hoursSince(lastSync);
+  let status: SourceStatus["status"];
+  if (entry?.status === "failed") status = "failed";
+  else if (!entry) status = "unknown";
+  else if (ageHours > 12) status = "failed";       // ETL should fire every 2h
+  else if (ageHours > 4 || entry.status === "partial") status = "partial";
+  else status = "success";
+  return {
+    label,
+    lastSync,
+    status,
+    latestDataDate: null,           // not meaningful for enrichment cards
+    daysLag: Math.floor(ageHours / 24),
+    recordsSynced: (entry?.records_synced as number) ?? 0,
+    durationSeconds: (entry?.duration_seconds as number) ?? null,
+    errorMessage: (entry?.error_message as string) ?? null,
+  };
 }
 
 export async function GET() {
@@ -113,6 +154,8 @@ export async function GET() {
     const journalEntry = latestBySrcType["whoop|journal_email"] ?? null;
     const mfpEntry = latestBySrcType["myfitnesspal|nutrition"] ?? null;
     const spotifyEntry = latestBySrcType["spotify|plays"] ?? null;
+    const reccobeatsEntry = latestBySrcType["reccobeats|audio_features"] ?? null;
+    const musicbrainzEntry = latestBySrcType["musicbrainz|artist_tags"] ?? null;
 
     const garminLag = daysLag(garminDate);
     const whoopLag = daysLag(whoopDate);
@@ -204,6 +247,14 @@ export async function GET() {
         durationSeconds: (spotifyEntry?.duration_seconds as number) ?? null,
         errorMessage: (spotifyEntry?.error_message as string) ?? null,
       },
+      reccobeats: enrichmentSource({
+        label: "ReccoBeats",
+        entry: reccobeatsEntry,
+      }),
+      musicbrainz: enrichmentSource({
+        label: "MusicBrainz",
+        entry: musicbrainzEntry,
+      }),
     };
 
     const recentHistory = (syncRows ?? []).slice(0, 20).map((r) => ({

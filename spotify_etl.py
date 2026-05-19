@@ -549,11 +549,25 @@ def existing_track_ids(sb: Client, track_ids: list[str]) -> set[str]:
 
 
 def log_sync(sb: Client, status: str, records: int, started_at: float, error: str | None = None):
+    log_sync_entry(sb, source="spotify", data_type="plays",
+                   status=status, records=records, started_at=started_at, error=error)
+
+
+def log_sync_entry(
+    sb: Client,
+    source: str,
+    data_type: str,
+    status: str,
+    records: int,
+    started_at: float,
+    error: str | None = None,
+):
+    """Generic sync_log insert for ETL subsystems (Spotify, ReccoBeats, MusicBrainz, ...)."""
     duration = int(time.time() - started_at)
     try:
         sb.schema("pds").table("sync_log").insert({
-            "source": "spotify",
-            "data_type": "plays",
+            "source": source,
+            "data_type": data_type,
             "status": status,
             "records_synced": records,
             "duration_seconds": duration,
@@ -561,7 +575,7 @@ def log_sync(sb: Client, status: str, records: int, started_at: float, error: st
             "sync_start": datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat(),
         }).execute()
     except Exception as e:
-        log.warning(f"sync_log insert failed: {e}")
+        log.warning(f"sync_log insert ({source}|{data_type}) failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -666,9 +680,18 @@ def run_etl(refeaturize: bool = False):
             except httpx.HTTPError as e:
                 log.warning(f"Failed to fetch track {tid}: {e}")
 
+        reccobeats_started = time.time()
         features = fetch_audio_features_reccobeats(to_fetch) if to_fetch else {}
         tracks_count = upsert_tracks(sb, track_objs, features)
         log.info(f"Upserted {tracks_count} tracks")
+        # Heartbeat for ReccoBeats — log even when no items were attempted so the
+        # status page sees a fresh entry every run. Status='partial' only if we
+        # tried to enrich items but ReccoBeats resolved none.
+        rb_status = "success" if (not to_fetch or features) else "partial"
+        log_sync_entry(
+            sb, source="reccobeats", data_type="audio_features",
+            status=rb_status, records=len(features), started_at=reccobeats_started,
+        )
 
         # Resolve new artists (not yet in spotify_artists) and enrich them
         new_artist_ids = list({
@@ -679,6 +702,10 @@ def run_etl(refeaturize: bool = False):
         new_artist_ids = [a for a in new_artist_ids if a]
         already_artists = existing_artist_ids(sb, new_artist_ids)
         artists_to_fetch = [aid for aid in new_artist_ids if aid not in already_artists]
+        mb_started = time.time()
+        mb_matched = 0
+        mb_attempted = 0
+        mb_error: str | None = None
         if artists_to_fetch:
             try:
                 artist_objs = client.artists(artists_to_fetch)
@@ -690,10 +717,19 @@ def run_etl(refeaturize: bool = False):
                     for a in artist_objs if a and a.get("id")
                 ]
                 if pairs:
-                    g = enrich_genres_via_musicbrainz(sb, pairs)
-                    log.info(f"Resolved genres via MusicBrainz for {g}/{len(pairs)} artists")
+                    mb_attempted = len(pairs)
+                    mb_matched = enrich_genres_via_musicbrainz(sb, pairs)
+                    log.info(f"Resolved genres via MusicBrainz for {mb_matched}/{mb_attempted} artists")
             except httpx.HTTPError as e:
                 log.warning(f"Artist enrichment failed (non-fatal): {e}")
+                mb_error = str(e)
+        # Heartbeat for MusicBrainz — log every run so /status sees us alive.
+        # Status='partial' only if we attempted lookups and zero matched.
+        mb_status = "failed" if mb_error else ("partial" if (mb_attempted > 0 and mb_matched == 0) else "success")
+        log_sync_entry(
+            sb, source="musicbrainz", data_type="artist_tags",
+            status=mb_status, records=mb_matched, started_at=mb_started, error=mb_error,
+        )
 
         # Optional: backfill features for previously-stored tracks that lack them
         if refeaturize:

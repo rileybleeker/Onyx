@@ -15,6 +15,9 @@ const SOURCE_BADGE: Record<string, string> = {
   habits: "NOTION",
   myfitnesspal: "MFP",
   hrv_analysis: "ML",
+  spotify: "SPOTIFY",
+  reccobeats: "RECCOBEATS",
+  musicbrainz: "MUSICBRAINZ",
 };
 
 const SOURCE_BADGE_COLOR: Record<string, string> = {
@@ -25,6 +28,9 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   habits: "text-text-tertiary",
   myfitnesspal: "text-text-tertiary",
   hrv_analysis: "text-blue-400",
+  spotify: "text-[#1DB954]",
+  reccobeats: "text-[#1DB954]/70",
+  musicbrainz: "text-[#1DB954]/70",
 };
 
 const STATUS_DOT: Record<string, string> = {
@@ -48,7 +54,18 @@ const STATUS_TEXT: Record<string, string> = {
   unknown: "text-text-tertiary",
 };
 
-const SOURCE_ORDER = ["garmin", "whoop", "eight_sleep", "whoop_journal", "habits", "myfitnesspal", "hrv_analysis"];
+const SOURCE_ORDER = [
+  "garmin",
+  "whoop",
+  "eight_sleep",
+  "whoop_journal",
+  "habits",
+  "myfitnesspal",
+  "hrv_analysis",
+  "spotify",
+  "reccobeats",
+  "musicbrainz",
+];
 
 function formatRelativeTime(isoStr: string | null): string {
   if (!isoStr) return "Never";
@@ -148,6 +165,9 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   whoop: "WHOOP",
   eight_sleep: "8Sleep",
   myfitnesspal: "MFP",
+  spotify: "Spotify",
+  reccobeats: "ReccoBeats",
+  musicbrainz: "MusicBrainz",
 };
 
 const HISTORY_TYPE_LABELS: Record<string, string> = {
@@ -155,6 +175,9 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   trends: "Trends",
   journal_email: "Journal Email",
   nutrition: "Nutrition",
+  plays: "Plays",
+  audio_features: "Audio Features",
+  artist_tags: "Artist Tags",
 };
 
 export default function StatusPage() {
