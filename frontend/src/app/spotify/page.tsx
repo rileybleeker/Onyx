@@ -17,10 +17,14 @@ import {
   getSpotifyTopTracks,
   getSpotifyHourOfDay,
   getSpotifySonicProfile,
+  getSpotifyLedger,
   rangeLabel,
   type SpotifyDailySignatureRow,
+  type SpotifyLedgerRow,
   type SpotifyRange,
 } from "@/lib/queries";
+
+const LEDGER_PER_PAGE = 50;
 
 const RANGE_OPTIONS: { value: SpotifyRange; label: string }[] = [
   { value: "1d",   label: "1D" },
@@ -57,6 +61,13 @@ export default function SpotifyPage() {
   const [sonic, setSonic] = useState<SonicProfile>(null);
   const [loading, setLoading] = useState(true);
   const [range, setRange] = useState<SpotifyRange>("30d");
+
+  // Ledger pagination is separate from the main page fetch so paging through
+  // doesn't re-load the charts.
+  const [ledgerPage, setLedgerPage] = useState(0);
+  const [ledger, setLedger] = useState<SpotifyLedgerRow[]>([]);
+  const [ledgerTotal, setLedgerTotal] = useState(0);
+  const [ledgerLoading, setLedgerLoading] = useState(true);
 
   // Create-playlist modal state
   const [modalOpen, setModalOpen] = useState(false);
@@ -122,7 +133,20 @@ export default function SpotifyPage() {
       })
       .catch((err) => console.error("Spotify page load:", err))
       .finally(() => setLoading(false));
+    // Reset ledger to page 0 whenever the range changes
+    setLedgerPage(0);
   }, [range]);
+
+  useEffect(() => {
+    setLedgerLoading(true);
+    getSpotifyLedger(range, ledgerPage, LEDGER_PER_PAGE)
+      .then(({ rows, totalCount }) => {
+        setLedger(rows);
+        setLedgerTotal(totalCount);
+      })
+      .catch((err) => console.error("Spotify ledger:", err))
+      .finally(() => setLedgerLoading(false));
+  }, [range, ledgerPage]);
 
   const hasData = (kpis?.totalPlays ?? 0) > 0;
 
@@ -450,8 +474,104 @@ export default function SpotifyPage() {
               </BarChart>
             </ResponsiveContainer>
           </ChartCard>
+
+          {/* Play ledger */}
+          <ChartCard
+            title="Play ledger"
+            subtitle={`every play, newest first · ${rangeLabel(range)}${ledgerTotal > 0 ? ` · ${ledgerTotal.toLocaleString()} plays` : ""}`}
+            source="SPOTIFY"
+            info="Every track that registered in Spotify's recently-played feed for the selected range. Spotify's 30-second minimum applies — anything skipped sooner doesn't appear."
+          >
+            {ledgerLoading && ledger.length === 0 && (
+              <p className="text-[11px] text-text-tertiary font-mono py-8 text-center">Loading…</p>
+            )}
+            {!ledgerLoading && ledger.length === 0 && (
+              <p className="text-[11px] text-text-tertiary font-mono py-8 text-center">
+                No plays in this range.
+              </p>
+            )}
+            {ledger.length > 0 && (
+              <>
+                <div className="overflow-x-auto -mx-1">
+                  <table className="w-full text-[12px] font-mono">
+                    <thead>
+                      <tr className="text-[10px] uppercase tracking-wide text-text-tertiary border-b border-border-subtle">
+                        <th className="text-left py-2 px-1 font-normal w-[140px]">When (ET)</th>
+                        <th className="text-left py-2 px-1 font-normal">Track</th>
+                        <th className="text-left py-2 px-1 font-normal">Artist</th>
+                        <th className="text-right py-2 px-1 font-normal w-[60px]">Dur</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ledger.map((r) => (
+                        <tr
+                          key={`${r.played_at}-${r.track_id}`}
+                          className="border-b border-border-subtle/50 hover:bg-white/[0.02]"
+                        >
+                          <td className="py-1.5 px-1 text-text-tertiary tabular-nums whitespace-nowrap">
+                            {formatPlayedAt(r.played_at)}
+                          </td>
+                          <td className="py-1.5 px-1 text-text-primary truncate max-w-[260px]" title={r.track_name ?? ""}>
+                            {r.track_name ?? "—"}
+                          </td>
+                          <td className="py-1.5 px-1 text-text-secondary truncate max-w-[200px]" title={r.artist_name ?? ""}>
+                            {r.artist_name ?? "—"}
+                          </td>
+                          <td className="py-1.5 px-1 text-right text-text-tertiary tabular-nums">
+                            {formatDuration(r.duration_ms)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="flex items-center justify-between mt-3 text-[11px] font-mono">
+                  <span className="text-text-tertiary">
+                    Page {ledgerPage + 1} of {Math.max(1, Math.ceil(ledgerTotal / LEDGER_PER_PAGE))}
+                  </span>
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => setLedgerPage((p) => Math.max(0, p - 1))}
+                      disabled={ledgerPage === 0 || ledgerLoading}
+                      className="px-2.5 py-1 text-[11px] text-text-secondary hover:text-text-primary disabled:opacity-30 disabled:cursor-not-allowed border border-border-subtle rounded-[4px] transition-colors"
+                    >
+                      ← Prev
+                    </button>
+                    <button
+                      onClick={() => setLedgerPage((p) => p + 1)}
+                      disabled={(ledgerPage + 1) * LEDGER_PER_PAGE >= ledgerTotal || ledgerLoading}
+                      className="px-2.5 py-1 text-[11px] text-text-secondary hover:text-text-primary disabled:opacity-30 disabled:cursor-not-allowed border border-border-subtle rounded-[4px] transition-colors"
+                    >
+                      Next →
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
+          </ChartCard>
         </>
       )}
     </div>
   );
+}
+
+const playedAtFmt = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+  hour12: true,
+});
+
+function formatPlayedAt(iso: string): string {
+  return playedAtFmt.format(new Date(iso));
+}
+
+function formatDuration(ms: number | null): string {
+  if (ms == null) return "—";
+  const totalSec = Math.round(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
 }

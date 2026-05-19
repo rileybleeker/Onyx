@@ -638,6 +638,34 @@ export async function getSpotifySonicProfile(range: SpotifyRange = "30d"): Promi
   return { profile, totalPlays, featurizedPlays };
 }
 
+export interface SpotifyLedgerRow {
+  played_at: string;
+  track_id: string;
+  track_name: string | null;
+  artist_name: string | null;
+  album_name: string | null;
+  duration_ms: number | null;
+}
+
+export async function getSpotifyLedger(
+  range: SpotifyRange = "30d",
+  page: number = 0,
+  perPage: number = 50,
+): Promise<{ rows: SpotifyLedgerRow[]; totalCount: number }> {
+  const from = page * perPage;
+  const to = from + perPage - 1;
+  let q = supabase
+    .from("spotify_plays")
+    .select("played_at,track_id,track_name,artist_name,album_name,duration_ms", { count: "exact" });
+  const since = sinceFor(range);
+  if (since) q = q.gte("played_date_et", since);
+  const { data, error, count } = await q
+    .order("played_at", { ascending: false })
+    .range(from, to);
+  if (error) throw error;
+  return { rows: (data ?? []) as SpotifyLedgerRow[], totalCount: count ?? 0 };
+}
+
 export async function getSpotifyHourOfDay(range: SpotifyRange = "30d") {
   let q = supabase.from("spotify_plays").select("played_at");
   const since = sinceFor(range);
