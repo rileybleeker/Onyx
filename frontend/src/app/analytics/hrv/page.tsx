@@ -16,6 +16,82 @@ import { getWorkoutSleepGap, rangeDays, rangeLabel, type Range, type WorkoutSlee
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
 
+/**
+ * Normalize a feature label for display. Some rows arrive pretty-printed from
+ * the Python pipeline ("Bed Temperature"); others are still raw column names
+ * ("whoop_cycle_avg_hr", "journal_slept_in_the_same_bed_as_usual"). One pass
+ * idempotently produces the displayable form: strip `journal_` prefix, swap
+ * underscores for spaces, title-case.
+ */
+function prettifyLabel(raw: string): string {
+  if (!raw) return "";
+  let s = raw.replace(/^journal_/, "");
+  if (s.includes("_")) {
+    s = s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+  return s;
+}
+
+/**
+ * Wrapped YAxis tick — labels in the correlation / journal-impact charts can
+ * run 30-40 chars long (e.g. "Learned Something Interesting Or Important").
+ * Default Recharts behavior truncates with no overflow indicator; we instead
+ * pack words greedily onto up to 2 lines and add a <title> hover so the full
+ * label is always recoverable.
+ *
+ * `maxCharsPerLine` is the soft target — a word will spill over by a few
+ * characters rather than break mid-word.
+ */
+function WrappedYAxisTick(
+  { x, y, payload, maxCharsPerLine = 24, fontSize = 10 }: {
+    x?: number; y?: number; payload?: { value?: string };
+    maxCharsPerLine?: number; fontSize?: number;
+  }
+) {
+  const raw = String(payload?.value ?? "");
+  const display = prettifyLabel(raw);
+  const words = display.split(/\s+/);
+  const lines: string[] = ["", ""];
+  let cursor = 0;
+  for (const w of words) {
+    const candidate = lines[cursor] ? `${lines[cursor]} ${w}` : w;
+    if (candidate.length <= maxCharsPerLine || cursor === 1) {
+      lines[cursor] = candidate;
+    } else {
+      cursor = 1;
+      lines[cursor] = w;
+    }
+  }
+  // If line 2 overflows the budget, truncate with ellipsis so it doesn't
+  // bleed into the bars. Hover (<title>) still shows the full label.
+  const hardCap = maxCharsPerLine + 6;
+  if (lines[1].length > hardCap) lines[1] = lines[1].slice(0, hardCap - 1) + "…";
+
+  const isWrapped = lines[1].length > 0;
+  return (
+    <g transform={`translate(${x},${y})`}>
+      <text
+        x={-4}
+        y={0}
+        textAnchor="end"
+        fill="#71717A"
+        fontSize={fontSize}
+        fontFamily="var(--font-geist-mono), monospace"
+      >
+        <title>{display}</title>
+        {isWrapped ? (
+          <>
+            <tspan x={-4} dy={-fontSize * 0.45}>{lines[0]}</tspan>
+            <tspan x={-4} dy={fontSize * 1.1}>{lines[1]}</tspan>
+          </>
+        ) : (
+          <tspan x={-4} dy={fontSize * 0.35}>{lines[0]}</tspan>
+        )}
+      </text>
+    </g>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Data fetching
 //
@@ -707,12 +783,13 @@ export default function HrvAnalysisPage() {
             source="SPEARMAN ρ"
             info="How strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises. A bar near −1.0 means the opposite. This doesn't change day to day — it's a long-term pattern. Journal behaviors appear in a separate section below because Yes/No features have a narrower correlation range than continuous metrics.">
             {correlations.length > 0 ? (
-              <ResponsiveContainer width="100%" height={300}>
+              <ResponsiveContainer width="100%" height={Math.max(360, correlations.length * 26)}>
                 <BarChart data={correlations} layout="vertical"
-                          margin={{ left: 160, right: 20, top: 4, bottom: 4 }}>
+                          margin={{ left: 8, right: 20, top: 4, bottom: 4 }}>
                   <CartesianGrid {...gridStyle} horizontal={false} />
                   <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
-                  <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160} />
+                  <YAxis type="category" dataKey="label" width={180}
+                         tick={<WrappedYAxisTick maxCharsPerLine={26} fontSize={10} />} />
                   <Tooltip {...chartTooltip}
                            formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
                   <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
@@ -739,13 +816,13 @@ export default function HrvAnalysisPage() {
                 Correlation between each logged behavior and the following night&apos;s HRV, across your entire history. Yes/No features naturally produce smaller correlation scores than continuous metrics — but a consistent +0.10 or −0.10 is still meaningful over hundreds of nights.
               </p>
               {journalCorrelations.length > 0 ? (
-                <ResponsiveContainer width="100%" height={Math.max(120, journalCorrelations.length * 22)}>
+                <ResponsiveContainer width="100%" height={Math.max(160, journalCorrelations.length * 28)}>
                   <BarChart data={journalCorrelations} layout="vertical"
-                            margin={{ left: 160, right: 20, top: 2, bottom: 2 }}>
+                            margin={{ left: 8, right: 20, top: 2, bottom: 2 }}>
                     <CartesianGrid {...gridStyle} horizontal={false} />
                     <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
-                    <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160}
-                           tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
+                    <YAxis type="category" dataKey="label" width={200}
+                           tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
                     <Tooltip {...chartTooltip}
                              formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
                     <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
@@ -808,14 +885,15 @@ export default function HrvAnalysisPage() {
           source="WELCH'S T-TEST"
           info="How each logged behavior affects your HRV the following night. A +15ms bar means your HRV was 15ms higher, on average, on nights after you did that thing. Green = helps recovery; red = hurts it. Method: Welch's two-sample t-test (unequal variance) on HRV distributions for Yes vs No nights, with Cohen's d and 95% CI computed per behavior.">
           {journalImpact.length > 0 ? (
-            <ResponsiveContainer width="100%" height={260}>
+            <ResponsiveContainer width="100%" height={Math.max(360, journalImpact.slice(0, 12).length * 30)}>
               <BarChart data={journalImpact.slice(0, 12)} layout="vertical"
-                        margin={{ left: 120, right: 20, top: 4, bottom: 20 }}>
+                        margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                 <CartesianGrid {...gridStyle} horizontal={false} />
                 <XAxis type="number" tick={axisTick}
                        tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
                        label={axisLabel("HRV Δ (ms)", "x")} />
-                <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={120} />
+                <YAxis type="category" dataKey="label" width={200}
+                       tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, n: any) => [`${Number(v).toFixed(1)} ms`, "HRV Δ"]} />
                 <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
