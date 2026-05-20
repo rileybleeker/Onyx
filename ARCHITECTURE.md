@@ -205,6 +205,29 @@ Joins all three device sources by `calendar_date` (~40 columns):
 
 ---
 
+## Time Conventions
+
+> Onyx makes a deliberate choice about how to bucket activity into "days".
+> The full rationale lives in `CLAUDE.md` under "Timezone convention" and
+> "Supplement intake — behavioral-day convention"; this is the summary.
+
+**Canonical timezone:** `America/New_York` (ET). All `calendar_date` join keys in `daily_health_matrix` are ET-aligned. Raw timestamps are stored as true UTC instants; date-only columns (MFP, Eight Sleep, WHOOP journal, habits, supplements) are stored ET-aligned at the source.
+
+**Two competing definitions of "a day"** coexist in the schema, on purpose:
+
+| Convention | Day boundary | Used by | Rationale |
+|---|---|---|---|
+| **Clock-date** (midnight-to-midnight ET) | 00:00 ET → 00:00 ET | MFP nutrition, point-in-time events (workouts, weigh-ins) | The analytical target is *daily energy balance* / discrete events. A midnight snack genuinely adds to the new day's calorie tally. |
+| **Behavioral-day** (bedtime-to-bedtime, ≈ WHOOP cycle) | bedtime → next bedtime | WHOOP cycles, WHOOP journal, supplement intake | The analytical target is *next-night recovery / sleep effects*. Pre-bed activity at 12:05 AM ET belongs to the day that just ended — it affects the sleep that immediately follows. |
+
+**WHOOP cycle derivation:** `((start_time + INTERVAL '12 hours') AT TIME ZONE 'America/New_York')::date` — lands at midday of the wake day. Robust to any bedtime drift.
+
+**Supplement intake:** `intake_date` is the behavioral day; `intake_time TIMESTAMPTZ` is the truthful clock instant. The two are stored independently so a 12:05 AM May 21 click attributed to May 20 keeps the accurate timestamp without losing the date semantics. The `/supplements` UI defaults intake_date to the current ET date but exposes a manual date override on the quick-tap log flow.
+
+**Why this matters for analysis:** `hrv_analysis.py:build_feature_matrix` uses `shift(-1)` to predict HRV(N+1) from behaviors(N). Any behavior that affects sleep (journal entries, supplements) must land on the date *before* the sleep it influenced — which is exactly what the behavioral-day convention guarantees. Putting a pre-bed 12:05 AM supplement on the new clock date would silently mis-train the model.
+
+---
+
 ## Frontend
 
 **Stack**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, Supabase JS 2.99

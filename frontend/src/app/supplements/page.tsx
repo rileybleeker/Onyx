@@ -77,6 +77,18 @@ function formatDoseTime(iso: string | null): string {
   });
 }
 
+/** Current ET date as YYYY-MM-DD — used as the default intake_date. */
+function etTodayStr(): string {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
+/** Pretty-print a YYYY-MM-DD as "May 20" for inline labels. */
+function formatShortDate(ymd: string): string {
+  // Construct as midday UTC so timezone shifts can't bump the day.
+  const d = new Date(`${ymd}T12:00:00Z`);
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
 export default function SupplementsPage() {
   const [products, setProducts] = useState<Product[]>([]);
   const [intakes, setIntakes] = useState<Intake[]>([]);
@@ -92,6 +104,14 @@ export default function SupplementsPage() {
 
   // Edit-intake modal
   const [editing, setEditing] = useState<EditableIntake | null>(null);
+
+  // Date that quick-tap log buttons attribute the intake to. Defaults to
+  // today (ET clock date); the user can override to attribute pre-bed
+  // post-midnight intakes to the previous day (behavioral-day convention —
+  // see CLAUDE.md "Supplement intake" bullet).
+  const [logDate, setLogDate] = useState<string>(etTodayStr());
+  const today = etTodayStr();
+  const isLoggingForToday = logDate === today;
 
   // Add product flow
   const [addOpen, setAddOpen] = useState(false);
@@ -159,7 +179,11 @@ export default function SupplementsPage() {
       const res = await fetch("/api/supplements/log-intake", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ product_id, intake_time: new Date().toISOString() }),
+        body: JSON.stringify({
+          product_id,
+          intake_date: logDate,
+          intake_time: new Date().toISOString(),
+        }),
       });
       if (!res.ok) throw new Error(await res.text());
       await refreshAll();
@@ -219,6 +243,7 @@ export default function SupplementsPage() {
           body: JSON.stringify({
             product_id: seeded.product_id,
             doses,
+            intake_date: logDate,
             intake_time: new Date().toISOString(),
           }),
         });
@@ -314,10 +339,39 @@ export default function SupplementsPage() {
         <>
           {/* Log intake — product picker */}
           <ChartCard
-            title="Log intake today"
-            subtitle="Tap a product to add one dose. Each click writes a fresh intake event with a timestamp."
+            title={isLoggingForToday ? "Log intake today" : `Log intake for ${formatShortDate(logDate)}`}
+            subtitle="Tap a product to add one dose. Each click writes a fresh intake event with the current clock timestamp."
             source="DSLD"
           >
+            {/* Manual date override — defaults to today; lets the user
+                attribute a post-midnight pre-bed intake to the day that
+                just ended (behavioral-day convention; see CLAUDE.md). */}
+            <div className="flex flex-wrap items-center gap-2 mb-3 pb-3 border-b border-border-subtle/40">
+              <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
+                Intake date
+              </label>
+              <input
+                type="date"
+                value={logDate}
+                max={today}
+                onChange={(e) => setLogDate(e.target.value || today)}
+                className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+              />
+              {!isLoggingForToday && (
+                <>
+                  <span className="text-[10px] font-mono text-amber-400/90">
+                    logging to {formatShortDate(logDate)} — not today
+                  </span>
+                  <button
+                    onClick={() => setLogDate(today)}
+                    className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
+                  >
+                    reset to today
+                  </button>
+                </>
+              )}
+            </div>
+
             {products.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
                 Library is empty. Add a product to get started.
