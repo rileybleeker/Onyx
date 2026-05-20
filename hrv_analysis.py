@@ -983,6 +983,14 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # (UNION with a `source` column) but get their own habit_ prefix so all
     # downstream analyses can break them out separately from WHOOP behaviors.
     # Labels are populated dynamically from the Notion-managed habit names.
+    #
+    # Tracking-window semantics (mirrors pivot_supplements): a habit_journal
+    # row only exists for dates Riley logged a completion, so a NaN after the
+    # merge means "no completion logged" — which behaviorally is "did NOT do
+    # the habit that day", i.e. should be 0 for the t-test/correlation. We
+    # fill per-habit from the first completion forward; rows *before* a
+    # habit's first completion stay NaN so we don't manufacture "No"s for
+    # a habit that didn't exist yet.
     existing_habit = [c for c in df.columns if c.startswith("habit_")]
     if not existing_habit and not data["journal"].empty:
         hdf, habit_label_map = pivot_habits(data["journal"])
@@ -990,6 +998,12 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
             df = df.merge(hdf, on="calendar_date", how="left")
             HABIT_LABELS.update(habit_label_map)
             FEATURE_LABELS.update(habit_label_map)
+            habit_cols = list(habit_label_map.keys())
+            df = df.sort_values("calendar_date").reset_index(drop=True)
+            for hcol in habit_cols:
+                first_done_idx = df[hcol].first_valid_index()
+                if first_done_idx is not None:
+                    df.loc[first_done_idx:, hcol] = df.loc[first_done_idx:, hcol].fillna(0)
             log.info(f"  Habits pivoted: {len(habit_label_map)} habit columns "
                      f"({', '.join(habit_label_map.values())})")
 
