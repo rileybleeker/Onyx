@@ -159,7 +159,7 @@ HIGH_VALUE_SPARSE_FEATURES = {
 # Controllable / behavioral features for the actionable-only SHAP ranking
 # (audit finding 7.K). Anything here is something Riley can change tomorrow.
 CONTROLLABLE_FEATURE_PREFIXES = (
-    "journal_", "mfp_", "whoop_sleep_", "garmin_sleep_", "eight_sleep_",
+    "journal_", "mfp_", "supplement_", "whoop_sleep_", "garmin_sleep_", "eight_sleep_",
     "whoop_workout_", "whoop_day_strain", "garmin_activity_",
     "rolling_3d_training_load", "rolling_7d_training_load", "sleep_debt",
     "moderate_intensity_minutes", "vigorous_intensity_minutes",
@@ -714,6 +714,49 @@ def pivot_journal(journal: pd.DataFrame) -> pd.DataFrame:
     return pivot
 
 
+def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """Pivot per-compound supplement intake into per-compound dose columns.
+
+    Returns (wide_df, tracking_start) where:
+      - wide_df has one row per calendar_date with columns:
+            supplement_<compound>_amount  (sum across products that day)
+        For dates within the tracking window where the compound wasn't taken,
+        the value is 0. For dates outside the tracking window (before the
+        first supplement record), the value stays NaN so the model can
+        distinguish "untracked" from "took zero".
+      - tracking_start is the earliest calendar_date in the supplements data,
+        used by callers to fill NaN → 0 only within the tracking window.
+
+    Caller is responsible for merging on calendar_date and applying the
+    tracking-window fillna(0). We keep that here at the matrix layer rather
+    than inside this function because the matrix has the full date spine.
+    """
+    if supplements is None or supplements.empty:
+        return pd.DataFrame(), None
+
+    def clean_col(c: str) -> str:
+        return ("supplement_" + str(c).lower()
+                .replace("?", "").replace(" ", "_")
+                .replace("/", "_").replace("-", "_")
+                .replace("'", "").replace(",", "")
+                .replace("(", "").replace(")", "")
+                .replace(".", "").replace("&", "and")
+                .strip("_") + "_amount")
+
+    supp = supplements.copy().dropna(subset=["calendar_date", "ingredient_group"])
+    supp["total_amount"] = pd.to_numeric(supp["total_amount"], errors="coerce")
+    tracking_start = str(supp["calendar_date"].min())
+
+    grouped = (supp.groupby(["calendar_date", "ingredient_group"], as_index=False)
+                   .agg(total_amount=("total_amount", "sum")))
+    wide = grouped.pivot_table(
+        index="calendar_date", columns="ingredient_group",
+        values="total_amount", aggfunc="sum",
+    ).reset_index()
+    wide.columns = ["calendar_date"] + [clean_col(c) for c in wide.columns[1:]]
+    return wide, tracking_start
+
+
 def build_feature_matrix(data: dict) -> pd.DataFrame:
     """Join all tables onto the daily_health_matrix spine and engineer features."""
     log.info("Building feature matrix…")
@@ -883,6 +926,25 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         jdf = pivot_journal(data["journal"])
         if not jdf.empty:
             df = df.merge(jdf, on="calendar_date", how="left")
+
+    # --- Supplement pivot: per-compound amount columns ---
+    # Within the tracking window, dates where a compound wasn't taken are
+    # filled with 0 (real "no dose"). Dates before tracking started stay NaN
+    # so XGBoost can distinguish "untracked era" from "took zero". The 5%
+    # non-null floor in prepare_ml_data will drop sparse compounds until
+    # tracking history accumulates, so this addition is a no-op for the
+    # current model run but plumbs supplements through for the future.
+    supp_data = data.get("supplements")
+    if supp_data is not None and not supp_data.empty:
+        sdf, supp_tracking_start = pivot_supplements(supp_data)
+        if not sdf.empty:
+            df = df.merge(sdf, on="calendar_date", how="left")
+            supp_cols = [c for c in sdf.columns if c != "calendar_date"]
+            in_window = df["calendar_date"] >= supp_tracking_start
+            for col in supp_cols:
+                df.loc[in_window, col] = df.loc[in_window, col].fillna(0)
+            log.info(f"  Supplements pivoted: {len(supp_cols)} compound columns "
+                     f"(tracking window from {supp_tracking_start})")
 
     # --- Sort by date ---
     df = df.sort_values("calendar_date").reset_index(drop=True)
@@ -1235,6 +1297,7 @@ def print_completeness(df: pd.DataFrame) -> None:
         "Eight Sleep": [c for c in df.columns if "eight_sleep" in c],
         "Nutrition":   [c for c in df.columns if "mfp_" in c],
         "Journal":     [c for c in df.columns if c.startswith("journal_")],
+        "Supplements": [c for c in df.columns if c.startswith("supplement_")],
     }
     for cat, cols in categories.items():
         valid = [c for c in cols if c in df.columns]
@@ -2089,10 +2152,16 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
         # Shift by 1 day so that HRV[N] is modelled using features[N-1].
         # This corrects the causal alignment: behaviors on day N-1 drive HRV on night N.
         # Exclude whoop_hrv_rmssd from exog (it's the endogenous variable itself).
+        # Coverage threshold lowered from 0.5 → 0.2 so behavioral features
+        # (journal/mfp/supplement, typically 20-30% coverage) are eligible;
+        # ffill+bfill on the chosen series still produces a continuous exog.
+        # Slot count raised from 5 → 7 so the category-seeded features fit
+        # alongside the global SHAP top.
         exog_feats = [f for f in top_features
                       if f in hrv_valid.columns
                       and f != TARGET
-                      and hrv_valid[f].notna().mean() >= 0.5][:5]
+                      and hrv_valid[f].notna().mean() >= 0.2][:7]
+        log.info(f"  SARIMAX exog features ({len(exog_feats)}): {exog_feats}")
         original_exog = hrv_valid[exog_feats].copy().ffill().bfill() if exog_feats else None
         # Shift forward 1 row: exog for row N = original feature values from row N-1
         exog = original_exog.shift(1).ffill().bfill() if original_exog is not None else None
@@ -2235,10 +2304,18 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
         hrv_df["y"] = hrv_df["y"].astype(float)
 
         # Regressor columns: exclude TARGET itself (it would be a perfect predictor of hrv_target_t1
-        # in the holdout since both come from the same dataset — circular leakage)
+        # in the holdout since both come from the same dataset — circular leakage).
+        # Coverage threshold lowered from 0.6 → 0.25 so behavioral features
+        # (journal/mfp/supplement) are eligible; ffill+bfill on the chosen
+        # series still produces a continuous regressor. Slot count held at 3
+        # — empirically Prophet's holdout MAE degraded ~4ms when widened to
+        # 5 (sparser ffilled regressors weakened the seasonal fit); since
+        # top_features is composed with behavioral seeds first, the first 3
+        # slots reliably include the category seeds anyway.
         reg_feats = [f for f in top_features if f in df_p.columns
                      and f != TARGET
-                     and df_p.dropna(subset=["hrv_target_t1"])[f].notna().mean() >= 0.6][:3]
+                     and df_p.dropna(subset=["hrv_target_t1"])[f].notna().mean() >= 0.25][:3]
+        log.info(f"  Prophet regressors ({len(reg_feats)}): {reg_feats}")
 
         if reg_feats:
             feat_df = df_p[["calendar_date"] + reg_feats].copy()
@@ -3088,9 +3165,39 @@ def main() -> None:
     log.info("=== PHASE 3: PREDICTION MODELS ===")
     xgb_model, xgb_results = train_xgboost(df)
 
-    top_features = list(xgb_results.get("feature_importance", {}).keys())[:10]
-    if not top_features and "correlations" in stat_results:
-        top_features = stat_results["correlations"].head(10)["feature"].tolist()
+    # Compose top_features for SARIMAX/Prophet. Default: XGBoost SHAP top-10.
+    # Enrichment: also seed in the top-ranked controllable feature from each
+    # major category (journal, mfp, supplement) — so behavioral signals get
+    # a fair shot at the SARIMAX exog / Prophet regressor slots even when the
+    # global SHAP top is dominated by sleep/HRV-lag features. We use the FULL
+    # SHAP ranking (feature_importance_full, all features) for the category
+    # search — the truncated top-30 dict can miss category leaders that rank
+    # 31st-50th. Fallback: Spearman correlation ranking from stat_results.
+    xgb_importance_full = xgb_results.get("feature_importance_full", {})
+    xgb_importance_top = xgb_results.get("feature_importance", {})
+
+    if xgb_importance_full:
+        full_ranked = list(xgb_importance_full.keys())
+    elif "correlations" in stat_results:
+        full_ranked = stat_results["correlations"]["feature"].tolist()
+    else:
+        full_ranked = []
+
+    top10_global = (list(xgb_importance_top.keys())[:10]
+                    if xgb_importance_top else full_ranked[:10])
+
+    def first_with_prefix(prefix: str) -> str | None:
+        return next((f for f in full_ranked if f.startswith(prefix)), None)
+
+    seeds: list[str] = []
+    for prefix in ("journal_", "mfp_", "supplement_"):
+        f = first_with_prefix(prefix)
+        if f and f not in seeds:
+            seeds.append(f)
+
+    top_features = list(dict.fromkeys(seeds + top10_global))[:12]
+    log.info(f"  Model exog/regressor candidates ({len(top_features)}): "
+             f"seeded={seeds}, top10_global={top10_global}")
 
     sarimax_results = train_sarimax(df, top_features)
     prophet_results = train_prophet(df, top_features)
