@@ -595,10 +595,10 @@ export default function HrvAnalysisPage() {
                   </p>
                 </div>
 
-                <div className="bg-red-500/10 border border-red-500/40 rounded-[6px] p-4 space-y-2">
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">SARIMAX</span>
-                    <span className="text-[9px] font-mono text-red-400 bg-red-500/20 px-1.5 py-0.5 rounded-[2px]">NEEDS FIX</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">SEASONAL</span>
                   </div>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
                     <strong className="text-text-secondary">What it is:</strong> A classical statistics model that predicts tomorrow&apos;s HRV using your own past HRV values (today&apos;s HRV predicts tomorrow&apos;s to some degree), while also factoring in external variables like training load.
