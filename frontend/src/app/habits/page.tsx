@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { getHabitJournal, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
@@ -124,10 +124,11 @@ export default function HabitsPage() {
 
   const today = todayStr();
 
-  async function toggleCompletion(habit: NotionHabit) {
-    const key = `${habit.name}|${today}`;
+  async function toggleCompletion(habit: NotionHabit, date: string) {
+    if (date > today) return; // never log future dates
+    const key = `${habit.name}|${date}`;
     const isCompleted = completionSet.has(key);
-    setToggling((prev) => new Set(prev).add(habit.name));
+    setToggling((prev) => new Set(prev).add(key));
 
     try {
       const res = await fetch("/api/habits/complete", {
@@ -135,7 +136,7 @@ export default function HabitsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           habit: habit.name,
-          date: today,
+          date,
           category: habit.category,
           notionPageId: habit.id,
           undo: isCompleted,
@@ -145,12 +146,12 @@ export default function HabitsPage() {
       if (res.ok) {
         if (isCompleted) {
           setJournal((prev) =>
-            prev.filter((j) => !(j.question === habit.name && j.cycle_date === today))
+            prev.filter((j) => !(j.question === habit.name && j.cycle_date === date))
           );
         } else {
           setJournal((prev) => [
-            ...prev.filter((j) => !(j.question === habit.name && j.cycle_date === today)),
-            { cycle_date: today, question: habit.name, category: habit.category, answer: "Yes" },
+            ...prev.filter((j) => !(j.question === habit.name && j.cycle_date === date)),
+            { cycle_date: date, question: habit.name, category: habit.category, answer: "Yes" },
           ]);
         }
       }
@@ -159,7 +160,7 @@ export default function HabitsPage() {
     } finally {
       setToggling((prev) => {
         const next = new Set(prev);
-        next.delete(habit.name);
+        next.delete(key);
         return next;
       });
     }
@@ -235,51 +236,21 @@ export default function HabitsPage() {
           <div className="space-y-1">
             {habits.map((h) => {
               const done = completionSet.has(`${h.name}|${today}`);
-              const isToggling = toggling.has(h.name);
+              const isToggling = toggling.has(`${h.name}|${today}`);
               const streak = calculateStreak(h.name, h.frequency, completionSet);
               const color = CATEGORY_COLORS[h.category] || CATEGORY_COLORS.general;
 
               return (
-                <button
+                <HabitRow
                   key={h.id}
-                  onClick={() => toggleCompletion(h)}
-                  disabled={isToggling}
-                  className={`w-full flex items-center gap-3 px-4 py-3 rounded-[4px] transition-all text-left group ${
-                    done ? "bg-white/[0.03]" : "hover:bg-white/[0.03]"
-                  } ${isToggling ? "opacity-50" : ""}`}
-                >
-                  <div
-                    className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all shrink-0 ${
-                      done ? "border-transparent" : "border-white/20 group-hover:border-white/40"
-                    }`}
-                    style={done ? { backgroundColor: color } : {}}
-                  >
-                    {done && (
-                      <svg className="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                      </svg>
-                    )}
-                  </div>
-
-                  <div className="flex-1 min-w-0">
-                    <span className={`text-sm font-medium transition-colors ${done ? "text-text-tertiary line-through" : "text-text-primary"}`}>
-                      {h.name}
-                    </span>
-                  </div>
-
-                  {streak > 0 && (
-                    <span
-                      className="text-[11px] font-mono font-medium px-2 py-0.5 rounded-full"
-                      style={{ backgroundColor: `${color}20`, color }}
-                    >
-                      {streak}d streak
-                    </span>
-                  )}
-
-                  <span className="text-[10px] font-mono text-text-tertiary/60 uppercase tracking-wider hidden sm:inline">
-                    {h.category}
-                  </span>
-                </button>
+                  habit={h}
+                  done={done}
+                  isToggling={isToggling}
+                  streak={streak}
+                  color={color}
+                  today={today}
+                  onToggle={(d) => toggleCompletion(h, d)}
+                />
               );
             })}
           </div>
@@ -315,12 +286,21 @@ export default function HabitsPage() {
                       </td>
                       {heatmapDates.map((d) => {
                         const done = completionSet.has(`${h.name}|${d}`);
+                        const isFuture = d > today;
+                        const cellToggling = toggling.has(`${h.name}|${d}`);
                         return (
                           <td key={d} className="px-0.5 py-1 text-center">
-                            <div
-                              className="w-5 h-5 rounded-sm mx-auto transition-colors"
+                            <button
+                              onClick={() => toggleCompletion(h, d)}
+                              disabled={isFuture || cellToggling}
+                              className={`w-5 h-5 rounded-sm mx-auto block transition-all ${
+                                isFuture
+                                  ? "cursor-not-allowed"
+                                  : "hover:ring-1 hover:ring-white/30 cursor-pointer"
+                              } ${cellToggling ? "opacity-50" : ""}`}
                               style={{ backgroundColor: done ? `${color}cc` : "rgba(255,255,255,0.03)" }}
-                              title={`${h.name}: ${d} — ${done ? "Done" : "Missed"}`}
+                              title={`${h.name}: ${d} — ${done ? "Done (click to undo)" : isFuture ? "Future" : "Click to log"}`}
+                              aria-label={`Toggle ${h.name} for ${d}`}
                             />
                           </td>
                         );
@@ -378,5 +358,104 @@ export default function HabitsPage() {
         </div>
       )}
     </>
+  );
+}
+
+interface HabitRowProps {
+  habit: NotionHabit;
+  done: boolean;
+  isToggling: boolean;
+  streak: number;
+  color: string;
+  today: string;
+  onToggle: (date: string) => void;
+}
+
+function HabitRow({ habit, done, isToggling, streak, color, today, onToggle }: HabitRowProps) {
+  const dateInputRef = useRef<HTMLInputElement>(null);
+
+  function openDatePicker(e: React.MouseEvent) {
+    e.stopPropagation();
+    const input = dateInputRef.current;
+    if (!input) return;
+    if (typeof input.showPicker === "function") {
+      input.showPicker();
+    } else {
+      input.focus();
+      input.click();
+    }
+  }
+
+  function onDateChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const picked = e.target.value;
+    if (picked && picked <= today) onToggle(picked);
+    e.target.value = "";
+  }
+
+  return (
+    <div
+      className={`w-full flex items-center gap-3 px-4 py-3 rounded-[4px] transition-all group ${
+        done ? "bg-white/[0.03]" : "hover:bg-white/[0.03]"
+      } ${isToggling ? "opacity-50" : ""}`}
+    >
+      <button
+        onClick={() => onToggle(today)}
+        disabled={isToggling}
+        className="flex items-center gap-3 flex-1 text-left min-w-0"
+        aria-label={`Toggle ${habit.name} for today`}
+      >
+        <div
+          className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all shrink-0 ${
+            done ? "border-transparent" : "border-white/20 group-hover:border-white/40"
+          }`}
+          style={done ? { backgroundColor: color } : {}}
+        >
+          {done && (
+            <svg className="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+            </svg>
+          )}
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <span className={`text-sm font-medium transition-colors ${done ? "text-text-tertiary line-through" : "text-text-primary"}`}>
+            {habit.name}
+          </span>
+        </div>
+      </button>
+
+      {streak > 0 && (
+        <span
+          className="text-[11px] font-mono font-medium px-2 py-0.5 rounded-full"
+          style={{ backgroundColor: `${color}20`, color }}
+        >
+          {streak}d streak
+        </span>
+      )}
+
+      <span className="text-[10px] font-mono text-text-tertiary/60 uppercase tracking-wider hidden sm:inline">
+        {habit.category}
+      </span>
+
+      <button
+        onClick={openDatePicker}
+        className="relative p-1.5 rounded-[4px] text-text-tertiary hover:text-text-primary hover:bg-white/5 transition-colors"
+        title="Log on a past date"
+        aria-label={`Backdate ${habit.name}`}
+      >
+        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+        </svg>
+        <input
+          ref={dateInputRef}
+          type="date"
+          max={today}
+          onChange={onDateChange}
+          className="absolute inset-0 opacity-0 pointer-events-none"
+          tabIndex={-1}
+          aria-hidden="true"
+        />
+      </button>
+    </div>
   );
 }

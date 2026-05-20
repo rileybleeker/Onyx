@@ -66,7 +66,18 @@ export async function POST(req: NextRequest) {
       }
 
       if (pageId) {
-        const notionDate = undo ? null : { start: completionDate };
+        // Derive Notion's "Last Completed" from the actual max cycle_date in habit_journal
+        // (so backdating or undoing doesn't overwrite a more recent completion).
+        const { data: latest } = await supabase
+          .from("habit_journal")
+          .select("cycle_date")
+          .eq("question", habit)
+          .order("cycle_date", { ascending: false })
+          .limit(1);
+
+        const latestDate = latest && latest.length > 0 ? latest[0].cycle_date : null;
+        const notionDate = latestDate ? { start: latestDate } : null;
+
         await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
           method: "PATCH",
           headers: {
