@@ -159,8 +159,8 @@ HIGH_VALUE_SPARSE_FEATURES = {
 # Controllable / behavioral features for the actionable-only SHAP ranking
 # (audit finding 7.K). Anything here is something Riley can change tomorrow.
 CONTROLLABLE_FEATURE_PREFIXES = (
-    "journal_", "mfp_", "supplement_", "whoop_sleep_", "garmin_sleep_", "eight_sleep_",
-    "whoop_workout_", "whoop_day_strain", "garmin_activity_",
+    "journal_", "habit_", "mfp_", "supplement_", "whoop_sleep_", "garmin_sleep_",
+    "eight_sleep_", "whoop_workout_", "whoop_day_strain", "garmin_activity_",
     "rolling_3d_training_load", "rolling_7d_training_load", "sleep_debt",
     "moderate_intensity_minutes", "vigorous_intensity_minutes",
     "active_seconds", "highly_active_seconds", "sedentary_seconds",
@@ -311,6 +311,13 @@ JOURNAL_LABELS: dict[str, str] = {
     "viewed_screen_in_bed": "Screen in Bed",
     "worked_late": "Worked Late",
 }
+
+# Habits live in Notion (managed by Riley) and flow through pds.journal with
+# source='habit'. Names are user-defined and may change at any time, so the
+# label map is populated at runtime in build_feature_matrix() from the original
+# question strings. This dict is the in-memory store the pivot fills; nothing
+# is hard-coded here on purpose.
+HABIT_LABELS: dict[str, str] = {}
 
 
 # ===========================================================================
@@ -547,7 +554,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["mfp"]["calendar_date"] = data["mfp"]["calendar_date"].astype(str)
 
     log.info("  Loading journal (WHOOP + habits)…")
-    data["journal"] = fetch_all("journal", select="cycle_date,question,answer")
+    data["journal"] = fetch_all("journal", select="cycle_date,question,answer,source")
 
     log.info("  Loading supplement_intake_by_compound…")
     data["supplements"] = fetch_all(
@@ -675,8 +682,24 @@ def aggregate_whoop_workouts(wk: pd.DataFrame, cycles: pd.DataFrame) -> pd.DataF
     ).reset_index()
 
 
+def _clean_question_col(prefix: str, question: str) -> str:
+    """Normalize a question string into a stable column name with a category prefix."""
+    return (prefix + str(question).lower()
+            .replace("?", "").replace(" ", "_")
+            .replace("/", "_").replace("-", "_")
+            .replace("'", "").replace(",", "")
+            .replace("(", "").replace(")", "")
+            .strip("_"))
+
+
 def pivot_journal(journal: pd.DataFrame) -> pd.DataFrame:
-    """Pivot journal rows into boolean columns per question per day.
+    """Pivot WHOOP journal rows into boolean columns per question per day.
+
+    Filters source='whoop' when the source column is present (the unified
+    pds.journal view UNIONs WHOOP + habits, and habits are pivoted separately
+    by pivot_habits with their own habit_ prefix). When source is absent —
+    e.g., older callers passing the raw whoop_journal table — every row is
+    treated as WHOOP, preserving the historical behavior.
 
     Date-semantics shift (audit finding 4.B): WHOOP asks journal questions on
     the morning the cycle ends, but the questions cover the *previous day's*
@@ -690,6 +713,10 @@ def pivot_journal(journal: pd.DataFrame) -> pd.DataFrame:
     if journal.empty:
         return pd.DataFrame()
     journal = journal.copy()
+    if "source" in journal.columns:
+        journal = journal[journal["source"] == "whoop"]
+        if journal.empty:
+            return pd.DataFrame()
     if WHOOP_JOURNAL_LAG_DAYS:
         journal["cycle_date"] = (
             pd.to_datetime(journal["cycle_date"], errors="coerce")
@@ -702,16 +729,40 @@ def pivot_journal(journal: pd.DataFrame) -> pd.DataFrame:
         journal.pivot_table(index="cycle_date", columns="question", values="is_yes", aggfunc="max")
         .reset_index()
     )
-    # Clean column names
-    def clean_col(c: str) -> str:
-        return ("journal_" + c.lower()
-                .replace("?", "").replace(" ", "_")
-                .replace("/", "_").replace("-", "_")
-                .replace("'", "").replace(",", "")
-                .replace("(", "").replace(")", "")
-                .strip("_"))
-    pivot.columns = ["calendar_date"] + [clean_col(c) for c in pivot.columns[1:]]
+    pivot.columns = ["calendar_date"] + [_clean_question_col("journal_", c) for c in pivot.columns[1:]]
     return pivot
+
+
+def pivot_habits(journal: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Pivot habit rows (source='habit' in the unified journal view) into
+    one boolean column per habit per day, prefixed `habit_`.
+
+    Date semantics: habit completions are recorded under the date Riley marks
+    them complete (ET), with no WHOOP-style next-morning-asking offset, so no
+    cycle_date shift is applied here — `habit_*` on calendar_date=N already
+    means "Riley did this habit on day N", which lines up with the rest of the
+    pipeline's behaviors-on-N → HRV(N+1) assumption.
+
+    Returns (wide_df, label_map) where label_map carries the original habit
+    name from Notion (preserving casing and special characters) keyed by the
+    cleaned column name, for use in FEATURE_LABELS at display time.
+    """
+    if journal.empty or "source" not in journal.columns:
+        return pd.DataFrame(), {}
+    habits = journal[journal["source"] == "habit"].copy()
+    if habits.empty:
+        return pd.DataFrame(), {}
+    habits["cycle_date"] = habits["cycle_date"].astype(str)
+    habits["is_yes"] = habits["answer"].str.lower().isin(["yes", "true", "1"]).astype(float)
+    pivot = (
+        habits.pivot_table(index="cycle_date", columns="question", values="is_yes", aggfunc="max")
+        .reset_index()
+    )
+    original_questions = list(pivot.columns[1:])
+    cleaned = [_clean_question_col("habit_", c) for c in original_questions]
+    pivot.columns = ["calendar_date"] + cleaned
+    label_map = {col: str(orig) for col, orig in zip(cleaned, original_questions)}
+    return pivot, label_map
 
 
 def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
@@ -927,6 +978,21 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         if not jdf.empty:
             df = df.merge(jdf, on="calendar_date", how="left")
 
+    # --- Habit pivot ---
+    # Habits flow through the same pds.journal view as WHOOP journal entries
+    # (UNION with a `source` column) but get their own habit_ prefix so all
+    # downstream analyses can break them out separately from WHOOP behaviors.
+    # Labels are populated dynamically from the Notion-managed habit names.
+    existing_habit = [c for c in df.columns if c.startswith("habit_")]
+    if not existing_habit and not data["journal"].empty:
+        hdf, habit_label_map = pivot_habits(data["journal"])
+        if not hdf.empty:
+            df = df.merge(hdf, on="calendar_date", how="left")
+            HABIT_LABELS.update(habit_label_map)
+            FEATURE_LABELS.update(habit_label_map)
+            log.info(f"  Habits pivoted: {len(habit_label_map)} habit columns "
+                     f"({', '.join(habit_label_map.values())})")
+
     # --- Supplement pivot: per-compound amount columns ---
     # Within the tracking window, dates where a compound wasn't taken are
     # filled with 0 (real "no dose"). Dates before tracking started stay NaN
@@ -1002,6 +1068,11 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
                  "journal_ate_food_close_to_bedtime"):
         if jcol in df.columns:
             df[f"{jcol}_lag1"] = df[jcol].shift(1)
+    # Cumulative effects of habit completion: 1-day lag for every habit so the
+    # model can detect "did this habit yesterday → today's HRV" relationships
+    # without us having to hardcode habit names (they're user-defined in Notion).
+    for hcol in [c for c in df.columns if c.startswith("habit_")]:
+        df[f"{hcol}_lag1"] = df[hcol].shift(1)
 
     # Day-of-week
     dt = pd.to_datetime(df["calendar_date"], errors="coerce")
@@ -1297,6 +1368,7 @@ def print_completeness(df: pd.DataFrame) -> None:
         "Eight Sleep": [c for c in df.columns if "eight_sleep" in c],
         "Nutrition":   [c for c in df.columns if "mfp_" in c],
         "Journal":     [c for c in df.columns if c.startswith("journal_")],
+        "Habits":      [c for c in df.columns if c.startswith("habit_")],
         "Supplements": [c for c in df.columns if c.startswith("supplement_")],
     }
     for cat, cols in categories.items():
@@ -1574,6 +1646,68 @@ def run_statistical_analysis(
                 log.info("  Saved: journal_impact.png")
         except Exception as e:
             log.warning(f"  Journal analysis failed: {e}")
+
+    # --- Habit conditional analysis ---
+    # Mirrors the journal Yes/No t-test but on habit_ columns sourced from
+    # pds.habit_journal (Notion-managed habit completions). Habits are user-
+    # defined so the column set is dynamic; the analysis is otherwise identical.
+    habit_cols = [c for c in hrv_valid.columns if c.startswith("habit_")
+                  and not c.endswith("_lag1")]
+    habit_impact = []
+    if habit_cols:
+        try:
+            for hc in habit_cols:
+                sub = hrv_valid[[STAT_TARGET, hc]].dropna()
+                yes = sub.loc[sub[hc] == 1, STAT_TARGET]
+                no = sub.loc[sub[hc] == 0, STAT_TARGET]
+                if len(yes) < 5 or len(no) < 5:
+                    continue
+                t_stat, p_val = stats.ttest_ind(yes, no, equal_var=False)
+                diff = yes.mean() - no.mean()
+                pooled_std = np.sqrt((yes.std()**2 + no.std()**2) / 2)
+                cohen_d = diff / pooled_std if pooled_std > 0 else 0
+                se = np.sqrt(yes.var() / len(yes) + no.var() / len(no))
+                ci_low = diff - 1.96 * se
+                ci_high = diff + 1.96 * se
+                clean_name = hc.replace("habit_", "")
+                label = HABIT_LABELS.get(hc, clean_name.replace("_", " ").title())
+                habit_impact.append({
+                    "feature": hc, "label": label,
+                    "mean_yes": float(yes.mean()), "mean_no": float(no.mean()),
+                    "diff_ms": float(diff), "ci_low": float(ci_low), "ci_high": float(ci_high),
+                    "p_value": float(p_val), "cohen_d": float(cohen_d),
+                    "n_yes": int(len(yes)), "n_no": int(len(no)),
+                })
+            if habit_impact:
+                hi_df = pd.DataFrame(habit_impact)
+                hi_order = np.argsort(np.abs(hi_df["diff_ms"].values))[::-1]
+                hi_df = hi_df.iloc[hi_order].reset_index(drop=True)
+                hi_df.to_csv(OUTPUT_DIR / "habit_impact.csv", index=False)
+                results["habit_impact"] = habit_impact
+
+                fig, ax = plt.subplots(figsize=(10, max(3, len(hi_df) * 0.6)))
+                colors = ["#22c55e" if d > 0 else "#ef4444" for d in hi_df["diff_ms"]]
+                y_pos = range(len(hi_df))
+                ax.barh(list(y_pos), hi_df["diff_ms"].tolist(), color=colors, alpha=0.85)
+                ax.set_yticks(list(y_pos))
+                ax.set_yticklabels(hi_df["label"].tolist(), fontsize=9)
+                ax.axvline(0, color="#ffffff", linewidth=0.5, alpha=0.4)
+                ax.set_xlabel("HRV Difference: Yes vs No (ms)")
+                ax.set_title("Habit Impact on Next-Day HRV")
+                ax.set_facecolor("#1a1a1d")
+                fig.patch.set_facecolor("#0a0a0b")
+                ax.tick_params(colors="#a1a1aa")
+                ax.xaxis.label.set_color("#a1a1aa")
+                ax.title.set_color("#f4f4f5")
+                plt.tight_layout()
+                fig.savefig(OUTPUT_DIR / "habit_impact.png", dpi=120)
+                plt.close(fig)
+                log.info("  Saved: habit_impact.png")
+            else:
+                log.info(f"  Habit analysis: {len(habit_cols)} habits found but none "
+                         f"met the n_yes>=5, n_no>=5 threshold yet")
+        except Exception as e:
+            log.warning(f"  Habit analysis failed: {e}")
 
     # --- Supplement Yes/No impact ---
     # Welch's two-sample t-test on next-night HRV for each compound (Yes vs No
@@ -2659,6 +2793,39 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                     em_df.to_csv(OUTPUT_DIR / "evaluation" / "error_modes.csv", index=False)
                     log.info(f"  Error modes: {len(em_df)} behaviors saved")
                     eval_results["error_modes"] = em_rows
+            # Mirror the same residual decomposition for habit_ columns so we can
+            # see where the model is well- or poorly-calibrated by habit completion.
+            hcols = [c for c in df.columns if c.startswith("habit_") and not c.endswith("_lag1")]
+            if hcols:
+                hdf = df[["calendar_date"] + hcols].copy()
+                hdf["calendar_date"] = hdf["calendar_date"].astype(str)
+                joined_h = xgb_bt.merge(
+                    hdf, left_on="pred_date", right_on="calendar_date", how="left",
+                )
+                em_h_rows = []
+                for hc in hcols:
+                    yes = joined_h.loc[joined_h[hc] == 1, "residual"]
+                    no = joined_h.loc[joined_h[hc] == 0, "residual"]
+                    if len(yes) < 5 or len(no) < 5:
+                        continue
+                    em_h_rows.append({
+                        "behavior": hc.replace("habit_", ""),
+                        "label": HABIT_LABELS.get(hc, hc.replace("habit_", "").replace("_", " ").title()),
+                        "n_yes": int(len(yes)), "n_no": int(len(no)),
+                        "mae_yes": float(yes.abs().mean()),
+                        "mae_no": float(no.abs().mean()),
+                        "mean_residual_yes": float(yes.mean()),
+                        "mean_residual_no": float(no.mean()),
+                        "mae_diff_yes_minus_no": float(yes.abs().mean() - no.abs().mean()),
+                    })
+                if em_h_rows:
+                    em_h_df = pd.DataFrame(em_h_rows)
+                    em_h_df = em_h_df.iloc[
+                        np.argsort(np.abs(em_h_df["mae_diff_yes_minus_no"].values))[::-1]
+                    ].reset_index(drop=True)
+                    em_h_df.to_csv(OUTPUT_DIR / "evaluation" / "error_modes_habits.csv", index=False)
+                    log.info(f"  Error modes (habits): {len(em_h_df)} habits saved")
+                    eval_results["error_modes_habits"] = em_h_rows
     except Exception as e:
         log.warning(f"  Error-mode analysis failed: {e}")
 
@@ -2878,7 +3045,8 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
                            controllable_importance: dict | None = None,
                            permutation_importance: dict | None = None,
                            dm_test: list | None = None,
-                           error_modes: list | None = None) -> None:
+                           error_modes: list | None = None,
+                           error_modes_habits: list | None = None) -> None:
     """Store pre-computed analysis results for the frontend."""
     rows: list[dict] = []
 
@@ -2902,12 +3070,31 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
                 "result_json": json.dumps(journal_corr_list),
             })
 
+        # Habit-specific correlations — same treatment as journal_, just on
+        # habit_ prefixed columns from pds.habit_journal.
+        habit_corr = corr_df[corr_df["feature"].str.startswith("habit_")].copy()
+        if not habit_corr.empty:
+            habit_corr_list = habit_corr.to_dict(orient="records")
+            rows.append({
+                "result_type": "correlation",
+                "result_key": "spearman_habit",
+                "result_json": json.dumps(habit_corr_list),
+            })
+
     # Journal impact
     if "journal_impact" in stat_results:
         rows.append({
             "result_type": "journal_impact",
             "result_key": "all",
             "result_json": json.dumps(stat_results["journal_impact"]),
+        })
+
+    # Habit impact (Yes/No t-test mirroring journal_impact)
+    if "habit_impact" in stat_results:
+        rows.append({
+            "result_type": "habit_impact",
+            "result_key": "all",
+            "result_json": json.dumps(stat_results["habit_impact"]),
         })
 
     # Supplement Yes/No impact
@@ -2956,6 +3143,17 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
                 "result_json": json.dumps(journal_fi_list),
             })
 
+        # Habit-specific SHAP importance — mirrors journal block
+        habit_fi = [(k, v) for k, v in fi_source.items() if k.startswith("habit_")]
+        if habit_fi:
+            habit_fi_list = [{"feature": k, "label": FEATURE_LABELS.get(k, k), "importance": v}
+                              for k, v in sorted(habit_fi, key=lambda x: x[1], reverse=True)]
+            rows.append({
+                "result_type": "feature_importance",
+                "result_key": "shap_habit",
+                "result_json": json.dumps(habit_fi_list),
+            })
+
     # Stage 3 standardized OLS results (audit fix 2.C)
     if "stage3_ols" in stat_results:
         rows.append({
@@ -3000,6 +3198,14 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             "result_type": "model_comparison",
             "result_key": "error_modes_by_journal",
             "result_json": json.dumps(error_modes),
+        })
+
+    # Error-mode analysis for habits — mirrors error_modes_by_journal
+    if error_modes_habits:
+        rows.append({
+            "result_type": "model_comparison",
+            "result_key": "error_modes_by_habit",
+            "result_json": json.dumps(error_modes_habits),
         })
 
     # Feature label map
@@ -3094,6 +3300,16 @@ def print_summary(df: pd.DataFrame, xgb_results: dict,
             print(f"  {j['label']:<30} d={j['diff_ms']:+.1f}ms  {sig}  "
                   f"(Yes={j['n_yes']}, No={j['n_no']})")
 
+    # Habit impact
+    if "habit_impact" in stat_results:
+        print(f"\nTOP HABITS (HRV impact)")
+        sorted_hi = sorted(stat_results["habit_impact"],
+                           key=lambda x: abs(x["diff_ms"]), reverse=True)[:10]
+        for h in sorted_hi:
+            sig = "***" if h["p_value"] < 0.001 else "** " if h["p_value"] < 0.01 else "*  " if h["p_value"] < 0.05 else "   "
+            print(f"  {h['label']:<30} d={h['diff_ms']:+.1f}ms  {sig}  "
+                  f"(Yes={h['n_yes']}, No={h['n_no']})")
+
     # Tomorrow's prediction
     print(f"\nTOMORROW'S PREDICTION ({str(date.today() + timedelta(days=1))})")
     if xgb_results and xgb_results.get("tomorrow_pred"):
@@ -3167,7 +3383,7 @@ def main() -> None:
 
     # Compose top_features for SARIMAX/Prophet. Default: XGBoost SHAP top-10.
     # Enrichment: also seed in the top-ranked controllable feature from each
-    # major category (journal, mfp, supplement) — so behavioral signals get
+    # major category (journal, habit, mfp, supplement) — so behavioral signals get
     # a fair shot at the SARIMAX exog / Prophet regressor slots even when the
     # global SHAP top is dominated by sleep/HRV-lag features. We use the FULL
     # SHAP ranking (feature_importance_full, all features) for the category
@@ -3190,7 +3406,7 @@ def main() -> None:
         return next((f for f in full_ranked if f.startswith(prefix)), None)
 
     seeds: list[str] = []
-    for prefix in ("journal_", "mfp_", "supplement_"):
+    for prefix in ("journal_", "habit_", "mfp_", "supplement_"):
         f = first_with_prefix(prefix)
         if f and f not in seeds:
             seeds.append(f)
@@ -3235,6 +3451,7 @@ def main() -> None:
         permutation_importance=xgb_results.get("permutation_importance"),
         dm_test=eval_results.get("dm_test"),
         error_modes=eval_results.get("error_modes"),
+        error_modes_habits=eval_results.get("error_modes_habits"),
     )
 
     # ---------- Run-Manifest Artifact (audit fix 4#38) ----------

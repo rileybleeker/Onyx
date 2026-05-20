@@ -271,6 +271,9 @@ export default function HrvAnalysisPage() {
   const [sarimaxForecast, setSarimaxForecast] = useState<any[]>([]);
   const [journalCorrelations, setJournalCorrelations] = useState<any[]>([]);
   const [journalShap, setJournalShap] = useState<any[]>([]);
+  const [habitImpact, setHabitImpact] = useState<any[]>([]);
+  const [habitCorrelations, setHabitCorrelations] = useState<any[]>([]);
+  const [habitShap, setHabitShap] = useState<any[]>([]);
   const [supplementImpact, setSupplementImpact] = useState<any[]>([]);
   const [supplementDoseResponse, setSupplementDoseResponse] = useState<any[]>([]);
   const [nutritionImpact, setNutritionImpact] = useState<any[]>([]);
@@ -299,7 +302,10 @@ export default function HrvAnalysisPage() {
       getHrvAnalysisResults("supplement_impact", "yes_no"),
       getHrvAnalysisResults("supplement_impact", "dose_response"),
       getHrvAnalysisResults("nutrition_impact", "spearman"),
-    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap, suppImp, suppDose, nutImp]) => {
+      getHrvAnalysisResults("habit_impact"),
+      getHrvAnalysisResults("correlation", "spearman_habit"),
+      getHrvAnalysisResults("feature_importance", "shap_habit"),
+    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap, suppImp, suppDose, nutImp, hi, hCorr, hShap]) => {
       setTomorrowPred(tomorrow);
       setAccuracy(acc);
       setMetrics(m);
@@ -331,6 +337,15 @@ export default function HrvAnalysisPage() {
       }
       if (nutImp?.result_json) {
         try { setNutritionImpact(JSON.parse(nutImp.result_json)); } catch {}
+      }
+      if (hi?.result_json) {
+        try { setHabitImpact(JSON.parse(hi.result_json)); } catch {}
+      }
+      if (hCorr?.result_json) {
+        try { setHabitCorrelations(JSON.parse(hCorr.result_json)); } catch {}
+      }
+      if (hShap?.result_json) {
+        try { setHabitShap(JSON.parse(hShap.result_json)); } catch {}
       }
     }).catch(console.error).finally(() => setLoading(false));
   }, [range]);
@@ -701,7 +716,7 @@ export default function HrvAnalysisPage() {
           </div>
           <p className="text-[10px] text-text-tertiary mt-3 pt-3 border-t border-border-subtle">
             When both charts agree on a factor, you can be confident it genuinely matters. When they disagree, the model has learned something more nuanced than the simple historical pattern alone suggests.
-            Your journal behaviors (alcohol, meditation, caffeine, etc.) are included in both analyses as Yes/No features — they appear in a dedicated sub-section at the bottom of each chart, separated because their scores are on a different scale to continuous metrics like heart rate.
+            Your journal behaviors (alcohol, meditation, caffeine, etc.) and Notion habits are included in both analyses as Yes/No features — each gets a dedicated sub-section at the bottom of each chart, separated because their scores are on a different scale to continuous metrics like heart rate.
           </p>
         </div>
 
@@ -796,6 +811,39 @@ export default function HrvAnalysisPage() {
                 </p>
               )}
             </div>
+
+            {/* Habit SHAP sub-section */}
+            <div className="mt-4 pt-4 border-t border-border-subtle">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Habits</span>
+                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">XGBOOST · SHAP</span>
+              </div>
+              <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
+                Notion-managed habits (from <a href="/habits" className="text-accent hover:underline">/habits</a>) are part of the model. Like journal behaviors, they&apos;re Yes/No features with smaller ms-impact than continuous metrics, but they shift the forecast in the direction shown.
+              </p>
+              {habitShap.length > 0 ? (
+                <ResponsiveContainer width="100%" height={Math.max(120, habitShap.length * 28)}>
+                  <BarChart data={habitShap} layout="vertical"
+                            margin={{ left: 160, right: 20, top: 2, bottom: 2 }}>
+                    <CartesianGrid {...gridStyle} horizontal={false} />
+                    <XAxis type="number" tick={axisTick} tickFormatter={v => v.toFixed(2)} />
+                    <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160} />
+                    <Tooltip {...chartTooltip}
+                             formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
+                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                    <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
+                      {habitShap.map((d, i) => (
+                        <Cell key={i} fill="#06b6d4" fillOpacity={0.75} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <p className="text-[11px] text-text-tertiary italic">
+                  Habit impacts not yet computed — need more completions logged at <a href="/habits" className="text-accent hover:underline">/habits</a>, then re-run hrv_analysis.py.
+                </p>
+              )}
+            </div>
           </ChartCard>
 
           <ChartCard title="HRV Correlates (Historical)" subtitle="What has historically moved with your HRV"
@@ -855,6 +903,40 @@ export default function HrvAnalysisPage() {
               ) : (
                 <p className="text-[11px] text-text-tertiary italic">
                   Journal behavior correlations not yet computed — re-run hrv_analysis.py to generate.
+                </p>
+              )}
+            </div>
+
+            {/* Habit correlation sub-section */}
+            <div className="mt-4 pt-4 border-t border-border-subtle">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Habits</span>
+                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">SPEARMAN ρ</span>
+              </div>
+              <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
+                Correlation between each Notion habit and the following night&apos;s HRV. Same statistical treatment as journal behaviors — habits are just a separate source of Yes/No flags you control day-to-day.
+              </p>
+              {habitCorrelations.length > 0 ? (
+                <ResponsiveContainer width="100%" height={Math.max(160, habitCorrelations.length * 32)}>
+                  <BarChart data={habitCorrelations} layout="vertical"
+                            margin={{ left: 8, right: 20, top: 2, bottom: 2 }}>
+                    <CartesianGrid {...gridStyle} horizontal={false} />
+                    <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
+                    <YAxis type="category" dataKey="label" width={200}
+                           tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
+                    <Tooltip {...chartTooltip}
+                             formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
+                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                    <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                      {habitCorrelations.map((d, i) => (
+                        <Cell key={i} fill={d.spearman_r > 0 ? "#06b6d4" : "#0ea5e9"} fillOpacity={0.75} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <p className="text-[11px] text-text-tertiary italic">
+                  Habit correlations not yet computed — need ≥20 days with the habit logged before correlations are reliable. Keep tracking at <a href="/habits" className="text-accent hover:underline">/habits</a>.
                 </p>
               )}
             </div>
@@ -926,6 +1008,47 @@ export default function HrvAnalysisPage() {
           ) : (
             <div className="h-[260px] flex items-center justify-center">
               <p className="text-[11px] text-text-tertiary">No journal data — run hrv_analysis.py</p>
+            </div>
+          )}
+        </ChartCard>
+      </div>
+
+      {/* ── Row 3a: Habit Impact ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <ChartCard title="Habit Impact" subtitle="Mean HRV difference: nights you completed the habit vs nights you didn't"
+          source="WELCH'S T-TEST"
+          info="Same statistical treatment as Journal Behavior Impact, applied to Notion-managed habits (from /habits). A +Xms bar means HRV averaged X ms higher on the night following days you completed that habit. Welch's two-sample t-test on next-night HRV for Yes vs No nights, with Cohen's d and 95% CI per habit. Habits need at least 5 Yes-nights and 5 No-nights before they appear (the t-test isn't meaningful with smaller groups). Add more habits or toggle them more consistently at /habits to populate this view.">
+          {habitImpact.length > 0 ? (
+            <ResponsiveContainer width="100%" height={Math.max(260, habitImpact.slice(0, 12).length * 36)}>
+              <BarChart data={habitImpact.slice(0, 12)} layout="vertical"
+                        margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
+                <CartesianGrid {...gridStyle} horizontal={false} />
+                <XAxis type="number" tick={axisTick}
+                       tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
+                       label={axisLabel("HRV Δ (ms)", "x")} />
+                <YAxis type="category" dataKey="label" width={200}
+                       tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
+                <Tooltip {...chartTooltip}
+                         formatter={(v: any, _n: any, p: any) => {
+                           const d = p?.payload ?? {};
+                           return [
+                             `${Number(v).toFixed(1)} ms (d=${(d.cohen_d ?? 0).toFixed(2)}, n=${d.n_yes}/${d.n_no})`,
+                             "HRV Δ",
+                           ];
+                         }} />
+                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
+                  {habitImpact.slice(0, 12).map((d, i) => (
+                    <Cell key={i} fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.8} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[260px] flex items-center justify-center px-6">
+              <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+                Not enough habit history yet — each habit needs ≥5 Yes-nights and ≥5 No-nights before the t-test is meaningful. Keep tracking at <a href="/habits" className="text-accent hover:underline">/habits</a>; this chart populates on the next pipeline run.
+              </p>
             </div>
           )}
         </ChartCard>
