@@ -2,7 +2,6 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { getHabitJournal, rangeDays, rangeLabel, type Range } from "@/lib/queries";
-import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -264,16 +263,19 @@ export default function HabitsPage() {
             <table className="w-full text-xs">
               <thead>
                 <tr>
-                  <th className="text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal pr-3 py-1 sticky left-0 bg-surface-card min-w-[140px]">
+                  <th className="text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal pr-3 py-1 sticky left-0 bg-surface-card min-w-[140px] align-bottom">
                     Habit
                   </th>
-                  {heatmapDates.map((d) => (
-                    <th key={d} className="text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal px-0.5 py-1 min-w-[24px]">
-                      <span className="block rotate-[-45deg] origin-bottom-left translate-x-2 whitespace-nowrap">
-                        {formatDate(d)}
-                      </span>
-                    </th>
-                  ))}
+                  {heatmapDates.map((d) => {
+                    const [, m, day] = d.split("-");
+                    return (
+                      <th key={d} className="text-text-tertiary text-[10px] font-mono font-normal px-0.5 pb-1 min-w-[28px] align-bottom">
+                        <span className="block whitespace-nowrap leading-tight tabular-nums">
+                          {Number(m)}/{Number(day)}
+                        </span>
+                      </th>
+                    );
+                  })}
                 </tr>
               </thead>
               <tbody>
