@@ -187,8 +187,12 @@ async function getHistoricalHrv(days = 180) {
 }
 
 async function getHrvResiduals() {
+  // Use the *_eval view (sibling of hrv_predictions_latest) so backtest
+  // model_versions are included. The latest view excludes them, which
+  // would render this chart nearly empty since most XGBoost evaluation
+  // history is stored as backtest_initial rows.
   const { data } = await supabase
-    .from("hrv_predictions_latest")
+    .from("hrv_predictions_eval")
     .select("prediction_date,model,predicted_hrv,actual_hrv,residual")
     .in("model", ["xgboost", "baseline_naive", "baseline_7d_avg"])
     .not("residual", "is", null)
@@ -1062,8 +1066,8 @@ export default function HrvAnalysisPage() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Prediction vs Actual */}
         <ChartCard title={`Prediction vs Actual (${rangeLabel(range)})`}
-                   subtitle="⚠ DATA INACCURATE — NEEDS FIX"
-                   info="What the model predicted each night (dashed) vs what your HRV actually was. Chart is styled red as a reminder that the underlying data is inaccurate and needs to be fixed.">
+                   subtitle="Red dots = miss > 15ms"
+                   info="What the model predicted each night (blue dashed) vs what your HRV actually was (green). Red dots are nights where it missed by more than 15ms. Fewer red dots = more accurate model.">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={predActualData}>
               <CartesianGrid {...gridStyle} />
@@ -1071,9 +1075,9 @@ export default function HrvAnalysisPage() {
               <YAxis tick={axisTick} width={55} domain={["auto", "auto"]} label={axisLabel("HRV (ms)", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line type="monotone" dataKey="actual" stroke="#ef4444" strokeWidth={2}
+              <Line type="monotone" dataKey="actual" stroke="#22c55e" strokeWidth={2}
                     dot={false} name="Actual HRV" />
-              <Line type="monotone" dataKey="predicted" stroke="#b91c1c" strokeWidth={2}
+              <Line type="monotone" dataKey="predicted" stroke="#3b82f6" strokeWidth={2}
                     dot={<HrvDot />} name="XGBoost Pred" strokeDasharray="4 2" />
             </LineChart>
           </ResponsiveContainer>
