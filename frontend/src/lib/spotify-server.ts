@@ -167,7 +167,7 @@ export interface CreatePlaylistArgs {
   description?: string;
   trackIds: string[];
   isPublic?: boolean;
-  createdVia: "chat" | "button";
+  createdVia: "chat" | "button" | "builder";
   prompt?: string;
 }
 

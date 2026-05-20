@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
   RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
@@ -87,6 +87,46 @@ function defaultPlaylistName(): string {
   return `Onyx — Top tracks ${fmt.format(new Date())}`;
 }
 
+const VIBE_PRESETS = [
+  "Chill",
+  "Focus",
+  "Workout",
+  "Late night",
+  "Upbeat",
+  "Melancholic",
+  "Driving",
+] as const;
+
+const SOURCE_POOLS = [
+  { value: "mix", label: "Mix", desc: "Both history + catalog" },
+  { value: "history", label: "History", desc: "Tracks you've played" },
+  { value: "discovery", label: "Discovery", desc: "New from catalog" },
+] as const;
+
+type SourcePool = (typeof SOURCE_POOLS)[number]["value"];
+
+const ERAS = ["Any", "2020s", "2010s", "2000s", "1990s", "1980s"] as const;
+
+interface GenResult {
+  playlist_id: string;
+  spotify_url: string;
+  name: string;
+  track_count: number;
+}
+
+interface GenLogEntry {
+  kind: "status" | "tool_use" | "tool_result" | "message";
+  text: string;
+}
+
+function chipClass(active: boolean, disabled = false): string {
+  const base =
+    "px-2.5 py-1 text-[11px] font-mono rounded-[4px] border transition-colors whitespace-nowrap";
+  if (disabled) return `${base} opacity-40 cursor-not-allowed border-border-subtle text-text-tertiary`;
+  if (active) return `${base} bg-[#1DB954]/25 border-[#1DB954]/50 text-text-primary`;
+  return `${base} bg-black/20 border-border-subtle text-text-secondary hover:border-[#1DB954]/40 hover:text-text-primary`;
+}
+
 export default function SpotifyPage() {
   const [kpis, setKpis] = useState<Kpis | null>(null);
   const [volume, setVolume] = useState<SpotifyDailySignatureRow[]>([]);
@@ -108,13 +148,27 @@ export default function SpotifyPage() {
   const [ledgerTotal, setLedgerTotal] = useState(0);
   const [ledgerLoading, setLedgerLoading] = useState(true);
 
-  // Create-playlist modal state
+  // Create-playlist modal state (existing: top-tracks one-click flow)
   const [modalOpen, setModalOpen] = useState(false);
   const [playlistName, setPlaylistName] = useState(defaultPlaylistName());
   const [playlistDesc, setPlaylistDesc] = useState("Created from Onyx — most-played tracks from the last 30 days.");
   const [creating, setCreating] = useState(false);
   const [createResult, setCreateResult] = useState<{ spotify_url: string; name: string; track_count: number } | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
+
+  // Generate-playlist modal state (new: prompt-driven, agentic, streamed)
+  const [genOpen, setGenOpen] = useState(false);
+  const [genPrompt, setGenPrompt] = useState("");
+  const [genVibes, setGenVibes] = useState<string[]>([]);
+  const [genSource, setGenSource] = useState<SourcePool>("mix");
+  const [genEra, setGenEra] = useState<string>("Any");
+  const [genGenres, setGenGenres] = useState<string[]>([]);
+  const [genCustomGenre, setGenCustomGenre] = useState("");
+  const [genRunning, setGenRunning] = useState(false);
+  const [genLog, setGenLog] = useState<GenLogEntry[]>([]);
+  const [genResult, setGenResult] = useState<GenResult | null>(null);
+  const [genError, setGenError] = useState<string | null>(null);
+  const logBottomRef = useRef<HTMLDivElement | null>(null);
 
   async function submitCreatePlaylist() {
     setCreating(true);
@@ -149,6 +203,107 @@ export default function SpotifyPage() {
     // Reset name to a fresh default for next time
     setPlaylistName(defaultPlaylistName());
   }
+
+  function closeGen() {
+    if (genRunning) return;
+    setGenOpen(false);
+    setGenResult(null);
+    setGenError(null);
+    setGenLog([]);
+  }
+
+  function toggleVibe(v: string) {
+    setGenVibes((prev) => (prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v]));
+  }
+
+  function toggleGenre(g: string) {
+    setGenGenres((prev) => (prev.includes(g) ? prev.filter((x) => x !== g) : [...prev, g]));
+  }
+
+  function addCustomGenre() {
+    const g = genCustomGenre.trim().toLowerCase();
+    if (!g) return;
+    if (!genGenres.includes(g)) setGenGenres((prev) => [...prev, g]);
+    setGenCustomGenre("");
+  }
+
+  async function submitGenerate() {
+    setGenRunning(true);
+    setGenLog([]);
+    setGenResult(null);
+    setGenError(null);
+
+    try {
+      const resp = await fetch("/api/spotify/generate-playlist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: genPrompt,
+          vibes: genVibes,
+          source_pool: genSource,
+          era: genEra === "Any" ? null : genEra,
+          genres: genGenres,
+        }),
+      });
+
+      if (!resp.ok || !resp.body) {
+        const txt = await resp.text().catch(() => "");
+        throw new Error(txt || `HTTP ${resp.status}`);
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE events delimited by blank lines
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith("data:")) continue;
+          const json = line.slice(5).trim();
+          if (!json) continue;
+          try {
+            handleSseEvent(JSON.parse(json));
+          } catch (err) {
+            console.error("SSE parse error:", err, json);
+          }
+        }
+      }
+    } catch (e) {
+      setGenError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGenRunning(false);
+    }
+  }
+
+  function handleSseEvent(evt: { type: string; [k: string]: unknown }) {
+    if (evt.type === "status") {
+      setGenLog((prev) => [...prev, { kind: "status", text: String(evt.message ?? "") }]);
+    } else if (evt.type === "tool_use") {
+      setGenLog((prev) => [...prev, { kind: "tool_use", text: `→ ${String(evt.tool ?? "tool")}` }]);
+    } else if (evt.type === "tool_result") {
+      setGenLog((prev) => [...prev, { kind: "tool_result", text: String(evt.summary ?? "") }]);
+    } else if (evt.type === "message") {
+      setGenLog((prev) => [...prev, { kind: "message", text: String(evt.text ?? "") }]);
+    } else if (evt.type === "done") {
+      setGenResult(evt.result as GenResult);
+    } else if (evt.type === "error") {
+      setGenError(String(evt.message ?? "Unknown error"));
+    }
+  }
+
+  useEffect(() => {
+    if (logBottomRef.current) {
+      logBottomRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
+  }, [genLog, genRunning, genResult, genError]);
 
   useEffect(() => {
     setLoading(true);
@@ -204,7 +359,15 @@ export default function SpotifyPage() {
             Listening behavior — {rangeLabel(range)}
           </p>
         </div>
-        <RangeFilter value={range} onChange={setRange} accent={spotifyGreen} />
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            onClick={() => setGenOpen(true)}
+            className="px-3 py-1.5 text-[11px] font-mono font-medium tracking-wide text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 border border-[#1DB954]/40 rounded-[4px] transition-colors whitespace-nowrap"
+          >
+            Generate playlist
+          </button>
+          <RangeFilter value={range} onChange={setRange} accent={spotifyGreen} />
+        </div>
       </header>
 
       <p className="text-[11px] text-text-tertiary leading-relaxed border-l-2 border-[#1DB954]/30 pl-3">
@@ -283,6 +446,248 @@ export default function SpotifyPage() {
                   </button>
                   <a
                     href={createResult.spotify_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 border border-[#1DB954]/40 rounded-[4px] transition-colors"
+                  >
+                    Open in Spotify
+                  </a>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {genOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={closeGen}
+        >
+          <div
+            className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card p-5 w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {!genResult && (
+              <>
+                <h2 className="text-[15px] font-medium text-text-primary mb-1">Generate playlist</h2>
+                <p className="text-[11px] text-text-tertiary mb-4">
+                  Free-text prompt + structured constraints. Claude picks tracks and creates the playlist in your Spotify account.
+                </p>
+
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
+                  Prompt
+                </label>
+                <textarea
+                  value={genPrompt}
+                  onChange={(e) => setGenPrompt(e.target.value)}
+                  rows={3}
+                  placeholder="e.g. Late-night drive through the rain, heavy on synths and slow burn. Mostly instrumental."
+                  className="w-full mb-4 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none transition-colors resize-none"
+                  disabled={genRunning}
+                />
+
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1.5">
+                  Source pool
+                </label>
+                <div className="flex gap-2 mb-4 flex-wrap">
+                  {SOURCE_POOLS.map((s) => (
+                    <button
+                      key={s.value}
+                      onClick={() => setGenSource(s.value)}
+                      disabled={genRunning}
+                      title={s.desc}
+                      className={chipClass(genSource === s.value, genRunning)}
+                    >
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1.5">
+                  Vibe <span className="text-text-tertiary/60 normal-case">(multi-select)</span>
+                </label>
+                <div className="flex gap-2 mb-4 flex-wrap">
+                  {VIBE_PRESETS.map((v) => (
+                    <button
+                      key={v}
+                      onClick={() => toggleVibe(v)}
+                      disabled={genRunning}
+                      className={chipClass(genVibes.includes(v), genRunning)}
+                    >
+                      {v}
+                    </button>
+                  ))}
+                </div>
+
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1.5">
+                  Era
+                </label>
+                <div className="flex gap-2 mb-4 flex-wrap">
+                  {ERAS.map((e) => (
+                    <button
+                      key={e}
+                      onClick={() => setGenEra(e)}
+                      disabled={genRunning}
+                      className={chipClass(genEra === e, genRunning)}
+                    >
+                      {e}
+                    </button>
+                  ))}
+                </div>
+
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1.5">
+                  Genres <span className="text-text-tertiary/60 normal-case">
+                    (from your top {rangeLabel(range)} — click to bias selection)
+                  </span>
+                </label>
+                <div className="flex gap-2 mb-2 flex-wrap">
+                  {genres.slice(0, 12).map((g) => (
+                    <button
+                      key={g.genre}
+                      onClick={() => toggleGenre(g.genre)}
+                      disabled={genRunning}
+                      className={chipClass(genGenres.includes(g.genre), genRunning)}
+                    >
+                      {g.genre}
+                    </button>
+                  ))}
+                  {genres.length === 0 && (
+                    <p className="text-[11px] text-text-tertiary font-mono">No top genres yet.</p>
+                  )}
+                </div>
+                <div className="flex gap-2 mb-4">
+                  <input
+                    type="text"
+                    value={genCustomGenre}
+                    onChange={(e) => setGenCustomGenre(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        addCustomGenre();
+                      }
+                    }}
+                    placeholder="Add custom genre (e.g. ambient)"
+                    disabled={genRunning}
+                    className="flex-1 px-3 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none transition-colors"
+                  />
+                  <button
+                    onClick={addCustomGenre}
+                    disabled={genRunning || !genCustomGenre.trim()}
+                    className="px-3 py-1.5 text-[11px] font-mono text-text-secondary hover:text-text-primary border border-border-subtle rounded-[4px] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                  >
+                    Add
+                  </button>
+                </div>
+                {genGenres.length > 0 && (
+                  <div className="flex gap-1.5 mb-4 flex-wrap">
+                    <span className="text-[10px] font-mono text-text-tertiary self-center">selected:</span>
+                    {genGenres.map((g) => (
+                      <button
+                        key={g}
+                        onClick={() => toggleGenre(g)}
+                        disabled={genRunning}
+                        className="px-2 py-0.5 text-[10px] font-mono bg-[#1DB954]/15 border border-[#1DB954]/30 rounded-[3px] text-text-primary hover:bg-[#1DB954]/25 disabled:opacity-40"
+                      >
+                        {g} ×
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                <p className="text-[10px] text-text-tertiary leading-relaxed border-l-2 border-amber-500/40 pl-2 mb-4">
+                  Playlists are requested private — Spotify&apos;s Dev-mode API may still publish them
+                  as Public; toggle to Private from the Spotify app if needed.
+                </p>
+
+                {genError && (
+                  <p className="text-[11px] text-red-400 font-mono mb-3 break-all">{genError}</p>
+                )}
+
+                <div className="flex gap-2 justify-end">
+                  <button
+                    onClick={closeGen}
+                    disabled={genRunning}
+                    className="px-3 py-2 text-[12px] text-text-secondary hover:text-text-primary disabled:opacity-40 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={submitGenerate}
+                    disabled={
+                      genRunning ||
+                      (!genPrompt.trim() && genVibes.length === 0 && genGenres.length === 0)
+                    }
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 disabled:opacity-40 disabled:cursor-not-allowed border border-[#1DB954]/40 rounded-[4px] transition-colors"
+                  >
+                    {genRunning ? "Generating…" : "Generate"}
+                  </button>
+                </div>
+
+                {(genRunning || genLog.length > 0) && (
+                  <div className="mt-4 border-t border-border-subtle pt-3">
+                    <p className="text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-2">
+                      Progress
+                    </p>
+                    <div className="bg-black/30 border border-border-subtle rounded-[4px] p-2.5 max-h-40 overflow-y-auto space-y-1">
+                      {genLog.map((entry, i) => (
+                        <div
+                          key={i}
+                          className={`text-[11px] font-mono leading-relaxed ${
+                            entry.kind === "status"
+                              ? "text-text-tertiary"
+                              : entry.kind === "tool_use"
+                              ? "text-[#1DB954]/80"
+                              : entry.kind === "tool_result"
+                              ? "text-text-secondary"
+                              : "text-text-primary"
+                          }`}
+                        >
+                          {entry.text}
+                        </div>
+                      ))}
+                      {genRunning && (
+                        <div className="text-[11px] font-mono text-text-tertiary animate-pulse">…</div>
+                      )}
+                      <div ref={logBottomRef} />
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+
+            {genResult && (
+              <>
+                <h2 className="text-[15px] font-medium text-text-primary mb-1">Playlist created</h2>
+                <p className="text-[12px] text-text-secondary mb-1 break-words">{genResult.name}</p>
+                <p className="text-[11px] text-text-tertiary font-mono mb-4">
+                  {genResult.track_count} tracks
+                </p>
+                {genLog.length > 0 && (
+                  <div className="mb-4 bg-black/30 border border-border-subtle rounded-[4px] p-2.5 max-h-32 overflow-y-auto space-y-1">
+                    {genLog
+                      .filter((e) => e.kind === "message" || e.kind === "tool_result")
+                      .map((entry, i) => (
+                        <div
+                          key={i}
+                          className={`text-[11px] font-mono leading-relaxed ${
+                            entry.kind === "message" ? "text-text-primary" : "text-text-secondary"
+                          }`}
+                        >
+                          {entry.text}
+                        </div>
+                      ))}
+                  </div>
+                )}
+                <div className="flex gap-2 justify-end">
+                  <button
+                    onClick={closeGen}
+                    className="px-3 py-2 text-[12px] text-text-secondary hover:text-text-primary transition-colors"
+                  >
+                    Close
+                  </button>
+                  <a
+                    href={genResult.spotify_url}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="px-4 py-2 text-[12px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 border border-[#1DB954]/40 rounded-[4px] transition-colors"
