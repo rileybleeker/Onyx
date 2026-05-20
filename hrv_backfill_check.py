@@ -46,6 +46,17 @@ TABLES_TO_CHECK = [
     ("whoop_cycles", "start_time", "updated_at"),
 ]
 
+# Sources whose backfills only show up in pds.sync_log, not via row-level
+# sync_col timestamps. Currently just habit_journal — a Postgres trigger
+# (habit_journal_backfill_trigger) emits a sync_log row for every past-date
+# INSERT/UPDATE/DELETE, covering paths the row-scan check misses: the
+# UPDATE branch of upsert (doesn't bump synced_at) and DELETE (no row left
+# to find).
+SYNC_LOG_SIGNALS = [
+    # (source, data_type)
+    ("habit_journal", "backfill_signal"),
+]
+
 
 def get_last_analysis_time() -> str | None:
     resp = (
@@ -79,6 +90,32 @@ def has_backfilled_rows(table: str, date_col: str, sync_col: str,
         return False
 
 
+def has_sync_log_signal(source: str, data_type: str, last_analysis: str,
+                        historical_cutoff: str) -> bool:
+    """Detect backfill via pds.sync_log signals (currently used for
+    habit_journal mutations — see habit_journal_backfill_trigger).
+
+    The trigger only emits a sync_log row when the affected cycle_date is
+    in the past, so we filter on date_range_start < historical_cutoff to
+    stay consistent with the row-scan threshold (today-2)."""
+    try:
+        resp = (
+            supa.schema("pds")
+            .from_("sync_log")
+            .select("sync_start")
+            .eq("source", source)
+            .eq("data_type", data_type)
+            .gt("sync_start", last_analysis)
+            .lt("date_range_start", historical_cutoff)
+            .limit(1)
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception as e:
+        log.warning(f"  sync_log[{source}/{data_type}]: check failed ({e}) — treating as no backfill")
+        return False
+
+
 def set_output(key: str, value: str) -> None:
     out_path = os.environ.get("GITHUB_OUTPUT")
     if out_path:
@@ -105,6 +142,13 @@ def main() -> int:
             detected = True
         else:
             log.info(f"  {table}: no backfill")
+
+    for source, data_type in SYNC_LOG_SIGNALS:
+        if has_sync_log_signal(source, data_type, last_analysis, historical_cutoff):
+            log.info(f"  sync_log[{source}/{data_type}]: backfill signal present")
+            detected = True
+        else:
+            log.info(f"  sync_log[{source}/{data_type}]: no signal")
 
     set_output("backfill_detected", "true" if detected else "false")
     if detected:
