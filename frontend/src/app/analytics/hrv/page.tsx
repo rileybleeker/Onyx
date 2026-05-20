@@ -267,6 +267,9 @@ export default function HrvAnalysisPage() {
   const [sarimaxForecast, setSarimaxForecast] = useState<any[]>([]);
   const [journalCorrelations, setJournalCorrelations] = useState<any[]>([]);
   const [journalShap, setJournalShap] = useState<any[]>([]);
+  const [supplementImpact, setSupplementImpact] = useState<any[]>([]);
+  const [supplementDoseResponse, setSupplementDoseResponse] = useState<any[]>([]);
+  const [nutritionImpact, setNutritionImpact] = useState<any[]>([]);
   const [workoutGap, setWorkoutGap] = useState<WorkoutSleepGap[]>([]);
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
@@ -289,7 +292,10 @@ export default function HrvAnalysisPage() {
       getHrvAnalysisResults("feature_importance", "shap_journal"),
       getSarimaxForecast(),
       getWorkoutSleepGap(days),
-    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap]) => {
+      getHrvAnalysisResults("supplement_impact", "yes_no"),
+      getHrvAnalysisResults("supplement_impact", "dose_response"),
+      getHrvAnalysisResults("nutrition_impact", "spearman"),
+    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap, suppImp, suppDose, nutImp]) => {
       setTomorrowPred(tomorrow);
       setAccuracy(acc);
       setMetrics(m);
@@ -313,6 +319,15 @@ export default function HrvAnalysisPage() {
       setProphetForecast(prophet);
       setSarimaxForecast(sarimax);
       setWorkoutGap(wkGap);
+      if (suppImp?.result_json) {
+        try { setSupplementImpact(JSON.parse(suppImp.result_json)); } catch {}
+      }
+      if (suppDose?.result_json) {
+        try { setSupplementDoseResponse(JSON.parse(suppDose.result_json)); } catch {}
+      }
+      if (nutImp?.result_json) {
+        try { setNutritionImpact(JSON.parse(nutImp.result_json)); } catch {}
+      }
     }).catch(console.error).finally(() => setLoading(false));
   }, [range]);
 
@@ -911,6 +926,137 @@ export default function HrvAnalysisPage() {
           )}
         </ChartCard>
       </div>
+
+      {/* ── Row 3b: Supplement Impact + Nutrition Correlations ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Supplement Yes/No Impact */}
+        <ChartCard
+          title="Supplement Impact (Yes vs No)"
+          subtitle="Mean HRV difference: nights compound taken vs not"
+          source="WELCH'S T-TEST"
+          info="How each supplement compound (rolled up across products via FDA UNII code, e.g. Vitamin C from a multi + standalone tablet sum into one row) affects HRV the following night. Method: Welch's two-sample t-test (unequal variance) on next-night HRV for Yes vs No nights, with Cohen's d and 95% CI per compound. BH-FDR corrected across compounds. Yes/No framing chosen because most compounds are taken at a near-constant dose, so the actionable question is 'does taking it help?' — a continuous test would collapse on near-zero amount variance. ⚠ marks compounds with fewer than 20 Yes or No nights — estimates are unstable. Associational, not causal."
+        >
+          {supplementImpact.length > 0 ? (
+            <ResponsiveContainer width="100%" height={Math.max(360, supplementImpact.slice(0, 14).length * 30)}>
+              <BarChart data={supplementImpact.slice(0, 14).map(d => ({ ...d, displayLabel: `${d.low_n ? "⚠ " : ""}${d.compound}` }))}
+                        layout="vertical"
+                        margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
+                <CartesianGrid {...gridStyle} horizontal={false} />
+                <XAxis type="number" tick={axisTick}
+                       tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
+                       label={axisLabel("HRV Δ (ms)", "x")} />
+                <YAxis type="category" dataKey="displayLabel" width={200}
+                       tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
+                <Tooltip {...chartTooltip}
+                         formatter={(v: any, _n: any, p: any) => {
+                           const d = p?.payload ?? {};
+                           return [
+                             `${Number(v).toFixed(1)} ms (d=${(d.cohen_d ?? 0).toFixed(2)}, n=${d.n_yes}/${d.n_no})`,
+                             "HRV Δ",
+                           ];
+                         }} />
+                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
+                  {supplementImpact.slice(0, 14).map((d, i) => (
+                    <Cell key={i} fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"}
+                          fillOpacity={d.low_n ? 0.35 : 0.8} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[260px] flex items-center justify-center px-6">
+              <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+                Not enough supplement history yet — the Yes/No t-test needs at least 3 nights of Yes and 3 of No per compound.
+                Keep logging at <a href="/supplements" className="text-accent hover:underline">/supplements</a>; the chart populates on the next pipeline run.
+              </p>
+            </div>
+          )}
+        </ChartCard>
+
+        {/* Nutrition Spearman */}
+        <ChartCard
+          title="Nutrition Correlations"
+          subtitle="Spearman ρ between daily nutrient totals and next-night HRV"
+          source="SPEARMAN ρ"
+          info="How each daily nutritional total correlates with HRV the next morning. Method: Spearman rank correlation (not Pearson) because nutrition data is heavy-tailed (occasional restaurant blowouts), non-normally distributed, and relationships are likely monotonic but not necessarily linear across the full range — e.g. HRV vs sodium 1g→8g. Rank-based test is robust to outliers and detects monotonic non-linear effects. BH-FDR corrected across nutrients. ⚠ marks rows with n<20 — estimates are unstable. Associational, not causal."
+        >
+          {nutritionImpact.length > 0 ? (
+            <ResponsiveContainer width="100%" height={Math.max(280, nutritionImpact.length * 38)}>
+              <BarChart data={nutritionImpact.map(d => ({ ...d, displayLabel: `${d.low_n ? "⚠ " : ""}${d.label}` }))}
+                        layout="vertical"
+                        margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
+                <CartesianGrid {...gridStyle} horizontal={false} />
+                <XAxis type="number" tick={axisTick} domain={[-1, 1]}
+                       tickFormatter={v => v.toFixed(2)}
+                       label={axisLabel("Spearman ρ", "x")} />
+                <YAxis type="category" dataKey="displayLabel" width={140}
+                       tick={<WrappedYAxisTick maxCharsPerLine={20} fontSize={11} />} />
+                <Tooltip {...chartTooltip}
+                         formatter={(v: any, _n: any, p: any) => {
+                           const d = p?.payload ?? {};
+                           return [
+                             `${Number(v).toFixed(3)} (p=${(d.p_value ?? 0).toFixed(3)}, n=${d.n})`,
+                             "Spearman ρ",
+                           ];
+                         }} />
+                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                  {nutritionImpact.map((d, i) => (
+                    <Cell key={i} fill={d.spearman_r > 0 ? "#22c55e" : "#ef4444"}
+                          fillOpacity={d.low_n ? 0.35 : 0.8} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[260px] flex items-center justify-center">
+              <p className="text-[11px] text-text-tertiary">No nutrition data — run hrv_analysis.py</p>
+            </div>
+          )}
+        </ChartCard>
+      </div>
+
+      {/* ── Row 3c: Supplement Dose-Response (only shown when there's data) ── */}
+      {supplementDoseResponse.length > 0 && (
+        <ChartCard
+          title="Supplement Dose-Response"
+          subtitle="Spearman ρ between daily amount and next-night HRV (compounds with ≥3 distinct doses)"
+          source="SPEARMAN ρ"
+          info="For compounds where the dose actually varies, this measures whether 'more = better/worse?' Method: Spearman rank correlation between daily total amount of that compound and next-night HRV. Only includes compounds with ≥3 distinct non-zero doses across the tracking window (constant-dose compounds appear in the Yes/No chart above instead). Rank-based to handle outliers and non-linear monotonic dose-response curves. BH-FDR corrected. ⚠ marks rows with n<20."
+        >
+          <ResponsiveContainer width="100%" height={Math.max(240, supplementDoseResponse.slice(0, 12).length * 30)}>
+            <BarChart data={supplementDoseResponse.slice(0, 12).map(d => ({
+                          ...d,
+                          displayLabel: `${d.low_n ? "⚠ " : ""}${d.compound}${d.unit ? ` (${d.unit})` : ""}`,
+                       }))}
+                      layout="vertical"
+                      margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
+              <CartesianGrid {...gridStyle} horizontal={false} />
+              <XAxis type="number" tick={axisTick} domain={[-1, 1]}
+                     tickFormatter={v => v.toFixed(2)}
+                     label={axisLabel("Spearman ρ (dose vs HRV)", "x")} />
+              <YAxis type="category" dataKey="displayLabel" width={220}
+                     tick={<WrappedYAxisTick maxCharsPerLine={30} fontSize={10} />} />
+              <Tooltip {...chartTooltip}
+                       formatter={(v: any, _n: any, p: any) => {
+                         const d = p?.payload ?? {};
+                         return [
+                           `${Number(v).toFixed(3)} (p=${(d.p_value ?? 0).toFixed(3)}, n=${d.n}, doses=${d.n_distinct_doses})`,
+                           "Spearman ρ",
+                         ];
+                       }} />
+              <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+              <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                {supplementDoseResponse.slice(0, 12).map((d, i) => (
+                  <Cell key={i} fill={d.spearman_r > 0 ? "#06b6d4" : "#f97316"}
+                        fillOpacity={d.low_n ? 0.35 : 0.8} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+      )}
 
       {/* ── Row 4: Prediction vs Actual + Accuracy by Horizon ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

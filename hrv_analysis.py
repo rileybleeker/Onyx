@@ -549,6 +549,17 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     log.info("  Loading journal (WHOOP + habits)…")
     data["journal"] = fetch_all("journal", select="cycle_date,question,answer")
 
+    log.info("  Loading supplement_intake_by_compound…")
+    data["supplements"] = fetch_all(
+        "supplement_intake_by_compound",
+        select="calendar_date,ingredient_group,category,unit,total_amount",
+    )
+    if not data["supplements"].empty:
+        data["supplements"]["calendar_date"] = data["supplements"]["calendar_date"].astype(str)
+        data["supplements"]["total_amount"] = pd.to_numeric(
+            data["supplements"]["total_amount"], errors="coerce"
+        )
+
     log.info(f"  Data loaded. Tables: {list(data.keys())}")
     return data
 
@@ -1236,8 +1247,17 @@ def print_completeness(df: pd.DataFrame) -> None:
 # PHASE 2 – STATISTICAL ANALYSIS
 # ===========================================================================
 
-def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
-    """Correlation analysis, journal impact, Granger tests. Returns result dict."""
+def run_statistical_analysis(
+    df: pd.DataFrame,
+    skip: bool = False,
+    supplements: pd.DataFrame | None = None,
+) -> dict:
+    """Correlation analysis, journal impact, Granger tests. Returns result dict.
+
+    `supplements` is the long-format supplement_intake_by_compound DataFrame
+    (one row per (calendar_date, ingredient_group)). When provided, runs
+    per-compound Yes/No t-tests and dose-response Spearman correlations.
+    """
     results: dict = {}
 
     # Use next-night HRV as the analysis target.
@@ -1491,6 +1511,193 @@ def run_statistical_analysis(df: pd.DataFrame, skip: bool = False) -> dict:
                 log.info("  Saved: journal_impact.png")
         except Exception as e:
             log.warning(f"  Journal analysis failed: {e}")
+
+    # --- Supplement Yes/No impact ---
+    # Welch's two-sample t-test on next-night HRV for each compound (Yes vs No
+    # nights), with Cohen's d and 95% CI. Yes/No framing is the headline because
+    # most compounds are taken at a near-constant dose, so the actionable
+    # question is "does taking it help?" rather than a dose-response one.
+    # Restricted to dates within the supplement-tracking window so untracked
+    # history isn't miscoded as No. BH-FDR corrected across compounds.
+    supplement_impact: list[dict] = []
+    if supplements is not None and not supplements.empty:
+        try:
+            supp = supplements.copy()
+            supp = supp.dropna(subset=["ingredient_group", "calendar_date"])
+            tracking_start = supp["calendar_date"].min()
+            tracked = hrv_valid[hrv_valid["calendar_date"] >= tracking_start].copy()
+            tracked = tracked[["calendar_date", STAT_TARGET]].dropna()
+
+            for compound, comp_rows in supp.groupby("ingredient_group"):
+                yes_dates = set(comp_rows["calendar_date"])
+                sub = tracked.copy()
+                sub["taken"] = sub["calendar_date"].isin(yes_dates).astype(int)
+                yes = sub.loc[sub["taken"] == 1, STAT_TARGET]
+                no = sub.loc[sub["taken"] == 0, STAT_TARGET]
+                if len(yes) < 3 or len(no) < 3:
+                    continue
+                try:
+                    _, p_val = stats.ttest_ind(yes, no, equal_var=False)
+                    diff = yes.mean() - no.mean()
+                    pooled_std = np.sqrt((yes.std() ** 2 + no.std() ** 2) / 2)
+                    cohen_d = diff / pooled_std if pooled_std > 0 else 0
+                    se = np.sqrt(yes.var() / len(yes) + no.var() / len(no))
+                    category = (comp_rows["category"].dropna().iloc[0]
+                                if not comp_rows["category"].dropna().empty else None)
+                    supplement_impact.append({
+                        "compound": str(compound),
+                        "category": str(category) if category else None,
+                        "mean_yes": float(yes.mean()),
+                        "mean_no": float(no.mean()),
+                        "diff_ms": float(diff),
+                        "ci_low": float(diff - 1.96 * se),
+                        "ci_high": float(diff + 1.96 * se),
+                        "p_value": float(p_val),
+                        "cohen_d": float(cohen_d),
+                        "n_yes": int(len(yes)),
+                        "n_no": int(len(no)),
+                        "low_n": bool(min(len(yes), len(no)) < 20),
+                    })
+                except Exception:
+                    continue
+
+            if supplement_impact and HAS_FDR and len(supplement_impact) > 1:
+                p_values = np.array([r["p_value"] for r in supplement_impact])
+                passes, q_values = fdrcorrection(p_values, alpha=FDR_Q_THRESHOLD)
+                for row, q, p_pass in zip(supplement_impact, q_values, passes):
+                    row["q_value"] = float(q)
+                    row["passes_fdr"] = bool(p_pass)
+
+            if supplement_impact:
+                supplement_impact.sort(key=lambda r: abs(r["diff_ms"]), reverse=True)
+                results["supplement_impact"] = supplement_impact
+                log.info(f"  Supplement impact: {len(supplement_impact)} compounds analyzed "
+                         f"(tracking window from {tracking_start})")
+            else:
+                n_compounds = supp["ingredient_group"].nunique()
+                tracked_days = supp["calendar_date"].nunique()
+                log.info(f"  Supplement impact: 0 compounds met n>=3 Yes/No threshold "
+                         f"({n_compounds} distinct compounds, {tracked_days} tracked days; "
+                         f"need more history)")
+        except Exception as e:
+            log.warning(f"  Supplement Yes/No analysis failed: {e}")
+
+    # --- Supplement dose-response ---
+    # Spearman rank correlation between daily total_amount and next-night HRV,
+    # for compounds where the dose actually varies (≥3 distinct non-zero amounts).
+    # Captures monotonic dose-response effects that Yes/No collapses on.
+    # Rank-based to handle outliers and non-linear monotonic responses.
+    supplement_dose_response: list[dict] = []
+    if supplements is not None and not supplements.empty:
+        try:
+            supp = supplements.copy()
+            supp = supp.dropna(subset=["ingredient_group", "calendar_date", "total_amount"])
+            tracking_start = supp["calendar_date"].min()
+            tracked = hrv_valid[hrv_valid["calendar_date"] >= tracking_start].copy()
+            tracked = tracked[["calendar_date", STAT_TARGET]].dropna()
+
+            for compound, comp_rows in supp.groupby("ingredient_group"):
+                distinct_doses = comp_rows["total_amount"].dropna().unique()
+                if len(distinct_doses) < 3:
+                    continue
+                # Build amount-per-date series; days with no intake = 0.
+                amt_by_date = comp_rows.groupby("calendar_date")["total_amount"].sum()
+                merged = tracked.merge(
+                    amt_by_date.rename("amount").reset_index(),
+                    on="calendar_date", how="left",
+                )
+                merged["amount"] = merged["amount"].fillna(0.0)
+                if merged["amount"].nunique() < 3 or len(merged) < 20:
+                    continue
+                try:
+                    res = stats.spearmanr(merged[STAT_TARGET], merged["amount"])
+                    r = float(res.statistic if hasattr(res, "statistic") else res[0])
+                    p = float(res.pvalue if hasattr(res, "pvalue") else res[1])
+                    unit = (comp_rows["unit"].dropna().iloc[0]
+                            if not comp_rows["unit"].dropna().empty else None)
+                    category = (comp_rows["category"].dropna().iloc[0]
+                                if not comp_rows["category"].dropna().empty else None)
+                    supplement_dose_response.append({
+                        "compound": str(compound),
+                        "category": str(category) if category else None,
+                        "unit": str(unit) if unit else None,
+                        "spearman_r": r,
+                        "p_value": p,
+                        "n": int(len(merged)),
+                        "n_distinct_doses": int(len(distinct_doses)),
+                        "low_n": bool(len(merged) < 20),
+                    })
+                except Exception:
+                    continue
+
+            if supplement_dose_response and HAS_FDR and len(supplement_dose_response) > 1:
+                p_values = np.array([r["p_value"] for r in supplement_dose_response])
+                passes, q_values = fdrcorrection(p_values, alpha=FDR_Q_THRESHOLD)
+                for row, q, p_pass in zip(supplement_dose_response, q_values, passes):
+                    row["q_value"] = float(q)
+                    row["passes_fdr"] = bool(p_pass)
+
+            if supplement_dose_response:
+                supplement_dose_response.sort(key=lambda r: abs(r["spearman_r"]), reverse=True)
+                results["supplement_dose_response"] = supplement_dose_response
+                log.info(f"  Supplement dose-response: {len(supplement_dose_response)} compounds (≥3 distinct doses)")
+            else:
+                log.info("  Supplement dose-response: 0 compounds with ≥3 distinct doses + n≥20 rows")
+        except Exception as e:
+            log.warning(f"  Supplement dose-response analysis failed: {e}")
+
+    # --- Nutrition Spearman correlation ---
+    # Per-nutrient rank correlation with next-night HRV. Spearman (not Pearson)
+    # because nutrition data is heavy-tailed (occasional restaurant blowouts),
+    # non-normal, and relationships are likely monotonic but not necessarily
+    # linear across the full range (e.g. HRV vs sodium 1g→8g).
+    # BH-FDR corrected across the nutrient set.
+    NUTRITION_COLS = {
+        "mfp_calories": ("Calories", "kcal"),
+        "mfp_protein_g": ("Protein", "g"),
+        "mfp_carbs_g": ("Carbohydrates", "g"),
+        "mfp_fat_g": ("Fat", "g"),
+        "mfp_fiber_g": ("Fiber", "g"),
+        "mfp_sugar_g": ("Sugar", "g"),
+        "mfp_sodium_mg": ("Sodium", "mg"),
+    }
+    nutrition_impact: list[dict] = []
+    try:
+        for col, (label, unit) in NUTRITION_COLS.items():
+            if col not in hrv_valid.columns:
+                continue
+            sub = hrv_valid[[STAT_TARGET, col]].dropna()
+            if len(sub) < 20 or sub[col].nunique() < 5:
+                continue
+            try:
+                res = stats.spearmanr(sub[STAT_TARGET], sub[col])
+                r = float(res.statistic if hasattr(res, "statistic") else res[0])
+                p = float(res.pvalue if hasattr(res, "pvalue") else res[1])
+                nutrition_impact.append({
+                    "feature": col,
+                    "label": label,
+                    "unit": unit,
+                    "spearman_r": r,
+                    "p_value": p,
+                    "n": int(len(sub)),
+                    "low_n": bool(len(sub) < 20),
+                })
+            except Exception:
+                continue
+
+        if nutrition_impact and HAS_FDR and len(nutrition_impact) > 1:
+            p_values = np.array([r["p_value"] for r in nutrition_impact])
+            passes, q_values = fdrcorrection(p_values, alpha=FDR_Q_THRESHOLD)
+            for row, q, p_pass in zip(nutrition_impact, q_values, passes):
+                row["q_value"] = float(q)
+                row["passes_fdr"] = bool(p_pass)
+
+        if nutrition_impact:
+            nutrition_impact.sort(key=lambda r: abs(r["spearman_r"]), reverse=True)
+            results["nutrition_impact"] = nutrition_impact
+            log.info(f"  Nutrition correlations: {len(nutrition_impact)} nutrients analyzed")
+    except Exception as e:
+        log.warning(f"  Nutrition analysis failed: {e}")
 
     # --- ACF / PACF ---
     if HAS_STATSMODELS:
@@ -2626,6 +2833,30 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             "result_json": json.dumps(stat_results["journal_impact"]),
         })
 
+    # Supplement Yes/No impact
+    if "supplement_impact" in stat_results:
+        rows.append({
+            "result_type": "supplement_impact",
+            "result_key": "yes_no",
+            "result_json": json.dumps(stat_results["supplement_impact"]),
+        })
+
+    # Supplement dose-response
+    if "supplement_dose_response" in stat_results:
+        rows.append({
+            "result_type": "supplement_impact",
+            "result_key": "dose_response",
+            "result_json": json.dumps(stat_results["supplement_dose_response"]),
+        })
+
+    # Nutrition Spearman
+    if "nutrition_impact" in stat_results:
+        rows.append({
+            "result_type": "nutrition_impact",
+            "result_key": "spearman",
+            "result_json": json.dumps(stat_results["nutrition_impact"]),
+        })
+
     # Feature importance (SHAP or XGB, top 30, all features)
     if feature_importance:
         fi_list = [{"feature": k, "label": FEATURE_LABELS.get(k, k), "importance": v}
@@ -2842,7 +3073,11 @@ def main() -> None:
 
     # ---------- Phase 2: Statistical Analysis ----------
     log.info("=== PHASE 2: STATISTICAL ANALYSIS ===")
-    stat_results = run_statistical_analysis(df, skip=args.skip_analysis)
+    stat_results = run_statistical_analysis(
+        df,
+        skip=args.skip_analysis,
+        supplements=data.get("supplements"),
+    )
 
     if args.skip_models:
         log.info("Skipping ML models (--skip-models set).")
