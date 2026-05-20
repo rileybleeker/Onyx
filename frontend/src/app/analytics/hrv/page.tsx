@@ -456,6 +456,26 @@ export default function HrvAnalysisPage() {
         </div>
       </div>
 
+      {/* TODO banner — model feature audit reminder */}
+      <div className="bg-amber-500/10 border-l-4 border-amber-400 rounded-[6px] p-5 flex items-start gap-4">
+        <span className="text-3xl leading-none" aria-hidden="true">⚠</span>
+        <div className="flex-1 min-w-0">
+          <h3 className="text-[20px] font-bold text-amber-200 leading-tight">
+            TODO: Audit model feature sets
+          </h3>
+          <p className="text-[14px] text-amber-100/85 mt-2 leading-relaxed">
+            Confirm that <span className="font-semibold">Prophet, XGBoost, and SARIMAX</span> are
+            consuming <span className="font-semibold">all relevant variables</span> — including the
+            newly-added <span className="font-semibold">habits</span> (via{" "}
+            <code className="font-mono text-amber-300 text-[13px]">pds.journal</code> view),{" "}
+            <span className="font-semibold">supplements</span> (per-compound presence + dose), and{" "}
+            <span className="font-semibold">nutrition</span> totals (calories, macros, fiber, sugar,
+            sodium). New features auto-flow into Spearman correlations and journal-impact tests, but
+            the predictive models must be verified to confirm they're using the full feature set.
+          </p>
+        </div>
+      </div>
+
       {/* ── Row 1: Hero Cards ── */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         {/* Tomorrow's Predicted HRV */}
