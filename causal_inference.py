@@ -156,18 +156,123 @@ class TreatmentSpec:
 # as the binary treatments, which makes the forest plot directly comparable.
 # Continuous nutrition is already covered by the Spearman card in the base
 # pipeline; this layer adds the *adjusted* contrast.
+#
+# Coverage: every controllable daytime variable from every data source.
+# Source families:
+#   nutrition  — MyFitnessPal (calories, macros, water, micros, ratios)
+#   behavior   — daytime activity / strain / training load / stress / body-battery /
+#                workout timing / days-since recovery markers
+#                (sourced from Garmin daily summary + Garmin training status +
+#                Garmin heart-rate zones + WHOOP cycles + WHOOP workouts +
+#                derived "days since" features)
+#
+# DELIBERATE EXCLUSIONS — these are not treatments, even though they exist in
+# the feature matrix:
+#   - Same-night sleep variables (whoop_sleep_*, garmin_sleep_*, eight_sleep_*,
+#     whoop_deep_pct, sleep_debt_ratio, etc.). These are MEDIATORS on the very
+#     path being estimated (e.g. alcohol → bad sleep → low HRV). Including them
+#     as treatments under the lagged framing also doesn't fit cleanly — the
+#     metric is contemporaneous with the outcome, not pre-treatment.
+#   - HRV-derived variables (whoop_recovery_score, whoop_rhr, garmin_rhr,
+#     whoop_skin_temp, hrv_z_28d, hrv_28d_mean, etc.). These are the outcome
+#     itself or near-tautological measurements of overnight physiology.
+#   - Body composition (weight_kg, bmi). Changes too slowly for a daily ATE.
+#   - Time-of-day "sleep timing" (bedtime_hour, wake_hour, sleep_midpoint_hour).
+#     Measured AT the sleep event, contemporaneous with the outcome.
 CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
-    # (column, family, label, unit)
-    ("mfp_calories",       "nutrition", "Calories above median",  "kcal"),
-    ("mfp_protein_g",      "nutrition", "Protein above median",   "g"),
-    ("mfp_carbs_g",        "nutrition", "Carbs above median",     "g"),
-    ("mfp_fat_g",          "nutrition", "Fat above median",       "g"),
-    ("mfp_fiber_g",        "nutrition", "Fiber above median",     "g"),
-    ("mfp_sugar_g",        "nutrition", "Sugar above median",     "g"),
-    ("mfp_sodium_mg",      "nutrition", "Sodium above median",    "mg"),
-    ("whoop_day_strain",   "behavior",  "Strain above median",    None),
-    ("rolling_7d_training_load", "behavior", "7d Training Load above median", None),
-    ("total_steps",        "behavior",  "Steps above median",     None),
+    # ── Nutrition (MyFitnessPal) ─────────────────────────────────────────────
+    ("mfp_calories",        "nutrition", "Calories above median",        "kcal"),
+    ("mfp_protein_g",       "nutrition", "Protein above median",         "g"),
+    ("mfp_carbs_g",         "nutrition", "Carbs above median",           "g"),
+    ("mfp_fat_g",           "nutrition", "Fat above median",             "g"),
+    ("mfp_fiber_g",         "nutrition", "Fiber above median",           "g"),
+    ("mfp_sugar_g",         "nutrition", "Sugar above median",           "g"),
+    ("mfp_sodium_mg",       "nutrition", "Sodium above median",          "mg"),
+    ("mfp_water_ml",        "nutrition", "Water intake above median",    "ml"),
+    ("exercise_kcal",       "nutrition", "Exercise kcal above median",   "kcal"),
+    ("net_calories",        "nutrition", "Net calories above median",    "kcal"),
+    ("protein_pct",         "nutrition", "Protein % of cals above median", "%"),
+    ("carb_pct",            "nutrition", "Carb % of cals above median",  "%"),
+    ("fat_pct",             "nutrition", "Fat % of cals above median",   "%"),
+
+    # ── Daytime strain / activity (WHOOP + Garmin) ───────────────────────────
+    ("whoop_day_strain",            "behavior", "WHOOP day strain above median",      None),
+    ("whoop_kilojoule",             "behavior", "Daily energy (kJ) above median",      "kJ"),
+    ("total_steps",                 "behavior", "Steps above median",                  None),
+    ("total_kilocalories",          "behavior", "Total kcal burned above median",      "kcal"),
+    ("active_kilocalories",         "behavior", "Active kcal burned above median",     "kcal"),
+    ("moderate_intensity_minutes",  "behavior", "Moderate-intensity min above median", "min"),
+    ("vigorous_intensity_minutes",  "behavior", "Vigorous-intensity min above median", "min"),
+    ("highly_active_seconds",       "behavior", "Highly-active seconds above median",  "s"),
+    ("active_seconds",              "behavior", "Active seconds above median",         "s"),
+    ("sedentary_seconds",           "behavior", "Sedentary seconds above median",      "s"),
+
+    # ── Training load (acute / chronic / rolling) ────────────────────────────
+    ("rolling_3d_training_load",    "behavior", "3-day training load above median",    None),
+    ("rolling_7d_training_load",    "behavior", "7-day training load above median",    None),
+    ("acute_training_load",         "behavior", "Acute training load above median",    None),
+    ("chronic_training_load",       "behavior", "Chronic training load above median",  None),
+    ("atl_ctl_ratio",               "behavior", "ATL/CTL ratio above median",          None),
+    ("total_training_load",         "behavior", "Daily training load above median",    None),
+
+    # ── Daytime stress (Garmin) ──────────────────────────────────────────────
+    ("avg_stress_level",            "behavior", "Avg stress level above median",       None),
+    ("max_stress_level",            "behavior", "Peak stress level above median",      None),
+    ("high_stress_duration_min",    "behavior", "High-stress minutes above median",    "min"),
+    ("pct_high_stress",             "behavior", "High-stress % of day above median",   "%"),
+    ("stress_ratio",                "behavior", "High/low stress ratio above median",  None),
+
+    # ── Body Battery (Garmin) ────────────────────────────────────────────────
+    ("body_battery_charged",        "behavior", "Body Battery charged above median",   None),
+    ("body_battery_drained",        "behavior", "Body Battery drained above median",   None),
+
+    # ── Workout timing (last workout → bedtime) ──────────────────────────────
+    ("last_workout_end_to_sleep_min", "behavior", "Workout-to-bed minutes above median", "min"),
+    ("whoop_strain_per_hour_to_bed",  "behavior", "Strain ÷ hours-to-bed above median",  None),
+
+    # ── Workout aggregates (Garmin activities) ───────────────────────────────
+    ("activity_count",              "behavior", "Workout count above median",          None),
+    ("total_activity_duration_min", "behavior", "Total workout minutes above median",  "min"),
+    ("total_activity_distance_km",  "behavior", "Total workout distance above median", "km"),
+    ("total_activity_calories",     "behavior", "Total workout kcal above median",     "kcal"),
+    ("max_aerobic_te",              "behavior", "Peak aerobic TE above median",        None),
+    ("max_anaerobic_te",            "behavior", "Peak anaerobic TE above median",      None),
+    ("max_activity_hr",             "behavior", "Peak workout HR above median",        "bpm"),
+    ("avg_activity_hr",             "behavior", "Avg workout HR above median",         "bpm"),
+    ("total_elevation_gain_m",      "behavior", "Total elevation gain above median",   "m"),
+
+    # ── Workout aggregates (WHOOP workouts) ──────────────────────────────────
+    ("whoop_workout_count",         "behavior", "WHOOP workout count above median",     None),
+    ("total_whoop_strain",          "behavior", "Total workout WHOOP strain above median", None),
+    ("total_whoop_kilojoule",       "behavior", "Total workout kJ above median",        "kJ"),
+    ("max_whoop_workout_hr",        "behavior", "Peak WHOOP workout HR above median",   "bpm"),
+    ("avg_whoop_workout_hr",        "behavior", "Avg WHOOP workout HR above median",    "bpm"),
+    ("total_zone4_5_milli",         "behavior", "Time in HR zones 4-5 (WHOOP) above median", "ms"),
+    ("total_zone0_1_milli",         "behavior", "Time in HR zones 0-1 (WHOOP) above median", "ms"),
+
+    # ── HR zone time (Garmin daily) ──────────────────────────────────────────
+    ("zone_2_seconds",              "behavior", "HR Zone 2 seconds above median",      "s"),
+    ("zone_3_seconds",              "behavior", "HR Zone 3 seconds above median",      "s"),
+    ("zone_4_seconds",              "behavior", "HR Zone 4 seconds above median",      "s"),
+    ("zone_5_seconds",              "behavior", "HR Zone 5 seconds above median",      "s"),
+
+    # ── Recovery state (days since event) ────────────────────────────────────
+    ("days_since_alcohol",          "behavior", "Days since last alcohol above median", "days"),
+    ("days_since_sauna",            "behavior", "Days since last sauna above median",   "days"),
+    ("days_since_hard_workout",     "behavior", "Days since hard workout above median", "days"),
+    ("days_since_rest_day",         "behavior", "Days since rest day above median",     "days"),
+    ("consecutive_run_days",        "behavior", "Consecutive run days above median",    "days"),
+)
+
+# Explicit binary treatments — derived 0/1 flags that don't match the
+# journal_/habit_/supplement_ prefix scan. Listed here so a future column
+# rename doesn't silently drop them.
+EXPLICIT_BINARY_TREATMENTS: tuple[tuple[str, str, str], ...] = (
+    # (column, family, label)
+    ("had_evening_workout", "behavior", "Had evening workout (after 6pm)"),
+    ("is_run_day",          "behavior", "Run day (any run logged)"),
+    ("is_rest_day",         "behavior", "Rest day (no workouts)"),
+    ("negative_split",      "behavior", "Negative split (second half faster)"),
 )
 
 
@@ -427,6 +532,17 @@ def _enumerate_binary_treatments(df: pd.DataFrame) -> list[TreatmentSpec]:
                 confounders=tuple(_confounders_for("supplement", available)),
                 kind="binary",
             ))
+
+    # Explicit behavior binaries (had_evening_workout, is_run_day, is_rest_day)
+    for col, family, label in EXPLICIT_BINARY_TREATMENTS:
+        if col in df.columns:
+            vals = df[col].dropna().unique()
+            if set(vals).issubset({0, 1, 0.0, 1.0}):
+                specs.append(TreatmentSpec(
+                    name=col, family=family, label=label,
+                    confounders=tuple(_confounders_for(family, available)),
+                    kind="binary",
+                ))
 
     return specs
 

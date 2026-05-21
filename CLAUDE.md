@@ -145,7 +145,7 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
 - Sync operations logged to `pds.sync_log`
 - `whoop_journal` data is boolean-only (Yes/No) — WHOOP's CSV export does not include quantity values entered in the app (e.g., "3 drinks", "200mg caffeine"). This is a WHOOP platform limitation.
 - HRV analysis tables: `hrv_predictions` (model forecasts + actuals), `hrv_model_metrics` (rolling eval), `hrv_analysis_results` (correlations, journal impact, model comparison as JSON)
-- **Causal inference layer (Phase 2.5 of `hrv_analysis.py`).** Lives in `causal_inference.py` and runs after the descriptive stats. For every binary treatment (journal_*, habit_*, supplement_*_amount > 0) and continuous treatment (mfp_calories, mfp_protein_g, whoop_day_strain, total_steps, etc. — binarized at the personal median) the layer estimates the ATE on next-night HRV three ways:
+- **Causal inference layer (Phase 2.5 of `hrv_analysis.py`).** Lives in `causal_inference.py` and runs after the descriptive stats. Treatments span every controllable variable across all data sources — see "Treatment coverage" subsection below. For each treatment the layer estimates the ATE on next-night HRV three ways:
   1. **Naive** — Welch's `mean(Y|T=1) − mean(Y|T=0)`. Same number the existing `journal_impact` / `supplement_impact` / `habit_impact` charts show; included as the unadjusted baseline.
   2. **Propensity Score Matching (PSM)** — 1:3 nearest-neighbor matching on logit propensity from a logistic model fit on the confounders, ATT estimated as the mean within-pair Y difference, CI by paired bootstrap (B=500). Common-support trimming at propensity ∈ [0.05, 0.95].
   3. **AIPW (doubly robust)** — logistic propensity + two Ridge outcome models (one per arm), combined via the AIPW influence function. 5-fold cross-fitting so models aren't evaluated on their training data. ATE = mean of the per-row influence values; SE = `sd(ψ)/√n`. Unbiased if either the propensity or the outcome model is correct.
@@ -166,6 +166,25 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
   **Frontend:** new "Causal Inference" section on `/analytics/hrv` (between the descriptive impact charts and the Prediction-vs-Actual section) with (a) an explanation card describing purpose + method, (b) a forest plot of binary AIPW ATEs with 95% CI error bars, (c) a naive-vs-adjusted comparison table sorted by absolute attenuation, (d) a continuous-treatment forest plot, and (e) a DAG / Assumptions card rendering the stored DAG payload. Empty until `python hrv_analysis.py` runs.
 
   **Why this is meaningfully different from the existing correlation / Welch / Granger machinery:** every other test in the pipeline answers *what's associated with* HRV. The causal layer answers *what would change HRV if intervened on*, by adjusting for the lifestyle clustering that confounds the naive comparison (e.g. alcohol nights co-occur with restaurant nights and weekend nights — naive Welch's blames alcohol for the whole pile).
+
+  **Treatment coverage (which variables get a causal estimate):**
+  - **Binary treatments** auto-enumerated from the matrix by prefix:
+    - `journal_*` (every WHOOP journal yes/no question — ~50 columns when fully populated)
+    - `habit_*` (Notion-managed habit completions, dynamic)
+    - `supplement_*_amount` (every compound from `pds.supplement_intake_by_compound`, binarized to taken/not-taken — ~50 compounds; most flagged `low_n=true` until tracking history accumulates)
+  - **Binary treatments** explicitly listed in `EXPLICIT_BINARY_TREATMENTS` (so they survive renames): `had_evening_workout`, `is_run_day`, `is_rest_day`, `negative_split`.
+  - **Continuous treatments** (median-split to put them on the same scale as the binaries), declared in `CONTINUOUS_TREATMENTS`. Covers every daytime/behavioral variable from every data source:
+    - *Nutrition (MFP):* calories, protein/carbs/fat (g + % of cals), fiber, sugar, sodium, water, exercise_kcal, net_calories
+    - *Daytime strain / activity (WHOOP + Garmin):* WHOOP day_strain, WHOOP kilojoule, steps, total_kcal, active_kcal, moderate/vigorous intensity minutes, highly_active/active/sedentary seconds
+    - *Training load:* rolling 3d/7d, acute, chronic, ATL/CTL ratio, total_training_load
+    - *Stress (Garmin):* avg / max stress level, high-stress duration, % high stress, stress ratio
+    - *Body Battery (Garmin):* charged, drained
+    - *Workout timing:* minutes from last workout to bedtime, strain÷hours-to-bed
+    - *Workout aggregates (Garmin):* activity_count, duration_min, distance_km, calories, max aerobic/anaerobic TE, max/avg activity HR, total elevation gain
+    - *Workout aggregates (WHOOP):* workout_count, total/avg strain, total kJ, peak/avg workout HR, total time in zones 4-5 / zones 0-1
+    - *HR zones (Garmin daily):* zone_2 through zone_5 seconds
+    - *Recovery state:* days_since_alcohol, days_since_sauna, days_since_hard_workout, days_since_rest_day, consecutive_run_days
+  - **DELIBERATELY excluded as treatments** (they are mediators or near-tautological outcomes — see the module's docstring for the full DAG argument): every same-night sleep variable (WHOOP `whoop_sleep_*`, Garmin `garmin_sleep_*`, Eight Sleep `eight_sleep_*`), every HRV-derived variable (`whoop_recovery_score`, `whoop_rhr`, `garmin_rhr`, `whoop_skin_temp`, `hrv_z_28d`), sleep timing recorded from the sleep itself (`bedtime_hour`, `wake_hour`, `sleep_midpoint_hour`), and body-composition (`weight_kg`, `bmi`) which changes too slowly for a daily ATE.
 - `pds.hrv_predictions_latest` view — DISTINCT ON (prediction_date, model, horizon_days) returning freshest row per forecast, excludes backtest. **All UI/analytics reads should go through the view**; the raw table accumulates multiple runs per day and generic fetches hit row limits fast. DDL in `sql/hrv_predictions_latest.sql`.
 - `supabase-py` schema access: always use `supa.schema("pds").from_(table)` — NOT `supa.table()` which defaults to `public`
 - `whoop_workouts` has no `cycle_id` column; use `workout_id` + derive `calendar_date` from `start_time` via ET-of-start (see TZ convention below)
