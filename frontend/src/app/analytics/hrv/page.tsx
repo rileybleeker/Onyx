@@ -1325,6 +1325,88 @@ export default function HrvAnalysisPage() {
         </div>
       </div>
 
+      {/* Supplements coverage callout — surfaces what's been dropped for low-n
+          so the user doesn't have to scroll into the DAG card to discover that
+          supplements are missing from the main forest plot. */}
+      {(() => {
+        const droppedSupps = causalDropped.filter((d: any) => d.family === "supplement");
+        const includedSupps = causalBinary.filter((d: any) => d.family === "supplement");
+        if (droppedSupps.length === 0 && includedSupps.length === 0) return null;
+        const minRep = causalMeta?.min_per_arm_reported ?? 10;
+        const topByN = [...droppedSupps]
+          .sort((a, b) => (Number(b.n_treated) || 0) - (Number(a.n_treated) || 0))
+          .slice(0, 10);
+        return (
+          <ChartCard
+            title="Supplements · coverage status"
+            subtitle={includedSupps.length > 0
+              ? `${includedSupps.length} estimated · ${droppedSupps.length} awaiting tracking history`
+              : `${droppedSupps.length} compounds enumerated but awaiting tracking history`}
+            source={includedSupps.length > 0 ? "AIPW (DOUBLY ROBUST)" : "INSUFFICIENT DATA"}
+            info={`Every compound in pds.supplement_intake_by_compound is enumerated as a binary treatment (taken vs not). They appear in the main forest plot only once at least ${minRep} days exist in each arm (Yes-nights AND No-nights). Until the supplement tracking window accumulates enough history, compounds will appear here with their current treated-day count so you can see which are closest to crossing the threshold.`}
+          >
+            {includedSupps.length > 0 ? (
+              <div className="text-[11px] text-text-secondary leading-relaxed pb-2">
+                <p className="mb-2">
+                  {includedSupps.length} supplement{includedSupps.length === 1 ? "" : "s"} estimated above
+                  in the main forest plot — look for the <code className="font-mono text-[10px]">family=supplement</code>{" "}
+                  entries.
+                </p>
+              </div>
+            ) : null}
+            {droppedSupps.length > 0 && (
+              <div className="text-[11px] text-text-secondary leading-relaxed">
+                <p className="mb-2">
+                  The supplement tracking window is too recent for causal estimation — every compound needs at least{" "}
+                  <strong>{minRep} treated days</strong> AND <strong>{minRep} control days</strong> before its
+                  estimate is reportable. Compounds closest to crossing the threshold:
+                </p>
+                <div className="overflow-x-auto -mx-2">
+                  <table className="min-w-full text-[11px] font-mono">
+                    <thead>
+                      <tr className="text-text-tertiary border-b border-border-subtle">
+                        <th className="text-left py-1.5 pl-3 pr-2 font-medium">Compound</th>
+                        <th className="text-right py-1.5 px-2 font-medium">Days taken</th>
+                        <th className="text-right py-1.5 px-2 font-medium">Days not taken</th>
+                        <th className="text-right py-1.5 pl-2 pr-3 font-medium">Need</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {topByN.map((d: any) => {
+                        const treated = Number(d.n_treated) || 0;
+                        const need = Math.max(0, minRep - treated);
+                        return (
+                          <tr key={d.treatment} className="border-b border-border-subtle/40">
+                            <td className="py-1.5 pl-3 pr-2 text-text-primary">{d.label}</td>
+                            <td className="py-1.5 px-2 text-right tabular-nums">{treated}</td>
+                            <td className="py-1.5 px-2 text-right tabular-nums text-text-tertiary">{d.n_control}</td>
+                            <td className="py-1.5 pl-2 pr-3 text-right tabular-nums">
+                              {need === 0
+                                ? <span className="text-emerald-400">ready</span>
+                                : <span className="text-amber-400">+{need} days</span>}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  {droppedSupps.length > topByN.length && (
+                    <p className="text-text-tertiary text-[10px] mt-2 italic">
+                      …and {droppedSupps.length - topByN.length} more compounds with fewer tracked days.
+                      Full list in the DAG &amp; Assumptions card.
+                    </p>
+                  )}
+                </div>
+                <p className="text-text-tertiary text-[10px] mt-3 leading-relaxed">
+                  Log supplement intake at <a href="/supplements" className="text-accent hover:underline">/supplements</a>;{" "}
+                  estimates populate on the next pipeline retrain after a compound crosses {minRep} treated days.
+                </p>
+              </div>
+            )}
+          </ChartCard>
+        );
+      })()}
+
       {/* Causal Forest Plot: Binary Treatments */}
       <ChartCard
         title="Causal Effects · Binary Treatments"
@@ -1627,21 +1709,59 @@ export default function HrvAnalysisPage() {
                 </div>
               )}
 
-              {causalDropped.length > 0 && (
-                <div className="pt-2 border-t border-border-subtle/50">
-                  <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
-                    Treatments dropped for insufficient sample
-                  </p>
-                  <p className="text-text-tertiary mb-1">{causalDropped.length} dropped:</p>
-                  <ul className="space-y-0.5 max-h-32 overflow-y-auto pr-1">
-                    {causalDropped.slice(0, 30).map((d: any) => (
-                      <li key={d.treatment} className="text-text-tertiary">
-                        ✕ {d.label} <span className="text-[10px]">({d.family}, n={d.n_treated}/{d.n_control})</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+              {causalDropped.length > 0 && (() => {
+                // Group dropped treatments by family and sort each group so the
+                // ones closest to crossing the threshold (highest n_treated)
+                // float to the top. This is essential for supplements — the
+                // user wants to see which compounds are 1-2 logs away from
+                // populating, not a flat alphabetical list.
+                const byFamily: Record<string, any[]> = {};
+                for (const d of causalDropped) {
+                  (byFamily[d.family] ??= []).push(d);
+                }
+                for (const fam of Object.keys(byFamily)) {
+                  byFamily[fam].sort((a, b) =>
+                    (Number(b.n_treated) || 0) - (Number(a.n_treated) || 0)
+                  );
+                }
+                const order = ["supplement", "journal", "habit", "behavior", "nutrition"]
+                  .filter(f => byFamily[f]?.length);
+                const minRep = causalMeta?.min_per_arm_reported ?? 10;
+                return (
+                  <div className="pt-2 border-t border-border-subtle/50">
+                    <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
+                      Treatments dropped for insufficient sample
+                    </p>
+                    <p className="text-text-tertiary mb-2">
+                      {causalDropped.length} dropped (need ≥{minRep} days in each arm)
+                    </p>
+                    <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
+                      {order.map(fam => (
+                        <div key={fam}>
+                          <p className="text-text-secondary text-[10px] uppercase tracking-wide mb-1">
+                            {fam} <span className="text-text-tertiary">— {byFamily[fam].length}</span>
+                          </p>
+                          <ul className="space-y-0.5 pl-1">
+                            {byFamily[fam].slice(0, 15).map((d: any) => (
+                              <li key={d.treatment} className="text-text-tertiary leading-snug">
+                                ✕ {d.label}{" "}
+                                <span className="text-[10px]">
+                                  (n={d.n_treated}/{d.n_control})
+                                </span>
+                              </li>
+                            ))}
+                            {byFamily[fam].length > 15 && (
+                              <li className="text-text-tertiary text-[10px] pl-3 italic">
+                                …and {byFamily[fam].length - 15} more
+                              </li>
+                            )}
+                          </ul>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           ) : (
             <p className="text-[11px] text-text-tertiary py-8 text-center">
