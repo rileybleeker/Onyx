@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
-  CartesianGrid, ReferenceLine, Cell,
+  CartesianGrid, ReferenceLine, Cell, ErrorBar,
 } from "recharts";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -278,6 +278,11 @@ export default function HrvAnalysisPage() {
   const [supplementDoseResponse, setSupplementDoseResponse] = useState<any[]>([]);
   const [nutritionImpact, setNutritionImpact] = useState<any[]>([]);
   const [workoutGap, setWorkoutGap] = useState<WorkoutSleepGap[]>([]);
+  const [causalBinary, setCausalBinary] = useState<any[]>([]);
+  const [causalContinuous, setCausalContinuous] = useState<any[]>([]);
+  const [causalDag, setCausalDag] = useState<any | null>(null);
+  const [causalMeta, setCausalMeta] = useState<any | null>(null);
+  const [causalDropped, setCausalDropped] = useState<any[]>([]);
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
   const [range, setRange] = useState<Range>("30d");
@@ -305,7 +310,12 @@ export default function HrvAnalysisPage() {
       getHrvAnalysisResults("habit_impact"),
       getHrvAnalysisResults("correlation", "spearman_habit"),
       getHrvAnalysisResults("feature_importance", "shap_habit"),
-    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap, suppImp, suppDose, nutImp, hi, hCorr, hShap]) => {
+      getHrvAnalysisResults("causal", "binary_treatments"),
+      getHrvAnalysisResults("causal", "continuous_treatments"),
+      getHrvAnalysisResults("causal", "dag"),
+      getHrvAnalysisResults("causal", "meta"),
+      getHrvAnalysisResults("causal", "dropped_low_n"),
+    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap, suppImp, suppDose, nutImp, hi, hCorr, hShap, cBin, cCont, cDag, cMeta, cDrop]) => {
       setTomorrowPred(tomorrow);
       setAccuracy(acc);
       setMetrics(m);
@@ -346,6 +356,21 @@ export default function HrvAnalysisPage() {
       }
       if (hShap?.result_json) {
         try { setHabitShap(JSON.parse(hShap.result_json)); } catch {}
+      }
+      if (cBin?.result_json) {
+        try { setCausalBinary(JSON.parse(cBin.result_json)); } catch {}
+      }
+      if (cCont?.result_json) {
+        try { setCausalContinuous(JSON.parse(cCont.result_json)); } catch {}
+      }
+      if (cDag?.result_json) {
+        try { setCausalDag(JSON.parse(cDag.result_json)); } catch {}
+      }
+      if (cMeta?.result_json) {
+        try { setCausalMeta(JSON.parse(cMeta.result_json)); } catch {}
+      }
+      if (cDrop?.result_json) {
+        try { setCausalDropped(JSON.parse(cDrop.result_json)); } catch {}
       }
     }).catch(console.error).finally(() => setLoading(false));
   }, [range]);
@@ -1184,6 +1209,447 @@ export default function HrvAnalysisPage() {
           </ResponsiveContainer>
         </ChartCard>
       )}
+
+      {/* ── Row 3d: Causal Inference ── */}
+      {/*
+        Where the other charts on this page measure ASSOCIATION (Spearman, Welch),
+        this section estimates causal effects with confounder adjustment. The
+        three estimators (naive, PSM, AIPW) are reported side-by-side so the
+        reader can see how much of each apparent effect survives adjustment.
+        Empty unless `python hrv_analysis.py` has populated the causal/* rows
+        in pds.hrv_analysis_results.
+      */}
+      <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 shadow-card">
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div>
+            <h3 className="text-[18px] font-medium text-text-primary">Causal Inference</h3>
+            <p className="text-[12px] text-text-tertiary mt-1">
+              Adjusted treatment effects · {causalMeta?.n_binary_treatments_analyzed ?? 0} binary +{" "}
+              {causalMeta?.n_continuous_treatments_analyzed ?? 0} continuous treatments
+            </p>
+          </div>
+          <span className="text-[9px] font-mono text-text-tertiary px-2 py-0.5 rounded border border-border-subtle">
+            AIPW · PSM · NAIVE
+          </span>
+        </div>
+
+        <div className="text-[12px] text-text-secondary leading-relaxed space-y-3 max-w-4xl">
+          <p>
+            Every other chart on this page measures <em>association</em>: how strongly each behavior moves
+            with HRV. None of them adjust for the fact that behaviors cluster — alcohol nights are also
+            weekend nights are also restaurant nights are also late-bed nights. The naive Yes/No t-test
+            blames alcohol for the whole pile. <strong>Adjusted causal estimates correct for that</strong>{" "}
+            by holding pre-treatment confounders fixed.
+          </p>
+
+          <div>
+            <p className="text-text-primary font-medium mb-1">What&apos;s being estimated</p>
+            <p>
+              For each behavior X, the Average Treatment Effect on next-night HRV:{" "}
+              <em>&ldquo;If you did X today (holding the pre-treatment confounders fixed), what would your
+              HRV be tomorrow, vs. if you didn&apos;t?&rdquo;</em> Outcome is{" "}
+              <code className="font-mono text-[11px] text-text-tertiary">whoop_hrv_rmssd</code> shifted
+              −1 day, the same convention as the XGBoost prediction model above.
+            </p>
+          </div>
+
+          <div>
+            <p className="text-text-primary font-medium mb-1">Three estimators, reported side-by-side</p>
+            <ol className="list-decimal list-inside space-y-1 ml-2">
+              <li>
+                <strong>Naive</strong> (Welch&apos;s t-test): <code className="font-mono text-[11px]">mean(Y|T=1) − mean(Y|T=0)</code>.
+                The unadjusted comparison — what every other chart on this page is built on.
+              </li>
+              <li>
+                <strong>Propensity Score Matching (PSM)</strong>: for each treated day, find the closest
+                control day in confounder-space (1:3 nearest-neighbor on logit propensity). Average the
+                within-pair HRV differences. CI by paired bootstrap (B=500).
+              </li>
+              <li>
+                <strong>AIPW (doubly-robust)</strong>: combines a logistic propensity model with two Ridge
+                outcome models (one per arm). Unbiased if <em>either</em> model is correct. 5-fold
+                cross-fit so the models aren&apos;t evaluated on their training data. CI from the
+                influence-function variance.
+              </li>
+            </ol>
+          </div>
+
+          <div>
+            <p className="text-text-primary font-medium mb-1">How to read it</p>
+            <ul className="list-disc list-inside space-y-1 ml-2">
+              <li><strong>AIPW ATE bar</strong> = the headline causal estimate, in ms of HRV.</li>
+              <li>
+                <strong>Error bars</strong> = 95% confidence interval. If the CI crosses 0, the effect
+                is consistent with no real causal influence.
+              </li>
+              <li>
+                <strong>E-value</strong> = how strong an <em>unmeasured</em> confounder would need to be
+                (on the risk-ratio scale, with both treatment and outcome) to fully explain the effect
+                away. Higher = more robust. Computed via the Chinn (2000) d→RR transform for continuous
+                outcomes, then VanderWeele &amp; Ding&apos;s formula{" "}
+                <code className="font-mono text-[11px]">E = RR + √(RR·(RR−1))</code>.
+              </li>
+              <li>
+                <strong>Attenuation</strong> (in the comparison table) = % by which adjustment shrunk
+                (or grew) the naive estimate. Big shrinkage = naive view was dominated by confounding.
+              </li>
+              <li>⚠ flags any treatment with fewer than 20 days in either arm — small-sample CIs are unreliable.</li>
+            </ul>
+          </div>
+
+          <div>
+            <p className="text-text-primary font-medium mb-1">Important caveats</p>
+            <ul className="list-disc list-inside space-y-1 ml-2">
+              <li>
+                This is <em>n-of-1 observational</em> data. Without randomization, all causal claims rest
+                on the assumption that the listed confounders are sufficient (no unmeasured confounding) —
+                which the E-value tries to probe but can&apos;t prove.
+              </li>
+              <li>
+                We adjust only for <strong>pre-treatment</strong> features (yesterday&apos;s HRV, strain,
+                sleep, training load, day-of-week). We deliberately do NOT adjust for same-night sleep
+                or recovery — those are mediators on the very path we&apos;re estimating
+                (adjusting for them would erase the effect).
+              </li>
+              <li>
+                Effects are reported as <em>population-average</em> ATEs (AIPW) or <em>effect-on-the-treated</em>{" "}
+                ATTs (PSM). They assume linear additivity — for very strong interactions
+                (e.g. alcohol × short-sleep), AIPW gives a weighted average that may smooth over real heterogeneity.
+              </li>
+              <li>
+                The outcome is HRV the morning <em>after</em> the behavior. Carry-over effects spanning
+                multiple days (e.g. alcohol depressing HRV for 2-3 nights) are not modeled here.
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      {/* Causal Forest Plot: Binary Treatments */}
+      <ChartCard
+        title="Causal Effects · Binary Treatments"
+        subtitle={`AIPW ATE on next-night HRV (ms) · 95% CI shown as error bars · top ${Math.min(causalBinary.length, 20)} by |effect|`}
+        source="AIPW (DOUBLY ROBUST)"
+        info="Each bar is the doubly-robust AIPW estimate of the average treatment effect on tomorrow's HRV. Error bars are 95% confidence intervals from the influence-function variance. Bars whose CI crosses 0 (gray) are statistically indistinguishable from no-effect; bars whose CI stays positive (green) or negative (red) are causal evidence under the stated confounder set. ⚠ marks treatments with fewer than 20 days in either arm — interpret with caution. The naive (unadjusted) estimate for each treatment is in the comparison table below."
+      >
+        {causalBinary.length > 0 ? (() => {
+          const top = causalBinary
+            .filter((d: any) => Number.isFinite(d.aipw_ate))
+            .slice(0, 20)
+            .map((d: any) => ({
+              ...d,
+              displayLabel: `${d.low_n ? "⚠ " : ""}${d.label}`,
+              errorRange: [
+                Math.max(0, (d.aipw_ate ?? 0) - (d.aipw_ci_low ?? 0)),
+                Math.max(0, (d.aipw_ci_high ?? 0) - (d.aipw_ate ?? 0)),
+              ],
+              barColor: !d.significant
+                ? "#71717a"
+                : d.aipw_ate > 0 ? "#22c55e" : "#ef4444",
+            }));
+          return (
+            <ResponsiveContainer width="100%" height={Math.max(420, top.length * 32)}>
+              <BarChart data={top} layout="vertical"
+                        margin={{ left: 8, right: 32, top: 4, bottom: 24 }}>
+                <CartesianGrid {...gridStyle} horizontal={false} />
+                <XAxis type="number" tick={axisTick}
+                       tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
+                       label={axisLabel("AIPW ATE (ms)", "x")} />
+                <YAxis type="category" dataKey="displayLabel" width={220}
+                       tick={<WrappedYAxisTick maxCharsPerLine={30} fontSize={10} />} />
+                <Tooltip {...chartTooltip}
+                         formatter={(v: any, _n: any, p: any) => {
+                           const d = p?.payload ?? {};
+                           const ci = `[${Number(d.aipw_ci_low).toFixed(1)}, ${Number(d.aipw_ci_high).toFixed(1)}]`;
+                           const ev = Number.isFinite(d.e_value) ? d.e_value.toFixed(2) : "—";
+                           return [
+                             `${Number(v).toFixed(1)} ms — CI ${ci}, E-val ${ev}, n=${d.n_treated}/${d.n_control}, family=${d.family}`,
+                             "AIPW ATE",
+                           ];
+                         }} />
+                <ReferenceLine x={0} stroke="rgba(255,255,255,0.15)" />
+                <Bar dataKey="aipw_ate" radius={[0, 3, 3, 0]}>
+                  {top.map((d: any, i: number) => (
+                    <Cell key={i} fill={d.barColor} fillOpacity={d.low_n ? 0.35 : 0.85} />
+                  ))}
+                  <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
+                            stroke="#f4f4f5" direction="x" />
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          );
+        })() : (
+          <div className="h-[260px] flex items-center justify-center px-6">
+            <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+              No causal results yet — run <code className="font-mono text-amber-400">python hrv_analysis.py</code>{" "}
+              to populate. The causal layer needs at least 10 treated + 10 control days per treatment;
+              very rare behaviors may never show up here even with full data.
+            </p>
+          </div>
+        )}
+      </ChartCard>
+
+      {/* Naive vs Adjusted Comparison Table */}
+      <ChartCard
+        title="Naive vs Adjusted: where confounding mattered"
+        subtitle="Treatments where adjustment changed the answer most"
+        source="WELCH vs AIPW"
+        info="Side-by-side comparison of the unadjusted (Welch's t-test) and adjusted (AIPW) estimates for the top treatments. ‘Attenuation’ is the % by which adjustment shrunk (or grew) the naive estimate — large positive values mean the naive view was inflated by confounding (e.g. alcohol nights co-occur with bad sleep, so the naive estimate blames alcohol for the whole drop). Sorted by absolute attenuation so the biggest course-corrections float to the top."
+      >
+        {causalBinary.length > 0 ? (
+          <div className="overflow-x-auto -mx-2">
+            <table className="min-w-full text-[11px] font-mono">
+              <thead>
+                <tr className="text-text-tertiary border-b border-border-subtle">
+                  <th className="text-left py-2 pl-3 pr-2 font-medium">Treatment</th>
+                  <th className="text-left py-2 px-2 font-medium">Family</th>
+                  <th className="text-right py-2 px-2 font-medium">Naive Δ</th>
+                  <th className="text-right py-2 px-2 font-medium">PSM ATT</th>
+                  <th className="text-right py-2 px-2 font-medium">AIPW ATE</th>
+                  <th className="text-right py-2 px-2 font-medium">95% CI</th>
+                  <th className="text-right py-2 px-2 font-medium">E-val</th>
+                  <th className="text-right py-2 px-2 font-medium">Attenuation</th>
+                  <th className="text-right py-2 pl-2 pr-3 font-medium">n T / n C</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...causalBinary]
+                  .filter((d: any) => Number.isFinite(d.aipw_ate) && Number.isFinite(d.naive_ate))
+                  .sort((a: any, b: any) => Math.abs(b.attenuation_pct ?? 0) - Math.abs(a.attenuation_pct ?? 0))
+                  .slice(0, 15)
+                  .map((d: any) => {
+                    const sigColor = d.significant
+                      ? (d.aipw_ate > 0 ? "text-emerald-400" : "text-red-400")
+                      : "text-text-tertiary";
+                    const attColor = (d.attenuation_pct ?? 0) > 30
+                      ? "text-amber-400"
+                      : (d.attenuation_pct ?? 0) < -30
+                        ? "text-cyan-400"
+                        : "text-text-secondary";
+                    return (
+                      <tr key={d.treatment} className="border-b border-border-subtle/40 hover:bg-white/[0.02]">
+                        <td className="py-2 pl-3 pr-2 text-text-primary">
+                          {d.low_n ? <span className="text-amber-400 mr-1">⚠</span> : null}
+                          {d.label}
+                        </td>
+                        <td className="py-2 px-2 text-text-tertiary">{d.family}</td>
+                        <td className="py-2 px-2 text-right tabular-nums">
+                          {d.naive_ate >= 0 ? "+" : ""}{Number(d.naive_ate).toFixed(1)}
+                        </td>
+                        <td className="py-2 px-2 text-right tabular-nums">
+                          {Number.isFinite(d.psm_ate)
+                            ? `${d.psm_ate >= 0 ? "+" : ""}${Number(d.psm_ate).toFixed(1)}`
+                            : "—"}
+                        </td>
+                        <td className={`py-2 px-2 text-right tabular-nums ${sigColor}`}>
+                          {d.aipw_ate >= 0 ? "+" : ""}{Number(d.aipw_ate).toFixed(1)}
+                        </td>
+                        <td className="py-2 px-2 text-right tabular-nums text-text-tertiary">
+                          [{Number(d.aipw_ci_low).toFixed(1)}, {Number(d.aipw_ci_high).toFixed(1)}]
+                        </td>
+                        <td className="py-2 px-2 text-right tabular-nums">
+                          {Number.isFinite(d.e_value) ? d.e_value.toFixed(2) : "—"}
+                        </td>
+                        <td className={`py-2 px-2 text-right tabular-nums ${attColor}`}>
+                          {Number.isFinite(d.attenuation_pct)
+                            ? `${(d.attenuation_pct ?? 0) >= 0 ? "+" : ""}${(d.attenuation_pct ?? 0).toFixed(0)}%`
+                            : "—"}
+                        </td>
+                        <td className="py-2 pl-2 pr-3 text-right tabular-nums text-text-tertiary">
+                          {d.n_treated} / {d.n_control}
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="text-[11px] text-text-tertiary py-8 text-center">
+            Run <code className="font-mono text-amber-400">python hrv_analysis.py</code> to populate.
+          </p>
+        )}
+      </ChartCard>
+
+      {/* Continuous treatments + DAG / Assumptions */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <ChartCard
+          title="Continuous Treatments (median-split)"
+          subtitle="Adjusted contrast: above-median vs below-median day"
+          source="AIPW (DOUBLY ROBUST)"
+          info="Continuous treatments (calories, strain, training load, steps) are binarized at their personal median, giving an 'above your usual' contrast that's directly comparable to the binary treatments. Same AIPW machinery, same pre-treatment confounders. Note that median-split loses dose information — for full dose-response curves see the Supplement Dose-Response chart above (which uses Spearman rather than adjusted contrasts)."
+        >
+          {causalContinuous.length > 0 ? (() => {
+            const top = causalContinuous
+              .filter((d: any) => Number.isFinite(d.aipw_ate))
+              .slice(0, 12)
+              .map((d: any) => ({
+                ...d,
+                displayLabel: `${d.low_n ? "⚠ " : ""}${d.label}`,
+                errorRange: [
+                  Math.max(0, (d.aipw_ate ?? 0) - (d.aipw_ci_low ?? 0)),
+                  Math.max(0, (d.aipw_ci_high ?? 0) - (d.aipw_ate ?? 0)),
+                ],
+                barColor: !d.significant
+                  ? "#71717a"
+                  : d.aipw_ate > 0 ? "#22c55e" : "#ef4444",
+              }));
+            return (
+              <ResponsiveContainer width="100%" height={Math.max(280, top.length * 36)}>
+                <BarChart data={top} layout="vertical"
+                          margin={{ left: 8, right: 28, top: 4, bottom: 24 }}>
+                  <CartesianGrid {...gridStyle} horizontal={false} />
+                  <XAxis type="number" tick={axisTick}
+                         tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
+                         label={axisLabel("AIPW ATE (ms)", "x")} />
+                  <YAxis type="category" dataKey="displayLabel" width={210}
+                         tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
+                  <Tooltip {...chartTooltip}
+                           formatter={(v: any, _n: any, p: any) => {
+                             const d = p?.payload ?? {};
+                             const ci = `[${Number(d.aipw_ci_low).toFixed(1)}, ${Number(d.aipw_ci_high).toFixed(1)}]`;
+                             return [
+                               `${Number(v).toFixed(1)} ms — CI ${ci}, n=${d.n_treated}/${d.n_control}`,
+                               "AIPW ATE",
+                             ];
+                           }} />
+                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.15)" />
+                  <Bar dataKey="aipw_ate" radius={[0, 3, 3, 0]}>
+                    {top.map((d: any, i: number) => (
+                      <Cell key={i} fill={d.barColor} fillOpacity={d.low_n ? 0.35 : 0.85} />
+                    ))}
+                    <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
+                              stroke="#f4f4f5" direction="x" />
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            );
+          })() : (
+            <div className="h-[260px] flex items-center justify-center px-6">
+              <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+                No continuous-treatment results yet.
+              </p>
+            </div>
+          )}
+        </ChartCard>
+
+        <ChartCard
+          title="Causal DAG &amp; Assumptions"
+          subtitle="What we adjust for, and what we deliberately don't"
+          source="DECLARED MODEL"
+          info="Every causal estimate above depends on this DAG. Confounders adjusted for must be sufficient — meaning, conditional on them, treatment assignment is (approximately) random. We deliberately exclude same-night sleep/recovery/HRV-derived variables because those are MEDIATORS — they lie on the causal path between behavior and outcome, and adjusting for them would block the very effect we're estimating. The E-value gives a quantitative sense of how much an unmeasured confounder would have to violate this assumption to overturn each finding."
+        >
+          {causalDag ? (
+            <div className="text-[11px] font-mono leading-relaxed space-y-3 max-h-[420px] overflow-y-auto pr-2">
+              <div>
+                <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
+                  Outcome
+                </p>
+                <p className="text-text-primary">
+                  <code className="text-cyan-400">{causalDag.outcome}</code> — {causalDag.outcome_description}
+                </p>
+              </div>
+
+              <div>
+                <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
+                  Common confounders (every family)
+                </p>
+                <ul className="space-y-0.5">
+                  {(causalDag.common_confounders ?? []).map((c: string) => (
+                    <li key={c} className="text-text-secondary">
+                      ► <code>{c}</code>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              {(causalDag.supplement_extra_confounders ?? []).length > 0 && (
+                <div>
+                  <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
+                    Extra confounders for SUPPLEMENT family
+                  </p>
+                  <ul className="space-y-0.5">
+                    {causalDag.supplement_extra_confounders.map((c: string) => (
+                      <li key={c} className="text-text-secondary">
+                        ► <code>{c}</code>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <div>
+                <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
+                  Mediators EXCLUDED on purpose
+                </p>
+                <ul className="space-y-1">
+                  {(causalDag.mediator_exclusions ?? []).map((m: string, i: number) => (
+                    <li key={i} className="text-text-secondary leading-relaxed">▼ {m}</li>
+                  ))}
+                </ul>
+              </div>
+
+              <div>
+                <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
+                  Identifying assumptions
+                </p>
+                <ul className="space-y-1">
+                  {(causalDag.identifying_assumptions ?? []).map((a: string, i: number) => (
+                    <li key={i} className="text-text-secondary leading-relaxed">• {a}</li>
+                  ))}
+                </ul>
+              </div>
+
+              <div>
+                <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
+                  Sensitivity: E-value
+                </p>
+                <p className="text-text-secondary leading-relaxed">
+                  {causalDag.sensitivity?.method}
+                </p>
+                <p className="text-text-tertiary mt-1 text-[10px] leading-relaxed">
+                  {causalDag.sensitivity?.transform}
+                </p>
+              </div>
+
+              {causalMeta && (
+                <div className="pt-2 border-t border-border-subtle/50">
+                  <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
+                    Run metadata
+                  </p>
+                  <p className="text-text-tertiary">
+                    Estimators: {(causalMeta.estimators ?? []).join(", ")}<br />
+                    PSM: k={causalMeta.psm_k}, bootstrap={causalMeta.psm_bootstrap_reps} reps<br />
+                    AIPW folds: {causalMeta.aipw_n_folds}<br />
+                    Propensity trim: [{(causalMeta.propensity_trim ?? [])[0]}, {(causalMeta.propensity_trim ?? [])[1]}]<br />
+                    Min per arm: {causalMeta.min_per_arm_reported} report / {causalMeta.min_per_arm_full} full
+                  </p>
+                </div>
+              )}
+
+              {causalDropped.length > 0 && (
+                <div className="pt-2 border-t border-border-subtle/50">
+                  <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
+                    Treatments dropped for insufficient sample
+                  </p>
+                  <p className="text-text-tertiary mb-1">{causalDropped.length} dropped:</p>
+                  <ul className="space-y-0.5 max-h-32 overflow-y-auto pr-1">
+                    {causalDropped.slice(0, 30).map((d: any) => (
+                      <li key={d.treatment} className="text-text-tertiary">
+                        ✕ {d.label} <span className="text-[10px]">({d.family}, n={d.n_treated}/{d.n_control})</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          ) : (
+            <p className="text-[11px] text-text-tertiary py-8 text-center">
+              Run <code className="font-mono text-amber-400">python hrv_analysis.py</code> to populate.
+            </p>
+          )}
+        </ChartCard>
+      </div>
 
       {/* ── Row 4: Prediction vs Actual + Accuracy by Horizon ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

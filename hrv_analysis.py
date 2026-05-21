@@ -92,6 +92,13 @@ try:
 except ImportError:
     HAS_FDR = False
 
+try:
+    import causal_inference as ci
+    HAS_CAUSAL = True
+except ImportError:
+    HAS_CAUSAL = False
+    print("WARNING: causal_inference module unavailable - skipping causal layer")
+
 import hashlib
 
 warnings.filterwarnings("ignore")
@@ -3060,7 +3067,8 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
                            permutation_importance: dict | None = None,
                            dm_test: list | None = None,
                            error_modes: list | None = None,
-                           error_modes_habits: list | None = None) -> None:
+                           error_modes_habits: list | None = None,
+                           causal_results: dict | None = None) -> None:
     """Store pre-computed analysis results for the frontend."""
     rows: list[dict] = []
 
@@ -3221,6 +3229,40 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             "result_key": "error_modes_by_habit",
             "result_json": json.dumps(error_modes_habits),
         })
+
+    # Causal inference results — separate rows per family so the frontend
+    # can fetch what it needs without parsing the whole payload.
+    if causal_results:
+        if causal_results.get("binary_treatments"):
+            rows.append({
+                "result_type": "causal",
+                "result_key": "binary_treatments",
+                "result_json": json.dumps(causal_results["binary_treatments"]),
+            })
+        if causal_results.get("continuous_treatments"):
+            rows.append({
+                "result_type": "causal",
+                "result_key": "continuous_treatments",
+                "result_json": json.dumps(causal_results["continuous_treatments"]),
+            })
+        if causal_results.get("dag"):
+            rows.append({
+                "result_type": "causal",
+                "result_key": "dag",
+                "result_json": json.dumps(causal_results["dag"]),
+            })
+        if causal_results.get("meta"):
+            rows.append({
+                "result_type": "causal",
+                "result_key": "meta",
+                "result_json": json.dumps(causal_results["meta"]),
+            })
+        if causal_results.get("dropped_low_n"):
+            rows.append({
+                "result_type": "causal",
+                "result_key": "dropped_low_n",
+                "result_json": json.dumps(causal_results["dropped_low_n"]),
+            })
 
     # Feature label map
     rows.append({
@@ -3386,6 +3428,25 @@ def main() -> None:
         supplements=data.get("supplements"),
     )
 
+    # ---------- Phase 2.5: Causal Inference ----------
+    # Runs after the descriptive stats and before the predictive models so its
+    # results sit alongside Spearman/Welch in the analysis_results table. The
+    # estimators (PSM, AIPW) are O(n_treatments × n_rows × n_bootstrap) — for
+    # ~50 binary treatments × ~500 rows × 500 bootstrap reps this takes a few
+    # minutes, which we accept once-per-retrain.
+    causal_results: dict | None = None
+    if HAS_CAUSAL and not args.skip_analysis:
+        log.info("=== PHASE 2.5: CAUSAL INFERENCE ===")
+        try:
+            causal_results = ci.run_causal_battery(df, supplements=data.get("supplements"))
+            n_bin = len(causal_results.get("binary_treatments", [])) if causal_results else 0
+            n_cont = len(causal_results.get("continuous_treatments", [])) if causal_results else 0
+            log.info(f"  Causal battery complete: {n_bin} binary + {n_cont} continuous "
+                     f"treatments estimated")
+        except Exception as e:
+            log.warning(f"  Causal inference failed: {e}")
+            causal_results = None
+
     if args.skip_models:
         log.info("Skipping ML models (--skip-models set).")
         print_summary(df, {}, {}, {}, {}, stat_results)
@@ -3466,6 +3527,7 @@ def main() -> None:
         dm_test=eval_results.get("dm_test"),
         error_modes=eval_results.get("error_modes"),
         error_modes_habits=eval_results.get("error_modes_habits"),
+        causal_results=causal_results,
     )
 
     # ---------- Run-Manifest Artifact (audit fix 4#38) ----------

@@ -31,6 +31,10 @@ Onyx/
 ├── hrv_analysis.py          # HRV deep analysis pipeline (Phases 1-3.5): data loading,
 │                            #   ~350-column / ~250-feature matrix, stat analysis, XGBoost/SARIMAX/Prophet,
 │                            #   walk-forward backtest, stores results to Supabase
+├── causal_inference.py      # Phase 2.5: doubly-robust causal estimates (AIPW + PSM + naive)
+│                            #   for every binary + continuous treatment, with E-value sensitivity
+│                            #   analysis. Imported by hrv_analysis.py; surfaced as causal/* rows
+│                            #   in pds.hrv_analysis_results and rendered on /analytics/hrv.
 ├── hrv_predict.py           # Daily HRV prediction: loads saved model, predicts tomorrow,
 │                            #   backfills actuals, recomputes rolling metrics, drift check
 ├── hrv_backfill_check.py    # Detects historical backfill (any row with calendar_date older
@@ -141,6 +145,27 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
 - Sync operations logged to `pds.sync_log`
 - `whoop_journal` data is boolean-only (Yes/No) — WHOOP's CSV export does not include quantity values entered in the app (e.g., "3 drinks", "200mg caffeine"). This is a WHOOP platform limitation.
 - HRV analysis tables: `hrv_predictions` (model forecasts + actuals), `hrv_model_metrics` (rolling eval), `hrv_analysis_results` (correlations, journal impact, model comparison as JSON)
+- **Causal inference layer (Phase 2.5 of `hrv_analysis.py`).** Lives in `causal_inference.py` and runs after the descriptive stats. For every binary treatment (journal_*, habit_*, supplement_*_amount > 0) and continuous treatment (mfp_calories, mfp_protein_g, whoop_day_strain, total_steps, etc. — binarized at the personal median) the layer estimates the ATE on next-night HRV three ways:
+  1. **Naive** — Welch's `mean(Y|T=1) − mean(Y|T=0)`. Same number the existing `journal_impact` / `supplement_impact` / `habit_impact` charts show; included as the unadjusted baseline.
+  2. **Propensity Score Matching (PSM)** — 1:3 nearest-neighbor matching on logit propensity from a logistic model fit on the confounders, ATT estimated as the mean within-pair Y difference, CI by paired bootstrap (B=500). Common-support trimming at propensity ∈ [0.05, 0.95].
+  3. **AIPW (doubly robust)** — logistic propensity + two Ridge outcome models (one per arm), combined via the AIPW influence function. 5-fold cross-fitting so models aren't evaluated on their training data. ATE = mean of the per-row influence values; SE = `sd(ψ)/√n`. Unbiased if either the propensity or the outcome model is correct.
+
+  **Confounder set** is pre-treatment lag-1 only (`hrv_lag1`, `hrv_7d_mean`, `whoop_day_strain_lag1`, `whoop_sleep_duration_milli_lag1`, `rolling_7d_training_load`, `sleep_debt_7d`, `day_of_week`, `is_weekend`). Supplement family additionally gets `journal_have_any_alcoholic_drinks_lag1` and `journal_consumed_caffeine_lag1` because supplement-conscious days tend to differ in adjacent lifestyle. **Same-night sleep/recovery/HRV-derived variables are DELIBERATELY EXCLUDED** — they are mediators on the very causal path being estimated; adjusting for them would block the effect (mediator-adjustment bias). The reported quantity is therefore the **total effect** (which includes the sleep-quality channel) — the actionable answer for "if I take magnesium tonight, what happens to my HRV tomorrow?"
+
+  **Sensitivity** via the VanderWeele & Ding (2017) E-value — minimum strength on the risk-ratio scale that an unmeasured confounder would need (with both T and Y) to fully explain the estimate away. Continuous outcome → Cohen's d → RR via Chinn (2000): `RR ≈ exp(0.91·d)`, then `E = RR + √(RR·(RR−1))`. Higher = more robust to unmeasured confounding.
+
+  **Cell-size gates:** treatments with fewer than 10 days in either arm are dropped entirely (recorded in `causal/dropped_low_n`); those with 10-19 in either arm are reported but flagged `low_n=true` (rendered with reduced opacity + ⚠ marker on the UI).
+
+  **Storage:** five new rows in `pds.hrv_analysis_results` per run, all under `result_type='causal'`:
+  - `binary_treatments` — list of binary-treatment results
+  - `continuous_treatments` — list of median-split continuous-treatment results
+  - `dag` — declared confounder sets + mediator exclusions + identifying assumptions (rendered as the DAG / Assumptions card on the UI for transparency)
+  - `meta` — run metadata (estimator versions, bootstrap reps, fold counts, trim bounds)
+  - `dropped_low_n` — treatments excluded for insufficient sample, with reason
+
+  **Frontend:** new "Causal Inference" section on `/analytics/hrv` (between the descriptive impact charts and the Prediction-vs-Actual section) with (a) an explanation card describing purpose + method, (b) a forest plot of binary AIPW ATEs with 95% CI error bars, (c) a naive-vs-adjusted comparison table sorted by absolute attenuation, (d) a continuous-treatment forest plot, and (e) a DAG / Assumptions card rendering the stored DAG payload. Empty until `python hrv_analysis.py` runs.
+
+  **Why this is meaningfully different from the existing correlation / Welch / Granger machinery:** every other test in the pipeline answers *what's associated with* HRV. The causal layer answers *what would change HRV if intervened on*, by adjusting for the lifestyle clustering that confounds the naive comparison (e.g. alcohol nights co-occur with restaurant nights and weekend nights — naive Welch's blames alcohol for the whole pile).
 - `pds.hrv_predictions_latest` view — DISTINCT ON (prediction_date, model, horizon_days) returning freshest row per forecast, excludes backtest. **All UI/analytics reads should go through the view**; the raw table accumulates multiple runs per day and generic fetches hit row limits fast. DDL in `sql/hrv_predictions_latest.sql`.
 - `supabase-py` schema access: always use `supa.schema("pds").from_(table)` — NOT `supa.table()` which defaults to `public`
 - `whoop_workouts` has no `cycle_id` column; use `workout_id` + derive `calendar_date` from `start_time` via ET-of-start (see TZ convention below)
