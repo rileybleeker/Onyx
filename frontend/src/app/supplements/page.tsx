@@ -6,6 +6,7 @@ import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
 import BarcodeScannerModal from "@/components/BarcodeScannerModal";
 import EditIntakeModal, { type EditableIntake } from "@/components/EditIntakeModal";
+import CustomSupplementFlow from "@/components/CustomSupplementFlow";
 import { rangeDays, rangeLabel, type Range } from "@/lib/queries";
 
 interface Product {
@@ -124,6 +125,8 @@ export default function SupplementsPage() {
   // After picking a hit, hold it here while the user enters a dose count.
   const [confirmHit, setConfirmHit] = useState<DsldHit | null>(null);
   const [confirmDoses, setConfirmDoses] = useState<string>("1");
+  // Custom-product fallback (photo → vision extraction → save).
+  const [customMode, setCustomMode] = useState(false);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -594,6 +597,7 @@ export default function SupplementsPage() {
             setAddOpen(false);
             setConfirmHit(null);
             setConfirmDoses("1");
+            setCustomMode(false);
           }}
         >
           <div
@@ -607,12 +611,29 @@ export default function SupplementsPage() {
                   setAddOpen(false);
                   setConfirmHit(null);
                   setConfirmDoses("1");
+                  setCustomMode(false);
                 }}
                 className="text-[11px] text-text-tertiary hover:text-text-secondary font-mono"
               >
                 Close
               </button>
             </div>
+
+            {customMode ? (
+              <CustomSupplementFlow
+                logDate={logDate}
+                onBack={() => setCustomMode(false)}
+                onSaved={async () => {
+                  await refreshAll();
+                  setAddOpen(false);
+                  setCustomMode(false);
+                  setSearchQ("");
+                  setSearchHits([]);
+                }}
+              />
+            ) : (
+              <>
+
             <p className="text-[11px] text-text-tertiary mb-3 leading-relaxed">
               Search the NIH Dietary Supplement Label Database by brand, product name, or UPC. Tap a hit to seed it into your library with the full ingredient list.
             </p>
@@ -646,6 +667,19 @@ export default function SupplementsPage() {
 
             {searchError && (
               <p className="text-[11px] font-mono text-red-400 mb-2 break-words">{searchError}</p>
+            )}
+
+            {!confirmHit && (
+              <div className="mb-3 pb-3 border-b border-border-subtle/40">
+                <button
+                  onClick={() => setCustomMode(true)}
+                  className="w-full px-3 py-2 text-[11px] font-mono text-text-secondary hover:text-text-primary bg-black/20 hover:bg-white/[0.04] border border-dashed border-border-subtle hover:border-border-hover rounded-[4px] transition-colors text-left"
+                >
+                  <span className="text-amber-400/80">Not in DSLD?</span>{" "}
+                  <span className="text-text-tertiary">Photograph the supplement facts panel — Claude will read it.</span>{" "}
+                  <span className="text-text-primary">Add custom →</span>
+                </button>
+              </div>
             )}
 
             {!confirmHit && (
@@ -736,6 +770,8 @@ export default function SupplementsPage() {
                   </button>
                 </div>
               </div>
+            )}
+              </>
             )}
           </div>
         </div>
