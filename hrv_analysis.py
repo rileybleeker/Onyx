@@ -131,18 +131,17 @@ FDR_Q_THRESHOLD = 0.05
 
 # WHOOP journal date-semantics shift, in days.
 #
-# IMPORTANT — this defaults to 0 (no shift) because the underlying assumption
-# about WHOOP's `cycle_date` semantics is **unverified**. The audit flagged
-# this as "Critical (verify)" — i.e., the *direction* of the lag depends on:
-#   (a) whether WHOOP's `cycle_date` is the cycle-start date (sleep onset)
-#       or cycle-end date (wake morning), and
-#   (b) whether the journal questions are filled at the start, end, or
-#       arbitrarily during the cycle.
+# Verified 2026-04-16: WHOOP `whoop_journal.cycle_date = X` describes behaviors
+# that happened on day X itself (behaviors-of-day-X semantics), not wake-morning
+# semantics. Verification: `plane=Yes` on cycle_date=2026-04-08 matches an
+# actual flight on Apr 8 — only consistent with behaviors-of-day-X.
 #
-# Don't flip this constant until verifying against a known-behavior date —
-# e.g., pick a date you know you drank alcohol, find which cycle_date row
-# carries `Have any alcoholic drinks? = Yes`, and confirm whether that row is
-# the calendar date of the drinking or the morning after.
+# Combined with `hrv_next = whoop_hrv_rmssd.shift(-1)`, alignment is correct:
+# journal_* on row N = behaviors of day N, hrv_next on row N = HRV from sleep
+# night N -> N+1. The behavior precedes the predicted HRV.
+#
+# Caveat: this assumes Riley fills the journal describing the current day.
+# If the habit changes, re-verify via tests/test_phase2_alignment.py.
 WHOOP_JOURNAL_LAG_DAYS = 0
 
 # Features whose 5%-non-null filter is too strict — these are canonical HRV
@@ -157,10 +156,12 @@ HIGH_VALUE_SPARSE_FEATURES = {
     "garmin_sleep_history_factor", "garmin_stress_history_factor",
     "garmin_vo2_max_running", "garmin_vo2_max_cycling", "garmin_fitness_age",
     "training_readiness_score",
+    "garmin_training_readiness_level_ord",
     "atl_ctl_ratio",
     # Garmin HRV baselines — sparse in 2024 but populated continuously since
     "garmin_hrv_baseline_low", "garmin_hrv_baseline_high",
     "garmin_hrv_5min_high", "garmin_hrv_weekly_avg",
+    "garmin_hrv_status_ord",
 }
 
 # Controllable / behavioral features for the actionable-only SHAP ranking
@@ -173,6 +174,8 @@ CONTROLLABLE_FEATURE_PREFIXES = (
     "active_seconds", "highly_active_seconds", "sedentary_seconds",
     "total_steps", "protein_pct", "carb_pct", "fat_pct", "net_calories",
     "days_since_alcohol", "days_since_sauna", "days_since_hard_workout",
+    "nj_",  # Notion Journal: mood / confidence / word_count / topic_count
+    "sp_",  # Spotify daily signature (opt-in via ONYX_INCLUDE_SPOTIFY=1)
 )
 
 # Computed once per run from the post-prepare_ml_data (X, y) and stamped onto every
@@ -245,6 +248,8 @@ FEATURE_LABELS: dict[str, str] = {
     "sedentary_seconds": "Sedentary Time (s)",
     "active_seconds": "Active Time (s)",
     "training_readiness_score": "Training Readiness Score",
+    "garmin_training_readiness_level_ord": "Training Readiness Level (Garmin)",
+    "garmin_hrv_status_ord": "HRV Status Ordinal (Garmin)",
     "sleep_score_factor": "Sleep Score Factor",
     "recovery_time_factor": "Recovery Time Factor",
     "hrv_factor": "HRV Readiness Factor",
@@ -290,6 +295,11 @@ FEATURE_LABELS: dict[str, str] = {
     "days_since_last_rest_day": "Days Since Rest Day (Journal)",
     "days_since_sauna": "Days Since Sauna",
     "weight_kg": "Body Weight (kg)",
+    "nj_mood_ord": "Notion Journal Mood (ordinal)",
+    "nj_confidence_ord": "Notion Journal Confidence (ordinal)",
+    "nj_word_count": "Notion Journal Word Count",
+    "nj_topic_count": "Notion Journal Topic Count",
+    "nj_entry_count": "Notion Journal Entry Count",
 }
 
 # Journal boolean questions → clean labels
@@ -470,12 +480,16 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["garmin_stress"]["calendar_date"] = data["garmin_stress"]["calendar_date"].astype(str)
 
     log.info("  Loading garmin_training_status…")
+    # training_readiness_score / training_readiness_level were missing from this
+    # select even though `training_readiness_score` is referenced in
+    # HIGH_VALUE_SPARSE_FEATURES — added as part of the variable-coverage audit fix.
     data["garmin_ts"] = fetch_all(
         "garmin_training_status",
         select="calendar_date,sleep_score_factor,recovery_time_factor,hrv_factor,"
                "sleep_history_factor,stress_history_factor,training_load_factor,"
                "training_status,training_load_balance,acute_training_load,chronic_training_load,"
-               "vo2_max_running,vo2_max_cycling,fitness_age,recovery_time_hours,recovery_heart_rate",
+               "vo2_max_running,vo2_max_cycling,fitness_age,recovery_time_hours,recovery_heart_rate,"
+               "training_readiness_score,training_readiness_level",
     )
     if not data["garmin_ts"].empty:
         data["garmin_ts"]["calendar_date"] = data["garmin_ts"]["calendar_date"].astype(str)
@@ -573,6 +587,38 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["supplements"]["total_amount"] = pd.to_numeric(
             data["supplements"]["total_amount"], errors="coerce"
         )
+
+    # Notion personal Journal: structured metadata (mood, confidence, word_count,
+    # topic_count) joined into the matrix per the audit's Finding #8. The textual
+    # content + embedding stay out (handled by the chat tool, not HRV analysis).
+    log.info("  Loading journal_entries (Notion)…")
+    data["notion_journal"] = fetch_all(
+        "journal_entries",
+        select="entry_date,mood,confidence,word_count,topics,archived",
+    )
+    if not data["notion_journal"].empty:
+        nj = data["notion_journal"]
+        nj = nj[nj["archived"].isna() | (nj["archived"] == False)].copy()  # noqa: E712
+        nj["entry_date"] = nj["entry_date"].astype(str)
+        data["notion_journal"] = nj
+
+    # Spotify daily signature — opt-in via ONYX_INCLUDE_SPOTIFY=1.
+    # Documented coverage gap: Garmin offline playback isn't reported to Spotify
+    # so workout-heavy listening is under-counted. We require featurized_plays
+    # >= 5 per day to filter out days with too-thin signal to bias the audio-
+    # feature means.
+    if os.environ.get("ONYX_INCLUDE_SPOTIFY") == "1":
+        log.info("  Loading spotify_daily_signature (ONYX_INCLUDE_SPOTIFY=1)…")
+        data["spotify_daily"] = fetch_all(
+            "spotify_daily_signature",
+            select="calendar_date,play_count,unique_tracks,unique_artists,total_minutes,"
+                   "featurized_plays,avg_valence,avg_energy,avg_tempo,avg_danceability,"
+                   "avg_acousticness,avg_instrumentalness,avg_loudness",
+        )
+        if not data["spotify_daily"].empty:
+            data["spotify_daily"]["calendar_date"] = data["spotify_daily"]["calendar_date"].astype(str)
+    else:
+        data["spotify_daily"] = pd.DataFrame()
 
     log.info(f"  Data loaded. Tables: {list(data.keys())}")
     return data
@@ -812,6 +858,16 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
         values="total_amount", aggfunc="sum",
     ).reset_index()
     wide.columns = ["calendar_date"] + [clean_col(c) for c in wide.columns[1:]]
+    # Distinct ingredient_group values can collapse to the same cleaned column
+    # name (e.g. "Alpha Lipoic Acid" and "Alpha-Lipoic Acid" both -> alpha_lipoic_acid).
+    # Sum across the duplicates so downstream merges don't choke on non-unique columns.
+    if wide.columns.duplicated().any():
+        dups = wide.columns[wide.columns.duplicated()].unique().tolist()
+        log.warning(f"  pivot_supplements: merging duplicate cleaned-col names: {dups}")
+        wide = wide.T.groupby(level=0).sum(min_count=1).T
+        # groupby on transposed loses calendar_date column ordering; restore
+        cols = ["calendar_date"] + [c for c in wide.columns if c != "calendar_date"]
+        wide = wide[cols]
     return wide, tracking_start
 
 
@@ -869,6 +925,12 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
             if c not in ("calendar_date", "hrv_status"):
                 ghrv[c] = pd.to_numeric(ghrv[c], errors="coerce")
         ghrv["hrv_vs_baseline"] = ghrv["last_night_avg_ms"] - ghrv["baseline_balanced_low_ms"]
+        # Ordinal-encode Garmin's qualitative HRV status (BALANCED/LOW/UNBALANCED/NONE).
+        # The audit flagged that this column was being silently dropped — it carries
+        # information that the numeric `last_night_avg_ms` alone doesn't (e.g. UNBALANCED
+        # means "variable across the window", distinct from a pure value reading).
+        HRV_STATUS_ORDINAL = {"LOW": 0, "UNBALANCED": 1, "BALANCED": 2}
+        ghrv["garmin_hrv_status_ord"] = ghrv["hrv_status"].map(HRV_STATUS_ORDINAL)
         ghrv = ghrv.drop(columns=["hrv_status"], errors="ignore")
         df = df.merge(ghrv, on="calendar_date", how="left", suffixes=("", "_garminhrv"))
 
@@ -890,10 +952,21 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # --- Join garmin_training_status ---
     if not data["garmin_ts"].empty:
         gts = data["garmin_ts"].copy()
+        text_cols = ("calendar_date", "training_status", "training_load_balance",
+                     "training_readiness_level")
         for c in gts.columns:
-            if c not in ("calendar_date", "training_status", "training_load_balance"):
+            if c not in text_cols:
                 gts[c] = pd.to_numeric(gts[c], errors="coerce")
-        gts = gts.drop(columns=["training_status", "training_load_balance"], errors="ignore")
+        # Ordinal-encode training_readiness_level (POOR<LOW<MODERATE<HIGH; NONE -> NaN).
+        # Adds garmin_training_readiness_level_ord. The numeric *_score column is
+        # already in this frame and rides alongside.
+        READINESS_ORDINAL = {"POOR": 0, "LOW": 1, "MODERATE": 2, "HIGH": 3}
+        if "training_readiness_level" in gts.columns:
+            gts["garmin_training_readiness_level_ord"] = (
+                gts["training_readiness_level"].map(READINESS_ORDINAL)
+            )
+        gts = gts.drop(columns=["training_status", "training_load_balance",
+                                  "training_readiness_level"], errors="ignore")
         df = df.merge(gts, on="calendar_date", how="left", suffixes=("", "_gts"))
 
     # --- Join garmin activities (aggregated) ---
@@ -1032,6 +1105,64 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
                 df.loc[in_window, col] = df.loc[in_window, col].fillna(0)
             log.info(f"  Supplements pivoted: {len(supp_cols)} compound columns "
                      f"(tracking window from {supp_tracking_start})")
+
+    # --- Join Notion personal Journal (mood / confidence / word_count) ---
+    # Audit Finding #8: structured journal metadata was previously isolated from
+    # the matrix on a blanket "Spotify-style isolation" principle. That principle
+    # was for textual / embedding data — the ordinal mood and confidence ratings,
+    # plus word_count as a "how much did I write" proxy, are clear daily-grain
+    # signals worth letting the analysis see.
+    # NOTE on prefix: use `nj_*` (Notion Journal) NOT `journal_*`. The latter
+    # is reserved for boolean WHOOP journal questions and is scanned by Welch's
+    # t-tests / causal-layer binary enumeration that assume 0/1 values.
+    nj_data = data.get("notion_journal")
+    if nj_data is not None and not nj_data.empty:
+        MOOD_ORDINAL = {"low": 0, "neutral": 1, "good": 2, "great": 3}
+        CONFIDENCE_ORDINAL = {"low": 0, "medium": 1, "high": 2}
+        nj = nj_data.copy()
+        nj["nj_mood_ord"] = nj["mood"].map(MOOD_ORDINAL)
+        nj["nj_confidence_ord"] = nj["confidence"].map(CONFIDENCE_ORDINAL)
+        nj["nj_word_count"] = pd.to_numeric(nj.get("word_count"), errors="coerce")
+        nj["nj_topic_count"] = nj["topics"].apply(
+            lambda t: len(t) if isinstance(t, list) else 0
+        )
+        # Multiple entries per day: take MAX mood (best of the day), MAX confidence,
+        # SUM word_count (total writing volume), MAX topic_count.
+        nj_daily = nj.groupby("entry_date").agg(
+            nj_mood_ord=("nj_mood_ord", "max"),
+            nj_confidence_ord=("nj_confidence_ord", "max"),
+            nj_word_count=("nj_word_count", "sum"),
+            nj_topic_count=("nj_topic_count", "max"),
+            nj_entry_count=("entry_date", "count"),
+        ).reset_index().rename(columns={"entry_date": "calendar_date"})
+        df = df.merge(nj_daily, on="calendar_date", how="left")
+        log.info(f"  Notion journal: {len(nj_daily)} days with entries merged "
+                 f"({len(nj_daily['nj_mood_ord'].dropna())} with mood)")
+
+    # --- Join Spotify daily signature (opt-in) ---
+    # Documented coverage gap: Garmin offline playback is invisible, so
+    # workout-heavy listening days under-count. Days with featurized_plays<5
+    # have too-thin a sample to give reliable audio-feature means and are
+    # zero'd out (treated as "no listening signal today" rather than biasing
+    # the mean by 1-2 random tracks).
+    sp_data = data.get("spotify_daily")
+    if sp_data is not None and not sp_data.empty:
+        sp = sp_data.copy()
+        # Numeric coerce
+        for c in sp.columns:
+            if c != "calendar_date":
+                sp[c] = pd.to_numeric(sp[c], errors="coerce")
+        # Mask audio-feature means below the featurization threshold.
+        low_coverage = sp["featurized_plays"].fillna(0) < 5
+        for c in ("avg_valence", "avg_energy", "avg_tempo", "avg_danceability",
+                  "avg_acousticness", "avg_instrumentalness", "avg_loudness"):
+            if c in sp.columns:
+                sp.loc[low_coverage, c] = np.nan
+        # Prefix all spotify columns so they're distinguishable in SHAP / Spearman
+        sp = sp.rename(columns={c: f"sp_{c}" for c in sp.columns if c != "calendar_date"})
+        df = df.merge(sp, on="calendar_date", how="left")
+        log.info(f"  Spotify daily signature: {len(sp)} days merged "
+                 f"(audio features masked on {int(low_coverage.sum())} low-coverage days)")
 
     # --- Sort by date ---
     df = df.sort_values("calendar_date").reset_index(drop=True)
@@ -1425,8 +1556,24 @@ def run_statistical_analysis(
     STAT_TARGET = "hrv_next"
 
     hrv_valid = df.dropna(subset=[STAT_TARGET])
+    # Exclude target + same-target-shifted-back + pure-autocorrelation transforms of HRV.
+    # Including these in the descriptive driver chart crowds out behavioral signals with
+    # trivial "yesterday's HRV correlates with tomorrow's HRV" results.
+    # `whoop_hrv_rmssd` IS the target one row back. `whoop_recovery_score` is the WHOOP
+    # composite of that same prior-night HRV/RHR pair. `hrv_*` lags/rolling/z-scores are
+    # explicit HRV-history transforms and are already used as Stage-3 OLS controls.
+    PHASE2_AUTOCORR_EXCLUDE = {
+        TARGET,
+        "whoop_recovery_score",
+        "hrv_lag1", "hrv_lag2", "hrv_lag3",
+        "hrv_7d_mean", "hrv_7d_std",
+        "hrv_28d_mean", "hrv_28d_std", "hrv_z_28d",
+        "delta_hrv", "hrv_vs_baseline",
+    }
     numeric_cols = [c for c in hrv_valid.columns
-                    if c not in ("calendar_date", STAT_TARGET) and hrv_valid[c].nunique() >= 2
+                    if c not in ("calendar_date", STAT_TARGET)
+                    and c not in PHASE2_AUTOCORR_EXCLUDE
+                    and hrv_valid[c].nunique() >= 2
                     and hrv_valid[c].notna().sum() >= 30]
 
     log.info(f"Statistical analysis: {len(numeric_cols)} numeric features, {len(hrv_valid)} rows")
@@ -1639,6 +1786,19 @@ def run_statistical_analysis(
                     "p_value": float(p_val), "cohen_d": float(cohen_d),
                     "n_yes": int(len(yes)), "n_no": int(len(no)),
                 })
+
+            # BH-FDR across the ~57 journal questions. Without correction we'd
+            # expect ~3 false positives at alpha=0.05, which the UI would surface
+            # as "real" drivers. Mirrors the supplement/nutrition correction.
+            if journal_impact and HAS_FDR and len(journal_impact) > 1:
+                p_values = np.array([r["p_value"] for r in journal_impact])
+                passes, q_values = fdrcorrection(p_values, alpha=FDR_Q_THRESHOLD)
+                for row, q, p_pass in zip(journal_impact, q_values, passes):
+                    row["q_value"] = float(q)
+                    row["passes_fdr"] = bool(p_pass)
+                n_surv = int(passes.sum())
+                log.info(f"  Journal impact BH-FDR (q<={FDR_Q_THRESHOLD}): "
+                         f"{n_surv}/{len(journal_impact)} survive")
             if journal_impact:
                 ji_df = pd.DataFrame(journal_impact)
                 ji_order = np.argsort(np.abs(ji_df["diff_ms"].values))[::-1]
@@ -1699,6 +1859,17 @@ def run_statistical_analysis(
                     "p_value": float(p_val), "cohen_d": float(cohen_d),
                     "n_yes": int(len(yes)), "n_no": int(len(no)),
                 })
+
+            # BH-FDR across habit columns. Same rationale as journal_impact.
+            if habit_impact and HAS_FDR and len(habit_impact) > 1:
+                p_values = np.array([r["p_value"] for r in habit_impact])
+                passes, q_values = fdrcorrection(p_values, alpha=FDR_Q_THRESHOLD)
+                for row, q, p_pass in zip(habit_impact, q_values, passes):
+                    row["q_value"] = float(q)
+                    row["passes_fdr"] = bool(p_pass)
+                n_surv = int(passes.sum())
+                log.info(f"  Habit impact BH-FDR (q<={FDR_Q_THRESHOLD}): "
+                         f"{n_surv}/{len(habit_impact)} survive")
             if habit_impact:
                 hi_df = pd.DataFrame(habit_impact)
                 hi_order = np.argsort(np.abs(hi_df["diff_ms"].values))[::-1]
@@ -1870,6 +2041,10 @@ def run_statistical_analysis(
     # non-normal, and relationships are likely monotonic but not necessarily
     # linear across the full range (e.g. HRV vs sodium 1g→8g).
     # BH-FDR corrected across the nutrient set.
+    # Aligned with the `nutrition` family in causal_inference.CONTINUOUS_TREATMENTS.
+    # The audit flagged that the descriptive Spearman chart was a 7-column subset
+    # of what the causal layer treats as nutrition treatments, so the dashboard
+    # silently understated coverage.
     NUTRITION_COLS = {
         "mfp_calories": ("Calories", "kcal"),
         "mfp_protein_g": ("Protein", "g"),
@@ -1878,6 +2053,12 @@ def run_statistical_analysis(
         "mfp_fiber_g": ("Fiber", "g"),
         "mfp_sugar_g": ("Sugar", "g"),
         "mfp_sodium_mg": ("Sodium", "mg"),
+        "mfp_water_ml": ("Water", "ml"),
+        "mfp_exercise_kcal": ("Exercise kcal (MFP)", "kcal"),
+        "net_calories": ("Net Calories", "kcal"),
+        "protein_pct": ("Protein % of Calories", "%"),
+        "carb_pct": ("Carb % of Calories", "%"),
+        "fat_pct": ("Fat % of Calories", "%"),
     }
     nutrition_impact: list[dict] = []
     try:
@@ -1934,9 +2115,13 @@ def run_statistical_analysis(
             log.warning(f"  ACF/PACF failed: {e}")
 
     # --- Granger causality for top 10 features ---
+    # Restricted to BH-FDR survivors so Granger isn't inheriting the multiple-
+    # comparison bias of the raw top-10 by |r|.
     if HAS_STATSMODELS and corr_rows:
         try:
-            top10 = corr_df.head(10)["feature"].tolist()
+            granger_pool = (corr_df[corr_df["passes_fdr"]]
+                            if "passes_fdr" in corr_df.columns else corr_df)
+            top10 = granger_pool.head(10)["feature"].tolist()
             granger_results = []
             for feat in top10:
                 sub = hrv_valid[[STAT_TARGET, feat]].dropna()

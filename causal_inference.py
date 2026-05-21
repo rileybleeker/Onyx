@@ -116,8 +116,12 @@ SUPPLEMENT_EXTRA_CONFOUNDERS = (
 # Minimum cell sizes
 MIN_BINARY_PER_ARM_FULL = 20      # full causal estimates require this many in each arm
 MIN_BINARY_PER_ARM_REPORT = 10    # below this we don't run estimators at all
-MIN_CONTINUOUS_N = 50             # binarized-at-median continuous treatments
-MIN_DISTINCT_DOSES = 3            # for dose-response
+# Continuous treatments are median-split, so the per-arm gate already implies
+# n_total >= 2*MIN_BINARY_PER_ARM_REPORT = 20. This adds a separate floor on
+# the total non-null sample (audit Finding #10 — previously declared but unused).
+MIN_CONTINUOUS_N = 50
+# (Dose-response causal estimation is not implemented; the descriptive
+# dose-response Spearman lives in hrv_analysis.run_statistical_analysis.)
 
 # Propensity trimming (common support)
 PROPENSITY_TRIM_LOW = 0.05
@@ -262,6 +266,30 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     ("days_since_hard_workout",     "behavior", "Days since hard workout above median", "days"),
     ("days_since_rest_day",         "behavior", "Days since rest day above median",     "days"),
     ("consecutive_run_days",        "behavior", "Consecutive run days above median",    "days"),
+
+    # ── Additions from variable-coverage audit ───────────────────────────────
+    # Stress buckets that were missing from CIc (only high_stress_duration was covered).
+    ("rest_stress_duration_min",    "behavior", "Rest-stress minutes above median",    "min"),
+    ("low_stress_duration_min",     "behavior", "Low-stress minutes above median",     "min"),
+    ("medium_stress_duration_min",  "behavior", "Medium-stress minutes above median",  "min"),
+    # Stair climbing — distinct activity dimension from steps.
+    ("floors_ascended",             "behavior", "Floors ascended above median",        "floors"),
+    # WHOOP daytime HR (cycle-wide), not just workout HR.
+    ("whoop_cycle_avg_hr",          "behavior", "WHOOP cycle avg HR above median",     "bpm"),
+    ("whoop_cycle_max_hr",          "behavior", "WHOOP cycle peak HR above median",    "bpm"),
+    # Pacing consistency from lap-level data (the laps merge is already in build_feature_matrix).
+    ("lap_pace_cv",                 "behavior", "Lap-pace CV above median",            None),
+    ("lap_hr_range",                "behavior", "Lap HR range above median",           "bpm"),
+    # Stack volume — independent of per-compound effects.
+    ("supplement_distinct_compounds", "behavior", "Distinct supplements taken above median", None),
+    ("supplement_total_doses",      "behavior", "Total supplement doses above median", None),
+    # Eight Sleep ambient bedroom temp — genuinely upstream (a control input), not a mediator.
+    ("eight_sleep_room_temp",       "behavior", "Bedroom temperature above median",    "C"),
+    # Notion Journal structured metadata (audit Finding #8). Family='behavior'
+    # because the journal entry is a daily self-report behavior, not nutrition.
+    ("nj_mood_ord",                 "behavior", "Journaled mood (ordinal) above median", None),
+    ("nj_confidence_ord",           "behavior", "Journaled confidence above median",     None),
+    ("nj_word_count",               "behavior", "Notion journal words above median",     "words"),
 )
 
 # Explicit binary treatments — derived 0/1 flags that don't match the
@@ -482,13 +510,29 @@ def _build_outcome_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+_CONFOUNDER_MISSING_WARNED: set[str] = set()
+
+
 def _confounders_for(family: str, available_cols: set[str]) -> list[str]:
     """Pick the confounder set for a treatment family, dropping any that
-    aren't in the matrix."""
+    aren't in the matrix.
+
+    Logs a one-shot warning per family if any declared confounder is missing
+    (audit Finding #11 — previously they were silently dropped, so a schema
+    rename of e.g. sleep_debt_7d would degrade adjustment quality without notice).
+    """
     base = list(COMMON_CONFOUNDERS)
     if family == "supplement":
         base += list(SUPPLEMENT_EXTRA_CONFOUNDERS)
-    return [c for c in base if c in available_cols]
+    kept = [c for c in base if c in available_cols]
+    missing = [c for c in base if c not in available_cols]
+    if missing and family not in _CONFOUNDER_MISSING_WARNED:
+        log.warning(
+            f"Causal: family={family!r} is missing declared confounders {missing} "
+            f"from the matrix; adjustment quality degraded. Used: {kept}"
+        )
+        _CONFOUNDER_MISSING_WARNED.add(family)
+    return kept
 
 
 def _enumerate_binary_treatments(df: pd.DataFrame) -> list[TreatmentSpec]:
@@ -614,6 +658,15 @@ def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarra
     if n_treated < MIN_BINARY_PER_ARM_REPORT or n_control < MIN_BINARY_PER_ARM_REPORT:
         return X_df.values, T, Y, {**meta, "too_few_obs": True}
 
+    # Continuous treatments get an additional floor on total non-null observations
+    # (post median-split). Audit Finding #10 — gate was declared but unused.
+    if spec.kind == "continuous_median_split" and len(T) < MIN_CONTINUOUS_N:
+        return X_df.values, T, Y, {
+            **meta,
+            "too_few_obs": True,
+            "reason_detail": f"continuous n={len(T)} < MIN_CONTINUOUS_N={MIN_CONTINUOUS_N}",
+        }
+
     return X_df.values, T, Y, meta
 
 
@@ -675,10 +728,15 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             continue
         X, T, Y, meta = prep
         if meta.get("too_few_obs"):
+            # Prefer the specific reason (e.g. continuous-n gate) when set,
+            # otherwise fall back to the binary per-arm gate text.
+            reason = meta.get("reason_detail") or (
+                f"n_treated<{MIN_BINARY_PER_ARM_REPORT} or n_control<{MIN_BINARY_PER_ARM_REPORT}"
+            )
             dropped_low_n.append({
                 "treatment": spec.name, "family": spec.family, "label": spec.label,
                 "n_treated": meta["n_treated"], "n_control": meta["n_control"],
-                "reason": f"n_treated<{MIN_BINARY_PER_ARM_REPORT} or n_control<{MIN_BINARY_PER_ARM_REPORT}",
+                "reason": reason,
             })
             continue
 
