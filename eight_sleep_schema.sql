@@ -27,9 +27,9 @@ CREATE TABLE IF NOT EXISTS pds.eight_sleep_trends (
     avg_hrv                 NUMERIC(8,4),       -- ms
     avg_breath_rate         NUMERIC(5,2),       -- breaths/min (per-night)
 
-    -- Environment
-    avg_bed_temp            NUMERIC(5,2),       -- °C or °F (as returned by API)
-    avg_room_temp           NUMERIC(5,2),
+    -- Environment (per-night median of per-minute readings during sleep)
+    median_bed_temp         NUMERIC(5,2),       -- °C or °F (as returned by API)
+    median_room_temp        NUMERIC(5,2),
 
     -- Sleep stages (seconds) — TOTAL across all sessions (main + naps).
     -- These match what the Eight Sleep app shows as the day's total sleep.
@@ -125,8 +125,8 @@ SELECT
     es.avg_hrv              AS eight_sleep_hrv,
     es.avg_heart_rate       AS eight_sleep_hr,
     es.avg_breath_rate      AS eight_sleep_breath_rate,
-    es.avg_bed_temp         AS eight_sleep_bed_temp,
-    es.avg_room_temp        AS eight_sleep_room_temp,
+    es.median_bed_temp      AS eight_sleep_bed_temp,
+    es.median_room_temp     AS eight_sleep_room_temp,
     es.time_slept_seconds   AS eight_sleep_duration_sec,
     es.deep_sleep_seconds   AS eight_sleep_deep_sec,
     es.rem_sleep_seconds    AS eight_sleep_rem_sec,

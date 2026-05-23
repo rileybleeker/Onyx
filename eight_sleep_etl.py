@@ -319,8 +319,8 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
         # payload's sleepQualityScore block doesn't expose tempBedC/tempRoomC
         # (only HR/HRV/respiratoryRate get the .current/.average treatment),
         # so we always compute the per-night value from the interval timeseries.
-        "avg_bed_temp": None,
-        "avg_room_temp": None,
+        "median_bed_temp": None,
+        "median_room_temp": None,
         # Sleep stages (seconds) — summed across all sessions per stageSummary
         # so multi-session days (main + nap) are internally consistent.
         "time_slept_seconds": sleep_duration,
@@ -380,10 +380,8 @@ def parse_interval(interval: dict, bed_side: str) -> dict | None:
         "avg_breath_rate": avg_timeseries(ts.get("respiratoryRate")),
         # Temps stored as MEDIAN of per-minute readings, not mean — robust to
         # the warm-up transient (bed cold when first in) and cool-off at wake.
-        # The column names retain the `avg_` prefix for backwards compatibility
-        # pending a deliberate rename pass.
-        "avg_bed_temp": median_timeseries(ts.get("tempBedC")),
-        "avg_room_temp": median_timeseries(ts.get("tempRoomC")),
+        "median_bed_temp": median_timeseries(ts.get("tempBedC")),
+        "median_room_temp": median_timeseries(ts.get("tempRoomC")),
         "toss_and_turns": sum_timeseries(ts.get("tnt")),
         "light_sleep_seconds": stage_totals.get("light"),
         "deep_sleep_seconds": stage_totals.get("deep"),
@@ -487,8 +485,8 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
             "avg_hrv": trend.get("avg_hrv"),
             "avg_breath_rate": trend.get("avg_breath_rate") or interval.get("avg_breath_rate"),
             # Environment
-            "avg_bed_temp": trend.get("avg_bed_temp") or interval.get("avg_bed_temp"),
-            "avg_room_temp": trend.get("avg_room_temp") or interval.get("avg_room_temp"),
+            "median_bed_temp": trend.get("median_bed_temp") or interval.get("median_bed_temp"),
+            "median_room_temp": trend.get("median_room_temp") or interval.get("median_room_temp"),
             # Sleep stages — prefer trend, fall back to interval
             "time_slept_seconds": trend.get("time_slept_seconds"),
             "awake_seconds": trend.get("awake_seconds") or interval.get("awake_seconds"),

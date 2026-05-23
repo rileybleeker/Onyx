@@ -279,8 +279,8 @@ export default function SleepPage() {
 
   const eightEnvData = eightSleep.map((d) => ({
     date:      formatDate(d.calendar_date),
-    bedTemp:   d.avg_bed_temp  ? +Number(d.avg_bed_temp).toFixed(1)  : null,
-    roomTemp:  d.avg_room_temp ? +Number(d.avg_room_temp).toFixed(1) : null,
+    bedTemp:   d.median_bed_temp  ? +Number(d.median_bed_temp).toFixed(1)  : null,
+    roomTemp:  d.median_room_temp ? +Number(d.median_room_temp).toFixed(1) : null,
     tossTurns: d.toss_and_turns,
   }));
 
