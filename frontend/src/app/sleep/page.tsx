@@ -79,10 +79,21 @@ export default function SleepPage() {
     );
   }
 
+  // Aggregate helper: mean over the selected range, ignoring null/NaN.
+  const avg = (arr: any[], key: string): number | null => {
+    const vals = arr
+      .map((d) => d?.[key])
+      .filter((v) => v != null && !isNaN(Number(v)))
+      .map(Number);
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  };
+  const rangeNote = range === "1d" ? "today" : `${rangeLabel(range)} avg`;
+
   // ── WHOOP ────────────────────────────────────────────────────────────────────
-  const latestRecovery = whoopRecovery[whoopRecovery.length - 1];
-  const latestCycle    = whoopCycles[whoopCycles.length - 1];
-  const latestSleep    = whoopSleep[whoopSleep.length - 1];
+  const avgRecoveryScore = avg(whoopRecovery, "recovery_score");
+  const avgWhoopHrv      = avg(whoopRecovery, "hrv_rmssd_milli");
+  const avgWhoopRhr      = avg(whoopRecovery, "resting_heart_rate");
+  const avgStrain        = avg(whoopCycles, "strain");
   const recoveryByCycle = new Map(whoopRecovery.map((r) => [r.cycle_id, r]));
 
   const recoveryData = whoopRecovery.map((d) => ({
@@ -125,8 +136,11 @@ export default function SleepPage() {
   });
 
   // ── Garmin ───────────────────────────────────────────────────────────────────
-  const latestSummary = summaries[summaries.length - 1];
-  const latestHr      = hr[hr.length - 1];
+  const avgMaxHr     = avg(hr, "max_heart_rate");
+  const avgMinHr     = avg(hr, "min_heart_rate");
+  const avgStress    = avg(summaries, "avg_stress_level");
+  const avgGarminRhr = avg(summaries, "resting_heart_rate")
+    ?? avg(summaries, "last_seven_days_avg_rhr");
 
   const hrData = hr.map((d) => ({
     date: formatDate(d.calendar_date),
@@ -140,7 +154,17 @@ export default function SleepPage() {
   }));
 
   // ── Eight Sleep ───────────────────────────────────────────────────────────────
-  const latestEight = eightSleep[eightSleep.length - 1];
+  const avgEightSleep    = avg(eightSleep, "sleep_score");
+  const avgEightFitness  = avg(eightSleep, "sleep_fitness_score");
+  const avgEightDuration = avg(eightSleep, "time_slept_seconds");
+  const avgEightHrv      = avg(eightSleep, "avg_hrv");
+
+  // ── WHOOP Sleep aggregates ───────────────────────────────────────────────────
+  const avgInBedMs       = avg(whoopSleep, "total_in_bed_time_milli");
+  const avgSleepPerf     = avg(whoopSleep, "sleep_performance_percentage");
+  const avgSleepEff      = avg(whoopSleep, "sleep_efficiency_percentage");
+  const avgDeepMs        = avg(whoopSleep, "total_slow_wave_sleep_time_milli");
+  const avgRemMs         = avg(whoopSleep, "total_rem_sleep_time_milli");
 
   const eightScoreData = eightSleep.map((d) => ({
     date:    formatDate(d.calendar_date),
@@ -186,13 +210,13 @@ export default function SleepPage() {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <StatCard
           label="Recovery"
-          value={latestRecovery?.recovery_score != null ? `${latestRecovery.recovery_score}%` : null}
-          sublabel={latestRecovery?.recovery_score != null ? (latestRecovery.recovery_score >= 67 ? "Green" : latestRecovery.recovery_score >= 34 ? "Yellow" : "Red") : undefined}
+          value={avgRecoveryScore != null ? `${avgRecoveryScore.toFixed(0)}%` : null}
+          sublabel={avgRecoveryScore != null ? `${avgRecoveryScore >= 67 ? "Green" : avgRecoveryScore >= 34 ? "Yellow" : "Red"} · ${rangeNote}` : rangeNote}
           source="WHOOP"
         />
-        <StatCard label="HRV" value={latestRecovery?.hrv_rmssd_milli ? Number(latestRecovery.hrv_rmssd_milli).toFixed(0) : null} unit="ms" source="WHOOP" />
-        <StatCard label="Day Strain" value={latestCycle?.strain ? Number(latestCycle.strain).toFixed(1) : null} source="WHOOP" />
-        <StatCard label="Resting HR" value={latestRecovery?.resting_heart_rate} unit="bpm" source="WHOOP" />
+        <StatCard label="HRV" value={avgWhoopHrv != null ? avgWhoopHrv.toFixed(0) : null} unit="ms" sublabel={rangeNote} source="WHOOP" />
+        <StatCard label="Day Strain" value={avgStrain != null ? avgStrain.toFixed(1) : null} sublabel={rangeNote} source="WHOOP" />
+        <StatCard label="Resting HR" value={avgWhoopRhr != null ? avgWhoopRhr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="WHOOP" />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
@@ -268,10 +292,10 @@ export default function SleepPage() {
       {/* ── Garmin Cardiac ──────────────────────────────────────────────────── */}
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">GARMIN · Cardiac</p>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <StatCard label="Max HR" value={latestHr?.max_heart_rate} unit="bpm" source="GARMIN" />
-        <StatCard label="Min HR" value={latestHr?.min_heart_rate} unit="bpm" source="GARMIN" />
-        <StatCard label="Stress Level" value={latestSummary?.avg_stress_level} sublabel={latestSummary?.stress_qualifier} source="GARMIN" />
-        <StatCard label="Avg RHR (7d)" value={latestSummary?.last_seven_days_avg_rhr} unit="bpm" source="GARMIN" />
+        <StatCard label="Max HR" value={avgMaxHr != null ? avgMaxHr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
+        <StatCard label="Min HR" value={avgMinHr != null ? avgMinHr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
+        <StatCard label="Stress Level" value={avgStress != null ? avgStress.toFixed(0) : null} sublabel={rangeNote} source="GARMIN" />
+        <StatCard label="Avg RHR" value={avgGarminRhr != null ? avgGarminRhr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-10">
@@ -323,10 +347,10 @@ export default function SleepPage() {
       {/* ── WHOOP Sleep ─────────────────────────────────────────────────────── */}
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Sleep</p>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <StatCard label="Duration" value={latestSleep?.total_in_bed_time_milli ? formatDuration(Math.round(latestSleep.total_in_bed_time_milli / 1000)) : null} source="WHOOP" />
-        <StatCard label="Sleep Performance" value={latestSleep?.sleep_performance_percentage != null ? `${latestSleep.sleep_performance_percentage}%` : null} sublabel={`Efficiency: ${latestSleep?.sleep_efficiency_percentage ?? "—"}%`} source="WHOOP" />
-        <StatCard label="Deep Sleep" value={latestSleep?.total_slow_wave_sleep_time_milli ? formatDuration(Math.round(latestSleep.total_slow_wave_sleep_time_milli / 1000)) : null} source="WHOOP" />
-        <StatCard label="REM Sleep" value={latestSleep?.total_rem_sleep_time_milli ? formatDuration(Math.round(latestSleep.total_rem_sleep_time_milli / 1000)) : null} source="WHOOP" />
+        <StatCard label="Duration" value={avgInBedMs != null ? formatDuration(Math.round(avgInBedMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
+        <StatCard label="Sleep Performance" value={avgSleepPerf != null ? `${avgSleepPerf.toFixed(0)}%` : null} sublabel={`Efficiency: ${avgSleepEff != null ? avgSleepEff.toFixed(0) : "—"}% · ${rangeNote}`} source="WHOOP" />
+        <StatCard label="Deep Sleep" value={avgDeepMs != null ? formatDuration(Math.round(avgDeepMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
+        <StatCard label="REM Sleep" value={avgRemMs != null ? formatDuration(Math.round(avgRemMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-10">
@@ -407,10 +431,10 @@ export default function SleepPage() {
       {/* ── Eight Sleep ─────────────────────────────────────────────────────── */}
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Eight Sleep</p>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <StatCard label="Sleep Score" value={latestEight?.sleep_score} source="8SLP" />
-        <StatCard label="Fitness Score" value={latestEight?.sleep_fitness_score} source="8SLP" />
-        <StatCard label="Duration" value={formatDuration(latestEight?.time_slept_seconds)} source="8SLP" />
-        <StatCard label="HRV" value={latestEight?.avg_hrv ? Number(latestEight.avg_hrv).toFixed(0) : null} unit="ms" source="8SLP" />
+        <StatCard label="Sleep Score" value={avgEightSleep != null ? avgEightSleep.toFixed(0) : null} sublabel={rangeNote} source="8SLP" />
+        <StatCard label="Fitness Score" value={avgEightFitness != null ? avgEightFitness.toFixed(0) : null} sublabel={rangeNote} source="8SLP" />
+        <StatCard label="Duration" value={avgEightDuration != null ? formatDuration(Math.round(avgEightDuration)) : null} sublabel={rangeNote} source="8SLP" />
+        <StatCard label="HRV" value={avgEightHrv != null ? avgEightHrv.toFixed(0) : null} unit="ms" sublabel={rangeNote} source="8SLP" />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
