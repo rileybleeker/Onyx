@@ -123,11 +123,24 @@ export default function SleepPage() {
     awake: d.total_awake_time_milli           ? +(d.total_awake_time_milli / 3600000).toFixed(2)           : 0,
   }));
 
+  // Hours vs Needed (WHOOP "Sleep Sufficiency"): asleep / sleep_need.
+  // asleep = in_bed − awake − no_data; need = baseline + debt + strain − nap.
+  const hoursVsNeeded = (d: any): number | null => {
+    const inBed = d.total_in_bed_time_milli;
+    const baseline = d.baseline_milli;
+    if (inBed == null || baseline == null) return null;
+    const asleep = inBed - (d.total_awake_time_milli ?? 0) - (d.total_no_data_time_milli ?? 0);
+    const need   = baseline + (d.need_from_sleep_debt_milli ?? 0) + (d.need_from_recent_strain_milli ?? 0) - (d.need_from_recent_nap_milli ?? 0);
+    if (!need) return null;
+    return (100 * asleep) / need;
+  };
+
   const whoopScoreData = whoopSleep.map((d) => ({
-    date:        formatDate(d.start_time?.split("T")[0]),
-    performance: d.sleep_performance_percentage,
-    efficiency:  d.sleep_efficiency_percentage,
-    consistency: d.sleep_consistency_percentage,
+    date:         formatDate(d.start_time?.split("T")[0]),
+    performance:  d.sleep_performance_percentage,
+    hoursNeeded:  hoursVsNeeded(d) != null ? +hoursVsNeeded(d)!.toFixed(1) : null,
+    efficiency:   d.sleep_efficiency_percentage,
+    consistency:  d.sleep_consistency_percentage,
   }));
 
   const whoopHrData = whoopSleep.map((d) => {
@@ -170,6 +183,10 @@ export default function SleepPage() {
   const avgSleepEff      = avg(whoopSleep, "sleep_efficiency_percentage");
   const avgDeepMs        = avg(whoopSleep, "total_slow_wave_sleep_time_milli");
   const avgRemMs         = avg(whoopSleep, "total_rem_sleep_time_milli");
+  const hoursVsNeededVals = whoopSleep.map(hoursVsNeeded).filter((v): v is number => v != null);
+  const avgHoursVsNeeded = hoursVsNeededVals.length
+    ? hoursVsNeededVals.reduce((a, b) => a + b, 0) / hoursVsNeededVals.length
+    : null;
 
   const eightScoreData = eightSleep.map((d) => ({
     date:    formatDate(d.calendar_date),
@@ -355,7 +372,9 @@ export default function SleepPage() {
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Sleep</p>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <StatCard label="Duration" value={avgInBedMs != null ? formatDuration(Math.round(avgInBedMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
-        <StatCard label="Sleep Performance" value={avgSleepPerf != null ? `${avgSleepPerf.toFixed(0)}%` : null} sublabel={`Efficiency: ${avgSleepEff != null ? avgSleepEff.toFixed(0) : "—"}% · ${rangeNote}`} source="WHOOP" />
+        <StatCard label="Hours vs Needed" value={avgHoursVsNeeded != null ? `${avgHoursVsNeeded.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
+        <StatCard label="Sleep Performance" value={avgSleepPerf != null ? `${avgSleepPerf.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
+        <StatCard label="Sleep Efficiency" value={avgSleepEff != null ? `${avgSleepEff.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="Deep Sleep" value={avgDeepMs != null ? formatDuration(Math.round(avgDeepMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="REM Sleep" value={avgRemMs != null ? formatDuration(Math.round(avgRemMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
       </div>
@@ -385,6 +404,10 @@ export default function SleepPage() {
                   <stop offset="0%" stopColor="#f59e0b" stopOpacity={0.15} />
                   <stop offset="100%" stopColor="#f59e0b" stopOpacity={0} />
                 </linearGradient>
+                <linearGradient id="sleepNeededGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#ec4899" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#ec4899" stopOpacity={0} />
+                </linearGradient>
                 <linearGradient id="sleepEffGrad" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor="#22c55e" stopOpacity={0.15} />
                   <stop offset="100%" stopColor="#22c55e" stopOpacity={0} />
@@ -400,6 +423,7 @@ export default function SleepPage() {
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Area type="monotone" dataKey="performance" stroke="#f59e0b" fill="url(#sleepPerfGrad)" strokeWidth={2} name="Performance" />
+              <Area type="monotone" dataKey="hoursNeeded" stroke="#ec4899" fill="url(#sleepNeededGrad)" strokeWidth={2} name="Hours vs Needed" />
               <Area type="monotone" dataKey="efficiency" stroke="#22c55e" fill="url(#sleepEffGrad)" strokeWidth={1.5} name="Efficiency" />
               <Area type="monotone" dataKey="consistency" stroke="#3b82f6" fill="url(#sleepConsGrad)" strokeWidth={1.5} name="Consistency" />
             </AreaChart>

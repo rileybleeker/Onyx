@@ -226,6 +226,39 @@ SELECT
     ws.total_rem_sleep_time_milli   AS whoop_rem_sleep_milli,
     ws.total_light_sleep_time_milli AS whoop_light_sleep_milli,
     ws.total_awake_time_milli       AS whoop_awake_milli,
+    -- Hours vs Needed (WHOOP "Sleep Sufficiency"): asleep_time / sleep_needed
+    -- asleep = in_bed − awake − no_data; need = baseline + debt + strain − nap
+    CASE
+        WHEN ws.total_in_bed_time_milli IS NULL THEN NULL
+        ELSE ws.total_in_bed_time_milli
+             - COALESCE(ws.total_awake_time_milli, 0)
+             - COALESCE(ws.total_no_data_time_milli, 0)
+    END AS whoop_asleep_milli,
+    CASE
+        WHEN ws.baseline_milli IS NULL THEN NULL
+        ELSE ws.baseline_milli
+             + COALESCE(ws.need_from_sleep_debt_milli, 0)
+             + COALESCE(ws.need_from_recent_strain_milli, 0)
+             - COALESCE(ws.need_from_recent_nap_milli, 0)
+    END AS whoop_sleep_need_milli,
+    CASE
+        WHEN ws.total_in_bed_time_milli IS NULL OR ws.baseline_milli IS NULL THEN NULL
+        ELSE ROUND(
+            100.0 * (
+                ws.total_in_bed_time_milli
+                - COALESCE(ws.total_awake_time_milli, 0)
+                - COALESCE(ws.total_no_data_time_milli, 0)
+            )::numeric
+            / NULLIF(
+                ws.baseline_milli
+                + COALESCE(ws.need_from_sleep_debt_milli, 0)
+                + COALESCE(ws.need_from_recent_strain_milli, 0)
+                - COALESCE(ws.need_from_recent_nap_milli, 0),
+                0
+            ),
+            1
+        )
+    END AS whoop_hours_vs_needed_pct,
     ws.disturbance_count    AS whoop_disturbances,
     ws.respiratory_rate     AS whoop_respiratory_rate,
     -- WHOOP strain
