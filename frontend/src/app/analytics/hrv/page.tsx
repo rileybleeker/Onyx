@@ -1012,34 +1012,47 @@ export default function HrvAnalysisPage() {
 
         <ChartCard collapsible title="Habit Impact" subtitle="Mean HRV difference: nights you completed the habit vs nights you didn't"
           source="WELCH'S T-TEST"
-          info="Same statistical treatment as Journal Behavior Impact, applied to Notion-managed habits (from /habits). A +Xms bar means HRV averaged X ms higher on the night following days you completed that habit. Method: Welch's two-sample t-test on next-night HRV for Yes vs No nights. Tooltip shorthand: 'd' is Cohen's d — the standardized effect size, i.e. the HRV gap divided by typical night-to-night HRV variability (|d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large). 'n=Y/N' is the sample sizes that fed the comparison (Y completed-nights, N skipped-nights). The 95% CI (also produced per habit but not visualized here) is the range the true HRV difference is likely to land in; if it crossed 0, the effect would be statistically indistinguishable from noise. Habits need at least 5 Yes-nights and 5 No-nights before they appear (the t-test isn't meaningful with smaller groups). Add more habits or toggle them more consistently at /habits to populate this view.">
-          {habitImpact.length > 0 ? (
-            <ResponsiveContainer width="100%" height={Math.max(260, habitImpact.slice(0, 12).length * 36)}>
-              <BarChart data={habitImpact.slice(0, 12)} layout="vertical"
+          info="Same statistical treatment as Journal Behavior Impact, applied to Notion-managed habits (from /habits). A +Xms bar means HRV averaged X ms higher on the night following days you completed that habit. Method: Welch's two-sample t-test on next-night HRV for Yes vs No nights. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise (and for habits with few completed-nights the whiskers will be wide — that's the chart honestly signaling 'trust this less'). Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Y completed-nights, N skipped-nights). Habits need at least 5 Yes-nights and 5 No-nights before they appear (the t-test isn't meaningful with smaller groups). Add more habits or toggle them more consistently at /habits to populate this view.">
+          {habitImpact.length > 0 ? (() => {
+            const hi = habitImpact.slice(0, 12).map((d: any) => ({
+              ...d,
+              errorRange: [
+                Math.max(0, (d.diff_ms ?? 0) - (d.ci_low ?? 0)),
+                Math.max(0, (d.ci_high ?? 0) - (d.diff_ms ?? 0)),
+              ],
+            }));
+            return (
+            <ResponsiveContainer width="100%" height={Math.max(260, hi.length * 36)}>
+              <BarChart data={hi} layout="vertical"
                         margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                 <CartesianGrid {...gridStyle} horizontal={false} />
                 <XAxis type="number" tick={axisTick}
                        tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
-                       label={axisLabel("HRV Δ (ms)", "x")} />
+                       label={axisLabel("HRV Δ (ms) · whiskers = 95% CI", "x")} />
                 <YAxis type="category" dataKey="label" width={axisW.long}
                        tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, _n: any, p: any) => {
                            const d = p?.payload ?? {};
+                           const lo = Number(d.ci_low ?? 0).toFixed(1);
+                           const hi = Number(d.ci_high ?? 0).toFixed(1);
                            return [
-                             `${Number(v).toFixed(1)} ms (d=${(d.cohen_d ?? 0).toFixed(2)}, n=${d.n_yes}/${d.n_no})`,
+                             `${Number(v).toFixed(1)} ms · 95% CI [${lo}, ${hi}] · d=${(d.cohen_d ?? 0).toFixed(2)} · n=${d.n_yes}/${d.n_no}`,
                              "HRV Δ",
                            ];
                          }} />
                 <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
                 <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
-                  {habitImpact.slice(0, 12).map((d, i) => (
+                  {hi.map((d: any, i: number) => (
                     <Cell key={i} fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.8} />
                   ))}
+                  <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
+                            stroke="#f4f4f5" direction="x" />
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
-          ) : (
+            );
+          })() : (
             <div className="h-[260px] flex items-center justify-center px-6">
               <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
                 Not enough habit history yet — each habit needs ≥5 Yes-nights and ≥5 No-nights before the t-test is meaningful. Keep tracking at <a href="/habits" className="text-accent hover:underline">/habits</a>; this chart populates on the next pipeline run.
@@ -1056,37 +1069,50 @@ export default function HrvAnalysisPage() {
           title="Supplement Impact (Yes vs No)"
           subtitle="Mean HRV difference: nights compound taken vs not"
           source="WELCH'S T-TEST"
-          info="How each supplement compound (rolled up across products via FDA UNII code, e.g. Vitamin C from a multi + standalone tablet sum into one row) affects HRV the following night. Method: Welch's two-sample t-test (unequal variance) on next-night HRV for Yes vs No nights. Tooltip shorthand: 'd' is Cohen's d — the standardized effect size, i.e. the HRV gap divided by typical night-to-night HRV variability (|d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large). 'n=Y/N' is the sample sizes (Y compound-taken nights, N compound-skipped nights). The 95% CI (computed per compound but not visualized here) is the range the true HRV difference is likely to land in; if it crossed 0, the effect would be statistically indistinguishable from noise. BH-FDR corrected across compounds. Yes/No framing chosen because most compounds are taken at a near-constant dose, so the actionable question is 'does taking it help?' — a continuous test would collapse on near-zero amount variance. ⚠ marks compounds with fewer than 20 Yes or No nights — estimates are unstable. Associational, not causal."
+          info="How each supplement compound (rolled up across products via FDA UNII code, e.g. Vitamin C from a multi + standalone tablet sum into one row) affects HRV the following night. Method: Welch's two-sample t-test (unequal variance) on next-night HRV for Yes vs No nights. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise (compounds with fewer tracked nights will show wide whiskers — that's the chart honestly signaling 'trust this less'). Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Y compound-taken nights, N compound-skipped nights). BH-FDR corrected across compounds. Yes/No framing chosen because most compounds are taken at a near-constant dose, so the actionable question is 'does taking it help?' — a continuous test would collapse on near-zero amount variance. ⚠ marks compounds with fewer than 20 Yes or No nights — estimates are unstable. Associational, not causal."
         >
-          {supplementImpact.length > 0 ? (
-            <ResponsiveContainer width="100%" height={Math.max(360, supplementImpact.slice(0, 14).length * 30)}>
-              <BarChart data={supplementImpact.slice(0, 14).map(d => ({ ...d, displayLabel: `${d.low_n ? "⚠ " : ""}${d.compound}` }))}
-                        layout="vertical"
+          {supplementImpact.length > 0 ? (() => {
+            const si = supplementImpact.slice(0, 14).map((d: any) => ({
+              ...d,
+              displayLabel: `${d.low_n ? "⚠ " : ""}${d.compound}`,
+              errorRange: [
+                Math.max(0, (d.diff_ms ?? 0) - (d.ci_low ?? 0)),
+                Math.max(0, (d.ci_high ?? 0) - (d.diff_ms ?? 0)),
+              ],
+            }));
+            return (
+            <ResponsiveContainer width="100%" height={Math.max(360, si.length * 30)}>
+              <BarChart data={si} layout="vertical"
                         margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                 <CartesianGrid {...gridStyle} horizontal={false} />
                 <XAxis type="number" tick={axisTick}
                        tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
-                       label={axisLabel("HRV Δ (ms)", "x")} />
+                       label={axisLabel("HRV Δ (ms) · whiskers = 95% CI", "x")} />
                 <YAxis type="category" dataKey="displayLabel" width={axisW.long}
                        tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, _n: any, p: any) => {
                            const d = p?.payload ?? {};
+                           const lo = Number(d.ci_low ?? 0).toFixed(1);
+                           const hi = Number(d.ci_high ?? 0).toFixed(1);
                            return [
-                             `${Number(v).toFixed(1)} ms (d=${(d.cohen_d ?? 0).toFixed(2)}, n=${d.n_yes}/${d.n_no})`,
+                             `${Number(v).toFixed(1)} ms · 95% CI [${lo}, ${hi}] · d=${(d.cohen_d ?? 0).toFixed(2)} · n=${d.n_yes}/${d.n_no}`,
                              "HRV Δ",
                            ];
                          }} />
                 <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
                 <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
-                  {supplementImpact.slice(0, 14).map((d, i) => (
+                  {si.map((d: any, i: number) => (
                     <Cell key={i} fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"}
                           fillOpacity={d.low_n ? 0.35 : 0.8} />
                   ))}
+                  <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
+                            stroke="#f4f4f5" direction="x" />
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
-          ) : (
+            );
+          })() : (
             <div className="h-[260px] flex items-center justify-center px-6">
               <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
                 Not enough supplement history yet — the Yes/No t-test needs at least 3 nights of Yes and 3 of No per compound.
