@@ -133,14 +133,16 @@ export default function SleepPage() {
   const whoopDurationData = whoopSleep.map((d) => {
     const date = formatDate(etDate(d.end_time));
     const nap = whoopNapsByDate.get(date);
-    const napHours = nap ? +(nap.deep + nap.light + nap.rem + nap.awake).toFixed(2) : 0;
     return {
       date,
       deep:  d.total_slow_wave_sleep_time_milli ? +(d.total_slow_wave_sleep_time_milli / 3600000).toFixed(2) : 0,
       light: d.total_light_sleep_time_milli     ? +(d.total_light_sleep_time_milli / 3600000).toFixed(2)     : 0,
       rem:   d.total_rem_sleep_time_milli       ? +(d.total_rem_sleep_time_milli / 3600000).toFixed(2)       : 0,
       awake: d.total_awake_time_milli           ? +(d.total_awake_time_milli / 3600000).toFixed(2)           : 0,
-      nap:   napHours,
+      nap_deep:  nap ? +nap.deep.toFixed(2)  : 0,
+      nap_light: nap ? +nap.light.toFixed(2) : 0,
+      nap_rem:   nap ? +nap.rem.toFixed(2)   : 0,
+      nap_awake: nap ? +nap.awake.toFixed(2) : 0,
     };
   });
   const avgWhoopNapMs = whoopNapsByDate.size
@@ -238,25 +240,28 @@ export default function SleepPage() {
     quality: d.sleep_quality_score,
   }));
 
-  // Eight Sleep stages: use main_session_* columns for the four primary stages
-  // and surface the nap delta as a distinct 5th segment so the bar shows
-  // exactly what came from the main sleep vs what came from naps.
+  // Eight Sleep stages: split each stage between main session and nap so the
+  // bar surfaces both the per-stage main breakdown AND the per-stage nap
+  // breakdown. nap_stage = total_stage − main_stage from the DB columns.
   const eightStagesData = eightSleep.map((d) => {
     const deepMain  = d.deep_sleep_main_session_seconds  ?? d.deep_sleep_seconds  ?? 0;
     const lightMain = d.light_sleep_main_session_seconds ?? d.light_sleep_seconds ?? 0;
     const remMain   = d.rem_sleep_main_session_seconds   ?? d.rem_sleep_seconds   ?? 0;
     const awakeMain = d.awake_main_session_seconds       ?? d.awake_seconds       ?? 0;
-    const totalAll  = (d.deep_sleep_seconds || 0) + (d.light_sleep_seconds || 0)
-                    + (d.rem_sleep_seconds || 0) + (d.awake_seconds || 0);
-    const mainAll   = deepMain + lightMain + remMain + awakeMain;
-    const napSec    = Math.max(0, totalAll - mainAll);
+    const napDeep   = Math.max(0, (d.deep_sleep_seconds  || 0) - deepMain);
+    const napLight  = Math.max(0, (d.light_sleep_seconds || 0) - lightMain);
+    const napRem    = Math.max(0, (d.rem_sleep_seconds   || 0) - remMain);
+    const napAwake  = Math.max(0, (d.awake_seconds       || 0) - awakeMain);
     return {
       date:  formatDate(d.calendar_date),
       deep:  +(deepMain  / 3600).toFixed(2),
       light: +(lightMain / 3600).toFixed(2),
       rem:   +(remMain   / 3600).toFixed(2),
       awake: +(awakeMain / 3600).toFixed(2),
-      nap:   +(napSec    / 3600).toFixed(2),
+      nap_deep:  +(napDeep  / 3600).toFixed(2),
+      nap_light: +(napLight / 3600).toFixed(2),
+      nap_rem:   +(napRem   / 3600).toFixed(2),
+      nap_awake: +(napAwake / 3600).toFixed(2),
     };
   });
   // Range averages: main sleep duration + average nap duration across the range
@@ -483,11 +488,14 @@ export default function SleepPage() {
               <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
               <Legend wrapperStyle={legendStyle} />
-              <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
+              <Bar dataKey="deep"  stackId="a" fill="#1e40af" name="Deep" />
               <Bar dataKey="light" stackId="a" fill="#60a5fa" name="Light" />
-              <Bar dataKey="rem" stackId="a" fill="#a78bfa" name="REM" />
+              <Bar dataKey="rem"   stackId="a" fill="#a78bfa" name="REM" />
               <Bar dataKey="awake" stackId="a" fill="#f87171" name="Awake" />
-              <Bar dataKey="nap" stackId="a" fill="#fbbf24" name="Nap" radius={[3, 3, 0, 0]} />
+              <Bar dataKey="nap_deep"  stackId="a" fill="#1e40af" fillOpacity={0.5} name="Deep (nap)" />
+              <Bar dataKey="nap_light" stackId="a" fill="#60a5fa" fillOpacity={0.5} name="Light (nap)" />
+              <Bar dataKey="nap_rem"   stackId="a" fill="#a78bfa" fillOpacity={0.5} name="REM (nap)" />
+              <Bar dataKey="nap_awake" stackId="a" fill="#f87171" fillOpacity={0.5} name="Awake (nap)" radius={[3, 3, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -692,11 +700,14 @@ export default function SleepPage() {
               <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
               <Legend wrapperStyle={legendStyle} />
-              <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
+              <Bar dataKey="deep"  stackId="a" fill="#1e40af" name="Deep" />
               <Bar dataKey="light" stackId="a" fill="#60a5fa" name="Light" />
-              <Bar dataKey="rem" stackId="a" fill="#a78bfa" name="REM" />
+              <Bar dataKey="rem"   stackId="a" fill="#a78bfa" name="REM" />
               <Bar dataKey="awake" stackId="a" fill="#f87171" name="Awake" />
-              <Bar dataKey="nap" stackId="a" fill="#fbbf24" name="Nap" radius={[3, 3, 0, 0]} />
+              <Bar dataKey="nap_deep"  stackId="a" fill="#1e40af" fillOpacity={0.5} name="Deep (nap)" />
+              <Bar dataKey="nap_light" stackId="a" fill="#60a5fa" fillOpacity={0.5} name="Light (nap)" />
+              <Bar dataKey="nap_rem"   stackId="a" fill="#a78bfa" fillOpacity={0.5} name="REM (nap)" />
+              <Bar dataKey="nap_awake" stackId="a" fill="#f87171" fillOpacity={0.5} name="Awake (nap)" radius={[3, 3, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
