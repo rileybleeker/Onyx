@@ -736,6 +736,12 @@ export default function HrvAnalysisPage() {
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
                     <strong className="text-text-secondary">Why it&apos;s used:</strong> Correlation tells you strength on a −1 to +1 scale; the t-test tells you the <em>actual HRV difference in ms</em> and whether it&apos;s statistically significant. That&apos;s why it drives the Journal Behavior Impact chart — the bars are mean HRV differences, with Cohen&apos;s d and a 95% confidence interval computed per behavior.
                   </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Reading the supporting numbers:</strong>
+                    {" "}<em>Cohen&apos;s d</em> is the standardized effect size — the HRV gap divided by the typical night-to-night HRV variability. The ms bar tells you raw size; <em>d</em> tells you whether that gap is big <em>relative to your usual noise</em>. Rule of thumb: |d| &lt; 0.2 trivial, 0.2–0.5 small, 0.5–0.8 medium, &gt; 0.8 large.
+                    {" "}<em>95% CI</em> (confidence interval) is the range the true difference is likely to land in given the data you have. If the CI crosses 0, the effect is statistically indistinguishable from no effect — meaning the apparent bar could just be noise.
+                    {" "}<em>n</em> in tooltips (e.g. <code className="font-mono text-[10px]">n=12/47</code>) is the sample sizes — 12 Yes-nights and 47 No-nights in this example. Bigger n → narrower CI → more trustworthy estimate.
+                  </p>
                 </div>
 
                 <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
@@ -1049,7 +1055,7 @@ export default function HrvAnalysisPage() {
         {/* Journal Impact */}
         <ChartCard collapsible title="Journal Behavior Impact" subtitle="Mean HRV difference: Yes vs No"
           source="WELCH'S T-TEST"
-          info="How each logged behavior affects your HRV the following night. A +15ms bar means your HRV was 15ms higher, on average, on nights after you did that thing. Green = helps recovery; red = hurts it. Method: Welch's two-sample t-test (unequal variance) on HRV distributions for Yes vs No nights, with Cohen's d and 95% CI computed per behavior.">
+          info="How each logged behavior affects your HRV the following night. A +15ms bar means your HRV was 15ms higher, on average, on nights after you did that thing. Green = helps recovery; red = hurts it. Method: Welch's two-sample t-test (unequal variance) on HRV distributions for Yes vs No nights. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise. Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Yes-nights / No-nights) that fed the comparison.">
           {journalImpact.length > 0 ? (() => {
             const ji = journalImpact.slice(0, 12).map((d: any) => ({
               ...d,
@@ -1101,7 +1107,7 @@ export default function HrvAnalysisPage() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <ChartCard collapsible title="Habit Impact" subtitle="Mean HRV difference: nights you completed the habit vs nights you didn't"
           source="WELCH'S T-TEST"
-          info="Same statistical treatment as Journal Behavior Impact, applied to Notion-managed habits (from /habits). A +Xms bar means HRV averaged X ms higher on the night following days you completed that habit. Welch's two-sample t-test on next-night HRV for Yes vs No nights, with Cohen's d and 95% CI per habit. Habits need at least 5 Yes-nights and 5 No-nights before they appear (the t-test isn't meaningful with smaller groups). Add more habits or toggle them more consistently at /habits to populate this view.">
+          info="Same statistical treatment as Journal Behavior Impact, applied to Notion-managed habits (from /habits). A +Xms bar means HRV averaged X ms higher on the night following days you completed that habit. Method: Welch's two-sample t-test on next-night HRV for Yes vs No nights. Tooltip shorthand: 'd' is Cohen's d — the standardized effect size, i.e. the HRV gap divided by typical night-to-night HRV variability (|d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large). 'n=Y/N' is the sample sizes that fed the comparison (Y completed-nights, N skipped-nights). The 95% CI (also produced per habit but not visualized here) is the range the true HRV difference is likely to land in; if it crossed 0, the effect would be statistically indistinguishable from noise. Habits need at least 5 Yes-nights and 5 No-nights before they appear (the t-test isn't meaningful with smaller groups). Add more habits or toggle them more consistently at /habits to populate this view.">
           {habitImpact.length > 0 ? (
             <ResponsiveContainer width="100%" height={Math.max(260, habitImpact.slice(0, 12).length * 36)}>
               <BarChart data={habitImpact.slice(0, 12)} layout="vertical"
@@ -1145,7 +1151,7 @@ export default function HrvAnalysisPage() {
           title="Supplement Impact (Yes vs No)"
           subtitle="Mean HRV difference: nights compound taken vs not"
           source="WELCH'S T-TEST"
-          info="How each supplement compound (rolled up across products via FDA UNII code, e.g. Vitamin C from a multi + standalone tablet sum into one row) affects HRV the following night. Method: Welch's two-sample t-test (unequal variance) on next-night HRV for Yes vs No nights, with Cohen's d and 95% CI per compound. BH-FDR corrected across compounds. Yes/No framing chosen because most compounds are taken at a near-constant dose, so the actionable question is 'does taking it help?' — a continuous test would collapse on near-zero amount variance. ⚠ marks compounds with fewer than 20 Yes or No nights — estimates are unstable. Associational, not causal."
+          info="How each supplement compound (rolled up across products via FDA UNII code, e.g. Vitamin C from a multi + standalone tablet sum into one row) affects HRV the following night. Method: Welch's two-sample t-test (unequal variance) on next-night HRV for Yes vs No nights. Tooltip shorthand: 'd' is Cohen's d — the standardized effect size, i.e. the HRV gap divided by typical night-to-night HRV variability (|d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large). 'n=Y/N' is the sample sizes (Y compound-taken nights, N compound-skipped nights). The 95% CI (computed per compound but not visualized here) is the range the true HRV difference is likely to land in; if it crossed 0, the effect would be statistically indistinguishable from noise. BH-FDR corrected across compounds. Yes/No framing chosen because most compounds are taken at a near-constant dose, so the actionable question is 'does taking it help?' — a continuous test would collapse on near-zero amount variance. ⚠ marks compounds with fewer than 20 Yes or No nights — estimates are unstable. Associational, not causal."
         >
           {supplementImpact.length > 0 ? (
             <ResponsiveContainer width="100%" height={Math.max(360, supplementImpact.slice(0, 14).length * 30)}>
@@ -1338,8 +1344,15 @@ export default function HrvAnalysisPage() {
             <ul className="list-disc list-inside space-y-1 ml-2">
               <li><strong>AIPW ATE bar</strong> = the headline causal estimate, in ms of HRV.</li>
               <li>
-                <strong>Error bars</strong> = 95% confidence interval. If the CI crosses 0, the effect
-                is consistent with no real causal influence.
+                <strong>Error bars</strong> = 95% confidence interval — the range the true causal
+                effect is likely to land in given the data. If the CI crosses 0, the effect is
+                consistent with no real causal influence (the apparent bar could just be noise).
+              </li>
+              <li>
+                <strong>Tooltip <code className="font-mono text-[11px]">n=Y/Z</code></strong> = sample
+                sizes that fed the estimate. Y is the number of <em>treated</em> days (the behavior
+                happened), Z is the number of <em>control</em> days (it didn&apos;t). Bigger n → narrower
+                CI → more trustworthy estimate.
               </li>
               <li>
                 <strong>E-value</strong> = how strong an <em>unmeasured</em> confounder would need to be
