@@ -540,12 +540,14 @@ export default function SleepPage() {
                 <table className="w-full text-xs">
                   <thead>
                     <tr>
-                      <th className="text-left bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal pr-3 py-1 sticky left-0 bg-surface-card min-w-[140px]">Behavior</th>
+                      <th className="text-left align-bottom bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal pr-3 pb-2 sticky left-0 bg-surface-card min-w-[140px]">Behavior</th>
                       {dates.map((d) => (
-                        <th key={d} className="bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal px-0.5 py-1 min-w-[24px]">
-                          <span className="block rotate-[-45deg] origin-bottom-left translate-x-2 whitespace-nowrap">
-                            {formatDate(d)}
-                          </span>
+                        <th key={d} className="align-bottom bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal px-0.5 min-w-[36px]">
+                          <div className="h-14 flex items-end justify-center">
+                            <span className="rotate-[-45deg] origin-bottom-left whitespace-nowrap translate-x-2">
+                              {formatDate(d)}
+                            </span>
+                          </div>
                         </th>
                       ))}
                     </tr>
