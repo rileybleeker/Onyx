@@ -191,6 +191,7 @@ export default function SleepPage() {
   const avgEightFitness  = avg(eightSleep, "sleep_fitness_score");
   const avgEightDuration = avg(eightSleep, "time_slept_seconds");
   const avgEightHrv      = avg(eightSleep, "avg_hrv");
+  const avgEightLatency  = avg(eightSleep, "latency_asleep_seconds");
 
   // ── WHOOP Sleep aggregates ───────────────────────────────────────────────────
   const avgInBedMs       = avg(whoopSleep, "total_in_bed_time_milli");
@@ -231,6 +232,17 @@ export default function SleepPage() {
     roomTemp:  d.avg_room_temp ? +Number(d.avg_room_temp).toFixed(1) : null,
     tossTurns: d.toss_and_turns,
   }));
+
+  // Sleep-onset latency in minutes; color-coded by clinical convention
+  // (<15 normal, 15–30 mild, >30 prolonged).
+  const eightLatencyData = eightSleep.map((d) => ({
+    date:    formatDate(d.calendar_date),
+    minutes: d.latency_asleep_seconds != null
+      ? +(d.latency_asleep_seconds / 60).toFixed(1)
+      : null,
+  }));
+  const latencyColor = (min: number | null) =>
+    min == null ? "#52525b" : min <= 15 ? "#22c55e" : min <= 30 ? "#f59e0b" : "#ef4444";
 
   // Snoring (Pod microphone-detected). Sparse: most nights are 0.
   // Plotted in minutes; heavy-snore is stacked on top so total bar height = total snoring.
@@ -347,7 +359,7 @@ export default function SleepPage() {
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={45} label={axisLabel("hours", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: number) => [`${v}h`, "Time in Bed"]} />
+              <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}h`, "Time in Bed"]} />
               <Bar dataKey="hours" name="Time in Bed" radius={[3, 3, 0, 0]} fill="#8b5cf6" />
             </BarChart>
           </ResponsiveContainer>
@@ -361,7 +373,7 @@ export default function SleepPage() {
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={45} label={axisLabel("hours", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: number) => [`${v} h`, "Sleep Debt"]} />
+              <Tooltip {...chartTooltip} formatter={(v: any) => [`${v} h`, "Sleep Debt"]} />
               <Bar dataKey="debt" name="Sleep Debt" radius={[3, 3, 0, 0]}>
                 {sleepDebtData.map((d, i) => (
                   <Cell key={i} fill={d.debt == null ? "#52525b" : d.debt < 1 ? "#22c55e" : d.debt < 2 ? "#f59e0b" : "#ef4444"} />
@@ -377,7 +389,7 @@ export default function SleepPage() {
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={45} domain={[0, (max: number) => Math.max(110, Math.ceil(max / 10) * 10)]} label={axisLabel("% of need met", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: number) => [`${v}%`, "Hours vs Needed"]} />
+              <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}%`, "Hours vs Needed"]} />
               <ReferenceLine y={100} stroke="#22c55e" strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "100%", position: "right", fill: "#22c55e", fontSize: 10 }} />
               <Bar dataKey="hoursNeeded" name="Hours vs Needed" radius={[3, 3, 0, 0]}>
                 {whoopScoreData.map((d, i) => (
@@ -394,7 +406,7 @@ export default function SleepPage() {
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={45} domain={[0, 100]} label={axisLabel("consistency %", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: number) => [`${v}%`, "Sleep Consistency"]} />
+              <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}%`, "Sleep Consistency"]} />
               <Bar dataKey="consistency" name="Sleep Consistency" radius={[3, 3, 0, 0]}>
                 {whoopScoreData.map((d, i) => (
                   <Cell key={i} fill={d.consistency == null ? "#52525b" : d.consistency >= 70 ? "#22c55e" : d.consistency >= 50 ? "#f59e0b" : "#ef4444"} />
@@ -625,6 +637,7 @@ export default function SleepPage() {
         <StatCard label="Fitness Score" value={avgEightFitness != null ? avgEightFitness.toFixed(0) : null} sublabel={rangeNote} source="8SLP" />
         <StatCard label="Duration" value={avgEightDuration != null ? formatDuration(Math.round(avgEightDuration)) : null} sublabel={rangeNote} source="8SLP" />
         <StatCard label="HRV" value={avgEightHrv != null ? avgEightHrv.toFixed(0) : null} unit="ms" sublabel={rangeNote} source="8SLP" />
+        <StatCard label="Sleep Latency" value={avgEightLatency != null ? (avgEightLatency / 60).toFixed(0) : null} unit="min" sublabel={rangeNote} source="8SLP" />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
@@ -704,10 +717,31 @@ export default function SleepPage() {
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: number, name: string) => [`${v} min`, name]} />
+              <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [`${v} min`, name]} />
               <Legend wrapperStyle={legendStyle} />
               <Bar dataKey="light" stackId="snore" fill="#60a5fa" name="Snoring" />
               <Bar dataKey="heavy" stackId="snore" fill="#ef4444" name="Heavy snoring" radius={[3, 3, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard
+          title="Time to Fall Asleep"
+          source="8SLP"
+          subtitle={avgEightLatency != null ? `avg ${(avgEightLatency / 60).toFixed(0)} min` : undefined}
+        >
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={eightLatencyData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
+              <Tooltip {...chartTooltip} formatter={(v: any) => [`${v} min`, "Latency"]} />
+              <ReferenceLine y={15} stroke="#22c55e" strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "15 min", position: "right", fill: "#22c55e", fontSize: 10 }} />
+              <Bar dataKey="minutes" name="Latency" radius={[3, 3, 0, 0]}>
+                {eightLatencyData.map((d, i) => (
+                  <Cell key={i} fill={latencyColor(d.minutes)} />
+                ))}
+              </Bar>
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
