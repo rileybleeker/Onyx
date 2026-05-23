@@ -235,7 +235,6 @@ export default function SleepPage() {
   const eightScoreData = eightSleep.map((d) => ({
     date:    formatDate(d.calendar_date),
     sleep:   d.sleep_score,
-    fitness: d.sleep_fitness_score,
     quality: d.sleep_quality_score,
   }));
 
@@ -684,7 +683,6 @@ export default function SleepPage() {
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Line type="monotone" dataKey="sleep" stroke="#8b5cf6" strokeWidth={2} dot={false} name="Sleep" />
-              <Line type="monotone" dataKey="fitness" stroke="#22c55e" strokeWidth={1.5} dot={false} name="Fitness" />
               <Line type="monotone" dataKey="quality" stroke="#3b82f6" strokeWidth={1.5} dot={false} name="Quality" />
             </LineChart>
           </ResponsiveContainer>
