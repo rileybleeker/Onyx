@@ -620,402 +620,7 @@ export default function HrvAnalysisPage() {
         </div>
       </div>
 
-      {/* ── Models & Methods ── */}
-      <div className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card overflow-hidden">
-        <button
-          onClick={() => setExpandedModels(!expandedModels)}
-          className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-white/[0.02] transition-colors"
-        >
-          <div>
-            <h3 className="text-[13px] font-medium text-text-secondary">Models &amp; Methods</h3>
-            <p className="text-[11px] text-text-tertiary mt-0.5">How the predictions and statistical analysis work — click to expand</p>
-          </div>
-          <svg className={`w-4 h-4 text-text-tertiary transition-transform ${expandedModels ? "rotate-180" : ""}`}
-               fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-          </svg>
-        </button>
-
-        {expandedModels && (
-          <div className="px-5 pb-6 border-t border-border-subtle pt-5 space-y-6">
-
-            {/* Primary models */}
-            <div>
-              <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Prediction Models</p>
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[12px] font-medium text-text-primary">XGBoost</span>
-                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">DAY-AHEAD</span>
-                  </div>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it is:</strong> A machine learning model that builds hundreds of small decision trees, each one correcting the mistakes of the last. The final prediction is all of them voting together.
-                  </p>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Excellent at finding non-obvious patterns across many variables at once — like &ldquo;high strain + poor sleep + high stress = low HRV&rdquo; — which simpler methods miss.
-                  </p>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it predicts:</strong> Tomorrow&apos;s HRV, using today&apos;s ~250-feature matrix (training load, sleep quality, behaviors, recent HRV trend, etc.).
-                  </p>
-                </div>
-
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[12px] font-medium text-text-primary">Prophet</span>
-                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">30-DAY FORECAST</span>
-                  </div>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it is:</strong> A forecasting model developed by Meta that splits your HRV history into three layers: a long-term trend, a weekly rhythm, and random noise — then adds them back together to project forward.
-                  </p>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Great at capturing repeating cycles — like &ldquo;HRV tends to dip on Mondays after heavy weekend training&rdquo; — and extending them into the future.
-                  </p>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it predicts:</strong> Your likely HRV range over the next 30 days, including an uncertainty band.
-                  </p>
-                </div>
-
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[12px] font-medium text-text-primary">SARIMAX</span>
-                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">SEASONAL</span>
-                  </div>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it is:</strong> A classical statistics model that predicts tomorrow&apos;s HRV using your own past HRV values (today&apos;s HRV predicts tomorrow&apos;s to some degree), while also factoring in external variables like training load.
-                  </p>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Provides a transparent, interpretable baseline alongside XGBoost. If both models agree, the prediction is more reliable.
-                  </p>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it predicts:</strong> Day-ahead HRV using recent HRV history + seasonal patterns + external inputs.
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            {/* Analysis methods */}
-            <div>
-              <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Analysis Methods</p>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[12px] font-medium text-text-primary">SHAP Values</span>
-                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">EXPLAINABILITY</span>
-                  </div>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it is:</strong> A method for opening up the &ldquo;black box&rdquo; of XGBoost to show why it made a specific prediction. Rooted in game theory — each feature gets credit proportional to how much it actually contributed.
-                  </p>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">Why it&apos;s used:</strong> XGBoost alone can&apos;t tell you <em>why</em> it predicted a number. SHAP translates each prediction into a plain breakdown: &ldquo;your resting HR added +8ms, your sleep duration added +4ms, your strain subtracted −12ms.&rdquo;
-                  </p>
-                </div>
-
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[12px] font-medium text-text-primary">Spearman Correlation</span>
-                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">HISTORICAL PATTERNS</span>
-                  </div>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it is:</strong> A statistical measure of how consistently two things move together. Instead of comparing raw numbers, it converts both to ranks (1st highest, 2nd highest, etc.) and checks how well those ranks agree.
-                  </p>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">Why it&apos;s used:</strong> More reliable than standard correlation for health data because it&apos;s not thrown off by outliers or skewed distributions. Scores range from −1.0 to +1.0.
-                  </p>
-                </div>
-
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[12px] font-medium text-text-primary">Welch&apos;s T-Test</span>
-                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">JOURNAL IMPACT</span>
-                  </div>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it is:</strong> A statistical test that compares the average HRV on nights you logged a behavior as <em>Yes</em> vs nights you logged <em>No</em>, and tells you whether the gap is real or just random noise. &ldquo;Welch&apos;s&rdquo; means it doesn&apos;t assume the two groups have the same variance — which matters because Yes/No nights are usually unbalanced.
-                  </p>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Correlation tells you strength on a −1 to +1 scale; the t-test tells you the <em>actual HRV difference in ms</em> and whether it&apos;s statistically significant. That&apos;s why it drives the Journal Behavior Impact chart — the bars are mean HRV differences, with Cohen&apos;s d and a 95% confidence interval computed per behavior.
-                  </p>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">Reading the supporting numbers:</strong>
-                    {" "}<em>Cohen&apos;s d</em> is the standardized effect size — the HRV gap divided by the typical night-to-night HRV variability. The ms bar tells you raw size; <em>d</em> tells you whether that gap is big <em>relative to your usual noise</em>. Rule of thumb: |d| &lt; 0.2 trivial, 0.2–0.5 small, 0.5–0.8 medium, &gt; 0.8 large.
-                    {" "}<em>95% CI</em> (confidence interval) is the range the true difference is likely to land in given the data you have. If the CI crosses 0, the effect is statistically indistinguishable from no effect — meaning the apparent bar could just be noise.
-                    {" "}<em>n</em> in tooltips (e.g. <code className="font-mono text-[10px]">n=12/47</code>) is the sample sizes — 12 Yes-nights and 47 No-nights in this example. Bigger n → narrower CI → more trustworthy estimate.
-                  </p>
-                </div>
-
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[12px] font-medium text-text-primary">Naive &amp; 7d Avg Baselines</span>
-                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">BENCHMARKS</span>
-                  </div>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What they are:</strong> The simplest possible &ldquo;models&rdquo; — no machine learning involved. Naive predicts tomorrow&apos;s HRV will equal today&apos;s. 7d Avg predicts it will equal the last 7-day mean.
-                  </p>
-                  <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">Why they&apos;re used:</strong> Every real model must beat these to prove it&apos;s actually learning something. If XGBoost can&apos;t outperform &ldquo;just copy yesterday,&rdquo; it isn&apos;t useful.
-                  </p>
-                </div>
-              </div>
-            </div>
-
-          </div>
-        )}
-      </div>
-
-      {/* ── Row 2: Prediction Drivers + HRV Correlates ── */}
-      <div className="space-y-4">
-        {/* Explanation banner */}
-        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card">
-          <h3 className="text-[13px] font-medium text-text-secondary mb-3">Two ways to understand what is associated with your HRV</h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <p className="text-[11px] font-medium text-text-primary mb-1">Prediction Drivers <span className="text-text-tertiary font-normal">(left chart)</span></p>
-              <p className="text-[11px] text-text-tertiary leading-relaxed">
-                What the model is using to push <em>tomorrow&apos;s specific forecast</em> up or down, right now. Recalculated every day. These are statistical associations the model has learned, not proven causes.
-              </p>
-            </div>
-            <div>
-              <p className="text-[11px] font-medium text-text-primary mb-1">HRV Correlates <span className="text-text-tertiary font-normal">(right chart)</span></p>
-              <p className="text-[11px] text-text-tertiary leading-relaxed">
-                What has <em>historically</em> moved with your HRV across all your data. Doesn&apos;t change day to day. No model involved — just a statistical pattern across your entire history.
-              </p>
-            </div>
-          </div>
-          <p className="text-[10px] text-text-tertiary mt-3 pt-3 border-t border-border-subtle">
-            When both charts agree on a factor, you can be confident it genuinely matters. When they disagree, the model has learned something more nuanced than the simple historical pattern alone suggests.
-            Your journal behaviors (alcohol, meditation, caffeine, etc.) and Notion habits are included in both analyses as Yes/No features — each gets a dedicated sub-section at the bottom of each chart, separated because their scores are on a different scale to continuous metrics like heart rate.
-          </p>
-        </div>
-
-        {/* Side-by-side charts */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <ChartCard collapsible title="Prediction Drivers (Today)" subtitle="What's driving tomorrow's forecast right now"
-            source="XGBOOST · SHAP"
-            info="Shows what's pushing tomorrow's prediction up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes. Journal behaviors appear in a separate section below because they're Yes/No entries — they have smaller numerical impact than continuous metrics like heart rate, but they're still part of the model.">
-            {topDrivers.length > 0 ? (
-              <ResponsiveContainer width="100%" height={300}>
-                <BarChart data={topDrivers.slice(0, 10)} layout="vertical"
-                          margin={{ left: sideMarginShort, right: 20, top: 4, bottom: 20 }}>
-                  <CartesianGrid {...gridStyle} horizontal={false} />
-                  <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(1)}`}
-                         label={axisLabel("HRV impact (ms)", "x")} />
-                  <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 11 }} width={axisW.short} />
-                  <Tooltip
-                    {...chartTooltip}
-                    formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)} ms`, "Impact"]}
-                  />
-                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-                  <Bar dataKey="shap_value" radius={[0, 3, 3, 0]}>
-                    {topDrivers.slice(0, 10).map((d, i) => (
-                      <Cell key={i}
-                        fill={(d.shap_value ?? d.importance) > 0 ? "#22c55e" : "#ef4444"}
-                        fillOpacity={0.85}
-                      />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="h-[300px] flex items-center justify-center">
-                <p className="text-[11px] text-text-tertiary">No prediction data — run hrv_analysis.py</p>
-              </div>
-            )}
-
-            {/* Journal behavior SHAP sub-section */}
-            <div className="mt-4 pt-4 border-t border-border-subtle">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Journal Behaviors</span>
-                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">XGBOOST · SHAP</span>
-              </div>
-              <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
-                Your logged Yes/No behaviors are part of the model. A <span className="text-[#22c55e]">green</span> bar means that behavior <em>raised</em> tomorrow&apos;s predicted HRV today; a <span className="text-[#ef4444]">red</span> bar means it <em>lowered</em> it. Binary features have smaller ms impact than continuous metrics but still shift the forecast.
-              </p>
-              {journalDriversToday.length > 0 ? (
-                <ResponsiveContainer width="100%" height={Math.max(120, journalDriversToday.length * 22)}>
-                  <BarChart data={journalDriversToday} layout="vertical"
-                            margin={{ left: sideMarginMed, right: 20, top: 2, bottom: 20 }}>
-                    <CartesianGrid {...gridStyle} horizontal={false} />
-                    <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(2)}`}
-                           label={axisLabel("HRV impact (ms)", "x")} />
-                    <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 10 }} width={axisW.med}
-                           tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
-                    <Tooltip {...chartTooltip}
-                             formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(3)} ms`, Number(v) > 0 ? "Raised forecast" : "Lowered forecast"]} />
-                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-                    <Bar dataKey="shap_value" radius={[0, 3, 3, 0]}>
-                      {journalDriversToday.map((d, i) => (
-                        <Cell key={i} fill={d.shap_value > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.85} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              ) : journalShap.length > 0 ? (
-                <>
-                  <p className="text-[10px] text-amber-400/80 italic mb-2">
-                    Showing historical average direction — re-run hrv_predict.py for today-specific signed values.
-                  </p>
-                  <ResponsiveContainer width="100%" height={Math.max(120, journalShap.length * 22)}>
-                    <BarChart data={journalShap} layout="vertical"
-                              margin={{ left: sideMarginMed, right: 20, top: 2, bottom: 2 }}>
-                      <CartesianGrid {...gridStyle} horizontal={false} />
-                      <XAxis type="number" tick={axisTick} tickFormatter={v => v.toFixed(2)} />
-                      <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 10 }} width={axisW.med}
-                             tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
-                      <Tooltip {...chartTooltip}
-                               formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
-                      <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-                      <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
-                        {journalShap.map((d, i) => (
-                          <Cell key={i} fill="#8b5cf6" fillOpacity={0.75} />
-                        ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
-                </>
-              ) : (
-                <p className="text-[11px] text-text-tertiary italic">
-                  Journal behavior impacts not yet computed — re-run hrv_analysis.py to generate.
-                </p>
-              )}
-            </div>
-
-            {/* Habit SHAP sub-section */}
-            <div className="mt-4 pt-4 border-t border-border-subtle">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Habits</span>
-                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">XGBOOST · SHAP</span>
-              </div>
-              <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
-                Notion-managed habits (from <a href="/habits" className="text-accent hover:underline">/habits</a>) are part of the model. Like journal behaviors, they&apos;re Yes/No features with smaller ms-impact than continuous metrics, but they shift the forecast in the direction shown.
-              </p>
-              {habitShap.length > 0 ? (
-                <ResponsiveContainer width="100%" height={Math.max(120, habitShap.length * 28)}>
-                  <BarChart data={habitShap} layout="vertical"
-                            margin={{ left: sideMarginMed, right: 20, top: 2, bottom: 2 }}>
-                    <CartesianGrid {...gridStyle} horizontal={false} />
-                    <XAxis type="number" tick={axisTick} tickFormatter={v => v.toFixed(2)} />
-                    <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 10 }} width={axisW.med} />
-                    <Tooltip {...chartTooltip}
-                             formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
-                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-                    <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
-                      {habitShap.map((d, i) => (
-                        <Cell key={i} fill="#06b6d4" fillOpacity={0.75} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              ) : (
-                <p className="text-[11px] text-text-tertiary italic">
-                  Habit impacts not yet computed — need more completions logged at <a href="/habits" className="text-accent hover:underline">/habits</a>, then re-run hrv_analysis.py.
-                </p>
-              )}
-            </div>
-          </ChartCard>
-
-          <ChartCard collapsible title="HRV Correlates (Historical)" subtitle="What has historically moved with your HRV"
-            source="SPEARMAN ρ"
-            info="How strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises. A bar near −1.0 means the opposite. This doesn't change day to day — it's a long-term pattern. Journal behaviors appear in a separate section below because Yes/No features have a narrower correlation range than continuous metrics.">
-            {correlations.length > 0 ? (
-              <ResponsiveContainer width="100%" height={Math.max(360, correlations.length * 26)}>
-                <BarChart data={correlations} layout="vertical"
-                          margin={{ left: 8, right: 20, top: 4, bottom: 4 }}>
-                  <CartesianGrid {...gridStyle} horizontal={false} />
-                  <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
-                  <YAxis type="category" dataKey="label" width={isMobile ? 110 : 180}
-                         tick={<WrappedYAxisTick maxCharsPerLine={chars.corr} fontSize={10} />} />
-                  <Tooltip {...chartTooltip}
-                           formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
-                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-                  <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
-                    {correlations.map((d, i) => (
-                      <Cell key={i} fill={d.spearman_r > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.8} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="h-[300px] flex items-center justify-center">
-                <p className="text-[11px] text-text-tertiary">Run hrv_analysis.py to compute correlations</p>
-              </div>
-            )}
-
-            {/* Journal behavior correlation sub-section */}
-            <div className="mt-4 pt-4 border-t border-border-subtle">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Journal Behaviors</span>
-                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">SPEARMAN ρ</span>
-              </div>
-              <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
-                Correlation between each logged behavior and the following night&apos;s HRV, across your entire history. Yes/No features naturally produce smaller correlation scores than continuous metrics — but a consistent +0.10 or −0.10 is still meaningful over hundreds of nights.
-              </p>
-              {journalCorrelations.length > 0 ? (
-                <ResponsiveContainer width="100%" height={Math.max(160, journalCorrelations.length * 28)}>
-                  <BarChart data={journalCorrelations} layout="vertical"
-                            margin={{ left: 8, right: 20, top: 2, bottom: 2 }}>
-                    <CartesianGrid {...gridStyle} horizontal={false} />
-                    <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
-                    <YAxis type="category" dataKey="label" width={axisW.long}
-                           tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
-                    <Tooltip {...chartTooltip}
-                             formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
-                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-                    <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
-                      {journalCorrelations.map((d, i) => (
-                        <Cell key={i} fill={d.spearman_r > 0 ? "#8b5cf6" : "#a855f7"} fillOpacity={0.75} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              ) : (
-                <p className="text-[11px] text-text-tertiary italic">
-                  Journal behavior correlations not yet computed — re-run hrv_analysis.py to generate.
-                </p>
-              )}
-            </div>
-
-            {/* Habit correlation sub-section */}
-            <div className="mt-4 pt-4 border-t border-border-subtle">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Habits</span>
-                <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">SPEARMAN ρ</span>
-              </div>
-              <p className="text-[10px] text-text-tertiary leading-relaxed">
-                <strong className="text-text-secondary">What it is:</strong> A statistical measure of how consistently two things move together. For each habit, every night gets two ranks — one by HRV, one by whether you completed the habit that day — and the score reflects how well those rankings agree.
-              </p>
-              <p className="text-[10px] text-text-tertiary leading-relaxed mt-1.5 mb-3">
-                <strong className="text-text-secondary">Why it&apos;s used:</strong> Rank-based, so it shrugs off outlier nights and skewed distributions that would distort a standard correlation. Scores range from −1.0 to +1.0; because habits are Yes/No, expect smaller magnitudes than continuous metrics — a steady ±0.10 across hundreds of nights is still real signal.
-              </p>
-              {habitCorrelations.length > 0 ? (
-                <ResponsiveContainer width="100%" height={Math.max(160, habitCorrelations.length * 32)}>
-                  <BarChart data={habitCorrelations} layout="vertical"
-                            margin={{ left: 8, right: 20, top: 2, bottom: 2 }}>
-                    <CartesianGrid {...gridStyle} horizontal={false} />
-                    <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
-                    <YAxis type="category" dataKey="label" width={axisW.long}
-                           tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
-                    <Tooltip {...chartTooltip}
-                             formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
-                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-                    <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
-                      {habitCorrelations.map((d, i) => (
-                        <Cell key={i} fill={d.spearman_r > 0 ? "#06b6d4" : "#0ea5e9"} fillOpacity={0.75} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              ) : (
-                <p className="text-[11px] text-text-tertiary italic">
-                  Habit correlations not yet computed — need ≥20 days with the habit logged before correlations are reliable. Keep tracking at <a href="/habits" className="text-accent hover:underline">/habits</a>.
-                </p>
-              )}
-            </div>
-          </ChartCard>
-        </div>
-      </div>
-
-      {/* ── Row 3: 30-Day Forecast + Journal Impact ── */}
+      {/* ── Forward-looking: what's predicted and why (today) ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* 30-Day Prophet Forecast */}
         <ChartCard collapsible title="30-Day HRV Forecast" source="PROPHET + SARIMAX"
@@ -1052,6 +657,309 @@ export default function HrvAnalysisPage() {
           )}
         </ChartCard>
 
+        <ChartCard collapsible title="Prediction Drivers (Today)" subtitle="What's driving tomorrow's forecast right now"
+          source="XGBOOST · SHAP"
+          info="Shows what's pushing tomorrow's prediction up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes. Journal behaviors appear in a separate section below because they're Yes/No entries — they have smaller numerical impact than continuous metrics like heart rate, but they're still part of the model.">
+          {topDrivers.length > 0 ? (
+            <ResponsiveContainer width="100%" height={300}>
+              <BarChart data={topDrivers.slice(0, 10)} layout="vertical"
+                        margin={{ left: sideMarginShort, right: 20, top: 4, bottom: 20 }}>
+                <CartesianGrid {...gridStyle} horizontal={false} />
+                <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(1)}`}
+                       label={axisLabel("HRV impact (ms)", "x")} />
+                <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 11 }} width={axisW.short} />
+                <Tooltip
+                  {...chartTooltip}
+                  formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)} ms`, "Impact"]}
+                />
+                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <Bar dataKey="shap_value" radius={[0, 3, 3, 0]}>
+                  {topDrivers.slice(0, 10).map((d, i) => (
+                    <Cell key={i}
+                      fill={(d.shap_value ?? d.importance) > 0 ? "#22c55e" : "#ef4444"}
+                      fillOpacity={0.85}
+                    />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[300px] flex items-center justify-center">
+              <p className="text-[11px] text-text-tertiary">No prediction data — run hrv_analysis.py</p>
+            </div>
+          )}
+
+          {/* Journal behavior SHAP sub-section */}
+          <div className="mt-4 pt-4 border-t border-border-subtle">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Journal Behaviors</span>
+              <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">XGBOOST · SHAP</span>
+            </div>
+            <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
+              Your logged Yes/No behaviors are part of the model. A <span className="text-[#22c55e]">green</span> bar means that behavior <em>raised</em> tomorrow&apos;s predicted HRV today; a <span className="text-[#ef4444]">red</span> bar means it <em>lowered</em> it. Binary features have smaller ms impact than continuous metrics but still shift the forecast.
+            </p>
+            {journalDriversToday.length > 0 ? (
+              <ResponsiveContainer width="100%" height={Math.max(120, journalDriversToday.length * 22)}>
+                <BarChart data={journalDriversToday} layout="vertical"
+                          margin={{ left: sideMarginMed, right: 20, top: 2, bottom: 20 }}>
+                  <CartesianGrid {...gridStyle} horizontal={false} />
+                  <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(2)}`}
+                         label={axisLabel("HRV impact (ms)", "x")} />
+                  <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 10 }} width={axisW.med}
+                         tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
+                  <Tooltip {...chartTooltip}
+                           formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(3)} ms`, Number(v) > 0 ? "Raised forecast" : "Lowered forecast"]} />
+                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                  <Bar dataKey="shap_value" radius={[0, 3, 3, 0]}>
+                    {journalDriversToday.map((d, i) => (
+                      <Cell key={i} fill={d.shap_value > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.85} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            ) : journalShap.length > 0 ? (
+              <>
+                <p className="text-[10px] text-amber-400/80 italic mb-2">
+                  Showing historical average direction — re-run hrv_predict.py for today-specific signed values.
+                </p>
+                <ResponsiveContainer width="100%" height={Math.max(120, journalShap.length * 22)}>
+                  <BarChart data={journalShap} layout="vertical"
+                            margin={{ left: sideMarginMed, right: 20, top: 2, bottom: 2 }}>
+                    <CartesianGrid {...gridStyle} horizontal={false} />
+                    <XAxis type="number" tick={axisTick} tickFormatter={v => v.toFixed(2)} />
+                    <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 10 }} width={axisW.med}
+                           tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
+                    <Tooltip {...chartTooltip}
+                             formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
+                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                    <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
+                      {journalShap.map((d, i) => (
+                        <Cell key={i} fill="#8b5cf6" fillOpacity={0.75} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </>
+            ) : (
+              <p className="text-[11px] text-text-tertiary italic">
+                Journal behavior impacts not yet computed — re-run hrv_analysis.py to generate.
+              </p>
+            )}
+          </div>
+
+          {/* Habit SHAP sub-section */}
+          <div className="mt-4 pt-4 border-t border-border-subtle">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Habits</span>
+              <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">XGBOOST · SHAP</span>
+            </div>
+            <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
+              Notion-managed habits (from <a href="/habits" className="text-accent hover:underline">/habits</a>) are part of the model. Like journal behaviors, they&apos;re Yes/No features with smaller ms-impact than continuous metrics, but they shift the forecast in the direction shown.
+            </p>
+            {habitShap.length > 0 ? (
+              <ResponsiveContainer width="100%" height={Math.max(120, habitShap.length * 28)}>
+                <BarChart data={habitShap} layout="vertical"
+                          margin={{ left: sideMarginMed, right: 20, top: 2, bottom: 2 }}>
+                  <CartesianGrid {...gridStyle} horizontal={false} />
+                  <XAxis type="number" tick={axisTick} tickFormatter={v => v.toFixed(2)} />
+                  <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 10 }} width={axisW.med} />
+                  <Tooltip {...chartTooltip}
+                           formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
+                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                  <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
+                    {habitShap.map((d, i) => (
+                      <Cell key={i} fill="#06b6d4" fillOpacity={0.75} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <p className="text-[11px] text-text-tertiary italic">
+                Habit impacts not yet computed — need more completions logged at <a href="/habits" className="text-accent hover:underline">/habits</a>, then re-run hrv_analysis.py.
+              </p>
+            )}
+          </div>
+        </ChartCard>
+      </div>
+
+      {/* ── How well does the model actually predict? ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Prediction vs Actual */}
+        <ChartCard collapsible storageKey="prediction-vs-actual" title={`Prediction vs Actual (${rangeLabel(range)})`}
+                   subtitle="Red dots = miss > 15ms"
+                   info="What the model predicted each night (blue dashed) vs what your HRV actually was (green). Red dots are nights where it missed by more than 15ms. Fewer red dots = more accurate model.">
+          <ResponsiveContainer width="100%" height={260}>
+            <LineChart data={predActualData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={55} domain={["auto", "auto"]} label={axisLabel("HRV (ms)", "y")} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
+              <Line type="monotone" dataKey="actual" stroke="#22c55e" strokeWidth={2}
+                    dot={false} name="Actual HRV" />
+              <Line type="monotone" dataKey="predicted" stroke="#3b82f6" strokeWidth={2}
+                    dot={<HrvDot />} name="XGBoost Pred" strokeDasharray="4 2" />
+            </LineChart>
+          </ResponsiveContainer>
+          {predActualData.length === 0 && (
+            <p className="text-[11px] text-text-tertiary text-center mt-2">No backtest data yet</p>
+          )}
+        </ChartCard>
+
+        {/* Accuracy by Horizon */}
+        <ChartCard collapsible title="Accuracy by Forecast Horizon"
+                   subtitle="MAE (ms) — lower is better"
+                   info="Accuracy drops the further ahead you predict — this shows how much. Each bar is the average miss in ms for that day. 'Naive' just repeats yesterday's HRV as the guess. If the model can't beat that, it's not actually learning anything.">
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={horizonData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="horizon" tick={axisTick} label={axisLabel("forecast horizon (days)", "x")} height={50} />
+              <YAxis tick={axisTick} width={55} label={axisLabel("MAE (ms)", "y")} />
+              <Tooltip {...chartTooltip} />
+              <Legend wrapperStyle={legendStyle} />
+              <Bar dataKey="xgboost" name="XGBoost" fill="#3b82f6" radius={[3, 3, 0, 0]} />
+              <Bar dataKey="naive" name="Naive" fill="#f59e0b" radius={[3, 3, 0, 0]} />
+              {horizonData.some(d => d.sarimax) && (
+                <Bar dataKey="sarimax" name="SARIMAX" fill="#8b5cf6" radius={[3, 3, 0, 0]} />
+              )}
+            </BarChart>
+          </ResponsiveContainer>
+          {horizonData.every(d => !d.xgboost) && (
+            <p className="text-[11px] text-text-tertiary text-center mt-2">No horizon metrics yet</p>
+          )}
+        </ChartCard>
+      </div>
+
+      {/* ── Where is HRV trending overall? ── */}
+      <ChartCard collapsible storageKey="hrv-trend" title={`HRV Trend (${rangeLabel(range)})`}
+                 subtitle="WHOOP HRV + 7-day rolling average"
+                 info="Your daily WHOOP HRV (faint line) swings a lot day-to-day — that's normal. The brighter line averages the last 7 days to show your real trend.">
+        <ResponsiveContainer width="100%" height={280}>
+          <LineChart data={trendData}>
+            <CartesianGrid {...gridStyle} />
+            <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+            <YAxis tick={axisTick} width={55} domain={["auto", "auto"]} label={axisLabel("HRV (ms)", "y")} />
+            <Tooltip {...chartTooltip} />
+            <Legend wrapperStyle={legendStyle} />
+            <Line type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={1.5}
+                  dot={false} name="WHOOP HRV" strokeOpacity={0.5} />
+            <Line type="monotone" dataKey="rolling7" stroke="#22c55e" strokeWidth={2.5}
+                  dot={false} name="7-Day Avg" />
+          </LineChart>
+        </ResponsiveContainer>
+      </ChartCard>
+
+      {/* ── What's associated with your HRV ── */}
+      <div className="space-y-4">
+        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card">
+          <h3 className="text-[13px] font-medium text-text-secondary mb-2">What&apos;s associated with your HRV</h3>
+          <p className="text-[11px] text-text-tertiary leading-relaxed">
+            The charts below are <em>associational</em> — they show which factors have historically moved with your HRV across your entire tracking history. No model is involved; these are direct statistical patterns. Start with the broad continuous-metric view, then read on through the behavior-impact, supplement, and lifestyle pairings. Adjusted causal estimates (with confounders held fixed) come further down in the Causal Inference section.
+          </p>
+        </div>
+
+        <ChartCard collapsible title="HRV Correlates (Historical)" subtitle="What has historically moved with your HRV"
+          source="SPEARMAN ρ"
+          info="How strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises. A bar near −1.0 means the opposite. This doesn't change day to day — it's a long-term pattern. Journal behaviors appear in a separate section below because Yes/No features have a narrower correlation range than continuous metrics.">
+          {correlations.length > 0 ? (
+            <ResponsiveContainer width="100%" height={Math.max(360, correlations.length * 26)}>
+              <BarChart data={correlations} layout="vertical"
+                        margin={{ left: 8, right: 20, top: 4, bottom: 4 }}>
+                <CartesianGrid {...gridStyle} horizontal={false} />
+                <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
+                <YAxis type="category" dataKey="label" width={isMobile ? 110 : 180}
+                       tick={<WrappedYAxisTick maxCharsPerLine={chars.corr} fontSize={10} />} />
+                <Tooltip {...chartTooltip}
+                         formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
+                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                  {correlations.map((d, i) => (
+                    <Cell key={i} fill={d.spearman_r > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.8} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[300px] flex items-center justify-center">
+              <p className="text-[11px] text-text-tertiary">Run hrv_analysis.py to compute correlations</p>
+            </div>
+          )}
+
+          {/* Journal behavior correlation sub-section */}
+          <div className="mt-4 pt-4 border-t border-border-subtle">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Journal Behaviors</span>
+              <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">SPEARMAN ρ</span>
+            </div>
+            <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
+              Correlation between each logged behavior and the following night&apos;s HRV, across your entire history. Yes/No features naturally produce smaller correlation scores than continuous metrics — but a consistent +0.10 or −0.10 is still meaningful over hundreds of nights.
+            </p>
+            {journalCorrelations.length > 0 ? (
+              <ResponsiveContainer width="100%" height={Math.max(160, journalCorrelations.length * 28)}>
+                <BarChart data={journalCorrelations} layout="vertical"
+                          margin={{ left: 8, right: 20, top: 2, bottom: 2 }}>
+                  <CartesianGrid {...gridStyle} horizontal={false} />
+                  <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
+                  <YAxis type="category" dataKey="label" width={axisW.long}
+                         tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
+                  <Tooltip {...chartTooltip}
+                           formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
+                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                  <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                    {journalCorrelations.map((d, i) => (
+                      <Cell key={i} fill={d.spearman_r > 0 ? "#8b5cf6" : "#a855f7"} fillOpacity={0.75} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <p className="text-[11px] text-text-tertiary italic">
+                Journal behavior correlations not yet computed — re-run hrv_analysis.py to generate.
+              </p>
+            )}
+          </div>
+
+          {/* Habit correlation sub-section */}
+          <div className="mt-4 pt-4 border-t border-border-subtle">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Habits</span>
+              <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">SPEARMAN ρ</span>
+            </div>
+            <p className="text-[10px] text-text-tertiary leading-relaxed">
+              <strong className="text-text-secondary">What it is:</strong> A statistical measure of how consistently two things move together. For each habit, every night gets two ranks — one by HRV, one by whether you completed the habit that day — and the score reflects how well those rankings agree.
+            </p>
+            <p className="text-[10px] text-text-tertiary leading-relaxed mt-1.5 mb-3">
+              <strong className="text-text-secondary">Why it&apos;s used:</strong> Rank-based, so it shrugs off outlier nights and skewed distributions that would distort a standard correlation. Scores range from −1.0 to +1.0; because habits are Yes/No, expect smaller magnitudes than continuous metrics — a steady ±0.10 across hundreds of nights is still real signal.
+            </p>
+            {habitCorrelations.length > 0 ? (
+              <ResponsiveContainer width="100%" height={Math.max(160, habitCorrelations.length * 32)}>
+                <BarChart data={habitCorrelations} layout="vertical"
+                          margin={{ left: 8, right: 20, top: 2, bottom: 2 }}>
+                  <CartesianGrid {...gridStyle} horizontal={false} />
+                  <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
+                  <YAxis type="category" dataKey="label" width={axisW.long}
+                         tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
+                  <Tooltip {...chartTooltip}
+                           formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
+                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                  <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                    {habitCorrelations.map((d, i) => (
+                      <Cell key={i} fill={d.spearman_r > 0 ? "#06b6d4" : "#0ea5e9"} fillOpacity={0.75} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <p className="text-[11px] text-text-tertiary italic">
+                Habit correlations not yet computed — need ≥20 days with the habit logged before correlations are reliable. Keep tracking at <a href="/habits" className="text-accent hover:underline">/habits</a>.
+              </p>
+            )}
+          </div>
+        </ChartCard>
+      </div>
+
+      {/* ── Behavior t-tests: Journal + Habit Impact ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Journal Impact */}
         <ChartCard collapsible title="Journal Behavior Impact" subtitle="Mean HRV difference: Yes vs No"
           source="WELCH'S T-TEST"
@@ -1101,10 +1009,7 @@ export default function HrvAnalysisPage() {
             </div>
           )}
         </ChartCard>
-      </div>
 
-      {/* ── Row 3a: Habit Impact ── */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <ChartCard collapsible title="Habit Impact" subtitle="Mean HRV difference: nights you completed the habit vs nights you didn't"
           source="WELCH'S T-TEST"
           info="Same statistical treatment as Journal Behavior Impact, applied to Notion-managed habits (from /habits). A +Xms bar means HRV averaged X ms higher on the night following days you completed that habit. Method: Welch's two-sample t-test on next-night HRV for Yes vs No nights. Tooltip shorthand: 'd' is Cohen's d — the standardized effect size, i.e. the HRV gap divided by typical night-to-night HRV variability (|d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large). 'n=Y/N' is the sample sizes that fed the comparison (Y completed-nights, N skipped-nights). The 95% CI (also produced per habit but not visualized here) is the range the true HRV difference is likely to land in; if it crossed 0, the effect would be statistically indistinguishable from noise. Habits need at least 5 Yes-nights and 5 No-nights before they appear (the t-test isn't meaningful with smaller groups). Add more habits or toggle them more consistently at /habits to populate this view.">
@@ -1144,7 +1049,7 @@ export default function HrvAnalysisPage() {
         </ChartCard>
       </div>
 
-      {/* ── Row 3b: Supplement Impact + Nutrition Correlations ── */}
+      {/* ── Supplements: Yes/No impact + Dose-Response ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Supplement Yes/No Impact */}
         <ChartCard collapsible
@@ -1191,6 +1096,50 @@ export default function HrvAnalysisPage() {
           )}
         </ChartCard>
 
+        {/* Supplement Dose-Response — conditional render */}
+        {supplementDoseResponse.length > 0 && (
+          <ChartCard collapsible
+            title="Supplement Dose-Response"
+            subtitle="Spearman ρ between daily amount and next-night HRV (compounds with ≥3 distinct doses)"
+            source="SPEARMAN ρ"
+            info="For compounds where the dose actually varies, this measures whether 'more = better/worse?' Method: Spearman rank correlation between daily total amount of that compound and next-night HRV. Only includes compounds with ≥3 distinct non-zero doses across the tracking window (constant-dose compounds appear in the Yes/No chart above instead). Rank-based to handle outliers and non-linear monotonic dose-response curves. BH-FDR corrected. ⚠ marks rows with n<20."
+          >
+            <ResponsiveContainer width="100%" height={Math.max(240, supplementDoseResponse.slice(0, 12).length * 30)}>
+              <BarChart data={supplementDoseResponse.slice(0, 12).map(d => ({
+                            ...d,
+                            displayLabel: `${d.low_n ? "⚠ " : ""}${d.compound}${d.unit ? ` (${d.unit})` : ""}`,
+                         }))}
+                        layout="vertical"
+                        margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
+                <CartesianGrid {...gridStyle} horizontal={false} />
+                <XAxis type="number" tick={axisTick} domain={[-1, 1]}
+                       tickFormatter={v => v.toFixed(2)}
+                       label={axisLabel("Spearman ρ (dose vs HRV)", "x")} />
+                <YAxis type="category" dataKey="displayLabel" width={axisW.xlong}
+                       tick={<WrappedYAxisTick maxCharsPerLine={chars.xlong} fontSize={10} />} />
+                <Tooltip {...chartTooltip}
+                         formatter={(v: any, _n: any, p: any) => {
+                           const d = p?.payload ?? {};
+                           return [
+                             `${Number(v).toFixed(3)} (p=${(d.p_value ?? 0).toFixed(3)}, n=${d.n}, doses=${d.n_distinct_doses})`,
+                             "Spearman ρ",
+                           ];
+                         }} />
+                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                  {supplementDoseResponse.slice(0, 12).map((d, i) => (
+                    <Cell key={i} fill={d.spearman_r > 0 ? "#06b6d4" : "#f97316"}
+                          fillOpacity={d.low_n ? 0.35 : 0.8} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        )}
+      </div>
+
+      {/* ── Lifestyle: Nutrition + Workout-to-Bed Gap ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Nutrition Spearman */}
         <ChartCard collapsible
           title="Nutrition Correlations"
@@ -1232,50 +1181,85 @@ export default function HrvAnalysisPage() {
             </div>
           )}
         </ChartCard>
+
+        <ChartCard collapsible
+          title="Workout-to-Bed Gap vs Next-Morning HRV"
+          subtitle={`${rangeLabel(range)} · each dot = one night`}
+          info="Hours between your last logged workout and the moment you fell asleep, plotted against the HRV measured from that night's sleep. Late-evening workouts (gap < 2h) are known to depress HRV; this chart lets you see whether that pattern shows up in your data. Dot color encodes WHOOP strain when available."
+        >
+          {(() => {
+            const points = workoutGap
+              .filter((g) => g.gap_minutes != null && g.next_morning_hrv != null)
+              .map((g) => ({
+                gap_hours: (g.gap_minutes as number) / 60,
+                hrv: g.next_morning_hrv as number,
+                strain: g.whoop_strain,
+                date: g.pred_date,
+              }));
+            if (points.length < 5) {
+              return (
+                <div className="h-[280px] flex items-center justify-center text-[12px] text-text-tertiary">
+                  Not enough workout-to-sleep data points yet (need ≥5).
+                </div>
+              );
+            }
+            // Bin into hour buckets for a faint trend overlay
+            const bins: Record<number, number[]> = {};
+            for (const p of points) {
+              const k = Math.min(12, Math.floor(p.gap_hours));
+              (bins[k] ||= []).push(p.hrv);
+            }
+            const binned = Object.entries(bins)
+              .map(([k, vs]) => ({
+                gap_hours: Number(k) + 0.5,
+                hrv_mean: vs.reduce((a, b) => a + b, 0) / vs.length,
+                n: vs.length,
+              }))
+              .sort((a, b) => a.gap_hours - b.gap_hours);
+            return (
+              <ResponsiveContainer width="100%" height={300}>
+                <LineChart data={binned}>
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis
+                    dataKey="gap_hours"
+                    type="number"
+                    domain={[0, 13]}
+                    tickFormatter={(v) => `${v}h`}
+                    tick={axisTick}
+                    height={50}
+                    label={axisLabel("hours from workout end → bed", "x")}
+                  />
+                  <YAxis tick={axisTick} width={55} domain={["auto", "auto"]}
+                         label={axisLabel("HRV (ms)", "y")} />
+                  <Tooltip {...chartTooltip}
+                           formatter={(value: any, name: any) =>
+                             name === "hrv_mean"
+                               ? [`${(value as number).toFixed(1)} ms`, "Mean HRV"]
+                               : [value, String(name)]
+                           } />
+                  <Line type="monotone" dataKey="hrv_mean" stroke="#22c55e" strokeWidth={2.5}
+                        dot={{ r: 5, fill: "#22c55e" }} name="Mean HRV per gap-hour bin" />
+                </LineChart>
+              </ResponsiveContainer>
+            );
+          })()}
+          <div className="mt-3 px-1 grid grid-cols-3 gap-2 text-[10px] text-text-tertiary">
+            <div>n nights with both workout + HRV: <span className="text-text-secondary tabular-nums">{workoutGap.filter(g => g.gap_minutes != null && g.next_morning_hrv != null).length}</span></div>
+            <div>median gap: <span className="text-text-secondary tabular-nums">{(() => {
+              const arr = workoutGap.map(g => g.gap_minutes).filter((v): v is number => v != null).sort((a, b) => a - b);
+              return arr.length ? `${(arr[Math.floor(arr.length / 2)] / 60).toFixed(1)}h` : "—";
+            })()}</span></div>
+            <div>evening workouts (after 6pm ET): <span className="text-text-secondary tabular-nums">{(() => {
+              return workoutGap.filter(g => g.last_workout_end_utc &&
+                new Date(g.last_workout_end_utc).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false }).includes(":") &&
+                Number(new Date(g.last_workout_end_utc).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit" })) >= 18
+              ).length;
+            })()}</span></div>
+          </div>
+        </ChartCard>
       </div>
 
-      {/* ── Row 3c: Supplement Dose-Response (only shown when there's data) ── */}
-      {supplementDoseResponse.length > 0 && (
-        <ChartCard collapsible
-          title="Supplement Dose-Response"
-          subtitle="Spearman ρ between daily amount and next-night HRV (compounds with ≥3 distinct doses)"
-          source="SPEARMAN ρ"
-          info="For compounds where the dose actually varies, this measures whether 'more = better/worse?' Method: Spearman rank correlation between daily total amount of that compound and next-night HRV. Only includes compounds with ≥3 distinct non-zero doses across the tracking window (constant-dose compounds appear in the Yes/No chart above instead). Rank-based to handle outliers and non-linear monotonic dose-response curves. BH-FDR corrected. ⚠ marks rows with n<20."
-        >
-          <ResponsiveContainer width="100%" height={Math.max(240, supplementDoseResponse.slice(0, 12).length * 30)}>
-            <BarChart data={supplementDoseResponse.slice(0, 12).map(d => ({
-                          ...d,
-                          displayLabel: `${d.low_n ? "⚠ " : ""}${d.compound}${d.unit ? ` (${d.unit})` : ""}`,
-                       }))}
-                      layout="vertical"
-                      margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
-              <CartesianGrid {...gridStyle} horizontal={false} />
-              <XAxis type="number" tick={axisTick} domain={[-1, 1]}
-                     tickFormatter={v => v.toFixed(2)}
-                     label={axisLabel("Spearman ρ (dose vs HRV)", "x")} />
-              <YAxis type="category" dataKey="displayLabel" width={axisW.xlong}
-                     tick={<WrappedYAxisTick maxCharsPerLine={chars.xlong} fontSize={10} />} />
-              <Tooltip {...chartTooltip}
-                       formatter={(v: any, _n: any, p: any) => {
-                         const d = p?.payload ?? {};
-                         return [
-                           `${Number(v).toFixed(3)} (p=${(d.p_value ?? 0).toFixed(3)}, n=${d.n}, doses=${d.n_distinct_doses})`,
-                           "Spearman ρ",
-                         ];
-                       }} />
-              <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-              <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
-                {supplementDoseResponse.slice(0, 12).map((d, i) => (
-                  <Cell key={i} fill={d.spearman_r > 0 ? "#06b6d4" : "#f97316"}
-                        fillOpacity={d.low_n ? 0.35 : 0.8} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
-      )}
-
-      {/* ── Row 3d: Causal Inference ── */}
+      {/* ── Causal Inference: from association to causation ── */}
       {/*
         Where the other charts on this page measure ASSOCIATION (Spearman, Welch),
         this section estimates causal effects with confounder adjustment. The
@@ -1843,151 +1827,150 @@ export default function HrvAnalysisPage() {
         </ChartCard>
       </div>
 
-      {/* ── Row 4: Prediction vs Actual + Accuracy by Horizon ── */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Prediction vs Actual */}
-        <ChartCard collapsible storageKey="prediction-vs-actual" title={`Prediction vs Actual (${rangeLabel(range)})`}
-                   subtitle="Red dots = miss > 15ms"
-                   info="What the model predicted each night (blue dashed) vs what your HRV actually was (green). Red dots are nights where it missed by more than 15ms. Fewer red dots = more accurate model.">
-          <ResponsiveContainer width="100%" height={260}>
-            <LineChart data={predActualData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={55} domain={["auto", "auto"]} label={axisLabel("HRV (ms)", "y")} />
-              <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={legendStyle} />
-              <Line type="monotone" dataKey="actual" stroke="#22c55e" strokeWidth={2}
-                    dot={false} name="Actual HRV" />
-              <Line type="monotone" dataKey="predicted" stroke="#3b82f6" strokeWidth={2}
-                    dot={<HrvDot />} name="XGBoost Pred" strokeDasharray="4 2" />
-            </LineChart>
-          </ResponsiveContainer>
-          {predActualData.length === 0 && (
-            <p className="text-[11px] text-text-tertiary text-center mt-2">No backtest data yet</p>
-          )}
-        </ChartCard>
+      {/* ── Models & Methods ── */}
+      <div className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card overflow-hidden">
+        <button
+          onClick={() => setExpandedModels(!expandedModels)}
+          className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-white/[0.02] transition-colors"
+        >
+          <div>
+            <h3 className="text-[13px] font-medium text-text-secondary">Models &amp; Methods</h3>
+            <p className="text-[11px] text-text-tertiary mt-0.5">How the predictions and statistical analysis work — click to expand</p>
+          </div>
+          <svg className={`w-4 h-4 text-text-tertiary transition-transform ${expandedModels ? "rotate-180" : ""}`}
+               fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
 
-        {/* Accuracy by Horizon */}
-        <ChartCard collapsible title="Accuracy by Forecast Horizon"
-                   subtitle="MAE (ms) — lower is better"
-                   info="Accuracy drops the further ahead you predict — this shows how much. Each bar is the average miss in ms for that day. 'Naive' just repeats yesterday's HRV as the guess. If the model can't beat that, it's not actually learning anything.">
-          <ResponsiveContainer width="100%" height={260}>
-            <BarChart data={horizonData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="horizon" tick={axisTick} label={axisLabel("forecast horizon (days)", "x")} height={50} />
-              <YAxis tick={axisTick} width={55} label={axisLabel("MAE (ms)", "y")} />
-              <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={legendStyle} />
-              <Bar dataKey="xgboost" name="XGBoost" fill="#3b82f6" radius={[3, 3, 0, 0]} />
-              <Bar dataKey="naive" name="Naive" fill="#f59e0b" radius={[3, 3, 0, 0]} />
-              {horizonData.some(d => d.sarimax) && (
-                <Bar dataKey="sarimax" name="SARIMAX" fill="#8b5cf6" radius={[3, 3, 0, 0]} />
-              )}
-            </BarChart>
-          </ResponsiveContainer>
-          {horizonData.every(d => !d.xgboost) && (
-            <p className="text-[11px] text-text-tertiary text-center mt-2">No horizon metrics yet</p>
-          )}
-        </ChartCard>
+        {expandedModels && (
+          <div className="px-5 pb-6 border-t border-border-subtle pt-5 space-y-6">
+
+            {/* Primary models */}
+            <div>
+              <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Prediction Models</p>
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">XGBoost</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">DAY-AHEAD</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A machine learning model that builds hundreds of small decision trees, each one correcting the mistakes of the last. The final prediction is all of them voting together.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Excellent at finding non-obvious patterns across many variables at once — like &ldquo;high strain + poor sleep + high stress = low HRV&rdquo; — which simpler methods miss.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it predicts:</strong> Tomorrow&apos;s HRV, using today&apos;s ~250-feature matrix (training load, sleep quality, behaviors, recent HRV trend, etc.).
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">Prophet</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">30-DAY FORECAST</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A forecasting model developed by Meta that splits your HRV history into three layers: a long-term trend, a weekly rhythm, and random noise — then adds them back together to project forward.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Great at capturing repeating cycles — like &ldquo;HRV tends to dip on Mondays after heavy weekend training&rdquo; — and extending them into the future.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it predicts:</strong> Your likely HRV range over the next 30 days, including an uncertainty band.
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">SARIMAX</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">SEASONAL</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A classical statistics model that predicts tomorrow&apos;s HRV using your own past HRV values (today&apos;s HRV predicts tomorrow&apos;s to some degree), while also factoring in external variables like training load.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Provides a transparent, interpretable baseline alongside XGBoost. If both models agree, the prediction is more reliable.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it predicts:</strong> Day-ahead HRV using recent HRV history + seasonal patterns + external inputs.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Analysis methods */}
+            <div>
+              <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Analysis Methods</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">SHAP Values</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">EXPLAINABILITY</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A method for opening up the &ldquo;black box&rdquo; of XGBoost to show why it made a specific prediction. Rooted in game theory — each feature gets credit proportional to how much it actually contributed.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> XGBoost alone can&apos;t tell you <em>why</em> it predicted a number. SHAP translates each prediction into a plain breakdown: &ldquo;your resting HR added +8ms, your sleep duration added +4ms, your strain subtracted −12ms.&rdquo;
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">Spearman Correlation</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">HISTORICAL PATTERNS</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A statistical measure of how consistently two things move together. Instead of comparing raw numbers, it converts both to ranks (1st highest, 2nd highest, etc.) and checks how well those ranks agree.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> More reliable than standard correlation for health data because it&apos;s not thrown off by outliers or skewed distributions. Scores range from −1.0 to +1.0.
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">Welch&apos;s T-Test</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">JOURNAL IMPACT</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> A statistical test that compares the average HRV on nights you logged a behavior as <em>Yes</em> vs nights you logged <em>No</em>, and tells you whether the gap is real or just random noise. &ldquo;Welch&apos;s&rdquo; means it doesn&apos;t assume the two groups have the same variance — which matters because Yes/No nights are usually unbalanced.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> Correlation tells you strength on a −1 to +1 scale; the t-test tells you the <em>actual HRV difference in ms</em> and whether it&apos;s statistically significant. That&apos;s why it drives the Journal Behavior Impact chart — the bars are mean HRV differences, with Cohen&apos;s d and a 95% confidence interval computed per behavior.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Reading the supporting numbers:</strong>
+                    {" "}<em>Cohen&apos;s d</em> is the standardized effect size — the HRV gap divided by the typical night-to-night HRV variability. The ms bar tells you raw size; <em>d</em> tells you whether that gap is big <em>relative to your usual noise</em>. Rule of thumb: |d| &lt; 0.2 trivial, 0.2–0.5 small, 0.5–0.8 medium, &gt; 0.8 large.
+                    {" "}<em>95% CI</em> (confidence interval) is the range the true difference is likely to land in given the data you have. If the CI crosses 0, the effect is statistically indistinguishable from no effect — meaning the apparent bar could just be noise.
+                    {" "}<em>n</em> in tooltips (e.g. <code className="font-mono text-[10px]">n=12/47</code>) is the sample sizes — 12 Yes-nights and 47 No-nights in this example. Bigger n → narrower CI → more trustworthy estimate.
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">Naive &amp; 7d Avg Baselines</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">BENCHMARKS</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What they are:</strong> The simplest possible &ldquo;models&rdquo; — no machine learning involved. Naive predicts tomorrow&apos;s HRV will equal today&apos;s. 7d Avg predicts it will equal the last 7-day mean.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why they&apos;re used:</strong> Every real model must beat these to prove it&apos;s actually learning something. If XGBoost can&apos;t outperform &ldquo;just copy yesterday,&rdquo; it isn&apos;t useful.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        )}
       </div>
 
-      {/* ── Row 5: HRV Trend ── */}
-      <ChartCard collapsible storageKey="hrv-trend" title={`HRV Trend (${rangeLabel(range)})`}
-                 subtitle="WHOOP HRV + 7-day rolling average"
-                 info="Your daily WHOOP HRV (faint line) swings a lot day-to-day — that's normal. The brighter line averages the last 7 days to show your real trend.">
-        <ResponsiveContainer width="100%" height={280}>
-          <LineChart data={trendData}>
-            <CartesianGrid {...gridStyle} />
-            <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-            <YAxis tick={axisTick} width={55} domain={["auto", "auto"]} label={axisLabel("HRV (ms)", "y")} />
-            <Tooltip {...chartTooltip} />
-            <Legend wrapperStyle={legendStyle} />
-            <Line type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={1.5}
-                  dot={false} name="WHOOP HRV" strokeOpacity={0.5} />
-            <Line type="monotone" dataKey="rolling7" stroke="#22c55e" strokeWidth={2.5}
-                  dot={false} name="7-Day Avg" />
-          </LineChart>
-        </ResponsiveContainer>
-      </ChartCard>
-
-      {/* ── Row 5b: Workout-to-sleep gap vs HRV ── */}
-      <ChartCard collapsible
-        title="Workout-to-Bed Gap vs Next-Morning HRV"
-        subtitle={`${rangeLabel(range)} · each dot = one night`}
-        info="Hours between your last logged workout and the moment you fell asleep, plotted against the HRV measured from that night's sleep. Late-evening workouts (gap < 2h) are known to depress HRV; this chart lets you see whether that pattern shows up in your data. Dot color encodes WHOOP strain when available."
-      >
-        {(() => {
-          const points = workoutGap
-            .filter((g) => g.gap_minutes != null && g.next_morning_hrv != null)
-            .map((g) => ({
-              gap_hours: (g.gap_minutes as number) / 60,
-              hrv: g.next_morning_hrv as number,
-              strain: g.whoop_strain,
-              date: g.pred_date,
-            }));
-          if (points.length < 5) {
-            return (
-              <div className="h-[280px] flex items-center justify-center text-[12px] text-text-tertiary">
-                Not enough workout-to-sleep data points yet (need ≥5).
-              </div>
-            );
-          }
-          // Bin into hour buckets for a faint trend overlay
-          const bins: Record<number, number[]> = {};
-          for (const p of points) {
-            const k = Math.min(12, Math.floor(p.gap_hours));
-            (bins[k] ||= []).push(p.hrv);
-          }
-          const binned = Object.entries(bins)
-            .map(([k, vs]) => ({
-              gap_hours: Number(k) + 0.5,
-              hrv_mean: vs.reduce((a, b) => a + b, 0) / vs.length,
-              n: vs.length,
-            }))
-            .sort((a, b) => a.gap_hours - b.gap_hours);
-          return (
-            <ResponsiveContainer width="100%" height={300}>
-              <LineChart data={binned}>
-                <CartesianGrid {...gridStyle} />
-                <XAxis
-                  dataKey="gap_hours"
-                  type="number"
-                  domain={[0, 13]}
-                  tickFormatter={(v) => `${v}h`}
-                  tick={axisTick}
-                  height={50}
-                  label={axisLabel("hours from workout end → bed", "x")}
-                />
-                <YAxis tick={axisTick} width={55} domain={["auto", "auto"]}
-                       label={axisLabel("HRV (ms)", "y")} />
-                <Tooltip {...chartTooltip}
-                         formatter={(value: any, name: any) =>
-                           name === "hrv_mean"
-                             ? [`${(value as number).toFixed(1)} ms`, "Mean HRV"]
-                             : [value, String(name)]
-                         } />
-                <Line type="monotone" dataKey="hrv_mean" stroke="#22c55e" strokeWidth={2.5}
-                      dot={{ r: 5, fill: "#22c55e" }} name="Mean HRV per gap-hour bin" />
-              </LineChart>
-            </ResponsiveContainer>
-          );
-        })()}
-        <div className="mt-3 px-1 grid grid-cols-3 gap-2 text-[10px] text-text-tertiary">
-          <div>n nights with both workout + HRV: <span className="text-text-secondary tabular-nums">{workoutGap.filter(g => g.gap_minutes != null && g.next_morning_hrv != null).length}</span></div>
-          <div>median gap: <span className="text-text-secondary tabular-nums">{(() => {
-            const arr = workoutGap.map(g => g.gap_minutes).filter((v): v is number => v != null).sort((a, b) => a - b);
-            return arr.length ? `${(arr[Math.floor(arr.length / 2)] / 60).toFixed(1)}h` : "—";
-          })()}</span></div>
-          <div>evening workouts (after 6pm ET): <span className="text-text-secondary tabular-nums">{(() => {
-            return workoutGap.filter(g => g.last_workout_end_utc &&
-              new Date(g.last_workout_end_utc).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false }).includes(":") &&
-              Number(new Date(g.last_workout_end_utc).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit" })) >= 18
-            ).length;
-          })()}</span></div>
-        </div>
-      </ChartCard>
-
-      {/* ── Row 6: Model Evaluation (collapsible) ── */}
+      {/* ── Model Evaluation Detail (collapsible — at-the-bottom diagnostics) ── */}
       <div className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card overflow-hidden">
         <button
           onClick={() => setExpandedEval(!expandedEval)}
