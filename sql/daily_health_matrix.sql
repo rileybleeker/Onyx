@@ -12,6 +12,7 @@
 --   WHOOP   : cycles (avg/max HR), recovery, sleep, workouts (aggregated)
 --   Eight Sleep : trends (left side)
 --   MyFitnessPal: nutrition
+--   Meal events: timing (last-meal hour, eating-window, last-meal-to-bedtime gap)
 --
 -- Apply: run in Supabase SQL Editor or via MCP apply_migration.
 -- =============================================================================
@@ -173,7 +174,18 @@ SELECT
   mfp.sugar_g                     AS mfp_sugar_g,
   mfp.sodium_mg                   AS mfp_sodium_mg,
   mfp.water_ml                    AS mfp_water_ml,
-  mfp.exercise_kcal               AS mfp_exercise_kcal
+  mfp.exercise_kcal               AS mfp_exercise_kcal,
+
+  -- ── Meal timing (pds.meal_timing_daily) ───────────────────────────────────
+  -- The bedtime-anchored gap (meal_last_meal_to_bedtime_minutes) is the
+  -- primary feature the HRV pipeline reads; it's monotonic in physiological
+  -- lateness regardless of clock wraparound, which the absolute last_hour
+  -- isn't (a 1:30 AM meal numerically reads as 1.5, not 25.5).
+  mt.last_meal_hour               AS meal_last_hour,
+  mt.first_meal_hour              AS meal_first_hour,
+  mt.eating_window_hours          AS meal_eating_window_hours,
+  mt.meal_event_count             AS meal_event_count,
+  mt.last_meal_to_bedtime_minutes AS meal_last_meal_to_bedtime_min
 
 FROM pds.garmin_daily_summary gds
 
@@ -256,6 +268,12 @@ LEFT JOIN pds.eight_sleep_trends es
 -- MyFitnessPal Nutrition
 LEFT JOIN pds.myfitnesspal_nutrition mfp
   ON mfp.calendar_date = gds.calendar_date
+
+-- Meal timing — keyed by behavioral day (event_date in pds.meal_events).
+-- The view itself handles the +1-day shift to find the WHOOP cycle that
+-- closes the day; we just join on the behavioral date directly.
+LEFT JOIN pds.meal_timing_daily mt
+  ON mt.calendar_date = gds.calendar_date
 
 ORDER BY gds.calendar_date DESC;
 

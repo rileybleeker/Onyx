@@ -52,16 +52,30 @@ CREATE TRIGGER trg_meal_events_updated_at
     FOR EACH ROW EXECUTE FUNCTION pds.touch_meal_events_updated_at();
 
 -- ---------------------------------------------------------------------------
--- 2. meal_timing_daily (view — one row per ET date)
+-- 2. meal_timing_daily (view — one row per ET behavioral date)
 -- ---------------------------------------------------------------------------
--- Aggregates raw events into per-day timing features:
---   last_meal_time       — clock instant of the last meal event that day
---   last_meal_hour       — ET hour as float (0-23.99); 19.75 = 7:45 PM
---   first_meal_time      — clock instant of the earliest event that day
---   first_meal_hour      — ET hour as float
---   eating_window_hours  — last - first, NULL when only one event
---   meal_event_count     — total events logged for the day
---   last_meal_kind       — kind of the last event (usually 'last_meal')
+-- Aggregates raw events into per-day timing features, then joins WHOOP sleep
+-- on the cycle that closes the behavioral day (the bedtime immediately
+-- following the last meal):
+--   last_meal_time                 — clock instant of the last meal event that day
+--   last_meal_hour                 — ET hour as float (0-23.99); 19.75 = 7:45 PM
+--   first_meal_time                — clock instant of the earliest event that day
+--   first_meal_hour                — ET hour as float
+--   eating_window_hours            — last - first, NULL when only one event
+--   meal_event_count               — total events logged for the day
+--   last_meal_kind                 — kind of the last event (usually 'last_meal')
+--   sleep_start_time               — start_time of the WHOOP cycle that closes day N
+--                                    (cycle tagged to N+1 via the +12h ET rule)
+--   last_meal_to_bedtime_minutes   — bedtime-anchored gap (sidesteps clock
+--                                    wraparound: a 1:30 AM meal + 1:35 AM
+--                                    bedtime = 5 minutes, not -19 hours).
+--                                    NULL when either side is missing.
+--
+-- Why anchor to bedtime, not to clock-of-day: `last_meal_hour` numerically
+-- wraps at midnight (0.083 < 19.75) which would invert the "later meal =
+-- worse HRV" relationship for post-midnight meals. `last_meal_to_bedtime_
+-- minutes` is monotonic in physiological lateness and the actual signal
+-- the HRV pipeline reads.
 --
 -- All hour fields are computed in ET so they're comparable across DST.
 -- ---------------------------------------------------------------------------
@@ -75,31 +89,57 @@ WITH ranked AS (
         ROW_NUMBER() OVER (PARTITION BY event_date ORDER BY event_time DESC) AS rn_last,
         ROW_NUMBER() OVER (PARTITION BY event_date ORDER BY event_time ASC)  AS rn_first
     FROM pds.meal_events
+),
+agg AS (
+    SELECT
+        event_date AS calendar_date,
+        MAX(event_time) FILTER (WHERE rn_last = 1)  AS last_meal_time,
+        MIN(event_time) FILTER (WHERE rn_first = 1) AS first_meal_time,
+        EXTRACT(
+            EPOCH FROM (MAX(event_time) FILTER (WHERE rn_last = 1)  AT TIME ZONE 'America/New_York')
+            - DATE_TRUNC('day', MAX(event_time) FILTER (WHERE rn_last = 1) AT TIME ZONE 'America/New_York')
+        ) / 3600.0 AS last_meal_hour,
+        EXTRACT(
+            EPOCH FROM (MIN(event_time) FILTER (WHERE rn_first = 1) AT TIME ZONE 'America/New_York')
+            - DATE_TRUNC('day', MIN(event_time) FILTER (WHERE rn_first = 1) AT TIME ZONE 'America/New_York')
+        ) / 3600.0 AS first_meal_hour,
+        CASE
+            WHEN COUNT(*) > 1 THEN
+                EXTRACT(EPOCH FROM (MAX(event_time) - MIN(event_time))) / 3600.0
+            ELSE NULL
+        END AS eating_window_hours,
+        COUNT(*) AS meal_event_count,
+        MAX(kind) FILTER (WHERE rn_last = 1) AS last_meal_kind
+    FROM ranked
+    GROUP BY event_date
 )
 SELECT
-    event_date AS calendar_date,
-    MAX(event_time) FILTER (WHERE rn_last = 1)  AS last_meal_time,
-    MIN(event_time) FILTER (WHERE rn_first = 1) AS first_meal_time,
-    -- ET hour as float (0-23.99). Cast via America/New_York so DST handles itself.
-    EXTRACT(
-        EPOCH FROM (MAX(event_time) FILTER (WHERE rn_last = 1)  AT TIME ZONE 'America/New_York')
-        - DATE_TRUNC('day', MAX(event_time) FILTER (WHERE rn_last = 1) AT TIME ZONE 'America/New_York')
-    ) / 3600.0 AS last_meal_hour,
-    EXTRACT(
-        EPOCH FROM (MIN(event_time) FILTER (WHERE rn_first = 1) AT TIME ZONE 'America/New_York')
-        - DATE_TRUNC('day', MIN(event_time) FILTER (WHERE rn_first = 1) AT TIME ZONE 'America/New_York')
-    ) / 3600.0 AS first_meal_hour,
-    -- Eating window in hours; NULL when only one event logged that day.
+    agg.calendar_date,
+    agg.last_meal_time,
+    agg.first_meal_time,
+    agg.last_meal_hour,
+    agg.first_meal_hour,
+    agg.eating_window_hours,
+    agg.meal_event_count,
+    agg.last_meal_kind,
+    ws.start_time AS sleep_start_time,
     CASE
-        WHEN COUNT(*) > 1 THEN
-            EXTRACT(EPOCH FROM (MAX(event_time) - MIN(event_time))) / 3600.0
+        WHEN ws.start_time IS NOT NULL AND agg.last_meal_time IS NOT NULL THEN
+            EXTRACT(EPOCH FROM (ws.start_time - agg.last_meal_time)) / 60.0
         ELSE NULL
-    END AS eating_window_hours,
-    COUNT(*) AS meal_event_count,
-    MAX(kind) FILTER (WHERE rn_last = 1) AS last_meal_kind
-FROM ranked
-GROUP BY event_date
-ORDER BY event_date DESC;
+    END AS last_meal_to_bedtime_minutes
+FROM agg
+-- The WHOOP cycle closing behavioral day N is tagged to N+1 (the wake day)
+-- via the codebase's `(start_time + 12h) AT NY ::date` rule. So we join
+-- on (agg.calendar_date + 1).
+LEFT JOIN pds.whoop_cycles wc
+    ON ((wc.start_time + INTERVAL '12 hours') AT TIME ZONE 'America/New_York')::date
+       = (agg.calendar_date + INTERVAL '1 day')::date
+LEFT JOIN pds.whoop_sleep ws
+    ON ws.cycle_id = wc.cycle_id
+   AND ws.is_nap = false
+   AND ws.score_state = 'SCORED'
+ORDER BY agg.calendar_date DESC;
 
 -- ---------------------------------------------------------------------------
 -- 3. RLS + grants

@@ -21,11 +21,38 @@ interface MealTimingRow {
   eating_window_hours: number | null;
   meal_event_count: number;
   last_meal_kind: string | null;
+  last_meal_to_bedtime_minutes: number | null;
 }
 
-/** Current ET date as YYYY-MM-DD — used as the default event_date. */
+/** Hour of the day in ET (0–23). */
+function etCurrentHour(): number {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    hour12: false,
+  });
+  return parseInt(fmt.format(new Date()), 10);
+}
+
+/** Current ET date as YYYY-MM-DD. */
 function etTodayStr(): string {
   return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
+/** Yesterday's ET date as YYYY-MM-DD. */
+function etYesterdayStr(): string {
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  return yesterday.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
+/**
+ * Behavioral-day default for the meal log: between midnight and 4 AM ET, the
+ * meal almost certainly belongs to yesterday's behavioral day (pre-bed snack
+ * before the user has slept). Mirrors the supplement-intake convention so the
+ * row lines up with the WHOOP cycle and the HRV pipeline's shift(-1).
+ */
+function defaultEventDate(): string {
+  return etCurrentHour() < 4 ? etYesterdayStr() : etTodayStr();
 }
 
 /** Pretty-print a YYYY-MM-DD as "May 22" for inline labels. */
@@ -83,10 +110,10 @@ export default function MealsPage() {
   const [logging, setLogging] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
 
-  // Event-date override — defaults to ET today. Same behavioral-day
-  // semantics as supplements (a 12:05 AM pre-bed meal can be attributed
-  // to the previous day).
-  const [eventDate, setEventDate] = useState<string>(etTodayStr());
+  // Event-date override — defaults to ET today, OR yesterday if the user is
+  // logging between midnight and 4 AM (pre-bed snack convention). Same
+  // behavioral-day semantics as supplements.
+  const [eventDate, setEventDate] = useState<string>(defaultEventDate());
 
   // Optional event-time override. Empty → use now() at log time.
   const [customTimeOpen, setCustomTimeOpen] = useState(false);
@@ -100,7 +127,14 @@ export default function MealsPage() {
   const [editNotes, setEditNotes] = useState("");
 
   const today = etTodayStr();
+  const yesterday = etYesterdayStr();
+  const currentHourET = etCurrentHour();
   const isLoggingForToday = eventDate === today;
+  // True when we've auto-attributed this meal to yesterday because it's a
+  // post-midnight, pre-bed snack. Distinct from a manual past-date override
+  // (which shows an amber "not today" warning instead).
+  const isAutoBedtimeAdjusted =
+    eventDate === yesterday && currentHourET < 4;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -249,7 +283,7 @@ export default function MealsPage() {
             subtitle="One tap = one event. By default uses the current clock time; tap 'change time' to log retroactively."
           >
             {/* Date override row */}
-            <div className="flex flex-wrap items-center gap-2 mb-3">
+            <div className="flex flex-wrap items-center gap-2 mb-1">
               <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
                 Date
               </label>
@@ -260,7 +294,19 @@ export default function MealsPage() {
                 onChange={(e) => setEventDate(e.target.value || today)}
                 className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
               />
-              {!isLoggingForToday && (
+              {isAutoBedtimeAdjusted ? (
+                <>
+                  <span className="text-[10px] font-mono text-emerald-300/90">
+                    auto-attributed to {formatShortDate(eventDate)} — pre-bed meal
+                  </span>
+                  <button
+                    onClick={() => setEventDate(today)}
+                    className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
+                  >
+                    use today instead
+                  </button>
+                </>
+              ) : !isLoggingForToday ? (
                 <>
                   <span className="text-[10px] font-mono text-amber-400/90">
                     logging to {formatShortDate(eventDate)} — not today
@@ -272,8 +318,33 @@ export default function MealsPage() {
                     reset to today
                   </button>
                 </>
-              )}
+              ) : null}
             </div>
+
+            {/* Bedtime-anchored explainer — shown whenever the date diverges
+                from the clock date, so the user understands the convention. */}
+            {(isAutoBedtimeAdjusted || !isLoggingForToday) && (
+              <div className="mb-3 px-3 py-2 text-[11px] leading-snug bg-emerald-500/5 border border-emerald-500/15 rounded-[4px] text-text-secondary">
+                <span className="font-mono uppercase tracking-wide text-[9px] text-emerald-300/90 block mb-0.5">
+                  Why {formatShortDate(eventDate)}?
+                </span>
+                {isAutoBedtimeAdjusted ? (
+                  <>
+                    It&apos;s {currentHourET < 1 ? "just past" : "after"} midnight, so this meal almost certainly belongs to <b>yesterday&apos;s</b> behavioral day —
+                    the pre-bed window before tonight&apos;s WHOOP cycle starts.
+                    The actual clock time stays accurate; only the date column flips.
+                    This lines the row up with the sleep that follows so the HRV pipeline
+                    can compute <code className="font-mono text-emerald-300/90">last_meal_to_bedtime_min</code> correctly.
+                    Tap <i>use today instead</i> if this was actually a 1 AM meal mid-day.
+                  </>
+                ) : (
+                  <>
+                    Each meal&apos;s <code className="font-mono text-emerald-300/90">event_date</code> reflects the behavioral day
+                    it belongs to — the day that <i>ends</i> with the following sleep. Same convention as supplements.
+                  </>
+                )}
+              </div>
+            )}
 
             {/* Time override row */}
             <div className="flex flex-wrap items-center gap-2 mb-3">
@@ -345,12 +416,12 @@ export default function MealsPage() {
           {/* Daily timing summary */}
           <ChartCard
             title="Daily timing"
-            subtitle="One row per ET date · last_meal_hour is what feeds the HRV pipeline"
-            info="last_meal_hour is a decimal hour (e.g. 19.75 = 7:45 PM ET). meal_event_count just tells you how many times you tapped the log button that day — typically 1."
+            subtitle="One row per ET date · last_meal → bedtime gap is what the HRV pipeline reads"
+            info="last_meal → bedtime is computed against the WHOOP cycle that closes the behavioral day; it stays monotonic in physiological lateness even for post-midnight meals (a 1:30 AM meal + 1:35 AM bedtime = 5 min). NULL until WHOOP syncs that night's sleep."
           >
             {timing.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
-                No meal events yet. Tap "Log last meal" above to start.
+                No meal events yet. Tap &quot;Log last meal&quot; above to start.
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -359,7 +430,7 @@ export default function MealsPage() {
                     <tr className="text-[10px] uppercase tracking-wide text-text-tertiary border-b border-border-subtle">
                       <th className="text-left py-2 px-1 font-normal w-[80px]">Date</th>
                       <th className="text-left py-2 px-1 font-normal">Last meal</th>
-                      <th className="text-right py-2 px-1 font-normal w-[100px]">Last hr</th>
+                      <th className="text-right py-2 px-1 font-normal w-[110px]">→ Bedtime</th>
                       <th className="text-right py-2 px-1 font-normal w-[80px]">Window</th>
                       <th className="text-right py-2 px-1 font-normal w-[60px]">Events</th>
                     </tr>
@@ -377,7 +448,9 @@ export default function MealsPage() {
                           {formatClockET(t.last_meal_time)}
                         </td>
                         <td className="py-1.5 px-1 text-right text-text-secondary tabular-nums">
-                          {t.last_meal_hour !== null ? Number(t.last_meal_hour).toFixed(2) : "—"}
+                          {t.last_meal_to_bedtime_minutes !== null
+                            ? `${Math.round(t.last_meal_to_bedtime_minutes)} min`
+                            : "—"}
                         </td>
                         <td className="py-1.5 px-1 text-right text-text-secondary tabular-nums">
                           {t.eating_window_hours !== null ? `${Number(t.eating_window_hours).toFixed(1)}h` : "—"}

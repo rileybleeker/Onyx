@@ -290,6 +290,15 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     ("nj_mood_ord",                 "behavior", "Journaled mood (ordinal) above median", None),
     ("nj_confidence_ord",           "behavior", "Journaled confidence above median",     None),
     ("nj_word_count",               "behavior", "Notion journal words above median",     "words"),
+
+    # ── Meal timing (pds.meal_timing_daily, joined in daily_health_matrix) ──
+    # last_meal_to_bedtime is bedtime-anchored, so it stays monotonic in
+    # physiological lateness even when the meal lands after midnight. Family
+    # is 'nutrition' so the causal layer attaches the supplement-style
+    # confounders (lifestyle clustering around late meals).
+    ("meal_last_meal_to_bedtime_min", "nutrition", "Last meal → bedtime minutes above median", "min"),
+    ("meal_eating_window_hours",      "nutrition", "Eating window above median",               "h"),
+    ("meal_last_hour",                "nutrition", "Last meal clock hour above median",        "ET hr"),
 )
 
 # Explicit binary treatments — derived 0/1 flags that don't match the

@@ -176,6 +176,7 @@ CONTROLLABLE_FEATURE_PREFIXES = (
     "days_since_alcohol", "days_since_sauna", "days_since_hard_workout",
     "nj_",  # Notion Journal: mood / confidence / word_count / topic_count
     "sp_",  # Spotify daily signature (opt-in via ONYX_INCLUDE_SPOTIFY=1)
+    "meal_",  # Meal timing: last_hour, first_hour, eating_window, last_meal_to_bedtime_min
 )
 
 # Computed once per run from the post-prepare_ml_data (X, y) and stamped onto every
@@ -300,6 +301,11 @@ FEATURE_LABELS: dict[str, str] = {
     "nj_word_count": "Notion Journal Word Count",
     "nj_topic_count": "Notion Journal Topic Count",
     "nj_entry_count": "Notion Journal Entry Count",
+    "meal_last_hour": "Last Meal (ET hour)",
+    "meal_first_hour": "First Meal (ET hour)",
+    "meal_eating_window_hours": "Eating Window (h)",
+    "meal_event_count": "Meal Events Logged",
+    "meal_last_meal_to_bedtime_min": "Minutes from Last Meal to Bedtime",
 }
 
 # Journal boolean questions → clean labels

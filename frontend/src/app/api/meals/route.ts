@@ -35,7 +35,7 @@ export async function GET(req: NextRequest) {
       .order("event_time", { ascending: false }),
     supabase
       .from("meal_timing_daily")
-      .select("calendar_date,last_meal_time,first_meal_time,last_meal_hour,first_meal_hour,eating_window_hours,meal_event_count,last_meal_kind")
+      .select("calendar_date,last_meal_time,first_meal_time,last_meal_hour,first_meal_hour,eating_window_hours,meal_event_count,last_meal_kind,last_meal_to_bedtime_minutes")
       .gte("calendar_date", cutoffStr)
       .order("calendar_date", { ascending: false }),
   ]);
