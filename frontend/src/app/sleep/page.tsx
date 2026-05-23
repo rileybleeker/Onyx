@@ -95,15 +95,20 @@ export default function SleepPage() {
   const avgWhoopRhr      = avg(whoopRecovery, "resting_heart_rate");
   const avgStrain        = avg(whoopCycles, "strain");
   const recoveryByCycle = new Map(whoopRecovery.map((r) => [r.cycle_id, r]));
+  const sleepByCycle    = new Map(whoopSleep.map((s) => [s.cycle_id, s]));
 
-  const recoveryData = whoopRecovery.map((d) => ({
-    date:     formatDate(new Date(d.created_at).toISOString().split("T")[0]),
-    recovery: d.recovery_score,
-    rhr:      d.resting_heart_rate,
-    hrv:      d.hrv_rmssd_milli ? +Number(d.hrv_rmssd_milli).toFixed(1) : null,
-    spo2:     d.spo2_percentage  ? +Number(d.spo2_percentage).toFixed(1)  : null,
-    skinTemp: d.skin_temp_celsius ? +Number(d.skin_temp_celsius).toFixed(1) : null,
-  }));
+  const recoveryData = whoopRecovery.map((d) => {
+    const sleep = sleepByCycle.get(d.cycle_id);
+    return {
+      date:     formatDate(new Date(d.created_at).toISOString().split("T")[0]),
+      recovery: d.recovery_score,
+      rhr:      d.resting_heart_rate,
+      hrv:      d.hrv_rmssd_milli ? +Number(d.hrv_rmssd_milli).toFixed(1) : null,
+      spo2:     d.spo2_percentage  ? +Number(d.spo2_percentage).toFixed(1)  : null,
+      skinTemp: d.skin_temp_celsius ? +Number(d.skin_temp_celsius).toFixed(1) : null,
+      respRate: sleep?.respiratory_rate ? +Number(sleep.respiratory_rate).toFixed(1) : null,
+    };
+  });
 
   const strainData = whoopCycles.map((d) => ({
     date:   formatDate(new Date(d.start_time).toISOString().split("T")[0]),
@@ -271,17 +276,19 @@ export default function SleepPage() {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="SpO2 & Skin Temperature" source="WHOOP">
+        <ChartCard title="SpO2, Skin Temp & Resp Rate" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={recoveryData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis yAxisId="spo2" tick={axisTick} width={40} domain={[90, 100]} />
               <YAxis yAxisId="temp" orientation="right" tick={axisTick} width={40} />
+              <YAxis yAxisId="resp" orientation="right" hide domain={[10, 22]} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Line yAxisId="spo2" type="monotone" dataKey="spo2" stroke="#06b6d4" strokeWidth={2} dot={false} name="SpO2 %" />
               <Line yAxisId="temp" type="monotone" dataKey="skinTemp" stroke="#f97316" strokeWidth={2} dot={false} name="Skin Temp (°C)" />
+              <Line yAxisId="resp" type="monotone" dataKey="respRate" stroke="#8b5cf6" strokeWidth={2} dot={false} name="Resp Rate (br/min)" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
