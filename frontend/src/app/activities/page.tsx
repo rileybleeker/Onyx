@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
-import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { AreaChart, Area, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDuration, formatDistance, formatPace, formatDate } from "@/lib/format";
 import RangeFilter from "@/components/RangeFilter";
 import StatCard from "@/components/StatCard";
@@ -97,14 +97,15 @@ export default function ActivitiesPage() {
   const [rows, setRows] = useState<ActivityRow[]>([]);
   const [workoutMap, setWorkoutMap] = useState<Record<string, any>>({});
   const [summaries, setSummaries] = useState<any[]>([]);
+  const [whoopCycles, setWhoopCycles] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [range, setRange] = useState<Range>("30d");
 
   useEffect(() => {
     setLoading(true);
     const days = rangeDays(range);
-    Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts(), getDailySummaries(days)])
-      .then(([garmin, whoop, wkts, sums]) => {
+    Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts(), getDailySummaries(days), getWhoopCycles(days)])
+      .then(([garmin, whoop, wkts, sums, cycles]) => {
         const merged = mergeAndDedup(
           garmin.map(normalizeGarmin),
           whoop.map(normalizeWhoop),
@@ -114,6 +115,7 @@ export default function ActivitiesPage() {
         for (const w of wkts) map[String(w.workout_id)] = w;
         setWorkoutMap(map);
         setSummaries(sums);
+        setWhoopCycles(cycles);
       })
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -124,6 +126,17 @@ export default function ActivitiesPage() {
     date: formatDate(d.calendar_date),
     steps: d.total_steps,
   }));
+
+  // WHOOP day-wide cycle avg HR (one value per cycle = behavioral day).
+  const cycleHrData = whoopCycles
+    .filter((c) => c.average_heart_rate != null)
+    .map((c) => ({
+      date: formatDate(new Date(c.start_time).toISOString().split("T")[0]),
+      hr:   c.average_heart_rate,
+    }));
+  const avgCycleHr = cycleHrData.length
+    ? cycleHrData.reduce((a, b) => a + b.hr, 0) / cycleHrData.length
+    : null;
 
   if (loading) {
     return (
@@ -155,9 +168,16 @@ export default function ActivitiesPage() {
           sublabel={latestSummary?.calendar_date}
           source="GARMIN"
         />
+        <StatCard
+          label="Avg HR"
+          value={avgCycleHr != null ? avgCycleHr.toFixed(0) : null}
+          unit="bpm"
+          sublabel={range === "1d" ? "today" : `${rangeLabel(range)} avg`}
+          source="WHOOP"
+        />
       </div>
 
-      <div className="mb-8">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
         <ChartCard title="Daily Steps" subtitle={rangeLabel(range)} source="GARMIN">
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={stepsData}>
@@ -167,6 +187,24 @@ export default function ActivitiesPage() {
               <Tooltip {...chartTooltip} />
               <Bar dataKey="steps" fill={accentColor} radius={[2, 2, 0, 0]} fillOpacity={0.85} />
             </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard title="Avg Heart Rate" subtitle={rangeLabel(range)} source="WHOOP">
+          <ResponsiveContainer width="100%" height={220}>
+            <AreaChart data={cycleHrData}>
+              <defs>
+                <linearGradient id="cycleHrGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#ef4444" stopOpacity={0.18} />
+                  <stop offset="100%" stopColor="#ef4444" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={55} label={axisLabel("bpm", "y")} />
+              <Tooltip {...chartTooltip} />
+              <Area type="monotone" dataKey="hr" stroke="#ef4444" fill="url(#cycleHrGrad)" strokeWidth={2} name="Avg HR" />
+            </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
       </div>
