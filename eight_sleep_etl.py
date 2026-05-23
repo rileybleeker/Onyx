@@ -227,8 +227,12 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
     # time-in-bed. Sum the per-session `stageSummary` fields instead — those are
     # internally consistent per session, and summing gives correct day totals.
     sessions = day.get("sessions") or []
+    main_session_id = day.get("mainSessionId")
     stage_sums = {"sleepDuration": 0, "awakeDuration": 0, "lightDuration": 0,
                   "deepDuration": 0, "remDuration": 0}
+    main_session_sums = {"sleepDuration": None, "awakeDuration": None,
+                          "lightDuration": None, "deepDuration": None,
+                          "remDuration": None}
     have_session_summaries = False
     for s in sessions:
         summary = s.get("stageSummary") or {}
@@ -239,6 +243,12 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
             v = summary.get(k)
             if v is not None:
                 stage_sums[k] += v
+        # Capture the main session separately for cross-device comparisons.
+        # WHOOP filters is_nap=false (main-only), so for Bland-Altman / HRV
+        # joins we need the symmetric Eight Sleep main-only value.
+        if main_session_id and s.get("id") == main_session_id:
+            for k in main_session_sums:
+                main_session_sums[k] = summary.get(k)
 
     if have_session_summaries:
         sleep_duration = stage_sums["sleepDuration"]
@@ -304,6 +314,15 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
         "light_sleep_seconds": light_seconds,
         "deep_sleep_seconds": deep_seconds,
         "rem_sleep_seconds": rem_seconds,
+        # Main-session-only stages (seconds) — isolated for cross-device
+        # comparisons against WHOOP, which filters is_nap=false. Use these
+        # (not the totals above) for Bland-Altman / HRV pipeline joins so the
+        # comparison is apples-to-apples.
+        "time_slept_main_session_seconds":  main_session_sums["sleepDuration"],
+        "awake_main_session_seconds":       main_session_sums["awakeDuration"],
+        "light_sleep_main_session_seconds": main_session_sums["lightDuration"],
+        "deep_sleep_main_session_seconds":  main_session_sums["deepDuration"],
+        "rem_sleep_main_session_seconds":   main_session_sums["remDuration"],
         # Other
         "toss_and_turns": day.get("tnt"),
         "latency_asleep_seconds": latency_asleep_seconds,

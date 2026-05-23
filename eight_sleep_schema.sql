@@ -32,12 +32,24 @@ CREATE TABLE IF NOT EXISTS pds.eight_sleep_trends (
     avg_bed_temp            NUMERIC(5,2),       -- °C or °F (as returned by API)
     avg_room_temp           NUMERIC(5,2),
 
-    -- Sleep stages (seconds)
+    -- Sleep stages (seconds) — TOTAL across all sessions (main + naps).
+    -- These match what the Eight Sleep app shows as the day's total sleep.
+    -- Use for user-facing display.
     time_slept_seconds      INTEGER,
     awake_seconds           INTEGER,
     light_sleep_seconds     INTEGER,
     deep_sleep_seconds      INTEGER,
     rem_sleep_seconds       INTEGER,
+    -- Sleep stages (seconds) — MAIN session only. WHOOP filters is_nap=false,
+    -- so for any cross-device comparison (Bland-Altman, HRV pipeline joins)
+    -- the symmetric Eight Sleep value to compare is main-session-only, not the
+    -- nap-inclusive totals above. Computed from the session in raw_json.sessions[]
+    -- whose `id` matches raw_json.mainSessionId.
+    time_slept_main_session_seconds   INTEGER,
+    awake_main_session_seconds        INTEGER,
+    light_sleep_main_session_seconds  INTEGER,
+    deep_sleep_main_session_seconds   INTEGER,
+    rem_sleep_main_session_seconds    INTEGER,
 
     -- Other
     toss_and_turns          INTEGER,
