@@ -114,6 +114,23 @@ export default function SupplementsPage() {
   const today = etTodayStr();
   const isLoggingForToday = logDate === today;
 
+  // Time the quick-tap log buttons stamp on intake_time. Default is
+  // empty = "use the current clock instant at the moment of tap" (the
+  // pre-existing behavior). When set, every tap on a product writes
+  // that fixed timestamp until cleared. Use this when you forgot to
+  // log a supplement earlier — e.g. "I took my caffeine at 9 AM but
+  // I'm tapping now at 11 AM." Stored as a datetime-local string
+  // (YYYY-MM-DDTHH:MM); converted to ISO at send time.
+  const [logTimeLocal, setLogTimeLocal] = useState<string>("");
+  const [logTimeOpen, setLogTimeOpen] = useState<boolean>(false);
+
+  // Convert "YYYY-MM-DDTHH:MM" (local clock) → ISO; empty/invalid → null.
+  function logTimeIso(): string | null {
+    if (!logTimeLocal) return null;
+    const d = new Date(logTimeLocal);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+
   // Add product flow
   const [addOpen, setAddOpen] = useState(false);
   const [searchQ, setSearchQ] = useState("");
@@ -185,7 +202,7 @@ export default function SupplementsPage() {
         body: JSON.stringify({
           product_id,
           intake_date: logDate,
-          intake_time: new Date().toISOString(),
+          intake_time: logTimeIso() ?? new Date().toISOString(),
         }),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -247,7 +264,7 @@ export default function SupplementsPage() {
             product_id: seeded.product_id,
             doses,
             intake_date: logDate,
-            intake_time: new Date().toISOString(),
+            intake_time: logTimeIso() ?? new Date().toISOString(),
           }),
         });
         if (!logRes.ok) throw new Error(await logRes.text());
@@ -349,7 +366,7 @@ export default function SupplementsPage() {
             {/* Manual date override — defaults to today; lets the user
                 attribute a post-midnight pre-bed intake to the day that
                 just ended (behavioral-day convention; see CLAUDE.md). */}
-            <div className="flex flex-wrap items-center gap-2 mb-3 pb-3 border-b border-border-subtle/40">
+            <div className="flex flex-wrap items-center gap-2 mb-2">
               <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
                 Intake date
               </label>
@@ -370,6 +387,56 @@ export default function SupplementsPage() {
                     className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
                   >
                     reset to today
+                  </button>
+                </>
+              )}
+            </div>
+
+            {/* Manual time override — defaults to "now at tap"; lets the
+                user attribute an intake to an earlier clock time when
+                they forgot to log right away. Critical for HRV timing
+                analysis (e.g. caffeine at 8 AM, logged at 11 AM). */}
+            <div className="flex flex-wrap items-center gap-2 mb-3 pb-3 border-b border-border-subtle/40">
+              <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
+                Intake time
+              </label>
+              {!logTimeOpen ? (
+                <>
+                  <span className="text-[12px] font-mono text-text-secondary">now</span>
+                  <button
+                    onClick={() => {
+                      // Pre-fill picker with current local clock so the
+                      // user just nudges backwards instead of typing.
+                      const now = new Date();
+                      const pad = (n: number) => String(n).padStart(2, "0");
+                      const local = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+                      setLogTimeLocal(local);
+                      setLogTimeOpen(true);
+                    }}
+                    className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
+                  >
+                    change time
+                  </button>
+                </>
+              ) : (
+                <>
+                  <input
+                    type="datetime-local"
+                    value={logTimeLocal}
+                    onChange={(e) => setLogTimeLocal(e.target.value)}
+                    className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                  />
+                  <span className="text-[10px] font-mono text-amber-400/90">
+                    stamping at custom clock time
+                  </span>
+                  <button
+                    onClick={() => {
+                      setLogTimeOpen(false);
+                      setLogTimeLocal("");
+                    }}
+                    className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
+                  >
+                    reset to now
                   </button>
                 </>
               )}
