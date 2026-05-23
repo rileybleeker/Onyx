@@ -500,11 +500,26 @@ export default function SleepPage() {
 
       {/* ── Journal ─────────────────────────────────────────────────────────── */}
       {journal.length > 0 && (() => {
+        // WHOOP's CSV `cycle_date` is the date bedtime began in WHOOP's local
+        // TZ. For post-midnight bedtimes (Riley's usual pattern) that's one
+        // day AFTER the day whose behaviors the journal answer describes. The
+        // heatmap should be keyed by behaviors-day, not bedtime-day, so the
+        // bar labeled "May 13" reflects "how I felt on May 13" — not "the
+        // cycle that began past midnight on May 14." Re-map via the
+        // whoopSleepDay rule (bedtime − 6h then ET) using the cycle table.
+        const cycleDateToBehaviorsDay = new Map<string, string>();
+        whoopCycles.forEach((c: any) => {
+          if (!c.start_time) return;
+          cycleDateToBehaviorsDay.set(etDate(c.start_time), whoopSleepDay(c.start_time));
+        });
+        const journalDate = (j: any) =>
+          cycleDateToBehaviorsDay.get(j.cycle_date) ?? j.cycle_date;
+
         const behaviors = [...new Set(journal.map((j: any) => j.question))].sort();
-        const dates     = [...new Set(journal.map((j: any) => j.cycle_date))].sort();
+        const dates     = [...new Set(journal.map(journalDate))].sort();
         const journalMap = new Map<string, string>();
         journal.forEach((j: any) => {
-          journalMap.set(`${j.cycle_date}|${j.question}`, j.answer);
+          journalMap.set(`${journalDate(j)}|${j.question}`, j.answer);
         });
 
         const categoryMap = new Map<string, string[]>();
