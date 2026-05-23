@@ -227,7 +227,12 @@ SELECT
     ws.total_light_sleep_time_milli AS whoop_light_sleep_milli,
     ws.total_awake_time_milli       AS whoop_awake_milli,
     -- Hours vs Needed (WHOOP "Sleep Sufficiency"): asleep_time / sleep_needed
-    -- asleep = in_bed − awake − no_data; need = baseline + debt + strain − nap
+    -- asleep = in_bed − awake − no_data
+    -- need   = baseline + debt + strain + nap   (NOTE: WHOOP's API returns
+    --         need_from_recent_nap_milli as a SIGNED value — negative when a
+    --         recent nap credits toward tonight's need. ADD it directly; the
+    --         prior `- need_from_recent_nap_milli` formulation inverted the
+    --         credit and inflated the denominator on nap-heavy days.)
     CASE
         WHEN ws.total_in_bed_time_milli IS NULL THEN NULL
         ELSE ws.total_in_bed_time_milli
@@ -239,7 +244,7 @@ SELECT
         ELSE ws.baseline_milli
              + COALESCE(ws.need_from_sleep_debt_milli, 0)
              + COALESCE(ws.need_from_recent_strain_milli, 0)
-             - COALESCE(ws.need_from_recent_nap_milli, 0)
+             + COALESCE(ws.need_from_recent_nap_milli, 0)
     END AS whoop_sleep_need_milli,
     CASE
         WHEN ws.total_in_bed_time_milli IS NULL OR ws.baseline_milli IS NULL THEN NULL
@@ -253,7 +258,7 @@ SELECT
                 ws.baseline_milli
                 + COALESCE(ws.need_from_sleep_debt_milli, 0)
                 + COALESCE(ws.need_from_recent_strain_milli, 0)
-                - COALESCE(ws.need_from_recent_nap_milli, 0),
+                + COALESCE(ws.need_from_recent_nap_milli, 0),
                 0
             ),
             1
