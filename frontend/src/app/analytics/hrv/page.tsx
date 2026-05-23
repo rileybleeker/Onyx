@@ -860,7 +860,7 @@ export default function HrvAnalysisPage() {
 
         <ChartCard collapsible title="HRV Correlates (Historical)" subtitle="What has historically moved with your HRV"
           source="SPEARMAN ρ"
-          info="How strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises. A bar near −1.0 means the opposite. This doesn't change day to day — it's a long-term pattern. Journal behaviors appear in a separate section below because Yes/No features have a narrower correlation range than continuous metrics.">
+          info="What it shows: how strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises; near −1.0 means the opposite. Long-term pattern, doesn't change day to day. Method: Spearman ρ — a rank-based correlation that's robust to outliers and skewed distributions; scores range −1.0 to +1.0. Journal behaviors and habits appear in separate sub-sections below because Yes/No features have a narrower correlation range than continuous metrics.">
           {correlations.length > 0 ? (
             <ResponsiveContainer width="100%" height={Math.max(360, correlations.length * 26)}>
               <BarChart data={correlations} layout="vertical"
@@ -870,7 +870,7 @@ export default function HrvAnalysisPage() {
                 <YAxis type="category" dataKey="label" width={isMobile ? 110 : 180}
                        tick={<WrappedYAxisTick maxCharsPerLine={chars.corr} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
-                         formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
+                         formatter={(v: any) => [Number(v).toFixed(3), "Spearman ρ"]} />
                 <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
                 <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
                   {correlations.map((d, i) => (
@@ -891,8 +891,11 @@ export default function HrvAnalysisPage() {
               <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Journal Behaviors</span>
               <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">SPEARMAN ρ</span>
             </div>
-            <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
-              Correlation between each logged behavior and the following night&apos;s HRV, across your entire history. Yes/No features naturally produce smaller correlation scores than continuous metrics — but a consistent +0.10 or −0.10 is still meaningful over hundreds of nights.
+            <p className="text-[10px] text-text-tertiary leading-relaxed">
+              <strong className="text-text-secondary">What it is:</strong> A statistical measure of how consistently two things move together. For each behavior, every night gets two ranks — one by HRV, one by whether the behavior was logged that day — and the score reflects how well those rankings agree.
+            </p>
+            <p className="text-[10px] text-text-tertiary leading-relaxed mt-1.5 mb-3">
+              <strong className="text-text-secondary">Why it&apos;s used:</strong> Rank-based, so it shrugs off outlier nights and skewed distributions that would distort a standard correlation. Scores range from −1.0 to +1.0; because behaviors are Yes/No, expect smaller magnitudes than continuous metrics — a steady ±0.10 across hundreds of nights is still real signal.
             </p>
             {journalCorrelations.length > 0 ? (
               <ResponsiveContainer width="100%" height={Math.max(160, journalCorrelations.length * 28)}>
@@ -903,7 +906,7 @@ export default function HrvAnalysisPage() {
                   <YAxis type="category" dataKey="label" width={axisW.long}
                          tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                   <Tooltip {...chartTooltip}
-                           formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
+                           formatter={(v: any) => [Number(v).toFixed(3), "Spearman ρ"]} />
                   <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
                   <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
                     {journalCorrelations.map((d, i) => (
@@ -940,7 +943,7 @@ export default function HrvAnalysisPage() {
                   <YAxis type="category" dataKey="label" width={axisW.long}
                          tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                   <Tooltip {...chartTooltip}
-                           formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
+                           formatter={(v: any) => [Number(v).toFixed(3), "Spearman ρ"]} />
                   <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
                   <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
                     {habitCorrelations.map((d, i) => (
@@ -1128,7 +1131,7 @@ export default function HrvAnalysisPage() {
             title="Supplement Dose-Response"
             subtitle="Spearman ρ between daily amount and next-night HRV (compounds with ≥3 distinct doses)"
             source="SPEARMAN ρ"
-            info="For compounds where the dose actually varies, this measures whether 'more = better/worse?' Method: Spearman rank correlation between daily total amount of that compound and next-night HRV. Only includes compounds with ≥3 distinct non-zero doses across the tracking window (constant-dose compounds appear in the Yes/No chart above instead). Rank-based to handle outliers and non-linear monotonic dose-response curves. BH-FDR corrected. ⚠ marks rows with n<20."
+            info="What it shows: for compounds where the dose actually varies, whether 'more = better/worse?' Only includes compounds with ≥3 distinct non-zero doses (constant-dose compounds appear in the Yes/No chart above instead). Method: Spearman ρ — a rank-based correlation between daily total amount and next-night HRV; robust to outliers and skewed distributions; handles non-linear monotonic dose-response curves; scores range −1.0 to +1.0. Tooltip: ρ is the correlation; p is the p-value (chance the link is random noise — <0.05 is the conventional significance threshold); n is the number of nights; doses is the count of distinct non-zero dose levels seen. BH-FDR corrected across compounds. ⚠ marks rows with n<20 — estimates are unstable. Associational, not causal."
           >
             <ResponsiveContainer width="100%" height={Math.max(240, supplementDoseResponse.slice(0, 12).length * 30)}>
               <BarChart data={supplementDoseResponse.slice(0, 12).map(d => ({
@@ -1171,7 +1174,7 @@ export default function HrvAnalysisPage() {
           title="Nutrition Correlations"
           subtitle="Spearman ρ between daily nutrient totals and next-night HRV"
           source="SPEARMAN ρ"
-          info="How strongly each daily nutrient total moves with HRV the following morning. A bar near +1.0 means that nutrient almost always rises when your HRV rises; near −1.0 means the opposite; near 0 means no consistent link. Uses Spearman's ρ (rank-based) rather than Pearson so occasional restaurant blowouts don't dominate and non-linear monotonic effects still show up — e.g. sodium at 1g vs 8g. BH-FDR corrected across nutrients. ⚠ marks rows with n<20 — estimates unstable. Associational, not causal."
+          info="What it shows: how strongly each daily nutrient total moves with HRV the following morning. A bar near +1.0 means that nutrient almost always rises when your HRV rises; near −1.0 means the opposite; near 0 means no consistent link. Method: Spearman ρ — a rank-based correlation that's robust to outliers and skewed distributions; scores range −1.0 to +1.0. Rank-based so occasional restaurant blowouts don't dominate and non-linear monotonic effects still show up — e.g. sodium at 1g vs 8g. Tooltip: ρ is the correlation; p is the p-value (chance the link is random noise — <0.05 is the conventional significance threshold); n is the number of nights. BH-FDR corrected across nutrients. ⚠ marks rows with n<20 — estimates unstable. Associational, not causal."
         >
           {nutritionImpact.length > 0 ? (
             <ResponsiveContainer width="100%" height={Math.max(280, nutritionImpact.length * 38)}>
@@ -1955,6 +1958,9 @@ export default function HrvAnalysisPage() {
                   </p>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
                     <strong className="text-text-secondary">Why it&apos;s used:</strong> More reliable than standard correlation for health data because it&apos;s not thrown off by outliers or skewed distributions. Scores range from −1.0 to +1.0.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Reading p-values:</strong> The <em>p</em> shown in chart tooltips is the chance the correlation could be random noise rather than a real link. Lower = more confident; <em>p</em> &lt; 0.05 is the conventional &ldquo;statistically significant&rdquo; threshold.
                   </p>
                 </div>
 
