@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import {
   AreaChart, Area, BarChart, Bar, LineChart, Line, CartesianGrid,
-  XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
+  XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, ReferenceLine, Cell,
 } from "recharts";
 import {
   getWhoopSleep, getWhoopRecovery, getWhoopCycles, getWhoopJournal,
@@ -305,6 +305,41 @@ export default function SleepPage() {
         <StatCard label="Sleep Efficiency" value={avgSleepEff != null ? `${avgSleepEff.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="Deep Sleep" value={avgDeepMs != null ? formatDuration(Math.round(avgDeepMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="REM Sleep" value={avgRemMs != null ? formatDuration(Math.round(avgRemMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+        <ChartCard title="Hours vs Needed" source="WHOOP">
+          <ResponsiveContainer width="100%" height={280}>
+            <BarChart data={whoopScoreData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={45} domain={[0, (max: number) => Math.max(110, Math.ceil(max / 10) * 10)]} label={axisLabel("% of need met", "y")} />
+              <Tooltip {...chartTooltip} formatter={(v: number) => [`${v}%`, "Hours vs Needed"]} />
+              <ReferenceLine y={100} stroke="#22c55e" strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "100%", position: "right", fill: "#22c55e", fontSize: 10 }} />
+              <Bar dataKey="hoursNeeded" name="Hours vs Needed" radius={[3, 3, 0, 0]}>
+                {whoopScoreData.map((d, i) => (
+                  <Cell key={i} fill={d.hoursNeeded == null ? "#52525b" : d.hoursNeeded >= 100 ? "#22c55e" : d.hoursNeeded >= 85 ? "#f59e0b" : "#ef4444"} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard title="Sleep Consistency" source="WHOOP">
+          <ResponsiveContainer width="100%" height={280}>
+            <BarChart data={whoopScoreData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={45} domain={[0, 100]} label={axisLabel("consistency %", "y")} />
+              <Tooltip {...chartTooltip} formatter={(v: number) => [`${v}%`, "Sleep Consistency"]} />
+              <Bar dataKey="consistency" name="Sleep Consistency" radius={[3, 3, 0, 0]}>
+                {whoopScoreData.map((d, i) => (
+                  <Cell key={i} fill={d.consistency == null ? "#52525b" : d.consistency >= 70 ? "#22c55e" : d.consistency >= 50 ? "#f59e0b" : "#ef4444"} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-10">
