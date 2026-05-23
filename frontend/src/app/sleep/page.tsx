@@ -421,13 +421,13 @@ export default function SleepPage() {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-10">
-        <ChartCard title="Sleep Stages (hours)" source="WHOOP">
+        <ChartCard title="Sleep Stages" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={whoopDurationData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
-              <Tooltip {...chartTooltip} />
+              <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
               <Legend wrapperStyle={legendStyle} />
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
               <Bar dataKey="light" stackId="a" fill="#60a5fa" name="Light" />
@@ -620,13 +620,13 @@ export default function SleepPage() {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Sleep Stages (hours)" source="8SLP">
+        <ChartCard title="Sleep Stages" source="8SLP">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={eightStagesData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
-              <Tooltip {...chartTooltip} />
+              <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
               <Legend wrapperStyle={legendStyle} />
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
               <Bar dataKey="light" stackId="a" fill="#60a5fa" name="Light" />
@@ -692,14 +692,14 @@ export default function SleepPage() {
         <ChartCard
           title="Time to Fall Asleep"
           source="8SLP"
-          subtitle={avgEightLatency != null ? `avg ${(avgEightLatency / 60).toFixed(0)} min` : undefined}
+          subtitle={avgEightLatency != null ? `avg ${formatDuration(Math.round(avgEightLatency))}` : undefined}
         >
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={eightLatencyData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: any) => [`${v} min`, "Latency"]} />
+              <Tooltip {...chartTooltip} formatter={(v: any) => [formatDuration(Math.round(Number(v) * 60)), "Latency"]} />
               <ReferenceLine y={15} stroke="#22c55e" strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "15 min", position: "right", fill: "#22c55e", fontSize: 10 }} />
               <Bar dataKey="minutes" name="Latency" radius={[3, 3, 0, 0]}>
                 {eightLatencyData.map((d, i) => (
