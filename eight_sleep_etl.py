@@ -225,6 +225,22 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
     if presence_duration is not None and sleep_duration is not None:
         awake_seconds = presence_duration - sleep_duration
 
+    # Sleep-onset latency: in-bed (presenceStart) → first sleep (sleepStart).
+    # The v2 trends payload exposes a latencyAsleepSeconds.score (0-100) but
+    # not the raw seconds, so we derive it from the timestamps.
+    latency_asleep_seconds = None
+    presence_start = day.get("presenceStart")
+    sleep_start = day.get("sleepStart")
+    if presence_start and sleep_start:
+        try:
+            ps = datetime.fromisoformat(presence_start.replace("Z", "+00:00"))
+            ss = datetime.fromisoformat(sleep_start.replace("Z", "+00:00"))
+            diff = int((ss - ps).total_seconds())
+            if diff >= 0:
+                latency_asleep_seconds = diff
+        except (ValueError, TypeError):
+            pass
+
     quality = day.get("sleepQualityScore", {}) or {}
     routine = day.get("sleepRoutineScore", {}) or {}
     fitness = day.get("sleepFitnessScore", {}) or {}
@@ -257,6 +273,11 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
         "rem_sleep_seconds": day.get("remDuration"),
         # Other
         "toss_and_turns": day.get("tnt"),
+        "latency_asleep_seconds": latency_asleep_seconds,
+        # Snoring (Pod's microphone-based detection; cleanest signal is
+        # duration — percent / event fields are sparse and inconsistent)
+        "snore_duration_seconds": day.get("snoreDuration"),
+        "heavy_snore_duration_seconds": day.get("heavySnoreDuration"),
         "session_date": day_str,
     }
 
@@ -408,6 +429,10 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
             "rem_sleep_seconds": trend.get("rem_sleep_seconds") or interval.get("rem_sleep_seconds"),
             # Other
             "toss_and_turns": trend.get("toss_and_turns") or interval.get("toss_and_turns"),
+            "latency_asleep_seconds": trend.get("latency_asleep_seconds"),
+            # Snoring (trends-only — intervals API doesn't expose these)
+            "snore_duration_seconds": trend.get("snore_duration_seconds"),
+            "heavy_snore_duration_seconds": trend.get("heavy_snore_duration_seconds"),
             "session_date": d,
             "raw_json": json.dumps(_strip_timeseries(raw)) if raw else None,
         }

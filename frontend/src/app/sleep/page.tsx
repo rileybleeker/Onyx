@@ -153,6 +153,11 @@ export default function SleepPage() {
       : null,
   }));
 
+  const inBedData = whoopSleep.map((d) => ({
+    date:  formatDate(d.start_time?.split("T")[0]),
+    hours: d.total_in_bed_time_milli ? +(d.total_in_bed_time_milli / 3600000).toFixed(2) : null,
+  }));
+
   const whoopHrData = whoopSleep.map((d) => {
     const rec = recoveryByCycle.get(d.cycle_id);
     return {
@@ -226,6 +231,24 @@ export default function SleepPage() {
     roomTemp:  d.avg_room_temp ? +Number(d.avg_room_temp).toFixed(1) : null,
     tossTurns: d.toss_and_turns,
   }));
+
+  // Snoring (Pod microphone-detected). Sparse: most nights are 0.
+  // Plotted in minutes; heavy-snore is stacked on top so total bar height = total snoring.
+  const eightSnoreData = eightSleep.map((d) => {
+    const totalSec = d.snore_duration_seconds ?? 0;
+    const heavySec = d.heavy_snore_duration_seconds ?? 0;
+    const lightSec = Math.max(0, totalSec - heavySec);
+    return {
+      date: formatDate(d.calendar_date),
+      light: +(lightSec / 60).toFixed(1),
+      heavy: +(heavySec / 60).toFixed(1),
+    };
+  });
+  const snoreNightsTracked = eightSleep.filter((d) => d.snore_duration_seconds != null).length;
+  const snoreNightsWithAny = eightSleep.filter((d) => (d.snore_duration_seconds ?? 0) > 0).length;
+  const avgSnoreMinutes    = snoreNightsTracked > 0
+    ? eightSleep.reduce((a, d) => a + (d.snore_duration_seconds ?? 0), 0) / snoreNightsTracked / 60
+    : null;
 
   return (
     <>
@@ -315,6 +338,20 @@ export default function SleepPage() {
         <StatCard label="Sleep Efficiency" value={avgSleepEff != null ? `${avgSleepEff.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="Deep Sleep" value={avgDeepMs != null ? formatDuration(Math.round(avgDeepMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="REM Sleep" value={avgRemMs != null ? formatDuration(Math.round(avgRemMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
+      </div>
+
+      <div className="mb-6">
+        <ChartCard title="Time in Bed" source="WHOOP">
+          <ResponsiveContainer width="100%" height={280}>
+            <BarChart data={inBedData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={45} label={axisLabel("hours", "y")} />
+              <Tooltip {...chartTooltip} formatter={(v: number) => [`${v}h`, "Time in Bed"]} />
+              <Bar dataKey="hours" name="Time in Bed" radius={[3, 3, 0, 0]} fill="#8b5cf6" />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
@@ -650,6 +687,28 @@ export default function SleepPage() {
               <Line yAxisId="temp" type="monotone" dataKey="roomTemp" stroke="#06b6d4" strokeWidth={2} dot={false} name="Room Temp" />
               <Line yAxisId="toss" type="monotone" dataKey="tossTurns" stroke="#a1a1aa" strokeWidth={1.5} dot={false} name="Toss & Turns" />
             </LineChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard
+          title="Snoring"
+          source="8SLP"
+          subtitle={
+            snoreNightsTracked > 0
+              ? `${snoreNightsWithAny}/${snoreNightsTracked} nights · avg ${avgSnoreMinutes?.toFixed(1) ?? "0"} min`
+              : "no data"
+          }
+        >
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={eightSnoreData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
+              <Tooltip {...chartTooltip} formatter={(v: number, name: string) => [`${v} min`, name]} />
+              <Legend wrapperStyle={legendStyle} />
+              <Bar dataKey="light" stackId="snore" fill="#60a5fa" name="Snoring" />
+              <Bar dataKey="heavy" stackId="snore" fill="#ef4444" name="Heavy snoring" radius={[3, 3, 0, 0]} />
+            </BarChart>
           </ResponsiveContainer>
         </ChartCard>
       </div>

@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS pds.eight_sleep_trends (
 
     -- Other
     toss_and_turns          INTEGER,
+    latency_asleep_seconds  INTEGER,            -- seconds from in-bed (presenceStart) to first sleep (sleepStart)
+    snore_duration_seconds        INTEGER,      -- Pod microphone-detected snore time
+    heavy_snore_duration_seconds  INTEGER,
     session_date            TEXT,               -- ISO date string from Eight Sleep
 
     raw_json    JSONB,
@@ -117,6 +120,7 @@ SELECT
     es.deep_sleep_seconds   AS eight_sleep_deep_sec,
     es.rem_sleep_seconds    AS eight_sleep_rem_sec,
     es.toss_and_turns       AS eight_sleep_toss_turns,
+    es.latency_asleep_seconds AS eight_sleep_latency_asleep_sec,
     -- Garmin training
     gts.training_readiness_score,
     gts.training_readiness_level
