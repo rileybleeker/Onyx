@@ -219,11 +219,43 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
     if day.get("processing"):
         return None
 
-    presence_duration = day.get("presenceDuration")
-    sleep_duration = day.get("sleepDuration")
-    awake_seconds = None
-    if presence_duration is not None and sleep_duration is not None:
-        awake_seconds = presence_duration - sleep_duration
+    # Eight Sleep's day-level payload is internally inconsistent on multi-session
+    # days (main sleep + nap): top-level `sleepDuration` reports only the main
+    # session, but top-level `deepDuration` / `lightDuration` / `remDuration` sum
+    # across all sessions. Computing `awake = presenceDuration - sleepDuration`
+    # therefore understated awake on nap days, while stage totals overstated
+    # time-in-bed. Sum the per-session `stageSummary` fields instead — those are
+    # internally consistent per session, and summing gives correct day totals.
+    sessions = day.get("sessions") or []
+    stage_sums = {"sleepDuration": 0, "awakeDuration": 0, "lightDuration": 0,
+                  "deepDuration": 0, "remDuration": 0}
+    have_session_summaries = False
+    for s in sessions:
+        summary = s.get("stageSummary") or {}
+        if not summary:
+            continue
+        have_session_summaries = True
+        for k in stage_sums:
+            v = summary.get(k)
+            if v is not None:
+                stage_sums[k] += v
+
+    if have_session_summaries:
+        sleep_duration = stage_sums["sleepDuration"]
+        awake_seconds  = stage_sums["awakeDuration"]
+        light_seconds  = stage_sums["lightDuration"]
+        deep_seconds   = stage_sums["deepDuration"]
+        rem_seconds    = stage_sums["remDuration"]
+    else:
+        # Fallback for older payloads without per-session stageSummary blocks.
+        presence_duration = day.get("presenceDuration")
+        sleep_duration = day.get("sleepDuration")
+        awake_seconds = None
+        if presence_duration is not None and sleep_duration is not None:
+            awake_seconds = presence_duration - sleep_duration
+        light_seconds = day.get("lightDuration")
+        deep_seconds  = day.get("deepDuration")
+        rem_seconds   = day.get("remDuration")
 
     # Sleep-onset latency: in-bed (presenceStart) → first sleep (sleepStart).
     # The v2 trends payload exposes a latencyAsleepSeconds.score (0-100) but
@@ -265,12 +297,13 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
         # Environment
         "avg_bed_temp": safe_get(quality, "tempBedC", "average"),
         "avg_room_temp": safe_get(quality, "tempRoomC", "average"),
-        # Sleep stages (seconds)
+        # Sleep stages (seconds) — summed across all sessions per stageSummary
+        # so multi-session days (main + nap) are internally consistent.
         "time_slept_seconds": sleep_duration,
         "awake_seconds": awake_seconds,
-        "light_sleep_seconds": day.get("lightDuration"),
-        "deep_sleep_seconds": day.get("deepDuration"),
-        "rem_sleep_seconds": day.get("remDuration"),
+        "light_sleep_seconds": light_seconds,
+        "deep_sleep_seconds": deep_seconds,
+        "rem_sleep_seconds": rem_seconds,
         # Other
         "toss_and_turns": day.get("tnt"),
         "latency_asleep_seconds": latency_asleep_seconds,
