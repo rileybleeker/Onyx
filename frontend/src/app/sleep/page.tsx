@@ -143,6 +143,16 @@ export default function SleepPage() {
     consistency:  d.sleep_consistency_percentage,
   }));
 
+  // Sleep Debt: WHOOP's `need_from_sleep_debt_milli` is the extra sleep need
+  // (in ms) that WHOOP says you're carrying from prior nights — i.e. your
+  // running sleep debt as of this cycle. Convert to hours.
+  const sleepDebtData = whoopSleep.map((d) => ({
+    date: formatDate(d.start_time?.split("T")[0]),
+    debt: d.need_from_sleep_debt_milli != null
+      ? +(d.need_from_sleep_debt_milli / 3600000).toFixed(2)
+      : null,
+  }));
+
   const whoopHrData = whoopSleep.map((d) => {
     const rec = recoveryByCycle.get(d.cycle_id);
     return {
@@ -307,7 +317,23 @@ export default function SleepPage() {
         <StatCard label="REM Sleep" value={avgRemMs != null ? formatDuration(Math.round(avgRemMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+        <ChartCard title="Sleep Debt" source="WHOOP">
+          <ResponsiveContainer width="100%" height={280}>
+            <BarChart data={sleepDebtData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={45} label={axisLabel("hours", "y")} />
+              <Tooltip {...chartTooltip} formatter={(v: number) => [`${v} h`, "Sleep Debt"]} />
+              <Bar dataKey="debt" name="Sleep Debt" radius={[3, 3, 0, 0]}>
+                {sleepDebtData.map((d, i) => (
+                  <Cell key={i} fill={d.debt == null ? "#52525b" : d.debt < 1 ? "#22c55e" : d.debt < 2 ? "#f59e0b" : "#ef4444"} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
         <ChartCard title="Hours vs Needed" source="WHOOP">
           <ResponsiveContainer width="100%" height={280}>
             <BarChart data={whoopScoreData}>
