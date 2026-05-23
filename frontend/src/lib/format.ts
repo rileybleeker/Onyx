@@ -18,6 +18,17 @@ export function etDate(instant: string | null | undefined): string {
   return `${get("year")}-${get("month")}-${get("day")}`;
 }
 
+// Shift a YYYY-MM-DD date string by `days` (positive forward, negative back).
+// Operates in UTC to sidestep browser-TZ / DST edges since the input is
+// already a calendar-date string.
+export function shiftDate(yyyymmdd: string, days: number): string {
+  if (!yyyymmdd) return "";
+  const [y, m, d] = yyyymmdd.split("-").map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d));
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
 export function formatDuration(seconds: number | null): string {
   if (!seconds) return "—";
   const h = Math.floor(seconds / 3600);

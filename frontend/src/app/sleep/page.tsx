@@ -10,7 +10,7 @@ import {
   getEightSleepTrends, getHeartRateData, getDailySummaries,
   rangeDays, rangeLabel, type Range,
 } from "@/lib/queries";
-import { formatDate, formatDuration, etDate } from "@/lib/format";
+import { formatDate, formatDuration, etDate, shiftDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -146,8 +146,11 @@ export default function SleepPage() {
   // Sleep Debt: WHOOP's `need_from_sleep_debt_milli` is the extra sleep need
   // (in ms) that WHOOP says you're carrying from prior nights — i.e. your
   // running sleep debt as of this cycle. Convert to hours.
+  // WHOOP labels sleep debt by the day the debt accumulated — the day BEFORE
+  // bedtime, i.e. wake_day − 1. (Verified against WHOOP app: 0.64h debt on
+  // sleep ending May 23 is shown under May 22.)
   const sleepDebtData = whoopSleep.map((d) => ({
-    date: formatDate(etDate(d.end_time)),
+    date: formatDate(shiftDate(etDate(d.end_time), -1)),
     debt: d.need_from_sleep_debt_milli != null
       ? +(d.need_from_sleep_debt_milli / 3600000).toFixed(2)
       : null,
