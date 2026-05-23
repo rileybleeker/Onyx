@@ -29,6 +29,17 @@ export function shiftDate(yyyymmdd: string, days: number): string {
   return date.toISOString().slice(0, 10);
 }
 
+// The WHOOP "biological day" for a sleep event: pre-6 AM ET bedtimes are
+// folded into the previous calendar day's nightly cycle; daytime and evening
+// bedtimes stay on their own day. Equivalent to wake_day − 1 for typical
+// post-midnight bedtimes, but lets daytime naps land on the actual day they
+// occurred — which is what WHOOP's app does.
+export function whoopSleepDay(startTime: string | null | undefined): string {
+  if (!startTime) return "";
+  const shifted = new Date(new Date(startTime).getTime() - 6 * 3600 * 1000);
+  return etDate(shifted.toISOString());
+}
+
 export function formatDuration(seconds: number | null): string {
   if (!seconds) return "—";
   const h = Math.floor(seconds / 3600);

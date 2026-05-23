@@ -6,11 +6,11 @@ import {
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, ReferenceLine, Cell,
 } from "recharts";
 import {
-  getWhoopSleep, getWhoopRecovery, getWhoopCycles, getWhoopJournal,
+  getWhoopSleep, getWhoopSleepAll, getWhoopRecovery, getWhoopCycles, getWhoopJournal,
   getEightSleepTrends, getHeartRateData, getDailySummaries,
   rangeDays, rangeLabel, type Range,
 } from "@/lib/queries";
-import { formatDate, formatDuration, etDate, shiftDate } from "@/lib/format";
+import { formatDate, formatDuration, etDate, whoopSleepDay } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -29,6 +29,7 @@ function recoveryColor(score: number | null): string {
 
 export default function SleepPage() {
   const [whoopSleep, setWhoopSleep]     = useState<any[]>([]);
+  const [whoopSleepAll, setWhoopSleepAll] = useState<any[]>([]);
   const [whoopRecovery, setWhoopRecovery] = useState<any[]>([]);
   const [whoopCycles, setWhoopCycles]   = useState<any[]>([]);
   const [journal, setJournal]           = useState<any[]>([]);
@@ -43,6 +44,7 @@ export default function SleepPage() {
     const days = rangeDays(range);
     Promise.all([
       getWhoopSleep(days),
+      getWhoopSleepAll(days),
       getWhoopRecovery(days),
       getWhoopCycles(days),
       getWhoopJournal(days),
@@ -50,8 +52,9 @@ export default function SleepPage() {
       getHeartRateData(days),
       getDailySummaries(days),
     ])
-      .then(([s, r, c, j, e, h, sum]) => {
+      .then(([s, sAll, r, c, j, e, h, sum]) => {
         setWhoopSleep(s);
+        setWhoopSleepAll(sAll);
         setWhoopRecovery(r);
         setWhoopCycles(c);
         setJournal(j);
@@ -146,15 +149,24 @@ export default function SleepPage() {
   // Sleep Debt: WHOOP's `need_from_sleep_debt_milli` is the extra sleep need
   // (in ms) that WHOOP says you're carrying from prior nights — i.e. your
   // running sleep debt as of this cycle. Convert to hours.
-  // WHOOP labels sleep debt by the day the debt accumulated — the day BEFORE
-  // bedtime, i.e. wake_day − 1. (Verified against WHOOP app: 0.64h debt on
-  // sleep ending May 23 is shown under May 22.)
-  const sleepDebtData = whoopSleep.map((d) => ({
-    date: formatDate(shiftDate(etDate(d.end_time), -1)),
-    debt: d.need_from_sleep_debt_milli != null
-      ? +(d.need_from_sleep_debt_milli / 3600000).toFixed(2)
-      : null,
-  }));
+  // WHOOP labels sleep debt by the calendar day the sleep event belongs to:
+  // pre-6 AM ET bedtimes fold into the previous day's nightly cycle (so a
+  // post-midnight main sleep lands on "yesterday"), but daytime naps stay on
+  // their actual day. Includes naps so travel days like April 30 — where the
+  // only sleep events are naps — still surface WHOOP's debt value. When a
+  // labeled day has multiple events (main + nap), the latest event's
+  // need_from_sleep_debt wins, matching WHOOP's "most recent reading" display.
+  const debtByDay = new Map<string, number>();
+  whoopSleepAll.forEach((d) => {
+    if (d.need_from_sleep_debt_milli == null) return;
+    debtByDay.set(whoopSleepDay(d.start_time), d.need_from_sleep_debt_milli);
+  });
+  const sleepDebtData = Array.from(debtByDay.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, debtMs]) => ({
+      date: formatDate(date),
+      debt: +(debtMs / 3600000).toFixed(2),
+    }));
 
   const inBedData = whoopSleep.map((d) => ({
     date:  formatDate(etDate(d.end_time)),

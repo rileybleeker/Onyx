@@ -156,6 +156,23 @@ export async function getWhoopSleep(days: number = 30) {
   return data ?? [];
 }
 
+// Same as getWhoopSleep but INCLUDES naps. Used for Sleep Debt chart so
+// nap-only days (travel, jet lag) still surface the WHOOP-recorded debt value.
+export async function getWhoopSleepAll(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("whoop_sleep")
+    .select("*")
+    .gte("start_time", since.toISOString())
+    .eq("score_state", "SCORED")
+    .order("start_time", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
 export async function getWhoopWorkouts(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
