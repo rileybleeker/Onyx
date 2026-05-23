@@ -339,7 +339,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={recoveryData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={40} domain={[0, 100]} />
               <Tooltip {...chartTooltip} />
               <Bar dataKey="recovery" name="Recovery %" radius={[3, 3, 0, 0]}
@@ -363,7 +363,7 @@ export default function SleepPage() {
                 </linearGradient>
               </defs>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={55} domain={[0, 21]} label={axisLabel("strain", "y")} />
               <Tooltip {...chartTooltip} />
               <Area type="monotone" dataKey="strain" stroke="#3b82f6" fill="url(#recStrainGrad)" strokeWidth={2} name="Strain" />
@@ -375,7 +375,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={recoveryData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis yAxisId="spo2" tick={axisTick} width={40} domain={[90, 100]} />
               <YAxis yAxisId="temp" orientation="right" tick={axisTick} width={40} />
               <YAxis yAxisId="resp" orientation="right" hide domain={[10, 22]} />
@@ -414,7 +414,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={280}>
             <BarChart data={inBedData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={45} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}h`, "Time in Bed"]} />
               <Bar dataKey="hours" name="Time in Bed" radius={[3, 3, 0, 0]} fill="#8b5cf6" />
@@ -428,7 +428,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={280}>
             <BarChart data={sleepDebtData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={45} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} formatter={(v: any) => [`${v} h`, "Sleep Debt"]} />
               <Bar dataKey="debt" name="Sleep Debt" radius={[3, 3, 0, 0]}>
@@ -444,7 +444,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={280}>
             <BarChart data={whoopScoreData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={45} domain={[0, (max: number) => Math.max(110, Math.ceil(max / 10) * 10)]} label={axisLabel("% of need met", "y")} />
               <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}%`, "Hours vs Needed"]} />
               <ReferenceLine y={100} stroke="#22c55e" strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "100%", position: "right", fill: "#22c55e", fontSize: 10 }} />
@@ -461,7 +461,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={280}>
             <BarChart data={whoopScoreData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={45} domain={[0, 100]} label={axisLabel("consistency %", "y")} />
               <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}%`, "Sleep Consistency"]} />
               <Bar dataKey="consistency" name="Sleep Consistency" radius={[3, 3, 0, 0]}>
@@ -479,7 +479,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={whoopDurationData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
               <Legend wrapperStyle={legendStyle} />
@@ -514,7 +514,7 @@ export default function SleepPage() {
                 </linearGradient>
               </defs>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={35} domain={[0, 100]} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
@@ -540,7 +540,7 @@ export default function SleepPage() {
                 </linearGradient>
               </defs>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis yAxisId="hr" tick={axisTick} width={40} />
               <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
@@ -673,7 +673,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={eightScoreData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={55} domain={[0, 100]} label={axisLabel("score (0–100)", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
@@ -688,7 +688,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={eightStagesData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
               <Legend wrapperStyle={legendStyle} />
@@ -705,7 +705,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={eightBiometricsData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis yAxisId="hr" tick={axisTick} width={40} />
               <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
@@ -720,7 +720,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={eightEnvData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis yAxisId="temp" tick={axisTick} width={40} />
               <YAxis yAxisId="toss" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
@@ -744,7 +744,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={eightSnoreData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
               <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [`${v} min`, name]} />
               <Legend wrapperStyle={legendStyle} />
@@ -762,7 +762,7 @@ export default function SleepPage() {
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={eightLatencyData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
               <Tooltip {...chartTooltip} formatter={(v: any) => [formatDuration(Math.round(Number(v) * 60)), "Latency"]} />
               <ReferenceLine y={15} stroke="#22c55e" strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "15 min", position: "right", fill: "#22c55e", fontSize: 10 }} />
