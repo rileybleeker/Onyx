@@ -217,7 +217,6 @@ export default function SleepPage() {
 
   // ── Eight Sleep ───────────────────────────────────────────────────────────────
   const avgEightSleep    = avg(eightSleep, "sleep_score");
-  const avgEightFitness  = avg(eightSleep, "sleep_fitness_score");
   const avgEightDuration = avg(eightSleep, "time_slept_seconds");
   const avgEightHrv      = avg(eightSleep, "avg_hrv");
   const avgEightLatency  = avg(eightSleep, "latency_asleep_seconds");
@@ -661,7 +660,6 @@ export default function SleepPage() {
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Eight Sleep</p>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <StatCard label="Sleep Score" value={avgEightSleep != null ? avgEightSleep.toFixed(0) : null} sublabel={rangeNote} source="8SLP" />
-        <StatCard label="Fitness Score" value={avgEightFitness != null ? avgEightFitness.toFixed(0) : null} sublabel={rangeNote} source="8SLP" />
         <StatCard
           label="Duration"
           value={avgEightDuration != null ? formatDuration(Math.round(avgEightDuration)) : null}
