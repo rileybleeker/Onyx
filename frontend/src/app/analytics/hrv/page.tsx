@@ -1021,7 +1021,15 @@ export default function HrvAnalysisPage() {
                 <YAxis type="category" dataKey="label" width={200}
                        tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
-                         formatter={(v: any, n: any) => [`${Number(v).toFixed(1)} ms`, "HRV Δ"]} />
+                         formatter={(v: any, _n: any, p: any) => {
+                           const d = p?.payload ?? {};
+                           const lo = Number(d.ci_low ?? 0).toFixed(1);
+                           const hi = Number(d.ci_high ?? 0).toFixed(1);
+                           return [
+                             `${Number(v).toFixed(1)} ms · 95% CI [${lo}, ${hi}] · d=${(d.cohen_d ?? 0).toFixed(2)} · n=${d.n_yes}/${d.n_no}`,
+                             "HRV Δ",
+                           ];
+                         }} />
                 <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
                 <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
                   {journalImpact.slice(0, 12).map((d, i) => (
@@ -1131,7 +1139,7 @@ export default function HrvAnalysisPage() {
           title="Nutrition Correlations"
           subtitle="Spearman ρ between daily nutrient totals and next-night HRV"
           source="SPEARMAN ρ"
-          info="How each daily nutritional total correlates with HRV the next morning. Method: Spearman rank correlation (not Pearson) because nutrition data is heavy-tailed (occasional restaurant blowouts), non-normally distributed, and relationships are likely monotonic but not necessarily linear across the full range — e.g. HRV vs sodium 1g→8g. Rank-based test is robust to outliers and detects monotonic non-linear effects. BH-FDR corrected across nutrients. ⚠ marks rows with n<20 — estimates are unstable. Associational, not causal."
+          info="How strongly each daily nutrient total moves with HRV the following morning. A bar near +1.0 means that nutrient almost always rises when your HRV rises; near −1.0 means the opposite; near 0 means no consistent link. Uses Spearman's ρ (rank-based) rather than Pearson so occasional restaurant blowouts don't dominate and non-linear monotonic effects still show up — e.g. sodium at 1g vs 8g. BH-FDR corrected across nutrients. ⚠ marks rows with n<20 — estimates unstable. Associational, not causal."
         >
           {nutritionImpact.length > 0 ? (
             <ResponsiveContainer width="100%" height={Math.max(280, nutritionImpact.length * 38)}>
