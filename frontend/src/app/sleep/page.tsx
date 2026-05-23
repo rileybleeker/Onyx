@@ -7,7 +7,7 @@ import {
 } from "recharts";
 import {
   getWhoopSleep, getWhoopSleepAll, getWhoopRecovery, getWhoopCycles, getWhoopJournal,
-  getEightSleepTrends, getHeartRateData, getDailySummaries,
+  getEightSleepTrends, getDailySummaries,
   rangeDays, rangeLabel, type Range,
 } from "@/lib/queries";
 import { formatDate, formatDuration, etDate, whoopSleepDay } from "@/lib/format";
@@ -34,7 +34,6 @@ export default function SleepPage() {
   const [whoopCycles, setWhoopCycles]   = useState<any[]>([]);
   const [journal, setJournal]           = useState<any[]>([]);
   const [eightSleep, setEightSleep]     = useState<any[]>([]);
-  const [hr, setHr]                     = useState<any[]>([]);
   const [summaries, setSummaries]       = useState<any[]>([]);
   const [loading, setLoading]           = useState(true);
   const [range, setRange]               = useState<Range>("30d");
@@ -49,17 +48,15 @@ export default function SleepPage() {
       getWhoopCycles(days),
       getWhoopJournal(days),
       getEightSleepTrends(days),
-      getHeartRateData(days),
       getDailySummaries(days),
     ])
-      .then(([s, sAll, r, c, j, e, h, sum]) => {
+      .then(([s, sAll, r, c, j, e, sum]) => {
         setWhoopSleep(s);
         setWhoopSleepAll(sAll);
         setWhoopRecovery(r);
         setWhoopCycles(c);
         setJournal(j);
         setEightSleep(e);
-        setHr(h);
         setSummaries(sum);
       })
       .catch(console.error)
@@ -187,22 +184,10 @@ export default function SleepPage() {
   });
 
   // ── Garmin ───────────────────────────────────────────────────────────────────
-  const avgMaxHr     = avg(hr, "max_heart_rate");
-  const avgMinHr     = avg(hr, "min_heart_rate");
-  const avgStress    = avg(summaries, "avg_stress_level");
+  // Only RHR lives here; Max HR / Min HR / Stress Level + HR Range and Stress
+  // charts moved to /activities since they're daytime/activity metrics.
   const avgGarminRhr = avg(summaries, "resting_heart_rate")
     ?? avg(summaries, "last_seven_days_avg_rhr");
-
-  const hrData = hr.map((d) => ({
-    date: formatDate(d.calendar_date),
-    min:  d.min_heart_rate,
-    max:  d.max_heart_rate,
-  }));
-
-  const stressData = summaries.map((d) => ({
-    date:    formatDate(d.calendar_date),
-    overall: d.avg_stress_level,
-  }));
 
   // ── Eight Sleep ───────────────────────────────────────────────────────────────
   const avgEightSleep    = avg(eightSleep, "sleep_score");
@@ -595,55 +580,8 @@ export default function SleepPage() {
 
       {/* ── Garmin Cardiac ──────────────────────────────────────────────────── */}
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">GARMIN · Cardiac</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <StatCard label="Max HR" value={avgMaxHr != null ? avgMaxHr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
-        <StatCard label="Min HR" value={avgMinHr != null ? avgMinHr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
-        <StatCard label="Stress Level" value={avgStress != null ? avgStress.toFixed(0) : null} sublabel={rangeNote} source="GARMIN" />
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-10">
         <StatCard label="Avg RHR" value={avgGarminRhr != null ? avgGarminRhr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-10">
-        <ChartCard title="Heart Rate Range" source="GARMIN">
-          <ResponsiveContainer width="100%" height={260}>
-            <AreaChart data={hrData}>
-              <defs>
-                <linearGradient id="heartMaxGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#ef4444" stopOpacity={0.15} />
-                  <stop offset="100%" stopColor="#ef4444" stopOpacity={0} />
-                </linearGradient>
-                <linearGradient id="heartMinGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#22c55e" stopOpacity={0.15} />
-                  <stop offset="100%" stopColor="#22c55e" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={55} label={axisLabel("bpm", "y")} />
-              <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={legendStyle} />
-              <Area type="monotone" dataKey="max" stroke="#ef4444" fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max HR" />
-              <Area type="monotone" dataKey="min" stroke="#22c55e" fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min HR" />
-            </AreaChart>
-          </ResponsiveContainer>
-        </ChartCard>
-
-        <ChartCard title="Stress Level" source="GARMIN">
-          <ResponsiveContainer width="100%" height={260}>
-            <AreaChart data={stressData}>
-              <defs>
-                <linearGradient id="heartStressGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#f97316" stopOpacity={0.15} />
-                  <stop offset="100%" stopColor="#f97316" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-              <YAxis tick={axisTick} width={55} domain={[0, 100]} label={axisLabel("stress (0–100)", "y")} />
-              <Tooltip {...chartTooltip} />
-              <Area type="monotone" dataKey="overall" stroke="#f97316" fill="url(#heartStressGrad)" strokeWidth={2} name="Stress Level" />
-            </AreaChart>
-          </ResponsiveContainer>
-        </ChartCard>
       </div>
 
       <div className="border-t border-border-subtle mb-8" />
