@@ -167,7 +167,11 @@ export default function BlandAltmanPage() {
   const whoopRhr = data.map((d) => d.whoop_rhr);
   const eightHr = data.map((d) => d.eight_sleep_hr ? +d.eight_sleep_hr : null);
 
-  // Compute all 9 Bland-Altman comparisons
+  const garminResp = data.map((d) => d.garmin_sleep_respiration ? +d.garmin_sleep_respiration : null);
+  const whoopResp = data.map((d) => d.whoop_respiratory_rate ? +d.whoop_respiratory_rate : null);
+  const eightResp = data.map((d) => d.eight_sleep_breath_rate ? +d.eight_sleep_breath_rate : null);
+
+  // Compute all 12 Bland-Altman comparisons
   const sleepBA = [
     blandAltman(garminSleep, whoopSleep),
     blandAltman(garminSleep, eightSleep),
@@ -183,11 +187,17 @@ export default function BlandAltmanPage() {
     blandAltman(garminRhr, eightHr),
     blandAltman(whoopRhr, eightHr),
   ];
+  const respBA = [
+    blandAltman(garminResp, whoopResp),
+    blandAltman(garminResp, eightResp),
+    blandAltman(whoopResp, eightResp),
+  ];
 
   const metrics = [
     { label: "Sleep Score", unit: "%", results: sleepBA },
     { label: "HRV", unit: "ms", results: hrvBA },
     { label: "Resting Heart Rate", unit: "bpm", results: rhrBA },
+    { label: "Respiratory Rate", unit: "br/min", results: respBA },
   ];
 
   return (
@@ -259,6 +269,13 @@ export default function BlandAltmanPage() {
                 <td className="text-center text-amber-400 font-mono">2 – 5 bpm</td>
                 <td className="text-center text-red-400 font-mono">&gt; 5 bpm</td>
                 <td className="text-center font-mono">± 5 bpm</td>
+              </tr>
+              <tr className="border-t border-white/5">
+                <td className="py-1.5">Respiratory Rate (br/min)</td>
+                <td className="text-center text-green-400 font-mono">&lt; 1 br/min</td>
+                <td className="text-center text-amber-400 font-mono">1 – 2 br/min</td>
+                <td className="text-center text-red-400 font-mono">&gt; 2 br/min</td>
+                <td className="text-center font-mono">± 2 br/min</td>
               </tr>
             </tbody>
           </table>

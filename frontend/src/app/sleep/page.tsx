@@ -708,17 +708,19 @@ export default function SleepPage() {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Heart Rate & HRV" source="8SLP">
+        <ChartCard title="Heart Rate, HRV & Resp Rate" source="8SLP">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={eightBiometricsData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis yAxisId="hr" tick={axisTick} width={40} />
               <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
+              <YAxis yAxisId="resp" orientation="right" hide domain={[10, 22]} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line yAxisId="hr" type="monotone" dataKey="hr" stroke="#ef4444" strokeWidth={2} dot={false} name="Avg HR (bpm)" />
-              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={2} dot={false} name="Avg HRV (ms)" />
+              <Line yAxisId="hr" type="monotone" dataKey="hr" stroke="#ef4444" strokeWidth={2} dot={false} name="RHR (bpm)" />
+              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={2} dot={false} name="HRV (ms)" />
+              <Line yAxisId="resp" type="monotone" dataKey="breathRate" stroke="#8b5cf6" strokeWidth={2} dot={false} name="Resp Rate (br/min)" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
