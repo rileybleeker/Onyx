@@ -24,10 +24,18 @@ and confirm:
   (2) the depression is anchored to the SAME row as the alcohol intake (not
       shifted ±1) by reconstructing the raw alignment.
 
-If alignment ever inverted (e.g., a future contributor flipped
-WHOOP_JOURNAL_LAG_DAYS or rewrote `+12h` cycle dating), the synthetic test
+If alignment ever inverted (e.g., a future contributor changed how
+pivot_journal keys rows or rewrote `+12h` cycle dating), the synthetic test
 would either fail to detect the simulated effect or detect it with reversed
 sign — either way, the assertion below catches it.
+
+Note: as of 2026-05-23, the off-by-one for post-midnight bedtimes is fixed at
+the DB layer via `pds.whoop_journal.behaviors_date` (computed via trigger
+from each cycle's bedtime − 6h in local TZ). `pivot_journal` keys on
+behaviors_date directly. The synthetic frame here bypasses pivot_journal —
+it constructs the analysis matrix with journal flags pre-aligned to behaviors-
+day — so it covers the Phase-2 alignment only; a complementary integration
+test would be needed to verify the DB-side trigger behavior.
 
 Run: python tests/test_phase2_alignment.py
 """
@@ -109,7 +117,7 @@ def test_alcohol_alignment() -> None:
         f"Expected negative Spearman r between alcohol(N) and hrv_next(N) "
         f"matching the simulated -12ms depression; got r={r:.3f}. "
         f"If r is near 0, alignment may be off by 1. If r is positive, "
-        f"alignment is INVERTED — check WHOOP_JOURNAL_LAG_DAYS and shift(-1)."
+        f"alignment is INVERTED — check pivot_journal (behaviors_date key) and shift(-1)."
     )
 
     # Reconstruct the alignment manually to lock in the exact row offset.

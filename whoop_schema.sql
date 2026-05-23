@@ -165,7 +165,8 @@ CREATE TABLE IF NOT EXISTS pds.whoop_body_measurements (
 -- 6. WHOOP Journal Entries (from CSV export — one row per behavior per day)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS pds.whoop_journal (
-    cycle_date      DATE NOT NULL,
+    cycle_date      DATE NOT NULL,              -- date bedtime BEGAN in WHOOP local TZ (what WHOOP exports)
+    behaviors_date  DATE,                       -- calendar day the answer DESCRIBES (auto-computed by trigger; differs from cycle_date for post-midnight bedtimes)
     question        TEXT NOT NULL,              -- behavior name (e.g., "Caffeine", "Melatonin")
     category        TEXT,                       -- e.g., Supplements, Lifestyle, Nutrition
     answer          TEXT,                       -- "Yes"/"No", quantity, time, or free text
@@ -177,7 +178,58 @@ CREATE TABLE IF NOT EXISTS pds.whoop_journal (
 );
 
 CREATE INDEX IF NOT EXISTS idx_whoop_journal_date ON pds.whoop_journal (cycle_date);
+CREATE INDEX IF NOT EXISTS idx_whoop_journal_behaviors_date ON pds.whoop_journal (behaviors_date);
 CREATE INDEX IF NOT EXISTS idx_whoop_journal_category ON pds.whoop_journal (category);
+
+-- behaviors_date trigger: WHOOP's CSV cycle_date is the date bedtime began in
+-- WHOOP's local TZ. For post-midnight bedtimes that's one calendar day AFTER
+-- the behaviors-day the journal answer describes. behaviors_date is computed
+-- as (start_time − 6h) in the cycle's local TZ — equals cycle_date for
+-- pre-midnight bedtimes, cycle_date − 1 for post-midnight bedtimes.
+CREATE OR REPLACE FUNCTION pds.compute_journal_behaviors_date()
+RETURNS TRIGGER AS $$
+BEGIN
+  SELECT (((c.start_time AT TIME ZONE 'UTC') + (c.timezone_offset)::interval - INTERVAL '6 hours'))::date
+    INTO NEW.behaviors_date
+  FROM pds.whoop_cycles c
+  WHERE (((c.start_time AT TIME ZONE 'UTC') + (c.timezone_offset)::interval))::date = NEW.cycle_date
+  ORDER BY c.start_time
+  LIMIT 1;
+  IF NEW.behaviors_date IS NULL THEN
+    NEW.behaviors_date := NEW.cycle_date;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS journal_behaviors_date_trigger ON pds.whoop_journal;
+CREATE TRIGGER journal_behaviors_date_trigger
+  BEFORE INSERT OR UPDATE OF cycle_date ON pds.whoop_journal
+  FOR EACH ROW EXECUTE FUNCTION pds.compute_journal_behaviors_date();
+
+-- Companion trigger: backfill behaviors_date on journal rows when a matching
+-- whoop_cycle arrives or its start_time changes (handles journal-imported-
+-- before-cycle ordering).
+CREATE OR REPLACE FUNCTION pds.refresh_journal_behaviors_dates_for_cycle()
+RETURNS TRIGGER AS $$
+DECLARE
+  cycle_bedtime_date DATE;
+  new_behaviors DATE;
+BEGIN
+  cycle_bedtime_date := (((NEW.start_time AT TIME ZONE 'UTC') + (NEW.timezone_offset)::interval))::date;
+  new_behaviors      := (((NEW.start_time AT TIME ZONE 'UTC') + (NEW.timezone_offset)::interval - INTERVAL '6 hours'))::date;
+  UPDATE pds.whoop_journal
+     SET behaviors_date = new_behaviors
+   WHERE cycle_date = cycle_bedtime_date
+     AND (behaviors_date IS NULL OR behaviors_date <> new_behaviors);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS cycle_refresh_journal_behaviors_trigger ON pds.whoop_cycles;
+CREATE TRIGGER cycle_refresh_journal_behaviors_trigger
+  AFTER INSERT OR UPDATE OF start_time, timezone_offset ON pds.whoop_cycles
+  FOR EACH ROW EXECUTE FUNCTION pds.refresh_journal_behaviors_dates_for_cycle();
 
 -- ---------------------------------------------------------------------------
 -- Enable RLS on all WHOOP tables

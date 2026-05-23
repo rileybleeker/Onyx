@@ -129,20 +129,25 @@ TARGET = "whoop_hrv_rmssd"
 # Stage-1 BH-FDR threshold for promoting features to Stage 2 partial correlations.
 FDR_Q_THRESHOLD = 0.05
 
-# WHOOP journal date-semantics shift, in days.
+# WHOOP journal date semantics — corrected 2026-05-23.
 #
-# Verified 2026-04-16: WHOOP `whoop_journal.cycle_date = X` describes behaviors
-# that happened on day X itself (behaviors-of-day-X semantics), not wake-morning
-# semantics. Verification: `plane=Yes` on cycle_date=2026-04-08 matches an
-# actual flight on Apr 8 — only consistent with behaviors-of-day-X.
+# The 2026-04-16 audit (finding 4.B) verified one data point (April 8, with a
+# pre-midnight bedtime) and incorrectly generalized that cycle_date =
+# behaviors-day always. In reality:
 #
-# Combined with `hrv_next = whoop_hrv_rmssd.shift(-1)`, alignment is correct:
-# journal_* on row N = behaviors of day N, hrv_next on row N = HRV from sleep
-# night N -> N+1. The behavior precedes the predicted HRV.
+#   cycle_date    = the date bedtime began in WHOOP's local TZ.
+#   behaviors_day = the day the user was awake answering the question about.
 #
-# Caveat: this assumes Riley fills the journal describing the current day.
-# If the habit changes, re-verify via tests/test_phase2_alignment.py.
-WHOOP_JOURNAL_LAG_DAYS = 0
+# For pre-midnight bedtimes those agree; for post-midnight bedtimes (Riley's
+# consistent pattern in Atlanta and Spain) cycle_date = behaviors_day + 1.
+# A "Feeling sick = Yes" answer for behaviors on Wed May 13 was stored with
+# cycle_date = 2026-05-14 because Riley went to bed at 00:11 AM May 14 ET.
+#
+# Resolution: `pds.whoop_journal` now carries a `behaviors_date` column
+# (computed by a DB trigger from each cycle's start_time − 6h in local TZ)
+# and the unified `pds.journal` view exposes it for both WHOOP and habit
+# sources. This pipeline reads `behaviors_date` directly so alignment is
+# correct for all bedtime patterns without an in-Python shift.
 
 # Features whose 5%-non-null filter is too strict — these are canonical HRV
 # predictors and their NULLs are concentrated in the early dataset where Garmin
@@ -581,7 +586,10 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["mfp"]["calendar_date"] = data["mfp"]["calendar_date"].astype(str)
 
     log.info("  Loading journal (WHOOP + habits)…")
-    data["journal"] = fetch_all("journal", select="cycle_date,question,answer,source")
+    data["journal"] = fetch_all(
+        "journal",
+        select="cycle_date,behaviors_date,question,answer,source",
+    )
 
     log.info("  Loading supplement_intake_by_compound…")
     data["supplements"] = fetch_all(
@@ -760,14 +768,16 @@ def pivot_journal(journal: pd.DataFrame) -> pd.DataFrame:
     e.g., older callers passing the raw whoop_journal table — every row is
     treated as WHOOP, preserving the historical behavior.
 
-    Date-semantics shift (audit finding 4.B): WHOOP asks journal questions on
-    the morning the cycle ends, but the questions cover the *previous day's*
-    behaviors (e.g., "did you drink alcohol [yesterday]?"). We subtract one day
-    from cycle_date so the resulting `journal_*` column on calendar_date=N
-    actually describes behaviors-on-day-N — which is the lag the rest of the
-    pipeline assumes (target = HRV at wake on N+1).
+    Date alignment: keys on `behaviors_date` (the calendar day the answer
+    describes), which the DB layer computes from each cycle's bedtime − 6h in
+    local TZ. For pre-midnight bedtimes this equals cycle_date; for
+    post-midnight bedtimes it's cycle_date − 1. The pipeline's downstream
+    `hrv_next = whoop_hrv_rmssd.shift(-1)` then puts journal_* on row N
+    (behaviors of day N) opposite hrv_next on row N (HRV from sleep N → N+1),
+    which is the intended 1-day causal lag.
 
-    `WHOOP_JOURNAL_LAG_DAYS = 0` reverts to the prior, off-by-one behavior.
+    Falls back to cycle_date if behaviors_date is missing (older rows pre-
+    backfill or rows with no matching whoop_cycle).
     """
     if journal.empty:
         return pd.DataFrame()
@@ -776,16 +786,16 @@ def pivot_journal(journal: pd.DataFrame) -> pd.DataFrame:
         journal = journal[journal["source"] == "whoop"]
         if journal.empty:
             return pd.DataFrame()
-    if WHOOP_JOURNAL_LAG_DAYS:
-        journal["cycle_date"] = (
-            pd.to_datetime(journal["cycle_date"], errors="coerce")
-            - pd.Timedelta(days=WHOOP_JOURNAL_LAG_DAYS)
-        ).dt.date.astype(str)
+    # Prefer behaviors_date (DB-computed via the (bedtime−6h)::date trigger);
+    # fall back to cycle_date for rows where it's NULL.
+    if "behaviors_date" in journal.columns:
+        date_col = journal["behaviors_date"].fillna(journal["cycle_date"])
     else:
-        journal["cycle_date"] = journal["cycle_date"].astype(str)
+        date_col = journal["cycle_date"]
+    journal["calendar_date"] = pd.to_datetime(date_col, errors="coerce").dt.date.astype(str)
     journal["is_yes"] = journal["answer"].str.lower().isin(["yes", "true", "1"]).astype(float)
     pivot = (
-        journal.pivot_table(index="cycle_date", columns="question", values="is_yes", aggfunc="max")
+        journal.pivot_table(index="calendar_date", columns="question", values="is_yes", aggfunc="max")
         .reset_index()
     )
     pivot.columns = ["calendar_date"] + [_clean_question_col("journal_", c) for c in pivot.columns[1:]]
@@ -3035,8 +3045,8 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
             xgb_bt["pred_date"] = pd.to_datetime(xgb_bt["prediction_date"]).dt.strftime("%Y-%m-%d")
             jcols = [c for c in df.columns if c.startswith("journal_")]
             if jcols:
-                # Lookup table: calendar_date -> journal flags. Recall journal cycle_date
-                # was already shifted -1 in pivot_journal so journal_*[N] = behaviors on N.
+                # Lookup table: calendar_date -> journal flags. journal_*[N] = behaviors
+                # on day N (pivot_journal keys on behaviors_date from the DB trigger).
                 jdf = df[["calendar_date"] + jcols].copy()
                 jdf["calendar_date"] = jdf["calendar_date"].astype(str)
                 joined = xgb_bt.merge(
