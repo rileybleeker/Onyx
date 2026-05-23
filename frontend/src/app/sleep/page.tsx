@@ -127,13 +127,16 @@ export default function SleepPage() {
   }));
 
   // Hours vs Needed (WHOOP "Sleep Sufficiency"): asleep / sleep_need.
-  // asleep = in_bed − awake − no_data; need = baseline + debt + strain − nap.
+  // asleep = in_bed − awake − no_data; need = baseline + debt + strain + nap.
+  // WHOOP's API returns need_from_recent_nap_milli as a NEGATIVE number when
+  // a recent nap has credited toward tonight's need — so we ADD it (signed)
+  // rather than subtracting, which would invert the credit.
   const hoursVsNeeded = (d: any): number | null => {
     const inBed = d.total_in_bed_time_milli;
     const baseline = d.baseline_milli;
     if (inBed == null || baseline == null) return null;
     const asleep = inBed - (d.total_awake_time_milli ?? 0) - (d.total_no_data_time_milli ?? 0);
-    const need   = baseline + (d.need_from_sleep_debt_milli ?? 0) + (d.need_from_recent_strain_milli ?? 0) - (d.need_from_recent_nap_milli ?? 0);
+    const need   = baseline + (d.need_from_sleep_debt_milli ?? 0) + (d.need_from_recent_strain_milli ?? 0) + (d.need_from_recent_nap_milli ?? 0);
     if (!need) return null;
     return (100 * asleep) / need;
   };
