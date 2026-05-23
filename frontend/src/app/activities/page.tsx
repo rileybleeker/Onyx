@@ -1,9 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getActivities, getWorkouts, getWhoopWorkouts, rangeDays, rangeLabel, type Range } from "@/lib/queries";
-import { formatDuration, formatDistance, formatPace } from "@/lib/format";
+import { BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { formatDuration, formatDistance, formatPace, formatDate } from "@/lib/format";
 import RangeFilter from "@/components/RangeFilter";
+import StatCard from "@/components/StatCard";
+import ChartCard from "@/components/ChartCard";
+import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -92,14 +96,15 @@ function mergeAndDedup(garmin: ActivityRow[], whoop: ActivityRow[]): ActivityRow
 export default function ActivitiesPage() {
   const [rows, setRows] = useState<ActivityRow[]>([]);
   const [workoutMap, setWorkoutMap] = useState<Record<string, any>>({});
+  const [summaries, setSummaries] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [range, setRange] = useState<Range>("30d");
 
   useEffect(() => {
     setLoading(true);
     const days = rangeDays(range);
-    Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts()])
-      .then(([garmin, whoop, wkts]) => {
+    Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts(), getDailySummaries(days)])
+      .then(([garmin, whoop, wkts, sums]) => {
         const merged = mergeAndDedup(
           garmin.map(normalizeGarmin),
           whoop.map(normalizeWhoop),
@@ -108,10 +113,17 @@ export default function ActivitiesPage() {
         const map: Record<string, any> = {};
         for (const w of wkts) map[String(w.workout_id)] = w;
         setWorkoutMap(map);
+        setSummaries(sums);
       })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, [range]);
+
+  const latestSummary = summaries[summaries.length - 1];
+  const stepsData = summaries.map((d) => ({
+    date: formatDate(d.calendar_date),
+    steps: d.total_steps,
+  }));
 
   if (loading) {
     return (
@@ -134,6 +146,29 @@ export default function ActivitiesPage() {
           <p className="text-sm text-text-tertiary mt-0.5">Training — {rangeLabel(range)}</p>
         </div>
         <RangeFilter value={range} onChange={setRange} />
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+        <StatCard
+          label="Steps"
+          value={latestSummary?.total_steps?.toLocaleString()}
+          sublabel={latestSummary?.calendar_date}
+          source="GARMIN"
+        />
+      </div>
+
+      <div className="mb-8">
+        <ChartCard title="Daily Steps" subtitle={rangeLabel(range)} source="GARMIN">
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={stepsData}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={55} label={axisLabel("steps", "y")} />
+              <Tooltip {...chartTooltip} />
+              <Bar dataKey="steps" fill={accentColor} radius={[2, 2, 0, 0]} fillOpacity={0.85} />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
       </div>
 
       {rows.length === 0 ? (

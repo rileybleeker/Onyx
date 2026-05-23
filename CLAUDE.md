@@ -63,7 +63,7 @@ Onyx/
 ├── .env                     # Secrets (NEVER commit)
 └── frontend/                # Next.js 15 app
     └── src/
-        ├── app/             # Pages (14 routes) + API routes
+        ├── app/             # Pages (13 routes; `/` is a redirect to /status) + API routes
         │   ├── analytics/hrv/  # HRV Analysis dashboard (predictions, SHAP, models)
         │   └── spotify/        # Spotify listening dashboard (volume, mood signature, sonic profile radar, top artists/tracks)
         ├── components/      # AppShell, Sidebar, MobileNav, ChartCard, StatCard
