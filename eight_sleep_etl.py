@@ -300,7 +300,7 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
         "wakeup_consistency_score": safe_get(routine, "wakeupConsistency", "score"),
         "sleep_routine_score": routine.get("total"),
         # Biometrics (v2 trends include these in sleepQualityScore)
-        "avg_heart_rate": safe_get(quality, "heartRate", "average"),
+        "avg_heart_rate": safe_get(quality, "heartRate", "current"),
         "avg_hrv": safe_get(quality, "hrv", "current"),
         "avg_breath_rate": safe_get(quality, "respiratoryRate", "current"),
         "avg_resp_rate": safe_get(quality, "respiratoryRate", "average"),
