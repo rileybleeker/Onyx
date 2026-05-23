@@ -115,13 +115,37 @@ export default function SleepPage() {
     strain: d.strain ? +Number(d.strain).toFixed(1) : null,
   }));
 
-  const whoopDurationData = whoopSleep.map((d) => ({
-    date:  formatDate(etDate(d.end_time)),
-    deep:  d.total_slow_wave_sleep_time_milli ? +(d.total_slow_wave_sleep_time_milli / 3600000).toFixed(2) : 0,
-    light: d.total_light_sleep_time_milli     ? +(d.total_light_sleep_time_milli / 3600000).toFixed(2)     : 0,
-    rem:   d.total_rem_sleep_time_milli       ? +(d.total_rem_sleep_time_milli / 3600000).toFixed(2)       : 0,
-    awake: d.total_awake_time_milli           ? +(d.total_awake_time_milli / 3600000).toFixed(2)           : 0,
-  }));
+  // Aggregate WHOOP nap rows per wake-day so we can stack them on top of the
+  // main-sleep stage bars and surface them in the Duration StatCard.
+  const whoopNapsByDate = new Map<string, { deep: number; light: number; rem: number; awake: number; inBedMs: number }>();
+  whoopSleepAll.forEach((s: any) => {
+    if (!s.is_nap) return;
+    const date = formatDate(etDate(s.end_time));
+    const cur = whoopNapsByDate.get(date) || { deep: 0, light: 0, rem: 0, awake: 0, inBedMs: 0 };
+    cur.deep    += (s.total_slow_wave_sleep_time_milli || 0) / 3600000;
+    cur.light   += (s.total_light_sleep_time_milli     || 0) / 3600000;
+    cur.rem     += (s.total_rem_sleep_time_milli       || 0) / 3600000;
+    cur.awake   += (s.total_awake_time_milli           || 0) / 3600000;
+    cur.inBedMs += s.total_in_bed_time_milli || 0;
+    whoopNapsByDate.set(date, cur);
+  });
+
+  const whoopDurationData = whoopSleep.map((d) => {
+    const date = formatDate(etDate(d.end_time));
+    const nap = whoopNapsByDate.get(date);
+    const napHours = nap ? +(nap.deep + nap.light + nap.rem + nap.awake).toFixed(2) : 0;
+    return {
+      date,
+      deep:  d.total_slow_wave_sleep_time_milli ? +(d.total_slow_wave_sleep_time_milli / 3600000).toFixed(2) : 0,
+      light: d.total_light_sleep_time_milli     ? +(d.total_light_sleep_time_milli / 3600000).toFixed(2)     : 0,
+      rem:   d.total_rem_sleep_time_milli       ? +(d.total_rem_sleep_time_milli / 3600000).toFixed(2)       : 0,
+      awake: d.total_awake_time_milli           ? +(d.total_awake_time_milli / 3600000).toFixed(2)           : 0,
+      nap:   napHours,
+    };
+  });
+  const avgWhoopNapMs = whoopNapsByDate.size
+    ? Array.from(whoopNapsByDate.values()).reduce((a, b) => a + b.inBedMs, 0) / whoopSleep.length
+    : 0;
 
   // Hours vs Needed (WHOOP "Sleep Sufficiency"): asleep / sleep_need.
   // asleep = in_bed − awake − no_data; need = baseline + debt + strain + nap.
@@ -214,13 +238,34 @@ export default function SleepPage() {
     quality: d.sleep_quality_score,
   }));
 
-  const eightStagesData = eightSleep.map((d) => ({
-    date:  formatDate(d.calendar_date),
-    deep:  d.deep_sleep_seconds  ? +(d.deep_sleep_seconds / 3600).toFixed(2)  : 0,
-    light: d.light_sleep_seconds ? +(d.light_sleep_seconds / 3600).toFixed(2) : 0,
-    rem:   d.rem_sleep_seconds   ? +(d.rem_sleep_seconds / 3600).toFixed(2)   : 0,
-    awake: d.awake_seconds       ? +(d.awake_seconds / 3600).toFixed(2)       : 0,
-  }));
+  // Eight Sleep stages: use main_session_* columns for the four primary stages
+  // and surface the nap delta as a distinct 5th segment so the bar shows
+  // exactly what came from the main sleep vs what came from naps.
+  const eightStagesData = eightSleep.map((d) => {
+    const deepMain  = d.deep_sleep_main_session_seconds  ?? d.deep_sleep_seconds  ?? 0;
+    const lightMain = d.light_sleep_main_session_seconds ?? d.light_sleep_seconds ?? 0;
+    const remMain   = d.rem_sleep_main_session_seconds   ?? d.rem_sleep_seconds   ?? 0;
+    const awakeMain = d.awake_main_session_seconds       ?? d.awake_seconds       ?? 0;
+    const totalAll  = (d.deep_sleep_seconds || 0) + (d.light_sleep_seconds || 0)
+                    + (d.rem_sleep_seconds || 0) + (d.awake_seconds || 0);
+    const mainAll   = deepMain + lightMain + remMain + awakeMain;
+    const napSec    = Math.max(0, totalAll - mainAll);
+    return {
+      date:  formatDate(d.calendar_date),
+      deep:  +(deepMain  / 3600).toFixed(2),
+      light: +(lightMain / 3600).toFixed(2),
+      rem:   +(remMain   / 3600).toFixed(2),
+      awake: +(awakeMain / 3600).toFixed(2),
+      nap:   +(napSec    / 3600).toFixed(2),
+    };
+  });
+  // Range averages: main sleep duration + average nap duration across the range
+  // (nap-less days contribute 0, so this is a per-day average that adds back to
+  // avgEightDuration when both are summed).
+  const avgEightMainSec = avg(eightSleep, "time_slept_main_session_seconds");
+  const avgEightNapSec  = avgEightDuration != null && avgEightMainSec != null
+    ? Math.max(0, avgEightDuration - avgEightMainSec)
+    : null;
 
   const eightBiometricsData = eightSleep.map((d) => ({
     date:       formatDate(d.calendar_date),
@@ -347,7 +392,16 @@ export default function SleepPage() {
       {/* ── WHOOP Sleep ─────────────────────────────────────────────────────── */}
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Sleep</p>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <StatCard label="Duration" value={avgInBedMs != null ? formatDuration(Math.round(avgInBedMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
+        <StatCard
+          label="Duration"
+          value={avgInBedMs != null ? formatDuration(Math.round((avgInBedMs + avgWhoopNapMs) / 1000)) : null}
+          sublabel={
+            avgInBedMs != null && avgWhoopNapMs > 0
+              ? `${formatDuration(Math.round(avgInBedMs / 1000))} main + ${formatDuration(Math.round(avgWhoopNapMs / 1000))} nap · ${rangeNote}`
+              : rangeNote
+          }
+          source="WHOOP"
+        />
         <StatCard label="Hours vs Needed" value={avgHoursVsNeeded != null ? `${avgHoursVsNeeded.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="Sleep Performance" value={avgSleepPerf != null ? `${avgSleepPerf.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="Sleep Efficiency" value={avgSleepEff != null ? `${avgSleepEff.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
@@ -432,7 +486,8 @@ export default function SleepPage() {
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
               <Bar dataKey="light" stackId="a" fill="#60a5fa" name="Light" />
               <Bar dataKey="rem" stackId="a" fill="#a78bfa" name="REM" />
-              <Bar dataKey="awake" stackId="a" fill="#f87171" name="Awake" radius={[3, 3, 0, 0]} />
+              <Bar dataKey="awake" stackId="a" fill="#f87171" name="Awake" />
+              <Bar dataKey="nap" stackId="a" fill="#fbbf24" name="Nap" radius={[3, 3, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -599,7 +654,16 @@ export default function SleepPage() {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <StatCard label="Sleep Score" value={avgEightSleep != null ? avgEightSleep.toFixed(0) : null} sublabel={rangeNote} source="8SLP" />
         <StatCard label="Fitness Score" value={avgEightFitness != null ? avgEightFitness.toFixed(0) : null} sublabel={rangeNote} source="8SLP" />
-        <StatCard label="Duration" value={avgEightDuration != null ? formatDuration(Math.round(avgEightDuration)) : null} sublabel={rangeNote} source="8SLP" />
+        <StatCard
+          label="Duration"
+          value={avgEightDuration != null ? formatDuration(Math.round(avgEightDuration)) : null}
+          sublabel={
+            avgEightMainSec != null && avgEightNapSec != null && avgEightNapSec > 0
+              ? `${formatDuration(Math.round(avgEightMainSec))} main + ${formatDuration(Math.round(avgEightNapSec))} nap · ${rangeNote}`
+              : rangeNote
+          }
+          source="8SLP"
+        />
         <StatCard label="HRV" value={avgEightHrv != null ? avgEightHrv.toFixed(0) : null} unit="ms" sublabel={rangeNote} source="8SLP" />
         <StatCard label="Sleep Latency" value={avgEightLatency != null ? (avgEightLatency / 60).toFixed(0) : null} unit="min" sublabel={rangeNote} source="8SLP" />
       </div>
@@ -631,7 +695,8 @@ export default function SleepPage() {
               <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
               <Bar dataKey="light" stackId="a" fill="#60a5fa" name="Light" />
               <Bar dataKey="rem" stackId="a" fill="#a78bfa" name="REM" />
-              <Bar dataKey="awake" stackId="a" fill="#f87171" name="Awake" radius={[3, 3, 0, 0]} />
+              <Bar dataKey="awake" stackId="a" fill="#f87171" name="Awake" />
+              <Bar dataKey="nap" stackId="a" fill="#fbbf24" name="Nap" radius={[3, 3, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
