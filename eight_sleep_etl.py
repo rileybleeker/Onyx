@@ -160,6 +160,17 @@ def avg_timeseries(timeseries: list | None) -> float | None:
     return round(total / len(timeseries), 2)
 
 
+def median_timeseries(timeseries: list | None) -> float | None:
+    """Compute median from a list of [timestamp, value] pairs."""
+    if not timeseries:
+        return None
+    values = sorted(entry[1] for entry in timeseries)
+    mid = len(values) // 2
+    if len(values) % 2:
+        return round(values[mid], 2)
+    return round((values[mid - 1] + values[mid]) / 2, 2)
+
+
 def sum_timeseries(timeseries: list | None) -> int | None:
     """Compute sum from a list of [timestamp, value] pairs."""
     if not timeseries:
@@ -303,9 +314,13 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
         "avg_heart_rate": safe_get(quality, "heartRate", "current"),
         "avg_hrv": safe_get(quality, "hrv", "current"),
         "avg_breath_rate": safe_get(quality, "respiratoryRate", "current"),
-        # Environment
-        "avg_bed_temp": safe_get(quality, "tempBedC", "average"),
-        "avg_room_temp": safe_get(quality, "tempRoomC", "average"),
+        # Environment — left null here so the upsert falls through to
+        # parse_interval()'s median of per-minute readings. The trends
+        # payload's sleepQualityScore block doesn't expose tempBedC/tempRoomC
+        # (only HR/HRV/respiratoryRate get the .current/.average treatment),
+        # so we always compute the per-night value from the interval timeseries.
+        "avg_bed_temp": None,
+        "avg_room_temp": None,
         # Sleep stages (seconds) — summed across all sessions per stageSummary
         # so multi-session days (main + nap) are internally consistent.
         "time_slept_seconds": sleep_duration,
@@ -363,8 +378,12 @@ def parse_interval(interval: dict, bed_side: str) -> dict | None:
         "bed_side": bed_side,
         "avg_heart_rate": avg_timeseries(ts.get("heartRate")),
         "avg_breath_rate": avg_timeseries(ts.get("respiratoryRate")),
-        "avg_bed_temp": avg_timeseries(ts.get("tempBedC")),
-        "avg_room_temp": avg_timeseries(ts.get("tempRoomC")),
+        # Temps stored as MEDIAN of per-minute readings, not mean — robust to
+        # the warm-up transient (bed cold when first in) and cool-off at wake.
+        # The column names retain the `avg_` prefix for backwards compatibility
+        # pending a deliberate rename pass.
+        "avg_bed_temp": median_timeseries(ts.get("tempBedC")),
+        "avg_room_temp": median_timeseries(ts.get("tempRoomC")),
         "toss_and_turns": sum_timeseries(ts.get("tnt")),
         "light_sleep_seconds": stage_totals.get("light"),
         "deep_sleep_seconds": stage_totals.get("deep"),
