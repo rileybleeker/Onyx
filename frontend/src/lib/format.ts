@@ -3,6 +3,20 @@ export function formatDate(dateStr: string): string {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+// WHOOP cycles span bedtime → bedtime and are labeled in the app by the wake-day.
+// Convert a cycle/sleep `start_time` (UTC ISO) to the wake-day ET date (YYYY-MM-DD)
+// via the canonical "+12h then America/New_York" rule documented in CLAUDE.md.
+export function whoopCycleDate(startTime: string | null | undefined): string {
+  if (!startTime) return "";
+  const shifted = new Date(new Date(startTime).getTime() + 12 * 3600 * 1000);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(shifted);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
 export function formatDuration(seconds: number | null): string {
   if (!seconds) return "—";
   const h = Math.floor(seconds / 3600);

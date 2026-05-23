@@ -10,7 +10,7 @@ import {
   getEightSleepTrends, getHeartRateData, getDailySummaries,
   rangeDays, rangeLabel, type Range,
 } from "@/lib/queries";
-import { formatDate, formatDuration } from "@/lib/format";
+import { formatDate, formatDuration, whoopCycleDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -111,12 +111,12 @@ export default function SleepPage() {
   });
 
   const strainData = whoopCycles.map((d) => ({
-    date:   formatDate(new Date(d.start_time).toISOString().split("T")[0]),
+    date:   formatDate(whoopCycleDate(d.start_time)),
     strain: d.strain ? +Number(d.strain).toFixed(1) : null,
   }));
 
   const whoopDurationData = whoopSleep.map((d) => ({
-    date:  formatDate(d.start_time?.split("T")[0]),
+    date:  formatDate(whoopCycleDate(d.start_time)),
     deep:  d.total_slow_wave_sleep_time_milli ? +(d.total_slow_wave_sleep_time_milli / 3600000).toFixed(2) : 0,
     light: d.total_light_sleep_time_milli     ? +(d.total_light_sleep_time_milli / 3600000).toFixed(2)     : 0,
     rem:   d.total_rem_sleep_time_milli       ? +(d.total_rem_sleep_time_milli / 3600000).toFixed(2)       : 0,
@@ -136,7 +136,7 @@ export default function SleepPage() {
   };
 
   const whoopScoreData = whoopSleep.map((d) => ({
-    date:         formatDate(d.start_time?.split("T")[0]),
+    date:         formatDate(whoopCycleDate(d.start_time)),
     performance:  d.sleep_performance_percentage,
     hoursNeeded:  hoursVsNeeded(d) != null ? +hoursVsNeeded(d)!.toFixed(1) : null,
     efficiency:   d.sleep_efficiency_percentage,
@@ -147,21 +147,21 @@ export default function SleepPage() {
   // (in ms) that WHOOP says you're carrying from prior nights — i.e. your
   // running sleep debt as of this cycle. Convert to hours.
   const sleepDebtData = whoopSleep.map((d) => ({
-    date: formatDate(d.start_time?.split("T")[0]),
+    date: formatDate(whoopCycleDate(d.start_time)),
     debt: d.need_from_sleep_debt_milli != null
       ? +(d.need_from_sleep_debt_milli / 3600000).toFixed(2)
       : null,
   }));
 
   const inBedData = whoopSleep.map((d) => ({
-    date:  formatDate(d.start_time?.split("T")[0]),
+    date:  formatDate(whoopCycleDate(d.start_time)),
     hours: d.total_in_bed_time_milli ? +(d.total_in_bed_time_milli / 3600000).toFixed(2) : null,
   }));
 
   const whoopHrData = whoopSleep.map((d) => {
     const rec = recoveryByCycle.get(d.cycle_id);
     return {
-      date:     formatDate(d.start_time?.split("T")[0]),
+      date:     formatDate(whoopCycleDate(d.start_time)),
       hr:       rec?.resting_heart_rate,
       hrv:      rec?.hrv_rmssd_milli ? +Number(rec.hrv_rmssd_milli).toFixed(1) : null,
       respRate: d.respiratory_rate   ? +Number(d.respiratory_rate).toFixed(1)  : null,
