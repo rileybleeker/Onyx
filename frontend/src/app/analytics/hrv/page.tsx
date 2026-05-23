@@ -16,6 +16,21 @@ import { getWorkoutSleepGap, rangeDays, rangeLabel, type Range, type WorkoutSlee
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
 
+// YAxis width on horizontal bar charts is a hardcoded Recharts prop, so mobile
+// scaling needs JS state — without it, the 200-220px label column crushes the
+// bar area into the right ~80px of a 320px mobile card.
+function useIsMobile(breakpoint = 640) {
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${breakpoint}px)`);
+    const update = () => setIsMobile(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, [breakpoint]);
+  return isMobile;
+}
+
 /**
  * Normalize a feature label for display. Some rows arrive pretty-printed from
  * the Python pipeline ("Bed Temperature"); others are still raw column names
@@ -286,6 +301,28 @@ export default function HrvAnalysisPage() {
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
   const [range, setRange] = useState<Range>("30d");
+  const isMobile = useIsMobile();
+
+  // Mobile-aware sizing for horizontal bar charts. On a ~320px wide mobile
+  // card, the desktop YAxis widths (180-220px) leave the bars squeezed into
+  // 80-120px on the right. These shrink the label column and font so the bars
+  // get most of the horizontal space. The <title> hover on WrappedYAxisTick
+  // still surfaces the full label when truncated.
+  const axisW = {
+    short: isMobile ? 90 : 140,   // Prediction Drivers (already-clean labels)
+    med:   isMobile ? 95 : 160,   // Journal/Habit SHAP sub-charts
+    long:  isMobile ? 110 : 200,  // Correlates, Journal/Habit Impact, Supplement Impact
+    xlong: isMobile ? 110 : 220,  // Dose-Response, Causal Binary
+    nutri: isMobile ? 100 : 140,  // Nutrition correlations
+  };
+  const chars = {
+    long:  isMobile ? 16 : 28,
+    xlong: isMobile ? 16 : 30,
+    corr:  isMobile ? 16 : 26,
+    nutri: isMobile ? 14 : 20,
+  };
+  const sideMarginShort = isMobile ? 4 : 140;  // matches axisW.short when desktop
+  const sideMarginMed   = isMobile ? 4 : 160;  // matches axisW.med when desktop
 
   useEffect(() => {
     setLoading(true);
@@ -747,17 +784,17 @@ export default function HrvAnalysisPage() {
 
         {/* Side-by-side charts */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <ChartCard title="Prediction Drivers (Today)" subtitle="What's driving tomorrow's forecast right now"
+          <ChartCard collapsible title="Prediction Drivers (Today)" subtitle="What's driving tomorrow's forecast right now"
             source="XGBOOST · SHAP"
             info="Shows what's pushing tomorrow's prediction up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes. Journal behaviors appear in a separate section below because they're Yes/No entries — they have smaller numerical impact than continuous metrics like heart rate, but they're still part of the model.">
             {topDrivers.length > 0 ? (
               <ResponsiveContainer width="100%" height={300}>
                 <BarChart data={topDrivers.slice(0, 10)} layout="vertical"
-                          margin={{ left: 140, right: 20, top: 4, bottom: 20 }}>
+                          margin={{ left: sideMarginShort, right: 20, top: 4, bottom: 20 }}>
                   <CartesianGrid {...gridStyle} horizontal={false} />
                   <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(1)}`}
                          label={axisLabel("HRV impact (ms)", "x")} />
-                  <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 11 }} width={140} />
+                  <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 11 }} width={axisW.short} />
                   <Tooltip
                     {...chartTooltip}
                     formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)} ms`, "Impact"]}
@@ -791,11 +828,11 @@ export default function HrvAnalysisPage() {
               {journalDriversToday.length > 0 ? (
                 <ResponsiveContainer width="100%" height={Math.max(120, journalDriversToday.length * 22)}>
                   <BarChart data={journalDriversToday} layout="vertical"
-                            margin={{ left: 160, right: 20, top: 2, bottom: 20 }}>
+                            margin={{ left: sideMarginMed, right: 20, top: 2, bottom: 20 }}>
                     <CartesianGrid {...gridStyle} horizontal={false} />
                     <XAxis type="number" tick={axisTick} tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(2)}`}
                            label={axisLabel("HRV impact (ms)", "x")} />
-                    <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160}
+                    <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 10 }} width={axisW.med}
                            tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
                     <Tooltip {...chartTooltip}
                              formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(3)} ms`, Number(v) > 0 ? "Raised forecast" : "Lowered forecast"]} />
@@ -814,10 +851,10 @@ export default function HrvAnalysisPage() {
                   </p>
                   <ResponsiveContainer width="100%" height={Math.max(120, journalShap.length * 22)}>
                     <BarChart data={journalShap} layout="vertical"
-                              margin={{ left: 160, right: 20, top: 2, bottom: 2 }}>
+                              margin={{ left: sideMarginMed, right: 20, top: 2, bottom: 2 }}>
                       <CartesianGrid {...gridStyle} horizontal={false} />
                       <XAxis type="number" tick={axisTick} tickFormatter={v => v.toFixed(2)} />
-                      <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160}
+                      <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 10 }} width={axisW.med}
                              tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
                       <Tooltip {...chartTooltip}
                                formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
@@ -849,10 +886,10 @@ export default function HrvAnalysisPage() {
               {habitShap.length > 0 ? (
                 <ResponsiveContainer width="100%" height={Math.max(120, habitShap.length * 28)}>
                   <BarChart data={habitShap} layout="vertical"
-                            margin={{ left: 160, right: 20, top: 2, bottom: 2 }}>
+                            margin={{ left: sideMarginMed, right: 20, top: 2, bottom: 2 }}>
                     <CartesianGrid {...gridStyle} horizontal={false} />
                     <XAxis type="number" tick={axisTick} tickFormatter={v => v.toFixed(2)} />
-                    <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: 10 }} width={160} />
+                    <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 10 }} width={axisW.med} />
                     <Tooltip {...chartTooltip}
                              formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
                     <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
@@ -871,7 +908,7 @@ export default function HrvAnalysisPage() {
             </div>
           </ChartCard>
 
-          <ChartCard title="HRV Correlates (Historical)" subtitle="What has historically moved with your HRV"
+          <ChartCard collapsible title="HRV Correlates (Historical)" subtitle="What has historically moved with your HRV"
             source="SPEARMAN ρ"
             info="How strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises. A bar near −1.0 means the opposite. This doesn't change day to day — it's a long-term pattern. Journal behaviors appear in a separate section below because Yes/No features have a narrower correlation range than continuous metrics.">
             {correlations.length > 0 ? (
@@ -880,8 +917,8 @@ export default function HrvAnalysisPage() {
                           margin={{ left: 8, right: 20, top: 4, bottom: 4 }}>
                   <CartesianGrid {...gridStyle} horizontal={false} />
                   <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
-                  <YAxis type="category" dataKey="label" width={180}
-                         tick={<WrappedYAxisTick maxCharsPerLine={26} fontSize={10} />} />
+                  <YAxis type="category" dataKey="label" width={isMobile ? 110 : 180}
+                         tick={<WrappedYAxisTick maxCharsPerLine={chars.corr} fontSize={10} />} />
                   <Tooltip {...chartTooltip}
                            formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
                   <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
@@ -913,8 +950,8 @@ export default function HrvAnalysisPage() {
                             margin={{ left: 8, right: 20, top: 2, bottom: 2 }}>
                     <CartesianGrid {...gridStyle} horizontal={false} />
                     <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
-                    <YAxis type="category" dataKey="label" width={200}
-                           tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
+                    <YAxis type="category" dataKey="label" width={axisW.long}
+                           tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                     <Tooltip {...chartTooltip}
                              formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
                     <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
@@ -938,8 +975,11 @@ export default function HrvAnalysisPage() {
                 <span className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase">Habits</span>
                 <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">SPEARMAN ρ</span>
               </div>
-              <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
-                Correlation between each Notion habit and the following night&apos;s HRV. Same statistical treatment as journal behaviors — habits are just a separate source of Yes/No flags you control day-to-day.
+              <p className="text-[10px] text-text-tertiary leading-relaxed">
+                <strong className="text-text-secondary">What it is:</strong> A statistical measure of how consistently two things move together. For each habit, every night gets two ranks — one by HRV, one by whether you completed the habit that day — and the score reflects how well those rankings agree.
+              </p>
+              <p className="text-[10px] text-text-tertiary leading-relaxed mt-1.5 mb-3">
+                <strong className="text-text-secondary">Why it&apos;s used:</strong> Rank-based, so it shrugs off outlier nights and skewed distributions that would distort a standard correlation. Scores range from −1.0 to +1.0; because habits are Yes/No, expect smaller magnitudes than continuous metrics — a steady ±0.10 across hundreds of nights is still real signal.
               </p>
               {habitCorrelations.length > 0 ? (
                 <ResponsiveContainer width="100%" height={Math.max(160, habitCorrelations.length * 32)}>
@@ -947,8 +987,8 @@ export default function HrvAnalysisPage() {
                             margin={{ left: 8, right: 20, top: 2, bottom: 2 }}>
                     <CartesianGrid {...gridStyle} horizontal={false} />
                     <XAxis type="number" tick={axisTick} domain={[-1, 1]} tickFormatter={v => v.toFixed(1)} />
-                    <YAxis type="category" dataKey="label" width={200}
-                           tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
+                    <YAxis type="category" dataKey="label" width={axisW.long}
+                           tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                     <Tooltip {...chartTooltip}
                              formatter={(v: any) => [Number(v).toFixed(3), "Correlation"]} />
                     <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
@@ -972,7 +1012,7 @@ export default function HrvAnalysisPage() {
       {/* ── Row 3: 30-Day Forecast + Journal Impact ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* 30-Day Prophet Forecast */}
-        <ChartCard title="30-Day HRV Forecast" source="PROPHET + SARIMAX"
+        <ChartCard collapsible title="30-Day HRV Forecast" source="PROPHET + SARIMAX"
           info="Prophet projects the next 30 days using your weekly patterns and long-term trend (orange dashed line + shaded uncertainty band — your HRV should land inside it about 4 out of 5 nights). The purple dotted line overlays SARIMAX's independent 7-day short-term forecast as a cross-check: when both models agree on the near-term, confidence is higher; when they diverge, recent dynamics look unusual.">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={prophetData}>
@@ -1007,19 +1047,27 @@ export default function HrvAnalysisPage() {
         </ChartCard>
 
         {/* Journal Impact */}
-        <ChartCard title="Journal Behavior Impact" subtitle="Mean HRV difference: Yes vs No"
+        <ChartCard collapsible title="Journal Behavior Impact" subtitle="Mean HRV difference: Yes vs No"
           source="WELCH'S T-TEST"
           info="How each logged behavior affects your HRV the following night. A +15ms bar means your HRV was 15ms higher, on average, on nights after you did that thing. Green = helps recovery; red = hurts it. Method: Welch's two-sample t-test (unequal variance) on HRV distributions for Yes vs No nights, with Cohen's d and 95% CI computed per behavior.">
-          {journalImpact.length > 0 ? (
-            <ResponsiveContainer width="100%" height={Math.max(360, journalImpact.slice(0, 12).length * 30)}>
-              <BarChart data={journalImpact.slice(0, 12)} layout="vertical"
+          {journalImpact.length > 0 ? (() => {
+            const ji = journalImpact.slice(0, 12).map((d: any) => ({
+              ...d,
+              errorRange: [
+                Math.max(0, (d.diff_ms ?? 0) - (d.ci_low ?? 0)),
+                Math.max(0, (d.ci_high ?? 0) - (d.diff_ms ?? 0)),
+              ],
+            }));
+            return (
+            <ResponsiveContainer width="100%" height={Math.max(360, ji.length * 30)}>
+              <BarChart data={ji} layout="vertical"
                         margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                 <CartesianGrid {...gridStyle} horizontal={false} />
                 <XAxis type="number" tick={axisTick}
                        tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
-                       label={axisLabel("HRV Δ (ms)", "x")} />
-                <YAxis type="category" dataKey="label" width={200}
-                       tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
+                       label={axisLabel("HRV Δ (ms) · whiskers = 95% CI", "x")} />
+                <YAxis type="category" dataKey="label" width={axisW.long}
+                       tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, _n: any, p: any) => {
                            const d = p?.payload ?? {};
@@ -1032,13 +1080,16 @@ export default function HrvAnalysisPage() {
                          }} />
                 <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
                 <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
-                  {journalImpact.slice(0, 12).map((d, i) => (
+                  {ji.map((d: any, i: number) => (
                     <Cell key={i} fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.8} />
                   ))}
+                  <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
+                            stroke="#f4f4f5" direction="x" />
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
-          ) : (
+            );
+          })() : (
             <div className="h-[260px] flex items-center justify-center">
               <p className="text-[11px] text-text-tertiary">No journal data — run hrv_analysis.py</p>
             </div>
@@ -1048,7 +1099,7 @@ export default function HrvAnalysisPage() {
 
       {/* ── Row 3a: Habit Impact ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <ChartCard title="Habit Impact" subtitle="Mean HRV difference: nights you completed the habit vs nights you didn't"
+        <ChartCard collapsible title="Habit Impact" subtitle="Mean HRV difference: nights you completed the habit vs nights you didn't"
           source="WELCH'S T-TEST"
           info="Same statistical treatment as Journal Behavior Impact, applied to Notion-managed habits (from /habits). A +Xms bar means HRV averaged X ms higher on the night following days you completed that habit. Welch's two-sample t-test on next-night HRV for Yes vs No nights, with Cohen's d and 95% CI per habit. Habits need at least 5 Yes-nights and 5 No-nights before they appear (the t-test isn't meaningful with smaller groups). Add more habits or toggle them more consistently at /habits to populate this view.">
           {habitImpact.length > 0 ? (
@@ -1059,8 +1110,8 @@ export default function HrvAnalysisPage() {
                 <XAxis type="number" tick={axisTick}
                        tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
                        label={axisLabel("HRV Δ (ms)", "x")} />
-                <YAxis type="category" dataKey="label" width={200}
-                       tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
+                <YAxis type="category" dataKey="label" width={axisW.long}
+                       tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, _n: any, p: any) => {
                            const d = p?.payload ?? {};
@@ -1090,7 +1141,7 @@ export default function HrvAnalysisPage() {
       {/* ── Row 3b: Supplement Impact + Nutrition Correlations ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Supplement Yes/No Impact */}
-        <ChartCard
+        <ChartCard collapsible
           title="Supplement Impact (Yes vs No)"
           subtitle="Mean HRV difference: nights compound taken vs not"
           source="WELCH'S T-TEST"
@@ -1105,8 +1156,8 @@ export default function HrvAnalysisPage() {
                 <XAxis type="number" tick={axisTick}
                        tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
                        label={axisLabel("HRV Δ (ms)", "x")} />
-                <YAxis type="category" dataKey="displayLabel" width={200}
-                       tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
+                <YAxis type="category" dataKey="displayLabel" width={axisW.long}
+                       tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, _n: any, p: any) => {
                            const d = p?.payload ?? {};
@@ -1135,7 +1186,7 @@ export default function HrvAnalysisPage() {
         </ChartCard>
 
         {/* Nutrition Spearman */}
-        <ChartCard
+        <ChartCard collapsible
           title="Nutrition Correlations"
           subtitle="Spearman ρ between daily nutrient totals and next-night HRV"
           source="SPEARMAN ρ"
@@ -1150,8 +1201,8 @@ export default function HrvAnalysisPage() {
                 <XAxis type="number" tick={axisTick} domain={[-1, 1]}
                        tickFormatter={v => v.toFixed(2)}
                        label={axisLabel("Spearman ρ", "x")} />
-                <YAxis type="category" dataKey="displayLabel" width={140}
-                       tick={<WrappedYAxisTick maxCharsPerLine={20} fontSize={11} />} />
+                <YAxis type="category" dataKey="displayLabel" width={axisW.nutri}
+                       tick={<WrappedYAxisTick maxCharsPerLine={chars.nutri} fontSize={isMobile ? 10 : 11} />} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, _n: any, p: any) => {
                            const d = p?.payload ?? {};
@@ -1179,7 +1230,7 @@ export default function HrvAnalysisPage() {
 
       {/* ── Row 3c: Supplement Dose-Response (only shown when there's data) ── */}
       {supplementDoseResponse.length > 0 && (
-        <ChartCard
+        <ChartCard collapsible
           title="Supplement Dose-Response"
           subtitle="Spearman ρ between daily amount and next-night HRV (compounds with ≥3 distinct doses)"
           source="SPEARMAN ρ"
@@ -1196,8 +1247,8 @@ export default function HrvAnalysisPage() {
               <XAxis type="number" tick={axisTick} domain={[-1, 1]}
                      tickFormatter={v => v.toFixed(2)}
                      label={axisLabel("Spearman ρ (dose vs HRV)", "x")} />
-              <YAxis type="category" dataKey="displayLabel" width={220}
-                     tick={<WrappedYAxisTick maxCharsPerLine={30} fontSize={10} />} />
+              <YAxis type="category" dataKey="displayLabel" width={axisW.xlong}
+                     tick={<WrappedYAxisTick maxCharsPerLine={chars.xlong} fontSize={10} />} />
               <Tooltip {...chartTooltip}
                        formatter={(v: any, _n: any, p: any) => {
                          const d = p?.payload ?? {};
@@ -1345,7 +1396,7 @@ export default function HrvAnalysisPage() {
           .sort((a, b) => (Number(b.n_treated) || 0) - (Number(a.n_treated) || 0))
           .slice(0, 10);
         return (
-          <ChartCard
+          <ChartCard collapsible
             title="Supplements · coverage status"
             subtitle={includedSupps.length > 0
               ? `${includedSupps.length} estimated · ${droppedSupps.length} awaiting tracking history`
@@ -1416,7 +1467,7 @@ export default function HrvAnalysisPage() {
       })()}
 
       {/* Causal Forest Plot: Binary Treatments */}
-      <ChartCard
+      <ChartCard collapsible
         title="Causal Effects · Binary Treatments"
         subtitle={`AIPW ATE on next-night HRV (ms) · 95% CI shown as error bars · top ${Math.min(causalBinary.length, 20)} by |effect|`}
         source="AIPW (DOUBLY ROBUST)"
@@ -1445,8 +1496,8 @@ export default function HrvAnalysisPage() {
                 <XAxis type="number" tick={axisTick}
                        tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
                        label={axisLabel("AIPW ATE (ms)", "x")} />
-                <YAxis type="category" dataKey="displayLabel" width={220}
-                       tick={<WrappedYAxisTick maxCharsPerLine={30} fontSize={10} />} />
+                <YAxis type="category" dataKey="displayLabel" width={axisW.xlong}
+                       tick={<WrappedYAxisTick maxCharsPerLine={chars.xlong} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, _n: any, p: any) => {
                            const d = p?.payload ?? {};
@@ -1480,7 +1531,7 @@ export default function HrvAnalysisPage() {
       </ChartCard>
 
       {/* Naive vs Adjusted Comparison Table */}
-      <ChartCard
+      <ChartCard collapsible
         title="Naive vs Adjusted: where confounding mattered"
         subtitle="Treatments where adjustment changed the answer most"
         source="WELCH vs AIPW"
@@ -1563,7 +1614,7 @@ export default function HrvAnalysisPage() {
 
       {/* Continuous treatments + DAG / Assumptions */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <ChartCard
+        <ChartCard collapsible
           title="Continuous Treatments (median-split)"
           subtitle="Adjusted contrast: above-median vs below-median day"
           source="AIPW (DOUBLY ROBUST)"
@@ -1592,8 +1643,8 @@ export default function HrvAnalysisPage() {
                   <XAxis type="number" tick={axisTick}
                          tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
                          label={axisLabel("AIPW ATE (ms)", "x")} />
-                  <YAxis type="category" dataKey="displayLabel" width={210}
-                         tick={<WrappedYAxisTick maxCharsPerLine={28} fontSize={10} />} />
+                  <YAxis type="category" dataKey="displayLabel" width={axisW.long}
+                         tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                   <Tooltip {...chartTooltip}
                            formatter={(v: any, _n: any, p: any) => {
                              const d = p?.payload ?? {};
@@ -1623,7 +1674,7 @@ export default function HrvAnalysisPage() {
           )}
         </ChartCard>
 
-        <ChartCard
+        <ChartCard collapsible
           title="Causal DAG &amp; Assumptions"
           subtitle="What we adjust for, and what we deliberately don't"
           source="DECLARED MODEL"
@@ -1782,7 +1833,7 @@ export default function HrvAnalysisPage() {
       {/* ── Row 4: Prediction vs Actual + Accuracy by Horizon ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Prediction vs Actual */}
-        <ChartCard title={`Prediction vs Actual (${rangeLabel(range)})`}
+        <ChartCard collapsible storageKey="prediction-vs-actual" title={`Prediction vs Actual (${rangeLabel(range)})`}
                    subtitle="Red dots = miss > 15ms"
                    info="What the model predicted each night (blue dashed) vs what your HRV actually was (green). Red dots are nights where it missed by more than 15ms. Fewer red dots = more accurate model.">
           <ResponsiveContainer width="100%" height={260}>
@@ -1804,7 +1855,7 @@ export default function HrvAnalysisPage() {
         </ChartCard>
 
         {/* Accuracy by Horizon */}
-        <ChartCard title="Accuracy by Forecast Horizon"
+        <ChartCard collapsible title="Accuracy by Forecast Horizon"
                    subtitle="MAE (ms) — lower is better"
                    info="Accuracy drops the further ahead you predict — this shows how much. Each bar is the average miss in ms for that day. 'Naive' just repeats yesterday's HRV as the guess. If the model can't beat that, it's not actually learning anything.">
           <ResponsiveContainer width="100%" height={260}>
@@ -1828,7 +1879,7 @@ export default function HrvAnalysisPage() {
       </div>
 
       {/* ── Row 5: HRV Trend ── */}
-      <ChartCard title={`HRV Trend (${rangeLabel(range)})`}
+      <ChartCard collapsible storageKey="hrv-trend" title={`HRV Trend (${rangeLabel(range)})`}
                  subtitle="WHOOP HRV + 7-day rolling average"
                  info="Your daily WHOOP HRV (faint line) swings a lot day-to-day — that's normal. The brighter line averages the last 7 days to show your real trend.">
         <ResponsiveContainer width="100%" height={280}>
@@ -1847,7 +1898,7 @@ export default function HrvAnalysisPage() {
       </ChartCard>
 
       {/* ── Row 5b: Workout-to-sleep gap vs HRV ── */}
-      <ChartCard
+      <ChartCard collapsible
         title="Workout-to-Bed Gap vs Next-Morning HRV"
         subtitle={`${rangeLabel(range)} · each dot = one night`}
         info="Hours between your last logged workout and the moment you fell asleep, plotted against the HRV measured from that night's sleep. Late-evening workouts (gap < 2h) are known to depress HRV; this chart lets you see whether that pattern shows up in your data. Dot color encodes WHOOP strain when available."
