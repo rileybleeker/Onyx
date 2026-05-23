@@ -171,11 +171,14 @@ async function getHrvPredictionAccuracy(days: number = 60) {
 }
 
 async function getHrvModelMetrics() {
+  // Latest eval_date now writes ~36 rows (xgboost + 3 baselines + sarimax all at
+  // h=1..7 = 35, plus prophet h=1 = 36). Limit must cover the full latest sweep
+  // so the Accuracy-by-Forecast-Horizon chart sees every (model × horizon) cell.
   const { data } = await supabase
     .from("hrv_model_metrics")
     .select("*")
     .order("eval_date", { ascending: false })
-    .limit(20);
+    .limit(100);
   return data ?? [];
 }
 

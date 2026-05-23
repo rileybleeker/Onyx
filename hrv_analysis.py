@@ -2181,14 +2181,22 @@ def run_statistical_analysis(
 # PHASE 3 – PREDICTION MODELS
 # ===========================================================================
 
-def prepare_ml_data(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], pd.Series]:
-    """Build X, feature_cols, y for ML (target = next-day HRV)."""
-    # Create next-day target
+def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, list[str], pd.Series]:
+    """Build X, feature_cols, y for ML. Target = HRV `horizon` days ahead.
+
+    horizon=1 (default) trains/scores a next-day model; horizon=h>1 produces
+    the same feature matrix paired with HRV h days into the future, used by
+    the multi-horizon backtest in run_evaluation(). Each horizon-specific
+    target column is named hrv_target_t{h} so a single dataframe can carry
+    multiple horizons side-by-side without colliding, and every hrv_target_t*
+    column is excluded from the feature set to prevent target leakage.
+    """
     df = df.copy()
-    df["hrv_target_t1"] = df[TARGET].shift(-1)
+    target_col = f"hrv_target_t{horizon}"
+    df[target_col] = df[TARGET].shift(-horizon)
 
     # Filter to rows with a valid target
-    model_df = df.dropna(subset=["hrv_target_t1", "hrv_lag1"])
+    model_df = df.dropna(subset=[target_col, "hrv_lag1"])
 
     # Feature columns: all numeric except the training target, date, and future-leaking columns.
     # NOTE: TARGET (whoop_hrv_rmssd) is intentionally kept as a feature — it represents
@@ -2197,9 +2205,11 @@ def prepare_ml_data(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], pd.Serie
     # whoop_recovery_score is excluded because it is derived from the same sleep's HRV
     # (circular leak). Other same-night WHOOP/Garmin sleep metrics are kept — they represent
     # yesterday's sleep quality, valid context for tonight's prediction.
-    exclude = {"calendar_date", "hrv_target_t1", "hrv_next",
+    exclude = {"calendar_date", "hrv_next",
                "whoop_recovery_score",  # derived from same sleep's HRV — circular
                }
+    # Drop every hrv_target_t* column (any horizon's target — they all leak the future)
+    exclude |= {c for c in model_df.columns if c.startswith("hrv_target_t")}
     feat_cols = [c for c in model_df.columns
                  if c not in exclude and pd.api.types.is_numeric_dtype(model_df[c])]
 
@@ -2216,7 +2226,7 @@ def prepare_ml_data(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], pd.Serie
     feat_cols = [c for c in feat_cols if model_df[c].notna().mean() >= 0.05]
 
     X = model_df[feat_cols].copy()
-    y = model_df["hrv_target_t1"].copy()
+    y = model_df[target_col].copy()
 
     return model_df, feat_cols, X, y
 
@@ -2774,94 +2784,129 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
 
     all_preds: list[dict] = []
 
+    # Horizons evaluated for every multi-horizon model + baseline. Matches
+    # SARIMAX's horizon range so the /analytics/hrv "Accuracy by Forecast
+    # Horizon" chart has XGBoost + naive bars at every t+h alongside SARIMAX.
+    HORIZONS = [1, 2, 3, 4, 5, 6, 7]
+
     # -----------------------------------------------------------------------
-    # XGBoost walk-forward backtest
+    # XGBoost walk-forward backtest — multi-horizon (h=1..7)
+    #
+    # Each horizon trains its own model: same feature matrix (today's signals)
+    # but target = HRV shifted -h days. The expected pattern is MAE rising with
+    # h as the predictive signal in today's features decays. We reuse the
+    # h=1 hyperparameter shape (no per-horizon Optuna) so the multi-horizon
+    # sweep stays under a few minutes; h=1 already had Optuna tuning in
+    # train_xgboost().
     # -----------------------------------------------------------------------
     if HAS_XGB and xgb_model is not None:
-        log.info(f"  XGBoost expanding-window backtest (step={step}, gap={GAP_DAYS}d)…")
-        for start in range(min_train, n - 1, step):
-            test_start = start + GAP_DAYS
-            if test_start >= n - 1:
-                break
-            end = min(test_start + step, n - 1)
-            X_tr, y_tr = X.iloc[:start], y.iloc[:start]
-            X_pred_block = X.iloc[test_start:end]
-            y_actual_block = y.iloc[test_start:end]
-            # Target dates = feature dates + 1 (y is shifted(-1), so y.iloc[i] is
-            # the HRV of the day AFTER model_df.calendar_date.iloc[i]). The row
-            # stored in hrv_predictions represents "the date being predicted".
-            dates_block = (
-                pd.to_datetime(model_df["calendar_date"].iloc[test_start:end])
-                + pd.Timedelta(days=1)
-            ).dt.strftime("%Y-%m-%d").values
-            train_start_d = model_df["calendar_date"].iloc[0]
-            train_end_d = model_df["calendar_date"].iloc[start - 1]
+        for h in HORIZONS:
+            model_df_h, feat_cols_h, X_h, y_h = prepare_ml_data(df, horizon=h)
+            n_h = len(X_h)
+            if n_h <= min_train + GAP_DAYS + 5:
+                log.warning(f"  XGBoost h={h}: insufficient rows ({n_h}) — skipped")
+                continue
+            log.info(f"  XGBoost h={h} expanding-window backtest "
+                     f"(n={n_h}, step={step}, gap={GAP_DAYS}d)…")
+            for start in range(min_train, n_h - 1, step):
+                test_start = start + GAP_DAYS
+                if test_start >= n_h - 1:
+                    break
+                end = min(test_start + step, n_h - 1)
+                X_tr, y_tr = X_h.iloc[:start], y_h.iloc[:start]
+                X_pred_block = X_h.iloc[test_start:end]
+                y_actual_block = y_h.iloc[test_start:end]
+                # Target dates = feature dates + h (y is shifted(-h), so y.iloc[i]
+                # is the HRV h days AFTER model_df_h.calendar_date.iloc[i]).
+                dates_block = (
+                    pd.to_datetime(model_df_h["calendar_date"].iloc[test_start:end])
+                    + pd.Timedelta(days=h)
+                ).dt.strftime("%Y-%m-%d").values
+                train_start_d = model_df_h["calendar_date"].iloc[0]
+                train_end_d = model_df_h["calendar_date"].iloc[start - 1]
 
-            try:
-                m = XGBRegressor(
-                    max_depth=4, learning_rate=0.05, n_estimators=200,
-                    min_child_weight=3, subsample=0.8, colsample_bytree=0.8,
-                    tree_method="hist", random_state=42,
-                )
-                m.fit(X_tr, y_tr, verbose=False)
-                preds = m.predict(X_pred_block)
-                residuals_std = np.std(y_tr.values - m.predict(X_tr))
-                for i, (pred, actual, d) in enumerate(
-                        zip(preds, y_actual_block.values, dates_block)):
-                    all_preds.append({
-                        "prediction_date": str(d),
-                        "model": "xgboost",
-                        "predicted_hrv": float(pred),
-                        "prediction_lower": float(pred - 1.645 * residuals_std),
-                        "prediction_upper": float(pred + 1.645 * residuals_std),
-                        "actual_hrv": float(actual),
-                        "residual": float(actual - pred),
-                        "horizon_days": 1,
-                        "model_version": "backtest_initial",
-                        "training_window_start": str(train_start_d),
-                        "training_window_end": str(train_end_d),
-                    })
-            except Exception:
-                pass
+                try:
+                    m = XGBRegressor(
+                        max_depth=4, learning_rate=0.05, n_estimators=200,
+                        min_child_weight=3, subsample=0.8, colsample_bytree=0.8,
+                        tree_method="hist", random_state=42,
+                    )
+                    m.fit(X_tr, y_tr, verbose=False)
+                    preds = m.predict(X_pred_block)
+                    residuals_std = np.std(y_tr.values - m.predict(X_tr))
+                    for pred, actual, d in zip(
+                            preds, y_actual_block.values, dates_block):
+                        all_preds.append({
+                            "prediction_date": str(d),
+                            "model": "xgboost",
+                            "predicted_hrv": float(pred),
+                            "prediction_lower": float(pred - 1.645 * residuals_std),
+                            "prediction_upper": float(pred + 1.645 * residuals_std),
+                            "actual_hrv": float(actual),
+                            "residual": float(actual - pred),
+                            "horizon_days": h,
+                            "model_version": "backtest_initial",
+                            "training_window_start": str(train_start_d),
+                            "training_window_end": str(train_end_d),
+                        })
+                except Exception:
+                    pass
 
     # -----------------------------------------------------------------------
-    # Naive baselines
+    # Naive baselines — multi-horizon (h=1..7)
+    #
+    # Naive persistence and 7d_avg are constant across h (the prediction is
+    # the same regardless of how far you look ahead), so their MAE rises with
+    # h purely because HRV drifts further from today. DOW depends on the
+    # target weekday, which shifts with h. Each baseline must beat noise at
+    # every horizon to claim signal — that's what the chart will show.
     # -----------------------------------------------------------------------
-    log.info("  Computing naive baselines…")
-    for i in range(min_train, n - 1):
-        pred_date = model_df["calendar_date"].iloc[i]
-        actual = float(y.iloc[i])
-        hrv_hist = model_df[TARGET].iloc[:i + 1].values.astype(float)
+    log.info("  Computing naive baselines (multi-horizon)…")
+    hrv_arr = model_df[TARGET].values.astype(float)
+    dates_arr = pd.to_datetime(model_df["calendar_date"]).values
+    for h in HORIZONS:
+        for i in range(min_train, n - h):
+            actual_idx = i + h
+            if actual_idx >= len(hrv_arr) or np.isnan(hrv_arr[actual_idx]):
+                continue
+            actual = float(hrv_arr[actual_idx])
+            feat_date = pd.Timestamp(dates_arr[i])
+            pred_date = (feat_date + pd.Timedelta(days=h)).strftime("%Y-%m-%d")
+            hrv_hist = hrv_arr[:i + 1]
 
-        # Naive persistence: predict = last known HRV
-        naive_pred = float(hrv_hist[-1])
-        all_preds.append({
-            "prediction_date": str(pred_date), "model": "baseline_naive",
-            "predicted_hrv": naive_pred, "actual_hrv": actual,
-            "residual": actual - naive_pred, "horizon_days": 1,
-            "model_version": "backtest_initial",
-        })
+            # Naive persistence: predict = last known HRV (constant across h)
+            naive_pred = float(hrv_hist[-1])
+            all_preds.append({
+                "prediction_date": pred_date, "model": "baseline_naive",
+                "predicted_hrv": naive_pred, "actual_hrv": actual,
+                "residual": actual - naive_pred, "horizon_days": h,
+                "model_version": "backtest_initial",
+            })
 
-        # 7-day rolling mean
-        roll7 = float(np.nanmean(hrv_hist[-7:])) if len(hrv_hist) >= 7 else naive_pred
-        all_preds.append({
-            "prediction_date": str(pred_date), "model": "baseline_7d_avg",
-            "predicted_hrv": roll7, "actual_hrv": actual,
-            "residual": actual - roll7, "horizon_days": 1,
-            "model_version": "backtest_initial",
-        })
+            # 7-day rolling mean (constant across h)
+            roll7 = float(np.nanmean(hrv_hist[-7:])) if len(hrv_hist) >= 7 else naive_pred
+            all_preds.append({
+                "prediction_date": pred_date, "model": "baseline_7d_avg",
+                "predicted_hrv": roll7, "actual_hrv": actual,
+                "residual": actual - roll7, "horizon_days": h,
+                "model_version": "backtest_initial",
+            })
 
-        # Day-of-week historical mean
-        dow = pd.Timestamp(pred_date).dayofweek
-        dow_mask = (pd.to_datetime(model_df["calendar_date"].iloc[:i]).dt.dayofweek == dow)
-        dow_vals = model_df[TARGET].iloc[:i][dow_mask.values].dropna().values
-        dow_pred = float(np.mean(dow_vals)) if len(dow_vals) >= 5 else naive_pred
-        all_preds.append({
-            "prediction_date": str(pred_date), "model": "baseline_dow",
-            "predicted_hrv": dow_pred, "actual_hrv": actual,
-            "residual": actual - dow_pred, "horizon_days": 1,
-            "model_version": "backtest_initial",
-        })
+            # Day-of-week historical mean — DOW of the TARGET date (i+h),
+            # not of the feature date, so the prediction is appropriate for
+            # the day being forecast.
+            dow = (feat_date + pd.Timedelta(days=h)).dayofweek
+            past_dows = pd.DatetimeIndex(dates_arr[:i]).dayofweek
+            dow_mask = past_dows == dow
+            dow_vals = hrv_arr[:i][dow_mask]
+            dow_vals = dow_vals[~np.isnan(dow_vals)]
+            dow_pred = float(np.mean(dow_vals)) if len(dow_vals) >= 5 else naive_pred
+            all_preds.append({
+                "prediction_date": pred_date, "model": "baseline_dow",
+                "predicted_hrv": dow_pred, "actual_hrv": actual,
+                "residual": actual - dow_pred, "horizon_days": h,
+                "model_version": "backtest_initial",
+            })
 
     # -----------------------------------------------------------------------
     # Aggregate metrics per model
@@ -2872,8 +2917,12 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     model_metrics_rows: list[dict] = []
     today_str = str(date.today())
 
-    for m_name in bt_df["model"].unique():
-        sub = bt_df[bt_df["model"] == m_name].dropna(subset=["actual_hrv", "predicted_hrv"])
+    # Aggregate per (model, horizon) so the Accuracy-by-Horizon chart can plot
+    # bars for every (model × t+h) combination. The h=1 row of each model is
+    # additionally stashed in eval_results[m_name] for backward-compat with
+    # downstream prints / "Model Comparison" table that report headline MAE.
+    for (m_name, h_val), sub in bt_df.groupby(["model", "horizon_days"]):
+        sub = sub.dropna(subset=["actual_hrv", "predicted_hrv"])
         if len(sub) < 5:
             continue
         yt = sub["actual_hrv"].values
@@ -2884,10 +2933,12 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                                     yl if yl is not None and not np.all(np.isnan(yl)) else None,
                                     yu if yu is not None and not np.all(np.isnan(yu)) else None)
         m_metrics["model"] = m_name
+        m_metrics["horizon_days"] = int(h_val)
         m_metrics["n"] = len(sub)
-        eval_results[m_name] = m_metrics
+        if int(h_val) == 1:
+            eval_results[m_name] = m_metrics
         model_metrics_rows.append({
-            "eval_date": today_str, "model": m_name, "horizon_days": 1,
+            "eval_date": today_str, "model": m_name, "horizon_days": int(h_val),
             "mae": m_metrics.get("mae"), "rmse": m_metrics.get("rmse"),
             "mape": m_metrics.get("mape"), "r_squared": m_metrics.get("r2"),
             "directional_accuracy": m_metrics.get("directional_accuracy"),
@@ -2906,14 +2957,18 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     # accuracy is statistically meaningful, not noise.
     # -----------------------------------------------------------------------
     try:
+        # DM test is a paired comparison on matched (model_a, model_b) predictions
+        # for the same target date — restrict to h=1 so we're not joining h=1
+        # XGBoost predictions against h=7 baseline predictions on the same date.
+        dm_df = bt_df[bt_df["horizon_days"] == 1]
         dm_rows = []
         models_present = [m for m in
                           ["xgboost", "baseline_7d_avg", "baseline_naive", "baseline_dow"]
-                          if m in bt_df["model"].unique()]
+                          if m in dm_df["model"].unique()]
         for i, a in enumerate(models_present):
             for b in models_present[i + 1:]:
-                sa = bt_df[bt_df["model"] == a].set_index("prediction_date")
-                sb = bt_df[bt_df["model"] == b].set_index("prediction_date")
+                sa = dm_df[dm_df["model"] == a].set_index("prediction_date")
+                sb = dm_df[dm_df["model"] == b].set_index("prediction_date")
                 joined = sa[["actual_hrv", "predicted_hrv"]].rename(
                     columns={"predicted_hrv": "pred_a"}
                 ).join(
@@ -2964,7 +3019,12 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     # behavior with sample sizes + mean absolute residual.
     # -----------------------------------------------------------------------
     try:
-        xgb_bt = bt_df[bt_df["model"] == "xgboost"].dropna(subset=["residual"]).copy()
+        # Error-mode analysis joins each XGBoost residual to that day's
+        # journal/habit flags. Restrict to h=1 so the join is unambiguous
+        # (each prediction_date appears once per model) and the residual
+        # distribution reflects the headline next-day model only.
+        xgb_bt = bt_df[(bt_df["model"] == "xgboost") & (bt_df["horizon_days"] == 1)] \
+                    .dropna(subset=["residual"]).copy()
         if not xgb_bt.empty:
             xgb_bt["pred_date"] = pd.to_datetime(xgb_bt["prediction_date"]).dt.strftime("%Y-%m-%d")
             jcols = [c for c in df.columns if c.startswith("journal_")]
@@ -3039,7 +3099,11 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     # Residual plots
     # -----------------------------------------------------------------------
     try:
-        xgb_bt = bt_df[bt_df["model"] == "xgboost"].dropna(subset=["residual"])
+        # Residual plots are h=1-only — the histogram / vs-predicted / DOW
+        # plots are interpretable for the headline next-day model; mixing
+        # h=1..7 residuals would smear the distribution by horizon.
+        xgb_bt = bt_df[(bt_df["model"] == "xgboost") & (bt_df["horizon_days"] == 1)] \
+                    .dropna(subset=["residual"])
         if not xgb_bt.empty:
             fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
@@ -3080,11 +3144,13 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
             fig.savefig(OUTPUT_DIR / "evaluation" / "residual_analysis.png", dpi=120)
             plt.close(fig)
 
-            # Rolling 30-day MAE comparison
+            # Rolling 30-day MAE comparison — h=1 only so the rolling line
+            # tracks next-day accuracy over time, not a blend of horizons.
             fig, ax = plt.subplots(figsize=(12, 5))
             for m_name, color in [("xgboost", "#3b82f6"), ("baseline_naive", "#f59e0b"),
                                    ("baseline_7d_avg", "#ef4444")]:
-                sub = bt_df[(bt_df["model"] == m_name)].dropna(subset=["residual"])
+                sub = bt_df[(bt_df["model"] == m_name) & (bt_df["horizon_days"] == 1)] \
+                          .dropna(subset=["residual"])
                 if len(sub) < 30:
                     continue
                 sub = sub.sort_values("prediction_date")
