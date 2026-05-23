@@ -571,7 +571,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         "eight_sleep_trends",
         select="calendar_date,sleep_quality_score,sleep_duration_score,latency_asleep_score,"
                "latency_out_score,wakeup_consistency_score,sleep_routine_score,"
-               "light_sleep_seconds,awake_seconds,avg_resp_rate",
+               "light_sleep_seconds,awake_seconds,avg_breath_rate",
         filters=[("bed_side", "eq", "left")],
     )
     if not data["eight_sleep"].empty:

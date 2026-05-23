@@ -25,8 +25,7 @@ CREATE TABLE IF NOT EXISTS pds.eight_sleep_trends (
     -- Biometrics
     avg_heart_rate          NUMERIC(5,2),       -- bpm
     avg_hrv                 NUMERIC(8,4),       -- ms
-    avg_breath_rate         NUMERIC(5,2),       -- breaths/min
-    avg_resp_rate           NUMERIC(5,2),       -- breaths/min
+    avg_breath_rate         NUMERIC(5,2),       -- breaths/min (per-night)
 
     -- Environment
     avg_bed_temp            NUMERIC(5,2),       -- °C or °F (as returned by API)

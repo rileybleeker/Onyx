@@ -303,7 +303,6 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
         "avg_heart_rate": safe_get(quality, "heartRate", "current"),
         "avg_hrv": safe_get(quality, "hrv", "current"),
         "avg_breath_rate": safe_get(quality, "respiratoryRate", "current"),
-        "avg_resp_rate": safe_get(quality, "respiratoryRate", "average"),
         # Environment
         "avg_bed_temp": safe_get(quality, "tempBedC", "average"),
         "avg_room_temp": safe_get(quality, "tempRoomC", "average"),
@@ -364,7 +363,6 @@ def parse_interval(interval: dict, bed_side: str) -> dict | None:
         "bed_side": bed_side,
         "avg_heart_rate": avg_timeseries(ts.get("heartRate")),
         "avg_breath_rate": avg_timeseries(ts.get("respiratoryRate")),
-        "avg_resp_rate": avg_timeseries(ts.get("respiratoryRate")),
         "avg_bed_temp": avg_timeseries(ts.get("tempBedC")),
         "avg_room_temp": avg_timeseries(ts.get("tempRoomC")),
         "toss_and_turns": sum_timeseries(ts.get("tnt")),
@@ -469,7 +467,6 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
             "avg_heart_rate": trend.get("avg_heart_rate") or interval.get("avg_heart_rate"),
             "avg_hrv": trend.get("avg_hrv"),
             "avg_breath_rate": trend.get("avg_breath_rate") or interval.get("avg_breath_rate"),
-            "avg_resp_rate": trend.get("avg_resp_rate") or interval.get("avg_resp_rate"),
             # Environment
             "avg_bed_temp": trend.get("avg_bed_temp") or interval.get("avg_bed_temp"),
             "avg_room_temp": trend.get("avg_room_temp") or interval.get("avg_room_temp"),
