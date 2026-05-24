@@ -455,52 +455,62 @@ def sync_training_status(garmin: Garmin, sb: Client, target_date: date) -> int:
 # Sync: Workout Definitions (target paces from Workout Builder)
 # ---------------------------------------------------------------------------
 
-def parse_interval_targets(workout: dict) -> dict:
-    """Extract interval target pace and structure from a workout definition.
+def _maybe_capture_segment(step: dict, iterations: int, out: list) -> None:
+    """If step is a pace-targeted interval, append a segment dict to out."""
+    step_key = safe_get(step, "stepType", "stepTypeKey")
+    target_key = safe_get(step, "targetType", "workoutTargetTypeKey")
+    if step_key != "interval" or not target_key or "pace" not in target_key:
+        return
+    cond_key = safe_get(step, "endCondition", "conditionTypeKey")
+    cond_val = step.get("endConditionValue")
+    out.append({
+        "step_order":      step.get("stepOrder"),
+        "step_id":         step.get("stepId"),
+        "target_low_mps":  step.get("targetValueOne"),
+        "target_high_mps": step.get("targetValueTwo"),
+        "distance_meters": cond_val if cond_key == "distance" else None,
+        "duration_seconds": cond_val if cond_key == "time"     else None,
+        "iterations":      iterations,
+    })
 
-    Handles two patterns:
-    1. RepeatGroupDTO containing interval steps (e.g., 5x1600m)
-    2. Standalone ExecutableStepDTO with stepType=interval (e.g., 10k tempo)
+
+def parse_interval_targets(workout: dict) -> dict:
+    """Extract every pace-targeted interval step from a workout definition.
+
+    Walks the full segment tree (no first-match break) so workouts with
+    multiple distinct pace targets — e.g. "1km TL + 12x400 VO2 + 1km TL" —
+    capture each segment with its target band and iteration count.
+
+    Returns:
+      segment_targets: full list of pace-targeted interval steps, in plan order,
+                       with parent-RepeatGroup iterations preserved per step.
+      interval_target_pace_low_mps / _high_mps / _distance_meters /
+      interval_count: backward-compat fields, populated from the FIRST segment.
     """
-    result = {
+    segments: list[dict] = []
+    for seg in workout.get("workoutSegments", []):
+        for step in seg.get("workoutSteps", []):
+            stype = step.get("type")
+            if stype == "RepeatGroupDTO":
+                iters = step.get("numberOfIterations") or 1
+                for sub in step.get("workoutSteps", []):
+                    _maybe_capture_segment(sub, iters, segments)
+            elif stype == "ExecutableStepDTO":
+                _maybe_capture_segment(step, 1, segments)
+
+    result: dict = {
+        "segment_targets": segments,
         "interval_target_pace_low_mps": None,
         "interval_target_pace_high_mps": None,
         "interval_distance_meters": None,
         "interval_count": None,
     }
-    for seg in workout.get("workoutSegments", []):
-        for step in seg.get("workoutSteps", []):
-            # Pattern 1: RepeatGroupDTO (interval blocks like 5x1600m)
-            if step.get("type") == "RepeatGroupDTO":
-                result["interval_count"] = step.get("numberOfIterations")
-                for sub in step.get("workoutSteps", []):
-                    step_key = safe_get(sub, "stepType", "stepTypeKey")
-                    target_key = safe_get(sub, "targetType", "workoutTargetTypeKey")
-                    if step_key == "interval" and target_key and "pace" in target_key:
-                        result["interval_target_pace_low_mps"] = sub.get("targetValueOne")
-                        result["interval_target_pace_high_mps"] = sub.get("targetValueTwo")
-                        cond_key = safe_get(sub, "endCondition", "conditionTypeKey")
-                        if cond_key == "distance":
-                            result["interval_distance_meters"] = sub.get("endConditionValue")
-                        break
-                if result["interval_target_pace_low_mps"]:
-                    break
-
-            # Pattern 2: Standalone interval step (e.g., tempo runs, marathon pace)
-            elif step.get("type") == "ExecutableStepDTO":
-                step_key = safe_get(step, "stepType", "stepTypeKey")
-                target_key = safe_get(step, "targetType", "workoutTargetTypeKey")
-                if step_key == "interval" and target_key and "pace" in target_key:
-                    result["interval_target_pace_low_mps"] = step.get("targetValueOne")
-                    result["interval_target_pace_high_mps"] = step.get("targetValueTwo")
-                    result["interval_count"] = 1
-                    cond_key = safe_get(step, "endCondition", "conditionTypeKey")
-                    if cond_key == "distance":
-                        result["interval_distance_meters"] = step.get("endConditionValue")
-                    break
-
-        if result["interval_target_pace_low_mps"]:
-            break
+    if segments:
+        first = segments[0]
+        result["interval_target_pace_low_mps"]  = first["target_low_mps"]
+        result["interval_target_pace_high_mps"] = first["target_high_mps"]
+        result["interval_distance_meters"]      = first.get("distance_meters")
+        result["interval_count"]                = first.get("iterations") or 1
     return result
 
 
@@ -530,6 +540,7 @@ def sync_workout_definitions(garmin: Garmin, sb: Client, activity_workout_ids: l
             "interval_target_pace_high_mps": targets["interval_target_pace_high_mps"],
             "interval_distance_meters": targets["interval_distance_meters"],
             "interval_count": targets["interval_count"],
+            "segment_targets": json.dumps(targets["segment_targets"]) if targets["segment_targets"] else None,
             "raw_json": json.dumps(workout, default=str),
         }
 

@@ -339,8 +339,22 @@ export async function getRunningRecoveryContext(days: number = 30) {
 
   const { data, error } = await supabase
     .from("recovery_vs_pace")
-    .select("activity_id, whoop_recovery, whoop_hrv, whoop_sleep_performance, pace_delta_pct")
+    .select("activity_id, whoop_recovery, whoop_hrv, whoop_sleep_performance, pace_delta_pct, segment_targets, segment_target_count")
     .gte("activity_date", since.toISOString().split("T")[0]);
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+export async function getActivityLaps(activityIds: number[]) {
+  if (activityIds.length === 0) return [];
+
+  const { data, error } = await supabase
+    .from("garmin_activity_laps")
+    .select("activity_id, lap_index, distance_meters, duration_seconds, avg_speed_mps, avg_heart_rate")
+    .in("activity_id", activityIds)
+    .order("activity_id", { ascending: true })
+    .order("lap_index", { ascending: true });
 
   if (error) throw error;
   return data ?? [];
