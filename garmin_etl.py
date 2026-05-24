@@ -455,8 +455,16 @@ def sync_training_status(garmin: Garmin, sb: Client, target_date: date) -> int:
 # Sync: Workout Definitions (target paces from Workout Builder)
 # ---------------------------------------------------------------------------
 
+_PACED_STEP_KINDS = ("interval", "warmup", "cooldown")
+
+
 def _maybe_capture_segment(step: dict, iterations: int, parent_step_id, out: list) -> None:
-    """If step is a pace-targeted interval, append a segment dict to out.
+    """If step has a pace target, append a segment dict to out.
+
+    Captures intervals, warmups, and cooldowns — anything with a pace.zone
+    target — so the per-segment splits table can show targets for every part
+    of the workout, not just the programmed reps. Rests typically have
+    targetType="no.target" and are correctly skipped.
 
     parent_step_id is the stepId of the enclosing RepeatGroupDTO (or None for
     top-level segments). Segments that share a parent are executed interleaved
@@ -464,7 +472,7 @@ def _maybe_capture_segment(step: dict, iterations: int, parent_step_id, out: lis
     """
     step_key = safe_get(step, "stepType", "stepTypeKey")
     target_key = safe_get(step, "targetType", "workoutTargetTypeKey")
-    if step_key != "interval" or not target_key or "pace" not in target_key:
+    if step_key not in _PACED_STEP_KINDS or not target_key or "pace" not in target_key:
         return
     cond_key = safe_get(step, "endCondition", "conditionTypeKey")
     cond_val = step.get("endConditionValue")
@@ -472,6 +480,7 @@ def _maybe_capture_segment(step: dict, iterations: int, parent_step_id, out: lis
         "step_order":      step.get("stepOrder"),
         "step_id":         step.get("stepId"),
         "parent_step_id":  parent_step_id,
+        "kind":            step_key,
         "target_low_mps":  step.get("targetValueOne"),
         "target_high_mps": step.get("targetValueTwo"),
         "distance_meters": cond_val if cond_key == "distance" else None,

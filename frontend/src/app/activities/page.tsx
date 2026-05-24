@@ -96,6 +96,7 @@ function mergeAndDedup(garmin: ActivityRow[], whoop: ActivityRow[]): ActivityRow
 type SegmentTarget = {
   step_order: number;
   parent_step_id: number | null;
+  kind: "interval" | "warmup" | "cooldown";
   target_low_mps: number;
   target_high_mps: number;
   distance_meters: number | null;
@@ -178,35 +179,62 @@ function formatNonRepLabel(lap: Lap, kind: RowKind): string {
   return `Lap ${lap.lap_index + 1} · ${dur}`;
 }
 
+function pacedRow(
+  kind: RowKind,
+  label: string,
+  seg: SegmentTarget | null,
+  lap: Lap | null,
+): WorkoutRow {
+  if (!seg || !lap) {
+    return {
+      label,
+      kind,
+      target_low_mps:  seg?.target_low_mps  ?? null,
+      target_high_mps: seg?.target_high_mps ?? null,
+      lap,
+      delta_pct:       null,
+      in_range:        false,
+    };
+  }
+  const mid = (seg.target_low_mps + seg.target_high_mps) / 2;
+  return {
+    label,
+    kind,
+    target_low_mps:  seg.target_low_mps,
+    target_high_mps: seg.target_high_mps,
+    lap,
+    delta_pct:       ((mid - lap.avg_speed_mps) / mid) * 100,
+    in_range:        lap.avg_speed_mps >= seg.target_low_mps && lap.avg_speed_mps <= seg.target_high_mps,
+  };
+}
+
 // One row per lap, in execution order. ACTIVE laps consume the next planned rep
-// (segments expanded interleaved-within-RepeatGroup); rest/warmup/cooldown laps
-// get their own un-targeted rows. Any planned reps with no matching lap (bailed
-// early) are appended at the end as lap=null so the gap is visible.
+// (interval segments expanded interleaved-within-RepeatGroup). WARMUP and
+// COOLDOWN laps pair with their (single) planned segment so the same target
+// shows on every chunk of a multi-lap warm-up. REST laps have no programmed
+// pace (targetType="no.target") so they render without a target. Any planned
+// reps with no matching lap (bailed early) are appended at the end as
+// lap=null so the gap is visible.
 function buildWorkoutRows(segments: SegmentTarget[], laps: Lap[]): WorkoutRow[] {
-  const expanded = expandSegmentsInExecutionOrder(segments);
+  const warmupSeg   = segments.find((s) => s.kind === "warmup")   ?? null;
+  const cooldownSeg = segments.find((s) => s.kind === "cooldown") ?? null;
+  const repSegments = segments.filter((s) => s.kind === "interval");
+  const expandedReps = expandSegmentsInExecutionOrder(repSegments);
   const sortedLaps = [...laps].sort((a, b) => a.lap_index - b.lap_index);
+
   const rows: WorkoutRow[] = [];
-  let segCursor = 0;
+  let repCursor = 0;
 
   for (const lap of sortedLaps) {
-    if (lap.intensity === "ACTIVE" && segCursor < expanded.length) {
-      const { seg, rep, total } = expanded[segCursor++];
-      const mid = (seg.target_low_mps + seg.target_high_mps) / 2;
-      rows.push({
-        label:           formatRepLabel(seg, rep, total),
-        kind:            "rep",
-        target_low_mps:  seg.target_low_mps,
-        target_high_mps: seg.target_high_mps,
-        lap,
-        delta_pct:       ((mid - lap.avg_speed_mps) / mid) * 100,
-        in_range:        lap.avg_speed_mps >= seg.target_low_mps && lap.avg_speed_mps <= seg.target_high_mps,
-      });
+    if (lap.intensity === "ACTIVE" && repCursor < expandedReps.length) {
+      const { seg, rep, total } = expandedReps[repCursor++];
+      rows.push(pacedRow("rep", formatRepLabel(seg, rep, total), seg, lap));
+    } else if (lap.intensity === "WARMUP") {
+      rows.push(pacedRow("warmup", formatNonRepLabel(lap, "warmup"), warmupSeg, lap));
+    } else if (lap.intensity === "COOLDOWN") {
+      rows.push(pacedRow("cooldown", formatNonRepLabel(lap, "cooldown"), cooldownSeg, lap));
     } else {
-      const kind: RowKind =
-        lap.intensity === "REST"     ? "rest"
-        : lap.intensity === "WARMUP"   ? "warmup"
-        : lap.intensity === "COOLDOWN" ? "cooldown"
-        : "other";
+      const kind: RowKind = lap.intensity === "REST" ? "rest" : "other";
       rows.push({
         label:           formatNonRepLabel(lap, kind),
         kind,
@@ -219,17 +247,9 @@ function buildWorkoutRows(segments: SegmentTarget[], laps: Lap[]): WorkoutRow[] 
     }
   }
 
-  while (segCursor < expanded.length) {
-    const { seg, rep, total } = expanded[segCursor++];
-    rows.push({
-      label:           formatRepLabel(seg, rep, total),
-      kind:            "rep",
-      target_low_mps:  seg.target_low_mps,
-      target_high_mps: seg.target_high_mps,
-      lap:             null,
-      delta_pct:       null,
-      in_range:        false,
-    });
+  while (repCursor < expandedReps.length) {
+    const { seg, rep, total } = expandedReps[repCursor++];
+    rows.push(pacedRow("rep", formatRepLabel(seg, rep, total), seg, null));
   }
 
   return rows;
@@ -631,9 +651,10 @@ export default function ActivitiesPage() {
                                 ? (r.lap ? "text-text-primary" : "text-text-tertiary")
                                 : "text-text-tertiary";
                               const deltaColor =
-                                r.delta_pct == null ? "text-text-tertiary"
-                                : r.in_range       ? "text-green-400"
-                                : r.delta_pct < 0  ? "text-emerald-300"
+                                r.delta_pct == null      ? "text-text-tertiary"
+                                : r.in_range             ? "text-green-400"
+                                : r.kind !== "rep"       ? "text-red-400"   // warmup/cooldown: out either way is bad
+                                : r.delta_pct < 0        ? "text-emerald-300" // rep faster = still a positive miss
                                 : "text-red-400";
                               return (
                                 <tr key={i} className="border-b border-white/5">
