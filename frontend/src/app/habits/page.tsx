@@ -69,7 +69,7 @@ function isEligibleDay(frequency: string, dateStr: string): boolean {
 // Returns days-ago of most recent completion (0 = today), or null if never completed.
 function daysSinceLastCompletion(habitName: string, completionSet: Set<string>): number | null {
   const now = new Date();
-  for (let i = 0; i < 730; i++) {
+  for (let i = 0; i < 365; i++) {
     const d = new Date(now);
     d.setDate(d.getDate() - i);
     const dateStr = d.toLocaleDateString("en-CA");
@@ -140,7 +140,7 @@ export default function HabitsPage() {
     try {
       const [habitsRes, journalData] = await Promise.all([
         fetch("/api/habits/list").then((r) => r.json()),
-        getHabitJournal(days),
+        getHabitJournal(Math.max(days, 365)),
       ]);
       setHabits(habitsRes.habits || []);
       setJournal(journalData);
@@ -152,7 +152,7 @@ export default function HabitsPage() {
         const { count } = await syncRes.json();
         if (count > 0) {
           // Reload journal data to pick up synced entries
-          const updated = await getHabitJournal(days);
+          const updated = await getHabitJournal(Math.max(days, 365));
           setJournal(updated);
         }
       }
