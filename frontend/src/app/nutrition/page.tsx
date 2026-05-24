@@ -255,7 +255,10 @@ export default function NutritionPage() {
       : null;
   const lateNights = timing
     .slice(0, 14)
-    .filter((t) => t.last_meal_hour !== null && (t.last_meal_hour as number) >= 21).length;
+    .filter((t) => {
+      const h = t.last_meal_hour as number | null;
+      return h !== null && (h >= 21 || h < 4);
+    }).length;
 
   // ─── Nutrition loader (responds to range filter) ───
   useEffect(() => {
@@ -318,7 +321,7 @@ export default function NutritionPage() {
           sublabel="trailing 7 days"
         />
         <StatCard
-          label="Late nights (≥9pm)"
+          label="Late nights (9pm–4am)"
           value={lateNights}
           sublabel="of last 14 days"
         />
