@@ -1915,15 +1915,18 @@ export default function HrvAnalysisPage() {
             nights and shouldn&apos;t drive decisions yet.
           </p>
           <p>
-            <strong>About the X-axis (Pod sensor vs. ambient):</strong> Eight Sleep&apos;s
-            room-temp sensor sits on the Pod unit itself, where it picks up heat from the
-            device&apos;s electronics and from your body radiating downward into the bedding.
-            Community-reported bias vs. a wall thermostat is +2 to +5°F. The top number on
-            each X-axis label is the <em>raw Pod reading</em> (what the Eight Sleep app
-            shows). The dimmer number underneath is the <em>ambient estimate</em>
-            (Pod − 4°F) — closer to what a wall thermostat in the same room would read.
-            Use the ambient row when comparing to setpoint recommendations like
-            &ldquo;65–68°F is optimal for sleep&rdquo;.
+            <strong>⚠ Pod sensor caveat:</strong> Eight Sleep&apos;s room-temp sensor sits
+            on the Pod unit (in/under the bed), where it picks up heat from the device
+            electronics and your body radiating downward. It reads <em>warmer than a
+            wall thermostat by an unknown amount</em> — the exact offset isn&apos;t
+            published anywhere I could find, and we haven&apos;t measured it yet. So:
+            don&apos;t compare these bucket values directly to setpoint recommendations
+            like &ldquo;65–68°F is optimal for sleep.&rdquo; The <em>relative shape</em>
+            (which bucket is the peak vs. which is the trough) is still valid for
+            finding your personal optimum, but absolute Fahrenheit values aren&apos;t.
+            Filed a follow-up to calibrate empirically by leaving a separate
+            thermometer in the room for a week and deriving the real offset from
+            paired readings.
           </p>
           <p className="text-[11px] text-text-tertiary">
             <strong>Sample size today:</strong> {envMatrix.length} nights collected.{" "}
@@ -1995,48 +1998,13 @@ export default function HrvAnalysisPage() {
             (m, r) => (r.meanHrv > m.meanHrv ? r : m)
           );
 
-          // The Pod's room-temp sensor sits in/under the bed and picks up Pod
-          // electronics heat + body heat radiating downward + insulation from
-          // bedding. It consistently reads ~4°F warmer than a wall thermostat
-          // (community-reported range is 2-5°F; we use 4 as a midpoint estimate).
-          // Render each X-axis tick with two lines: the raw Pod reading on top,
-          // and the ambient-equivalent estimate (Pod − 4°F) underneath in a
-          // dimmer color, so the chart is honest about what the values mean.
-          const POD_TO_AMBIENT_OFFSET_F = 4;
-          const renderBucketTick = (props: any) => {
-            const { x, y, payload } = props;
-            const m = payload.value.match(/(\d+)-(\d+)°F/);
-            if (!m) {
-              return (
-                <text x={x} y={y + 12} textAnchor="middle" fill="#71717a" fontSize={10}
-                      fontFamily="var(--font-geist-mono), monospace">
-                  {payload.value}
-                </text>
-              );
-            }
-            const lo = parseInt(m[1]);
-            const hi = parseInt(m[2]);
-            return (
-              <g>
-                <text x={x} y={y + 12} textAnchor="middle" fill="#71717a" fontSize={10}
-                      fontFamily="var(--font-geist-mono), monospace">
-                  {payload.value}
-                </text>
-                <text x={x} y={y + 26} textAnchor="middle" fill="#52525b" fontSize={9}
-                      fontFamily="var(--font-geist-mono), monospace">
-                  ≈{lo - POD_TO_AMBIENT_OFFSET_F}-{hi - POD_TO_AMBIENT_OFFSET_F}°F
-                </text>
-              </g>
-            );
-          };
-
           return (
             <>
-              <ResponsiveContainer width="100%" height={320}>
-                <BarChart data={rows} margin={{ left: 8, right: 20, top: 4, bottom: 44 }}>
+              <ResponsiveContainer width="100%" height={280}>
+                <BarChart data={rows} margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                   <CartesianGrid {...gridStyle} />
-                  <XAxis dataKey="bucket" tick={renderBucketTick} height={50}
-                    label={axisLabel("Pod sensor (top) · ambient estimate (bottom)", "x")} />
+                  <XAxis dataKey="bucket" tick={axisTick}
+                    label={axisLabel("median room temp (°F · Pod sensor, uncalibrated)", "x")} />
                   <YAxis tick={axisTick} width={55}
                     label={axisLabel("WHOOP HRV (ms)", "y")} />
                   <Tooltip {...chartTooltip}
@@ -2060,8 +2028,7 @@ export default function HrvAnalysisPage() {
               <p className="text-[11px] text-text-tertiary mt-3">
                 {rows.length >= 3 && envMatrix.length >= 10 ? (
                   <>
-                    Peak bucket: <strong className="text-text-secondary">{peakRow.bucket}</strong>{" "}
-                    (≈{peakRow.start - POD_TO_AMBIENT_OFFSET_F}–{peakRow.start + 2 - POD_TO_AMBIENT_OFFSET_F}°F ambient),{" "}
+                    Peak bucket (Pod sensor): <strong className="text-text-secondary">{peakRow.bucket}</strong>,{" "}
                     {peakRow.meanHrv} ms mean HRV across {peakRow.n} night{peakRow.n !== 1 ? "s" : ""}.
                     {reliable.length === 0 && " ⚠ No buckets yet have ≥5 nights — treat the peak as preliminary."}
                   </>
