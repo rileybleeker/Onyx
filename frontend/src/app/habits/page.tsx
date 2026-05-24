@@ -579,6 +579,41 @@ export default function HabitsPage() {
         </ChartCard>
       )}
 
+      {/* Scoring legend */}
+      {habits.length > 0 && (
+        <ChartCard title="How rates & streaks are scored" className="mt-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-3 text-[12px] leading-relaxed">
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">daily</span>
+              <span className="text-text-tertiary">
+                Counts every day. Streak resets if you miss a day (today is grace).
+              </span>
+            </div>
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">weekdays</span>
+              <span className="text-text-tertiary">
+                Counts Mon–Fri only; weekends are skipped. Streak resets if you miss a weekday.
+              </span>
+            </div>
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">weekly</span>
+              <span className="text-text-tertiary">
+                Done at least once in any 7-day window = 100% for that window. Streak resets if you skip a whole week.
+              </span>
+            </div>
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">Ad Hoc</span>
+              <span className="text-text-tertiary">
+                Never required. Excluded from every rate. Shown with recency only (&ldquo;3 days ago&rdquo;).
+              </span>
+            </div>
+          </div>
+          <p className="text-[11px] text-text-tertiary/70 mt-4 pt-3 border-t border-border-subtle">
+            Frequency is set per habit in Notion. Longest Streak compares across frequencies by days-equivalent (a weekly streak counts as 7 days per week kept).
+          </p>
+        </ChartCard>
+      )}
+
       {habits.length === 0 && (
         <div className="text-center py-20">
           <p className="text-text-secondary text-sm mb-3">No active habits found.</p>
