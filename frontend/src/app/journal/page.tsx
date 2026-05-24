@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState, useMemo, useRef } from "react";
-import ReactMarkdown from "react-markdown";
 import { rangeToDays, rangeLabel, type Range } from "@/lib/queries";
 import RangeFilter from "@/components/RangeFilter";
 
@@ -293,23 +292,8 @@ export default function JournalPage() {
                     {loadingFull ? (
                       <div className="text-text-tertiary text-sm">Loading full entry…</div>
                     ) : fullEntry ? (
-                      <div
-                        className="text-[14px] text-text-secondary leading-relaxed
-                          [&_p]:mb-3 [&_p:last-child]:mb-0
-                          [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:mb-3 [&_ul]:space-y-1
-                          [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:mb-3 [&_ol]:space-y-1
-                          [&_li]:marker:text-text-tertiary
-                          [&_h1]:text-base [&_h1]:font-semibold [&_h1]:text-text-primary [&_h1]:mt-4 [&_h1]:mb-2
-                          [&_h2]:text-base [&_h2]:font-semibold [&_h2]:text-text-primary [&_h2]:mt-4 [&_h2]:mb-2
-                          [&_h3]:text-[14px] [&_h3]:font-semibold [&_h3]:text-text-primary [&_h3]:mt-3 [&_h3]:mb-2
-                          [&_a]:text-blue-300 [&_a]:underline [&_a]:underline-offset-2
-                          [&_strong]:text-text-primary [&_strong]:font-semibold
-                          [&_em]:italic
-                          [&_code]:bg-white/[0.06] [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-[13px]
-                          [&_blockquote]:border-l-2 [&_blockquote]:border-border-subtle [&_blockquote]:pl-3 [&_blockquote]:text-text-tertiary [&_blockquote]:italic [&_blockquote]:mb-3
-                          [&_hr]:border-border-subtle [&_hr]:my-4"
-                      >
-                        <ReactMarkdown>{fullEntry.content_md}</ReactMarkdown>
+                      <div className="text-[14px] text-text-secondary leading-relaxed whitespace-pre-wrap">
+                        {fullEntry.content_md}
                       </div>
                     ) : (
                       <div className="text-text-tertiary text-sm">No content.</div>
