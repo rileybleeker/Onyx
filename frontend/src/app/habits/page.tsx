@@ -53,13 +53,35 @@ function getDatesArray(days: number): string[] {
   return dates;
 }
 
+function isAdHocFrequency(frequency: string): boolean {
+  const f = frequency.trim().toLowerCase();
+  return f === "ad hoc" || f === "adhoc" || f === "ad-hoc";
+}
+
 function isEligibleDay(frequency: string, dateStr: string): boolean {
+  if (isAdHocFrequency(frequency)) return false; // ad hoc never has expected days
   if (frequency !== "weekdays") return true;
   const dow = new Date(dateStr + "T00:00:00").getDay();
   return dow !== 0 && dow !== 6;
 }
 
+// For ad hoc habits, the "streak" concept doesn't apply — instead show recency.
+// Returns days-ago of most recent completion (0 = today), or null if never completed.
+function daysSinceLastCompletion(habitName: string, completionSet: Set<string>): number | null {
+  const now = new Date();
+  for (let i = 0; i < 730; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toLocaleDateString("en-CA");
+    if (completionSet.has(`${habitName}|${dateStr}`)) return i;
+  }
+  return null;
+}
+
 function calculateStreak(habitName: string, frequency: string, completionSet: Set<string>): number {
+  // Ad hoc habits have no expected cadence; no meaningful streak.
+  if (isAdHocFrequency(frequency)) return 0;
+
   const now = new Date();
 
   // Weekly: count consecutive 7-day windows ending at today with >=1 completion.
@@ -213,8 +235,10 @@ export default function HabitsPage() {
     );
   }
 
-  const todayCompleted = habits.filter((h) => completionSet.has(`${h.name}|${today}`)).length;
+  const requiredHabits = habits.filter((h) => !isAdHocFrequency(h.frequency));
+  const todayCompleted = requiredHabits.filter((h) => completionSet.has(`${h.name}|${today}`)).length;
   const streaks = habits.map((h) => {
+    const adHoc = isAdHocFrequency(h.frequency);
     const streak = calculateStreak(h.name, h.frequency, completionSet);
     const isWeekly = h.frequency === "weekly";
     return {
@@ -222,27 +246,31 @@ export default function HabitsPage() {
       streak,
       unit: isWeekly ? "weeks" : "days",
       shortUnit: isWeekly ? "w" : "d",
+      isAdHoc: adHoc,
+      daysSince: adHoc ? daysSinceLastCompletion(h.name, completionSet) : null,
       // Days-equivalent for cross-frequency comparison (a 4-week weekly streak ≈ 28 days sustained).
-      rankValue: isWeekly ? streak * 7 : streak,
+      // Ad hoc habits have rankValue 0 so they never win Longest Streak.
+      rankValue: adHoc ? 0 : (isWeekly ? streak * 7 : streak),
     };
   });
   const longestEntry = streaks.length > 0
     ? streaks.reduce((best, curr) => (curr.rankValue > best.rankValue ? curr : best))
     : null;
-  const longestStreak = longestEntry?.streak ?? 0;
-  const longestUnit = longestEntry?.unit ?? "days";
-  const bestHabit = longestEntry?.habit;
+  const longestStreak = longestEntry && longestEntry.rankValue > 0 ? longestEntry.streak : 0;
+  const longestUnit = longestEntry && longestEntry.rankValue > 0 ? longestEntry.unit : "days";
+  const bestHabit = longestEntry && longestEntry.rankValue > 0 ? longestEntry.habit : undefined;
 
   const heatmapDates = getDatesArray(Math.min(rangeDays(range), 365));
 
   // Per-habit frequency-aware rate aggregator.
   // daily: 1 slot per day. weekdays: 1 slot per Mon-Fri. weekly: 1 slot per 7-day chunk
   // (chunked from the END of `dates`; leftover days <7 still get 1 slot so short ranges
-  // don't drop weekly habits entirely).
+  // don't drop weekly habits entirely). ad hoc: skipped entirely (never expected).
   function rateOver(dates: string[]): { possible: number; completed: number; rate: number } {
     let possible = 0;
     let completed = 0;
     habits.forEach((h) => {
+      if (isAdHocFrequency(h.frequency)) return;
       if (h.frequency === "weekly") {
         const slots = Math.max(1, Math.floor(dates.length / 7));
         for (let i = 0; i < slots; i++) {
@@ -279,9 +307,12 @@ export default function HabitsPage() {
     return { date: formatDate(d), rate: rateOver(window).rate };
   });
 
-  // Per-category completion rate over the active range
+  // Per-category completion rate over the active range. Ad hoc habits don't count
+  // toward any denominator, so they neither add to nor reduce a category's rate.
+  // Categories that contain only ad hoc habits are filtered out below.
   const categoryAgg: Record<string, { possible: number; completed: number; count: number }> = {};
   habits.forEach((h) => {
+    if (isAdHocFrequency(h.frequency)) return;
     const cat = h.category || "general";
     if (!categoryAgg[cat]) categoryAgg[cat] = { possible: 0, completed: 0, count: 0 };
     categoryAgg[cat].count++;
@@ -292,9 +323,10 @@ export default function HabitsPage() {
     });
   });
   const categoryRates = Object.entries(categoryAgg)
+    .filter(([, m]) => m.possible > 0)
     .map(([cat, m]) => ({
       category: cat,
-      rate: m.possible > 0 ? Math.round((m.completed / m.possible) * 100) : 0,
+      rate: Math.round((m.completed / m.possible) * 100),
       habitCount: m.count,
       color: CATEGORY_COLORS[cat] || CATEGORY_COLORS.general,
     }))
@@ -325,7 +357,7 @@ export default function HabitsPage() {
 
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <StatCard label="Today" value={`${todayCompleted}/${habits.length}`} sublabel="habits completed" />
+        <StatCard label="Today" value={`${todayCompleted}/${requiredHabits.length}`} sublabel="required habits" />
         <StatCard label="7-Day Rate" value={`${completionRate}%`} sublabel={`${completedLast7} of ${possibleLast7} check-ins`} />
         <StatCard label="Longest Streak" value={longestStreak} unit={longestUnit} sublabel={bestHabit?.name} />
         <StatCard
@@ -494,25 +526,52 @@ export default function HabitsPage() {
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
             {streaks
               .slice()
-              .sort((a, b) => b.rankValue - a.rankValue)
-              .map(({ habit, streak, unit, rankValue }) => {
+              .sort((a, b) => {
+                // Ad hoc habits sort to the bottom, then by recency (more recent first; never = last).
+                if (a.isAdHoc !== b.isAdHoc) return a.isAdHoc ? 1 : -1;
+                if (a.isAdHoc && b.isAdHoc) {
+                  const ax = a.daysSince ?? Infinity;
+                  const bx = b.daysSince ?? Infinity;
+                  return ax - bx;
+                }
+                return b.rankValue - a.rankValue;
+              })
+              .map(({ habit, streak, unit, rankValue, isAdHoc, daysSince }) => {
                 const color = CATEGORY_COLORS[habit.category] || CATEGORY_COLORS.general;
                 const unitSingular = unit === "weeks" ? "week" : "day";
+                let label: string;
+                if (isAdHoc) {
+                  if (daysSince === null) label = "never logged";
+                  else if (daysSince === 0) label = "logged today";
+                  else if (daysSince === 1) label = "1 day ago";
+                  else label = `${daysSince} days ago`;
+                } else {
+                  label = streak > 0 ? `${streak} ${unitSingular}${streak !== 1 ? "s" : ""}` : "No streak";
+                }
                 return (
                   <div key={habit.id} className="flex items-center gap-3 px-3 py-2.5 rounded-[4px] bg-white/[0.02]">
                     <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: color }} />
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm text-text-primary font-medium truncate">{habit.name}</p>
-                      <p className="text-[11px] font-mono" style={{ color }}>
-                        {streak > 0 ? `${streak} ${unitSingular}${streak !== 1 ? "s" : ""}` : "No streak"}
+                      <p className="text-sm text-text-primary font-medium truncate">
+                        {habit.name}
+                        {isAdHoc && (
+                          <span className="ml-1.5 text-[9px] font-mono uppercase tracking-wider text-text-tertiary/70">
+                            ad hoc
+                          </span>
+                        )}
+                      </p>
+                      <p className="text-[11px] font-mono" style={{ color: isAdHoc ? "var(--color-text-tertiary, #71717a)" : color }}>
+                        {label}
                       </p>
                     </div>
-                    <div className="w-12 h-2 bg-white/5 rounded-full overflow-hidden">
-                      <div
-                        className="h-full rounded-full transition-all"
-                        style={{ width: `${Math.min(100, (rankValue / 30) * 100)}%`, backgroundColor: color }}
-                      />
-                    </div>
+                    {!isAdHoc && (
+                      <div className="w-12 h-2 bg-white/5 rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all"
+                          style={{ width: `${Math.min(100, (rankValue / 30) * 100)}%`, backgroundColor: color }}
+                        />
+                      </div>
+                    )}
                   </div>
                 );
               })}
