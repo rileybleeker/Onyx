@@ -60,8 +60,34 @@ function isEligibleDay(frequency: string, dateStr: string): boolean {
 }
 
 function calculateStreak(habitName: string, frequency: string, completionSet: Set<string>): number {
-  let streak = 0;
   const now = new Date();
+
+  // Weekly: count consecutive 7-day windows ending at today with >=1 completion.
+  // Current week is allowed to be incomplete (mirrors the daily/weekday "today is grace" rule).
+  if (frequency === "weekly") {
+    let streak = 0;
+    for (let weekIdx = 0; weekIdx < 52; weekIdx++) {
+      let hasCompletion = false;
+      for (let d = 0; d < 7; d++) {
+        const dt = new Date(now);
+        dt.setDate(dt.getDate() - (weekIdx * 7 + d));
+        const dateStr = dt.toLocaleDateString("en-CA");
+        if (completionSet.has(`${habitName}|${dateStr}`)) {
+          hasCompletion = true;
+          break;
+        }
+      }
+      if (hasCompletion) {
+        streak++;
+      } else {
+        if (weekIdx === 0) continue;
+        break;
+      }
+    }
+    return streak;
+  }
+
+  let streak = 0;
   for (let i = 0; i < 365; i++) {
     const d = new Date(now);
     d.setDate(d.getDate() - i);
@@ -188,20 +214,46 @@ export default function HabitsPage() {
   }
 
   const todayCompleted = habits.filter((h) => completionSet.has(`${h.name}|${today}`)).length;
-  const streaks = habits.map((h) => ({
-    habit: h,
-    streak: calculateStreak(h.name, h.frequency, completionSet),
-  }));
-  const longestStreak = streaks.length > 0 ? Math.max(...streaks.map((s) => s.streak)) : 0;
-  const bestHabit = streaks.find((s) => s.streak === longestStreak)?.habit;
+  const streaks = habits.map((h) => {
+    const streak = calculateStreak(h.name, h.frequency, completionSet);
+    const isWeekly = h.frequency === "weekly";
+    return {
+      habit: h,
+      streak,
+      unit: isWeekly ? "weeks" : "days",
+      shortUnit: isWeekly ? "w" : "d",
+      // Days-equivalent for cross-frequency comparison (a 4-week weekly streak ≈ 28 days sustained).
+      rankValue: isWeekly ? streak * 7 : streak,
+    };
+  });
+  const longestEntry = streaks.length > 0
+    ? streaks.reduce((best, curr) => (curr.rankValue > best.rankValue ? curr : best))
+    : null;
+  const longestStreak = longestEntry?.streak ?? 0;
+  const longestUnit = longestEntry?.unit ?? "days";
+  const bestHabit = longestEntry?.habit;
 
   const heatmapDates = getDatesArray(Math.min(rangeDays(range), 365));
 
-  // Per-habit frequency-aware rate aggregator
+  // Per-habit frequency-aware rate aggregator.
+  // daily: 1 slot per day. weekdays: 1 slot per Mon-Fri. weekly: 1 slot per 7-day chunk
+  // (chunked from the END of `dates`; leftover days <7 still get 1 slot so short ranges
+  // don't drop weekly habits entirely).
   function rateOver(dates: string[]): { possible: number; completed: number; rate: number } {
     let possible = 0;
     let completed = 0;
     habits.forEach((h) => {
+      if (h.frequency === "weekly") {
+        const slots = Math.max(1, Math.floor(dates.length / 7));
+        for (let i = 0; i < slots; i++) {
+          const end = dates.length - i * 7;
+          const start = Math.max(0, end - 7);
+          const slot = dates.slice(start, end);
+          possible++;
+          if (slot.some((d) => completionSet.has(`${h.name}|${d}`))) completed++;
+        }
+        return;
+      }
       dates.forEach((d) => {
         if (!isEligibleDay(h.frequency, d)) return;
         possible++;
@@ -275,7 +327,7 @@ export default function HabitsPage() {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <StatCard label="Today" value={`${todayCompleted}/${habits.length}`} sublabel="habits completed" />
         <StatCard label="7-Day Rate" value={`${completionRate}%`} sublabel={`${completedLast7} of ${possibleLast7} check-ins`} />
-        <StatCard label="Longest Streak" value={longestStreak} unit="days" sublabel={bestHabit?.name} />
+        <StatCard label="Longest Streak" value={longestStreak} unit={longestUnit} sublabel={bestHabit?.name} />
         <StatCard
           label="vs Prior Week"
           value={prev7Stats.possible > 0 ? `${deltaVsPrior >= 0 ? "+" : ""}${deltaVsPrior}` : "—"}
@@ -441,22 +493,24 @@ export default function HabitsPage() {
         <ChartCard title="Current Streaks" className="mt-6">
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
             {streaks
-              .sort((a, b) => b.streak - a.streak)
-              .map(({ habit, streak }) => {
+              .slice()
+              .sort((a, b) => b.rankValue - a.rankValue)
+              .map(({ habit, streak, unit, rankValue }) => {
                 const color = CATEGORY_COLORS[habit.category] || CATEGORY_COLORS.general;
+                const unitSingular = unit === "weeks" ? "week" : "day";
                 return (
                   <div key={habit.id} className="flex items-center gap-3 px-3 py-2.5 rounded-[4px] bg-white/[0.02]">
                     <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: color }} />
                     <div className="flex-1 min-w-0">
                       <p className="text-sm text-text-primary font-medium truncate">{habit.name}</p>
                       <p className="text-[11px] font-mono" style={{ color }}>
-                        {streak > 0 ? `${streak} day${streak !== 1 ? "s" : ""}` : "No streak"}
+                        {streak > 0 ? `${streak} ${unitSingular}${streak !== 1 ? "s" : ""}` : "No streak"}
                       </p>
                     </div>
                     <div className="w-12 h-2 bg-white/5 rounded-full overflow-hidden">
                       <div
                         className="h-full rounded-full transition-all"
-                        style={{ width: `${Math.min(100, (streak / 30) * 100)}%`, backgroundColor: color }}
+                        style={{ width: `${Math.min(100, (rankValue / 30) * 100)}%`, backgroundColor: color }}
                       />
                     </div>
                   </div>
@@ -551,7 +605,7 @@ function HabitRow({ habit, done, isToggling, streak, color, today, onToggle }: H
           className="text-[11px] font-mono font-medium px-2 py-0.5 rounded-full"
           style={{ backgroundColor: `${color}20`, color }}
         >
-          {streak}d streak
+          {streak}{habit.frequency === "weekly" ? "w" : "d"} streak
         </span>
       )}
 
