@@ -204,6 +204,19 @@ async function getHistoricalHrv(days = 180) {
   return data ?? [];
 }
 
+// All-time pull (no date filter) of nights that have both a median room temp
+// and a WHOOP HRV reading. Powers the Environment Sweet Spot dose-response
+// chart, which buckets nights by temperature and shows mean HRV per bucket.
+async function getEnvDoseResponseData() {
+  const { data } = await supabase
+    .from("daily_health_matrix")
+    .select("calendar_date,eight_sleep_room_temp,eight_sleep_bed_temp,whoop_hrv_rmssd")
+    .not("eight_sleep_room_temp", "is", null)
+    .not("whoop_hrv_rmssd", "is", null)
+    .order("calendar_date", { ascending: true });
+  return data ?? [];
+}
+
 async function getHrvResiduals() {
   // Use the *_eval view (sibling of hrv_predictions_latest) so backtest
   // model_versions are included. The latest view excludes them, which
@@ -301,6 +314,7 @@ export default function HrvAnalysisPage() {
   const [causalDag, setCausalDag] = useState<any | null>(null);
   const [causalMeta, setCausalMeta] = useState<any | null>(null);
   const [causalDropped, setCausalDropped] = useState<any[]>([]);
+  const [envMatrix, setEnvMatrix] = useState<any[]>([]);
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
   const [range, setRange] = useState<Range>("30d");
@@ -355,7 +369,8 @@ export default function HrvAnalysisPage() {
       getHrvAnalysisResults("causal", "dag"),
       getHrvAnalysisResults("causal", "meta"),
       getHrvAnalysisResults("causal", "dropped_low_n"),
-    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap, suppImp, suppDose, nutImp, hi, hCorr, hShap, cBin, cCont, cDag, cMeta, cDrop]) => {
+      getEnvDoseResponseData(),
+    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap, suppImp, suppDose, nutImp, hi, hCorr, hShap, cBin, cCont, cDag, cMeta, cDrop, envM]) => {
       setTomorrowPred(tomorrow);
       setAccuracy(acc);
       setMetrics(m);
@@ -412,6 +427,7 @@ export default function HrvAnalysisPage() {
       if (cDrop?.result_json) {
         try { setCausalDropped(JSON.parse(cDrop.result_json)); } catch {}
       }
+      setEnvMatrix(envM);
     }).catch(console.error).finally(() => setLoading(false));
   }, [range]);
 
@@ -1857,6 +1873,154 @@ export default function HrvAnalysisPage() {
             </p>
           )}
         </ChartCard>
+      </div>
+
+      {/* ── Environment Sweet Spot: dose-response for controllable inputs ── */}
+      {/*
+        The causal layer above answers "does warmer/cooler than usual move HRV?"
+        (binary direction). This panel answers the different question "what
+        SPECIFIC temperature is optimal for me?" by binning every night by the
+        median room temp slept in and showing mean WHOOP HRV per bucket. The
+        peak bucket = personal sweet spot. Error bars are ±1 SEM. Computed
+        client-side from daily_health_matrix; no python pipeline dependency.
+        Will fill in as nightly ETL accumulates more eight_sleep_room_temp data
+        (only ~9 nights as of initial ship, since Eight Sleep's intervals API
+        only began exposing temp timeseries on ~2026-05-15).
+      */}
+      <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 shadow-card">
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div>
+            <h3 className="text-[18px] font-medium text-text-primary">Environment Sweet Spot</h3>
+            <p className="text-[12px] text-text-tertiary mt-1">
+              Mean WHOOP HRV per room-temperature bucket · {envMatrix.length} nights
+            </p>
+          </div>
+          <span className="text-[9px] font-mono text-text-tertiary px-2 py-0.5 rounded border border-border-subtle">
+            BINNED MEAN ± SEM
+          </span>
+        </div>
+
+        <div className="text-[12px] text-text-secondary leading-relaxed space-y-3 max-w-4xl mb-4">
+          <p>
+            The Causal Inference section above tells you whether <em>warmer-than-usual</em> or
+            <em> cooler-than-usual</em> rooms move your HRV. This panel answers a different
+            question: <strong>which specific temperature is actually optimal for you?</strong>{" "}
+            Every night with both a median room temp and a WHOOP HRV reading is binned into
+            1°C buckets, and the mean HRV per bucket is plotted. The peak bucket is your
+            personal sweet spot.
+          </p>
+          <p>
+            <strong>Error bars are ±1 SEM</strong> (standard error of the mean). Narrower bars
+            = more nights in that bucket = more trustworthy. Bars at &lt;35% opacity have n&lt;5
+            nights and shouldn&apos;t drive decisions yet.
+          </p>
+          <p className="text-[11px] text-text-tertiary">
+            <strong>Sample size today:</strong> {envMatrix.length} nights collected.{" "}
+            {envMatrix.length < 30 && (
+              <span>Directional reads need <strong>~30 nights</strong>; confident reads need <strong>~100</strong>. Eight Sleep&apos;s intervals API began exposing temp data ~2026-05-15, so this fills in one night per daily ETL run going forward.</span>
+            )}
+            {envMatrix.length >= 30 && envMatrix.length < 100 && (
+              <span>Enough for a <strong>directional read</strong>. More nights will tighten the bars.</span>
+            )}
+            {envMatrix.length >= 100 && (
+              <span>Sample size is sufficient for a <strong>confident read</strong> on the optimal bucket.</span>
+            )}
+          </p>
+        </div>
+
+        {(() => {
+          if (envMatrix.length === 0) {
+            return (
+              <p className="text-[11px] text-text-tertiary py-8 text-center">
+                No nights with both room temp and HRV yet. Will populate as the nightly Eight
+                Sleep ETL accumulates new data.
+              </p>
+            );
+          }
+
+          const BUCKET_SIZE = 1.0;
+          const buckets: Record<string, number[]> = {};
+          envMatrix.forEach((d: any) => {
+            const t = Number(d.eight_sleep_room_temp);
+            const h = Number(d.whoop_hrv_rmssd);
+            if (isNaN(t) || isNaN(h)) return;
+            const start = Math.floor(t / BUCKET_SIZE) * BUCKET_SIZE;
+            const key = start.toFixed(1);
+            if (!buckets[key]) buckets[key] = [];
+            buckets[key].push(h);
+          });
+
+          const rows = Object.entries(buckets)
+            .map(([k, hrvs]) => {
+              const n = hrvs.length;
+              const mean = hrvs.reduce((a, b) => a + b, 0) / n;
+              const variance = n > 1
+                ? hrvs.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1)
+                : 0;
+              const sd = Math.sqrt(variance);
+              const sem = n > 1 ? sd / Math.sqrt(n) : 0;
+              const lo = parseFloat(k);
+              return {
+                start: lo,
+                bucket: `${lo.toFixed(0)}–${(lo + BUCKET_SIZE).toFixed(0)}°C`,
+                n,
+                meanHrv: +mean.toFixed(1),
+                sem: +sem.toFixed(2),
+                sd: +sd.toFixed(2),
+              };
+            })
+            .sort((a, b) => a.start - b.start);
+
+          if (rows.length === 0) {
+            return <p className="text-[11px] text-text-tertiary py-8 text-center">No valid data to bucket.</p>;
+          }
+
+          const reliable = rows.filter(r => r.n >= 5);
+          const peakRow = (reliable.length > 0 ? reliable : rows).reduce(
+            (m, r) => (r.meanHrv > m.meanHrv ? r : m)
+          );
+
+          return (
+            <>
+              <ResponsiveContainer width="100%" height={280}>
+                <BarChart data={rows} margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis dataKey="bucket" tick={axisTick}
+                    label={axisLabel("median room temp (°C)", "x")} />
+                  <YAxis tick={axisTick} width={55}
+                    label={axisLabel("WHOOP HRV (ms)", "y")} />
+                  <Tooltip {...chartTooltip}
+                    formatter={(v: any, _name: any, p: any) => {
+                      const d = p?.payload ?? {};
+                      return [
+                        `${Number(v).toFixed(1)} ms (n=${d.n}, SEM=±${d.sem}, SD=${d.sd})`,
+                        "Mean HRV",
+                      ];
+                    }} />
+                  <Bar dataKey="meanHrv" radius={[3, 3, 0, 0]}>
+                    {rows.map((r, i) => (
+                      <Cell key={i}
+                        fill={r.bucket === peakRow.bucket ? "#22c55e" : "#06b6d4"}
+                        fillOpacity={r.n < 5 ? 0.35 : 0.85} />
+                    ))}
+                    <ErrorBar dataKey="sem" width={4} strokeWidth={1.5} stroke="#f59e0b" />
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+              <p className="text-[11px] text-text-tertiary mt-3">
+                {rows.length >= 3 && envMatrix.length >= 10 ? (
+                  <>
+                    Peak bucket: <strong className="text-text-secondary">{peakRow.bucket}</strong>{" "}
+                    ({peakRow.meanHrv} ms mean HRV across {peakRow.n} night{peakRow.n !== 1 ? "s" : ""}).
+                    {reliable.length === 0 && " ⚠ No buckets yet have ≥5 nights — treat the peak as preliminary."}
+                  </>
+                ) : (
+                  <>Too few nights / buckets to identify a meaningful peak. Check back as data accumulates.</>
+                )}
+              </p>
+            </>
+          );
+        })()}
       </div>
 
       {/* ── Models & Methods ── */}
