@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useRef } from "react";
+import ReactMarkdown from "react-markdown";
 import { rangeToDays, rangeLabel, type Range } from "@/lib/queries";
 import RangeFilter from "@/components/RangeFilter";
 
@@ -42,6 +43,23 @@ function formatDate(iso: string): string {
   });
 }
 
+// True when the title is just a date-only restatement of entry_date (in any
+// of Notion's common auto-generated formats) — in which case showing both the
+// formatted date header and the title row is redundant.
+function titleIsJustDate(title: string | null, entryDate: string): boolean {
+  if (!title) return true;
+  const t = title.trim();
+  if (t === entryDate) return true;
+  const d = new Date(entryDate + "T00:00:00");
+  const variants = [
+    d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" }),
+    d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+    d.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" }),
+    d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" }),
+  ];
+  return variants.some((v) => t === v);
+}
+
 export default function JournalPage() {
   const [entries, setEntries] = useState<JournalEntryListItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -49,11 +67,15 @@ export default function JournalPage() {
 
   const [moodFilter, setMoodFilter] = useState<Mood | null>(null);
   const [topicFilter, setTopicFilter] = useState<string | null>(null);
-  const [range, setRange] = useState<Range>("30d");
+  const [range, setRange] = useState<Range>("all");
 
   const [expanded, setExpanded] = useState<string | null>(null);
   const [fullEntry, setFullEntry] = useState<JournalEntryFull | null>(null);
   const [loadingFull, setLoadingFull] = useState(false);
+
+  // Session-scoped cache so toggling expand on the same entry twice doesn't
+  // re-fetch. Held in a ref so populating it doesn't trigger a re-render.
+  const entryCache = useRef<Map<string, JournalEntryFull>>(new Map());
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -67,9 +89,10 @@ export default function JournalPage() {
     }
     params.set("limit", "200");
 
+    const ctrl = new AbortController();
     setLoading(true);
     setError(null);
-    fetch(`/api/journal/list?${params}`)
+    fetch(`/api/journal/list?${params}`, { signal: ctrl.signal })
       .then((r) => r.json())
       .then((data) => {
         if (data.error) {
@@ -79,8 +102,13 @@ export default function JournalPage() {
           setEntries(data.entries || []);
         }
       })
-      .catch((e) => setError(String(e)))
+      .catch((e) => {
+        if ((e as Error).name === "AbortError") return;
+        setError(String(e));
+      })
       .finally(() => setLoading(false));
+
+    return () => ctrl.abort();
   }, [moodFilter, topicFilter, range]);
 
   // Unique topics from currently loaded entries (chip palette).
@@ -97,12 +125,23 @@ export default function JournalPage() {
       return;
     }
     setExpanded(id);
+    const cached = entryCache.current.get(id);
+    if (cached) {
+      setFullEntry(cached);
+      setLoadingFull(false);
+      return;
+    }
     setLoadingFull(true);
     setFullEntry(null);
     try {
       const r = await fetch(`/api/journal/${id}`);
       const data = await r.json();
-      setFullEntry(data.entry);
+      if (data.entry) {
+        entryCache.current.set(id, data.entry);
+        setFullEntry(data.entry);
+      } else if (data.error) {
+        setError(data.error);
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -224,7 +263,7 @@ export default function JournalPage() {
                       {e.word_count ?? 0} words
                     </span>
                   </div>
-                  {e.title && (
+                  {e.title && !titleIsJustDate(e.title, e.entry_date) && (
                     <div className="mt-1 text-[14px] font-medium text-text-primary">
                       {e.title}
                     </div>
@@ -254,8 +293,23 @@ export default function JournalPage() {
                     {loadingFull ? (
                       <div className="text-text-tertiary text-sm">Loading full entry…</div>
                     ) : fullEntry ? (
-                      <div className="prose prose-invert max-w-none text-[14px] text-text-secondary leading-relaxed whitespace-pre-wrap">
-                        {fullEntry.content_md}
+                      <div
+                        className="text-[14px] text-text-secondary leading-relaxed
+                          [&_p]:mb-3 [&_p:last-child]:mb-0
+                          [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:mb-3 [&_ul]:space-y-1
+                          [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:mb-3 [&_ol]:space-y-1
+                          [&_li]:marker:text-text-tertiary
+                          [&_h1]:text-base [&_h1]:font-semibold [&_h1]:text-text-primary [&_h1]:mt-4 [&_h1]:mb-2
+                          [&_h2]:text-base [&_h2]:font-semibold [&_h2]:text-text-primary [&_h2]:mt-4 [&_h2]:mb-2
+                          [&_h3]:text-[14px] [&_h3]:font-semibold [&_h3]:text-text-primary [&_h3]:mt-3 [&_h3]:mb-2
+                          [&_a]:text-blue-300 [&_a]:underline [&_a]:underline-offset-2
+                          [&_strong]:text-text-primary [&_strong]:font-semibold
+                          [&_em]:italic
+                          [&_code]:bg-white/[0.06] [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-[13px]
+                          [&_blockquote]:border-l-2 [&_blockquote]:border-border-subtle [&_blockquote]:pl-3 [&_blockquote]:text-text-tertiary [&_blockquote]:italic [&_blockquote]:mb-3
+                          [&_hr]:border-border-subtle [&_hr]:my-4"
+                      >
+                        <ReactMarkdown>{fullEntry.content_md}</ReactMarkdown>
                       </div>
                     ) : (
                       <div className="text-text-tertiary text-sm">No content.</div>
