@@ -1,7 +1,10 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { getHabitJournal, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { axisTick, gridStyle, chartTooltip } from "@/lib/chart-theme";
+import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -50,6 +53,12 @@ function getDatesArray(days: number): string[] {
   return dates;
 }
 
+function isEligibleDay(frequency: string, dateStr: string): boolean {
+  if (frequency !== "weekdays") return true;
+  const dow = new Date(dateStr + "T00:00:00").getDay();
+  return dow !== 0 && dow !== 6;
+}
+
 function calculateStreak(habitName: string, frequency: string, completionSet: Set<string>): number {
   let streak = 0;
   const now = new Date();
@@ -58,10 +67,7 @@ function calculateStreak(habitName: string, frequency: string, completionSet: Se
     d.setDate(d.getDate() - i);
     const dateStr = d.toLocaleDateString("en-CA");
 
-    if (frequency === "weekdays") {
-      const day = d.getDay();
-      if (day === 0 || day === 6) continue;
-    }
+    if (!isEligibleDay(frequency, dateStr)) continue;
 
     if (completionSet.has(`${habitName}|${dateStr}`)) {
       streak++;
@@ -191,12 +197,56 @@ export default function HabitsPage() {
 
   const heatmapDates = getDatesArray(Math.min(rangeDays(range), 365));
 
+  // Per-habit frequency-aware rate aggregator
+  function rateOver(dates: string[]): { possible: number; completed: number; rate: number } {
+    let possible = 0;
+    let completed = 0;
+    habits.forEach((h) => {
+      dates.forEach((d) => {
+        if (!isEligibleDay(h.frequency, d)) return;
+        possible++;
+        if (completionSet.has(`${h.name}|${d}`)) completed++;
+      });
+    });
+    return { possible, completed, rate: possible > 0 ? Math.round((completed / possible) * 100) : 0 };
+  }
+
   const last7 = getDatesArray(7);
-  const possibleLast7 = habits.length * 7;
-  const completedLast7 = habits.reduce((acc, h) => {
-    return acc + last7.filter((d) => completionSet.has(`${h.name}|${d}`)).length;
-  }, 0);
-  const completionRate = possibleLast7 > 0 ? Math.round((completedLast7 / possibleLast7) * 100) : 0;
+  const prev7 = getDatesArray(14).slice(0, 7); // days -14..-8
+  const last7Stats = rateOver(last7);
+  const prev7Stats = rateOver(prev7);
+  const completionRate = last7Stats.rate;
+  const completedLast7 = last7Stats.completed;
+  const possibleLast7 = last7Stats.possible;
+  const deltaVsPrior = completionRate - prev7Stats.rate;
+
+  // 7-day rolling completion rate across the active range (for trend chart)
+  const activeRangeDates = heatmapDates;
+  const trendData = activeRangeDates.map((d, idx) => {
+    const window = activeRangeDates.slice(Math.max(0, idx - 6), idx + 1);
+    return { date: formatDate(d), rate: rateOver(window).rate };
+  });
+
+  // Per-category completion rate over the active range
+  const categoryAgg: Record<string, { possible: number; completed: number; count: number }> = {};
+  habits.forEach((h) => {
+    const cat = h.category || "general";
+    if (!categoryAgg[cat]) categoryAgg[cat] = { possible: 0, completed: 0, count: 0 };
+    categoryAgg[cat].count++;
+    activeRangeDates.forEach((d) => {
+      if (!isEligibleDay(h.frequency, d)) return;
+      categoryAgg[cat].possible++;
+      if (completionSet.has(`${h.name}|${d}`)) categoryAgg[cat].completed++;
+    });
+  });
+  const categoryRates = Object.entries(categoryAgg)
+    .map(([cat, m]) => ({
+      category: cat,
+      rate: m.possible > 0 ? Math.round((m.completed / m.possible) * 100) : 0,
+      habitCount: m.count,
+      color: CATEGORY_COLORS[cat] || CATEGORY_COLORS.general,
+    }))
+    .sort((a, b) => b.rate - a.rate);
 
   return (
     <>
@@ -226,7 +276,12 @@ export default function HabitsPage() {
         <StatCard label="Today" value={`${todayCompleted}/${habits.length}`} sublabel="habits completed" />
         <StatCard label="7-Day Rate" value={`${completionRate}%`} sublabel={`${completedLast7} of ${possibleLast7} check-ins`} />
         <StatCard label="Longest Streak" value={longestStreak} unit="days" sublabel={bestHabit?.name} />
-        <StatCard label="Active Habits" value={habits.length} />
+        <StatCard
+          label="vs Prior Week"
+          value={prev7Stats.possible > 0 ? `${deltaVsPrior >= 0 ? "+" : ""}${deltaVsPrior}` : "—"}
+          unit={prev7Stats.possible > 0 ? "%" : undefined}
+          sublabel={prev7Stats.possible > 0 ? `prior 7d was ${prev7Stats.rate}%` : "no prior data"}
+        />
       </div>
 
       {/* Today's Checklist */}
@@ -252,6 +307,71 @@ export default function HabitsPage() {
                 />
               );
             })}
+          </div>
+        </ChartCard>
+      )}
+
+      {/* Completion-rate trend */}
+      {habits.length > 0 && (
+        <ChartCard
+          title="7-Day Rolling Completion Rate"
+          subtitle={`Across ${rangeLabel(range)} — frequency-aware denominator`}
+          className="mt-6"
+        >
+          <ResponsiveContainer width="100%" height={240}>
+            <AreaChart data={trendData}>
+              <defs>
+                <linearGradient id="habitRateGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.2} />
+                  <stop offset="95%" stopColor="#06b6d4" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} domain={[0, 100]} unit="%" />
+              <Tooltip {...chartTooltip} />
+              <Area
+                type="monotone"
+                dataKey="rate"
+                stroke="#06b6d4"
+                strokeWidth={2}
+                fill="url(#habitRateGrad)"
+                name="Completion %"
+                connectNulls={false}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        </ChartCard>
+      )}
+
+      {/* Per-category breakdown */}
+      {habits.length > 0 && categoryRates.length > 0 && (
+        <ChartCard
+          title="By Category"
+          subtitle={`Completion rate across ${rangeLabel(range)}`}
+          className="mt-6"
+        >
+          <div className="space-y-2.5">
+            {categoryRates.map(({ category, rate, habitCount, color }) => (
+              <div key={category} className="flex items-center gap-3">
+                <div className="w-28 shrink-0 flex items-center gap-2">
+                  <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: color }} />
+                  <span className="text-[12px] text-text-secondary capitalize truncate">{category}</span>
+                </div>
+                <div className="flex-1 h-2.5 bg-white/5 rounded-full overflow-hidden">
+                  <div
+                    className="h-full rounded-full transition-all"
+                    style={{ width: `${rate}%`, backgroundColor: color }}
+                  />
+                </div>
+                <span className="text-[12px] font-mono tabular-nums text-text-primary w-12 text-right">
+                  {rate}%
+                </span>
+                <span className="text-[10px] font-mono text-text-tertiary w-16 text-right">
+                  {habitCount} habit{habitCount === 1 ? "" : "s"}
+                </span>
+              </div>
+            ))}
           </div>
         </ChartCard>
       )}
