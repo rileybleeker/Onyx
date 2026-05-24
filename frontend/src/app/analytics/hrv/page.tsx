@@ -1906,7 +1906,7 @@ export default function HrvAnalysisPage() {
             <em> cooler-than-usual</em> rooms move your HRV. This panel answers a different
             question: <strong>which specific temperature is actually optimal for you?</strong>{" "}
             Every night with both a median room temp and a WHOOP HRV reading is binned into
-            1°C buckets, and the mean HRV per bucket is plotted. The peak bucket is your
+            2°F buckets, and the mean HRV per bucket is plotted. The peak bucket is your
             personal sweet spot.
           </p>
           <p>
@@ -1938,13 +1938,17 @@ export default function HrvAnalysisPage() {
             );
           }
 
-          const BUCKET_SIZE = 1.0;
+          // Convert °C → °F at the bin boundary so the chart reads in user-native
+          // units. DB stays canonical in °C; only the presentation changes.
+          const cToF = (c: number) => c * 9 / 5 + 32;
+          const BUCKET_SIZE = 2.0; // °F bins
           const buckets: Record<string, number[]> = {};
           envMatrix.forEach((d: any) => {
-            const t = Number(d.eight_sleep_room_temp);
+            const tC = Number(d.eight_sleep_room_temp);
             const h = Number(d.whoop_hrv_rmssd);
-            if (isNaN(t) || isNaN(h)) return;
-            const start = Math.floor(t / BUCKET_SIZE) * BUCKET_SIZE;
+            if (isNaN(tC) || isNaN(h)) return;
+            const tF = cToF(tC);
+            const start = Math.floor(tF / BUCKET_SIZE) * BUCKET_SIZE;
             const key = start.toFixed(1);
             if (!buckets[key]) buckets[key] = [];
             buckets[key].push(h);
@@ -1962,7 +1966,7 @@ export default function HrvAnalysisPage() {
               const lo = parseFloat(k);
               return {
                 start: lo,
-                bucket: `${lo.toFixed(0)}–${(lo + BUCKET_SIZE).toFixed(0)}°C`,
+                bucket: `${lo.toFixed(0)}–${(lo + BUCKET_SIZE).toFixed(0)}°F`,
                 n,
                 meanHrv: +mean.toFixed(1),
                 sem: +sem.toFixed(2),
@@ -1986,7 +1990,7 @@ export default function HrvAnalysisPage() {
                 <BarChart data={rows} margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                   <CartesianGrid {...gridStyle} />
                   <XAxis dataKey="bucket" tick={axisTick}
-                    label={axisLabel("median room temp (°C)", "x")} />
+                    label={axisLabel("median room temp (°F)", "x")} />
                   <YAxis tick={axisTick} width={55}
                     label={axisLabel("WHOOP HRV (ms)", "y")} />
                   <Tooltip {...chartTooltip}

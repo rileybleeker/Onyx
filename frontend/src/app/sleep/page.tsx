@@ -20,6 +20,11 @@ import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme"
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
 
+// Temps come from the Eight Sleep / WHOOP APIs in °C. Convert to °F at the
+// display layer for the US-based reader. Returns null for null/undefined input.
+const cToF = (c: number | null | undefined): number | null =>
+  c == null ? null : +(Number(c) * 9 / 5 + 32).toFixed(1);
+
 function recoveryColor(score: number | null): string {
   if (!score) return "#71717a";
   if (score >= 67) return "#22c55e";
@@ -105,7 +110,7 @@ export default function SleepPage() {
       rhr:      d.resting_heart_rate,
       hrv:      d.hrv_rmssd_milli ? +Number(d.hrv_rmssd_milli).toFixed(1) : null,
       spo2:     d.spo2_percentage  ? +Number(d.spo2_percentage).toFixed(1)  : null,
-      skinTemp: d.skin_temp_celsius ? +Number(d.skin_temp_celsius).toFixed(1) : null,
+      skinTemp: cToF(d.skin_temp_celsius),
       respRate: sleep?.respiratory_rate ? +Number(sleep.respiratory_rate).toFixed(1) : null,
     };
   });
@@ -279,8 +284,8 @@ export default function SleepPage() {
 
   const eightEnvData = eightSleep.map((d) => ({
     date:      formatDate(d.calendar_date),
-    bedTemp:   d.median_bed_temp  ? +Number(d.median_bed_temp).toFixed(1)  : null,
-    roomTemp:  d.median_room_temp ? +Number(d.median_room_temp).toFixed(1) : null,
+    bedTemp:   cToF(d.median_bed_temp),
+    roomTemp:  cToF(d.median_room_temp),
     tossTurns: d.toss_and_turns,
   }));
 
@@ -385,7 +390,7 @@ export default function SleepPage() {
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Line yAxisId="spo2" type="monotone" dataKey="spo2" stroke="#06b6d4" strokeWidth={2} dot={false} name="SpO2 %" />
-              <Line yAxisId="temp" type="monotone" dataKey="skinTemp" stroke="#f97316" strokeWidth={2} dot={false} name="Skin Temp (°C)" />
+              <Line yAxisId="temp" type="monotone" dataKey="skinTemp" stroke="#f97316" strokeWidth={2} dot={false} name="Skin Temp (°F)" />
               <Line yAxisId="resp" type="monotone" dataKey="respRate" stroke="#8b5cf6" strokeWidth={2} dot={false} name="Resp Rate (br/min)" />
             </LineChart>
           </ResponsiveContainer>
@@ -734,8 +739,8 @@ export default function SleepPage() {
               <YAxis yAxisId="toss" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line yAxisId="temp" type="monotone" dataKey="bedTemp" stroke="#f97316" strokeWidth={2} dot={false} name="Bed Temp" />
-              <Line yAxisId="temp" type="monotone" dataKey="roomTemp" stroke="#06b6d4" strokeWidth={2} dot={false} name="Room Temp" />
+              <Line yAxisId="temp" type="monotone" dataKey="bedTemp" stroke="#f97316" strokeWidth={2} dot={false} name="Bed Temp (°F)" />
+              <Line yAxisId="temp" type="monotone" dataKey="roomTemp" stroke="#06b6d4" strokeWidth={2} dot={false} name="Room Temp (°F)" />
               <Line yAxisId="toss" type="monotone" dataKey="tossTurns" stroke="#a1a1aa" strokeWidth={1.5} dot={false} name="Toss & Turns" />
             </LineChart>
           </ResponsiveContainer>
