@@ -48,6 +48,20 @@ export function formatDuration(seconds: number | null): string {
   return `${m}m`;
 }
 
+// Second-precision duration for short events (lap times, intervals). Format:
+// <60s → "30s"; <1h → "8:09"; ≥1h → "1:02:42".
+export function formatShortDuration(seconds: number | null): string {
+  if (seconds == null || Number.isNaN(seconds)) return "—";
+  const s = Math.round(seconds);
+  if (s < 60) return `${s}s`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  if (h > 0) return `${h}:${pad(m)}:${pad(sec)}`;
+  return `${m}:${pad(sec)}`;
+}
+
 export function formatDistance(meters: number | null): string {
   if (!meters) return "—";
   const miles = meters / 1609.344;

@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { AreaChart, Area, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, getRunningRecoveryContext, getActivityLaps, rangeDays, rangeLabel, type Range } from "@/lib/queries";
-import { formatDuration, formatDistance, formatPace, formatDate } from "@/lib/format";
+import { formatDuration, formatShortDuration, formatDistance, formatPace, formatDate } from "@/lib/format";
 import RangeFilter from "@/components/RangeFilter";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -161,18 +161,24 @@ function expandSegmentsInExecutionOrder(
   return out;
 }
 
-function formatRepLabel(seg: SegmentTarget, rep: number, total: number): string {
-  const base =
-    seg.distance_meters != null
-      ? `${Math.round(seg.distance_meters)}m`
-      : seg.duration_seconds != null
-        ? formatDuration(seg.duration_seconds)
-        : "?";
-  return total > 1 ? `${base} (${rep}/${total})` : base;
+// Lap dimension: prefer the unit the planned step targets (time-based step →
+// duration, distance-based step → distance). Falls back to whatever the lap
+// actually has.
+function lapDimension(lap: Lap, seg: SegmentTarget | null): string {
+  if (seg?.duration_seconds != null) return formatShortDuration(lap.duration_seconds);
+  if (seg?.distance_meters != null) return formatDistance(lap.distance_meters);
+  // No segment to anchor — show whichever is meaningful.
+  if (lap.distance_meters >= 400) return formatDistance(lap.distance_meters);
+  return formatShortDuration(lap.duration_seconds);
+}
+
+function formatRepLabel(seg: SegmentTarget, rep: number, total: number, lap: Lap): string {
+  const dim = lapDimension(lap, seg);
+  return total > 1 ? `${dim} · ${rep}/${total}` : dim;
 }
 
 function formatNonRepLabel(lap: Lap, kind: RowKind): string {
-  const dur = formatDuration(lap.duration_seconds);
+  const dur = formatShortDuration(lap.duration_seconds);
   if (kind === "warmup")   return `Warm-up · ${dur}`;
   if (kind === "cooldown") return `Cool-down · ${dur}`;
   if (kind === "rest")     return `Rest · ${dur}`;
@@ -208,13 +214,18 @@ function pacedRow(
   };
 }
 
-// One row per lap, in execution order. ACTIVE laps consume the next planned rep
-// (interval segments expanded interleaved-within-RepeatGroup). WARMUP and
-// COOLDOWN laps pair with their (single) planned segment so the same target
-// shows on every chunk of a multi-lap warm-up. REST laps have no programmed
-// pace (targetType="no.target") so they render without a target. Any planned
-// reps with no matching lap (bailed early) are appended at the end as
-// lap=null so the gap is visible.
+// One row per lap, in execution order. WARMUP and COOLDOWN laps pair with
+// their (single) planned segment so the same target shows on every chunk of
+// a multi-lap warm-up. REST laps have no programmed pace
+// (targetType="no.target") so they render without a target. ACTIVE laps
+// consume planned interval reps (segments expanded interleaved-within-
+// RepeatGroup); consecutive ACTIVE laps that share a (wkt_step_index,
+// wkt_index) are treated as one rep that Garmin auto-lapped into multiple
+// sub-laps — all share the same target, each shows its own actual + Δ. The
+// rep cursor only advances on a new step key. A non-ACTIVE lap resets the
+// step-key tracker so a new active block always starts a new rep.
+// Any planned reps with no matching lap (bailed early) are appended at the
+// end as lap=null so the gap is visible.
 function buildWorkoutRows(segments: SegmentTarget[], laps: Lap[]): WorkoutRow[] {
   const warmupSeg   = segments.find((s) => s.kind === "warmup")   ?? null;
   const cooldownSeg = segments.find((s) => s.kind === "cooldown") ?? null;
@@ -224,12 +235,37 @@ function buildWorkoutRows(segments: SegmentTarget[], laps: Lap[]): WorkoutRow[] 
 
   const rows: WorkoutRow[] = [];
   let repCursor = 0;
+  let currentRep: { seg: SegmentTarget; rep: number; total: number } | null = null;
+  let currentStepKey: string | null = null;
 
   for (const lap of sortedLaps) {
-    if (lap.intensity === "ACTIVE" && repCursor < expandedReps.length) {
-      const { seg, rep, total } = expandedReps[repCursor++];
-      rows.push(pacedRow("rep", formatRepLabel(seg, rep, total), seg, lap));
-    } else if (lap.intensity === "WARMUP") {
+    if (lap.intensity === "ACTIVE") {
+      const stepKey = `${lap.wkt_step_index ?? "?"}:${lap.wkt_index ?? 0}`;
+      if (stepKey !== currentStepKey) {
+        currentRep = repCursor < expandedReps.length ? expandedReps[repCursor++] : null;
+        currentStepKey = stepKey;
+      }
+      if (currentRep) {
+        const { seg, rep, total } = currentRep;
+        rows.push(pacedRow("rep", formatRepLabel(seg, rep, total, lap), seg, lap));
+      } else {
+        rows.push({
+          label:           formatNonRepLabel(lap, "other"),
+          kind:            "other",
+          target_low_mps:  null,
+          target_high_mps: null,
+          lap,
+          delta_pct:       null,
+          in_range:        false,
+        });
+      }
+      continue;
+    }
+
+    currentRep = null;
+    currentStepKey = null;
+
+    if (lap.intensity === "WARMUP") {
       rows.push(pacedRow("warmup", formatNonRepLabel(lap, "warmup"), warmupSeg, lap));
     } else if (lap.intensity === "COOLDOWN") {
       rows.push(pacedRow("cooldown", formatNonRepLabel(lap, "cooldown"), cooldownSeg, lap));
@@ -249,7 +285,17 @@ function buildWorkoutRows(segments: SegmentTarget[], laps: Lap[]): WorkoutRow[] 
 
   while (repCursor < expandedReps.length) {
     const { seg, rep, total } = expandedReps[repCursor++];
-    rows.push(pacedRow("rep", formatRepLabel(seg, rep, total), seg, null));
+    rows.push({
+      label:           total > 1
+        ? `${seg.distance_meters != null ? formatDistance(seg.distance_meters) : formatShortDuration(seg.duration_seconds)} · ${rep}/${total}`
+        : (seg.distance_meters != null ? formatDistance(seg.distance_meters) : formatShortDuration(seg.duration_seconds)),
+      kind:            "rep",
+      target_low_mps:  seg.target_low_mps,
+      target_high_mps: seg.target_high_mps,
+      lap:             null,
+      delta_pct:       null,
+      in_range:        false,
+    });
   }
 
   return rows;
