@@ -455,8 +455,13 @@ def sync_training_status(garmin: Garmin, sb: Client, target_date: date) -> int:
 # Sync: Workout Definitions (target paces from Workout Builder)
 # ---------------------------------------------------------------------------
 
-def _maybe_capture_segment(step: dict, iterations: int, out: list) -> None:
-    """If step is a pace-targeted interval, append a segment dict to out."""
+def _maybe_capture_segment(step: dict, iterations: int, parent_step_id, out: list) -> None:
+    """If step is a pace-targeted interval, append a segment dict to out.
+
+    parent_step_id is the stepId of the enclosing RepeatGroupDTO (or None for
+    top-level segments). Segments that share a parent are executed interleaved
+    across iterations — the frontend matcher needs this to pair laps correctly.
+    """
     step_key = safe_get(step, "stepType", "stepTypeKey")
     target_key = safe_get(step, "targetType", "workoutTargetTypeKey")
     if step_key != "interval" or not target_key or "pace" not in target_key:
@@ -466,6 +471,7 @@ def _maybe_capture_segment(step: dict, iterations: int, out: list) -> None:
     out.append({
         "step_order":      step.get("stepOrder"),
         "step_id":         step.get("stepId"),
+        "parent_step_id":  parent_step_id,
         "target_low_mps":  step.get("targetValueOne"),
         "target_high_mps": step.get("targetValueTwo"),
         "distance_meters": cond_val if cond_key == "distance" else None,
@@ -493,10 +499,11 @@ def parse_interval_targets(workout: dict) -> dict:
             stype = step.get("type")
             if stype == "RepeatGroupDTO":
                 iters = step.get("numberOfIterations") or 1
+                parent_id = step.get("stepId")
                 for sub in step.get("workoutSteps", []):
-                    _maybe_capture_segment(sub, iters, segments)
+                    _maybe_capture_segment(sub, iters, parent_id, segments)
             elif stype == "ExecutableStepDTO":
-                _maybe_capture_segment(step, 1, segments)
+                _maybe_capture_segment(step, 1, None, segments)
 
     result: dict = {
         "segment_targets": segments,
@@ -665,7 +672,9 @@ def _sync_laps_for_activity(garmin: Garmin, sb: Client, activity_id, start_ts) -
                     "end_latitude": lap.get("endLatitude"),
                     "end_longitude": lap.get("endLongitude"),
                     "lap_trigger": lap.get("lapTrigger"),
-                    "intensity": lap.get("intensity"),
+                    "intensity": lap.get("intensityType"),
+                    "wkt_step_index": lap.get("wktStepIndex"),
+                    "wkt_index": lap.get("wktIndex"),
                     "raw_json": json.dumps(lap),
                 })
             upsert_to_supabase(sb, "garmin_activity_laps", lap_rows,

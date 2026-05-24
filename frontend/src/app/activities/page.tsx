@@ -95,6 +95,7 @@ function mergeAndDedup(garmin: ActivityRow[], whoop: ActivityRow[]): ActivityRow
 
 type SegmentTarget = {
   step_order: number;
+  parent_step_id: number | null;
   target_low_mps: number;
   target_high_mps: number;
   distance_meters: number | null;
@@ -108,6 +109,9 @@ type Lap = {
   duration_seconds: number;
   avg_speed_mps: number;
   avg_heart_rate: number | null;
+  intensity: string | null;
+  wkt_step_index: number | null;
+  wkt_index: number | null;
 };
 
 type SegmentMatch = {
@@ -116,56 +120,81 @@ type SegmentMatch = {
   target_low_mps: number;
   target_high_mps: number;
   planned_distance_m: number | null;
+  planned_duration_s: number | null;
   lap: Lap | null;
   delta_pct: number | null;
   in_range: boolean;
 };
 
-// Greedy positional match: expand each segment_target by its iterations, then
-// consume active laps (speed > 1.5 mps, distance > 100m) in order, picking the
-// next lap whose distance is within ±20% of the planned segment distance.
-// Laps that don't match advance the cursor (treated as warmup/cooldown).
+// Expand segments into their actual execution order:
+//   - Segments that share a parent_step_id (= a RepeatGroupDTO) interleave
+//     across iterations: rep1 of segA, rep1 of segB, …, rep2 of segA, …
+//   - Standalone segments (parent_step_id null) expand sequentially.
+//   - Consecutive segments with the same parent stay one group; if a workout
+//     has two separate repeat groups they get expanded independently in plan
+//     order.
+function expandSegmentsInExecutionOrder(
+  segments: SegmentTarget[],
+): { seg: SegmentTarget; rep: number; total: number }[] {
+  const out: { seg: SegmentTarget; rep: number; total: number }[] = [];
+  let i = 0;
+  while (i < segments.length) {
+    const parent = segments[i].parent_step_id;
+    if (parent == null) {
+      const s = segments[i];
+      const total = s.iterations || 1;
+      for (let r = 1; r <= total; r++) out.push({ seg: s, rep: r, total });
+      i++;
+      continue;
+    }
+    // Consume the contiguous run of segments sharing this parent.
+    let j = i;
+    while (j < segments.length && segments[j].parent_step_id === parent) j++;
+    const group = segments.slice(i, j);
+    const total = group[0].iterations || 1;
+    for (let r = 1; r <= total; r++) {
+      for (const s of group) out.push({ seg: s, rep: r, total });
+    }
+    i = j;
+  }
+  return out;
+}
+
+// ACTIVE laps in lap_index order are the planned reps in execution order. Pair
+// positionally; no heuristic matching needed.
 function matchSegmentsToLaps(segments: SegmentTarget[], laps: Lap[]): SegmentMatch[] {
-  const expanded: { seg: SegmentTarget; rep: number; total: number }[] = [];
-  for (const s of segments) {
-    for (let i = 1; i <= (s.iterations || 1); i++) {
-      expanded.push({ seg: s, rep: i, total: s.iterations || 1 });
-    }
-  }
-  const active = laps.filter((l) => l.avg_speed_mps > 1.5 && l.distance_meters > 100);
-  const matches: SegmentMatch[] = [];
-  let cursor = 0;
-  for (const { seg, rep, total } of expanded) {
-    let matched: Lap | null = null;
-    const target = seg.distance_meters;
-    while (cursor < active.length && matched == null) {
-      const lap = active[cursor];
-      cursor++;
-      if (target == null) {
-        // time-based segment — match by duration ±20%
-        if (seg.duration_seconds != null
-          && Math.abs(lap.duration_seconds - seg.duration_seconds) / seg.duration_seconds <= 0.2) {
-          matched = lap;
-        }
-      } else if (Math.abs(lap.distance_meters - target) / target <= 0.2) {
-        matched = lap;
-      }
-    }
+  const expanded = expandSegmentsInExecutionOrder(segments);
+  const activeLaps = laps
+    .filter((l) => l.intensity === "ACTIVE")
+    .sort((a, b) => a.lap_index - b.lap_index);
+
+  return expanded.map(({ seg, rep, total }, idx) => {
+    const lap = activeLaps[idx] ?? null;
     const mid = (seg.target_low_mps + seg.target_high_mps) / 2;
-    matches.push({
-      rep_index: rep,
-      iter_total: total,
-      target_low_mps:  seg.target_low_mps,
-      target_high_mps: seg.target_high_mps,
+    return {
+      rep_index:          rep,
+      iter_total:         total,
+      target_low_mps:     seg.target_low_mps,
+      target_high_mps:    seg.target_high_mps,
       planned_distance_m: seg.distance_meters,
-      lap: matched,
-      delta_pct: matched ? ((mid - matched.avg_speed_mps) / mid) * 100 : null,
-      in_range: matched
-        ? matched.avg_speed_mps >= seg.target_low_mps && matched.avg_speed_mps <= seg.target_high_mps
+      planned_duration_s: seg.duration_seconds,
+      lap,
+      delta_pct: lap ? ((mid - lap.avg_speed_mps) / mid) * 100 : null,
+      in_range: lap
+        ? lap.avg_speed_mps >= seg.target_low_mps && lap.avg_speed_mps <= seg.target_high_mps
         : false,
-    });
-  }
-  return matches;
+    };
+  });
+}
+
+function formatSegmentLabel(m: SegmentMatch): string {
+  const base =
+    m.planned_distance_m != null
+      ? `${Math.round(m.planned_distance_m)}m`
+      : m.planned_duration_s != null
+        ? formatDuration(m.planned_duration_s)
+        : "?";
+  return m.iter_total > 1 ? `${base} (${m.rep_index}/${m.iter_total})` : base;
 }
 
 export default function ActivitiesPage() {
@@ -227,6 +256,9 @@ export default function ActivitiesPage() {
                 duration_seconds: Number(l.duration_seconds),
                 avg_speed_mps:    Number(l.avg_speed_mps),
                 avg_heart_rate:   l.avg_heart_rate,
+                intensity:        l.intensity ?? null,
+                wkt_step_index:   l.wkt_step_index ?? null,
+                wkt_index:        l.wkt_index ?? null,
               });
             }
             setLapsByActivity(grouped);
@@ -553,9 +585,7 @@ export default function ActivitiesPage() {
                           </thead>
                           <tbody>
                             {matches.map((m, i) => {
-                              const label = m.iter_total > 1
-                                ? `${m.planned_distance_m ?? "?"}m (${m.rep_index}/${m.iter_total})`
-                                : `${m.planned_distance_m ?? "?"}m`;
+                              const label = formatSegmentLabel(m);
                               return (
                                 <tr key={i} className="border-b border-white/5">
                                   <td className="py-1.5 text-text-secondary">{label}</td>

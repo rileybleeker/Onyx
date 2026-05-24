@@ -351,7 +351,7 @@ export async function getActivityLaps(activityIds: number[]) {
 
   const { data, error } = await supabase
     .from("garmin_activity_laps")
-    .select("activity_id, lap_index, distance_meters, duration_seconds, avg_speed_mps, avg_heart_rate")
+    .select("activity_id, lap_index, distance_meters, duration_seconds, avg_speed_mps, avg_heart_rate, intensity, wkt_step_index, wkt_index")
     .in("activity_id", activityIds)
     .order("activity_id", { ascending: true })
     .order("lap_index", { ascending: true });
