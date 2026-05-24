@@ -581,7 +581,7 @@ export default function SleepPage() {
 
         const categoryMap = new Map<string, string[]>();
         journal.forEach((j: any) => {
-          const cat = j.category || "Other";
+          const cat = j.category || "WHOOP Journal";
           if (!categoryMap.has(cat)) categoryMap.set(cat, []);
           const list = categoryMap.get(cat)!;
           if (!list.includes(j.question)) list.push(j.question);
