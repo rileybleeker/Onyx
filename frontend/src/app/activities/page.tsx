@@ -114,14 +114,14 @@ type Lap = {
   wkt_index: number | null;
 };
 
-type SegmentMatch = {
-  rep_index: number;       // 1-based index within iterations of this segment
-  iter_total: number;
-  target_low_mps: number;
-  target_high_mps: number;
-  planned_distance_m: number | null;
-  planned_duration_s: number | null;
-  lap: Lap | null;
+type RowKind = "rep" | "rest" | "warmup" | "cooldown" | "other";
+
+type WorkoutRow = {
+  label: string;
+  kind: RowKind;
+  target_low_mps: number | null;
+  target_high_mps: number | null;
+  lap: Lap | null;           // null only for a planned rep that has no matching lap
   delta_pct: number | null;
   in_range: boolean;
 };
@@ -160,41 +160,79 @@ function expandSegmentsInExecutionOrder(
   return out;
 }
 
-// ACTIVE laps in lap_index order are the planned reps in execution order. Pair
-// positionally; no heuristic matching needed.
-function matchSegmentsToLaps(segments: SegmentTarget[], laps: Lap[]): SegmentMatch[] {
-  const expanded = expandSegmentsInExecutionOrder(segments);
-  const activeLaps = laps
-    .filter((l) => l.intensity === "ACTIVE")
-    .sort((a, b) => a.lap_index - b.lap_index);
-
-  return expanded.map(({ seg, rep, total }, idx) => {
-    const lap = activeLaps[idx] ?? null;
-    const mid = (seg.target_low_mps + seg.target_high_mps) / 2;
-    return {
-      rep_index:          rep,
-      iter_total:         total,
-      target_low_mps:     seg.target_low_mps,
-      target_high_mps:    seg.target_high_mps,
-      planned_distance_m: seg.distance_meters,
-      planned_duration_s: seg.duration_seconds,
-      lap,
-      delta_pct: lap ? ((mid - lap.avg_speed_mps) / mid) * 100 : null,
-      in_range: lap
-        ? lap.avg_speed_mps >= seg.target_low_mps && lap.avg_speed_mps <= seg.target_high_mps
-        : false,
-    };
-  });
+function formatRepLabel(seg: SegmentTarget, rep: number, total: number): string {
+  const base =
+    seg.distance_meters != null
+      ? `${Math.round(seg.distance_meters)}m`
+      : seg.duration_seconds != null
+        ? formatDuration(seg.duration_seconds)
+        : "?";
+  return total > 1 ? `${base} (${rep}/${total})` : base;
 }
 
-function formatSegmentLabel(m: SegmentMatch): string {
-  const base =
-    m.planned_distance_m != null
-      ? `${Math.round(m.planned_distance_m)}m`
-      : m.planned_duration_s != null
-        ? formatDuration(m.planned_duration_s)
-        : "?";
-  return m.iter_total > 1 ? `${base} (${m.rep_index}/${m.iter_total})` : base;
+function formatNonRepLabel(lap: Lap, kind: RowKind): string {
+  const dur = formatDuration(lap.duration_seconds);
+  if (kind === "warmup")   return `Warm-up · ${dur}`;
+  if (kind === "cooldown") return `Cool-down · ${dur}`;
+  if (kind === "rest")     return `Rest · ${dur}`;
+  return `Lap ${lap.lap_index + 1} · ${dur}`;
+}
+
+// One row per lap, in execution order. ACTIVE laps consume the next planned rep
+// (segments expanded interleaved-within-RepeatGroup); rest/warmup/cooldown laps
+// get their own un-targeted rows. Any planned reps with no matching lap (bailed
+// early) are appended at the end as lap=null so the gap is visible.
+function buildWorkoutRows(segments: SegmentTarget[], laps: Lap[]): WorkoutRow[] {
+  const expanded = expandSegmentsInExecutionOrder(segments);
+  const sortedLaps = [...laps].sort((a, b) => a.lap_index - b.lap_index);
+  const rows: WorkoutRow[] = [];
+  let segCursor = 0;
+
+  for (const lap of sortedLaps) {
+    if (lap.intensity === "ACTIVE" && segCursor < expanded.length) {
+      const { seg, rep, total } = expanded[segCursor++];
+      const mid = (seg.target_low_mps + seg.target_high_mps) / 2;
+      rows.push({
+        label:           formatRepLabel(seg, rep, total),
+        kind:            "rep",
+        target_low_mps:  seg.target_low_mps,
+        target_high_mps: seg.target_high_mps,
+        lap,
+        delta_pct:       ((mid - lap.avg_speed_mps) / mid) * 100,
+        in_range:        lap.avg_speed_mps >= seg.target_low_mps && lap.avg_speed_mps <= seg.target_high_mps,
+      });
+    } else {
+      const kind: RowKind =
+        lap.intensity === "REST"     ? "rest"
+        : lap.intensity === "WARMUP"   ? "warmup"
+        : lap.intensity === "COOLDOWN" ? "cooldown"
+        : "other";
+      rows.push({
+        label:           formatNonRepLabel(lap, kind),
+        kind,
+        target_low_mps:  null,
+        target_high_mps: null,
+        lap,
+        delta_pct:       null,
+        in_range:        false,
+      });
+    }
+  }
+
+  while (segCursor < expanded.length) {
+    const { seg, rep, total } = expanded[segCursor++];
+    rows.push({
+      label:           formatRepLabel(seg, rep, total),
+      kind:            "rep",
+      target_low_mps:  seg.target_low_mps,
+      target_high_mps: seg.target_high_mps,
+      lap:             null,
+      delta_pct:       null,
+      in_range:        false,
+    });
+  }
+
+  return rows;
 }
 
 export default function ActivitiesPage() {
@@ -470,8 +508,8 @@ export default function ActivitiesPage() {
               ? Number(act.id.split(":")[1])
               : null;
             const laps = activityIdNum != null ? lapsByActivity[activityIdNum] : undefined;
-            const matches = isExpanded && isMultiSeg && recCtx?.segments && laps
-              ? matchSegmentsToLaps(recCtx.segments, laps)
+            const rows = isExpanded && isMultiSeg && recCtx?.segments && laps
+              ? buildWorkoutRows(recCtx.segments, laps)
               : null;
 
             return (
@@ -571,7 +609,7 @@ export default function ActivitiesPage() {
                   </div>
 
                   {isMultiSeg && (
-                    matches ? (
+                    rows ? (
                       <div className="overflow-x-auto">
                         <table className="w-full text-[12px] font-mono">
                           <thead>
@@ -584,27 +622,35 @@ export default function ActivitiesPage() {
                             </tr>
                           </thead>
                           <tbody>
-                            {matches.map((m, i) => {
-                              const label = formatSegmentLabel(m);
+                            {rows.map((r, i) => {
+                              const labelColor = r.kind === "rep"
+                                ? "text-text-secondary"
+                                : "text-text-tertiary italic";
+                              const hasTarget = r.target_low_mps != null && r.target_high_mps != null;
+                              const actualColor = r.kind === "rep"
+                                ? (r.lap ? "text-text-primary" : "text-text-tertiary")
+                                : "text-text-tertiary";
+                              const deltaColor =
+                                r.delta_pct == null ? "text-text-tertiary"
+                                : r.in_range       ? "text-green-400"
+                                : r.delta_pct < 0  ? "text-emerald-300"
+                                : "text-red-400";
                               return (
                                 <tr key={i} className="border-b border-white/5">
-                                  <td className="py-1.5 text-text-secondary">{label}</td>
+                                  <td className={`py-1.5 ${labelColor}`}>{r.label}</td>
                                   <td className="py-1.5 text-right text-text-secondary pl-4">
-                                    {formatPace(m.target_high_mps)} – {formatPace(m.target_low_mps)}
+                                    {hasTarget
+                                      ? `${formatPace(r.target_high_mps!)} – ${formatPace(r.target_low_mps!)}`
+                                      : <span className="text-text-tertiary">—</span>}
                                   </td>
-                                  <td className={`py-1.5 text-right pl-4 ${m.lap ? "text-text-primary" : "text-text-tertiary"}`}>
-                                    {m.lap ? formatPace(m.lap.avg_speed_mps) : "—"}
+                                  <td className={`py-1.5 text-right pl-4 ${actualColor}`}>
+                                    {r.lap ? formatPace(r.lap.avg_speed_mps) : "—"}
                                   </td>
-                                  <td className={`py-1.5 text-right pl-4 ${
-                                    m.delta_pct == null ? "text-text-tertiary"
-                                    : m.in_range ? "text-green-400"
-                                    : m.delta_pct < 0 ? "text-emerald-300"
-                                    : "text-red-400"
-                                  }`}>
-                                    {m.delta_pct == null ? "—" : `${m.delta_pct > 0 ? "+" : ""}${m.delta_pct.toFixed(1)}%`}
+                                  <td className={`py-1.5 text-right pl-4 ${deltaColor}`}>
+                                    {r.delta_pct == null ? "—" : `${r.delta_pct > 0 ? "+" : ""}${r.delta_pct.toFixed(1)}%`}
                                   </td>
                                   <td className="py-1.5 text-right text-text-secondary pl-4">
-                                    {m.lap?.avg_heart_rate ?? "—"}
+                                    {r.lap?.avg_heart_rate ?? "—"}
                                   </td>
                                 </tr>
                               );
