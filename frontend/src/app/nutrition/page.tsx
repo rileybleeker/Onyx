@@ -283,8 +283,10 @@ export default function NutritionPage() {
     fat: d.fat_g ? +Number(d.fat_g).toFixed(1) : 0,
   }));
 
-  const fiberSugarData = nutritionData.map((d) => ({
+  const detailData = nutritionData.map((d) => ({
     date: formatDate(d.calendar_date),
+    protein: d.protein_g ? +Number(d.protein_g).toFixed(1) : null,
+    fat: d.fat_g ? +Number(d.fat_g).toFixed(1) : null,
     fiber: d.fiber_g ? +Number(d.fiber_g).toFixed(1) : null,
     sugar: d.sugar_g ? +Number(d.sugar_g).toFixed(1) : null,
   }));
@@ -655,30 +657,18 @@ export default function NutritionPage() {
               </ResponsiveContainer>
             </ChartCard>
 
-            <ChartCard title="Fiber & Sugar (g)" source="MFP">
+            <ChartCard title="Protein, Fat, Fiber & Sugar (g)" source="MFP" className="lg:col-span-2">
               <ResponsiveContainer width="100%" height={260}>
-                <LineChart data={fiberSugarData}>
+                <LineChart data={detailData}>
                   <CartesianGrid {...gridStyle} />
                   <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
                   <YAxis tick={axisTick} width={40} />
                   <Tooltip {...chartTooltip} />
                   <Legend wrapperStyle={legendStyle} />
+                  <Line type="monotone" dataKey="protein" stroke="#22c55e" strokeWidth={2} dot={false} name="Protein (g)" connectNulls={false} />
+                  <Line type="monotone" dataKey="fat" stroke="#f59e0b" strokeWidth={2} dot={false} name="Fat (g)" connectNulls={false} />
                   <Line type="monotone" dataKey="fiber" stroke="#a78bfa" strokeWidth={2} dot={false} name="Fiber (g)" connectNulls={false} />
                   <Line type="monotone" dataKey="sugar" stroke="#f87171" strokeWidth={2} dot={false} name="Sugar (g)" connectNulls={false} />
-                </LineChart>
-              </ResponsiveContainer>
-            </ChartCard>
-
-            <ChartCard title="Protein vs Fat (g)" source="MFP">
-              <ResponsiveContainer width="100%" height={260}>
-                <LineChart data={macroData}>
-                  <CartesianGrid {...gridStyle} />
-                  <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-                  <YAxis tick={axisTick} width={40} />
-                  <Tooltip {...chartTooltip} />
-                  <Legend wrapperStyle={legendStyle} />
-                  <Line type="monotone" dataKey="protein" stroke="#22c55e" strokeWidth={2} dot={false} name="Protein (g)" />
-                  <Line type="monotone" dataKey="fat" stroke="#f59e0b" strokeWidth={2} dot={false} name="Fat (g)" />
                 </LineChart>
               </ResponsiveContainer>
             </ChartCard>
