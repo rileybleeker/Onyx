@@ -329,6 +329,43 @@ export async function getMfpNutrition(days: number = 30) {
   return data ?? [];
 }
 
+/**
+ * WHOOP daily energy expenditure ("calories burnt") for the same window.
+ *
+ * Source of record on Onyx — NOT Garmin. Reads `pds.whoop_cycles.kilojoule`
+ * and converts to kcal via /4.184. Each cycle is tagged to its ET cycle date
+ * via the +12h rule (a bedtime-start cycle lands on the wake day), matching
+ * the canonical timezone convention in CLAUDE.md.
+ */
+export async function getWhoopCaloriesBurnt(days: number = 30) {
+  const since = new Date();
+  // Pad by 1 day so the boundary cycle (whose start might be the night before
+  // the requested window) is included before we re-tag to its ET cycle date.
+  since.setDate(since.getDate() - (days + 1));
+
+  const { data, error } = await supabase
+    .from("whoop_cycles")
+    .select("cycle_id, start_time, kilojoule")
+    .gte("start_time", since.toISOString())
+    .order("start_time", { ascending: true });
+
+  if (error) throw error;
+
+  const byDate = new Map<string, { calendar_date: string; kilojoule: number; calories_burnt: number }>();
+  for (const c of data ?? []) {
+    if (!c.start_time || c.kilojoule == null) continue;
+    const start = new Date(c.start_time);
+    const midday = new Date(start.getTime() + 12 * 3600 * 1000);
+    const calendar_date = midday.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const kcal = Math.round(Number(c.kilojoule) / 4.184);
+    // Ascending order means last-write-wins picks the later cycle on the rare
+    // day with two; in practice there's one cycle per ET date.
+    byDate.set(calendar_date, { calendar_date, kilojoule: Number(c.kilojoule), calories_burnt: kcal });
+  }
+  return Array.from(byDate.values()).sort((a, b) => (a.calendar_date < b.calendar_date ? -1 : 1));
+}
+
+
 // ---------------------------------------------------------------------------
 // Recovery context for running activities (merged into /activities row cards)
 // ---------------------------------------------------------------------------

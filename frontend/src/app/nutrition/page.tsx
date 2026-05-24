@@ -3,11 +3,19 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   AreaChart, Area,
-  BarChart, Bar,
+  BarChart, Bar, Cell,
   LineChart, Line,
+  ComposedChart,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
+  ReferenceLine,
 } from "recharts";
-import { getMfpNutrition, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import {
+  getMfpNutrition,
+  getWhoopCaloriesBurnt,
+  rangeDays,
+  rangeLabel,
+  type Range,
+} from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -126,11 +134,34 @@ function avg(arr: any[], key: string): number {
   return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
 }
 
+// ─── Weight helpers ──────────────────────────────────────────────────────────
+
+interface WeightRow {
+  log_date: string;
+  weight_kg: number;
+  notes: string | null;
+  logged_at: string;
+}
+
+const KG_PER_LB = 0.45359237;
+const LB_PER_KG = 1 / KG_PER_LB;
+const kgToLb = (kg: number | null | undefined) => (kg == null ? null : kg * LB_PER_KG);
+const lbToKg = (lb: number) => lb * KG_PER_LB;
+
 export default function NutritionPage() {
   // ─── Nutrition state ───
   const [nutritionData, setNutritionData] = useState<any[]>([]);
+  const [burntData, setBurntData] = useState<any[]>([]);
   const [nutritionLoading, setNutritionLoading] = useState(true);
   const [range, setRange] = useState<Range>("30d");
+
+  // ─── Weight state ───
+  const [weightRows, setWeightRows] = useState<WeightRow[]>([]);
+  const [weightLoading, setWeightLoading] = useState(true);
+  const [weightInput, setWeightInput] = useState<string>("");
+  const [weightDate, setWeightDate] = useState<string>("");
+  const [weightNotes, setWeightNotes] = useState<string>("");
+  const [savingWeight, setSavingWeight] = useState(false);
 
   // ─── Meal-timing state ───
   const [events, setEvents] = useState<MealEvent[]>([]);
@@ -260,21 +291,137 @@ export default function NutritionPage() {
       return h !== null && (h >= 21 || h < 4);
     }).length;
 
-  // ─── Nutrition loader (responds to range filter) ───
+  // ─── Nutrition + burnt loader (responds to range filter) ───
   useEffect(() => {
     setNutritionLoading(true);
-    getMfpNutrition(rangeDays(range))
-      .then(setNutritionData)
+    Promise.all([
+      getMfpNutrition(rangeDays(range)),
+      getWhoopCaloriesBurnt(rangeDays(range)),
+    ])
+      .then(([n, b]) => {
+        setNutritionData(n);
+        setBurntData(b);
+      })
       .catch(console.error)
       .finally(() => setNutritionLoading(false));
   }, [range]);
 
+  // ─── Weight loader + default date init ───
+  const loadWeight = useCallback(async () => {
+    setWeightLoading(true);
+    try {
+      const res = await fetch(`/api/weight?days=${Math.max(rangeDays(range), 90)}`);
+      const json = await res.json();
+      setWeightRows((json.rows ?? []) as WeightRow[]);
+    } catch (e) {
+      console.error("Weight load:", e);
+    } finally {
+      setWeightLoading(false);
+    }
+  }, [range]);
+
+  useEffect(() => { loadWeight(); }, [loadWeight]);
+  useEffect(() => { setWeightDate(etTodayStr()); }, []);
+
+  async function saveWeight() {
+    const lb = parseFloat(weightInput);
+    if (!Number.isFinite(lb) || lb <= 0 || lb > 1000) {
+      alert("Enter a weight in pounds between 0 and 1000.");
+      return;
+    }
+    setSavingWeight(true);
+    try {
+      const res = await fetch("/api/weight", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          log_date: weightDate || etTodayStr(),
+          weight_kg: lbToKg(lb),
+          notes: weightNotes.trim() || undefined,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setWeightInput("");
+      setWeightNotes("");
+      await loadWeight();
+    } catch (e) {
+      console.error("Save weight:", e);
+      alert(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingWeight(false);
+    }
+  }
+
+  async function deleteWeight(log_date: string) {
+    if (!confirm(`Delete weight entry for ${log_date}?`)) return;
+    try {
+      const res = await fetch(`/api/weight?log_date=${log_date}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      await loadWeight();
+    } catch (e) {
+      console.error("Delete weight:", e);
+      alert(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   const latest = nutritionData[nutritionData.length - 1];
 
-  const calorieData = nutritionData.map((d) => ({
-    date: formatDate(d.calendar_date),
-    calories: d.calories ?? null,
+  // Calories consumed (MFP) vs burnt (WHOOP cycle kilojoule → kcal).
+  // Joined by calendar_date; missing days on either side render null and skip.
+  const burntByDate = new Map<string, number | null>();
+  for (const b of burntData) {
+    burntByDate.set(b.calendar_date, b.calories_burnt ?? null);
+  }
+  const allDates = new Set<string>([
+    ...nutritionData.map((d) => d.calendar_date),
+    ...burntData.map((d) => d.calendar_date),
+  ]);
+  const calorieData = Array.from(allDates)
+    .sort()
+    .map((cd) => {
+      const n = nutritionData.find((d) => d.calendar_date === cd);
+      const consumed = n?.calories ?? null;
+      const burnt = burntByDate.get(cd) ?? null;
+      return {
+        date: formatDate(cd),
+        consumed,
+        burnt,
+        net: consumed !== null && burnt !== null ? consumed - burnt : null,
+      };
+    });
+
+  const avgBurnt = (() => {
+    const vals = burntData.map((d) => Number(d.calories_burnt)).filter((v) => !isNaN(v) && v > 0);
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+  })();
+
+  // ─── Weight derivations ───
+  const weightChartData = weightRows.map((w) => ({
+    date: formatDate(w.log_date),
+    weight_lb: kgToLb(Number(w.weight_kg)),
   }));
+  const latestWeight = weightRows[weightRows.length - 1];
+  const latestWeightLb = latestWeight ? kgToLb(Number(latestWeight.weight_kg)) : null;
+  const sevenDayWeightAvg = (() => {
+    const last7 = weightRows.slice(-7);
+    if (last7.length === 0) return null;
+    const sum = last7.reduce((s, w) => s + Number(w.weight_kg), 0);
+    return kgToLb(sum / last7.length);
+  })();
+  const thirtyDayDelta = (() => {
+    if (weightRows.length < 2) return null;
+    const recent = weightRows[weightRows.length - 1];
+    // Find the row closest to (recent.log_date − 30d) without going past it.
+    const targetMs = new Date(recent.log_date + "T12:00:00Z").getTime() - 30 * 24 * 3600 * 1000;
+    let baseline: WeightRow | null = null;
+    for (const w of weightRows) {
+      if (new Date(w.log_date + "T12:00:00Z").getTime() <= targetMs) baseline = w;
+      else break;
+    }
+    if (!baseline) return null;
+    return kgToLb(Number(recent.weight_kg) - Number(baseline.weight_kg));
+  })();
+  const todayWeight = weightRows.find((w) => w.log_date === etTodayStr());
 
   const macroData = nutritionData.map((d) => ({
     date: formatDate(d.calendar_date),
@@ -616,12 +763,17 @@ export default function NutritionPage() {
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <ChartCard title="Calorie Trend" source="MFP" className="lg:col-span-2">
-              <ResponsiveContainer width="100%" height={260}>
-                <AreaChart data={calorieData}>
+            <ChartCard
+              title="Calorie Trend — Consumed vs Burnt"
+              subtitle="MFP daily intake against WHOOP cycle energy expenditure (kilojoule → kcal). Net = consumed − burnt."
+              source="MFP + WHOOP"
+              className="lg:col-span-2"
+            >
+              <ResponsiveContainer width="100%" height={280}>
+                <ComposedChart data={calorieData}>
                   <defs>
-                    <linearGradient id="calGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.15} />
+                    <linearGradient id="calConsumedGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.18} />
                       <stop offset="95%" stopColor="#06b6d4" stopOpacity={0} />
                     </linearGradient>
                   </defs>
@@ -629,16 +781,51 @@ export default function NutritionPage() {
                   <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
                   <YAxis tick={axisTick} width={60} label={axisLabel("kcal", "y")} />
                   <Tooltip {...chartTooltip} />
+                  <Legend wrapperStyle={legendStyle} />
                   <Area
                     type="monotone"
-                    dataKey="calories"
+                    dataKey="consumed"
                     stroke="#06b6d4"
                     strokeWidth={2}
-                    fill="url(#calGrad)"
-                    name="Calories (kcal)"
+                    fill="url(#calConsumedGrad)"
+                    name="Consumed (MFP)"
                     connectNulls={false}
                   />
-                </AreaChart>
+                  <Line
+                    type="monotone"
+                    dataKey="burnt"
+                    stroke="#f59e0b"
+                    strokeWidth={2}
+                    dot={false}
+                    name="Burnt (WHOOP)"
+                    connectNulls={false}
+                  />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </ChartCard>
+
+            <ChartCard
+              title="Net Energy Balance"
+              subtitle="Consumed − burnt per day. Above zero = surplus, below = deficit."
+              source="MFP + WHOOP"
+              className="lg:col-span-2"
+            >
+              <ResponsiveContainer width="100%" height={220}>
+                <BarChart data={calorieData}>
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+                  <YAxis tick={axisTick} width={60} label={axisLabel("kcal", "y")} />
+                  <Tooltip {...chartTooltip} />
+                  <ReferenceLine y={0} stroke="rgba(255,255,255,0.25)" />
+                  <Bar dataKey="net" name="Net (kcal)" radius={[2, 2, 0, 0]}>
+                    {calorieData.map((d, i) => (
+                      <Cell
+                        key={i}
+                        fill={(d.net ?? 0) >= 0 ? "#f59e0b" : "#22c55e"}
+                      />
+                    ))}
+                  </Bar>
+                </BarChart>
               </ResponsiveContainer>
             </ChartCard>
 
@@ -675,6 +862,191 @@ export default function NutritionPage() {
           </div>
         </>
       )}
+
+      <div className="border-t border-border-subtle my-10" />
+
+      {/* ─── Body Weight ───────────────────────────────────────────────────── */}
+      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Body Weight</p>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+        <StatCard
+          label="Latest"
+          value={latestWeightLb !== null ? `${latestWeightLb.toFixed(1)} lb` : "—"}
+          sublabel={latestWeight ? formatShortDate(latestWeight.log_date) : "no entries"}
+        />
+        <StatCard
+          label="7d avg"
+          value={sevenDayWeightAvg !== null ? `${sevenDayWeightAvg.toFixed(1)} lb` : "—"}
+          sublabel="trailing 7 days"
+        />
+        <StatCard
+          label="30d delta"
+          value={
+            thirtyDayDelta !== null
+              ? `${thirtyDayDelta >= 0 ? "+" : ""}${thirtyDayDelta.toFixed(1)} lb`
+              : "—"
+          }
+          sublabel="vs ~30 days ago"
+        />
+        <StatCard
+          label="Entries"
+          value={weightRows.length}
+          sublabel="last 90 days"
+        />
+      </div>
+
+      <div className="space-y-6 mb-10">
+        {/* Quick-log card */}
+        <ChartCard
+          title={weightDate === etTodayStr() ? "Log weight — today" : `Log weight for ${formatShortDate(weightDate)}`}
+          subtitle={
+            todayWeight && weightDate === etTodayStr()
+              ? `Already logged today (${kgToLb(Number(todayWeight.weight_kg))!.toFixed(1)} lb). Saving overwrites.`
+              : "One entry per day. Stored in kg; entered + displayed in pounds."
+          }
+        >
+          <div className="flex flex-wrap items-center gap-2 mb-3">
+            <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
+              Date
+            </label>
+            <input
+              type="date"
+              value={weightDate}
+              max={etTodayStr()}
+              onChange={(e) => setWeightDate(e.target.value || etTodayStr())}
+              disabled={savingWeight}
+              className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none disabled:opacity-40"
+            />
+            {weightDate !== etTodayStr() && (
+              <>
+                <span className="text-[10px] font-mono text-amber-400/90">
+                  logging to {formatShortDate(weightDate)} — not today
+                </span>
+                <button
+                  onClick={() => setWeightDate(etTodayStr())}
+                  className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
+                >
+                  reset to today
+                </button>
+              </>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 mb-3">
+            <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
+              Weight
+            </label>
+            <input
+              type="number"
+              step="0.1"
+              inputMode="decimal"
+              value={weightInput}
+              onChange={(e) => setWeightInput(e.target.value)}
+              placeholder="e.g. 178.4"
+              disabled={savingWeight}
+              className="w-[120px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none disabled:opacity-40"
+            />
+            <span className="text-[10px] font-mono text-text-tertiary">lb</span>
+            {weightInput && !isNaN(parseFloat(weightInput)) && (
+              <span className="text-[10px] font-mono text-text-tertiary">
+                = {lbToKg(parseFloat(weightInput)).toFixed(2)} kg
+              </span>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 mb-3">
+            <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono shrink-0">
+              Notes
+            </label>
+            <input
+              type="text"
+              value={weightNotes}
+              onChange={(e) => setWeightNotes(e.target.value)}
+              placeholder="optional — e.g. 'morning, post-bathroom', 'after workout'"
+              disabled={savingWeight}
+              className="flex-1 min-w-[200px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none disabled:opacity-40"
+            />
+          </div>
+
+          <button
+            onClick={saveWeight}
+            disabled={savingWeight || !weightInput}
+            className="w-full px-4 py-3 text-[13px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 disabled:opacity-40 disabled:cursor-not-allowed border border-[#1DB954]/40 rounded-[4px] transition-colors"
+          >
+            {savingWeight ? "Saving…" : "Save weight"}
+          </button>
+        </ChartCard>
+
+        {/* Trend chart */}
+        <ChartCard
+          title="Weight Trend"
+          subtitle="One row per ET day · displayed in pounds (stored as kg)"
+        >
+          {weightLoading ? (
+            <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">Loading…</p>
+          ) : weightChartData.length === 0 ? (
+            <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
+              No entries yet. Log your first weight above to start the trend.
+            </p>
+          ) : (
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart data={weightChartData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+                <YAxis tick={axisTick} width={50} domain={["auto", "auto"]} label={axisLabel("lb", "y")} />
+                <Tooltip {...chartTooltip} />
+                <Line
+                  type="monotone"
+                  dataKey="weight_lb"
+                  stroke="#a78bfa"
+                  strokeWidth={2}
+                  dot={{ r: 3, fill: "#a78bfa" }}
+                  name="Weight (lb)"
+                  connectNulls={false}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+        </ChartCard>
+
+        {/* Recent entries (delete-only — edit a row by re-logging the same date) */}
+        {weightRows.length > 0 && (
+          <ChartCard
+            title="Recent entries"
+            subtitle="Newest first · re-log the same date to overwrite · trash to delete"
+          >
+            <div className="space-y-1">
+              {[...weightRows].reverse().slice(0, 10).map((w) => (
+                <div
+                  key={w.log_date}
+                  className="flex items-center justify-between gap-3 py-1.5 border-b border-border-subtle/40 last:border-b-0 text-[12px] font-mono"
+                >
+                  <div className="flex items-baseline gap-2 min-w-0">
+                    <span className="text-text-tertiary tabular-nums shrink-0 w-[80px]">
+                      {formatShortDate(w.log_date)}
+                    </span>
+                    <span className="text-text-primary tabular-nums">
+                      {kgToLb(Number(w.weight_kg))!.toFixed(1)} lb
+                    </span>
+                    <span className="text-text-tertiary tabular-nums">
+                      ({Number(w.weight_kg).toFixed(2)} kg)
+                    </span>
+                    {w.notes && (
+                      <span className="text-text-tertiary truncate">· {w.notes}</span>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => deleteWeight(w.log_date)}
+                    className="text-[10px] text-text-tertiary hover:text-red-400 transition-colors shrink-0"
+                  >
+                    delete
+                  </button>
+                </div>
+              ))}
+            </div>
+          </ChartCard>
+        )}
+      </div>
 
       {/* Edit modal — shared, lives at the bottom so it overlays everything */}
       {editingId !== null && (

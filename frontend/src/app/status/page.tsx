@@ -21,6 +21,7 @@ const SOURCE_BADGE: Record<string, string> = {
   musicbrainz: "MUSICBRAINZ",
   supplements: "DSLD",
   meals: "MEALS",
+  weight: "WEIGHT",
 };
 
 const SOURCE_BADGE_COLOR: Record<string, string> = {
@@ -37,6 +38,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   musicbrainz: "text-[#1DB954]/70",
   supplements: "text-amber-400",
   meals: "text-amber-500",
+  weight: "text-amber-500",
 };
 
 const STATUS_DOT: Record<string, string> = {
@@ -84,6 +86,7 @@ const SOURCE_ORDER = [
   "musicbrainz",
   "supplements",
   "meals",
+  "weight",
 ];
 
 function formatRelativeTime(isoStr: string | null): string {

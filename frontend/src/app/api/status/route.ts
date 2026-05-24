@@ -39,6 +39,7 @@ const CADENCE: Record<string, string> = {
   supplements: "Manual",
   notion_journal: "Hourly :35",
   meals: "Manual",
+  weight: "Manual",
 };
 
 // Integration method per source.
@@ -61,6 +62,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   supplements:    { method: "manual",         label: "Manual entry" },
   notion_journal: { method: "automated",      label: "Notion sync" },
   meals:          { method: "manual",         label: "Manual entry" },
+  weight:         { method: "manual",         label: "Manual entry" },
 };
 
 export interface DriftAlert {
@@ -160,7 +162,7 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, mealsRes, driftRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, mealsRes, weightRes, driftRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -172,6 +174,7 @@ export async function GET() {
       supabase.from("supplement_intake").select("intake_date").order("intake_date", { ascending: false }).limit(1),
       supabase.from("journal_entries").select("entry_date").eq("archived", false).order("entry_date", { ascending: false }).limit(1),
       supabase.from("meal_events").select("event_date").order("event_date", { ascending: false }).limit(1),
+      supabase.from("weight_log").select("log_date").order("log_date", { ascending: false }).limit(1),
       supabase
         .from("sync_log")
         .select("id, created_at, sync_start, error_message, source, data_type")
@@ -201,6 +204,7 @@ export async function GET() {
     const supplementsDate = supplementsRes.data?.[0]?.intake_date ?? null;
     const notionJournalDate = notionJournalRes.data?.[0]?.entry_date ?? null;
     const mealsDate = mealsRes.data?.[0]?.event_date ?? null;
+    const weightDate = weightRes.data?.[0]?.log_date ?? null;
 
     const garminEntry = latestBySrcType["garmin|full_sync"] ?? null;
     const whoopEntry = latestBySrcType["whoop|full_sync"] ?? null;
@@ -223,6 +227,7 @@ export async function GET() {
     const supplementsLag = daysLag(supplementsDate);
     const notionJournalLag = daysLag(notionJournalDate);
     const mealsLag = daysLag(mealsDate);
+    const weightLag = daysLag(weightDate);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -383,6 +388,20 @@ export async function GET() {
         cadence: CADENCE.meals,
         integrationMethod: METHOD.meals.method,
         methodLabel: METHOD.meals.label,
+      },
+      // Weight: user-driven daily body weight log, freshness from latest log_date.
+      weight: {
+        label: "Weight",
+        lastSync: weightDate,
+        status: deriveStatus(null, weightLag),
+        latestDataDate: weightDate,
+        daysLag: weightLag,
+        recordsSynced: 0,
+        durationSeconds: null,
+        errorMessage: null,
+        cadence: CADENCE.weight,
+        integrationMethod: METHOD.weight.method,
+        methodLabel: METHOD.weight.label,
       },
     };
 
