@@ -330,19 +330,17 @@ export async function getMfpNutrition(days: number = 30) {
 }
 
 // ---------------------------------------------------------------------------
-// Recovery vs Pace Correlation
+// Recovery context for running activities (merged into /activities row cards)
 // ---------------------------------------------------------------------------
 
-export async function getRecoveryVsPace(days: number = 365) {
+export async function getRunningRecoveryContext(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
   const { data, error } = await supabase
     .from("recovery_vs_pace")
-    .select("*")
-    .gte("activity_date", since.toISOString().split("T")[0])
-    .not("whoop_recovery", "is", null)
-    .order("activity_date", { ascending: true });
+    .select("activity_id, whoop_recovery, whoop_hrv, whoop_sleep_performance, pace_delta_pct")
+    .gte("activity_date", since.toISOString().split("T")[0]);
 
   if (error) throw error;
   return data ?? [];

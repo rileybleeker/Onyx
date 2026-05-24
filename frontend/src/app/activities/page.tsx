@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { AreaChart, Area, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
-import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, getRunningRecoveryContext, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDuration, formatDistance, formatPace, formatDate } from "@/lib/format";
 import RangeFilter from "@/components/RangeFilter";
 import StatCard from "@/components/StatCard";
@@ -99,14 +99,15 @@ export default function ActivitiesPage() {
   const [summaries, setSummaries] = useState<any[]>([]);
   const [whoopCycles, setWhoopCycles] = useState<any[]>([]);
   const [hr, setHr] = useState<any[]>([]);
+  const [recoveryMap, setRecoveryMap] = useState<Record<string, { recovery: number | null; hrv: number | null; sleepPerf: number | null; paceDelta: number | null }>>({});
   const [loading, setLoading] = useState(true);
   const [range, setRange] = useState<Range>("30d");
 
   useEffect(() => {
     setLoading(true);
     const days = rangeDays(range);
-    Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts(), getDailySummaries(days), getWhoopCycles(days), getHeartRateData(days)])
-      .then(([garmin, whoop, wkts, sums, cycles, h]) => {
+    Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts(), getDailySummaries(days), getWhoopCycles(days), getHeartRateData(days), getRunningRecoveryContext(days)])
+      .then(([garmin, whoop, wkts, sums, cycles, h, recCtx]) => {
         const merged = mergeAndDedup(
           garmin.map(normalizeGarmin),
           whoop.map(normalizeWhoop),
@@ -118,6 +119,16 @@ export default function ActivitiesPage() {
         setSummaries(sums);
         setWhoopCycles(cycles);
         setHr(h);
+        const recMap: Record<string, { recovery: number | null; hrv: number | null; sleepPerf: number | null; paceDelta: number | null }> = {};
+        for (const r of recCtx) {
+          recMap[`garmin:${r.activity_id}`] = {
+            recovery:  r.whoop_recovery != null ? +r.whoop_recovery : null,
+            hrv:       r.whoop_hrv != null ? +Number(r.whoop_hrv).toFixed(1) : null,
+            sleepPerf: r.whoop_sleep_performance != null ? +r.whoop_sleep_performance : null,
+            paceDelta: r.pace_delta_pct != null ? +r.pace_delta_pct : null,
+          };
+        }
+        setRecoveryMap(recMap);
       })
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -301,6 +312,12 @@ export default function ActivitiesPage() {
             const sourceBadge = act.source === "whoop"
               ? "bg-emerald-500/10 text-emerald-300"
               : "bg-sky-500/10 text-sky-300";
+            const recCtx = recoveryMap[act.id];
+            const recColor = recCtx?.recovery == null
+              ? "text-text-secondary"
+              : recCtx.recovery >= 67 ? "text-green-400"
+              : recCtx.recovery >= 34 ? "text-amber-400"
+              : "text-red-400";
 
             return (
             <div key={act.id} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 hover:border-border-hover transition-colors flex flex-col sm:flex-row sm:items-center gap-3">
@@ -351,6 +368,26 @@ export default function ActivitiesPage() {
                   <div>
                     <span className="text-text-tertiary text-[12px]">Cal </span>
                     <span className="text-text-secondary font-mono text-[13px]">{act.calories}</span>
+                  </div>
+                )}
+                {recCtx?.recovery != null && (
+                  <div>
+                    <span className="text-text-tertiary text-[12px]">Recovery </span>
+                    <span className={`${recColor} font-mono text-[13px]`}>{recCtx.recovery.toFixed(0)}%</span>
+                  </div>
+                )}
+                {recCtx?.hrv != null && (
+                  <div>
+                    <span className="text-text-tertiary text-[12px]">HRV </span>
+                    <span className="text-text-secondary font-mono text-[13px]">{recCtx.hrv.toFixed(0)} ms</span>
+                  </div>
+                )}
+                {recCtx?.paceDelta != null && (
+                  <div>
+                    <span className="text-text-tertiary text-[12px]">Δ </span>
+                    <span className={`${recCtx.paceDelta <= 0 ? "text-green-400" : "text-red-400"} font-mono text-[13px]`}>
+                      {recCtx.paceDelta > 0 ? "+" : ""}{recCtx.paceDelta.toFixed(1)}%
+                    </span>
                   </div>
                 )}
               </div>
