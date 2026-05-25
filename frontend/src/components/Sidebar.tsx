@@ -9,6 +9,7 @@ const nav = [
   { href: "/activities", label: "Activities", shortcut: "A", icon: "M13 10V3L4 14h7v7l9-11h-7z" },
   { href: "/nutrition", label: "Nutrition / Meal Timing", shortcut: "N", icon: "M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" },
   { href: "/analytics/hrv", label: "HRV Analysis", shortcut: "V", icon: "M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" },
+  { href: "/analytics/travel", label: "Travel Analysis", shortcut: "R", icon: "M3 21l3-3m0 0l3-3m-3 3h12a6 6 0 000-12h-3m-9 9v-6a6 6 0 016-6h3" },
   { href: "/bland-altman", label: "Bland-Altman", shortcut: "B", icon: "M3 3v18h18M9 15l3-6 3 4 3-7" },
   { href: "/habits", label: "Habits", shortcut: "T", icon: "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" },
   { href: "/journal", label: "Journal", shortcut: "J", icon: "M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" },
