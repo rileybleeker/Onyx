@@ -278,6 +278,11 @@ FEATURE_LABELS: dict[str, str] = {
     "days_since_hard_workout": "Days Since Hard Workout",
     "days_since_rest_day": "Days Since Rest Day",
     "consecutive_run_days": "Consecutive Run Days",
+    "is_transition_day": "Travel Transition Day",
+    "days_since_transition": "Days Since Last Transition",
+    "offset_delta_hours": "TZ Offset Change (h)",
+    "is_outbound": "Outbound Travel",
+    "is_return": "Return Home Travel",
     "last_night_avg_ms": "Garmin Last-Night HRV",
     "hrv_vs_baseline": "HRV vs Personal Baseline",
     "eight_sleep_score": "Eight Sleep Score",
@@ -535,7 +540,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     log.info("  Loading whoop_cycles…")
     data["whoop_cycles"] = fetch_all(
         "whoop_cycles",
-        select="cycle_id,start_time,strain,kilojoule,average_heart_rate,max_heart_rate",
+        select="cycle_id,start_time,strain,kilojoule,average_heart_rate,max_heart_rate,timezone_offset",
     )
     if not data["whoop_cycles"].empty:
         # Match view join: ((start_time + 12h) AT TIME ZONE 'America/New_York')::date
@@ -1010,10 +1015,14 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
 
     # --- Join whoop_cycles extra columns ---
     if not data["whoop_cycles"].empty:
-        wc = data["whoop_cycles"][["calendar_date", "average_heart_rate", "max_heart_rate"]].copy()
-        wc.columns = ["calendar_date", "whoop_cycle_avg_hr", "whoop_cycle_max_hr"]
+        wc = data["whoop_cycles"][["calendar_date", "average_heart_rate", "max_heart_rate", "timezone_offset"]].copy()
+        wc.columns = ["calendar_date", "whoop_cycle_avg_hr", "whoop_cycle_max_hr", "timezone_offset"]
         for c in ["whoop_cycle_avg_hr", "whoop_cycle_max_hr"]:
             wc[c] = pd.to_numeric(wc[c], errors="coerce")
+        # On transition days WHOOP can have multiple cycles per behavioral
+        # date; pick the LONGEST-offset row (matches the behavioral view's
+        # LATERAL pick). Simpler proxy: just take last value per date.
+        wc = wc.groupby("calendar_date", as_index=False).last()
         df = df.merge(wc, on="calendar_date", how="left", suffixes=("", "_wc"))
 
     # --- Join whoop_sleep extra columns ---
@@ -1281,6 +1290,61 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         df["days_since_rest_day"] = _days_since(df["is_rest_day"].fillna(1))
     if "is_run_day" in df.columns:
         df["consecutive_run_days"] = _consecutive_days(df["is_run_day"].fillna(0))
+
+    # ── ADR-0001 Travel features (Phase A) ──────────────────────────────────
+    # Surface transition-day patterns to the model so it can learn travel-day
+    # behavior rather than treating those rows as noise. All four features
+    # derive from whoop_cycles.timezone_offset + transition flag already on
+    # the behavioral view. Useful for both XGBoost (as direct features) and
+    # the causal layer (Phase B treats is_transition_day as a treatment).
+    if "onyx_is_transition_day" in df.columns:
+        df["is_transition_day"] = df["onyx_is_transition_day"].fillna(False).astype(int)
+        # Days since most recent transition. 0 on transition day itself,
+        # 1 the day after, 2 the day after that, etc. Reset on every
+        # transition. Captures the recovery curve from jet lag (most
+        # severe day 0-1, fading over ~3-5 days).
+        df["days_since_transition"] = _days_since(df["is_transition_day"].astype(float))
+        # WHOOP timezone_offset is "+02:00" / "-04:00"; parse to signed
+        # hours. Then offset_delta = this_day's_offset - prior_day's_offset
+        # (zero on non-transition days, nonzero on transitions). Magnitude
+        # = how big the jump was (Berlin = +6h east, Texas = -1h west).
+        if "timezone_offset" in df.columns:
+            def _parse_off_hours(s):
+                if not s or pd.isna(s): return np.nan
+                sign = 1 if str(s)[0] == "+" else -1
+                try:
+                    hh, mm = str(s)[1:].split(":")
+                    return sign * (int(hh) + int(mm) / 60.0)
+                except Exception:
+                    return np.nan
+            df["_offset_hours"] = df["timezone_offset"].apply(_parse_off_hours)
+            df["offset_delta_hours"] = df["_offset_hours"] - df["_offset_hours"].shift(1)
+            df["offset_delta_hours"] = df["offset_delta_hours"].fillna(0.0)
+            # is_outbound: traveling AWAY from NY (offset != NY's offset on
+            # transition day, and the prior day WAS NY's offset).
+            # is_return: traveling BACK to NY (this day IS NY's offset, prior
+            # day wasn't). NY offset varies with DST so we determine via
+            # absolute magnitude: outbound usually means |delta| > 0 going
+            # to non-NY; return means delta back toward 0.
+            #
+            # Simpler heuristic: outbound = transition AND moving offset
+            # AWAY from 0 (or NY-typical -4/-5). Return = transition AND
+            # moving offset TOWARD it.
+            ny_typical_offsets = {-4.0, -5.0}
+            def _classify(row):
+                if not row["is_transition_day"]:
+                    return 0, 0
+                this_off = row["_offset_hours"]
+                if pd.isna(this_off):
+                    return 0, 0
+                # outbound if THIS day's offset is NOT NY-typical
+                outbound = 1 if this_off not in ny_typical_offsets else 0
+                return_ = 1 if this_off in ny_typical_offsets else 0
+                return outbound, return_
+            classifications = df.apply(_classify, axis=1, result_type="expand")
+            df["is_outbound"] = classifications[0]
+            df["is_return"] = classifications[1]
+            df.drop(columns=["_offset_hours"], inplace=True)
 
     # Cumulative sleep debt proxy (7-day rolling avg vs 8h baseline)
     if "whoop_sleep_duration_milli" in df.columns:

@@ -299,6 +299,9 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     ("meal_last_meal_to_bedtime_min", "nutrition", "Last meal → bedtime minutes above median", "min"),
     ("meal_eating_window_hours",      "nutrition", "Eating window above median",               "h"),
     ("meal_last_hour",                "nutrition", "Last meal clock hour above median",        "ET hr"),
+    # ADR-0001 Phase B travel treatments — magnitude/recovery
+    ("offset_delta_hours",            "travel",    "TZ offset shift magnitude above median",   "h"),
+    ("days_since_transition",         "travel",    "Days since last transition above median",  "days"),
 )
 
 # Explicit binary treatments — derived 0/1 flags that don't match the
@@ -310,6 +313,10 @@ EXPLICIT_BINARY_TREATMENTS: tuple[tuple[str, str, str], ...] = (
     ("is_run_day",          "behavior", "Run day (any run logged)"),
     ("is_rest_day",         "behavior", "Rest day (no workouts)"),
     ("negative_split",      "behavior", "Negative split (second half faster)"),
+    # ADR-0001 Phase B travel treatments
+    ("is_transition_day",   "travel",   "Travel transition day"),
+    ("is_outbound",         "travel",   "Outbound travel (NY → away)"),
+    ("is_return",           "travel",   "Return travel (away → NY)"),
 )
 
 
