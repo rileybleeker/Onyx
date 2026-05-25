@@ -205,11 +205,14 @@ export async function GET() {
         .order("created_at", { ascending: false })
         .limit(10),
       // ADR-0001 drastic-TZ-abroad gap #3: WHOOP cycles whose offset disagrees
-      // with the user_tz_log lookup. Surface as a banner so Riley sees
-      // forgotten-trip-log within ~1h of next WHOOP sync.
+      // with the user_tz_log lookup. Filter to gap_type='travel' so DST-
+      // artifact rows (single NY DST-transition nights) don't surface as
+      // false-positive "Travel detected" banner entries. DST rows remain
+      // in the view for analytical queries that want them.
       supabase
         .from("tz_log_gaps")
         .select("cycle_id, gap_et_date, source_offset, log_resolved_tz, delta_minutes")
+        .eq("gap_type", "travel")
         .order("gap_et_date", { ascending: false })
         .limit(50),
     ]);
