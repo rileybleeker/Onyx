@@ -540,13 +540,17 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     log.info("  Loading whoop_cycles…")
     data["whoop_cycles"] = fetch_all(
         "whoop_cycles",
-        select="cycle_id,start_time,strain,kilojoule,average_heart_rate,max_heart_rate,timezone_offset",
+        select="cycle_id,start_time,strain,kilojoule,average_heart_rate,max_heart_rate,timezone_offset,onyx_behavioral_date",
     )
     if not data["whoop_cycles"].empty:
-        # Match view join: ((start_time + 12h) AT TIME ZONE 'America/New_York')::date
-        data["whoop_cycles"]["calendar_date"] = to_cycle_et_date_str(
-            data["whoop_cycles"]["start_time"]
-        )
+        # Per ADR-0001 (post-Phase 1): the matrix spine is now
+        # onyx_behavioral_date (from daily_health_matrix_behavioral). To
+        # join correctly on transition days, use whoop_cycles'
+        # onyx_behavioral_date directly instead of recomputing via the
+        # legacy +12h ET rule (which gives wake-day and disagrees with
+        # behavioral_date on transition cycles by 1 day — silently dropped
+        # timezone_offset from those rows in earlier Phase A iteration).
+        data["whoop_cycles"]["calendar_date"] = data["whoop_cycles"]["onyx_behavioral_date"].astype(str)
 
     log.info("  Loading whoop_sleep…")
     # start_time / end_time added for the workout-to-sleep gap feature.
