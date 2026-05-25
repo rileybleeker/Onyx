@@ -118,7 +118,7 @@ cd frontend && npm run build            # Production build
 cd frontend && npm run lint             # ESLint
 
 # Install
-pip install garminconnect supabase python-dotenv httpx requests
+pip install garminconnect supabase python-dotenv httpx requests timezonefinder
 pip install -r requirements-analysis.txt  # HRV analysis deps
 cd frontend && npm install
 
@@ -229,6 +229,8 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
   - The `hrv_analysis.py` pipeline previously mirrored these rules via `to_date_str()` / `to_et_date_str()` / `to_cycle_et_date_str()` helpers; post-ADR-0001 it reads the behavioral view, so `calendar_date` in the loaded matrix IS `onyx_behavioral_date`.
 
   **Snapshot for A/B**: `pds_legacy.daily_health_matrix_v0` is a frozen materialization of the pre-ADR view (794 rows), retained for the Phase 2 sensitivity test and rollback if needed.
+
+  **GPS-based TZ auto-population** (ADR-0001 Phase 4 step 4): `gps_tz_backfill.py` scans `pds.garmin_activities` for `(start_latitude, start_longitude)` and inserts new `pds.user_tz_log` rows whenever the GPS-inferred IANA TZ disagrees with what `pds.tz_for_instant` currently returns. Filters out same-UTC-offset cases (e.g. Toronto/Louisville share EDT with NY — geographically distinct but behaviorally identical). Runs automatically at the end of `garmin_etl.py` with `--since <earliest_date_this_run>` to keep the per-run cost ~5s. One-shot full-history sweep available via `python gps_tz_backfill.py --apply`. Closes the "WHOOP-offline travel" detection gap from the drastic-TZ-abroad section of the ADR.
 - **Supplement intake — behavioral-day convention (NOT clock date).** A `pds.supplement_intake` row's `intake_date` should reflect the **day the intake belongs to behaviorally**, not the wall-clock date of the moment it was taken. A pre-bed supplement consumed at 12:05 AM ET — *before* the user has slept — belongs to the day that just ended, not the new clock date. Rationale (three converging reasons):
   1. **WHOOP cycle alignment.** WHOOP defines a "day" by bedtime-to-bedtime spans (see the `+12h` cycle rule above). The awake-tail period after midnight but before sleep is part of the *previous* cycle, not the new one. Treating supplements the same way keeps the journal × cycle × intake triple consistent.
   2. **HRV pipeline correctness.** `hrv_analysis.py:build_feature_matrix` uses `shift(-1)` to predict HRV(N+1) from behaviors(N). A pre-bed supplement affects the *immediately following* sleep, whose HRV is recorded on cycle_date N+1. To make the shift line up, the intake must be on row N. A naive clock-date attribution at 12:05 AM would silently mis-train the model.

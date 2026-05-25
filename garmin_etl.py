@@ -892,6 +892,24 @@ def main():
     log.info(f"Done! {total_records} total records | {errors} errors | {duration:.1f}s")
     log.info("=" * 60)
 
+    # ADR-0001 Phase 4 step 4: auto-extend user_tz_log from new GPS activities.
+    # Run only the rolling window we just ingested to keep it cheap (full
+    # history sweep takes ~1.5 min via per-row RPC; the rolling --since cut
+    # is ~5s). Silently skip if timezonefinder isn't installed (treat as
+    # optional dependency; ETL still succeeds).
+    try:
+        import subprocess
+        # Run as a separate process so an import-side issue in
+        # gps_tz_backfill doesn't crash the ETL.
+        since_iso = dates[0]  # earliest date this run touched
+        log.info(f"Running gps_tz_backfill --since {since_iso} --apply…")
+        subprocess.run(
+            [sys.executable, "gps_tz_backfill.py", "--since", since_iso, "--apply"],
+            check=False, timeout=120,
+        )
+    except Exception as e:
+        log.warning(f"  gps_tz_backfill skipped: {e}")
+
 
 if __name__ == "__main__":
     main()
