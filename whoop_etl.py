@@ -564,6 +564,24 @@ def main():
     log.info(f"Done! {total_records} total records | {errors} errors | {duration:.1f}s")
     log.info("=" * 60)
 
+    # ADR-0001 Phase 4 step 4 (extended): auto-extend user_tz_log from any
+    # WHOOP cycle whose timezone_offset disagrees with the log. Catches the
+    # case where Riley travels but doesn't do a GPS-tracked activity
+    # (rest trip, watch off, etc.) — WHOOP is always-worn so this is the
+    # most reliable trip-detector we have. IANA is history-inferred since
+    # WHOOP gives offset not IANA; manual entries always win and are never
+    # overridden. Silently skips if anything goes wrong (ETL still succeeds).
+    try:
+        import subprocess
+        since_iso = start_dt.date().isoformat()
+        log.info(f"Running whoop_tz_backfill --since {since_iso} --apply…")
+        subprocess.run(
+            [sys.executable, "whoop_tz_backfill.py", "--since", since_iso, "--apply"],
+            check=False, timeout=120,
+        )
+    except Exception as e:
+        log.warning(f"  whoop_tz_backfill skipped: {e}")
+
 
 if __name__ == "__main__":
     main()
