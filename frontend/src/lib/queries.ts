@@ -405,8 +405,11 @@ export async function getHealthMatrix(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
+  // Per ADR-0001 D5: HRV/behavior analytics join on onyx_behavioral_date.
+  // pds.daily_health_matrix_behavioral exposes it as `calendar_date`
+  // (same column name retained for downstream compatibility).
   const { data, error } = await supabase
-    .from("daily_health_matrix")
+    .from("daily_health_matrix_behavioral")
     .select("*")
     .gte("calendar_date", since.toISOString().split("T")[0])
     .order("calendar_date", { ascending: true });

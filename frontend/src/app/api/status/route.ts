@@ -71,6 +71,19 @@ export interface DriftAlert {
   message: string;
 }
 
+// Per ADR-0001 drastic-TZ-abroad gap #3: rows from pds.tz_log_gaps —
+// WHOOP cycles whose source-reported timezone_offset disagrees with what
+// pds.tz_for_instant returns from user_tz_log. Each row = a day where Riley
+// likely traveled but forgot to add a user_tz_log entry. /status renders a
+// yellow banner so the gap surfaces within ~1h of the next ETL.
+export interface TzGapRow {
+  cycleId: string;
+  gapEtDate: string;            // YYYY-MM-DD
+  sourceOffset: string;          // e.g. '+02:00'
+  logResolvedTz: string;         // e.g. 'America/New_York'
+  deltaMinutes: number;          // source - log_resolved, signed
+}
+
 export interface StatusResponse {
   sources: Record<string, SourceStatus>;
   recentHistory: Array<{
@@ -83,6 +96,7 @@ export interface StatusResponse {
     error_message: string | null;
   }>;
   driftAlerts: DriftAlert[];
+  tzGaps: TzGapRow[];
   fetchedAt: string;
 }
 
@@ -162,7 +176,7 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, mealsRes, weightRes, driftRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, mealsRes, weightRes, driftRes, tzGapsRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -182,6 +196,14 @@ export async function GET() {
         .gte("created_at", sevenDaysAgo)
         .order("created_at", { ascending: false })
         .limit(10),
+      // ADR-0001 drastic-TZ-abroad gap #3: WHOOP cycles whose offset disagrees
+      // with the user_tz_log lookup. Surface as a banner so Riley sees
+      // forgotten-trip-log within ~1h of next WHOOP sync.
+      supabase
+        .from("tz_log_gaps")
+        .select("cycle_id, gap_et_date, source_offset, log_resolved_tz, delta_minutes")
+        .order("gap_et_date", { ascending: false })
+        .limit(50),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -421,7 +443,15 @@ export async function GET() {
       message: (r.error_message as string) ?? "HRV model drift detected",
     }));
 
-    return NextResponse.json({ sources, recentHistory, driftAlerts, fetchedAt: new Date().toISOString() } satisfies StatusResponse);
+    const tzGaps: TzGapRow[] = (tzGapsRes.data ?? []).map((r) => ({
+      cycleId: String(r.cycle_id),
+      gapEtDate: r.gap_et_date as string,
+      sourceOffset: r.source_offset as string,
+      logResolvedTz: r.log_resolved_tz as string,
+      deltaMinutes: (r.delta_minutes as number) ?? 0,
+    }));
+
+    return NextResponse.json({ sources, recentHistory, driftAlerts, tzGaps, fetchedAt: new Date().toISOString() } satisfies StatusResponse);
   } catch (err) {
     console.error("Status API error:", err);
     return NextResponse.json({ error: "Failed to fetch status" }, { status: 500 });

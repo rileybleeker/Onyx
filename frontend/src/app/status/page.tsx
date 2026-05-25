@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
-import type { DriftAlert, SourceStatus, StatusResponse } from "@/app/api/status/route";
+import type { DriftAlert, SourceStatus, StatusResponse, TzGapRow } from "@/app/api/status/route";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -270,6 +270,33 @@ export default function StatusPage() {
   const sources = data?.sources ?? {};
   const history = data?.recentHistory ?? [];
   const driftAlerts: DriftAlert[] = data?.driftAlerts ?? [];
+  const tzGaps: TzGapRow[] = data?.tzGaps ?? [];
+
+  // Group tz_log_gaps into contiguous date ranges per (offset, tz) for a
+  // less spammy banner: "Apr 30 → May 3 (+02:00)" reads cleaner than 4
+  // separate dates per trip.
+  const tzGapRanges: Array<{ from: string; to: string; offset: string; tz: string; days: number }> = (() => {
+    if (tzGaps.length === 0) return [];
+    const sorted = [...tzGaps].sort((a, b) => a.gapEtDate.localeCompare(b.gapEtDate));
+    const out: typeof tzGapRanges = [];
+    let cur: (typeof tzGapRanges)[number] | null = null;
+    for (const g of sorted) {
+      const nextDay = (d: string) => {
+        const dt = new Date(d + "T00:00:00Z");
+        dt.setUTCDate(dt.getUTCDate() + 1);
+        return dt.toISOString().slice(0, 10);
+      };
+      if (cur && cur.offset === g.sourceOffset && cur.tz === g.logResolvedTz && nextDay(cur.to) === g.gapEtDate) {
+        cur.to = g.gapEtDate;
+        cur.days += 1;
+      } else {
+        if (cur) out.push(cur);
+        cur = { from: g.gapEtDate, to: g.gapEtDate, offset: g.sourceOffset, tz: g.logResolvedTz, days: 1 };
+      }
+    }
+    if (cur) out.push(cur);
+    return out.sort((a, b) => b.from.localeCompare(a.from));
+  })();
 
   // KPI calculations
   const sourceList = SOURCE_ORDER.map((k) => ({ key: k, info: sources[k] })).filter((s) => !!s.info);
@@ -307,6 +334,39 @@ export default function StatusPage() {
           Refresh
         </button>
       </div>
+
+      {/* tz_log_gaps banner — per ADR-0001 drastic-TZ-abroad gap #3. WHOOP
+          cycles whose offset disagrees with pds.tz_for_instant — Riley
+          likely traveled but forgot to add a user_tz_log entry. */}
+      {tzGapRanges.length > 0 && (
+        <div className="mb-6 border border-yellow-500/30 bg-yellow-500/10 rounded-[6px] p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="w-2 h-2 rounded-full bg-yellow-400" />
+            <p className="text-[13px] font-medium text-yellow-300">
+              Travel detected without log entry
+              {tzGapRanges.length > 1 ? ` — ${tzGapRanges.length} trips` : ""}
+            </p>
+          </div>
+          <ul className="space-y-1.5 mb-2">
+            {tzGapRanges.slice(0, 8).map((r, i) => (
+              <li key={i} className="text-[12px] text-yellow-200/90 font-mono">
+                <span className="text-yellow-300/60 mr-2">
+                  {r.from}{r.from !== r.to ? ` → ${r.to}` : ""}
+                </span>
+                offset {r.offset} (log says {r.tz})
+                <span className="text-yellow-300/50 ml-2">
+                  {r.days} {r.days === 1 ? "day" : "days"}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <p className="text-[11px] text-yellow-300/60 leading-relaxed">
+            Add rows to <code className="text-yellow-200/80">pds.user_tz_log</code> for these trips so behavioral-date attribution uses the right TZ.
+            Example:{" "}
+            <code className="text-yellow-200/80">{`INSERT INTO pds.user_tz_log(effective_from, tz) VALUES ('${tzGapRanges[0].from}T00:00:00Z', 'Europe/Berlin');`}</code>
+          </p>
+        </div>
+      )}
 
       {/* Drift alerts banner */}
       {driftAlerts.length > 0 && (

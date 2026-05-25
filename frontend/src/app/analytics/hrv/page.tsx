@@ -196,7 +196,7 @@ async function getHistoricalHrv(days = 180) {
   const since = new Date();
   since.setDate(since.getDate() - days);
   const { data } = await supabase
-    .from("daily_health_matrix")
+    .from("daily_health_matrix_behavioral")
     .select("calendar_date,whoop_hrv_rmssd")
     .gte("calendar_date", since.toISOString().split("T")[0])
     .not("whoop_hrv_rmssd", "is", null)
@@ -209,7 +209,7 @@ async function getHistoricalHrv(days = 180) {
 // chart, which buckets nights by temperature and shows mean HRV per bucket.
 async function getEnvDoseResponseData() {
   const { data } = await supabase
-    .from("daily_health_matrix")
+    .from("daily_health_matrix_behavioral")
     .select("calendar_date,eight_sleep_room_temp,eight_sleep_bed_temp,whoop_hrv_rmssd")
     .not("eight_sleep_room_temp", "is", null)
     .not("whoop_hrv_rmssd", "is", null)
