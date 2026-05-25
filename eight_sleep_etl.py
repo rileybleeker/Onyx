@@ -19,6 +19,7 @@ import time
 import argparse
 import logging
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
@@ -362,7 +363,15 @@ def parse_interval(interval: dict, bed_side: str) -> dict | None:
         except (ValueError, TypeError):
             return None
 
-    calendar_date = dt.date().isoformat()
+    # interval.ts is UTC ("...Z"); converting to the user's local TZ before
+    # taking .date() ensures the interval lands on the same calendar day the
+    # rest of the trend payload uses (`parse_trend_day` calls the API with
+    # ?tz=EIGHTSLEEP_TIMEZONE). Without this, a 2 AM ET in-bed event has its
+    # ts at ~06:00 UTC and would get attributed to the UTC date, differing
+    # from the trend-day attribution. Once Phase 1 of ADR-0001 ships, this
+    # becomes onyx_behavioral_date from the WHOOP cycle anchor.
+    dt_utc = dt.replace(tzinfo=timezone.utc)
+    calendar_date = dt_utc.astimezone(ZoneInfo(EIGHTSLEEP_TIMEZONE)).date().isoformat()
     ts = interval.get("timeseries", {}) or {}
 
     stages = interval.get("stages", [])

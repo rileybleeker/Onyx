@@ -17,7 +17,14 @@ const supabase = createClient(
  */
 export async function POST(req: NextRequest) {
   const { habit, date, category, notionPageId, undo } = await req.json();
-  const completionDate = date || new Date().toISOString().split("T")[0];
+  // Default to ET today, NOT UTC today. A habit tap at 21:00 ET is 01:00 UTC
+  // the next day — the old `new Date().toISOString().split("T")[0]` would
+  // silently file tomorrow's row. Per ADR-0001 D6, calendar attribution uses
+  // America/New_York; en-CA gives the ISO YYYY-MM-DD format we need for the
+  // DATE column. Phase 1 of ADR-0001 will additionally populate
+  // onyx_behavioral_date via the WHOOP cycle anchor (handling the awake-tail
+  // 00:00–04:00 ET case).
+  const completionDate = date || new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
 
   if (!habit) {
     return NextResponse.json({ error: "habit is required" }, { status: 400 });

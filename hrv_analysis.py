@@ -123,7 +123,7 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 supa = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-MODEL_VERSION = f"{date.today().isoformat()}_v1"
+MODEL_VERSION = f"{date.today().isoformat()}_behavioral_v1"
 TARGET = "whoop_hrv_rmssd"
 
 # Stage-1 BH-FDR threshold for promoting features to Stage 2 partial correlations.
@@ -424,8 +424,14 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     """Load every relevant table from Supabase. Returns a dict of DataFrames."""
     data: dict[str, pd.DataFrame] = {}
 
-    log.info("  Loading daily_health_matrix (base view)…")
-    data["matrix"] = fetch_all("daily_health_matrix")
+    log.info("  Loading daily_health_matrix_behavioral (base view, ADR-0001)…")
+    # Per ADR-0001: switched from pds.daily_health_matrix to
+    # pds.daily_health_matrix_behavioral. The new view's `calendar_date`
+    # column IS onyx_behavioral_date (same name retained for downstream
+    # compatibility). Every per-source join in the view is keyed on
+    # onyx_behavioral_date, so awake-tail behaviors align with the WHOOP
+    # cycle that closes the day rather than splitting across two rows.
+    data["matrix"] = fetch_all("daily_health_matrix_behavioral")
     if "calendar_date" in data["matrix"].columns:
         data["matrix"]["calendar_date"] = data["matrix"]["calendar_date"].astype(str)
 
@@ -821,7 +827,16 @@ def pivot_habits(journal: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
     habits = journal[journal["source"] == "habit"].copy()
     if habits.empty:
         return pd.DataFrame(), {}
-    habits["cycle_date"] = habits["cycle_date"].astype(str)
+    # Per ADR-0001: key on behaviors_date (which for habits equals cycle_date
+    # today via the pds.journal view's `habit_journal.cycle_date AS
+    # behaviors_date` alias). Identical semantics today; gives a future hook
+    # if habit_journal ever gains a smarter behavioral derivation (e.g.
+    # WHOOP-cycle anchor for taps recorded close to a bedtime).
+    if "behaviors_date" in habits.columns:
+        date_col = habits["behaviors_date"].fillna(habits["cycle_date"])
+    else:
+        date_col = habits["cycle_date"]
+    habits["cycle_date"] = pd.to_datetime(date_col, errors="coerce").dt.date.astype(str)
     habits["is_yes"] = habits["answer"].str.lower().isin(["yes", "true", "1"]).astype(float)
     pivot = (
         habits.pivot_table(index="cycle_date", columns="question", values="is_yes", aggfunc="max")
