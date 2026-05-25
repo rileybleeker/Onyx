@@ -180,9 +180,9 @@ Each phase is sized to ship independently. Reversibility marked per step.
 
 ### Phase 4 — Eight Sleep + ongoing improvements — **EASY reversibility**
 
-1. **Eight Sleep empirical test** (one of the 5 deferred from the sourcing audit) — capture raw response from `/v1/users/{id}/intervals` or `/sleep-sessions`. Confirm whether IANA `timezone` field is present per pyEight's claim.
-2. If present: add `timezone` column to `eight_sleep_trends`, ETL captures it, trigger promotes Eight Sleep to D3 tier-1.
-3. **`user_tz_log` retroactive entries** — Riley reconstructs travel periods from calendar / photo geotags / expense reports. Re-run Phase 1 step 4 backfill against the new log.
+1. ~~**Eight Sleep empirical test**~~ — **RESOLVED 2026-05-25**. Captured `pds.eight_sleep_trends.raw_json` from production confirms the `/trends` payload carries no IANA `timezone` field (only UTC instants). pyEight claim does not hold for this endpoint. Eight Sleep stays at D3 tier-2/5; promotion path closed unless we add a `/sleep-sessions` endpoint call (separate scope).
+2. ~~If present: add `timezone` column to `eight_sleep_trends`, ETL captures it, trigger promotes Eight Sleep to D3 tier-1.~~ — Removed; gating step #1 returned negative.
+3. **`user_tz_log` retroactive entries** — Riley reconstructs travel periods from calendar / photo geotags / expense reports. Use `pds.tz_log_gaps` (Phase 1 step 9) as the candidate list — 18 distinct trip ranges across history covering Europe (+02:00), PST (-08:00), CST/CDT (-06:00/-05:00). Bulk-INSERT one or two rows per trip, then `UPDATE pds.whoop_cycles SET start_time = start_time` to re-trigger backfill against the new log. `/status` banner shrinks as gaps close.
 4. **GPS-based TZ inference** (optional, low priority) — for Garmin activities with `start_latitude / start_longitude`, use `tz-lookup` or equivalent to backstop `user_tz_log`.
 5. **Old `calendar_date` column eventual retirement** — only after every consumer in D5 is verified on the new keys. Probably 1–2 quarters out; not a Phase 4 commitment, just a forward note.
 
@@ -191,7 +191,7 @@ Each phase is sized to ship independently. Reversibility marked per step.
 ## Open questions deferred to follow-up
 
 1. **Sensitivity test magnitude** — deferred per Riley's "correct regardless of impact" framing, but Phase 2 step 4 surfaces it. If the gain is >5% RMSE or moves the top-10 SHAP ranking, that confirms the schema choice empirically; if it's <2%, the schema was still right but Riley should know the model wasn't structurally biased by the old attribution.
-2. **Eight Sleep `timezone` field empirical verification** — gating Phase 4 step 1. Estimated 30 min.
+2. ~~**Eight Sleep `timezone` field empirical verification** — gating Phase 4 step 1.~~ **RESOLVED 2026-05-25** by inspecting captured `raw_json` from `pds.eight_sleep_trends` (production data). The `/trends` payload has **no `timezone`, no `tz`, no IANA field anywhere** — only UTC instants (`presenceStart`, `sleepStart` ending in `Z`). The pyEight community claim does not hold for this endpoint. Eight Sleep stays at D3 tier-2 (cycle-anchor) / tier-5 (ET fallback) indefinitely. Phase 4 step 2 (promote to tier-1) is removed from the rollout plan. The hard-coded `?tz=America/New_York` request param remains the only TZ signal Eight Sleep accepts.
 3. **Whether to ever retire `calendar_date`** — see Phase 4 step 5.
 4. **`meal_last_hour` view definition** — currently hard-codes `'America/New_York'` ([meal_schema.sql:98-101](../../meal_schema.sql#L98-L101)). Replace with `onyx_local_date`-aware projection in Phase 3, but requires the meal-events `onyx_local_date` to be populated first (which requires Phase 1 to have shipped). Sequencing is captured but the exact view rewrite is not.
 5. **`spotify_plays.played_date_et` migration** — the STORED generated column locks ET into the schema. The existing roadmap edge case (a) flagged this; the chosen approach is layer-a-view-on-top rather than drop-and-recompute. Revisit if the STORED column becomes a real constraint.

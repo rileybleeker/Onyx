@@ -100,13 +100,21 @@ export interface StatusResponse {
   fetchedAt: string;
 }
 
-function daysLag(dateStr: string | null): number {
+// Per ADR-0001 Phase 3 step 5: freshness compares to the SPINE's most-recent
+// date (= max calendar_date across all sources) instead of browser-local today.
+// When Riley is in Berlin, the spine's freshest day is today-in-Berlin; an
+// ET-anchored "today" would falsely report all sources as ~18h stale even
+// though Garmin/WHOOP are real-time in Berlin local. Pass spineMaxDate from
+// the GET handler; falls back to ET today if no spine signal yet.
+function daysLag(dateStr: string | null, spineMaxDate: string | null = null): number {
   if (!dateStr) return 999;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  const reference = spineMaxDate
+    ? new Date(spineMaxDate + (spineMaxDate.includes("T") ? "" : "T00:00:00"))
+    : (() => { const t = new Date(); t.setHours(0, 0, 0, 0); return t; })();
+  reference.setHours(0, 0, 0, 0);
   const d = new Date(dateStr + (dateStr.includes("T") ? "" : "T00:00:00"));
   d.setHours(0, 0, 0, 0);
-  return Math.round((today.getTime() - d.getTime()) / 86400000);
+  return Math.round((reference.getTime() - d.getTime()) / 86400000);
 }
 
 // Hours since a timestamp — used for enrichment cards (ReccoBeats, MusicBrainz)
@@ -228,6 +236,15 @@ export async function GET() {
     const mealsDate = mealsRes.data?.[0]?.event_date ?? null;
     const weightDate = weightRes.data?.[0]?.log_date ?? null;
 
+    // Per ADR-0001 Phase 3 step 5: anchor freshness to the spine's most-recent
+    // date (max across all sources), not browser-local today. When Riley is
+    // abroad, the freshest day in his lived timeline IS today-in-his-current-TZ.
+    // An ET-anchored "today" would falsely report all sources ~18h stale.
+    const spineMaxDate = [garminDate, whoopDate, eightSleepDate, mfpDate, hrvDate, spotifyDate]
+      .filter((d): d is string => typeof d === "string")
+      .sort()
+      .pop() ?? null;
+
     const garminEntry = latestBySrcType["garmin|full_sync"] ?? null;
     const whoopEntry = latestBySrcType["whoop|full_sync"] ?? null;
     const eightSleepEntry = latestBySrcType["eight_sleep|trends"] ?? null;
@@ -238,18 +255,18 @@ export async function GET() {
     const musicbrainzEntry = latestBySrcType["musicbrainz|artist_tags"] ?? null;
     const notionJournalEntry = latestBySrcType["notion_journal|entries"] ?? null;
 
-    const garminLag = daysLag(garminDate);
-    const whoopLag = daysLag(whoopDate);
-    const eightSleepLag = daysLag(eightSleepDate);
-    const journalLag = daysLag(journalDate);
-    const habitsLag = daysLag(habitsDate);
-    const mfpLag = daysLag(mfpDate);
-    const hrvLag = daysLag(hrvDate);
-    const spotifyLag = daysLag(spotifyDate);
-    const supplementsLag = daysLag(supplementsDate);
-    const notionJournalLag = daysLag(notionJournalDate);
-    const mealsLag = daysLag(mealsDate);
-    const weightLag = daysLag(weightDate);
+    const garminLag = daysLag(garminDate, spineMaxDate);
+    const whoopLag = daysLag(whoopDate, spineMaxDate);
+    const eightSleepLag = daysLag(eightSleepDate, spineMaxDate);
+    const journalLag = daysLag(journalDate, spineMaxDate);
+    const habitsLag = daysLag(habitsDate, spineMaxDate);
+    const mfpLag = daysLag(mfpDate, spineMaxDate);
+    const hrvLag = daysLag(hrvDate, spineMaxDate);
+    const spotifyLag = daysLag(spotifyDate, spineMaxDate);
+    const supplementsLag = daysLag(supplementsDate, spineMaxDate);
+    const notionJournalLag = daysLag(notionJournalDate, spineMaxDate);
+    const mealsLag = daysLag(mealsDate, spineMaxDate);
+    const weightLag = daysLag(weightDate, spineMaxDate);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
