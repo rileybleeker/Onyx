@@ -227,4 +227,56 @@ Against the Part 2 evaluation criteria from the design-notes page:
 | **7. Robustness** | Good: tiered TZ detection has a real fallback ladder; failure modes are surfaced (not hidden) via `onyx_tz_source`. |
 | **8. Source-of-truth preservation** | **Hard filter satisfied by construction.** All derivations are in new columns alongside source fields; no source data is mutated. |
 
+---
+
+## Phase 2.3 sensitivity test — empirical results
+
+*Run 2026-05-25 (overnight, post-Phase-1-applied). Closes the deferred audit #4 from the original design-notes Decision framework.*
+
+The sensitivity comparison was possible without modifying the pipeline: today's HRV pipeline run against `pds.daily_health_matrix_behavioral` writes its backtest metrics to `pds.hrv_model_metrics` tagged `backtest_initial`, and yesterday's run (2026-05-24, against the legacy `pds.daily_health_matrix`) is still in the table under `backtest_initial` with `created_at` from the prior day. The two regimes joined by `(model, horizon_days)` give a clean per-horizon delta. n is slightly larger on the new view (+8-9 rows per backtest) because the behavioral spine includes ~41 more dates than the Garmin-daily-summary spine — small enough to treat as comparable.
+
+### Headline findings
+
+**SARIMAX improves materially across all horizons.** This is the most informative result because SARIMAX leans heavily on the time-series structure of the input — proper behavioral alignment lets it learn lag patterns that were previously smeared by day-boundary errors.
+
+| Horizon | ΔMAE (new − old) | ΔRMSE | ΔR² |
+|---|---|---|---|
+| h=2 | −0.43 ms | −3.02 ms | +0.150 |
+| h=3 | −1.48 ms | −3.45 ms | +0.166 |
+| h=4 | −2.13 ms | −4.10 ms | +0.217 |
+| h=5 | −2.54 ms | −5.02 ms | +0.264 |
+| h=6 | −2.92 ms | −4.20 ms | +0.203 |
+| h=7 | −3.05 ms | −5.73 ms | +0.293 |
+
+At h=7 that's an 8.6% MAE reduction and 13.0% RMSE reduction. R² goes from significantly negative to substantially less negative or net positive at longer horizons. Directional accuracy is slightly worse at some horizons (−8.3pp at h=2) — interpretation: the model is now hugging the mean more tightly (better MAE, slightly less directionally bold), consistent with cleaner input letting variance get learned out.
+
+**XGBoost is essentially flat** (ΔMAE ranges −1.64 to +1.43 across horizons, no monotonic pattern). Tree models are more robust to small per-row attribution noise than time-series models — this matches the prior literature on attribution sensitivity. The headline xgboost predictions for upcoming days under the new attribution: tomorrow's HRV 122.0 ms (CI 66.6–177.4); today's actual was 176.6 ms.
+
+**Baselines correctly unchanged** (ΔMAE within ±0.4 ms for `baseline_7d_avg`, `baseline_dow`, `baseline_naive`). These don't use behavioral semantics, so the only difference is the ~9 extra rows the new spine contributes — confirms the comparison harness is sound rather than measurement-only noise.
+
+### Top correlates and SHAP under behavioral attribution
+
+Pulled from today's `pds.hrv_analysis_results` (yesterday's rows overwritten on each run, so no direct A/B for these — but ordering is stable vs prior-week SHAP plots Riley reviewed). New top-10 Spearman correlates:
+
+1. `whoop_cycle_avg_hr` r=−0.352 ***
+2. `Day Strain` r=−0.298 ***
+3. `WHOOP Resting HR` r=−0.296 ***
+4. `Daily Energy (kJ)` r=−0.286 ***
+5. `whoop_cycle_max_hr` r=−0.261 ***
+6. `whoop_day_strain_z28d` r=−0.260 ***
+7. `journal_took_an_anti_inflammatory_drug_nsaids` r=+0.229 *
+8. `bmr_kilocalories` r=−0.221 ***
+9. `journal_slept_in_the_same_bed_as_usual` r=+0.214 ***
+10. `Toss & Turns` r=+0.200 *
+
+Top-10 SHAP (avg |SHAP|): `Day Strain`, `WHOOP HRV (RMSSD)`, `hrv_z_28d`, `whoop_day_strain_z28d`, `whoop_cycle_avg_hr`, `hrv_28d_std`, `whoop_cycle_max_hr`, `whoop_sleep_duration_milli_lag2`, `Light Sleep (WHOOP)`, `Skin Temperature`.
+
+The journal behavior with the largest positive HRV impact is `Slept In The Same Bed As Usual` (d=+16.3 ms, p<0.001, n=181/77) — `usual-bed` consistency robustly tracks with better recovery in the new attribution. Cold Shower shows d=−12.3 ms (p<0.05) which is counterintuitive but matches historical runs (likely confounded with hard-workout days).
+
+### Conclusion
+
+The sensitivity test answers the deferred Decision-framework audit #4 (Part 5 stopping rule): **the new attribution materially improves SARIMAX (3-8% MAE depending on horizon), is neutral for XGBoost, and leaves baselines unchanged.** SARIMAX's improvement is large enough to consider it the headline win — the time-series model finally has clean per-row inputs to learn from. For XGBoost the change is in the noise floor, but XGBoost was already the strong model; not regressing is the right outcome.
+
+This closes Phase 2.3 of the rollout. The new `behavioral_v1`-tagged forward predictions (38 rows: 30 prophet + 7 sarimax + 1 xgboost) are visible on `/analytics/hrv` immediately. Backtest metrics overwrite the legacy `backtest_initial` rows in the same table, so the "Accuracy by Forecast Horizon" chart will show the new (improved) SARIMAX numbers and the marginally-different XGBoost numbers on the next page load.
+
 No proposed option fails the source-of-truth hard filter.
