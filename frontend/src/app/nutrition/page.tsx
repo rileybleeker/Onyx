@@ -323,6 +323,22 @@ export default function NutritionPage() {
   useEffect(() => { loadWeight(); }, [loadWeight]);
   useEffect(() => { setWeightDate(etTodayStr()); }, []);
 
+  // Override the client-computed default with the server's behavioral_today
+  // (TZ-aware + awake-tail-aware via pds.behavioral_today_now). Falls back
+  // silently if the RPC fails; the client default already handles 00-04 ET.
+  useEffect(() => {
+    fetch("/api/behavioral-today")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (j?.behavioral_today && j.behavioral_today !== eventDate) {
+          setEventDate(j.behavioral_today);
+        }
+      })
+      .catch(() => {});
+    // Run once on mount; intentionally exclude eventDate from deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function saveWeight() {
     const lb = parseFloat(weightInput);
     if (!Number.isFinite(lb) || lb <= 0 || lb > 1000) {

@@ -26,12 +26,21 @@ export async function POST(req: NextRequest) {
   if (!body.product_id) {
     return NextResponse.json({ error: "product_id is required" }, { status: 400 });
   }
+  // Default intake_date to behavioral-today via pds.behavioral_today_now()
+  // — TZ-aware (travel) + awake-tail-aware (-6h rule).
+  let intake_date = body.intake_date;
+  if (!intake_date) {
+    try {
+      const { data: bday } = await supabase.rpc("behavioral_today_now");
+      intake_date = bday || new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    } catch {
+      intake_date = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    }
+  }
   const row = {
     product_id: body.product_id,
     doses: body.doses ?? 1,
-    intake_date:
-      body.intake_date ??
-      new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" }),
+    intake_date,
     intake_time: body.intake_time ?? null,
     notes: body.notes ?? null,
   };

@@ -106,12 +106,25 @@ export default function SupplementsPage() {
   // Edit-intake modal
   const [editing, setEditing] = useState<EditableIntake | null>(null);
 
-  // Date that quick-tap log buttons attribute the intake to. Defaults to
-  // today (ET clock date); the user can override to attribute pre-bed
-  // post-midnight intakes to the previous day (behavioral-day convention —
-  // see CLAUDE.md "Supplement intake" bullet).
+  // Date that quick-tap log buttons attribute the intake to. Default seeded
+  // with ET-clock-today as a synchronous best-guess, then overridden on
+  // mount via /api/behavioral-today which calls pds.behavioral_today_now()
+  // — TZ-aware (travel) and awake-tail-aware (-6h rule). User can still
+  // manually override via the date picker for retroactive entries.
   const [logDate, setLogDate] = useState<string>(etTodayStr());
   const today = etTodayStr();
+  useEffect(() => {
+    fetch("/api/behavioral-today")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (j?.behavioral_today && j.behavioral_today !== logDate) {
+          setLogDate(j.behavioral_today);
+        }
+      })
+      .catch(() => {});
+    // Run once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const isLoggingForToday = logDate === today;
 
   // Time the quick-tap log buttons stamp on intake_time. Default is

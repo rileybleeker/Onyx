@@ -81,9 +81,20 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "event_time must be a valid ISO timestamp" }, { status: 400 });
   }
 
-  const event_date =
-    body.event_date ??
-    new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  // Default to Riley's current behavioral day via pds.behavioral_today_now()
+  // — TZ-aware (handles travel) + awake-tail-aware (-6h rule). The previous
+  // ET-clock-today default broke for westbound trips and for awake-tail
+  // post-midnight ET meals (which the /nutrition page partially compensated
+  // for with a 00:00-04:00 ET special-case, now subsumed by the -6h rule).
+  let event_date = body.event_date;
+  if (!event_date) {
+    try {
+      const { data: bday } = await supabase.rpc("behavioral_today_now");
+      event_date = bday || new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    } catch {
+      event_date = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    }
+  }
 
   const row = {
     event_date,
