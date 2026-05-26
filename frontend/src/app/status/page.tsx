@@ -308,8 +308,13 @@ export default function StatusPage() {
     ? allLastSyncs.reduce((a, b) => (new Date(a) > new Date(b) ? a : b))
     : null;
 
+  // "Records · Latest Today" sums the records_synced from each source's
+  // MOST-RECENT sync, when that sync happened today. It's the headline
+  // count for "what got pulled in by the most recent runs today" — not the
+  // total of every row synced today (which would need a server-side sum
+  // over sync_log). Labeled accordingly so the math is honest.
   const todayStr = new Date().toLocaleDateString("en-CA");
-  const recordsToday = sourceList.reduce((sum, s) => {
+  const recordsLatestToday = sourceList.reduce((sum, s) => {
     const lastSyncDate = s.info.lastSync ? new Date(s.info.lastSync).toLocaleDateString("en-CA") : null;
     return sum + (lastSyncDate === todayStr ? s.info.recordsSynced : 0);
   }, 0);
@@ -401,9 +406,9 @@ export default function StatusPage() {
           sublabel={mostRecentSync ? formatSyncTime(mostRecentSync) : "No data"}
         />
         <StatCard
-          label="Records Today"
-          value={recordsToday > 0 ? recordsToday.toLocaleString() : "—"}
-          sublabel="rows synced"
+          label="Records · Latest Today"
+          value={recordsLatestToday > 0 ? recordsLatestToday.toLocaleString() : "—"}
+          sublabel="sum across each source's most-recent run today"
         />
         <StatCard
           label="Active Errors"

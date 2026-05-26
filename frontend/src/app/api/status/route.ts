@@ -32,7 +32,10 @@ const CADENCE: Record<string, string> = {
   whoop_journal: "Hourly :30 (IMAP)",
   habits: "Hourly :45",
   myfitnesspal: "Hourly :15 (IMAP)",
-  hrv_analysis: "After each ETL + 23:50 ET",
+  // Predict: every hourly ETL + 23:50 ET (DST-gated). Retrain: hourly
+  // conditional on backfill detection + daily 12:00 UTC unconditional
+  // safety-net.
+  hrv_analysis: "Predict: hourly + 23:50 ET · Retrain: hourly (cond.) + 12:00 UTC",
   spotify: "Every 2h :50",
   reccobeats: "With Spotify ETL",
   musicbrainz: "With Spotify ETL",
@@ -189,14 +192,18 @@ export async function GET() {
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
-      supabase.from("habit_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
+      supabase.from("habit_journal").select("cycle_date,synced_at").order("synced_at", { ascending: false }).limit(1),
       supabase.from("myfitnesspal_nutrition").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("hrv_predictions").select("prediction_date").eq("model", "xgboost").eq("horizon_days", 1).not("model_version", "like", "backtest%").order("prediction_date", { ascending: false }).limit(1),
       supabase.from("spotify_plays").select("played_date_et").order("played_date_et", { ascending: false }).limit(1),
-      supabase.from("supplement_intake").select("intake_date").order("intake_date", { ascending: false }).limit(1),
+      // Manual sources: include the actual log timestamp so the "Last Sync"
+      // row shows real-time "Xm ago" rather than midnight of the latest
+      // entry date. created_at on supplement/meal/weight is the row insert
+      // time; for weight the user-facing timestamp is updated_at on edits.
+      supabase.from("supplement_intake").select("intake_date,created_at").order("intake_time", { ascending: false }).limit(1),
       supabase.from("journal_entries").select("entry_date").eq("archived", false).order("entry_date", { ascending: false }).limit(1),
-      supabase.from("meal_events").select("event_date").order("event_date", { ascending: false }).limit(1),
-      supabase.from("weight_log").select("log_date").order("log_date", { ascending: false }).limit(1),
+      supabase.from("meal_events").select("event_date,created_at").order("event_time", { ascending: false }).limit(1),
+      supabase.from("weight_log").select("log_date,updated_at").order("log_date", { ascending: false }).limit(1),
       supabase
         .from("sync_log")
         .select("id, created_at, sync_start, error_message, source, data_type")
@@ -238,13 +245,17 @@ export async function GET() {
     const eightSleepDate = eightSleepRes.data?.[0]?.calendar_date ?? null;
     const journalDate = journalRes.data?.[0]?.cycle_date ?? null;
     const habitsDate = habitsRes.data?.[0]?.cycle_date ?? null;
+    const habitsLastLog = (habitsRes.data?.[0]?.synced_at as string | undefined) ?? null;
     const mfpDate = mfpRes.data?.[0]?.calendar_date ?? null;
     const hrvDate = hrvRes.data?.[0]?.prediction_date ?? null;
     const spotifyDate = spotifyRes.data?.[0]?.played_date_et ?? null;
     const supplementsDate = supplementsRes.data?.[0]?.intake_date ?? null;
+    const supplementsLastLog = (supplementsRes.data?.[0]?.created_at as string | undefined) ?? null;
     const notionJournalDate = notionJournalRes.data?.[0]?.entry_date ?? null;
     const mealsDate = mealsRes.data?.[0]?.event_date ?? null;
+    const mealsLastLog = (mealsRes.data?.[0]?.created_at as string | undefined) ?? null;
     const weightDate = weightRes.data?.[0]?.log_date ?? null;
+    const weightLastLog = (weightRes.data?.[0]?.updated_at as string | undefined) ?? null;
 
     // Per ADR-0001 Phase 3 step 5: anchor freshness to the spine's most-recent
     // date (max across all sources), not browser-local today. When Riley is
@@ -333,7 +344,10 @@ export async function GET() {
       },
       habits: {
         label: "Habits",
-        lastSync: habitsDate,
+        // Habits is bi-directional Notion sync; synced_at fires on every
+        // tap and on the hourly :45 cron. Use it for "Last Sync" so a
+        // fresh tap shows "1m ago" instead of "9h ago".
+        lastSync: habitsLastLog ?? habitsDate,
         status: deriveStatus(null, habitsLag),
         latestDataDate: habitsDate,
         daysLag: habitsLag,
@@ -417,11 +431,12 @@ export async function GET() {
         methodLabel: METHOD.musicbrainz.label,
       },
       // Supplements is user-driven (no ETL); status derives purely from the
-      // most-recent intake_date. Same pattern as Habits — see deriveStatus's
-      // null-syncEntry branch.
+      // most-recent intake_date. lastSync uses the actual created_at of the
+      // most-recent intake row so the "Xm ago" relative time reflects when
+      // Riley actually logged, not midnight of the intake_date.
       supplements: {
         label: "Supplements",
-        lastSync: supplementsDate,
+        lastSync: supplementsLastLog ?? supplementsDate,
         status: deriveStatus(null, supplementsLag),
         latestDataDate: supplementsDate,
         daysLag: supplementsLag,
@@ -432,10 +447,11 @@ export async function GET() {
         integrationMethod: METHOD.supplements.method,
         methodLabel: METHOD.supplements.label,
       },
-      // Meals: user-driven, freshness from latest meal_events.event_date.
+      // Meals: user-driven; lastSync uses the latest event row's created_at
+      // (insert time) for accurate "Xm ago" rendering.
       meals: {
         label: "Meals",
-        lastSync: mealsDate,
+        lastSync: mealsLastLog ?? mealsDate,
         status: deriveStatus(null, mealsLag),
         latestDataDate: mealsDate,
         daysLag: mealsLag,
@@ -446,10 +462,12 @@ export async function GET() {
         integrationMethod: METHOD.meals.method,
         methodLabel: METHOD.meals.label,
       },
-      // Weight: user-driven daily body weight log, freshness from latest log_date.
+      // Weight: user-driven daily body weight log. lastSync uses updated_at
+      // (touched on every POST/PATCH) so an edit-in-place to today's row
+      // refreshes the "Xm ago" reading; falls back to log_date as before.
       weight: {
         label: "Weight",
-        lastSync: weightDate,
+        lastSync: weightLastLog ?? weightDate,
         status: deriveStatus(null, weightLag),
         latestDataDate: weightDate,
         daysLag: weightLag,
