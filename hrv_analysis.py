@@ -1849,6 +1849,42 @@ def run_statistical_analysis(
                 X_full = stage3_df[survivors].astype(float).values
                 y = stage3_df[STAT_TARGET].astype(float).values
                 X_full_std = StandardScaler().fit_transform(X_full)
+
+                # Iteratively drop predictors with VIF > 10 (audit P1 finding).
+                # HAC SEs don't rescue standardized betas from multicollinearity:
+                # if a predictor is near-linearly-redundant with others its
+                # standalone coefficient is unstable regardless of how the SE
+                # is computed. Threshold 10 = conventional "severe" cutoff;
+                # 5 would be too aggressive at n~100 / k~10.
+                from statsmodels.stats.outliers_influence import variance_inflation_factor
+                vif_drops: list[dict] = []
+                while X_full_std.shape[1] > 2:
+                    X_vif = sm.add_constant(X_full_std)
+                    vifs = []
+                    for j in range(1, X_vif.shape[1]):
+                        try:
+                            vifs.append(float(variance_inflation_factor(X_vif, j)))
+                        except Exception:
+                            vifs.append(float("nan"))
+                    finite_vifs = [v for v in vifs if not np.isnan(v)]
+                    if not finite_vifs or max(finite_vifs) <= 10.0:
+                        break
+                    drop_idx = int(np.nanargmax(vifs))
+                    vif_drops.append({"feature": survivors[drop_idx],
+                                      "vif": float(vifs[drop_idx])})
+                    log.info(f"  Stage 3 OLS — dropping '{survivors[drop_idx]}' "
+                             f"(VIF={vifs[drop_idx]:.1f} > 10)")
+                    survivors = [s for i, s in enumerate(survivors) if i != drop_idx]
+                    X_full_std = np.delete(X_full_std, drop_idx, axis=1)
+                final_vifs: list[float] = []
+                if X_full_std.shape[1] >= 1:
+                    X_vif_final = sm.add_constant(X_full_std)
+                    for j in range(1, X_vif_final.shape[1]):
+                        try:
+                            final_vifs.append(float(variance_inflation_factor(X_vif_final, j)))
+                        except Exception:
+                            final_vifs.append(float("nan"))
+
                 X_full_const = sm.add_constant(X_full_std)
                 full_fit = sm.OLS(y, X_full_const).fit(
                     cov_type="HAC", cov_kwds={"maxlags": 7}
@@ -1870,6 +1906,7 @@ def run_statistical_analysis(
                         "se_hac": float(full_fit.bse[i + 1]),
                         "p_value": float(full_fit.pvalues[i + 1]),
                         "cohens_f2": float(f2),
+                        "vif": final_vifs[i] if i < len(final_vifs) else float("nan"),
                         "r2_full": r2_full,
                         "r2_reduced": r2_red,
                         "n": int(len(stage3_df)),
@@ -1881,12 +1918,17 @@ def run_statistical_analysis(
                     s3 = s3.iloc[np.argsort(np.abs(s3["beta_std"].values))[::-1]].reset_index(drop=True)
                     s3.to_csv(OUTPUT_DIR / "stage3_standardized_ols.csv", index=False)
                     obs_pp = len(stage3_df) / max(len(survivors), 1)
+                    max_vif = (max(v for v in final_vifs if not np.isnan(v))
+                               if any(not np.isnan(v) for v in final_vifs) else 0.0)
                     log.info(f"  Stage 3 OLS (HAC SE): n={len(stage3_df)}, k={len(survivors)}, "
-                             f"obs/predictor={obs_pp:.1f}, R²={r2_full:.3f}")
+                             f"obs/predictor={obs_pp:.1f}, R²={r2_full:.3f}, "
+                             f"max_vif={max_vif:.1f}, dropped {len(vif_drops)} for collinearity")
                     if obs_pp < 20:
                         log.warning(f"  Stage 3 obs/predictor={obs_pp:.1f} < 20 — betas may be unstable")
                     log.info("  Saved: stage3_standardized_ols.csv")
                     results["stage3_ols"] = stage3_rows
+                    if vif_drops:
+                        results["stage3_vif_drops"] = vif_drops
     except Exception as e:
         log.warning(f"  Stage 3 OLS failed: {e}")
 
@@ -2644,8 +2686,24 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                       and hrv_valid[f].notna().mean() >= 0.2][:7]
         log.info(f"  SARIMAX exog features ({len(exog_feats)}): {exog_feats}")
         original_exog = hrv_valid[exog_feats].copy().ffill().bfill() if exog_feats else None
-        # Shift forward 1 row: exog for row N = original feature values from row N-1
+        # Shift forward 1 row: exog for row N = original feature values from row N-1.
+        # Audit P1 contract assertion (paired with the full-data forecast fix
+        # below): for k >= 1, exog.iloc[k] must equal original_exog.iloc[k-1].
+        # Everything else in this function — walk-forward future-exog slicing
+        # at line ~2710, full-data future-exog at line ~2740 — relies on this
+        # invariant. If shift semantics ever change, this assertion catches it.
         exog = original_exog.shift(1).ffill().bfill() if original_exog is not None else None
+        if original_exog is not None and exog is not None and len(exog) >= 3:
+            chk = min(max(1, len(exog) // 2), len(exog) - 1)
+            if not np.allclose(
+                exog.iloc[chk].to_numpy(dtype=float),
+                original_exog.iloc[chk - 1].to_numpy(dtype=float),
+                equal_nan=True,
+            ):
+                log.warning(
+                    f"  SARIMAX exog shift contract violated at idx={chk} — "
+                    "training/forecast alignment is unreliable"
+                )
 
         n = len(hrv_series)
         split = int(n * 0.85)
@@ -2723,14 +2781,20 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                 sarimax_metrics[h]["n"] = len(preds_by_horizon[h])
                 log.info(f"  SARIMAX h={h}: MAE={sarimax_metrics[h].get('mae', '?'):.2f}")
 
-        # Full-data forecast for next 7 days
+        # Full-data forecast for next 7 days.
         full_model = SARIMAX(hrv_series, exog=exog, order=(1, 1, 1),
                              seasonal_order=(1, 0, 1, 7),
                              enforce_stationarity=False, enforce_invertibility=False)
         full_fit = full_model.fit(disp=False, maxiter=200)
-        # For the h-step-ahead forecast, the shifted exog at step h uses original_exog[N+h-1].
-        # We use the last 7 days of original_exog as a proxy for unknown future values.
-        fut_exog_all = original_exog.iloc[-7:] if original_exog is not None else None
+        # Audit P1 fix: training contract is exog[N] = original_exog[N-1] (one
+        # row above), so the forecast at step k from last training row T wants
+        # exog[T+k] = original_exog[T+k-1] — future behaviors we don't know.
+        # As a proxy, pass the last 7 rows of the already-shifted `exog`
+        # matrix; semantically that's "use the past week's lagged behaviors as
+        # a stand-in for tomorrow's." Passing `original_exog.iloc[-7:]` here
+        # (the previous code) fed unshifted values into a shifted-trained
+        # model — off by one at every horizon.
+        fut_exog_all = exog.iloc[-7:] if exog is not None else None
         fc_full = full_fit.get_forecast(steps=7, exog=fut_exog_all)
         fc_mean = fc_full.predicted_mean
         fc_ci = fc_full.conf_int(alpha=0.10)  # 90% CI
