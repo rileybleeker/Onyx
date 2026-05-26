@@ -171,15 +171,21 @@ export default function BlandAltmanPage() {
   const whoopResp = data.map((d) => d.whoop_respiratory_rate ? +d.whoop_respiratory_rate : null);
   const eightResp = data.map((d) => d.eight_sleep_breath_rate ? +d.eight_sleep_breath_rate : null);
 
-  // Sleep Duration in MINUTES. Each side is main-session-only so naps don't
+  // Duration pairs in MINUTES. Each side is main-session-only so naps don't
   // bias one device upward (see Notion decision record on nap-inclusion
-  // convention). Garmin sleep_duration_seconds and WHOOP
-  // total_in_bed_time_milli are both main-session by their respective
-  // is_nap=false filters in the matrix view; Eight Sleep uses the
-  // _main_sec column added 2026-05-25.
+  // convention). Garmin uses is_nap=false in the matrix; WHOOP same; Eight
+  // Sleep uses the _main_sec columns added 2026-05-25.
   const garminDurMin = data.map((d) => d.garmin_sleep_duration_sec ? +d.garmin_sleep_duration_sec / 60 : null);
   const whoopDurMin = data.map((d) => d.whoop_sleep_duration_milli ? +d.whoop_sleep_duration_milli / 60000 : null);
   const eightDurMin = data.map((d) => d.eight_sleep_duration_main_sec ? +d.eight_sleep_duration_main_sec / 60 : null);
+
+  const garminDeepMin = data.map((d) => d.garmin_deep_sleep_sec ? +d.garmin_deep_sleep_sec / 60 : null);
+  const whoopDeepMin = data.map((d) => d.whoop_deep_sleep_milli ? +d.whoop_deep_sleep_milli / 60000 : null);
+  const eightDeepMin = data.map((d) => d.eight_sleep_deep_main_sec ? +d.eight_sleep_deep_main_sec / 60 : null);
+
+  const garminRemMin = data.map((d) => d.garmin_rem_sleep_sec ? +d.garmin_rem_sleep_sec / 60 : null);
+  const whoopRemMin = data.map((d) => d.whoop_rem_sleep_milli ? +d.whoop_rem_sleep_milli / 60000 : null);
+  const eightRemMin = data.map((d) => d.eight_sleep_rem_main_sec ? +d.eight_sleep_rem_main_sec / 60 : null);
 
   // Compute all Bland-Altman comparisons
   const sleepBA = [
@@ -191,6 +197,16 @@ export default function BlandAltmanPage() {
     blandAltman(garminDurMin, whoopDurMin),
     blandAltman(garminDurMin, eightDurMin),
     blandAltman(whoopDurMin, eightDurMin),
+  ];
+  const deepBA = [
+    blandAltman(garminDeepMin, whoopDeepMin),
+    blandAltman(garminDeepMin, eightDeepMin),
+    blandAltman(whoopDeepMin, eightDeepMin),
+  ];
+  const remBA = [
+    blandAltman(garminRemMin, whoopRemMin),
+    blandAltman(garminRemMin, eightRemMin),
+    blandAltman(whoopRemMin, eightRemMin),
   ];
   const hrvBA = [
     blandAltman(garminHrv, whoopHrv),
@@ -220,6 +236,18 @@ export default function BlandAltmanPage() {
       unit: "min",
       results: durationBA,
       footnote: "All three sides are main-session only. Eight Sleep uses time_slept_main_session_seconds (Pod 4 splits multi-session days into main + naps); WHOOP and Garmin filter is_nap=false in the matrix view.",
+    },
+    {
+      label: "Deep Sleep Duration",
+      unit: "min",
+      results: deepBA,
+      footnote: "Deep / slow-wave duration. All three sides main-session only (deep_sleep_main_session_seconds on Eight Sleep; total_slow_wave_sleep_time_milli on WHOOP, deep_sleep_seconds on Garmin — both naturally main-only via is_nap=false in the matrix view). Each device's deep-sleep detection algorithm differs (Eight Sleep uses pressure/HRV/movement, WHOOP uses HR + accelerometer, Garmin uses optical HR + accelerometer) so bias here is expected even on perfectly aligned nights.",
+    },
+    {
+      label: "REM Sleep Duration",
+      unit: "min",
+      results: remBA,
+      footnote: "REM duration. Same main-only sourcing as Deep. Detection-algorithm differences are larger for REM than for Deep across consumer wearables — interpret narrow LoA as a coincidence rather than method agreement.",
     },
     { label: "HRV", unit: "ms", results: hrvBA },
     {
