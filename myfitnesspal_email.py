@@ -356,11 +356,18 @@ def check_email(dry_run: bool = False) -> int:
     """Connect to IMAP, find MFP export emails, process each one."""
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     imap = None
+    t_start = time.time()
     try:
         imap = connect_imap()
         emails = find_mfp_emails(imap)
         if not emails:
+            # Audit P1 fix: emit a heartbeat even when no email was found.
+            # "No new export" is the healthy state for a manual-export flow,
+            # so /status would otherwise see staleness grow without any sync
+            # event confirming the cron is alive.
             log.info("No new MFP export emails")
+            log_sync(sb, "myfitnesspal", "nutrition", "success",
+                     records=0, duration=time.time() - t_start)
             return 0
 
         processed = 0

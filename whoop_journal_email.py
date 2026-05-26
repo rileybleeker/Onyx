@@ -320,11 +320,17 @@ def check_email(dry_run: bool = False) -> int:
     """Connect to IMAP, find WHOOP export emails, process each one."""
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     imap = None
+    t_start = time.time()
     try:
         imap = connect_imap()
         emails = find_whoop_emails(imap)
         if not emails:
+            # Audit P1 fix: heartbeat on no-op runs so /status sees the cron
+            # is alive even on quiet days (manual-export flow — most days
+            # have no new email and that's healthy).
             log.info("No new WHOOP export emails")
+            log_sync(sb, "whoop", "journal_email", "success",
+                     records=0, duration=time.time() - t_start)
             return 0
 
         processed = 0

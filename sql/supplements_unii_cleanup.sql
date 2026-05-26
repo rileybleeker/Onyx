@@ -49,6 +49,14 @@ WHERE EXISTS (
 );
 
 -- ----- Unit normalization helper ----------------------------------------
+-- Audit P1 fix (2026-05-26): added 'mcgdfe' (Dietary Folate Equivalent) and
+-- 'mcgrae' (Retinol Activity Equivalent) which previously silently returned
+-- NULL. Both equivalence units are treated as mcg for our purposes — exact
+-- DFE/RAE conversion would need source-form-specific factors (folic acid vs
+-- 5-MTHF; preformed retinol vs beta-carotene), which we don't capture per-row.
+-- 'IU' still returns NULL: conversion is vitamin-specific (Vit D 1 IU =
+-- 0.025 mcg, Vit A 1 IU = 0.3 mcg, Vit E 1 IU = 0.67 mg) and the function
+-- has no UNII context. Use pds.supplement_intake_unmapped to surface drops.
 CREATE OR REPLACE FUNCTION pds.unit_to_mg_factor(u TEXT)
 RETURNS NUMERIC
 LANGUAGE sql
@@ -58,6 +66,8 @@ AS $$
         WHEN 'mg'          THEN 1
         WHEN 'milligram'   THEN 1
         WHEN 'milligrams'  THEN 1
+        WHEN 'mcgdfe'      THEN 0.001  -- Folate DFE (approximation: treats as mcg)
+        WHEN 'mcgrae'      THEN 0.001  -- Vitamin A RAE (approximation: treats as mcg)
         WHEN 'g'           THEN 1000
         WHEN 'gram'        THEN 1000
         WHEN 'grams'       THEN 1000

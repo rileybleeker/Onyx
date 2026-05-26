@@ -693,13 +693,20 @@ def run_etl(refeaturize: bool = False):
             status=rb_status, records=len(features), started_at=reccobeats_started,
         )
 
-        # Resolve new artists (not yet in spotify_artists) and enrich them
+        # Resolve new artists (not yet in spotify_artists) and enrich them.
+        # Audit P1 fix: previously only the primary artist (artists[0]) was
+        # enqueued for enrichment, so collaborator artists on multi-artist
+        # tracks never got an artist-images / MusicBrainz-genres row. Iterate
+        # every artist on every play. spotify_plays.artist_id intentionally
+        # remains the primary artist (artists[0]) — see upsert_plays — since
+        # that's a single-FK column; the collaborators live in
+        # spotify_tracks.artists JSONB and now in spotify_artists too.
         new_artist_ids = list({
-            (it.get("track") or {}).get("artists", [{}])[0].get("id")
+            a.get("id")
             for it in items
-            if (it.get("track") or {}).get("artists")
+            for a in ((it.get("track") or {}).get("artists") or [])
+            if a.get("id")
         })
-        new_artist_ids = [a for a in new_artist_ids if a]
         already_artists = existing_artist_ids(sb, new_artist_ids)
         artists_to_fetch = [aid for aid in new_artist_ids if aid not in already_artists]
         mb_started = time.time()
