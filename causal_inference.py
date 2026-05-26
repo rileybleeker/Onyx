@@ -130,6 +130,14 @@ PROPENSITY_TRIM_HIGH = 0.95
 # AIPW cross-fitting
 N_FOLDS_AIPW = 5
 
+# Block-bootstrap parameters for AIPW CI. Per audit finding F-001's follow-up
+# recommendation: resample contiguous time blocks of the influence values to
+# preserve HRV autocorrelation that the IF-based SE assumes is i.i.d.
+# Reported alongside the IF CI; meaningful divergence (>50% width gap) flags
+# that the IF SE is unreliable for that treatment.
+N_BOOTSTRAP_AIPW = 1000
+AIPW_BOOTSTRAP_BLOCK_LEN = 7  # days; matches the weekly periodicity in HRV/training data
+
 # Bootstrap reps for PSM CI
 N_BOOTSTRAP_PSM = 500
 
@@ -413,6 +421,32 @@ def estimate_psm(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
     }
 
 
+def _block_bootstrap_ci(psi: np.ndarray, block_len: int = AIPW_BOOTSTRAP_BLOCK_LEN,
+                         n_boot: int = N_BOOTSTRAP_AIPW, seed: int = 42,
+                         alpha: float = 0.05) -> tuple[float, float]:
+    """Block bootstrap CI for the mean of a time-ordered influence-function array.
+
+    Resamples contiguous blocks of length `block_len` with replacement to preserve
+    autocorrelation structure. Returns (ci_low, ci_high) at (1-alpha) confidence.
+
+    Returns (NaN, NaN) if n < 2 * block_len (not enough rows to form a meaningful
+    block bootstrap).
+    """
+    n = len(psi)
+    if n < 2 * block_len:
+        return (float("nan"), float("nan"))
+    rng = np.random.default_rng(seed)
+    n_blocks = int(np.ceil(n / block_len))
+    # Vectorized block resample: pick n_blocks random starting indices, gather contiguous slices.
+    starts = rng.integers(0, n - block_len + 1, size=(n_boot, n_blocks))
+    # Build the index matrix: for each row, the indices of its sampled blocks concatenated.
+    offsets = np.arange(block_len)
+    idx_matrix = (starts[:, :, None] + offsets[None, None, :]).reshape(n_boot, -1)[:, :n]
+    boot_means = psi[idx_matrix].mean(axis=1)
+    return (float(np.quantile(boot_means, alpha / 2)),
+            float(np.quantile(boot_means, 1 - alpha / 2)))
+
+
 def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
                   n_folds: int = N_FOLDS_AIPW) -> dict:
     """Doubly robust AIPW with k-fold cross-fitting. Returns ATE + IF-based CI."""
@@ -467,12 +501,29 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
 
     ate = float(psi_valid.mean())
     se = float(psi_valid.std(ddof=1) / np.sqrt(len(psi_valid)))
+    ci_low_if = ate - 1.96 * se
+    ci_high_if = ate + 1.96 * se
+
+    # Block-bootstrap CI alongside the IF-based one. Per audit finding F-001
+    # follow-up: HRV is autocorrelated; the IF SE assumes i.i.d. influence values,
+    # which is violated by hrv_lag1 + temporal residual structure. Block bootstrap
+    # over 7-day blocks gives an autocorrelation-aware CI for comparison.
+    ci_low_bb, ci_high_bb = _block_bootstrap_ci(psi_valid)
+
+    # Compare CI widths. If they diverge meaningfully, the IF SE is unreliable.
+    width_if = ci_high_if - ci_low_if
+    width_bb = ci_high_bb - ci_low_bb if not np.isnan(ci_low_bb) else float("nan")
+    bb_width_ratio = float(width_bb / width_if) if width_if > 0 and not np.isnan(width_bb) else float("nan")
+
     return {
         "ate": ate,
-        "ci_low": ate - 1.96 * se,
-        "ci_high": ate + 1.96 * se,
+        "ci_low": ci_low_if,
+        "ci_high": ci_high_if,
         "se": se,
         "n_used": int(len(psi_valid)),
+        "ci_low_bb": ci_low_bb,
+        "ci_high_bb": ci_high_bb,
+        "bb_width_ratio": bb_width_ratio,  # bb_width / if_width; >1 means BB is wider (IF too narrow)
     }
 
 
@@ -787,6 +838,12 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             "aipw_ci_low": est["aipw"]["ci_low"],
             "aipw_ci_high": est["aipw"]["ci_high"],
             "aipw_se": est["aipw"]["se"],
+            # Block-bootstrap CI (autocorrelation-aware sanity check) — reported
+            # alongside the IF CI. bb_width_ratio > 1 means the IF CI is too
+            # narrow relative to what the temporal structure of psi justifies.
+            "aipw_ci_low_bb": est["aipw"].get("ci_low_bb"),
+            "aipw_ci_high_bb": est["aipw"].get("ci_high_bb"),
+            "aipw_bb_width_ratio": est["aipw"].get("bb_width_ratio"),
             "e_value": est["sensitivity"]["e_value"],
             "e_value_ci": est["sensitivity"]["e_value_ci"],
             "n_treated": meta["n_treated"],
