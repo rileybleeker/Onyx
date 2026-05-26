@@ -83,7 +83,7 @@ import pandas as pd
 try:
     from sklearn.linear_model import LogisticRegression, Ridge
     from sklearn.preprocessing import StandardScaler
-    from sklearn.model_selection import KFold
+    from sklearn.model_selection import KFold, TimeSeriesSplit
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
@@ -422,7 +422,10 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
                 "ci_high": float("nan"), "se": float("nan")}
 
     X_std = _standardize(X)
-    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    # TimeSeriesSplit (not shuffled KFold) — HRV is autocorrelated (ρ₁ ≈ 0.4-0.5);
+    # shuffled folds let the outcome model see near-future values via hrv_lag1,
+    # narrowing the IF variance and overstating CI coverage. Audit finding F-001.
+    kf = TimeSeriesSplit(n_splits=n_folds)
     psi = np.zeros(n)
 
     for train_idx, test_idx in kf.split(X_std):
@@ -655,9 +658,11 @@ def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarra
     # Outcome
     Y = sub[OUTCOME_COL].astype(float).values
 
-    # Confounders — forward-fill within-source then drop remaining NaN rows
+    # Confounders — forward-fill only; bfill would pull future values into past
+    # confounders, violating temporal ordering required for AIPW identification.
+    # Audit finding F-003.
     X_df = sub[list(confounders)].copy()
-    X_df = X_df.ffill().bfill()
+    X_df = X_df.ffill(limit=2)
     keep_mask = X_df.notna().all(axis=1).values
     X_df = X_df.loc[keep_mask]
     T = T[keep_mask]

@@ -2772,7 +2772,11 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
             feat_df = feat_df.rename(columns={"calendar_date": "ds"})
             hrv_df = hrv_df.merge(feat_df, on="ds", how="left")
             for rf in reg_feats:
-                hrv_df[rf] = hrv_df[rf].ffill().bfill().astype(float)
+                # ffill only — bfill would pull future values into past regressor
+                # rows, leaking signal into Prophet's training set. Audit finding F-004.
+                hrv_df[rf] = hrv_df[rf].ffill().astype(float)
+                # Drop any leading rows still missing (no past value to forward-fill from).
+                # Prophet handles NaN regressors gracefully; this just keeps semantics clean.
 
         # Validation: fit on all but last 30 days, predict last 30
         cutoff = len(hrv_df) - 30

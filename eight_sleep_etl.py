@@ -509,7 +509,7 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
             "snore_duration_seconds": trend.get("snore_duration_seconds"),
             "heavy_snore_duration_seconds": trend.get("heavy_snore_duration_seconds"),
             "session_date": d,
-            "raw_json": json.dumps(_strip_timeseries(raw)) if raw else None,
+            "raw_json": _strip_timeseries(raw) if raw else None,
         }
         rows.append(row)
 

@@ -225,7 +225,7 @@ def sync_daily_summary(garmin: Garmin, sb: Client, target_date: date) -> int:
         "sedentary_seconds": stats.get("sedentarySeconds"),
         "sleeping_seconds": stats.get("sleepingSeconds"),
         "abnormal_hr_count": stats.get("abnormalHeartRateAlertsCount"),
-        "raw_json": json.dumps(stats),
+        "raw_json": stats,
     }
 
     return upsert_to_supabase(sb, "garmin_daily_summary", [row], "calendar_date,ts")
@@ -264,15 +264,16 @@ def sync_sleep(garmin: Garmin, sb: Client, target_date: date) -> int:
     sleep_start_gmt = dto.get("sleepStartTimestampGMT")
     sleep_end_gmt = dto.get("sleepEndTimestampGMT")
     if sleep_start_gmt is None or sleep_end_gmt is None:
-        # Loud warning rather than silent fallback. The whole reason for this
-        # fix is the Local field encodes local-as-UTC; a silent fallback would
-        # silently re-introduce the bug audit finding 4.A described.
+        # Refuse the *Local fallback — the field encodes local clock as UTC
+        # and silently shifts timestamps by Riley's TZ offset (~4-5h). Better to
+        # store NULL and let downstream callers flag the row as unattributable
+        # than to write a corrupted timestamp. Audit finding TZ-Claude-F-003.
         log.warning(
             f"  sleep {ds}: Garmin response missing sleepStart/EndTimestampGMT "
-            f"— falling back to *Local with TZ offset bug. Inspect dailySleepDTO keys."
+            f"— storing NULL timestamps rather than silently corrupting via *Local."
         )
-    sleep_start = sleep_start_gmt or dto.get("sleepStartTimestampLocal")
-    sleep_end = sleep_end_gmt or dto.get("sleepEndTimestampLocal")
+    sleep_start = sleep_start_gmt  # do NOT fall back to *Local
+    sleep_end = sleep_end_gmt
 
     row = {
         "ts": date_to_ts(target_date),
@@ -308,7 +309,7 @@ def sync_sleep(garmin: Garmin, sb: Client, target_date: date) -> int:
         "is_nap": False,
         "auto_detected": dto.get("autoSleepStartTimestampGMT") is not None,
         "sleep_result_type": dto.get("sleepResultType"),
-        "raw_json": json.dumps(sleep),
+        "raw_json": sleep,
     }
 
     return upsert_to_supabase(sb, "garmin_sleep", [row], "calendar_date,sleep_id,ts")
@@ -337,7 +338,7 @@ def sync_heart_rate(garmin: Garmin, sb: Client, target_date: date) -> int:
         "min_heart_rate": hr.get("minHeartRate"),
         "max_heart_rate": hr.get("maxHeartRate"),
         "last_seven_days_avg_rhr": hr.get("lastSevenDaysAvgRestingHeartRate"),
-        "raw_hr_values": json.dumps(hr.get("heartRateValues")),
+        "raw_hr_values": hr.get("heartRateValues"),
     }
 
     return upsert_to_supabase(sb, "garmin_heart_rate", [row], "calendar_date,ts")
@@ -375,7 +376,7 @@ def sync_hrv(garmin: Garmin, sb: Client, target_date: date) -> int:
         "start_timestamp": summary.get("startTimestampGMT"),
         "end_timestamp": summary.get("endTimestampGMT"),
         "create_timestamp": summary.get("createTimeStamp"),
-        "raw_hrv_readings": json.dumps(hrv.get("hrvReadings")),
+        "raw_hrv_readings": hrv.get("hrvReadings"),
     }
 
     return upsert_to_supabase(sb, "garmin_hrv", [row], "calendar_date,ts")
@@ -406,7 +407,7 @@ def sync_stress(garmin: Garmin, sb: Client, target_date: date) -> int:
         "medium_stress_duration_sec": stress.get("mediumStressDuration"),
         "high_stress_duration_sec": stress.get("highStressDuration"),
         "stress_qualifier": stress.get("stressQualifier"),
-        "raw_stress_values": json.dumps(stress.get("stressValuesArray")),
+        "raw_stress_values": stress.get("stressValuesArray"),
     }
 
     return upsert_to_supabase(sb, "garmin_stress", [row], "calendar_date,ts")
@@ -445,7 +446,7 @@ def sync_training_status(garmin: Garmin, sb: Client, target_date: date) -> int:
         "sleep_history_factor": safe_get(tr, "sleepHistoryFactor", "score"),
         "stress_history_factor": safe_get(tr, "stressHistoryFactor", "score"),
         "training_load_factor": safe_get(tr, "acuteTrainingLoadFactor", "score"),
-        "raw_json": json.dumps(tr),
+        "raw_json": tr,
     }
 
     return upsert_to_supabase(sb, "garmin_training_status", [row], "calendar_date,ts")
@@ -556,8 +557,11 @@ def sync_workout_definitions(garmin: Garmin, sb: Client, activity_workout_ids: l
             "interval_target_pace_high_mps": targets["interval_target_pace_high_mps"],
             "interval_distance_meters": targets["interval_distance_meters"],
             "interval_count": targets["interval_count"],
-            "segment_targets": json.dumps(targets["segment_targets"]) if targets["segment_targets"] else None,
-            "raw_json": json.dumps(workout, default=str),
+            "segment_targets": targets["segment_targets"] if targets["segment_targets"] else None,
+            # default=str via dumps+loads sanitizes datetime/Decimal for JSONB while
+            # avoiding the double-encoding bug (audit ETL-F-001). supabase-py serializes
+            # the resulting plain dict correctly.
+            "raw_json": json.loads(json.dumps(workout, default=str)),
         }
 
         count = upsert_to_supabase(sb, "garmin_workouts", [row], "workout_id")
@@ -635,7 +639,7 @@ def sync_activities(garmin: Garmin, sb: Client, start_date: date, end_date: date
             "manual_activity": act.get("manual", False),
             "has_splits": act.get("hasSplits", False),
             "has_polyline": act.get("hasPolyline", False),
-            "raw_json": json.dumps(act),
+            "raw_json": act,
         }
 
         count = upsert_to_supabase(sb, "garmin_activities", [row], "activity_id,ts")
@@ -684,7 +688,7 @@ def _sync_laps_for_activity(garmin: Garmin, sb: Client, activity_id, start_ts) -
                     "intensity": lap.get("intensityType"),
                     "wkt_step_index": lap.get("wktStepIndex"),
                     "wkt_index": lap.get("wktIndex"),
-                    "raw_json": json.dumps(lap),
+                    "raw_json": lap,
                 })
             upsert_to_supabase(sb, "garmin_activity_laps", lap_rows,
                                "activity_id,lap_index,ts")

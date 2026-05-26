@@ -199,7 +199,7 @@ def infer_proposed_inserts(cycles: list[dict], history_map: dict[str, str]) -> l
             "effective_from": ts_iso,
             "tz": inferred_iana,
             "notes": (f"whoop-auto: cycle {c['cycle_id']} offset {whoop_offset_str}; "
-                      f"{provenance}; log was {log_tz} ({log_offset_str})"),
+                      f"{provenance}; log was {log_tz} ({log_offset_at_start})"),
         })
         last_proposed_tz = inferred_iana
     return proposals

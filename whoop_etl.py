@@ -327,7 +327,7 @@ def sync_cycles(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
             "kilojoule": score.get("kilojoule"),
             "average_heart_rate": score.get("average_heart_rate"),
             "max_heart_rate": score.get("max_heart_rate"),
-            "raw_json": json.dumps(c),
+            "raw_json": c,
         })
 
     return upsert_to_supabase(sb, "whoop_cycles", rows, "cycle_id")
@@ -355,7 +355,7 @@ def sync_recovery(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
             "spo2_percentage": score.get("spo2_percentage"),
             "skin_temp_celsius": score.get("skin_temp_celsius"),
             "user_calibrating": score.get("user_calibrating"),
-            "raw_json": json.dumps(r),
+            "raw_json": r,
         })
 
     return upsert_to_supabase(sb, "whoop_recovery", rows, "cycle_id")
@@ -403,7 +403,7 @@ def sync_sleep(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
             "sleep_performance_percentage": score.get("sleep_performance_percentage"),
             "sleep_consistency_percentage": score.get("sleep_consistency_percentage"),
             "sleep_efficiency_percentage": score.get("sleep_efficiency_percentage"),
-            "raw_json": json.dumps(s),
+            "raw_json": s,
         })
 
     return upsert_to_supabase(sb, "whoop_sleep", rows, "sleep_id")
@@ -445,7 +445,7 @@ def sync_workouts(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
             "zone_three_milli": zones.get("zone_three_milli"),
             "zone_four_milli": zones.get("zone_four_milli"),
             "zone_five_milli": zones.get("zone_five_milli"),
-            "raw_json": json.dumps(w),
+            "raw_json": w,
         })
 
     return upsert_to_supabase(sb, "whoop_workouts", rows, "workout_id")
@@ -467,7 +467,7 @@ def sync_body_measurement(whoop: WhoopClient, sb: Client) -> int:
         "height_meter": bm.get("height_meter"),
         "weight_kilogram": bm.get("weight_kilogram"),
         "max_heart_rate": bm.get("max_heart_rate"),
-        "raw_json": json.dumps(bm),
+        "raw_json": bm,
     }
 
     return upsert_to_supabase(sb, "whoop_body_measurements", [row], "measured_at")

@@ -249,7 +249,7 @@ def backfill_actuals() -> int:
 
     min_date = past_preds["prediction_date"].min()
     actuals_raw = fetch_all(
-        "daily_health_matrix",
+        "daily_health_matrix_behavioral",
         select="calendar_date,whoop_hrv_rmssd",
         filters=[("calendar_date", "gte", min_date)],
     )

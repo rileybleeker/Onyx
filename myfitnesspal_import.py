@@ -194,8 +194,8 @@ def import_nutrition(csv_path: str, dry_run: bool = False) -> int:
             "fiber_g": totals.get("fiber_g"),
             "sugar_g": totals.get("sugar_g"),
             "sodium_mg": totals.get("sodium_mg"),
-            "meals_json": json.dumps(meals) if meals else None,
-            "raw_json": json.dumps({"totals": totals, "meals": meals}),
+            "meals_json": meals if meals else None,
+            "raw_json": {"totals": totals, "meals": meals},
         })
 
     dates = [r["calendar_date"] for r in db_rows]
