@@ -334,7 +334,7 @@ export default function ActivitiesPage() {
         for (const r of recCtx) {
           recMap[`garmin:${r.activity_id}`] = {
             recovery:  r.whoop_recovery != null ? +r.whoop_recovery : null,
-            hrv:       r.whoop_hrv != null ? +Number(r.whoop_hrv).toFixed(1) : null,
+            hrv:       r.whoop_hrv_rmssd_ms != null ? +Number(r.whoop_hrv_rmssd_ms).toFixed(1) : null,
             sleepPerf: r.whoop_sleep_performance != null ? +r.whoop_sleep_performance : null,
             paceDelta: r.pace_delta_pct != null ? +r.pace_delta_pct : null,
             segments:  Array.isArray(r.segment_targets) ? r.segment_targets as SegmentTarget[] : null,

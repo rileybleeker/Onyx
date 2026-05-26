@@ -233,7 +233,7 @@ def backfill_actuals() -> int:
 
     past_preds = fetch_all(
         "hrv_predictions",
-        select="prediction_date,model,horizon_days,predicted_hrv",
+        select="prediction_date,model,horizon_days,model_version,predicted_hrv",
         filters=[("actual_hrv", "is_", "null")],
     )
     if past_preds.empty:
@@ -271,13 +271,18 @@ def backfill_actuals() -> int:
             "prediction_date": str(row["prediction_date"]),
             "model": str(row["model"]),
             "horizon_days": int(row["horizon_days"]),
+            "model_version": row.get("model_version"),
             "actual_hrv": actual_f,
             "residual": actual_f - pred_f,
         })
 
     if updates:
+        # Audit P1 (G1): on_conflict now targets the (date,model,horizon,version)
+        # unique index so each retrain run preserves history. NULL versions are
+        # handled via NULLS NOT DISTINCT on the underlying index.
         supa.schema("pds").from_("hrv_predictions").upsert(
-            _clean_for_json(updates), on_conflict="prediction_date,model,horizon_days"
+            _clean_for_json(updates),
+            on_conflict="prediction_date,model,horizon_days,model_version"
         ).execute()
         log.info(f"  Backfilled actuals for {len(updates)} predictions.")
 
@@ -433,9 +438,12 @@ def main() -> None:
                     today_hrv = prediction.pop("today_hrv", None)
 
                     payload = [{k: v for k, v in prediction.items() if v is not None}]
+                    # Audit P1 (G1): on_conflict targets the 4-tuple so retrain
+                    # versions accumulate as separate rows; same-day reruns
+                    # with the same version upsert in place.
                     supa.schema("pds").from_("hrv_predictions").upsert(
                         _clean_for_json(payload),
-                        on_conflict="prediction_date,model,horizon_days",
+                        on_conflict="prediction_date,model,horizon_days,model_version",
                     ).execute()
 
                     log.info(

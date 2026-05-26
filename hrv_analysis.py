@@ -3552,7 +3552,10 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
             })
 
     log.info(f"  Upserting {len(rows)} prediction rows…")
-    upsert_batch("hrv_predictions", rows, "prediction_date,model,horizon_days")
+    # Audit P1 (G1): on_conflict targets the 4-tuple including model_version
+    # so backtest reruns from different versions accumulate as separate rows.
+    upsert_batch("hrv_predictions", rows,
+                 "prediction_date,model,horizon_days,model_version")
 
 
 def store_metrics(eval_results: dict) -> None:

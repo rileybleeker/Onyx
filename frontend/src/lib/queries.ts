@@ -376,7 +376,7 @@ export async function getRunningRecoveryContext(days: number = 30) {
 
   const { data, error } = await supabase
     .from("recovery_vs_pace")
-    .select("activity_id, whoop_recovery, whoop_hrv, whoop_sleep_performance, pace_delta_pct, segment_targets, segment_target_count")
+    .select("activity_id, whoop_recovery, whoop_hrv_rmssd_ms, whoop_sleep_performance, pace_delta_pct, segment_targets, segment_target_count")
     .gte("activity_date", since.toISOString().split("T")[0]);
 
   if (error) throw error;

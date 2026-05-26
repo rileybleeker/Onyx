@@ -43,8 +43,11 @@ WITH all_behavioral_dates AS (
         WHERE onyx_behavioral_date IS NOT NULL
     UNION SELECT onyx_behavioral_date FROM pds.supplement_intake
         WHERE onyx_behavioral_date IS NOT NULL
-    UNION SELECT calendar_date FROM pds.garmin_daily_summary
-        WHERE calendar_date IS NOT NULL
+    -- garmin_daily_summary intentionally NOT in the spine (audit P1 G3): its
+    -- calendar_date is Garmin watch-local, which can diverge from
+    -- onyx_behavioral_date on travel days. GDS still LEFT JOINs below via
+    -- calendar_date, accepting that travel-day rows may miss GDS data. Per
+    -- ADR-0001 D5 the spine must be canonically behavioral.
 )
 SELECT s.calendar_date,
     s.calendar_date AS onyx_behavioral_date,
