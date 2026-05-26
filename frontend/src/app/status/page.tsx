@@ -16,6 +16,7 @@ const SOURCE_BADGE: Record<string, string> = {
   notion_journal: "NOTION",
   myfitnesspal: "MFP",
   hrv_analysis: "ML",
+  hrv_retrain: "ML",
   spotify: "SPOTIFY",
   reccobeats: "RECCOBEATS",
   musicbrainz: "MUSICBRAINZ",
@@ -33,6 +34,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   notion_journal: "text-text-tertiary",
   myfitnesspal: "text-text-tertiary",
   hrv_analysis: "text-blue-400",
+  hrv_retrain: "text-blue-400/70",
   spotify: "text-[#1DB954]",
   reccobeats: "text-[#1DB954]/70",
   musicbrainz: "text-[#1DB954]/70",
@@ -81,6 +83,7 @@ const SOURCE_ORDER = [
   "notion_journal",
   "myfitnesspal",
   "hrv_analysis",
+  "hrv_retrain",
   "spotify",
   "reccobeats",
   "musicbrainz",
@@ -200,6 +203,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   reccobeats: "ReccoBeats",
   musicbrainz: "MusicBrainz",
   notion_journal: "Notion Journal",
+  hrv_analysis: "HRV Retrain",
 };
 
 const HISTORY_TYPE_LABELS: Record<string, string> = {
@@ -211,6 +215,7 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   audio_features: "Audio Features",
   artist_tags: "Artist Tags",
   entries: "Entries",
+  retrain: "Retrain",
 };
 
 export default function StatusPage() {

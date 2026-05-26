@@ -32,10 +32,12 @@ const CADENCE: Record<string, string> = {
   whoop_journal: "Hourly :30 (IMAP)",
   habits: "Hourly :45",
   myfitnesspal: "Hourly :15 (IMAP)",
-  // Predict: every hourly ETL + 23:50 ET (DST-gated). Retrain: hourly
-  // conditional on backfill detection + daily 12:00 UTC unconditional
-  // safety-net.
-  hrv_analysis: "Predict: hourly + 23:50 ET · Retrain: hourly (cond.) + 12:00 UTC",
+  // Predict: every hourly ETL + 23:50 ET (DST-gated).
+  hrv_analysis: "Predict: hourly + 23:50 ET",
+  // Retrain: hourly conditional on backfill detection + daily 12:00 UTC
+  // unconditional safety-net. Tracked separately because the predict path
+  // can stay green while the retrain crashes silently (the model is cached).
+  hrv_retrain: "Hourly (cond.) + 12:00 UTC safety-net",
   spotify: "Every 2h :50",
   reccobeats: "With Spotify ETL",
   musicbrainz: "With Spotify ETL",
@@ -59,6 +61,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   habits:         { method: "automated",      label: "Notion sync" },
   myfitnesspal:   { method: "semi-automated", label: "Email import" },
   hrv_analysis:   { method: "automated",      label: "Computed" },
+  hrv_retrain:    { method: "automated",      label: "Model retrain" },
   spotify:        { method: "automated",      label: "API ETL" },
   reccobeats:     { method: "automated",      label: "API ETL" },
   musicbrainz:    { method: "automated",      label: "API ETL" },
@@ -187,7 +190,7 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, mealsRes, weightRes, driftRes, tzGapsRes, hrvGapsRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, mealsRes, weightRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -229,6 +232,16 @@ export async function GET() {
         .from("hrv_prediction_gaps")
         .select("expected_date, gap_type")
         .order("expected_date", { ascending: false }),
+      // HRV RETRAIN freshness — most recent computed_at in hrv_analysis_results.
+      // This catches silent failures of the hrv_analysis.py pipeline that the
+      // prediction card misses (predict keeps writing fresh rows from the
+      // cached model even when retrain has been crashing). Audit gap discovered
+      // when category→categories rename broke retrain for weeks unnoticed.
+      supabase
+        .from("hrv_analysis_results")
+        .select("computed_at")
+        .order("computed_at", { ascending: false })
+        .limit(1),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -275,6 +288,11 @@ export async function GET() {
     const reccobeatsEntry = latestBySrcType["reccobeats|audio_features"] ?? null;
     const musicbrainzEntry = latestBySrcType["musicbrainz|artist_tags"] ?? null;
     const notionJournalEntry = latestBySrcType["notion_journal|entries"] ?? null;
+    // Latest hrv_analysis retrain heartbeat (added 2026-05-26 — older runs
+    // didn't emit one, so fall back to MAX(hrv_analysis_results.computed_at)
+    // below for historical signal).
+    const hrvRetrainEntry = latestBySrcType["hrv_analysis|retrain"] ?? null;
+    const hrvRetrainComputedAt = (hrvRetrainRes.data?.[0]?.computed_at as string | undefined) ?? null;
 
     const garminLag = daysLag(garminDate, spineMaxDate);
     const whoopLag = daysLag(whoopDate, spineMaxDate);
@@ -405,6 +423,39 @@ export async function GET() {
         integrationMethod: METHOD.hrv_analysis.method,
         methodLabel: METHOD.hrv_analysis.label,
       },
+      // HRV Retrain (separate from Predict above) — tracks whether
+      // hrv_analysis.py is actually completing. The predict path can stay
+      // green while the retrain crashes silently (cached model keeps serving),
+      // so we surface it independently. Daily safety-net runs at 12:00 UTC,
+      // so >30h since the last successful computed_at = failure.
+      hrv_retrain: (() => {
+        // Prefer the new sync_log heartbeat (going forward); fall back to
+        // hrv_analysis_results.computed_at (works for historical runs).
+        const lastSync = (hrvRetrainEntry?.sync_start as string)
+          ?? hrvRetrainComputedAt;
+        const heartbeatStatus = hrvRetrainEntry?.status as string | undefined;
+        const ageHours = hoursSince(lastSync);
+        let status: SourceStatus["status"];
+        if (heartbeatStatus === "failed") status = "failed";
+        else if (!lastSync) status = "unknown";
+        else if (ageHours > 30) status = "failed";        // missed daily safety net
+        else if (ageHours > 26 || heartbeatStatus === "partial") status = "partial";
+        else status = "success";
+        return {
+          label: "HRV Retrain",
+          lastSync,
+          status,
+          latestDataDate: null,                            // not date-anchored
+          daysLag: Math.floor(ageHours / 24),
+          recordsSynced: (hrvRetrainEntry?.records_synced as number) ?? 0,
+          durationSeconds: (hrvRetrainEntry?.duration_seconds as number) ?? null,
+          errorMessage: (hrvRetrainEntry?.error_message as string)
+            ?? (ageHours > 30 ? `Last successful retrain ${ageHours}h ago (daily safety-net runs at 12:00 UTC).` : null),
+          cadence: CADENCE.hrv_retrain,
+          integrationMethod: METHOD.hrv_retrain.method,
+          methodLabel: METHOD.hrv_retrain.label,
+        };
+      })(),
       spotify: {
         label: "Spotify",
         lastSync: (spotifyEntry?.sync_start as string) ?? null,

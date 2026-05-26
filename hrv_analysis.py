@@ -123,6 +123,33 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 supa = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+
+def log_sync_entry(status: str, records: int = 0, error: str | None = None,
+                    duration: float | None = None) -> None:
+    """Emit a sync_log heartbeat for the HRV analysis retrain pipeline.
+
+    Without this, the pipeline can crash silently and /status will keep showing
+    green because hrv_predict.py still writes fresh predictions using the
+    cached model. Audit gap: discovered when the `category`/`categories` column
+    rename broke every retrain attempt for weeks unnoticed.
+    """
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(seconds=duration) if duration is not None else end
+    try:
+        supa.schema("pds").table("sync_log").insert({
+            "source": "hrv_analysis",
+            "data_type": "retrain",
+            "status": status,
+            "records_synced": records,
+            "error_message": error[:1000] if error else None,
+            "duration_seconds": duration,
+            "sync_start": start.isoformat(),
+            "sync_end": end.isoformat(),
+        }).execute()
+    except Exception as e:
+        log.warning(f"Failed to write hrv_analysis sync_log heartbeat: {e}")
+
+
 MODEL_VERSION = f"{date.today().isoformat()}_behavioral_v1"
 TARGET = "whoop_hrv_rmssd"
 
@@ -2780,8 +2807,12 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
                 # ffill only — bfill would pull future values into past regressor
                 # rows, leaking signal into Prophet's training set. Audit finding F-004.
                 hrv_df[rf] = hrv_df[rf].ffill().astype(float)
-                # Drop any leading rows still missing (no past value to forward-fill from).
-                # Prophet handles NaN regressors gracefully; this just keeps semantics clean.
+            # Drop any leading rows where ffill couldn't supply a value (no past
+            # observation to fill from). Prophet's stan_init does NOT accept NaN
+            # regressors and the failure mode is a hard crash. Trimming leading
+            # rows preserves the no-future-leakage property; alternatives like
+            # median-fill or zero-fill would lie about the missingness.
+            hrv_df = hrv_df.dropna(subset=reg_feats).reset_index(drop=True)
 
         # Validation: fit on all but last 30 days, predict last 30
         cutoff = len(hrv_df) - 30
@@ -3919,4 +3950,25 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import time as _time
+    _started_at = _time.time()
+    try:
+        main()
+        log_sync_entry(
+            status="success",
+            records=0,
+            duration=_time.time() - _started_at,
+        )
+    except SystemExit:
+        # argparse --help and similar — don't emit a failure heartbeat
+        raise
+    except BaseException as _e:
+        # Catch *everything* (including KeyboardInterrupt) so the failure shows
+        # on /status. Then re-raise so the process exits non-zero and CI flags it.
+        log_sync_entry(
+            status="failed",
+            records=0,
+            error=f"{type(_e).__name__}: {_e}",
+            duration=_time.time() - _started_at,
+        )
+        raise
