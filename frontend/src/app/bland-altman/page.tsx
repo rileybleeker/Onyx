@@ -171,11 +171,26 @@ export default function BlandAltmanPage() {
   const whoopResp = data.map((d) => d.whoop_respiratory_rate ? +d.whoop_respiratory_rate : null);
   const eightResp = data.map((d) => d.eight_sleep_breath_rate ? +d.eight_sleep_breath_rate : null);
 
-  // Compute all 12 Bland-Altman comparisons
+  // Sleep Duration in MINUTES. Each side is main-session-only so naps don't
+  // bias one device upward (see Notion decision record on nap-inclusion
+  // convention). Garmin sleep_duration_seconds and WHOOP
+  // total_in_bed_time_milli are both main-session by their respective
+  // is_nap=false filters in the matrix view; Eight Sleep uses the
+  // _main_sec column added 2026-05-25.
+  const garminDurMin = data.map((d) => d.garmin_sleep_duration_sec ? +d.garmin_sleep_duration_sec / 60 : null);
+  const whoopDurMin = data.map((d) => d.whoop_sleep_duration_milli ? +d.whoop_sleep_duration_milli / 60000 : null);
+  const eightDurMin = data.map((d) => d.eight_sleep_duration_main_sec ? +d.eight_sleep_duration_main_sec / 60 : null);
+
+  // Compute all Bland-Altman comparisons
   const sleepBA = [
     blandAltman(garminSleep, whoopSleep),
     blandAltman(garminSleep, eightSleep),
     blandAltman(whoopSleep, eightSleep),
+  ];
+  const durationBA = [
+    blandAltman(garminDurMin, whoopDurMin),
+    blandAltman(garminDurMin, eightDurMin),
+    blandAltman(whoopDurMin, eightDurMin),
   ];
   const hrvBA = [
     blandAltman(garminHrv, whoopHrv),
@@ -193,11 +208,32 @@ export default function BlandAltmanPage() {
     blandAltman(whoopResp, eightResp),
   ];
 
-  const metrics = [
-    { label: "Sleep Score", unit: "%", results: sleepBA },
+  const metrics: Array<{ label: string; unit: string; results: (BAResult | null)[]; footnote?: string }> = [
+    {
+      label: "Sleep Score",
+      unit: "%",
+      results: sleepBA,
+      footnote: "Eight Sleep's sleep_score is generated per-day after every session is synced, so it has indirect nap context; WHOOP sleep_performance_percentage and Garmin overall_sleep_score are main-session only. Normalization to 0-100 keeps the asymmetry small but it's not strictly apples-to-apples.",
+    },
+    {
+      label: "Sleep Duration",
+      unit: "min",
+      results: durationBA,
+      footnote: "All three sides are main-session only. Eight Sleep uses time_slept_main_session_seconds (Pod 4 splits multi-session days into main + naps); WHOOP and Garmin filter is_nap=false in the matrix view.",
+    },
     { label: "HRV", unit: "ms", results: hrvBA },
-    { label: "Resting Heart Rate", unit: "bpm", results: rhrBA },
-    { label: "Respiratory Rate", unit: "br/min", results: respBA },
+    {
+      label: "Resting Heart Rate",
+      unit: "bpm",
+      results: rhrBA,
+      footnote: "Eight Sleep avg_heart_rate aggregates across all sessions for the day (no main-only variant in the API). WHOOP and Garmin RHR are derived from the main sleep session. Nap-heavy days may bias the Eight Sleep side.",
+    },
+    {
+      label: "Respiratory Rate",
+      unit: "br/min",
+      results: respBA,
+      footnote: "Same nap-inclusion asymmetry as RHR: Eight Sleep avg_breath_rate is day-wide; WHOOP / Garmin are main-session.",
+    },
   ];
 
   return (
@@ -284,7 +320,12 @@ export default function BlandAltmanPage() {
 
       {metrics.map((metric) => (
         <div key={metric.label} className="mb-8">
-          <h3 className="text-lg font-semibold text-text-primary mb-4">{metric.label}</h3>
+          <h3 className="text-lg font-semibold text-text-primary mb-1">{metric.label}</h3>
+          {metric.footnote && (
+            <p className="text-[11px] text-text-tertiary leading-relaxed mb-3 max-w-3xl">
+              {metric.footnote}
+            </p>
+          )}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             {PAIRS.map(([a, b, color], i) => (
               <BAPlot
