@@ -3371,7 +3371,7 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
                                  1.645 * xgb_results.get("pred_std", 0)),
             "actual_hrv": None,
             "horizon_days": 1,
-            "top_drivers": json.dumps(xgb_results.get("top_drivers", [])),
+            "top_drivers": xgb_results.get("top_drivers", []),
             "model_version": MODEL_VERSION,
             "training_window_start": xgb_results.get("train_start"),
             "training_window_end": xgb_results.get("train_end"),
@@ -3469,7 +3469,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "correlation",
             "result_key": "spearman_top50",
-            "result_json": json.dumps(corr_list),
+            "result_json": corr_list,
         })
 
         # Journal-specific correlations (all journal_ features, sorted by abs r)
@@ -3479,7 +3479,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             rows.append({
                 "result_type": "correlation",
                 "result_key": "spearman_journal",
-                "result_json": json.dumps(journal_corr_list),
+                "result_json": journal_corr_list,
             })
 
         # Habit-specific correlations — same treatment as journal_, just on
@@ -3490,7 +3490,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             rows.append({
                 "result_type": "correlation",
                 "result_key": "spearman_habit",
-                "result_json": json.dumps(habit_corr_list),
+                "result_json": habit_corr_list,
             })
 
     # Journal impact
@@ -3498,7 +3498,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "journal_impact",
             "result_key": "all",
-            "result_json": json.dumps(stat_results["journal_impact"]),
+            "result_json": stat_results["journal_impact"],
         })
 
     # Habit impact (Yes/No t-test mirroring journal_impact)
@@ -3506,7 +3506,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "habit_impact",
             "result_key": "all",
-            "result_json": json.dumps(stat_results["habit_impact"]),
+            "result_json": stat_results["habit_impact"],
         })
 
     # Supplement Yes/No impact
@@ -3514,7 +3514,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "supplement_impact",
             "result_key": "yes_no",
-            "result_json": json.dumps(stat_results["supplement_impact"]),
+            "result_json": stat_results["supplement_impact"],
         })
 
     # Supplement dose-response
@@ -3522,7 +3522,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "supplement_impact",
             "result_key": "dose_response",
-            "result_json": json.dumps(stat_results["supplement_dose_response"]),
+            "result_json": stat_results["supplement_dose_response"],
         })
 
     # Nutrition Spearman
@@ -3530,7 +3530,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "nutrition_impact",
             "result_key": "spearman",
-            "result_json": json.dumps(stat_results["nutrition_impact"]),
+            "result_json": stat_results["nutrition_impact"],
         })
 
     # Feature importance (SHAP or XGB, top 30, all features)
@@ -3540,7 +3540,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "feature_importance",
             "result_key": "shap_mean_abs",
-            "result_json": json.dumps(fi_list),
+            "result_json": fi_list,
         })
 
         # Journal-specific SHAP importance — use full dict so features outside top-30 are included
@@ -3552,7 +3552,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             rows.append({
                 "result_type": "feature_importance",
                 "result_key": "shap_journal",
-                "result_json": json.dumps(journal_fi_list),
+                "result_json": journal_fi_list,
             })
 
         # Habit-specific SHAP importance — mirrors journal block
@@ -3563,7 +3563,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             rows.append({
                 "result_type": "feature_importance",
                 "result_key": "shap_habit",
-                "result_json": json.dumps(habit_fi_list),
+                "result_json": habit_fi_list,
             })
 
     # Stage 3 standardized OLS results (audit fix 2.C)
@@ -3571,7 +3571,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "regression",
             "result_key": "stage3_standardized_ols",
-            "result_json": json.dumps(stat_results["stage3_ols"]),
+            "result_json": stat_results["stage3_ols"],
         })
 
     # Controllable-only SHAP ranking (audit fix 7.K) — what's actionable
@@ -3579,10 +3579,10 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "feature_importance",
             "result_key": "shap_controllable",
-            "result_json": json.dumps([
+            "result_json": [
                 {"feature": k, "label": FEATURE_LABELS.get(k, k), "importance": v}
                 for k, v in controllable_importance.items()
-            ]),
+            ],
         })
 
     # Permutation importance cross-check (audit fix 7.L)
@@ -3590,10 +3590,10 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "feature_importance",
             "result_key": "permutation",
-            "result_json": json.dumps([
+            "result_json": [
                 {"feature": k, "label": FEATURE_LABELS.get(k, k), "importance": v}
                 for k, v in permutation_importance.items()
-            ]),
+            ],
         })
 
     # Diebold-Mariano pairwise model comparison (audit fix 7.I)
@@ -3601,7 +3601,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "model_comparison",
             "result_key": "diebold_mariano",
-            "result_json": json.dumps(dm_test),
+            "result_json": dm_test,
         })
 
     # Error-mode analysis (audit fix 7.J): per-behavior MAE
@@ -3609,7 +3609,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "model_comparison",
             "result_key": "error_modes_by_journal",
-            "result_json": json.dumps(error_modes),
+            "result_json": error_modes,
         })
 
     # Error-mode analysis for habits — mirrors error_modes_by_journal
@@ -3617,7 +3617,7 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         rows.append({
             "result_type": "model_comparison",
             "result_key": "error_modes_by_habit",
-            "result_json": json.dumps(error_modes_habits),
+            "result_json": error_modes_habits,
         })
 
     # Causal inference results — separate rows per family so the frontend
@@ -3627,38 +3627,38 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             rows.append({
                 "result_type": "causal",
                 "result_key": "binary_treatments",
-                "result_json": json.dumps(causal_results["binary_treatments"]),
+                "result_json": causal_results["binary_treatments"],
             })
         if causal_results.get("continuous_treatments"):
             rows.append({
                 "result_type": "causal",
                 "result_key": "continuous_treatments",
-                "result_json": json.dumps(causal_results["continuous_treatments"]),
+                "result_json": causal_results["continuous_treatments"],
             })
         if causal_results.get("dag"):
             rows.append({
                 "result_type": "causal",
                 "result_key": "dag",
-                "result_json": json.dumps(causal_results["dag"]),
+                "result_json": causal_results["dag"],
             })
         if causal_results.get("meta"):
             rows.append({
                 "result_type": "causal",
                 "result_key": "meta",
-                "result_json": json.dumps(causal_results["meta"]),
+                "result_json": causal_results["meta"],
             })
         if causal_results.get("dropped_low_n"):
             rows.append({
                 "result_type": "causal",
                 "result_key": "dropped_low_n",
-                "result_json": json.dumps(causal_results["dropped_low_n"]),
+                "result_json": causal_results["dropped_low_n"],
             })
 
     # Feature label map
     rows.append({
         "result_type": "feature_labels",
         "result_key": "all",
-        "result_json": json.dumps(FEATURE_LABELS),
+        "result_json": FEATURE_LABELS,
     })
 
     if rows:

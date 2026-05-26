@@ -213,7 +213,7 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
         "prediction_upper": round(upper, 2),
         "actual_hrv": None,
         "horizon_days": 1,
-        "top_drivers": json.dumps(top_drivers_payload),
+        "top_drivers": top_drivers_payload,
         "model_version": MODEL_VERSION,
         "training_window_start": model_bundle.get("model_version", "").split("_")[0],
         "training_window_end": train_end,
