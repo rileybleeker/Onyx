@@ -204,14 +204,20 @@ async function getHistoricalHrv(days = 180) {
   return data ?? [];
 }
 
-// All-time pull (no date filter) of nights that have both a median room temp
-// and a WHOOP HRV reading. Powers the Environment Sweet Spot dose-response
-// chart, which buckets nights by temperature and shows mean HRV per bucket.
+// All-time pull (no date filter) of nights that have a temperature reading
+// AND any of the next-night outcomes. Powers the Environment Sweet Spot
+// dose-response chart, which buckets nights by selected temperature and
+// shows mean of the selected outcome per bucket. Filters at "any temp + HRV"
+// so we don't drop nights where bed_temp is present but room_temp isn't.
+// Per-row null-check happens client-side per selected axis pair.
 async function getEnvDoseResponseData() {
   const { data } = await supabase
     .from("daily_health_matrix_behavioral")
-    .select("calendar_date,eight_sleep_room_temp,eight_sleep_bed_temp,whoop_hrv_rmssd")
-    .not("eight_sleep_room_temp", "is", null)
+    .select(
+      "calendar_date,eight_sleep_room_temp,eight_sleep_bed_temp,whoop_hrv_rmssd," +
+      "whoop_recovery_score,whoop_sleep_efficiency,whoop_deep_sleep_milli"
+    )
+    .or("eight_sleep_room_temp.not.is.null,eight_sleep_bed_temp.not.is.null")
     .not("whoop_hrv_rmssd", "is", null)
     .order("calendar_date", { ascending: true });
   return data ?? [];
@@ -315,6 +321,11 @@ export default function HrvAnalysisPage() {
   const [causalMeta, setCausalMeta] = useState<any | null>(null);
   const [causalDropped, setCausalDropped] = useState<any[]>([]);
   const [envMatrix, setEnvMatrix] = useState<any[]>([]);
+  // Environment Sweet Spot dual-axis selectors. X axis is which temp sensor
+  // to bucket by (Pod room vs bed surface); Y axis is which next-night
+  // outcome to plot. Defaults preserve the original chart (room × HRV).
+  const [envXAxis, setEnvXAxis] = useState<"room" | "bed">("room");
+  const [envOutcome, setEnvOutcome] = useState<"hrv" | "recovery" | "efficiency" | "deep">("hrv");
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
   const [range, setRange] = useState<Range>("30d");
@@ -1925,19 +1936,51 @@ export default function HrvAnalysisPage() {
         The causal layer above answers "does warmer/cooler than usual move HRV?"
         (binary direction). This panel answers the different question "what
         SPECIFIC temperature is optimal for me?" by binning every night by the
-        median room temp slept in and showing mean WHOOP HRV per bucket. The
-        peak bucket = personal sweet spot. Error bars are ±1 SEM. Computed
-        client-side from daily_health_matrix; no python pipeline dependency.
-        Will fill in as nightly ETL accumulates more eight_sleep_room_temp data
-        (only ~9 nights as of initial ship, since Eight Sleep's intervals API
-        only began exposing temp timeseries on ~2026-05-15).
+        selected temperature sensor and showing the mean of the selected
+        next-night outcome per bucket. Peak bucket = personal sweet spot for
+        that outcome. Error bars are ±1 SEM. Computed client-side from
+        daily_health_matrix; no python pipeline dependency.
+
+        Both X and Y axes are user-selectable (since 2026-05-25): toggle
+        between Pod room temp / bed surface temp on the X axis, and HRV /
+        Recovery Score / Sleep Efficiency / Deep Sleep duration on the Y.
+        The optimal temperature for HRV may differ from optimal for deep
+        sleep — surfacing that lets you pick a target based on the metric
+        you actually want to optimize.
       */}
+      {(() => {
+        const X_AXIS_META = {
+          room: {
+            label: "Room temp",
+            column: "eight_sleep_room_temp",
+            axisLabel: "median room temp (°F · Pod sensor, uncalibrated)",
+            sensorCaveat: "the Pod's room-temp sensor sits on the unit (in/under the bed) and reads warmer than a wall thermostat by an unknown amount — the relative shape (peak vs trough) is valid for finding your personal optimum, but absolute Fahrenheit values aren't.",
+          },
+          bed: {
+            label: "Bed temp",
+            column: "eight_sleep_bed_temp",
+            axisLabel: "median bed-surface temp (°F · Pod sensor)",
+            sensorCaveat: "bed temp reflects both your Pod heater/cooler setpoint AND your body warming the surface — it's partly an OUTPUT of how hot you slept, not just an input. Treat the peak as 'the bed temp my best nights converged on' rather than a setpoint recommendation.",
+          },
+        } as const;
+        const Y_OUTCOMES = {
+          hrv: { label: "WHOOP HRV", column: "whoop_hrv_rmssd", unit: "ms", axisLabel: "WHOOP HRV (ms)" },
+          recovery: { label: "Recovery Score", column: "whoop_recovery_score", unit: "%", axisLabel: "WHOOP Recovery (%)" },
+          efficiency: { label: "Sleep Efficiency", column: "whoop_sleep_efficiency", unit: "%", axisLabel: "WHOOP Sleep Efficiency (%)" },
+          deep: { label: "Deep Sleep", column: "whoop_deep_sleep_milli", unit: "min", axisLabel: "WHOOP Deep Sleep (min)" },
+        } as const;
+        const xMeta = X_AXIS_META[envXAxis];
+        const yMeta = Y_OUTCOMES[envOutcome];
+        const useableRows = envMatrix.filter(
+          (d: any) => d[xMeta.column] != null && d[yMeta.column] != null
+        );
+      return (
       <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 shadow-card">
         <div className="flex items-start justify-between gap-3 mb-4">
           <div>
             <h3 className="text-[18px] font-medium text-text-primary">Environment Sweet Spot</h3>
             <p className="text-[12px] text-text-tertiary mt-1">
-              Mean WHOOP HRV per room-temperature bucket · {envMatrix.length} nights
+              Mean {yMeta.label} per {xMeta.label.toLowerCase()} bucket · {useableRows.length} nights
             </p>
           </div>
           <span className="text-[9px] font-mono text-text-tertiary px-2 py-0.5 rounded border border-border-subtle">
@@ -1945,14 +1988,50 @@ export default function HrvAnalysisPage() {
           </span>
         </div>
 
+        {/* Axis selectors — surfaced above the explanation block so the
+            chart-controls relationship is obvious. */}
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 mb-4 text-[11px] font-mono">
+          <div className="flex items-center gap-2">
+            <span className="text-text-tertiary uppercase tracking-wide">Temp sensor</span>
+            {(Object.keys(X_AXIS_META) as Array<keyof typeof X_AXIS_META>).map((k) => (
+              <button
+                key={k}
+                onClick={() => setEnvXAxis(k)}
+                className={`px-2 py-0.5 rounded-[3px] border ${envXAxis === k
+                  ? "bg-[#06b6d4]/15 border-[#06b6d4]/40 text-text-primary"
+                  : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"}`}
+              >
+                {X_AXIS_META[k].label}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-text-tertiary uppercase tracking-wide">Outcome</span>
+            {(Object.keys(Y_OUTCOMES) as Array<keyof typeof Y_OUTCOMES>).map((k) => (
+              <button
+                key={k}
+                onClick={() => setEnvOutcome(k)}
+                className={`px-2 py-0.5 rounded-[3px] border ${envOutcome === k
+                  ? "bg-[#22c55e]/15 border-[#22c55e]/40 text-text-primary"
+                  : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"}`}
+              >
+                {Y_OUTCOMES[k].label}
+              </button>
+            ))}
+          </div>
+        </div>
+
         <div className="text-[12px] text-text-secondary leading-relaxed space-y-3 max-w-4xl mb-4">
           <p>
             The Causal Inference section above tells you whether <em>warmer-than-usual</em> or
-            <em> cooler-than-usual</em> rooms move your HRV. This panel answers a different
-            question: <strong>which specific temperature is actually optimal for you?</strong>{" "}
-            Every night with both a median room temp and a WHOOP HRV reading is binned into
-            2°F buckets, and the mean HRV per bucket is plotted. The peak bucket is your
-            personal sweet spot.
+            <em> cooler-than-usual</em> moves your outcome (binary direction). This panel
+            answers a different question: <strong>which specific temperature is actually
+            optimal for the outcome you care about?</strong>{" "}
+            Every night with both a temperature reading and a {yMeta.label.toLowerCase()}{" "}
+            value is binned into 2°F buckets and plotted as the per-bucket mean. The peak
+            bucket is your personal sweet spot for that outcome. The optimal temperature
+            for HRV may differ from the optimal for deep sleep — that&apos;s the point of
+            the outcome toggle.
           </p>
           <p>
             <strong>Error bars are ±1 SEM</strong> (standard error of the mean). Narrower bars
@@ -1960,65 +2039,60 @@ export default function HrvAnalysisPage() {
             nights and shouldn&apos;t drive decisions yet.
           </p>
           <p>
-            <strong>⚠ Pod sensor caveat:</strong> Eight Sleep&apos;s room-temp sensor sits
-            on the Pod unit (in/under the bed), where it picks up heat from the device
-            electronics and your body radiating downward. It reads <em>warmer than a
-            wall thermostat by an unknown amount</em> — the exact offset isn&apos;t
-            published anywhere I could find, and we haven&apos;t measured it yet. So:
-            don&apos;t compare these bucket values directly to setpoint recommendations
-            like &ldquo;65–68°F is optimal for sleep.&rdquo; The <em>relative shape</em>
-            (which bucket is the peak vs. which is the trough) is still valid for
-            finding your personal optimum, but absolute Fahrenheit values aren&apos;t.
-            Filed a follow-up to calibrate empirically by leaving a separate
-            thermometer in the room for a week and deriving the real offset from
-            paired readings.
+            <strong>⚠ Sensor caveat ({xMeta.label}):</strong> {xMeta.sensorCaveat} Filed
+            a follow-up to calibrate empirically by leaving a separate thermometer in the
+            room for a week and deriving the real offset from paired readings.
           </p>
           <p className="text-[11px] text-text-tertiary">
-            <strong>Sample size today:</strong> {envMatrix.length} nights collected.{" "}
-            {envMatrix.length < 30 && (
+            <strong>Sample size today:</strong> {useableRows.length} nights collected for
+            this {xMeta.label.toLowerCase()} × {yMeta.label.toLowerCase()} pair.{" "}
+            {useableRows.length < 30 && (
               <span>Directional reads need <strong>~30 nights</strong>; confident reads need <strong>~100</strong>. Eight Sleep&apos;s intervals API began exposing temp data ~2026-05-15, so this fills in one night per daily ETL run going forward.</span>
             )}
-            {envMatrix.length >= 30 && envMatrix.length < 100 && (
+            {useableRows.length >= 30 && useableRows.length < 100 && (
               <span>Enough for a <strong>directional read</strong>. More nights will tighten the bars.</span>
             )}
-            {envMatrix.length >= 100 && (
+            {useableRows.length >= 100 && (
               <span>Sample size is sufficient for a <strong>confident read</strong> on the optimal bucket.</span>
             )}
           </p>
         </div>
 
         {(() => {
-          if (envMatrix.length === 0) {
+          if (useableRows.length === 0) {
             return (
               <p className="text-[11px] text-text-tertiary py-8 text-center">
-                No nights with both room temp and HRV yet. Will populate as the nightly Eight
-                Sleep ETL accumulates new data.
+                No nights with both {xMeta.label.toLowerCase()} and {yMeta.label.toLowerCase()} yet.
+                Will populate as the nightly ETL accumulates new data.
               </p>
             );
           }
 
-          // Convert °C → °F at the bin boundary so the chart reads in user-native
-          // units. DB stays canonical in °C; only the presentation changes.
+          // Convert °C → °F at the bin boundary (DB canonical = °C). Outcome
+          // conversion for milliseconds-stored fields (deep sleep) → minutes
+          // so the Y axis reads in user-native units.
           const cToF = (c: number) => c * 9 / 5 + 32;
+          const outcomeToDisplay = (raw: number) =>
+            envOutcome === "deep" ? raw / 60000 : raw; // ms → min for deep sleep
           const BUCKET_SIZE = 2.0; // °F bins
           const buckets: Record<string, number[]> = {};
-          envMatrix.forEach((d: any) => {
-            const tC = Number(d.eight_sleep_room_temp);
-            const h = Number(d.whoop_hrv_rmssd);
-            if (isNaN(tC) || isNaN(h)) return;
+          useableRows.forEach((d: any) => {
+            const tC = Number(d[xMeta.column]);
+            const yRaw = Number(d[yMeta.column]);
+            if (isNaN(tC) || isNaN(yRaw)) return;
             const tF = cToF(tC);
             const start = Math.floor(tF / BUCKET_SIZE) * BUCKET_SIZE;
             const key = start.toFixed(1);
             if (!buckets[key]) buckets[key] = [];
-            buckets[key].push(h);
+            buckets[key].push(outcomeToDisplay(yRaw));
           });
 
           const rows = Object.entries(buckets)
-            .map(([k, hrvs]) => {
-              const n = hrvs.length;
-              const mean = hrvs.reduce((a, b) => a + b, 0) / n;
+            .map(([k, ys]) => {
+              const n = ys.length;
+              const mean = ys.reduce((a, b) => a + b, 0) / n;
               const variance = n > 1
-                ? hrvs.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1)
+                ? ys.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1)
                 : 0;
               const sd = Math.sqrt(variance);
               const sem = n > 1 ? sd / Math.sqrt(n) : 0;
@@ -2027,7 +2101,7 @@ export default function HrvAnalysisPage() {
                 start: lo,
                 bucket: `${lo.toFixed(0)}–${(lo + BUCKET_SIZE).toFixed(0)}°F`,
                 n,
-                meanHrv: +mean.toFixed(1),
+                meanY: +mean.toFixed(1),
                 sem: +sem.toFixed(2),
                 sd: +sd.toFixed(2),
               };
@@ -2040,7 +2114,7 @@ export default function HrvAnalysisPage() {
 
           const reliable = rows.filter(r => r.n >= 5);
           const peakRow = (reliable.length > 0 ? reliable : rows).reduce(
-            (m, r) => (r.meanHrv > m.meanHrv ? r : m)
+            (m, r) => (r.meanY > m.meanY ? r : m)
           );
 
           return (
@@ -2049,18 +2123,18 @@ export default function HrvAnalysisPage() {
                 <BarChart data={rows} margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                   <CartesianGrid {...gridStyle} />
                   <XAxis dataKey="bucket" tick={axisTick}
-                    label={axisLabel("median room temp (°F · Pod sensor, uncalibrated)", "x")} />
+                    label={axisLabel(xMeta.axisLabel, "x")} />
                   <YAxis tick={axisTick} width={55}
-                    label={axisLabel("WHOOP HRV (ms)", "y")} />
+                    label={axisLabel(yMeta.axisLabel, "y")} />
                   <Tooltip {...chartTooltip}
                     formatter={(v: any, _name: any, p: any) => {
                       const d = p?.payload ?? {};
                       return [
-                        `${Number(v).toFixed(1)} ms (n=${d.n}, SEM=±${d.sem}, SD=${d.sd})`,
-                        "Mean HRV",
+                        `${Number(v).toFixed(1)} ${yMeta.unit} (n=${d.n}, SEM=±${d.sem}, SD=${d.sd})`,
+                        `Mean ${yMeta.label}`,
                       ];
                     }} />
-                  <Bar dataKey="meanHrv" radius={[3, 3, 0, 0]}>
+                  <Bar dataKey="meanY" radius={[3, 3, 0, 0]}>
                     {rows.map((r, i) => (
                       <Cell key={i}
                         fill={r.bucket === peakRow.bucket ? "#22c55e" : "#06b6d4"}
@@ -2071,10 +2145,12 @@ export default function HrvAnalysisPage() {
                 </BarChart>
               </ResponsiveContainer>
               <p className="text-[11px] text-text-tertiary mt-3">
-                {rows.length >= 3 && envMatrix.length >= 10 ? (
+                {rows.length >= 3 && useableRows.length >= 10 ? (
                   <>
-                    Peak bucket (Pod sensor): <strong className="text-text-secondary">{peakRow.bucket}</strong>,{" "}
-                    {peakRow.meanHrv} ms mean HRV across {peakRow.n} night{peakRow.n !== 1 ? "s" : ""}.
+                    Peak bucket ({xMeta.label.toLowerCase()}):{" "}
+                    <strong className="text-text-secondary">{peakRow.bucket}</strong>,{" "}
+                    {peakRow.meanY} {yMeta.unit} mean {yMeta.label.toLowerCase()} across{" "}
+                    {peakRow.n} night{peakRow.n !== 1 ? "s" : ""}.
                     {reliable.length === 0 && " ⚠ No buckets yet have ≥5 nights — treat the peak as preliminary."}
                   </>
                 ) : (
@@ -2085,6 +2161,8 @@ export default function HrvAnalysisPage() {
           );
         })()}
       </div>
+      );
+      })()}
 
       {/* ── Models & Methods ── */}
       <div className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card overflow-hidden">
