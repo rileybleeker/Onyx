@@ -531,11 +531,18 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
 # Sensitivity Analysis (E-value)
 # ===========================================================================
 
-def compute_e_value(ate: float, ci_low: float, pooled_sd: float) -> dict:
+def compute_e_value(ate: float, ci_low: float, ci_high: float,
+                     pooled_sd: float) -> dict:
     """E-value for continuous outcomes via Chinn (2000) d→RR transform.
 
     Returns the E-value for the point estimate AND for the CI bound nearest
     to the null — the latter is what's usually quoted for robustness.
+
+    Audit P1 fix: previous signature took ci_low only and reused it for both
+    positive and negative ATEs. For a negative ATE the bound nearest zero is
+    ci_high (the UPPER bound), not ci_low — the old version reported the
+    E-value at the FARTHER bound, overstating robustness. Now picks ci_low
+    for positive ATE and ci_high for negative ATE explicitly.
     """
     if pooled_sd <= 0 or np.isnan(ate):
         return {"e_value": float("nan"), "e_value_ci": float("nan")}
@@ -549,16 +556,22 @@ def compute_e_value(ate: float, ci_low: float, pooled_sd: float) -> dict:
     rr = np.exp(0.91 * d)
     e_point = _e(rr)
 
-    # E-value for the CI bound nearest the null
+    # CI bound nearest the null:
+    #   positive ATE → ci_low (lower bound is closer to zero)
+    #   negative ATE → ci_high (upper bound is closer to zero)
+    # CI crosses the null → E-value collapses to 1.0 (no robustness).
     if ate > 0:
-        d_ci = ci_low / pooled_sd
+        if ci_low <= 0:
+            e_ci = 1.0
+        else:
+            d_ci = ci_low / pooled_sd
+            e_ci = _e(np.exp(0.91 * d_ci))
     else:
-        d_ci = -ci_low / pooled_sd if ci_low < 0 else 0.0
-    rr_ci = np.exp(0.91 * abs(d_ci))
-    if (ate > 0 and ci_low <= 0) or (ate < 0 and ci_low >= 0):
-        e_ci = 1.0  # CI crosses null
-    else:
-        e_ci = _e(rr_ci)
+        if ci_high >= 0:
+            e_ci = 1.0
+        else:
+            d_ci = ci_high / pooled_sd  # negative; _e handles rr<1
+            e_ci = _e(np.exp(0.91 * d_ci))
 
     return {"e_value": e_point, "e_value_ci": e_ci}
 
@@ -749,7 +762,7 @@ def _estimate_one(X: np.ndarray, T: np.ndarray, Y: np.ndarray) -> dict:
     aipw = estimate_aipw(X, T, Y)
 
     pooled_sd = float(Y.std(ddof=1)) if len(Y) > 1 else float("nan")
-    ev = compute_e_value(aipw["ate"], aipw["ci_low"], pooled_sd)
+    ev = compute_e_value(aipw["ate"], aipw["ci_low"], aipw["ci_high"], pooled_sd)
 
     return {
         "naive": naive,

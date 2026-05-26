@@ -3003,6 +3003,51 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     # train_xgboost().
     # -----------------------------------------------------------------------
     if HAS_XGB and xgb_model is not None:
+        # Audit P1 fix: PIs previously used in-sample training residuals which
+        # are over-tight by construction (the model is fit to those points),
+        # producing CIs that under-cover the nominal level. Compute an OOF-
+        # honest σ per horizon via TimeSeriesSplit on the full feature matrix
+        # once, then reuse across every backtest fold at that h. For h=1 reuse
+        # the value train_xgboost already computed (same OOF method).
+        pred_std_by_horizon: dict[int, float] = {}
+        headline_pred_std = xgb_results.get("pred_std") if xgb_results else None
+        if headline_pred_std and headline_pred_std > 0:
+            pred_std_by_horizon[1] = float(headline_pred_std)
+        try:
+            from sklearn.model_selection import TimeSeriesSplit
+            for _h in HORIZONS:
+                if _h in pred_std_by_horizon:
+                    continue
+                try:
+                    _, _, X_h_full, y_h_full = prepare_ml_data(df, horizon=_h)
+                    if len(X_h_full) < 60:
+                        continue
+                    tscv_h = TimeSeriesSplit(n_splits=5)
+                    oof_resid: list[float] = []
+                    for tr_idx, va_idx in tscv_h.split(X_h_full):
+                        if len(tr_idx) < 30 or len(va_idx) < 5:
+                            continue
+                        fm = XGBRegressor(
+                            max_depth=4, learning_rate=0.05, n_estimators=200,
+                            min_child_weight=3, subsample=0.8, colsample_bytree=0.8,
+                            tree_method="hist", random_state=42,
+                        )
+                        fm.fit(X_h_full.iloc[tr_idx], y_h_full.iloc[tr_idx], verbose=False)
+                        oof_resid.extend(
+                            (y_h_full.iloc[va_idx].values
+                             - fm.predict(X_h_full.iloc[va_idx])).tolist()
+                        )
+                    if len(oof_resid) >= 30:
+                        pred_std_by_horizon[_h] = float(np.std(oof_resid))
+                except Exception as _e:
+                    log.debug(f"  pred_std OOF for h={_h} failed: {_e}")
+        except Exception:
+            pass
+        if pred_std_by_horizon:
+            log.info("  Walk-forward pred_std by horizon: " +
+                     ", ".join(f"h={h}:{s:.2f}"
+                               for h, s in sorted(pred_std_by_horizon.items())))
+
         for h in HORIZONS:
             model_df_h, feat_cols_h, X_h, y_h = prepare_ml_data(df, horizon=h)
             n_h = len(X_h)
@@ -3036,7 +3081,12 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                     )
                     m.fit(X_tr, y_tr, verbose=False)
                     preds = m.predict(X_pred_block)
-                    residuals_std = np.std(y_tr.values - m.predict(X_tr))
+                    # Use the OOF-honest σ computed once per horizon above.
+                    # Fall back to in-sample residuals only if OOF failed at
+                    # this h (insufficient data / TSS error).
+                    residuals_std = pred_std_by_horizon.get(
+                        h, float(np.std(y_tr.values - m.predict(X_tr)))
+                    )
                     for pred, actual, d in zip(
                             preds, y_actual_block.values, dates_block):
                         all_preds.append({
