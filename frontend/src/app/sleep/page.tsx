@@ -10,7 +10,7 @@ import {
   getEightSleepTrends, getDailySummaries,
   rangeDays, rangeLabel, type Range,
 } from "@/lib/queries";
-import { formatDate, formatDuration, etDate, whoopSleepDay } from "@/lib/format";
+import { formatDate, formatDuration, etDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -102,10 +102,22 @@ export default function SleepPage() {
   const recoveryByCycle = new Map(whoopRecovery.map((r) => [r.cycle_id, r]));
   const sleepByCycle    = new Map(whoopSleep.map((s) => [s.cycle_id, s]));
 
+  // PAGE-WIDE DATE CONVENTION (audited 2026-05-25): every WHOOP and Eight
+  // Sleep series on this page is keyed on the WAKE-DAY in ET — i.e. the
+  // morning the user woke up from the cycle. This matches WHOOP's app
+  // (which labels each sleep by its wake day) and Eight Sleep's
+  // session_date. The only exception is the Journal heatmap further down,
+  // which uses behaviors-day (the bedtime day) by deliberate fix in commit
+  // c836594 so the heatmap aligns with the day the answer describes.
+  //
+  // Prior bug here: recoveryData was keyed on UTC-of-created_at, which is
+  // the WHOOP scoring-write timestamp — any cycle scored after 8pm ET
+  // shifted onto the next calendar day. Now derived from the paired
+  // sleep's end_time (ET) for consistency with every other WHOOP series.
   const recoveryData = whoopRecovery.map((d) => {
     const sleep = sleepByCycle.get(d.cycle_id);
     return {
-      date:     formatDate(new Date(d.created_at).toISOString().split("T")[0]),
+      date:     formatDate(etDate(sleep?.end_time ?? d.created_at)),
       recovery: d.recovery_score,
       rhr:      d.resting_heart_rate,
       hrv:      d.hrv_rmssd_milli ? +Number(d.hrv_rmssd_milli).toFixed(1) : null,
@@ -180,17 +192,19 @@ export default function SleepPage() {
   // Sleep Debt: WHOOP's `need_from_sleep_debt_milli` is the extra sleep need
   // (in ms) that WHOOP says you're carrying from prior nights — i.e. your
   // running sleep debt as of this cycle. Convert to hours.
-  // WHOOP labels sleep debt by the calendar day the sleep event belongs to:
-  // pre-6 AM ET bedtimes fold into the previous day's nightly cycle (so a
-  // post-midnight main sleep lands on "yesterday"), but daytime naps stay on
-  // their actual day. Includes naps so travel days like April 30 — where the
-  // only sleep events are naps — still surface WHOOP's debt value. When a
-  // labeled day has multiple events (main + nap), the latest event's
-  // need_from_sleep_debt wins, matching WHOOP's "most recent reading" display.
+  //
+  // Keyed on WAKE-day to match every other WHOOP series on this page (see
+  // page-wide convention comment above recoveryData). Includes naps so
+  // travel days where the only sleep events are naps still surface WHOOP's
+  // debt value. When a labeled day has multiple events (main + nap),
+  // last-write-wins on the Map matches WHOOP's "most recent reading"
+  // display. Earlier version used whoopSleepDay (start_time − 6h ET =
+  // behavioral-day), which produced off-by-one between the debt chart and
+  // the rest of the page for Riley's post-midnight bedtimes.
   const debtByDay = new Map<string, number>();
   whoopSleepAll.forEach((d) => {
     if (d.need_from_sleep_debt_milli == null) return;
-    debtByDay.set(whoopSleepDay(d.start_time), d.need_from_sleep_debt_milli);
+    debtByDay.set(etDate(d.end_time ?? d.start_time), d.need_from_sleep_debt_milli);
   });
   const sleepDebtData = Array.from(debtByDay.entries())
     .sort(([a], [b]) => a.localeCompare(b))
