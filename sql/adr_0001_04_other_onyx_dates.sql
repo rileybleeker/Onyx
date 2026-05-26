@@ -252,15 +252,53 @@ CREATE INDEX IF NOT EXISTS idx_whoop_journal_behavioral_date_onyx
 
 CREATE OR REPLACE FUNCTION pds.set_onyx_dates_whoop_journal()
 RETURNS TRIGGER AS $$
+DECLARE
+    d                RECORD;
+    cycle_start_time TIMESTAMPTZ;
+    cycle_tz_offset  TEXT;
 BEGIN
-    NEW.onyx_behavioral_date := COALESCE(NEW.behaviors_date, NEW.cycle_date);
-    NEW.onyx_et_date         := NEW.cycle_date;
-    NEW.onyx_local_date      := NEW.cycle_date;
-    NEW.onyx_tz_source       :=
-        CASE WHEN NEW.behaviors_date IS NOT NULL
-             THEN 'cycle_anchor'
-             ELSE 'default_et_fallback'
-        END;
+    -- Audit P0 fix: pre-fix version set onyx_et_date := NEW.cycle_date and
+    -- onyx_local_date := NEW.cycle_date, which silently mis-attributes on
+    -- travel days. WHOOP's cycle_date is the user-local wake day; on a PT
+    -- trip a 22:00 PT bedtime → cycle_date 2026-04-16 PT, but the ET clock
+    -- day of that bedtime instant is 2026-04-16 too (often) or 2026-04-15
+    -- (rarely). The pre-fix used PT-labeled date as both onyx_et_date and
+    -- onyx_local_date — only one of those is wrong, but consumers can't
+    -- tell which.
+    --
+    -- Fix: look up the cycle anchored to NEW.cycle_date and call
+    -- pds.derive_onyx_dates with cycle.start_time + cycle.timezone_offset.
+    -- Join key is (start_time + 12h) ET — the +12h trick maps any bedtime
+    -- to its WHOOP-canonical wake day regardless of TZ (12h > any TZ
+    -- offset, so always crosses midnight ET into the wake day, matching
+    -- WHOOP CSV's cycle_date labeling).
+    SELECT wc.start_time, wc.timezone_offset
+      INTO cycle_start_time, cycle_tz_offset
+      FROM pds.whoop_cycles wc
+     WHERE ((wc.start_time + INTERVAL '12 hours')
+            AT TIME ZONE 'America/New_York')::date = NEW.cycle_date
+     ORDER BY wc.start_time
+     LIMIT 1;
+
+    IF cycle_start_time IS NOT NULL THEN
+        SELECT * INTO d
+        FROM pds.derive_onyx_dates(cycle_start_time, cycle_tz_offset, 'cycle_anchor');
+        NEW.onyx_et_date         := d.onyx_et_date;
+        NEW.onyx_local_date      := d.onyx_local_date;
+        -- behaviors_date (when the older trigger has computed it) wins for
+        -- behavioral_date — that's the explicit user-typed answer to "what
+        -- day are these behaviors about?" — fall back to derive's value
+        -- otherwise.
+        NEW.onyx_behavioral_date := COALESCE(NEW.behaviors_date, d.onyx_behavioral_date);
+        NEW.onyx_tz_source       := d.onyx_tz_source;
+    ELSE
+        -- Orphaned journal entry (no matching cycle). Keep the pre-fix
+        -- fallback so consumers don't see NULL.
+        NEW.onyx_et_date         := NEW.cycle_date;
+        NEW.onyx_local_date      := NEW.cycle_date;
+        NEW.onyx_behavioral_date := COALESCE(NEW.behaviors_date, NEW.cycle_date);
+        NEW.onyx_tz_source       := 'default_et_fallback';
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
