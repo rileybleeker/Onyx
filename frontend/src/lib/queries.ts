@@ -60,11 +60,17 @@ export async function getActivities(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
+  // Audit P1 fix (3-of-3 consensus): filter/sort by start_time_gmt (true UTC)
+  // instead of start_time_local. Garmin stores start_time_local as wall-clock
+  // labeled +00 — comparing it against a true-UTC since cutoff produces
+  // off-by-TZ-offset boundaries. Display can still use start_time_local for
+  // wall-clock rendering; the API contract here is "activities in the last N
+  // calendar days UTC", which start_time_gmt provides cleanly.
   const { data, error } = await supabase
     .from("garmin_activities")
     .select("*")
-    .gte("start_time_local", since.toISOString())
-    .order("start_time_local", { ascending: false });
+    .gte("start_time_gmt", since.toISOString())
+    .order("start_time_gmt", { ascending: false });
 
   if (error) throw error;
   return data ?? [];

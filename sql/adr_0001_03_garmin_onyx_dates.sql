@@ -65,23 +65,30 @@ RETURNS TRIGGER AS $$
 DECLARE
     d            RECORD;
     tzd          TEXT;
-    instant_utc  TIMESTAMPTZ;
 BEGIN
-    -- Prefer start_time_gmt (true UTC). If start_time_local present too,
-    -- derive offset; if either missing, fall through to user_tz_log.
-    instant_utc := NEW.start_time_gmt;
-    IF instant_utc IS NULL THEN
-        instant_utc := NEW.start_time_local;  -- fallback (semantic lossy)
+    -- Audit P1 fix: when start_time_gmt is NULL, refuse the start_time_local
+    -- fallback. Garmin stores start_time_local as wall-clock labeled +00, so
+    -- treating it as a true UTC instant silently mis-attributes by the
+    -- user's offset. Refusing (option a) leaves onyx_* NULL on degenerate
+    -- rows so they show up as "missing" rather than as wrong dates. Today
+    -- 0/349 rows have NULL start_time_gmt — this is purely defensive against
+    -- future degenerate ingest.
+    IF NEW.start_time_gmt IS NULL THEN
+        NEW.onyx_et_date         := NULL;
+        NEW.onyx_behavioral_date := NULL;
+        NEW.onyx_local_date      := NULL;
+        NEW.onyx_tz_source       := 'missing_gmt_instant';
+        RETURN NEW;
     END IF;
 
-    IF NEW.start_time_local IS NOT NULL AND NEW.start_time_gmt IS NOT NULL THEN
+    IF NEW.start_time_local IS NOT NULL THEN
         tzd := pds.interval_to_tzd(NEW.start_time_local - NEW.start_time_gmt);
     ELSE
         tzd := NULL;
     END IF;
 
     SELECT * INTO d FROM pds.derive_onyx_dates(
-        instant_utc,
+        NEW.start_time_gmt,
         tzd,
         CASE WHEN tzd IS NOT NULL THEN 'source_field' ELSE NULL END
     );
