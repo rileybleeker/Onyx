@@ -224,11 +224,37 @@ CREATE INDEX IF NOT EXISTS idx_habit_journal_behavioral_date
 
 CREATE OR REPLACE FUNCTION pds.set_onyx_dates_habit_journal()
 RETURNS TRIGGER AS $$
+DECLARE
+    noon_et TIMESTAMPTZ;
+    log_tz  TEXT;
 BEGIN
-    NEW.onyx_behavioral_date := NEW.cycle_date;
     NEW.onyx_et_date         := NEW.cycle_date;
-    NEW.onyx_local_date      := NEW.cycle_date;
-    NEW.onyx_tz_source       := 'default_et_fallback';
+    NEW.onyx_behavioral_date := NEW.cycle_date;
+
+    -- Audit P1 fix: previously tagged every row as 'default_et_fallback' and
+    -- copied cycle_date into onyx_local_date verbatim — wrong on any travel
+    -- day. Anchor at noon ET on cycle_date and consult user_tz_log; if a row
+    -- matches and tz is non-NY, the user was in that TZ on this date, so
+    -- shift onyx_local_date to the local clock day.
+    noon_et := (NEW.cycle_date::timestamp + INTERVAL '12 hours')
+               AT TIME ZONE 'America/New_York';
+
+    SELECT tz INTO log_tz
+      FROM pds.user_tz_log
+     WHERE effective_from <= noon_et
+     ORDER BY effective_from DESC
+     LIMIT 1;
+
+    IF log_tz IS NOT NULL AND log_tz <> 'America/New_York' THEN
+        NEW.onyx_local_date := (noon_et AT TIME ZONE log_tz)::date;
+        NEW.onyx_tz_source  := 'user_tz_log';
+    ELSE
+        NEW.onyx_local_date := NEW.cycle_date;
+        NEW.onyx_tz_source  := CASE WHEN log_tz IS NOT NULL
+                                    THEN 'user_tz_log'   -- explicit NY hit
+                                    ELSE 'default_et_fallback'
+                               END;
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -292,12 +318,37 @@ BEGIN
         NEW.onyx_behavioral_date := COALESCE(NEW.behaviors_date, d.onyx_behavioral_date);
         NEW.onyx_tz_source       := d.onyx_tz_source;
     ELSE
-        -- Orphaned journal entry (no matching cycle). Keep the pre-fix
-        -- fallback so consumers don't see NULL.
-        NEW.onyx_et_date         := NEW.cycle_date;
-        NEW.onyx_local_date      := NEW.cycle_date;
-        NEW.onyx_behavioral_date := COALESCE(NEW.behaviors_date, NEW.cycle_date);
-        NEW.onyx_tz_source       := 'default_et_fallback';
+        -- Orphaned journal entry (no matching cycle). TZ-aware fallback
+        -- (audit P1, paired with the habit_journal fix): anchor at noon ET
+        -- on cycle_date, consult user_tz_log so onyx_local_date reflects
+        -- the user's TZ that day rather than blindly copying cycle_date.
+        DECLARE
+            noon_et TIMESTAMPTZ;
+            log_tz  TEXT;
+        BEGIN
+            NEW.onyx_et_date         := NEW.cycle_date;
+            NEW.onyx_behavioral_date := COALESCE(NEW.behaviors_date, NEW.cycle_date);
+
+            noon_et := (NEW.cycle_date::timestamp + INTERVAL '12 hours')
+                       AT TIME ZONE 'America/New_York';
+
+            SELECT tz INTO log_tz
+              FROM pds.user_tz_log
+             WHERE effective_from <= noon_et
+             ORDER BY effective_from DESC
+             LIMIT 1;
+
+            IF log_tz IS NOT NULL AND log_tz <> 'America/New_York' THEN
+                NEW.onyx_local_date := (noon_et AT TIME ZONE log_tz)::date;
+                NEW.onyx_tz_source  := 'user_tz_log';
+            ELSE
+                NEW.onyx_local_date := NEW.cycle_date;
+                NEW.onyx_tz_source  := CASE WHEN log_tz IS NOT NULL
+                                            THEN 'user_tz_log'
+                                            ELSE 'default_et_fallback'
+                                       END;
+            END IF;
+        END;
     END IF;
     RETURN NEW;
 END;

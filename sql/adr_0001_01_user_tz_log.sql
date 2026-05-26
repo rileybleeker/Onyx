@@ -84,6 +84,36 @@ COMMENT ON FUNCTION pds.tz_for_instant(TIMESTAMPTZ) IS
 'Per ADR-0001 D3 tier 3+5: returns IANA TZ in effect at the given instant per user_tz_log, falling back to America/New_York. Used by triggers that derive onyx_local_date without a source TZ field.';
 
 -- ---------------------------------------------------------------------------
+-- 2b. pds.cycle_offset_for_instant — Tier-2 WHOOP cycle anchor
+-- ---------------------------------------------------------------------------
+-- Returns the WHOOP cycle's TZD-format timezone_offset for any instant that
+-- falls inside [cycle.start_time, cycle.end_time). NULL if ts is outside
+-- any cycle's range. Used by derive_onyx_dates as Tier 2 (between source-
+-- field offset and user_tz_log).
+--
+-- Rationale: WHOOP cycles record the user's local offset at sleep time,
+-- which (for personal data scale) matches their daytime TZ on either side
+-- of that sleep. Plays / supplements / meals / journals during waking hours
+-- usually fall inside an adjacent cycle's range, so this is the most-
+-- authoritative TZ source available without manual user_tz_log entries.
+CREATE OR REPLACE FUNCTION pds.cycle_offset_for_instant(ts TIMESTAMPTZ)
+RETURNS TEXT
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT timezone_offset
+      FROM pds.whoop_cycles
+     WHERE ts >= start_time
+       AND (end_time IS NULL OR ts < end_time)
+       AND timezone_offset IS NOT NULL
+     ORDER BY start_time DESC
+     LIMIT 1;
+$$;
+
+COMMENT ON FUNCTION pds.cycle_offset_for_instant(TIMESTAMPTZ) IS
+'Per ADR-0001 D3 tier 2: returns the WHOOP cycle.timezone_offset when ts is in [start_time, end_time). NULL otherwise — caller falls through to user_tz_log.';
+
+-- ---------------------------------------------------------------------------
 -- 3. pds.derive_onyx_dates — pure derivation function
 -- ---------------------------------------------------------------------------
 -- Returns the three onyx_* dates + provenance enum, given:
@@ -117,6 +147,8 @@ DECLARE
     resolved_offset   INTERVAL;
     resolved_tz       TEXT;
     resolved_source   TEXT;
+    cycle_offset_text TEXT;
+    log_tz            TEXT;
 BEGIN
     IF ts IS NULL THEN
         RETURN QUERY SELECT NULL::DATE, NULL::DATE, NULL::DATE, NULL::TEXT;
@@ -126,7 +158,7 @@ BEGIN
     -- ET is always derivable (canonical reference).
     onyx_et_date := (ts AT TIME ZONE 'America/New_York')::date;
 
-    -- Resolve local TZ via tier ladder.
+    -- Resolve local TZ via tier ladder (ADR-0001 D3).
     IF tz_offset_text IS NOT NULL AND tz_offset_text <> '' THEN
         -- Tier 1: source provided TZD offset directly.
         resolved_offset := tz_offset_text::interval;
@@ -136,21 +168,44 @@ BEGIN
         onyx_local_date      := local_instant::date;
         onyx_behavioral_date := (local_instant - INTERVAL '6 hours')::date;
     ELSE
-        -- Tier 3+5: user_tz_log lookup, ET fallback.
-        resolved_tz := pds.tz_for_instant(ts);
-        IF resolved_tz = 'America/New_York' AND NOT EXISTS (
-            SELECT 1 FROM pds.user_tz_log
-             WHERE effective_from <= ts
-             LIMIT 1
-        ) THEN
-            resolved_source := COALESCE(tz_source_in, 'default_et_fallback');
-        ELSE
-            resolved_source := COALESCE(tz_source_in, 'user_tz_log');
-        END IF;
+        -- Tier 2: WHOOP cycle anchor (audit P1 fix — was previously skipped).
+        -- If the instant falls inside a WHOOP cycle's [start_time, end_time)
+        -- range, prefer that cycle's recorded offset over user_tz_log. The
+        -- cycle offset is the most authoritative non-source-field signal
+        -- because WHOOP records it per-sleep at sync time.
+        cycle_offset_text := pds.cycle_offset_for_instant(ts);
+        IF cycle_offset_text IS NOT NULL THEN
+            resolved_offset := cycle_offset_text::interval;
+            local_instant   := (ts AT TIME ZONE 'UTC') + resolved_offset;
+            resolved_source := COALESCE(tz_source_in, 'cycle_anchor');
 
-        local_instant        := ts AT TIME ZONE resolved_tz;
-        onyx_local_date      := local_instant::date;
-        onyx_behavioral_date := (local_instant - INTERVAL '6 hours')::date;
+            onyx_local_date      := local_instant::date;
+            onyx_behavioral_date := (local_instant - INTERVAL '6 hours')::date;
+        ELSE
+            -- Tier 3+5: explicit user_tz_log lookup with NY fallback.
+            -- Audit P1 fix (Gemini): the previous EXISTS-based check could
+            -- tag rows as 'user_tz_log' when the actual TZ used was the NY
+            -- fallback (e.g., when log rows exist before ts but none match).
+            -- Read the row explicitly so the source label reflects whether
+            -- a log row was actually selected.
+            SELECT tz INTO log_tz
+              FROM pds.user_tz_log
+             WHERE effective_from <= ts
+             ORDER BY effective_from DESC
+             LIMIT 1;
+
+            IF log_tz IS NOT NULL THEN
+                resolved_tz     := log_tz;
+                resolved_source := COALESCE(tz_source_in, 'user_tz_log');
+            ELSE
+                resolved_tz     := 'America/New_York';
+                resolved_source := COALESCE(tz_source_in, 'default_et_fallback');
+            END IF;
+
+            local_instant        := ts AT TIME ZONE resolved_tz;
+            onyx_local_date      := local_instant::date;
+            onyx_behavioral_date := (local_instant - INTERVAL '6 hours')::date;
+        END IF;
     END IF;
 
     onyx_tz_source := resolved_source;
