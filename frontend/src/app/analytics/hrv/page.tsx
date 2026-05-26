@@ -1527,23 +1527,37 @@ export default function HrvAnalysisPage() {
         title="Causal Effects · Binary Treatments"
         subtitle={`AIPW ATE on next-night HRV (ms) · 95% CI shown as error bars · top ${Math.min(causalBinary.length, 20)} by |effect|`}
         source="AIPW (DOUBLY ROBUST)"
-        info="Each bar is the doubly-robust AIPW estimate of the average treatment effect on tomorrow's HRV. Error bars are 95% confidence intervals from the influence-function variance. Bars whose CI crosses 0 (gray) are statistically indistinguishable from no-effect; bars whose CI stays positive (green) or negative (red) are causal evidence under the stated confounder set. ⚠ marks treatments with fewer than 20 days in either arm — interpret with caution. The naive (unadjusted) estimate for each treatment is in the comparison table below."
+        info="Each bar is the doubly-robust AIPW estimate of the average treatment effect on tomorrow's HRV. Error bars are 95% CIs from the influence-function variance. ⚠ marks treatments with fewer than 20 days in either arm. ⊕ marks treatments where the autocorrelation-aware block-bootstrap CI is meaningfully wider than the IF CI (ratio >1.5×) — the BB CI is the more honest answer for those rows; check the tooltip. A pale-green or pale-red bar means IF said the effect is significant but the BB CI crosses zero (the temporal structure of the residuals doesn't support the IF call). Bars whose IF CI stays positive (saturated green) or negative (saturated red) are robust causal evidence under the stated confounder set. The naive estimate is in the comparison table below."
       >
         {causalBinary.length > 0 ? (() => {
           const top = causalBinary
             .filter((d: any) => Number.isFinite(d.aipw_ate))
             .slice(0, 20)
-            .map((d: any) => ({
-              ...d,
-              displayLabel: `${d.low_n ? "⚠ " : ""}${d.label}`,
-              errorRange: [
-                Math.max(0, (d.aipw_ate ?? 0) - (d.aipw_ci_low ?? 0)),
-                Math.max(0, (d.aipw_ci_high ?? 0) - (d.aipw_ate ?? 0)),
-              ],
-              barColor: !d.significant
-                ? "#71717a"
-                : d.aipw_ate > 0 ? "#22c55e" : "#ef4444",
-            }));
+            .map((d: any) => {
+              const ratio = Number(d.aipw_bb_width_ratio);
+              const bbDivergent = Number.isFinite(ratio) && ratio > 1.5;
+              const bbExcludesZero = Number.isFinite(d.aipw_ci_low_bb) && Number.isFinite(d.aipw_ci_high_bb)
+                ? (d.aipw_ci_low_bb > 0 || d.aipw_ci_high_bb < 0)
+                : null;
+              // If IF said significant but BB CI spans zero, that's the most
+              // actionable disagreement — render dimmer to flag it.
+              const bbHidesSig = d.significant && bbExcludesZero === false;
+              return {
+                ...d,
+                bbDivergent,
+                bbHidesSig,
+                displayLabel: `${d.low_n ? "⚠ " : ""}${bbDivergent ? "⊕ " : ""}${d.label}`,
+                errorRange: [
+                  Math.max(0, (d.aipw_ate ?? 0) - (d.aipw_ci_low ?? 0)),
+                  Math.max(0, (d.aipw_ci_high ?? 0) - (d.aipw_ate ?? 0)),
+                ],
+                barColor: !d.significant
+                  ? "#71717a"
+                  : bbHidesSig
+                    ? (d.aipw_ate > 0 ? "#86efac" : "#fca5a5")   // pale: IF says sig, BB doesn't
+                    : d.aipw_ate > 0 ? "#22c55e" : "#ef4444",
+              };
+            });
           return (
             <ResponsiveContainer width="100%" height={Math.max(420, top.length * 32)}>
               <BarChart data={top} layout="vertical"
@@ -1558,9 +1572,12 @@ export default function HrvAnalysisPage() {
                          formatter={(v: any, _n: any, p: any) => {
                            const d = p?.payload ?? {};
                            const ci = `[${Number(d.aipw_ci_low).toFixed(1)}, ${Number(d.aipw_ci_high).toFixed(1)}]`;
+                           const bbCi = Number.isFinite(d.aipw_ci_low_bb) && Number.isFinite(d.aipw_ci_high_bb)
+                             ? ` · BB CI [${Number(d.aipw_ci_low_bb).toFixed(1)}, ${Number(d.aipw_ci_high_bb).toFixed(1)}] (×${Number(d.aipw_bb_width_ratio).toFixed(2)})`
+                             : "";
                            const ev = Number.isFinite(d.e_value) ? d.e_value.toFixed(2) : "—";
                            return [
-                             `${Number(v).toFixed(1)} ms — CI ${ci}, E-val ${ev}, n=${d.n_treated}/${d.n_control}, family=${d.family}`,
+                             `${Number(v).toFixed(1)} ms — CI ${ci}${bbCi}, E-val ${ev}, n=${d.n_treated}/${d.n_control}, family=${d.family}`,
                              "AIPW ATE",
                            ];
                          }} />
@@ -1694,23 +1711,35 @@ export default function HrvAnalysisPage() {
           title="Continuous Treatments (median-split)"
           subtitle="Adjusted contrast: above-median vs below-median day"
           source="AIPW (DOUBLY ROBUST)"
-          info="Continuous treatments (calories, strain, training load, steps) are binarized at their personal median, giving an 'above your usual' contrast that's directly comparable to the binary treatments. Same AIPW machinery, same pre-treatment confounders. Note that median-split loses dose information — for full dose-response curves see the Supplement Dose-Response chart above (which uses Spearman rather than adjusted contrasts)."
+          info="Continuous treatments (calories, strain, training load, steps) are binarized at their personal median, giving an 'above your usual' contrast that's directly comparable to the binary treatments. Same AIPW machinery, same pre-treatment confounders. ⚠ marks small-arm treatments. ⊕ marks treatments where the autocorrelation-aware block-bootstrap CI is meaningfully wider than the IF CI (ratio >1.5×) — trust the BB CI for those; check the tooltip. Pale bars = IF said significant but BB CI crosses zero (treat as inconclusive). Note that median-split loses dose information — for full dose-response curves see the Supplement Dose-Response chart above."
         >
           {causalContinuous.length > 0 ? (() => {
             const top = causalContinuous
               .filter((d: any) => Number.isFinite(d.aipw_ate))
               .slice(0, 12)
-              .map((d: any) => ({
-                ...d,
-                displayLabel: `${d.low_n ? "⚠ " : ""}${d.label}`,
-                errorRange: [
-                  Math.max(0, (d.aipw_ate ?? 0) - (d.aipw_ci_low ?? 0)),
-                  Math.max(0, (d.aipw_ci_high ?? 0) - (d.aipw_ate ?? 0)),
-                ],
-                barColor: !d.significant
-                  ? "#71717a"
-                  : d.aipw_ate > 0 ? "#22c55e" : "#ef4444",
-              }));
+              .map((d: any) => {
+                const ratio = Number(d.aipw_bb_width_ratio);
+                const bbDivergent = Number.isFinite(ratio) && ratio > 1.5;
+                const bbExcludesZero = Number.isFinite(d.aipw_ci_low_bb) && Number.isFinite(d.aipw_ci_high_bb)
+                  ? (d.aipw_ci_low_bb > 0 || d.aipw_ci_high_bb < 0)
+                  : null;
+                const bbHidesSig = d.significant && bbExcludesZero === false;
+                return {
+                  ...d,
+                  bbDivergent,
+                  bbHidesSig,
+                  displayLabel: `${d.low_n ? "⚠ " : ""}${bbDivergent ? "⊕ " : ""}${d.label}`,
+                  errorRange: [
+                    Math.max(0, (d.aipw_ate ?? 0) - (d.aipw_ci_low ?? 0)),
+                    Math.max(0, (d.aipw_ci_high ?? 0) - (d.aipw_ate ?? 0)),
+                  ],
+                  barColor: !d.significant
+                    ? "#71717a"
+                    : bbHidesSig
+                      ? (d.aipw_ate > 0 ? "#86efac" : "#fca5a5")
+                      : d.aipw_ate > 0 ? "#22c55e" : "#ef4444",
+                };
+              });
             return (
               <ResponsiveContainer width="100%" height={Math.max(280, top.length * 36)}>
                 <BarChart data={top} layout="vertical"
@@ -1725,9 +1754,12 @@ export default function HrvAnalysisPage() {
                            formatter={(v: any, _n: any, p: any) => {
                              const d = p?.payload ?? {};
                              const ci = `[${Number(d.aipw_ci_low).toFixed(1)}, ${Number(d.aipw_ci_high).toFixed(1)}]`;
+                             const bbCi = Number.isFinite(d.aipw_ci_low_bb) && Number.isFinite(d.aipw_ci_high_bb)
+                               ? ` · BB CI [${Number(d.aipw_ci_low_bb).toFixed(1)}, ${Number(d.aipw_ci_high_bb).toFixed(1)}] (×${Number(d.aipw_bb_width_ratio).toFixed(2)})`
+                               : "";
                              const ev = Number.isFinite(d.e_value) ? d.e_value.toFixed(2) : "—";
                              return [
-                               `${Number(v).toFixed(1)} ms — CI ${ci}, E-val ${ev}, n=${d.n_treated}/${d.n_control}`,
+                               `${Number(v).toFixed(1)} ms — CI ${ci}${bbCi}, E-val ${ev}, n=${d.n_treated}/${d.n_control}`,
                                "AIPW ATE",
                              ];
                            }} />
