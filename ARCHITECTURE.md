@@ -205,6 +205,36 @@ Joins all three device sources by `calendar_date` (~40 columns):
 
 ---
 
+## HRV Analytics Pipeline
+
+Three jobs run on different cadences. They share one model artifact + three Postgres tables (`pds.hrv_predictions`, `pds.hrv_model_metrics`, `pds.hrv_analysis_results`).
+
+| Job | Trigger | Action |
+|---|---|---|
+| `hrv-prediction.yml` | `workflow_run` after every hourly Health ETL + `50 3 * * *` & `50 4 * * *` UTC (DST-gated to land on 23:50 ET year-round) | Run `hrv_predict.py` — backfills actuals, forecasts tomorrow using the saved model. No retrain. |
+| `hrv-retrain-on-backfill.yml` (hourly path) | `20 * * * *` | `hrv_backfill_check.py` checks for any row with `calendar_date < today − 2` updated since last `hrv_analysis_results.computed_at`, OR a `backfill_signal` from the `habit_journal` trigger. If either: full `hrv_analysis.py` retrain. |
+| `hrv-retrain-on-backfill.yml` (daily path) | `0 12 * * *` UTC (~08:00 ET) | Unconditional full retrain — safety net so descriptive stats and causal estimates stay current even when no backfill ever fires. |
+
+Net effect: hourly predictions, retraining at least daily, more often when something old changes.
+
+### Feature coverage scales with data automatically
+
+The pipeline is data-driven; new features get analyzed on the next retrain with **zero code change**. The causal layer (`causal_inference.py`) enumerates binary treatments by prefix — `journal_*`, `habit_*`, `supplement_*_amount` — so a new WHOOP journal question, a new Notion-managed habit, or a new supplement compound auto-promotes into the next run. Welch t-tests + Spearman correlations apply the same prefix-based discovery.
+
+Three cell-size tiers manage statistical honesty as `n` grows:
+
+| Tier | n threshold (per arm, for binary treatments) | Rendering |
+|---|---|---|
+| Dropped | `< 10` in either arm | Excluded; recorded in `causal/dropped_low_n` for traceability |
+| Low-n | `10–19` in either arm | Reported but flagged `low_n=true` → faded bar + ⚠ marker on `/analytics/hrv` |
+| Full | `≥ 20` in both arms | Full opacity, default rendering |
+
+A treatment graduates between tiers automatically on the retrain after the threshold is crossed. Welch journal/habit/supplement t-tests have analogous gates (≥5 Yes + ≥5 No nights). The matrix-level Spearman pass excludes columns whose non-null coverage falls below 5%.
+
+**What does NOT auto-include:** entirely new *data sources* (a new wearable, a new third-party CSV) need to be added to the loader + matrix view manually. New *columns* on existing sources are picked up by the data-driven pivots without code edits.
+
+---
+
 ## Time Conventions
 
 > Onyx makes a deliberate choice about how to bucket activity into "days".
