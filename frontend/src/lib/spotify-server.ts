@@ -212,10 +212,21 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
   const playlistId = playlist.id as string;
   const spotifyUrl = (playlist.external_urls?.spotify as string) ?? `https://open.spotify.com/playlist/${playlistId}`;
 
-  // 1a. Enforce visibility via PUT /playlists/{id}.
-  //     Spotify's POST /me/playlists silently ignores the `public` field and
-  //     creates the playlist as public regardless; a follow-up PUT is the only
-  //     way to actually set the flag. Belt-and-suspenders.
+  // 1a. Enforce visibility via three layered attempts.
+  //
+  //     KNOWN ISSUE (audited 2026-05-25): on Spotify Development Mode apps
+  //     (apps without Extended Quota approval) the `public` field on both
+  //     POST /me/playlists and PUT /playlists/{id} is silently accepted but
+  //     ignored — the playlist lands Public regardless. There's no clean
+  //     code-only fix; the durable paths are (a) apply for Extended Quota
+  //     in the Spotify dashboard, or (b) the playlist owner toggles the
+  //     visibility manually in the Spotify app. This code tries every
+  //     documented lever (PUT body + PUT /followers) and then VERIFIES the
+  //     end-state via GET so we can surface an honest warning rather than
+  //     pretending success.
+  //
+  //     PUT /playlists/{id} — documented visibility setter; silently
+  //     ignored in Dev mode.
   const visResp = await spotifyFetch(`/playlists/${playlistId}`, {
     accessToken,
     method: "PUT",
@@ -226,6 +237,39 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
       `Spotify visibility PUT failed (${visResp.status}) for ${playlistId}: ${await visResp.text()} ` +
         `(playlist exists but may be public)`
     );
+  }
+
+  //     PUT /playlists/{id}/followers — the OWNER auto-follows on create;
+  //     the follow's `public` flag is a secondary lever some users report
+  //     actually takes effect. Empirically untested in Dev mode; logged
+  //     for diagnostic. Body is documented as the follow's visibility, not
+  //     the playlist's, but we try regardless.
+  const followResp = await spotifyFetch(`/playlists/${playlistId}/followers`, {
+    accessToken,
+    method: "PUT",
+    body: JSON.stringify({ public: isPublic }),
+  });
+  if (!followResp.ok) {
+    console.warn(
+      `Spotify followers PUT (visibility plan B) failed (${followResp.status}) for ${playlistId}: ${await followResp.text()}`
+    );
+  }
+
+  //     Verify end-state. GET /playlists/{id} after both write attempts
+  //     and log whether `public` actually matches isPublic. Surfaces the
+  //     silent-ignore bug instead of letting it pass unnoticed.
+  if (!isPublic) {
+    const verifyResp = await spotifyFetch(`/playlists/${playlistId}?fields=public,name`, { accessToken });
+    if (verifyResp.ok) {
+      const verifyJson = await verifyResp.json();
+      if (verifyJson.public === true) {
+        console.warn(
+          `Spotify visibility BUG confirmed for ${playlistId} ("${verifyJson.name}"): ` +
+            `requested public=false but playlist landed Public after both PUT attempts. ` +
+            `Dev-mode limitation — toggle manually in Spotify app, or apply for Extended Quota.`
+        );
+      }
+    }
   }
 
   // 2. Add tracks in chunks of 100.

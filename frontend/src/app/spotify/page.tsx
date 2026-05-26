@@ -390,8 +390,13 @@ export default function SpotifyPage() {
             {!createResult && (
               <>
                 <h2 className="text-[15px] font-medium text-text-primary mb-1">Create Spotify playlist</h2>
-                <p className="text-[11px] text-text-tertiary mb-4">
+                <p className="text-[11px] text-text-tertiary mb-2">
                   {topTracks.length} tracks · private · added to your Spotify account
+                </p>
+                <p className="text-[10px] text-amber-300/80 mb-4 leading-relaxed">
+                  Heads up: Spotify Dev-mode apps ignore the private flag — the
+                  playlist may land Public. Toggle to private in the Spotify
+                  app if needed. (Server logs warn when this happens.)
                 </p>
                 <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">Name</label>
                 <input
@@ -471,8 +476,13 @@ export default function SpotifyPage() {
             {!genResult && (
               <>
                 <h2 className="text-[15px] font-medium text-text-primary mb-1">Generate playlist</h2>
-                <p className="text-[11px] text-text-tertiary mb-4">
+                <p className="text-[11px] text-text-tertiary mb-2">
                   Free-text prompt + structured constraints. Claude picks tracks and creates the playlist in your Spotify account.
+                </p>
+                <p className="text-[10px] text-amber-300/80 mb-4 leading-relaxed">
+                  Heads up: Spotify Dev-mode apps ignore the private flag — the
+                  playlist may land Public. Toggle to private in the Spotify
+                  app if needed.
                 </p>
 
                 <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
