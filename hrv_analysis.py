@@ -609,12 +609,17 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     log.info("  Loading supplement_intake_by_compound…")
     data["supplements"] = fetch_all(
         "supplement_intake_by_compound",
-        select="calendar_date,ingredient_group,category,unit,total_amount",
+        select="calendar_date,ingredient_group,categories,unit,total_amount",
     )
     if not data["supplements"].empty:
         data["supplements"]["calendar_date"] = data["supplements"]["calendar_date"].astype(str)
         data["supplements"]["total_amount"] = pd.to_numeric(
             data["supplements"]["total_amount"], errors="coerce"
+        )
+        # Flatten categories (text[] array from the view) into a single string
+        # for downstream use. Multi-category compounds get comma-joined.
+        data["supplements"]["category"] = data["supplements"]["categories"].apply(
+            lambda c: ", ".join(c) if isinstance(c, list) and c else None
         )
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
