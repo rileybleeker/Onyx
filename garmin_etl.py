@@ -812,8 +812,19 @@ def main():
         log.info(f"Workout sync done: {count} definitions | {duration:.1f}s")
         return
 
-    # Determine date range
-    today = date.today()
+    # Determine date range. Audit P0 fix: use ET-local, not UTC. On a UTC
+    # GHA runner late in the user's evening, date.today() returns the next
+    # day in the user's frame — and that tail date would be passed to every
+    # sync_* function. sync_daily_summary has its own ET-local guard so it
+    # skips, but the other sync_* paths (heart_rate, hrv, stress, etc.) have
+    # no future guard and would happily store Garmin's stub rows for the
+    # future date. Fixing the source `today` at the iteration boundary stops
+    # the bug at the root for all sync_* functions in one place.
+    try:
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        today = date.today()
     if args.date:
         dates = [date.fromisoformat(args.date)]
         log.info(f"Syncing single date: {args.date}")
