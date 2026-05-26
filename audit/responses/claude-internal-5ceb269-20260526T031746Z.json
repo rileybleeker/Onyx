@@ -1,0 +1,295 @@
+{
+  "reviewer_metadata": {
+    "model": "claude-opus-4-7-internal",
+    "review_date": "2026-05-25",
+    "bundle_commit": "5ceb269"
+  },
+  "domain_scores": {
+    "correctness":   {"score": 3, "rationale": "Most tests are right tool for right job and recent self-audit fixes landed cleanly, but AIPW uses random K-fold on an autocorrelated outcome and the XGBoost walk-forward writes prediction intervals from training-set residuals — both can ship miscalibrated effect estimates."},
+    "robustness":    {"score": 4, "rationale": "Solid cell-size gates, ffill of high-value sparse Garmin metrics, broad try/except around each subsystem so a single failure can't kill the run; the chief brittleness is silent confounder-imputation via bfill and a few transition-day inconsistencies between SQL view and pandas dedup."},
+    "scalability":   {"score": 4, "rationale": "Hourly retrains complete in minutes at the documented scale; full-matrix re-read each run and per-treatment refit are fine for n=568 but the AIPW pass is O(n_treatments × n_bootstrap_PSM × n) and will dominate runtime as supplements/habits histories grow."},
+    "idiomaticness": {"score": 4, "rationale": "Pipelines use the right stack (sklearn, statsmodels, xgboost, shap, pingouin, scipy.stats); a handful of bespoke routines (PSM, AIPW, DM with Newey-West, _days_since loop) reimplement standard packages but the implementations are mostly faithful."}
+  },
+  "summary": "The pipeline is meaningfully more careful than the typical n=1 self-quant project — it cross-fits AIPW, embargos the walk-forward by exactly the longest rolling-window (28 days), applies BH-FDR consistently across descriptive families after the May-21 self-audit, and explicitly excludes mediators from the causal adjustment set. The behavioral-day attribution + `behaviors_date` join in `pivot_journal` is genuinely the right fix and aligns features with the correct night's HRV.\n\nThat said, three statistical issues meaningfully threaten the *reported* effect estimates:\n\n1. **AIPW cross-fitting uses random folds on a daily time series with strong serial autocorrelation in HRV** (`causal_inference.py:425`). With `hrv_lag1` already in the confounder set and Ridge as the outcome model, the model can almost-memorize the held-out day's HRV via its neighbors that ended up in the training fold. Influence-function SEs computed from these too-good residuals will be artificially narrow — the AIPW ATEs are probably approximately right (point estimate) but the CIs are too tight and any 'significant' flag is unreliable.\n\n2. **The XGBoost walk-forward writes prediction intervals from *training-set* residual std** (`hrv_analysis.py:2935`). Train residuals systematically under-estimate true predictive σ in a tree-based model — the same code in `train_xgboost` correctly uses TimeSeriesSplit OOF residuals (lines 2487-2504), so the backtest path silently regressed. Empirical `ci_coverage` should be substantially below 80% here; this affects every backtest row in `pds.hrv_predictions` and any analytic relying on coverage calibration.\n\n3. **Confounder imputation uses `ffill().bfill()` per treatment** (`causal_inference.py:660`) — bfill pulls future values into the past, which is a mild but real form of data leakage for what are supposed to be pre-treatment confounders. Better to forward-fill only, or drop rows where the lag is genuinely missing.\n\nSecondary concerns: SARIMAX's full-data forecast uses unshifted `original_exog.iloc[-7:]` as future exog when the trained model expects shifted exog (a semantic mismatch that distorts the 7-day forecast and its CI); the BH-FDR family granularity is set per-source which lets some test paths (Spearman global, journal, habit, supplement, nutrition) each spend their own α; and there is no VIF / explicit collinearity check on the Stage-3 OLS predictor set, which at n≈98 with k≤15 has ~6 obs/predictor in practice when the joint-non-null subset shrinks.\n\nThings done genuinely well: the behavioral-day pivot via `behaviors_date`, the GAP=28 day embargo aligned to longest rolling window, the median-split formalism for putting continuous + binary treatments on a comparable AIPW scale, the per-family BH-FDR fix in journal/habit_impact, the explicit mediator-exclusion documentation in `CONTINUOUS_TREATMENTS`, the E-value sensitivity computation, the stage-failure isolation in `hrv_predict.py:main`, the et_today() use to avoid UTC date drift, and the cell-size gates with explicit reason tracking.\n\nIf I could only fix three: (a) switch AIPW to `TimeSeriesSplit` or use a block bootstrap; (b) replace the backtest's training-residual PI with the same TimeSeriesSplit OOF residual approach used in `train_xgboost`; (c) remove bfill from confounder imputation.",
+  "findings": [
+    {
+      "id": "F-001",
+      "title": "AIPW cross-fitting uses random K-fold on autocorrelated HRV time series",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "causal_inference.py:425",
+      "description": "`KFold(n_splits=5, shuffle=True, random_state=42)` puts adjacent days into different folds on a daily series whose lag-1 autocorrelation is large (HRV ρ_1 typically 0.4-0.5). The Ridge outcome model trained on fold k receives values for day N-1 and N+1 and can predict fold-k+1's day-N near-perfectly via `hrv_lag1` (which is in the confounder set). The resulting residuals are too small, the influence-function variance is too narrow, and CI coverage of AIPW ATEs is overstated. The naive 'significant: True' flag (`causal_inference.py:707`) therefore over-fires.",
+      "evidence": "`kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)` at line 425; `psi[test_idx] = mu1 - mu0 + Tv * (Yv - mu1) / e - (1 - Tv) * (Yv - mu0) / (1 - e)` at 451; SE estimated as `sd(ψ)/√n` at 466. With `hrv_lag1` ∈ COMMON_CONFOUNDERS (line 102) and Ridge outcome model, in-neighborhood prediction is essentially trivial under random shuffle.",
+      "recommendation": "Switch to `TimeSeriesSplit(n_splits=5)` for the cross-fitting splits, which preserves time order. As a check, add an option to compute a block-bootstrap CI (block length ~7-14 days) on the AIPW ATE alongside the IF-based one and compare; if they diverge meaningfully, the IF SE was too narrow."
+    },
+    {
+      "id": "F-002",
+      "title": "XGBoost walk-forward writes PIs from training-residual std (under-coverage)",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "hrv_analysis.py:2935",
+      "description": "`residuals_std = np.std(y_tr.values - m.predict(X_tr))` uses *training-set* residuals to scale 80%/90% prediction intervals on every backtest row. Tree-based learners over-fit training data, so this std is biased downward. Empirical `ci_coverage` will sit well below nominal. `train_xgboost` at lines 2487-2504 correctly uses TimeSeriesSplit OOF residuals; the walk-forward path silently regressed to a worse estimator and writes the under-covered bounds into `pds.hrv_predictions.prediction_lower/upper` for every backtest row.",
+      "evidence": "Backtest fold body at lines 2933-2950: `m.fit(X_tr, y_tr, ...)` followed by `residuals_std = np.std(y_tr.values - m.predict(X_tr))` then `prediction_lower = float(pred - 1.645 * residuals_std)`. Compare with `train_xgboost` lines 2487-2504 where TimeSeriesSplit OOF residuals are pooled.",
+      "recommendation": "Either reuse the `pred_std` from `train_xgboost` (computed once via TimeSeriesSplit OOF) for every backtest fold, or run a nested TimeSeriesSplit inside each backtest fold's training window. Verify `pds.hrv_model_metrics.ci_coverage` matches nominal 80%/90% after the fix; if it doesn't, conformal prediction with a calibration set is the next step."
+    },
+    {
+      "id": "F-003",
+      "title": "Confounder imputation uses bfill — pulls future values into past",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "causal_inference.py:660",
+      "description": "`X_df = X_df.ffill().bfill()` in `_prepare_treatment` fills missing pre-treatment confounders by bringing future observations backward. For confounders like `hrv_7d_mean` or `sleep_debt_7d` this is a small but real form of data leakage — the confounder at row N is supposed to reflect the pre-treatment state but bfill mixes in post-treatment information. Forward-fill alone is justifiable when missingness is sporadic; bfill never is for pre-treatment adjustment.",
+      "evidence": "Line 660: `X_df = X_df.ffill().bfill()` applied to confounder columns just before the keep_mask is computed. Affects every AIPW and PSM estimate.",
+      "recommendation": "Drop the `.bfill()` call and require ffill only with a sensible limit (e.g. `ffill(limit=2)`); rows still missing after that should be dropped. The number of dropped rows per treatment is small at current N."
+    },
+    {
+      "id": "F-004",
+      "title": "SARIMAX full-data 7-day forecast uses unshifted exog despite training on shifted exog",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "hrv_analysis.py:2701",
+      "description": "`fut_exog_all = original_exog.iloc[-7:]` is the last 7 rows of the *unshifted* exog, but the full SARIMAX model at line 2695 was fit with `exog=exog` where `exog = original_exog.shift(1).ffill().bfill()` (line 2616). The model's internal contract is `exog[N] = features[N-1]`; the forecast supplies `exog[N+h] = features[N+h]`. This semantic mismatch corrupts both the forecast mean and the predicted-vs-actual 90% CI on the 7-day forecast stored in `pds.hrv_predictions` under model='sarimax'.",
+      "evidence": "Line 2616: `exog = original_exog.shift(1).ffill().bfill()`. Line 2695-2697: `full_model = SARIMAX(hrv_series, exog=exog, ...)`. Line 2701-2702: `fut_exog_all = original_exog.iloc[-7:]` then `fc_full = full_fit.get_forecast(steps=7, exog=fut_exog_all)`.",
+      "recommendation": "Pass `exog.iloc[-7:]` (the already-shifted version, ffill/bfilled forward) as the future exog, or explicitly construct the next-7-day shifted exog matrix consistent with the training contract. Then re-evaluate the SARIMAX horizon metrics in `hrv_model_metrics` since the walk-forward path at line 2664-2682 also forecasts with `exog.iloc[split+i:split+i+h]` (raw, not shifted) — same issue."
+    },
+    {
+      "id": "F-005",
+      "title": "Walk-forward SARIMAX exog window is raw not shifted — same semantic mismatch",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "hrv_analysis.py:2673",
+      "description": "In the walk-forward block, `fut_exog = exog.iloc[split + i: split + i + h]` is passed to `f_step.forecast(steps=h, exog=fut_exog)`. But `exog` here is the shifted exog (line 2616), so `exog[split+i] = original_features[split+i-1]`. For an h=1 forecast at time t=split+i, the model expects `exog[t+1] = features[t]`; what's passed is `exog[t+1] = features[t]` IF the indexing is interpreted as shifted-exog. Read carefully, this case may actually be correct — but it's identical syntax to the broken case in F-004 so I cannot tell without runtime instrumentation. Flagging for an alignment test.",
+      "evidence": "Line 2673: `fut_exog = (exog.iloc[split + i: split + i + h] if exog is not None else None)`. Line 2675: `fc = f_step.forecast(steps=h, exog=fut_exog)`. The shifted-exog indexing convention is non-obvious; same-named `exog` variable carries shifted data but is sliced positionally without accompanying comment.",
+      "recommendation": "Add a small assertion test: pick a date d in the walk-forward range; verify `exog.loc[d]` equals `original_exog.loc[d - 1 day]`. If yes, walk-forward is correct and only the full-data forecast (F-004) needs fixing. Either way, add an inline comment at line 2673 spelling out the semantics — this is the kind of bug that survives a year before anyone catches it."
+    },
+    {
+      "id": "F-006",
+      "title": "`whoop_recovery_score_z28d` not in Phase-2 autocorrelation exclusion set",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "hrv_analysis.py:1664-1671",
+      "description": "`PHASE2_AUTOCORR_EXCLUDE` lists `whoop_recovery_score` and the raw `hrv_*` transforms, but `_personal_z(...)` at lines 1249-1253 creates `whoop_recovery_score_z28d`, `whoop_rhr_z28d`, `garmin_rhr_z28d`, etc. The personal z-score of `whoop_recovery_score` carries the same circular leak as `whoop_recovery_score` itself (it's the same composite of yesterday's HRV/RHR, just standardized). It will pass the numeric_cols filter and survive into the Spearman top-50 driver chart as a 'driver'.",
+      "evidence": "Line 1249-1253: `for c in (\"whoop_rhr\", \"whoop_sleep_duration_milli\", \"whoop_day_strain\", \"garmin_rhr\", \"whoop_recovery_score\"): ... df[f\"{c}_z28d\"] = z`. PHASE2_AUTOCORR_EXCLUDE at 1664 does not include any *_z28d columns.",
+      "recommendation": "Add `whoop_recovery_score_z28d` (and arguably `whoop_rhr_z28d` / `garmin_rhr_z28d` since RHR is HRV-derived per the documented mediator rule) to PHASE2_AUTOCORR_EXCLUDE. Alternatively, gate the personal-z block on prefix and exclude HRV/RHR/recovery from receiving _z28d at all."
+    },
+    {
+      "id": "F-007",
+      "title": "No VIF / multicollinearity check on Stage-3 OLS predictor set",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Correctness"],
+      "file_ref": "hrv_analysis.py:1789-1858",
+      "description": "The Stage-3 standardized OLS with HAC SE fits y on up to 15 BH-FDR survivors with no VIF check. Survivors will routinely include `whoop_sleep_duration_milli` + `whoop_deep_sleep_milli` + `whoop_rem_sleep_milli` (the components sum to the whole) or multiple training-load aggregates, producing severe collinearity. Standardized betas under high VIF flip sign and lose interpretability — the chart at `/analytics/hrv` will show implausible coefficients on highly correlated features. The obs/predictor floor of 20 helps stability but does nothing for collinearity.",
+      "evidence": "Lines 1816-1849: full_fit / red_fit are fit on the survivor matrix with no `pd.DataFrame.corr()`-based prefilter, no VIF computation via `statsmodels.stats.outliers_influence.variance_inflation_factor`, and no orthogonalization. With ~250-feature universe and FDR survivors clustered in the WHOOP-sleep family, VIF > 10 on multiple columns is likely.",
+      "recommendation": "Compute VIF on the standardized survivor matrix; drop any feature with VIF > 10 iteratively from highest to lowest until all remaining are below 10. Document the dropped features in the stored stage3_ols payload so they appear in the dashboard. At n≈100 the result will be a cleaner 5-8 predictor set, which is actually more honest about how many independent dimensions the data supports."
+    },
+    {
+      "id": "F-008",
+      "title": "Walk-forward XGBoost backtest doesn't retrain at fold boundary — uses dropped features from `prepare_ml_data` at h=1",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Correctness"],
+      "file_ref": "hrv_analysis.py:2902-2952",
+      "description": "Each horizon's backtest calls `prepare_ml_data(df, horizon=h)` once outside the fold loop (line 2903), which computes the 5%-density feature filter (`feat_cols = [c for c in feat_cols if model_df[c].notna().mean() >= 0.05]`, line 2325) over the **full** dataset including future data. At early folds, columns that pass the 5% gate by virtue of dense late-period coverage but are sparse in the training tail are included. This is a mild form of feature-selection leakage — the *list* of features available to the model is informed by future data, even if the *values* in each row are not.",
+      "evidence": "Line 2903: `model_df_h, feat_cols_h, X_h, y_h = prepare_ml_data(df, horizon=h)` — called once. Line 2325 inside prepare_ml_data: `feat_cols = [c for c in feat_cols if model_df[c].notna().mean() >= 0.05]` — computed on the full model_df.",
+      "recommendation": "Recompute the 5%-density filter per fold using only the training slice (`X_tr.notna().mean() >= 0.05`), or accept a slight robustness loss and use a larger density threshold (e.g. 25%) for backtest feature inclusion. The simpler fix is to wrap the prepare_ml_data call inside the fold loop and pass a slicing argument."
+    },
+    {
+      "id": "F-009",
+      "title": "`hrv_predict.py:backfill_actuals` reads from legacy clock-date matrix, not behavioral",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "hrv_predict.py:252",
+      "description": "Backfill fetches actuals from `daily_health_matrix` (legacy clock-date view) while the training pipeline runs against `daily_health_matrix_behavioral`. On transition days (~3% of the spine per data profile) the two views attribute HRV to dates that differ by 1 day. The prediction for behavioral-day N+1 will be back-filled against the legacy view's clock-date N+1 actual, which may be a different night's HRV. Residual signs are wrong on those days and downstream metrics (rolling MAE, drift detection, directional accuracy) inherit the misalignment.",
+      "evidence": "Line 251-255: `actuals_raw = fetch_all(\"daily_health_matrix\", ...)`. Bundle's CONTEXT.md states the pipeline operates on `daily_health_matrix_behavioral`; `pds.daily_health_matrix` is retained for backward-compat (MFP energy balance / status freshness) per CLAUDE.md.",
+      "recommendation": "Change the table name to `daily_health_matrix_behavioral` so backfill uses the same date attribution as training. Drop-in change with no schema impact. Verify the 28 transition-day rows before/after to make sure residuals don't flip sign."
+    },
+    {
+      "id": "F-010",
+      "title": "WHOOP cycle dedup uses `.last()` not 'longest cycle' to match the SQL view",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "hrv_analysis.py:1029",
+      "description": "Python dedup of multiple WHOOP cycles per behavioral day takes the last row by sort order: `wc = wc.groupby(\"calendar_date\", as_index=False).last()`. The companion SQL view uses LATERAL ... ORDER BY (end_time - start_time) DESC LIMIT 1 (the longest cycle wins on transition days). Inconsistent — on the ~28 transition days the Python merge can pick a different cycle than the view, putting different `timezone_offset` and `whoop_cycle_avg_hr` on those rows.",
+      "evidence": "Line 1027-1029: `# On transition days WHOOP can have multiple cycles per behavioral date; pick the LONGEST-offset row (matches the behavioral view's LATERAL pick). Simpler proxy: just take last value per date.` The comment acknowledges the mismatch.",
+      "recommendation": "Replace `.last()` with the actual longest-cycle pick: compute duration in load_all_data (load `end_time` as well), then `sort_values('duration_sec', ascending=False).drop_duplicates('calendar_date', keep='first')`. Affects 28 rows but those rows are also the most informative ones for travel/jet-lag analysis."
+    },
+    {
+      "id": "F-011",
+      "title": "PSM common-support filter applied after propensity clipping is partially idempotent",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "causal_inference.py:366-378",
+      "description": "`p_hat = _fit_propensity(X_std, T)` returns already-clipped propensities ∈ [0.05, 0.95]. The subsequent common-support filter `p_hat[treated_idx] < PROPENSITY_TRIM_HIGH` (strict less-than 0.95) drops any treated unit whose *original* propensity was ≥ 0.95 (they got clipped to exactly 0.95). The semantic intent — drop units with no real counterfactual — works, but the path is brittle: a future refactor that swaps `<` for `<=` would silently keep them.",
+      "evidence": "Line 338: `return _trim_propensity(p)` clips at 0.95. Line 374: `in_support = (p_hat[treated_idx] < PROPENSITY_TRIM_HIGH)` strict-less-than against the same 0.95.",
+      "recommendation": "Either fit propensity without clipping then apply the support filter on raw scores (cleaner separation of concerns), or add an inline comment at line 374 explaining the strict-less-than is intentional. The current code is correct but easy to break."
+    },
+    {
+      "id": "F-012",
+      "title": "AIPW outcome models use fixed Ridge alpha=1.0 — no regularization tuning",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Correctness"],
+      "file_ref": "causal_inference.py:445-446",
+      "description": "`Ridge(alpha=1.0).fit(X1, Y1)` is fit per arm without cross-validating alpha. With ~10-30 confounders, alpha=1.0 is arbitrary — too high under-fits and biases the outcome surface (which leaks into the AIPW correction term `Tv * (Yv - mu1) / e`), too low overfits and inflates SE. For continuous treatments where the sample is median-split (often 30-60 per arm), a one-shot alpha is unlikely to be optimal.",
+      "evidence": "Lines 445-446: `mu1_model = Ridge(alpha=1.0).fit(X1, Y1)` / `mu0_model = Ridge(alpha=1.0).fit(X0, Y0)`. No cross-validation, no scaling check beyond the global `_standardize(X)` at line 424.",
+      "recommendation": "Replace with `RidgeCV(alphas=np.logspace(-3, 3, 13), cv=3).fit(X1, Y1)`. Adds a fraction of a second per treatment. Re-run the binary treatment battery and check that the AIPW point estimates shift by less than 1 SE — if they shift more, the alpha choice was material and the new estimates are the right ones."
+    },
+    {
+      "id": "F-013",
+      "title": "Diebold-Mariano variance estimator hard-codes Newey-West bandwidth 7 for h=1 forecasts",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Correctness", "Idiomaticness"],
+      "file_ref": "hrv_analysis.py:3084-3091",
+      "description": "DM test is computed on h=1 paired predictions (correctly filtered at line 3062) but the Newey-West long-run variance uses up to 7 lags: `for k in range(1, min(7, n_d - 1)): long_run += 2 * (1 - k/7) * cov_k`. Theory says NW bandwidth for h-step forecasts is h-1; for h=1 that's 0, meaning the iid variance is correct. Using 7 inflates the variance estimate and makes DM under-reject (conservative). The comment correctly notes 'allow up to 7 for weekly autocorrelation in residuals' — that's a defensible deviation, but the resulting test is no longer a clean DM.",
+      "evidence": "Lines 3084-3091. Comment at 3084 acknowledges the choice.",
+      "recommendation": "Either drop the lag (use `np.var(d, ddof=1)` directly for h=1) and rename the function accordingly, or keep the weekly-bandwidth and rename the stored result_key to 'modified_dm_weekly_lag' so consumers know they aren't reading a textbook DM. The latter is fine, just label it."
+    },
+    {
+      "id": "F-014",
+      "title": "Continuous median-split uses post-conditioned median, not pre-treatment marginal",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "causal_inference.py:652",
+      "description": "For continuous treatments the median is computed as `med = sub[spec.name].median()` after `dropna(subset=[spec.name, OUTCOME_COL])` and confounder ffill+bfill+dropna. The median is therefore conditioned on outcome availability and confounder availability, not on the marginal distribution of the treatment. This biases the cut-point on systematically-missing days (e.g. early WHOOP-only era for steps). For treatments with strong period effects (sleep_debt_7d, training_load) this shifts the median by enough to flip 5-10% of days between arms.",
+      "evidence": "Line 646: `sub = sub.dropna(subset=[spec.name, OUTCOME_COL])`. Line 651-653: `med = sub[spec.name].median(); T = (sub[spec.name] > med).astype(int).values` operates on the conditioned subset.",
+      "recommendation": "Compute the median on the full (pre-dropna) treatment series and pass it down: `med = df[spec.name].median()` before the dropna. The treatment vector is then defined relative to a sample-marginal cut-point, which is what readers will assume the 'above median' label means."
+    },
+    {
+      "id": "F-015",
+      "title": "Granger uses BH-FDR survivors but doesn't multiple-compare across the surviving × lag grid",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "hrv_analysis.py:2219-2244",
+      "description": "Granger runs on the top 10 BH-FDR survivors at lags 1-3 — 30 tests, each yielding its own p_value, all stored without correction. The May-21 audit fixed the upstream selection bias (now uses survivors not raw |r|) but the family of (feature × lag) tests is then unflagged. A spurious 'feature X Granger-causes HRV at lag 2 only' will appear at p<0.05 by chance roughly once every 20 (feature, lag) cells.",
+      "evidence": "Lines 2225-2237: nested loop over feat × lag, append per-(feat, lag) row, no FDR adjustment on the resulting set before the CSV save at line 2241.",
+      "recommendation": "Apply BH-FDR across the 30-cell (feature × lag) grid before storing. With only ~10 features × 3 lags this is a small correction but it makes the Granger CSV defensibly interpretable."
+    },
+    {
+      "id": "F-016",
+      "title": "Permutation importance shuffles iid on autocorrelated time series",
+      "severity": "P3",
+      "effort": "M",
+      "dimensions": ["Correctness"],
+      "file_ref": "hrv_analysis.py:2526-2530",
+      "description": "`sklearn.inspection.permutation_importance(..., n_repeats=5)` shuffles each column iid. With strong autocorrelation in features like `hrv_lag1`, `hrv_7d_mean`, sleep duration, the iid-shuffle destroys both the cross-sectional and temporal structure, exaggerating the importance of any feature the model exploited time-locally. This makes permutation importance disagree with SHAP and noisily so.",
+      "evidence": "Lines 2526-2527: `perm = _perm(final_model, X_test, y_test, n_repeats=5, scoring=\"neg_mean_absolute_error\", random_state=42, n_jobs=1)`.",
+      "recommendation": "Either drop permutation importance (SHAP already does the job) or replace with a block-permutation variant: shuffle within contiguous 7-day blocks. The result is a fairer importance for time-series features. Low-priority since SHAP is the primary surface."
+    },
+    {
+      "id": "F-017",
+      "title": "ADF/Ljung-Box on SARIMAX residuals only logs warnings — no retune path",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Robustness"],
+      "file_ref": "hrv_analysis.py:2641-2644",
+      "description": "When `lb_p7 < 0.05` the code logs 'SARIMAX residual autocorrelation present — consider re-tuning order' but never acts. The (1,1,1)x(1,0,1,7) order is hard-coded; if the residuals are correlated, the model is genuinely under-specified and the multi-horizon CIs are wrong, but the pipeline ships the forecast anyway and the dashboard shows it.",
+      "evidence": "Lines 2641-2644: warning logged, no flag stored. The order at line 2625-2627 is fixed: `order=(1, 1, 1), seasonal_order=(1, 0, 1, 7)`.",
+      "recommendation": "If lb_p7 < 0.05, store a 'sarimax_residual_autocorrelation: true' flag in `hrv_model_metrics` so the frontend can show a caution next to the SARIMAX forecast. Optionally try a fallback order ((2,1,1) or (1,1,2)) and keep whichever fits cleaner residuals — that's an order-of-day's-work additional change."
+    },
+    {
+      "id": "F-018",
+      "title": "`_days_since` is O(n) row-by-row Python loop — fine at 568, brittle at 5000",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Scalability", "Idiomaticness"],
+      "file_ref": "hrv_analysis.py:1454-1462",
+      "description": "Pure-Python iteration over a Series with `iloc` per row. Acceptable at N=568, but multiple `_days_since` calls (alcohol, sauna, hard workout, rest day, transition) plus `_consecutive_days` for run streaks add up to ~6 such loops per run, each O(n). At 10× data volume this becomes the dominant cost in feature engineering.",
+      "evidence": "Lines 1454-1462: `for i, v in enumerate(flag): ... result.iloc[i] = i - last if not np.isnan(last) else np.nan`.",
+      "recommendation": "Vectorize with `np.where(flag.values == 1)[0]` then `np.maximum.accumulate` to broadcast the last-flagged index, then subtract row index. One-liner with numpy; preserves NaN semantics with a boolean mask."
+    },
+    {
+      "id": "F-019",
+      "title": "`store_analysis_results` upserts rows one at a time — N round-trips",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Scalability"],
+      "file_ref": "hrv_analysis.py:3633-3638",
+      "description": "Comment says 'Upsert each row individually to avoid bulk insert dropping rows' but doesn't explain what was dropping. ~10-14 individual HTTP calls per run, each ~100-200ms latency to Supabase. At current scale this adds ~2-3 seconds; not breaking anything. The reason for the individual loop should be documented or fixed.",
+      "evidence": "Lines 3633-3638: individual upsert in a for loop with per-row log.info.",
+      "recommendation": "Try `upsert_batch('hrv_analysis_results', rows, 'result_type,result_key')` once. If a row gets silently dropped (the implied original problem), inspect the conflict key — most likely some result_json was too large for a single batch and Supabase truncated. Either way, document the root cause inline."
+    },
+    {
+      "id": "F-020",
+      "title": "`onyx_is_transition_day` is in the matrix but never excluded from descriptive analyses",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "hrv_analysis.py:1304-1311",
+      "description": "Transition days are ~3% of the spine and per the bundle's data profile they carry a legitimate behavioral discontinuity (TZ change, often associated travel meals/alcohol/disrupted sleep). The pipeline correctly surfaces `is_transition_day` and `days_since_transition` as features and treats `is_transition_day` as a causal treatment, but the descriptive Spearman / Welch / Granger tests run on the full sample including transition days. For features like `whoop_sleep_duration_milli`, a 4-hour jet lag night will dominate the tails of the correlation estimate.",
+      "evidence": "Lines 1304-1311 surface the flags. No `df[~df['is_transition_day']]` filter appears in `run_statistical_analysis` (lines 1636-2276).",
+      "recommendation": "Either run all descriptive tests twice (with and without transition days) and store both, or store a 'transition_day_share_in_test_subset' column alongside each result so the user can interpret. Low-priority since the transition flag is causally analyzed elsewhere, but a footnote on the Spearman card would be honest."
+    }
+  ],
+  "things_done_well": [
+    {
+      "title": "Walk-forward GAP=28d matches longest rolling feature window",
+      "file_ref": "hrv_analysis.py:2876-2882",
+      "why_it_matters": "Most personal-quant pipelines either skip the embargo or set it to 7 days arbitrarily. The 28-day embargo is exactly the right size for the `hrv_28d_mean` / `hrv_28d_std` / `*_z28d` features the pipeline computes — without it, the first ~21 test rows overlap the training tail through the rolling windows and report inflated accuracy."
+    },
+    {
+      "title": "Behavioral-day join via `behaviors_date` in pivot_journal",
+      "file_ref": "hrv_analysis.py:777-817",
+      "why_it_matters": "Aligning journal answers to the behavioral day (not the WHOOP cycle wake-day) is exactly the correct semantics for the shift(-1) target framing. The fallback to cycle_date for rows missing behaviors_date is also right. This is the single most consequential fix for Welch's t-tests to mean what they claim."
+    },
+    {
+      "title": "Mediator-exclusion is explicit and documented in CONTINUOUS_TREATMENTS comments",
+      "file_ref": "causal_inference.py:173-185",
+      "why_it_matters": "The docstring spells out *why* every same-night sleep variable, HRV-derived variable, and body composition column is excluded as a treatment. The TOTAL-vs-direct effect choice is justified. Most causal-pipeline DAG documentation hand-waves; this one names what it's adjusting for and what it deliberately isn't."
+    },
+    {
+      "title": "BH-FDR fix in journal_impact and habit_impact",
+      "file_ref": "hrv_analysis.py:1892-1900",
+      "why_it_matters": "Welch's t-tests across 57 journal questions without correction produce ~3 false positives by chance at α=0.05; the May-21 audit caught it and the fix is correctly applied with the same fdrcorrection() machinery used in the supplement/nutrition families. The dashboard's `passes_fdr` field is now meaningful for journal and habit cards."
+    },
+    {
+      "title": "TimeSeriesSplit OOF residuals for `train_xgboost` prediction interval σ",
+      "file_ref": "hrv_analysis.py:2486-2506",
+      "why_it_matters": "Most XGBoost PI implementations naively use the validation slice or training residuals. Using 5-fold time-series-aware OOF residuals is the right answer for a single-point σ estimate without going to full conformal prediction. The handle-back-to-val fallback at line 2509 is also defensive."
+    },
+    {
+      "title": "Stage-failure isolation in hrv_predict.py:main",
+      "file_ref": "hrv_predict.py:408-465",
+      "why_it_matters": "Each subsystem (backfill, recompute_rolling_metrics, predict, check_drift) is wrapped in its own try/except so a NaN in backfill cannot kill predictions for the day. Comment at line 406-407 explicitly references the historical 9-day outage from exactly that failure mode. Operational-discipline detail that earns its weight."
+    },
+    {
+      "title": "et_today() avoids UTC date drift on GitHub runners",
+      "file_ref": "hrv_predict.py:47-51",
+      "why_it_matters": "GitHub Actions runs in UTC; a late-ET-evening run can fire between 03:00 and 05:00 UTC and a naive `date.today()` would advance to tomorrow's UTC date, mis-tagging the prediction by 1 day. zoneinfo-based et_today() is the right fix and the docstring documents the failure mode explicitly."
+    },
+    {
+      "title": "Cell-size gates with explicit reason tracking",
+      "file_ref": "causal_inference.py:746-756",
+      "why_it_matters": "Treatments dropped for insufficient sample go to `dropped_low_n` with their actual n_treated/n_control and a reason string. The continuous-vs-binary reasons are different and tracked separately. This is how a future debugger figures out why a particular treatment 'didn't show up' on the dashboard."
+    },
+    {
+      "title": "E-value sensitivity analysis on AIPW + CI-bound variant",
+      "file_ref": "causal_inference.py:480-509",
+      "why_it_matters": "The point E-value tells the reader 'how strong an unmeasured confounder would have to be to explain this away,' and the CI-bound E-value tells the reader the same for the lower end of the CI. Both are stored. Nudging the reader toward 'is this estimate robust' rather than 'is p < 0.05' is the right framing for n=1 decision-making."
+    },
+    {
+      "title": "Personal z-scores against 28d shifted rolling baseline",
+      "file_ref": "hrv_analysis.py:1241-1253",
+      "why_it_matters": "Computing personal z-scores against a *prior-only* rolling baseline (the `.shift(1)` matters) puts cross-device-scale features on a comparable axis without leaking the target row into the standardization. This is exactly the right way to compute personal anomaly scores for XGBoost features."
+    }
+  ],
+  "questions_for_followup": [
+    "What does `pds.hrv_model_metrics.ci_coverage` actually average to across the backtest rows? If it sits at ~50-65% rather than ~80%, F-002 is confirmed.",
+    "Is `pds.daily_health_matrix_behavioral.calendar_date` equal to `pds.daily_health_matrix.calendar_date` on the ~770 non-transition days, with the ~28 transition days being the only places they disagree? If so, F-009 is a clean transition-day bug; if there's a larger drift, the impact is bigger.",
+    "On the walk-forward SARIMAX path (line 2673), does `f_step.forecast(steps=h, exog=exog.iloc[split+i:split+i+h])` actually use shifted exog or raw — i.e., what is `exog` after `exog = original_exog.shift(1).ffill().bfill()` when sliced positionally? An assertion test inside the loop would settle F-005 without instrumentation.",
+    "How many distinct binary treatments end up flagged `low_n=true` today, and how many of those are *just* below the 20-per-arm gate? If a meaningful fraction are at n=18-19 per arm, raising MIN_BINARY_PER_ARM_FULL to 25 might be more defensible than the current threshold.",
+    "Does the saved `xgboost_hrv_model.pkl` carry a `feat_cols` list that includes columns not present at next-prediction time? `hrv_predict.py:get_latest_features` adds missing columns as NaN — at how many rows per prediction is the feature filled vs left NaN? If most features are NaN-padded today, the daily prediction is being driven by a small fraction of the trained feature set."
+  ]
+}

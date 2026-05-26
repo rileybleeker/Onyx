@@ -1,0 +1,191 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "5ceb269",
+  "fired_at": "2026-05-26T03:09:05.445235+00:00",
+  "usage": {
+    "prompt_tokens": 84055,
+    "completion_tokens": 9460,
+    "total_tokens": 93515,
+    "prompt_tokens_details": {
+      "cached_tokens": 83968,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 6400,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-4.1",
+      "review_date": "2026-05-26",
+      "bundle_commit": "5ceb269"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "Core alignment, lag handling, FDR, and leakage guards are largely correct, but AIPW uses random cross-fitting on a time series, E-value CI uses the wrong bound, and backtest prediction intervals are miscalibrated and mismatched to the documented nominal."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "Good NaN handling, cell-size gates, embargoed walk-forward, and mediator exclusions; a few fragile spots remain (bfill of confounders; PI calibration)."
+      },
+      "scalability": {
+        "score": 5,
+        "rationale": "All methods are linear or near-linear in N with small per-run constants; batching to Postgres and incremental backtesting will comfortably handle 10\u00d7 data."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Uses standard libraries (scikit-learn, statsmodels, SHAP) in mostly idiomatic ways; one notable exception is time-series AIPW using shuffled KFold."
+      }
+    },
+    "summary": "Overall, this is a thoughtful single-subject pipeline with careful behavioral-day alignment, correct target shifting, strong leakage guards (28\u2011day embargo, lagged/rolled features computed with shift(1)), and consistent multiple-comparison control for all high-surface families. The SARIMAX exog shift and the XGBoost feature pool are defensible; Stage\u20113 OLS caps predictors and uses HAC errors appropriately. The most material weaknesses are in the causal layer: AIPW cross-fitting uses shuffled KFold on an autocorrelated outcome, which risks optimistic estimates/SEs; confounders are imputed with bfill (future information); and the E\u2011value CI uses the wrong bound for negative effects. On the predictive side, daily and backtest XGBoost prediction intervals are calibrated at \u00b11.645\u03c3 (\u224890%) while the schema/labels say 80%; in the multi-horizon backtest \u03c3 is taken from in-sample training residuals, which will under-cover. These are fixable with modest code changes. Riskiest assumptions: that random cross-fitting breaks no time dependence; that backfilled confounders are innocuous; and that PI coverage is close to nominal. If I could only fix three things: (1) switch AIPW cross-fitting to a time-respecting split (TimeSeriesSplit or blocked folds) and remove any future-informed scaling; (2) compute PIs consistently at the documented nominal (80%) and use out-of-fold residuals for backtest intervals; (3) correct the E\u2011value CI computation to use the confidence limit nearest the null (upper bound for negative ATEs) and use the pooled within-group SD for d.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "AIPW cross-fitting uses shuffled KFold on autocorrelated HRV",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "causal_inference.py:205-260",
+        "description": "estimate_aipw applies KFold(n_splits=5, shuffle=True) to a daily time series with known HRV autocorrelation, allowing adjacent days to land in different folds and letting models indirectly see near-future outcomes.",
+        "evidence": "In estimate_aipw: `kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)` then folds are used to fit ps_model and outcome models; no time-order constraint is enforced.",
+        "recommendation": "Use TimeSeriesSplit (or blocked, non-shuffled folds) for cross-fitting, and include hrv_lag1 explicitly if not already; alternatively perform rolling-origin cross-fitting so training strictly precedes validation in time."
+      },
+      {
+        "id": "F-002",
+        "title": "E-value CI uses wrong bound for negative effects",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:300-345",
+        "description": "compute_e_value takes only ci_low and always uses it to form the CI-based E-value; for negative ATEs the bound nearest the null is typically the upper bound, so using the lower bound inflates robustness.",
+        "evidence": "Function signature `compute_e_value(ate, ci_low, pooled_sd)`; logic sets `d_ci = ci_low/pooled_sd` for ate>0, else uses `-ci_low` if ci_low<0; ci_high is never passed or considered.",
+        "recommendation": "Pass both ci_low and ci_high; compute the bound nearest zero (lower for positive ATE, upper for negative ATE), then apply the Chinn transform and VanderWeele\u2013Ding formula accordingly."
+      },
+      {
+        "id": "F-003",
+        "title": "Confounder imputation bfills future values in causal prep",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "causal_inference.py:415-445",
+        "description": "In _prepare_treatment, confounders are imputed with `X_df.ffill().bfill()`, which can use future observations to fill missing pre-treatment covariates, violating the temporal ordering required for identification.",
+        "evidence": "Code: `X_df = sub[list(confounders)].copy(); X_df = X_df.ffill().bfill()`; no restriction to forward-only imputation.",
+        "recommendation": "Restrict imputation to forward-fill only (ffill) and drop remaining missing rows, or use model-based imputation trained on past data only; document any remaining missingness-driven drops."
+      },
+      {
+        "id": "F-004",
+        "title": "Prediction intervals miscalibrated and nominal mismatch (90% vs 80%)",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:1165-1180",
+        "description": "XGBoost PIs are constructed as \u00b11.645\u03c3 (\u224890%) but the schema comments and historical dashboards describe 80%; in the multi-horizon backtest \u03c3 is taken from training residuals, which yields optimistic coverage.",
+        "evidence": "train_xgboost: `test_lower = test_pred - 1.645 * pred_std` (and same for upper). In run_evaluation XGBoost backtest uses `residuals_std = np.std(y_tr - m.predict(X_tr))` per fold.",
+        "recommendation": "Decide on a single nominal (80% or 90%) and use it consistently across training, backtest, and storage; for backtest, compute \u03c3 from out-of-fold or validation residuals within each window rather than in-sample training residuals."
+      },
+      {
+        "id": "F-005",
+        "title": "AIPW standardization fits on full sample before cross-fitting",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "causal_inference.py:210-220",
+        "description": "Features are standardized via _standardize(X) before fold splits, so test-fold scaling parameters are influenced by the held-out data, which is non-ideal for cross-fitting and time series.",
+        "evidence": "`X_std = _standardize(X)` where `_standardize` does `StandardScaler().fit_transform(X)` prior to `kf.split(X_std)`.",
+        "recommendation": "Move scaling inside the fold loop: fit the scaler on Xt (train fold) and transform both Xt and Xv per fold; for time series, use parameters from past-only data."
+      },
+      {
+        "id": "F-006",
+        "title": "Explicit binary 'negative_split' can be non-binary and gets silently dropped",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "hrv_analysis.py:338-390",
+        "description": "Daily negative_split is computed as the mean of per-activity flags, which can produce 0.5 on multi-activity days; enumeration later requires values \u2286 {0,1}, causing the intended binary treatment to be skipped.",
+        "evidence": "aggregate_activities computes `negative_split=('negative_split','mean')`; _enumerate_binary_treatments checks `set(vals).issubset({0,1,0.0,1.0})`.",
+        "recommendation": "Convert daily negative_split to a strict 0/1 (e.g., any activity with negative split \u21d2 1) before enumeration, or round the mean to {0,1}."
+      },
+      {
+        "id": "F-007",
+        "title": "E-value effect size uses overall SD, not pooled within-group SD",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:280-345",
+        "description": "Cohen\u2019s d for continuous outcomes should use the pooled within-group SD; using the overall SD can misstate the magnitude and thus the E-value.",
+        "evidence": "_estimate_one sets `pooled_outcome_sd = Y.std(ddof=1)`; compute_e_value then divides ate by this.",
+        "recommendation": "Compute pooled SD: sqrt(((n1\u22121)s1\u00b2 + (n0\u22121)s0\u00b2)/(n1+n0\u22122)), and pass that value into compute_e_value."
+      },
+      {
+        "id": "F-008",
+        "title": "Backtest PIs recorded without coverage for baselines; horizon label may mislead CI chart",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:1470-1540",
+        "description": "Only XGBoost backtest rows carry PI bands; baselines lack lower/upper, but ci_coverage is aggregated per model\u00d7horizon without guardrails, which can confuse downstream coverage displays.",
+        "evidence": "In run_evaluation, baselines append rows without prediction_lower/upper; compute_metrics handles None, but stored metrics may mix models/horizons with and without CIs.",
+        "recommendation": "Either compute comparable PIs for baselines (e.g., empirical residual \u03c3) or explicitly label/omit CI coverage for models without PIs to avoid misleading comparisons."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Time-respecting backtest with 28\u2011day embargo to prevent rolling-window leakage",
+        "file_ref": "hrv_analysis.py:1338-1395",
+        "why_it_matters": "Ensures no overlap between training windows and evaluation targets when 28\u2011day rolling HRV baselines are used, preventing subtle target leakage in a single-user time series."
+      },
+      {
+        "title": "Consistent BH-FDR across high-surface families and exclusion of autocorrelation artifacts",
+        "file_ref": "hrv_analysis.py:985-1090",
+        "why_it_matters": "Applying FDR to Spearman, journal, habit, supplement, and nutrition protects against spurious findings in n=1 exploratory analyses; excluding HRV transforms avoids trivial persistence dominating drivers."
+      },
+      {
+        "title": "Causal DAG respects mediator exclusion and uses pre-treatment lags only",
+        "file_ref": "causal_inference.py:38-76",
+        "why_it_matters": "Avoids conditioning on same-night sleep/recovery mediators, so estimated effects remain actionable total effects (what changes if I intervene tonight?)."
+      },
+      {
+        "title": "SARIMAX exogenous features correctly shifted and residual diagnostics logged",
+        "file_ref": "hrv_analysis.py:1210-1315",
+        "why_it_matters": "Shifting exog by one day keeps causal alignment intact; Ljung\u2013Box and ADF checks add needed feedback on model adequacy and stationarity."
+      },
+      {
+        "title": "Out-of-fold residual \u03c3 for XGBoost PIs (training stage) with TimeSeriesSplit",
+        "file_ref": "hrv_analysis.py:1122-1159",
+        "why_it_matters": "Calibrating \u03c3 from time-ordered out-of-fold residuals produces more realistic predictive uncertainty than a single validation slice."
+      }
+    ],
+    "questions_for_followup": [
+      "The schema comments say '80% PI' in pds.hrv_predictions, but code uses \u00b11.645\u03c3 (~90%). Which nominal should the UI and metrics assume, and should we migrate stored bands to match?",
+      "Do dashboards currently filter journal/habit/supplement result tables by passes_fdr, or do they display raw p-values/q-values? A screenshot or query would clarify presentation intent.",
+      "For AIPW, can we confirm empirical HRV autocorrelation (e.g., \u03c11) on this dataset to choose fold sizes/block lengths for time-respecting cross-fitting?",
+      "Should 'negative_split' be treated as 'any negative split that day' or 'all activities negative split'? Clarifying the intended semantics will inform binarization.",
+      "Is baseline CI coverage (hrv_model_metrics.ci_coverage) plotted alongside XGBoost/SARIMAX/Prophet? If so, do we want to compute comparable bands for baselines or hide coverage for those models?"
+    ]
+  }
+}

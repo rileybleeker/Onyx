@@ -1,0 +1,145 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-2.5-pro",
+  "bundle_commit": "5ceb269",
+  "fired_at": "2026-05-26T03:15:46.423647+00:00",
+  "usage": {
+    "promptTokenCount": 98241,
+    "candidatesTokenCount": 2616,
+    "totalTokenCount": 105794,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 98241
+      }
+    ],
+    "thoughtsTokenCount": 4937,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "claude-3-opus-20240229",
+      "review_date": "2026-05-26",
+      "bundle_commit": "5ceb269"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "The causal inference layer uses random cross-validation folds on time-series data, a significant flaw likely producing incorrect standard errors, while the descriptive and predictive components are largely correct."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "The pipeline includes cell-size gates, handles missing data, and uses robust methods for prediction interval estimation, but lacks multicollinearity checks and a caliper in propensity score matching."
+      },
+      "scalability": {
+        "score": 5,
+        "rationale": "As a single-user longitudinal pipeline with daily batch execution and walk-forward evaluation, the current design will comfortably scale to a decade or more of data without architectural changes."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "The code correctly and extensively uses standard libraries like scikit-learn, statsmodels, and pandas, following recognizable patterns for data analysis and machine learning in Python."
+      }
+    },
+    "summary": "The Onyx statistics pipeline demonstrates a sophisticated approach to n=1 longitudinal analysis, with several components implemented to a high standard. The walk-forward backtesting for predictive models is well-designed, featuring an appropriate embargo period to prevent leakage from rolling features and a robust method for estimating prediction intervals using out-of-fold residuals from a TimeSeriesSplit. Multiple comparison correction via BH-FDR is applied systematically across all relevant statistical tests, a critical feature given the large number of journal questions. However, the pipeline contains a severe methodological flaw in its most advanced component: the causal inference layer. The AIPW estimator uses randomly shuffled K-Folds for cross-fitting on a time-series outcome with known autocorrelation, which violates the assumptions of the procedure and likely leads to biased estimates and underestimated standard errors. This is the single most critical issue to address. Other, less severe risks include the lack of multicollinearity checks in the exploratory OLS model, which could render coefficients unstable and uninterpretable, and the absence of a caliper in the PSM implementation. If I could only fix three things, they would be: 1) Replace `KFold` with `TimeSeriesSplit` in the AIPW estimator. 2) Add VIF filtering to the Stage 3 OLS model to ensure coefficient stability. 3) Implement a caliper in the PSM estimator to improve match quality.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "AIPW cross-fitting uses random folds on autocorrelated time-series data",
+        "severity": "P0",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:402",
+        "description": "The AIPW estimator uses `KFold(shuffle=True)` for its cross-fitting procedure. On time-series data like daily HRV with significant autocorrelation, this allows the outcome models to leak information across folds, as adjacent days can be split into training and testing sets. This violates the assumptions of cross-fitting for dependent data and can lead to underestimated standard errors and biased ATEs.",
+        "evidence": "The code at `causal_inference.py:402` explicitly instantiates a shuffled KFold for a time-series analysis: `kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)`.",
+        "recommendation": "Replace `sklearn.model_selection.KFold` with `sklearn.model_selection.TimeSeriesSplit` to ensure the cross-fitting folds respect the temporal ordering of the data."
+      },
+      {
+        "id": "F-002",
+        "title": "Exploratory OLS model lacks multicollinearity checks",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "hrv_analysis.py:1555-1609",
+        "description": "The Stage 3 standardized OLS model is fit on multiple, potentially correlated features (e.g., `total_steps`, `active_kilocalories`, `whoop_day_strain`). The absence of a multicollinearity check (e.g., Variance Inflation Factor) means that the resulting beta coefficients can be highly unstable and uninterpretable, even if the overall model has predictive power. This is especially risky in a model intended to compare effect sizes.",
+        "evidence": "The function `run_statistical_analysis` fits a `statsmodels.api.sm.OLS` model on a set of FDR survivors without first assessing or filtering for multicollinearity among the predictors.",
+        "recommendation": "Before fitting the OLS model, compute the VIF for all candidate predictors. Iteratively remove the feature with the highest VIF until all remaining features are below a standard threshold (e.g., 5 or 10)."
+      },
+      {
+        "id": "F-003",
+        "title": "Propensity Score Matching does not use a caliper",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "causal_inference.py:349-360",
+        "description": "The PSM estimator matches each treated unit to its k-nearest neighbors in propensity score space. However, it does not enforce a caliper, which is a maximum allowable distance for a match. This can result in poor-quality matches if the nearest neighbors are still far away, potentially biasing the treatment effect estimate.",
+        "evidence": "The loop at `causal_inference.py:357` finds the nearest neighbors by sorting distances (`np.argsort(dists)`) without a threshold on the distance itself.",
+        "recommendation": "Add a caliper to the matching procedure. A common choice is 0.25 standard deviations of the logit of the propensity score. Discard any treated units for which no control unit exists within the caliper."
+      },
+      {
+        "id": "F-004",
+        "title": "Prophet regressors are backfilled, leaking future information",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2485",
+        "description": "When preparing regressors for the Prophet model, missing values are filled using `ffill().bfill()`. The backfill (`bfill`) component can pull information from the future into the regressor series for past dates, which constitutes a form of data leakage during model fitting.",
+        "evidence": "The line `hrv_df[rf] = hrv_df[rf].ffill().bfill().astype(float)` in `train_prophet` uses a backfill operation on the entire series before splitting into train and test sets.",
+        "recommendation": "Change the fill method to `ffill()` only. This ensures that regressor values at time `t` are only informed by data from `t` and earlier."
+      },
+      {
+        "id": "F-005",
+        "title": "SARIMAX model order is hardcoded",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2320",
+        "description": "The SARIMAX model uses a fixed `order=(1, 1, 1)` and `seasonal_order=(1, 0, 1, 7)`. While these are reasonable defaults, they may not be optimal for this specific time series. Without a systematic model selection procedure (e.g., based on AIC/BIC), the model may be under-specified or over-specified, leading to suboptimal forecasts.",
+        "evidence": "The `SARIMAX` call in `train_sarimax` uses hardcoded order parameters without a preceding model selection step.",
+        "recommendation": "Incorporate an automated order selection process, for example by using a library like `pmdarima` (`auto_arima`) to find the best (p,d,q)(P,D,Q) combination based on an information criterion like AIC."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Time-series aware walk-forward backtesting with embargo",
+        "file_ref": "hrv_analysis.py:2540-2567",
+        "why_it_matters": "The use of an expanding window with a 28-day gap (`GAP_DAYS`) between train and test sets is a robust method for evaluating time-series models that correctly prevents leakage from long-window rolling features."
+      },
+      {
+        "title": "Robust estimation of prediction interval width",
+        "file_ref": "hrv_analysis.py:2180-2200",
+        "why_it_matters": "Calculating the residual standard deviation from out-of-fold predictions using `TimeSeriesSplit` provides a much more stable and reliable estimate for prediction intervals than using a single, arbitrary validation set."
+      },
+      {
+        "title": "Systematic application of FDR correction",
+        "file_ref": "hrv_analysis.py:1459-1865",
+        "why_it_matters": "Benjamini-Hochberg FDR correction is correctly applied to every family of multiple hypothesis tests (Spearman, journal, habit, supplement, nutrition), which is essential for controlling the false discovery rate and preventing the user from acting on spurious findings."
+      },
+      {
+        "title": "Correct exclusion of mediators from causal confounder set",
+        "file_ref": "causal_inference.py:78-94",
+        "why_it_matters": "The explicit, documented decision to exclude same-night sleep and recovery variables from the confounder set is methodologically sound. This correctly avoids mediator-adjustment bias and allows for the estimation of the total effect of a behavior, which is the actionable quantity of interest."
+      },
+      {
+        "title": "Inclusion of E-value for sensitivity analysis",
+        "file_ref": "causal_inference.py:440-462",
+        "why_it_matters": "Reporting E-values alongside causal estimates provides crucial context about their robustness to unmeasured confounding, empowering the user to gauge how much confidence to place in a given finding."
+      }
+    ],
+    "questions_for_followup": [
+      "The `VARIABLE_COVERAGE_AUDIT.md` file appears to be out of sync with the current code, flagging issues (like missing FDR correction and Granger inputs) that have since been fixed. Can you confirm if this audit report predates the latest code changes?",
+      "The Stage 3 OLS model in `hrv_analysis.py` is used for descriptive purposes, but the instability of coefficients due to potential multicollinearity could be misleading. What is the intended use of this model's output in the frontend, and are the individual beta coefficients being presented to the user?"
+    ]
+  }
+}

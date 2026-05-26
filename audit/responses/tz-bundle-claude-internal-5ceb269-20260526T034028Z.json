@@ -1,0 +1,255 @@
+{
+  "reviewer_metadata": {
+    "model": "claude-opus-4-7-internal",
+    "review_date": "2026-05-25",
+    "bundle_commit": "5ceb269"
+  },
+  "domain_scores": {
+    "correctness": {
+      "score": 3,
+      "rationale": "Core derive_onyx_dates function is sound and the -6h behavioral rule is faithfully implemented. WHOOP/Garmin-activities triggers correctly use per-row offsets. However there are several concrete divergences from the ADR: whoop_tz_backfill.py crashes at line 202 with NameError before any travel proposal is ever inserted; habit_journal trigger always tags 'default_et_fallback' regardless of any active user_tz_log entry; mfp + eight_sleep triggers tag 'source_field' despite the ADR explicitly noting Eight Sleep has no IANA field and MFP CSV has no source TZ; daily_health_matrix_behavioral mixes garmin_daily_summary.calendar_date (watch-local) into a behavioral-date spine. Most produce subtle attribution errors, not catastrophic ones, but they violate the provenance auditability the ADR markets as a load-bearing benefit."
+    },
+    "robustness": {
+      "score": 3,
+      "rationale": "DST artifact handling in tz_log_gaps + whoop_tz_backfill is thoughtful (the dst_artifact vs travel split is good work). Same-offset filtering in gps_tz_backfill correctly skips Toronto/Louisville noise. But: (a) garmin_activities trigger silently treats start_time_local as UTC when start_time_gmt is NULL — start_time_local is per CLAUDE.md a wall-clock-labelled-as-UTC, so this produces wrong dates rather than failing loudly; (b) the WHOOP-auto path can insert an effective_from row AFTER a manual entry, splitting a manual NY window mid-trip; (c) no test/handling for IDL crossings beyond a documented 'acceptable limitation'; (d) NULL ts in derive_onyx_dates silently produces all-NULL rather than raising; (e) gps_tz_backfill returns-to-ET coverage depends on a GPS activity firing back in NY — silent gap if Riley returns and doesn't run outside immediately."
+    },
+    "scalability": {
+      "score": 3,
+      "rationale": "tz_for_instant is O(log n) with the DESC index — adequate. Behavioral-date column indexes are created per table — good. But: (a) gps_tz_backfill issues one RPC per Garmin activity (~349 round-trips per full sweep), trivially batchable to one local pds.tz_for_instant computation but isn't; (b) whoop_tz_backfill same N+1 pattern (~575 cycles per sweep); (c) the transition-flag trigger does a per-row SELECT against whoop_cycles on every INSERT — fine today, but no explicit index on (start_time DESC); (d) daily_health_matrix_behavioral spine is a UNION across 9 tables on every query — non-trivial; consider materializing if it gets read on every dashboard render. None of these break at current scale, but the N+1 patterns in the backfill scripts are the easy fix to harvest first."
+    },
+    "idiomaticness": {
+      "score": 4,
+      "rationale": "Good use of BEFORE INSERT OR UPDATE triggers with targeted UPDATE OF column lists, LATERAL subqueries for dedup, window functions for one-shot backfills, partial index for the transition-day flag. derive_onyx_dates returning a TABLE that's unpacked via SELECT INTO is clean. The CHECK regex for IANA TZ names is a nice belt-and-suspenders touch. Minor lapses: 9 nearly-identical set_onyx_dates_* functions could be one parameterized function or a shared template; interval_to_tzd reinvents a small wheel (to_char with FMTZH:TZM doesn't work on INTERVAL, but EXTRACT-and-format is idiomatic enough); explicit STABLE marker on derive_onyx_dates would let the planner inline. The Postgres TZ primitives (AT TIME ZONE) are used correctly where it counts."
+    }
+  },
+  "summary": "ADR-0001's design is realized faithfully in the load-bearing core: derive_onyx_dates correctly composes the three date columns from a UTC instant plus an optional source offset, the -6h behavioral rule is consistently applied, WHOOP/Garmin-activity triggers use per-row offsets, and daily_health_matrix_behavioral correctly dedupes WHOOP cycles per behavioral day via LATERAL ... LIMIT 1. The DST-artifact vs real-travel split in tz_log_gaps and whoop_tz_backfill is the highlight — it's a hard problem and the solution is principled.\n\nThe gap between design and implementation shows up at the edges. whoop_tz_backfill.py contains an undefined-variable bug (line 202 references log_offset_str which is never bound) that will crash every real-travel proposal; this is P0 because the script silently no-ops on dry-run (DST-artifact filter catches DST and no-op trips, so dry-run shows '0 proposals' and looks healthy) but will throw on any actual trip that needs backfilling. habit_journal always tags default_et_fallback regardless of any covering user_tz_log entry, defeating the ADR's provenance promise for the largest-volume manual-attribution table. mfp + eight_sleep tag source_field where the ADR explicitly says neither has a real source field, making 'who tagged what' queries unreliable. daily_health_matrix_behavioral's spine includes garmin_daily_summary.calendar_date — a watch-local clock-date that won't align with behavioral_date on travel days, producing phantom or missing rows around transitions.\n\nTop 3 fixes, in order: (1) fix the whoop_tz_backfill NameError before the next trip happens — it's a one-line bind error; (2) wire habit_journal's trigger through pds.tz_for_instant so manual log entries actually influence its provenance; (3) replace the garmin_daily_summary.calendar_date spine contribution with a Garmin-instant-derived behavioral date, OR document that the spine accepts watch-local for the Garmin family and accept the ~3% transition-day skew. Secondary cleanups: factor the 9 trigger functions into one parameterized helper; add explicit indexes to support the transition-flag SELECT; tighten provenance tagging on eight_sleep_trends + mfp.",
+  "findings": [
+    {
+      "id": "F-001",
+      "title": "whoop_tz_backfill.py crashes with NameError on first real travel proposal",
+      "severity": "P0",
+      "effort": "S",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "audit/tz-bundle/whoop_tz_backfill.py:202",
+      "description": "The notes-string interpolation on the proposal row references `log_offset_str`, a variable that is never bound in scope. The two adjacent variables that do exist are `log_offset_at_start` and `log_offset_at_end`. Any cycle that survives the DST-artifact filter (i.e. every real travel cycle the script is supposed to detect) will hit this line and raise NameError.",
+      "evidence": "Line 202: `f\"{provenance}; log was {log_tz} ({log_offset_str})\"`). `log_offset_str` is not assigned anywhere in the file. The function defines `log_offset_at_start` (line 171) and `log_offset_at_end` (line 179), and the DST-artifact filter at line 189 uses both, but the proposal-emit branch references the undefined name.",
+      "recommendation": "Replace with `log_offset_at_start` (the relevant offset at cycle start). Add a unit test that exercises the real-travel branch (e.g. mock a cycle with timezone_offset='+02:00' against an empty user_tz_log) so this can never regress silently again."
+    },
+    {
+      "id": "F-002",
+      "title": "habit_journal trigger never consults user_tz_log; always tags default_et_fallback",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_04_other_onyx_dates.sql:225-234",
+      "description": "set_onyx_dates_habit_journal unconditionally copies cycle_date into all three onyx_* dates and tags `default_et_fallback`. Even when a manual user_tz_log entry covers the date (e.g. Riley flew to Berlin and logged the trip), habit completions on that trip will be flagged as ET-fallback. The ADR promises provenance auditability; this table is the largest manual-attribution table by row count and silently misreports.",
+      "evidence": "Lines 225-234: function sets onyx_tz_source := 'default_et_fallback' with no branching. cycle_date is a DATE (not TIMESTAMPTZ) so the trigger can't strictly call derive_onyx_dates, but it could still call pds.tz_for_instant against a representative instant (e.g. cycle_date + '12 hours' AT TIME ZONE 'America/New_York') and tag user_tz_log when a non-NY zone resolves.",
+      "recommendation": "When cycle_date IS NOT NULL, look up pds.tz_for_instant((cycle_date + interval '12 hours') AT TIME ZONE 'America/New_York'). If non-NY, tag 'user_tz_log' and set onyx_local_date to that TZ's clock-date for cycle_date. Same fix applies to whoop_journal's fallback branch."
+    },
+    {
+      "id": "F-003",
+      "title": "garmin_activities trigger treats start_time_local as a UTC instant when start_time_gmt is NULL",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_03_garmin_onyx_dates.sql:73-74",
+      "description": "When start_time_gmt IS NULL, the trigger falls back to start_time_local as the canonical instant. Per the project's own documentation (CLAUDE.md: 'Garmin start_time_local is stored as local wall-clock labeled as UTC (+00)'), this is a non-UTC clock value masquerading as a TIMESTAMPTZ. Treating it as a true UTC instant via `AT TIME ZONE 'America/New_York'` will mis-attribute by the activity's actual UTC offset (4-5h for ET, larger abroad).",
+      "evidence": "Lines 73-74: `IF instant_utc IS NULL THEN instant_utc := NEW.start_time_local; END IF;` — `instant_utc` is then passed to derive_onyx_dates which treats it as a real UTC instant.",
+      "recommendation": "When start_time_gmt IS NULL, either (a) refuse the fallback (set all onyx_* to NULL + tag default_et_fallback so the row is queryable), or (b) explicitly convert start_time_local to UTC by subtracting an offset from user_tz_log. Silent treatment as UTC is the worst of both worlds."
+    },
+    {
+      "id": "F-004",
+      "title": "daily_health_matrix_behavioral spine mixes watch-local calendar_date with onyx_behavioral_date",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": ["Correctness"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_08_daily_health_matrix_behavioral.sql:48",
+      "description": "The spine CTE unions onyx_behavioral_date across 8 tables PLUS garmin_daily_summary.calendar_date — a watch-local clock-date populated by Garmin's backend, not a behavioral date. On travel days the watch auto-switches TZ mid-flight; garmin_daily_summary.calendar_date can skip or duplicate a date relative to the behavioral spine, producing phantom rows or doubled-up rows in the view. ADR Phase 1 step 8 acknowledges Garmin daily summary attribution is 'accepted as-is' but the spine should still represent ONE concept (behavioral days).",
+      "evidence": "Line 48: `UNION SELECT calendar_date FROM pds.garmin_daily_summary WHERE calendar_date IS NOT NULL`. This is the ONLY source in the union not keyed on onyx_behavioral_date.",
+      "recommendation": "Either (a) drop garmin_daily_summary from the spine (rely on the other 8 sources to define the date set; garmin_daily_summary still LEFT-joins via calendar_date = s.calendar_date), or (b) add onyx_behavioral_date to garmin_daily_summary via a backfill that derives behavioral_date from a representative cycle on each calendar_date, and union THAT. Option (a) is the lower-risk path."
+    },
+    {
+      "id": "F-005",
+      "title": "Provenance tag 'source_field' applied to eight_sleep_trends + mfp where no source field exists",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness", "Idiomaticness"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_04_other_onyx_dates.sql:40,296",
+      "description": "Both eight_sleep_trends (line 40) and myfitnesspal_nutrition (line 296) set onyx_tz_source := 'source_field'. The ADR explicitly says (Phase 4 step 1) Eight Sleep has no IANA timezone field and the API call hard-codes `?tz=America/New_York` from the client side. MFP's CSV export has no source TZ at all — its clock-date semantic is an Onyx convention, not a source-provided fact. The provenance enum is supposed to make 'where did this TZ come from' auditable; tagging 'source_field' here is misleading.",
+      "evidence": "Line 40: `NEW.onyx_tz_source := 'source_field';` in eight_sleep trigger. Line 296: same in mfp trigger.",
+      "recommendation": "Add a new enum value 'client_hardcoded_et' (or reuse 'cycle_anchor' loosely, or invent 'onyx_convention'). Two source-table semantics are conflated under 'source_field': (a) WHOOP, where the source genuinely sends a TZ offset on every row, and (b) Eight Sleep/MFP, where ET is an Onyx-side default. They should be distinguishable in 'who is reliable on travel days' queries."
+    },
+    {
+      "id": "F-006",
+      "title": "tz_for_instant + gps_tz_backfill issue N+1 RPC pattern across full backfills",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Scalability"],
+      "file_ref": "audit/tz-bundle/gps_tz_backfill.py:102, whoop_tz_backfill.py:168",
+      "description": "Both backfill scripts call tz_for_instant_via_pg once per row (~349 + ~575 = ~924 round-trips on a full sweep). At Onyx's current scale this is ~30s of latency that's invisible to the user; at 10x scale or if the scripts move into a hot path, it's a P2 brake. Either batch the resolution (one SELECT pulling all log entries, do the lookup in Python) or push the whole comparison into SQL (CTE that joins activities/cycles against user_tz_log on the latest-effective_from-<=-ts predicate).",
+      "evidence": "gps_tz_backfill.py line 102: `log_says = tz_for_instant_via_pg(ts_iso)` inside the per-activity loop. whoop_tz_backfill.py line 168: same pattern.",
+      "recommendation": "Pull all of pds.user_tz_log into Python at the start; do the latest-effective_from-<=-ts lookup in-memory via bisect. Cuts both scripts to 1 RPC + 1 INSERT per proposal."
+    },
+    {
+      "id": "F-007",
+      "title": "derive_onyx_dates silently returns all-NULL when ts IS NULL",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Robustness"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_01_user_tz_log.sql:121-124",
+      "description": "When called with NULL ts, the function returns (NULL, NULL, NULL, NULL) — the trigger then assigns NULLs to all onyx_* columns. The intent is graceful handling, but the call sites (every set_onyx_dates_* trigger) pass timestamps that are nominally NOT NULL on production tables. Silent NULL propagation hides data-quality issues where a critical timestamp went missing — exactly the case where you'd want a loud failure.",
+      "evidence": "Lines 121-124: `IF ts IS NULL THEN RETURN QUERY SELECT NULL::DATE, NULL::DATE, NULL::DATE, NULL::TEXT; RETURN; END IF;`",
+      "recommendation": "Either RAISE EXCEPTION on NULL ts, or set onyx_tz_source := 'null_ts_error' and let a monitoring view (similar to tz_log_gaps) surface affected rows. Pure NULL propagation downstream silently breaks behavioral-date joins."
+    },
+    {
+      "id": "F-008",
+      "title": "Auto-population scripts can split a manual user_tz_log window mid-trip",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "audit/tz-bundle/whoop_tz_backfill.py:14-20",
+      "description": "The script's comment claims 'Manual entries are NEVER overridden,' but the lookup table is keyed only on effective_from — there is no priority field. If Riley manually logs Berlin 2026-04-30 → 2026-05-04 as ONE entry (effective_from=2026-04-30), and the WHOOP-auto script later proposes Europe/Berlin with effective_from=2026-04-30 03:00 UTC (the first WHOOP cycle on that trip whose offset disagrees with NY because Riley landed late), the script's `tz_for_instant_via_pg` check at start_time would return Europe/Berlin (manual entry covers it), the offsets match, no proposal generated. OK. BUT — the same script can propose entries at any timestamp where the LOG offset disagrees with WHOOP, including timestamps STRICTLY INSIDE a manual window where the manual entry was logged with the wrong (or generic) IANA tz. Result: silently slicing a manual trip window into smaller auto-window segments.",
+      "evidence": "Lines 14-20 (docstring): 'Manual entries are NEVER overridden.' But the only mechanism is effective_from <= ts ORDER BY effective_from DESC LIMIT 1 — newer entries always win for instants after them.",
+      "recommendation": "Either (a) add a `source` enum column ('manual' | 'gps-auto' | 'whoop-auto') and have tz_for_instant prefer 'manual' over 'auto' at equal-or-later effective_from, or (b) on insert, refuse to write an auto entry if any manual entry with effective_from BETWEEN (this_instant - 1 week) AND (this_instant + 1 week) exists. Document the chosen policy."
+    },
+    {
+      "id": "F-009",
+      "title": "Transition-day trigger does per-row SELECT without explicit index",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Scalability"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_05_transition_day_flag.sql:39-43",
+      "description": "set_whoop_cycles_transition_flag does a `SELECT timezone_offset FROM whoop_cycles WHERE start_time < NEW.start_time ORDER BY start_time DESC LIMIT 1` on every BEFORE INSERT/UPDATE. This needs an index on (start_time DESC) to be fast; the migration adds NONE. whoop_cycles probably has a PK on cycle_id and not on start_time. At current scale this is ~575 rows scanned per insert via seq scan — fine, but as the table grows and the trigger fires on every WHOOP ETL run, this becomes a quiet linear hot spot.",
+      "evidence": "Lines 39-43 of trigger function; no CREATE INDEX in this migration covers start_time on whoop_cycles. Lines 23-25 only index onyx_is_transition_day WHERE TRUE.",
+      "recommendation": "Add `CREATE INDEX IF NOT EXISTS idx_whoop_cycles_start_time ON pds.whoop_cycles (start_time DESC);` to this migration. Cheap insurance."
+    },
+    {
+      "id": "F-010",
+      "title": "WHOOP cycle 'longest wins' picker uses end_time - start_time which can be NULL on in-progress cycles",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Robustness", "Correctness"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_08_daily_health_matrix_behavioral.sql:216-222",
+      "description": "The LATERAL pick for the 'main' WHOOP cycle on a behavioral day orders by `(wc2.end_time - wc2.start_time) DESC NULLS LAST`. An in-progress cycle (end_time NULL) will sort last under NULLS LAST, which is the intent, but then the tiebreaker is `start_time DESC`. On a day with one completed nap (10 minutes) and one in-progress main cycle (NULL end_time), the in-progress cycle gets picked first but the LATERAL still LIMIT 1's it. Result: the in-progress cycle's onyx_behavioral_date is whatever the trigger set at cycle start, which may not yet be the same as today's behavioral date if the cycle is going to span the boundary. Edge case but real for the dashboard at 11:55 PM ET.",
+      "evidence": "Lines 216-222. The LATERAL returns one row; `NULLS LAST` on the DESC sort puts NULL-duration cycles last, but then the tiebreaker is `start_time DESC` — newer cycles win over older completed cycles of equal/larger duration.",
+      "recommendation": "Add `WHERE wc2.end_time IS NOT NULL` to the LATERAL, OR document that in-progress cycles are deliberately excluded from the headline picker. Either is fine; the current behavior is ambiguous and depends on which path NULL hits in the comparator."
+    },
+    {
+      "id": "F-011",
+      "title": "gps_tz_backfill return-to-ET requires a GPS activity in NY; silently delays the close-out otherwise",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Robustness"],
+      "file_ref": "audit/tz-bundle/gps_tz_backfill.py:86-133",
+      "description": "When Riley flies NY→Berlin and runs in Berlin, the script proposes Europe/Berlin. When he returns to NY, the close-out proposal only fires when a GPS activity records back in NY. If the first post-return week has no outdoor activity (rest week, treadmill only), all dates between return-landing and first-NY-GPS-activity will be tagged Berlin in tz_for_instant, mis-attributing every manual source. This is a foreseeable failure mode — the script's own dedup logic ('skip if last_proposed_tz == inferred') hides it from operators because dry-run shows '0 proposals' instead of '1 proposal pending GPS confirmation.'",
+      "evidence": "Lines 86-133: the loop only emits proposals when a GPS-fix activity exists; no fallback to manual review prompt when prior tz != NY and N days have elapsed without contradiction.",
+      "recommendation": "After the per-activity loop, scan the resulting log: if the latest entry is non-NY and the most recent GPS activity in NY is older than the latest log entry, emit a 'pending close-out' warning to stderr listing the days affected. Equivalent: surface as a row in tz_log_gaps."
+    },
+    {
+      "id": "F-012",
+      "title": "Nine near-identical trigger functions; should be one parameterized helper",
+      "severity": "P3",
+      "effort": "M",
+      "dimensions": ["Idiomaticness"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_02_whoop_onyx_dates.sql:55-122, sql/adr_0001_03_garmin_onyx_dates.sql:63-179, sql/adr_0001_04_other_onyx_dates.sql:31-304",
+      "description": "Nine set_onyx_dates_<table> functions exist; six of them are byte-identical except for the table name in the trigger declaration. The shared body is 8 lines (SELECT * INTO d FROM pds.derive_onyx_dates(...); NEW.onyx_* := d.onyx_*; RETURN NEW). Future changes (e.g. adding an enum value to onyx_tz_source) require touching 9 functions and 9 triggers in lockstep — easy place to miss one.",
+      "evidence": "Direct line-by-line comparison of set_onyx_dates_whoop_cycles, _whoop_sleep, _whoop_workouts, _spotify_plays shows identical body modulo table-bound NEW columns.",
+      "recommendation": "Either (a) define one generic trigger function pds.set_onyx_dates_from_instant(ts_col TEXT, offset_col TEXT, source_label TEXT) that uses dynamic SQL — slower but DRY; or (b) accept the duplication and add a comment header naming the canonical version that all others must mirror. Option (b) is fine; the cost is documentation, not lines."
+    },
+    {
+      "id": "F-013",
+      "title": "Default index on user_tz_log uses DESC; lookup in tz_for_instant matches but documentation is ambiguous",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Idiomaticness", "Scalability"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_01_user_tz_log.sql:48-49",
+      "description": "The index is created as `effective_from DESC` and the lookup is `ORDER BY effective_from DESC LIMIT 1`. The match is exact and fine. But the function signature `pds.tz_for_instant(ts TIMESTAMPTZ)` doesn't take a STABLE marker (it does have STABLE on line 71 — verified) but the docstring doesn't explain that callers must NOT mutate user_tz_log inside the same transaction or the planner may return stale results. Edge case but worth a one-line note.",
+      "evidence": "Function declared STABLE (line 71); index DESC (lines 48-49); the combination works for the inline read path but a planner footgun if anyone ever calls tz_for_instant inside a trigger that's also inserting into user_tz_log.",
+      "recommendation": "Add a comment to the function: 'STABLE marker assumes user_tz_log is not mutated within the same statement. Do not call from triggers that write to user_tz_log.'"
+    },
+    {
+      "id": "F-014",
+      "title": "whoop_journal provenance tag conflates 'cycle_anchor' with 'behaviors_date computed'",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_04_other_onyx_dates.sql:259-263",
+      "description": "set_onyx_dates_whoop_journal tags 'cycle_anchor' when behaviors_date is non-NULL — but behaviors_date is computed from start_time + timezone_offset - 6h via the pre-existing compute_journal_behaviors_date trigger, which IS the cycle anchor. That's fine. But when behaviors_date is NULL (which happens when no matching cycle was found in the cycle-anchor lookup), the fallback tag is 'default_et_fallback' regardless of whether a user_tz_log entry covers the cycle_date. Same flaw as habit_journal (F-002).",
+      "evidence": "Lines 259-263: the CASE has only two branches (cycle_anchor vs default_et_fallback) and never consults user_tz_log.",
+      "recommendation": "When behaviors_date IS NULL, call pds.tz_for_instant((NEW.cycle_date + interval '12 hours') AT TIME ZONE 'America/New_York') and tag 'user_tz_log' if non-NY resolves. Mirror the F-002 fix."
+    },
+    {
+      "id": "F-015",
+      "title": "tz_log_gaps view emits dst_artifact for cycles even when the user is also abroad",
+      "severity": "P3",
+      "effort": "M",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_06_tz_log_gaps_view.sql:69-74",
+      "description": "The gap_type CASE marks a cycle 'dst_artifact' when source_offset matches EITHER log_offset_at_start OR log_offset_at_end. On a Berlin trip that happens to span Europe's DST transition (last Sunday of March/October), the WHOOP offset will match Berlin's log offset at one end and not the other — the row gets tagged dst_artifact even though it's a real Berlin cycle. Result: /status page's travel banner would hide a real gap.",
+      "evidence": "Lines 69-74: CASE WHEN source_offset_minutes = log_offset_minutes_at_start OR source_offset_minutes = log_offset_minutes_at_end → 'dst_artifact'. No constraint that the log_resolved_tz is America/New_York.",
+      "recommendation": "Add `AND log_resolved_tz = 'America/New_York'` to the dst_artifact branch. DST artifacts are only relevant when Riley is HOME and NY's DST flips; abroad-DST cycles should still surface as travel gaps."
+    },
+    {
+      "id": "F-016",
+      "title": "Sanity tests in 01-migration are comments, not actual tests; nothing enforces correctness post-deploy",
+      "severity": "P3",
+      "effort": "L",
+      "dimensions": ["Robustness"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_01_user_tz_log.sql:168-195",
+      "description": "The bottom of the user_tz_log migration documents three sanity tests as SQL comments (NY 11:55 PM, NY 12:30 AM, Berlin 11 PM). The expected outputs are documented but no automated assertion runs. The repo has tests/test_phase2_alignment.py for the HRV alignment regression test; no equivalent exists for derive_onyx_dates. A subtle bug in the −6h math or AT TIME ZONE composition would silently corrupt every behavioral-date join.",
+      "evidence": "Lines 168-195: three -- comments with `-- Expected: ...`. No CALL or SELECT outside comments. No corresponding tests/ file referenced in the bundle.",
+      "recommendation": "Add tests/test_derive_onyx_dates.py that connects to a test DB (or uses pglast/pgmock), inserts the three documented cases plus a DST-transition case, and asserts the returned columns. Five minutes of setup per case, perpetual confidence."
+    },
+    {
+      "id": "F-017",
+      "title": "trips view filters non-NY but doesn't expose IANA name for NY periods between trips",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Idiomaticness"],
+      "file_ref": "audit/tz-bundle/sql/adr_0001_09_trips_view.sql:31-32",
+      "description": "The trips view (per its declared purpose, powering /analytics/travel) returns rows ONLY for non-NY days. Acceptable for the travel-only use case, but the view name 'trips' suggests it could include 'NY home' as the implicit gap. Downstream consumers may want a contiguous timeline including home periods. Minor — a derived view (`home_periods` or extending trips with `is_home BOOLEAN`) would close the gap.",
+      "evidence": "Lines 31-32: `non_ny AS (SELECT * FROM date_tz WHERE resolved_tz != 'America/New_York')`. NY periods filtered out before grouping.",
+      "recommendation": "Either add a second view pds.trips_with_home that includes NY-segment rows, or document the filter prominently in the view comment so consumers don't write 'all of Riley's dates' as `SELECT * FROM pds.trips`."
+    }
+  ],
+  "things_done_well": [
+    {
+      "title": "DST-artifact vs real-travel disambiguation in tz_log_gaps + whoop_tz_backfill",
+      "file_ref": "audit/tz-bundle/sql/adr_0001_06_tz_log_gaps_view.sql:69-74, whoop_tz_backfill.py:184-191",
+      "why_it_matters": "DST is the canonical source of false-positive 'gap' alerts in any TZ-tracking system — twice a year, every system suddenly thinks the user moved. Splitting cycles into dst_artifact vs travel by comparing WHOOP's per-cycle offset to BOTH the log's offset-at-start and offset-at-end is a clean, principled solution that doesn't require external DST schedule data. The /status page can filter on gap_type='travel' and operators get exactly the noise-free signal they need."
+    },
+    {
+      "title": "Same-offset filter in gps_tz_backfill (Toronto/Louisville/Detroit/NY all on EDT)",
+      "file_ref": "audit/tz-bundle/gps_tz_backfill.py:108-120",
+      "why_it_matters": "Naive TZ inference would emit a proposed user_tz_log entry for every Garmin activity in Toronto, Louisville, Atlanta, etc — all of which share the same offset as NY at the same instant. Comparing UTC offsets (not IANA names) before proposing is the right behavioral test. Without this, every cross-border road trip generates spurious log churn. Cleanly implemented via zoneinfo.ZoneInfo().utcoffset()."
+    },
+    {
+      "title": "WHOOP cycle dedup via LATERAL ... LIMIT 1 in behavioral matrix",
+      "file_ref": "audit/tz-bundle/sql/adr_0001_08_daily_health_matrix_behavioral.sql:216-222",
+      "why_it_matters": "Transition days where WHOOP records 'arrival nap' + 'main night' both share the same onyx_behavioral_date — a naive LEFT JOIN would double-count strain, kJ, recovery on those days. Picking the longest cycle is the right heuristic; LATERAL ... LIMIT 1 expresses it idiomatically. The bool_or aggregation of onyx_is_transition_day across all cycles on the day (separate LATERAL at line 226-230) is a nice complement — preserves the flag even when the picked cycle wasn't the transition one."
+    },
+    {
+      "title": "Single SQL backfill pass for transition flag using LAG() instead of cascading triggers",
+      "file_ref": "audit/tz-bundle/sql/adr_0001_05_transition_day_flag.sql:60-82",
+      "why_it_matters": "The inline comment notes 'An earlier iteration of this migration had an AFTER trigger that propagated the flag to the NEXT cycle when a new row arrived; combined with the backfill UPDATE it caused O(N^2) cascade timeouts.' Moving to LAG() in a single CTE is the textbook fix — one pass, no cascade. Documenting the bad path that was discarded is also valuable institutional memory."
+    },
+    {
+      "title": "Source-of-truth preservation discipline — all derivations in new columns alongside source fields",
+      "file_ref": "audit/tz-bundle/sql/adr_0001_02_whoop_onyx_dates.sql, _03, _04",
+      "why_it_matters": "Every migration in the bundle is purely additive: new columns onyx_* are added, no source column is dropped or mutated. The ADR's hard constraint ('source-provided date fields stay untouched') is satisfied by construction across all 9 SQL files. This is the kind of discipline that lets the whole change be reverted by dropping columns; lock-in is correctly limited to D1 (which is explicit in the ADR)."
+    },
+    {
+      "title": "History-derived offset->IANA map computed only from MANUAL entries to avoid bootstrap bias",
+      "file_ref": "audit/tz-bundle/whoop_tz_backfill.py:94-115",
+      "why_it_matters": "When inferring IANA from a WHOOP offset, the script could naively use all of user_tz_log — but that would let earlier whoop-auto entries influence later whoop-auto inferences, amplifying any wrong guess. Filtering to `notes` not starting with 'whoop-auto:' or 'gps-auto:' keeps the inference rooted in Riley's authoritative input. This is the kind of subtlety that matters at year 3+."
+    }
+  ],
+  "questions_for_followup": [
+    "Has any real travel-cycle proposal been generated by whoop_tz_backfill.py since the script landed? F-001 (NameError on line 202) would have crashed it. If the script is being run only on dry-runs with the DST-artifact filter masking all cases, the bug stays hidden indefinitely.",
+    "What's the expected production behavior of habit_journal when Riley is in Berlin and a manual user_tz_log entry covers the trip? Today the trigger ignores user_tz_log entirely and tags default_et_fallback (F-002). Is that intentional (habits are conceptually-ET-only) or an oversight?",
+    "How does daily_health_matrix_behavioral handle a behavioral date that exists in WHOOP but NOT in garmin_daily_summary (e.g. Riley left the Garmin watch home for a weekend)? The spine union includes garmin_daily_summary.calendar_date — but the rest of the join logic uses LEFT JOIN, so the row should still appear via WHOOP. Has this been validated end-to-end with a row count vs the legacy daily_health_matrix on the same date range?",
+    "Are the 3 sanity-test SQL comments at the bottom of adr_0001_01_user_tz_log.sql ever actually run, even manually? If so, by whom, with what frequency? If not, is there appetite for a tests/test_derive_onyx_dates.py to lock them in (F-016)?",
+    "What's the policy for an abroad-DST cycle (Berlin trip spanning Europe's DST transition)? The tz_log_gaps view will currently tag it dst_artifact and hide it from /status banners (F-015). Is that the desired UX, or should abroad-DST surface as a separate gap_type='abroad_dst_transition'?",
+    "Does the team have a smoke test that compares pds.daily_health_matrix vs pds.daily_health_matrix_behavioral row counts and column nulls over a fixed window? The schema-bundle audit's Phase 2.3 sensitivity test compares HRV metrics; a parallel per-row reconciliation would catch issues like F-004 (spine mismatch) before they reach the HRV pipeline."
+  ]
+}

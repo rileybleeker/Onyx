@@ -1,0 +1,324 @@
+-- =============================================================================
+-- ADR-0001 Phase 1, step 4 — onyx_* columns on remaining tables
+-- =============================================================================
+-- Per docs/adr/0001-timezone-and-behavioral-day-handling.md (D4).
+--
+-- Sources covered:
+--   pds.eight_sleep_trends — date-only; bed is stationary in NY ET
+--   pds.spotify_plays      — TIMESTAMPTZ instant (played_at)
+--   pds.supplement_intake  — Onyx-owned: behavioral_date already canonical
+--                            (intake_date), enrich with instant-derived et/local
+--   pds.meal_events        — same pattern as supplement_intake
+--   pds.journal_entries    — Notion date-only + notion_created_at instant
+--   pds.habit_journal      — date-only; behaviors_date already trigger-derived
+--   pds.myfitnesspal_nutrition — date-only; MFP intentionally clock-date
+--
+-- Depends on: sql/adr_0001_01_user_tz_log.sql
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- 1. eight_sleep_trends — stationary bed, calendar_date is already correct
+-- ---------------------------------------------------------------------------
+ALTER TABLE pds.eight_sleep_trends
+    ADD COLUMN IF NOT EXISTS onyx_et_date         DATE,
+    ADD COLUMN IF NOT EXISTS onyx_behavioral_date DATE,
+    ADD COLUMN IF NOT EXISTS onyx_local_date      DATE,
+    ADD COLUMN IF NOT EXISTS onyx_tz_source       TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_eight_sleep_trends_behavioral_date
+    ON pds.eight_sleep_trends (onyx_behavioral_date);
+
+CREATE OR REPLACE FUNCTION pds.set_onyx_dates_eight_sleep_trends()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Bed is stationary in NY ET. Trends are pre-attributed by Eight Sleep
+    -- backend (request hard-codes ?tz=America/New_York). All three onyx_*
+    -- dates collapse to calendar_date.
+    NEW.onyx_et_date         := NEW.calendar_date;
+    NEW.onyx_behavioral_date := NEW.calendar_date;
+    NEW.onyx_local_date      := NEW.calendar_date;
+    NEW.onyx_tz_source       := 'source_field';
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS eight_sleep_trends_set_onyx_dates ON pds.eight_sleep_trends;
+CREATE TRIGGER eight_sleep_trends_set_onyx_dates
+    BEFORE INSERT OR UPDATE OF calendar_date ON pds.eight_sleep_trends
+    FOR EACH ROW EXECUTE FUNCTION pds.set_onyx_dates_eight_sleep_trends();
+
+-- ---------------------------------------------------------------------------
+-- 2. spotify_plays — true UTC instant
+-- ---------------------------------------------------------------------------
+ALTER TABLE pds.spotify_plays
+    ADD COLUMN IF NOT EXISTS onyx_et_date         DATE,
+    ADD COLUMN IF NOT EXISTS onyx_behavioral_date DATE,
+    ADD COLUMN IF NOT EXISTS onyx_local_date      DATE,
+    ADD COLUMN IF NOT EXISTS onyx_tz_source       TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_spotify_plays_behavioral_date
+    ON pds.spotify_plays (onyx_behavioral_date);
+
+CREATE OR REPLACE FUNCTION pds.set_onyx_dates_spotify_plays()
+RETURNS TRIGGER AS $$
+DECLARE
+    d RECORD;
+BEGIN
+    SELECT * INTO d FROM pds.derive_onyx_dates(NEW.played_at, NULL, NULL);
+    NEW.onyx_et_date         := d.onyx_et_date;
+    NEW.onyx_behavioral_date := d.onyx_behavioral_date;
+    NEW.onyx_local_date      := d.onyx_local_date;
+    NEW.onyx_tz_source       := d.onyx_tz_source;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS spotify_plays_set_onyx_dates ON pds.spotify_plays;
+CREATE TRIGGER spotify_plays_set_onyx_dates
+    BEFORE INSERT OR UPDATE OF played_at ON pds.spotify_plays
+    FOR EACH ROW EXECUTE FUNCTION pds.set_onyx_dates_spotify_plays();
+
+-- ---------------------------------------------------------------------------
+-- 3. supplement_intake — Onyx-owned behavioral date + optional instant
+-- ---------------------------------------------------------------------------
+ALTER TABLE pds.supplement_intake
+    ADD COLUMN IF NOT EXISTS onyx_et_date         DATE,
+    ADD COLUMN IF NOT EXISTS onyx_behavioral_date DATE,
+    ADD COLUMN IF NOT EXISTS onyx_local_date      DATE,
+    ADD COLUMN IF NOT EXISTS onyx_tz_source       TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_supplement_intake_behavioral_date
+    ON pds.supplement_intake (onyx_behavioral_date);
+
+CREATE OR REPLACE FUNCTION pds.set_onyx_dates_supplement_intake()
+RETURNS TRIGGER AS $$
+DECLARE
+    d RECORD;
+BEGIN
+    -- onyx_behavioral_date = the Onyx-owned intake_date (already behavioral
+    -- per CLAUDE.md "Supplement intake — behavioral-day convention").
+    NEW.onyx_behavioral_date := NEW.intake_date;
+
+    -- If intake_time is captured, derive et/local from it. Otherwise default
+    -- to intake_date for both (no instant to project, so the clock-date
+    -- assumption is "same day in ET").
+    IF NEW.intake_time IS NOT NULL THEN
+        SELECT * INTO d FROM pds.derive_onyx_dates(NEW.intake_time, NULL, NULL);
+        NEW.onyx_et_date    := d.onyx_et_date;
+        NEW.onyx_local_date := d.onyx_local_date;
+        NEW.onyx_tz_source  := d.onyx_tz_source;
+    ELSE
+        NEW.onyx_et_date    := NEW.intake_date;
+        NEW.onyx_local_date := NEW.intake_date;
+        NEW.onyx_tz_source  := 'default_et_fallback';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS supplement_intake_set_onyx_dates ON pds.supplement_intake;
+CREATE TRIGGER supplement_intake_set_onyx_dates
+    BEFORE INSERT OR UPDATE OF intake_date, intake_time ON pds.supplement_intake
+    FOR EACH ROW EXECUTE FUNCTION pds.set_onyx_dates_supplement_intake();
+
+-- ---------------------------------------------------------------------------
+-- 4. meal_events — same pattern as supplement_intake
+-- ---------------------------------------------------------------------------
+ALTER TABLE pds.meal_events
+    ADD COLUMN IF NOT EXISTS onyx_et_date         DATE,
+    ADD COLUMN IF NOT EXISTS onyx_behavioral_date DATE,
+    ADD COLUMN IF NOT EXISTS onyx_local_date      DATE,
+    ADD COLUMN IF NOT EXISTS onyx_tz_source       TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_meal_events_behavioral_date
+    ON pds.meal_events (onyx_behavioral_date);
+
+CREATE OR REPLACE FUNCTION pds.set_onyx_dates_meal_events()
+RETURNS TRIGGER AS $$
+DECLARE
+    d RECORD;
+BEGIN
+    NEW.onyx_behavioral_date := NEW.event_date;
+
+    IF NEW.event_time IS NOT NULL THEN
+        SELECT * INTO d FROM pds.derive_onyx_dates(NEW.event_time, NULL, NULL);
+        NEW.onyx_et_date    := d.onyx_et_date;
+        NEW.onyx_local_date := d.onyx_local_date;
+        NEW.onyx_tz_source  := d.onyx_tz_source;
+    ELSE
+        NEW.onyx_et_date    := NEW.event_date;
+        NEW.onyx_local_date := NEW.event_date;
+        NEW.onyx_tz_source  := 'default_et_fallback';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS meal_events_set_onyx_dates ON pds.meal_events;
+CREATE TRIGGER meal_events_set_onyx_dates
+    BEFORE INSERT OR UPDATE OF event_date, event_time ON pds.meal_events
+    FOR EACH ROW EXECUTE FUNCTION pds.set_onyx_dates_meal_events();
+
+-- ---------------------------------------------------------------------------
+-- 5. journal_entries — Notion date-only + notion_created_at instant
+-- ---------------------------------------------------------------------------
+ALTER TABLE pds.journal_entries
+    ADD COLUMN IF NOT EXISTS onyx_et_date         DATE,
+    ADD COLUMN IF NOT EXISTS onyx_behavioral_date DATE,
+    ADD COLUMN IF NOT EXISTS onyx_local_date      DATE,
+    ADD COLUMN IF NOT EXISTS onyx_tz_source       TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_journal_entries_behavioral_date
+    ON pds.journal_entries (onyx_behavioral_date);
+
+CREATE OR REPLACE FUNCTION pds.set_onyx_dates_journal_entries()
+RETURNS TRIGGER AS $$
+DECLARE
+    d RECORD;
+BEGIN
+    -- entry_date is user-typed (Notion Date prop, date-only). Treat that as
+    -- the canonical behavioral_date. notion_created_at is the underlying
+    -- UTC instant when the page was first written — use it to derive et/
+    -- local but only when entry_date matches the created_at date (so an
+    -- intentional backdated entry doesn't get its et/local overwritten).
+    NEW.onyx_behavioral_date := NEW.entry_date;
+
+    IF NEW.notion_created_at IS NOT NULL
+       AND NEW.entry_date = (NEW.notion_created_at AT TIME ZONE 'America/New_York')::date
+    THEN
+        SELECT * INTO d FROM pds.derive_onyx_dates(NEW.notion_created_at, NULL, NULL);
+        NEW.onyx_et_date    := d.onyx_et_date;
+        NEW.onyx_local_date := d.onyx_local_date;
+        NEW.onyx_tz_source  := d.onyx_tz_source;
+    ELSE
+        NEW.onyx_et_date    := NEW.entry_date;
+        NEW.onyx_local_date := NEW.entry_date;
+        NEW.onyx_tz_source  := 'default_et_fallback';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS journal_entries_set_onyx_dates ON pds.journal_entries;
+CREATE TRIGGER journal_entries_set_onyx_dates
+    BEFORE INSERT OR UPDATE OF entry_date, notion_created_at ON pds.journal_entries
+    FOR EACH ROW EXECUTE FUNCTION pds.set_onyx_dates_journal_entries();
+
+-- ---------------------------------------------------------------------------
+-- 6. habit_journal — date-only; NO behaviors_date column (only whoop_journal has it)
+-- ---------------------------------------------------------------------------
+-- Audit assumed habit_journal mirrored whoop_journal's schema, but it
+-- doesn't have the behaviors_date column. cycle_date is what the user typed
+-- when they tapped — treat it as the behavioral date directly. Forward fix
+-- for awake-tail attribution: the api/habits/complete bug fix (UTC -> ET)
+-- closes the most common offender; deeper attribution would need a tap-
+-- instant timestamp the table doesn't capture.
+ALTER TABLE pds.habit_journal
+    ADD COLUMN IF NOT EXISTS onyx_et_date         DATE,
+    ADD COLUMN IF NOT EXISTS onyx_behavioral_date DATE,
+    ADD COLUMN IF NOT EXISTS onyx_local_date      DATE,
+    ADD COLUMN IF NOT EXISTS onyx_tz_source       TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_habit_journal_behavioral_date
+    ON pds.habit_journal (onyx_behavioral_date);
+
+CREATE OR REPLACE FUNCTION pds.set_onyx_dates_habit_journal()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.onyx_behavioral_date := NEW.cycle_date;
+    NEW.onyx_et_date         := NEW.cycle_date;
+    NEW.onyx_local_date      := NEW.cycle_date;
+    NEW.onyx_tz_source       := 'default_et_fallback';
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS habit_journal_set_onyx_dates ON pds.habit_journal;
+CREATE TRIGGER habit_journal_set_onyx_dates
+    BEFORE INSERT OR UPDATE OF cycle_date ON pds.habit_journal
+    FOR EACH ROW EXECUTE FUNCTION pds.set_onyx_dates_habit_journal();
+
+-- ---------------------------------------------------------------------------
+-- 7. whoop_journal — same as habit_journal (already has behaviors_date)
+-- ---------------------------------------------------------------------------
+ALTER TABLE pds.whoop_journal
+    ADD COLUMN IF NOT EXISTS onyx_et_date         DATE,
+    ADD COLUMN IF NOT EXISTS onyx_behavioral_date DATE,
+    ADD COLUMN IF NOT EXISTS onyx_local_date      DATE,
+    ADD COLUMN IF NOT EXISTS onyx_tz_source       TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_whoop_journal_behavioral_date_onyx
+    ON pds.whoop_journal (onyx_behavioral_date);
+
+CREATE OR REPLACE FUNCTION pds.set_onyx_dates_whoop_journal()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.onyx_behavioral_date := COALESCE(NEW.behaviors_date, NEW.cycle_date);
+    NEW.onyx_et_date         := NEW.cycle_date;
+    NEW.onyx_local_date      := NEW.cycle_date;
+    NEW.onyx_tz_source       :=
+        CASE WHEN NEW.behaviors_date IS NOT NULL
+             THEN 'cycle_anchor'
+             ELSE 'default_et_fallback'
+        END;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS whoop_journal_set_onyx_dates ON pds.whoop_journal;
+-- Fire AFTER the existing behaviors_date trigger so we see its computed value.
+CREATE TRIGGER whoop_journal_set_onyx_dates
+    BEFORE INSERT OR UPDATE OF cycle_date, behaviors_date ON pds.whoop_journal
+    FOR EACH ROW EXECUTE FUNCTION pds.set_onyx_dates_whoop_journal();
+
+-- ---------------------------------------------------------------------------
+-- 8. myfitnesspal_nutrition — clock-date by design (energy balance)
+-- ---------------------------------------------------------------------------
+ALTER TABLE pds.myfitnesspal_nutrition
+    ADD COLUMN IF NOT EXISTS onyx_et_date         DATE,
+    ADD COLUMN IF NOT EXISTS onyx_behavioral_date DATE,
+    ADD COLUMN IF NOT EXISTS onyx_local_date      DATE,
+    ADD COLUMN IF NOT EXISTS onyx_tz_source       TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_myfitnesspal_nutrition_behavioral_date
+    ON pds.myfitnesspal_nutrition (onyx_behavioral_date);
+
+CREATE OR REPLACE FUNCTION pds.set_onyx_dates_myfitnesspal_nutrition()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Per ADR D5, MFP is intentionally clock-date (energy balance semantics).
+    -- All three onyx_* dates collapse to calendar_date. Consumers join on
+    -- onyx_et_date for energy balance and onyx_behavioral_date for HRV-
+    -- adjacent analytics (both = calendar_date here).
+    NEW.onyx_et_date         := NEW.calendar_date;
+    NEW.onyx_behavioral_date := NEW.calendar_date;
+    NEW.onyx_local_date      := NEW.calendar_date;
+    NEW.onyx_tz_source       := 'source_field';
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS mfp_nutrition_set_onyx_dates ON pds.myfitnesspal_nutrition;
+CREATE TRIGGER mfp_nutrition_set_onyx_dates
+    BEFORE INSERT OR UPDATE OF calendar_date ON pds.myfitnesspal_nutrition
+    FOR EACH ROW EXECUTE FUNCTION pds.set_onyx_dates_myfitnesspal_nutrition();
+
+-- ---------------------------------------------------------------------------
+-- 9. Backfill all 8 tables (no-op UPDATE fires triggers)
+-- ---------------------------------------------------------------------------
+UPDATE pds.eight_sleep_trends      SET calendar_date = calendar_date
+    WHERE calendar_date IS NOT NULL;
+UPDATE pds.spotify_plays           SET played_at = played_at
+    WHERE played_at IS NOT NULL;
+UPDATE pds.supplement_intake       SET intake_date = intake_date
+    WHERE intake_date IS NOT NULL;
+UPDATE pds.meal_events             SET event_date = event_date
+    WHERE event_date IS NOT NULL;
+UPDATE pds.journal_entries         SET entry_date = entry_date
+    WHERE entry_date IS NOT NULL;
+UPDATE pds.habit_journal           SET cycle_date = cycle_date
+    WHERE cycle_date IS NOT NULL;
+UPDATE pds.whoop_journal           SET cycle_date = cycle_date
+    WHERE cycle_date IS NOT NULL;
+UPDATE pds.myfitnesspal_nutrition  SET calendar_date = calendar_date
+    WHERE calendar_date IS NOT NULL;

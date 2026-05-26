@@ -1,0 +1,180 @@
+{
+  "reviewer_metadata": {
+    "model": "claude-opus-4-7-internal",
+    "review_date": "2026-05-25",
+    "bundle_commit": "5ceb269"
+  },
+  "domain_scores": {
+    "correctness": {
+      "score": 4,
+      "rationale": "The two highest-leverage conversions (kJ -> kcal at /4.184 and meters -> miles at /1609.344) are correct and use the exact universal factors. WHOOP RMSSD and Garmin time-weighted HRV are read from their own columns and never blended in queries.ts. The one material correctness issue is getActivities() filtering Garmin's wall-clock-as-UTC start_time_local column with a true-UTC ISO string from new Date().toISOString() -- this is exactly the 'timestamp labeled as something else' trap CLAUDE.md and CONTEXT.md flagged. Net effect: a 30-day window silently becomes ~30d + (-utc_offset) days, so the activities page can miss or include extra recent rows depending on ET/UTC drift."
+    },
+    "robustness": {
+      "score": 3,
+      "rationale": "pds.unit_to_mg_factor returns NULL for IU/oz/mL/drops/scoops/capsules with no logging, no fallback, no telemetry -- a labeled Vitamin D capsule simply doesn't appear in the compound rollup. formatDuration treats 0 as missing (`if (!seconds) return '—'`) which collides with legitimate zero-minute days (e.g. sedentary_seconds=0 highly_active edge cases). formatDistance has the same `if (!meters)` falsy issue. formatPace handles zero but not negative or absurdly small speeds. The getWhoopCaloriesBurnt 'last-write-wins' on the rare two-cycle-per-day case is documented but silently discards one cycle's kJ instead of summing them."
+    },
+    "scalability": {
+      "score": 4,
+      "rationale": "Conversion concentrated in two layers: format.ts for display, getWhoopCaloriesBurnt for kJ->kcal at query time. No chart-layer reinvention visible here. Body weight kg/lb conversion lives in helpers (kgToLb/lbToKg referenced in CLAUDE.md but not shown in this bundle -- have to take that on faith). Spotify duration_ms -> minutes is converted at three independent call sites (getSpotifyKpis line 564, getSpotifyTopArtists line 789, getSpotifyTopTracks line 862) -- mild drift risk if the unit ever changes."
+    },
+    "idiomaticness": {
+      "score": 3,
+      "rationale": "Magic numbers 4.184 (kJ/kcal), 1609.344 (m/mi), 2.20462 (kg/lb, in CLAUDE.md), 60000 (ms/min), 3_600_000 (ms/hr), 18*60*60*1000 (gap window) appear as inline literals across queries.ts and format.ts with no shared constants module. The kJ/kcal factor has an inline comment, m/mi does not, ms/min is repeated. No KCAL_PER_KJ / METERS_PER_MILE / MS_PER_MIN constants. CLAUDE.md is the de-facto source-of-truth document but a code-level constants file would be one Find-Usages away from a single rename if the spec ever evolves."
+    }
+  },
+  "summary": "Onyx's unit-handling layer is in good shape on the high-leverage axes: the kJ -> kcal (4.184) and meters -> miles (1609.344) conversions are exact and used at one well-documented site each; the three semantically distinct HRV columns (whoop_recovery.hrv_rmssd_milli, garmin_hrv.last_night_avg_ms, eight_sleep_trends.avg_hrv) are read from their own tables and never composed or averaged in queries.ts. getWhoopCaloriesBurnt has an exemplary docstring naming WHOOP as canonical and citing the ET +12h cycle rule -- this is the kind of self-documenting helper that prevents future-Riley (or future-Claude) from reaching for Garmin's total_kilocalories instead. The strongest finding is structural rather than wrong-number-today: getActivities() filters Garmin's start_time_local column (wall-clock-labeled-as-UTC per CLAUDE.md) with since.toISOString() (a true-UTC instant). That's a labeled-timestamp mismatch -- the same class of bug that motivated the entire sleep_start GMT/Local fix CLAUDE.md describes. Below that, pds.unit_to_mg_factor's silent-NULL behavior for unrecognized units (IU, oz, mL, drops, scoops, capsules) is the supplements pipeline's biggest blind spot: a row with unit='IU' lands in supplement_intake fine but contributes ZERO to supplement_intake_by_compound's compound rollup with no warning, no log, no badge -- it just disappears from the daily_supplement_matrix and the causal-inference treatment enumeration. Since Vitamin D, Vitamin A, and Vitamin E are commonly IU-labeled on US bottles, this is a P1 -- a near-miss the first time Riley logs one of them from a non-DSLD seed. Other findings cluster in the brittle-but-not-wrong bucket: formatDuration / formatDistance using `if (!x)` falsy guards that swallow legitimate zero, the absence of a constants module (4.184, 1609.344, 60000, 3_600_000 are inline literals at 5+ sites), and duration_ms -> minutes conversions repeated at three Spotify call sites without a shared helper. Things done well: the WHOOP-canonical-for-TDEE rule materialized in getWhoopCaloriesBurnt with a docstring; conversion arithmetic at the query/format boundary not the chart layer; the formatPace 60-second-rollover edge case (59.5s rounds to 60 -> +1 minute, secs=0) handled explicitly.",
+  "findings": [
+    {
+      "id": "F-001",
+      "title": "getActivities() filters Garmin wall-clock-as-UTC column with true-UTC instant",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "queries.ts:59-71",
+      "description": "getActivities() does `.gte('start_time_local', since.toISOString())` and orders by the same. Per CLAUDE.md: 'Garmin start_time_local: stored as local wall-clock labeled as UTC (+00); ::date yields ET date directly.' So start_time_local is NOT a true UTC instant -- it's a wall-clock value that Postgres serializes with a +00 offset. Comparing it to since.toISOString() (a real UTC instant ~4-5 hours behind ET) produces a silent off-by-N-hours window. A user requesting 'last 30 days' from the activities page gets a window that's actually ~30 days + offset, shifted in the wrong direction depending on the user's current UTC offset.",
+      "evidence": "Line 66: .gte('start_time_local', since.toISOString()). new Date() returns now in UTC, .toISOString() emits Z-suffixed UTC; start_time_local is the +00-labeled local wall-clock. The two are not comparable as instants. Mirror pattern exists correctly at line 220 (start_time_gmt against sinceISO -- both real UTC).",
+      "recommendation": "Either (a) switch the filter+order to start_time_gmt (true UTC) and post-process display from start_time_local, or (b) compute the since boundary as a local-wall-clock string (since.toISOString().split('T')[0] + 'T00:00:00+00') if the activities UI needs ET-day semantics. Add a regression test: a 30-day window should always return N rows where N is the count of garmin_activities with ET-date >= today - 30d."
+    },
+    {
+      "id": "F-002",
+      "title": "unit_to_mg_factor silently drops IU/oz/mL/drops/scoops/capsules from supplement rollup",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+      "description": "The function returns NULL for any unit not in {mg, g, mcg/ug, kg}. supplement_intake_by_compound filters NULL out (any reasonable rollup would), so a supplement logged with unit='IU' (Vitamin D, A, E -- ubiquitous on US bottles), 'oz', 'mL', 'drops', 'scoops', or 'capsules' is INVISIBLE to daily_supplement_matrix, the causal-inference treatment enumeration, supplement_*_amount binary treatments, and the compound impact charts. No warning, no log, no UI affordance.",
+      "evidence": "SQL_UNITS.md lines 13-30 enumerate the recognized set. CONTEXT.md explicitly flags IU. CLAUDE.md describes supplement_intake_by_compound as the rollup that 'just works' for cross-product summation via UNII -- but only for units in the dictionary. IU->mcg is compound-specific (Vit D: 1 IU = 0.025 mcg; Vit A retinol: 1 IU = 0.3 mcg; Vit E: 1 IU = 0.67 mg for alpha-tocopherol) so unit_to_mg_factor can't be a pure unit table for IU -- the conversion has to live in the (UNII, label_unit) join. But oz, mL, drops, scoops, capsules are not even attempted.",
+      "recommendation": "(1) Add a unit_drops audit view `pds.supplement_intake_unmapped` = SELECT product_id, ingredient_group, label_unit, COUNT(*) FROM supplement_intake JOIN supplement_products WHERE unit_to_mg_factor(label_unit) IS NULL GROUP BY 1,2,3 -- expose on /status as a drop counter. (2) Add a (unii_code, source_unit, target_unit, factor) lookup table so IU can convert per-vitamin. (3) For volumetric units (mL, drops, oz), require label density in the product seed so the conversion can be (volume * density_mg_per_ml). (4) Log NULL returns to sync_log."
+    },
+    {
+      "id": "F-003",
+      "title": "formatDuration treats 0 seconds as missing, swallowing legitimate zero",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Robustness", "Correctness"],
+      "file_ref": "format.ts:43-49",
+      "description": "`if (!seconds) return '—'` collapses three cases into one: null (no data), undefined (no data), AND 0 (zero seconds of activity). A genuinely sedentary day with highly_active_seconds=0 will render as '—' instead of '0m', misleadingly indistinguishable from a missing-data day. Same falsy guard at formatDistance line 66.",
+      "evidence": "format.ts:43 `export function formatDuration(seconds: number | null): string { if (!seconds) return '—'; ...}`. Contrast with formatShortDuration line 54 which uses the correct `seconds == null || Number.isNaN(seconds)` guard.",
+      "recommendation": "Replace `if (!seconds)` with `if (seconds == null || Number.isNaN(seconds))` in both formatDuration and formatDistance. Same change for formatPace line 73 if a true-zero speed should ever render differently from a null."
+    },
+    {
+      "id": "F-004",
+      "title": "Magic conversion constants scattered, no shared module",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Idiomaticness", "Scalability"],
+      "file_ref": "format.ts:67,74; queries.ts:360,564,789,862",
+      "description": "4.184 (kJ per kcal), 1609.344 (m per mi), 60000 (ms per minute), 3_600_000 (ms per hour), 18*60*60*1000 (workout-to-sleep gap window) appear as inline literals. No KCAL_PER_KJ, METERS_PER_MILE, MS_PER_MINUTE, MS_PER_HOUR constants. 2.20462 (kg/lb, per CLAUDE.md) lives in unseen helpers. Risk: a future contributor types 4.18 or 1609 by mistake; nothing catches it.",
+      "evidence": "queries.ts:360 `const kcal = Math.round(Number(c.kilojoule) / 4.184);` format.ts:67 `const miles = meters / 1609.344;` format.ts:74 `const minPerMile = 1609.344 / speedMps / 60;` queries.ts:564 `totalHours: totalMs / 3_600_000` queries.ts:789,862 `entry.minutes += (r.duration_ms ?? 0) / 60000;`",
+      "recommendation": "Create frontend/src/lib/units.ts exporting `export const KCAL_PER_KJ = 1 / 4.184; export const METERS_PER_MILE = 1609.344; export const MS_PER_MINUTE = 60_000; export const MS_PER_HOUR = 3_600_000; export const POUNDS_PER_KG = 2.20462;` Each with a single-line citation comment (e.g. // CODATA 2018; NIST handbook). Import everywhere these literals currently appear."
+    },
+    {
+      "id": "F-005",
+      "title": "getWhoopCaloriesBurnt rounds at query time, losing sub-kcal precision",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Correctness", "Idiomaticness"],
+      "file_ref": "queries.ts:360",
+      "description": "`const kcal = Math.round(Number(c.kilojoule) / 4.184);` rounds to integer kcal at the query layer. Per CLAUDE.md/CONTEXT.md, the convention is conversion-once-at-display. If any downstream consumer wants to sum 7 days for a weekly TDEE or compute a rolling 30d avg, the rounding propagates and accumulates a ~0.5 kcal per day bias.",
+      "evidence": "queries.ts:360. The accompanying object keeps both `kilojoule` (raw) and `calories_burnt` (rounded). Consumers that sum calories_burnt accumulate up to N*0.5 kcal of rounding error over N days; consumers that recompute from kilojoule are fine but bypass the helper's intent.",
+      "recommendation": "Keep `calories_burnt` as the full float (no Math.round) and round only at display via a formatKcal helper. Or move kcal computation entirely into a view (`pds.whoop_cycles_v` with a generated kcal column = kilojoule / 4.184) so no client ever has to remember."
+    },
+    {
+      "id": "F-006",
+      "title": "getWhoopCaloriesBurnt last-write-wins drops second cycle on rare two-cycle days",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "queries.ts:362-363",
+      "description": "The comment acknowledges 'last-write-wins picks the later cycle on the rare day with two; in practice there's one cycle per ET date.' But 'rare' isn't 'never' -- the WHOOP-cycle TZ backfill machinery in CLAUDE.md exists precisely because cycles span time zones and a transition day can carry an arrival nap + main cycle. Silently overwriting one cycle's kilojoule with another's underreports TDEE on transition days specifically -- the days where the user's behavioral state is most unusual and therefore most analytically interesting.",
+      "evidence": "queries.ts:362-363. Compare with the `pds.daily_health_matrix_behavioral` view's LATERAL pattern (CLAUDE.md describes 'WHOOP cycle deduplicated via LATERAL ... LIMIT 1 longest cycle per behavioral day') -- the SQL side handles transition days explicitly; the kcal helper does not.",
+      "recommendation": "Sum kilojoule per behavioral_date instead of replace: `const existing = byDate.get(calendar_date); byDate.set(calendar_date, { calendar_date, kilojoule: (existing?.kilojoule ?? 0) + Number(c.kilojoule), calories_burnt: ... });` Then compute kcal from the summed kilojoule at the end. Match the behavioral-day aggregation rule rather than relying on the rarity argument."
+    },
+    {
+      "id": "F-007",
+      "title": "Spotify duration_ms -> minutes conversion repeated at 3 sites with inline /60000",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Scalability", "Idiomaticness"],
+      "file_ref": "queries.ts:564,789,862",
+      "description": "Three different aggregation helpers (getSpotifyKpis, getSpotifyTopArtists, getSpotifyTopTracks) each do `(r.duration_ms ?? 0) / 60000` or `/ 3_600_000` inline. If duration_ms ever switches column name (e.g. duration_sec, duration_us), or the storage convention changes, the rename is a 3-site update with no compiler nudge.",
+      "evidence": "queries.ts:564 `const totalMs = rows.reduce((s, r) => s + (r.duration_ms ?? 0), 0);` then `totalHours: totalMs / 3_600_000`. queries.ts:789 `entry.minutes += (r.duration_ms ?? 0) / 60000;` queries.ts:862 same.",
+      "recommendation": "`export const msToMinutes = (ms: number | null) => (ms ?? 0) / 60_000;` in the units module. Use everywhere."
+    },
+    {
+      "id": "F-008",
+      "title": "etDate() called on a synthetic ISO string from getTime()+shift introduces silent UTC round-trip",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness", "Idiomaticness"],
+      "file_ref": "format.ts:37-41",
+      "description": "whoopSleepDay does `new Date(startTime).getTime() - 6 * 3600 * 1000` then `.toISOString()` then etDate(). The intermediate ISO conversion is needed only to satisfy etDate's signature; the Date.toISOString round-trip is fine semantically but wastes work and obscures the actual computation. More importantly, etDate's docstring says callers should pass `sleep.end_time` (wake-day attribution), but whoopSleepDay subtracts 6h from start_time -- which is a different rule. Both rules can be correct for their own use cases but the comment-vs-code coupling is fragile.",
+      "evidence": "format.ts:11-19 (etDate comment: 'callers should pass sleep.end_time'). format.ts:37-41 (whoopSleepDay passes start_time minus 6h, which is the ADR-0001 behavioral-day rule, NOT the wake-day rule the etDate doc describes).",
+      "recommendation": "Either (a) rename etDate's docstring to drop the end_time-vs-start_time guidance and just describe it as `instant -> ET calendar date`, or (b) add a behavioralDate() helper alongside etDate() with its own docstring explicitly citing ADR-0001's -6h rule. Avoid two different date-attribution rules sharing one function."
+    },
+    {
+      "id": "F-009",
+      "title": "formatDate constructs Date from 'YYYY-MM-DDT00:00:00' (no TZ) -> renders in browser-local TZ",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "format.ts:1-4",
+      "description": "`new Date(dateStr + 'T00:00:00')` parses as local time per JS spec, so the date renders correctly for any user in ET but would render off-by-one for a user east of UTC (because midnight local of dateStr there becomes the previous UTC day, but the toLocaleDateString call reformats in the same local TZ so it usually round-trips). The bug surface is small for an n=1 American single-user, but the function is innocuous-looking and gets copy-pasted.",
+      "evidence": "format.ts:1-4. Compare with shiftDate (lines 24-30) which correctly uses Date.UTC to sidestep TZ.",
+      "recommendation": "Use the same UTC pattern: `const [y, m, d] = dateStr.split('-').map(Number); return new Date(Date.UTC(y, m-1, d)).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });` Explicit, no implicit local-TZ branch."
+    },
+    {
+      "id": "F-010",
+      "title": "getWorkoutSleepGap pred_date computed from cycleStart -1 day with no TZ-aware shift",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Correctness", "Scalability"],
+      "file_ref": "queries.ts:262-268",
+      "description": "`const predDateMs = cycleStartMs - 24 * 60 * 60 * 1000; const predDate = new Date(predDateMs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });` This works for ~95% of days but on a DST transition the 24-hour subtraction can land on the wrong day (the ET day boundary shifted by 1h during spring/fall transition). Same TZ-arithmetic landmine that ADR-0001 was written to eliminate.",
+      "evidence": "queries.ts:262-268. The cycle_id is right there; the loader could have read cycle_date from whoop_cycles directly instead of recomputing from start_time, which would inherit whatever ET-correct logic the trigger already applied.",
+      "recommendation": "Read whoop_cycles.cycle_date (the trigger-populated ET cycle date) instead of recomputing from start_time. If that column isn't selected, add it: `.select('cycle_id,start_time,cycle_date')`. Then `predDate = cycle_date` (or `shiftDate(cycle_date, -1)` if -1 is intended)."
+    },
+    {
+      "id": "F-011",
+      "title": "Three HRV columns correctly isolated -- but no shared type guard prevents future conflation",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Robustness", "Idiomaticness"],
+      "file_ref": "queries.ts:216,275",
+      "description": "queries.ts reads whoop_recovery.hrv_rmssd_milli (line 216) and exposes it as next_morning_hrv (line 275). getHrvData (line 45) reads garmin_hrv. getEightSleepTrends (line 299) reads eight_sleep_trends.avg_hrv. Three sources, three columns, three names -- correctly kept separate. But there's no TypeScript brand/nominal type stopping someone from passing a WHOOP RMSSD value into a function expecting Garmin's time-weighted HRV. The next_morning_hrv field on WorkoutSleepGap is typed `number | null` -- semantically RMSSD but the type can't enforce it.",
+      "evidence": "queries.ts:194-201 (WorkoutSleepGap interface), line 275 (assignment from cycleHrv). The type signature next_morning_hrv: number gives no hint about which HRV definition. CLAUDE.md explicitly says 'never average or substitute' the three.",
+      "recommendation": "Use TypeScript branded types: `type WhoopRmssdMs = number & { __brand: 'WhoopRmssdMs' }; type GarminHrvMs = number & { __brand: 'GarminHrvMs' };` Then `next_morning_hrv: WhoopRmssdMs | null` etc. The compiler will refuse to assign a GarminHrvMs to a WhoopRmssdMs slot. Cheap, no runtime cost, eliminates the entire conflation class."
+    },
+    {
+      "id": "F-012",
+      "title": "formatPace lacks sanity guard for absurdly slow speeds (returns 60+ minutes)",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Robustness"],
+      "file_ref": "format.ts:72-79",
+      "description": "formatPace handles 0 and null but not a tiny positive number like 0.01 m/s (which would give 2682 min/mi). A jammed GPS or a paused-but-not-stopped activity can produce these. The display would render '2682:00 /mi' -- not wrong per se, but unhelpful.",
+      "evidence": "format.ts:72-79. Compare with formatShortDuration which caps at h:mm:ss but doesn't bound the h.",
+      "recommendation": "Add `if (minPerMile > 30) return '—';` or render as 'walking' / 'paused' if pace exceeds a configurable threshold. Add the same lower-bound check (no faster than world-record pace ~3:43/mi)."
+    }
+  ],
+  "things_done_well": [
+    "getWhoopCaloriesBurnt docstring explicitly names WHOOP as canonical and Garmin's total_kilocalories as the wrong-answer alternative, citing the ET +12h cycle rule. This is the kind of self-documenting helper that prevents future regressions and is exactly what a unit-conversion audit hopes to find.",
+    "kJ -> kcal factor 4.184 is exact (matches NIST). Meters -> miles 1609.344 is exact (international mile). No rounded approximations.",
+    "format.ts:formatPace handles the 60-second rollover (59.5s rounds to 60, increment minute, zero seconds) -- the rare edge case that would otherwise produce '7:60 /mi'.",
+    "Three semantically distinct HRV columns (whoop_recovery.hrv_rmssd_milli, garmin_hrv.last_night_avg_ms, eight_sleep_trends.avg_hrv) are read from their own tables; no fill-missing/coalesce/average logic mixes them in queries.ts. CLAUDE.md's 'never average or substitute' rule is honored in this file.",
+    "Distance conversion gracefully degrades to meters under 0.5mi rather than rendering '0.3 mi' (format.ts:68-69). Good UX choice.",
+    "shiftDate explicitly uses Date.UTC to dodge TZ/DST edges with a clear comment explaining why (format.ts:21-23). This is the right pattern for date-string arithmetic.",
+    "getSpotifyKpis derives totalHours from totalMs / 3_600_000 -- a single conversion, not double-converted via minutes. Avoids the rounding-chain trap.",
+    "getEightSleepTrends correctly reads the typed avg_hrv field and exposes it as-is; CLAUDE.md notes Eight Sleep's HRV is undocumented and this code doesn't pretend to know what it is.",
+    "formatShortDuration uses `seconds == null || Number.isNaN(seconds)` -- the correct guard (vs. formatDuration's incorrect `!seconds` falsy guard). Some of the file already knows the right pattern."
+  ],
+  "questions_for_followup": [
+    "Does any chart on /analytics/hrv or /sleep coalesce/fill garmin_hrv into whoop_hrv (or vice versa) when one source is missing? Bundle shows queries are isolated but page-level rendering wasn't shown.",
+    "What is the actual count of pds.supplement_intake rows where unit_to_mg_factor(label_unit) IS NULL? Even a heuristic floor (e.g. 'every Vitamin D row Riley has logged') would calibrate F-002's severity.",
+    "kgToLb / lbToKg helpers referenced in CLAUDE.md but not present in this bundle. Are they 2.20462 exactly, or 2.2? And do they round before final display (which would be a precision-loss bug invisible to this audit)?",
+    "Is there any place that reads garmin_sleep.sleep_start_local (the deprecated wall-clock-as-UTC field) anywhere on the frontend? The bundle showed getSleepData selects '*' from garmin_sleep -- if downstream components access the local column they'd inherit the TZ shift CLAUDE.md flagged.",
+    "Does pds.supplement_intake_by_compound surface a 'unrecognized_unit' diagnostic, or is the silent NULL drop truly silent (no metric, no alarm, no /status panel)?",
+    "duration_ms vs duration_seconds vs duration_milli: how many distinct duration unit columns exist across the schema, and is there a lint rule preventing a new helper from reading the wrong one?",
+    "Does the activities page (/activities) actually exhibit the off-by-N-hours window symptom from F-001? A quick check: a query for last 1 day at 11 PM ET should return today's activities; if it sometimes returns yesterday's, F-001 is observably wrong."
+  ]
+}

@@ -1,0 +1,269 @@
+{
+  "reviewer_metadata": {
+    "model": "claude-opus-4-7-internal",
+    "review_date": "2026-05-25",
+    "bundle_commit": "5ceb269"
+  },
+  "domain_scores": {
+    "correctness": {
+      "score": 3,
+      "rationale": "Core write-path constraints are correct and the ADR-0001 attribution is internally consistent, but missing FKs, inconsistent RLS targeting, and a duplicated 130+ column view definition leave concrete classes of silent corruption available."
+    },
+    "robustness": {
+      "score": 3,
+      "rationale": "BEFORE-trigger derivation isolates callers from TZ math well, but the schema has no FK fences for the WHOOP/Spotify/Garmin parent-child invariants that the ETL relies on, and the matrix views drift apart through copy-paste rather than composition."
+    },
+    "scalability": {
+      "score": 4,
+      "rationale": "Volumes are modest (~12K row peak, ~36 rows/day growth) and the dominant access paths are date-keyed with appropriate indexes; the only real scaling risk is the per-row trigger cost on cycle-cascade backfills, which has already been hit once."
+    },
+    "idiomaticness": {
+      "score": 4,
+      "rationale": "GIN on JSONB arrays, HNSW on the embedding column, partial indexes on the open-interval pattern, generated date columns, and the DISTINCT ON tiebreak view are all idiomatic Postgres; the un-idiomatic bits are the 11 near-clone trigger functions and the un-deduplicated view bodies."
+    }
+  },
+  "summary": "The schema is mostly well-designed for an n=1 personal-use platform built incrementally over nine months. ADR-0001 behavioral-day attribution is the standout: it carries four derived dates per event with a single derive_onyx_dates() helper, indexes the join key on every consuming table, exposes a tz_log_gaps canary, and snapshots the pre-rewrite matrix into pds_legacy for A/B and rollback. JSONB is used appropriately — open-ended compound spaces, Notion topic tags, and API response payloads — with GIN where it pays off and HNSW on the Voyage embedding. Date/time conventions are documented in-line and reflected in the schema (generated played_date_et column, CHECK on weight kg range, IANA-format CHECK on user_tz_log).\n\nThe risky design choices live in three places. First, foreign keys: only one FK in 36 tables, and the missing ones (whoop_recovery.cycle_id, whoop_sleep.cycle_id, whoop_workouts.cycle_id, garmin_activity_laps.activity_id, spotify_plays.track_id/artist_id) are exactly the relationships the canonical matrix view assumes hold. With incremental ETL, an out-of-order arrival or a deleted parent will silently produce orphan rows that LEFT JOIN as NULLs, and the schema gives the analytics no way to notice. Second, RLS: the docs note several service_full_access policies target {public} instead of {service_role} and many tables have anon_read but no explicit service policy (relying on service_role's bypass-RLS privilege). Both work today on Supabase but the {public}-targeting policies are semantically broader than intended, and the bypass-RLS dependency is a latent migration trap. Third, the two matrix views (legacy daily_health_matrix + canonical daily_health_matrix_behavioral) duplicate ~130 columns of join machinery, with the canonical view defined twice in the bundle itself (sql/adr_0001_08_*.sql and sql/daily_health_matrix_behavioral_main_session.sql) — whichever ran last wins, and the column lists drifted (Eight Sleep main-session columns + meal_event_count alias parity).\n\nTop 3 fixes if I could only fix three: (1) add FKs for the WHOOP cycle hub (recovery, sleep, workouts → cycles) and the Garmin laps→activities relationship — these are the joins the matrix views assume; (2) normalize the RLS pattern across every pds table to a uniform anon_read + service_role_full pair and stop relying on the bypass-RLS implicit privilege; (3) collapse the two parallel matrix views into one parameterized form (or deprecate the legacy view) and dedupe the two competing canonical-view definitions in the bundle.",
+  "findings": [
+    {
+      "id": "F-001",
+      "title": "Two competing definitions of daily_health_matrix_behavioral in the bundle — last-write wins",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql vs sql/daily_health_matrix_behavioral_main_session.sql",
+      "description": "Both files run DROP VIEW IF EXISTS pds.daily_health_matrix_behavioral CASCADE and then CREATE VIEW with different column lists. The adr_0001_08 version omits the Eight Sleep main-session columns and aliases meal_event_count one way; the main_session version adds eight_sleep_*_main_sec columns and aliases meal_event_count without the AS. Production state depends entirely on which migration ran last. If someone re-runs the bundle from scratch in lexicographic order, the older view definition wins and the Bland-Altman page silently regresses to nap-inclusive Eight Sleep totals.",
+      "evidence": "sql/adr_0001_08_daily_health_matrix_behavioral.sql:27 'DROP VIEW IF EXISTS pds.daily_health_matrix_behavioral;' then CREATE VIEW with es.time_slept_seconds and no main-session columns. sql/daily_health_matrix_behavioral_main_session.sql:26 'DROP VIEW IF EXISTS pds.daily_health_matrix_behavioral CASCADE;' then CREATE VIEW with es.time_slept_main_session_seconds added. Both files target the same view name.",
+      "recommendation": "Delete sql/adr_0001_08_daily_health_matrix_behavioral.sql (or convert it to a no-op pointer comment) and treat sql/daily_health_matrix_behavioral_main_session.sql as the canonical definition. Going forward, every change to this view should rewrite this one file rather than adding a successor file."
+    },
+    {
+      "id": "F-002",
+      "title": "Missing FKs on the WHOOP cycle hub allow silent orphans",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "pds.whoop_recovery, pds.whoop_sleep, pds.whoop_workouts",
+      "description": "The matrix views join whoop_recovery, whoop_sleep, and whoop_workouts to whoop_cycles via cycle_id, and the behavioral matrix join requires cycle_id from the longest-cycle LATERAL pick. None of these references is FK-enforced. An ETL bug that lands a recovery/sleep/workout row before the parent cycle (or after its deletion) yields rows that silently LEFT JOIN as NULLs in the matrix; the analytics layer has no way to detect this. At ~9 months of stable WHOOP ETL the immediate risk is low, but the only thing protecting downstream HRV correctness from a future regression is application code.",
+      "evidence": "SCHEMA_DDL.md:191 explicitly lists supplement_intake.product_id as the only FK. whoop_recovery PK is (cycle_id) but no REFERENCES clause in whoop_schema.sql:38-58. whoop_sleep.cycle_id and whoop_workouts cycle_id similarly unconstrained.",
+      "recommendation": "Add ALTER TABLE pds.whoop_recovery ADD CONSTRAINT whoop_recovery_cycle_fk FOREIGN KEY (cycle_id) REFERENCES pds.whoop_cycles(cycle_id) ON DELETE CASCADE; same for whoop_sleep and whoop_workouts. Use ON DELETE CASCADE rather than NO ACTION — the children are derived per-cycle and have no independent meaning."
+    },
+    {
+      "id": "F-003",
+      "title": "Missing FK pds.garmin_activity_laps.activity_id → garmin_activities permits lap orphans",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "pds.garmin_activity_laps",
+      "description": "garmin_activity_laps has a UNIQUE on (activity_id, lap_index, ts) but no FK to garmin_activities.activity_id. The lap data is meaningless without its parent activity; a deleted activity leaves laps in place and no downstream view will join them.",
+      "evidence": "SCHEMA_DDL.md:31-33 shows UNIQUE (activity_id, lap_index, ts) and idx (activity_id, lap_index). No FK appears in the bundle's referential integrity inventory.",
+      "recommendation": "ALTER TABLE pds.garmin_activity_laps ADD CONSTRAINT laps_activity_fk FOREIGN KEY (activity_id) REFERENCES pds.garmin_activities(activity_id) ON DELETE CASCADE. Garmin activity PK is (activity_id, ts) in the inventory — if the FK has to match the composite PK, store the laps' ts column and reference both."
+    },
+    {
+      "id": "F-004",
+      "title": "Spotify play/track/artist relationships unenforced — track and artist orphans on dim refresh",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "pds.spotify_plays",
+      "description": "spotify_plays.track_id and spotify_plays.artist_id reference text PKs on spotify_tracks and spotify_artists but with no FK. The ReccoBeats refeaturize path and the MusicBrainz backfill both write to the dim tables; a re-run that drops and re-inserts a dim row (or fails to upsert a new artist) leaves play rows pointing at a missing dim, which the spotify_daily_signature view masks with LEFT JOIN.",
+      "evidence": "spotify_schema.sql:15-41 defines spotify_plays with track_id TEXT NOT NULL and artist_id TEXT, no REFERENCES. spotify_daily_signature LEFT JOINs spotify_tracks ON track_id, so the bias is hidden as 'unfeaturized plays' in featurized_plays denominator.",
+      "recommendation": "Add FKs as ON DELETE SET NULL (artist) and ON DELETE NO ACTION (track) so play history is preserved when a dim row is intentionally archived but unintentional drops fail loudly. Alternative if FK overhead is unwanted: add a periodic canary view spotify_orphan_plays similar to supplement_unii_sentinel_check."
+    },
+    {
+      "id": "F-005",
+      "title": "RLS inconsistency: service_full_access targeting {public} instead of {service_role}",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness", "Idiomaticness"],
+      "file_ref": "SCHEMA_DDL.md:223 (whoop_cycles, whoop_recovery, whoop_sleep, whoop_workouts, garmin_*, sync_log)",
+      "description": "Per SCHEMA_DDL.md, several service_full_access policies target {public} (which includes anon + authenticated) rather than {service_role}. Even with qual='true' the semantic gap is real: any future role added to the cluster, or any anon-routed write that bypasses the API key check, would carry full access. On Supabase today this is masked because the anon key only signs requests for the anon role, but the policy text is more permissive than intent.",
+      "evidence": "SCHEMA_DDL.md row 223: 'Several (whoop_cycles, whoop_recovery, whoop_sleep, whoop_workouts, garmin_*, sync_log) target {public} instead. The public role technically includes anon...'",
+      "recommendation": "Normalize every service_full_access policy to TO service_role. One migration: DROP POLICY service_full_access ON pds.<table>; CREATE POLICY service_full_access ON pds.<table> FOR ALL TO service_role USING (true) WITH CHECK (true). Apply across all 6 listed tables."
+    },
+    {
+      "id": "F-006",
+      "title": "Many tables have anon_read but no explicit service_role policy",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Robustness", "Idiomaticness"],
+      "file_ref": "pds.garmin_workouts, pds.habit_metadata_history, pds.meal_events, pds.journal_entries, pds.myfitnesspal_nutrition, pds.spotify_*, pds.supplement_*, pds.weight_log",
+      "description": "These tables enable RLS and define only an anon_read SELECT policy. Service-role writes succeed because service_role has the bypass-RLS attribute, not because a policy allows it. This is portable across Supabase but creates two latent traps: (a) any migration off Supabase to a Postgres where service_role doesn't have BYPASSRLS will break every ETL write; (b) any future tightening that REVOKEs BYPASSRLS from service_role (a reasonable security hardening) silently bricks writes.",
+      "evidence": "SCHEMA_DDL.md:224 explicitly calls out this set. weight_schema.sql:48-55 and meal_schema.sql:147-153 each create only the anon_read policy.",
+      "recommendation": "Add CREATE POLICY service_full_access ON pds.<table> FOR ALL TO service_role USING (true) WITH CHECK (true) to each listed table. One migration. The bypass-RLS path is a Supabase convenience, not a design choice; make the schema self-describing."
+    },
+    {
+      "id": "F-007",
+      "title": "Duplicate indexes on PK column prefixes",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Scalability", "Idiomaticness"],
+      "file_ref": "pds.weight_log idx_weight_log_date, pds.myfitnesspal_nutrition idx_mfp_nutrition_date, pds.whoop_journal idx_whoop_journal_date",
+      "description": "These three indexes duplicate the PK column-set. weight_log PK is (log_date) and idx_weight_log_date is (log_date DESC); the PK already supports both directions of ordered scan since it's a btree. Same for myfitnesspal_nutrition (PK calendar_date + idx calendar_date) and whoop_journal where the PK starts with cycle_date and the named index is on (cycle_date). The cost is write-amplification on every insert/update and ~negligible space, but every query that 'uses idx_X' would have used the PK equally well.",
+      "evidence": "SCHEMA_DDL.md:152-155 weight_log: 'PK (log_date) / idx (log_date DESC) -- duplicate? PK already covers'. Same annotation for mfp_nutrition:107 and whoop_journal:170.",
+      "recommendation": "DROP INDEX pds.idx_weight_log_date; DROP INDEX pds.idx_mfp_nutrition_date; DROP INDEX pds.idx_whoop_journal_date. Postgres btree PKs serve both ASC and DESC scans equally; the auxiliary indexes add nothing."
+    },
+    {
+      "id": "F-008",
+      "title": "spotify_plays has no PK or UNIQUE on (track_id+played_at) ordering invariants but artist join is loose",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "pds.spotify_plays",
+      "description": "spotify_plays PK is (played_at, track_id) which makes 'same track played at same instant' impossible. But the row also carries artist_id, artist_name, album_id, album_name as denormalized columns — if a track is re-attributed (artist rename in Spotify, label change), the denormalized values diverge from the spotify_tracks/spotify_artists dim rows. The view spotify_daily_signature uses LEFT JOIN to dims, so the dim view of audio features is authoritative, but the artist/album text in spotify_plays is a frozen denormalization. Either accept that and document it, or drop the redundant text columns and join.",
+      "evidence": "spotify_schema.sql:15-41 keeps track_name, artist_name, album_name on the play row. ETL code (spotify_etl.py per CLAUDE.md) writes them at insert time.",
+      "recommendation": "Either (a) DROP COLUMN track_name, artist_name, album_name on spotify_plays and force consumers to join, or (b) add a comment to the schema documenting the denormalization is intentional and the dim tables are authoritative on the 'current' label."
+    },
+    {
+      "id": "F-009",
+      "title": "hrv_predictions has no UNIQUE on (date, model, horizon, model_version) — multiple rows per logical key tolerated",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "pds.hrv_predictions",
+      "description": "PK on hrv_predictions is (prediction_date, model, horizon_days). The hrv_predictions_latest view's design comment says 'pds.hrv_predictions keeps every row from every run (multiple rows per date/model/horizon as model_version rolls)'. This is contradictory: a (date, model, horizon) PK forbids multiple rows. Either the PK as listed in SCHEMA_DDL.md is wrong (and the actual structure is something looser, like UNIQUE on (date, model, horizon, model_version)) or the design intent (keep history) conflicts with the constraint and the comment is misleading. Worth confirming the live production state.",
+      "evidence": "SCHEMA_DDL.md:87 lists PK (prediction_date, model, horizon_days). hrv_predictions_latest.sql:25 comment: 'pds.hrv_predictions keeps every row from every run (multiple rows per date/model/horizon...)'. The DISTINCT ON tiebreak would be unnecessary if the PK held.",
+      "recommendation": "Audit the live constraint. If the PK is really (date, model, horizon), document that each run upserts and 'history' must come from a separate audit table. If the design intent is to keep history, the PK should be (date, model, horizon, model_version, created_at) or a serial id with a UNIQUE on the logical key including model_version."
+    },
+    {
+      "id": "F-010",
+      "title": "Eleven near-clone set_onyx_dates_* trigger functions — drift risk + maintenance cost",
+      "severity": "P2",
+      "effort": "L",
+      "dimensions": ["Robustness", "Idiomaticness"],
+      "file_ref": "sql/adr_0001_02_whoop_onyx_dates.sql, sql/adr_0001_03_garmin_onyx_dates.sql, sql/adr_0001_04_other_onyx_dates.sql",
+      "description": "Each table that holds a TIMESTAMPTZ event has its own per-table trigger function: set_onyx_dates_whoop_cycles, _whoop_sleep, _whoop_workouts, _garmin_activities, _garmin_sleep, _garmin_hrv, _eight_sleep_trends, _spotify_plays, _supplement_intake, _meal_events, _journal_entries, _habit_journal, _whoop_journal, _myfitnesspal_nutrition. Several of these are byte-identical except for the column names of the source instant + offset (e.g. whoop_cycles / whoop_sleep / whoop_workouts are textual triplets). Drift between them is the load-bearing risk — any future bugfix has to be applied 11 times. The pattern is also un-idiomatic: a single generic trigger keyed by trigger argument (or by TG_TABLE_NAME + a lookup table) would handle all of them.",
+      "evidence": "sql/adr_0001_02_whoop_onyx_dates.sql:55-122 has three near-identical functions. sql/adr_0001_03_garmin_onyx_dates.sql:63-94 + 113-138 + 155-179 has three more.",
+      "recommendation": "Refactor to a single trigger function pds.set_onyx_dates_generic() that takes the instant-column-name and the offset-column-name as trigger arguments (CREATE TRIGGER ... EXECUTE FUNCTION pds.set_onyx_dates_generic('start_time', 'timezone_offset')). Use TG_ARGV[0] + dynamic record access. Net effect: one function body to maintain, 11 small CREATE TRIGGER statements. Effort is L because each per-table behavior (e.g. journal_entries' 'don't overwrite et if backdated') has special handling that needs to be expressed declaratively."
+    },
+    {
+      "id": "F-011",
+      "title": "daily_health_matrix legacy view still in use — deprecation path not started",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Robustness", "Scalability"],
+      "file_ref": "pds.daily_health_matrix vs pds.daily_health_matrix_behavioral",
+      "description": "The two views overlap by ~130 columns; the legacy view is keyed on garmin_daily_summary.calendar_date and the canonical view on a UNION-of-behavioral-dates spine. CONTEXT.md explicitly says the legacy view is 'retained for backward-compat' but lists no deprecation plan. Any frontend query or analytical script reading the legacy view gets a different spine + a different WHOOP-cycle attribution than the rest of the system; the schema isn't preventing accidental mixed reads. Worth either deleting the legacy view (and migrating its few remaining consumers) or aliasing it as a thin wrapper SELECT * FROM daily_health_matrix_behavioral with the columns the legacy view exposed.",
+      "evidence": "CONTEXT.md:41-44 'Retained both during migration. Reviewer should consider whether the legacy view can be deprecated/removed.' Both views drop+recreate the same column set with different join logic.",
+      "recommendation": "Identify every consumer of pds.daily_health_matrix (grep frontend/src + Python scripts). Migrate to _behavioral or, if the consumer truly needs clock-day semantics (MFP energy balance), create a thin pds.daily_health_matrix_clock view with just the MFP columns. Then drop the legacy 130-column view to remove the ambiguity surface."
+    },
+    {
+      "id": "F-012",
+      "title": "hrv_predictions and whoop_journal grow without partitioning — single-table scans dominate analytical queries",
+      "severity": "P3",
+      "effort": "L",
+      "dimensions": ["Scalability"],
+      "file_ref": "pds.hrv_predictions, pds.whoop_journal",
+      "description": "hrv_predictions is ~11K rows, ~36/day, doubling in ~9 months. whoop_journal is ~12K rows, ~44/day. At Postgres's planner-friendly scale these are tiny, but every analytical query (Spearman matrices, walk-forward backtest reads) materializes the whole table. Range-partitioning on prediction_date / cycle_date with monthly partitions would let queries on the last 30/90 days prune to one or two partitions and would make TRUNCATE-and-rebuild on a model_version retire trivial. Worth flagging now because adding partitioning later requires a downtime window or pg_partman migration. At current scale the cost-benefit favors waiting — note as a deferred design choice.",
+      "evidence": "SCHEMA_DDL.md inventory: hrv_predictions PK (prediction_date, model, horizon_days), no partitioning declaration; whoop_journal PK (cycle_date, question).",
+      "recommendation": "Defer partitioning until either (a) a table crosses ~500K rows, or (b) typical analytical queries cross 200ms. Document the trigger condition in CLAUDE.md so a future contributor doesn't burn time on the migration prematurely. When triggered, use RANGE partitioning by month on hrv_predictions.prediction_date and whoop_journal.cycle_date."
+    },
+    {
+      "id": "F-013",
+      "title": "Wide LATERAL aggregation in behavioral matrix view repeated 5+ times — extract to scalar subqueries or named CTEs",
+      "severity": "P3",
+      "effort": "M",
+      "dimensions": ["Robustness", "Idiomaticness"],
+      "file_ref": "sql/daily_health_matrix_behavioral_main_session.sql:196-243",
+      "description": "The view body has 5 LEFT JOIN LATERAL blocks (garmin_sleep best-non-nap, garmin_hrv latest, garmin_activities aggregate, whoop_cycles longest, whoop_workouts aggregate) plus a 6th tx subquery. Each is a self-contained 4-10 line block whose only varying parameters are the source table, the predicate, and the columns aggregated. The pattern is correct but copy-paste-heavy; any future column added to a per-source aggregate (e.g. SUM(distance_meters)) requires touching the right block in the right LATERAL and not the others. Worth a refactor to either materialized helper views (one per source) that the matrix joins, or named CTEs with explicit aliases.",
+      "evidence": "daily_health_matrix_behavioral_main_session.sql:196-243 contains the LATERAL stack. Same shape appears in daily_health_matrix.sql:195-263.",
+      "recommendation": "Create per-source helper views: pds.behavioral_garmin_sleep_pick, pds.behavioral_whoop_cycle_pick, pds.behavioral_workout_agg, pds.behavioral_activity_agg. Each is one CREATE VIEW with the LATERAL/aggregation logic. Then the matrix view becomes a flat SELECT joining the helpers on calendar_date. Reduces matrix view body by ~40% and makes single-source changes trivial."
+    },
+    {
+      "id": "F-014",
+      "title": "supplement_products.ingredients JSONB has no shape check — schema drift is invisible",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "pds.supplement_products",
+      "description": "ingredients is JSONB NOT NULL with no CHECK constraint enforcing the documented shape. The downstream view supplement_intake_by_compound relies on every element having a quantity (regex-filtered ~'^[0-9.]+$'), and the daily_supplement_matrix relies on ingredient_group being present. A future ingestion bug that writes ingredients as a single object instead of an array, or omits the quantity key, would silently produce rows where the rollup quietly skips ingredients. The supplement_unii_sentinel_check view is a good defensive pattern; the same should exist for ingredient-shape integrity.",
+      "evidence": "supplement_schema.sql:47 'ingredients JSONB NOT NULL' with no CHECK. supplement_intake_by_compound view filters WHERE quantity ~'^[0-9.]+$' (silently skips malformed rows). supplements_unii_cleanup.sql:144 supplement_unii_sentinel_check is a regression canary for one specific shape bug.",
+      "recommendation": "Either (a) add CHECK (jsonb_typeof(ingredients) = 'array' AND jsonb_array_length(ingredients) > 0) plus a per-element validity function; or (b) add a canary view pds.supplement_ingredient_shape_check that returns rows whose ingredients shape doesn't match (missing quantity, missing ingredient_group on non-empty rows, etc.) — same pattern as the existing sentinel check."
+    },
+    {
+      "id": "F-015",
+      "title": "whoop_journal long-format with synthetic 'Yes'/'No' answer TEXT column — leaks type info to consumers",
+      "severity": "P3",
+      "effort": "L",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "pds.whoop_journal",
+      "description": "answer is TEXT and the pipeline's Spearman/causal layers binarize 'Yes' → 1, otherwise 0 at read time. Per CLAUDE.md WHOOP's CSV is boolean-only, but the column still permits quantities, free text, NULLs, and any future enrichment WHOOP might add. The lack of a CHECK or domain means a future ETL change that starts emitting 'yes' (lower case) or 'YES' silently mis-binarizes. Long-format itself is the right design (new questions don't require migration), but the answer column's permissiveness undermines write-time safety.",
+      "evidence": "whoop_schema.sql:167-178 'answer TEXT, -- Yes/No, quantity, time, or free text'. No CHECK, no normalization.",
+      "recommendation": "Add a CHECK constraint that enforces the values currently in use (CHECK (answer IS NULL OR answer IN ('Yes','No','N/A')) IF WHOOP's API really is boolean-only; otherwise add a normalization column answer_bool BOOLEAN GENERATED ALWAYS AS (LOWER(answer) = 'yes') STORED and have the pipeline read that. Either path makes the boolean intent explicit at storage time."
+    },
+    {
+      "id": "F-016",
+      "title": "ci_tokens has no service-role policy — depends on bypass-RLS for writes",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "pds.ci_tokens",
+      "description": "ci_tokens.sql enables RLS and says 'No anon policy: only service_role key can access tokens'. There is also no service_role policy. Writes work because service_role has BYPASSRLS, but reads against ci_tokens via the service key would also work for the same reason — the policy comment is correct only because no policy exists for anon. The comment's framing implies a deliberate deny; the actual mechanism is implicit-allow-via-bypass. Same robustness concern as F-006 but more acute because ci_tokens holds OAuth refresh tokens.",
+      "evidence": "sql/ci_tokens.sql:11-12 'ALTER TABLE pds.ci_tokens ENABLE ROW LEVEL SECURITY; -- No anon policy: only service_role key can access tokens.'",
+      "recommendation": "Add explicit CREATE POLICY ci_tokens_service_all ON pds.ci_tokens FOR ALL TO service_role USING (true) WITH CHECK (true). Optionally also add CREATE POLICY ci_tokens_anon_deny ON pds.ci_tokens FOR ALL TO anon USING (false) to make the deny explicit (it's redundant under RLS-enabled but communicates intent)."
+    },
+    {
+      "id": "F-017",
+      "title": "Behavioral matrix view emits calendar_date plus three onyx_* date columns that are byte-identical aliases",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Idiomaticness"],
+      "file_ref": "sql/daily_health_matrix_behavioral_main_session.sql:49-52",
+      "description": "Both view definitions select 's.calendar_date AS calendar_date, s.calendar_date AS onyx_behavioral_date, s.calendar_date AS onyx_et_date, s.calendar_date AS onyx_local_date'. The intent is to expose the four ADR-0001 date columns at the matrix grain, but at the spine grain they collapse to one value, so the view emits the same value four times. That's fine semantically — but consumers may use any of the four interchangeably and the schema doesn't tell them they're identical, encouraging confused downstream queries that filter on one but not the others.",
+      "evidence": "daily_health_matrix_behavioral_main_session.sql:49-52 — all four aliased to s.calendar_date.",
+      "recommendation": "Emit only calendar_date in the view, with a COMMENT ON COLUMN noting it equals all three onyx_* dates at the daily grain. If downstream code expects the onyx_* names specifically, alias-then-comment that the four are identical. Saves consumers from writing WHERE onyx_behavioral_date = onyx_et_date defensive clauses."
+    },
+    {
+      "id": "F-018",
+      "title": "hrv_predictions_latest view's tiebreak is correct but undocumented for legacy_v0 rows",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "sql/hrv_predictions_latest.sql:46",
+      "description": "The DISTINCT ON tiebreak is 'CASE WHEN model_version LIKE 'backtest%' THEN 1 ELSE 0 END, created_at DESC'. The sql/hrv_predictions_relabel_legacy_v0.sql migration renamed 44 historical 'backtest_initial' rows to 'legacy_v0' explicitly so they would tie with live predictions (legacy_v0 doesn't match 'backtest%'). That's correct, but the view definition doesn't comment on it — a future reader looking at hrv_predictions_latest.sql in isolation won't see why legacy_v0 was the chosen rename. If another batch of 'backtest_initial' rows is later relabeled differently, the view could silently start hiding them.",
+      "evidence": "hrv_predictions_latest.sql:46 'CASE WHEN model_version LIKE 'backtest%' THEN 1 ELSE 0 END' with no mention of legacy_v0. The relabel logic lives only in sql/hrv_predictions_relabel_legacy_v0.sql.",
+      "recommendation": "Add a comment block in hrv_predictions_latest.sql enumerating the model_version values the tiebreak treats as 'live' (i.e., anything that doesn't match 'backtest%'), including 'legacy_v0'. Cross-link to the relabel migration."
+    }
+  ],
+  "things_done_well": [
+    {
+      "title": "ADR-0001 attribution: trigger-based behavioral-day derivation with provenance",
+      "file_ref": "sql/adr_0001_01_user_tz_log.sql, sql/adr_0001_02_whoop_onyx_dates.sql",
+      "why_it_matters": "Four derived date columns + provenance label per event, computed at write time by a single derive_onyx_dates() helper that reads user_tz_log. Every consuming table is indexed on onyx_behavioral_date. The pds_legacy.daily_health_matrix_v0 snapshot lets the team A/B the old and new attribution. This is the kind of load-bearing date semantics that most schemas get wrong by mixing the convention in application code; this one isolates it cleanly to the database."
+    },
+    {
+      "title": "tz_log_gaps canary view + dst_artifact / travel distinction",
+      "file_ref": "sql/adr_0001_06_tz_log_gaps_view.sql",
+      "why_it_matters": "Detects 'user traveled but forgot to log it' by comparing WHOOP's per-cycle timezone_offset against pds.tz_for_instant. The v2 update that adds gap_type to distinguish dst_artifact from travel shows mature thinking about false positives — the same pattern (compare two independent sources of a derived value, surface disagreements as a canary view) should be replicated for the FK-absent relationships flagged in F-002/F-003/F-004."
+    },
+    {
+      "title": "supplement_unii_sentinel_check regression canary view",
+      "file_ref": "sql/supplements_unii_cleanup.sql:144",
+      "why_it_matters": "Empty-if-healthy view that catches DSLD parser regressions emitting placeholder UNIIs (0 or 1). The 'regression check view' pattern is exactly right for schema-level correctness invariants the constraint system can't easily express — should be applied to ingredient shape (F-014), Spotify orphans (F-004), and any future write-time invariant that can't be a CHECK."
+    },
+    {
+      "title": "habit_metadata_history bitemporal pattern with partial unique index",
+      "file_ref": "sql/habit_metadata_history.sql",
+      "why_it_matters": "Closed/open intervals of (frequency, category) per habit with a partial UNIQUE INDEX (notion_page_id) WHERE valid_to IS NULL enforcing 'at most one open interval'. This is the textbook bitemporal pattern in Postgres and a non-obvious feature use — Postgres can't UNIQUE on expressions but it can on partial indexes, which is what's used here. Solves the silent-retroactive-rewrite class of bugs for habit metadata correctly."
+    },
+    {
+      "title": "spotify_plays.played_date_et generated stored column",
+      "file_ref": "spotify_schema.sql:18",
+      "why_it_matters": "GENERATED ALWAYS AS ((played_at AT TIME ZONE 'America/New_York')::date) STORED with an index on it. Lets daily aggregations skip the timezone conversion at query time and prevents the canonical ET-day attribution from ever drifting from played_at. Right use of generated columns: deterministic function of the same row."
+    },
+    {
+      "title": "vector(1024) embedding with HNSW vector_cosine_ops index",
+      "file_ref": "journal_schema.sql:28-48",
+      "why_it_matters": "Idiomatic pgvector usage: dimension matched to voyage-3-large, HNSW (not IVFFlat) for read-heavy workloads at this size, vector_cosine_ops matched to the query metric. The notion_edited_at skip-if-unchanged guard prevents re-embedding cost on no-op syncs. The search_journal_entries RPC encapsulates the similarity query so PostgREST consumers don't have to write the cosine math."
+    },
+    {
+      "title": "GIN indexes on JSONB array columns (topics, ingredients, genres)",
+      "file_ref": "pds.journal_entries.topics, pds.supplement_products.ingredients, pds.spotify_artists.genres",
+      "why_it_matters": "Correct use of GIN for JSONB containment + array membership. Each column has a documented access pattern that GIN supports (tag filter, 'which products contain magnesium', genre filter), so the index actually carries its weight rather than being added speculatively."
+    }
+  ],
+  "questions_for_followup": [
+    "Is pds.hrv_predictions PK really (prediction_date, model, horizon_days) — and if so, how does the table 'keep every row from every run' as the latest-view comment claims? Or has model_version been added to the PK in production but not in the bundle docs?",
+    "Are the {public}-targeting service_full_access policies (F-005) deliberate (matching some older Supabase tutorial pattern) or accidental drift from an early-development copy-paste? The answer informs whether the fix is a one-shot ALTER POLICY migration or also needs a code search for callers depending on the broader grant.",
+    "Does anything in frontend/src/lib/queries.ts or hrv_analysis.py still read pds.daily_health_matrix (the legacy view), or has the migration to _behavioral fully landed? The answer determines whether F-011 is a code migration or just a DROP VIEW.",
+    "Was the bundle-level duplication of daily_health_matrix_behavioral (F-001) intentional (incremental migration history) or accidental? If incremental, the bundle should reflect the latest definition only and the audit can't tell production state from the .sql files alone."
+  ]
+}

@@ -1,0 +1,106 @@
+name: HRV Prediction
+
+on:
+  workflow_run:
+    workflows: ["Hourly Health ETL"]
+    types: [completed]
+  # Two UTC crons to land exactly on 23:50 ET year-round (GitHub Actions cron
+  # has no DST awareness). Only one will be the correct DST-state run on any
+  # given day — the dst-gate job below rejects the other.
+  schedule:
+    - cron: '50 3 * * *'   # 23:50 EDT (summer, UTC-4) | 22:50 EST (winter) — skipped in winter
+    - cron: '50 4 * * *'   # 23:50 EST (winter, UTC-5) | 00:50 EDT (summer) — skipped in summer
+  workflow_dispatch:
+
+concurrency:
+  group: hrv-prediction
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  dst-gate:
+    # For scheduled runs, proceed only when the current ET hour is 23 — i.e.,
+    # exactly 23:50 ET. This lets both UTC crons coexist year-round while
+    # ensuring only the DST-appropriate one actually runs the prediction.
+    # Non-scheduled runs (workflow_run, workflow_dispatch) always proceed.
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ET_HOUR=$(TZ=America/New_York date +%H)
+          if [ "$ET_HOUR" = "23" ]; then
+            echo "Scheduled run at 23:$(TZ=America/New_York date +%M) ET — proceeding."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Scheduled cron fired at ET hour $ET_HOUR — wrong DST state, skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  hrv-predict:
+    needs: dst-gate
+    runs-on: ubuntu-latest
+    # Gate on dst-gate for scheduled runs; preserve the original
+    # workflow_run success check for ETL-triggered runs.
+    if: >
+      needs.dst-gate.outputs.proceed == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event_name == 'schedule' ||
+       github.event.workflow_run.conclusion == 'success')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-hrv-${{ hashFiles('requirements-analysis.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-hrv-
+
+      - name: Install analysis dependencies
+        run: |
+          pip install -r requirements-analysis.txt
+          pip install supabase python-dotenv
+
+      - name: Download model artifact
+        # Try to restore the trained model from cache. Key is per-run so
+        # retrain workflows can save a new cache without "already exists"
+        # collisions; restore-keys matches the most recently saved model.
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: analysis_output/xgboost_hrv_model.pkl
+          key: hrv-model-${{ runner.os }}-v1-${{ github.run_id }}
+          restore-keys: |
+            hrv-model-${{ runner.os }}-v1-
+            hrv-model-${{ runner.os }}-
+
+      - name: Train model if missing
+        # Self-heal: if cache was empty or the pickle is gone, retrain from scratch
+        # so hrv_predict.py always has a model to load.
+        if: hashFiles('analysis_output/xgboost_hrv_model.pkl') == ''
+        run: |
+          echo "Model pickle missing - running hrv_analysis.py to retrain"
+          python hrv_analysis.py --skip-analysis
+
+      - name: Backfill actuals & predict tomorrow
+        run: python hrv_predict.py --predict
+
+      - name: Upload model artifact
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: analysis_output/xgboost_hrv_model.pkl
+          key: hrv-model-${{ runner.os }}-v1-${{ github.run_id }}

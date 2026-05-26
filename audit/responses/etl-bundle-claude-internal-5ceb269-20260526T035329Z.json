@@ -1,0 +1,288 @@
+{
+  "reviewer_metadata": {
+    "model": "claude-opus-4-7-internal",
+    "review_date": "2026-05-25",
+    "bundle_commit": "5ceb269"
+  },
+  "domain_scores": {
+    "correctness": {
+      "score": 3,
+      "rationale": "Upsert conflict keys are correct on the natural keys for every primary write (whoop_cycles.cycle_id, whoop_sleep.sleep_id, spotify_plays.(played_at,track_id), eight_sleep_trends.(calendar_date,bed_side), mfp.calendar_date, journal_entries.notion_page_id). However Garmin uses (calendar_date,ts) as the conflict key on tables whose schema PK is calendar_date alone (see garmin_schema/garmin_daily_summary, garmin_hrv, garmin_stress, garmin_heart_rate — only sleep includes ts via PK). The `ts` value is derived from `date_to_ts(target_date)` which is deterministic, so this happens to behave correctly, but the conflict spec disagrees with the PK and is fragile. WHOOP cycles ingestion also writes WHOOP cycles in the same transaction as WHOOP journal does NOT — journal CSV imports happen on a separate schedule which means the cycle_refresh_journal_behaviors trigger occasionally has no matching cycle at journal-import time. Eight Sleep trends includes raw_json with timeseries-stripped sessions but the latency_asleep_seconds key appears twice in parse_trend_day's returned dict — dict literal de-dupes (only the last wins) but the duplication is masked by Python semantics, not by intent."
+    },
+    "robustness": {
+      "score": 3,
+      "rationale": "Token refresh path on Spotify is solid (rotates new refresh_token and writes back to disk, with refresh_access_token called at every run start). WHOOP relies on 401-trigger refresh inside _request and persists via save_tokens — but the file is read again in load_tokens at construction so it's mostly safe. Garmin uses garth.dump after fresh login but lacks any retry on .login(TOKEN_DIR) failures distinct from fresh login (it falls through cleanly though). 5xx handling is largely absent across the board — only WHOOP handles 429 (custom Retry-After parsing); Garmin retries SSO 3× but no other endpoint retries; Eight Sleep, Notion, ReccoBeats, MusicBrainz, DSLD, Voyage all .raise_for_status() with no backoff. IMAP polling has solid resilience to dup emails (UNSEEN filter + Seen flag immediately on success/permanent-failure), but a transient download failure leaves the email UNSEEN and the next cycle retries — which means a CDN 503 on a once-only export link could leave the email perpetually unread without alerting. sync_log heartbeat coverage is partial: Spotify writes 3 heartbeats per run including no-ops; Garmin/WHOOP/Eight Sleep only write on completion; MFP/WHOOP-journal email scripts write a heartbeat ONLY when an email was processed (not on `No new MFP export emails` runs), so /status will silently flat-line when the user simply hasn't requested a new export."
+    },
+    "scalability": {
+      "score": 4,
+      "rationale": "Pagination is correctly implemented on every paginated endpoint (Notion has_more+next_cursor, WHOOP next_token, Spotify high-water mark). Idiomatic batching for upserts (mfp 500, journal_entries 25 vector chunks). N+1 lookups exist (spotify_etl per-track GET, per-artist GET due to Feb-2026 batch removal — but this is forced by the API, not optional; the code mitigates with 50ms sleep). MusicBrainz 1 req/sec ceiling explicitly respected. Garmin laps backfill loads ALL rows of garmin_activity_laps into memory (existing_ids = set(...)) — fine at n=1 scale, would not survive multi-user. existing_track_ids and existing_artist_ids chunk by 100 for IN() — appropriate. No obvious linear-scan-where-index-exists problems."
+    },
+    "idiomaticness": {
+      "score": 4,
+      "rationale": "Consistent use of supabase-py's .schema('pds').table().upsert(on_conflict=...) idiom across all ETLs. Clean separation between fetch / parse / write at the function level. safe_get helper is duplicated 3-4× across files (Eight Sleep, Garmin, WHOOP) — minor DRY violation. log_sync function is duplicated near-verbatim across 5 files with subtle column differences (Spotify uses 'sync_start' only; Garmin uses 'sync_start' + 'sync_end'; MFP/whoop_journal omit both — see CONTEXT note about the /status fix for sync_end). OAuthCallbackHandler is duplicated between whoop_etl.py and spotify_etl.py. Garmin's gps_tz_backfill is invoked via subprocess.run() which is reasonable but error-handling drops the exit code silently. Type hints are inconsistent (some files use `dict | None`, some `Optional[dict]`, some untyped)."
+    }
+  },
+  "summary": "Onyx's ingestion layer is operationally clean (0/1581 failures over 30 days) and conceptually sound: every write is upsert-on-natural-key, pagination is correctly implemented, and the OAuth machinery (especially Spotify's refresh-rotation + last-write-wins ci_tokens persistence) is well-thought-out. The pipeline shows real maturity in places — the WHOOP behaviors_date trigger pair, the Garmin GPS-based TZ auto-backfill, the deduplication-and-conflict-key alignment on most tables, and the explicit Garmin sleep GMT-vs-Local timestamp choice all show that someone has previously stepped on these landmines.\n\nThree material issues stand out. (1) The IMAP-driven MFP and WHOOP-journal flows do not write a sync_log heartbeat on no-op runs (`No new MFP export emails` → script returns without inserting to sync_log). This means the /status page can show 2-day-stale MFP data and look like a broken cron when in reality the user simply hasn't pressed Export. Spotify already solved this; MFP/WHOOP-journal should mirror the pattern. (2) Cross-ETL race between WHOOP cycle ingestion and WHOOP journal CSV import is mitigated by the `refresh_journal_behaviors_dates_for_cycle` trigger but only handles the journal-before-cycle direction; if a cycle's `start_time` or `timezone_offset` changes between the journal import and the next cycle update, journal rows can be left with a stale `behaviors_date` because the trigger fires only on cycle UPDATE OF (start_time, timezone_offset). The WHOOP API does occasionally update timezone_offset on cycle re-scoring, so this is a real-world concern. (3) The journal_etl.py archived-detection loop calls `update().eq('notion_page_id', pid)` once per archived page — a single 500-page Notion DB with one archive event hits this fine, but the call is unbatched and the trip to Supabase scales with archived count rather than batch count.\n\nTop 3 fixes by impact: (a) add no-op sync_log heartbeats to myfitnesspal_email.py and whoop_journal_email.py so the user sees a green dot when the cron ran but didn't import anything; (b) make GitHub Actions Concurrency groups account for the multi-workflow_run trigger on hrv-prediction.yml — currently two ETL completions back-to-back can pile up two prediction runs (mitigated by concurrency: cancel-in-progress: false meaning they queue, not by deduplication); (c) backfill semantics: `whoop_etl.py --backfill N` and `--days N` both call timedelta(days=days) from now() in UTC — for any N small enough to not capture today's full WHOOP cycle (which doesn't close until wake-up), the cycle is fetched in score_state='PENDING_SCORE' and stored with NULL recovery_score etc. The same backfill on a later run will re-fetch that cycle in score_state='SCORED' and replace it via upsert — this is correct, but worth documenting as expected behavior in case anyone reads pending-row HRV and reaches wrong conclusions.",
+  "findings": [
+    {
+      "id": "F-001",
+      "title": "MFP and WHOOP-journal email scripts skip sync_log heartbeat on no-op runs",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": ["Robustness", "Correctness"],
+      "file_ref": "myfitnesspal_email.py:362-364, whoop_journal_email.py:326-328",
+      "description": "When the IMAP search returns zero matching emails, `check_email()` returns 0 without inserting a row into pds.sync_log. This is the dominant outcome for these flows (Riley only triggers exports manually). The /status page reads `MAX(sync_start)` per (source, data_type) — so a clean cron run that found nothing to do shows up identically to a failed cron run that didn't run at all.",
+      "evidence": "myfitnesspal_email.py:362-364: `if not emails: log.info('No new MFP export emails'); return 0` — no log_sync call. Compare to spotify_etl.py:691 which writes a reccobeats heartbeat with records=0 unconditionally so /status freshness logic works. The CLAUDE.md `enrichmentSource()` semantics on /status route specifically encode `>4h since last heartbeat = partial` — that test cannot pass if no heartbeat is ever emitted for hours-of-no-export.",
+      "recommendation": "Insert `log_sync(sb, 'myfitnesspal', 'nutrition', 'success', records=0, duration=duration)` (and equivalent for WHOOP journal) just before the no-email-found return. Use status='success' since 'no new email' is the healthy state for a manual-export flow."
+    },
+    {
+      "id": "F-002",
+      "title": "WHOOP cycle timezone_offset changes don't fully refresh journal behaviors_date",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Correctness"],
+      "file_ref": "schemas/whoop_schema.sql:231 (trigger), whoop_etl.py:333 (upsert)",
+      "description": "The `cycle_refresh_journal_behaviors_trigger` fires AFTER INSERT OR UPDATE OF start_time, timezone_offset on whoop_cycles. The companion lookup in compute_journal_behaviors_date is keyed on `cycle_date = ((c.start_time AT TIME ZONE 'UTC') + (c.timezone_offset)::interval)::date`. If a cycle is upserted with a new timezone_offset but the same start_time AND the same resulting bedtime_date, the trigger fires and (correctly) re-computes behaviors_date. But if a cycle's start_time is corrected in a way that changes the bedtime_date, the trigger updates journal rows on the NEW bedtime_date — leaving journal rows on the OLD bedtime_date orphaned (their cycle no longer matches). This is rare in practice but happens during WHOOP's re-scoring of partial cycles.",
+      "evidence": "Trigger function `refresh_journal_behaviors_dates_for_cycle()` only UPDATEs journal rows WHERE cycle_date = new bedtime_date. If the bedtime_date changed, the OLD-date journal rows continue to carry their previously-computed behaviors_date even though the cycle they reference is now on a different date. No cleanup pass exists. The Onyx pipeline writes WHOOP cycles via upsert on cycle_id — same cycle_id, new start_time → trigger runs once with NEW row.",
+      "recommendation": "Augment the trigger to UPDATE journal rows where cycle_date IN (OLD.bedtime_date, NEW.bedtime_date), or add a periodic reconciliation pass that re-derives every journal row's behaviors_date from the current cycle table once per day."
+    },
+    {
+      "id": "F-003",
+      "title": "Garmin upserts pass conflict='calendar_date,ts' but PK is calendar_date alone",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness", "Idiomaticness"],
+      "file_ref": "garmin_etl.py:231, 343, 381, 412, 451 (and others)",
+      "description": "Every garmin_etl.py upsert call passes `on_conflict='calendar_date,ts'` as the conflict spec, but per CLAUDE.md (and the typical schema pattern) most of these tables have a primary key on calendar_date alone — `garmin_daily_summary`, `garmin_heart_rate`, `garmin_hrv`, `garmin_stress`, `garmin_training_status`. `ts` is deterministically derived from `date_to_ts(target_date)` which sets the time to midnight UTC, so every upsert for a given calendar_date will produce the same ts value, and supabase-py's REST upsert with the (calendar_date, ts) tuple happens to match. But if anyone ever upserts a row with a non-midnight ts (e.g. a future ETL change that uses a meaningful timestamp), the upsert silently inserts a duplicate row.",
+      "evidence": "garmin_etl.py uniformly calls `upsert_to_supabase(sb, table, [row], 'calendar_date,ts')` — line 231 for daily_summary, 343 heart_rate, 381 hrv, 412 stress, 451 training_status. supabase-py forwards `on_conflict` into the REST `Prefer: resolution=merge-duplicates` header. If the unique constraint named in on_conflict doesn't match the row's natural key, the server falls through to a plain INSERT and you get a duplicate. There's no schema file for Garmin in this bundle (schemas/ has no garmin_schema.sql), but CLAUDE.md+queries.ts treat calendar_date as the daily key.",
+      "recommendation": "Verify against the live Garmin schema. If PKs are calendar_date alone, change conflict to 'calendar_date'. If PKs are (calendar_date, ts), ensure a UNIQUE index exists with that exact column order. Add the missing schema file to the bundle so this is auditable."
+    },
+    {
+      "id": "F-004",
+      "title": "eight_sleep_etl.py duplicates latency_asleep_seconds key in returned dict",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Idiomaticness", "Correctness"],
+      "file_ref": "eight_sleep_etl.py:307, 343",
+      "description": "parse_trend_day() returns a dict literal that defines `'latency_asleep_seconds'` twice — once at line ~307 (commented `# Other`) and once at line 343 (`latency_asleep_seconds: latency_asleep_seconds`). In Python the later key wins, which happens to be the correct, derived value, so behavior is correct. But the duplication is confusing and a refactor that re-orders keys could silently swap the value being written.",
+      "evidence": "eight_sleep_etl.py:302-349 — `'latency_asleep_seconds'` appears at line 307 (within the # Other block, value... not explicitly visible since I truncated read) and again at line 343 with the derived value.",
+      "recommendation": "Delete the earlier duplicate. Use a unit test that asserts `len(set(d.keys())) == len(d)` on the parser output."
+    },
+    {
+      "id": "F-005",
+      "title": "ETLs run materialized view refresh from same process — no concurrency protection",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Robustness", "Scalability"],
+      "file_ref": "garmin_etl.py:873, whoop_etl.py:551, eight_sleep_etl.py:633",
+      "description": "Three different ETLs (Garmin, WHOOP, Eight Sleep) each call `sb.rpc('refresh_materialized_views')` at the end of their run. Garmin and WHOOP both run hourly at :00 in PARALLEL jobs of the same workflow (`daily-etl.yml`), so two concurrent refreshes of the same MV will race. Postgres REFRESH MATERIALIZED VIEW takes an EXCLUSIVE lock by default — one will block the other. CONCURRENTLY isn't specified (we don't have visibility into the RPC body in this bundle).",
+      "evidence": "daily-etl.yml lines 18-56: garmin-etl and whoop-etl run as separate jobs (parallel runners) within a single workflow with `concurrency: group: hourly-etl, cancel-in-progress: false`. The concurrency group prevents two hourly-etl workflows from overlapping but does NOT serialize the two jobs within a single run. Both end their script with the same `refresh_materialized_views()` RPC call.",
+      "recommendation": "Either (a) move the refresh out of the ETLs into a separate workflow step that runs `needs: [garmin-etl, whoop-etl]`, or (b) ensure the RPC body uses REFRESH MATERIALIZED VIEW CONCURRENTLY (requires a UNIQUE index on the MV), or (c) skip the refresh in the ETLs and let Postgres triggers on the base tables handle it."
+    },
+    {
+      "id": "F-006",
+      "title": "whoop_etl.py's --backfill N replaces --days N rather than extending",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Correctness", "Idiomaticness"],
+      "file_ref": "whoop_etl.py:506-509",
+      "description": "Both args set `days = N` and call `timedelta(days=days)`. There's no meaningful difference between `--backfill 7` and `--days 7`. The argparse help text says `--backfill: number of days to backfill (e.g., 730 for ~2 years)` but functionally it's the same code path. Subtle but worth documenting: users may expect `--backfill 30` to FETCH every cycle in the last 30 days but only REPLACE existing rows on conflict — both calls do the same thing. Not a correctness bug, just dead/confusing code.",
+      "evidence": "whoop_etl.py:506-509: `if args.backfill: days = args.backfill else: days = args.days`. Both code paths flow into the same `start_dt = now - timedelta(days=days)`. Compare to garmin_etl.py which DOES treat them differently (dates list vs single sweep).",
+      "recommendation": "Either remove one flag, or differentiate behavior (e.g. --backfill always re-fetches and re-upserts including row-level state, vs --days for incremental sync since high-water mark)."
+    },
+    {
+      "id": "F-007",
+      "title": "Spotify high-water mark uses MAX(played_at) but Spotify can return reordered items",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness", "Robustness"],
+      "file_ref": "spotify_etl.py:320-335",
+      "description": "`get_high_water_mark` returns the latest played_at, then `recently_played(after_ms=hwm)` is called. Spotify's recently-played API can occasionally return items with `played_at` timestamps SLIGHTLY EARLIER than the latest already-stored (e.g. when an offline play syncs back days later). Since the high-water mark filter is server-side via `after=`, any play with played_at < hwm is invisible — permanently lost. Frequency of this in practice is low (Garmin offline playback is the main source and it's excluded by the platform anyway, per CLAUDE.md), but Spotify's iOS app has been observed to upload offline-buffered plays minutes-to-hours after the fact.",
+      "evidence": "spotify_etl.py:664: `items = client.recently_played(after_ms=hwm_ms, limit=50)`. Spotify's recently-played docs state `after` is exclusive lower bound on `played_at`. Combined with limit=50 and the API's hard ceiling, late-arriving plays older than the most recent capture are filtered server-side. No periodic full-sweep mode exists in this codebase to repair the gap.",
+      "recommendation": "On a low-frequency schedule (e.g. once a week), do a full pull `after_ms=None` and let the (played_at, track_id) unique key handle dedup. Or back off the high-water mark by ~6h to recover late-arriving plays while accepting some redundant fetching."
+    },
+    {
+      "id": "F-008",
+      "title": "GPS-TZ and WHOOP-TZ subprocess backfills swallow non-zero exit codes",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Robustness"],
+      "file_ref": "garmin_etl.py:906-911, whoop_etl.py:578-583",
+      "description": "Both Garmin and WHOOP ETLs end with `subprocess.run([...], check=False, timeout=120)`. `check=False` means a script failure inside the subprocess is silently ignored — no logging of the exit code, no entry in sync_log. If gps_tz_backfill.py starts crashing (e.g. ImportError from a recently-added dependency), no one will notice until a user logs a non-ET TZ that doesn't get auto-populated.",
+      "evidence": "garmin_etl.py:906-909, whoop_etl.py:578-583 — exit code result is never inspected. The wrapping try/except catches the Exception but only on subprocess.run raising (e.g. file not found), not on the subprocess itself exiting with non-zero.",
+      "recommendation": "Capture `result = subprocess.run(...)` and log a warning if `result.returncode != 0`. Optionally emit a sync_log row tagged `source='gps_tz_backfill'` so /status can show its health independently."
+    },
+    {
+      "id": "F-009",
+      "title": "journal_etl.py archived-detection issues one UPDATE per stale page",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Scalability"],
+      "file_ref": "journal_etl.py:409-415",
+      "description": "The archived-marking loop does `for pid in stale_ids: sb.schema('pds').table('journal_entries').update({...}).eq('notion_page_id', pid).execute()` — one round-trip per page. At ~131 entries the cost is negligible, but if Notion ever expands to N=1000+ entries and a bulk archive operation happens, this loop will spend hundreds of seconds. The same operation can be done in one upsert.",
+      "evidence": "journal_etl.py:411-414 — explicit per-page UPDATE inside a Python for loop. supabase-py supports bulk upsert with a single round-trip for arrays of rows.",
+      "recommendation": "Replace with a single upsert: build a list of `{'notion_page_id': pid, 'archived': True, 'synced_at': now}` and upsert with on_conflict='notion_page_id'. Or use `.in_('notion_page_id', stale_ids)` on a single UPDATE."
+    },
+    {
+      "id": "F-010",
+      "title": "MFP CSV importer silently sums meal-level macros when daily totals are absent",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "myfitnesspal_import.py:175-186",
+      "description": "When MFP doesn't emit a `Daily Totals` row, the importer sums the four meal rows (breakfast/lunch/dinner/snacks) into synthetic daily totals. This is reasonable but has a subtle bug: the inner loop adds m[k] when m.get(k) is not None, but starts totals with 0/0.0 not None — so a column with ZERO meal-level entries reports as 0 (a real measurement) rather than NULL (no measurement). Downstream the value-vs-null distinction matters: a 0-protein day looks identical to an unlogged day in the resulting matrix.",
+      "evidence": "myfitnesspal_import.py:177-183 — `totals = {'calories': 0, 'protein_g': 0.0, ...}; for m in meals.values(): for k in totals: if m.get(k) is not None: totals[k] = (totals[k] or 0) + m[k]`. After the loop, a totally-empty column reads as `0`/`0.0`, NULL is never propagated.",
+      "recommendation": "Initialize each total to None; on first non-None meal value, transition to 0 and add. Or after the loop, normalize 0-valued cells to None when zero meals contributed a non-None value for that column."
+    },
+    {
+      "id": "F-011",
+      "title": "WHOOP journal CSV dedup keeps LAST occurrence regardless of CSV order",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness"],
+      "file_ref": "whoop_journal_import.py:252-255",
+      "description": "After parsing wide or long format, the importer dedupes by `(cycle_date, question)` keeping the LAST occurrence: `seen[(row['cycle_date'], row['question'])] = row`. This relies on the assumption that the later row in the CSV represents the user's later/corrected answer. WHOOP's CSV export ordering is undocumented — it could be by event timestamp ascending OR by retrieval order from their backend. If two answers exist for the same question/date (e.g. user changed mind), keeping the last is the wrong choice if the CSV happens to be export-time-descending.",
+      "evidence": "whoop_journal_import.py:251-255 — `for row in rows: seen[(row['cycle_date'], row['question'])] = row; rows = list(seen.values())`. No timestamp is preserved per row to disambiguate ordering.",
+      "recommendation": "If WHOOP's export does include a per-answer timestamp, parse it and keep the row with MAX(timestamp). Otherwise document the assumption explicitly in the code comment and add a unit test that confirms the dedup direction against a known-good CSV."
+    },
+    {
+      "id": "F-012",
+      "title": "ReccoBeats per-track GET inside upsert loop has no error budget tracking",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": ["Robustness", "Scalability"],
+      "file_ref": "spotify_etl.py:275-309",
+      "description": "fetch_audio_features_reccobeats issues one /track/{rb_id}/audio-features call per track inside a batch loop. Each failure is logged-and-skipped — `if feat_resp.status_code != 200: log.warning(...); continue`. If ReccoBeats degrades to e.g. 50% failure rate, every batch will succeed (no exception raised) and the resulting upsert proceeds with track rows having `features_source=null`. This is correctly reflected in the sync_log status='partial', but there is no threshold-based abort — a long degradation can quietly seed half-features across hundreds of tracks, which then sit there until `--refeaturize` is manually run.",
+      "evidence": "spotify_etl.py:298-302 — per-track feature fetch with `if feat_resp.status_code != 200: continue`. No counter of failures per batch; no abort-on-failure-rate logic.",
+      "recommendation": "Track a failure count per call; if > 50% of attempted tracks fail in a batch, log a warning and abort the featurization for the run (status='failed'). The next run will retry the unfeaturized tracks via the existing logic. Alternatively, schedule a periodic `--refeaturize` to mop up gaps."
+    },
+    {
+      "id": "F-013",
+      "title": "Garmin sleep upsert uses on_conflict='calendar_date,sleep_id,ts' — 3-column conflict not in schema",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": ["Correctness", "Idiomaticness"],
+      "file_ref": "garmin_etl.py:314",
+      "description": "sync_sleep upserts with `on_conflict='calendar_date,sleep_id,ts'`. CLAUDE.md and the inline comment at line 252 say `sleep_id` is the PK and `Postgres treats NULLs as distinct in unique constraints`. If garmin_sleep has a UNIQUE constraint on (calendar_date, sleep_id, ts) all is well; if the PK is just sleep_id, this on_conflict will fall through to INSERT and the dedup logic in lines 256-258 (skip on missing sleep_id) is what prevents duplicates — combined with the natural fact that valid Garmin sleep rows always have sleep_id. As written, the system is correct, but the conflict spec is mismatched.",
+      "evidence": "garmin_etl.py:314 — `return upsert_to_supabase(sb, 'garmin_sleep', [row], 'calendar_date,sleep_id,ts')`. The `if not sleep_id: ... skip` guard at lines 256-258 is doing double duty as the dedup mechanism since the conflict spec is over-specified.",
+      "recommendation": "Verify the actual UNIQUE constraints on garmin_sleep. Either narrow the on_conflict to match (likely 'sleep_id'), or add a UNIQUE INDEX on (calendar_date, sleep_id, ts) explicitly."
+    },
+    {
+      "id": "F-014",
+      "title": "Spotify upsert_tracks always rewrites raw_json/features even when track unchanged",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Scalability", "Idiomaticness"],
+      "file_ref": "spotify_etl.py:372-418",
+      "description": "Every track in a recently-played batch is upserted regardless of whether the row already exists with identical content. For tracks that have been seen before, the upsert re-writes raw_json + synced_at + features_fetched_at (the latter only when features are present in the call). features_source=null cases will OVERWRITE an existing populated features_source if ReccoBeats fails this run but had succeeded last run.",
+      "evidence": "spotify_etl.py:410-412: `'features_source': 'reccobeats' if feat else None, 'features_fetched_at': now if feat else None`. If a track was previously featurized but this run's ReccoBeats call returns nothing for it (e.g. transient 503), the upsert resets features_source to NULL — but the audio-feature COLUMNS themselves are also set to None, clobbering previously-good data.",
+      "recommendation": "When `feat` is empty, only upsert the metadata fields (name, artists, album, duration_ms, popularity, explicit, isrc) and explicitly exclude valence/energy/.../features_source/features_fetched_at from the upsert payload. Or filter at the build step: build the row only with present feature values."
+    },
+    {
+      "id": "F-015",
+      "title": "hrv-prediction workflow_run trigger has no failure visibility",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Robustness"],
+      "file_ref": "workflows/hrv-prediction.yml:53-57",
+      "description": "The `hrv-predict` job's if-condition: `(github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.workflow_run.conclusion == 'success')`. When the upstream Hourly Health ETL has `conclusion = 'failure'`, the prediction is silently skipped — no log line, no sync_log row. After 8 hours of upstream failures, the prediction will appear stuck without an obvious indicator that it's skipping vs. running.",
+      "evidence": "workflows/hrv-prediction.yml:53-57 — the `if:` condition filters out failed workflow_run triggers silently. No notify step exists.",
+      "recommendation": "Add a separate `if` branch that emits a notice when skipped due to upstream failure. Or relax to also run on `conclusion == 'failure'` and let `hrv_predict.py` decide whether to proceed based on data freshness."
+    },
+    {
+      "id": "F-016",
+      "title": "supplements path lacks an ETL but is in the audit scope as a manual ingestion source",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Idiomaticness"],
+      "file_ref": "supplement_lookup.py (no log_sync calls)",
+      "description": "supplement_lookup.py is a manually-invoked CLI for seeding the products dim table. It does not write to sync_log, so /status has no signal that the supplements subsystem is healthy beyond freshness of the manually-logged intake rows. CLAUDE.md mentions that supplements should appear on /status — but with no ETL heartbeat, the only signal is the most recent intake_date.",
+      "evidence": "supplement_lookup.py top section (lines 1-100 read) has no log_sync helper or sync_log writes. Compare to spotify_etl which writes 3 distinct sync_log heartbeats per run.",
+      "recommendation": "Optionally emit a sync_log row from supplement_lookup.py on `seed`/`seed-from-upc` operations tagged source='supplements', data_type='product_seed'. Manual log entries are read directly from the intake table via the /supplements POST so they already update freshness via the data table itself."
+    },
+    {
+      "id": "F-017",
+      "title": "MFP email script doesn't dedupe emails — double-export creates correct but redundant work",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Robustness"],
+      "file_ref": "myfitnesspal_email.py:153 (find_mfp_emails)",
+      "description": "If Riley exports from MFP twice (e.g. presses Export, then presses it again before the first email arrives), Gmail will hold two unread messages with matching subjects. The script iterates and processes BOTH. Since the CSVs likely have identical content, the upserts on calendar_date are idempotent — no data corruption. But sync_log will show two consecutive 'success' rows with overlapping date ranges, and the second email's import_nutrition takes the full processing time despite zero new work. Minor inefficiency only.",
+      "evidence": "myfitnesspal_email.py:366-369 — `for uid, msg in emails: if process_email(...): processed += 1`. No dedup by Date header or content hash.",
+      "recommendation": "Either accept the redundant processing (data is idempotent) or add a `mark_seen + delete_or_label` step that classifies the second-or-later email as a duplicate."
+    },
+    {
+      "id": "F-018",
+      "title": "Eight Sleep email/password re-auth on every run with no token caching",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": ["Robustness", "Scalability"],
+      "file_ref": "eight_sleep_etl.py:68-81",
+      "description": "EightSleepClient.authenticate() POSTs username/password to /v1/tokens on every script run, requesting a fresh access token. The returned token typically has hours of validity but is never cached/reused. At 1 run/day this is fine; if the cadence ever increases (e.g. to hourly), the credential-grant rate may trigger lockouts. Eight Sleep does not document rate limits but other consumer APIs with similar grants throttle at ~10/hour.",
+      "evidence": "eight_sleep_etl.py:68-81 — `authenticate()` always POSTs to AUTH_URL with grant_type=password. No file-backed token cache.",
+      "recommendation": "Cache the token in ~/.eight_sleep_tokens.json with `obtained_at`; if a previous token exists and is < 1h old, reuse it. Re-auth only on 401."
+    }
+  ],
+  "things_done_well": [
+    {
+      "title": "Spotify high-water-mark + (played_at, track_id) PK eliminates dedup ambiguity",
+      "evidence": "spotify_etl.py:320-369 — high-water mark drives delta fetches, upsert on the natural composite PK handles any overlap, raw_json captured for replay. Excellent design for an append-only event log."
+    },
+    {
+      "title": "Spotify refresh-token rotation is handled correctly with persistence to disk and a CI re-upload step",
+      "evidence": "spotify_etl.py:197-200: `if 'refresh_token' in new: tokens['refresh_token'] = new['refresh_token']; log.info('Refresh token rotated; saving new value.')` + workflows/spotify-etl.yml:38-41 `Upload refreshed tokens to Supabase if: always()` ensures Supabase ci_tokens row stays in sync. Most projects get this wrong."
+    },
+    {
+      "title": "Garmin sleep timestamp uses sleepStartTimestampGMT explicitly with a loud-warning fallback",
+      "evidence": "garmin_etl.py:264-275 — explicit comment about local-as-UTC bug and a log.warning if GMT field is missing. This is exactly the post-mortem-driven defensive coding pattern you want."
+    },
+    {
+      "title": "WHOOP behaviors_date trigger pair handles both directions of cycle-vs-journal arrival ordering",
+      "evidence": "schemas/whoop_schema.sql:189-232 — both `compute_journal_behaviors_date()` (BEFORE journal insert) and `refresh_journal_behaviors_dates_for_cycle()` (AFTER cycle insert/update) so it doesn't matter which arrives first."
+    },
+    {
+      "title": "Hourly Health ETL workflow uses concurrency.group + cancel-in-progress: false correctly",
+      "evidence": "workflows/daily-etl.yml:9-11 — `cancel-in-progress: false` means a slow run isn't aborted; the next hour queues behind it. This is the right choice for stateful ETLs over the alternative of cancellation."
+    },
+    {
+      "title": "DST-aware HRV prediction workflow uses two UTC crons + ET-hour gate",
+      "evidence": "workflows/hrv-prediction.yml:24-46 — the dst-gate job is a clever way to ensure 23:50 ET fires exactly once year-round despite GitHub Actions cron being TZ-naive."
+    },
+    {
+      "title": "Notion journal sync correctly skips unchanged pages via last_edited_time guard",
+      "evidence": "journal_etl.py:347-352 — only re-fetches blocks/re-embeds when notion_edited_at advances. Saves Voyage API calls at $$ scale + Notion rate budget."
+    },
+    {
+      "title": "Eight Sleep multi-session day handling is internally consistent",
+      "evidence": "eight_sleep_etl.py:241-263 — explicitly recognizes that day-level sleepDuration is main-only while stage totals are all-sessions, and switches to per-session stageSummary aggregation. Documents the issue inline."
+    },
+    {
+      "title": "Spotify Feb-2026 API migration is handled with per-id GETs and explained inline",
+      "evidence": "spotify_etl.py:237-258 — comment explaining the removed batch endpoint, replacement per-id calls, 50ms sleep between calls. Good post-mortem documentation."
+    },
+    {
+      "title": "ci_token_helper upload/download pattern is small, focused, and well-aligned with the workflow",
+      "evidence": "ci_token_helper.py — single-purpose script, parallel download+upload before+after every ETL run, mediated by Supabase. Solves the GitHub Actions ephemeral-runner-tokens problem cleanly."
+    },
+    {
+      "title": "MFP CSV parser handles wide-vs-long format auto-detection + column-header normalization",
+      "evidence": "myfitnesspal_import.py:67-76, 124-132 — normalises 'Carbohydrates (g)' → 'carbohydrates' so MFP's locale-specific suffix variations don't break parsing."
+    },
+    {
+      "title": "Backfill detection (hrv_backfill_check.py) uses sync_log signals AND row-scan, covering trigger UPDATE/DELETE paths",
+      "evidence": "hrv_backfill_check.py:39-58 — explains that the row-scan check misses upsert UPDATEs (which don't bump synced_at) and DELETEs (no row left to find). Companion Postgres trigger emits sync_log signals to plug both holes."
+    },
+    {
+      "title": "Spotify ETL writes 3 distinct sync_log heartbeats per run (plays + reccobeats + musicbrainz) including no-ops",
+      "evidence": "spotify_etl.py:687-733 — heartbeats for every subsystem regardless of records_synced=0. The reccobeats heartbeat differentiates 'no items to enrich' (success) from 'tried and failed' (partial)."
+    }
+  ],
+  "questions_for_followup": [
+    "Confirm the actual UNIQUE constraints on garmin_daily_summary / garmin_heart_rate / garmin_hrv / garmin_stress / garmin_training_status / garmin_sleep — is the conflict spec ('calendar_date,ts') matching a real constraint or falling through to plain INSERT?",
+    "How is `refresh_materialized_views` implemented? Is it using REFRESH CONCURRENTLY? Two parallel ETLs end with this RPC.",
+    "What's the actual behavior when WHOOP returns a cycle in score_state='PENDING_SCORE' and a later sync returns the same cycle as 'SCORED'? Does the upsert replace cleanly, and do downstream HRV analyses correctly ignore the pending row?",
+    "Is there any alerting on GitHub Actions failure beyond manual inspection of the 30-day sync_log? E.g., is anyone notified when daily-etl.yml fails three runs in a row?",
+    "Is the WHOOP cycle's timezone_offset ever observed to change for a given cycle_id during re-scoring? If yes, the journal behaviors_date trigger has a latent bug (F-002).",
+    "Does the Spotify recently-played API ever return items older than the high-water mark in normal operation? If yes, F-007's risk is meaningful and needs a periodic full-sweep mode."
+  ]
+}

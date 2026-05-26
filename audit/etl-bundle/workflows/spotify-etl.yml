@@ -1,0 +1,41 @@
+name: Spotify ETL
+
+on:
+  schedule:
+    # Every 2h at :50 — slots into the existing :00/:15/:30/:45 cadence.
+    # Spotify's recently-played caps at 50 items; 2h gives margin for heavy listening.
+    - cron: '50 */2 * * *'
+  workflow_dispatch: # Manual trigger for testing
+
+concurrency:
+  group: spotify-etl
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  spotify-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install httpx supabase python-dotenv
+
+      - name: Download Spotify tokens from Supabase
+        run: python ci_token_helper.py download spotify
+
+      - name: Run Spotify ETL
+        run: python spotify_etl.py
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+
+      - name: Upload refreshed tokens to Supabase
+        # Spotify rotates refresh tokens occasionally — persist whatever's on disk
+        if: always()
+        run: python ci_token_helper.py upload spotify

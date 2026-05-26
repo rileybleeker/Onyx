@@ -1,0 +1,230 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "5ceb269",
+  "fired_at": "2026-05-26T03:53:13.709753+00:00",
+  "usage": {
+    "prompt_tokens": 66609,
+    "completion_tokens": 10900,
+    "total_tokens": 77509,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 7168,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-4.1",
+      "review_date": "2026-05-26",
+      "bundle_commit": "5ceb269"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "Most ETLs use natural-key upserts correctly and respect table PKs, but multiple pipelines serialize JSONB payloads with json.dumps before upsert, storing JSON as strings (not objects). This breaks raw_json querying and can silently impair downstream analysis. A few conflict-key choices in Garmin should be verified against the actual unique constraints to avoid non-matching ON CONFLICT. Backfill windows appear consistent and idempotent across sources."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "Token refresh handling is solid (WHOOP/Spotify) and workflows prevent overlap via concurrency groups. However, HTTP fetches across Eight Sleep/WHOOP/Garmin lack retries/backoff for 5xx/timeouts beyond a few spots (401/429), risking silent partials. IMAP flows are resilient, marking as read only on success. sync_log logging exists widely, but several scripts omit sync_end/sync_start leading to inconsistent status visibility."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Pagination and HWM patterns are used (Spotify), and batching is generally reasonable. WHOOP and Spotify artist enrichment are rate-limit-aware. One notable inefficiency: Eight Sleep fetches all intervals every run and only filters client-side, which can scale poorly as history grows. ReccoBeats enrichment does a two-step per chunk that could be reduced."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Clear separation of fetch/parse/write, consistent upsert helpers, and appropriate use of Supabase client. Good use of triggers and post-ETL maintenance steps. Minor inconsistencies (e.g., double-encoding JSONB, schema-qualified RPC usage) and limited retry logic prevent a 5."
+      }
+    },
+    "summary": "The bundle is well-structured and largely idempotent: most tables are upserted on their natural keys, pagination is implemented where applicable, and workflows gate concurrency to prevent overlaps. Spotify shows exemplary patterns: high-water mark, separate heartbeats for enrichment subsystems, and robust token refresh. WHOOP and Garmin respect key dependencies (e.g., post-run TZ backfills), and the WHOOP journal path is carefully deduped with triggers backfilling behaviors_date if cycles arrive later.\n\nThe highest-impact issue is JSONB misuse: several ETLs json.dumps raw payloads before upserting into JSONB columns, resulting in JSON strings rather than objects. This breaks raw_json querying and could degrade downstream analysis or reparse logic. Retry/backoff is also thin across Eight Sleep/WHOOP/Garmin for transient 5xx/timeout cases. A smaller but consequential inconsistency: some sync_log entries omit sync_start/sync_end fields, harming freshness diagnostics.\n\nTop 3 fixes:\n1) Stop double-encoding JSONB across Garmin/WHOOP/Eight Sleep/MFP import; write dicts/lists directly. Provide a one-time migration to CAST stringified JSON into JSONB objects in-place.\n2) Add resilient HTTP retry with exponential backoff and jitter for transient errors (5xx/timeouts) across Eight Sleep/WHOOP/Garmin clients; keep 401/429 handling as-is.\n3) Standardize sync_log across scripts to always include sync_start and sync_end heartbeats (even on no-op) and schema-qualify RPC calls. Address Eight Sleep intervals overfetch by adding date filters or a rolling-window fetch.\n",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "JSONB raw_json is double-encoded (string) in Garmin ETL",
+        "severity": "P0",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "garmin_etl.py:170",
+        "description": "Rows upserted into Garmin tables set raw_json via json.dumps(...). For JSONB columns this stores a JSON string, not an object, breaking raw_json-> queries and downstream processing.",
+        "evidence": "In sync_daily_summary row: \"raw_json\": json.dumps(stats). Similar patterns in sleep (json.dumps(sleep)), activities (json.dumps(act)), laps (json.dumps(lap)), workouts segment_targets json.dumps(...).",
+        "recommendation": "Pass native Python dict/list to Supabase so PostgREST stores JSONB objects. Remove json.dumps for JSONB columns. Run a one-time SQL migration to CAST existing stringified JSON into proper JSONB: UPDATE \u2026 SET raw_json = raw_json::jsonb WHERE jsonb_typeof(raw_json) IS NULL;"
+      },
+      {
+        "id": "F-002",
+        "title": "WHOOP ETL stores JSONB as strings via json.dumps",
+        "severity": "P0",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "whoop_etl.py:232",
+        "description": "sync_cycles/sync_recovery/sync_sleep/sync_workouts use json.dumps for raw_json fields. This inserts string values into JSONB columns, impairing JSON operations.",
+        "evidence": "E.g., sync_cycles rows: \"raw_json\": json.dumps(c). Similar in recovery (r), sleep (s), workouts (w).",
+        "recommendation": "Remove json.dumps and send dicts directly. Backfill existing rows with ALTER TABLE + UPDATE casting raw_json::jsonb where needed."
+      },
+      {
+        "id": "F-003",
+        "title": "Eight Sleep ETL json.dumps raw_json into JSONB",
+        "severity": "P0",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "eight_sleep_etl.py:309",
+        "description": "Upsert rows set \"raw_json\": json.dumps(_strip_timeseries(raw)), which stores JSON strings instead of JSONB objects.",
+        "evidence": "rows.append(row) block in sync_user sets raw_json via json.dumps.",
+        "recommendation": "Send raw dict; remove json.dumps. Backfill existing rows by casting text to JSONB."
+      },
+      {
+        "id": "F-004",
+        "title": "MyFitnessPal importer stores meals_json/raw_json as strings",
+        "severity": "P0",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "myfitnesspal_import.py:171",
+        "description": "meals_json and raw_json are json.dumps-ed before upsert into JSONB columns, producing JSON strings.",
+        "evidence": "db_rows append: \"meals_json\": json.dumps(meals), \"raw_json\": json.dumps({...}).",
+        "recommendation": "Insert dicts directly (meals_json as dict, raw_json as dict). Add a migration to coerce existing rows to JSONB objects."
+      },
+      {
+        "id": "F-005",
+        "title": "Thin retry/backoff for transient HTTP failures (5xx/timeouts)",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness",
+          "Scalability"
+        ],
+        "file_ref": "eight_sleep_etl.py:78",
+        "description": "Eight Sleep/WHOOP/Garmin clients mostly lack retries on 5xx or network timeouts. WHOOP handles 401/429 but not general 5xx; Eight Sleep has none. This risks silent partials when providers transiently fail.",
+        "evidence": "EightSleepClient.get_trends/get_intervals authenticate via httpx without retry. WhoopClient._request only refreshes on 401 and sleeps on 429; other 5xx are raised and skipped. Garmin per-call try/except logs and continues without retry.",
+        "recommendation": "Introduce a shared retry wrapper with exponential backoff + jitter for idempotent GETs (httpx/requests). Retry on 5xx/timeout up to N attempts; keep 401 refresh/429-reset logic. Log partials to sync_log with error details."
+      },
+      {
+        "id": "F-006",
+        "title": "Eight Sleep intervals overfetch on every run (no server-side date filter)",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Scalability"
+        ],
+        "file_ref": "eight_sleep_etl.py:112",
+        "description": "get_intervals() fetches all intervals each run, then a client-side filter keeps only the target window. As history grows, this becomes increasingly wasteful.",
+        "evidence": "sync_user: intervals = client.get_intervals(user_id); then interval_by_date[...] limited to date window. No API params reduce server payload.",
+        "recommendation": "If API supports it, add from/to/date-range params to intervals. Otherwise, cache a max seen ts/date and request only recent intervals, or skip intervals entirely when trend v2 has the needed metrics for the window."
+      },
+      {
+        "id": "F-007",
+        "title": "Inconsistent sync_log heartbeats (missing sync_start/sync_end)",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "journal_etl.py:183",
+        "description": "Some ETLs omit sync_start/sync_end fields, hurting freshness visibility. journal_etl logs only sync_start; whoop_journal_email and myfitnesspal_email omit sync_start/end entirely.",
+        "evidence": "journal_etl.log_sync sets sync_start, no sync_end; myfitnesspal_email.log_sync and whoop_journal_email.log_sync don\u2019t include sync_start/sync_end.",
+        "recommendation": "Standardize a shared log_sync utility to always set sync_start and sync_end. Emit a heartbeat even on 0-record runs to keep /status consistent."
+      },
+      {
+        "id": "F-008",
+        "title": "Schema-qualified RPC inconsistency for materialized view refresh",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "eight_sleep_etl.py:405",
+        "description": "eight_sleep_etl calls sb.rpc('refresh_materialized_views') without schema, while garmin/whoop use sb.schema('pds').rpc(...). If the function lives under pds, the unqualified call will fail.",
+        "evidence": "eight_sleep_etl: sb.rpc('refresh_materialized_views', {}). Other scripts: garmin_etl uses sb.schema('pds').rpc('refresh_materialized_views').",
+        "recommendation": "Use sb.schema('pds').rpc('refresh_materialized_views') consistently or move the function to public. Log and surface failures in sync_log."
+      },
+      {
+        "id": "F-009",
+        "title": "Verify Garmin ON CONFLICT targets match actual unique constraints",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "garmin_etl.py:560",
+        "description": "Upserts use conflict keys like 'calendar_date,ts' and 'activity_id,ts'. If the DB unique index is only on calendar_date or activity_id, ON CONFLICT won\u2019t match and can create duplicates (or fail at insert).",
+        "evidence": "Examples: upsert_to_supabase(... 'garmin_daily_summary', ..., 'calendar_date,ts'); upsert garmin_activities on 'activity_id,ts'; laps on 'activity_id,lap_index,ts'. Garmin schema is not in this bundle to confirm.",
+        "recommendation": "Cross-check conflict targets against actual unique indexes. Align the conflict column set to the table\u2019s PK/unique constraint (e.g., activity_id if that\u2019s the PK). Add a CI smoke test to reject mismatched on_conflict specs."
+      },
+      {
+        "id": "F-010",
+        "title": "ReccoBeats enrichment uses 1+N requests per chunk (avoidable)",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "spotify_etl.py:261",
+        "description": "The ETL calls /track with batched IDs, then for each item calls /track/{id}/audio-features, doubling request count. This scales poorly if many tracks arrive in a burst.",
+        "evidence": "fetch_audio_features_reccobeats: GET /track?ids=... returns content with ReccoBeats ids, then loops per item to GET /track/{rb_id}/audio-features.",
+        "recommendation": "Prefer a single batch features endpoint if available, or parallelize with bounded concurrency and backoff. Cache resolved RB ids to avoid re-resolving for repeats."
+      },
+      {
+        "id": "F-011",
+        "title": "Eight Sleep trend parsing may miss/rename nested score fields",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "eight_sleep_etl.py:214",
+        "description": "safe_get paths like sleepDurationSeconds.score from sleepQualityScore/routine may not match actual v2 payload field names, risking NULL scores silently.",
+        "evidence": "parse_trend_day: 'sleep_duration_score': safe_get(quality, 'sleepDurationSeconds', 'score'); check official v2 schema for exact path names.",
+        "recommendation": "Log when expected score fields are missing and add unit tests with representative v2 payloads. Consider storing the source sub-objects (as JSONB) alongside parsed scalars to enable post-hoc fixes."
+      },
+      {
+        "id": "F-012",
+        "title": "WHOOP artists/body measurements minor style and consistency nits",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness"
+        ],
+        "file_ref": "whoop_etl.py:77",
+        "description": "A few unused imports (hashlib), inconsistent spacing, and repeated json.dumps patterns reduce clarity.",
+        "evidence": "whoop_etl imports hashlib but does not use it; repeated json.dumps across sync_* functions (also a correctness defect captured in F-002).",
+        "recommendation": "Prune unused imports, DRY shared helpers, and adopt a shared JSONB upsert utility to prevent double-encoding."
+      }
+    ],
+    "things_done_well": [
+      "Consistent upsert-on-natural-key design across ETLs (WHOOP: cycle_id/sleep_id/workout_id; Spotify: played_at+track_id; Eight Sleep: calendar_date+bed_side).",
+      "Spotify ETL shows robust patterns: high-water mark fetch, three separate sync_log heartbeats (plays, ReccoBeats, MusicBrainz), and token refresh with rotation persistence.",
+      "WHOOP journal path is thoughtfully idempotent: CSV importer dedupes on (cycle_date, question), IMAP flow marks read on success only, and DB triggers backfill behaviors_date when cycles land later.",
+      "Garmin/WHOOP workflows prevent overlapping runs via concurrency groups; token persistence via ci_token_helper is clean and per-service isolated.",
+      "TZ/backfill orchestration: GPS TZ backfill invoked post-Garmin; WHOOP TZ backfill invoked post-WHOOP \u2014 reduces cross-source ordering hazards.",
+      "Journal ETL uses edit-time guard and batch embeddings with a reputable model; vector dim matches schema and chunking is conservative."
+    ],
+    "questions_for_followup": [
+      "Confirm the exact unique/primary key definitions for garmin_* tables (daily_summary, activities, laps, workouts). Should ON CONFLICT target only activity_id (activities) and calendar_date (daily_summary), or do composite uniques exist as coded?",
+      "Are raw_json and meals_json columns declared JSONB in all affected tables (Garmin, WHOOP, MFP, Eight Sleep)? If yes, can we run a migration to coerce existing stringified JSON into proper JSONB (and add a guard test)?",
+      "Eight Sleep intervals API: is there a server-side date-range filter we can leverage? If not, what is the typical intervals payload size for the account, and should we introduce a rolling max(date) cache to avoid repeated full pulls?",
+      "For sync_log standardization: do we want every subsystem to include both sync_start and sync_end, and to log on strict no-op runs (0 records) for heartbeat visibility?",
+      "ReccoBeats API: is there a batch audio-features endpoint to avoid the current 1+N pattern? If not, what QPS limits apply so we can choose an optimal parallelization strategy?",
+      "Materialized views RPC: is refresh_materialized_views installed under schema pds or public? Should all ETLs schema-qualify the RPC call to avoid environment drift?",
+      "WHOOP pagination: please confirm the response field name next_token and request param nextToken match the current API spec to future-proof the client (names appear mixed case by design)."
+    ]
+  },
+  "bundle": "etl-bundle"
+}

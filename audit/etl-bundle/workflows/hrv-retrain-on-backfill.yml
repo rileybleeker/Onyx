@@ -1,0 +1,85 @@
+name: HRV Analysis Retrain
+
+on:
+  schedule:
+    # Hourly at :20 — backfill detector. Runs hrv_analysis.py only if a row
+    # with calendar_date < today-2 was written since the last analysis.
+    - cron: '20 * * * *'
+    # Daily at 12:00 UTC (~8am ET) — unconditional safety-net retrain.
+    # Guarantees correlations and the XGBoost model are refreshed at least
+    # once a day with all data available (yesterday's HRV has been scored
+    # by WHOOP after morning wake-up and pulled by the hourly ETL).
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: hrv-retrain
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  check-and-retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install detection dependencies
+        run: pip install supabase python-dotenv
+
+      - name: Check for backfilled historical data
+        id: check
+        run: python hrv_backfill_check.py
+
+      - name: Decide whether to retrain
+        # Run analysis unconditionally on the daily cron and on manual
+        # workflow_dispatch; otherwise run only when the backfill detector
+        # flagged historical data. GitHub exposes the triggering cron via
+        # github.event.schedule for scheduled runs.
+        id: decide
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "reason=manual dispatch"
+            echo "retrain=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event.schedule }}" == "0 12 * * *" ]]; then
+            echo "reason=daily safety-net"
+            echo "retrain=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.check.outputs.backfill_detected }}" == "true" ]]; then
+            echo "reason=backfill detected"
+            echo "retrain=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reason=no trigger"
+            echo "retrain=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache pip (analysis deps)
+        if: steps.decide.outputs.retrain == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-hrv-${{ hashFiles('requirements-analysis.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-hrv-
+
+      - name: Install analysis dependencies
+        if: steps.decide.outputs.retrain == 'true'
+        run: pip install -r requirements-analysis.txt
+
+      - name: Run full HRV analysis (refresh correlations + retrain model)
+        if: steps.decide.outputs.retrain == 'true'
+        run: python hrv_analysis.py
+
+      - name: Save refreshed model to cache
+        # Per-run key so this save never collides with an existing cache; the
+        # companion restore step in hrv-prediction.yml uses restore-keys to
+        # find the most recently saved pickle regardless of exact key.
+        if: steps.decide.outputs.retrain == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: analysis_output/xgboost_hrv_model.pkl
+          key: hrv-model-${{ runner.os }}-v1-${{ github.run_id }}

@@ -1,0 +1,164 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "5ceb269",
+  "fired_at": "2026-05-26T03:55:27.870136+00:00",
+  "usage": {
+    "prompt_tokens": 13351,
+    "completion_tokens": 7584,
+    "total_tokens": 20935,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 4544,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-4.1",
+      "review_date": "2026-05-26",
+      "bundle_commit": "5ceb269"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "Key conversions (kJ\u2192kcal; m\u2192mi; m/s\u2192min/mi) are implemented correctly and HRV sources are not combined in shown code paths. One foreseeable correctness pitfall remains: getActivities filters/sorts by Garmin start_time_local instead of the GMT/UTC field, which can shift windows. Supplements mg-normalization currently drops non-mass units, leading to partial rollups."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "Supplement unit normalization returns NULL for many real-world units (IU, mL, oz, etc.), silently excluding rows. Several formatters treat 0 as missing, hiding valid zeros. Defensive checks exist for nulls elsewhere, but unknown-unit handling and logging are thin."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Conversions occur in canonical layers (kJ\u2192kcal at query; distance/pace in a single formatter). However, Garmin daily summaries are surfaced raw, creating a risk of future misuse of total_kilocalories by consumers outside the dedicated WHOOP calories path."
+      },
+      "idiomaticness": {
+        "score": 3,
+        "rationale": "Correct constants are used but appear as magic numbers (1609.344, 4.184) across files. Comments are strong, but a shared constants module and explicit unit-typed fields would reduce drift. The SQL unit map lacks coverage notes/tests and a non-null fallback."
+      }
+    },
+    "summary": "Overall, unit-handling is solid in core paths. The frontend formatter correctly converts metric storage to the UI\u2019s mile-based display using 1609.344 and derives pace from m/s to min/mile with edge handling for 60s rollovers. The WHOOP TDEE query uses whoop_cycles.kilojoule with a correct 4.184 divisor and applies the +12h ET day-tagging rule consistent with the documentation. HRV sources are kept distinct in the visible code: Garmin HRV is fetched separately from WHOOP recovery RMSSD and Eight Sleep trends; the workout\u2013sleep gap analysis uses WHOOP RMSSD exclusively for the outcome.\nThe main gaps are robustness and drift risks. The SQL pds.unit_to_mg_factor returns NULL for a wide range of real-world supplement units (IU, mL, oz, drops, scoops, capsule counts) and even collapses \u201cmg/mL\u201d to an unrecognized token; this silently removes rows from the compound-intake rollup. A second risk: getActivities filters/orders on Garmin start_time_local rather than *_gmt, a historically problematic field that encodes local time as UTC. While many displays will still \u201clook okay,\u201d boundary windows can be off by several hours. Finally, magic numbers are repeated without a single source of truth, and zero values for distances/durations format as em dashes, which can hide data.\nAddressing these: (1) extend (or restructure) unit normalization to cover IU and volume/serving-based units with explicit fallbacks and logging; (2) standardize on *_gmt for Garmin times in queries; (3) introduce shared unit constants; (4) render 0 explicitly. These changes would raise robustness and idiomaticness without large refactors.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Supplement unit normalization silently drops common units (IU, mL, oz, etc.)",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+        "description": "The SQL function pds.unit_to_mg_factor only recognizes mass units (mg, g, \u00b5g, kg). It returns NULL for unrecognized units, causing rows to be excluded from pds.supplement_intake_by_compound. Real-world labels often use IU (vitamins A/D/E), volume (mL, fl-oz), or serving-based units (drops, scoops, capsules). The regex also collapses compound strings like \"mg/mL\" to \"mgml\", which then returns NULL.",
+        "evidence": "Function body shows CASE mapping for mg/g/mcg/\u00b5g/kg only and ELSE NULL. Comment in SQL_UNITS.md: \"Returns NULL for unrecognized units \u2014 silently drops rows... Does NOT handle IU, oz, mL, fl-oz, drops, scoops, capsules... 'mg/mL' \u2192 'mgml' \u2192 NULL\".",
+        "recommendation": "Add coverage for common units and introduce explicit fallbacks: (a) Extend dictionary for volume (mL, L) with concentration-aware paths when per-serving mass is available; (b) Handle IU via compound-specific mappings (e.g., Vitamin D: 1 IU = 0.025 \u00b5g cholecalciferol) by moving conversion to a function that accepts (compound_name, unit) or by joining to a per-compound unit map; (c) For truly unconvertible units, emit a sentinel (e.g., 0 with flagged column) rather than NULL and add a log/metric of unknown-unit counts so rows aren\u2019t silently dropped."
+      },
+      {
+        "id": "F-002",
+        "title": "Garmin activities filtered/sorted by start_time_local instead of *_gmt",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "queries.ts:getActivities",
+        "description": "getActivities uses start_time_local for the date window and ordering. Historical notes indicate *Local encodes local wall-clock as UTC, which can shift comparisons/sorts by several hours versus true instants. This risks off-by-hours windowing and mis-ordered activity lists near range boundaries.",
+        "evidence": "Code: .from(\"garmin_activities\").select(\"*\").gte(\"start_time_local\", since.toISOString()).order(\"start_time_local\", { ascending: false }). CLAUDE excerpt warns that prior *Local fields encoded local time as UTC.",
+        "recommendation": "Use start_time_gmt for filtering and ordering (consistent with getWorkoutSleepGap). If UI requires local-time display, convert on the client from *_gmt with a known timezone. Consider deprecating exposure of *Local fields in queries to prevent accidental reuse."
+      },
+      {
+        "id": "F-003",
+        "title": "Risk of calorie-source conflation (Garmin total_kilocalories vs WHOOP kJ\u2192kcal)",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Scalability"
+        ],
+        "file_ref": "queries.ts:getDailySummaries; SQL_UNITS.md:Calories decision",
+        "description": "WHOOP is the canonical source for daily energy expenditure (convert kJ/4.184). While getWhoopCaloriesBurnt implements this correctly, getDailySummaries surfaces raw Garmin daily summaries (which likely include total_kilocalories). Downstream charts or KPIs could accidentally plot Garmin calories, violating the source-of-record decision.",
+        "evidence": "CLAUDE.md excerpt in SQL_UNITS.md: \u201cDon\u2019t substitute Garmin\u2019s total_kilocalories.\u201d Code exposes garmin_daily_summary via select(\"*\") with no guardrails.",
+        "recommendation": "Reduce drift sites: (1) Avoid exposing raw Garmin calorie fields where not explicitly needed; or alias them as garmin_total_kilocalories; (2) Centralize a single TDEE query (getWhoopCaloriesBurnt) and refactor consumers to use it; (3) Add a lint/test that blocks Garmin calories in TDEE contexts."
+      },
+      {
+        "id": "F-004",
+        "title": "HRV semantic conflation remains a latent risk across sources",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "queries.ts:getHrvData, getWhoopRecovery, getEightSleepTrends, getRunningRecoveryContext",
+        "description": "Garmin HRV (time-weighted average), WHOOP RMSSD, and Eight Sleep\u2019s avg_hrv are different constructs sharing the label \u201cHRV.\u201d Current code fetches them separately (good), but generic field names (e.g., whoop_hrv in recovery_vs_pace) and exposing multiple HRVs raise the risk of downstream averaging/substitution.",
+        "evidence": "Separate getters exist for Garmin HRV and WHOOP recovery; Eight Sleep trends returns avg_hrv. SQL_UNITS.md warns against mixing them.",
+        "recommendation": "Enforce source- and algorithm-specific naming end-to-end (e.g., garmin_hrv_avg_ms, whoop_hrv_rmssd_ms, eight_sleep_hrv_unknown_ms). Provide a typed union or discriminated type in the API layer and add tests to prevent cross-source joins/charts without explicit intent."
+      },
+      {
+        "id": "F-005",
+        "title": "Zero values render as missing in formatters (silent loss of legitimate zeros)",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "format.ts:formatDuration, formatDistance, formatPace",
+        "description": "formatDuration and formatDistance treat 0 as falsy and return an em dash, hiding valid 0-second or 0-meter values. formatPace hides 0 m/s (rest) similarly. While rare for aggregates, laps/segments can be zero-length or placeholder rows.",
+        "evidence": "formatDuration: if (!seconds) return \"\u2014\"; formatDistance: if (!meters) return \"\u2014\"; formatPace: if (!speedMps || speedMps === 0) return \"\u2014\".",
+        "recommendation": "Use explicit null checks (seconds == null) and render zeros explicitly (e.g., \u201c0m\u201d, \u201c0s\u201d, \u201c\u2014\u201d only for null). For pace, consider \u201c\u2014\u201d for 0 m/s but differentiate from null via tooltip or muted style."
+      },
+      {
+        "id": "F-006",
+        "title": "Magic numbers for units are duplicated without a single source of truth",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness",
+          "Scalability"
+        ],
+        "file_ref": "format.ts:1609.344 in formatDistance/formatPace; queries.ts:getWhoopCaloriesBurnt(4.184)",
+        "description": "Constants 1609.344 (m/mi) and 4.184 (kJ/kcal) appear inline. Repetition risks drift and complicates audits.",
+        "evidence": "formatDistance and formatPace both inline 1609.344; getWhoopCaloriesBurnt inlines 4.184.",
+        "recommendation": "Create a shared constants module (e.g., units.ts) exporting METERS_PER_MILE and KILOJOULES_PER_KILOCALORIE with source comments. Import across both frontend and query layers."
+      },
+      {
+        "id": "F-007",
+        "title": "Early rounding of kcal in TDEE query",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness",
+          "Robustness"
+        ],
+        "file_ref": "queries.ts:getWhoopCaloriesBurnt",
+        "description": "The query converts kJ\u2192kcal and immediately Math.rounds to an integer. This forfeits fractional precision that might be useful for aggregation or alternate displays.",
+        "evidence": "const kcal = Math.round(Number(c.kilojoule) / 4.184);",
+        "recommendation": "Return a precise numeric (e.g., with one decimal) from the query and defer rounding to the final display. If integers are desired, document the choice and perform rounding at the presentation layer."
+      }
+    ],
+    "things_done_well": [
+      "Correct kJ\u2192kcal conversion with clear source-of-record comments and +12h ET attribution in getWhoopCaloriesBurnt.",
+      "Distance and pace formatting are accurate (1609.344; m/s\u2192min/mi with 60s rollover handling).",
+      "HRV sources are fetched separately; workout\u2013sleep gap analysis uses WHOOP RMSSD only, avoiding conflation.",
+      "Timezone-aware helpers (etDate, whoopSleepDay) reflect WHOOP\u2019s labeling and US-ET conventions.",
+      "Null-safety patterns in queries (return [] on no data; defensive filters) reduce runtime errors."
+    ],
+    "questions_for_followup": [
+      "Which UI surfaces currently consume garmin_daily_summary.total_kilocalories? Can we audit and migrate all TDEE displays to getWhoopCaloriesBurnt?",
+      "Do we have an inventory of supplement ingredient units present in the DB (IU, mL, oz, servings)? This would guide prioritization of unit_to_mg_factor coverage.",
+      "Would you accept compound-aware IU conversion (e.g., Vitamin D/E/A specific factors) via a reference table joined in the view, or should we display IU separately with a flag when conversion is ambiguous?",
+      "Can we deprecate or hide *Local timestamp fields at the API/query layer to prevent accidental reuse (as with getActivities)?",
+      "Are there any charts/views that currently combine Garmin HRV, WHOOP RMSSD, or Eight Sleep HRV? If so, can we rename fields and split visuals by source?",
+      "Should we introduce a shared units/constants module consumable by both frontend and query layers to eliminate magic numbers and centralize documentation?"
+    ]
+  },
+  "bundle": "units-bundle"
+}

@@ -1,0 +1,173 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-2.5-pro",
+  "bundle_commit": "5ceb269",
+  "fired_at": "2026-05-26T03:40:21.074033+00:00",
+  "usage": {
+    "promptTokenCount": 37812,
+    "candidatesTokenCount": 3631,
+    "totalTokenCount": 46195,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 37812
+      }
+    ],
+    "thoughtsTokenCount": 4752,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "claude-3.5-sonnet-20240620",
+      "review_date": "2026-05-25",
+      "bundle_commit": "5ceb269"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "The implementation is mostly correct, but contains a load-bearing error in the `whoop_journal` trigger, which fails to derive correct `et_date` and `local_date` values. There is also a subtle bug in `onyx_tz_source` provenance attribution, causing it to be mislabeled when falling back to the default ET timezone after a trip. These issues lead to incorrect dates and metadata for specific sources."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "The system is highly robust, with excellent handling of DST transitions, travel-day detection, and pragmatic fallbacks for data quality issues (e.g., `garmin_hrv`). The Python backfill scripts are idempotent and intelligently designed. The score is reduced from 5 due to the correctness issues which represent a failure mode under specific, known conditions."
+      },
+      "scalability": {
+        "score": 5,
+        "rationale": "The implementation is highly scalable. The critical `tz_for_instant` lookup is supported by a DESC index, making it efficient. Triggers are lightweight, and backfills use efficient window functions instead of row-by-row operations. The design avoids O(n) lookups and should perform well at 10x scale."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "The implementation is largely idiomatic, making excellent use of Postgres features like `AT TIME ZONE`, `BEFORE` triggers, `LATERAL` joins, and window functions. The creation of a helper function for TZD formatting is a necessary, if not perfectly idiomatic, step. The main detractor is the `whoop_journal` trigger, which breaks the compositional pattern established by all other triggers."
+      }
+    },
+    "summary": "The implementation of ADR-0001 is a strong and largely successful effort, establishing a robust framework for timezone and behavioral-day handling. The core derivation logic, tiered timezone resolution, and handling of complex cases like DST transitions are excellent. The Python backfill scripts for auto-populating `user_tz_log` are particularly impressive, demonstrating sophisticated logic for disambiguation and noise reduction. However, the implementation is marred by a few significant correctness gaps. The most critical is the trigger for `pds.whoop_journal`, which fails to use the new derivation system, resulting in incorrect `et_date` and `local_date` values for that source and undermining the 'three-date-type' principle. A secondary issue exists in the provenance tracking logic, which can mislabel the timezone source during fallbacks. These issues prevent the system from being fully correct today. Top 3 recommended fixes are: 1) Rewrite the `whoop_journal` trigger to properly derive all three date columns by joining to its parent `whoop_cycle`. 2) Refine the provenance logic in `derive_onyx_dates` to be more precise about when `user_tz_log` is the active source. 3) Correct a minor variable scope bug in the `whoop_tz_backfill.py` script's logging.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "whoop_journal trigger incorrectly populates onyx_et_date and onyx_local_date",
+        "severity": "P0",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:203",
+        "description": "The `set_onyx_dates_whoop_journal` trigger sets `onyx_et_date` and `onyx_local_date` to the `cycle_date`, a date-only field. This bypasses the `derive_onyx_dates` function and fails to produce correct clock-day dates based on the cycle's actual timestamp, leading to incorrect data for this source.",
+        "evidence": "NEW.onyx_et_date         := NEW.cycle_date;\nNEW.onyx_local_date      := NEW.cycle_date;",
+        "recommendation": "Modify the trigger to look up the `start_time` and `timezone_offset` from the associated `pds.whoop_cycles` row and call `pds.derive_onyx_dates` to correctly populate all three date columns."
+      },
+      {
+        "id": "F-002",
+        "title": "Provenance `onyx_tz_source` can be misattributed on fallback to ET",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql:160",
+        "description": "In `derive_onyx_dates`, if `tz_for_instant` finds no covering `user_tz_log` entry and falls back to 'America/New_York', the `onyx_tz_source` is set to 'user_tz_log' if any historical log entries exist. The source should only be 'user_tz_log' if an entry from that table was actively used to determine the timezone.",
+        "evidence": "resolved_source := COALESCE(tz_source_in, 'user_tz_log');\n-- This line is reached even when the COALESCE in tz_for_instant is what returns 'America/New_York'.",
+        "recommendation": "Refine the logic to check if the selected `tz` came from the `user_tz_log` table explicitly, rather than relying on a broad `EXISTS` check, before assigning 'user_tz_log' as the source."
+      },
+      {
+        "id": "F-003",
+        "title": "Garmin HRV trigger falls back to using a single date for all three date columns",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness",
+          "Correctness"
+        ],
+        "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql:168",
+        "description": "The `set_onyx_dates_garmin_hrv` trigger correctly identifies that `start_timestamp` is always NULL in historical data and falls back to using `calendar_date` for all three `onyx_*` dates. While pragmatic, this collapses three distinct concepts into one, losing precision and silently propagating a data quality issue.",
+        "evidence": "ELSE\n    NEW.onyx_et_date         := NEW.calendar_date;\n    NEW.onyx_behavioral_date := NEW.calendar_date;\n    NEW.onyx_local_date      := NEW.calendar_date;\n    NEW.onyx_tz_source       := 'default_et_fallback';\nEND IF;",
+        "recommendation": "This is a data quality issue at the source. The long-term fix is to investigate why the Garmin ETL does not populate `start_timestamp`. For now, document this limitation clearly in the table's comments."
+      },
+      {
+        "id": "F-004",
+        "title": "Undefined variable used in log message in WHOOP backfill script",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "whoop_tz_backfill.py:223",
+        "description": "The script `whoop_tz_backfill.py` constructs a log message for proposed inserts using the variable `log_offset_str`, which is not defined in that scope. This will cause a `NameError` if this code path is executed.",
+        "evidence": "\"notes\": (f\"whoop-auto: cycle {c['cycle_id']} offset {whoop_offset_str}; \"\n          f\"{provenance}; log was {log_tz} ({log_offset_str})\"),",
+        "recommendation": "Replace the undefined variable `log_offset_str` with the correctly scoped `log_offset_at_start` to ensure the log message is generated correctly."
+      },
+      {
+        "id": "F-005",
+        "title": "Habit journal attribution lacks timestamp precision",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:186",
+        "description": "Similar to Garmin HRV, the `habit_journal` trigger sets all three `onyx_*` dates to the `cycle_date` because the source table lacks a timestamp for when the habit was completed. This prevents correct awake-tail attribution for habits completed after midnight.",
+        "evidence": "NEW.onyx_behavioral_date := NEW.cycle_date;\nNEW.onyx_et_date         := NEW.cycle_date;\nNEW.onyx_local_date      := NEW.cycle_date;",
+        "recommendation": "Consider adding a `completed_at TIMESTAMPTZ` column to `pds.habit_journal` and populating it from the application layer. Then, update the trigger to use this new timestamp with `derive_onyx_dates`."
+      },
+      {
+        "id": "F-006",
+        "title": "Inconsistent provenance passed to derive_onyx_dates",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql:140",
+        "description": "Some trigger functions (e.g., `set_onyx_dates_garmin_sleep`) call `derive_onyx_dates` with `NULL` for the `tz_source_in` parameter, relying on the function's internal `COALESCE` logic. Others are explicit. This inconsistency makes the call sites harder to reason about.",
+        "evidence": "SELECT * INTO d FROM pds.derive_onyx_dates(\n    NEW.sleep_start,\n    NULL,    -- no source TZ; fall through to user_tz_log \u2192 ET\n    NULL\n);",
+        "recommendation": "Update all trigger functions to pass an explicit, non-NULL `tz_source_in` value that corresponds to the tier of the resolution hierarchy they intend to use (e.g., 'user_tz_log' for `garmin_sleep`)."
+      },
+      {
+        "id": "F-007",
+        "title": "`tz_for_instant` behavior before first log entry is implicit",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql:75",
+        "description": "The function correctly falls back to 'America/New_York' for any timestamp before the first `effective_from` in `user_tz_log`. This is the desired behavior but relies on the user knowing that the log doesn't need an initial entry for the home timezone. This could be confusing.",
+        "evidence": "SELECT COALESCE(\n    (SELECT tz\n       FROM pds.user_tz_log\n      WHERE effective_from <= ts\n      ORDER BY effective_from DESC\n      LIMIT 1),\n    'America/New_York'\n);",
+        "recommendation": "Add a comment to the `pds.user_tz_log` table definition clarifying that an initial entry for 'America/New_York' is not required, as it is the system-wide default."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Robust DST handling in tz_log_gaps view and backfill script",
+        "file_ref": "sql/adr_0001_06_tz_log_gaps_view.sql:45",
+        "why_it_matters": "The logic explicitly checks timezone offsets at both the start and end of a WHOOP cycle. This correctly distinguishes genuine travel from DST-transition artifacts, preventing false positives and making the automated gap detection highly reliable."
+      },
+      {
+        "title": "Intelligent IANA Disambiguation in WHOOP Backfill Script",
+        "file_ref": "whoop_tz_backfill.py:101",
+        "why_it_matters": "The script solves the non-bijective offset-to-IANA problem by learning from prior manual `user_tz_log` entries. This data-driven approach is far more accurate than a static map and makes the automated backfill much more useful."
+      },
+      {
+        "title": "Efficient and Robust `daily_health_matrix_behavioral` View",
+        "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql:198",
+        "why_it_matters": "The view uses `LATERAL` joins to correctly and efficiently select the single longest WHOOP cycle per behavioral day. This is a robust pattern for handling potential duplicates (e.g., naps) and is more performant than alternatives like window functions in subqueries."
+      },
+      {
+        "title": "Effective Same-Offset Filtering in GPS Backfill Script",
+        "file_ref": "gps_tz_backfill.py:110",
+        "why_it_matters": "The script avoids creating noisy `user_tz_log` entries by checking if an inferred IANA zone (e.g., `America/Toronto`) has the same UTC offset as the current zone (`America/New_York`). This focuses the log on changes that have a material impact on date attribution."
+      },
+      {
+        "title": "Efficient Window Function for Transition Day Backfill",
+        "file_ref": "sql/adr_0001_05_transition_day_flag.sql:43",
+        "why_it_matters": "The backfill for the `onyx_is_transition_day` flag uses a single `UPDATE ... FROM` with a `LAG()` window function. This is vastly more performant and scalable than a trigger-based cascade, showing a mature approach to data migrations."
+      }
+    ],
+    "questions_for_followup": [
+      "The `garmin_hrv` table consistently has NULL `start_timestamp` values, forcing the trigger to fall back to `calendar_date`. Is this a known and accepted limitation of the Garmin ETL, or should a bug be filed to investigate populating this field?",
+      "Given the `whoop_journal` and `habit_journal` triggers currently lack timestamp precision, what is the priority for enhancing their respective source tables (`pds.habit_journal`) or join logic (`pds.whoop_journal`) to enable full, correct three-date attribution?",
+      "The `trips` view logic assumes a trip is any non-ET period. Should there be a way to distinguish between different non-ET locations if a user flies from, e.g., Berlin to Tokyo without returning to NY in between?"
+    ]
+  },
+  "bundle": "tz-bundle"
+}

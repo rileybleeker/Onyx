@@ -1,0 +1,268 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "5ceb269",
+  "fired_at": "2026-05-26T03:34:33.380236+00:00",
+  "usage": {
+    "prompt_tokens": 50448,
+    "completion_tokens": 11480,
+    "total_tokens": 61928,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 7360,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "GPT-4o",
+      "review_date": "2026-05-26",
+      "bundle_commit": "5ceb269"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "Core attribution/view logic is sound, but lack of foreign keys and a predictions table key mismatch risk silent join failures or write-time conflicts."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "ADR-0001 trigger machinery, sentinel views, and defensive LATERAL dedup are thoughtfully implemented, though trigger sprawl and missing FKs invite drift."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Volumes are modest and most joins are indexed; one hot-path expression index is missing but partitioning isn\u2019t warranted yet."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Generally idiomatic Postgres (GIN/HNSW/LATERAL/partial indexes), but RLS policy targets are inconsistent and FKs are underused."
+      }
+    },
+    "summary": "Overall, the pds schema is well-shaped for a single-user analytics system: attribution is centralized in derive_onyx_dates(), informative canary views catch TZ/ETL issues, and the behavioral matrix uses LATERAL de-duplication patterns that match the data semantics. JSONB is used judiciously where schemas are open-ended (supplement ingredients, Spotify payloads), and the journal embeddings are indexed correctly for vector search.\n\nThe riskiest areas are referential integrity and a subtle modeling/DDL mismatch: only one foreign key exists across many fact/dim relationships (WHOOP, Spotify, Garmin laps), which makes silent orphaning possible and shifts error detection from writes to later joins. Separately, pds.hrv_predictions is defined with a composite PK that implies one row per (date, model, horizon), while the views and commentary assume multiple versions per triple; this discrepancy can lead to upsert conflicts or loss of run history. RLS is broadly consistent but several service policies target public instead of service_role, and some tables rely solely on service-role bypass rather than explicit service policies.\n\nIf I could only fix three things: (1) add NOT VALID foreign keys on core join paths (whoop_recovery/sleep\u2192cycles; spotify_plays\u2192tracks/artists; garmin_laps\u2192activities via a unique on activities.activity_id) and validate after a quick orphan audit; (2) resolve the hrv_predictions key semantics by introducing a surrogate PK and making (date, model, horizon, model_version) unique so multiple runs can coexist; (3) normalize RLS by replacing any public-targeted service policies with service_role and adding explicit service_full_access policies on tables that currently rely on bypass. These are low-risk at current scale and buy strong write-time guarantees against future ETL drift.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Add FKs: whoop_recovery/sleep.cycle_id \u2192 whoop_cycles.cycle_id",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.whoop_recovery, pds.whoop_sleep, pds.whoop_cycles",
+        "description": "Today there\u2019s no FK enforcing that recovery/sleep rows reference an existing WHOOP cycle, so deletions or out-of-order loads can create orphans that join away silently in matrix views.",
+        "evidence": "SCHEMA_DDL.md: 'Referential integrity \u2014 only 1 FK' lists whoop_recovery.cycle_id and whoop_sleep.cycle_id as notably absent.",
+        "recommendation": "Add NOT VALID FKs and then VALIDATE after an orphan check: ALTER TABLE pds.whoop_recovery ADD CONSTRAINT whoop_recovery_cycle_fkey FOREIGN KEY (cycle_id) REFERENCES pds.whoop_cycles(cycle_id) ON UPDATE CASCADE ON DELETE RESTRICT NOT VALID; ALTER TABLE pds.whoop_sleep ADD CONSTRAINT whoop_sleep_cycle_fkey FOREIGN KEY (cycle_id) REFERENCES pds.whoop_cycles(cycle_id) ON UPDATE CASCADE ON DELETE RESTRICT NOT VALID; then VALIDATE CONSTRAINT after backfill."
+      },
+      {
+        "id": "F-002",
+        "title": "Add FKs: spotify_plays.track_id/artist_id \u2192 dims",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "pds.spotify_plays, pds.spotify_tracks, pds.spotify_artists",
+        "description": "Orphan plays are possible if a track/artist row is missing or removed; downstream joins (e.g., spotify_daily_signature) would undercount features subtly.",
+        "evidence": "SCHEMA_DDL.md 'Notably absent foreign keys' lists spotify_plays.track_id and artist_id FKs as absent.",
+        "recommendation": "Enforce with deferred, NOT VALID FKs to avoid ingest-order pain: ALTER TABLE pds.spotify_plays ADD CONSTRAINT spotify_plays_track_fkey FOREIGN KEY (track_id) REFERENCES pds.spotify_tracks(track_id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED NOT VALID; and similarly for artist_id\u2192spotify_artists(artist_id); then VALIDATE after confirming no orphans."
+      },
+      {
+        "id": "F-003",
+        "title": "Garmin laps \u2192 activities FK (via unique activity_id on parent)",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "pds.garmin_activity_laps, pds.garmin_activities",
+        "description": "Laps can become orphaned from activities; current parent PK is (activity_id, ts), so no simple FK exists.",
+        "evidence": "SCHEMA_DDL.md: 'garmin_activity_laps.activity_id \u2192 garmin_activities.activity_id' listed among absent FKs; parent PK is composite.",
+        "recommendation": "If activity_id is globally unique in practice, add a parent-side unique and then the FK: CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_garmin_activities_activity_id ON pds.garmin_activities(activity_id); ALTER TABLE pds.garmin_activity_laps ADD CONSTRAINT laps_activity_fkey FOREIGN KEY (activity_id) REFERENCES pds.garmin_activities(activity_id) ON DELETE CASCADE NOT VALID; then VALIDATE. If not unique, revisit parent PK design."
+      },
+      {
+        "id": "F-004",
+        "title": "RLS service policies target public instead of service_role",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "SCHEMA_DDL.md \u2014 Row-Level Security policies",
+        "description": "Several service_full_access policies grant ALL to public, broadening scope beyond service_role; while GRANTs still block anon writes, this is non-idiomatic and fragile.",
+        "evidence": "SCHEMA_DDL.md: \u201cSeveral (whoop_*, garmin_*, sync_log) target {public} instead. Likely early-development pattern.\u201d",
+        "recommendation": "Normalize to service_role: for each affected table, DROP POLICY service_full_access (or rename) and CREATE POLICY service_full_access ON pds.<table> FOR ALL TO service_role USING (true) WITH CHECK (true); review that no policy grants ALL to public."
+      },
+      {
+        "id": "F-005",
+        "title": "Tables rely on service bypass with no explicit service policy",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.meal_events, pds.journal_entries, pds.myfitnesspal_nutrition, pds.spotify_*, pds.supplement_*, pds.weight_log, pds.habit_metadata_history",
+        "description": "A handful of tables have RLS enabled with anon_read but no explicit service policy, relying on Supabase\u2019s service-role bypass semantics; this hurts portability and policy clarity.",
+        "evidence": "SCHEMA_DDL.md notes 'A few tables have RLS enabled with anon_read but no service_* policy.'",
+        "recommendation": "Add a uniform service policy: CREATE POLICY service_full_access ON pds.<table> FOR ALL TO service_role USING (true) WITH CHECK (true); keep anon_read SELECT as-is."
+      },
+      {
+        "id": "F-006",
+        "title": "hrv_predictions PK blocks multi-run history expected by views",
+        "severity": "P1",
+        "effort": "L",
+        "dimensions": [
+          "Correctness",
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.hrv_predictions; sql/hrv_predictions_latest.sql",
+        "description": "Production lists PK(prediction_date, model, horizon_days), but views/docs assume multiple rows per triple with DISTINCT ON picking the freshest; current PK forces overwrite or write failures.",
+        "evidence": "SCHEMA_DDL.md: 'pds.hrv_predictions PK (prediction_date, model, horizon_days)'; sql/hrv_predictions_latest.sql comment: 'keeps every row from every run... DISTINCT ON picks the latest.'",
+        "recommendation": "Migrate to a surrogate PK and make versioned uniqueness explicit: ALTER TABLE pds.hrv_predictions ADD COLUMN id BIGSERIAL; ALTER TABLE pds.hrv_predictions DROP CONSTRAINT IF EXISTS hrv_predictions_pkey; ALTER TABLE pds.hrv_predictions ADD PRIMARY KEY (id); CREATE UNIQUE INDEX uq_hrv_pred_triple_version ON pds.hrv_predictions(prediction_date, model, horizon_days, COALESCE(model_version,'')); Update ETL to not upsert on the triple."
+      },
+      {
+        "id": "F-007",
+        "title": "Missing covering index for hrv_predictions_latest tiebreak",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/hrv_predictions_latest.sql",
+        "description": "The DISTINCT ON ORDER BY uses a CASE on model_version; without an expression index Postgres may sort a large working set as rows grow.",
+        "evidence": "ORDER BY prediction_date, model, horizon_days, CASE WHEN model_version LIKE 'backtest%' THEN 1 ELSE 0 END, created_at DESC.",
+        "recommendation": "Add an expression index to match the sort: CREATE INDEX IF NOT EXISTS idx_hrv_pred_latest ON pds.hrv_predictions (prediction_date, model, horizon_days, (model_version LIKE 'backtest%'), created_at DESC);"
+      },
+      {
+        "id": "F-008",
+        "title": "Duplicate/low-value indexes that mirror PKs",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.myfitnesspal_nutrition, pds.weight_log, pds.whoop_journal",
+        "description": "Several single-column indexes duplicate leading PK columns with DESC sort only, adding write overhead without improving common queries.",
+        "evidence": "SCHEMA_DDL.md: myfitnesspal_nutrition PK(calendar_date) + idx(calendar_date); weight_log PK(log_date) + idx(log_date DESC); whoop_journal PK(cycle_date, question) + idx(cycle_date).",
+        "recommendation": "Drop duplicates: DROP INDEX IF EXISTS idx_mfp_nutrition_date; DROP INDEX IF EXISTS idx_weight_log_date; DROP INDEX IF EXISTS idx_whoop_journal_date; retain more selective/behavioral-date indexes."
+      },
+      {
+        "id": "F-009",
+        "title": "Behavioral matrix repeats LATERAL+LIMIT dedup blocks",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql",
+        "description": "The view repeats near-identical LATERAL de-dupe snippets (best sleep, most-recent HRV, longest cycle), which is correct but raises maintenance cost and drift risk.",
+        "evidence": "Five LATERAL subqueries in daily_health_matrix_behavioral selecting per-day representatives.",
+        "recommendation": "Extract reusable subviews (e.g., garmin_best_sleep_per_day, whoop_longest_cycle_per_day, garmin_hrv_per_day_latest) and join those in both matrix views to DRY and ease future changes."
+      },
+      {
+        "id": "F-010",
+        "title": "Two parallel matrix views; deprecate legacy after snapshot",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.daily_health_matrix, pds.daily_health_matrix_behavioral",
+        "description": "Keeping both views invites accidental use of the legacy clock-day view by new queries and doubles maintenance burden.",
+        "evidence": "CONTEXT.md and SCHEMA_DDL.md note both are retained; snapshot exists in pds_legacy.daily_health_matrix_v0.",
+        "recommendation": "Mark pds.daily_health_matrix deprecated and plan removal: migrate remaining consumers, keep pds_legacy.daily_health_matrix_v0 as rollback, then DROP the legacy view and references."
+      },
+      {
+        "id": "F-011",
+        "title": "Trigger sprawl for ADR-0001 onyx_* population",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "SCHEMA_DDL.md \u2014 Functions and triggers",
+        "description": "11+ nearly-identical set_onyx_dates_* trigger functions are easy to drift over time and harder to test as a unit.",
+        "evidence": "SCHEMA_DDL.md: 'set_onyx_dates_* BEFORE INSERT/UPDATE triggers (11 of these), each calling derive_onyx_dates.'",
+        "recommendation": "Consolidate into 2\u20133 generic trigger functions by data shape: (instant+offset), (instant-only), and (date-only), each parameterized where feasible; replace per-table clones to reduce drift."
+      },
+      {
+        "id": "F-012",
+        "title": "Constrain enumerations (meal_events.kind, etc.)",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "pds.meal_events",
+        "description": "Free-text enums invite typos that later pivot logic won\u2019t recognize (e.g., 'Last_meal' vs 'last_meal').",
+        "evidence": "meal_schema.sql: kind TEXT NOT NULL DEFAULT 'last_meal' with no CHECK.",
+        "recommendation": "Add CHECKs: ALTER TABLE pds.meal_events ADD CONSTRAINT meal_kind_chk CHECK (kind IN ('last_meal','first_meal','snack','other')); consider similar checks for small-domain fields elsewhere (score_state, mood)."
+      },
+      {
+        "id": "F-013",
+        "title": "WHOOP journal behaviors_date cycle pick can be ambiguous",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "whoop_schema.sql",
+        "description": "compute_journal_behaviors_date() picks the first cycle by start_time for a given cycle_date; on transition days two cycles may map, and the shortest may be chosen.",
+        "evidence": "whoop_schema.sql: ORDER BY c.start_time LIMIT 1 in compute_journal_behaviors_date().",
+        "recommendation": "Mirror the matrix logic and prefer the longest cycle: change ORDER BY (c.end_time - c.start_time) DESC NULLS LAST, c.start_time DESC LIMIT 1; then re-run the backfill trigger to refresh historical rows."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Centralized behavioral-day derivation with provenance",
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql",
+        "why_it_matters": "derive_onyx_dates() and tz_for_instant() encode complex TZ/behavioral attribution once, reducing app code complexity and making attribution auditable and testable."
+      },
+      {
+        "title": "Use of LATERAL + LIMIT for per-day representative picks",
+        "file_ref": "sql/daily_health_matrix.sql",
+        "why_it_matters": "Choosing 'best sleep' or 'longest cycle' at query-time prevents duplicates from polluting features without pre-aggregation loss of detail."
+      },
+      {
+        "title": "Sentinel/diagnostic views to catch upstream drift",
+        "file_ref": "sql/adr_0001_06_tz_log_gaps_view.sql",
+        "why_it_matters": "tz_log_gaps and hrv_prediction_gaps make silent sources of analytical error visible quickly, aligning with the 'catch at write-time or early' philosophy."
+      },
+      {
+        "title": "JSONB used where schemas are open-ended, with GIN",
+        "file_ref": "pds.supplement_products",
+        "why_it_matters": "Keeping deeply nested supplement ingredients in JSONB with GIN enables flexible queries without forcing brittle column explosion; promotion paths exist via views."
+      },
+      {
+        "title": "Vector search configured idiomatically",
+        "file_ref": "pds.journal_entries",
+        "why_it_matters": "HNSW on embedding(1024) with cosine ops is a correct, performant choice for semantic search over personal journal entries."
+      }
+    ],
+    "questions_for_followup": [
+      "Is pds.garmin_activities.activity_id globally unique in practice? If yes, we can safely add UNIQUE(activity_id) to support the laps\u2192activities FK.",
+      "Should pds.hrv_predictions retain full run history per (date, model, horizon)? If yes, we\u2019ll migrate to a surrogate PK; if no, we can keep the composite PK and simplify the 'latest' views.",
+      "Does the Spotify ETL guarantee dims (tracks/artists) are upserted before plays in the same job? If not, should we mark the new FKs DEFERRABLE INITIALLY DEFERRED and/or load dims first?",
+      "Are there known orphan rows today (e.g., whoop_sleep without matching cycles) that would fail FK VALIDATE? If so, should we soft-delete or fix them before enabling constraints?",
+      "Any consumer still requires the legacy pds.daily_health_matrix? If not, can we schedule its deprecation using the existing pds_legacy snapshot as safety net?"
+    ]
+  },
+  "bundle": "schema-bundle"
+}

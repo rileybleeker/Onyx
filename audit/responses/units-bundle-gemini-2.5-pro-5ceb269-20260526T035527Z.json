@@ -1,0 +1,139 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-2.5-pro",
+  "bundle_commit": "5ceb269",
+  "fired_at": "2026-05-26T03:55:06.634491+00:00",
+  "usage": {
+    "promptTokenCount": 15387,
+    "candidatesTokenCount": 3379,
+    "totalTokenCount": 22078,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 15387
+      }
+    ],
+    "thoughtsTokenCount": 3312,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "claude-3.5-sonnet-20240620",
+      "review_date": "2026-05-25",
+      "bundle_commit": "5ceb269"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "Core conversions like kJ\u2192kcal and meters\u2192miles are correct. However, there are significant latent and active risks. The supplement unit conversion function silently drops common units (P1). A query still uses a deprecated Garmin timestamp field (`start_time_local`), likely causing incorrect date filtering (P1). The risk of semantic conflation for HRV metrics exists in upstream database views whose definitions were not provided, which could be a P0 if they are mixed."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "The system has critical robustness gaps. The primary supplement unit conversion function fails silently on unknown units, leading to data loss. Its string parsing is also brittle. Some calculations round prematurely, which could lead to precision loss in aggregate statistics. On the positive side, some formatters handle edge cases well (e.g., zero speed in `formatPace`)."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Unit conversions and business logic are largely centralized in the query layer (`queries.ts`) or database views, which is good practice and avoids logic drift in the UI. The main exception is a complex client-side join in `getWorkoutSleepGap`, but the code comments suggest this was a deliberate trade-off. This centralization makes the system relatively easy to maintain and scale."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "The code is generally well-commented and clear. Key decisions, like the choice of WHOOP for canonical calorie data, are documented with rationale in comments. The main weakness is the repeated use of magic numbers for key physical constants (e.g., 4.184, 1609.344) instead of named constants, which slightly harms readability and maintainability."
+      }
+    },
+    "summary": "The unit conversion and semantic conflation domain is in a reasonably healthy state but contains several high-leverage, latent risks. Core conversions for distance, pace, and energy expenditure are correctly implemented and centralized in the query or formatting layers. The project also shows a clear awareness of semantic conflation risks, particularly around the different HRV metrics, and avoids mixing them in the application code.\n\nThe most significant issues are 'silent failures'. The SQL function for normalizing supplement dosages to milligrams (`unit_to_mg_factor`) returns NULL for common units like 'IU', which will cause supplements to be silently dropped from analyses. This is a foreseeable data-loss bug. Similarly, a query on Garmin activities uses a `start_time_local` field, which is documented as problematic and likely leads to incorrect time-window filtering. Finally, while the application code correctly isolates different HRV sources, the risk of conflation has been pushed into upstream database views (`daily_health_matrix_behavioral`) which could not be audited. These issues represent the highest priority for remediation, as they have the potential to display incorrect data or silently corrupt statistical analyses.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Supplement unit conversion function silently drops rows with common units",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "SQL_UNITS.md:pds.unit_to_mg_factor",
+        "description": "The `pds.unit_to_mg_factor` SQL function, used to normalize supplement ingredients to milligrams, returns NULL for any unit not in its hardcoded list. This list omits common units for vitamins and other supplements, such as 'IU' (International Units), 'mL', 'oz', 'scoops', and 'capsules'. When this function is used in the `supplement_intake_by_compound` view, any ingredient with an unrecognized unit will be silently dropped from aggregations, leading to incomplete and incorrect data.",
+        "evidence": "The function's `CASE` statement has an `ELSE NULL` clause and lacks handlers for many common units.\n```sql\nELSE NULL\n```\n`SQL_UNITS.md` explicitly notes: \"Returns `NULL` for unrecognized units \u2014 silently drops rows from the rollup view... when a product spec uses IU, oz, mL, fl-oz, drops, scoops, capsules, etc.\"",
+        "recommendation": "1. Query the production `supplement_products` table to identify all distinct units currently in use. 2. Extend the `pds.unit_to_mg_factor` function to support these units. For units like 'IU' that require a substance-specific conversion factor, this may require a more complex function or a separate lookup table (`compound_to_mg_factor`). 3. For non-convertible units ('scoops', 'capsules'), decide on a handling strategy (e.g., log a warning, store dosage as a string). 4. Add monitoring to detect and alert when a new, unrecognized unit is introduced."
+      },
+      {
+        "id": "F-002",
+        "title": "Risk of HRV semantic conflation in unaudited upstream database views",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "queries.ts:517",
+        "description": "The application code correctly avoids averaging or substituting the three different HRV metrics (`whoop_hrv_rmssd_milli`, `garmin_hrv.last_night_avg_ms`, `eight_sleep_trends.avg_hrv`). However, queries for the `getHealthMatrix` and `getRunningRecoveryContext` functions rely on upstream database views (`daily_health_matrix_behavioral` and `recovery_vs_pace`, respectively) that contain generic `hrv` or `whoop_hrv` columns. The logic within these views is not available for audit. There is a significant risk that these views might be improperly combining the semantically different HRV sources, which would lead to statistically invalid data being displayed in the UI.",
+        "evidence": "`queries.ts:517` calls `from(\"daily_health_matrix_behavioral\")`. `CONTEXT.md` explicitly warns: \"Treat each as its own variable; never average or substitute.\" The source of the HRV column in the view is unknown and could violate this rule.",
+        "recommendation": "Audit the definitions of the `pds.daily_health_matrix_behavioral` and `pds.recovery_vs_pace` views. Ensure that any HRV column has a single, well-defined source (e.g., it is always WHOOP RMSSD). If a unified HRV metric is desired, it must be created with a statistically sound method (e.g., z-scoring each source independently before combining), not by direct averaging. Rename columns in the views to be specific (e.g., `whoop_hrv_rmssd_ms`) to prevent future confusion."
+      },
+      {
+        "id": "F-003",
+        "title": "Query for Garmin activities uses a potentially incorrect local timestamp field",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "queries.ts:81",
+        "description": "`CONTEXT.md` and `SQL_UNITS.md` warn that Garmin's `*Local` timestamp fields are problematic, encoding local clock time as UTC, which can cause off-by-hours errors. The `getActivities` query filters `garmin_activities` using `start_time_local`. This is compared against `since.toISOString()`, which is a true UTC value. This comparison is likely incorrect and will result in activities being included or excluded from the wrong time windows.",
+        "evidence": "```typescript\n// queries.ts:81\n.gte(\"start_time_local\", since.toISOString())\n```\nContrast this with `getWorkoutSleepGap` which correctly uses `start_time_gmt` for Garmin activities (`queries.ts:291`). This inconsistency indicates `start_time_local` is likely being used incorrectly.",
+        "recommendation": "Update the `getActivities` query to filter on the `start_time_gmt` column instead of `start_time_local` to ensure correct, timezone-aware filtering. If `start_time_gmt` is not available on `garmin_activities`, it should be added during ETL. Remove usage of `start_time_local` throughout the codebase to prevent this bug from recurring."
+      },
+      {
+        "id": "F-004",
+        "title": "Magic numbers are used for key unit conversion factors",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness"
+        ],
+        "file_ref": "queries.ts:427",
+        "description": "Key physical and conversion constants are hardcoded as magic numbers in the codebase. Examples include `4.184` for kJ-to-kcal conversion and `1609.344` for meters-to-miles conversion. While the values are correct, using unnamed numbers reduces readability and makes maintenance harder. If a constant needs to be updated, it might have to be changed in multiple places, risking inconsistency.",
+        "evidence": "`const kcal = Math.round(Number(c.kilojoule) / 4.184);` in `queries.ts:427`.\n`const miles = meters / 1609.344;` in `format.ts:75`.",
+        "recommendation": "Define a shared constants file (e.g., `constants.ts`) and export named constants for all physical conversion factors. For example: `export const KCAL_PER_KILOJOULE = 1 / 4.184;` and `export const METERS_PER_MILE = 1609.344;`. Replace all magic numbers in the code with these named constants to improve clarity and maintainability."
+      },
+      {
+        "id": "F-005",
+        "title": "Regex in `unit_to_mg_factor` is fragile for compound units",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "SQL_UNITS.md:pds.unit_to_mg_factor",
+        "description": "The regex `REGEXP_REPLACE(..., '[^a-z\u00b5]', '', 'g')` in the `unit_to_mg_factor` function strips all non-alphabetic characters to normalize the unit string. This is brittle and can lead to incorrect parsing. For example, a unit like 'mg/mL' would be transformed into 'mgml', which is not recognized and would fall through to the `ELSE NULL` case, silently dropping the data.",
+        "evidence": "The `SQL_UNITS.md` file itself points out this flaw: \"The regex `[^a-z\u00b5]` ... collapses \"mg/mL\" \u2192 \"mgml\" \u2192 falls through to NULL silently.\"",
+        "recommendation": "Refine the normalization logic. Instead of stripping all non-alphabetic characters, consider a more targeted approach. For example, trim whitespace and trailing punctuation, and then match against a list of known units. This would correctly identify 'mg' from 'mg/mL' if the goal is to extract the mass unit, or it could be enhanced to parse concentration units explicitly if needed."
+      },
+      {
+        "id": "F-006",
+        "title": "Premature rounding in kilojoule to kilocalorie conversion",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "queries.ts:427",
+        "description": "In the `getWhoopCaloriesBurnt` function, the result of the kJ-to-kcal conversion is immediately rounded to the nearest integer using `Math.round()`. While this is acceptable for final display of a single day's value, it is a loss of precision. If this data were ever used for downstream calculations, such as weekly averages or other statistical analysis, this premature rounding could accumulate and introduce small errors.",
+        "evidence": "```typescript\n// queries.ts:427\nconst kcal = Math.round(Number(c.kilojoule) / 4.184);\n```",
+        "recommendation": "Return the floating-point value from the conversion in the query function. The `calories_burnt` field in the returned object should be a `number`, not a rounded integer. Perform rounding only at the last possible moment, i.e., in the UI component that displays the number. This preserves maximum precision for any intermediate calculations."
+      }
+    ],
+    "things_done_well": [
+      "The critical kJ \u2192 kcal conversion is correctly implemented and centralized in a single query function (`getWhoopCaloriesBurnt`), preventing logic drift.",
+      "Excellent comments in `queries.ts` clearly explain the business rule for using WHOOP as the canonical source for TDEE, improving maintainability.",
+      "The frontend distance and pace formatting functions in `format.ts` are correct, handle edge cases like zero speed, and use sensible logic for displaying meters vs. miles.",
+      "The application-layer code shows a clear understanding of the HRV semantic conflation problem and correctly avoids mixing the different sources in its own logic.",
+      "The `getWorkoutSleepGap` function correctly handles mixed duration units from Garmin (seconds) and WHOOP (milliseconds) when calculating workout end times."
+    ],
+    "questions_for_followup": [
+      "What are the source columns for the HRV metrics in the `daily_health_matrix_behavioral` and `recovery_vs_pace` database views? How can we verify that the semantically different HRV metrics from WHOOP, Garmin, and Eight Sleep are not being averaged or conflated within these views?",
+      "Can you provide a complete list of distinct `unit` values from the `supplement_products.ingredients` table? This is necessary to assess the full impact of the missing units in `pds.unit_to_mg_factor` and prioritize adding new conversion rules.",
+      "What is the exact nature of the `start_time_local` column in the `garmin_activities` table? Is it a true local timestamp with timezone information, or is it the problematic 'local time encoded as UTC' format? This will confirm whether the finding F-003 is valid."
+    ]
+  },
+  "bundle": "units-bundle"
+}

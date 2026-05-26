@@ -1,0 +1,224 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "5ceb269",
+  "fired_at": "2026-05-26T03:40:41.091736+00:00",
+  "usage": {
+    "prompt_tokens": 32453,
+    "completion_tokens": 10723,
+    "total_tokens": 43176,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 7104,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-4.1",
+      "review_date": "2026-05-26",
+      "bundle_commit": "5ceb269"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "WHOOP and Garmin-activity rows correctly derive dates and ET/local projections with the \u22126h rule, but Tier-2 cycle-anchoring (use the active WHOOP cycle\u2019s offset for other sources) is not implemented anywhere; most non-WHOOP sources fall straight to user_tz_log \u2192 ET. Provenance is also mis-assigned in some places (e.g., Garmin HRV). These divergences can produce wrong local/behavioral dates on travel days unless user_tz_log is perfectly maintained."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "DST artifacts and transition days are explicitly handled (transition flag; tz_log_gaps distinguishes DST vs travel). NULL ts are guarded. GPS backfill skips same-offset noise. However, the missing cycle-anchor fallback reduces resilience when user_tz_log is incomplete or WHOOP is the only TZ signal."
+      },
+      "scalability": {
+        "score": 5,
+        "rationale": "All derivations are trigger-based with a single stable function. tz_for_instant is O(log n) with an index. LATERAL LIMIT 1 patterns avoid explosion. Backfills use no-op UPDATEs and a window-function pass for transitions. Overhead is acceptable for n=1 and would scale to 10x comfortably."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Uses AT TIME ZONE correctly, BEFORE triggers, stable functions, and LATERAL joins. Minor nits (provenance handling via notes inspection; UTC+offset arithmetic) but overall clean, readable SQL and minimal bespoke mechanics."
+      }
+    },
+    "summary": "The implementation lands the three onyx_* dates and derives them consistently for sources with their own TZ signals (WHOOP timezone_offset; Garmin activities\u2019 local\u2212UTC delta). The \u22126h behavioral boundary is applied uniformly where an instant exists, and helpful operational features are in place (transition-day flag; tz_log_gaps with DST/travel discrimination). The main divergence from ADR-0001 is the absence of Tier-2 cycle anchoring for sources without a native TZ field (Spotify, Garmin sleep/HRV, journal/meal times): triggers fall back directly to user_tz_log \u2192 ET default, so non-WHOOP events on travel days are mis-attributed unless the log is comprehensive. Provenance is also leaky: per-row onyx_tz_source can\u2019t distinguish whether tz resolution came from a GPS- or WHOOP-derived tz_log entry. Two smaller defects: garmin_hrv rows without a start_timestamp are labeled default_et_fallback (should be source_field or use cycle anchor), and whoop_tz_backfill has a NameError that prevents inserts. Top fixes: (1) implement cycle-anchor lookup in pds.derive_onyx_dates (or a sibling) and use it in triggers before tz_for_instant; (2) fix whoop_tz_backfill\u2019s NameError and enforce resolution priority (Manual > GPS > WHOOP) deterministically; (3) carry provenance through user_tz_log (add a source enum) and surface it via tz_for_instant so onyx_tz_source is accurate. With these changes, the code will fully align with ADR-0001 and be robust on transition/travel days without relying on perfect manual logging.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Tier-2 WHOOP cycle anchor not applied for non-WHOOP sources",
+        "severity": "P1",
+        "effort": "L",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql: pds.derive_onyx_dates",
+        "description": "ADR-0001 specifies using the active WHOOP cycle\u2019s timezone_offset for any event falling within that cycle\u2019s window. The current derivation only uses (a) source-provided offset or (b) user_tz_log \u2192 ET fallback; no trigger consults the cycle to resolve TZ.",
+        "evidence": "Example triggers pass NULL tz_offset_text: spotify_plays (sql/adr_0001_04_other_onyx_dates.sql, set_onyx_dates_spotify_plays) and garmin_sleep (sql/adr_0001_03_garmin_onyx_dates.sql, set_onyx_dates_garmin_sleep) call derive_onyx_dates(ts, NULL, NULL), which resolves via tz_for_instant only.",
+        "recommendation": "Add a Tier-2 step: a function pds.cycle_offset_for_instant(ts) that returns wc.timezone_offset when ts \u2208 [cycle.start_time, cycle.end_time), and modify derive_onyx_dates (or wrapper) to try cycle anchor before user_tz_log. Set onyx_tz_source='cycle_anchor' when used."
+      },
+      {
+        "id": "F-002",
+        "title": "whoop_tz_backfill NameError prevents any proposed inserts",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "whoop_tz_backfill.py: infer_proposed_inserts()",
+        "description": "The notes string references an undefined variable log_offset_str, causing a runtime error and aborting proposals, so user_tz_log never gets WHOOP-based entries.",
+        "evidence": "notes=f\"whoop-auto: cycle {\u2026}; \u2026; log was {log_tz} ({log_offset_str})\" \u2014 variable log_offset_str is never defined.",
+        "recommendation": "Replace with log_offset_at_start (and/or end) in the f-string and add a quick unit test for infer_proposed_inserts so this can\u2019t regress."
+      },
+      {
+        "id": "F-003",
+        "title": "Per-row provenance loses GPS/WHOOP origin once tz comes via user_tz_log",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql: pds.derive_onyx_dates",
+        "description": "When tz_offset_text is NULL, onyx_tz_source is set to 'user_tz_log' or 'default_et_fallback'. If tz_log was auto-populated from GPS or WHOOP, events do not reflect 'gps_inferred' or 'cycle_anchor' as specified by ADR-0001.",
+        "evidence": "ELSE branch in derive_onyx_dates assigns resolved_source := 'user_tz_log' or 'default_et_fallback'; no path to 'gps_inferred' or 'cycle_anchor' without a direct offset.",
+        "recommendation": "Add a provenance column to pds.user_tz_log (enum) and have tz_for_instant return (tz, source). Propagate that into onyx_tz_source so row-level provenance aligns with ADR."
+      },
+      {
+        "id": "F-004",
+        "title": "garmin_hrv fallback mislabels provenance as default_et_fallback",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql: pds.set_onyx_dates_garmin_hrv",
+        "description": "When start_timestamp is NULL, all three onyx_* dates are set to calendar_date with onyx_tz_source='default_et_fallback'. That isn\u2019t an ET fallback \u2014 it\u2019s a source-provided clock date.",
+        "evidence": "ELSE branch assigns NEW.onyx_* := NEW.calendar_date and NEW.onyx_tz_source := 'default_et_fallback'.",
+        "recommendation": "Set onyx_tz_source='source_field' in this path (or apply cycle-anchor if available). Keep default_et_fallback only for true ET fallbacks."
+      },
+      {
+        "id": "F-005",
+        "title": "Cycle anchor also missing for Garmin sleep",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql: pds.set_onyx_dates_garmin_sleep",
+        "description": "Behavioral-day attribution for garmin_sleep uses tz_for_instant directly. On travel days without a tz_log row, bedtime may be attributed to ET instead of the cycle\u2019s offset.",
+        "evidence": "Trigger calls derive_onyx_dates(NEW.sleep_start, NULL, NULL) \u2014 no attempt to consult whoop_cycles for timezone_offset.",
+        "recommendation": "Use the new Tier-2 helper (see F-001) to resolve via the active WHOOP cycle before falling back to tz_for_instant."
+      },
+      {
+        "id": "F-006",
+        "title": "Supabase RPC call to schema-qualified function may not resolve",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "gps_tz_backfill.py: tz_for_instant_via_pg; whoop_tz_backfill.py: tz_for_instant_via_pg",
+        "description": "supabase-py RPC often exposes only public schema functions. Using .schema('pds').rpc('tz_for_instant', ...) may fail unless PostgREST is configured to expose pds functions.",
+        "evidence": "Both scripts call supa.schema(\"pds\").rpc(\"tz_for_instant\", {\"ts\": ts_iso}).",
+        "recommendation": "Create a SECURITY DEFINER wrapper in public schema (public.tz_for_instant_pds) or adjust RPC usage per Supabase docs to ensure calls succeed."
+      },
+      {
+        "id": "F-007",
+        "title": "Resolution priority Manual > GPS > WHOOP depends on run order",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "whoop_tz_backfill.py: header; gps_tz_backfill.py: header",
+        "description": "Scripts skip inserts when tz_for_instant already resolves the instant, but neither enforces that GPS-derived entries take precedence over WHOOP if both run concurrently or out of documented order.",
+        "evidence": "Comments specify priority but no mechanism ensures GPS precedes WHOOP beyond operator discipline.",
+        "recommendation": "Either (a) persist a provenance field in user_tz_log and allow GPS to supersede same-offset WHOOP rows within a small window, or (b) provide a single orchestrator that runs WHOOP first, GPS second deterministically."
+      },
+      {
+        "id": "F-008",
+        "title": "Default-ET labeling leaks into date-only tables inconsistently",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Consistency"
+        ],
+        "file_ref": "sql/adr_0001_04_other_onyx_dates.sql: set_onyx_dates_habit_journal / whoop_journal",
+        "description": "For date-only tables, onyx_tz_source varies between 'source_field', 'cycle_anchor', and 'default_et_fallback'. Semantics should reflect whether the date is a deliberate behavioral date, not an ET fallback.",
+        "evidence": "whoop_journal sets onyx_et_date/local_date = cycle_date and toggles source based on behaviors_date presence; habit_journal labels 'default_et_fallback'.",
+        "recommendation": "Standardize: for date-only behavioral sources, set onyx_behavioral_date and onyx_tz_source='source_field' (or 'cycle_anchor' where explicitly derived), and leave et/local as null or equal to behavioral with 'source_field'."
+      },
+      {
+        "id": "F-009",
+        "title": "Null-ts path returns NULL provenance",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql: pds.derive_onyx_dates",
+        "description": "When ts is NULL, the function returns NULL for onyx_tz_source, which can complicate downstream filters expecting a known provenance bucket.",
+        "evidence": "IF ts IS NULL THEN RETURN ... NULL::TEXT;",
+        "recommendation": "Return onyx_tz_source='default_et_fallback' (or 'no_instant') for clarity; document the contract."
+      },
+      {
+        "id": "F-010",
+        "title": "daily_health_matrix_behavioral spine includes GDS calendar_date",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Consistency"
+        ],
+        "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql: all_behavioral_dates CTE",
+        "description": "ADR describes the spine as the union of onyx_behavioral_date across sources; the view also unions garmin_daily_summary.calendar_date, which may add dates not present in any onyx_behavioral_date.",
+        "evidence": "UNION SELECT calendar_date FROM pds.garmin_daily_summary ...",
+        "recommendation": "Either document this intentional inclusion or switch to onyx_behavioral_date in GDS once populated to keep semantics uniform."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Centralized derivation with idiomatic AT TIME ZONE and BEFORE triggers",
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql: pds.derive_onyx_dates",
+        "why_it_matters": "Keeps attribution logic consistent across sources and reduces drift; easy to harden once Tier-2 is added."
+      },
+      {
+        "title": "Garmin activities recover per-row offsets cleanly",
+        "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql: pds.interval_to_tzd + set_onyx_dates_garmin_activities",
+        "why_it_matters": "Leverages the local\u2212UTC delta to avoid relying on external logs; aligns with ADR Tier-1."
+      },
+      {
+        "title": "Explicit transition-day flag with efficient backfill",
+        "file_ref": "sql/adr_0001_05_transition_day_flag.sql",
+        "why_it_matters": "Surfaces ambiguity at TZ boundaries and lets downstream consumers filter/weight appropriately without O(N^2) trigger cascades."
+      },
+      {
+        "title": "DST-aware tz_log_gaps view distinguishes travel vs DST artifacts",
+        "file_ref": "sql/adr_0001_06_tz_log_gaps_view.sql",
+        "why_it_matters": "Avoids false positives on DST nights and provides actionable signals to maintain user_tz_log integrity."
+      },
+      {
+        "title": "Behavioral matrix view dedup logic for WHOOP cycles",
+        "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql",
+        "why_it_matters": "Picking the longest cycle and aggregating the transition flag yields stable daily rows on complicated nights."
+      },
+      {
+        "title": "GPS backfill\u2019s same-offset guard prevents noisy IANA churn",
+        "file_ref": "gps_tz_backfill.py: infer_proposed_inserts",
+        "why_it_matters": "Skipping entries where offsets match avoids needless log entries (e.g., different city names with same EDT)."
+      }
+    ],
+    "questions_for_followup": [
+      "Should Tier-2 use [cycle.start_time, cycle.end_time) strictly, or window to nearest cycle when end_time is NULL or naps occur?",
+      "Do we want per-row provenance to reflect the origin of the tz_log entry (gps/WHOOP/manual)? If so, add a source enum on pds.user_tz_log and return it from tz_for_instant.",
+      "Confirm Supabase RPC exposure for schema-qualified functions; do we need a public wrapper for pds.tz_for_instant?",
+      "For garmin_hrv without start_timestamp, should we try cycle-anchor before falling back to calendar_date, or keep calendar_date with onyx_tz_source='source_field'?",
+      "Should we null onyx_et_date/onyx_local_date on date-only behavioral sources to avoid implying clock-date precision that doesn\u2019t exist?"
+    ]
+  },
+  "bundle": "tz-bundle"
+}
