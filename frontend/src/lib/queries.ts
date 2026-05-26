@@ -436,6 +436,24 @@ export async function getHabitJournal(days: number = 30) {
   return data ?? [];
 }
 
+export interface HabitMetadataInterval {
+  notion_page_id: string;
+  valid_from: string;   // YYYY-MM-DD
+  valid_to: string | null;   // YYYY-MM-DD or null = open interval
+  frequency: string;
+  category: string | null;
+}
+
+export async function getHabitMetadataHistory(): Promise<HabitMetadataInterval[]> {
+  const { data, error } = await supabase
+    .from("habit_metadata_history")
+    .select("notion_page_id,valid_from,valid_to,frequency,category")
+    .order("notion_page_id")
+    .order("valid_from", { ascending: false });
+  if (error) throw error;
+  return data ?? [];
+}
+
 // ---------------------------------------------------------------------------
 // Unified Journal (WHOOP + Habits via view)
 // ---------------------------------------------------------------------------

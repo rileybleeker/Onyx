@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
-import { getHabitJournal, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { getHabitJournal, getHabitMetadataHistory, rangeDays, rangeLabel, type Range, type HabitMetadataInterval } from "@/lib/queries";
 import { axisTick, gridStyle, chartTooltip } from "@/lib/chart-theme";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
@@ -65,6 +65,24 @@ function isEligibleDay(frequency: string, dateStr: string): boolean {
   return dow !== 0 && dow !== 6;
 }
 
+// Find the metadata interval covering `date` for this habit. Falls back to
+// the current Notion values when no history row exists yet (matches the
+// pre-history-table behavior — see sql/habit_metadata_history.sql).
+function resolveMetadata(
+  pageId: string,
+  date: string,
+  history: HabitMetadataInterval[],
+  fallback: { frequency: string; category: string },
+): { frequency: string; category: string } {
+  for (const h of history) {
+    if (h.notion_page_id !== pageId) continue;
+    if (date < h.valid_from) continue;
+    if (h.valid_to !== null && date > h.valid_to) continue;
+    return { frequency: h.frequency, category: h.category ?? fallback.category };
+  }
+  return fallback;
+}
+
 // For ad hoc habits, the "streak" concept doesn't apply — instead show recency.
 // Returns days-ago of most recent completion (0 = today), or null if never completed.
 function daysSinceLastCompletion(habitName: string, completionSet: Set<string>): number | null {
@@ -78,15 +96,22 @@ function daysSinceLastCompletion(habitName: string, completionSet: Set<string>):
   return null;
 }
 
-function calculateStreak(habitName: string, frequency: string, completionSet: Set<string>): number {
-  // Ad hoc habits have no expected cadence; no meaningful streak.
-  if (isAdHocFrequency(frequency)) return 0;
+// Streak is anchored to the habit's CURRENT frequency (the one in effect
+// today) — that's the meaningful answer to "how many consecutive periods
+// have I kept this going?" Changing a habit from daily to weekly resets
+// the lens, but past completions still count if they satisfy the new
+// cadence. Eligibility/category lookups inside the loop are per-date so
+// retroactive prop changes don't silently rewrite history.
+function calculateStreak(
+  habit: { id: string; name: string; frequency: string; category: string },
+  completionSet: Set<string>,
+  history: HabitMetadataInterval[],
+): number {
+  if (isAdHocFrequency(habit.frequency)) return 0;
 
   const now = new Date();
 
-  // Weekly: count consecutive 7-day windows ending at today with >=1 completion.
-  // Current week is allowed to be incomplete (mirrors the daily/weekday "today is grace" rule).
-  if (frequency === "weekly") {
+  if (habit.frequency === "weekly") {
     let streak = 0;
     for (let weekIdx = 0; weekIdx < 52; weekIdx++) {
       let hasCompletion = false;
@@ -94,7 +119,7 @@ function calculateStreak(habitName: string, frequency: string, completionSet: Se
         const dt = new Date(now);
         dt.setDate(dt.getDate() - (weekIdx * 7 + d));
         const dateStr = dt.toLocaleDateString("en-CA");
-        if (completionSet.has(`${habitName}|${dateStr}`)) {
+        if (completionSet.has(`${habit.name}|${dateStr}`)) {
           hasCompletion = true;
           break;
         }
@@ -115,9 +140,10 @@ function calculateStreak(habitName: string, frequency: string, completionSet: Se
     d.setDate(d.getDate() - i);
     const dateStr = d.toLocaleDateString("en-CA");
 
-    if (!isEligibleDay(frequency, dateStr)) continue;
+    const freqOnDate = resolveMetadata(habit.id, dateStr, history, habit).frequency;
+    if (!isEligibleDay(freqOnDate, dateStr)) continue;
 
-    if (completionSet.has(`${habitName}|${dateStr}`)) {
+    if (completionSet.has(`${habit.name}|${dateStr}`)) {
       streak++;
     } else {
       if (i === 0) continue; // Allow today to be incomplete
@@ -130,6 +156,7 @@ function calculateStreak(habitName: string, frequency: string, completionSet: Se
 export default function HabitsPage() {
   const [habits, setHabits] = useState<NotionHabit[]>([]);
   const [journal, setJournal] = useState<JournalEntry[]>([]);
+  const [history, setHistory] = useState<HabitMetadataInterval[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [toggling, setToggling] = useState<Set<string>>(new Set());
@@ -138,23 +165,27 @@ export default function HabitsPage() {
   const load = useCallback(async (days: number) => {
     setLoading(true);
     try {
-      const [habitsRes, journalData] = await Promise.all([
+      const [habitsRes, journalData, historyData] = await Promise.all([
         fetch("/api/habits/list").then((r) => r.json()),
         getHabitJournal(Math.max(days, 365)),
+        getHabitMetadataHistory(),
       ]);
       setHabits(habitsRes.habits || []);
       setJournal(journalData);
+      setHistory(historyData);
 
-      // Sync completions from Notion (Last Completed dates)
+      // Sync from Notion (Last Completed + metadata-history diff). The sync
+      // route may insert new history rows on a property change, so refetch
+      // history after it returns.
       setSyncing(true);
       const syncRes = await fetch("/api/habits/sync", { method: "POST" });
       if (syncRes.ok) {
         const { count } = await syncRes.json();
         if (count > 0) {
-          // Reload journal data to pick up synced entries
           const updated = await getHabitJournal(Math.max(days, 365));
           setJournal(updated);
         }
+        setHistory(await getHabitMetadataHistory());
       }
       setSyncing(false);
     } catch (e) {
@@ -239,7 +270,7 @@ export default function HabitsPage() {
   const todayCompleted = requiredHabits.filter((h) => completionSet.has(`${h.name}|${today}`)).length;
   const streaks = habits.map((h) => {
     const adHoc = isAdHocFrequency(h.frequency);
-    const streak = calculateStreak(h.name, h.frequency, completionSet);
+    const streak = calculateStreak(h, completionSet, history);
     const isWeekly = h.frequency === "weekly";
     return {
       habit: h,
@@ -261,6 +292,56 @@ export default function HabitsPage() {
   const bestHabit = longestEntry && longestEntry.rankValue > 0 ? longestEntry.habit : undefined;
 
   const heatmapDates = getDatesArray(Math.min(rangeDays(range), 365));
+  const rangeStart = heatmapDates[0];
+
+  // Recent metadata changes — surfaced as a small banner so the user knows
+  // KPIs span a period when a habit's Frequency or Category was different.
+  // A change is a non-seed interval starting on/after the visible range
+  // (seed = the EARLIEST interval per pageId, which represents the initial
+  // capture, not a real edit).
+  const recentChanges: Array<{
+    habitName: string;
+    from: string;
+    to: string;
+    field: "frequency" | "category";
+    fromVal: string;
+    toVal: string;
+  }> = [];
+  const habitNameById = new Map(habits.map((h) => [h.id, h.name]));
+  const intervalsByPage = new Map<string, HabitMetadataInterval[]>();
+  history.forEach((row) => {
+    const list = intervalsByPage.get(row.notion_page_id) ?? [];
+    list.push(row);
+    intervalsByPage.set(row.notion_page_id, list);
+  });
+  intervalsByPage.forEach((rows, pageId) => {
+    const sorted = [...rows].sort((a, b) => a.valid_from.localeCompare(b.valid_from));
+    for (let i = 1; i < sorted.length; i++) {
+      const curr = sorted[i];
+      const prev = sorted[i - 1];
+      if (curr.valid_from < rangeStart) continue;
+      if (prev.frequency !== curr.frequency) {
+        recentChanges.push({
+          habitName: habitNameById.get(pageId) ?? pageId.slice(0, 8),
+          from: prev.valid_from,
+          to: curr.valid_from,
+          field: "frequency",
+          fromVal: prev.frequency,
+          toVal: curr.frequency,
+        });
+      }
+      if ((prev.category || "") !== (curr.category || "")) {
+        recentChanges.push({
+          habitName: habitNameById.get(pageId) ?? pageId.slice(0, 8),
+          from: prev.valid_from,
+          to: curr.valid_from,
+          field: "category",
+          fromVal: prev.category || "—",
+          toVal: curr.category || "—",
+        });
+      }
+    }
+  });
 
   // Per-habit frequency-aware rate aggregator.
   // daily: 1 slot per day. weekdays: 1 slot per Mon-Fri. weekly: 1 slot per 7-day chunk
@@ -270,6 +351,10 @@ export default function HabitsPage() {
     let possible = 0;
     let completed = 0;
     habits.forEach((h) => {
+      // Skip habits that are ad-hoc TODAY but check per-date frequency below
+      // for the eligibility test. Weekly cadence is anchored to today's
+      // frequency because the 7-day-window concept doesn't translate
+      // mid-stream if the cadence flipped.
       if (isAdHocFrequency(h.frequency)) return;
       if (h.frequency === "weekly") {
         const slots = Math.max(1, Math.floor(dates.length / 7));
@@ -283,7 +368,8 @@ export default function HabitsPage() {
         return;
       }
       dates.forEach((d) => {
-        if (!isEligibleDay(h.frequency, d)) return;
+        const freqOnDate = resolveMetadata(h.id, d, history, h).frequency;
+        if (!isEligibleDay(freqOnDate, d)) return;
         possible++;
         if (completionSet.has(`${h.name}|${d}`)) completed++;
       });
@@ -313,13 +399,21 @@ export default function HabitsPage() {
   const categoryAgg: Record<string, { possible: number; completed: number; count: number }> = {};
   habits.forEach((h) => {
     if (isAdHocFrequency(h.frequency)) return;
-    const cat = h.category || "general";
-    if (!categoryAgg[cat]) categoryAgg[cat] = { possible: 0, completed: 0, count: 0 };
-    categoryAgg[cat].count++;
+    // habitCount keyed on current category — the "13 habits in fitness" line
+    // describes the present, not the union of every historical category.
+    const currentCat = h.category || "general";
+    if (!categoryAgg[currentCat]) categoryAgg[currentCat] = { possible: 0, completed: 0, count: 0 };
+    categoryAgg[currentCat].count++;
+
     activeRangeDates.forEach((d) => {
-      if (!isEligibleDay(h.frequency, d)) return;
-      categoryAgg[cat].possible++;
-      if (completionSet.has(`${h.name}|${d}`)) categoryAgg[cat].completed++;
+      const meta = resolveMetadata(h.id, d, history, h);
+      if (!isEligibleDay(meta.frequency, d)) return;
+      // Use per-date category so a habit that was 'general' last month and
+      // 'fitness' this month contributes to the correct bucket per day.
+      const catOnDate = meta.category || "general";
+      if (!categoryAgg[catOnDate]) categoryAgg[catOnDate] = { possible: 0, completed: 0, count: 0 };
+      categoryAgg[catOnDate].possible++;
+      if (completionSet.has(`${h.name}|${d}`)) categoryAgg[catOnDate].completed++;
     });
   });
   const categoryRates = Object.entries(categoryAgg)
@@ -355,6 +449,26 @@ export default function HabitsPage() {
         </div>
       </div>
 
+      {recentChanges.length > 0 && (
+        <div className="mb-6 px-3 py-2.5 rounded-[6px] border border-amber-500/30 bg-amber-500/[0.04]">
+          <p className="text-[11px] font-mono uppercase tracking-wider text-amber-300/80 mb-1.5">
+            Metadata changed within this range — rates reflect each day&apos;s in-effect values
+          </p>
+          <ul className="text-[12px] text-text-secondary space-y-0.5">
+            {recentChanges.slice(0, 6).map((c, i) => (
+              <li key={i}>
+                <span className="text-text-primary">{c.habitName}</span>
+                {": "}
+                {c.field} {c.fromVal} → {c.toVal} on {c.to}
+              </li>
+            ))}
+            {recentChanges.length > 6 && (
+              <li className="text-text-tertiary">+{recentChanges.length - 6} more</li>
+            )}
+          </ul>
+        </div>
+      )}
+
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <StatCard label="Today" value={`${todayCompleted}/${requiredHabits.length}`} sublabel="required habits" />
@@ -375,7 +489,7 @@ export default function HabitsPage() {
             {habits.map((h) => {
               const done = completionSet.has(`${h.name}|${today}`);
               const isToggling = toggling.has(`${h.name}|${today}`);
-              const streak = calculateStreak(h.name, h.frequency, completionSet);
+              const streak = calculateStreak(h, completionSet, history);
               const color = CATEGORY_COLORS[h.category] || CATEGORY_COLORS.general;
 
               return (
