@@ -1594,7 +1594,12 @@ export default function HrvAnalysisPage() {
                   <th className="text-right py-2 px-2 font-medium">AIPW ATE</th>
                   <th className="text-right py-2 px-2 font-medium">95% CI</th>
                   <th className="text-right py-2 px-2 font-medium">E-val</th>
-                  <th className="text-right py-2 px-2 font-medium">Attenuation</th>
+                  <th
+                    className="text-right py-2 px-2 font-medium"
+                    title="(|naive| − |adjusted|) / |naive|. Positive = adjustment shrunk the effect (naive was inflated by confounding). Negative = adjustment grew it (confounding was masking it). ↻ marks sign-flip — naive and adjusted disagree on direction."
+                  >
+                    Attenuation <span className="text-text-tertiary text-[10px]">(+ shrunk · − grew)</span>
+                  </th>
                   <th className="text-right py-2 pl-2 pr-3 font-medium">n T / n C</th>
                 </tr>
               </thead>
@@ -1612,6 +1617,13 @@ export default function HrvAnalysisPage() {
                       : (d.attenuation_pct ?? 0) < -30
                         ? "text-cyan-400"
                         : "text-text-secondary";
+                    // Sign-flip = naive and AIPW disagree on direction.
+                    // Visually distinct because it's the most consequential
+                    // change adjustment can produce (the conclusion reverses,
+                    // not just shrinks/grows).
+                    const naiveSign = Math.sign(Number(d.naive_ate));
+                    const aipwSign = Math.sign(Number(d.aipw_ate));
+                    const signFlip = naiveSign !== 0 && aipwSign !== 0 && naiveSign !== aipwSign;
                     return (
                       <tr key={d.treatment} className="border-b border-border-subtle/40 hover:bg-white/[0.02]">
                         <td className="py-2 pl-3 pr-2 text-text-primary">
@@ -1637,6 +1649,14 @@ export default function HrvAnalysisPage() {
                           {Number.isFinite(d.e_value) ? d.e_value.toFixed(2) : "—"}
                         </td>
                         <td className={`py-2 px-2 text-right tabular-nums ${attColor}`}>
+                          {signFlip && (
+                            <span
+                              className="text-violet-400 mr-1"
+                              title={`Sign flip: naive said ${d.naive_ate > 0 ? "positive" : "negative"}, AIPW says ${d.aipw_ate > 0 ? "positive" : "negative"} — confounding reversed the direction, not just the magnitude.`}
+                            >
+                              ↻
+                            </span>
+                          )}
                           {Number.isFinite(d.attenuation_pct)
                             ? `${(d.attenuation_pct ?? 0) >= 0 ? "+" : ""}${(d.attenuation_pct ?? 0).toFixed(0)}%`
                             : "—"}
@@ -1694,8 +1714,9 @@ export default function HrvAnalysisPage() {
                            formatter={(v: any, _n: any, p: any) => {
                              const d = p?.payload ?? {};
                              const ci = `[${Number(d.aipw_ci_low).toFixed(1)}, ${Number(d.aipw_ci_high).toFixed(1)}]`;
+                             const ev = Number.isFinite(d.e_value) ? d.e_value.toFixed(2) : "—";
                              return [
-                               `${Number(v).toFixed(1)} ms — CI ${ci}, n=${d.n_treated}/${d.n_control}`,
+                               `${Number(v).toFixed(1)} ms — CI ${ci}, E-val ${ev}, n=${d.n_treated}/${d.n_control}`,
                                "AIPW ATE",
                              ];
                            }} />
@@ -1735,6 +1756,30 @@ export default function HrvAnalysisPage() {
                   <code className="text-cyan-400">{causalDag.outcome}</code> — {causalDag.outcome_description}
                 </p>
               </div>
+
+              {causalDag.estimand && (
+                <div>
+                  <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
+                    Estimand
+                  </p>
+                  <p className="text-text-secondary leading-relaxed">{causalDag.estimand}</p>
+                </div>
+              )}
+
+              {(causalDag.treatment_families ?? []).length > 0 && (
+                <div>
+                  <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
+                    Treatment families
+                  </p>
+                  <p className="text-text-secondary">
+                    {(causalDag.treatment_families as string[]).map((f, i) => (
+                      <span key={f}>
+                        <code>{f}</code>{i < causalDag.treatment_families.length - 1 ? ", " : ""}
+                      </span>
+                    ))}
+                  </p>
+                </div>
+              )}
 
               <div>
                 <p className="text-text-tertiary uppercase tracking-wide text-[10px] mb-1">
