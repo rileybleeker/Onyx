@@ -14,9 +14,22 @@ const supabase = createClient(
  * compound rollup comes straight from the supplement_intake_by_compound
  * view so cross-product summation (e.g. Vitamin C from multivitamin +
  * standalone Vitamin C) just works.
+ *
+ * "Today" = pds.behavioral_today_now() — the awake-tail-aware,
+ * TZ-aware behavioral day. At 1 AM ET this returns YESTERDAY (your
+ * day hasn't ended pre-bed yet), matching the convention the
+ * /supplements page uses for its log defaults. Using ET-clock-today
+ * here would cause a silent display gap during the awake-tail: a
+ * just-logged pre-bed intake would be hidden until midnight ticked
+ * past the behavioral cutoff.
  */
 export async function GET() {
-  const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  const { data: behavioralToday, error: btErr } = await supabase.rpc("behavioral_today_now");
+  if (btErr) {
+    console.error("behavioral_today_now RPC failed, falling back to ET clock:", btErr);
+  }
+  const today = (behavioralToday as string | null)
+    ?? new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
 
   const [intakesRes, compoundsRes] = await Promise.all([
     supabase
