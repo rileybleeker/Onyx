@@ -184,7 +184,7 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, mealsRes, weightRes, driftRes, tzGapsRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, mealsRes, weightRes, driftRes, tzGapsRes, hrvGapsRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -215,6 +215,13 @@ export async function GET() {
         .eq("gap_type", "travel")
         .order("gap_et_date", { ascending: false })
         .limit(50),
+      // HRV prediction drift monitor — any expected_date in the last 30 days
+      // where no live xgboost forecast was written. Backtest fills don't
+      // count. Empty array = healthy.
+      supabase
+        .from("hrv_prediction_gaps")
+        .select("expected_date, gap_type")
+        .order("expected_date", { ascending: false }),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -366,12 +373,20 @@ export async function GET() {
       hrv_analysis: {
         label: "HRV Analysis",
         lastSync: hrvDate,
-        status: deriveStatus(null, hrvLag),
+        // Prediction-pipeline drift takes priority over freshness lag: if
+        // any of the last 30 days is missing a live xgboost forecast, the
+        // pipeline silently broke that day — degrade to 'partial' even if
+        // today's forecast is on time.
+        status: (hrvGapsRes.data?.length ?? 0) > 0
+          ? "partial"
+          : deriveStatus(null, hrvLag),
         latestDataDate: hrvDate,
         daysLag: hrvLag,
         recordsSynced: 0,
         durationSeconds: null,
-        errorMessage: null,
+        errorMessage: (hrvGapsRes.data?.length ?? 0) > 0
+          ? `${hrvGapsRes.data!.length} prediction gap${hrvGapsRes.data!.length === 1 ? "" : "s"} in last 30d: ${(hrvGapsRes.data as Array<{ expected_date: string; gap_type: string }>).slice(0, 3).map((g) => `${g.expected_date} (${g.gap_type})`).join(", ")}${hrvGapsRes.data!.length > 3 ? "…" : ""}`
+          : null,
         cadence: CADENCE.hrv_analysis,
         integrationMethod: METHOD.hrv_analysis.method,
         methodLabel: METHOD.hrv_analysis.label,
