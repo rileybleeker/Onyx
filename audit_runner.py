@@ -89,7 +89,7 @@ def discover_bundle_files(bundle_dir: Path) -> list[Path]:
 #   Gemini: gemini-2.5-pro → gemini-3.1-pro-preview. gemini-3-pro original
 #     preview was deprecated 2026-03-09; 3.1-pro is current. gemini-2.5-pro
 #     remains available as a stable fallback if 3.1-pro-preview throws.
-OPENAI_MODEL = "gpt-5.5-pro"
+OPENAI_MODEL = "gpt-5"
 GEMINI_MODEL = "gemini-3.1-pro-preview"
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
