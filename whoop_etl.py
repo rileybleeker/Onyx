@@ -540,11 +540,21 @@ def main():
     log.info(f"Syncing {days} days: {start_dt.date()} — {now.date()}")
 
     # Profile check
+    profile_started = time.time()
     try:
         profile = whoop.get_profile()
         log.info(f"Authenticated as: {profile.get('first_name')} {profile.get('last_name')}")
     except Exception as e:
-        log.error(f"Profile check failed: {e}")
+        # Audit fix: previously returned without writing a sync_log row, so
+        # /status saw silence on every run with a broken token / WHOOP outage.
+        # Per CLAUDE.md: every ETL run emits a heartbeat, success AND failure.
+        msg = f"WHOOP profile check failed: {e}"
+        log.error(msg)
+        log_sync(
+            sb, "whoop", "full_sync", "failed",
+            records=0, error=msg,
+            duration=time.time() - profile_started,
+        )
         return
 
     # Sync all data types
@@ -609,4 +619,24 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Belt-and-suspenders top-level heartbeat: any uncaught exception inside
+    # main() (e.g. token refresh failure before the per-endpoint try/except
+    # blocks, or import/config errors) gets a sync_log row so /status sees
+    # the failure rather than silently going stale. Skipped for --auth, which
+    # is interactive bootstrap, not a scheduled run.
+    _is_auth_run = "--auth" in sys.argv
+    _t_main_start = time.time()
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001 — top-level safety net
+        if not _is_auth_run:
+            try:
+                _sb_for_log = get_supabase_client()
+                log_sync(
+                    _sb_for_log, "whoop", "full_sync", "failed",
+                    records=0, error=f"Uncaught exception: {exc}",
+                    duration=time.time() - _t_main_start,
+                )
+            except Exception as log_exc:  # noqa: BLE001
+                log.error(f"Could not write failure sync_log row: {log_exc}")
+        raise
