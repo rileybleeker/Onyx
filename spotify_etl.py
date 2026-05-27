@@ -37,6 +37,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import httpx
 from dotenv import load_dotenv
+from postgrest.exceptions import APIError as PostgrestAPIError
 from supabase import create_client, Client
 
 from sync_log_helper import log_sync as _shared_log_sync
@@ -751,7 +752,11 @@ def run_etl(refeaturize: bool = False):
                     mb_attempted = len(pairs)
                     mb_matched = enrich_genres_via_musicbrainz(sb, pairs)
                     log.info(f"Resolved genres via MusicBrainz for {mb_matched}/{mb_attempted} artists")
-            except httpx.HTTPError as e:
+            except (httpx.HTTPError, PostgrestAPIError) as e:
+                # PostgrestAPIError catches Supabase-side failures (RLS denial,
+                # schema drift, constraint violation) — without this, plays got
+                # written, but the script crashed before the sync_log heartbeat
+                # for either musicbrainz or the main spotify run could fire.
                 log.warning(f"Artist enrichment failed (non-fatal): {e}")
                 mb_error = str(e)
         # Heartbeat for MusicBrainz — log every run so /status sees us alive.
