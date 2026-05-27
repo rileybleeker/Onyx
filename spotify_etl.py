@@ -717,14 +717,16 @@ def run_etl(refeaturize: bool = False):
                 "been lost server-side."
             )
 
-        plays_count = upsert_plays(sb, items)
-        log.info(f"Upserted {plays_count} plays")
-
-        # Resolve new tracks (not yet in spotify_tracks) and featurize them
+        # --- Tracks BEFORE plays ---
+        # spotify_plays.track_id has a NOT NULL FK to spotify_tracks(track_id).
+        # The FK is DEFERRABLE INITIALLY DEFERRED but supabase-py upserts are
+        # per-call PostgREST HTTP — each in its own transaction — so deferral
+        # has no effect across calls. Parent dim must be upserted first. Same
+        # reasoning applies to the artist FK in the next block.
         new_track_ids = list({(it.get("track") or {}).get("id") for it in items if (it.get("track") or {}).get("id")})
-        already = existing_track_ids(sb, new_track_ids)
-        to_fetch = [tid for tid in new_track_ids if tid not in already]
-        log.info(f"New tracks to enrich: {len(to_fetch)} (skipping {len(already)} already in dim)")
+        already_tracks = existing_track_ids(sb, new_track_ids)
+        to_fetch = [tid for tid in new_track_ids if tid not in already_tracks]
+        log.info(f"New tracks to enrich: {len(to_fetch)} (skipping {len(already_tracks)} already in dim)")
 
         track_objs: list[dict] = []
         for tid in to_fetch:
@@ -746,7 +748,7 @@ def run_etl(refeaturize: bool = False):
             status=rb_status, records=len(features), started_at=reccobeats_started,
         )
 
-        # Resolve new artists (not yet in spotify_artists) and enrich them.
+        # --- Artists BEFORE plays ---
         # Audit P1 fix: previously only the primary artist (artists[0]) was
         # enqueued for enrichment, so collaborator artists on multi-artist
         # tracks never got an artist-images / MusicBrainz-genres row. Iterate
@@ -794,6 +796,20 @@ def run_etl(refeaturize: bool = False):
             sb, source="musicbrainz", data_type="artist_tags",
             status=mb_status, records=mb_matched, started_at=mb_started, error=mb_error,
         )
+
+        # --- Plays LAST, only for plays whose track was landed ---
+        # Defensive: if client.track(tid) raised above, that tid is missing
+        # from track_objs and won't be in spotify_tracks. A play referencing
+        # it would FK-violate and roll back the whole upsert batch. Skip those
+        # plays here; they'll be retried next run because the high-water mark
+        # only advances on a successful run.
+        landed_track_ids = set(already_tracks) | {t.get("id") for t in track_objs if t and t.get("id")}
+        safe_items = [it for it in items if (it.get("track") or {}).get("id") in landed_track_ids]
+        skipped = len(items) - len(safe_items)
+        if skipped:
+            log.warning(f"Skipping {skipped} plays whose track failed to upsert this run (will retry next cron).")
+        plays_count = upsert_plays(sb, safe_items)
+        log.info(f"Upserted {plays_count} plays")
 
         # Optional: backfill features for previously-stored tracks that lack them
         if refeaturize:
