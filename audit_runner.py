@@ -71,8 +71,16 @@ def discover_bundle_files(bundle_dir: Path) -> list[Path]:
     priority.sort(key=lambda t: t[0])
     return [p for _, p in priority] + docs + code
 
-OPENAI_MODEL = "gpt-5"
-GEMINI_MODEL = "gemini-2.5-pro"
+# Bumped 2026-05-26 to the current flagship Pro-tier models.
+#   OpenAI: gpt-5 → gpt-5.5-pro (released 2026-04-23). The 'pro' tier adds
+#     extended-reasoning compute on top of the reasoning_effort='high'
+#     parameter we send. Combined cost is ~3-5x gpt-5 base, justified for
+#     the heavy review task.
+#   Gemini: gemini-2.5-pro → gemini-3.1-pro-preview. gemini-3-pro original
+#     preview was deprecated 2026-03-09; 3.1-pro is current. gemini-2.5-pro
+#     remains available as a stable fallback if 3.1-pro-preview throws.
+OPENAI_MODEL = "gpt-5.5-pro"
+GEMINI_MODEL = "gemini-3.1-pro-preview"
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
