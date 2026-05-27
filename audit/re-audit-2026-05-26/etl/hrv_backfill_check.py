@@ -57,7 +57,6 @@ SYNC_LOG_SIGNALS = [
     ("habit_journal", "backfill_signal"),
 ]
 
-
 def get_last_analysis_time() -> str | None:
     resp = (
         supa.schema("pds")
@@ -70,7 +69,6 @@ def get_last_analysis_time() -> str | None:
     if not resp.data:
         return None
     return resp.data[0]["computed_at"]
-
 
 def has_backfilled_rows(table: str, date_col: str, sync_col: str,
                         last_analysis: str, historical_cutoff: str) -> bool:
@@ -88,7 +86,6 @@ def has_backfilled_rows(table: str, date_col: str, sync_col: str,
     except Exception as e:
         log.warning(f"  {table}: check failed ({e}) — treating as no backfill")
         return False
-
 
 def has_sync_log_signal(source: str, data_type: str, last_analysis: str,
                         historical_cutoff: str) -> bool:
@@ -115,14 +112,12 @@ def has_sync_log_signal(source: str, data_type: str, last_analysis: str,
         log.warning(f"  sync_log[{source}/{data_type}]: check failed ({e}) — treating as no backfill")
         return False
 
-
 def set_output(key: str, value: str) -> None:
     out_path = os.environ.get("GITHUB_OUTPUT")
     if out_path:
         with open(out_path, "a") as f:
             f.write(f"{key}={value}\n")
     log.info(f"output: {key}={value}")
-
 
 def main() -> int:
     last_analysis = get_last_analysis_time()
@@ -156,7 +151,6 @@ def main() -> int:
     else:
         log.info("No backfill detected — skipping retrain.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

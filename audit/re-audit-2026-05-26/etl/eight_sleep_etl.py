@@ -49,7 +49,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("eight_sleep_etl")
 
-
 # ---------------------------------------------------------------------------
 # Eight Sleep API Client (OAuth2)
 # ---------------------------------------------------------------------------
@@ -129,14 +128,12 @@ class EightSleepClient:
     def close(self):
         self.http.close()
 
-
 # ---------------------------------------------------------------------------
 # Supabase
 # ---------------------------------------------------------------------------
 
 def get_supabase_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -152,14 +149,12 @@ def safe_get(data: dict, *keys, default=None):
             return default
     return current
 
-
 def avg_timeseries(timeseries: list | None) -> float | None:
     """Compute average from a list of [timestamp, value] pairs."""
     if not timeseries:
         return None
     total = sum(entry[1] for entry in timeseries)
     return round(total / len(timeseries), 2)
-
 
 def median_timeseries(timeseries: list | None) -> float | None:
     """Compute median from a list of [timestamp, value] pairs."""
@@ -171,13 +166,11 @@ def median_timeseries(timeseries: list | None) -> float | None:
         return round(values[mid], 2)
     return round((values[mid - 1] + values[mid]) / 2, 2)
 
-
 def sum_timeseries(timeseries: list | None) -> int | None:
     """Compute sum from a list of [timestamp, value] pairs."""
     if not timeseries:
         return None
     return int(sum(entry[1] for entry in timeseries))
-
 
 def log_sync(sb: Client, source: str, data_type: str, status: str,
              records: int = 0, date_start: date = None, date_end: date = None,
@@ -200,7 +193,6 @@ def log_sync(sb: Client, source: str, data_type: str, status: str,
     except Exception as e:
         log.warning(f"Failed to write sync log: {e}")
 
-
 def upsert_to_supabase(sb: Client, table: str, rows: list[dict],
                         conflict_columns: str):
     if not rows:
@@ -212,7 +204,6 @@ def upsert_to_supabase(sb: Client, table: str, rows: list[dict],
         .execute()
     )
     return len(result.data) if result.data else 0
-
 
 # ---------------------------------------------------------------------------
 # Parsers
@@ -348,7 +339,6 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
         "session_date": day_str,
     }
 
-
 def parse_interval(interval: dict, bed_side: str) -> dict | None:
     """Parse an interval dict for biometric data (fallback for older data)."""
     ts_str = interval.get("ts")
@@ -398,7 +388,6 @@ def parse_interval(interval: dict, bed_side: str) -> dict | None:
         "awake_seconds": stage_totals.get("awake"),
     }
 
-
 def _strip_timeseries(data: dict) -> dict:
     """Return a copy with bulky timeseries arrays removed."""
     stripped = {}
@@ -415,7 +404,6 @@ def _strip_timeseries(data: dict) -> dict:
         else:
             stripped[k] = v
     return stripped
-
 
 # ---------------------------------------------------------------------------
 # Sync logic
@@ -524,7 +512,6 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
     log.info(f"  [{bed_side}] No data found")
     return 0
 
-
 # ---------------------------------------------------------------------------
 # Discover bed sides
 # ---------------------------------------------------------------------------
@@ -560,7 +547,6 @@ def discover_users(client: EightSleepClient) -> dict[str, str]:
 
     log.info(f"Discovered bed sides: {list(users.keys())}")
     return users
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -647,7 +633,6 @@ def main():
     log.info("=" * 60)
 
     client.close()
-
 
 if __name__ == "__main__":
     main()

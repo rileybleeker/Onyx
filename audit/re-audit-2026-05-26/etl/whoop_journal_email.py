@@ -63,7 +63,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 from whoop_journal_import import import_journal
 
-
 # ---------------------------------------------------------------------------
 # HTML link extraction (stdlib only — no BeautifulSoup needed)
 # ---------------------------------------------------------------------------
@@ -93,12 +92,10 @@ class LinkExtractor(HTMLParser):
             self._current_href = None
             self._current_text = ""
 
-
 def extract_links_from_html(html: str) -> list[tuple[str, str]]:
     parser = LinkExtractor()
     parser.feed(html)
     return parser.links
-
 
 # ---------------------------------------------------------------------------
 # Sync log (identical pattern to other ETLs)
@@ -120,7 +117,6 @@ def log_sync(sb: Client, source: str, data_type: str, status: str,
     except Exception as e:
         log.warning(f"Failed to write sync log: {e}")
 
-
 # ---------------------------------------------------------------------------
 # IMAP helpers
 # ---------------------------------------------------------------------------
@@ -135,7 +131,6 @@ def connect_imap() -> imaplib.IMAP4_SSL:
     imap.login(IMAP_EMAIL, IMAP_APP_PASSWORD)
     return imap
 
-
 def decode_subject(msg: email.message.Message) -> str:
     """Decode a possibly-encoded email subject."""
     raw = msg.get("Subject", "")
@@ -147,7 +142,6 @@ def decode_subject(msg: email.message.Message) -> str:
         else:
             decoded.append(part)
     return " ".join(decoded)
-
 
 def find_whoop_emails(imap: imaplib.IMAP4_SSL) -> list[tuple[bytes, email.message.Message]]:
     """Search for unread WHOOP export emails. Returns list of (uid, message)."""
@@ -170,7 +164,6 @@ def find_whoop_emails(imap: imaplib.IMAP4_SSL) -> list[tuple[bytes, email.messag
 
     log.info(f"Found {len(results)} unread WHOOP export email(s)")
     return results
-
 
 # ---------------------------------------------------------------------------
 # Email processing
@@ -219,7 +212,6 @@ def extract_download_url(msg: email.message.Message) -> str | None:
 
     return None
 
-
 def download_and_extract(url: str, dest_dir: str) -> str | None:
     """Download the ZIP from url and extract journal_entries.csv to dest_dir."""
     log.info("Downloading export ZIP...")
@@ -251,7 +243,6 @@ def download_and_extract(url: str, dest_dir: str) -> str | None:
         csv_path = os.path.join(dest_dir, journal_file)
         log.info(f"Extracted {journal_file}")
         return csv_path
-
 
 def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
                   msg: email.message.Message, sb: Client,
@@ -312,7 +303,6 @@ def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
              records=count, duration=duration)
     return True
 
-
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -325,7 +315,7 @@ def check_email(dry_run: bool = False) -> int:
         imap = connect_imap()
         emails = find_whoop_emails(imap)
         if not emails:
-            # Audit P1 fix: heartbeat on no-op runs so /status sees the cron
+            # heartbeat on no-op runs so /status sees the cron
             # is alive even on quiet days (manual-export flow — most days
             # have no new email and that's healthy).
             log.info("No new WHOOP export emails")
@@ -348,7 +338,6 @@ def check_email(dry_run: bool = False) -> int:
                 imap.logout()
             except Exception:
                 pass
-
 
 def main():
     parser = argparse.ArgumentParser(description="WHOOP Journal Email → Supabase")
@@ -384,7 +373,6 @@ def main():
             time.sleep(args.interval)
     except KeyboardInterrupt:
         log.info("\nStopped.")
-
 
 if __name__ == "__main__":
     main()

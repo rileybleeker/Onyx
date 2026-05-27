@@ -76,11 +76,9 @@ def get_garmin_client() -> Garmin:
             log.warning("Garmin: login attempt %d failed (%s), retrying in %ds...", attempt, e, wait)
             time.sleep(wait)
 
-
 def get_supabase_client() -> Client:
     """Create Supabase client with service role key."""
     return create_client(SUPABASE_URL, SUPABASE_KEY)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -89,7 +87,6 @@ def get_supabase_client() -> Client:
 def date_to_ts(d: date) -> str:
     """Convert a date to a midnight UTC timestamp string."""
     return datetime(d.year, d.month, d.day, tzinfo=timezone.utc).isoformat()
-
 
 def safe_get(data: dict, *keys, default=None):
     """Safely navigate nested dicts."""
@@ -101,11 +98,9 @@ def safe_get(data: dict, *keys, default=None):
             return default
     return current
 
-
 def to_int(val):
     """Convert a value to int if not None (handles floats like 180.0 for integer columns)."""
     return int(val) if val is not None else None
-
 
 def log_sync(sb: Client, source: str, data_type: str, status: str,
              records: int = 0, date_start: date = None, date_end: date = None,
@@ -135,7 +130,6 @@ def log_sync(sb: Client, source: str, data_type: str, status: str,
     except Exception as e:
         log.warning(f"Failed to write sync log: {e}")
 
-
 def upsert_to_supabase(sb: Client, table: str, rows: list[dict],
                         conflict_columns: str):
     """Upsert rows to a Supabase table in the pds schema."""
@@ -149,7 +143,6 @@ def upsert_to_supabase(sb: Client, table: str, rows: list[dict],
         .execute()
     )
     return len(result.data) if result.data else 0
-
 
 # ---------------------------------------------------------------------------
 # Sync: Daily Summary
@@ -229,7 +222,6 @@ def sync_daily_summary(garmin: Garmin, sb: Client, target_date: date) -> int:
     }
 
     return upsert_to_supabase(sb, "garmin_daily_summary", [row], "calendar_date,ts")
-
 
 # ---------------------------------------------------------------------------
 # Sync: Sleep
@@ -314,7 +306,6 @@ def sync_sleep(garmin: Garmin, sb: Client, target_date: date) -> int:
 
     return upsert_to_supabase(sb, "garmin_sleep", [row], "calendar_date,sleep_id,ts")
 
-
 # ---------------------------------------------------------------------------
 # Sync: Heart Rate
 # ---------------------------------------------------------------------------
@@ -342,7 +333,6 @@ def sync_heart_rate(garmin: Garmin, sb: Client, target_date: date) -> int:
     }
 
     return upsert_to_supabase(sb, "garmin_heart_rate", [row], "calendar_date,ts")
-
 
 # ---------------------------------------------------------------------------
 # Sync: HRV
@@ -381,7 +371,6 @@ def sync_hrv(garmin: Garmin, sb: Client, target_date: date) -> int:
 
     return upsert_to_supabase(sb, "garmin_hrv", [row], "calendar_date,ts")
 
-
 # ---------------------------------------------------------------------------
 # Sync: Stress
 # ---------------------------------------------------------------------------
@@ -411,7 +400,6 @@ def sync_stress(garmin: Garmin, sb: Client, target_date: date) -> int:
     }
 
     return upsert_to_supabase(sb, "garmin_stress", [row], "calendar_date,ts")
-
 
 # ---------------------------------------------------------------------------
 # Sync: Training Status
@@ -451,13 +439,11 @@ def sync_training_status(garmin: Garmin, sb: Client, target_date: date) -> int:
 
     return upsert_to_supabase(sb, "garmin_training_status", [row], "calendar_date,ts")
 
-
 # ---------------------------------------------------------------------------
 # Sync: Workout Definitions (target paces from Workout Builder)
 # ---------------------------------------------------------------------------
 
 _PACED_STEP_KINDS = ("interval", "warmup", "cooldown")
-
 
 def _maybe_capture_segment(step: dict, iterations: int, parent_step_id, out: list) -> None:
     """If step has a pace target, append a segment dict to out.
@@ -488,7 +474,6 @@ def _maybe_capture_segment(step: dict, iterations: int, parent_step_id, out: lis
         "duration_seconds": cond_val if cond_key == "time"     else None,
         "iterations":      iterations,
     })
-
 
 def parse_interval_targets(workout: dict) -> dict:
     """Extract every pace-targeted interval step from a workout definition.
@@ -530,7 +515,6 @@ def parse_interval_targets(workout: dict) -> dict:
         result["interval_count"]                = first.get("iterations") or 1
     return result
 
-
 def sync_workout_definitions(garmin: Garmin, sb: Client, activity_workout_ids: list[str]) -> int:
     """Sync workout definitions for activities that have workoutIds."""
     if not activity_workout_ids:
@@ -570,7 +554,6 @@ def sync_workout_definitions(garmin: Garmin, sb: Client, activity_workout_ids: l
 
     log.info(f"  Workouts: {total} synced out of {len(unique_ids)} unique IDs")
     return total
-
 
 # ---------------------------------------------------------------------------
 # Sync: Activities + Laps
@@ -651,7 +634,6 @@ def sync_activities(garmin: Garmin, sb: Client, start_date: date, end_date: date
 
     return total, workout_ids
 
-
 def _sync_laps_for_activity(garmin: Garmin, sb: Client, activity_id, start_ts) -> int:
     """Fetch and upsert laps for a single activity."""
     try:
@@ -697,7 +679,6 @@ def _sync_laps_for_activity(garmin: Garmin, sb: Client, activity_id, start_ts) -
         log.debug(f"  laps for activity {activity_id}: error ({e})")
     return 0
 
-
 def backfill_laps(garmin: Garmin, sb: Client) -> int:
     """Backfill laps for all activities that have splits but no laps in DB."""
     # Get all activity IDs with splits
@@ -736,7 +717,6 @@ def backfill_laps(garmin: Garmin, sb: Client) -> int:
     log.info(f"  Laps backfill complete: {count} activities processed")
     return count
 
-
 # ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
@@ -759,7 +739,6 @@ def sync_date(garmin: Garmin, sb: Client, target_date: date) -> dict:
             log.warning(f"  {name} {target_date}: {e}")
             counts[name] = 0
     return counts
-
 
 def main():
     parser = argparse.ArgumentParser(description="Garmin ETL — Supabase")
@@ -812,7 +791,7 @@ def main():
         log.info(f"Workout sync done: {count} definitions | {duration:.1f}s")
         return
 
-    # Determine date range. Audit P0 fix: use ET-local, not UTC. On a UTC
+    # Determine date range. use ET-local, not UTC. On a UTC
     # GHA runner late in the user's evening, date.today() returns the next
     # day in the user's frame — and that tail date would be passed to every
     # sync_* function. sync_daily_summary has its own ET-local guard so it
@@ -924,7 +903,6 @@ def main():
         )
     except Exception as e:
         log.warning(f"  gps_tz_backfill skipped: {e}")
-
 
 if __name__ == "__main__":
     main()

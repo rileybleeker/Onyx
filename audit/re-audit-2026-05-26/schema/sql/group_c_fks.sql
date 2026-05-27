@@ -1,4 +1,4 @@
--- Audit P1 (Group C): schema FKs for Garmin laps → activities and
+-- schema FKs for Garmin laps → activities and
 -- Spotify plays → tracks/artists. Same pattern as the WHOOP cycle hub FKs
 -- in sql/whoop_cycle_fks.sql.
 --

@@ -78,7 +78,6 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress HTTP server logs
 
-
 def do_oauth_flow() -> dict:
     """Run the OAuth2 authorization code flow. Opens browser, waits for callback."""
     state = secrets.token_urlsafe(16)
@@ -128,12 +127,10 @@ def do_oauth_flow() -> dict:
     log.info("OAuth tokens obtained and saved!")
     return tokens
 
-
 def save_tokens(tokens: dict):
     """Save tokens to disk."""
     with open(TOKEN_FILE, "w") as f:
         json.dump(tokens, f, indent=2)
-
 
 def load_tokens() -> dict:
     """Load tokens from disk."""
@@ -143,7 +140,6 @@ def load_tokens() -> dict:
         )
     with open(TOKEN_FILE, "r") as f:
         return json.load(f)
-
 
 def refresh_access_token(tokens: dict) -> dict:
     """Refresh the access token using the refresh token."""
@@ -165,7 +161,6 @@ def refresh_access_token(tokens: dict) -> dict:
     save_tokens(new_tokens)
     log.info("Access token refreshed")
     return new_tokens
-
 
 # ---------------------------------------------------------------------------
 # API Client
@@ -247,14 +242,12 @@ class WhoopClient:
     def get_workouts(self, start: str, end: str) -> list:
         return self.get_paginated("/v2/activity/workout", start=start, end=end)
 
-
 # ---------------------------------------------------------------------------
 # Supabase helpers
 # ---------------------------------------------------------------------------
 
 def get_supabase_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
-
 
 def upsert_to_supabase(sb: Client, table: str, rows: list[dict],
                         conflict_columns: str) -> int:
@@ -267,7 +260,6 @@ def upsert_to_supabase(sb: Client, table: str, rows: list[dict],
         .execute()
     )
     return len(result.data) if result.data else 0
-
 
 def log_sync(sb: Client, source: str, data_type: str, status: str,
              records: int = 0, date_start=None, date_end=None,
@@ -290,7 +282,6 @@ def log_sync(sb: Client, source: str, data_type: str, status: str,
     except Exception as e:
         log.warning(f"Failed to write sync log: {e}")
 
-
 def safe_get(data: dict, *keys, default=None):
     current = data
     for key in keys:
@@ -299,7 +290,6 @@ def safe_get(data: dict, *keys, default=None):
         else:
             return default
     return current
-
 
 # ---------------------------------------------------------------------------
 # Sync functions
@@ -332,7 +322,6 @@ def sync_cycles(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
 
     return upsert_to_supabase(sb, "whoop_cycles", rows, "cycle_id")
 
-
 def sync_recovery(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
     """Sync WHOOP recovery data."""
     recoveries = whoop.get_recovery(start, end)
@@ -359,7 +348,6 @@ def sync_recovery(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
         })
 
     return upsert_to_supabase(sb, "whoop_recovery", rows, "cycle_id")
-
 
 def sync_sleep(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
     """Sync WHOOP sleep data."""
@@ -408,7 +396,6 @@ def sync_sleep(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
 
     return upsert_to_supabase(sb, "whoop_sleep", rows, "sleep_id")
 
-
 def sync_workouts(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
     """Sync WHOOP workout data."""
     workouts = whoop.get_workouts(start, end)
@@ -450,7 +437,6 @@ def sync_workouts(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
 
     return upsert_to_supabase(sb, "whoop_workouts", rows, "workout_id")
 
-
 def sync_body_measurement(whoop: WhoopClient, sb: Client) -> int:
     """Sync WHOOP body measurement (singleton — snapshot over time)."""
     try:
@@ -471,7 +457,6 @@ def sync_body_measurement(whoop: WhoopClient, sb: Client) -> int:
     }
 
     return upsert_to_supabase(sb, "whoop_body_measurements", [row], "measured_at")
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -581,7 +566,6 @@ def main():
         )
     except Exception as e:
         log.warning(f"  whoop_tz_backfill skipped: {e}")
-
 
 if __name__ == "__main__":
     main()

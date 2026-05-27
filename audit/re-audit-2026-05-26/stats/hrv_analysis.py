@@ -123,7 +123,6 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 supa = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
 def log_sync_entry(status: str, records: int = 0, error: str | None = None,
                     duration: float | None = None) -> None:
     """Emit a sync_log heartbeat for the HRV analysis retrain pipeline.
@@ -148,7 +147,6 @@ def log_sync_entry(status: str, records: int = 0, error: str | None = None,
         }).execute()
     except Exception as e:
         log.warning(f"Failed to write hrv_analysis sync_log heartbeat: {e}")
-
 
 MODEL_VERSION = f"{date.today().isoformat()}_behavioral_v1"
 TARGET = "whoop_hrv_rmssd"
@@ -216,7 +214,6 @@ CONTROLLABLE_FEATURE_PREFIXES = (
 # we can detect when a stored result was produced from a different snapshot of the
 # input data (backfills, revisions, schema changes).
 INPUT_DATA_HASH: str | None = None
-
 
 def compute_input_data_hash(X: pd.DataFrame, y: pd.Series) -> str:
     """SHA-256 of the sorted feature matrix + target. Stable across pandas dtypes."""
@@ -379,7 +376,6 @@ JOURNAL_LABELS: dict[str, str] = {
 # is hard-coded here on purpose.
 HABIT_LABELS: dict[str, str] = {}
 
-
 # ===========================================================================
 # PHASE 1 – DATA LOADING
 # ===========================================================================
@@ -412,7 +408,6 @@ def fetch_all(table: str, select: str = "*", filters: list | None = None,
         return pd.DataFrame()
     return pd.DataFrame(rows)
 
-
 def to_date_str(s: pd.Series) -> pd.Series:
     """Coerce a series to 'YYYY-MM-DD' string dates.
 
@@ -421,7 +416,6 @@ def to_date_str(s: pd.Series) -> pd.Series:
     calendar date directly.
     """
     return pd.to_datetime(s, utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
-
 
 def to_et_date_str(s: pd.Series) -> pd.Series:
     """Coerce a true-UTC timestamp series to ET (America/New_York) 'YYYY-MM-DD'.
@@ -436,7 +430,6 @@ def to_et_date_str(s: pd.Series) -> pd.Series:
         .dt.strftime("%Y-%m-%d")
     )
 
-
 def to_cycle_et_date_str(s: pd.Series) -> pd.Series:
     """Canonical ET calendar date for a WHOOP cycle from its `start_time`.
 
@@ -450,7 +443,6 @@ def to_cycle_et_date_str(s: pd.Series) -> pd.Series:
         .dt.tz_convert("America/New_York")
         .dt.strftime("%Y-%m-%d")
     )
-
 
 def load_all_data() -> dict[str, pd.DataFrame]:
     """Load every relevant table from Supabase. Returns a dict of DataFrames."""
@@ -684,7 +676,6 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     log.info(f"  Data loaded. Tables: {list(data.keys())}")
     return data
 
-
 # ===========================================================================
 # PHASE 1 – FEATURE ENGINEERING
 # ===========================================================================
@@ -769,7 +760,6 @@ def aggregate_activities(acts: pd.DataFrame, laps: pd.DataFrame) -> pd.DataFrame
 
     return daily
 
-
 def aggregate_whoop_workouts(wk: pd.DataFrame, cycles: pd.DataFrame) -> pd.DataFrame:
     """Aggregate whoop_workouts to daily level using start_time-derived date."""
     if wk.empty:
@@ -795,7 +785,6 @@ def aggregate_whoop_workouts(wk: pd.DataFrame, cycles: pd.DataFrame) -> pd.DataF
         ),
     ).reset_index()
 
-
 def _clean_question_col(prefix: str, question: str) -> str:
     """Normalize a question string into a stable column name with a category prefix."""
     return (prefix + str(question).lower()
@@ -804,7 +793,6 @@ def _clean_question_col(prefix: str, question: str) -> str:
             .replace("'", "").replace(",", "")
             .replace("(", "").replace(")", "")
             .strip("_"))
-
 
 def pivot_journal(journal: pd.DataFrame) -> pd.DataFrame:
     """Pivot WHOOP journal rows into boolean columns per question per day.
@@ -848,7 +836,6 @@ def pivot_journal(journal: pd.DataFrame) -> pd.DataFrame:
     pivot.columns = ["calendar_date"] + [_clean_question_col("journal_", c) for c in pivot.columns[1:]]
     return pivot
 
-
 def pivot_habits(journal: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
     """Pivot habit rows (source='habit' in the unified journal view) into
     one boolean column per habit per day, prefixed `habit_`.
@@ -888,7 +875,6 @@ def pivot_habits(journal: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
     pivot.columns = ["calendar_date"] + cleaned
     label_map = {col: str(orig) for col, orig in zip(cleaned, original_questions)}
     return pivot, label_map
-
 
 def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
     """Pivot per-compound supplement intake into per-compound dose columns.
@@ -941,7 +927,6 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
         cols = ["calendar_date"] + [c for c in wide.columns if c != "calendar_date"]
         wide = wide[cols]
     return wide, tracking_start
-
 
 def build_feature_matrix(data: dict) -> pd.DataFrame:
     """Join all tables onto the daily_health_matrix spine and engineer features."""
@@ -1183,11 +1168,11 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
                      f"(tracking window from {supp_tracking_start})")
 
     # --- Join Notion personal Journal (mood / confidence / word_count) ---
-    # Audit Finding #8: structured journal metadata was previously isolated from
-    # the matrix on a blanket "Spotify-style isolation" principle. That principle
-    # was for textual / embedding data — the ordinal mood and confidence ratings,
-    # plus word_count as a "how much did I write" proxy, are clear daily-grain
-    # signals worth letting the analysis see.
+    # Structured Notion journal metadata (ordinal mood/confidence + word_count)
+    # is joined into the matrix despite the broader "Spotify-style isolation"
+    # principle for cross-source data. The isolation principle is meant for
+    # textual / embedding data; daily-grain ordinal signals are different and
+    # the analysis can use them directly.
     # NOTE on prefix: use `nj_*` (Notion Journal) NOT `journal_*`. The latter
     # is reserved for boolean WHOOP journal questions and is scanned by Welch's
     # t-tests / causal-layer binary enumeration that assume 0/1 values.
@@ -1482,7 +1467,6 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     log.info(f"Feature matrix shape: {df.shape}")
     return df
 
-
 def _days_since(flag: pd.Series) -> pd.Series:
     """Return days elapsed since the last True/1 value in a binary series."""
     result = pd.Series(np.nan, index=flag.index, dtype=float)
@@ -1492,7 +1476,6 @@ def _days_since(flag: pd.Series) -> pd.Series:
             last = i
         result.iloc[i] = i - last if not np.isnan(last) else np.nan
     return result
-
 
 def workout_to_sleep_gap(data: dict) -> pd.DataFrame:
     """Compute time between last workout end and sleep onset, per calendar_date.
@@ -1625,7 +1608,6 @@ def workout_to_sleep_gap(data: dict) -> pd.DataFrame:
         "had_evening_workout",
     ]]
 
-
 def _consecutive_days(flag: pd.Series) -> pd.Series:
     """Count consecutive 1s up to and including the current row."""
     result = pd.Series(0.0, index=flag.index)
@@ -1637,7 +1619,6 @@ def _consecutive_days(flag: pd.Series) -> pd.Series:
             streak = 0
         result.iloc[i] = streak
     return result
-
 
 def print_completeness(df: pd.DataFrame) -> None:
     """Log per-column non-null percentages."""
@@ -1659,7 +1640,6 @@ def print_completeness(df: pd.DataFrame) -> None:
         if valid:
             pct = df[valid].notna().mean().mean() * 100
             log.info(f"  {cat}: {pct:.0f}% coverage ({len(valid)} features)")
-
 
 # ===========================================================================
 # PHASE 2 – STATISTICAL ANALYSIS
@@ -1850,7 +1830,7 @@ def run_statistical_analysis(
                 y = stage3_df[STAT_TARGET].astype(float).values
                 X_full_std = StandardScaler().fit_transform(X_full)
 
-                # Iteratively drop predictors with VIF > 10 (audit P1 finding).
+                # Iteratively drop predictors with VIF > 10 .
                 # HAC SEs don't rescue standardized betas from multicollinearity:
                 # if a predictor is near-linearly-redundant with others its
                 # standalone coefficient is unstable regardless of how the SE
@@ -2349,7 +2329,6 @@ def run_statistical_analysis(
     log.info("  Statistical analysis complete.")
     return results
 
-
 # ===========================================================================
 # PHASE 3 – PREDICTION MODELS
 # ===========================================================================
@@ -2403,7 +2382,6 @@ def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, l
 
     return model_df, feat_cols, X, y
 
-
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
                     y_lower: np.ndarray | None = None,
                     y_upper: np.ndarray | None = None) -> dict:
@@ -2444,7 +2422,6 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
             "directional_accuracy": dir_acc,
             "directional_accuracy_legacy": dir_acc_legacy,
             "ci_coverage": ci_cov, "ci_avg_width": ci_width}
-
 
 def train_xgboost(df: pd.DataFrame) -> tuple:
     """Train XGBoost next-day HRV predictor. Returns (model, results_dict)."""
@@ -2653,14 +2630,12 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
     }
     return final_model, results
 
-
 def _fallback_feature_importance(model, feat_cols: list) -> list:
     """Fallback: use XGBoost built-in feature importance when SHAP is unavailable."""
     scores = model.feature_importances_
     fi = sorted(zip(feat_cols, scores), key=lambda x: x[1], reverse=True)[:10]
     return [{"feature": f, "label": FEATURE_LABELS.get(f, f), "shap_value": float(v)}
             for f, v in fi]
-
 
 def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
     """Train SARIMAX model for 1–7 day forecasting."""
@@ -2687,11 +2662,10 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
         log.info(f"  SARIMAX exog features ({len(exog_feats)}): {exog_feats}")
         original_exog = hrv_valid[exog_feats].copy().ffill().bfill() if exog_feats else None
         # Shift forward 1 row: exog for row N = original feature values from row N-1.
-        # Audit P1 contract assertion (paired with the full-data forecast fix
-        # below): for k >= 1, exog.iloc[k] must equal original_exog.iloc[k-1].
-        # Everything else in this function — walk-forward future-exog slicing
-        # at line ~2710, full-data future-exog at line ~2740 — relies on this
-        # invariant. If shift semantics ever change, this assertion catches it.
+        # Contract assertion: for k >= 1, exog.iloc[k] must equal
+        # original_exog.iloc[k-1]. Walk-forward future-exog slicing and the
+        # full-data future-exog slice both rely on this invariant; the check
+        # below catches any future refactor that breaks shift semantics.
         exog = original_exog.shift(1).ffill().bfill() if original_exog is not None else None
         if original_exog is not None and exog is not None and len(exog) >= 3:
             chk = min(max(1, len(exog) // 2), len(exog) - 1)
@@ -2786,7 +2760,7 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                              seasonal_order=(1, 0, 1, 7),
                              enforce_stationarity=False, enforce_invertibility=False)
         full_fit = full_model.fit(disp=False, maxiter=200)
-        # Audit P1 fix: training contract is exog[N] = original_exog[N-1] (one
+        # training contract is exog[N] = original_exog[N-1] (one
         # row above), so the forecast at step k from last training row T wants
         # exog[T+k] = original_exog[T+k-1] — future behaviors we don't know.
         # As a proxy, pass the last 7 rows of the already-shifted `exog`
@@ -2832,7 +2806,6 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
     except Exception as e:
         log.warning(f"  SARIMAX failed: {e}")
         return {}
-
 
 def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
     """Train Facebook Prophet for 30-day trend forecast."""
@@ -2964,7 +2937,6 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
         log.warning(f"  Prophet failed: {e}")
         return {}
 
-
 # ===========================================================================
 # PHASE 3.5 – EVALUATION & BACKTESTING
 # ===========================================================================
@@ -3003,7 +2975,7 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     # train_xgboost().
     # -----------------------------------------------------------------------
     if HAS_XGB and xgb_model is not None:
-        # Audit P1 fix: PIs previously used in-sample training residuals which
+        # PIs previously used in-sample training residuals which
         # are over-tight by construction (the model is fit to those points),
         # producing CIs that under-cover the nominal level. Compute an OOF-
         # honest σ per horizon via TimeSeriesSplit on the full feature matrix
@@ -3449,7 +3421,6 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
 
     return eval_results
 
-
 # ===========================================================================
 # DB STORAGE
 # ===========================================================================
@@ -3464,7 +3435,6 @@ def upsert_batch(table: str, rows: list[dict], conflict_cols: str) -> None:
         # Remove None values for cleaner upsert
         cleaned = [{k: v for k, v in r.items() if v is not None and v == v} for r in batch]
         supa.schema("pds").from_(table).upsert(cleaned, on_conflict=conflict_cols).execute()
-
 
 def store_predictions(xgb_results: dict, sarimax_results: dict,
                       prophet_results: dict, eval_results: dict) -> None:
@@ -3552,11 +3522,10 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
             })
 
     log.info(f"  Upserting {len(rows)} prediction rows…")
-    # Audit P1 (G1): on_conflict targets the 4-tuple including model_version
+    # on_conflict targets the 4-tuple including model_version
     # so backtest reruns from different versions accumulate as separate rows.
     upsert_batch("hrv_predictions", rows,
                  "prediction_date,model,horizon_days,model_version")
-
 
 def store_metrics(eval_results: dict) -> None:
     """Upsert model metrics into pds.hrv_model_metrics."""
@@ -3566,7 +3535,6 @@ def store_metrics(eval_results: dict) -> None:
             r.setdefault("input_data_hash", INPUT_DATA_HASH)
         log.info(f"  Upserting {len(rows)} metric rows…")
         upsert_batch("hrv_model_metrics", rows, "eval_date,model,horizon_days")
-
 
 def store_analysis_results(stat_results: dict, feature_importance: dict,
                            feature_importance_full: dict | None = None,
@@ -3794,7 +3762,6 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             ).execute()
             log.info(f"    Upserted: {row['result_type']}/{row['result_key']}")
 
-
 # ===========================================================================
 # SUMMARY REPORT
 # ===========================================================================
@@ -3895,7 +3862,6 @@ def print_summary(df: pd.DataFrame, xgb_results: dict,
     print(f"  XGBoost model:   {OUTPUT_DIR}/xgboost_hrv_model.pkl")
     print(f"  DB tables populated:  pds.hrv_predictions, pds.hrv_model_metrics, pds.hrv_analysis_results")
     print(f"\n{sep}\n")
-
 
 # ===========================================================================
 # MAIN
@@ -4064,7 +4030,6 @@ def main() -> None:
 
     # ---------- Summary ----------
     print_summary(df, xgb_results, sarimax_results, prophet_results, eval_results, stat_results)
-
 
 if __name__ == "__main__":
     import time as _time

@@ -60,7 +60,7 @@ export async function getActivities(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
-  // Audit P1 fix (3-of-3 consensus): filter/sort by start_time_gmt (true UTC)
+  // filter/sort by start_time_gmt (true UTC)
   // instead of start_time_local. Garmin stores start_time_local as wall-clock
   // labeled +00 — comparing it against a true-UTC since cutoff produces
   // off-by-TZ-offset boundaries. Display can still use start_time_local for
@@ -370,7 +370,6 @@ export async function getWhoopCaloriesBurnt(days: number = 30) {
   }
   return Array.from(byDate.values()).sort((a, b) => (a.calendar_date < b.calendar_date ? -1 : 1));
 }
-
 
 // ---------------------------------------------------------------------------
 // Recovery context for running activities (merged into /activities row cards)

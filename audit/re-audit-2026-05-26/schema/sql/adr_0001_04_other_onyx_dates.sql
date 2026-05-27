@@ -231,7 +231,7 @@ BEGIN
     NEW.onyx_et_date         := NEW.cycle_date;
     NEW.onyx_behavioral_date := NEW.cycle_date;
 
-    -- Audit P1 fix: previously tagged every row as 'default_et_fallback' and
+    -- previously tagged every row as 'default_et_fallback' and
     -- copied cycle_date into onyx_local_date verbatim — wrong on any travel
     -- day. Anchor at noon ET on cycle_date and consult user_tz_log; if a row
     -- matches and tz is non-NY, the user was in that TZ on this date, so
@@ -283,12 +283,12 @@ DECLARE
     cycle_start_time TIMESTAMPTZ;
     cycle_tz_offset  TEXT;
 BEGIN
-    -- Audit P0 fix: pre-fix version set onyx_et_date := NEW.cycle_date and
+    -- previously version set onyx_et_date := NEW.cycle_date and
     -- onyx_local_date := NEW.cycle_date, which silently mis-attributes on
     -- travel days. WHOOP's cycle_date is the user-local wake day; on a PT
     -- trip a 22:00 PT bedtime → cycle_date 2026-04-16 PT, but the ET clock
     -- day of that bedtime instant is 2026-04-16 too (often) or 2026-04-15
-    -- (rarely). The pre-fix used PT-labeled date as both onyx_et_date and
+    -- (rarely). The previously used PT-labeled date as both onyx_et_date and
     -- onyx_local_date — only one of those is wrong, but consumers can't
     -- tell which.
     --
@@ -319,7 +319,7 @@ BEGIN
         NEW.onyx_tz_source       := d.onyx_tz_source;
     ELSE
         -- Orphaned journal entry (no matching cycle). TZ-aware fallback
-        -- (audit P1, paired with the habit_journal fix): anchor at noon ET
+        -- : anchor at noon ET
         -- on cycle_date, consult user_tz_log so onyx_local_date reflects
         -- the user's TZ that day rather than blindly copying cycle_date.
         DECLARE

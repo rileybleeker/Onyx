@@ -71,7 +71,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("spotify_etl")
 
-
 # ---------------------------------------------------------------------------
 # Token storage (~/.spotify_tokens.json — same pattern as WHOOP)
 # ---------------------------------------------------------------------------
@@ -87,12 +86,10 @@ def load_tokens() -> dict:
     with open(SPOTIFY_TOKEN_FILE, "r") as f:
         return json.load(f)
 
-
 def save_tokens(tokens: dict):
     with open(SPOTIFY_TOKEN_FILE, "w") as f:
         json.dump(tokens, f, indent=2)
     log.info(f"Spotify tokens saved to {SPOTIFY_TOKEN_FILE}")
-
 
 # ---------------------------------------------------------------------------
 # OAuth — one-time bootstrap (run locally)
@@ -116,7 +113,6 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):  # silence default logging
         return
-
 
 def run_auth_flow():
     """Open browser → Spotify consent → capture code → exchange for tokens."""
@@ -171,7 +167,6 @@ def run_auth_flow():
     save_tokens(tokens)
     log.info("OAuth bootstrap complete. Run `python ci_token_helper.py upload spotify` next.")
 
-
 # ---------------------------------------------------------------------------
 # Token refresh
 # ---------------------------------------------------------------------------
@@ -199,7 +194,6 @@ def refresh_access_token(tokens: dict) -> dict:
         log.info("Refresh token rotated; saving new value.")
     save_tokens(tokens)
     return tokens
-
 
 # ---------------------------------------------------------------------------
 # Spotify API client
@@ -257,7 +251,6 @@ class SpotifyClient:
             time.sleep(0.05)
         return out
 
-
 # ---------------------------------------------------------------------------
 # Audio features (ReccoBeats — Spotify endpoint is dead for post-Nov-2024 apps)
 # ---------------------------------------------------------------------------
@@ -308,14 +301,12 @@ def fetch_audio_features_reccobeats(track_ids: list[str]) -> dict[str, dict]:
     log.info(f"ReccoBeats: resolved features for {len(out)}/{len(track_ids)} tracks")
     return out
 
-
 # ---------------------------------------------------------------------------
 # Supabase upserts
 # ---------------------------------------------------------------------------
 
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
-
 
 def get_high_water_mark(sb: Client) -> int | None:
     """Return MAX(played_at) as Unix ms, or None if table is empty."""
@@ -333,7 +324,6 @@ def get_high_water_mark(sb: Client) -> int | None:
     # Postgres returns "2026-05-16T14:32:01+00:00"
     dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
     return int(dt.timestamp() * 1000)
-
 
 def upsert_plays(sb: Client, items: list[dict]) -> int:
     """Upsert recently-played items into pds.spotify_plays. Returns count inserted/updated."""
@@ -367,7 +357,6 @@ def upsert_plays(sb: Client, items: list[dict]) -> int:
         rows, on_conflict="played_at,track_id"
     ).execute()
     return len(rows)
-
 
 def upsert_tracks(sb: Client, tracks: list[dict], features_by_id: dict[str, dict]) -> int:
     """Upsert track metadata + (optional) audio features into pds.spotify_tracks."""
@@ -417,7 +406,6 @@ def upsert_tracks(sb: Client, tracks: list[dict], features_by_id: dict[str, dict
     ).execute()
     return len(rows)
 
-
 def fetch_musicbrainz_tags(artist_name: str) -> list[str]:
     """
     Look up an artist by name on MusicBrainz, take the top-scored match, return its
@@ -452,7 +440,6 @@ def fetch_musicbrainz_tags(artist_name: str) -> list[str]:
         log.warning(f"MusicBrainz lookup failed for {artist_name!r}: {e}")
         return []
 
-
 def enrich_genres_via_musicbrainz(sb: Client, pairs: list[dict]) -> int:
     """
     For each {artist_id, name} pair, fetch MusicBrainz tags and UPDATE the
@@ -475,7 +462,6 @@ def enrich_genres_via_musicbrainz(sb: Client, pairs: list[dict]) -> int:
             updated += 1
         time.sleep(1.05)  # 1 req/sec ceiling, small margin
     return updated
-
 
 def upsert_artists(sb: Client, artists: list[dict]) -> int:
     """Upsert artist enrichment (genres, popularity, followers) into pds.spotify_artists."""
@@ -508,7 +494,6 @@ def upsert_artists(sb: Client, artists: list[dict]) -> int:
     ).execute()
     return len(rows)
 
-
 def existing_artist_ids(sb: Client, artist_ids: list[str]) -> set[str]:
     """Return the subset of artist_ids already in pds.spotify_artists."""
     if not artist_ids:
@@ -526,7 +511,6 @@ def existing_artist_ids(sb: Client, artist_ids: list[str]) -> set[str]:
         )
         out.update(r["artist_id"] for r in (row.data or []))
     return out
-
 
 def existing_track_ids(sb: Client, track_ids: list[str]) -> set[str]:
     """Return the subset of track_ids already in pds.spotify_tracks."""
@@ -547,11 +531,9 @@ def existing_track_ids(sb: Client, track_ids: list[str]) -> set[str]:
         out.update(r["track_id"] for r in (row.data or []))
     return out
 
-
 def log_sync(sb: Client, status: str, records: int, started_at: float, error: str | None = None):
     log_sync_entry(sb, source="spotify", data_type="plays",
                    status=status, records=records, started_at=started_at, error=error)
-
 
 def log_sync_entry(
     sb: Client,
@@ -576,7 +558,6 @@ def log_sync_entry(
         }).execute()
     except Exception as e:
         log.warning(f"sync_log insert ({source}|{data_type}) failed: {e}")
-
 
 # ---------------------------------------------------------------------------
 # Main flows
@@ -625,7 +606,6 @@ def run_backfill_artists():
     count = upsert_artists(sb, artists)
     log.info(f"Backfilled {count} artists in {int(time.time() - started)}s")
 
-
 def run_refresh_genres():
     """Re-fetch MusicBrainz tags for every spotify_artists row whose genres are empty/null."""
     started = time.time()
@@ -647,7 +627,6 @@ def run_refresh_genres():
         return
     count = enrich_genres_via_musicbrainz(sb, needs)
     log.info(f"Updated {count}/{len(needs)} artists with MusicBrainz tags in {int(time.time()-started)}s")
-
 
 def run_etl(refeaturize: bool = False):
     started = time.time()
@@ -694,7 +673,7 @@ def run_etl(refeaturize: bool = False):
         )
 
         # Resolve new artists (not yet in spotify_artists) and enrich them.
-        # Audit P1 fix: previously only the primary artist (artists[0]) was
+        # previously only the primary artist (artists[0]) was
         # enqueued for enrichment, so collaborator artists on multi-artist
         # tracks never got an artist-images / MusicBrainz-genres row. Iterate
         # every artist on every play. spotify_plays.artist_id intentionally
@@ -780,7 +759,6 @@ def run_etl(refeaturize: bool = False):
         log_sync(sb, status="failed", records=0, started_at=started, error=str(e))
         sys.exit(1)
 
-
 def main():
     parser = argparse.ArgumentParser(description="Spotify ETL Pipeline")
     parser.add_argument("--auth", action="store_true", help="One-time OAuth bootstrap (run locally)")
@@ -806,7 +784,6 @@ def main():
         log.warning("Spotify recently-played returns at most 50 items; ignoring --backfill > 50")
 
     run_etl(refeaturize=args.refeaturize)
-
 
 if __name__ == "__main__":
     main()

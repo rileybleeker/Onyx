@@ -146,7 +146,6 @@ PSM_K = 3
 
 RNG = np.random.default_rng(42)
 
-
 # ---------------------------------------------------------------------------
 # Treatment configuration
 # ---------------------------------------------------------------------------
@@ -160,7 +159,6 @@ class TreatmentSpec:
     confounders: tuple                   # column names
     kind: str = "binary"                 # 'binary' or 'continuous_median_split'
     unit: str | None = None              # for continuous (mg, g, etc.)
-
 
 # Continuous variables we binarize at the personal median to get a clean
 # "above/below your usual" treatment contrast. Median-split is a deliberate
@@ -327,14 +325,12 @@ EXPLICIT_BINARY_TREATMENTS: tuple[tuple[str, str, str], ...] = (
     ("is_return",           "travel",   "Return travel (away → NY)"),
 )
 
-
 # ===========================================================================
 # Estimators
 # ===========================================================================
 
 def _trim_propensity(p: np.ndarray) -> np.ndarray:
     return np.clip(p, PROPENSITY_TRIM_LOW, PROPENSITY_TRIM_HIGH)
-
 
 def _fit_propensity(X: np.ndarray, T: np.ndarray) -> np.ndarray:
     """Logistic regression propensity model. Returns trimmed P(T=1|X)."""
@@ -345,11 +341,9 @@ def _fit_propensity(X: np.ndarray, T: np.ndarray) -> np.ndarray:
     p = model.predict_proba(X)[:, 1]
     return _trim_propensity(p)
 
-
 def _standardize(X: np.ndarray) -> np.ndarray:
     scaler = StandardScaler()
     return scaler.fit_transform(X)
-
 
 def estimate_naive(T: np.ndarray, Y: np.ndarray) -> dict:
     """Mean(Y|T=1) − Mean(Y|T=0) with Welch's CI."""
@@ -365,7 +359,6 @@ def estimate_naive(T: np.ndarray, Y: np.ndarray) -> dict:
         "n_treated": int(len(y1)),
         "n_control": int(len(y0)),
     }
-
 
 def estimate_psm(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
                  k: int = PSM_K, n_boot: int = N_BOOTSTRAP_PSM) -> dict:
@@ -420,7 +413,6 @@ def estimate_psm(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
         "n_dropped_common_support": n_dropped,
     }
 
-
 def _block_bootstrap_ci(psi: np.ndarray, block_len: int = AIPW_BOOTSTRAP_BLOCK_LEN,
                          n_boot: int = N_BOOTSTRAP_AIPW, seed: int = 42,
                          alpha: float = 0.05) -> tuple[float, float]:
@@ -445,7 +437,6 @@ def _block_bootstrap_ci(psi: np.ndarray, block_len: int = AIPW_BOOTSTRAP_BLOCK_L
     boot_means = psi[idx_matrix].mean(axis=1)
     return (float(np.quantile(boot_means, alpha / 2)),
             float(np.quantile(boot_means, 1 - alpha / 2)))
-
 
 def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
                   n_folds: int = N_FOLDS_AIPW) -> dict:
@@ -526,7 +517,6 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
         "bb_width_ratio": bb_width_ratio,  # bb_width / if_width; >1 means BB is wider (IF too narrow)
     }
 
-
 # ===========================================================================
 # Sensitivity Analysis (E-value)
 # ===========================================================================
@@ -538,11 +528,9 @@ def compute_e_value(ate: float, ci_low: float, ci_high: float,
     Returns the E-value for the point estimate AND for the CI bound nearest
     to the null — the latter is what's usually quoted for robustness.
 
-    Audit P1 fix: previous signature took ci_low only and reused it for both
-    positive and negative ATEs. For a negative ATE the bound nearest zero is
-    ci_high (the UPPER bound), not ci_low — the old version reported the
-    E-value at the FARTHER bound, overstating robustness. Now picks ci_low
-    for positive ATE and ci_high for negative ATE explicitly.
+    Takes both ci_low and ci_high and picks the bound nearest zero by sign
+    of the ATE: ci_low for positive ATE, ci_high for negative ATE. CI
+    crossing the null collapses e_ci to 1.0 (no robustness).
     """
     if pooled_sd <= 0 or np.isnan(ate):
         return {"e_value": float("nan"), "e_value_ci": float("nan")}
@@ -575,7 +563,6 @@ def compute_e_value(ate: float, ci_low: float, ci_high: float,
 
     return {"e_value": e_point, "e_value_ci": e_ci}
 
-
 # ===========================================================================
 # Pipeline
 # ===========================================================================
@@ -592,9 +579,7 @@ def _build_outcome_frame(df: pd.DataFrame) -> pd.DataFrame:
         out[OUTCOME_COL] = out[target_col].shift(-1)
     return out
 
-
 _CONFOUNDER_MISSING_WARNED: set[str] = set()
-
 
 def _confounders_for(family: str, available_cols: set[str]) -> list[str]:
     """Pick the confounder set for a treatment family, dropping any that
@@ -616,7 +601,6 @@ def _confounders_for(family: str, available_cols: set[str]) -> list[str]:
         )
         _CONFOUNDER_MISSING_WARNED.add(family)
     return kept
-
 
 def _enumerate_binary_treatments(df: pd.DataFrame) -> list[TreatmentSpec]:
     """Find all binary treatment candidates in the feature matrix:
@@ -673,7 +657,6 @@ def _enumerate_binary_treatments(df: pd.DataFrame) -> list[TreatmentSpec]:
 
     return specs
 
-
 def _enumerate_continuous_treatments(df: pd.DataFrame) -> list[TreatmentSpec]:
     """Continuous treatments are binarized at their personal median and
     treated as 'above median' contrasts."""
@@ -688,7 +671,6 @@ def _enumerate_continuous_treatments(df: pd.DataFrame) -> list[TreatmentSpec]:
                 unit=unit,
             ))
     return specs
-
 
 def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict] | None:
     """Build (X, T, Y) arrays for one treatment + a metadata dict.
@@ -744,7 +726,7 @@ def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarra
         return X_df.values, T, Y, {**meta, "too_few_obs": True}
 
     # Continuous treatments get an additional floor on total non-null observations
-    # (post median-split). Audit Finding #10 — gate was declared but unused.
+    # (post median-split). MIN_CONTINUOUS_N is the explicit gate.
     if spec.kind == "continuous_median_split" and len(T) < MIN_CONTINUOUS_N:
         return X_df.values, T, Y, {
             **meta,
@@ -753,7 +735,6 @@ def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarra
         }
 
     return X_df.values, T, Y, meta
-
 
 def _estimate_one(X: np.ndarray, T: np.ndarray, Y: np.ndarray) -> dict:
     """Run all three estimators for one treatment."""
@@ -772,7 +753,6 @@ def _estimate_one(X: np.ndarray, T: np.ndarray, Y: np.ndarray) -> dict:
         "pooled_outcome_sd": pooled_sd,
     }
 
-
 def _significance_flags(aipw: dict) -> dict:
     """Determine whether AIPW estimate excludes zero."""
     ci_low = aipw.get("ci_low", float("nan"))
@@ -787,7 +767,6 @@ def _significance_flags(aipw: dict) -> dict:
     else:
         direction = "negative"
     return {"significant": bool(significant), "direction": direction}
-
 
 def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None) -> dict:
     """Top-level entry. Returns the full causal-results payload."""
@@ -923,7 +902,6 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
         "dag": dag_payload,
         "meta": meta_payload,
     }
-
 
 def _attenuation(naive: float, adjusted: float) -> float | None:
     """% by which adjustment shrinks (or grows) the naive estimate.

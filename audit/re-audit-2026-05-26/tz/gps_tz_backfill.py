@@ -48,7 +48,6 @@ log = logging.getLogger(__name__)
 # Single TimezoneFinder instance (lazy-loads ~50MB of polygon data).
 tf = TimezoneFinder()
 
-
 def fetch_gps_activities(since: str | None = None) -> list[dict]:
     """Return Garmin activities with GPS coordinates, sorted by start_time_gmt."""
     q = (supa.schema("pds")
@@ -71,7 +70,6 @@ def fetch_gps_activities(since: str | None = None) -> list[dict]:
         offset += 1000
     return rows
 
-
 def tz_for_instant_via_pg(ts_iso: str) -> str:
     """Query pds.tz_for_instant for the IANA TZ in effect at ts."""
     # Use RPC-style call; the function takes a TIMESTAMPTZ and returns TEXT.
@@ -81,7 +79,6 @@ def tz_for_instant_via_pg(ts_iso: str) -> str:
     if res.data:
         return res.data
     return "America/New_York"
-
 
 def infer_proposed_inserts(activities: list[dict]) -> list[dict]:
     """For each activity, infer IANA TZ from lat/lon. Yield rows where the
@@ -132,7 +129,6 @@ def infer_proposed_inserts(activities: list[dict]) -> list[dict]:
         last_proposed_tz = inferred
     return proposals
 
-
 def apply_proposals(proposals: list[dict]) -> int:
     if not proposals:
         return 0
@@ -146,7 +142,6 @@ def apply_proposals(proposals: list[dict]) -> int:
         except Exception as e:
             log.warning(f"  Skipped {p['effective_from']} ({p['tz']}): {e}")
     return inserted
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -182,7 +177,6 @@ def main():
     n = apply_proposals(proposals)
     log.info(f"  Inserted {n} of {len(proposals)} proposed rows.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

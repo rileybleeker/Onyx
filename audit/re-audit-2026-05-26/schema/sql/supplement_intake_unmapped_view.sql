@@ -1,5 +1,5 @@
 -- =============================================================================
--- Audit P1 follow-up: visibility into rows that pds.unit_to_mg_factor drops
+-- visibility into rows that pds.unit_to_mg_factor drops
 -- =============================================================================
 -- The unit conversion function returns NULL for any unit it doesn't recognise
 -- (e.g. 'IU' which needs vitamin-specific factors, or 'Calorie(s)' which isn't

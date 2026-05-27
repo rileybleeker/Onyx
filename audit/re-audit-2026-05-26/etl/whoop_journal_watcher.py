@@ -42,17 +42,14 @@ ARCHIVE = os.path.join(SCRIPT_DIR, "journal_archive")
 sys.path.insert(0, SCRIPT_DIR)
 from whoop_journal_import import import_journal
 
-
 def ensure_dirs():
     """Create inbox/archive folders if they don't exist."""
     os.makedirs(INBOX, exist_ok=True)
     os.makedirs(ARCHIVE, exist_ok=True)
 
-
 def get_csv_files() -> list[str]:
     """Find all CSV files in the inbox folder."""
     return sorted(glob.glob(os.path.join(INBOX, "*.csv")))
-
 
 def archive_file(csv_path: str):
     """Move a processed CSV to the archive folder with a timestamp."""
@@ -63,7 +60,6 @@ def archive_file(csv_path: str):
     dest = os.path.join(ARCHIVE, archive_name)
     shutil.move(csv_path, dest)
     log.info(f"Archived → {archive_name}")
-
 
 def process_inbox() -> int:
     """Process all CSV files in the inbox. Returns count of files processed."""
@@ -95,7 +91,6 @@ def process_inbox() -> int:
 
     return processed
 
-
 def watch(interval: int = 10):
     """Poll the inbox folder at a regular interval."""
     ensure_dirs()
@@ -115,7 +110,6 @@ def watch(interval: int = 10):
     except KeyboardInterrupt:
         log.info("\nStopped.")
 
-
 def main():
     parser = argparse.ArgumentParser(description="WHOOP Journal Folder Watcher")
     parser.add_argument("--once", action="store_true",
@@ -132,7 +126,6 @@ def main():
             log.info("No CSV files found in inbox.")
     else:
         watch(interval=args.interval)
-
 
 if __name__ == "__main__":
     main()

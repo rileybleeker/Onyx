@@ -66,7 +66,7 @@ DECLARE
     d            RECORD;
     tzd          TEXT;
 BEGIN
-    -- Audit P1 fix: when start_time_gmt is NULL, refuse the start_time_local
+    -- when start_time_gmt is NULL, refuse the start_time_local
     -- fallback. Garmin stores start_time_local as wall-clock labeled +00, so
     -- treating it as a true UTC instant silently mis-attributes by the
     -- user's offset. Refusing (option a) leaves onyx_* NULL on degenerate

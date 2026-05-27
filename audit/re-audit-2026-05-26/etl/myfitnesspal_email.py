@@ -64,7 +64,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 from myfitnesspal_import import import_nutrition
 
-
 # ---------------------------------------------------------------------------
 # HTML link extraction (same as whoop_journal_email.py)
 # ---------------------------------------------------------------------------
@@ -92,12 +91,10 @@ class LinkExtractor(HTMLParser):
             self._current_href = None
             self._current_text = ""
 
-
 def extract_links_from_html(html: str) -> list[tuple[str, str]]:
     parser = LinkExtractor()
     parser.feed(html)
     return parser.links
-
 
 # ---------------------------------------------------------------------------
 # Sync log
@@ -119,7 +116,6 @@ def log_sync(sb: Client, source: str, data_type: str, status: str,
     except Exception as e:
         log.warning(f"Failed to write sync log: {e}")
 
-
 # ---------------------------------------------------------------------------
 # IMAP helpers
 # ---------------------------------------------------------------------------
@@ -133,7 +129,6 @@ def connect_imap() -> imaplib.IMAP4_SSL:
     imap.login(IMAP_EMAIL, IMAP_APP_PASSWORD)
     return imap
 
-
 def decode_subject(msg: email.message.Message) -> str:
     raw = msg.get("Subject", "")
     parts = decode_header(raw)
@@ -144,7 +139,6 @@ def decode_subject(msg: email.message.Message) -> str:
         else:
             decoded.append(part)
     return " ".join(decoded)
-
 
 def find_mfp_emails(imap: imaplib.IMAP4_SSL) -> list[tuple[bytes, email.message.Message]]:
     """Search for unread MFP export emails."""
@@ -167,7 +161,6 @@ def find_mfp_emails(imap: imaplib.IMAP4_SSL) -> list[tuple[bytes, email.message.
 
     log.info(f"Found {len(results)} unread MFP export email(s)")
     return results
-
 
 # ---------------------------------------------------------------------------
 # Email processing
@@ -200,7 +193,6 @@ def extract_csv_from_attachment(msg: email.message.Message,
 
     return None
 
-
 def extract_csv_from_zip(zip_path: str, dest_dir: str) -> str | None:
     """Extract nutrition CSV from a ZIP file."""
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -231,7 +223,6 @@ def extract_csv_from_zip(zip_path: str, dest_dir: str) -> str | None:
         csv_path = os.path.join(dest_dir, csv_file)
         log.info(f"Extracted {csv_file} from ZIP")
         return csv_path
-
 
 def extract_download_url(msg: email.message.Message) -> str | None:
     """Extract download URL from email body."""
@@ -272,7 +263,6 @@ def extract_download_url(msg: email.message.Message) -> str | None:
 
     return None
 
-
 def download_csv(url: str, dest_dir: str) -> str | None:
     """Download CSV or ZIP from url, return path to CSV."""
     log.info("Downloading MFP export...")
@@ -292,7 +282,6 @@ def download_csv(url: str, dest_dir: str) -> str | None:
         with open(csv_path, "wb") as f:
             f.write(resp.content)
         return csv_path
-
 
 def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
                   msg: email.message.Message, sb: Client,
@@ -348,7 +337,6 @@ def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
              records=count, duration=duration)
     return True
 
-
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -361,7 +349,7 @@ def check_email(dry_run: bool = False) -> int:
         imap = connect_imap()
         emails = find_mfp_emails(imap)
         if not emails:
-            # Audit P1 fix: emit a heartbeat even when no email was found.
+            # emit a heartbeat even when no email was found.
             # "No new export" is the healthy state for a manual-export flow,
             # so /status would otherwise see staleness grow without any sync
             # event confirming the cron is alive.
@@ -385,7 +373,6 @@ def check_email(dry_run: bool = False) -> int:
                 imap.logout()
             except Exception:
                 pass
-
 
 def main():
     parser = argparse.ArgumentParser(description="MyFitnessPal Email → Supabase")
@@ -417,7 +404,6 @@ def main():
             time.sleep(args.interval)
     except KeyboardInterrupt:
         log.info("\nStopped.")
-
 
 if __name__ == "__main__":
     main()

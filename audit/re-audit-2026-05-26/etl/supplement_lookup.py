@@ -41,7 +41,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("supplement_lookup")
 
-
 # ---------------------------------------------------------------------------
 # DSLD client
 # ---------------------------------------------------------------------------
@@ -56,13 +55,11 @@ def dsld_search(query: str, size: int = 10) -> list[dict]:
     resp.raise_for_status()
     return resp.json().get("hits", [])
 
-
 def dsld_label(dsld_id: int) -> dict:
     """Fetch a full label record by DSLD numeric id."""
     resp = httpx.get(f"{DSLD_API}/label/{dsld_id}", timeout=20)
     resp.raise_for_status()
     return resp.json()
-
 
 # ---------------------------------------------------------------------------
 # Label → our normalized shape
@@ -74,7 +71,6 @@ def _digits_only(s: str | None) -> str | None:
         return None
     out = "".join(c for c in s if c.isdigit())
     return out or None
-
 
 def _flatten_ingredient(ing: dict) -> dict:
     """
@@ -112,7 +108,6 @@ def _flatten_ingredient(ing: dict) -> dict:
         "notes": ing.get("notes"),
     }
 
-
 def normalize_label(label: dict) -> dict:
     """Convert a DSLD label payload into a supplement_products row."""
     dsld_id = label.get("id")
@@ -142,7 +137,6 @@ def normalize_label(label: dict) -> dict:
         "raw_json": label,
     }
 
-
 # ---------------------------------------------------------------------------
 # Supabase
 # ---------------------------------------------------------------------------
@@ -150,12 +144,10 @@ def normalize_label(label: dict) -> dict:
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
 def upsert_product(sb: Client, row: dict) -> None:
     sb.schema("pds").table("supplement_products").upsert(
         row, on_conflict="product_id"
     ).execute()
-
 
 # ---------------------------------------------------------------------------
 # Hit formatting (CLI display)
@@ -170,7 +162,6 @@ def fmt_hit(hit: dict) -> str:
         f"upc:{_digits_only(s.get('upcSku')) or '—'}"
     )
 
-
 # ---------------------------------------------------------------------------
 # CLI flows
 # ---------------------------------------------------------------------------
@@ -181,7 +172,6 @@ def cmd_search(query: str, size: int) -> None:
     for h in hits:
         print(fmt_hit(h))
 
-
 def cmd_seed(dsld_id: int) -> None:
     sb = get_supabase()
     label = dsld_label(dsld_id)
@@ -191,7 +181,6 @@ def cmd_seed(dsld_id: int) -> None:
         f"Seeded {row['product_id']} — {row['brand_name']}: {row['full_name']} "
         f"({len(row['ingredients'])} ingredients)"
     )
-
 
 def cmd_seed_from_upc(upc: str) -> None:
     """Search DSLD by UPC, prompt for the correct match if multiple, seed."""
@@ -209,7 +198,6 @@ def cmd_seed_from_upc(upc: str) -> None:
         idx = int(input("Pick one (number): "))
         chosen = hits[idx]
     cmd_seed(int(chosen["_id"]))
-
 
 def cmd_list() -> None:
     sb = get_supabase()
@@ -229,7 +217,6 @@ def cmd_list() -> None:
             f"{(r.get('full_name') or '?'):<48}  "
             f"{n_ings} ingredients"
         )
-
 
 def main():
     parser = argparse.ArgumentParser(description="DSLD-backed supplement lookup")
@@ -256,7 +243,6 @@ def main():
         cmd_seed_from_upc(args.upc)
     elif args.cmd == "list":
         cmd_list()
-
 
 if __name__ == "__main__":
     main()

@@ -36,10 +36,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("ci_token_helper")
 
-
 def get_supabase():
     return create_client(SUPABASE_URL, SUPABASE_KEY)
-
 
 # ---------------------------------------------------------------------------
 # Download
@@ -72,7 +70,6 @@ def download_garmin():
 
     log.info(f"Garmin tokens written to {GARMIN_TOKEN_DIR}")
 
-
 def download_whoop():
     """Download WHOOP tokens from Supabase and write to ~/.whoop_tokens.json."""
     sb = get_supabase()
@@ -96,7 +93,6 @@ def download_whoop():
 
     log.info(f"WHOOP tokens written to {WHOOP_TOKEN_FILE}")
 
-
 def download_spotify():
     """Download Spotify tokens from Supabase and write to ~/.spotify_tokens.json."""
     sb = get_supabase()
@@ -119,7 +115,6 @@ def download_spotify():
         f.write(token_data)
 
     log.info(f"Spotify tokens written to {SPOTIFY_TOKEN_FILE}")
-
 
 # ---------------------------------------------------------------------------
 # Upload
@@ -146,7 +141,6 @@ def upload_garmin():
 
     log.info("Garmin tokens uploaded to Supabase")
 
-
 def upload_whoop():
     """Read WHOOP tokens from ~/.whoop_tokens.json and upload to Supabase."""
     if not os.path.exists(WHOOP_TOKEN_FILE):
@@ -164,7 +158,6 @@ def upload_whoop():
     }).execute()
 
     log.info("WHOOP tokens uploaded to Supabase")
-
 
 def upload_spotify():
     """Read Spotify tokens from ~/.spotify_tokens.json and upload to Supabase."""
@@ -184,7 +177,6 @@ def upload_spotify():
 
     log.info("Spotify tokens uploaded to Supabase")
 
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -198,7 +190,6 @@ COMMANDS = {
     ("upload", "spotify"): upload_spotify,
 }
 
-
 def main():
     if len(sys.argv) != 3 or (sys.argv[1], sys.argv[2]) not in COMMANDS:
         print("Usage: python ci_token_helper.py <download|upload> <garmin|whoop|spotify>")
@@ -206,7 +197,6 @@ def main():
 
     action, service = sys.argv[1], sys.argv[2]
     COMMANDS[(action, service)]()
-
 
 if __name__ == "__main__":
     main()

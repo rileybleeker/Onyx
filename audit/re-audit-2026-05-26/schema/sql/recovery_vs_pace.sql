@@ -5,7 +5,7 @@
 -- WHOOP recovery / HRV / sleep performance. Joins runs against the WHOOP
 -- cycle whose ET-wake-day matches activity_date (via the +12h trick).
 --
--- Audit P1 (G4) 2026-05-26: column whoop_hrv renamed to whoop_hrv_rmssd_ms.
+-- column whoop_hrv renamed to whoop_hrv_rmssd_ms.
 -- Pre-rename the name hid both the source (WHOOP RMSSD vs Garmin's algorithm
 -- vs Eight Sleep's avg_hrv) and the unit (milliseconds). The three HRV
 -- sources are deliberately NEVER combined statistically — each has its own

@@ -82,12 +82,10 @@ CATEGORY_MAP = {
     "period": "Hormonal Health", "pms": "Hormonal Health",
 }
 
-
 def guess_category(question: str) -> str | None:
     """Best-effort category assignment from question text."""
     q = question.lower().strip()
     return CATEGORY_MAP.get(q)
-
 
 def parse_date(value: str) -> str | None:
     """Try common date formats and return YYYY-MM-DD."""
@@ -98,7 +96,6 @@ def parse_date(value: str) -> str | None:
         except ValueError:
             continue
     return None
-
 
 def detect_format(headers: list[str]) -> str:
     """Detect whether the CSV is wide-format or long-format."""
@@ -121,7 +118,6 @@ def detect_format(headers: list[str]) -> str:
     # Default: assume wide if many columns, long if few
     return "wide" if len(headers) > 5 else "long"
 
-
 def find_date_column(headers: list[str]) -> int:
     """Find the index of the date column in wide-format CSV."""
     candidates = {"date", "cycle start time", "cycle_start", "cycle date",
@@ -130,7 +126,6 @@ def find_date_column(headers: list[str]) -> int:
         if h.lower().strip() in candidates:
             return i
     return 0  # Fall back to first column
-
 
 def parse_wide_format(reader, headers: list[str]) -> list[dict]:
     """Parse wide-format CSV: one row per day, columns = behaviors."""
@@ -162,7 +157,6 @@ def parse_wide_format(reader, headers: list[str]) -> list[dict]:
             })
 
     return rows
-
 
 def parse_long_format(reader, headers: list[str]) -> list[dict]:
     """Parse long-format CSV: one row per question-answer pair."""
@@ -232,7 +226,6 @@ def parse_long_format(reader, headers: list[str]) -> list[dict]:
 
     return rows
 
-
 def import_journal(csv_path: str, dry_run: bool = False) -> int:
     """Parse a WHOOP journal CSV and upsert into Supabase."""
     log.info(f"Reading {csv_path}...")
@@ -294,7 +287,6 @@ def import_journal(csv_path: str, dry_run: bool = False) -> int:
     log.info(f"Done! {total} journal entries synced to Supabase")
     return total
 
-
 def main():
     parser = argparse.ArgumentParser(description="WHOOP Journal CSV → Supabase")
     parser.add_argument("csv_file", help="Path to journal_entries.csv from WHOOP export")
@@ -311,7 +303,6 @@ def main():
     log.info("=" * 60)
 
     import_journal(args.csv_file, dry_run=args.dry_run)
-
 
 if __name__ == "__main__":
     main()

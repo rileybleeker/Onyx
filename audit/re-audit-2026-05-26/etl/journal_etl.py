@@ -58,7 +58,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("journal_etl")
 
-
 # ---------------------------------------------------------------------------
 # Notion client helpers
 # ---------------------------------------------------------------------------
@@ -69,7 +68,6 @@ def _notion_headers() -> dict:
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
-
 
 def query_database(client: httpx.Client) -> list[dict]:
     """Fetch all pages in the journal DB, following pagination."""
@@ -92,7 +90,6 @@ def query_database(client: httpx.Client) -> list[dict]:
             break
         cursor = data.get("next_cursor")
     return pages
-
 
 def fetch_blocks(client: httpx.Client, block_id: str) -> list[dict]:
     """Recursively fetch all child blocks under a given block id."""
@@ -119,7 +116,6 @@ def fetch_blocks(client: httpx.Client, block_id: str) -> list[dict]:
         cursor = data.get("next_cursor")
     return blocks
 
-
 # ---------------------------------------------------------------------------
 # Block → markdown conversion
 # ---------------------------------------------------------------------------
@@ -128,7 +124,6 @@ def _rich_text(rt: list[dict] | None) -> str:
     if not rt:
         return ""
     return "".join(t.get("plain_text", "") for t in rt)
-
 
 def _block_to_md(block: dict, list_index: int | None = None, depth: int = 0) -> str:
     btype = block.get("type", "")
@@ -192,7 +187,6 @@ def _block_to_md(block: dict, list_index: int | None = None, depth: int = 0) -> 
             out = children_md
     return out
 
-
 def blocks_to_markdown(blocks: list[dict]) -> str:
     lines: list[str] = []
     n = 0
@@ -205,7 +199,6 @@ def blocks_to_markdown(blocks: list[dict]) -> str:
             lines.append(_block_to_md(b))
     return "\n\n".join(s for s in lines if s).strip()
 
-
 # ---------------------------------------------------------------------------
 # Page property extraction
 # ---------------------------------------------------------------------------
@@ -216,25 +209,21 @@ def _select(prop: dict | None) -> str | None:
     sel = prop.get("select")
     return sel.get("name") if sel else None
 
-
 def _multi_select(prop: dict | None) -> list[str]:
     if not prop:
         return []
     return [x.get("name") for x in prop.get("multi_select", []) if x.get("name")]
-
 
 def _title(prop: dict | None) -> str:
     if not prop:
         return ""
     return _rich_text(prop.get("title", []))
 
-
 def _date_start(prop: dict | None) -> str | None:
     if not prop:
         return None
     d = prop.get("date")
     return d.get("start") if d else None
-
 
 def extract_metadata(page: dict) -> dict:
     props = page.get("properties", {})
@@ -250,7 +239,6 @@ def extract_metadata(page: dict) -> dict:
         "notion_edited_at": page.get("last_edited_time"),
         "archived": page.get("archived", False),
     }
-
 
 # ---------------------------------------------------------------------------
 # Voyage embeddings
@@ -280,7 +268,6 @@ def embed_documents(client: httpx.Client, texts: list[str]) -> list[list[float]]
     data = r.json()
     return [d["embedding"] for d in data["data"]]
 
-
 # ---------------------------------------------------------------------------
 # sync_log (matches spotify_etl.log_sync_entry pattern)
 # ---------------------------------------------------------------------------
@@ -299,7 +286,6 @@ def log_sync(sb: Client, status: str, records: int, started_at: float, error: st
         }).execute()
     except Exception as e:
         log.warning(f"sync_log insert failed: {e}")
-
 
 # ---------------------------------------------------------------------------
 # Main flow
@@ -419,7 +405,6 @@ def main(full: bool, reembed: bool) -> int:
     )
     log_sync(sb, "success", len(rows_to_upsert), started)
     return 0
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

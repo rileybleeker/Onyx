@@ -49,7 +49,7 @@ WHERE EXISTS (
 );
 
 -- ----- Unit normalization helper ----------------------------------------
--- Audit P1 fix (2026-05-26): added 'mcgdfe' (Dietary Folate Equivalent) and
+-- added 'mcgdfe' (Dietary Folate Equivalent) and
 -- 'mcgrae' (Retinol Activity Equivalent) which previously silently returned
 -- NULL. Both equivalence units are treated as mcg for our purposes — exact
 -- DFE/RAE conversion would need source-form-specific factors (folic acid vs

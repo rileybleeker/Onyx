@@ -46,10 +46,8 @@ supa = create_client(SUPABASE_URL, SUPABASE_KEY)
 # instead of tomorrow, silently skipping the ET day the user actually cares about.
 ET_TZ = ZoneInfo("America/New_York")
 
-
 def et_today() -> date:
     return datetime.now(ET_TZ).date()
-
 
 MODEL_PATH = Path("analysis_output") / "xgboost_hrv_model.pkl"
 MODEL_VERSION = f"{et_today().isoformat()}_v1"
@@ -59,7 +57,6 @@ DRIFT_THRESHOLD = 1.5
 # Window for "rolling" metrics. Previously the function aggregated *all* history,
 # desensitizing the metric over time. 30 days matches the function name.
 ROLLING_WINDOW_DAYS = 30
-
 
 def _clean_for_json(obj):
     """Recursively replace NaN / NaT / numpy scalars with JSON-safe Python types.
@@ -87,7 +84,6 @@ def _clean_for_json(obj):
         return str(obj)
     return obj
 
-
 def fetch_all(table: str, select: str = "*", filters: list | None = None,
               chunk: int = 1000) -> pd.DataFrame:
     rows = []
@@ -112,14 +108,12 @@ def fetch_all(table: str, select: str = "*", filters: list | None = None,
         offset += chunk
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-
 def load_model() -> dict | None:
     if not MODEL_PATH.exists():
         log.error(f"Model not found at {MODEL_PATH}. Run hrv_analysis.py first.")
         return None
     with open(MODEL_PATH, "rb") as f:
         return pickle.load(f)
-
 
 def get_latest_features(feat_cols: list) -> pd.DataFrame | None:
     """Fetch and rebuild features for the most recent available day."""
@@ -147,7 +141,6 @@ def get_latest_features(feat_cols: list) -> pd.DataFrame | None:
     except Exception as e:
         log.error(f"Feature building failed: {e}")
         return None, None
-
 
 def predict_tomorrow(model_bundle: dict) -> dict | None:
     """Generate tomorrow's prediction using the loaded model."""
@@ -221,7 +214,6 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
         "input_data_hash": input_data_hash,
     }
 
-
 def backfill_actuals() -> int:
     """Fill actual_hrv and residual for past predictions where actual is NULL.
 
@@ -277,7 +269,7 @@ def backfill_actuals() -> int:
         })
 
     if updates:
-        # Audit P1 (G1): on_conflict now targets the (date,model,horizon,version)
+        # on_conflict now targets the (date,model,horizon,version)
         # unique index so each retrain run preserves history. NULL versions are
         # handled via NULLS NOT DISTINCT on the underlying index.
         supa.schema("pds").from_("hrv_predictions").upsert(
@@ -287,7 +279,6 @@ def backfill_actuals() -> int:
         log.info(f"  Backfilled actuals for {len(updates)} predictions.")
 
     return len(updates)
-
 
 def recompute_rolling_metrics() -> None:
     """Recompute rolling N-day metrics and upsert into hrv_model_metrics.
@@ -360,7 +351,6 @@ def recompute_rolling_metrics() -> None:
         ).execute()
         log.info(f"  Updated metrics for {len(rows)} models (last {ROLLING_WINDOW_DAYS} days).")
 
-
 def check_drift(current_mae: float | None) -> None:
     """Compare current 30-day MAE against backtest MAE; log warning if drifting."""
     if current_mae is None:
@@ -395,7 +385,6 @@ def check_drift(current_mae: float | None) -> None:
             "records_synced": 0,
             "error_message": f"HRV model drift: current MAE={current_mae:.1f}ms vs backtest {baseline_mae:.1f}ms",
         })).execute()
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Onyx HRV Daily Prediction")
@@ -438,7 +427,7 @@ def main() -> None:
                     today_hrv = prediction.pop("today_hrv", None)
 
                     payload = [{k: v for k, v in prediction.items() if v is not None}]
-                    # Audit P1 (G1): on_conflict targets the 4-tuple so retrain
+                    # on_conflict targets the 4-tuple so retrain
                     # versions accumulate as separate rows; same-day reruns
                     # with the same version upsert in place.
                     supa.schema("pds").from_("hrv_predictions").upsert(
@@ -470,7 +459,6 @@ def main() -> None:
     if stage_errors:
         log.error(f"{len(stage_errors)} stage(s) failed: {', '.join(stage_errors)}")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

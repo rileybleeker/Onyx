@@ -1,4 +1,4 @@
--- Audit P1 fix: WHOOP cycle hub FKs (GPT-5 + Claude variants, 3-of-3 consensus).
+-- WHOOP cycle hub FKs (GPT-5 + Claude variants, ).
 -- whoop_recovery.cycle_id and whoop_sleep.cycle_id both pointed at
 -- pds.whoop_cycles.cycle_id with no FK, so a cycle delete would leave orphans
 -- and an Onyx-side ETL bug rewriting a cycle_id would silently corrupt joins.

@@ -73,13 +73,11 @@ GENERIC_OFFSET_IANA = {
     "+10:00": "Australia/Sydney",
 }
 
-
 def parse_offset_str(offset_str: str) -> timedelta:
     """Parse '+02:00' / '-06:00' to a timedelta."""
     sign = 1 if offset_str[0] == "+" else -1
     hh, mm = offset_str[1:].split(":")
     return sign * timedelta(hours=int(hh), minutes=int(mm))
-
 
 def format_offset(td: timedelta | None) -> str | None:
     """Format a timedelta as +HH:MM / -HH:MM."""
@@ -89,7 +87,6 @@ def format_offset(td: timedelta | None) -> str | None:
     sign = "+" if total_min >= 0 else "-"
     abs_min = abs(total_min)
     return f"{sign}{abs_min // 60:02d}:{abs_min % 60:02d}"
-
 
 def build_history_iana_map() -> dict[str, str]:
     """Derive offset -> most-common IANA from manual user_tz_log entries.
@@ -114,7 +111,6 @@ def build_history_iana_map() -> dict[str, str]:
             log.warning(f"  history-map: skipped {r['effective_from']} ({tz_name}): {e}")
     return {off: max(c.items(), key=lambda x: x[1])[0] for off, c in counts.items()}
 
-
 def infer_iana(offset_str: str, history_map: dict[str, str]) -> tuple[str, str]:
     """Return (iana, provenance_string) for the inferred zone."""
     if offset_str in history_map:
@@ -122,7 +118,6 @@ def infer_iana(offset_str: str, history_map: dict[str, str]) -> tuple[str, str]:
     if offset_str in GENERIC_OFFSET_IANA:
         return GENERIC_OFFSET_IANA[offset_str], f"generic default for {offset_str}"
     return "Etc/UTC", f"no inference available for {offset_str}; using UTC placeholder"
-
 
 def fetch_cycles(since: str | None = None) -> list[dict]:
     """Return WHOOP cycles, sorted by start_time."""
@@ -144,12 +139,10 @@ def fetch_cycles(since: str | None = None) -> list[dict]:
         offset += 1000
     return rows
 
-
 def tz_for_instant_via_pg(ts_iso: str) -> str:
     """Query pds.tz_for_instant for the IANA TZ in effect at ts."""
     res = supa.schema("pds").rpc("tz_for_instant", {"ts": ts_iso}).execute()
     return res.data or "America/New_York"
-
 
 def infer_proposed_inserts(cycles: list[dict], history_map: dict[str, str]) -> list[dict]:
     """For each cycle, propose a user_tz_log row only if:
@@ -204,7 +197,6 @@ def infer_proposed_inserts(cycles: list[dict], history_map: dict[str, str]) -> l
         last_proposed_tz = inferred_iana
     return proposals
 
-
 def apply_proposals(proposals: list[dict]) -> int:
     if not proposals:
         return 0
@@ -216,7 +208,6 @@ def apply_proposals(proposals: list[dict]) -> int:
         except Exception as e:
             log.warning(f"  Skipped {p['effective_from']} ({p['tz']}): {e}")
     return inserted
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -260,7 +251,6 @@ def main():
     n = apply_proposals(proposals)
     log.info(f"  Inserted {n} of {len(proposals)} proposed rows.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

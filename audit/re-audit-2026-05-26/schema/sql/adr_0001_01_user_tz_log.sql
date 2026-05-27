@@ -168,7 +168,7 @@ BEGIN
         onyx_local_date      := local_instant::date;
         onyx_behavioral_date := (local_instant - INTERVAL '6 hours')::date;
     ELSE
-        -- Tier 2: WHOOP cycle anchor (audit P1 fix — was previously skipped).
+        -- Tier 2: WHOOP cycle anchor .
         -- If the instant falls inside a WHOOP cycle's [start_time, end_time)
         -- range, prefer that cycle's recorded offset over user_tz_log. The
         -- cycle offset is the most authoritative non-source-field signal
@@ -183,7 +183,7 @@ BEGIN
             onyx_behavioral_date := (local_instant - INTERVAL '6 hours')::date;
         ELSE
             -- Tier 3+5: explicit user_tz_log lookup with NY fallback.
-            -- Audit P1 fix (Gemini): the previous EXISTS-based check could
+            -- the previous EXISTS-based check could
             -- tag rows as 'user_tz_log' when the actual TZ used was the NY
             -- fallback (e.g., when log rows exist before ts but none match).
             -- Read the row explicitly so the source label reflects whether
