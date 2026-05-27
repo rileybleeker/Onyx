@@ -741,8 +741,20 @@ def backfill_laps(garmin: Garmin, sb: Client) -> int:
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
-def sync_date(garmin: Garmin, sb: Client, target_date: date) -> dict:
-    """Sync all data types for a single date. Returns counts per type."""
+def sync_date(garmin: Garmin, sb: Client, target_date: date) -> tuple[dict, int]:
+    """Sync all data types for a single date.
+
+    Returns:
+        counts: per-type record count
+        errors: number of per-type sync_* calls that raised before persisting
+
+    Pre-fix this used to return only `counts` and silently coerce caught
+    exceptions to `counts[name] = 0`. The outer loop then saw `day_total = 0`
+    and counted the day as "no data" instead of as a failure — a constraint
+    violation or connection loss on every upsert would show up as a green
+    sync_log row with `records=0`. Now per-type errors propagate to a count
+    that the caller can fold into the run's overall failure status.
+    """
     syncs = {
         "daily_summary": sync_daily_summary,
         "sleep": sync_sleep,
@@ -751,14 +763,16 @@ def sync_date(garmin: Garmin, sb: Client, target_date: date) -> dict:
         "stress": sync_stress,
         "training_status": sync_training_status,
     }
-    counts = {}
+    counts: dict[str, int] = {}
+    errors = 0
     for name, func in syncs.items():
         try:
             counts[name] = func(garmin, sb, target_date)
         except Exception as e:
-            log.warning(f"  {name} {target_date}: {e}")
+            log.warning(f"  {name} {target_date}: {e}", exc_info=True)
             counts[name] = 0
-    return counts
+            errors += 1
+    return counts, errors
 
 
 def main():
@@ -844,10 +858,14 @@ def main():
 
     for i, d in enumerate(dates):
         try:
-            counts = sync_date(garmin, sb, d)
+            counts, day_errors = sync_date(garmin, sb, d)
             day_total = sum(counts.values())
             total_records += day_total
-            if day_total > 0:
+            errors += day_errors
+            if day_errors > 0:
+                log.warning(f"  [{i+1}/{len(dates)}] {d}: {day_total} records, "
+                            f"{day_errors} per-type errors")
+            elif day_total > 0:
                 log.info(f"  [{i+1}/{len(dates)}] {d}: {day_total} records synced")
             else:
                 log.debug(f"  [{i+1}/{len(dates)}] {d}: no data")
@@ -892,11 +910,18 @@ def main():
 
     duration = time.time() - t0
 
-    # Log sync summary
-    log_sync(sb, "garmin", "full_sync", "success" if errors == 0 else "partial",
+    # Log sync summary. Per the audit re-2026-05-26 fix, ANY accumulated
+    # error (per-type sync exception OR whole-day failure) trips status to
+    # 'failed' so /status surfaces it. Previously the only "partial"/"failed"
+    # signal came from whole-day exceptions that escaped sync_date — but
+    # sync_date used to swallow per-type failures and return zeroes, so a
+    # day with all six sync_* functions raising looked indistinguishable
+    # from a day with no Garmin data.
+    status = "success" if errors == 0 else "failed"
+    log_sync(sb, "garmin", "full_sync", status,
              records=total_records, date_start=dates[0], date_end=dates[-1],
              duration=duration,
-             error=f"{errors} date(s) failed" if errors else None)
+             error=f"{errors} sync error(s) across {len(dates)} day(s)" if errors else None)
 
     # Persist any refreshed tokens to disk (needed for CI token upload)
     # garth attribute removed in newer garminconnect versions; login(TOKEN_DIR) handles persistence
