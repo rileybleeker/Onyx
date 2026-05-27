@@ -41,6 +41,7 @@ from postgrest.exceptions import APIError as PostgrestAPIError
 from supabase import create_client, Client
 
 from sync_log_helper import log_sync as _shared_log_sync
+from retry_helper import retry_http
 
 # ---------------------------------------------------------------------------
 # Config
@@ -239,13 +240,26 @@ class SpotifyClient:
         return {"Authorization": f"Bearer {self.tokens['access_token']}"}
 
     def _request(self, method: str, url: str, **kwargs):
+        # 401 path: explicit refresh-and-retry once. Spotify uses 401 for
+        # expired access tokens; that's not a transient error, it's "rotate the
+        # token then call again." Done outside retry_http so we don't waste an
+        # attempt on a known-stale token.
         resp = self.http.request(method, url, headers=self._headers(), **kwargs)
         if resp.status_code == 401:
             log.info("Access token expired; refreshing.")
             self.tokens = refresh_access_token(self.tokens)
             resp = self.http.request(method, url, headers=self._headers(), **kwargs)
-        resp.raise_for_status()
-        return resp
+            resp.raise_for_status()
+            return resp
+        # All other paths: wrap in retry_http so 5xx / 429 / network errors
+        # get up to 3 attempts with exponential backoff (honoring Retry-After
+        # on 429). retry_http calls .raise_for_status() so non-retryable 4xx
+        # propagates immediately.
+        return retry_http(
+            lambda: self.http.request(method, url, headers=self._headers(), **kwargs),
+            max_attempts=3,
+            log=log,
+        )
 
     def recently_played(self, after_ms: int | None = None, limit: int = 50) -> list[dict]:
         """GET /me/player/recently-played. `after_ms` is a Unix ms timestamp."""

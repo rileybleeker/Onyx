@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 from sync_log_helper import log_sync as _shared_log_sync
+from retry_helper import retry_http
 
 # ---------------------------------------------------------------------------
 # Config
@@ -81,13 +82,16 @@ def query_database(client: httpx.Client) -> list[dict]:
         body: dict = {"page_size": 100}
         if cursor:
             body["start_cursor"] = cursor
-        r = client.post(
-            f"{NOTION_API}/databases/{NOTION_JOURNAL_DB}/query",
-            headers=_notion_headers(),
-            json=body,
-            timeout=30,
+        r = retry_http(
+            lambda: client.post(
+                f"{NOTION_API}/databases/{NOTION_JOURNAL_DB}/query",
+                headers=_notion_headers(),
+                json=body,
+                timeout=30,
+            ),
+            max_attempts=5,  # Notion is the chattiest, give it room
+            log=log,
         )
-        r.raise_for_status()
         data = r.json()
         pages.extend(data.get("results", []))
         if not data.get("has_more"):
@@ -104,13 +108,16 @@ def fetch_blocks(client: httpx.Client, block_id: str) -> list[dict]:
         params: dict = {"page_size": 100}
         if cursor:
             params["start_cursor"] = cursor
-        r = client.get(
-            f"{NOTION_API}/blocks/{block_id}/children",
-            headers=_notion_headers(),
-            params=params,
-            timeout=30,
+        r = retry_http(
+            lambda: client.get(
+                f"{NOTION_API}/blocks/{block_id}/children",
+                headers=_notion_headers(),
+                params=params,
+                timeout=30,
+            ),
+            max_attempts=5,
+            log=log,
         )
-        r.raise_for_status()
         data = r.json()
         for block in data.get("results", []):
             blocks.append(block)
@@ -264,21 +271,24 @@ def embed_documents(client: httpx.Client, texts: list[str]) -> list[list[float]]
         return []
     if not VOYAGE_API_KEY:
         raise RuntimeError("VOYAGE_API_KEY is not set")
-    r = client.post(
-        VOYAGE_API,
-        headers={
-            "Authorization": f"Bearer {VOYAGE_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "input": texts,
-            "model": VOYAGE_MODEL,
-            "input_type": "document",
-            "output_dimension": VOYAGE_DIM,
-        },
-        timeout=60,
+    r = retry_http(
+        lambda: client.post(
+            VOYAGE_API,
+            headers={
+                "Authorization": f"Bearer {VOYAGE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "input": texts,
+                "model": VOYAGE_MODEL,
+                "input_type": "document",
+                "output_dimension": VOYAGE_DIM,
+            },
+            timeout=60,
+        ),
+        max_attempts=3,
+        log=log,
     )
-    r.raise_for_status()
     data = r.json()
     return [d["embedding"] for d in data["data"]]
 
