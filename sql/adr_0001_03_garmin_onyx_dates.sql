@@ -159,6 +159,16 @@ CREATE INDEX IF NOT EXISTS idx_garmin_hrv_behavioral_date
 -- garmin_hrv.start_timestamp is 100% NULL in our history (Garmin doesn't
 -- populate it via our ETL). Fall back to calendar_date which is already
 -- wake-day attributed by Garmin's backend.
+--
+-- Audit re-2026-05-26 P1 fix: the previous fallback set behavioral_date
+-- directly to calendar_date (watch-local) but labelled provenance as
+-- 'default_et_fallback' (a non-ET date masquerading as ET). It also missed
+-- user_tz_log lookups so travel days got the wrong behavioral_date.
+-- New behaviour: synthesize an NY-noon instant from calendar_date and route
+-- it through derive_onyx_dates so user_tz_log can shift behavioral_date when
+-- Riley was abroad. onyx_local_date stays watch-local (calendar_date is
+-- already pre-attributed by Garmin's backend in the wearer's TZ). Provenance
+-- is now 'garmin_calendar_date'.
 CREATE OR REPLACE FUNCTION pds.set_onyx_dates_garmin_hrv()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -171,10 +181,15 @@ BEGIN
         NEW.onyx_local_date      := d.onyx_local_date;
         NEW.onyx_tz_source       := d.onyx_tz_source;
     ELSE
-        NEW.onyx_et_date         := NEW.calendar_date;
-        NEW.onyx_behavioral_date := NEW.calendar_date;
+        SELECT * INTO d FROM pds.derive_onyx_dates(
+            (NEW.calendar_date + INTERVAL '12 hours') AT TIME ZONE 'America/New_York',
+            NULL,
+            'garmin_calendar_date'
+        );
+        NEW.onyx_et_date         := d.onyx_et_date;
+        NEW.onyx_behavioral_date := d.onyx_behavioral_date;
         NEW.onyx_local_date      := NEW.calendar_date;
-        NEW.onyx_tz_source       := 'default_et_fallback';
+        NEW.onyx_tz_source       := 'garmin_calendar_date';
     END IF;
     RETURN NEW;
 END;
