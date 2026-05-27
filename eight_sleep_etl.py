@@ -399,6 +399,20 @@ def parse_interval(interval: dict, bed_side: str) -> dict | None:
     }
 
 
+def _prefer_trend(trend: dict, interval: dict, key: str):
+    """Prefer trend[key], fall back to interval[key], treating 0 / 0.0 / False
+    as valid trend values (not falsy holes).
+
+    The naive `trend.get(key) or interval.get(key)` pattern silently overwrites
+    legitimate zeros from the trends payload (e.g. awake_seconds=0 on a perfect
+    sleep, deep_sleep_seconds=0 on a degraded reading, toss_and_turns=0) with
+    whatever the interval API returned for the same key — which may be stale,
+    absent, or computed differently.
+    """
+    v = trend.get(key)
+    return v if v is not None else interval.get(key)
+
+
 def _strip_timeseries(data: dict) -> dict:
     """Return a copy with bulky timeseries arrays removed."""
     stripped = {}
@@ -490,20 +504,20 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
             "wakeup_consistency_score": trend.get("wakeup_consistency_score"),
             "sleep_routine_score": trend.get("sleep_routine_score"),
             # Biometrics — prefer trend (v2), fall back to interval
-            "avg_heart_rate": trend.get("avg_heart_rate") or interval.get("avg_heart_rate"),
+            "avg_heart_rate": _prefer_trend(trend, interval, "avg_heart_rate"),
             "avg_hrv": trend.get("avg_hrv"),
-            "avg_breath_rate": trend.get("avg_breath_rate") or interval.get("avg_breath_rate"),
+            "avg_breath_rate": _prefer_trend(trend, interval, "avg_breath_rate"),
             # Environment
-            "median_bed_temp": trend.get("median_bed_temp") or interval.get("median_bed_temp"),
-            "median_room_temp": trend.get("median_room_temp") or interval.get("median_room_temp"),
+            "median_bed_temp": _prefer_trend(trend, interval, "median_bed_temp"),
+            "median_room_temp": _prefer_trend(trend, interval, "median_room_temp"),
             # Sleep stages — prefer trend, fall back to interval
             "time_slept_seconds": trend.get("time_slept_seconds"),
-            "awake_seconds": trend.get("awake_seconds") or interval.get("awake_seconds"),
-            "light_sleep_seconds": trend.get("light_sleep_seconds") or interval.get("light_sleep_seconds"),
-            "deep_sleep_seconds": trend.get("deep_sleep_seconds") or interval.get("deep_sleep_seconds"),
-            "rem_sleep_seconds": trend.get("rem_sleep_seconds") or interval.get("rem_sleep_seconds"),
+            "awake_seconds": _prefer_trend(trend, interval, "awake_seconds"),
+            "light_sleep_seconds": _prefer_trend(trend, interval, "light_sleep_seconds"),
+            "deep_sleep_seconds": _prefer_trend(trend, interval, "deep_sleep_seconds"),
+            "rem_sleep_seconds": _prefer_trend(trend, interval, "rem_sleep_seconds"),
             # Other
-            "toss_and_turns": trend.get("toss_and_turns") or interval.get("toss_and_turns"),
+            "toss_and_turns": _prefer_trend(trend, interval, "toss_and_turns"),
             "latency_asleep_seconds": trend.get("latency_asleep_seconds"),
             # Snoring (trends-only — intervals API doesn't expose these)
             "snore_duration_seconds": trend.get("snore_duration_seconds"),
