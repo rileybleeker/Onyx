@@ -30,6 +30,8 @@ Onyx/
 ├── journal_etl.py           # Notion personal Journal → Supabase (entries + Voyage embeddings)
 ├── journal_schema.sql       # pds.journal_entries table + search_journal_entries RPC
 ├── ci_token_helper.py       # Download/upload OAuth tokens for CI
+├── sync_log_helper.py       # Shared pds.sync_log writer — always sets sync_start + sync_end + duration
+├── retry_helper.py          # Shared httpx retry wrapper: exponential backoff + 429 Retry-After honoring
 ├── hrv_analysis.py          # HRV deep analysis pipeline (Phases 1-3.5): data loading,
 │                            #   ~350-column / ~250-feature matrix, stat analysis, XGBoost/SARIMAX/Prophet,
 │                            #   walk-forward backtest, stores results to Supabase
