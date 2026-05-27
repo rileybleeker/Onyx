@@ -3367,14 +3367,27 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     # behavior with sample sizes + mean absolute residual.
     # -----------------------------------------------------------------------
     try:
-        # Error-mode analysis joins each XGBoost residual to that day's
-        # journal/habit flags. Restrict to h=1 so the join is unambiguous
-        # (each prediction_date appears once per model) and the residual
-        # distribution reflects the headline next-day model only.
+        # Error-mode analysis joins each XGBoost residual to the BEHAVIOR DAY
+        # whose features drove that residual. Restrict to h=1 so the join is
+        # unambiguous (each prediction_date appears once per model) and the
+        # residual distribution reflects the headline next-day model only.
+        #
+        # Audit re-2026-05-26 P1 (gpt-5 stats F-002): previously the merge
+        # used prediction_date == calendar_date, which joined journal_*[N]
+        # (behaviors of day N) to residuals predicting HRV on day N. The
+        # model's features for HRV[N] are from day N-1 (the shift-1 contract
+        # in build_feature_matrix); the behavior attribution was therefore
+        # off-by-one, blaming the morning-after for the prior night's drink.
+        # Fix: feature_date = prediction_date - horizon_days. We retain
+        # horizon_days in the arithmetic so the same code generalizes if the
+        # h>1 filter is ever relaxed.
         xgb_bt = bt_df[(bt_df["model"] == "xgboost") & (bt_df["horizon_days"] == 1)] \
                     .dropna(subset=["residual"]).copy()
         if not xgb_bt.empty:
-            xgb_bt["pred_date"] = pd.to_datetime(xgb_bt["prediction_date"]).dt.strftime("%Y-%m-%d")
+            xgb_bt["feature_date"] = (
+                pd.to_datetime(xgb_bt["prediction_date"])
+                - pd.to_timedelta(xgb_bt["horizon_days"].astype(int), unit="D")
+            ).dt.strftime("%Y-%m-%d")
             jcols = [c for c in df.columns if c.startswith("journal_")]
             if jcols:
                 # Lookup table: calendar_date -> journal flags. journal_*[N] = behaviors
@@ -3382,7 +3395,7 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                 jdf = df[["calendar_date"] + jcols].copy()
                 jdf["calendar_date"] = jdf["calendar_date"].astype(str)
                 joined = xgb_bt.merge(
-                    jdf, left_on="pred_date", right_on="calendar_date", how="left",
+                    jdf, left_on="feature_date", right_on="calendar_date", how="left",
                 )
                 em_rows = []
                 for jc in jcols:
@@ -3414,7 +3427,7 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                 hdf = df[["calendar_date"] + hcols].copy()
                 hdf["calendar_date"] = hdf["calendar_date"].astype(str)
                 joined_h = xgb_bt.merge(
-                    hdf, left_on="pred_date", right_on="calendar_date", how="left",
+                    hdf, left_on="feature_date", right_on="calendar_date", how="left",
                 )
                 em_h_rows = []
                 for hc in hcols:
