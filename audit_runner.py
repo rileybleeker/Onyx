@@ -135,9 +135,14 @@ async def call_openai(client: httpx.AsyncClient, bundle_text: str, commit: str) 
             {"role": "user", "content": bundle_text},
         ],
         "response_format": {"type": "json_object"},
+        # High reasoning effort for max thoroughness on the audit task. GPT-5
+        # default is 'medium'; 'high' uses substantially more reasoning tokens
+        # (~2-3x cost) but catches subtler issues. See docs:
+        # https://platform.openai.com/docs/guides/reasoning
+        "reasoning_effort": "high",
     }
 
-    log.info(f"[openai] firing request to {OPENAI_MODEL} (bundle size: {len(bundle_text):,} chars)")
+    log.info(f"[openai] firing request to {OPENAI_MODEL} (reasoning=high, bundle size: {len(bundle_text):,} chars)")
     resp = await client.post(
         OPENAI_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -189,12 +194,17 @@ async def call_gemini(client: httpx.AsyncClient, bundle_text: str, commit: str) 
         "contents": [{"role": "user", "parts": [{"text": bundle_text}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
-            # Let the model use its full thinking budget; this is a heavy review task.
             "temperature": 0.2,
+            # Max thinking budget for Gemini 2.5 Pro (32768 is the cap). The
+            # default for 2.5 Pro is dynamic (the model decides); pinning to
+            # max forces it to use the full budget on this heavy review task.
+            # Cost impact: thinking tokens charged at ~$3.50/1M, so +$0.10/call.
+            # See: https://ai.google.dev/gemini-api/docs/thinking
+            "thinkingConfig": {"thinkingBudget": 32768, "includeThoughts": False},
         },
     }
 
-    log.info(f"[gemini] firing request to {GEMINI_MODEL} (bundle size: {len(bundle_text):,} chars)")
+    log.info(f"[gemini] firing request to {GEMINI_MODEL} (thinking_budget=32768, bundle size: {len(bundle_text):,} chars)")
     resp = await client.post(
         f"{GEMINI_URL}?key={api_key}",
         headers={"Content-Type": "application/json"},
@@ -288,7 +298,10 @@ async def run(args: argparse.Namespace) -> int:
         log.info(f"  {fname}: {size:,} chars")
 
     head = current_commit()
-    pinned = args.commit or "5ceb269"
+    # Default to current HEAD so the saved bundle_commit always reflects what
+    # the model actually saw. Pass --commit to override (e.g. when replaying
+    # an old bundle).
+    pinned = args.commit or head
     if head != pinned:
         log.warning(f"Current git HEAD ({head}) does not match pinned commit ({pinned}).")
         log.warning(f"Audit will be saved under bundle_commit={pinned}, but the files on disk are at {head}.")
@@ -347,7 +360,7 @@ def main() -> int:
     parser.add_argument("--model", choices=["openai", "gemini", "both"], default="both",
                         help="Which model(s) to call")
     parser.add_argument("--commit", default=None,
-                        help="Override pinned commit (default: 5ceb269)")
+                        help="Override pinned commit (default: current git HEAD)")
     args = parser.parse_args()
 
     if args.fire and args.dry_run:
