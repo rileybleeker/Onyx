@@ -1,4 +1,5 @@
 import { supabase } from "./supabase";
+import { whoopSleepDay } from "./format";
 
 /**
  * Duration unit convention across this module:
@@ -296,13 +297,15 @@ export async function getWorkoutSleepGap(days: number = 60): Promise<WorkoutSlee
       }
       if (workouts[i].end < sleepMs - eighteenHrMs) break;
     }
-    // pred_date = ET date of (cycle_start - 1 day), matching pipeline attribution
+    // pred_date = behavioral date (day the workout/strain "belongs to" for the
+    // following sleep). Use whoopSleepDay() — `(cycle_start − 6h)::ET date` —
+    // matching the canonical pipeline attribution (ADR-0001, see CLAUDE.md
+    // behavioral-day rule). The previous naive (cycle_start − 24h) math pushed
+    // pre-midnight bedtimes back TWO calendar days instead of one, mis-pairing
+    // workouts with the wrong day's sleep on every pre-midnight night.
     const cycleStart = cycleStartByCycle.get(s.cycle_id as number);
-    const cycleStartMs = cycleStart ? new Date(cycleStart).getTime() : sleepMs;
-    const predDateMs = cycleStartMs - 24 * 60 * 60 * 1000;
-    const predDate = new Date(predDateMs).toLocaleDateString("en-CA", {
-      timeZone: "America/New_York",
-    });
+    const cycleStartISO = cycleStart ?? (s.start_time as string);
+    const predDate = whoopSleepDay(cycleStartISO);
     out.push({
       pred_date: predDate,
       sleep_onset_utc: s.start_time as string,
