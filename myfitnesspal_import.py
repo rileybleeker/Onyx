@@ -28,7 +28,7 @@ import csv
 import json
 import argparse
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 
 from dotenv import load_dotenv
@@ -109,10 +109,21 @@ def build_macro_dict(row: list[str], col_map: dict[str, int]) -> dict:
     }
 
 
-def import_nutrition(csv_path: str, dry_run: bool = False) -> int:
+def import_nutrition(
+    csv_path: str,
+    dry_run: bool = False,
+    export_received_at: datetime | None = None,
+) -> int:
     """Parse a MyFitnessPal nutrition CSV and upsert to Supabase.
 
     Returns the number of rows upserted.
+
+    If `export_received_at` is supplied (typically the email's Date header from
+    myfitnesspal_email.process_email), days whose existing row was synced AFTER
+    that timestamp are skipped — protects against an older MFP export
+    overwriting a newer one when Riley triggers multiple exports in quick
+    succession (deepseek etl/F-005). When unset (direct CLI use), nothing is
+    skipped and all rows are upserted as before.
     """
     log.info(f"Reading {csv_path}...")
 
@@ -214,6 +225,46 @@ def import_nutrition(csv_path: str, dry_run: bool = False) -> int:
 
     # Upsert to Supabase in batches
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    # Ordering check: skip dates whose existing row was synced AFTER this
+    # export was received. Single batched select keeps the round-trips small
+    # vs per-row lookups even for ~30-day exports.
+    if export_received_at is not None and db_rows:
+        if export_received_at.tzinfo is None:
+            export_received_at = export_received_at.replace(tzinfo=timezone.utc)
+        existing = (
+            sb.schema("pds")
+            .table("myfitnesspal_nutrition")
+            .select("calendar_date, synced_at")
+            .in_("calendar_date", [r["calendar_date"] for r in db_rows])
+            .execute()
+        )
+        existing_synced: dict[str, datetime] = {}
+        for row in existing.data or []:
+            d = row.get("calendar_date")
+            s = row.get("synced_at")
+            if not d or not s:
+                continue
+            try:
+                existing_synced[d] = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                continue
+        original_count = len(db_rows)
+        db_rows = [
+            r for r in db_rows
+            if r["calendar_date"] not in existing_synced
+            or existing_synced[r["calendar_date"]] <= export_received_at
+        ]
+        skipped_newer = original_count - len(db_rows)
+        if skipped_newer:
+            log.info(
+                f"Ordering guard: skipped {skipped_newer} day(s) whose existing "
+                f"row was synced after this export's received-at ({export_received_at.isoformat()})."
+            )
+        if not db_rows:
+            log.info("All dates in this export are stale vs DB — nothing to upsert.")
+            return 0
+
     batch_size = 500
     total = 0
 

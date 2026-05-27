@@ -37,6 +37,7 @@ from html.parser import HTMLParser
 
 import requests
 from dotenv import load_dotenv
+from email.utils import parsedate_to_datetime
 from supabase import create_client, Client
 
 from sync_log_helper import log_sync as _shared_log_sync
@@ -300,6 +301,17 @@ def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
     email_date = msg.get("Date", "unknown")
     log.info(f"Processing: \"{subject}\" ({email_date})")
 
+    # Parse the email's Date header so the importer can refuse to overwrite a
+    # newer row with stale data from an older export (deepseek etl/F-005).
+    # Falls back to now() if unparseable — same as old behaviour.
+    email_received_at: datetime | None = None
+    raw_date = msg.get("Date")
+    if raw_date:
+        try:
+            email_received_at = parsedate_to_datetime(raw_date)
+        except (TypeError, ValueError):
+            email_received_at = None
+
     t0 = time.time()
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -332,7 +344,10 @@ def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
 
         # Step 2: Import nutrition data
         try:
-            count = import_nutrition(csv_path, dry_run=dry_run)
+            count = import_nutrition(
+                csv_path, dry_run=dry_run,
+                export_received_at=email_received_at,
+            )
         except Exception as e:
             log.error(f"Import failed: {e} — will retry next cycle")
             log_sync(sb, "myfitnesspal", "nutrition", "error",
