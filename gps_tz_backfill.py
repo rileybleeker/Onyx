@@ -88,9 +88,22 @@ def infer_proposed_inserts(activities: list[dict]) -> list[dict]:
     inferred TZ differs from what user_tz_log currently resolves to.
 
     Collapses consecutive same-TZ proposals into one row (earliest instant).
+
+    Audit re-2026-05-26 P1 (gemini tz/F-001): seed ``current_tz`` from one
+    DB query then maintain it in memory; update after every proposal. The
+    prior implementation called ``tz_for_instant`` per activity, so an
+    outbound-flight proposal generated during run N never propagated to
+    later activities in the same run — the return flight back to ET could
+    be missed because the DB still resolved the home tz.
     """
     proposals: list[dict] = []
     last_proposed_tz: str | None = None
+
+    current_tz: str | None = None
+    if activities:
+        current_tz = tz_for_instant_via_pg(activities[0]["start_time_gmt"])
+        log.info(f"  seeded current_tz from DB: {current_tz} "
+                 f"(at {activities[0]['start_time_gmt']})")
 
     for act in activities:
         lat = float(act["start_latitude"])
@@ -99,7 +112,7 @@ def infer_proposed_inserts(activities: list[dict]) -> list[dict]:
         inferred = tf.timezone_at(lat=lat, lng=lon)
         if not inferred:
             continue
-        log_says = tz_for_instant_via_pg(ts_iso)
+        log_says = current_tz or "America/New_York"
         if inferred == log_says:
             last_proposed_tz = inferred
             continue
@@ -130,6 +143,9 @@ def infer_proposed_inserts(activities: list[dict]) -> list[dict]:
             "notes": f"gps-auto: Garmin activity {act['activity_id']} @ ({lat:.4f},{lon:.4f}); log was {log_says}",
         })
         last_proposed_tz = inferred
+        # Update in-memory state so subsequent activities (including the
+        # return-flight half of a round trip) see the new tz.
+        current_tz = inferred
     return proposals
 
 

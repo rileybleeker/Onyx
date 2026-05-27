@@ -168,26 +168,39 @@ def infer_proposed_inserts(cycles: list[dict], history_map: dict[str, str]) -> l
           currently returns at this instant, AND
       (b) we haven't already proposed the same IANA for the immediately
           prior cycle (deduplication).
+
+    Audit re-2026-05-26 P1 (gemini tz/F-001): rather than calling
+    ``tz_for_instant`` for every cycle, seed an in-memory ``current_tz`` from
+    one initial DB query and update it whenever this loop generates a
+    proposal. Without that, an outbound flight proposal in run N doesn't
+    surface to subsequent cycles' comparisons during the same run, and the
+    return flight back to ET can be missed entirely because the DB still
+    reports the home tz. Also drops ~N-1 RPC round-trips per run.
     """
     proposals: list[dict] = []
     last_proposed_tz: str | None = None
+
+    # Seed current_tz from the DB once. Subsequent updates happen in-memory.
+    current_tz: str | None = None
+    if cycles:
+        current_tz = tz_for_instant_via_pg(cycles[0]["start_time"])
+        log.info(f"  seeded current_tz from DB: {current_tz} "
+                 f"(at {cycles[0]['start_time']})")
 
     for c in cycles:
         ts_iso = c["start_time"]
         end_iso = c.get("end_time")
         whoop_offset_str = c["timezone_offset"]
-        log_tz = tz_for_instant_via_pg(ts_iso)
+        log_tz = current_tz or "America/New_York"
         try:
             ts_aware = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
             log_offset_at_start = format_offset(ts_aware.astimezone(ZoneInfo(log_tz)).utcoffset())
             log_offset_at_end = None
             if end_iso:
                 end_aware = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-                # Use the same log_tz lookup at end_time so DST shifts mid-cycle
-                # are visible. (tz_for_instant returns the IANA, ZoneInfo
-                # handles DST per-instant.)
-                end_log_tz = tz_for_instant_via_pg(end_iso)
-                log_offset_at_end = format_offset(end_aware.astimezone(ZoneInfo(end_log_tz)).utcoffset())
+                # ZoneInfo handles DST per-instant, so the same log_tz IANA
+                # produces the right (possibly different) offset at end_time.
+                log_offset_at_end = format_offset(end_aware.astimezone(ZoneInfo(log_tz)).utcoffset())
         except Exception as e:
             log.warning(f"  cycle {c['cycle_id']}: log-offset compute failed: {e}")
             continue
@@ -221,6 +234,11 @@ def infer_proposed_inserts(cycles: list[dict], history_map: dict[str, str]) -> l
                       f"{provenance}; log was {log_tz} ({log_offset_at_start})"),
         })
         last_proposed_tz = inferred_iana
+        # Update in-memory state so the next cycle's comparison sees the new
+        # tz (necessary to detect the return-flight half of a round trip on
+        # the first run; without this, the return is masked because the DB
+        # still resolves the home tz until the proposal is actually applied).
+        current_tz = inferred_iana
     return proposals
 
 
