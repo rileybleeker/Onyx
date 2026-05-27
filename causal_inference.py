@@ -408,15 +408,41 @@ def estimate_psm(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
     if len(treated_idx) < 5 or len(control_idx) < k:
         return {"ate": float("nan"), "ci_low": float("nan"),
                 "ci_high": float("nan"), "se": float("nan"),
-                "n_treated_matched": 0, "n_dropped_common_support": 0}
+                "n_treated_matched": 0, "n_dropped_common_support": 0,
+                "caliper_value": float("nan"), "caliper_drops": 0}
 
-    # For each treated, k nearest controls on logit propensity
-    matched_diffs = []
+    # Audit re-2026-05-26 P2 (gpt-5 stats F-006): PSM previously matched the
+    # NEAREST k controls on logit propensity with no caliper, so under
+    # propensity misspecification a treated unit could pair with controls at
+    # materially different propensities. Standard caliper = 0.2·SD(logit p)
+    # over the analysis sample. A treated unit whose NEAREST control sits
+    # outside the caliper is dropped (counted as caliper_drop) instead of
+    # being forced to match.
+    caliper = float(0.2 * np.std(logit_p))
+
+    # For each treated, k nearest controls on logit propensity WITHIN caliper.
+    matched_diffs: list[float] = []
+    caliper_drops = 0
     for ti in treated_idx:
         dists = np.abs(logit_p[control_idx] - logit_p[ti])
-        nn = control_idx[np.argsort(dists)[:k]]
+        order = np.argsort(dists)
+        # Take up to k nearest whose distance is within the caliper.
+        in_cal = dists[order] <= caliper
+        nn_idx = order[in_cal][:k]
+        if len(nn_idx) == 0:
+            caliper_drops += 1
+            continue
+        nn = control_idx[nn_idx]
         matched_diffs.append(Y[ti] - Y[nn].mean())
     matched_diffs = np.array(matched_diffs)
+
+    if len(matched_diffs) < 5:
+        return {"ate": float("nan"), "ci_low": float("nan"),
+                "ci_high": float("nan"), "se": float("nan"),
+                "n_treated_matched": int(len(matched_diffs)),
+                "n_dropped_common_support": int(np.sum(T) - len(treated_idx)
+                                                + (T == 0).sum() - len(control_idx)),
+                "caliper_value": caliper, "caliper_drops": int(caliper_drops)}
 
     att = float(matched_diffs.mean())
 
@@ -437,8 +463,12 @@ def estimate_psm(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
         "ci_low": ci_low,
         "ci_high": ci_high,
         "se": se,
-        "n_treated_matched": int(len(treated_idx)),
+        # n_treated_matched now counts treated units that found at least one
+        # in-caliper control (post-caliper sample), not the pre-caliper count.
+        "n_treated_matched": int(len(matched_diffs)),
         "n_dropped_common_support": n_dropped,
+        "caliper_value": caliper,
+        "caliper_drops": int(caliper_drops),
     }
 
 
@@ -489,8 +519,13 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
     # AIPW shift harness (audit/aipw_shift_findings.md).
     kf = TimeSeriesSplit(n_splits=n_folds)
     psi = np.zeros(n)
+    # Audit re-2026-05-26 P2 (gpt-5 stats F-007): track per-fold class-balance
+    # skips. Previously NaN'd silently; with sparse treatments many folds can
+    # drop without alerting the user. Log once at the end and flag the result
+    # as `unreliable` when > 2 of n_folds are skipped.
+    fold_failures = 0
 
-    for train_idx, test_idx in kf.split(X):
+    for fold_idx, (train_idx, test_idx) in enumerate(kf.split(X)):
         # Per-fold scaler fit on training rows only (no leakage from val).
         scaler = StandardScaler().fit(X[train_idx])
         Xt = scaler.transform(X[train_idx])
@@ -498,7 +533,14 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
         Tt, Yt = T[train_idx], Y[train_idx]
 
         # Need at least one treated and one control in the training fold to fit
-        if Tt.sum() < 2 or (Tt == 0).sum() < 2:
+        n_treated_tr = int(Tt.sum())
+        n_control_tr = int((Tt == 0).sum())
+        if n_treated_tr < 2 or n_control_tr < 2:
+            log.warning(
+                f"  AIPW fold {fold_idx}: class imbalance "
+                f"(T={n_treated_tr}, C={n_control_tr}); skipping"
+            )
+            fold_failures += 1
             psi[test_idx] = np.nan
             continue
 
@@ -522,13 +564,16 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
                 - (1 - Tv) * (Yv - mu0) / (1 - e)
             )
         except Exception as ex:
-            log.warning(f"  AIPW fold failed: {ex}")
+            log.warning(f"  AIPW fold {fold_idx} failed: {ex}")
+            fold_failures += 1
             psi[test_idx] = np.nan
 
     psi_valid = psi[~np.isnan(psi)]
     if len(psi_valid) < 10:
         return {"ate": float("nan"), "ci_low": float("nan"),
-                "ci_high": float("nan"), "se": float("nan")}
+                "ci_high": float("nan"), "se": float("nan"),
+                "fold_failures": int(fold_failures), "n_folds": int(n_folds),
+                "unreliable": True}
 
     ate = float(psi_valid.mean())
     se = float(psi_valid.std(ddof=1) / np.sqrt(len(psi_valid)))
@@ -546,6 +591,11 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
     width_bb = ci_high_bb - ci_low_bb if not np.isnan(ci_low_bb) else float("nan")
     bb_width_ratio = float(width_bb / width_if) if width_if > 0 and not np.isnan(width_bb) else float("nan")
 
+    # AIPW unreliable when > 2 of n_folds were skipped (class imbalance or
+    # estimator failure). Frontend renders these with a ⚠ marker similar to
+    # the existing low_n badge.
+    unreliable = fold_failures > 2
+
     return {
         "ate": ate,
         "ci_low": ci_low_if,
@@ -555,6 +605,9 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
         "ci_low_bb": ci_low_bb,
         "ci_high_bb": ci_high_bb,
         "bb_width_ratio": bb_width_ratio,  # bb_width / if_width; >1 means BB is wider (IF too narrow)
+        "fold_failures": int(fold_failures),
+        "n_folds": int(n_folds),
+        "unreliable": bool(unreliable),
     }
 
 
@@ -928,6 +981,14 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             "aipw_ci_low_bb": est["aipw"].get("ci_low_bb"),
             "aipw_ci_high_bb": est["aipw"].get("ci_high_bb"),
             "aipw_bb_width_ratio": est["aipw"].get("bb_width_ratio"),
+            # Audit re-2026-05-26 P2 (gpt-5 F-007): per-treatment fold-failure
+            # accounting + unreliable flag for AIPW cross-fitting.
+            "aipw_fold_failures": est["aipw"].get("fold_failures", 0),
+            "aipw_n_folds": est["aipw"].get("n_folds", N_FOLDS_AIPW),
+            "aipw_unreliable": bool(est["aipw"].get("unreliable", False)),
+            # PSM caliper bookkeeping (gpt-5 F-006).
+            "psm_caliper_value": est["psm"].get("caliper_value"),
+            "psm_caliper_drops": est["psm"].get("caliper_drops", 0),
             "e_value": est["sensitivity"]["e_value"],
             "e_value_ci": est["sensitivity"]["e_value_ci"],
             "n_treated": meta["n_treated"],

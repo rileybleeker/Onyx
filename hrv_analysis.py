@@ -2320,18 +2320,35 @@ def run_statistical_analysis(
                             if "passes_fdr" in corr_df.columns else corr_df)
             top10 = granger_pool.head(10)["feature"].tolist()
             granger_results = []
+            # Audit re-2026-05-26 P2 (gpt-5 stats F-005): adjust per-feature
+            # lag-1/2/3 p-values via Holm so the family-wise error rate within
+            # one feature stays at α=0.05. Raw p-values are still stored
+            # (p_value) so downstream readers can see what was uncorrected.
+            try:
+                from statsmodels.stats.multitest import multipletests as _mt
+            except Exception:
+                _mt = None
             for feat in top10:
                 sub = hrv_valid[[STAT_TARGET, feat]].dropna()
                 if len(sub) < 50:
                     continue
                 try:
                     gc = grangercausalitytests(sub[[STAT_TARGET, feat]], maxlag=3, verbose=False)
-                    for lag in range(1, 4):
-                        f_stat = gc[lag][0]["ssr_ftest"][0]
-                        p_val = gc[lag][0]["ssr_ftest"][1]
+                    lags = list(range(1, 4))
+                    raw_ps = [float(gc[l][0]["ssr_ftest"][1]) for l in lags]
+                    if _mt is not None:
+                        _, p_holm, _, _ = _mt(raw_ps, method="holm")
+                        p_holm_list = [float(p) for p in p_holm]
+                    else:
+                        p_holm_list = list(raw_ps)
+                    for lag, p_raw, p_h in zip(lags, raw_ps, p_holm_list):
+                        f_stat = float(gc[lag][0]["ssr_ftest"][0])
                         granger_results.append({
                             "feature": feat, "label": FEATURE_LABELS.get(feat, feat),
-                            "lag": lag, "f_stat": float(f_stat), "p_value": float(p_val),
+                            "lag": lag, "f_stat": f_stat,
+                            "p_value": p_raw,
+                            "p_value_holm": p_h,
+                            "passes_holm_05": bool(p_h < 0.05),
                         })
                 except Exception:
                     pass
