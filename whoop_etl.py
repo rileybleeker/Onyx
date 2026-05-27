@@ -208,7 +208,16 @@ class WhoopClient:
         return self._request("GET", path, **kwargs).json()
 
     def get_paginated(self, path: str, start: str = None, end: str = None) -> list:
-        """Fetch all pages from a paginated endpoint."""
+        """Fetch all pages from a paginated endpoint.
+
+        WHOOP v2 contract (verified against developer.whoop.com/api):
+          - Request param: nextToken (camelCase)
+          - Response field: next_token (snake_case)
+
+        Loop guard: if the API ever returns the same token twice in a row
+        (indicating a regression or server-side bug), we'd otherwise spin
+        forever. Track seen tokens and break with a warning instead.
+        """
         all_records = []
         params = {}
         if start:
@@ -216,17 +225,33 @@ class WhoopClient:
         if end:
             params["end"] = end
 
+        seen_tokens: set[str] = set()
+        page_count = 0
+        last_token: str | None = None
         while True:
             data = self.get(path, params=params)
             records = data.get("records", [])
             all_records.extend(records)
+            page_count += 1
 
             next_token = data.get("next_token")
             if not next_token:
                 break
+            if next_token in seen_tokens:
+                log.warning(
+                    f"{path}: pagination token repeated ({next_token!r}); "
+                    f"breaking after {page_count} pages to avoid infinite loop."
+                )
+                break
+            seen_tokens.add(next_token)
+            last_token = next_token
             params["nextToken"] = next_token
             time.sleep(0.3)  # Be gentle with rate limits
 
+        log.info(
+            f"{path}: fetched {len(all_records)} records across {page_count} page(s)"
+            + (f" (final token={last_token})" if last_token else "")
+        )
         return all_records
 
     def get_profile(self) -> dict:
