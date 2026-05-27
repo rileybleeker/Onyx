@@ -2691,13 +2691,26 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
         # `.asfreq('D')` injects NaN rows at every missing date — the Kalman
         # filter handles missing observations natively (combined with
         # enforce_stationarity=False / enforce_invertibility=False below).
+        #
+        # IMPORTANT: clamp the daily spine to the span of OBSERVED HRV days.
+        # The raw feature matrix may carry rows from years before HRV
+        # monitoring started (other sources backfilled longer); reindexing to
+        # the full min..max date range would inject thousands of NaN rows
+        # that Kalman has to integrate over, producing degenerate forecasts
+        # and zero-MAE walk-forward folds. Anchor the spine to the first/last
+        # day with non-null HRV instead.
         hrv_indexed = df.set_index(pd.to_datetime(df["calendar_date"]))
         hrv_indexed = hrv_indexed[~hrv_indexed.index.duplicated(keep="last")]
-        full_idx = pd.date_range(hrv_indexed.index.min(), hrv_indexed.index.max(), freq="D")
+        valid_hrv_dates = hrv_indexed.index[hrv_indexed[TARGET].notna()]
+        if len(valid_hrv_dates) < 30:
+            log.warning(f"  SARIMAX: only {len(valid_hrv_dates)} observed HRV days — skipping")
+            return {}
+        full_idx = pd.date_range(valid_hrv_dates.min(), valid_hrv_dates.max(), freq="D")
         hrv_valid = hrv_indexed.reindex(full_idx)
         hrv_series = hrv_valid[TARGET].astype(float).asfreq("D")
         n_missing_hrv = int(hrv_series.isna().sum())
-        log.info(f"  SARIMAX: {len(hrv_series)} daily rows; "
+        log.info(f"  SARIMAX: {len(hrv_series)} daily rows "
+                 f"({hrv_series.index.min().date()} → {hrv_series.index.max().date()}); "
                  f"{n_missing_hrv} HRV gaps handled via Kalman filter")
 
         # Exogenous: top features with sufficient coverage.
@@ -2804,12 +2817,26 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
         sarimax_metrics: dict[int, dict] = {}
         for h in range(1, 8):
             if len(preds_by_horizon[h]) >= 5:
-                sarimax_metrics[h] = compute_metrics(
+                m = compute_metrics(
                     np.array(actuals_by_horizon[h]),
                     np.array(preds_by_horizon[h])
                 )
-                sarimax_metrics[h]["n"] = len(preds_by_horizon[h])
-                log.info(f"  SARIMAX h={h}: MAE={sarimax_metrics[h].get('mae', '?'):.2f}")
+                # compute_metrics returns {} if fewer than 3 non-NaN pairs
+                # survived its internal mask — common when the underlying
+                # series has heavy missingness, which the audit re-2026-05-26
+                # P0 fix can amplify because the asfreq'd index admits more
+                # NaN-tainted forecast points. Skip the row entirely instead
+                # of writing an empty metrics dict that the storage layer
+                # would then misrender.
+                if not m or "mae" not in m or m["mae"] is None:
+                    n_pairs = len(preds_by_horizon[h])
+                    n_nan = int(np.isnan(np.asarray(preds_by_horizon[h], dtype=float)).sum())
+                    log.warning(f"  SARIMAX h={h}: insufficient valid predictions "
+                                f"({n_pairs} pairs, {n_nan} NaN) — skip horizon")
+                    continue
+                m["n"] = len(preds_by_horizon[h])
+                sarimax_metrics[h] = m
+                log.info(f"  SARIMAX h={h}: MAE={m['mae']:.2f}")
 
         # Full-data forecast for next 7 days.
         full_model = SARIMAX(hrv_series, exog=exog, order=(1, 1, 1),
