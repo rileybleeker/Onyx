@@ -2506,6 +2506,39 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
 
     log.info(f"  Train: {train_end} rows | Val: {val_end - train_end} | Test: {n - val_end}")
 
+    # Audit re-2026-05-26 P2 (deepseek stats F-004): N is small (~600 rows)
+    # relative to p (~250 features). XGBoost itself handles the high-dim
+    # case fine, but SHAP / permutation importance attributions can be
+    # unstable when features are heavily collinear — a tree-based explainer
+    # is free to "blame" any of N near-duplicate features for the same
+    # learned split. Compute the condition number of the standardized
+    # training matrix and emit a warning when it exceeds 30 (the standard
+    # cutoff from Belsley et al. 1980); record the value + a boolean flag
+    # on the result row so the frontend can render a caveat alongside the
+    # SHAP chart.
+    feature_condition_number = float("nan")
+    shap_unstable = False
+    try:
+        from numpy.linalg import cond as _cond
+        X_train_std = StandardScaler().fit_transform(
+            X_train.fillna(X_train.mean(numeric_only=True))
+        )
+        feature_condition_number = float(_cond(X_train_std))
+        if not np.isfinite(feature_condition_number):
+            feature_condition_number = float("inf")
+        if feature_condition_number > 30:
+            shap_unstable = True
+            log.warning(
+                f"  XGBoost feature matrix condition number = "
+                f"{feature_condition_number:.1f} > 30 — SHAP / permutation "
+                "importance may over-credit collinear feature siblings"
+            )
+        else:
+            log.info(f"  XGBoost feature matrix cond({X_train.shape[1]}d) = "
+                     f"{feature_condition_number:.2f}")
+    except Exception as _e:
+        log.debug(f"  Condition number compute failed: {_e}")
+
     # Hyperparameter tuning with Optuna (20 trials) or simple defaults
     best_params = {
         "max_depth": 4, "learning_rate": 0.05, "n_estimators": 300,
@@ -2691,6 +2724,9 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
         "train_end": model_df["calendar_date"].iloc[train_end - 1],
         "test_start": model_df["calendar_date"].iloc[val_end],
         "test_end": model_df["calendar_date"].iloc[-1],
+        # Audit re-2026-05-26 P2 (deepseek stats F-004): high-dim warning.
+        "feature_condition_number": feature_condition_number,
+        "shap_unstable": shap_unstable,
     }
     return final_model, results
 

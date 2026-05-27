@@ -480,11 +480,24 @@ def _block_bootstrap_ci(psi: np.ndarray, block_len: int = AIPW_BOOTSTRAP_BLOCK_L
     Resamples contiguous blocks of length `block_len` with replacement to preserve
     autocorrelation structure. Returns (ci_low, ci_high) at (1-alpha) confidence.
 
-    Returns (NaN, NaN) if n < 2 * block_len (not enough rows to form a meaningful
-    block bootstrap).
+    Audit re-2026-05-26 P2 (gemini stats F-007): psi may carry NaN at index
+    positions where the cross-fitting fold was skipped (class imbalance) or
+    the upstream row was dropped (e.g. confounder ffill couldn't fill).
+    Densifying with ``psi_valid = psi[~isnan(psi)]`` before bootstrapping
+    re-glues non-adjacent calendar days, breaking the autocorrelation
+    structure the block bootstrap is designed to preserve. The new contract:
+    callers pass the FULL psi (calendar-contiguous order, NaN where missing),
+    and ``np.nanmean`` over each bootstrap row skips the gaps without
+    re-densifying. Bootstrap rows whose 7-day blocks are entirely NaN are
+    discarded; if too few survive (<100), we return NaN.
+
+    Returns (NaN, NaN) when fewer than 2*block_len non-NaN psi values exist
+    (not enough material for a meaningful block bootstrap).
     """
+    psi = np.asarray(psi, dtype=float)
     n = len(psi)
-    if n < 2 * block_len:
+    n_valid = int((~np.isnan(psi)).sum())
+    if n < 2 * block_len or n_valid < 2 * block_len:
         return (float("nan"), float("nan"))
     rng = np.random.default_rng(seed)
     n_blocks = int(np.ceil(n / block_len))
@@ -493,7 +506,12 @@ def _block_bootstrap_ci(psi: np.ndarray, block_len: int = AIPW_BOOTSTRAP_BLOCK_L
     # Build the index matrix: for each row, the indices of its sampled blocks concatenated.
     offsets = np.arange(block_len)
     idx_matrix = (starts[:, :, None] + offsets[None, None, :]).reshape(n_boot, -1)[:, :n]
-    boot_means = psi[idx_matrix].mean(axis=1)
+    boot_samples = psi[idx_matrix]
+    with np.errstate(invalid="ignore"):
+        boot_means = np.nanmean(boot_samples, axis=1)
+    boot_means = boot_means[~np.isnan(boot_means)]
+    if len(boot_means) < 100:
+        return (float("nan"), float("nan"))
     return (float(np.quantile(boot_means, alpha / 2)),
             float(np.quantile(boot_means, 1 - alpha / 2)))
 
@@ -584,7 +602,12 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
     # follow-up: HRV is autocorrelated; the IF SE assumes i.i.d. influence values,
     # which is violated by hrv_lag1 + temporal residual structure. Block bootstrap
     # over 7-day blocks gives an autocorrelation-aware CI for comparison.
-    ci_low_bb, ci_high_bb = _block_bootstrap_ci(psi_valid)
+    #
+    # Audit re-2026-05-26 P2 (gemini stats F-007): pass the FULL psi (with
+    # NaN gaps preserved) so the 7-day blocks correspond to calendar-
+    # contiguous days. Densifying via psi_valid would glue non-adjacent days
+    # and break the autocorrelation structure the bootstrap relies on.
+    ci_low_bb, ci_high_bb = _block_bootstrap_ci(psi)
 
     # Compare CI widths. If they diverge meaningfully, the IF SE is unreliable.
     width_if = ci_high_if - ci_low_if
