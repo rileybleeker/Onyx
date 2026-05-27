@@ -155,25 +155,45 @@ def upsert_to_supabase(sb: Client, table: str, rows: list[dict],
 # Sync: Daily Summary
 # ---------------------------------------------------------------------------
 
+def _et_local_today() -> date:
+    """Return today's date in ET (America/New_York). Falls back to date.today()
+    if zoneinfo lookup fails (shouldn't happen on Python 3.9+ runners).
+
+    GHA runners default to UTC, so a bare `date.today()` rolls into tomorrow
+    around 7-8pm ET. Every guard that compares against "is this a future
+    date?" must use ET-local, not the runner's UTC clock.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        return date.today()
+
+
+def _is_future_et(target_date: date, dataset: str) -> bool:
+    """Per-sync_* future-date guard. Centralizes the ET-local logic that was
+    inlined into sync_daily_summary so every dataset returns 0 (clean no-op)
+    if the caller hands it a date past today. Audit re-2026-05-26 P1
+    (deepseek etl F-002): defense-in-depth against direct calls from
+    --backfill / manual one-shots / future refactors that bypass main()'s
+    ET-local boundary.
+    """
+    local_today = _et_local_today()
+    if target_date > local_today:
+        log.debug(f"  {dataset} {target_date.isoformat()}: future date "
+                  f"(ET-local today {local_today}), skipping")
+        return True
+    return False
+
+
 def sync_daily_summary(garmin: Garmin, sb: Client, target_date: date) -> int:
     """Sync one day of daily summary stats."""
     ds = target_date.isoformat()
     # Skip future dates: Garmin's API returns a stub row for today+1 onwards with
     # all metric columns NULL. Storing those breaks "latest data date" queries
     # in /status and seeds garbage forward-edges into the daily_health_matrix view
-    # (audit finding 1.F).
-    #
-    # Self-review fix: previously used `date.today()` which on the GHA runner is
-    # UTC-local. For a user in ET (UTC-4/-5), UTC may have already rolled into
-    # tomorrow while the user's local "today" is yesterday — making the guard
-    # accept a real-world-future row. Compare against ET-local date instead.
-    try:
-        from zoneinfo import ZoneInfo
-        local_today = datetime.now(ZoneInfo("America/New_York")).date()
-    except Exception:
-        local_today = date.today()
-    if target_date > local_today:
-        log.debug(f"  daily_summary {ds}: future date (local {local_today}), skipping")
+    # (audit finding 1.F + re-2026-05-26 deepseek etl F-002).
+    if _is_future_et(target_date, "daily_summary"):
         return 0
     try:
         stats = garmin.get_stats(ds)
@@ -237,6 +257,8 @@ def sync_daily_summary(garmin: Garmin, sb: Client, target_date: date) -> int:
 
 def sync_sleep(garmin: Garmin, sb: Client, target_date: date) -> int:
     """Sync one day of sleep data."""
+    if _is_future_et(target_date, "sleep"):
+        return 0
     ds = target_date.isoformat()
     try:
         sleep = garmin.get_sleep_data(ds)
@@ -321,6 +343,8 @@ def sync_sleep(garmin: Garmin, sb: Client, target_date: date) -> int:
 
 def sync_heart_rate(garmin: Garmin, sb: Client, target_date: date) -> int:
     """Sync one day of heart rate data."""
+    if _is_future_et(target_date, "heart_rate"):
+        return 0
     ds = target_date.isoformat()
     try:
         hr = garmin.get_heart_rates(ds)
@@ -350,6 +374,8 @@ def sync_heart_rate(garmin: Garmin, sb: Client, target_date: date) -> int:
 
 def sync_hrv(garmin: Garmin, sb: Client, target_date: date) -> int:
     """Sync one day of HRV data."""
+    if _is_future_et(target_date, "hrv"):
+        return 0
     ds = target_date.isoformat()
     try:
         hrv = garmin.get_hrv_data(ds)
@@ -388,6 +414,8 @@ def sync_hrv(garmin: Garmin, sb: Client, target_date: date) -> int:
 
 def sync_stress(garmin: Garmin, sb: Client, target_date: date) -> int:
     """Sync one day of stress data."""
+    if _is_future_et(target_date, "stress"):
+        return 0
     ds = target_date.isoformat()
     try:
         stress = garmin.get_stress_data(ds)
@@ -419,6 +447,8 @@ def sync_stress(garmin: Garmin, sb: Client, target_date: date) -> int:
 
 def sync_training_status(garmin: Garmin, sb: Client, target_date: date) -> int:
     """Sync one day of training readiness/status data."""
+    if _is_future_et(target_date, "training_status"):
+        return 0
     ds = target_date.isoformat()
     try:
         tr = garmin.get_training_readiness(ds)
