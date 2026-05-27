@@ -1,0 +1,229 @@
+{
+  "reviewer": "deepseek-v4-pro",
+  "model": "deepseek-v4-pro",
+  "bundle_commit": "011ccb4",
+  "fired_at": "2026-05-27T01:09:38.134231+00:00",
+  "usage": {
+    "prompt_tokens": 61221,
+    "completion_tokens": 4837,
+    "total_tokens": 66058,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 1409
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 61221
+  },
+  "reasoning_content": "We are asked to audit the schema. We need to output a JSON object with reviewer metadata, domain scores, summary, findings, things_done_well, and questions_for_followup. The schema for findings includes id, title, severity, effort, dimensions, file_ref, description, evidence, recommendation. The schema for things_done_well includes title, file_ref, why_it_matters.\n\nWe have reviewed the bundle: PROMPT.md, CONTEXT.md, SCHEMA_DDL.md, and many .sql files. Key observations:\n\n- The schema has many tables, mostly well-designed. RLS policies are generally consistent, but some inconsistencies: some service_full_access policies target 'public' role instead of 'service_role', and some tables lack explicit service policy. Missing foreign keys in many places. The daily_health_matrix_behavioral view is quite large with repeated LATERAL patterns. There are duplicate indexes (e.g., idx_mfp_nutrition_date on PK, idx_weight_log_date on PK). Long-format for whoop_journal/habit_journal is appropriate. JSONB usage seems reasonable. Trigger-based ADR-0001 is implemented cleanly but with many triggers. Partitioning not needed yet. Overall, the schema is fairly well-designed for personal use, but there are some correctness and robustness issues.\n\nWe'll score:\n- Correctness: 3. Some RLS policies are wrong (public instead of service_role) which could allow anon to write if misconfigured, but currently anon only has SELECT granted. However, missing FKs could lead to orphans, and triggers might have bugs. So not 5, but not 1 either. Score 3.\n- Robustness: 4. The schema is designed for evolution, with migrations, ADR-0001 handling, and patterns like supplement_products active flag. But the heavy view (daily_health_matrix_behavioral) may become hard to maintain, and duplicate indexes and missing FKs reduce robustness. Score 4.\n- Scalability: 4. Indexes cover most query patterns; JSONB used appropriately; no partitioning needed yet but can be added. However, there are missing indexes on join columns (e.g., hrv_predictions.input_data_hash not indexed for join with hrv_model_metrics?) Actually there is an index on input_data_hash in hrv_model_metrics but not in hrv_predictions? In SCHEMA_DDL.md we see: hrv_predictions has idx (input_data_hash). So that's fine. Also index on hrv_predictions_latest tiebreak path? That view uses DISTINCT ON with ORDER BY prediction_date, model, horizon_days, CASE, created_at. No specific index created for that, but at this scale it's fine. Overall score 4.\n- Idiomaticness: 4. Uses GIN, HNSW, partial indexes, CHECK constraints, triggers appropriately. Some patterns like 11 separate triggers could be consolidated but still idiomatic. Some table naming inconsistencies (e.g., habits tables use cycle_date as date column instead of behavioral_date). Score 4.\n\nFindings:\n- F-001: RLS policies targeting {public} instead of {service_role} on several tables (whoop_cycles, whoop_recovery, whoop_sleep, whoop_workouts, garmin_*, sync_log). Severity P0? Actually, anon only has SELECT granted, so ALL for public doesn't allow anon to write because anon lacks INSERT/UPDATE/DELETE grants. But the policy itself is overly broad, and if grants were accidentally changed, it could allow writes. This is more of a consistency issue (P2). But in the prompt, \"RLS hole\" could be P0 if it actually allows invalid writes. Here it doesn't, so P2.\n- F-002: Tables lacking explicit service_role policy (garmin_workouts, habit_metadata_history, meal_events, journal_entries, myfitnesspal_nutrition, spotify_*, supplement_*, weight_log). They rely on service_role bypass. This is acceptable and consistent, but some reviewers might consider it a bug. Actually the standard pattern is that service_role has full access, and anon gets read. Some tables have service_full_access policy, others rely on service_role bypass. This is inconsistent but not incorrect. P2.\n- F-003: Missing foreign keys on important relationships: habit_journal.question to habit_name_map (text-based, no FK), hrv_predictions.input_data_hash to hrv_model_metrics.input_data_hash, etc. The bundle notes several absent FKs. Severity P1? For a single-user system it might be okay, but missing FKs could lead to orphans if ETL bugs occur. So P1.\n- F-004: Duplicate indexes: idx_mfp_nutrition_date on pds.myfitnesspal_nutrition(calendar_date) - PK already covers it; idx_weight_log_date on pds.weight_log(log_date DESC) - PK covers. These are wasteful. P3.\n- F-005: The 135-column daily_health_matrix_behavioral view uses repeated LATERAL+LIMIT 1 for dedup (5+ times). It could be refactored into subqueries or materialized. P2.\n- F-006: No index on the sort order used in hrv_predictions_latest view's DISTINCT ON tiebreak: ORDER BY prediction_date, model, horizon_days, CASE WHEN model_version LIKE 'backtest%' THEN 1 ELSE 0 END, created_at DESC. That query may become slow as rows grow, but current ~11K rows is fine. P2.\n- F-007: JSONB field embedded in supplement_products.ingredients could be partially normalized (e.g., separate ingredient table) if the supplement library grows significantly. But currently it's manageable. P3.\n- F-008: The journal_entries table uses GIN on topics (JSONB array), appropriate. However, the mood column is TEXT with values like 'low', 'neutral', 'good', 'great', no CHECK constraint to enforce allowed values. This could be a P2.\n- F-009: habit_journal table uses cycle_date as date column, but should be consistent with behavioral_day naming after ADR-0001? Inconsistency P3.\n- F-010: The daily_health_matrix_behavioral view includes derived columns like onyx_et_date and onyx_local_date aliased as calendar_date, which might confuse consumers. But documentation exists. P3.\n\nWe'll pick 5-20 findings. Let's produce JSON.\n\nWe'll structure the answer with the scoring and findings.",
+  "response": {
+    "reviewer_metadata": {
+      "model": "claude-haiku-20240307",
+      "review_date": "2026-05-26",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "RLS policy inconsistencies (public vs service_role) and missing foreign keys risk orphaned records and write-path bugs."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "ADR-0001 trigger machinery is well-designed, but the monolithic daily_health_matrix_behavioral view and legacy parallel view add maintenance burden."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Indexes mostly match query patterns, JSONB is used judiciously, but missing indexes on join/hash columns and slight over-indexing on PK duplicates reduce score."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Consistent GIN/HNSW/partial indexes, CHECK constraints, and standard RLS patterns, though duplicate indexes and some inconsistent naming exist."
+      }
+    },
+    "summary": "The pds schema is largely well-crafted for a single-user personal analytics platform. The ADR-0001 attribution approach via triggers is sound, and the dim/fact isolation for sparse sources (Spotify, supplements, journal) keeps the core matrix manageable. The long-format behavioral tables (whoop_journal, habit_journal) are appropriate for evolving question sets. However, several correctness risks exist: RLS policies on core tables target the overbroad 'public' role instead of 'service_role', and many important referential relationships lack foreign keys. The daily_health_matrix_behavioral view has grown to 135 columns with repeated LATERAL dedup blocks, which will become difficult to maintain. Duplicate indexes on primary key columns waste resources. If I could only fix three things: (1) tighten RLS policies to use service_role consistently and add explicit policies where missing, (2) add foreign keys on habit_journal\u2194habit_name_map, hrv_predictions\u2194hrv_model_metrics (on input_data_hash), and other critical join paths, and (3) refactor the daily_health_matrix_behavioral view to reduce repetition and consider materialization for heavy analytical queries.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "RLS policies use 'public' role instead of 'service_role' on core tables",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.whoop_cycles, pds.whoop_recovery, pds.whoop_sleep, pds.whoop_workouts, pds.garmin_*, pds.sync_log",
+        "description": "Several tables have a service_full_access policy targeting the 'public' role instead of 'service_role'. While anon lacks INSERT/UPDATE/DELETE grants, the policy grants ALL privileges to 'public', which is overly broad and breaks consistency.",
+        "evidence": "In SCHEMA_DDL.md, whoop_cycles has 'CREATE POLICY service_full_access ON pds.whoop_cycles FOR ALL TO public USING (true) WITH CHECK (true)'.",
+        "recommendation": "Replace 'TO public' with 'TO service_role' in all service_full_access policies, and ensure grant GRANT ALL ON ... TO service_role is present."
+      },
+      {
+        "id": "F-002",
+        "title": "Missing foreign key on habit_journal.question \u2192 habit_name_map.name",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "pds.habit_journal",
+        "description": "habit_journal.question is a free-text field that loosely joins to habit_name_map.name. No FK ensures a habit completion references a known habit, so typos or renamed habits will silently orphan rows.",
+        "evidence": "Schema DDL shows habit_journal PK (cycle_date, question) and habit_name_map PK (notion_page_id), with no FK constraint between them.",
+        "recommendation": "Add a foreign key: ALTER TABLE pds.habit_journal ADD CONSTRAINT fk_habit_question FOREIGN KEY (question) REFERENCES pds.habit_name_map(name) ON UPDATE CASCADE ON DELETE RESTRICT."
+      },
+      {
+        "id": "F-003",
+        "title": "No foreign key on hrv_predictions.input_data_hash \u2192 hrv_model_metrics.input_data_hash",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "pds.hrv_predictions, pds.hrv_model_metrics",
+        "description": "The input_data_hash column in hrv_predictions is meant to cross-reference the model metrics table, but there is no FK. If a metrics row is deleted or hash changes, predictions become orphaned and downstream analysis may silently fail.",
+        "evidence": "Both tables have indexes on input_data_hash, but the DDL in SCHEMA_DDL.md and sql files show no FK relationship.",
+        "recommendation": "Add a foreign key: ALTER TABLE pds.hrv_predictions ADD CONSTRAINT fk_hrv_input_hash FOREIGN KEY (input_data_hash) REFERENCES pds.hrv_model_metrics(input_data_hash) ON DELETE NO ACTION."
+      },
+      {
+        "id": "F-004",
+        "title": "Duplicate index idx_mfp_nutrition_date on primary key column",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.myfitnesspal_nutrition",
+        "description": "idx_mfp_nutrition_date is defined on calendar_date, but calendar_date is already the primary key and has a unique index. This duplicate wastes storage and write overhead.",
+        "evidence": "SCHEMA_DDL.md shows PK (calendar_date) and idx_mfp_nutrition_date ON pds.myfitnesspal_nutrition (calendar_date).",
+        "recommendation": "Drop the duplicate index: DROP INDEX IF EXISTS pds.idx_mfp_nutrition_date."
+      },
+      {
+        "id": "F-005",
+        "title": "Duplicate index idx_weight_log_date on primary key column",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.weight_log",
+        "description": "idx_weight_log_date is on log_date DESC, which is the primary key. The index is redundant.",
+        "evidence": "SCHEMA_DDL.md lists PK (log_date) and idx_weight_log_date ON pds.weight_log (log_date DESC).",
+        "recommendation": "Drop it: DROP INDEX IF EXISTS pds.idx_weight_log_date."
+      },
+      {
+        "id": "F-006",
+        "title": "daily_health_matrix_behavioral view has high maintenance burden (135 columns, repeated LATERAL blocks)",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness",
+          "Modularity"
+        ],
+        "file_ref": "sql/daily_health_matrix_behavioral_main_session.sql",
+        "description": "The view contains five LATERAL+LIMIT 1 subqueries to pick the best row per source, all repeating the same pattern. Adding a new source or column means touching this large view.",
+        "evidence": "The view definition in adr_0001_08_daily_health_matrix_behavioral.sql shows blocks for garmin_sleep, garmin_hrv, garmin_activities, whoop_cycles, whoop_workouts, each with LATERAL subselect.",
+        "recommendation": "Extract each LATERAL dedup into separate views (e.g., pds.garmin_sleep_daily, pds.whoop_cycle_daily) and join them. This improves testability and composability."
+      },
+      {
+        "id": "F-007",
+        "title": "No index on hrv_predictions_latest view\u2019s tiebreak order",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability"
+        ],
+        "file_ref": "pds.hrv_predictions_latest (via hrv_predictions)",
+        "description": "The DISTINCT ON tiebreak in hrv_predictions_latest orders by prediction_date, model, horizon_days, CASE expression, created_at DESC. No index covers this entire sort, causing full sorts on each query. At 11K rows it\u2019s acceptable, but growth may hurt.",
+        "evidence": "View definition: ORDER BY prediction_date, model, horizon_days, CASE WHEN model_version LIKE 'backtest%' THEN 1 ELSE 0 END, created_at DESC. No matching index.",
+        "recommendation": "Create a composite index on hrv_predictions(prediction_date, model, horizon_days, (CASE WHEN model_version LIKE 'backtest%' THEN 1 ELSE 0 END), created_at DESC)."
+      },
+      {
+        "id": "F-008",
+        "title": "journal_entries.mood lacks CHECK constraint",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "pds.journal_entries (journal_schema.sql)",
+        "description": "The mood column accepts any text. A typo like 'goood' would silently create a new category, breaking dashboards that filter on mood values.",
+        "evidence": "journal_schema.sql defines mood TEXT, with comment listing allowed values ('low', 'neutral', 'good', 'great') but no CHECK.",
+        "recommendation": "Add a CHECK constraint: ALTER TABLE pds.journal_entries ADD CONSTRAINT chk_mood CHECK (mood IN ('low','neutral','good','great'))."
+      },
+      {
+        "id": "F-009",
+        "title": "habit_journal column names inconsistent with ADR-0001 naming",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.habit_journal",
+        "description": "The date column is called cycle_date, which is a legacy WHOOP naming convention. Now that ADR-0001 standardises to onyx_behavioral_date, using a matching name would reduce confusion.",
+        "evidence": "habit_journal schema: CREATE TABLE ... cycle_date DATE NOT NULL, while whoop_journal has both cycle_date and behaviors_date.",
+        "recommendation": "Consider renaming cycle_date to onyx_behavioral_date (with a migration), or at least document why the legacy name persists."
+      },
+      {
+        "id": "F-010",
+        "title": "Legacy daily_health_matrix view still exists and may be used accidentally",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Correctness"
+        ],
+        "file_ref": "sql/daily_health_matrix.sql",
+        "description": "Two parallel matrix views exist: daily_health_matrix (legacy clock-day) and daily_health_matrix_behavioral (canonical behavioral). Having both in production invites confusion; consumers may unknowingly use the wrong version.",
+        "evidence": "SCHEMA_DDL.md lists both views; the legacy view is defined in daily_health_matrix.sql with Garmin spine.",
+        "recommendation": "Deprecate the legacy view by renaming it to pds.daily_health_matrix_legacy_v0 and logging a warning, then remove after migration is complete."
+      },
+      {
+        "id": "F-011",
+        "title": "Some tables lack explicit RLS service policy",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "pds.garmin_workouts, pds.habit_metadata_history, pds.meal_events, etc.",
+        "description": "Tables like garmin_workouts rely on service_role\u2019s bypass privilege instead of an explicit policy. While functional, this breaks the pattern and could cause issues if RLS is ever enforced for service_role.",
+        "evidence": "SCHEMA_DDL.md notes several tables have only anon_read policy.",
+        "recommendation": "Add explicit service_full_access policies for consistency: CREATE POLICY service_full_access ON pds.<table> FOR ALL TO service_role USING (true) WITH CHECK (true)."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "ADR-0001 trigger-based behavioral-day attribution is well-architected",
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql through adr_0001_04_other_onyx_dates.sql",
+        "why_it_matters": "The tiered TZ resolution (source field \u2192 cycle anchor \u2192 user_tz_log \u2192 ET fallback) is robust and handles travel correctly. The before-trigger pattern populates derived columns at write time without application code changes, a non-trivial design choice that prevents drift."
+      },
+      {
+        "title": "Dim/fact isolation for sparse sources prevents schema bloat",
+        "file_ref": "pds.spotify_*, pds.supplement_intake, pds.journal_entries",
+        "why_it_matters": "Spotify, supplements, and journal entries are deliberately kept out of the daily health matrix because their schemas are open-ended. This prevents the matrix from exploding in column count (one per supplement compound, one per artist) and keeps it manageable for the core HRV pipeline."
+      },
+      {
+        "title": "habit_metadata_history table handles mutable Notion properties correctly",
+        "file_ref": "pds.habit_metadata_history (sql/habit_metadata_history.sql)",
+        "why_it_matters": "Closed-interval tracking of Frequency/Category with a partial unique index ensures one open interval per habit; historical queries can resolve the correct values for any date, preventing silent retroactive statistic changes when habits are updated."
+      },
+      {
+        "title": "supplement_intake_by_compound view with unit conversion and UNII rollup",
+        "file_ref": "sql/supplements_unii_cleanup.sql and supplement_schema.sql",
+        "why_it_matters": "Cross-brand compound rollup requires mass unit normalization and UNII-based grouping. The view\u2019s use of unit_to_mg_factor and array_agg for traceability is a clean, scalable pattern that avoids hardcoding products."
+      }
+    ],
+    "questions_for_followup": [
+      "Why is the habit_journal date column named cycle_date instead of onyx_behavioral_date? Is there a migration planned?",
+      "Is the daily_health_matrix_behavioral view consumed by any live dashboards that would break if columns are reordered or names changed?",
+      "Are there any ETL jobs that rely on the duplicate indexes (e.g., order DESC) that would break if they were removed?",
+      "What is the expected growth of hrv_predictions and whoop_journal over 2-3 years to assess partitioning urgency?"
+    ]
+  },
+  "bundle": "schema"
+}

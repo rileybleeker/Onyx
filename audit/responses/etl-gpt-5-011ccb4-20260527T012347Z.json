@@ -1,0 +1,218 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "011ccb4",
+  "fired_at": "2026-05-27T01:23:46.998608+00:00",
+  "usage": {
+    "prompt_tokens": 67112,
+    "completion_tokens": 19359,
+    "total_tokens": 86471,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 15680,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "GPT-4.1",
+      "review_date": "2026-05-27",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "Core upsert patterns and natural keys are mostly correct and idempotent across ETLs. Cross-ETL ordering is sensible and triggers (WHOOP journal behaviors_date) are respected. However, multiple ETLs JSON-encode Python dicts before sending to JSONB columns (double-encoding), and some Garmin upsert conflict keys include ts unnecessarily, creating a duplicate risk if timestamps drift. WHOOP pagination may use an incorrect next-page param casing."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "WHOOP has token refresh and 401/429 handling; Garmin login retries are present. Many other HTTP paths (Eight Sleep, Notion, Spotify) lack retries/backoff for 5xx/429. Some flows (WHOOP ETL) can early-exit on auth/profile failure without writing a sync_log heartbeat. IMAP flows handle duplicates well but subject filters are narrow."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Pagination is implemented where available; Spotify and Notion chunking is correct. However, Eight Sleep fetches all intervals every run (O(history) network usage), which will degrade with long history. MusicBrainz rate limiting is observed. Most DB writes are batched and upserts are set-based."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Good separation of fetch/parse/write, consistent supabase upserts with on_conflict, clear logging, and sync_log heartbeats in most places. Token helper is clean and schema-agnostic. Some inconsistencies remain (JSON double-encoding, mixed rpc schema usage, narrow IMAP searches)."
+      }
+    },
+    "summary": "Overall, the ETL bundle is well-structured and largely idempotent: each write path consistently uses Supabase upserts on sensible keys, and scheduling across workflows respects behavioral dependencies (WHOOP cycles before journal behaviors_date; Garmin activities before GPS TZ backfill). Token persistence via pds.ci_tokens is clean, and Spotify\u2019s multi-heartbeat logging is a good observability pattern. Most pipelines handle no-op runs gracefully by writing sync_log heartbeats, and WHOOP\u2019s client implements both token refresh and 429 handling.\n\nMain correctness gaps: multiple ETLs pass json.dumps strings into JSONB columns (raw_json/meals_json), which produces JSON strings instead of objects and will break JSON operators and downstream replay. Garmin upserts use ts in conflict keys for activities/laps, which can create inadvertent duplicates if start timestamps shift. WHOOP pagination may use nextToken instead of next_token, risking page loops or silent truncation if API expects snake_case.\n\nRobustness gaps: several APIs (Eight Sleep, Spotify, Notion) lack retry/backoff on 5xx/429, making silent data holes during transient outages likely. A WHOOP ETL early return on profile failure skips sync_log, hiding failures from the status page. Eight Sleep fetches all intervals each run, which will scale poorly over time.\n\nTop 3 fixes: (1) Stop JSON double-encoding (pass dict/list objects directly to Supabase for JSONB). (2) Verify and correct WHOOP pagination param; add defensive loop guards. (3) Add standardized retry with exponential backoff (honor Retry-After for 429) to Eight Sleep, Spotify, and Notion clients. Second-tier: tighten Garmin conflict keys to natural keys, ensure every run writes sync_end in sync_log, and narrow IMAP filters more robustly.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "JSON double-encoding into JSONB (raw_json/meals_json) across ETLs",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "whoop_etl.py:222",
+        "description": "Several ETLs call json.dumps on dicts before upsert to JSONB columns. PostgREST will receive strings, so JSONB columns will contain JSON strings rather than objects, breaking jsonb operators and replay.",
+        "evidence": "whoop_etl.py: rows use \"raw_json\": json.dumps(c) in sync_cycles, and similarly in sync_recovery/sleep/workouts/body_measurement. eight_sleep_etl.py: sync_user sets \"raw_json\": json.dumps(_strip_timeseries(raw)). myfitnesspal_import.py: db_rows set meals_json/raw_json via json.dumps(...). All these targets are JSONB in schemas.",
+        "recommendation": "Pass Python dict/list objects directly (no json.dumps). Supabase client will serialize to JSON automatically. For safety, add a tiny helper jsonb(obj) that validates types and prevents accidental double-encoding. Consider migrating existing rows: UPDATE ... SET raw_json = raw_json::jsonb WHERE jsonb_typeof(raw_json) = 'string' AND raw_json ~ '^\\s*\\{'."
+      },
+      {
+        "id": "F-002",
+        "title": "WHOOP pagination uses nextToken param; may be next_token per API",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Scalability",
+          "Robustness"
+        ],
+        "file_ref": "whoop_etl.py:150",
+        "description": "WhoopClient.get_paginated reads next_token from the response but sends params['nextToken'] on subsequent requests. If WHOOP expects 'next_token', pagination may be ignored, risking infinite loops or truncated fetches.",
+        "evidence": "whoop_etl.py:get_paginated \u2014 next_token = data.get('next_token'); then params['nextToken'] = next_token.",
+        "recommendation": "Confirm WHOOP v2 docs and align request param to 'next_token'. Add a loop guard to break when the returned next_token repeats or when no new records are produced. Log page counts and final token for visibility."
+      },
+      {
+        "id": "F-003",
+        "title": "Garmin upsert conflict keys include ts; duplicate risk on timestamp drift",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "garmin_etl.py:412",
+        "description": "Upserts for activities and laps use composite conflicts that include ts, e.g., (activity_id, ts) and (activity_id, lap_index, ts). If Garmin corrects startTime or a local-vs-GMT normalization changes, these upserts may create duplicate logical rows.",
+        "evidence": "garmin_etl.py: sync_activities upsert(..., on_conflict='activity_id,ts'); _sync_laps_for_activity upsert(..., on_conflict='activity_id,lap_index,ts'). Daily tables use (calendar_date,ts) though calendar_date alone would suffice.",
+        "recommendation": "Use natural keys only: activities on (activity_id), laps on (activity_id, lap_index), daily_summary on (calendar_date), sleep on (sleep_id) or (calendar_date,sleep_id). Ensure unique indexes in DB match these natural keys."
+      },
+      {
+        "id": "F-004",
+        "title": "Eight Sleep fetches all intervals every run (O(history) network)",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Scalability",
+          "Robustness"
+        ],
+        "file_ref": "eight_sleep_etl.py:83",
+        "description": "sync_user calls client.get_intervals(user_id) with no date range, downloading the full historical intervals set each run, then filtering in Python. This will degrade as history grows and increases failure surface.",
+        "evidence": "eight_sleep_etl.py: get_intervals() has no start/end; sync_user() unconditionally calls it, then maps by date.",
+        "recommendation": "If the API supports range filters, pass start/end. Otherwise, persist a high-water mark (latest ts ingested) in DB (or sync_log metadata) and skip downloading older intervals. As a fallback, keep a small cache keyed by last N days in local run directory."
+      },
+      {
+        "id": "F-005",
+        "title": "Missing retries/backoff for 5xx/429 on several sources",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "spotify_etl.py:295",
+        "description": "Eight Sleep, Spotify, and Notion clients generally raise on HTTP errors but don\u2019t retry transient 5xx/429 responses. This can cause silent gaps on bad network hours.",
+        "evidence": "eight_sleep_etl.py: httpx calls with raise_for_status, no retry. journal_etl.py: Notion + Voyage calls likewise. spotify_etl.py: _request handles 401 but not 429/5xx; no Retry-After handling.",
+        "recommendation": "Add a lightweight retry wrapper (e.g., tenacity) with exponential backoff, jitter, and 429 Retry-After honoring. Bound retries/timeouts per source (Spotify 3 tries, Notion 5 with 2x backoff, etc.). Log partials to sync_log when an endpoint repeatedly fails."
+      },
+      {
+        "id": "F-006",
+        "title": "sync_log missing sync_end or start in some ETLs; freshness ambiguity",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "journal_etl.py:170",
+        "description": "Some ETLs write sync_log heartbeats without sync_end (or without explicit sync_start), making the /status freshness computation inconsistent.",
+        "evidence": "journal_etl.py:log_sync inserts sync_start but not sync_end. myfitnesspal_email.py and whoop_journal_email.py log without sync_start/sync_end. garmin_etl.py comment notes prior breakage from missing sync_end.",
+        "recommendation": "Standardize a shared log_sync util across ETLs that always sets sync_start and sync_end. Backfill older rows is optional; future runs should adhere."
+      },
+      {
+        "id": "F-007",
+        "title": "IMAP subject search is narrow and may miss valid export emails",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "myfitnesspal_email.py:128",
+        "description": "Email searches use strict SUBJECT filters that may miss legitimate export variants (locale/branding changes).",
+        "evidence": "myfitnesspal_email.py: IMAP SEARCH '(UNSEEN SUBJECT \"MyFitnessPal\")' then keyword check; whoop_journal_email.py: '(UNSEEN SUBJECT \"WHOOP Export\")'.",
+        "recommendation": "Widen IMAP search: combine FROM filters (official sender domains) plus SUBJECT wildcards (e.g., \"fitnesspal\" OR \"my fitness pal\"). Fall back to scanning last N recent UNSEEN messages if search returns nothing."
+      },
+      {
+        "id": "F-008",
+        "title": "WHOOP ETL early return on profile failure skips sync_log",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "whoop_etl.py:309",
+        "description": "If the profile check fails, the script logs an error and returns without writing a sync_log row, hiding failures from the status page.",
+        "evidence": "whoop_etl.py: in main(), profile fetch in try/except; on exception: log.error(...) and return.",
+        "recommendation": "Always write a sync_log heartbeat with status='failed' on any early termination path. Wrap main with a top-level try/finally that emits a log no matter what."
+      },
+      {
+        "id": "F-009",
+        "title": "Spotify ETL lacks explicit 429 handling and Retry-After honor",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "spotify_etl.py:224",
+        "description": "Spotify client refreshes tokens on 401 but does not handle 429 rate limiting. Burst runs (backfills or network blips) may intermittently fail.",
+        "evidence": "spotify_etl.py: SpotifyClient._request has 401-refresh but no 429 branch. fetch_audio_features_reccobeats also lacks bounded retries for 5xx.",
+        "recommendation": "Add 429 handling with sleep based on Retry-After header, capped retries, and sync_log 'partial' status when enrichment is incomplete."
+      },
+      {
+        "id": "F-010",
+        "title": "Spotify artist dim table used but not defined in provided schemas",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "spotify_etl.py:491",
+        "description": "ETL writes/updates pds.spotify_artists but the table DDL is not in this bundle\u2019s schemas/ directory. Migration drift can cause runtime errors or missing tables in new environments.",
+        "evidence": "spotify_etl.py: upsert_artists(), enrich_genres_via_musicbrainz() target pds.spotify_artists; schemas/spotify_schema.sql defines plays/tracks only.",
+        "recommendation": "Include spotify_artists DDL alongside other schemas. Add a startup check to create the table if missing or fail fast with a clear error."
+      },
+      {
+        "id": "F-011",
+        "title": "Garmin 'standalone' workout sync filters raw_json via string null check",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness"
+        ],
+        "file_ref": "garmin_etl.py:591",
+        "description": "Standalone --sync-workouts fetch filters activities with .neq('raw_json', 'null'), which is a string literal. Depending on PostgREST semantics this may not filter null JSONB as intended.",
+        "evidence": "garmin_etl.py: result = sb.schema('pds').from_('garmin_activities').select('raw_json').neq('raw_json', 'null')...",
+        "recommendation": "Use .not_.is_('raw_json','null') or a dedicated boolean filter column (has_workout_id) to drive the selection."
+      }
+    ],
+    "things_done_well": [
+      "Consistent use of upsert with on_conflict across tables; largely natural keys ensure idempotency.",
+      "Schedules respect behavioral dependencies (WHOOP cycles before journal behaviors_date; Garmin activities before GPS TZ backfill).",
+      "Token persistence via pds.ci_tokens with download/upload steps in workflows; per-service isolation avoids cross-contamination.",
+      "WHOOP client handles 401 token refresh and 429 rate limits; Garmin login has exponential backoff.",
+      "Robust sync_log coverage in core ETLs; Spotify emits subsystem heartbeats (plays, ReccoBeats, MusicBrainz).",
+      "Garmin ETL addresses the ET-vs-UTC future-date guard to avoid writing stubs.",
+      "Notion journal ETL is incremental via last_edited_time and batches embeddings to avoid large payloads.",
+      "WHOOP journal import deduplicates by (cycle_date, question) and relies on triggers to compute behaviors_date \u2014 a clean attribution chain."
+    ],
+    "questions_for_followup": [
+      "Confirm WHOOP pagination: does the API expect 'next_token' (snake_case) as the request param? If so, we should change params['nextToken'] to params['next_token'] and add guards.",
+      "Please run: SELECT jsonb_typeof(raw_json) FROM pds.whoop_sleep LIMIT 10; and for MFP: SELECT jsonb_typeof(meals_json) FROM pds.myfitnesspal_nutrition LIMIT 10; to verify whether JSONB columns contain 'string' due to double-encoding.",
+      "For Garmin, can we confirm unique indexes for activities (activity_id) and laps (activity_id, lap_index)? If not present, we should add them and adjust on_conflict keys.",
+      "Does Eight Sleep\u2019s /users/{id}/intervals support from/to parameters? If yes, we should adopt them; if not, we may need a high-water mark strategy.",
+      "Where is pds.spotify_artists defined? If it exists outside this bundle, can we add the DDL here to prevent migration drift in new environments?",
+      "Any downstream queries depend on MFP meals_json structure? If so, the double-encoding fix will unlock JSONB operators and should be prioritized."
+    ]
+  },
+  "bundle": "etl"
+}

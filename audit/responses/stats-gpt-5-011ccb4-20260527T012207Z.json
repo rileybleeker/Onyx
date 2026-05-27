@@ -1,0 +1,187 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "011ccb4",
+  "fired_at": "2026-05-27T01:22:07.941951+00:00",
+  "usage": {
+    "prompt_tokens": 87802,
+    "completion_tokens": 16863,
+    "total_tokens": 104665,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 13888,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-5",
+      "review_date": "2026-05-27",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "Core choices (time-respecting cross-fitting, embargoed walk-forward, mediator exclusions, FDR) are sound with only minor methodological leaks and alignment nits remaining."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "Good gating on low-N, missingness handling, HAC SEs, and diagnostics; a few spots (scaling leakage, off-by-one residual join) reduce resilience under edge cases."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Pipeline is vectorized and incremental enough for 10\u00d7 n; causal bootstraps are the main O(n\u00b7B) cost but fine at current scale."
+      },
+      "idiomaticness": {
+        "score": 5,
+        "rationale": "Uses standard libraries and patterns (sklearn, statsmodels, Prophet, XGBoost, BH-FDR) in a way an experienced reviewer would recognize."
+      }
+    },
+    "summary": "This pipeline has matured into a statistically careful, time-respecting analysis for a single-user longitudinal setting. High points include: behavioral-day attribution end to end; rolling features that exclude the target row; an embargoed multi-horizon walk-forward backtest; SARIMAX exogenous shifting validated by checks; AIPW with TimeSeriesSplit to respect autocorrelation; and multiple-comparison control extended to the large journal and habit families. The causal layer correctly excludes mediators and limits confounders to pre-treatment lags, reports AIPW/PSM/naive side-by-side, and adds E-values, which is appropriate for a self-experiment context.\n\nRemaining risks are mostly second-order but worth addressing: (1) feature standardization for AIPW/PSM is fit on the full sample before folds, which leaks future-fold distributional information into the training step; (2) the error-mode residual breakdown joins residuals to the prediction date\u2019s journal/habit flags rather than the feature day (off by one), potentially misleading post-hoc narratives; and (3) nominal prediction-interval levels differ across models (XGBoost/SARIMAX at 90% vs Prophet\u2019s 80%), making the stored ci_coverage metric not directly comparable. Granger\u2019s per-lag multiplicity and PSM\u2019s lack of a caliper are lesser issues.\n\nIf I could fix only three things: (1) fit the StandardScaler within each cross-fitting fold and in PSM\u2019s propensity step to remove leakage; (2) realign the error-mode joins to use feature-date (prediction_date \u2212 1 for h=1) and document the convention; (3) standardize PI nominal coverage across models (or store per-row nominal_level) so ci_coverage is interpretable across methods and horizons.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "AIPW/PSM standardization fit on full sample leaks future-fold info",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "causal_inference.py:139-158,200-214",
+        "description": "Both AIPW and PSM call _standardize(X) once on the full dataset before splitting, so fold-specific models are trained on features centered/scaled using information from the validation folds (future in time), violating strict time-respecting cross-fitting.",
+        "evidence": "def _standardize(X): scaler = StandardScaler(); return scaler.fit_transform(X). In estimate_aipw: X_std = _standardize(X); kf = TimeSeriesSplit(...). In estimate_psm: X_std = _standardize(X) precedes fitting the propensity on all rows.",
+        "recommendation": "Within each fold, fit the scaler on Xt and transform Xt/Xv separately; for PSM, fit the scaler on all rows used in the propensity model within the trimmed, time-respecting analysis subset or refit per fold when doing cross-fit AIPW. Implement a fold-aware scaler to avoid leakage."
+      },
+      {
+        "id": "F-002",
+        "title": "Error-mode residuals joined to wrong day (off-by-one with journal/habit)",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2649-2736",
+        "description": "Residuals for h=1 predictions are merged to journal_/habit_ flags on prediction_date, but the model\u2019s features (and behaviors of interest) are from the prior day, so the breakdown attributes errors to the wrong day\u2019s behaviors.",
+        "evidence": "xgb_bt['pred_date'] = prediction_date; joined = xgb_bt.merge(jdf, left_on='pred_date', right_on='calendar_date', ...). For h=1, features for date D produce a prediction with prediction_date D+1.",
+        "recommendation": "Join on feature-date for h=1 (prediction_date minus 1 day) and, more generally, prediction_date minus h for horizon h. Add a small helper to compute feature_date = prediction_date \u2212 horizon_days."
+      },
+      {
+        "id": "F-003",
+        "title": "Nominal PI levels inconsistent across models; ci_coverage not comparable",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2197-2213,2383-2393,2468-2476",
+        "description": "XGBoost and SARIMAX use \u00b11.645\u03c3 (\u224890%) while Prophet uses its default ~80% bands; the schema comment refers to 80%. Mixing nominal levels makes ci_coverage incomparable across models/horizons.",
+        "evidence": "XGB: test_lower = pred \u2212 1.645*pred_std; SARIMAX: conf_int(alpha=0.10) \u2192 90%; Prophet uses yhat_lower/yhat_upper (80% default) and is labeled '80% CI' in plotting.",
+        "recommendation": "Standardize to a single nominal level (e.g., 80% or 90%) for all models, or add a 'ci_nominal' field in hrv_model_metrics and compute coverage against that level per row."
+      },
+      {
+        "id": "F-004",
+        "title": "Prophet holdout uses realized regressors, inflating reported skill",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2421-2456",
+        "description": "The 30-day holdout evaluation merges actual regressor values from the holdout period and forward-fills, which evaluates conditional accuracy given known future exogenous inputs rather than a genuine forecast scenario.",
+        "evidence": "future_holdout = m.make_future_dataframe(...); then for rf in reg_feats: future_holdout = future_holdout.merge(hrv_df[['ds', rf]], ...).ffill().",
+        "recommendation": "Either (a) treat Prophet\u2019s reported metrics as conditional-on-exog and label them as such, or (b) simulate exogenous features for the holdout (e.g., last-values or seasonal baselines) to reflect true forecasting difficulty."
+      },
+      {
+        "id": "F-005",
+        "title": "Granger per-lag multiplicity not adjusted; may overstate significance",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2069-2100",
+        "description": "Granger is run for lags 1..3 and p-values are stored without adjustment, so per-feature multiple testing across lags can inflate false positives even though inputs are FDR survivors.",
+        "evidence": "gc = grangercausalitytests(..., maxlag=3); loop over lag in 1..3 appends p_value with no correction.",
+        "recommendation": "Within each feature, adjust p-values across tested lags (e.g., Holm/Bonferroni) or report the minimum p with a note about the 3-lag family-wise error."
+      },
+      {
+        "id": "F-006",
+        "title": "PSM lacks caliper; poor matches under propensity-model misspecification",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "causal_inference.py:160-191",
+        "description": "Nearest-neighbor matching on logit propensity has no caliper, so treated units can be matched to controls with materially different propensities under model misspecification, inflating bias/variance.",
+        "evidence": "dists = |logit_p[control_idx] \u2212 logit_p[ti]|; takes k smallest without a maximum allowed distance.",
+        "recommendation": "Add a caliper (e.g., 0.2\u00b7SD of logit propensity) and drop treated units with no control within the caliper; record and report caliper drops."
+      },
+      {
+        "id": "F-007",
+        "title": "Fold-level class imbalance may break AIPW folds silently",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "causal_inference.py:215-244",
+        "description": "When a training fold lacks either class, psi[test_idx] is set to NaN and the fold is skipped; with sparse treatments this can affect many folds without alerting the user.",
+        "evidence": "if Tt.sum() < 2 or (Tt==0).sum() < 2: psi[test_idx] = np.nan; continue; later uses psi_valid with no per-treatment warning.",
+        "recommendation": "Log per-treatment fold drop counts and, if too many folds fail (e.g. >2 of 5), flag the estimate as unreliable in the output."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "AIPW cross-fitting uses TimeSeriesSplit on autocorrelated HRV",
+        "file_ref": "causal_inference.py:206-214",
+        "why_it_matters": "Time-respecting folds avoid outcome leakage across adjacent days, a common pitfall in doubly-robust estimation on time series."
+      },
+      {
+        "title": "Exogenous regressor shift for SARIMAX is explicit and validated",
+        "file_ref": "hrv_analysis.py:2298-2340",
+        "why_it_matters": "Shifting exog by one day with a contract check prevents subtle \u2018same-day\u2019 leakage and guarantees alignment between behaviors and the HRV they aim to forecast."
+      },
+      {
+        "title": "Embargo gap in walk-forward prevents rolling-window leakage",
+        "file_ref": "hrv_analysis.py:2555-2569",
+        "why_it_matters": "A 28-day gap matches the longest rolling feature window, ensuring training data cannot indirectly contain information about the first test rows."
+      },
+      {
+        "title": "Rolling HRV baselines exclude the target row",
+        "file_ref": "hrv_analysis.py:1333-1342",
+        "why_it_matters": "Shifting by one before computing rolling means/stds avoids target leakage that would otherwise inflate feature\u2013target associations."
+      },
+      {
+        "title": "BH-FDR applied to journal and habit families",
+        "file_ref": "hrv_analysis.py:1764-1776,1827-1839",
+        "why_it_matters": "Corrects the largest multiple-comparison surface (59+ journal questions), materially reducing false-positive behavioral \u2018hits\u2019."
+      },
+      {
+        "title": "Stage-3 OLS uses HAC SEs and VIF-based pruning",
+        "file_ref": "hrv_analysis.py:1879-2014",
+        "why_it_matters": "HAC standard errors acknowledge serial correlation, and VIF pruning tames multicollinearity, making standardized betas more interpretable."
+      },
+      {
+        "title": "Prediction intervals based on out-of-fold residuals",
+        "file_ref": "hrv_analysis.py:2148-2186",
+        "why_it_matters": "Using OOF residuals for \u03c3 produces more realistic PI coverage than in-sample residuals, improving risk calibration."
+      }
+    ],
+    "questions_for_followup": [
+      "Schema vs code disagreement: hrv_model_metrics.ci_coverage is documented as 80% in SCHEMA.md; should all models standardize to 80% or should we store a ci_nominal column? Please confirm the desired nominal level.",
+      "For causal AIPW, do we want per-treatment logs of folds dropped for class imbalance (to expose fragile estimates in the UI)? If yes, where should this surface in hrv_analysis_results?",
+      "Are Prophet metrics intended to be \u2018conditional on realized exogenous inputs\u2019 or should we simulate exogenous features for a true forecast evaluation? Clarify the evaluation contract.",
+      "Confirm that journal_* coverage semantics should exclude pre-tracking days (current code does so by dropna on treatment); do we want to fill 0 only from the first-asked date onward for journals, like habits/supplements?",
+      "Do we want to harmonize Granger reporting by adjusting per-lag multiplicity (Bonferroni/Holm) or only show the best lag with a correction note?"
+    ]
+  },
+  "bundle": "stats"
+}

@@ -1,0 +1,125 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "011ccb4",
+  "fired_at": "2026-05-27T01:17:20.593302+00:00",
+  "usage": {
+    "prompt_tokens": 13517,
+    "completion_tokens": 8427,
+    "total_tokens": 21944,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 6400,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-4.1",
+      "review_date": "2026-05-27",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "No active P0 conflations spotted. WHOOP kJ\u2192kcal conversion is correct and used in a dedicated query. Distance and pace conversions are correct. Primary risk is supplements: non-mass units convert to NULL and get dropped from rollups."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "Supplement unit conversion silently returns NULL for many real-world units (IU, mL, fl-oz, scoops), causing silent data loss. Formatters use falsy checks that collapse 0 to '\u2014'. Defensive handling and instrumentation are limited."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Energy conversion lives in a single query helper; distance/pace conversions live in a single formatter. However, magic-number duplication (meters-per-mile) exists in multiple functions."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Good comments and source citations; clear separation of concerns. Minor style issues: premature rounding of kcal and duplicated conversion constants without named constants."
+      }
+    },
+    "summary": "This unit/conflation audit finds the core pathways largely correct and aligned with the documented decisions. Calories are sourced from WHOOP cycles and converted from kilojoules to kilocalories using the correct 4.184 factor in a single helper, avoiding Garmin\u2019s divergent totals. Distance and pace formatting correctly use meters-per-mile and m/s\u2192min/mi conversion and include an edge-case fix for 60-second rollovers. HRV sources are fetched separately (WHOOP recovery RMSSD vs. Garmin HRV); no code path merges or substitutes them. Garmin activity queries correctly use the true-UTC start_time_gmt for filtering to avoid the historic Local-vs-UTC pitfall.\n\nThe most material risk is supplements: the SQL function pds.unit_to_mg_factor only handles mass units (mg/g/\u00b5g/kg) and returns NULL for many common label units (IU, mL, fl-oz, drops, scoops, capsules). Because the downstream view normalizes to mg, NULLs likely cause entire rows to be excluded from rollups, creating silent coverage gaps. Additionally, the kJ\u2192kcal conversion rounds per-day kcal to an integer at the query layer, which can slightly bias aggregates; rounding should be deferred to display. Frontend formatters use falsy checks that treat 0 values as missing, potentially hiding legitimate zero distances/durations.\n\nOverall, conversions are mostly correct and centralized, but a few robustness and style improvements would harden the system: expand the unit dictionary (or visibly flag unhandled units), add telemetry for dropped-units, avoid premature rounding, and deduplicate conversion constants via named exports.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Supplement unit_to_mg_factor drops non-mass units (IU, mL, fl-oz, scoops, capsules, mg/mL) via NULL, causing silent loss",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness",
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+        "description": "The normalization function only recognizes mg/g/\u00b5g/kg and returns NULL for other units. The downstream view normalizes all intakes to mg; rows with unrecognized units are effectively excluded from rollups, silently shrinking coverage. The regex also collapses \"mg/mL\" to \"mgml\" and returns NULL.",
+        "evidence": "CREATE FUNCTION ... CASE ... ELSE NULL; and notes: 'Returns NULL for unrecognized units \u2014 silently drops rows ... IU, oz, mL, fl-oz, drops, scoops, capsules...'",
+        "recommendation": "- Extend dictionary to cover common real-world units (oz\u2192g, mL\u2192mg via density when available; IU via compound-specific mappings).\n- Add a parallel 'unhandled_units' view or logging counter to quantify drops.\n- For inherently ambiguous units (IU, mg/mL), require per-compound conversion metadata; otherwise surface rows as 'unconverted' instead of dropping.\n- Preserve original unit/value in the rollup with a flag (converted:boolean) so UI can display and/or prompt for missing mappings."
+      },
+      {
+        "id": "F-002",
+        "title": "Premature rounding of WHOOP kcal at query layer",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness",
+          "Correctness"
+        ],
+        "file_ref": "queries.ts:getWhoopCaloriesBurnt",
+        "description": "Daily calories are rounded to an integer during the kJ\u2192kcal conversion. This loses precision and can bias aggregates (e.g., weekly averages, correlations) by accumulating rounding error.",
+        "evidence": "const kcal = Math.round(Number(c.kilojoule) / 4.184);",
+        "recommendation": "Keep a precise numeric (e.g., kcal_exact = kilojoule / 4.184) through the data layer and round only in display formatters. If integer display is desired, return both kcal_exact and kcal_display."
+      },
+      {
+        "id": "F-003",
+        "title": "Falsy checks in formatters hide legitimate zero values",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "format.ts:formatDuration, format.ts:formatDistance, format.ts:formatPace",
+        "description": "Several formatters use truthy checks, causing 0 to render as '\u2014'. Zero duration or zero distance are legitimate values and should be shown explicitly.",
+        "evidence": "formatDuration: if (!seconds) return '\u2014'; formatDistance: if (!meters) return '\u2014'; formatPace: if (!speedMps || speedMps === 0) return '\u2014';",
+        "recommendation": "Use explicit null/undefined/NaN checks: if (seconds == null || Number.isNaN(seconds)) ... Similarly for meters/speed. Render 0 as '0m', '0 m', or a defined placeholder distinct from missing."
+      },
+      {
+        "id": "F-004",
+        "title": "Meters-per-mile magic number duplicated without a named constant",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness",
+          "Scalability"
+        ],
+        "file_ref": "format.ts:formatDistance, format.ts:formatPace",
+        "description": "The constant 1609.344 appears in multiple functions. Duplication risks drift if one site changes. A single named constant improves clarity and maintainability.",
+        "evidence": "formatDistance: meters / 1609.344; formatPace: 1609.344 / speedMps / 60;",
+        "recommendation": "Define and export a single METERS_PER_MILE constant (with a source comment) and use it in all distance/pace helpers. Consider centralizing pace/distance helpers to one module."
+      }
+    ],
+    "things_done_well": [
+      "Correct and centralized kJ\u2192kcal conversion with clear source-of-truth (WHOOP cycles) and strong in-code documentation.",
+      "Distance and pace conversions are correct and handle the 60-second rollover edge case in pace formatting.",
+      "Activities are filtered/sorted using true UTC (start_time_gmt) to avoid the known Garmin Local-vs-UTC trap.",
+      "HRV sources are fetched separately with no observed conflation between WHOOP RMSSD and Garmin\u2019s proprietary HRV metric.",
+      "Helpful, source-cited comments make intent and time-zone/day-attribution rules explicit (e.g., WHOOP +12h cycle tagging)."
+    ],
+    "questions_for_followup": [
+      "What proportion of supplement ingredients currently fall into unrecognized units (IU, mL, capsules, scoops)? Can we surface a count to prioritize dictionary expansion?",
+      "For IU-based compounds (e.g., Vitamin D), do we have or can we add compound-specific IU\u2194mg mappings so that unit_to_mg_factor can normalize them correctly?",
+      "Should daily kcal remain integer-displayed, or do we prefer one decimal place? If integer, can we still provide a precise value for analytics while rounding only at render?",
+      "Does any downstream chart or view (e.g., daily_health_matrix_behavioral) merge HRV metrics across sources? If yes, we should split or label them clearly.",
+      "Are there any UI components performing ad-hoc distance/pace conversions outside format.ts? If so, can we consolidate onto the shared helpers and constants?",
+      "Is there any weight UI in this app bundle? If so, where are kg\u2194lb conversions implemented, and are they using a canonical factor (2.20462) with display-only rounding?",
+      "Should 0 values (e.g., 0 m distance) be rendered explicitly rather than as '\u2014'? If so, align formatter semantics and update tests/callers accordingly."
+    ]
+  },
+  "bundle": "units"
+}

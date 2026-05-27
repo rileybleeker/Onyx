@@ -1,0 +1,142 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "011ccb4",
+  "fired_at": "2026-05-27T01:09:05.971239+00:00",
+  "usage": {
+    "promptTokenCount": 66707,
+    "candidatesTokenCount": 2381,
+    "totalTokenCount": 71811,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 66707
+      }
+    ],
+    "thoughtsTokenCount": 2723,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "o3-mini",
+      "review_date": "2026-05-26",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "Core logic is sound, but latent bugs exist with RLS policies targeting the public role and missing foreign keys on loose joins."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "The trigger-based ADR-0001 attribution and raw_json preservation patterns make the schema highly resilient to upstream ETL changes."
+      },
+      "scalability": {
+        "score": 5,
+        "rationale": "At ~12K rows and ~36 rows/day growth, the current indexing and lack of partitioning is perfectly appropriate; partitioning would be premature optimization."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Excellent use of advanced Postgres features (LATERAL, DISTINCT ON, GIN, HNSW), though marred slightly by redundant b-tree indexes on primary keys."
+      }
+    },
+    "summary": "Overall, the Onyx `pds` schema is well-designed for a single-user analytical workload. The decision to use a trigger-based approach for ADR-0001 timezone attribution is a standout success: it guarantees data integrity at write-time regardless of how the data is ingested. The use of JSONB for upstream API payloads (`raw_json`) combined with relational columns for core metrics strikes the perfect balance between queryability and ETL resilience. The long-format design for `whoop_journal` and `habit_journal` is also correct, avoiding painful schema migrations when new habits are tracked.\n\nHowever, there are a few risky design choices hiding in the implementation. First, several RLS policies grant `ALL` to the `public` role instead of `service_role`. While currently mitigated by table-level `GRANT` statements that restrict `anon` to `SELECT`, this is a latent security hole. Second, there are multiple redundant indexes that duplicate primary key column-sets, wasting storage and write cycles. Third, the schema maintains two parallel 'god views' (`daily_health_matrix` and `daily_health_matrix_behavioral`); keeping the legacy view invites split-brain analytics downstream.\n\nIf I could only fix three things, I would: 1) Normalize all `service_full_access` RLS policies to target `{service_role}` exclusively. 2) Drop the redundant indexes on `mfp_nutrition`, `weight_log`, and `whoop_journal`. 3) Add a covering index to support the `hrv_predictions_latest` view's `DISTINCT ON` sort order to ensure it remains fast as the table grows.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "RLS policies grant ALL to public role instead of service_role",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "SCHEMA_DDL.md",
+        "description": "Several tables (e.g., whoop_cycles, garmin_*, sync_log) have a `service_full_access` policy that targets the `public` role with `USING (true) WITH CHECK (true)`. Because `public` includes the `anon` role, this policy technically allows unauthenticated users to write data if they ever receive INSERT/UPDATE grants.",
+        "evidence": "Context notes: 'Several target {public} instead. The public role technically includes anon... granting ALL to public is semantically broader than service_role.'",
+        "recommendation": "ALTER the offending policies to explicitly target `service_role`. Run `DROP POLICY ...` and `CREATE POLICY ... TO service_role USING (true) WITH CHECK (true);` for all affected tables."
+      },
+      {
+        "id": "F-002",
+        "title": "Redundant indexes on primary key columns",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness",
+          "Scalability"
+        ],
+        "file_ref": "SCHEMA_DDL.md",
+        "description": "Several tables have explicit secondary indexes that perfectly duplicate the coverage of their Primary Key indexes. Postgres automatically creates a unique b-tree index for PKs, making these secondary indexes dead weight.",
+        "evidence": "pds.myfitnesspal_nutrition has PK (calendar_date) and idx_mfp_nutrition_date (calendar_date). pds.weight_log has PK (log_date) and idx_weight_log_date (log_date DESC). pds.whoop_journal has PK (cycle_date, question) and idx_whoop_journal_date (cycle_date).",
+        "recommendation": "DROP INDEX idx_mfp_nutrition_date; DROP INDEX idx_weight_log_date; DROP INDEX idx_whoop_journal_date;"
+      },
+      {
+        "id": "F-003",
+        "title": "Missing index for hrv_predictions_latest DISTINCT ON sort",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability"
+        ],
+        "file_ref": "sql/hrv_predictions_latest.sql:22",
+        "description": "The `hrv_predictions_latest` view uses a `DISTINCT ON (prediction_date, model, horizon_days)` clause with an `ORDER BY` that includes a `CASE` statement and `created_at DESC`. Without a supporting index, this requires a heavy sort operation on every query.",
+        "evidence": "ORDER BY prediction_date, model, horizon_days, CASE WHEN model_version LIKE 'backtest%' THEN 1 ELSE 0 END, created_at DESC;",
+        "recommendation": "Create a composite index: `CREATE INDEX idx_hrv_predictions_latest_sort ON pds.hrv_predictions (prediction_date, model, horizon_days, created_at DESC);` to partially cover the sort path."
+      },
+      {
+        "id": "F-004",
+        "title": "Missing foreign key on habit_journal to habit_name_map",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "SCHEMA_DDL.md",
+        "description": "There is no foreign key enforcing that `habit_journal.question` exists in `habit_name_map.name`. If a habit is renamed or deleted in Notion, historical journal entries will silently orphan and drop out of downstream joins.",
+        "evidence": "Context notes: 'habit_journal.question \u2194 habit_name_map.name (no FK; loose join in app code)'.",
+        "recommendation": "Add a foreign key: `ALTER TABLE pds.habit_journal ADD CONSTRAINT fk_habit_journal_question FOREIGN KEY (question) REFERENCES pds.habit_name_map(name) ON UPDATE CASCADE;`"
+      },
+      {
+        "id": "F-005",
+        "title": "Legacy daily_health_matrix view creates split-brain analytics risk",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "sql/daily_health_matrix.sql",
+        "description": "Maintaining both `daily_health_matrix` (legacy clock-day) and `daily_health_matrix_behavioral` (ADR-0001) means downstream queries might accidentally mix attribution models. The legacy view should be deprecated to enforce a single source of truth.",
+        "evidence": "Context notes: 'Retained both during migration. Reviewer should consider whether the legacy view can be deprecated/removed.'",
+        "recommendation": "Migrate remaining frontend queries to `daily_health_matrix_behavioral`, then DROP VIEW `pds.daily_health_matrix` to prevent future regressions."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Trigger-based ADR-0001 timezone attribution",
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql",
+        "why_it_matters": "Centralizing the behavioral-day logic in Postgres triggers ensures that no matter how data is inserted (Python ETL, Next.js API, manual SQL), the timezone attribution is always perfectly consistent. This prevents silent data corruption."
+      },
+      {
+        "title": "Long-format storage for journal entries",
+        "file_ref": "whoop_schema.sql",
+        "why_it_matters": "Storing `whoop_journal` and `habit_journal` as `(date, question, answer)` rather than wide columns prevents the need for DDL migrations every time the user adds a new habit or WHOOP question. Pivoting in pandas is the correct downstream pattern."
+      },
+      {
+        "title": "Preservation of raw API payloads",
+        "file_ref": "spotify_schema.sql",
+        "why_it_matters": "Storing `raw_json` alongside relational columns is an excellent defensive ETL practice. It allows the schema to evolve and historical data to be re-parsed without needing to re-query external APIs."
+      },
+      {
+        "title": "Appropriate restraint on partitioning",
+        "file_ref": "CONTEXT.md",
+        "why_it_matters": "Recognizing that 12K rows growing at 36 rows/day does not require Postgres table partitioning shows good architectural restraint. Partitioning here would add maintenance overhead with zero performance benefit."
+      }
+    ],
+    "questions_for_followup": [
+      "Are there any frontend optimistic updates that rely on the overly permissive `public` RLS policies, or is the frontend strictly reading via the `anon` key?",
+      "For the missing FK on `hrv_model_metrics.input_data_hash` to `hrv_predictions`, is it guaranteed that predictions are always written before metrics in the ETL pipeline to satisfy a constraint?"
+    ]
+  },
+  "bundle": "schema"
+}

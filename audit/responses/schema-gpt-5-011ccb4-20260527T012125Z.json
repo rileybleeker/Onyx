@@ -1,0 +1,256 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "011ccb4",
+  "fired_at": "2026-05-27T01:21:25.209710+00:00",
+  "usage": {
+    "prompt_tokens": 55849,
+    "completion_tokens": 12107,
+    "total_tokens": 67956,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 8192,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-4.1",
+      "review_date": "2026-05-27",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "Constraints, FKs, and ADR-0001 triggers are generally sound; a few RLS scope and uniqueness/indexing gaps merit fixes but no clear P0s surfaced."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "The ADR-0001 design centralizes attribution logic well; some trigger sprawl and duplicated view patterns create maintenance risk."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Indexes generally match query paths at current scale; a few targeted partial/composite indexes would future\u2011proof hot joins and LATERAL tiebreaks."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Good use of DEFERRABLE FKs, GIN/HNSW, partial unique indexes; RLS policy targeting of public and duplicate single\u2011column indexes are the main non\u2011idiomatic spots."
+      }
+    },
+    "summary": "Overall this is a solid, thoughtfully designed single\u2011user schema. The ADR\u20110001 attribution is implemented cleanly: a single pure function derives the onyx_* dates, and per\u2011table BEFORE triggers supply the right source signals. Key parent/child relationships are now FK\u2011enforced (WHOOP cycle hub, Garmin laps\u2192activities, Spotify plays\u2192tracks/artists, supplement intake\u2192products), and JSONB is used judiciously where schemas are open\u2011ended (supplement ingredients, journal topics, raw Spotify payloads). Views cover the primary analytics surfaces, with behavioral attribution now canonical via daily_health_matrix_behavioral.\n\nWhat isn\u2019t perfect: a handful of RLS policies grant ALL to public instead of service_role (harmless today due to missing table\u2011level write grants, but non\u2011idiomatic and risky for future grants). The HRV predictions table in production still shows the legacy composite PK, diverging from the intended surrogate\u2011PK + 4\u2011tuple UNIQUE design; adding that uniqueness and a supporting index will harden the latest/tiebreak views. The 135\u2011column behavioral matrix repeats three similar LATERAL\u2011LIMIT\u20111 dedup blocks, increasing maintenance friction; factoring those into helper views (or materialized helper views) will reduce drift and improve explainability. Several duplicate single\u2011column indexes mirror PKs and can be dropped.\n\nRiskiest design choices: reliance on role public in write\u2011policies, divergence between intended and live HRV predictions uniqueness, and the growing maintenance burden in the matrix view. If I could only fix three things: (1) normalize RLS so ALL policies target service_role, (2) apply the surrogate PK + UNIQUE quad and add a covering index to support hrv_predictions_latest, and (3) extract the repeated LATERAL dedups into small helper views with appropriate indexes.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "RLS 'service_full_access' granted to public instead of service_role",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "SCHEMA_DDL.md \u2014 Row-Level Security policies",
+        "description": "Several tables grant ALL to the public role rather than to service_role. It\u2019s harmless today (no table-level INSERT/UPDATE/DELETE grants to anon/authenticated), but it widens the trust boundary and could become a write hole if future grants land.",
+        "evidence": "SCHEMA_DDL.md: \u201cSeveral (whoop_*, garmin_*, sync_log) target {public} instead\u2026 granting ALL to public is semantically broader than service_role.\u201d",
+        "recommendation": "Replace ALL-to-public policies with ALL-to-service_role on affected tables; explicitly REVOKE ALL from public to avoid surprises."
+      },
+      {
+        "id": "F-002",
+        "title": "Missing explicit service write policies on some RLS-enabled tables",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "SCHEMA_DDL.md \u2014 Row-Level Security policies",
+        "description": "A few tables have only anon_read and rely on Supabase's bypass-RLS for service writes. Works on Supabase but reduces portability and makes intent unclear.",
+        "evidence": "SCHEMA_DDL.md: \u201cA few tables have RLS enabled with anon_read but no service_* policy\u2026 rely on service-role's bypass-RLS privilege.\u201d",
+        "recommendation": "Add a consistent service_full_access policy (TO service_role USING true WITH CHECK true) for all writeable tables."
+      },
+      {
+        "id": "F-003",
+        "title": "HRV predictions: intended surrogate PK + UNIQUE quad not reflected in prod",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness",
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.hrv_predictions; sql/hrv_predictions_surrogate_pk.sql",
+        "description": "Production shows PK (prediction_date, model, horizon_days), but intended DDL adds a surrogate id and UNIQUE(prediction_date, model, horizon_days, model_version) NULLS NOT DISTINCT. Without it, duplicates per model_version aren\u2019t constrained and DISTINCT ON views rely on timing rather than integrity.",
+        "evidence": "SCHEMA_DDL.md: PK (prediction_date, model, horizon_days). sql/hrv_predictions_surrogate_pk.sql: drops composite PK, adds id PK + UNIQUE quad.",
+        "recommendation": "Apply sql/hrv_predictions_surrogate_pk.sql to production; then add an index on (prediction_date, model, horizon_days, model_version, created_at DESC) to support hrv_predictions_latest\u2019s tiebreak efficiently."
+      },
+      {
+        "id": "F-004",
+        "title": "Add covering/partial indexes for common SCORED/primary-branch joins",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.whoop_recovery, pds.whoop_sleep, pds.garmin_sleep",
+        "description": "Hot joins repeatedly filter by score_state='SCORED' and is_nap=false, and LATERAL blocks ORDER BY overall_sleep_score LIMIT 1. Current single-column indexes help but don\u2019t exploit these predicates.",
+        "evidence": "daily views join whoop_recovery on (cycle_id AND score_state='SCORED') and whoop_sleep on (cycle_id AND is_nap=false AND score_state='SCORED'); garmin_sleep LATERAL orders by overall_sleep_score DESC LIMIT 1.",
+        "recommendation": "Create partial indexes: whoop_recovery(cycle_id) WHERE score_state='SCORED'; whoop_sleep(cycle_id) WHERE score_state='SCORED' AND is_nap=false; a composite on garmin_sleep(onyx_behavioral_date, overall_sleep_score DESC) WHERE is_nap=false AND sleep_id IS NOT NULL."
+      },
+      {
+        "id": "F-005",
+        "title": "Matrix view repeats LATERAL+LIMIT-1 patterns; factor into helper views",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql",
+        "description": "garmin_sleep best-of-day, garmin_hrv latest-of-day, and whoop_cycles longest-of-day are repeated LATERAL dedups in large views. This increases drift risk and hinders reuse.",
+        "evidence": "Multiple LEFT JOIN LATERAL (...) LIMIT 1 blocks in daily_health_matrix_behavioral and its main_session variant.",
+        "recommendation": "Create small helper views (e.g., garmin_sleep_best_per_behavioral_date, garmin_hrv_latest_per_behavioral_date, whoop_main_cycle_per_behavioral_date) with the same dedup logic and appropriate indexes; join those from both matrix views."
+      },
+      {
+        "id": "F-006",
+        "title": "Legacy and behavioral matrix views coexist; deprecate the legacy one",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.daily_health_matrix; pds.daily_health_matrix_behavioral",
+        "description": "Two parallel matrix views invite accidental use of the wrong attribution regime. A legacy snapshot already exists for rollback/A\u2011B.",
+        "evidence": "SCHEMA_DDL.md: both views present; sql/adr_0001_07_snapshot_daily_health_matrix.sql snapshots the legacy.",
+        "recommendation": "Move pds.daily_health_matrix to pds_legacy.daily_health_matrix_legacy (or drop with clear migration notes) and update consumers to the behavioral view."
+      },
+      {
+        "id": "F-007",
+        "title": "Duplicate single-column indexes that duplicate PKs",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.myfitnesspal_nutrition.idx_mfp_nutrition_date; pds.weight_log.idx_weight_log_date; pds.whoop_journal.idx(cycle_date)",
+        "description": "These indexes duplicate the leading key(s) of existing PK/UNIQUE constraints and add write overhead without improving plans.",
+        "evidence": "SCHEMA_DDL.md lists: myfitnesspal_nutrition PK(calendar_date) + idx(calendar_date); weight_log PK(log_date) + idx(log_date DESC); whoop_journal PK(cycle_date, question) + idx(cycle_date).",
+        "recommendation": "Drop the redundant single\u2011column indexes; keep the PK/UNIQUE only."
+      },
+      {
+        "id": "F-008",
+        "title": "Free-text enums lack CHECKs (bed_side, score_state, mood, kind)",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "pds.eight_sleep_trends.bed_side; pds.whoop_* .score_state; pds.journal_entries.mood; pds.meal_events.kind",
+        "description": "Several categorical fields are TEXT with de facto enumerations. Typos would silently create new categories and break filters.",
+        "evidence": "eight_sleep_trends.bed_side comment indicates 'left'/'right'; whoop tables use SCORED; meal_events.kind lists nominal values; journal_entries.mood has a small set.",
+        "recommendation": "Add CHECK constraints or enum types: bed_side IN ('left','right'); whoop score_state IN ('SCORED','PENDING_SCORE','UNSCORABLE'); meal_events.kind IN (...); journal_entries.mood IN (...)."
+      },
+      {
+        "id": "F-009",
+        "title": "Habit/Whoop journal questions are free-text without a dim map",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.habit_journal; pds.whoop_journal; pds.habit_name_map",
+        "description": "Long-format journal stores (date, question) with free-text question values. Without a FK/dim, spelling drift or renames can fragment signals.",
+        "evidence": "SCHEMA_DDL.md: \u201chabit_journal.question \u2194 habit_name_map.name \u2014 loose join in app code; no FK.\u201d",
+        "recommendation": "Introduce a journal_questions dim (id, canonical_name, source) and store question_id in fact tables; enforce via FK; provide a mapping/backfill script."
+      },
+      {
+        "id": "F-010",
+        "title": "Trigger sprawl for ADR-0001 attribution increases drift surface",
+        "severity": "P3",
+        "effort": "M",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "SCHEMA_DDL.md \u2014 Functions and triggers",
+        "description": "11+ nearly identical set_onyx_dates_* triggers each call derive_onyx_dates with minor variations, making it easy for behavior to drift across tables.",
+        "evidence": "SCHEMA_DDL.md: \u201c11 of these\u2026 each calling pds.derive_onyx_dates().\u201d",
+        "recommendation": "Refactor to a single parameterized trigger function (table/column config via TG_ARGV) or consolidate shared logic; add lightweight regression tests to validate per-table semantics."
+      },
+      {
+        "id": "F-011",
+        "title": "Behavioral matrix still emits onyx_* as calendar_date literals",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql",
+        "description": "The view sets onyx_behavioral_date/onyx_et_date/onyx_local_date to the same s.calendar_date literal. It\u2019s harmless but semantically odd alongside ADR-0001: consumers may assume these were recomputed per-source.",
+        "evidence": "SELECT list: s.calendar_date AS onyx_behavioral_date, s.calendar_date AS onyx_et_date, s.calendar_date AS onyx_local_date.",
+        "recommendation": "Either drop these passthrough aliases from the view or rename them to avoid confusion (or add a comment in the view definition clarifying they\u2019re the spine\u2019s behavioral date)."
+      },
+      {
+        "id": "F-012",
+        "title": "Consider indexing spotify_daily_signature inputs for future growth",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability"
+        ],
+        "file_ref": "pds.spotify_plays; pds.spotify_tracks; sql/spotify_schema.sql",
+        "description": "The daily signature aggregates by played_date_et with a LEFT JOIN to tracks; current indexes cover played_date_et and track_id, which is fine now but add a partial index to keep scans tight as plays grow.",
+        "evidence": "Indexes: spotify_plays(played_date_et), (track_id); spotify_tracks(track_id), (features_source).",
+        "recommendation": "Add a multicolumn index on spotify_plays(played_date_et, track_id) to speed GROUP BY + join, and consider a partial index on spotify_tracks(track_id) WHERE valence IS NOT NULL to favor featurized rows."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "ADR\u20110001 centralization with derive_onyx_dates + triggers",
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql; SCHEMA_DDL.md \u2014 Triggers",
+        "why_it_matters": "A pure, reusable function plus lightweight per\u2011table triggers ensures consistent behavioral\u2011day attribution and catches TZ edge cases at write time."
+      },
+      {
+        "title": "Use of DEFERRABLE FKs on Spotify ingest",
+        "file_ref": "pds.spotify_plays",
+        "why_it_matters": "DEFERRABLE INITIALLY DEFERRED avoids fragile ingest ordering while preserving referential integrity \u2014 idiomatic for ETL pipelines."
+      },
+      {
+        "title": "JSONB where it belongs, with indexes",
+        "file_ref": "pds.supplement_products.ingredients; pds.journal_entries.topics",
+        "why_it_matters": "Open\u2011ended payloads with GIN indexing allow flexible queries without premature schema lock\u2011in; promotion to columns is used only where the shape is stable."
+      },
+      {
+        "title": "Partial unique index to enforce one open habit interval",
+        "file_ref": "pds.habit_metadata_history.uq_habit_metadata_history_one_open",
+        "why_it_matters": "Enforcing a single open interval in history tables prevents subtle logic bugs and is a clean, idiomatic Postgres pattern."
+      },
+      {
+        "title": "Safety/diagnostic views for pipeline health",
+        "file_ref": "pds.hrv_prediction_gaps; pds.tz_log_gaps",
+        "why_it_matters": "Proactive canaries surface missing predictions and TZ\u2011log drift early, reducing silent analytic errors."
+      }
+    ],
+    "questions_for_followup": [
+      "Can we list the exact tables whose service_full_access policies currently target public so we can batch\u2011fix them with one migration?",
+      "Are any write privileges (INSERT/UPDATE/DELETE) granted to authenticated or anon outside this bundle (e.g., via Supabase dashboard)?",
+      "Do consumers of hrv_predictions_latest ever filter by model_version explicitly, or should we add a filtered view per live/backtest to simplify usage?",
+      "Is whoop_workouts ever joined to a specific cycle_id in analytics (beyond date attribution)? If yes, should we add a derived cycle_id column to enable future FK?",
+      "Should habit/Whoop journal questions be normalized now (dim table) or do we prefer post\u2011hoc mapping in Python?",
+      "Is Eight Sleep ever used for the right bed side? If not, can we enforce bed_side='left' via CHECK or default to reduce accidental drift?",
+      "Can we safely drop the redundant single\u2011column indexes now, or do any client apps rely on their names for introspection?"
+    ]
+  },
+  "bundle": "schema"
+}

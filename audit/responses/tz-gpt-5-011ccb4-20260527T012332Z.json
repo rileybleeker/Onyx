@@ -1,0 +1,218 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "011ccb4",
+  "fired_at": "2026-05-27T01:23:32.576651+00:00",
+  "usage": {
+    "prompt_tokens": 34234,
+    "completion_tokens": 24923,
+    "total_tokens": 59157,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 21632,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-4o",
+      "review_date": "2026-05-27",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "Core triggers implement ADR-0001: three date types, \u22126h behavioral rule, provenance, and tiered TZ resolution. A WHOOP backfill script bug can leave user_tz_log under-populated and some non-cycle events fall back to ET on travel days. Minor inconsistencies in tz_source labeling and cycle-pick logic for whoop_journal remain."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "Edge cases are handled: DST artifacts filtered in WHOOP auto-fill, transition-day flag, tz_log_gaps canary. Most NULL and degenerate inputs are guarded. Gaps remain around midday events when user_tz_log is missing and a small whoop_journal dedup choice."
+      },
+      "scalability": {
+        "score": 5,
+        "rationale": "Derivation centralized in a STABLE function; BEFORE triggers write in-place with indexes on behavioral_date. tz_for_instant has an index-backed lookup. Views use lateral picks and aggregation efficiently at n=1 scale and beyond."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Good use of AT TIME ZONE, BEFORE triggers, function composition, provenance. Minor bespoke bits (interval_to_tzd) and a few semantic labeling choices keep it just shy of perfect."
+      }
+    },
+    "summary": "Overall, the implementation closely matches ADR-0001. The \u22126h behavioral-day rule is applied consistently in pds.derive_onyx_dates across WHOOP, Garmin, Spotify, and Onyx-owned sources. Tiered TZ resolution is realized: source-provided offsets first, then a WHOOP cycle anchor when the instant falls inside [start_time, end_time), and finally pds.user_tz_log with a clearly flagged ET fallback. Provenance is carried via onyx_tz_source, transition days are flagged on cycles, and a tz_log_gaps view elevates missing travel-log entries while distinguishing DST artifacts.\n\nTwo issues merit attention. First, whoop_tz_backfill.py has a NameError that prevents it from inserting auto-inferred user_tz_log rows; without these, midday events outside the sleep window can default to ET on travel days until manual/GPS rows are present. Second, the whoop_journal trigger picks the earliest cycle on a behavioral day, not the longest, which can mis-attribute when multiple cycles share a day.\n\nSmaller inconsistencies: garmin_hrv\u2019s no-instant fallback labels tz_source as default_et_fallback while copying a watch-local calendar_date into onyx_et_date/local/behavioral, which is semantically misleading. Cycle-anchor lookup is limited to the sleep window; this is by design but increases reliance on user_tz_log for waking events.\n\nTop 3 fixes: (1) Fix whoop_tz_backfill NameError and add unit smoke to ensure proposals print/insert. (2) Change whoop_journal cycle selection to \u201clongest cycle\u201d to match the behavioral matrix. (3) Adjust garmin_hrv fallback provenance to source_field (or a dedicated label) and document its semantics, or prefer cycle/user_tz_log where possible.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "whoop_tz_backfill crashes due to undefined variable in notes",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "whoop_tz_backfill.py:137-149",
+        "description": "The script references log_offset_str in the notes f-string but never defines it, raising a NameError and preventing any proposals/inserts.",
+        "evidence": "notes: (f\"whoop-auto: cycle {c['cycle_id']} offset {whoop_offset_str}; ...; log was {log_tz} ({log_offset_str})\") \u2014 log_offset_str is not defined.",
+        "recommendation": "Replace log_offset_str with log_offset_at_start (and/or include end) or remove the parenthetical. Add a quick smoke test to ensure proposals list without exception."
+      },
+      {
+        "id": "F-002",
+        "title": "whoop_journal picks earliest cycle; should pick the longest",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:160-182",
+        "description": "When multiple cycles share a behavioral day, the trigger selects ORDER BY start_time LIMIT 1, which can choose an arrival nap over the main sleep.",
+        "evidence": "SELECT wc.start_time, wc.timezone_offset ... ORDER BY wc.start_time LIMIT 1;",
+        "recommendation": "Align with the behavioral matrix: ORDER BY (end_time - start_time) DESC NULLS LAST, start_time DESC LIMIT 1 to pick the longest cycle."
+      },
+      {
+        "id": "F-003",
+        "title": "garmin_hrv fallback labels and ET-date semantics are misleading",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql:102-125",
+        "description": "When start_timestamp is NULL, onyx_et_date/local/behavioral are set to a watch-local calendar_date, but onyx_tz_source is set to 'default_et_fallback'. This implies ET-derived fallback yet copies a non-ET date.",
+        "evidence": "NEW.onyx_et_date := NEW.calendar_date; ... NEW.onyx_tz_source := 'default_et_fallback';",
+        "recommendation": "Use a clearer provenance ('source_field' or a dedicated 'garmin_calendar_date') and document that the date is Garmin\u2019s wake-day. Optionally, prefer cycle/user_tz_log to establish local/behavioral and compute ET via noon-ET projection when feasible."
+      },
+      {
+        "id": "F-004",
+        "title": "Cycle-anchor limited to sleep window increases ET fallbacks by day",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql:78-101",
+        "description": "pds.cycle_offset_for_instant returns an offset only inside [start_time, end_time). Midday events rely entirely on user_tz_log; if not populated (e.g., WHOOP auto-fill bug or no GPS), events default to ET on travel days.",
+        "evidence": "WHERE ts >= start_time AND (end_time IS NULL OR ts < end_time)",
+        "recommendation": "Consider a wider anchor (e.g., map instants to the nearest cycle by time with a capped window) or ensure auto-population (WHOOP/GPS) reliably covers waking hours; at minimum, document the tradeoff."
+      },
+      {
+        "id": "F-005",
+        "title": "Missing explicit index to support cycle_offset_for_instant lookups",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability"
+        ],
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql:61-101",
+        "description": "cycle_offset_for_instant scans whoop_cycles by start_time with ORDER BY DESC LIMIT 1. No index is created in this bundle to guarantee efficient access.",
+        "evidence": "SELECT timezone_offset FROM pds.whoop_cycles WHERE ts >= start_time ... ORDER BY start_time DESC LIMIT 1;",
+        "recommendation": "Ensure an index exists on pds.whoop_cycles(start_time) (and ideally on (start_time, end_time)) to keep Tier-2 lookups O(log n) as data grows."
+      },
+      {
+        "id": "F-006",
+        "title": "gps_tz_backfill may propose noisy same-offset IANA names intermittently",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Correctness"
+        ],
+        "file_ref": "gps_tz_backfill.py:72-121",
+        "description": "Same-offset filter is present, but last_proposed_tz dedup relies on previous inference only; an isolated same-offset activity flanked by gaps could still propose redundant IANA if the offset check ever fails (e.g., rare historical TZ rule anomalies).",
+        "evidence": "if off_inf == off_log: continue; ... if inferred == last_proposed_tz: continue;",
+        "recommendation": "Also dedup against the most recent existing user_tz_log row at/preceding ts to guard against isolated same-offset proposals."
+      },
+      {
+        "id": "F-007",
+        "title": "habit_journal onyx_tz_source ambiguously marks NY days as user_tz_log",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:116-153",
+        "description": "When a user_tz_log row exists and resolves to NY, tz_source is still 'user_tz_log'. This collapses ET-default and explicit-NY into one label.",
+        "evidence": "NEW.onyx_tz_source := CASE WHEN log_tz IS NOT NULL THEN 'user_tz_log' ELSE 'default_et_fallback' END;",
+        "recommendation": "Consider setting tz_source to 'default_et_fallback' for NY results unless an explicit non-ET entry was matched, or introduce a 'user_tz_log_et' label to distinguish cases."
+      },
+      {
+        "id": "F-008",
+        "title": "interval_to_tzd ignores seconds; could misreport rare half-minute offsets",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql:22-48",
+        "description": "The formatter truncates to minutes, dropping seconds. While Garmin offsets are expected in whole minutes, the function contract is broader and could misformat unusual intervals.",
+        "evidence": "total_min := EXTRACT(EPOCH FROM diff)::INT / 60; mins := abs_min % 60;",
+        "recommendation": "Document minute precision or round before formatting. If future sources expose non-minute offsets, expand the formatter or validate input."
+      },
+      {
+        "id": "F-009",
+        "title": "daily_health_matrix_behavioral exposes onyx_et_date/local as behavioral",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql:31-41",
+        "description": "The view sets onyx_et_date and onyx_local_date equal to the behavioral spine date s.calendar_date. This is fine if treated as convenience fields, but can be misread as true ET/local projections.",
+        "evidence": "s.calendar_date AS onyx_et_date, s.calendar_date AS onyx_local_date",
+        "recommendation": "Add an inline comment clarifying these columns are placeholders mirroring the spine date; consumers should use per-source onyx_* on joined tables for actual ET/local semantics."
+      },
+      {
+        "id": "F-010",
+        "title": "tz_log_gaps numeric conversion truncates seconds before dividing",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "sql/adr_0001_06_tz_log_gaps_view.sql:22-64",
+        "description": "EXTRACT(EPOCH ...)::int / 60 truncates seconds pre-division. This is harmless for whole-minute offsets but brittle if inputs include seconds.",
+        "evidence": "EXTRACT(EPOCH FROM (...))::int / 60",
+        "recommendation": "Use ROUND(EXTRACT(EPOCH ...)/60.0) to keep integer minutes while avoiding double truncation."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Centralized derivation with clear provenance and \u22126h rule",
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql:106-179",
+        "why_it_matters": "A single function pds.derive_onyx_dates applies the bedtime-to-bedtime rule consistently and tags the source, reducing drift across triggers."
+      },
+      {
+        "title": "WHOOP cycle anchor implemented cleanly for Tier-2",
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql:48-75",
+        "why_it_matters": "When available, per-cycle offsets provide authoritative local context without requiring manual log entries."
+      },
+      {
+        "title": "Transition-day surface area with an indexed flag",
+        "file_ref": "sql/adr_0001_05_transition_day_flag.sql:1-57",
+        "why_it_matters": "Consumers can detect and treat TZ-change days explicitly, avoiding silent contamination of lag features."
+      },
+      {
+        "title": "Canary view distinguishes DST from real travel gaps",
+        "file_ref": "sql/adr_0001_06_tz_log_gaps_view.sql:1-77",
+        "why_it_matters": "Separating 'dst_artifact' from 'travel' prevents false alarms and guides targeted user_tz_log maintenance."
+      },
+      {
+        "title": "Behavioral matrix uses LATERAL to dedupe to longest sleep",
+        "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql:118-142",
+        "why_it_matters": "Selecting the main sleep per day yields stable, interpretable features that match intended semantics."
+      }
+    ],
+    "questions_for_followup": [
+      "Should we broaden Tier-2 (cycle anchor) to the nearest cycle for waking-hour events within a capped window, to further reduce reliance on user_tz_log on travel days?",
+      "For garmin_hrv rows lacking start_timestamp, would you accept a provenance label like 'garmin_calendar_date' instead of 'default_et_fallback' to avoid implying ET derivation?",
+      "Do we already have an index on pds.whoop_cycles(start_time)? If not, can we add one to support pds.cycle_offset_for_instant and daily views at scale?",
+      "Is it desirable to standardize tz_source semantics when the resolved IANA is explicitly America/New_York via user_tz_log (distinct from ET fallback)?",
+      "Should the behavioral matrix omit or rename its onyx_et_date/local placeholders to prevent accidental misuse in downstream consumers?"
+    ]
+  },
+  "bundle": "tz"
+}

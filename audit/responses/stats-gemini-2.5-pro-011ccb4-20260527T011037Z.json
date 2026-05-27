@@ -1,0 +1,161 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "011ccb4",
+  "fired_at": "2026-05-27T01:10:24.526511+00:00",
+  "usage": {
+    "promptTokenCount": 102599,
+    "candidatesTokenCount": 2538,
+    "totalTokenCount": 120266,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 102599
+      }
+    ],
+    "thoughtsTokenCount": 15129,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "o3-mini-2025-01-31",
+      "review_date": "2026-05-26",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 2,
+        "rationale": "Critical missing FDR correction in the causal layer and multiple instances of future leakage in backtests and cross-fitting."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "Handles missing data gracefully, enforces appropriate cell-size gates, and uses robust estimators (AIPW, HAC)."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "In-memory pandas/scikit-learn pipeline is perfectly adequate for n=1 longitudinal data with plenty of headroom."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Standard use of scikit-learn and statsmodels, though some time-series nuances (contiguous indices) are missed."
+      }
+    },
+    "summary": "The pipeline is conceptually well-designed, correctly identifying the need to separate descriptive associations from causal estimates. The causal layer's DAG correctly excludes same-night mediators to estimate actionable total effects, and the behavioral-day attribution aligns events correctly. However, the statistical execution has several critical flaws. First, the causal layer tests ~150 treatments without FDR correction, guaranteeing false positive interventions that the user will act on. Second, the time-series models (SARIMAX) and HAC standard errors are applied to data with ~32% missing days as if they were contiguous, destroying the day-of-week seasonality and corrupting the lag structure. Finally, there are multiple instances of future leakage in the evaluation metrics: SARIMAX and Prophet backtests use actual future behaviors for h>1 forecasts, the AIPW cross-fitting scales the entire dataset before splitting, and the XGBoost backtest sizes past prediction intervals using future residuals. Fixing the contiguous-time assumption and applying FDR to the causal layer are the highest priorities.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "SARIMAX seasonality and HAC standard errors applied to non-contiguous data",
+        "severity": "P0",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2303",
+        "description": "The pipeline drops rows with missing HRV targets, removing ~32% of the days, but passes the remaining rows to SARIMAX and HAC estimators as if they were contiguous time steps.",
+        "evidence": "`hrv_valid = df.dropna(subset=[TARGET]).set_index(\"calendar_date\")` removes missing days. Statsmodels `SARIMAX` treats the remaining rows as contiguous. The `seasonal_order=(1, 0, 1, 7)` looks 7 *rows* back, which averages ~10 days ago, completely misaligning the day-of-week seasonality.",
+        "recommendation": "Resample the dataframe to a strict daily frequency (`.asfreq('D')`) before fitting SARIMAX, allowing the Kalman filter to handle the NaNs natively. Do the same for the Stage 3 OLS HAC estimator."
+      },
+      {
+        "id": "F-002",
+        "title": "No FDR correction in the causal inference layer",
+        "severity": "P0",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:440-450",
+        "description": "The causal layer tests ~150 binary and continuous treatments for significance without any multiple-testing correction, guaranteeing false positive interventions.",
+        "evidence": "`significant = (ci_low > 0) or (ci_high < 0)` evaluates significance at an uncorrected \u03b1=0.05. With ~150 treatments, this guarantees ~7.5 false positive discoveries by pure chance.",
+        "recommendation": "Extract the p-values from the AIPW z-scores (estimate / SE) and apply Benjamini-Hochberg FDR correction across all tested treatments before flagging them as `significant`."
+      },
+      {
+        "id": "F-003",
+        "title": "Future leakage in SARIMAX and Prophet multi-horizon backtests",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2352",
+        "description": "In the walk-forward backtest for h>1, SARIMAX and Prophet are evaluated using actual future exogenous variables, artificially inflating accuracy.",
+        "evidence": "`fut_exog = (exog.iloc[split + i: split + i + h] if exog is not None else None)` passes the user's actual future behaviors to the forecast method. The models are evaluated on how well they predict the future given perfect knowledge of future behaviors.",
+        "recommendation": "For backtesting h>1, pass a naive proxy for future behaviors (e.g., the last known behavior repeated h times), exactly as is done for the live `full_model` forecast on line 2382."
+      },
+      {
+        "id": "F-004",
+        "title": "Future leakage in AIPW cross-fitting via global StandardScaler",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:307",
+        "description": "The features are standardized over the entire dataset before TimeSeriesSplit, leaking the mean and variance of future test folds into the training folds.",
+        "evidence": "`X_std = _standardize(X)` applies `StandardScaler` to the entire dataset. Then `for train_idx, test_idx in kf.split(X_std):` splits the already-scaled data, violating the strict temporal separation required for time-series cross-fitting.",
+        "recommendation": "Fit the `StandardScaler` only on `Xt` (the training fold) and use it to transform both `Xt` and `Xv` inside the cross-fitting loop."
+      },
+      {
+        "id": "F-005",
+        "title": "Future leakage in XGBoost backtest CI coverage",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:1240-1250",
+        "description": "The prediction interval standard deviation is computed using TimeSeriesSplit on the entire dataset, leaking future residual variance into past prediction intervals.",
+        "evidence": "`pred_std_by_horizon[_h]` is computed using `X_h_full` (the entire dataset). The walk-forward backtest then uses this global standard deviation to construct prediction intervals for past dates.",
+        "recommendation": "Compute `pred_std` dynamically within each step of the walk-forward backtest using only the expanding `X_tr` window, or explicitly document that the CI coverage metric is a retrospective pseudo-metric."
+      },
+      {
+        "id": "F-006",
+        "title": "Confounder ffill applied after dropping missing outcomes uses stale data",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "causal_inference.py:380",
+        "description": "Forward-filling confounders is done on a dataframe that has already had rows dropped due to missing HRV, causing it to fill from the last observed day rather than the actual previous calendar day.",
+        "evidence": "`sub = sub.dropna(subset=[spec.name, OUTCOME_COL])` removes days with missing HRV. Then `X_df = sub[list(confounders)].copy(); X_df = X_df.ffill(limit=2)` fills missing confounders using the previous row in `sub`, which could be several days ago.",
+        "recommendation": "Apply `ffill(limit=2)` to the confounders on the full daily spine `df` *before* dropping rows for `sub`."
+      },
+      {
+        "id": "F-007",
+        "title": "Block bootstrap applied to non-contiguous influence values",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:348",
+        "description": "The block bootstrap for AIPW confidence intervals assumes contiguous time steps, but is applied to an array with missing days, breaking the true autocorrelation structure.",
+        "evidence": "`psi_valid = psi[~np.isnan(psi)]` removes NaNs (which include days with missing HRV). `_block_bootstrap_ci` then samples contiguous blocks of length 7 from this array, stitching together days that are not actually contiguous.",
+        "recommendation": "Either pad `psi` with NaNs to maintain calendar continuity and use a NaN-aware block bootstrap, or remove the block bootstrap diagnostic entirely as it is invalid for sparse treatments."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Explicit DAG and Mediator Exclusion",
+        "file_ref": "causal_inference.py:80",
+        "why_it_matters": "Deliberately excluding same-night sleep and HRV-derived variables from the confounder set correctly avoids mediator-adjustment bias, ensuring the pipeline estimates the actionable total effect of behaviors."
+      },
+      {
+        "title": "Behavioral-Day Attribution",
+        "file_ref": "hrv_analysis.py:340",
+        "why_it_matters": "Aligning post-midnight events with the correct sleep cycle via `onyx_behavioral_date` prevents silent misalignment of late-night behaviors (like alcohol or late meals) with the wrong night's HRV."
+      },
+      {
+        "title": "E-value Sensitivity Analysis",
+        "file_ref": "causal_inference.py:360",
+        "why_it_matters": "Including the VanderWeele & Ding E-value is a rigorous and highly appropriate addition for observational n=1 data, providing a concrete measure of robustness to unmeasured confounding."
+      }
+    ],
+    "questions_for_followup": [
+      "For the causal inference layer, what is the acceptable false discovery rate (q-value) for interventions? Should it match the descriptive stats (q=0.05), or be tuned differently given the cost of false positive interventions?",
+      "How often does Riley actually miss wearing the WHOOP device? If the 32% missingness is mostly from before 2024, should the SARIMAX model simply be restricted to the post-2024 contiguous period rather than attempting to model the sparse historical data?"
+    ]
+  },
+  "bundle": "stats"
+}

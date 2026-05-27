@@ -1,0 +1,124 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "011ccb4",
+  "fired_at": "2026-05-27T01:11:12.731672+00:00",
+  "usage": {
+    "promptTokenCount": 80872,
+    "candidatesTokenCount": 2179,
+    "totalTokenCount": 101797,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 80872
+      }
+    ],
+    "thoughtsTokenCount": 18746,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "o3-mini",
+      "review_date": "2026-05-26",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 2,
+        "rationale": "Garmin ETL has a systematic bug in its upsert conflict columns that causes all writes to fail, and exception swallowing hides this from the sync_log. Several ETLs fail to populate sync_end in the sync_log."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "IMAP polling and token rotation are generally robust, but Spotify ETL crashes on Supabase API errors due to overly narrow exception catching. Garmin ETL's error swallowing masks critical failures."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Pagination is handled correctly across APIs. Batching is used for embeddings and Supabase upserts. MusicBrainz enrichment is rate-limited and only runs for new artists."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Code is generally clean and modular. Good use of standard libraries and clear separation of concerns. However, the copy-pasted sync_log logic across files led to inconsistent implementations."
+      }
+    },
+    "summary": "The ETL pipeline is operationally stable but suffers from a critical silent failure in the Garmin ingestion path. The Garmin ETL appends `,ts` to the `on_conflict` clause for almost all tables, which violates Postgres unique constraints and causes the upserts to fail. Because the `sync_date` function catches all exceptions and returns 0, these failures are swallowed, and the `sync_log` records a 'successful' run with 0 records. Additionally, several ETLs fail to populate `sync_end` in the `sync_log`, breaking frontend freshness queries. The Spotify ETL has a brittle exception handler that will crash the entire run if the artist enrichment upsert fails. On the positive side, the IMAP-based email parsing is robust, token rotation is handled safely, and cross-ETL dependencies are elegantly resolved via Postgres triggers.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Garmin ETL upserts fail due to incorrect on_conflict columns",
+        "severity": "P0",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "garmin_etl.py:168",
+        "description": "The Garmin ETL appends `,ts` to the `on_conflict` string for almost all tables (e.g., `calendar_date,ts` for `garmin_daily_summary`, `activity_id,ts` for `garmin_activities`). Since `ts` is not part of the primary key / unique constraint for these tables, Postgres rejects the upsert with an error.",
+        "evidence": "Lines 168, 228, 245, 270, 292, 316, 449, 485 all use `ts` in the `on_conflict` string. Supabase's `upsert` requires the `on_conflict` columns to exactly match a unique constraint.",
+        "recommendation": "Remove `,ts` from the `on_conflict` strings in `garmin_etl.py` so they exactly match the primary keys of the respective tables (e.g., `calendar_date` for daily summary, `activity_id` for activities)."
+      },
+      {
+        "id": "F-002",
+        "title": "Garmin ETL silently swallows upsert exceptions, masking complete failures",
+        "severity": "P0",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Correctness"
+        ],
+        "file_ref": "garmin_etl.py:519",
+        "description": "The `sync_date` function catches all exceptions during individual sync tasks (like `sync_daily_summary`) and returns 0. This prevents the outer loop from incrementing the `errors` counter, causing the script to log a 'successful' sync with 0 records even when every upsert fails.",
+        "evidence": "In `sync_date` (line 519), `except Exception as e:` logs a warning and sets `counts[name] = 0`. The outer loop in `main` (line 581) only increments `errors` if `sync_date` itself raises, which it never does.",
+        "recommendation": "Remove the broad `except Exception` block in `sync_date` and let exceptions bubble up to the outer loop, or increment an error counter within `sync_date` and return it so the overall run is marked as 'partial' or 'failed'."
+      },
+      {
+        "id": "F-003",
+        "title": "Multiple ETLs fail to populate sync_end in sync_log",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "spotify_etl.py:417",
+        "description": "The `sync_log` inserts in `spotify_etl.py`, `journal_etl.py`, `myfitnesspal_email.py`, and `whoop_journal_email.py` do not populate the `sync_end` column. As noted in the prompt, leaving `sync_end` NULL breaks frontend freshness queries.",
+        "evidence": "In `spotify_etl.py` `log_sync_entry` (line 417), `sync_start` is populated but `sync_end` is missing. The same applies to `journal_etl.py` (line 204), `myfitnesspal_email.py` (line 89), and `whoop_journal_email.py` (line 88).",
+        "recommendation": "Update the `log_sync` functions in these scripts to explicitly set `sync_end: datetime.now(timezone.utc).isoformat()`."
+      },
+      {
+        "id": "F-004",
+        "title": "Spotify ETL crashes on Supabase API errors during artist enrichment",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "spotify_etl.py:532",
+        "description": "The Spotify ETL attempts to catch errors during artist enrichment using `except httpx.HTTPError`. However, if the Supabase upsert fails (e.g., if the `spotify_artists` table is missing or has a constraint violation), it raises a `postgrest.exceptions.APIError`, which bypasses the catch block and crashes the entire ETL.",
+        "evidence": "Line 532 catches `httpx.HTTPError`, but `upsert_artists` (line 529) calls Supabase's `execute()`, which raises `APIError` on failure. This bubbles up to the main exception handler (line 565) and exits the script.",
+        "recommendation": "Broaden the exception handler around artist enrichment to catch `Exception` (or specifically `postgrest.exceptions.APIError` alongside `httpx.HTTPError`) so that a failure to enrich artists doesn't crash the core plays/tracks sync."
+      },
+      {
+        "id": "F-005",
+        "title": "Email ETLs fail to populate sync_start in sync_log",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "myfitnesspal_email.py:89",
+        "description": "The `log_sync` functions in `myfitnesspal_email.py` and `whoop_journal_email.py` do not explicitly populate `sync_start`. While Postgres defaults this to `now()`, it is inconsistent with the other ETLs and relies on the database default rather than the actual script start time.",
+        "evidence": "Lines 89-98 in `myfitnesspal_email.py` omit `sync_start`. The `duration_seconds` is logged, but the exact start time is left to the database.",
+        "recommendation": "Pass `started_at` to `log_sync` and explicitly populate `sync_start` (and `sync_end`) in the `sync_log` insert."
+      }
+    ],
+    "things_done_well": [
+      "IMAP email parsing is highly robust, correctly handling multipart emails, extracting links from both HTML and plain text, and safely falling back to attachments.",
+      "Token rotation is handled safely across ephemeral CI runs using the `ci_token_helper.py` utility.",
+      "Cross-ETL dependencies (like WHOOP cycles and journal entries) are elegantly resolved using Postgres triggers, eliminating the need for strict orchestration ordering.",
+      "Pagination is implemented correctly across all third-party APIs (Notion, WHOOP, Garmin)."
+    ],
+    "questions_for_followup": [
+      "Does the `pds.spotify_artists` table exist in the production database? It is missing from `spotify_schema.sql`.",
+      "Should the `sync_log` inserts be centralized into a shared utility module to prevent drift and missing columns across the 13 ETL scripts?"
+    ]
+  },
+  "bundle": "etl"
+}

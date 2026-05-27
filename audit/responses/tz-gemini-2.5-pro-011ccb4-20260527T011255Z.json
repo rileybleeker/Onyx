@@ -1,0 +1,122 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "011ccb4",
+  "fired_at": "2026-05-27T01:12:23.016630+00:00",
+  "usage": {
+    "promptTokenCount": 39865,
+    "candidatesTokenCount": 2071,
+    "totalTokenCount": 71465,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 39865
+      }
+    ],
+    "thoughtsTokenCount": 29529,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "o1",
+      "review_date": "2026-05-26",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "The core SQL implementation is highly correct and faithfully implements the ADR. The -6h rule and +12h ET alignment are mathematically sound. However, the Python backfill scripts have a state-tracking bug that causes them to miss return trips on the first run, and the tz_log_gaps view drops half of the DST artifacts."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "The SQL triggers handle edge cases (missing timestamps, backdated entries) gracefully with appropriate fallbacks. The Python scripts are brittle when encountering unknown offsets (falling back to Etc/UTC and causing infinite proposal loops)."
+      },
+      "scalability": {
+        "score": 5,
+        "rationale": "Triggers are efficient and avoid cross-table cascades. Backfills use bulk SQL where appropriate. Indexes are added for all new behavioral date columns to support the new join patterns."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Excellent use of Postgres AT TIME ZONE and interval math. The Python scripts could be more idiomatic by maintaining state rather than querying the DB in a loop."
+      }
+    },
+    "summary": "The timezone and behavioral-day implementation is exceptionally well-designed at the database layer. The core `derive_onyx_dates` function and the per-table triggers correctly implement the tiered TZ detection and the -6h behavioral boundary. The use of Postgres date math (e.g., the +12h ET rule) is elegant and robust. The primary issues lie in the Python auto-population scripts: both scripts query the database statelessly in a loop, causing them to miss return trips on the first run because the database still reflects the home timezone. Additionally, the `tz_log_gaps` view has a WHERE clause that inadvertently filters out half of the DST artifacts it intends to flag.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Auto-population scripts miss return trips on first run due to stateless DB queries",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "whoop_tz_backfill.py:145, gps_tz_backfill.py:75",
+        "description": "Both backfill scripts query the database (`tz_for_instant_via_pg`) for every row to determine the current logged timezone. When proposing a new timezone for an outbound flight, they do not update any in-memory state. When evaluating the return flight, the database still reports the home timezone, which matches the return timezone, causing the script to skip proposing the return entry. This requires running the scripts multiple times to fully backfill round trips.",
+        "evidence": "log_says = tz_for_instant_via_pg(ts_iso)\nif inferred == log_says:\n    last_proposed_tz = inferred\n    continue",
+        "recommendation": "Maintain a `current_tz` variable in memory during the loop. Initialize it via a single DB query, update it whenever a proposal is generated, and use it instead of querying the DB for every row."
+      },
+      {
+        "id": "F-002",
+        "title": "tz_log_gaps view silently drops half of DST artifacts due to WHERE clause",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "sql/adr_0001_06_tz_log_gaps_view.sql:47",
+        "description": "The view intends to flag cycles spanning a DST shift as `gap_type='dst_artifact'`. However, the `WHERE log_offset_minutes_at_start IS DISTINCT FROM source_offset_minutes` clause completely filters out any cycle where WHOOP's offset matches the pre-DST (start) offset. These rows never make it into the view, so they are never labeled as DST artifacts.",
+        "evidence": "WHERE log_offset_minutes_at_start IS DISTINCT FROM source_offset_minutes",
+        "recommendation": "Change the WHERE clause to `WHERE source_offset_minutes IS DISTINCT FROM log_offset_minutes_at_start OR source_offset_minutes IS DISTINCT FROM log_offset_minutes_at_end` to ensure all gaps and DST artifacts are included."
+      },
+      {
+        "id": "F-003",
+        "title": "Unknown WHOOP offsets cause infinite proposal loops due to Etc/UTC fallback",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "whoop_tz_backfill.py:88",
+        "description": "In `whoop_tz_backfill.py`, if a WHOOP offset is not in the user's history or the generic map (e.g., `+05:30` for India), `infer_iana` falls back to `Etc/UTC`. Because `Etc/UTC`'s offset (`+00:00`) will never match the WHOOP offset, the script will repeatedly propose `Etc/UTC` for every day of the trip on every subsequent run, leading to PK violation spam.",
+        "evidence": "return \"Etc/UTC\", f\"no inference available for {offset_str}; using UTC placeholder\"",
+        "recommendation": "Instead of falling back to `Etc/UTC`, either construct a fixed-offset POSIX timezone string (e.g., `UTC-05:30`), or simply skip the proposal and log a warning that manual intervention is required for the unknown offset."
+      },
+      {
+        "id": "F-004",
+        "title": "Inconsistent WHOOP cycle selection between journal trigger and matrix view",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:205",
+        "description": "The `whoop_journal` trigger selects the first cycle of the day (`ORDER BY start_time LIMIT 1`) to anchor its timezone, whereas `daily_health_matrix_behavioral` selects the longest cycle. On transition days with an arrival nap, these may pick different cycles with different timezone offsets, leading to slight inconsistencies in `onyx_local_date` attribution.",
+        "evidence": "ORDER BY wc.start_time\nLIMIT 1;",
+        "recommendation": "Update the `whoop_journal` trigger to order by `(end_time - start_time) DESC NULLS LAST` to match the matrix view's 'main sleep' logic."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Brilliant use of Postgres date math for WHOOP cycle alignment",
+        "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:202",
+        "why_it_matters": "The `+12h ET` rule perfectly aligns the UTC `start_time` with WHOOP's `cycle_date` regardless of the user's timezone, avoiding complex and brittle timezone conversions."
+      },
+      {
+        "title": "Robust TIMESTAMPTZ to local TIMESTAMP conversion",
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql:109",
+        "why_it_matters": "Using `AT TIME ZONE 'UTC' + interval` safely converts a UTC instant to a local wall-clock timestamp without relying on the server's timezone setting."
+      },
+      {
+        "title": "Comprehensive provenance tracking",
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql:130",
+        "why_it_matters": "The `onyx_tz_source` column explicitly tracks the tier of timezone detection used for every row, making it trivial to audit and filter fallback rows in downstream analytics."
+      }
+    ],
+    "questions_for_followup": [
+      "Should `whoop_tz_backfill.py` and `gps_tz_backfill.py` be rewritten to maintain in-memory state of the user's timezone to avoid requiring multiple runs for round trips?",
+      "Is it intentional that `tz_log_gaps` excludes DST artifacts where WHOOP's offset matches the pre-DST offset, or should the WHERE clause be expanded to include them?"
+    ]
+  },
+  "bundle": "tz"
+}

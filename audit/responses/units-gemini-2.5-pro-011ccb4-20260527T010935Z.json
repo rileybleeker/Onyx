@@ -1,0 +1,141 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "011ccb4",
+  "fired_at": "2026-05-27T01:09:35.605346+00:00",
+  "usage": {
+    "promptTokenCount": 15576,
+    "candidatesTokenCount": 2202,
+    "totalTokenCount": 31573,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 15576
+      }
+    ],
+    "thoughtsTokenCount": 13795,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "o3-mini",
+      "review_date": "2026-05-26",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "Several unit conversions and date boundary calculations are incorrect, leading to wrong behavioral dates for pre-midnight bedtimes and dropped data for midnight Spotify plays."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "Silent failures in the SQL unit conversion drop unhandled units without warnings. Falsy checks in formatters drop valid zero values."
+      },
+      "scalability": {
+        "score": 3,
+        "rationale": "Weight conversions are missing from the canonical formatter, and raw kilojoules are exposed to the UI by general queries, forcing conversion at the chart layer."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Good use of named constants and clear separation of concerns in most queries, though some magic numbers exist in date math."
+      }
+    },
+    "summary": "The unit conversion and semantic conflation domain shows good discipline in separating distinct metrics (e.g., HRV sources are kept strictly separate) and handling Garmin's UTC timestamps correctly. However, there are several critical bugs in edge cases. The SQL unit conversion silently drops unhandled units like IU and mg/mL, leading to missing supplement data in rollups. Date math in `getWorkoutSleepGap` misaligns pre-midnight bedtimes by a full day. Additionally, midnight Spotify plays are silently dropped due to a quirk in `Intl.DateTimeFormat`. Centralizing weight and calorie conversions into the canonical formatter would improve scalability and prevent UI drift.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "`unit_to_mg_factor` silently drops valid supplement units (IU, mg/mL)",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+        "description": "The SQL function returns `NULL` for unrecognized units, which silently drops rows from the `supplement_intake_by_compound` rollup. It lacks support for `IU`, `oz`, `mL`, `drops`, etc. Additionally, the regex `[^a-z\u00b5]` strips the slash from `mg/mL`, resulting in `mgml`, which falls through to `NULL`.",
+        "evidence": "`WHEN 'mg' THEN 1 ... ELSE NULL` and `REGEXP_REPLACE(..., '[^a-z\u00b5]', '', 'g')`.",
+        "recommendation": "Add `WHEN 'iu'` (with appropriate conversion or 1:1 pass-through if handled downstream), `WHEN 'mgml'`, and other common units. Consider logging or returning a sentinel value instead of silently dropping rows."
+      },
+      {
+        "id": "F-002",
+        "title": "`getWorkoutSleepGap` assigns wrong `pred_date` for pre-midnight bedtimes",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "queries.ts:getWorkoutSleepGap",
+        "description": "The function calculates the behavioral date (`pred_date`) by subtracting exactly 24 hours from the `cycle_start` epoch time. For pre-midnight bedtimes (e.g., 11 PM ET), subtracting 24 hours pushes the date back two calendar days instead of one, misaligning the workout gap with the wrong day's behaviors.",
+        "evidence": "`const predDateMs = cycleStartMs - 24 * 60 * 60 * 1000;`",
+        "recommendation": "Replace the 24-hour subtraction math with the existing `whoopSleepDay(cycleStart)` helper from `format.ts`, which correctly handles the 6 AM ET boundary for WHOOP sleep cycles."
+      },
+      {
+        "id": "F-003",
+        "title": "`getSpotifyHourOfDay` silently drops midnight plays",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Correctness"
+        ],
+        "file_ref": "queries.ts:getSpotifyHourOfDay",
+        "description": "The function uses `Intl.DateTimeFormat` with `hour12: false` to extract the hour. In many JS environments (like Node/V8), this returns `\"24\"` for midnight instead of `\"00\"`. The subsequent check `h >= 0 && h < 24` fails for `24`, causing plays between 00:00 and 00:59 to be silently dropped from the histogram.",
+        "evidence": "`const h = parseInt(fmt.format(...)); if (!Number.isNaN(h) && h >= 0 && h < 24) buckets[h].plays++;`",
+        "recommendation": "Use `hourCycle: \"h23\"` instead of `hour12: false` in the `Intl.DateTimeFormat` options, or explicitly map `h === 24` to `0`."
+      },
+      {
+        "id": "F-004",
+        "title": "Missing `kgToLb` / `lbToKg` helpers in canonical formatter",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "format.ts",
+        "description": "The audit context notes that the frontend accepts and displays pounds via `kgToLb`/`lbToKg` helpers, and that `format.ts` is the canonical formatter. However, these helpers are missing from `format.ts`, indicating that weight conversion logic is scattered across UI components rather than centralized.",
+        "evidence": "`format.ts` contains formatters for distance, pace, and duration, but no weight conversion functions.",
+        "recommendation": "Move the `kgToLb` and `lbToKg` helpers into `format.ts` using the canonical `2.20462` factor, ensuring no premature rounding occurs before final display."
+      },
+      {
+        "id": "F-005",
+        "title": "`getWhoopCycles` exposes raw `kilojoule` without conversion helper",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability"
+        ],
+        "file_ref": "queries.ts:getWhoopCycles",
+        "description": "While `getWhoopCaloriesBurnt` correctly converts kJ to kcal, `getWhoopCycles` returns the raw `kilojoule` value. Any UI component using `getWhoopCycles` must implement the `/ 4.184` conversion itself, creating multiple drift sites and risking kJ being displayed as kcal.",
+        "evidence": "`getWhoopCycles` returns `select(\"*\")` from `whoop_cycles`.",
+        "recommendation": "Add a computed `calories_burnt` field to the returned objects in `getWhoopCycles`, or provide a canonical `kjToKcal` helper in `format.ts` and enforce its use."
+      },
+      {
+        "id": "F-006",
+        "title": "`formatDistance` and `formatDuration` display \"\u2014\" for exactly zero",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "format.ts",
+        "description": "The formatters use a falsy check (`!meters`, `!seconds`) which catches `0` as well as `null`/`undefined`. A valid distance or duration of `0` will be displayed as `\"\u2014\"` instead of `\"0 m\"` or `\"0m\"`.",
+        "evidence": "`if (!meters) return \"\u2014\";` and `if (!seconds) return \"\u2014\";`",
+        "recommendation": "Change the checks to `if (meters == null || Number.isNaN(meters))` and similarly for `seconds`, matching the safer pattern used in `formatShortDuration`."
+      }
+    ],
+    "things_done_well": [
+      "HRV metrics from WHOOP, Garmin, and Eight Sleep are strictly separated in queries, avoiding semantic conflation.",
+      "Garmin sleep and activity queries correctly use `start_time_gmt` instead of the misleading `start_time_local`.",
+      "`whoopSleepDay` correctly implements the 6 AM ET boundary logic for WHOOP sleep cycles.",
+      "`getWhoopCaloriesBurnt` correctly applies the +12h rule and the 4.184 kJ to kcal conversion factor."
+    ],
+    "questions_for_followup": [
+      "How should activity-related supplement units like IU be converted in `unit_to_mg_factor`? Should they be passed through 1:1 or converted based on the specific compound?",
+      "Are there UI components currently using `getWhoopCycles` that might be displaying raw kilojoules as calories?",
+      "Where are the `kgToLb` and `lbToKg` helpers currently implemented, and can they be migrated to `format.ts`?"
+    ]
+  },
+  "bundle": "units"
+}
