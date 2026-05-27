@@ -146,14 +146,40 @@ def decode_subject(msg: email.message.Message) -> str:
 
 
 def find_whoop_emails(imap: imaplib.IMAP4_SSL) -> list[tuple[bytes, email.message.Message]]:
-    """Search for unread WHOOP export emails. Returns list of (uid, message)."""
-    imap.select("INBOX")
-    status, data = imap.uid("SEARCH", None, '(UNSEEN SUBJECT "WHOOP Export")')
-    if status != "OK" or not data[0]:
-        return []
+    """Search for unread WHOOP export emails. Returns list of (uid, message).
 
-    uids = data[0].split()
-    results = []
+    Two-stage search (parallels myfitnesspal_email.find_mfp_emails) to
+    survive subject-line locale / branding changes:
+      1. FROM filter (`whoop.com`) — stable across subject rewrites.
+      2. Legacy SUBJECT filter as fallback for forwarded-from-personal-inbox
+         setups where the From header gets masked.
+    Diagnostic warning emitted when WHOOP-domain unseen messages exist but
+    none subject-match — surfaces a rebrand before days of missed imports.
+    """
+    imap.select("INBOX")
+
+    # Stage 1: by FROM
+    status, data = imap.uid("SEARCH", None, '(UNSEEN FROM "whoop.com")')
+    by_from_uids: list[bytes] = []
+    if status == "OK" and data and data[0]:
+        by_from_uids = data[0].split()
+
+    # Stage 2 (fallback): by SUBJECT
+    status, data = imap.uid("SEARCH", None, '(UNSEEN SUBJECT "WHOOP Export")')
+    by_subject_uids: list[bytes] = []
+    if status == "OK" and data and data[0]:
+        by_subject_uids = data[0].split()
+
+    # Merge UID sets (preserve order, dedupe)
+    seen: set[bytes] = set()
+    uids: list[bytes] = []
+    for u in by_from_uids + by_subject_uids:
+        if u not in seen:
+            seen.add(u)
+            uids.append(u)
+
+    results: list[tuple[bytes, email.message.Message]] = []
+    other_from_subjects: list[str] = []
     for uid in uids:
         status, msg_data = imap.uid("FETCH", uid, "(RFC822)")
         if status != "OK" or not msg_data[0]:
@@ -161,10 +187,20 @@ def find_whoop_emails(imap: imaplib.IMAP4_SSL) -> list[tuple[bytes, email.messag
         raw = msg_data[0][1]
         msg = email.message_from_bytes(raw)
         subject = decode_subject(msg)
-        if "whoop" in subject.lower() and "export" in subject.lower():
+        s_lower = subject.lower()
+        if "whoop" in s_lower and "export" in s_lower:
             results.append((uid, msg))
+        elif uid in by_from_uids:
+            other_from_subjects.append(subject[:80])
 
     log.info(f"Found {len(results)} unread WHOOP export email(s)")
+    if not results and other_from_subjects:
+        log.warning(
+            f"No WHOOP export emails matched our subject keywords, but "
+            f"{len(other_from_subjects)} unseen email(s) came from whoop.com "
+            f"with these subjects: {other_from_subjects[:5]}. Did WHOOP "
+            f"change the export-email subject? Update find_whoop_emails."
+        )
     return results
 
 

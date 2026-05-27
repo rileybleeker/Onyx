@@ -146,14 +146,47 @@ def decode_subject(msg: email.message.Message) -> str:
 
 
 def find_mfp_emails(imap: imaplib.IMAP4_SSL) -> list[tuple[bytes, email.message.Message]]:
-    """Search for unread MFP export emails."""
-    imap.select("INBOX")
-    status, data = imap.uid("SEARCH", None, '(UNSEEN SUBJECT "MyFitnessPal")')
-    if status != "OK" or not data[0]:
-        return []
+    """Search for unread MFP export emails.
 
-    uids = data[0].split()
-    results = []
+    Two-stage search to survive subject-line locale / branding changes:
+      1. FROM filter (`myfitnesspal.com`) catches every unread message from
+         the official sender regardless of subject. Domain is more stable
+         than localized subject text.
+      2. Client-side keyword filter (`MFP_SUBJECT_KEYWORDS`) keeps the
+         match-set tight — non-export emails (newsletters, support replies)
+         from myfitnesspal.com are excluded.
+
+    Falls back to the legacy SUBJECT search if the FROM search returns
+    nothing (some IMAP servers / forwarding setups lose / mask the From
+    header). If both return nothing but the sender DOES have unseen
+    messages with a different subject, log a warning so a subject-format
+    change can be diagnosed before days of missed imports accumulate.
+    """
+    imap.select("INBOX")
+
+    # Stage 1: by FROM (resilient to subject changes)
+    status, data = imap.uid("SEARCH", None, '(UNSEEN FROM "myfitnesspal.com")')
+    by_from_uids: list[bytes] = []
+    if status == "OK" and data and data[0]:
+        by_from_uids = data[0].split()
+
+    # Stage 2 (fallback): by SUBJECT — covers forwarded-from-personal-inbox
+    # cases where the From header doesn't carry the original sender.
+    status, data = imap.uid("SEARCH", None, '(UNSEEN SUBJECT "MyFitnessPal")')
+    by_subject_uids: list[bytes] = []
+    if status == "OK" and data and data[0]:
+        by_subject_uids = data[0].split()
+
+    # Merge UID sets (preserve order, dedupe)
+    seen: set[bytes] = set()
+    uids: list[bytes] = []
+    for u in by_from_uids + by_subject_uids:
+        if u not in seen:
+            seen.add(u)
+            uids.append(u)
+
+    results: list[tuple[bytes, email.message.Message]] = []
+    other_from_subjects: list[str] = []
     for uid in uids:
         status, msg_data = imap.uid("FETCH", uid, "(RFC822)")
         if status != "OK" or not msg_data[0]:
@@ -163,8 +196,19 @@ def find_mfp_emails(imap: imaplib.IMAP4_SSL) -> list[tuple[bytes, email.message.
         subject = decode_subject(msg).lower()
         if any(kw in subject for kw in MFP_SUBJECT_KEYWORDS):
             results.append((uid, msg))
+        elif uid in by_from_uids:
+            # Came from myfitnesspal.com but subject didn't keyword-match —
+            # could be the "your weekly newsletter" type, or a rebrand.
+            other_from_subjects.append(subject[:80])
 
     log.info(f"Found {len(results)} unread MFP export email(s)")
+    if not results and other_from_subjects:
+        log.warning(
+            f"No MFP export emails matched our subject keywords, but "
+            f"{len(other_from_subjects)} unseen email(s) came from myfitnesspal.com "
+            f"with these subjects: {other_from_subjects[:5]}. Did MFP change "
+            f"their export-email subject? Update MFP_SUBJECT_KEYWORDS."
+        )
     return results
 
 
