@@ -77,7 +77,7 @@ DISTINCT ON `(prediction_date, model, horizon_days)` returning freshest row per 
 One row per behavioral day, ADR-0001 attribution rules applied. **135 columns wide.** This is the base for `hrv_analysis.py:load_data`.
 
 Key structural choices:
-- **Date spine** built via UNION across every source's `onyx_behavioral_date` (whoop_cycles + garmin_activities + garmin_sleep + garmin_hrv + eight_sleep_trends + myfitnesspal_nutrition + meal_events + supplement_intake + garmin_daily_summary).
+- **Date spine** built via UNION across every source's `onyx_behavioral_date` (whoop_cycles + garmin_activities + garmin_sleep + garmin_hrv + eight_sleep_trends + myfitnesspal_nutrition + meal_events + supplement_intake). garmin_daily_summary is intentionally NOT in the spine — its `calendar_date` is watch-local (can diverge from behavioral_date on travel transitions), so it LEFT JOINs via calendar_date with the known travel-day mismatch instead.
 - **WHOOP cycle deduplication via LATERAL with `LIMIT 1`** ordered by `(end_time − start_time) DESC` — longest cycle per behavioral day wins (handles transition-day "nap + main cycle" duplicates).
 - **Garmin sleep dedup**: LATERAL `LIMIT 1` ordered by `overall_sleep_score DESC NULLS LAST` filtered to `is_nap = false AND sleep_id IS NOT NULL`.
 - **Garmin HRV dedup**: LATERAL `LIMIT 1` ordered by `calendar_date DESC` (no duplicates expected, just safety).
