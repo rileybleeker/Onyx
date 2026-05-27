@@ -689,6 +689,20 @@ def run_etl(refeaturize: bool = False):
         items = client.recently_played(after_ms=hwm_ms, limit=50)
         log.info(f"Spotify returned {len(items)} recently-played items")
 
+        # Cap-hit detection: Spotify's /me/player/recently-played stores at most
+        # the last 50 plays server-side, regardless of pagination params. If we
+        # got exactly 50, plays older than the oldest item in this batch were
+        # already discarded by Spotify before we polled — gap in history. Cron
+        # is hourly to minimize this, but log a warning so the gap is visible.
+        cap_hit = len(items) >= 50
+        if cap_hit:
+            log.warning(
+                "Spotify recently-played returned exactly 50 items — likely "
+                "hit the rolling 50-track cap. Some plays between the prior "
+                "high-water mark and the oldest item in this batch may have "
+                "been lost server-side."
+            )
+
         plays_count = upsert_plays(sb, items)
         log.info(f"Upserted {plays_count} plays")
 
@@ -801,7 +815,13 @@ def run_etl(refeaturize: bool = False):
                             "features_fetched_at": now,
                         }).eq("track_id", tid).execute()
 
-        log_sync(sb, status="success", records=plays_count, started_at=started)
+        final_status = "partial" if cap_hit else "success"
+        final_error = (
+            "Hit Spotify 50-track recently-played cap — likely lost some plays"
+            if cap_hit else None
+        )
+        log_sync(sb, status=final_status, records=plays_count, started_at=started,
+                 error=final_error)
         log.info(f"Spotify ETL complete: {plays_count} plays, {tracks_count} tracks in {int(time.time()-started)}s")
 
     except SpotifyAuthError as e:

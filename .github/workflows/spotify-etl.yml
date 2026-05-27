@@ -2,9 +2,14 @@ name: Spotify ETL
 
 on:
   schedule:
-    # Every 2h at :50 — slots into the existing :00/:15/:30/:45 cadence.
-    # Spotify's recently-played caps at 50 items; 2h gives margin for heavy listening.
-    - cron: '50 */2 * * *'
+    # Hourly at :50 — halves the risk of losing plays to Spotify's 50-track
+    # recently-played cap during heavy listening sessions (workout playlists
+    # can easily hit 50 plays in 2h; was previously '50 */2 * * *'). Spotify's
+    # API only stores the last 50 plays server-side regardless of pagination
+    # params, so the cron interval is the only available mitigation. The ETL
+    # also emits a 'partial' sync_log status whenever a run returns exactly 50
+    # items so /status can surface cap-hit incidents.
+    - cron: '50 * * * *'
   workflow_dispatch: # Manual trigger for testing
 
 concurrency:
