@@ -283,6 +283,22 @@ DECLARE
     cycle_start_time TIMESTAMPTZ;
     cycle_tz_offset  TEXT;
 BEGIN
+    -- Audit re-2026-05-26 P2 (trigger order cluster): the standalone
+    -- behaviors_date trigger has been merged into this function so we no
+    -- longer depend on alphabetical BEFORE-trigger ordering. The formula
+    -- is the same as the dropped pds.compute_journal_behaviors_date so
+    -- behaviors_date values are preserved verbatim.
+    SELECT (((c.start_time AT TIME ZONE 'UTC') + (c.timezone_offset)::interval - INTERVAL '6 hours'))::date
+      INTO NEW.behaviors_date
+      FROM pds.whoop_cycles c
+     WHERE (((c.start_time AT TIME ZONE 'UTC') + (c.timezone_offset)::interval))::date = NEW.cycle_date
+     ORDER BY c.start_time
+     LIMIT 1;
+
+    IF NEW.behaviors_date IS NULL THEN
+        NEW.behaviors_date := NEW.cycle_date;
+    END IF;
+
     -- Audit P0 fix: pre-fix version set onyx_et_date := NEW.cycle_date and
     -- onyx_local_date := NEW.cycle_date, which silently mis-attributes on
     -- travel days. WHOOP's cycle_date is the user-local wake day; on a PT

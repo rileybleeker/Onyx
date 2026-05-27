@@ -82,6 +82,54 @@ UPDATE pds.whoop_cycles wc
  WHERE wc.cycle_id = f.cycle_id;
 
 -- ---------------------------------------------------------------------------
+-- 4. Forward-insert propagation (audit re-2026-05-26)
+-- ---------------------------------------------------------------------------
+-- When a cycle arrives/updates out of order, the immediately-NEXT cycle's
+-- flag (computed against ITS prev cycle, which was someone-else before this
+-- insert) may now be stale. This AFTER trigger refreshes it.
+--
+-- Cascade safety: pg_trigger_depth() > 1 short-circuits, so the chain
+-- terminates after one hop. The IS DISTINCT FROM filter avoids a no-op
+-- UPDATE that would still fire the BEFORE trigger.
+CREATE OR REPLACE FUNCTION pds.refresh_next_transition_day()
+RETURNS TRIGGER AS $$
+DECLARE
+    next_id      BIGINT;
+    next_off     TEXT;
+    correct_flag BOOLEAN;
+BEGIN
+    IF pg_trigger_depth() > 1 THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT cycle_id, timezone_offset
+      INTO next_id, next_off
+      FROM pds.whoop_cycles
+     WHERE start_time > NEW.start_time
+     ORDER BY start_time ASC
+     LIMIT 1;
+
+    IF next_id IS NOT NULL THEN
+        correct_flag := (NEW.timezone_offset IS NOT NULL
+                         AND next_off IS NOT NULL
+                         AND NEW.timezone_offset <> next_off);
+        UPDATE pds.whoop_cycles
+           SET onyx_is_transition_day = correct_flag
+         WHERE cycle_id = next_id
+           AND onyx_is_transition_day IS DISTINCT FROM correct_flag;
+    END IF;
+
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS whoop_cycles_refresh_next_transition_day ON pds.whoop_cycles;
+CREATE TRIGGER whoop_cycles_refresh_next_transition_day
+    AFTER INSERT OR UPDATE OF timezone_offset, start_time
+    ON pds.whoop_cycles
+    FOR EACH ROW EXECUTE FUNCTION pds.refresh_next_transition_day();
+
+-- ---------------------------------------------------------------------------
 -- 5. Sanity check (optional manual probe)
 -- ---------------------------------------------------------------------------
 -- Expected: ~8 transitions across history (4 trips × 2 direction-changes).
