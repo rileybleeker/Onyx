@@ -1,23 +1,33 @@
 """
 Onyx Audit Runner
 =================
-Fires the stats-domain audit at two external models (GPT-5 + Gemini 2.5 Pro)
-in parallel and saves their JSON responses to audit/responses/.
+Fires the audit at three external reviewer models in parallel and saves
+their JSON responses to audit/responses/:
+  - OpenAI GPT-5.5-pro (reasoning_effort=high)
+  - Google Gemini 3.1-pro-preview (thinkingBudget=32768)
+  - DeepSeek V4-Pro (thinking mode enabled, reasoning_effort=high)
 
-This is the "external reviewer" half of the triangulated audit defined in
-Notion: "Onyx System Audit -- Plan & Findings". Claude does its own
-independent stats review separately; results are reconciled afterward.
+DeepSeek is the third independent reviewer added 2026-05-26 — Chinese
+training lineage, distinct from the OpenAI/Google axis.
+
+This is the "external reviewer" half of the triangulated audit. Claude
+does its own independent review separately (via Claude Code / "-internal");
+results are reconciled afterward.
 
 Usage:
-    python audit_runner.py                                       # Dry-run (default) -- prints plan, makes no API calls
-    python audit_runner.py --fire                                # Actually call both APIs in parallel (default bundle: stats-bundle)
-    python audit_runner.py --fire --bundle audit/schema-bundle   # Different bundle
-    python audit_runner.py --fire --model openai                 # Only GPT-5
-    python audit_runner.py --fire --model gemini                 # Only Gemini
-    python audit_runner.py --commit <sha>                        # Override pinned commit (default: read current HEAD)
+    python audit_runner.py                                              # Dry-run (default)
+    python audit_runner.py --fire                                       # Fire all 3 in parallel (default bundle: stats-bundle)
+    python audit_runner.py --fire --bundle audit/re-audit-2026-05-26/stats
+    python audit_runner.py --fire --model openai                        # Only GPT
+    python audit_runner.py --fire --model gemini                        # Only Gemini
+    python audit_runner.py --fire --model deepseek                      # Only DeepSeek
+    python audit_runner.py --fire --model both                          # OpenAI + Gemini (backward compat)
+    python audit_runner.py --fire --model all                           # All three (default)
+    python audit_runner.py --commit <sha>                               # Override pinned commit (default: HEAD)
 
 Requirements:
     pip install httpx python-dotenv
+    .env must define: OPENAI_API_KEY, GOOGLE_API_KEY, DEEPSEEK_API_KEY
 """
 
 import argparse
@@ -84,6 +94,12 @@ GEMINI_MODEL = "gemini-3.1-pro-preview"
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# DeepSeek added 2026-05-26 as a 3rd independent reviewer (Chinese training
+# lineage, distinct from the OpenAI/Google axis). API is OpenAI-compatible
+# but thinking mode requires the explicit "thinking" payload field.
+DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
 # Required top-level keys in the returned JSON
 REQUIRED_KEYS = {"reviewer_metadata", "domain_scores", "summary", "findings", "things_done_well", "questions_for_followup"}
@@ -252,6 +268,77 @@ async def call_gemini(client: httpx.AsyncClient, bundle_text: str, commit: str) 
     }
 
 
+async def call_deepseek(client: httpx.AsyncClient, bundle_text: str, commit: str) -> dict:
+    """POST the bundle to DeepSeek V4-Pro with thinking mode enabled.
+
+    DeepSeek's chat completions API is OpenAI-compatible; the differences vs
+    call_openai: thinking mode requires `thinking={"type": "enabled"}` in the
+    payload (default but explicit for safety), and the response carries a
+    `reasoning_content` field alongside the regular `content`.
+    """
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY not set in .env")
+
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an independent statistical methodology reviewer. "
+                    "Read the entire bundle. Return a single JSON object matching the schema in PROMPT.md. "
+                    "Do not include any text outside the JSON."
+                ),
+            },
+            {"role": "user", "content": bundle_text},
+        ],
+        "response_format": {"type": "json_object"},
+        "reasoning_effort": "high",
+        # Thinking is the default for v4-pro but specify explicitly so a
+        # future API change doesn't silently swap us into non-thinking mode.
+        "thinking": {"type": "enabled"},
+    }
+
+    log.info(f"[deepseek] firing request to {DEEPSEEK_MODEL} (thinking=enabled, reasoning=high, bundle size: {len(bundle_text):,} chars)")
+    resp = await client.post(
+        DEEPSEEK_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=600.0,
+    )
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"DeepSeek returned {resp.status_code}: {resp.text[:500]}")
+
+    body = resp.json()
+    usage = body.get("usage", {})
+    log.info(
+        f"[deepseek] response received — "
+        f"prompt={usage.get('prompt_tokens', '?')} tok, "
+        f"completion={usage.get('completion_tokens', '?')} tok, "
+        f"reasoning={usage.get('reasoning_tokens', usage.get('completion_tokens_details', {}).get('reasoning_tokens', '?'))} tok"
+    )
+
+    msg = body["choices"][0]["message"]
+    content = msg["content"]
+    reasoning_content = msg.get("reasoning_content")  # CoT, may be present
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"DeepSeek returned non-JSON content: {e}\n{content[:500]}")
+
+    return {
+        "reviewer": "deepseek-v4-pro",
+        "model": DEEPSEEK_MODEL,
+        "bundle_commit": commit,
+        "fired_at": datetime.now(timezone.utc).isoformat(),
+        "usage": usage,
+        "reasoning_content": reasoning_content,  # may be None
+        "response": parsed,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Validation + persistence
 # ---------------------------------------------------------------------------
@@ -329,13 +416,15 @@ async def run(args: argparse.Namespace) -> int:
     # Fire actual API calls
     async with httpx.AsyncClient() as client:
         tasks = []
-        if args.model in ("openai", "both"):
+        if args.model in ("openai", "both", "all"):
             tasks.append(("openai", call_openai(client, bundle_text, pinned)))
-        if args.model in ("gemini", "both"):
+        if args.model in ("gemini", "both", "all"):
             tasks.append(("gemini", call_gemini(client, bundle_text, pinned)))
+        if args.model in ("deepseek", "all"):
+            tasks.append(("deepseek", call_deepseek(client, bundle_text, pinned)))
 
         if not tasks:
-            log.error(f"No models selected. --model must be openai, gemini, or both. Got: {args.model}")
+            log.error(f"No models selected. --model must be openai, gemini, deepseek, both, or all. Got: {args.model}")
             return 1
 
         results = await asyncio.gather(*(t[1] for t in tasks), return_exceptions=True)
@@ -365,8 +454,11 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Save the full prompt to disk for inspection")
     parser.add_argument("--bundle", default=None,
                         help="Path to bundle directory (default: audit/stats-bundle)")
-    parser.add_argument("--model", choices=["openai", "gemini", "both"], default="both",
-                        help="Which model(s) to call")
+    parser.add_argument("--model",
+                        choices=["openai", "gemini", "deepseek", "both", "all"],
+                        default="all",
+                        help="Which model(s) to call. 'both' = openai+gemini (backward compat); "
+                             "'all' = openai+gemini+deepseek (default)")
     parser.add_argument("--commit", default=None,
                         help="Override pinned commit (default: current git HEAD)")
     args = parser.parse_args()
