@@ -2811,9 +2811,27 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                                  seasonal_order=(1, 0, 1, 7),
                                  enforce_stationarity=False, enforce_invertibility=False)
                 f_step = m_step.filter(fit.params)
+                # Audit re-2026-05-26 P1 (gemini F-003, gpt-5 F-004): the
+                # walk-forward previously passed ACTUAL future shifted-exog
+                # values (`exog.iloc[split+i : split+i+h]`) into get_forecast,
+                # which leaks future behaviors into the held-out window and
+                # artificially inflates SARIMAX skill. Live forecasting cannot
+                # know tomorrow's journal/strain — substitute the last KNOWN
+                # exog row repeated h times. Under the shift contract
+                # exog.iloc[N] == original_exog.iloc[N-1], so exog.iloc[split+i]
+                # is the shifted-exog row aligned with the first forecast step
+                # (= behaviors of the latest training day).
+                if exog is not None:
+                    last_known_idx = min(split + i, len(exog) - 1)
+                    last_row = exog.iloc[[last_known_idx]].to_numpy(dtype=float)
                 for h in range(1, min(8, len(test_endog) - i + 1)):
-                    fut_exog = (exog.iloc[split + i: split + i + h]
-                                if exog is not None else None)
+                    if exog is not None:
+                        fut_exog = pd.DataFrame(
+                            np.tile(last_row, (h, 1)),
+                            columns=exog.columns,
+                        )
+                    else:
+                        fut_exog = None
                     fc = f_step.forecast(steps=h, exog=fut_exog)
                     pred_val = float(fc.iloc[-1]) if hasattr(fc, "iloc") else float(fc[-1])
                     act_idx = split + i + h - 1
@@ -2962,10 +2980,19 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
         m.fit(train_df)
 
         # Forecast holdout period
+        # Audit re-2026-05-26 P1 (gpt-5 F-004): previously merged the FULL
+        # hrv_df regressor frame into the holdout future, which lets actual
+        # holdout-period regressors leak in — equivalent to a forecast that
+        # knows tomorrow's behaviors. Fix: only merge train_df regressors;
+        # ffill then carries the latest training-time value across all 30
+        # holdout days (the same "last-known-behavior" naive proxy applied
+        # to the SARIMAX backtest path).
         future_holdout = m.make_future_dataframe(periods=30)
-        for rf in reg_feats:
-            feat_col_df = hrv_df[["ds", rf]].copy()
-            future_holdout = future_holdout.merge(feat_col_df, on="ds", how="left").ffill()
+        if reg_feats:
+            train_reg = train_df[["ds"] + reg_feats].copy()
+            future_holdout = future_holdout.merge(train_reg, on="ds", how="left")
+            for rf in reg_feats:
+                future_holdout[rf] = future_holdout[rf].ffill()
         fc_holdout = m.predict(future_holdout)
         fc_30 = fc_holdout.tail(30)
         holdout_preds = fc_30["yhat"].values[: len(holdout_df)]
