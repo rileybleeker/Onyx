@@ -838,10 +838,15 @@ def main():
     # Handle standalone sync-workouts mode
     if args.sync_workouts:
         t0 = time.time()
-        # Get all unique workout IDs from activities
+        # Get all unique workout IDs from activities.
+        # Audit re-2026-05-26 P3 (gpt-5 etl F-011): .neq('raw_json', 'null')
+        # is a string-literal filter; PostgREST evaluates JSONB NULL via the
+        # `is` operator, not `eq` over 'null'. Use the explicit not-is-null
+        # form so a JSONB NULL is filtered out rather than (potentially)
+        # coerced to the string "null" and incorrectly included.
         result = sb.schema("pds").from_("garmin_activities").select(
             "raw_json"
-        ).neq("raw_json", "null").execute()
+        ).not_.is_("raw_json", "null").execute()
         workout_ids = []
         for row in (result.data or []):
             try:

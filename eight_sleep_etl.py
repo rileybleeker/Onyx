@@ -34,6 +34,15 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 EIGHTSLEEP_EMAIL = os.environ["EIGHTSLEEP_EMAIL"]
 EIGHTSLEEP_PASSWORD = os.environ["EIGHTSLEEP_PASSWORD"]
+# Eight Sleep API requires a TZ to slice "today's trend" — passed as ?tz=...
+# This is also used to attribute interval timestamps to a calendar_date. On
+# travel days the env var doesn't update, so non-ET sleeps may attribute to
+# the wrong calendar day until manually re-exported. The DB trigger on
+# pds.eight_sleep_trends.start_time corrects this downstream via
+# pds.derive_onyx_dates -> tz_for_instant (ADR-0001), so the audit-flagged
+# concern is bounded to the raw `calendar_date` join key only. Future option:
+# call pds.tz_for_instant for each fetch's date as a per-fetch override.
+# Audit re-2026-05-26 P3 (deepseek etl F-007).
 EIGHTSLEEP_TIMEZONE = os.environ.get("EIGHTSLEEP_TIMEZONE", "America/New_York")
 
 AUTH_URL = "https://auth-api.8slp.net/v1/tokens"
@@ -596,6 +605,9 @@ def main():
     log.info("=" * 60)
     log.info("Personal Data Scientist — Eight Sleep ETL")
     log.info("=" * 60)
+    # Surface the configured TZ so a wrong env var on a travel day is
+    # visible in the run log. Audit re-2026-05-26 P3 (deepseek etl F-007).
+    log.info(f"Eight Sleep TZ (EIGHTSLEEP_TIMEZONE): {EIGHTSLEEP_TIMEZONE}")
 
     # Connect
     client = EightSleepClient(EIGHTSLEEP_EMAIL, EIGHTSLEEP_PASSWORD,
