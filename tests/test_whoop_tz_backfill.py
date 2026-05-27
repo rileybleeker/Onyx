@@ -68,7 +68,36 @@ def test_dst_artifact_cycle_is_skipped() -> None:
     assert proposals == []
 
 
+def test_unknown_offset_skips_instead_of_proposing_etc_utc() -> None:
+    """When an offset is not in user history AND not in the generic map, the
+    backfill must SKIP the proposal rather than fall back to Etc/UTC. The old
+    Etc/UTC fallback (gemini tz/F-003) would propose Etc/UTC on every cycle of
+    a trip because Etc/UTC's offset (+00:00) never matches the WHOOP offset
+    that triggered the proposal — infinite oscillation."""
+    # Use an offset the generic map definitely doesn't cover (+05:45 = Nepal).
+    cycle = {
+        "cycle_id": 4242,
+        "start_time": "2026-04-01T18:00:00+00:00",
+        "end_time": "2026-04-02T18:00:00+00:00",
+        "timezone_offset": "+05:45",
+    }
+    # Ensure the generic-map fallback doesn't accidentally cover this offset.
+    assert "+05:45" not in wtb.GENERIC_OFFSET_IANA, (
+        "test premise broken: +05:45 is now in the generic map; pick a new "
+        "obscure offset for this test."
+    )
+    with patch.object(wtb, "tz_for_instant_via_pg", return_value="America/New_York"):
+        proposals = wtb.infer_proposed_inserts([cycle], history_map={})
+    assert proposals == [], (
+        f"expected skip on unknown offset; got proposal: {proposals}"
+    )
+    # And the direct infer_iana call should return None too.
+    iana, reason = wtb.infer_iana("+05:45", {})
+    assert iana is None, f"expected None, got {iana!r} ({reason})"
+
+
 if __name__ == "__main__":
     test_infer_proposed_inserts_builds_notes_without_nameerror()
     test_dst_artifact_cycle_is_skipped()
+    test_unknown_offset_skips_instead_of_proposing_etc_utc()
     print("OK — whoop_tz_backfill regression tests passed.")

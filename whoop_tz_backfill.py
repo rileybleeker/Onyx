@@ -115,13 +115,24 @@ def build_history_iana_map() -> dict[str, str]:
     return {off: max(c.items(), key=lambda x: x[1])[0] for off, c in counts.items()}
 
 
-def infer_iana(offset_str: str, history_map: dict[str, str]) -> tuple[str, str]:
-    """Return (iana, provenance_string) for the inferred zone."""
+def infer_iana(offset_str: str, history_map: dict[str, str]) -> tuple[str | None, str]:
+    """Return (iana, provenance_string) for the inferred zone.
+
+    Returns (None, reason) when no IANA can be confidently inferred so the
+    caller skips rather than proposing a bogus placeholder. Previously this
+    fell back to 'Etc/UTC' on unknown offsets — but Etc/UTC's offset is
+    +00:00, which never matches the WHOOP offset that triggered the proposal,
+    so on every subsequent cycle for the same trip the script would propose
+    Etc/UTC again and again without converging (gemini tz/F-003).
+    """
     if offset_str in history_map:
         return history_map[offset_str], f"history-inferred from past {offset_str} trips"
     if offset_str in GENERIC_OFFSET_IANA:
         return GENERIC_OFFSET_IANA[offset_str], f"generic default for {offset_str}"
-    return "Etc/UTC", f"no inference available for {offset_str}; using UTC placeholder"
+    return None, (
+        f"no inference available for {offset_str}; manual user_tz_log entry "
+        "required — skipping proposal to avoid Etc/UTC oscillation"
+    )
 
 
 def fetch_cycles(since: str | None = None) -> list[dict]:
@@ -192,6 +203,14 @@ def infer_proposed_inserts(cycles: list[dict], history_map: dict[str, str]) -> l
 
         # WHOOP says one thing, log says another — propose a new entry.
         inferred_iana, provenance = infer_iana(whoop_offset_str, history_map)
+        if inferred_iana is None:
+            # No confident inference (unknown offset, no manual history).
+            # Skip rather than oscillating on Etc/UTC. Log once per cycle so
+            # the user can spot trips needing a manual user_tz_log row.
+            log.warning(
+                f"  cycle {c['cycle_id']} offset {whoop_offset_str}: {provenance}"
+            )
+            continue
         if inferred_iana == last_proposed_tz:
             # Same IANA we just proposed for the prior cycle — skip dup.
             continue
