@@ -88,6 +88,30 @@ export function formatDistance(meters: number | null): string {
   return `${Math.round(meters)} m`;
 }
 
+// ─── Canonical unit conversions ───
+// Helpers live here (not in component files) so every conversion site reads
+// from one source. format.ts is the canonical formatter per CLAUDE.md.
+// Conversions are precise; rounding/formatting happens at display time only,
+// so weekly / monthly averages don't accumulate per-cycle rounding error.
+export const KJ_PER_KCAL = 4.184;
+export const KG_PER_LB = 0.45359237;
+export const LB_PER_KG = 1 / KG_PER_LB;
+
+export const kjToKcal = (kj: number): number => kj / KJ_PER_KCAL;
+export const kgToLb = (kg: number | null | undefined): number | null =>
+  kg == null ? null : kg * LB_PER_KG;
+export const lbToKg = (lb: number): number => lb * KG_PER_LB;
+
+/**
+ * Format a kJ value as kcal for display. Rounds to the integer at the
+ * boundary — pass the raw kJ; the helper handles the conversion AND the
+ * rounding, so consumers can't accidentally pre-round and lose precision.
+ */
+export function formatKcal(kj: number | null | undefined): string {
+  if (kj == null || Number.isNaN(kj)) return "—";
+  return `${Math.round(kjToKcal(kj))} kcal`;
+}
+
 export function formatPace(speedMps: number | null): string {
   if (!speedMps || speedMps === 0) return "—";
   const minPerMile = 1609.344 / speedMps / 60;

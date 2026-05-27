@@ -16,7 +16,7 @@ import {
   rangeLabel,
   type Range,
 } from "@/lib/queries";
-import { formatDate } from "@/lib/format";
+import { formatDate, kgToLb, lbToKg } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -142,11 +142,6 @@ interface WeightRow {
   notes: string | null;
   logged_at: string;
 }
-
-const KG_PER_LB = 0.45359237;
-const LB_PER_KG = 1 / KG_PER_LB;
-const kgToLb = (kg: number | null | undefined) => (kg == null ? null : kg * LB_PER_KG);
-const lbToKg = (lb: number) => lb * KG_PER_LB;
 
 export default function NutritionPage() {
   // ─── Nutrition state ───

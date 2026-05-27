@@ -1,5 +1,5 @@
 import { supabase } from "./supabase";
-import { whoopSleepDay } from "./format";
+import { whoopSleepDay, kjToKcal } from "./format";
 
 /**
  * Duration unit convention across this module:
@@ -391,16 +391,28 @@ export async function getWhoopCaloriesBurnt(days: number = 30) {
 
   if (error) throw error;
 
-  const byDate = new Map<string, { calendar_date: string; kilojoule: number; calories_burnt: number }>();
+  const byDate = new Map<
+    string,
+    { calendar_date: string; kilojoule: number; calories_burnt: number; kcal_exact: number }
+  >();
   for (const c of data ?? []) {
     if (!c.start_time || c.kilojoule == null) continue;
     const start = new Date(c.start_time);
     const midday = new Date(start.getTime() + 12 * 3600 * 1000);
     const calendar_date = midday.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-    const kcal = Math.round(Number(c.kilojoule) / 4.184);
+    const kj = Number(c.kilojoule);
+    const kcalExact = kjToKcal(kj);
+    // `kcal_exact` carries precision for downstream weekly/monthly averaging;
+    // `calories_burnt` keeps the rounded value for backwards-compat with
+    // existing chart consumers.
     // Ascending order means last-write-wins picks the later cycle on the rare
     // day with two; in practice there's one cycle per ET date.
-    byDate.set(calendar_date, { calendar_date, kilojoule: Number(c.kilojoule), calories_burnt: kcal });
+    byDate.set(calendar_date, {
+      calendar_date,
+      kilojoule: kj,
+      calories_burnt: Math.round(kcalExact),
+      kcal_exact: kcalExact,
+    });
   }
   return Array.from(byDate.values()).sort((a, b) => (a.calendar_date < b.calendar_date ? -1 : 1));
 }
@@ -1024,10 +1036,13 @@ export async function getSpotifyHourOfDay(range: SpotifyRange = "30d") {
   const { data, error } = await q;
   if (error) throw error;
   const buckets = Array.from({ length: 24 }, (_, h) => ({ hour: h, plays: 0 }));
+  // hourCycle: 'h23' returns 0..23 always; the old `hour12: false` config
+  // returns '24' for midnight in V8/Node and the h<24 guard would drop every
+  // 00:00–00:59 play silently (gemini units/F-003).
   const fmt = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
     hour: "2-digit",
-    hour12: false,
+    hourCycle: "h23",
   });
   for (const r of data ?? []) {
     const h = parseInt(fmt.format(new Date(r.played_at)), 10);
