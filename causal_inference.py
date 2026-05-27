@@ -88,6 +88,13 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
+try:
+    from scipy.stats import norm
+    from statsmodels.stats.multitest import multipletests
+    HAS_FDR = True
+except ImportError:
+    HAS_FDR = False
+
 log = logging.getLogger("hrv_analysis.causal")
 warnings.filterwarnings("ignore")
 
@@ -137,6 +144,12 @@ N_FOLDS_AIPW = 5
 # that the IF SE is unreliable for that treatment.
 N_BOOTSTRAP_AIPW = 1000
 AIPW_BOOTSTRAP_BLOCK_LEN = 7  # days; matches the weekly periodicity in HRV/training data
+
+# BH-FDR q-threshold for the joint binary + continuous treatment family.
+# Matches hrv_analysis.FDR_Q_THRESHOLD. At alpha=0.05 with ~150 treatments,
+# ~7-8 false-positive interventions are expected by chance without correction —
+# the BH step controls the false-discovery rate across the union.
+FDR_Q_THRESHOLD = 0.05
 
 # Bootstrap reps for PSM CI
 N_BOOTSTRAP_PSM = 500
@@ -874,6 +887,64 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
         else:
             continuous_results.append(result_row)
 
+    # BH-FDR across the joint binary + continuous family. Audit re-2026-05-26
+    # finding stats/gemini/F-002 (P0): ~150 simultaneous AIPW estimates at
+    # alpha=0.05 produce ~7-8 false-positive interventions by chance unless
+    # multiple-testing-corrected. Journal / habit / supplement / nutrition
+    # Welch tests in hrv_analysis.py have been BH-corrected since 2026-05-21;
+    # the causal layer was the last uncorrected test family.
+    #
+    # Per-treatment p comes from the AIPW Wald statistic |ate / se| against
+    # a standard normal (the IF-based SE the layer already reports). We pool
+    # binary + continuous into one family because both arms answer the same
+    # decision question ("which intervention should I make?"); separating
+    # them would relax the correction artificially.
+    all_results = binary_results + continuous_results
+    if HAS_FDR and all_results:
+        p_raws: list[float] = []
+        for r in all_results:
+            ate = r.get("aipw_ate")
+            se = r.get("aipw_se")
+            if (ate is None or se is None
+                    or (isinstance(ate, float) and np.isnan(ate))
+                    or (isinstance(se, float) and np.isnan(se))
+                    or se <= 0):
+                p_raws.append(float("nan"))
+            else:
+                z = abs(float(ate) / float(se))
+                p_raws.append(float(2.0 * (1.0 - norm.cdf(z))))
+
+        valid_idx = [i for i, p in enumerate(p_raws) if not np.isnan(p)]
+        if valid_idx:
+            valid_ps = [p_raws[i] for i in valid_idx]
+            reject, p_adj, *_ = multipletests(valid_ps, alpha=FDR_Q_THRESHOLD,
+                                              method="fdr_bh")
+            adj_by_idx = {i: (float(q), bool(ok))
+                          for i, q, ok in zip(valid_idx, p_adj, reject)}
+        else:
+            adj_by_idx = {}
+
+        n_pass = 0
+        for i, r in enumerate(all_results):
+            p_raw = p_raws[i]
+            q, ok = adj_by_idx.get(i, (float("nan"), False))
+            r["p_raw"] = p_raw
+            r["p_fdr_adjusted"] = q
+            r["passes_fdr"] = ok
+            if ok:
+                n_pass += 1
+        log.info(f"  Causal BH-FDR (q<={FDR_Q_THRESHOLD}): "
+                 f"{n_pass}/{len(all_results)} treatments survive")
+    else:
+        # No statsmodels/scipy available — mark every row as un-evaluated so
+        # downstream consumers can detect the gap explicitly.
+        for r in all_results:
+            r.setdefault("p_raw", float("nan"))
+            r.setdefault("p_fdr_adjusted", float("nan"))
+            r.setdefault("passes_fdr", False)
+        if not HAS_FDR:
+            log.warning("  Causal BH-FDR skipped: scipy/statsmodels unavailable")
+
     # Sort by absolute AIPW ATE so the strongest effects float to the top.
     binary_results.sort(key=lambda r: -abs(r.get("aipw_ate") or 0.0))
     continuous_results.sort(key=lambda r: -abs(r.get("aipw_ate") or 0.0))
@@ -914,6 +985,13 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
         "propensity_trim": [PROPENSITY_TRIM_LOW, PROPENSITY_TRIM_HIGH],
         "min_per_arm_full": MIN_BINARY_PER_ARM_FULL,
         "min_per_arm_reported": MIN_BINARY_PER_ARM_REPORT,
+        # Multiple-testing correction applied across the binary+continuous union
+        "multiple_testing": {
+            "method": "BH-FDR",
+            "family": "binary + continuous (one family)",
+            "q_threshold": FDR_Q_THRESHOLD,
+            "p_source": "AIPW Wald |ate/se_if| vs N(0,1)",
+        },
     }
 
     return {
