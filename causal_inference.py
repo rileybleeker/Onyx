@@ -382,7 +382,15 @@ def estimate_naive(T: np.ndarray, Y: np.ndarray) -> dict:
 
 def estimate_psm(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
                  k: int = PSM_K, n_boot: int = N_BOOTSTRAP_PSM) -> dict:
-    """1:k nearest-neighbor propensity matching. Returns ATT + bootstrap CI."""
+    """1:k nearest-neighbor propensity matching. Returns ATT + bootstrap CI.
+
+    Unlike AIPW, PSM has no train/validate fold structure — the propensity
+    model is fit and consumed on the SAME rows (matching is performed within
+    that set). Standardizing on the full X here is therefore not the same kind
+    of leakage AIPW suffers from; there is no held-out fold whose statistics
+    we are peeking at. The audit re-2026-05-26 fold-local scaling fix is
+    consequently scoped to AIPW. Documented for the next reviewer.
+    """
     X_std = _standardize(X)
     p_hat = _fit_propensity(X_std, T)
     logit_p = np.log(p_hat / (1 - p_hat))
@@ -468,16 +476,26 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
         return {"ate": float("nan"), "ci_low": float("nan"),
                 "ci_high": float("nan"), "se": float("nan")}
 
-    X_std = _standardize(X)
     # TimeSeriesSplit (not shuffled KFold) — HRV is autocorrelated (ρ₁ ≈ 0.4-0.5);
     # shuffled folds let the outcome model see near-future values via hrv_lag1,
     # narrowing the IF variance and overstating CI coverage. Audit finding F-001.
+    #
+    # Audit re-2026-05-26 P1 (gemini F-004, gpt-5 F-001) follow-up: the
+    # StandardScaler is now fit FRESH on the training rows of each fold and
+    # applied to that fold's validation rows. The previous full-data scaler
+    # leaked the validation fold's mean/variance back into training — small
+    # numerical effect on point estimates, but a strict violation of time-
+    # respecting cross-fitting. Verified empirically with the existing
+    # AIPW shift harness (audit/aipw_shift_findings.md).
     kf = TimeSeriesSplit(n_splits=n_folds)
     psi = np.zeros(n)
 
-    for train_idx, test_idx in kf.split(X_std):
-        Xt, Tt, Yt = X_std[train_idx], T[train_idx], Y[train_idx]
-        Xv = X_std[test_idx]
+    for train_idx, test_idx in kf.split(X):
+        # Per-fold scaler fit on training rows only (no leakage from val).
+        scaler = StandardScaler().fit(X[train_idx])
+        Xt = scaler.transform(X[train_idx])
+        Xv = scaler.transform(X[test_idx])
+        Tt, Yt = T[train_idx], Y[train_idx]
 
         # Need at least one treated and one control in the training fold to fit
         if Tt.sum() < 2 or (Tt == 0).sum() < 2:
