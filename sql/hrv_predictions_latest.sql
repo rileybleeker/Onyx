@@ -48,3 +48,18 @@ ORDER BY
 
 COMMENT ON VIEW pds.hrv_predictions_latest IS
   'Latest forecast per (prediction_date, model, horizon_days). When both live and backtest rows exist for the same date, live wins; backtest is used as fallback so dates that only have backtest predictions still surface. Use this view for UI/analytics; use pds.hrv_predictions directly only when you need history across multiple runs.';
+
+-- Composite index supporting the DISTINCT ON sort above. Without this, every
+-- read of the view scans + sorts the whole table. The CASE expression matches
+-- the view's tiebreak so PostgreSQL can use the index for the full ORDER BY.
+CREATE INDEX IF NOT EXISTS idx_hrv_predictions_tiebreak
+  ON pds.hrv_predictions (
+    prediction_date,
+    model,
+    horizon_days,
+    ((CASE WHEN model_version LIKE 'backtest%' THEN 1 ELSE 0 END)),
+    created_at DESC
+  );
+
+COMMENT ON INDEX pds.idx_hrv_predictions_tiebreak IS
+  'Supports the DISTINCT ON sort path in pds.hrv_predictions_latest. Live (non-backtest) rows tiebreak before backtest rows for the same (prediction_date, model, horizon_days); then most recent created_at wins.';
