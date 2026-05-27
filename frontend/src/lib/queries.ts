@@ -11,7 +11,19 @@ export async function getDailySummaries(days: number = 30) {
     .order("calendar_date", { ascending: true });
 
   if (error) throw error;
-  return data ?? [];
+
+  // TDEE guard: CLAUDE.md is explicit that WHOOP `kilojoule / 4.184` is the
+  // canonical "calories burnt" — Garmin's `total_kilocalories` must not be
+  // substituted. Rename on the way out so any chart that destructures
+  // `total_kilocalories` as TDEE silently breaks instead of silently
+  // misreporting. Use getWhoopCaloriesBurnt() in queries.ts for TDEE.
+  return (data ?? []).map((row) => {
+    if (row && typeof row === "object" && "total_kilocalories" in row) {
+      const { total_kilocalories, ...rest } = row as Record<string, unknown>;
+      return { ...rest, garmin_total_kcal_NOT_TDEE: total_kilocalories };
+    }
+    return row;
+  });
 }
 
 export async function getSleepData(days: number = 30) {
