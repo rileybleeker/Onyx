@@ -722,8 +722,23 @@ def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarra
     cols_needed = [spec.name, OUTCOME_COL] + list(confounders)
     sub = df[cols_needed].copy()
 
+    # Audit re-2026-05-26 P1 (deepseek F-003 + gemini F-006): ffill confounders
+    # on the FULL daily spine BEFORE filtering for missing treatment/outcome.
+    # Previously, the pipeline dropped rows for missing outcome first and then
+    # ffilled — which made the ffill window count "rows since last observed
+    # day with HRV" instead of "actual previous calendar day". Days where HRV
+    # was missing were silently treated as absent, so a 2-day-gap with two
+    # missing HRV nights ffilled across what was really 4 calendar days. The
+    # order swap below preserves the bfill-prohibition (temporal ordering for
+    # AIPW identification, audit finding F-003) while making the ffill window
+    # mean what it says.
+    if confounders:
+        sub[list(confounders)] = sub[list(confounders)].ffill(limit=2)
+
+    n_pre_drop = int(len(sub))
     # Drop rows with missing outcome or treatment
     sub = sub.dropna(subset=[spec.name, OUTCOME_COL])
+    n_after_outcome_drop = int(len(sub))
 
     # Build treatment vector
     if spec.kind == "binary":
@@ -735,24 +750,40 @@ def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarra
     # Outcome
     Y = sub[OUTCOME_COL].astype(float).values
 
-    # Confounders — forward-fill only; bfill would pull future values into past
-    # confounders, violating temporal ordering required for AIPW identification.
-    # Audit finding F-003.
+    # Confounders already ffilled above; this is just the alignment slice.
     X_df = sub[list(confounders)].copy()
-    X_df = X_df.ffill(limit=2)
     keep_mask = X_df.notna().all(axis=1).values
+    n_dropped_confounder = int((~keep_mask).sum())
     X_df = X_df.loc[keep_mask]
     T = T[keep_mask]
     Y = Y[keep_mask]
 
     n_treated = int(T.sum())
     n_control = int((T == 0).sum())
+    fraction_dropped = (
+        float(n_dropped_confounder) / float(n_after_outcome_drop)
+        if n_after_outcome_drop > 0
+        else 0.0
+    )
     meta = {
         "n_total": int(len(T)),
         "n_treated": n_treated,
         "n_control": n_control,
         "treatment_prevalence": float(T.mean()) if len(T) else 0.0,
+        # Audit re-2026-05-26 P1 (deepseek F-005): expose confounder-loss
+        # diagnostics so dropped_low_n can flag treatments where confounders
+        # rather than per-arm cell-size drove the exclusion.
+        "n_pre_drop": n_pre_drop,
+        "n_after_outcome_drop": n_after_outcome_drop,
+        "n_dropped_for_confounder_missing": n_dropped_confounder,
+        "fraction_dropped_confounder": fraction_dropped,
     }
+    if fraction_dropped > 0.10:
+        log.warning(
+            f"  Causal {spec.name!r}: confounder ffill dropped "
+            f"{n_dropped_confounder}/{n_after_outcome_drop} rows "
+            f"({fraction_dropped:.1%}) — early-tracking periods may be lost"
+        )
     if n_treated < MIN_BINARY_PER_ARM_REPORT or n_control < MIN_BINARY_PER_ARM_REPORT:
         return X_df.values, T, Y, {**meta, "too_few_obs": True}
 
@@ -831,10 +862,19 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             reason = meta.get("reason_detail") or (
                 f"n_treated<{MIN_BINARY_PER_ARM_REPORT} or n_control<{MIN_BINARY_PER_ARM_REPORT}"
             )
+            # Audit re-2026-05-26 P1: when the per-arm gate would have passed
+            # before the confounder-ffill drop, surface that so the UI can
+            # distinguish "data ran out" from "confounders incomplete in
+            # tracking window."
+            n_dropped_cf = int(meta.get("n_dropped_for_confounder_missing", 0))
+            frac_cf = float(meta.get("fraction_dropped_confounder", 0.0))
             dropped_low_n.append({
                 "treatment": spec.name, "family": spec.family, "label": spec.label,
                 "n_treated": meta["n_treated"], "n_control": meta["n_control"],
                 "reason": reason,
+                "n_after_outcome_drop": int(meta.get("n_after_outcome_drop", 0)),
+                "n_dropped_for_confounder_missing": n_dropped_cf,
+                "fraction_dropped_confounder": frac_cf,
             })
             continue
 
