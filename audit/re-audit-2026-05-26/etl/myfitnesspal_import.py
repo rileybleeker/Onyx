@@ -52,6 +52,7 @@ log = logging.getLogger("myfitnesspal_import")
 MEAL_NAMES = {"breakfast", "lunch", "dinner", "snacks", "snack"}
 TOTALS_NAMES = {"daily totals", "totals"}
 
+
 def parse_date(value: str) -> str | None:
     """Try common date formats and return YYYY-MM-DD."""
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%dT%H:%M:%S",
@@ -61,6 +62,7 @@ def parse_date(value: str) -> str | None:
         except ValueError:
             continue
     return None
+
 
 def normalise_col(name: str) -> str:
     """Strip unit suffixes and lowercase a column header for matching.
@@ -72,6 +74,7 @@ def normalise_col(name: str) -> str:
     import re
     return re.sub(r"\s*\([^)]*\)", "", name).strip().lower()
 
+
 def parse_float(value: str) -> float | None:
     """Parse a numeric cell, returning None on blank or non-numeric."""
     v = value.strip().replace(",", "")
@@ -82,9 +85,11 @@ def parse_float(value: str) -> float | None:
     except ValueError:
         return None
 
+
 def parse_int(value: str) -> int | None:
     f = parse_float(value)
     return int(round(f)) if f is not None else None
+
 
 def build_macro_dict(row: list[str], col_map: dict[str, int]) -> dict:
     """Extract macro fields from a CSV row using normalised column map."""
@@ -102,6 +107,7 @@ def build_macro_dict(row: list[str], col_map: dict[str, int]) -> dict:
         "sugar_g": parse_float(get("sugar")),
         "sodium_mg": parse_float(get("sodium")),
     }
+
 
 def import_nutrition(csv_path: str, dry_run: bool = False) -> int:
     """Parse a MyFitnessPal nutrition CSV and upsert to Supabase.
@@ -188,8 +194,8 @@ def import_nutrition(csv_path: str, dry_run: bool = False) -> int:
             "fiber_g": totals.get("fiber_g"),
             "sugar_g": totals.get("sugar_g"),
             "sodium_mg": totals.get("sodium_mg"),
-            "meals_json": json.dumps(meals) if meals else None,
-            "raw_json": json.dumps({"totals": totals, "meals": meals}),
+            "meals_json": meals if meals else None,
+            "raw_json": {"totals": totals, "meals": meals},
         })
 
     dates = [r["calendar_date"] for r in db_rows]
@@ -226,6 +232,7 @@ def import_nutrition(csv_path: str, dry_run: bool = False) -> int:
     log.info(f"Done! {total} nutrition days synced to Supabase")
     return total
 
+
 def main():
     parser = argparse.ArgumentParser(description="MyFitnessPal CSV → Supabase")
     parser.add_argument("csv_file", help="Path to nutrition CSV from MFP export")
@@ -242,6 +249,7 @@ def main():
     log.info("=" * 60)
 
     import_nutrition(args.csv_file, dry_run=args.dry_run)
+
 
 if __name__ == "__main__":
     main()

@@ -84,7 +84,8 @@ pds.hrv_model_metrics
   idx        (input_data_hash)
 
 pds.hrv_predictions
-  PK         (prediction_date, model, horizon_days)
+  PK         (id)
+  UNIQUE     (prediction_date, model, horizon_days, model_version) NULLS NOT DISTINCT
   idx        (input_data_hash)
 
 pds.journal_entries
