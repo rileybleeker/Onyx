@@ -176,8 +176,28 @@ def run_auth_flow():
 # Token refresh
 # ---------------------------------------------------------------------------
 
+class SpotifyAuthError(Exception):
+    """Raised when Spotify refuses the stored refresh token (expired/revoked).
+
+    Distinct from transient HTTP errors so the ETL can write an actionable
+    sync_log entry and exit 0 (no retry) instead of looping the cron on a
+    permanently-broken token.
+    """
+
+
+REAUTH_INSTRUCTIONS = (
+    "Spotify refresh token rejected. Re-run `python spotify_etl.py --auth` "
+    "locally then `python ci_token_helper.py upload spotify`."
+)
+
+
 def refresh_access_token(tokens: dict) -> dict:
-    """Exchange refresh_token for a fresh access_token. Returns updated tokens dict."""
+    """Exchange refresh_token for a fresh access_token. Returns updated tokens dict.
+
+    Raises SpotifyAuthError on a 400/401 from /api/token — the documented
+    invalid_grant response when the refresh token has expired or been revoked
+    (Spotify rotates these occasionally; see CLAUDE.md).
+    """
     basic = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
     resp = httpx.post(
         SPOTIFY_TOKEN_URL,
@@ -188,6 +208,8 @@ def refresh_access_token(tokens: dict) -> dict:
         },
         timeout=30,
     )
+    if resp.status_code in (400, 401):
+        raise SpotifyAuthError(f"{REAUTH_INSTRUCTIONS} (HTTP {resp.status_code}: {resp.text})")
     resp.raise_for_status()
     new = resp.json()
     tokens["access_token"] = new["access_token"]
@@ -588,7 +610,13 @@ def run_backfill_artists():
     sb = get_supabase()
 
     tokens = load_tokens()
-    tokens = refresh_access_token(tokens)
+    try:
+        tokens = refresh_access_token(tokens)
+    except SpotifyAuthError as e:
+        log.error(str(e))
+        log_sync_entry(sb, source="spotify", data_type="artist_backfill",
+                       status="failed", records=0, started_at=started, error=str(e))
+        sys.exit(0)
     client = SpotifyClient(tokens)
 
     # Pull distinct artist_ids from spotify_plays in pages (Supabase row limit is 1000/req)
@@ -654,7 +682,12 @@ def run_etl(refeaturize: bool = False):
     sb = get_supabase()
 
     tokens = load_tokens()
-    tokens = refresh_access_token(tokens)
+    try:
+        tokens = refresh_access_token(tokens)
+    except SpotifyAuthError as e:
+        log.error(str(e))
+        log_sync(sb, status="failed", records=0, started_at=started, error=str(e))
+        sys.exit(0)
     client = SpotifyClient(tokens)
 
     try:
@@ -775,6 +808,12 @@ def run_etl(refeaturize: bool = False):
         log_sync(sb, status="success", records=plays_count, started_at=started)
         log.info(f"Spotify ETL complete: {plays_count} plays, {tracks_count} tracks in {int(time.time()-started)}s")
 
+    except SpotifyAuthError as e:
+        # Refresh token died mid-run (rare: access-token refresh inside _request).
+        # Same actionable message + exit 0 as the pre-flight catch above.
+        log.error(str(e))
+        log_sync(sb, status="failed", records=0, started_at=started, error=str(e))
+        sys.exit(0)
     except Exception as e:
         log.exception("Spotify ETL failed")
         log_sync(sb, status="failed", records=0, started_at=started, error=str(e))
