@@ -38,6 +38,8 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
+from sync_log_helper import log_sync as _shared_log_sync
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -105,20 +107,14 @@ def extract_links_from_html(html: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 def log_sync(sb: Client, source: str, data_type: str, status: str,
              records: int = 0, date_start: date = None, date_end: date = None,
-             error: str = None, duration: float = None):
-    try:
-        sb.schema("pds").table("sync_log").insert({
-            "source": source,
-            "data_type": data_type,
-            "status": status,
-            "records_synced": records,
-            "date_range_start": date_start.isoformat() if date_start else None,
-            "date_range_end": date_end.isoformat() if date_end else None,
-            "error_message": error,
-            "duration_seconds": duration,
-        }).execute()
-    except Exception as e:
-        log.warning(f"Failed to write sync log: {e}")
+             error: str = None, started_at: float = None):
+    """Sync_log heartbeat. Delegates to sync_log_helper so both sync_start and
+    sync_end are populated consistently with the rest of the ETLs."""
+    _shared_log_sync(
+        sb, source=source, data_type=data_type, status=status,
+        records=records, started_at=started_at, error=error,
+        date_range_start=date_start, date_range_end=date_end,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +265,7 @@ def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
         log.warning("No download URL found in email — marking as read to avoid reprocessing")
         imap.uid("STORE", uid, "+FLAGS", "\\Seen")
         log_sync(sb, "whoop", "journal_email", "error",
-                 error="No download URL found in email")
+                 error="No download URL found in email", started_at=t0)
         return False
 
     # Step 2: Download ZIP and extract CSV
@@ -279,19 +275,19 @@ def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
         except requests.RequestException as e:
             log.error(f"Download failed: {e} — will retry next cycle")
             log_sync(sb, "whoop", "journal_email", "error",
-                     error=f"Download failed: {e}")
+                     error=f"Download failed: {e}", started_at=t0)
             return False
         except zipfile.BadZipFile as e:
             log.error(f"Corrupt ZIP: {e} — marking as read")
             imap.uid("STORE", uid, "+FLAGS", "\\Seen")
             log_sync(sb, "whoop", "journal_email", "error",
-                     error=f"Corrupt ZIP: {e}")
+                     error=f"Corrupt ZIP: {e}", started_at=t0)
             return False
 
         if not csv_path:
             imap.uid("STORE", uid, "+FLAGS", "\\Seen")
             log_sync(sb, "whoop", "journal_email", "error",
-                     error="journal_entries.csv not found in ZIP")
+                     error="journal_entries.csv not found in ZIP", started_at=t0)
             return False
 
         # Step 3: Import journal entries
@@ -300,7 +296,7 @@ def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
         except Exception as e:
             log.error(f"Import failed: {e} — will retry next cycle")
             log_sync(sb, "whoop", "journal_email", "error",
-                     error=f"Import failed: {e}")
+                     error=f"Import failed: {e}", started_at=t0)
             return False
 
     # Step 4: Mark as read and log success
@@ -309,7 +305,7 @@ def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
     action = "parsed (dry run)" if dry_run else "imported"
     log.info(f"Successfully {action} {count} journal entries in {duration:.1f}s")
     log_sync(sb, "whoop", "journal_email", "success",
-             records=count, duration=duration)
+             records=count, started_at=t0)
     return True
 
 
@@ -330,7 +326,7 @@ def check_email(dry_run: bool = False) -> int:
             # have no new email and that's healthy).
             log.info("No new WHOOP export emails")
             log_sync(sb, "whoop", "journal_email", "success",
-                     records=0, duration=time.time() - t_start)
+                     records=0, started_at=t_start)
             return 0
 
         processed = 0

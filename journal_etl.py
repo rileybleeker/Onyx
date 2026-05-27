@@ -31,6 +31,8 @@ import httpx
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
+from sync_log_helper import log_sync as _shared_log_sync
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -286,19 +288,8 @@ def embed_documents(client: httpx.Client, texts: list[str]) -> list[list[float]]
 # ---------------------------------------------------------------------------
 
 def log_sync(sb: Client, status: str, records: int, started_at: float, error: str | None = None):
-    duration = int(time.time() - started_at)
-    try:
-        sb.schema("pds").table("sync_log").insert({
-            "source": "notion_journal",
-            "data_type": "entries",
-            "status": status,
-            "records_synced": records,
-            "duration_seconds": duration,
-            "error_message": error,
-            "sync_start": datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat(),
-        }).execute()
-    except Exception as e:
-        log.warning(f"sync_log insert failed: {e}")
+    _shared_log_sync(sb, source="notion_journal", data_type="entries", status=status,
+                     records=records, started_at=started_at, error=error)
 
 
 # ---------------------------------------------------------------------------

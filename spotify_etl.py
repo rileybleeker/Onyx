@@ -39,6 +39,8 @@ import httpx
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
+from sync_log_helper import log_sync as _shared_log_sync
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -585,19 +587,8 @@ def log_sync_entry(
     error: str | None = None,
 ):
     """Generic sync_log insert for ETL subsystems (Spotify, ReccoBeats, MusicBrainz, ...)."""
-    duration = int(time.time() - started_at)
-    try:
-        sb.schema("pds").table("sync_log").insert({
-            "source": source,
-            "data_type": data_type,
-            "status": status,
-            "records_synced": records,
-            "duration_seconds": duration,
-            "error_message": error,
-            "sync_start": datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat(),
-        }).execute()
-    except Exception as e:
-        log.warning(f"sync_log insert ({source}|{data_type}) failed: {e}")
+    _shared_log_sync(sb, source=source, data_type=data_type, status=status,
+                     records=records, started_at=started_at, error=error)
 
 
 # ---------------------------------------------------------------------------

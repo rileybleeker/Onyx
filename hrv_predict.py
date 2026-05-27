@@ -27,6 +27,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client
 
+from sync_log_helper import log_sync as _shared_log_sync
+
 load_dotenv()
 
 logging.basicConfig(
@@ -388,13 +390,11 @@ def check_drift(current_mae: float | None) -> None:
             f"backtest MAE={baseline_mae:.1f}ms (threshold ×{DRIFT_THRESHOLD}). "
             "Consider retraining."
         )
-        supa.schema("pds").from_("sync_log").insert(_clean_for_json({
-            "source": "hrv_predict",
-            "data_type": "drift_alert",
-            "status": "warning",
-            "records_synced": 0,
-            "error_message": f"HRV model drift: current MAE={current_mae:.1f}ms vs backtest {baseline_mae:.1f}ms",
-        })).execute()
+        _shared_log_sync(
+            supa, source="hrv_predict", data_type="drift_alert",
+            status="warning", records=0,
+            error=f"HRV model drift: current MAE={current_mae:.1f}ms vs backtest {baseline_mae:.1f}ms",
+        )
 
 
 def main() -> None:
