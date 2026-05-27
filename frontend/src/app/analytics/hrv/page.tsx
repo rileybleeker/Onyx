@@ -580,7 +580,7 @@ export default function HrvAnalysisPage() {
                 <span className="text-base font-normal text-text-secondary ml-1">ms</span>
               </p>
               <p className="text-[11px] text-text-tertiary mt-1.5">
-                90% CI: {Number(tomorrowPred.prediction_lower).toFixed(0)}–{Number(tomorrowPred.prediction_upper).toFixed(0)} ms
+                80% CI: {Number(tomorrowPred.prediction_lower).toFixed(0)}–{Number(tomorrowPred.prediction_upper).toFixed(0)} ms
               </p>
               {todayActualHrv && (
                 <p className="text-[11px] mt-1" style={{
@@ -2406,11 +2406,11 @@ export default function HrvAnalysisPage() {
                       {Number(xgbMetrics.ci_coverage).toFixed(0)}%
                     </span>
                     <div>
-                      <p className="text-sm text-text-secondary">of actuals inside 90% CI</p>
+                      <p className="text-sm text-text-secondary">of actuals inside 80% CI</p>
                       <p className="text-[11px] text-text-tertiary">
-                        {Number(xgbMetrics.ci_coverage) >= 85 && Number(xgbMetrics.ci_coverage) <= 95
+                        {Number(xgbMetrics.ci_coverage) >= 75 && Number(xgbMetrics.ci_coverage) <= 85
                           ? "Well calibrated"
-                          : Number(xgbMetrics.ci_coverage) < 85
+                          : Number(xgbMetrics.ci_coverage) < 75
                           ? "Intervals too narrow (overconfident)"
                           : "Intervals too wide (underconfident)"}
                       </p>

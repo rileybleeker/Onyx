@@ -156,6 +156,15 @@ TARGET = "whoop_hrv_rmssd"
 # Stage-1 BH-FDR threshold for promoting features to Stage 2 partial correlations.
 FDR_Q_THRESHOLD = 0.05
 
+# Canonical prediction-interval nominal level for XGBoost / SARIMAX / Prophet.
+# Prophet defaults to 80% (interval_width=0.80); XGBoost+SARIMAX previously used
+# 90% (1.645·σ / alpha=0.10), making ci_coverage incomparable across models.
+# Audit re-2026-05-26 (deepseek F-001/F-002, gpt-5 F-003) — standardized to 80%.
+# CI_Z is the two-sided normal quantile for 80% (P(|Z| < 1.282) = 0.80).
+CI_NOMINAL = 0.80
+CI_Z = 1.282
+CI_ALPHA = 1.0 - CI_NOMINAL  # 0.20 — pass to statsmodels conf_int()
+
 # WHOOP journal date semantics — corrected 2026-05-23.
 #
 # The 2026-04-16 audit (finding 4.B) verified one data point (April 8, with a
@@ -2600,11 +2609,11 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
         pred_std = float(np.std(y_val.values - val_pred))
         log.info(f"  pred_std (val-fit fallback): {pred_std:.2f} ms")
 
-    test_lower = test_pred - 1.645 * pred_std  # ~90% CI
-    test_upper = test_pred + 1.645 * pred_std
+    test_lower = test_pred - CI_Z * pred_std  # 80% CI — see CI_NOMINAL
+    test_upper = test_pred + CI_Z * pred_std
     ci_metrics = compute_metrics(y_test.values, test_pred, test_lower, test_upper)
-    log.info(f"  test CI coverage at ±1.645·σ: {ci_metrics.get('ci_coverage', float('nan')):.1f}% "
-             f"(target: 90%)")
+    log.info(f"  test CI coverage at ±{CI_Z}·σ: {ci_metrics.get('ci_coverage', float('nan')):.1f}% "
+             f"(target: {int(CI_NOMINAL * 100)}%)")
 
     # Permutation importance as an independent cross-check on SHAP (audit 7.L).
     # SHAP can over-credit features the model overfits; permutation importance
@@ -2854,7 +2863,7 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
         fut_exog_all = exog.iloc[-7:] if exog is not None else None
         fc_full = full_fit.get_forecast(steps=7, exog=fut_exog_all)
         fc_mean = fc_full.predicted_mean
-        fc_ci = fc_full.conf_int(alpha=0.10)  # 90% CI
+        fc_ci = fc_full.conf_int(alpha=CI_ALPHA)  # 80% CI — see CI_NOMINAL
 
         # Save forecast plot
         try:
@@ -2946,6 +2955,7 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
             weekly_seasonality=True,
             daily_seasonality=False,
             yearly_seasonality=False,
+            interval_width=CI_NOMINAL,
         )
         for rf in reg_feats:
             m.add_regressor(rf)
@@ -2974,6 +2984,7 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
             weekly_seasonality=True,
             daily_seasonality=False,
             yearly_seasonality=False,
+            interval_width=CI_NOMINAL,
         )
         for rf in reg_feats:
             m_full.add_regressor(rf)
@@ -3150,8 +3161,8 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                             "prediction_date": str(d),
                             "model": "xgboost",
                             "predicted_hrv": float(pred),
-                            "prediction_lower": float(pred - 1.645 * residuals_std),
-                            "prediction_upper": float(pred + 1.645 * residuals_std),
+                            "prediction_lower": float(pred - CI_Z * residuals_std),
+                            "prediction_upper": float(pred + CI_Z * residuals_std),
                             "actual_hrv": float(actual),
                             "residual": float(actual - pred),
                             "horizon_days": h,
@@ -3537,9 +3548,9 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
             "model": "xgboost",
             "predicted_hrv": xgb_results.get("tomorrow_pred"),
             "prediction_lower": (xgb_results.get("tomorrow_pred", 0) -
-                                 1.645 * xgb_results.get("pred_std", 0)),
+                                 CI_Z * xgb_results.get("pred_std", 0)),
             "prediction_upper": (xgb_results.get("tomorrow_pred", 0) +
-                                 1.645 * xgb_results.get("pred_std", 0)),
+                                 CI_Z * xgb_results.get("pred_std", 0)),
             "actual_hrv": None,
             "horizon_days": 1,
             "top_drivers": xgb_results.get("top_drivers", []),
@@ -3935,14 +3946,14 @@ def print_summary(df: pd.DataFrame, xgb_results: dict,
     if xgb_results and xgb_results.get("tomorrow_pred"):
         p = xgb_results["tomorrow_pred"]
         std = xgb_results.get("pred_std", 0)
-        print(f"  XGBoost:   {p:.1f} ms  (90% CI: {p - 1.645*std:.1f} - {p + 1.645*std:.1f})")
+        print(f"  XGBoost:   {p:.1f} ms  ({int(CI_NOMINAL * 100)}% CI: {p - CI_Z*std:.1f} - {p + CI_Z*std:.1f})")
     if sarimax_results.get("t1_pred"):
         print(f"  SARIMAX:   {sarimax_results['t1_pred']:.1f} ms  (horizon=1)")
     if prophet_results.get("t1_pred"):
         p = prophet_results["t1_pred"]
         lo = prophet_results.get("t1_lower", p)
         hi = prophet_results.get("t1_upper", p)
-        print(f"  Prophet:   {p:.1f} ms  (80% CI: {lo:.1f} - {hi:.1f})")
+        print(f"  Prophet:   {p:.1f} ms  ({int(CI_NOMINAL * 100)}% CI: {lo:.1f} - {hi:.1f})")
     if xgb_results and xgb_results.get("today_hrv"):
         print(f"  Today's actual HRV:  {xgb_results['today_hrv']:.1f} ms")
 

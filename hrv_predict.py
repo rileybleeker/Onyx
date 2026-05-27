@@ -58,6 +58,12 @@ MODEL_VERSION = f"{et_today().isoformat()}_v1"
 
 # Drift threshold: alert if rolling 30-day MAE exceeds 1.5x backtest MAE
 DRIFT_THRESHOLD = 1.5
+
+# Canonical PI nominal level (kept in sync with hrv_analysis.CI_NOMINAL).
+# Standardized to 80% to match Prophet's default — see hrv_analysis.py for the
+# audit re-2026-05-26 rationale (deepseek F-001/F-002, gpt-5 F-003).
+CI_NOMINAL = 0.80
+CI_Z = 1.282
 # Window for "rolling" metrics. Previously the function aggregated *all* history,
 # desensitizing the metric over time. 30 days matches the function name.
 ROLLING_WINDOW_DAYS = 30
@@ -176,8 +182,8 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
     # Predict on latest row
     latest_X = X.iloc[[-1]]
     pred_val = float(model.predict(latest_X)[0])
-    lower = pred_val - 1.645 * pred_std
-    upper = pred_val + 1.645 * pred_std
+    lower = pred_val - CI_Z * pred_std
+    upper = pred_val + CI_Z * pred_std
 
     # SHAP top drivers if available
     top_drivers_payload: dict | list = []
@@ -449,7 +455,7 @@ def main() -> None:
                     log.info(
                         f"Tomorrow ({prediction['prediction_date']}): "
                         f"predicted HRV = {prediction['predicted_hrv']} ms  "
-                        f"(90% CI: {prediction['prediction_lower']} - {prediction['prediction_upper']})"
+                        f"({int(CI_NOMINAL * 100)}% CI: {prediction['prediction_lower']} - {prediction['prediction_upper']})"
                     )
                     if today_hrv:
                         log.info(f"Today's actual HRV: {today_hrv:.1f} ms")
