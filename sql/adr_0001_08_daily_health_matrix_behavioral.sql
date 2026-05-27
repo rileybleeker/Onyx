@@ -13,17 +13,57 @@
 -- query in lib/queries.ts not yet migrated).
 --
 -- SPINE: union of every onyx_behavioral_date that any source has produced.
--- WHOOP cycle JOIN: deduplicated via LATERAL ... LIMIT 1 — on transition
---   days WHOOP can record an "arrival nap" + main cycle that both share the
---   same onyx_behavioral_date; pick the LONGEST as the main sleep.
--- onyx_is_transition_day: aggregated across ALL cycles on the day via
---   bool_or, so a transition shows even if the longest cycle wasn't the
---   transition one.
--- garmin_hrv JOIN: deduplicated via LATERAL too (defensive).
+-- Per-source dedup lives in helper views (refactored 2026-05-26 per audit):
+--   pds.garmin_sleep_best_per_behavioral_date   — best non-nap by score
+--   pds.garmin_hrv_latest_per_behavioral_date   — latest by calendar_date
+--   pds.whoop_main_cycle_per_behavioral_date    — longest cycle (real night)
+-- onyx_is_transition_day stays inline (aggregate across all cycles via
+-- bool_or, not a dedup).
 --
 -- Depends on: every prior adr_0001_*.sql migration.
 -- =============================================================================
 
+-- ---------------------------------------------------------------------------
+-- Helper views — per-source dedup, independently testable
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE VIEW pds.garmin_sleep_best_per_behavioral_date AS
+SELECT DISTINCT ON (onyx_behavioral_date) *
+FROM pds.garmin_sleep
+WHERE is_nap = false
+  AND sleep_id IS NOT NULL
+  AND onyx_behavioral_date IS NOT NULL
+ORDER BY onyx_behavioral_date, overall_sleep_score DESC NULLS LAST;
+
+COMMENT ON VIEW pds.garmin_sleep_best_per_behavioral_date IS
+'One row per onyx_behavioral_date: the highest-scoring non-nap garmin_sleep row. Replaces the LATERAL+LIMIT-1 block in pds.daily_health_matrix_behavioral.';
+
+CREATE OR REPLACE VIEW pds.garmin_hrv_latest_per_behavioral_date AS
+SELECT DISTINCT ON (onyx_behavioral_date) *
+FROM pds.garmin_hrv
+WHERE onyx_behavioral_date IS NOT NULL
+ORDER BY onyx_behavioral_date, calendar_date DESC NULLS LAST;
+
+COMMENT ON VIEW pds.garmin_hrv_latest_per_behavioral_date IS
+'One row per onyx_behavioral_date: the latest garmin_hrv row (by calendar_date). Replaces the LATERAL+LIMIT-1 block in pds.daily_health_matrix_behavioral.';
+
+CREATE OR REPLACE VIEW pds.whoop_main_cycle_per_behavioral_date AS
+SELECT DISTINCT ON (onyx_behavioral_date) *
+FROM pds.whoop_cycles
+WHERE onyx_behavioral_date IS NOT NULL
+ORDER BY onyx_behavioral_date,
+         (end_time - start_time) DESC NULLS LAST,
+         start_time DESC;
+
+COMMENT ON VIEW pds.whoop_main_cycle_per_behavioral_date IS
+'One row per onyx_behavioral_date: the longest whoop_cycle (real night sleep), with start_time DESC tiebreak. Replaces the LATERAL+LIMIT-1 block in pds.daily_health_matrix_behavioral. Use this — not pds.whoop_cycles directly — for any "main cycle of the day" query.';
+
+GRANT SELECT ON pds.garmin_sleep_best_per_behavioral_date  TO anon, authenticated;
+GRANT SELECT ON pds.garmin_hrv_latest_per_behavioral_date  TO anon, authenticated;
+GRANT SELECT ON pds.whoop_main_cycle_per_behavioral_date   TO anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- The main matrix view — flat join over the helpers
+-- ---------------------------------------------------------------------------
 DROP VIEW IF EXISTS pds.daily_health_matrix_behavioral;
 
 CREATE VIEW pds.daily_health_matrix_behavioral AS
@@ -75,7 +115,7 @@ SELECT
     gstr.medium_stress_duration_sec AS garmin_medium_stress_sec,
     gstr.high_stress_duration_sec AS garmin_high_stress_sec,
 
-    -- Garmin Sleep (best non-nap per behavioral day)
+    -- Garmin Sleep (best non-nap per behavioral day — via helper view)
     gs.overall_sleep_score AS garmin_sleep_score,
     gs.sleep_duration_seconds AS garmin_sleep_duration_sec,
     gs.deep_sleep_seconds AS garmin_deep_sleep_sec,
@@ -86,7 +126,7 @@ SELECT
     gs.avg_respiration_rate AS garmin_sleep_respiration,
     gs.avg_sleep_stress AS garmin_sleep_stress,
 
-    -- Garmin HRV (most recent per behavioral day)
+    -- Garmin HRV (most recent per behavioral day — via helper view)
     ghrv.weekly_avg_ms AS garmin_hrv_weekly_avg,
     ghrv.last_night_avg_ms AS garmin_hrv_last_night,
     ghrv.last_night_5min_high_ms AS garmin_hrv_5min_high,
@@ -117,7 +157,7 @@ SELECT
     gts.vo2_max_cycling AS garmin_vo2_max_cycling,
     gts.fitness_age AS garmin_fitness_age,
 
-    -- Garmin Activities (aggregated)
+    -- Garmin Activities (aggregate stays inline — not a dedup)
     acts.activity_count AS garmin_activity_count,
     acts.activity_duration_sec AS garmin_activity_duration_sec,
     acts.activity_distance_m AS garmin_activity_distance_m,
@@ -126,11 +166,12 @@ SELECT
     acts.activity_max_hr AS garmin_activity_max_hr,
     acts.activity_avg_hr AS garmin_activity_avg_hr,
 
-    -- WHOOP Cycle (longest per behavioral day)
+    -- WHOOP Cycle (longest per behavioral day — via helper view)
     wc.strain AS whoop_day_strain, wc.kilojoule AS whoop_kilojoule,
     wc.average_heart_rate AS whoop_cycle_avg_hr,
     wc.max_heart_rate AS whoop_cycle_max_hr,
-    -- Transition flag: TRUE if ANY cycle on this behavioral day was a transition
+    -- Transition flag: TRUE if ANY cycle on this behavioral day was a transition.
+    -- Aggregate stays inline (not a dedup).
     COALESCE(tx.any_transition, FALSE) AS onyx_is_transition_day,
 
     -- WHOOP Recovery (via picked cycle_id)
@@ -150,7 +191,7 @@ SELECT
     ws.disturbance_count AS whoop_disturbances,
     ws.respiratory_rate AS whoop_respiratory_rate,
 
-    -- WHOOP Workouts (aggregated)
+    -- WHOOP Workouts (aggregate stays inline)
     wkts.whoop_workout_count, wkts.whoop_workout_strain, wkts.whoop_zone2_milli,
 
     -- Eight Sleep
@@ -180,24 +221,17 @@ SELECT
     mt.last_meal_to_bedtime_minutes AS meal_last_meal_to_bedtime_min
 
 FROM all_behavioral_dates s
-LEFT JOIN pds.garmin_daily_summary gds ON gds.calendar_date = s.calendar_date
-LEFT JOIN pds.garmin_stress        gstr ON gstr.calendar_date = s.calendar_date
-LEFT JOIN pds.garmin_heart_rate    ghr  ON ghr.calendar_date  = s.calendar_date
-LEFT JOIN pds.garmin_training_status gts ON gts.calendar_date = s.calendar_date
+LEFT JOIN pds.garmin_daily_summary    gds  ON gds.calendar_date  = s.calendar_date
+LEFT JOIN pds.garmin_stress           gstr ON gstr.calendar_date = s.calendar_date
+LEFT JOIN pds.garmin_heart_rate       ghr  ON ghr.calendar_date  = s.calendar_date
+LEFT JOIN pds.garmin_training_status  gts  ON gts.calendar_date  = s.calendar_date
 
-LEFT JOIN LATERAL (
-    SELECT * FROM pds.garmin_sleep gs2
-    WHERE gs2.onyx_behavioral_date = s.calendar_date
-      AND gs2.is_nap = false AND gs2.sleep_id IS NOT NULL
-    ORDER BY gs2.overall_sleep_score DESC NULLS LAST LIMIT 1
-) gs ON true
+-- Helper-view joins replace LATERAL+LIMIT-1 blocks
+LEFT JOIN pds.garmin_sleep_best_per_behavioral_date    gs   ON gs.onyx_behavioral_date   = s.calendar_date
+LEFT JOIN pds.garmin_hrv_latest_per_behavioral_date    ghrv ON ghrv.onyx_behavioral_date = s.calendar_date
+LEFT JOIN pds.whoop_main_cycle_per_behavioral_date     wc   ON wc.onyx_behavioral_date   = s.calendar_date
 
-LEFT JOIN LATERAL (
-    SELECT * FROM pds.garmin_hrv ghrv2
-    WHERE ghrv2.onyx_behavioral_date = s.calendar_date
-    ORDER BY ghrv2.calendar_date DESC NULLS LAST LIMIT 1
-) ghrv ON true
-
+-- Aggregates stay inline (not dedup patterns)
 LEFT JOIN LATERAL (
     SELECT COUNT(*)::int AS activity_count,
         SUM(duration_seconds) AS activity_duration_sec,
@@ -209,17 +243,6 @@ LEFT JOIN LATERAL (
     FROM pds.garmin_activities ga
     WHERE ga.onyx_behavioral_date = s.calendar_date
 ) acts ON true
-
--- WHOOP cycle: pick the longest cycle as the "main" sleep for that day.
--- On transition days WHOOP records an "arrival nap" + main cycle that share
--- the same behavioral_date; the longer one is the real night sleep.
-LEFT JOIN LATERAL (
-    SELECT * FROM pds.whoop_cycles wc2
-    WHERE wc2.onyx_behavioral_date = s.calendar_date
-    ORDER BY (wc2.end_time - wc2.start_time) DESC NULLS LAST,
-             wc2.start_time DESC
-    LIMIT 1
-) wc ON true
 
 -- Aggregate any-transition flag across all cycles on the day (so transition
 -- shows even if the longest cycle wasn't the transition one).
@@ -255,4 +278,4 @@ ORDER BY s.calendar_date DESC;
 GRANT SELECT ON pds.daily_health_matrix_behavioral TO anon, authenticated;
 
 COMMENT ON VIEW pds.daily_health_matrix_behavioral IS
-'Per ADR-0001 D4/D5: parallel join view to pds.daily_health_matrix. Spine is the union of every onyx_behavioral_date across all sources. Every per-source join is keyed on onyx_behavioral_date instead of calendar_date / +12h ET rule. WHOOP cycle deduplicated via LATERAL (picks longest cycle per behavioral day). onyx_is_transition_day aggregated via bool_or across all cycles on the day. Used by Phase 2 HRV pipeline and Phase 3 HRV/behavior consumers. The original pds.daily_health_matrix stays unchanged for backward-compat (MFP energy balance, /status freshness).';
+'Per ADR-0001 D4/D5: parallel join view to pds.daily_health_matrix. Spine is the union of every onyx_behavioral_date across all sources. Per-source dedup lives in pds.garmin_sleep_best_per_behavioral_date / pds.garmin_hrv_latest_per_behavioral_date / pds.whoop_main_cycle_per_behavioral_date helpers — those replace the inline LATERAL+LIMIT-1 blocks for clarity and independent testability. onyx_is_transition_day aggregated via bool_or across all cycles on the day. The original pds.daily_health_matrix stays unchanged for backward-compat (MFP energy balance, /status freshness).';
