@@ -1,0 +1,34 @@
+name: Eight Sleep ETL
+
+on:
+  schedule:
+    # 19:00 UTC = 3:00 PM EDT (3 PM Eastern during DST, 2 PM EST in winter)
+    - cron: '0 19 * * *'
+  workflow_dispatch: # Manual trigger for testing
+
+concurrency:
+  group: eight-sleep-etl
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  eight-sleep-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install httpx supabase python-dotenv
+      - name: Run Eight Sleep ETL
+        run: python eight_sleep_etl.py --days 7
+        env:
+          EIGHTSLEEP_EMAIL: ${{ secrets.EIGHTSLEEP_EMAIL }}
+          EIGHTSLEEP_PASSWORD: ${{ secrets.EIGHTSLEEP_PASSWORD }}
+          EIGHTSLEEP_TIMEZONE: America/New_York
+          EIGHTSLEEP_CLIENT_ID: ${{ secrets.EIGHTSLEEP_CLIENT_ID }}
+          EIGHTSLEEP_CLIENT_SECRET: ${{ secrets.EIGHTSLEEP_CLIENT_SECRET }}
