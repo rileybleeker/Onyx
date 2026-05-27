@@ -1,5 +1,24 @@
 import { supabase } from "./supabase";
 
+/**
+ * Duration unit convention across this module:
+ *   - Garmin daily summary / sleep / activities → SECONDS (`*_seconds`,
+ *     `duration_seconds`, etc.)
+ *   - Eight Sleep trends + sessions → SECONDS (`*_seconds`)
+ *   - WHOOP sleep / workouts / recovery → MILLISECONDS (`*_milli`)
+ *
+ * For chart layer:
+ *   - `formatDuration(sec)` expects seconds. Pass Garmin/Eight Sleep fields
+ *     directly.
+ *   - `formatDurationMs(ms)` accepts milliseconds. Pass WHOOP `*_milli`
+ *     fields directly instead of dividing by 1000 in the call site.
+ *
+ * The asymmetry comes from the upstream APIs (WHOOP's v2 API returns ms,
+ * everyone else returns seconds). We preserve the unit in the field name
+ * rather than normalizing at the query layer so the units stay obvious in
+ * every consumer.
+ */
+
 export async function getDailySummaries(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);

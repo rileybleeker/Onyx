@@ -40,12 +40,31 @@ export function whoopSleepDay(startTime: string | null | undefined): string {
   return etDate(shifted.toISOString());
 }
 
+/**
+ * Format a duration expressed in SECONDS as "Xh Ym" or "Ym".
+ *
+ * Unit convention (canonical across the codebase):
+ *   - Garmin + Eight Sleep store durations in SECONDS — pass directly.
+ *   - WHOOP stores durations in MILLISECONDS — use `formatDurationMs` or
+ *     divide by 1000 first. Passing raw WHOOP `_milli` values here renders
+ *     durations 1000× too large.
+ */
 export function formatDuration(seconds: number | null): string {
   if (!seconds) return "—";
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+/**
+ * Format a duration expressed in MILLISECONDS. Thin wrapper that converts
+ * to seconds and delegates — exists so WHOOP `_milli` fields can be passed
+ * directly without each caller risking the off-by-1000 bug.
+ */
+export function formatDurationMs(ms: number | null): string {
+  if (ms == null || Number.isNaN(ms)) return "—";
+  return formatDuration(Math.round(ms / 1000));
 }
 
 // Second-precision duration for short events (lap times, intervals). Format:

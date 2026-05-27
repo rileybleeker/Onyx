@@ -10,7 +10,7 @@ import {
   getEightSleepTrends, getDailySummaries,
   rangeDays, rangeLabel, type Range,
 } from "@/lib/queries";
-import { formatDate, formatDuration, etDate } from "@/lib/format";
+import { formatDate, formatDuration, formatDurationMs, etDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -416,10 +416,10 @@ export default function SleepPage() {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <StatCard
           label="Duration"
-          value={avgInBedMs != null ? formatDuration(Math.round((avgInBedMs + avgWhoopNapMs) / 1000)) : null}
+          value={avgInBedMs != null ? formatDurationMs(avgInBedMs + avgWhoopNapMs) : null}
           sublabel={
             avgInBedMs != null && avgWhoopNapMs > 0
-              ? `${formatDuration(Math.round(avgInBedMs / 1000))} main + ${formatDuration(Math.round(avgWhoopNapMs / 1000))} nap · ${rangeNote}`
+              ? `${formatDurationMs(avgInBedMs)} main + ${formatDurationMs(avgWhoopNapMs)} nap · ${rangeNote}`
               : rangeNote
           }
           source="WHOOP"
@@ -427,8 +427,8 @@ export default function SleepPage() {
         <StatCard label="Hours vs Needed" value={avgHoursVsNeeded != null ? `${avgHoursVsNeeded.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="Sleep Performance" value={avgSleepPerf != null ? `${avgSleepPerf.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="Sleep Efficiency" value={avgSleepEff != null ? `${avgSleepEff.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
-        <StatCard label="Deep Sleep" value={avgDeepMs != null ? formatDuration(Math.round(avgDeepMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
-        <StatCard label="REM Sleep" value={avgRemMs != null ? formatDuration(Math.round(avgRemMs / 1000)) : null} sublabel={rangeNote} source="WHOOP" />
+        <StatCard label="Deep Sleep" value={avgDeepMs != null ? formatDurationMs(avgDeepMs) : null} sublabel={rangeNote} source="WHOOP" />
+        <StatCard label="REM Sleep" value={avgRemMs != null ? formatDurationMs(avgRemMs) : null} sublabel={rangeNote} source="WHOOP" />
       </div>
 
       <div className="mb-6">
