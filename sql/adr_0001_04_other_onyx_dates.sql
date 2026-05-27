@@ -298,12 +298,18 @@ BEGIN
     -- to its WHOOP-canonical wake day regardless of TZ (12h > any TZ
     -- offset, so always crosses midnight ET into the wake day, matching
     -- WHOOP CSV's cycle_date labeling).
+    -- Audit re-2026-05-26 P2: pick the LONGEST cycle (real night sleep), not
+    -- the earliest. Transition days have an "arrival nap" + main cycle that
+    -- both map to the same cycle_date via the +12h-ET rule; the nap's
+    -- timezone_offset is the OLD zone and would anchor the journal to the
+    -- wrong TZ. Matches daily_health_matrix_behavioral's longest-cycle pick.
     SELECT wc.start_time, wc.timezone_offset
       INTO cycle_start_time, cycle_tz_offset
       FROM pds.whoop_cycles wc
      WHERE ((wc.start_time + INTERVAL '12 hours')
             AT TIME ZONE 'America/New_York')::date = NEW.cycle_date
-     ORDER BY wc.start_time
+     ORDER BY (wc.end_time - wc.start_time) DESC NULLS LAST,
+              wc.start_time DESC
      LIMIT 1;
 
     IF cycle_start_time IS NOT NULL THEN
