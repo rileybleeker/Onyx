@@ -1886,8 +1886,23 @@ def run_statistical_analysis(
                             final_vifs.append(float("nan"))
 
                 X_full_const = sm.add_constant(X_full_std)
+                # Audit re-2026-05-26 P0 (stats/gemini/F-001) limitation:
+                # stage3_df was built via dropna across [TARGET + survivors],
+                # so the kept rows are NOT a contiguous daily series — gaps
+                # exist wherever any column was NaN. HAC `maxlags=7` is
+                # therefore "7 rows back" in this non-contiguous index, not
+                # exactly "7 calendar days back". sm.OLS doesn't accept NaN
+                # so we can't reindex the way SARIMAX does. `use_correction=
+                # True` applies the small-sample HAC bias correction
+                # (Andrews 1991), which partially compensates; the
+                # consequence is that the HAC SEs here approximate the
+                # autocorrelation structure rather than measure it exactly.
+                # Materially this is small — Riley's HRV series has ~1-2%
+                # of cells missing per row on average — but the limitation
+                # is intentionally documented for downstream interpretation.
                 full_fit = sm.OLS(y, X_full_const).fit(
-                    cov_type="HAC", cov_kwds={"maxlags": 7}
+                    cov_type="HAC",
+                    cov_kwds={"maxlags": 7, "use_correction": True},
                 )
                 r2_full = float(full_fit.rsquared)
                 stage3_rows = []
@@ -2668,8 +2683,22 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
         return {}
     log.info("Training SARIMAX model…")
     try:
-        hrv_valid = df.dropna(subset=[TARGET]).set_index("calendar_date")
-        hrv_series = hrv_valid[TARGET].copy().astype(float)
+        # Audit re-2026-05-26 P0 (stats/gemini/F-001): keep contiguous daily
+        # frequency so the AR(1) lag and seasonal_7 lag refer to actual 1-day
+        # and 7-day spans. The previous `dropna(subset=[TARGET])` left a row-
+        # ordered series with gaps where HRV was missing; SARIMAX then treated
+        # those gappy rows as consecutive days and biased AR(1) toward 0.
+        # `.asfreq('D')` injects NaN rows at every missing date — the Kalman
+        # filter handles missing observations natively (combined with
+        # enforce_stationarity=False / enforce_invertibility=False below).
+        hrv_indexed = df.set_index(pd.to_datetime(df["calendar_date"]))
+        hrv_indexed = hrv_indexed[~hrv_indexed.index.duplicated(keep="last")]
+        full_idx = pd.date_range(hrv_indexed.index.min(), hrv_indexed.index.max(), freq="D")
+        hrv_valid = hrv_indexed.reindex(full_idx)
+        hrv_series = hrv_valid[TARGET].astype(float).asfreq("D")
+        n_missing_hrv = int(hrv_series.isna().sum())
+        log.info(f"  SARIMAX: {len(hrv_series)} daily rows; "
+                 f"{n_missing_hrv} HRV gaps handled via Kalman filter")
 
         # Exogenous: top features with sufficient coverage.
         # Shift by 1 day so that HRV[N] is modelled using features[N-1].
@@ -2685,7 +2714,8 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                       and f != TARGET
                       and hrv_valid[f].notna().mean() >= 0.2][:7]
         log.info(f"  SARIMAX exog features ({len(exog_feats)}): {exog_feats}")
-        original_exog = hrv_valid[exog_feats].copy().ffill().bfill() if exog_feats else None
+        original_exog = (hrv_valid[exog_feats].copy().ffill().bfill().asfreq("D")
+                          if exog_feats else None)
         # Shift forward 1 row: exog for row N = original feature values from row N-1.
         # Audit P1 contract assertion (paired with the full-data forecast fix
         # below): for k >= 1, exog.iloc[k] must equal original_exog.iloc[k-1].
