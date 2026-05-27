@@ -15,6 +15,12 @@
 -- /status banner filters gap_type='travel'; analytical consumers can read
 -- the full view including DST artifacts via SELECT * directly.
 --
+-- v3 (audit re-2026-05-26, F-010): offset-minute conversions use ROUND on
+-- numeric to avoid the ::int seconds-truncation that happens pre-division
+-- when EXTRACT(EPOCH ...)::int / 60 is written. For minute-aligned IANA
+-- offsets the values are identical; this is defensive against sub-minute
+-- garbage input.
+--
 -- One row per disagreeing cycle. /status reads this view and surfaces a
 -- yellow banner with a one-click prompt to add the entry.
 --
@@ -30,21 +36,21 @@ WITH whoop_inferred AS (
         wc.start_time,
         wc.end_time,
         wc.timezone_offset,
-        (
-            SELECT EXTRACT(EPOCH FROM (
+        ROUND(
+            EXTRACT(EPOCH FROM (
                 (wc.start_time AT TIME ZONE pds.tz_for_instant(wc.start_time)) -
                 (wc.start_time AT TIME ZONE 'UTC')
-            ))::int / 60
-        ) AS log_offset_minutes_at_start,
+            ))::numeric / 60.0
+        )::int AS log_offset_minutes_at_start,
         CASE WHEN wc.end_time IS NOT NULL THEN
-            (
-                SELECT EXTRACT(EPOCH FROM (
+            ROUND(
+                EXTRACT(EPOCH FROM (
                     (wc.end_time AT TIME ZONE pds.tz_for_instant(wc.end_time)) -
                     (wc.end_time AT TIME ZONE 'UTC')
-                ))::int / 60
-            )
+                ))::numeric / 60.0
+            )::int
         ELSE NULL END AS log_offset_minutes_at_end,
-        EXTRACT(EPOCH FROM wc.timezone_offset::interval)::int / 60
+        ROUND(EXTRACT(EPOCH FROM wc.timezone_offset::interval)::numeric / 60.0)::int
             AS source_offset_minutes,
         pds.tz_for_instant(wc.start_time) AS resolved_tz
     FROM pds.whoop_cycles wc

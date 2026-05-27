@@ -47,7 +47,9 @@ DECLARE
     mins       INT;
 BEGIN
     IF diff IS NULL THEN RETURN NULL; END IF;
-    total_min := EXTRACT(EPOCH FROM diff)::INT / 60;
+    -- Audit re-2026-05-26 P2 (F-008): ROUND on numeric (not ::INT truncate)
+    -- so sub-minute inputs round to the nearest minute rather than always-down.
+    total_min := ROUND(EXTRACT(EPOCH FROM diff)::numeric / 60.0)::int;
     IF total_min >= 0 THEN sign_char := '+'; ELSE sign_char := '-'; END IF;
     abs_min := abs(total_min);
     hours   := abs_min / 60;

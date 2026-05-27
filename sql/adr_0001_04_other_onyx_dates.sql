@@ -245,15 +245,19 @@ BEGIN
      ORDER BY effective_from DESC
      LIMIT 1;
 
+    -- Audit re-2026-05-26 P2 (F-007): distinguish explicit-NY ('user_tz_log_et')
+    -- from non-NY ('user_tz_log') from no-log-row ('default_et_fallback').
+    -- Previously the explicit-NY case was indistinguishable from non-NY in
+    -- onyx_tz_source.
     IF log_tz IS NOT NULL AND log_tz <> 'America/New_York' THEN
         NEW.onyx_local_date := (noon_et AT TIME ZONE log_tz)::date;
         NEW.onyx_tz_source  := 'user_tz_log';
+    ELSIF log_tz = 'America/New_York' THEN
+        NEW.onyx_local_date := NEW.cycle_date;
+        NEW.onyx_tz_source  := 'user_tz_log_et';
     ELSE
         NEW.onyx_local_date := NEW.cycle_date;
-        NEW.onyx_tz_source  := CASE WHEN log_tz IS NOT NULL
-                                    THEN 'user_tz_log'   -- explicit NY hit
-                                    ELSE 'default_et_fallback'
-                               END;
+        NEW.onyx_tz_source  := 'default_et_fallback';
     END IF;
     RETURN NEW;
 END;
@@ -360,15 +364,17 @@ BEGIN
              ORDER BY effective_from DESC
              LIMIT 1;
 
+            -- Audit re-2026-05-26 P2 (F-007): same label distinction as
+            -- habit_journal's fallback above.
             IF log_tz IS NOT NULL AND log_tz <> 'America/New_York' THEN
                 NEW.onyx_local_date := (noon_et AT TIME ZONE log_tz)::date;
                 NEW.onyx_tz_source  := 'user_tz_log';
+            ELSIF log_tz = 'America/New_York' THEN
+                NEW.onyx_local_date := NEW.cycle_date;
+                NEW.onyx_tz_source  := 'user_tz_log_et';
             ELSE
                 NEW.onyx_local_date := NEW.cycle_date;
-                NEW.onyx_tz_source  := CASE WHEN log_tz IS NOT NULL
-                                            THEN 'user_tz_log'
-                                            ELSE 'default_et_fallback'
-                                       END;
+                NEW.onyx_tz_source  := 'default_et_fallback';
             END IF;
         END;
     END IF;

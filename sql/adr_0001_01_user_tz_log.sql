@@ -96,22 +96,35 @@ COMMENT ON FUNCTION pds.tz_for_instant(TIMESTAMPTZ) IS
 -- of that sleep. Plays / supplements / meals / journals during waking hours
 -- usually fall inside an adjacent cycle's range, so this is the most-
 -- authoritative TZ source available without manual user_tz_log entries.
+-- Audit re-2026-05-26 P2 (F-004): widen the cycle anchor. Midday/daytime
+-- events fall OUTSIDE any sleep cycle [start_time, end_time) window. Fall
+-- back to the nearest cycle within ±6h so they still get a per-cycle offset
+-- (a midday event sits between the evening's just-ended cycle and the
+-- upcoming bedtime — either is a good TZ signal). NULL only when no cycle
+-- is within ±6h, at which point the caller falls through to user_tz_log.
 CREATE OR REPLACE FUNCTION pds.cycle_offset_for_instant(ts TIMESTAMPTZ)
 RETURNS TEXT
 LANGUAGE sql
 STABLE
 AS $$
-    SELECT timezone_offset
-      FROM pds.whoop_cycles
-     WHERE ts >= start_time
-       AND (end_time IS NULL OR ts < end_time)
-       AND timezone_offset IS NOT NULL
-     ORDER BY start_time DESC
-     LIMIT 1;
+    SELECT timezone_offset FROM (
+        SELECT
+            timezone_offset,
+            (ts >= start_time AND (end_time IS NULL OR ts < end_time)) AS in_window,
+            abs(extract(epoch from (start_time - ts))) AS dist_sec
+          FROM pds.whoop_cycles
+         WHERE timezone_offset IS NOT NULL
+           AND (
+                (ts >= start_time AND (end_time IS NULL OR ts < end_time))
+                OR abs(extract(epoch from (start_time - ts))) <= 6 * 60 * 60
+           )
+    ) candidates
+    ORDER BY in_window DESC, dist_sec ASC
+    LIMIT 1;
 $$;
 
 COMMENT ON FUNCTION pds.cycle_offset_for_instant(TIMESTAMPTZ) IS
-'Per ADR-0001 D3 tier 2: returns the WHOOP cycle.timezone_offset when ts is in [start_time, end_time). NULL otherwise — caller falls through to user_tz_log.';
+'Per ADR-0001 D3 tier 2: returns the WHOOP cycle.timezone_offset for ts. Prefers cycles whose [start, end) bracket ts; falls back to the nearest cycle within ±6h so midday events still get an offset. NULL when no cycle is within ±6h — caller falls through to user_tz_log.';
 
 -- ---------------------------------------------------------------------------
 -- 3. pds.derive_onyx_dates — pure derivation function
