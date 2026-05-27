@@ -88,10 +88,15 @@ WITH all_behavioral_dates AS (
     SELECT calendar_date FROM pds.garmin_daily_summary WHERE calendar_date IS NOT NULL
 )
 SELECT
+    -- Spine date exposed as calendar_date + onyx_behavioral_date (both
+    -- names accurately describe what's held). Audit re-2026-05-26 P3
+    -- dropped the onyx_et_date / onyx_local_date aliases because they
+    -- were misleading — they suggested per-row ET/local projection but
+    -- always equalled the behavioral spine. For real ET/local semantics
+    -- per source, JOIN the source table and read its onyx_et_date /
+    -- onyx_local_date columns directly.
     s.calendar_date,
     s.calendar_date AS onyx_behavioral_date,
-    s.calendar_date AS onyx_et_date,
-    s.calendar_date AS onyx_local_date,
 
     -- Garmin Daily Summary
     gds.total_steps, gds.total_distance_meters, gds.floors_ascended, gds.floors_descended,
