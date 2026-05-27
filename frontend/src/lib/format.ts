@@ -49,8 +49,11 @@ export function whoopSleepDay(startTime: string | null | undefined): string {
  *     divide by 1000 first. Passing raw WHOOP `_milli` values here renders
  *     durations 1000× too large.
  */
-export function formatDuration(seconds: number | null): string {
-  if (!seconds) return "—";
+export function formatDuration(seconds: number | null | undefined): string {
+  // Explicit null/NaN guard rather than `!seconds` so a legitimate 0-second
+  // duration (e.g. a logged "rest" or "warm-up only") renders as "0m" instead
+  // of being swallowed as "—".
+  if (seconds == null || Number.isNaN(seconds)) return "—";
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   if (h > 0) return `${h}h ${m}m`;
@@ -81,9 +84,9 @@ export function formatShortDuration(seconds: number | null): string {
   return `${m}:${pad(sec)}`;
 }
 
-export function formatDistance(meters: number | null): string {
-  if (!meters) return "—";
-  const miles = meters / 1609.344;
+export function formatDistance(meters: number | null | undefined): string {
+  if (meters == null || Number.isNaN(meters)) return "—";
+  const miles = meters / METERS_PER_MILE;
   if (miles >= 0.5) return `${miles.toFixed(1)} mi`;
   return `${Math.round(meters)} m`;
 }
@@ -93,6 +96,7 @@ export function formatDistance(meters: number | null): string {
 // from one source. format.ts is the canonical formatter per CLAUDE.md.
 // Conversions are precise; rounding/formatting happens at display time only,
 // so weekly / monthly averages don't accumulate per-cycle rounding error.
+export const METERS_PER_MILE = 1609.344;  // International mile (exact)
 export const KJ_PER_KCAL = 4.184;
 export const KG_PER_LB = 0.45359237;
 export const LB_PER_KG = 1 / KG_PER_LB;
@@ -112,9 +116,11 @@ export function formatKcal(kj: number | null | undefined): string {
   return `${Math.round(kjToKcal(kj))} kcal`;
 }
 
-export function formatPace(speedMps: number | null): string {
-  if (!speedMps || speedMps === 0) return "—";
-  const minPerMile = 1609.344 / speedMps / 60;
+export function formatPace(speedMps: number | null | undefined): string {
+  // Pace is undefined at zero speed (division by zero) — keep the 0-rejection
+  // intentional, but separate the null/NaN guard so the intent is explicit.
+  if (speedMps == null || Number.isNaN(speedMps) || speedMps === 0) return "—";
+  const minPerMile = METERS_PER_MILE / speedMps / 60;
   const mins = Math.floor(minPerMile);
   const secs = Math.round((minPerMile - mins) * 60);
   if (secs === 60) return `${mins + 1}:00 /mi`;
