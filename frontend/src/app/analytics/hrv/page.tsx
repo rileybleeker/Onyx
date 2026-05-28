@@ -329,6 +329,14 @@ export default function HrvAnalysisPage() {
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
   const [range, setRange] = useState<Range>("30d");
+  // Global FDR filter — when ON (default), every chart whose rows carry a
+  // `passes_fdr` flag hides the non-survivors. BH-FDR is applied per family
+  // in the pipeline (causal binary/continuous, journal/habit/supplement
+  // impact, nutrition correlations); a row that fails its family's q-value
+  // threshold is almost always noise dressed up as significance by the raw
+  // t-test, so the safe default is "don't show it." Toggle OFF surfaces all
+  // rows with non-survivors at 0.5 opacity so the contrast is still legible.
+  const [fdrOnly, setFdrOnly] = useState(true);
   const isMobile = useIsMobile();
 
   // Mobile-aware sizing for horizontal bar charts. On a ~320px wide mobile
@@ -558,6 +566,17 @@ export default function HrvAnalysisPage() {
           </p>
         </div>
         <div className="flex items-center gap-3">
+          <button
+            onClick={() => setFdrOnly(v => !v)}
+            title={fdrOnly
+              ? "Showing only rows that survive BH-FDR per family. Click to also show non-survivors at 0.5 opacity."
+              : "Showing all rows; non-FDR-significant rows are dimmed to 0.5 opacity. Click to hide them entirely."}
+            className={`px-2.5 py-1 rounded-[3px] text-[11px] font-mono border transition-colors ${fdrOnly
+              ? "bg-emerald-500/10 border-emerald-500/40 text-emerald-300"
+              : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"}`}
+          >
+            FDR-significant only {fdrOnly ? "✓" : "○"}
+          </button>
           <RangeFilter value={range} onChange={setRange} />
           {!hasData && (
             <div className="text-sm text-text-tertiary bg-amber-500/10 border border-amber-500/20 rounded px-3 py-1.5">
@@ -998,13 +1017,30 @@ export default function HrvAnalysisPage() {
           source="WELCH'S T-TEST"
           info="How each logged behavior affects your HRV the following night. A +15ms bar means your HRV was 15ms higher, on average, on nights after you did that thing. Green = helps recovery; red = hurts it. Method: Welch's two-sample t-test (unequal variance) on HRV distributions for Yes vs No nights. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise. Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Yes-nights / No-nights) that fed the comparison.">
           {journalImpact.length > 0 ? (() => {
-            const ji = journalImpact.slice(0, 12).map((d: any) => ({
+            const filtered = fdrOnly
+              ? journalImpact.filter((d: any) => d.passes_fdr === true)
+              : journalImpact;
+            const ji = filtered.slice(0, 12).map((d: any) => ({
               ...d,
+              displayLabel: `${d.passes_fdr ? "✓ " : ""}${d.label}`,
               errorRange: [
                 Math.max(0, (d.diff_ms ?? 0) - (d.ci_low ?? 0)),
                 Math.max(0, (d.ci_high ?? 0) - (d.diff_ms ?? 0)),
               ],
             }));
+            if (ji.length === 0) {
+              return (
+                <div className="h-[260px] flex items-center justify-center px-6">
+                  <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+                    No journal behaviors survive BH-FDR at q&lt;0.05.{" "}
+                    <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
+                      Show all
+                    </button>{" "}
+                    to see the unfiltered Welch ranking.
+                  </p>
+                </div>
+              );
+            }
             return (
             <ResponsiveContainer width="100%" height={Math.max(360, ji.length * 30)}>
               <BarChart data={ji} layout="vertical"
@@ -1013,22 +1049,25 @@ export default function HrvAnalysisPage() {
                 <XAxis type="number" tick={axisTick}
                        tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
                        label={axisLabel("HRV Δ (ms) · whiskers = 95% CI", "x")} />
-                <YAxis type="category" dataKey="label" width={axisW.long}
+                <YAxis type="category" dataKey="displayLabel" width={axisW.long}
                        tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, _n: any, p: any) => {
                            const d = p?.payload ?? {};
                            const lo = Number(d.ci_low ?? 0).toFixed(1);
                            const hi = Number(d.ci_high ?? 0).toFixed(1);
+                           const fdr = d.passes_fdr ? " · FDR✓" : "";
                            return [
-                             `${Number(v).toFixed(1)} ms · 95% CI [${lo}, ${hi}] · d=${(d.cohen_d ?? 0).toFixed(2)} · n=${d.n_yes}/${d.n_no}`,
+                             `${Number(v).toFixed(1)} ms · 95% CI [${lo}, ${hi}] · d=${(d.cohen_d ?? 0).toFixed(2)} · n=${d.n_yes}/${d.n_no}${fdr}`,
                              "HRV Δ",
                            ];
                          }} />
                 <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
                 <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
                   {ji.map((d: any, i: number) => (
-                    <Cell key={i} fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.8} />
+                    <Cell key={i}
+                          fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"}
+                          fillOpacity={d.passes_fdr ? 0.8 : 0.5} />
                   ))}
                   <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
                             stroke="#f4f4f5" direction="x" />
@@ -1047,13 +1086,30 @@ export default function HrvAnalysisPage() {
           source="WELCH'S T-TEST"
           info="Same statistical treatment as Journal Behavior Impact, applied to Notion-managed habits (from /habits). A +Xms bar means HRV averaged X ms higher on the night following days you completed that habit. Method: Welch's two-sample t-test on next-night HRV for Yes vs No nights. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise (and for habits with few completed-nights the whiskers will be wide — that's the chart honestly signaling 'trust this less'). Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Y completed-nights, N skipped-nights). Habits need at least 5 Yes-nights and 5 No-nights before they appear (the t-test isn't meaningful with smaller groups). Add more habits or toggle them more consistently at /habits to populate this view.">
           {habitImpact.length > 0 ? (() => {
-            const hi = habitImpact.slice(0, 12).map((d: any) => ({
+            const filtered = fdrOnly
+              ? habitImpact.filter((d: any) => d.passes_fdr === true)
+              : habitImpact;
+            const hi = filtered.slice(0, 12).map((d: any) => ({
               ...d,
+              displayLabel: `${d.passes_fdr ? "✓ " : ""}${d.label}`,
               errorRange: [
                 Math.max(0, (d.diff_ms ?? 0) - (d.ci_low ?? 0)),
                 Math.max(0, (d.ci_high ?? 0) - (d.diff_ms ?? 0)),
               ],
             }));
+            if (hi.length === 0) {
+              return (
+                <div className="h-[260px] flex items-center justify-center px-6">
+                  <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+                    No habits survive BH-FDR at q&lt;0.05 yet.{" "}
+                    <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
+                      Show all
+                    </button>{" "}
+                    to see the unfiltered Welch ranking.
+                  </p>
+                </div>
+              );
+            }
             return (
             <ResponsiveContainer width="100%" height={Math.max(260, hi.length * 36)}>
               <BarChart data={hi} layout="vertical"
@@ -1062,22 +1118,25 @@ export default function HrvAnalysisPage() {
                 <XAxis type="number" tick={axisTick}
                        tickFormatter={v => `${v > 0 ? "+" : ""}${v.toFixed(0)}`}
                        label={axisLabel("HRV Δ (ms) · whiskers = 95% CI", "x")} />
-                <YAxis type="category" dataKey="label" width={axisW.long}
+                <YAxis type="category" dataKey="displayLabel" width={axisW.long}
                        tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, _n: any, p: any) => {
                            const d = p?.payload ?? {};
                            const lo = Number(d.ci_low ?? 0).toFixed(1);
                            const hi = Number(d.ci_high ?? 0).toFixed(1);
+                           const fdr = d.passes_fdr ? " · FDR✓" : "";
                            return [
-                             `${Number(v).toFixed(1)} ms · 95% CI [${lo}, ${hi}] · d=${(d.cohen_d ?? 0).toFixed(2)} · n=${d.n_yes}/${d.n_no}`,
+                             `${Number(v).toFixed(1)} ms · 95% CI [${lo}, ${hi}] · d=${(d.cohen_d ?? 0).toFixed(2)} · n=${d.n_yes}/${d.n_no}${fdr}`,
                              "HRV Δ",
                            ];
                          }} />
                 <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
                 <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
                   {hi.map((d: any, i: number) => (
-                    <Cell key={i} fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.8} />
+                    <Cell key={i}
+                          fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"}
+                          fillOpacity={d.passes_fdr ? 0.8 : 0.5} />
                   ))}
                   <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
                             stroke="#f4f4f5" direction="x" />
@@ -1105,14 +1164,30 @@ export default function HrvAnalysisPage() {
           info="How each supplement compound (rolled up across products via FDA UNII code, e.g. Vitamin C from a multi + standalone tablet sum into one row) affects HRV the following night. Method: Welch's two-sample t-test (unequal variance) on next-night HRV for Yes vs No nights. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise (compounds with fewer tracked nights will show wide whiskers — that's the chart honestly signaling 'trust this less'). Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Y compound-taken nights, N compound-skipped nights). BH-FDR corrected across compounds. Yes/No framing chosen because most compounds are taken at a near-constant dose, so the actionable question is 'does taking it help?' — a continuous test would collapse on near-zero amount variance. ⚠ marks compounds with fewer than 20 Yes or No nights — estimates are unstable. Associational, not causal."
         >
           {supplementImpact.length > 0 ? (() => {
-            const si = supplementImpact.slice(0, 14).map((d: any) => ({
+            const filtered = fdrOnly
+              ? supplementImpact.filter((d: any) => d.passes_fdr === true)
+              : supplementImpact;
+            const si = filtered.slice(0, 14).map((d: any) => ({
               ...d,
-              displayLabel: `${d.low_n ? "⚠ " : ""}${d.compound}`,
+              displayLabel: `${d.low_n ? "⚠ " : ""}${d.passes_fdr ? "✓ " : ""}${d.compound}`,
               errorRange: [
                 Math.max(0, (d.diff_ms ?? 0) - (d.ci_low ?? 0)),
                 Math.max(0, (d.ci_high ?? 0) - (d.diff_ms ?? 0)),
               ],
             }));
+            if (si.length === 0) {
+              return (
+                <div className="h-[260px] flex items-center justify-center px-6">
+                  <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+                    No supplements survive BH-FDR at q&lt;0.05.{" "}
+                    <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
+                      Show all
+                    </button>{" "}
+                    to see the unfiltered Welch ranking.
+                  </p>
+                </div>
+              );
+            }
             return (
             <ResponsiveContainer width="100%" height={Math.max(360, si.length * 30)}>
               <BarChart data={si} layout="vertical"
@@ -1128,8 +1203,9 @@ export default function HrvAnalysisPage() {
                            const d = p?.payload ?? {};
                            const lo = Number(d.ci_low ?? 0).toFixed(1);
                            const hi = Number(d.ci_high ?? 0).toFixed(1);
+                           const fdr = d.passes_fdr ? " · FDR✓" : "";
                            return [
-                             `${Number(v).toFixed(1)} ms · 95% CI [${lo}, ${hi}] · d=${(d.cohen_d ?? 0).toFixed(2)} · n=${d.n_yes}/${d.n_no}`,
+                             `${Number(v).toFixed(1)} ms · 95% CI [${lo}, ${hi}] · d=${(d.cohen_d ?? 0).toFixed(2)} · n=${d.n_yes}/${d.n_no}${fdr}`,
                              "HRV Δ",
                            ];
                          }} />
@@ -1137,7 +1213,7 @@ export default function HrvAnalysisPage() {
                 <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
                   {si.map((d: any, i: number) => (
                     <Cell key={i} fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"}
-                          fillOpacity={d.low_n ? 0.35 : 0.8} />
+                          fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.8 : 0.5)} />
                   ))}
                   <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
                             stroke="#f4f4f5" direction="x" />
@@ -1163,36 +1239,60 @@ export default function HrvAnalysisPage() {
             source="SPEARMAN ρ"
             info="What it shows: for compounds where the dose actually varies, whether 'more = better/worse?' Only includes compounds with ≥3 distinct non-zero doses (constant-dose compounds appear in the Yes/No chart above instead). Method: Spearman ρ — a rank-based correlation between daily total amount and next-night HRV; robust to outliers and skewed distributions; handles non-linear monotonic dose-response curves; scores range −1.0 to +1.0. Tooltip: ρ is the correlation; p is the p-value (chance the link is random noise — <0.05 is the conventional significance threshold); n is the number of nights; doses is the count of distinct non-zero dose levels seen. BH-FDR corrected across compounds. ⚠ marks rows with n<20 — estimates are unstable. Associational, not causal."
           >
-            <ResponsiveContainer width="100%" height={Math.max(240, supplementDoseResponse.slice(0, 12).length * 30)}>
-              <BarChart data={supplementDoseResponse.slice(0, 12).map(d => ({
-                            ...d,
-                            displayLabel: `${d.low_n ? "⚠ " : ""}${d.compound}${d.unit ? ` (${d.unit})` : ""}`,
-                         }))}
-                        layout="vertical"
-                        margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
-                <CartesianGrid {...gridStyle} horizontal={false} />
-                <XAxis type="number" tick={axisTick} domain={[-1, 1]}
-                       tickFormatter={v => v.toFixed(2)}
-                       label={axisLabel("Spearman ρ (dose vs HRV)", "x")} />
-                <YAxis type="category" dataKey="displayLabel" width={axisW.xlong}
-                       tick={<WrappedYAxisTick maxCharsPerLine={chars.xlong} fontSize={10} />} />
-                <Tooltip {...chartTooltip}
-                         formatter={(v: any, _n: any, p: any) => {
-                           const d = p?.payload ?? {};
-                           return [
-                             `${Number(v).toFixed(3)} (p=${(d.p_value ?? 0).toFixed(3)}, n=${d.n}, doses=${d.n_distinct_doses})`,
-                             "Spearman ρ",
-                           ];
-                         }} />
-                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
-                <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
-                  {supplementDoseResponse.slice(0, 12).map((d, i) => (
-                    <Cell key={i} fill={d.spearman_r > 0 ? "#06b6d4" : "#f97316"}
-                          fillOpacity={d.low_n ? 0.35 : 0.8} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+            {(() => {
+              // dose-response rows may or may not carry passes_fdr depending
+              // on pipeline version; treat missing as "FDR unknown" — when
+              // the global FDR filter is ON we hide only rows that EXPLICITLY
+              // failed (passes_fdr === false), so older payloads still render.
+              const dr = (fdrOnly
+                ? supplementDoseResponse.filter((d: any) => d.passes_fdr !== false)
+                : supplementDoseResponse
+              ).slice(0, 12);
+              const drDecorated = dr.map((d: any) => ({
+                ...d,
+                displayLabel: `${d.low_n ? "⚠ " : ""}${d.passes_fdr === true ? "✓ " : ""}${d.compound}${d.unit ? ` (${d.unit})` : ""}`,
+              }));
+              if (drDecorated.length === 0) {
+                return (
+                  <p className="text-[11px] text-text-tertiary py-6 text-center px-6">
+                    No dose-response rows survive BH-FDR at q&lt;0.05.{" "}
+                    <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
+                      Show all
+                    </button>.
+                  </p>
+                );
+              }
+              return (
+                <ResponsiveContainer width="100%" height={Math.max(240, drDecorated.length * 30)}>
+                  <BarChart data={drDecorated} layout="vertical"
+                            margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
+                    <CartesianGrid {...gridStyle} horizontal={false} />
+                    <XAxis type="number" tick={axisTick} domain={[-1, 1]}
+                           tickFormatter={v => v.toFixed(2)}
+                           label={axisLabel("Spearman ρ (dose vs HRV)", "x")} />
+                    <YAxis type="category" dataKey="displayLabel" width={axisW.xlong}
+                           tick={<WrappedYAxisTick maxCharsPerLine={chars.xlong} fontSize={10} />} />
+                    <Tooltip {...chartTooltip}
+                             formatter={(v: any, _n: any, p: any) => {
+                               const d = p?.payload ?? {};
+                               const fdr = d.passes_fdr === true ? " · FDR✓"
+                                         : d.passes_fdr === false ? " · FDR✗" : "";
+                               return [
+                                 `${Number(v).toFixed(3)} (p=${(d.p_value ?? 0).toFixed(3)}, n=${d.n}, doses=${d.n_distinct_doses}${fdr})`,
+                                 "Spearman ρ",
+                               ];
+                             }} />
+                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                    <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                      {drDecorated.map((d: any, i: number) => (
+                        <Cell key={i} fill={d.spearman_r > 0 ? "#06b6d4" : "#f97316"}
+                              fillOpacity={d.low_n ? 0.3 : (d.passes_fdr === false ? 0.5 : 0.8)} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              );
+            })()}
           </ChartCard>
         )}
       </div>
@@ -1206,9 +1306,30 @@ export default function HrvAnalysisPage() {
           source="SPEARMAN ρ"
           info="What it shows: how strongly each daily nutrient total moves with HRV the following morning. A bar near +1.0 means that nutrient almost always rises when your HRV rises; near −1.0 means the opposite; near 0 means no consistent link. Method: Spearman ρ — a rank-based correlation that's robust to outliers and skewed distributions; scores range −1.0 to +1.0. Rank-based so occasional restaurant blowouts don't dominate and non-linear monotonic effects still show up — e.g. sodium at 1g vs 8g. Tooltip: ρ is the correlation; p is the p-value (chance the link is random noise — <0.05 is the conventional significance threshold); n is the number of nights. BH-FDR corrected across nutrients. ⚠ marks rows with n<20 — estimates unstable. Associational, not causal."
         >
-          {nutritionImpact.length > 0 ? (
-            <ResponsiveContainer width="100%" height={Math.max(280, nutritionImpact.length * 38)}>
-              <BarChart data={nutritionImpact.map(d => ({ ...d, displayLabel: `${d.low_n ? "⚠ " : ""}${d.label}` }))}
+          {nutritionImpact.length > 0 ? (() => {
+            const filtered = fdrOnly
+              ? nutritionImpact.filter((d: any) => d.passes_fdr === true)
+              : nutritionImpact;
+            const ni = filtered.map((d: any) => ({
+              ...d,
+              displayLabel: `${d.low_n ? "⚠ " : ""}${d.passes_fdr ? "✓ " : ""}${d.label}`,
+            }));
+            if (ni.length === 0) {
+              return (
+                <div className="h-[260px] flex items-center justify-center px-6">
+                  <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+                    No nutrients survive BH-FDR at q&lt;0.05.{" "}
+                    <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
+                      Show all
+                    </button>{" "}
+                    to see the unfiltered Spearman ranking.
+                  </p>
+                </div>
+              );
+            }
+            return (
+            <ResponsiveContainer width="100%" height={Math.max(280, ni.length * 38)}>
+              <BarChart data={ni}
                         layout="vertical"
                         margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                 <CartesianGrid {...gridStyle} horizontal={false} />
@@ -1220,21 +1341,23 @@ export default function HrvAnalysisPage() {
                 <Tooltip {...chartTooltip}
                          formatter={(v: any, _n: any, p: any) => {
                            const d = p?.payload ?? {};
+                           const fdr = d.passes_fdr ? " · FDR✓" : "";
                            return [
-                             `${Number(v).toFixed(3)} (p=${(d.p_value ?? 0).toFixed(3)}, n=${d.n})`,
+                             `${Number(v).toFixed(3)} (p=${(d.p_value ?? 0).toFixed(3)}, n=${d.n}${fdr})`,
                              "Spearman ρ",
                            ];
                          }} />
                 <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
                 <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
-                  {nutritionImpact.map((d, i) => (
+                  {ni.map((d: any, i: number) => (
                     <Cell key={i} fill={d.spearman_r > 0 ? "#22c55e" : "#ef4444"}
-                          fillOpacity={d.low_n ? 0.35 : 0.8} />
+                          fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.8 : 0.5)} />
                   ))}
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
-          ) : (
+            );
+          })() : (
             <div className="h-[260px] flex items-center justify-center">
               <p className="text-[11px] text-text-tertiary">No nutrition data — run hrv_analysis.py</p>
             </div>
@@ -1530,8 +1653,11 @@ export default function HrvAnalysisPage() {
         info="Each bar is the doubly-robust AIPW estimate of the average treatment effect on tomorrow's HRV. Error bars are 95% CIs from the influence-function variance. ⚠ marks treatments with fewer than 20 days in either arm. ⊕ marks treatments where the autocorrelation-aware block-bootstrap CI is meaningfully wider than the IF CI (ratio >1.5×) — the BB CI is the more honest answer for those rows; check the tooltip. A pale-green or pale-red bar means IF said the effect is significant but the BB CI crosses zero (the temporal structure of the residuals doesn't support the IF call). Bars whose IF CI stays positive (saturated green) or negative (saturated red) are robust causal evidence under the stated confounder set. The naive estimate is in the comparison table below."
       >
         {causalBinary.length > 0 ? (() => {
-          const top = causalBinary
-            .filter((d: any) => Number.isFinite(d.aipw_ate))
+          const finiteRows = causalBinary.filter((d: any) => Number.isFinite(d.aipw_ate));
+          const fdrFiltered = fdrOnly
+            ? finiteRows.filter((d: any) => d.passes_fdr === true)
+            : finiteRows;
+          const top = fdrFiltered
             .slice(0, 20)
             .map((d: any) => {
               const ratio = Number(d.aipw_bb_width_ratio);
@@ -1546,7 +1672,7 @@ export default function HrvAnalysisPage() {
                 ...d,
                 bbDivergent,
                 bbHidesSig,
-                displayLabel: `${d.low_n ? "⚠ " : ""}${bbDivergent ? "⊕ " : ""}${d.label}`,
+                displayLabel: `${d.low_n ? "⚠ " : ""}${bbDivergent ? "⊕ " : ""}${d.passes_fdr ? "✓ " : ""}${d.label}`,
                 errorRange: [
                   Math.max(0, (d.aipw_ate ?? 0) - (d.aipw_ci_low ?? 0)),
                   Math.max(0, (d.aipw_ci_high ?? 0) - (d.aipw_ate ?? 0)),
@@ -1558,6 +1684,19 @@ export default function HrvAnalysisPage() {
                     : d.aipw_ate > 0 ? "#22c55e" : "#ef4444",
               };
             });
+          if (top.length === 0) {
+            return (
+              <div className="h-[260px] flex items-center justify-center px-6">
+                <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+                  No causal binary treatments survive BH-FDR at q&lt;0.05.{" "}
+                  <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
+                    Show all
+                  </button>{" "}
+                  to see the unfiltered ranking (non-FDR rows at 0.5 opacity).
+                </p>
+              </div>
+            );
+          }
           return (
             <ResponsiveContainer width="100%" height={Math.max(420, top.length * 32)}>
               <BarChart data={top} layout="vertical"
@@ -1576,15 +1715,17 @@ export default function HrvAnalysisPage() {
                              ? ` · BB CI [${Number(d.aipw_ci_low_bb).toFixed(1)}, ${Number(d.aipw_ci_high_bb).toFixed(1)}] (×${Number(d.aipw_bb_width_ratio).toFixed(2)})`
                              : "";
                            const ev = Number.isFinite(d.e_value) ? d.e_value.toFixed(2) : "—";
+                           const fdr = d.passes_fdr ? " · FDR✓" : " · FDR✗";
                            return [
-                             `${Number(v).toFixed(1)} ms — CI ${ci}${bbCi}, E-val ${ev}, n=${d.n_treated}/${d.n_control}, family=${d.family}`,
+                             `${Number(v).toFixed(1)} ms — CI ${ci}${bbCi}, E-val ${ev}, n=${d.n_treated}/${d.n_control}, family=${d.family}${fdr}`,
                              "AIPW ATE",
                            ];
                          }} />
                 <ReferenceLine x={0} stroke="rgba(255,255,255,0.15)" />
                 <Bar dataKey="aipw_ate" radius={[0, 3, 3, 0]}>
                   {top.map((d: any, i: number) => (
-                    <Cell key={i} fill={d.barColor} fillOpacity={d.low_n ? 0.35 : 0.85} />
+                    <Cell key={i} fill={d.barColor}
+                          fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.85 : 0.5)} />
                   ))}
                   <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
                             stroke="#f4f4f5" direction="x" />
@@ -1714,8 +1855,11 @@ export default function HrvAnalysisPage() {
           info="Continuous treatments (calories, strain, training load, steps) are binarized at their personal median, giving an 'above your usual' contrast that's directly comparable to the binary treatments. Same AIPW machinery, same pre-treatment confounders. ⚠ marks small-arm treatments. ⊕ marks treatments where the autocorrelation-aware block-bootstrap CI is meaningfully wider than the IF CI (ratio >1.5×) — trust the BB CI for those; check the tooltip. Pale bars = IF said significant but BB CI crosses zero (treat as inconclusive). Note that median-split loses dose information — for full dose-response curves see the Supplement Dose-Response chart above."
         >
           {causalContinuous.length > 0 ? (() => {
-            const top = causalContinuous
-              .filter((d: any) => Number.isFinite(d.aipw_ate))
+            const finiteRows = causalContinuous.filter((d: any) => Number.isFinite(d.aipw_ate));
+            const fdrFiltered = fdrOnly
+              ? finiteRows.filter((d: any) => d.passes_fdr === true)
+              : finiteRows;
+            const top = fdrFiltered
               .slice(0, 12)
               .map((d: any) => {
                 const ratio = Number(d.aipw_bb_width_ratio);
@@ -1728,7 +1872,7 @@ export default function HrvAnalysisPage() {
                   ...d,
                   bbDivergent,
                   bbHidesSig,
-                  displayLabel: `${d.low_n ? "⚠ " : ""}${bbDivergent ? "⊕ " : ""}${d.label}`,
+                  displayLabel: `${d.low_n ? "⚠ " : ""}${bbDivergent ? "⊕ " : ""}${d.passes_fdr ? "✓ " : ""}${d.label}`,
                   errorRange: [
                     Math.max(0, (d.aipw_ate ?? 0) - (d.aipw_ci_low ?? 0)),
                     Math.max(0, (d.aipw_ci_high ?? 0) - (d.aipw_ate ?? 0)),
@@ -1740,6 +1884,19 @@ export default function HrvAnalysisPage() {
                       : d.aipw_ate > 0 ? "#22c55e" : "#ef4444",
                 };
               });
+            if (top.length === 0) {
+              return (
+                <div className="h-[260px] flex items-center justify-center px-6">
+                  <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+                    No continuous treatments survive BH-FDR at q&lt;0.05.{" "}
+                    <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
+                      Show all
+                    </button>{" "}
+                    to see the unfiltered ranking.
+                  </p>
+                </div>
+              );
+            }
             return (
               <ResponsiveContainer width="100%" height={Math.max(280, top.length * 36)}>
                 <BarChart data={top} layout="vertical"
@@ -1758,15 +1915,17 @@ export default function HrvAnalysisPage() {
                                ? ` · BB CI [${Number(d.aipw_ci_low_bb).toFixed(1)}, ${Number(d.aipw_ci_high_bb).toFixed(1)}] (×${Number(d.aipw_bb_width_ratio).toFixed(2)})`
                                : "";
                              const ev = Number.isFinite(d.e_value) ? d.e_value.toFixed(2) : "—";
+                             const fdr = d.passes_fdr ? " · FDR✓" : " · FDR✗";
                              return [
-                               `${Number(v).toFixed(1)} ms — CI ${ci}${bbCi}, E-val ${ev}, n=${d.n_treated}/${d.n_control}`,
+                               `${Number(v).toFixed(1)} ms — CI ${ci}${bbCi}, E-val ${ev}, n=${d.n_treated}/${d.n_control}${fdr}`,
                                "AIPW ATE",
                              ];
                            }} />
                   <ReferenceLine x={0} stroke="rgba(255,255,255,0.15)" />
                   <Bar dataKey="aipw_ate" radius={[0, 3, 3, 0]}>
                     {top.map((d: any, i: number) => (
-                      <Cell key={i} fill={d.barColor} fillOpacity={d.low_n ? 0.35 : 0.85} />
+                      <Cell key={i} fill={d.barColor}
+                            fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.85 : 0.5)} />
                     ))}
                     <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
                               stroke="#f4f4f5" direction="x" />
