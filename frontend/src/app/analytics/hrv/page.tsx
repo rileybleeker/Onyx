@@ -195,12 +195,19 @@ async function getHrvAnalysisResults(resultType: string, resultKey?: string) {
 async function getHistoricalHrv(days = 180) {
   const since = new Date();
   since.setDate(since.getDate() - days);
+  // ADR-0001 Phase 3: HRV is the morning-after measurement that "belongs to"
+  // the prior night's behaviors, so the trend line should sit on the
+  // bedtime-day (onyx_behavioral_date), not the watch-local clock-day. The
+  // difference is invisible most nights, but a pre-midnight bedtime shifts
+  // calendar_date one day earlier than the behavioral attribution; charts
+  // that key on calendar_date drift relative to the prediction/causal
+  // panels which are already behavioral-day-keyed.
   const { data } = await supabase
     .from("daily_health_matrix_behavioral")
-    .select("calendar_date,whoop_hrv_rmssd")
-    .gte("calendar_date", since.toISOString().split("T")[0])
+    .select("onyx_behavioral_date,whoop_hrv_rmssd")
+    .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
     .not("whoop_hrv_rmssd", "is", null)
-    .order("calendar_date", { ascending: true });
+    .order("onyx_behavioral_date", { ascending: true });
   return data ?? [];
 }
 
@@ -211,15 +218,19 @@ async function getHistoricalHrv(days = 180) {
 // so we don't drop nights where bed_temp is present but room_temp isn't.
 // Per-row null-check happens client-side per selected axis pair.
 async function getEnvDoseResponseData() {
+  // ADR-0001 Phase 3: order by onyx_behavioral_date so the sweet-spot
+  // buckets pair each temperature reading with the HRV/recovery measured
+  // the morning of the same bedtime-day, not the clock-day calendar slot
+  // that pre-midnight bedtimes would mis-attribute by ±1 day.
   const { data } = await supabase
     .from("daily_health_matrix_behavioral")
     .select(
-      "calendar_date,eight_sleep_room_temp,eight_sleep_bed_temp,whoop_hrv_rmssd," +
+      "onyx_behavioral_date,eight_sleep_room_temp,eight_sleep_bed_temp,whoop_hrv_rmssd," +
       "whoop_recovery_score,whoop_sleep_efficiency,whoop_deep_sleep_milli"
     )
     .or("eight_sleep_room_temp.not.is.null,eight_sleep_bed_temp.not.is.null")
     .not("whoop_hrv_rmssd", "is", null)
-    .order("calendar_date", { ascending: true });
+    .order("onyx_behavioral_date", { ascending: true });
   return data ?? [];
 }
 
@@ -484,10 +495,12 @@ export default function HrvAnalysisPage() {
     ? []
     : (rawDrivers?.journal ?? []);
 
-  // HRV trend data with 7-day rolling avg
+  // HRV trend data with 7-day rolling avg. X-axis date is the behavioral
+  // day per ADR-0001 Phase 3 — pre-midnight bedtimes now plot under the
+  // bedtime-day, matching the prediction/causal panels.
   const hrvValues = historicalHrv.map(d => Number(d.whoop_hrv_rmssd));
   const trendData = historicalHrv.map((d, i) => ({
-    date: fmtDate(d.calendar_date),
+    date: fmtDate(d.onyx_behavioral_date),
     hrv: Number(d.whoop_hrv_rmssd),
     rolling7: rolling7(hrvValues, i),
   }));
@@ -507,7 +520,7 @@ export default function HrvAnalysisPage() {
   );
   const prophetData = [
     ...historicalHrv.slice(-30).map(d => ({
-      date: fmtDate(d.calendar_date),
+      date: fmtDate(d.onyx_behavioral_date),
       actual: Number(d.whoop_hrv_rmssd),
       forecast: null, lower: null, upper: null, sarimax: null,
     })),
