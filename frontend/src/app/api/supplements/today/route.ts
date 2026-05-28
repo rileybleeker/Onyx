@@ -39,9 +39,8 @@ export async function GET() {
       .order("intake_time", { ascending: false, nullsFirst: false }),
     supabase
       .from("supplement_intake_by_compound")
-      .select("compound_key,ingredient_group,ingredient_name,unii_code,category,unit,total_amount,total_doses,source_product_count")
+      .select("compound_key,ingredient_group,ingredient_names,unii_code,categories,unit_class,unit,source_units,total_amount,total_doses,source_product_count")
       .eq("calendar_date", today)
-      .order("category")
       .order("ingredient_group"),
   ]);
 
@@ -67,9 +66,18 @@ export async function GET() {
     full_name: productNames[i.product_id]?.full_name ?? null,
   }));
 
+  // The view returns ingredient_names/categories as arrays (multiple source
+  // ingredients can map to one UNII). Collapse to the singular scalars the UI
+  // renders, while passing the arrays through for any future multi-value use.
+  const compounds = (compoundsRes.data ?? []).map((c) => ({
+    ...c,
+    category: Array.isArray(c.categories) ? (c.categories[0] ?? null) : (c.categories ?? null),
+    ingredient_name: Array.isArray(c.ingredient_names) ? (c.ingredient_names[0] ?? null) : (c.ingredient_names ?? null),
+  }));
+
   return NextResponse.json({
     date: today,
     intakes: decoratedIntakes,
-    compounds: compoundsRes.data ?? [],
+    compounds,
   });
 }
