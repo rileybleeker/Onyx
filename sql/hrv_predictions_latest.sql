@@ -5,16 +5,22 @@
 -- row exists. Readers (dashboard, notebooks, chat tools) use this view so they
 -- don't have to reason about run-history or model_version freshness.
 --
--- The earlier definition excluded backtest rows entirely. That broke the
--- dashboard's Prediction-vs-Actual chart, because the daily prediction job
--- only writes ONE row per day (tomorrow's forecast). All historical h=1
--- forecasts had model_version='backtest_initial' (a misleading legacy name —
--- they were genuine day-ahead forecasts, just made before the *_v1 naming
--- convention was introduced). The blanket exclusion swept all 57 of them out.
+-- Historical context: an earlier definition excluded backtest rows entirely.
+-- That broke the dashboard's Prediction-vs-Actual chart, because the daily
+-- prediction job only writes ONE row per day (tomorrow's forecast). Pre-naming-
+-- convention live forecasts had been written with model_version='backtest_initial'
+-- (a misleading legacy name — they were genuine day-ahead forecasts) and were
+-- swept out by the blanket exclusion. Those rows have since been relabeled to
+-- 'legacy_v0' via migration audit_re_2026_05_26_relabel_backtest_initial; the
+-- relabel only touched h=1 rows whose created_at was within 2 days of
+-- prediction_date, so the ~10K true-backtest rows (h=1..7 from walk-forward
+-- runs created months after prediction_date) still carry the 'backtest_initial'
+-- label and the CASE WHEN tiebreak below still correctly deprioritizes them.
 --
--- New behaviour: live wins when both exist for the same date; backtest fills
--- the gap when it doesn't. The DISTINCT ON tiebreaker is the CASE expression
--- below, followed by created_at DESC so the most recent run still wins
+-- Behaviour: live wins when both exist for the same date; backtest fills the
+-- gap when it doesn't. The DISTINCT ON tiebreaker is the CASE expression below
+-- (legacy_v0 and live *_v1 share priority 0; backtest_initial gets priority 1
+-- and loses), followed by created_at DESC so the most recent run still wins
 -- within each category.
 --
 -- pds.hrv_predictions keeps every row from every run (multiple rows per
