@@ -50,11 +50,16 @@ export async function getSleepData(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
+  // ADR-0001 Phase 3: sleep is "the night of behavior X", so filter on
+  // onyx_behavioral_date (bedtime-day) rather than garmin's watch-local
+  // calendar_date. The two diverge on pre-midnight bedtimes and TZ shifts.
+  // Each row still carries calendar_date for any display that wants the
+  // watch's labeling.
   const { data, error } = await supabase
     .from("garmin_sleep")
     .select("*")
-    .gte("calendar_date", since.toISOString().split("T")[0])
-    .order("calendar_date", { ascending: true });
+    .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
+    .order("onyx_behavioral_date", { ascending: true });
 
   if (error) throw error;
   return data ?? [];
@@ -340,12 +345,16 @@ export async function getEightSleepTrends(days: number = 30, side: string = "lef
   const since = new Date();
   since.setDate(since.getDate() - days);
 
+  // ADR-0001 Phase 3: filter on the canonical behavioral date (bedtime-day)
+  // rather than Eight Sleep's session date. These usually match but diverge
+  // on pre-midnight bedtimes and TZ-shift days. The /sleep page still
+  // formats display labels off the row's own calendar_date.
   const { data, error } = await supabase
     .from("eight_sleep_trends")
     .select("*")
     .eq("bed_side", side)
-    .gte("calendar_date", since.toISOString().split("T")[0])
-    .order("calendar_date", { ascending: true });
+    .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
+    .order("onyx_behavioral_date", { ascending: true });
 
   if (error) throw error;
   return data ?? [];
@@ -457,14 +466,16 @@ export async function getHealthMatrix(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
-  // Per ADR-0001 D5: HRV/behavior analytics join on onyx_behavioral_date.
-  // pds.daily_health_matrix_behavioral exposes it as `calendar_date`
-  // (same column name retained for downstream compatibility).
+  // ADR-0001 Phase 3: filter/order by onyx_behavioral_date so the window
+  // and ordering use the bedtime-day attribution that the rest of the HRV
+  // pipeline assumes. The view exposes BOTH onyx_behavioral_date and
+  // calendar_date (watch-local clock-day) — `select *` keeps the latter
+  // available for any consumer that still wants clock-day labeling.
   const { data, error } = await supabase
     .from("daily_health_matrix_behavioral")
     .select("*")
-    .gte("calendar_date", since.toISOString().split("T")[0])
-    .order("calendar_date", { ascending: true });
+    .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
+    .order("onyx_behavioral_date", { ascending: true });
 
   if (error) throw error;
   return data ?? [];
