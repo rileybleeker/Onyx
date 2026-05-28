@@ -321,6 +321,7 @@ export default function HrvAnalysisPage() {
   const [causalMeta, setCausalMeta] = useState<any | null>(null);
   const [causalDropped, setCausalDropped] = useState<any[]>([]);
   const [envMatrix, setEnvMatrix] = useState<any[]>([]);
+  const [xgbDiagnostics, setXgbDiagnostics] = useState<any | null>(null);
   // Environment Sweet Spot dual-axis selectors. X axis is which temp sensor
   // to bucket by (Pod room vs bed surface); Y axis is which next-night
   // outcome to plot. Defaults preserve the original chart (room × HRV).
@@ -389,7 +390,8 @@ export default function HrvAnalysisPage() {
       getHrvAnalysisResults("causal", "meta"),
       getHrvAnalysisResults("causal", "dropped_low_n"),
       getEnvDoseResponseData(),
-    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap, suppImp, suppDose, nutImp, hi, hCorr, hShap, cBin, cCont, cDag, cMeta, cDrop, envM]) => {
+      getHrvAnalysisResults("model_diagnostics", "xgboost"),
+    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap, suppImp, suppDose, nutImp, hi, hCorr, hShap, cBin, cCont, cDag, cMeta, cDrop, envM, xgbDiag]) => {
       setTomorrowPred(tomorrow);
       setAccuracy(acc);
       setMetrics(m);
@@ -447,6 +449,18 @@ export default function HrvAnalysisPage() {
         try { setCausalDropped(JSON.parse(cDrop.result_json)); } catch {}
       }
       setEnvMatrix(envM);
+      // model_diagnostics/xgboost row carries feature_condition_number +
+      // shap_unstable from the latest train_xgboost run; the banner above
+      // Prediction Drivers reads it to flag SHAP attributions as unreliable
+      // when the training matrix is heavily collinear.
+      if (xgbDiag?.result_json) {
+        try {
+          const parsed = typeof xgbDiag.result_json === "string"
+            ? JSON.parse(xgbDiag.result_json)
+            : xgbDiag.result_json;
+          setXgbDiagnostics(parsed);
+        } catch {}
+      }
     }).catch(console.error).finally(() => setLoading(false));
   }, [range]);
 
@@ -720,6 +734,20 @@ export default function HrvAnalysisPage() {
         <ChartCard collapsible title="Prediction Drivers (Today)" subtitle="What's driving tomorrow's forecast right now"
           source="XGBOOST · SHAP"
           info="Shows what's pushing tomorrow's prediction up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes. Journal behaviors appear in a separate section below because they're Yes/No entries — they have smaller numerical impact than continuous metrics like heart rate, but they're still part of the model.">
+          {xgbDiagnostics?.shap_unstable && (
+            <div className="mb-3 bg-amber-500/10 border border-amber-500/30 rounded-[4px] px-3 py-2 text-[11px] leading-relaxed text-amber-200">
+              <strong className="text-amber-100">High feature collinearity detected</strong>
+              {xgbDiagnostics.feature_condition_number != null && (
+                <> (condition number ={" "}
+                <span className="font-mono">
+                  {Number(xgbDiagnostics.feature_condition_number).toFixed(1)}
+                </span>
+                , threshold {xgbDiagnostics.threshold ?? 30})</>
+              )} — SHAP attributions may over-credit one of several near-duplicate features.
+              Treat similar-meaning drivers as substitutes rather than independent signals.
+              A VIF prefilter would tighten the explanation.
+            </div>
+          )}
           {topDrivers.length > 0 ? (
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={topDrivers.slice(0, 10)} layout="vertical"

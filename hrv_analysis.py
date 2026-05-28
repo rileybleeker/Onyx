@@ -3736,7 +3736,8 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
                            dm_test: list | None = None,
                            error_modes: list | None = None,
                            error_modes_habits: list | None = None,
-                           causal_results: dict | None = None) -> None:
+                           causal_results: dict | None = None,
+                           xgb_diagnostics: dict | None = None) -> None:
     """Store pre-computed analysis results for the frontend."""
     rows: list[dict] = []
 
@@ -3843,6 +3844,28 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
                 "result_key": "shap_habit",
                 "result_json": habit_fi_list,
             })
+
+    # XGBoost training diagnostics — surfaces the condition number of the
+    # standardized feature matrix that train_xgboost computes (audit commit
+    # 93a7323). When cond(X) > 30, SHAP / permutation importance can over-
+    # credit collinear feature siblings; the frontend reads this row to
+    # render a caveat banner above the Prediction Drivers panel.
+    if xgb_diagnostics:
+        cond_num = xgb_diagnostics.get("feature_condition_number")
+        # JSON can't represent NaN/Inf — coerce them so upsert doesn't fail.
+        if cond_num is None or (isinstance(cond_num, float) and not np.isfinite(cond_num)):
+            cond_num_json = None
+        else:
+            cond_num_json = float(cond_num)
+        rows.append({
+            "result_type": "model_diagnostics",
+            "result_key": "xgboost",
+            "result_json": {
+                "feature_condition_number": cond_num_json,
+                "shap_unstable": bool(xgb_diagnostics.get("shap_unstable", False)),
+                "threshold": 30,  # Belsley et al. 1980 cutoff
+            },
+        })
 
     # Stage 3 standardized OLS results (audit fix 2.C)
     if "stage3_ols" in stat_results:
@@ -4196,6 +4219,10 @@ def main() -> None:
         error_modes=eval_results.get("error_modes"),
         error_modes_habits=eval_results.get("error_modes_habits"),
         causal_results=causal_results,
+        xgb_diagnostics={
+            "feature_condition_number": xgb_results.get("feature_condition_number"),
+            "shap_unstable": xgb_results.get("shap_unstable", False),
+        },
     )
 
     # ---------- Run-Manifest Artifact (audit fix 4#38) ----------
