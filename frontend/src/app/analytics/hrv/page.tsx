@@ -192,6 +192,14 @@ async function getHrvAnalysisResults(resultType: string, resultKey?: string) {
   return data?.[0] ?? null;
 }
 
+// hrv_analysis_results.result_json is a jsonb column, so supabase-js returns it
+// already-parsed — calling JSON.parse() on the object throws (silently, via the
+// bare catch blocks below) and the chart renders empty. Pre-2026-05-26 rows were
+// double-encoded strings (the JSONB-audit bug), so still handle the string case.
+function parseJsonb(v: unknown): any {
+  return typeof v === "string" ? JSON.parse(v) : (v ?? null);
+}
+
 async function getHistoricalHrv(days = 180) {
   const since = new Date();
   since.setDate(since.getDate() - days);
@@ -408,56 +416,56 @@ export default function HrvAnalysisPage() {
       setMetrics(m);
       setHistoricalHrv(hist);
       if (corr?.result_json) {
-        try { setCorrelations(JSON.parse(corr.result_json).slice(0, 15)); } catch {}
+        try { setCorrelations(parseJsonb(corr.result_json).slice(0, 15)); } catch {}
       }
       if (ji?.result_json) {
-        try { setJournalImpact(JSON.parse(ji.result_json).slice(0, 15)); } catch {}
+        try { setJournalImpact(parseJsonb(ji.result_json).slice(0, 15)); } catch {}
       }
       if (fi?.result_json) {
-        try { setFeatureImportance(JSON.parse(fi.result_json).slice(0, 10)); } catch {}
+        try { setFeatureImportance(parseJsonb(fi.result_json).slice(0, 10)); } catch {}
       }
       if (jCorr?.result_json) {
-        try { setJournalCorrelations(JSON.parse(jCorr.result_json)); } catch {}
+        try { setJournalCorrelations(parseJsonb(jCorr.result_json)); } catch {}
       }
       if (jShap?.result_json) {
-        try { setJournalShap(JSON.parse(jShap.result_json)); } catch {}
+        try { setJournalShap(parseJsonb(jShap.result_json)); } catch {}
       }
       setResiduals(res);
       setProphetForecast(prophet);
       setSarimaxForecast(sarimax);
       setWorkoutGap(wkGap);
       if (suppImp?.result_json) {
-        try { setSupplementImpact(JSON.parse(suppImp.result_json)); } catch {}
+        try { setSupplementImpact(parseJsonb(suppImp.result_json)); } catch {}
       }
       if (suppDose?.result_json) {
-        try { setSupplementDoseResponse(JSON.parse(suppDose.result_json)); } catch {}
+        try { setSupplementDoseResponse(parseJsonb(suppDose.result_json)); } catch {}
       }
       if (nutImp?.result_json) {
-        try { setNutritionImpact(JSON.parse(nutImp.result_json)); } catch {}
+        try { setNutritionImpact(parseJsonb(nutImp.result_json)); } catch {}
       }
       if (hi?.result_json) {
-        try { setHabitImpact(JSON.parse(hi.result_json)); } catch {}
+        try { setHabitImpact(parseJsonb(hi.result_json)); } catch {}
       }
       if (hCorr?.result_json) {
-        try { setHabitCorrelations(JSON.parse(hCorr.result_json)); } catch {}
+        try { setHabitCorrelations(parseJsonb(hCorr.result_json)); } catch {}
       }
       if (hShap?.result_json) {
-        try { setHabitShap(JSON.parse(hShap.result_json)); } catch {}
+        try { setHabitShap(parseJsonb(hShap.result_json)); } catch {}
       }
       if (cBin?.result_json) {
-        try { setCausalBinary(JSON.parse(cBin.result_json)); } catch {}
+        try { setCausalBinary(parseJsonb(cBin.result_json)); } catch {}
       }
       if (cCont?.result_json) {
-        try { setCausalContinuous(JSON.parse(cCont.result_json)); } catch {}
+        try { setCausalContinuous(parseJsonb(cCont.result_json)); } catch {}
       }
       if (cDag?.result_json) {
-        try { setCausalDag(JSON.parse(cDag.result_json)); } catch {}
+        try { setCausalDag(parseJsonb(cDag.result_json)); } catch {}
       }
       if (cMeta?.result_json) {
-        try { setCausalMeta(JSON.parse(cMeta.result_json)); } catch {}
+        try { setCausalMeta(parseJsonb(cMeta.result_json)); } catch {}
       }
       if (cDrop?.result_json) {
-        try { setCausalDropped(JSON.parse(cDrop.result_json)); } catch {}
+        try { setCausalDropped(parseJsonb(cDrop.result_json)); } catch {}
       }
       setEnvMatrix(envM);
       // model_diagnostics/xgboost row carries feature_condition_number +
@@ -484,7 +492,7 @@ export default function HrvAnalysisPage() {
   const naiveMetrics = metrics.find(m => m.model === "baseline_naive");
 
   const rawDrivers: any = tomorrowPred?.top_drivers
-    ? (() => { try { return JSON.parse(tomorrowPred.top_drivers); } catch { return null; } })()
+    ? (() => { try { return parseJsonb(tomorrowPred.top_drivers); } catch { return null; } })()
     : null;
   const topDrivers: any[] = Array.isArray(rawDrivers)
     ? rawDrivers
