@@ -516,17 +516,28 @@ export default function HrvAnalysisPage() {
     return { model: m, ...row };
   }).filter(r => r.mae);
 
-  // MAE by horizon (XGBoost vs SARIMAX)
+  // MAE by horizon — all 5 multi-horizon models. Prophet writes h=1 only
+  // (it's a 30-day forecaster, not a per-horizon evaluator) so it's
+  // omitted from this view; see the Model Comparison table for its single
+  // headline number. For each (model × h) cell we pick the *latest*
+  // eval_date so a partial backfill that wrote some horizons today and
+  // others yesterday still composes a coherent row.
+  const HORIZON_MODELS = [
+    { key: "xgboost",           label: "XGBoost",        color: "#3b82f6" },
+    { key: "sarimax",           label: "SARIMAX",        color: "#8b5cf6" },
+    { key: "baseline_naive",    label: "Naive",          color: "#f59e0b" },
+    { key: "baseline_7d_avg",   label: "7d Avg",         color: "#06b6d4" },
+    { key: "baseline_dow",      label: "Day-of-week",    color: "#a1a1aa" },
+  ] as const;
   const horizonData = [1, 2, 3, 4, 5, 6, 7].map(h => {
-    const xgbH = metrics.find(m => m.model === "xgboost" && m.horizon_days === h);
-    const sarimaxH = metrics.find(m => m.model === "sarimax" && m.horizon_days === h);
-    const naiveH = metrics.find(m => m.model === "baseline_naive" && m.horizon_days === h);
-    return {
-      horizon: `t+${h}`,
-      xgboost: xgbH?.mae ? Number(xgbH.mae) : null,
-      sarimax: sarimaxH?.mae ? Number(sarimaxH.mae) : null,
-      naive: naiveH?.mae ? Number(naiveH.mae) : null,
-    };
+    const row: Record<string, number | string | null> = { horizon: `t+${h}` };
+    for (const { key } of HORIZON_MODELS) {
+      const rows = metrics.filter(m => m.model === key && m.horizon_days === h);
+      const latest = rows.sort((a, b) =>
+        new Date(b.eval_date).getTime() - new Date(a.eval_date).getTime())[0];
+      row[key] = latest?.mae != null ? Number(latest.mae) : null;
+    }
+    return row;
   });
 
   // Residual histogram
@@ -857,25 +868,42 @@ export default function HrvAnalysisPage() {
 
         {/* Accuracy by Horizon */}
         <ChartCard collapsible title="Accuracy by Forecast Horizon"
-                   subtitle="MAE (ms) — lower is better"
-                   info="Accuracy drops the further ahead you predict — this shows how much. Each bar is the average miss in ms for that day. 'Naive' just repeats yesterday's HRV as the guess. If the model can't beat that, it's not actually learning anything.">
-          <ResponsiveContainer width="100%" height={260}>
-            <BarChart data={horizonData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="horizon" tick={axisTick} label={axisLabel("forecast horizon (days)", "x")} height={50} />
-              <YAxis tick={axisTick} width={55} label={axisLabel("MAE (ms)", "y")} />
-              <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={legendStyle} />
-              <Bar dataKey="xgboost" name="XGBoost" fill="#3b82f6" radius={[3, 3, 0, 0]} />
-              <Bar dataKey="naive" name="Naive" fill="#f59e0b" radius={[3, 3, 0, 0]} />
-              {horizonData.some(d => d.sarimax) && (
-                <Bar dataKey="sarimax" name="SARIMAX" fill="#8b5cf6" radius={[3, 3, 0, 0]} />
-              )}
-            </BarChart>
-          </ResponsiveContainer>
-          {horizonData.every(d => !d.xgboost) && (
-            <p className="text-[11px] text-text-tertiary text-center mt-2">No horizon metrics yet</p>
-          )}
+                   subtitle="MAE (ms) — lower is better · 5 models × 7 horizons"
+                   info="Accuracy drops the further ahead you predict — this shows how much. Each grouped bar set is the average miss in ms for that horizon. Two real models (XGBoost, SARIMAX) sit alongside three trivial baselines: Naive (repeat yesterday), 7d Avg (last 7-day mean), and Day-of-week (same DOW last week). If the real models can't beat the cheapest baselines, they aren't actually learning anything. Prophet is excluded because it only writes h=1 — it's a long-horizon forecaster, not a per-horizon evaluator.">
+          {(() => {
+            const activeModels = HORIZON_MODELS.filter(m =>
+              horizonData.some(d => d[m.key] != null)
+            );
+            if (activeModels.length === 0) {
+              return (
+                <div className="h-[260px] flex items-center justify-center">
+                  <p className="text-[11px] text-text-tertiary">No horizon metrics yet — run hrv_analysis.py</p>
+                </div>
+              );
+            }
+            return (
+              <>
+                <ResponsiveContainer width="100%" height={280}>
+                  <BarChart data={horizonData} margin={{ top: 4, right: 8, left: 0, bottom: 8 }}>
+                    <CartesianGrid {...gridStyle} />
+                    <XAxis dataKey="horizon" tick={axisTick}
+                           label={axisLabel("forecast horizon (days)", "x")} height={50} />
+                    <YAxis tick={axisTick} width={55} label={axisLabel("MAE (ms)", "y")} />
+                    <Tooltip {...chartTooltip}
+                             formatter={(v: any, name: any) => [
+                               v == null ? "—" : `${Number(v).toFixed(1)} ms`,
+                               String(name),
+                             ]} />
+                    <Legend wrapperStyle={legendStyle} />
+                    {activeModels.map(m => (
+                      <Bar key={m.key} dataKey={m.key} name={m.label}
+                           fill={m.color} radius={[2, 2, 0, 0]} />
+                    ))}
+                  </BarChart>
+                </ResponsiveContainer>
+              </>
+            );
+          })()}
         </ChartCard>
       </div>
 
