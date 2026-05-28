@@ -1,58 +1,70 @@
 -- =============================================================================
--- daily_health_matrix_behavioral: expose Eight Sleep main-session columns
+-- daily_health_matrix_behavioral: behavioral-spine matrix with main-only sleep
 -- =============================================================================
 -- Closes Notion roadmap "Bland-Altman: switch to main-only columns for
--- apples-to-apples cross-device comparisons"
--- (page 369bf5b4-4bf2-8149-803f-d81ff6b9f417).
+-- apples-to-apples cross-device comparisons" (page 369bf5b4-4bf2-8149-803f-d81ff6b9f417).
 --
--- Why: cross-device BA currently pairs WHOOP main-only sleep against Eight
--- Sleep nap-inclusive totals. The /bland-altman page reads this view to
--- compute the difference-vs-mean plots; without main-only Eight Sleep
--- columns the comparison silently biases toward "Eight Sleep shows more
--- sleep" on nap days. Now that pds.eight_sleep_trends carries both
--- nap-inclusive totals AND *_main_session_seconds columns (commit 501bd5b)
--- we can expose the main-only fields alongside the existing totals and
--- let the BA page pair them symmetrically.
+-- Production state captured 2026-05-27. Source-prefixed columns (audit P1 G4),
+-- per-behavioral-date helper views for Garmin sleep / Garmin HRV / WHOOP main
+-- cycle (refactor from LATERAL subqueries), and main-only Eight Sleep
+-- durations appended at the end so the /bland-altman page can pair WHOOP
+-- main-only sleep against Eight Sleep main-only sleep symmetrically. WHOOP
+-- main is already enforced via ws.is_nap = false; Garmin main is enforced via
+-- pds.garmin_sleep_best_per_behavioral_date which picks one row per night by
+-- overall_sleep_score DESC.
 --
--- The existing eight_sleep_duration_sec / eight_sleep_deep_sec /
--- eight_sleep_rem_sec stay (nap-inclusive totals, used elsewhere). The new
--- _main suffix columns are the apples-to-apples partners for WHOOP and
--- Garmin main-session-only durations.
+-- Migration history (latest first):
+--   audit_re_2026_05_27_add_eight_sleep_main_cols — appended 5 _main_sec cols
+--   audit_p1_g3_dhm_behavioral_drop_gds_spine     — (claimed) GDS out of UNION
+--   audit_p1_g4_recovery_vs_pace_rename_hrv_column — renamed hrv_rmssd_milli
+--
+-- NOTE on garmin_daily_summary in the spine: audit P1 G3 was supposed to
+-- remove GDS from the UNION (its calendar_date is watch-local and can drift
+-- from onyx_behavioral_date on travel days). The committed file removed it
+-- but the deployed view still includes it; the migration is pending. Per
+-- ADR-0001 D5 the spine should be canonically behavioral.
 -- =============================================================================
 
--- Drop CASCADE because we're widening the column list — CREATE OR REPLACE
--- can only widen, but the JSON shape changes affect downstream readers
--- that snapshot the column set, so we re-grant after recreate.
-DROP VIEW IF EXISTS pds.daily_health_matrix_behavioral CASCADE;
-
-CREATE VIEW pds.daily_health_matrix_behavioral AS
-WITH all_behavioral_dates AS (
-    SELECT onyx_behavioral_date AS calendar_date FROM pds.whoop_cycles
-        WHERE onyx_behavioral_date IS NOT NULL
-    UNION SELECT onyx_behavioral_date FROM pds.garmin_activities
-        WHERE onyx_behavioral_date IS NOT NULL
-    UNION SELECT onyx_behavioral_date FROM pds.garmin_sleep
-        WHERE onyx_behavioral_date IS NOT NULL
-    UNION SELECT onyx_behavioral_date FROM pds.garmin_hrv
-        WHERE onyx_behavioral_date IS NOT NULL
-    UNION SELECT onyx_behavioral_date FROM pds.eight_sleep_trends
-        WHERE onyx_behavioral_date IS NOT NULL
-    UNION SELECT onyx_behavioral_date FROM pds.myfitnesspal_nutrition
-        WHERE onyx_behavioral_date IS NOT NULL
-    UNION SELECT onyx_behavioral_date FROM pds.meal_events
-        WHERE onyx_behavioral_date IS NOT NULL
-    UNION SELECT onyx_behavioral_date FROM pds.supplement_intake
-        WHERE onyx_behavioral_date IS NOT NULL
-    -- garmin_daily_summary intentionally NOT in the spine (audit P1 G3): its
-    -- calendar_date is Garmin watch-local, which can diverge from
-    -- onyx_behavioral_date on travel days. GDS still LEFT JOINs below via
-    -- calendar_date, accepting that travel-day rows may miss GDS data. Per
-    -- ADR-0001 D5 the spine must be canonically behavioral.
-)
-SELECT s.calendar_date,
+CREATE OR REPLACE VIEW pds.daily_health_matrix_behavioral AS
+ WITH all_behavioral_dates AS (
+         SELECT whoop_cycles.onyx_behavioral_date AS calendar_date
+           FROM pds.whoop_cycles
+          WHERE whoop_cycles.onyx_behavioral_date IS NOT NULL
+        UNION
+         SELECT garmin_activities.onyx_behavioral_date
+           FROM pds.garmin_activities
+          WHERE garmin_activities.onyx_behavioral_date IS NOT NULL
+        UNION
+         SELECT garmin_sleep.onyx_behavioral_date
+           FROM pds.garmin_sleep
+          WHERE garmin_sleep.onyx_behavioral_date IS NOT NULL
+        UNION
+         SELECT garmin_hrv.onyx_behavioral_date
+           FROM pds.garmin_hrv
+          WHERE garmin_hrv.onyx_behavioral_date IS NOT NULL
+        UNION
+         SELECT eight_sleep_trends.onyx_behavioral_date
+           FROM pds.eight_sleep_trends
+          WHERE eight_sleep_trends.onyx_behavioral_date IS NOT NULL
+        UNION
+         SELECT myfitnesspal_nutrition.onyx_behavioral_date
+           FROM pds.myfitnesspal_nutrition
+          WHERE myfitnesspal_nutrition.onyx_behavioral_date IS NOT NULL
+        UNION
+         SELECT meal_events.onyx_behavioral_date
+           FROM pds.meal_events
+          WHERE meal_events.onyx_behavioral_date IS NOT NULL
+        UNION
+         SELECT supplement_intake.onyx_behavioral_date
+           FROM pds.supplement_intake
+          WHERE supplement_intake.onyx_behavioral_date IS NOT NULL
+        UNION
+         SELECT garmin_daily_summary.calendar_date
+           FROM pds.garmin_daily_summary
+          WHERE garmin_daily_summary.calendar_date IS NOT NULL
+        )
+ SELECT s.calendar_date,
     s.calendar_date AS onyx_behavioral_date,
-    s.calendar_date AS onyx_et_date,
-    s.calendar_date AS onyx_local_date,
     gds.total_steps,
     gds.total_distance_meters,
     gds.floors_ascended,
@@ -164,18 +176,9 @@ SELECT s.calendar_date,
     es.avg_breath_rate AS eight_sleep_breath_rate,
     es.median_bed_temp AS eight_sleep_bed_temp,
     es.median_room_temp AS eight_sleep_room_temp,
-    -- Nap-inclusive totals (existing — match the Eight Sleep app's daily display)
     es.time_slept_seconds AS eight_sleep_duration_sec,
     es.deep_sleep_seconds AS eight_sleep_deep_sec,
     es.rem_sleep_seconds AS eight_sleep_rem_sec,
-    -- Main-session-only durations (new — apples-to-apples partner for WHOOP
-    -- main-only sleep on the Bland-Altman page and for any cross-device
-    -- comparison that needs to exclude naps).
-    es.time_slept_main_session_seconds AS eight_sleep_duration_main_sec,
-    es.deep_sleep_main_session_seconds AS eight_sleep_deep_main_sec,
-    es.light_sleep_main_session_seconds AS eight_sleep_light_main_sec,
-    es.rem_sleep_main_session_seconds AS eight_sleep_rem_main_sec,
-    es.awake_main_session_seconds AS eight_sleep_awake_main_sec,
     es.toss_and_turns AS eight_sleep_toss_turns,
     mfp.calories AS mfp_calories,
     mfp.protein_g AS mfp_protein_g,
@@ -190,64 +193,46 @@ SELECT s.calendar_date,
     mt.first_meal_hour AS meal_first_hour,
     mt.eating_window_hours AS meal_eating_window_hours,
     mt.meal_event_count,
-    mt.last_meal_to_bedtime_minutes AS meal_last_meal_to_bedtime_min
-FROM all_behavioral_dates s
-LEFT JOIN pds.garmin_daily_summary gds ON gds.calendar_date = s.calendar_date
-LEFT JOIN pds.garmin_stress gstr ON gstr.calendar_date = s.calendar_date
-LEFT JOIN pds.garmin_heart_rate ghr ON ghr.calendar_date = s.calendar_date
-LEFT JOIN pds.garmin_training_status gts ON gts.calendar_date = s.calendar_date
-LEFT JOIN LATERAL (
-    SELECT gs2.*
-    FROM pds.garmin_sleep gs2
-    WHERE gs2.onyx_behavioral_date = s.calendar_date
-      AND gs2.is_nap = false AND gs2.sleep_id IS NOT NULL
-    ORDER BY gs2.overall_sleep_score DESC NULLS LAST
-    LIMIT 1
-) gs ON true
-LEFT JOIN LATERAL (
-    SELECT ghrv2.*
-    FROM pds.garmin_hrv ghrv2
-    WHERE ghrv2.onyx_behavioral_date = s.calendar_date
-    ORDER BY ghrv2.calendar_date DESC NULLS LAST
-    LIMIT 1
-) ghrv ON true
-LEFT JOIN LATERAL (
-    SELECT COUNT(*)::integer AS activity_count,
-        SUM(ga.duration_seconds) AS activity_duration_sec,
-        SUM(ga.distance_meters) AS activity_distance_m,
-        SUM(ga.calories) AS activity_calories,
-        SUM(ga.training_load) AS activity_training_load,
-        MAX(ga.max_heart_rate) AS activity_max_hr,
-        AVG(ga.avg_heart_rate) AS activity_avg_hr
-    FROM pds.garmin_activities ga
-    WHERE ga.onyx_behavioral_date = s.calendar_date
-) acts ON true
-LEFT JOIN LATERAL (
-    SELECT wc2.*
-    FROM pds.whoop_cycles wc2
-    WHERE wc2.onyx_behavioral_date = s.calendar_date
-    ORDER BY (wc2.end_time - wc2.start_time) DESC NULLS LAST, wc2.start_time DESC
-    LIMIT 1
-) wc ON true
-LEFT JOIN LATERAL (
-    SELECT BOOL_OR(wcx.onyx_is_transition_day) AS any_transition
-    FROM pds.whoop_cycles wcx
-    WHERE wcx.onyx_behavioral_date = s.calendar_date
-) tx ON true
-LEFT JOIN pds.whoop_recovery wr ON wr.cycle_id = wc.cycle_id AND wr.score_state = 'SCORED'
-LEFT JOIN pds.whoop_sleep ws ON ws.cycle_id = wc.cycle_id AND ws.is_nap = false AND ws.score_state = 'SCORED'
-LEFT JOIN LATERAL (
-    SELECT COUNT(*)::integer AS whoop_workout_count,
-        SUM(ww.strain) AS whoop_workout_strain,
-        SUM(ww.zone_two_milli) AS whoop_zone2_milli
-    FROM pds.whoop_workouts ww
-    WHERE ww.onyx_behavioral_date = s.calendar_date
-      AND ww.score_state = 'SCORED'
-) wkts ON true
-LEFT JOIN pds.eight_sleep_trends es ON es.onyx_behavioral_date = s.calendar_date
-    AND es.bed_side = 'left'
-LEFT JOIN pds.myfitnesspal_nutrition mfp ON mfp.onyx_behavioral_date = s.calendar_date
-LEFT JOIN pds.meal_timing_daily mt ON mt.calendar_date = s.calendar_date
-ORDER BY s.calendar_date DESC;
+    mt.last_meal_to_bedtime_minutes AS meal_last_meal_to_bedtime_min,
+    -- Main-session-only Eight Sleep durations (added 2026-05-27 for /bland-altman
+    -- apples-to-apples cross-device comparison; WHOOP filters is_nap=false above
+    -- and Garmin uses garmin_sleep_best_per_behavioral_date which also restricts
+    -- to main sleep, so these complete the symmetric main-only triplet).
+    es.time_slept_main_session_seconds AS eight_sleep_duration_main_sec,
+    es.deep_sleep_main_session_seconds AS eight_sleep_deep_main_sec,
+    es.light_sleep_main_session_seconds AS eight_sleep_light_main_sec,
+    es.rem_sleep_main_session_seconds AS eight_sleep_rem_main_sec,
+    es.awake_main_session_seconds AS eight_sleep_awake_main_sec
+   FROM all_behavioral_dates s
+     LEFT JOIN pds.garmin_daily_summary gds ON gds.calendar_date = s.calendar_date
+     LEFT JOIN pds.garmin_stress gstr ON gstr.calendar_date = s.calendar_date
+     LEFT JOIN pds.garmin_heart_rate ghr ON ghr.calendar_date = s.calendar_date
+     LEFT JOIN pds.garmin_training_status gts ON gts.calendar_date = s.calendar_date
+     LEFT JOIN pds.garmin_sleep_best_per_behavioral_date gs ON gs.onyx_behavioral_date = s.calendar_date
+     LEFT JOIN pds.garmin_hrv_latest_per_behavioral_date ghrv ON ghrv.onyx_behavioral_date = s.calendar_date
+     LEFT JOIN pds.whoop_main_cycle_per_behavioral_date wc ON wc.onyx_behavioral_date = s.calendar_date
+     LEFT JOIN LATERAL ( SELECT count(*)::integer AS activity_count,
+            sum(ga.duration_seconds) AS activity_duration_sec,
+            sum(ga.distance_meters) AS activity_distance_m,
+            sum(ga.calories) AS activity_calories,
+            sum(ga.training_load) AS activity_training_load,
+            max(ga.max_heart_rate) AS activity_max_hr,
+            avg(ga.avg_heart_rate) AS activity_avg_hr
+           FROM pds.garmin_activities ga
+          WHERE ga.onyx_behavioral_date = s.calendar_date) acts ON true
+     LEFT JOIN LATERAL ( SELECT bool_or(wcx.onyx_is_transition_day) AS any_transition
+           FROM pds.whoop_cycles wcx
+          WHERE wcx.onyx_behavioral_date = s.calendar_date) tx ON true
+     LEFT JOIN pds.whoop_recovery wr ON wr.cycle_id = wc.cycle_id AND wr.score_state = 'SCORED'::text
+     LEFT JOIN pds.whoop_sleep ws ON ws.cycle_id = wc.cycle_id AND ws.is_nap = false AND ws.score_state = 'SCORED'::text
+     LEFT JOIN LATERAL ( SELECT count(*)::integer AS whoop_workout_count,
+            sum(ww.strain) AS whoop_workout_strain,
+            sum(ww.zone_two_milli) AS whoop_zone2_milli
+           FROM pds.whoop_workouts ww
+          WHERE ww.onyx_behavioral_date = s.calendar_date AND ww.score_state = 'SCORED'::text) wkts ON true
+     LEFT JOIN pds.eight_sleep_trends es ON es.onyx_behavioral_date = s.calendar_date AND es.bed_side = 'left'::text
+     LEFT JOIN pds.myfitnesspal_nutrition mfp ON mfp.onyx_behavioral_date = s.calendar_date
+     LEFT JOIN pds.meal_timing_daily mt ON mt.calendar_date = s.calendar_date
+  ORDER BY s.calendar_date DESC;
 
 GRANT SELECT ON pds.daily_health_matrix_behavioral TO anon, authenticated;

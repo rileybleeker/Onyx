@@ -159,7 +159,13 @@ export default function BlandAltmanPage() {
   const whoopSleep = data.map((d) => d.whoop_sleep_performance);
   const eightSleep = data.map((d) => d.eight_sleep_score);
 
-  const garminHrv = data.map((d) => d.garmin_hrv ? +d.garmin_hrv : null);
+  // Per-night HRV reading from each device's main-sleep session. Garmin
+  // exposes weekly_avg / last_night / 5min_high / baselines on the matrix;
+  // `last_night_avg_ms` is the only one that's a per-night reading directly
+  // comparable to WHOOP's per-cycle hrv_rmssd_milli and Eight Sleep's avg_hrv.
+  // (The view previously surfaced a `garmin_hrv` alias which was removed in
+  // the c0cff10 source-prefixing pass.)
+  const garminHrv = data.map((d) => d.garmin_hrv_last_night ? +d.garmin_hrv_last_night : null);
   const whoopHrv = data.map((d) => d.whoop_hrv_rmssd ? +d.whoop_hrv_rmssd : null);
   const eightHrv = data.map((d) => d.eight_sleep_hrv ? +d.eight_sleep_hrv : null);
 
