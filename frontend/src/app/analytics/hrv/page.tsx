@@ -610,6 +610,12 @@ export default function HrvAnalysisPage() {
           <p className="text-sm text-text-tertiary mt-0.5">
             Predictive modeling · Statistical drivers · {rangeLabel(range)} · {historicalHrv.length} days of data
           </p>
+          <p className="text-[11px] text-text-tertiary/80 mt-1 max-w-2xl leading-relaxed">
+            Driver, impact &amp; causal charts default to <span className="text-emerald-300/90">FDR-significant</span> rows
+            only — relationships that hold up after correcting for the hundreds tested here. Toggle the filter to see
+            everything; the full explanation is in <strong className="text-text-secondary">Models &amp; Methods</strong> at
+            the bottom of the page.
+          </p>
         </div>
         <div className="flex items-center gap-3">
           <button
@@ -2451,6 +2457,27 @@ export default function HrvAnalysisPage() {
         {expandedModels && (
           <div className="px-5 pb-6 border-t border-border-subtle pt-5 space-y-6">
 
+            {/* Statistical significance / FDR — page-wide concept, explained first
+                because the "FDR-significant only" toggle at the top gates most charts. */}
+            <div>
+              <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Statistical Significance</p>
+              <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2 border-l-2 border-emerald-500/40">
+                <div className="flex items-center justify-between">
+                  <span className="text-[12px] font-medium text-text-primary">FDR-significant (Benjamini–Hochberg)</span>
+                  <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">PAGE-WIDE FILTER</span>
+                </div>
+                <p className="text-[11px] text-text-tertiary leading-relaxed">
+                  <strong className="text-text-secondary">The problem it solves:</strong> This page tests <em>hundreds</em> of relationships at once — every journal behavior, habit, supplement, nutrient, and causal treatment against your HRV. At the usual &ldquo;<em>p</em> &lt; 0.05&rdquo; bar, pure chance throws a false positive about 1 time in 20 — so testing ~100 behaviors hands you <em>~5 fake &ldquo;significant&rdquo; findings</em> even if nothing real were there. Chasing those is how you end up acting on noise.
+                </p>
+                <p className="text-[11px] text-text-tertiary leading-relaxed">
+                  <strong className="text-text-secondary">What FDR does:</strong> the Benjamini–Hochberg <em>False Discovery Rate</em> correction re-weighs every raw <em>p</em>-value by how many tests were run, producing a <em>q-value</em>. <strong>q &lt; 0.05</strong> means: of all the rows flagged significant, we expect fewer than 5% to be false. A row is <strong className="text-text-secondary">FDR-significant (✓)</strong> when it clears that bar — i.e. it&apos;s still standing <em>after</em> accounting for everything else we tested, not just impressive on its own.
+                </p>
+                <p className="text-[11px] text-text-tertiary leading-relaxed">
+                  <strong className="text-text-secondary">The toggle at the top of the page:</strong> <code className="font-mono text-[10px]">FDR-significant only</code> defaults to <strong>ON</strong> — it hides rows that look significant on a raw test but don&apos;t survive correction (almost always multiple-comparisons noise). Turn it <strong>OFF</strong> to see the full ranking, with non-survivors dimmed to 0.5 opacity and marked <code className="font-mono text-[10px]">FDR✗</code> in tooltips. Correction is applied <em>per family</em> — causal binary, causal continuous, journal impact, habit impact, supplement impact, and nutrition correlations are each corrected within themselves, so a small family isn&apos;t penalized for a large one.
+                </p>
+              </div>
+            </div>
+
             {/* Primary models */}
             <div>
               <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Prediction Models</p>
@@ -2561,14 +2588,63 @@ export default function HrvAnalysisPage() {
 
                 <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
                   <div className="flex items-center justify-between">
-                    <span className="text-[12px] font-medium text-text-primary">Naive &amp; 7d Avg Baselines</span>
+                    <span className="text-[12px] font-medium text-text-primary">Baselines &amp; MAE</span>
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">BENCHMARKS</span>
                   </div>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What they are:</strong> The simplest possible &ldquo;models&rdquo; — no machine learning involved. Naive predicts tomorrow&apos;s HRV will equal today&apos;s. 7d Avg predicts it will equal the last 7-day mean.
+                    <strong className="text-text-secondary">The baselines:</strong> three dumb &ldquo;models&rdquo; with no machine learning. <em>Naive</em> predicts tomorrow&apos;s HRV = today&apos;s. <em>7-day avg</em> predicts the last 7-day mean. <em>Day-of-week</em> predicts your average for that weekday. Every real model must beat all three to prove it&apos;s actually learning — if XGBoost can&apos;t outperform &ldquo;just copy yesterday,&rdquo; it isn&apos;t useful.
                   </p>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">Why they&apos;re used:</strong> Every real model must beat these to prove it&apos;s actually learning something. If XGBoost can&apos;t outperform &ldquo;just copy yesterday,&rdquo; it isn&apos;t useful.
+                    <strong className="text-text-secondary">MAE &amp; forecast horizon:</strong> <em>MAE</em> (mean absolute error) is the average miss in ms — lower is better. The <em>Accuracy by Forecast Horizon</em> chart plots MAE for each model at horizons <code className="font-mono text-[10px]">h=1</code> (tomorrow) through <code className="font-mono text-[10px]">h=7</code> (a week out); error naturally grows as the horizon lengthens.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Causal inference methods */}
+            <div>
+              <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Causal Inference</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">AIPW (Doubly Robust)</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">CAUSAL ATE</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> Every other chart here answers &ldquo;what&apos;s <em>associated</em> with my HRV?&rdquo; AIPW (Augmented Inverse-Probability Weighting) answers the harder question — &ldquo;what would change my HRV if I actually <em>intervened</em>?&rdquo; — by estimating a behavior&apos;s effect while statistically holding your confounding habits fixed.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Why it&apos;s used:</strong> correlation conflates a behavior with everything it travels with — alcohol nights are also weekend, restaurant, and late nights, so a raw comparison blames alcohol for the whole pile. AIPW adjusts for that lifestyle clustering. &ldquo;Doubly robust&rdquo; = it combines a model for <em>which nights you do the behavior</em> with a model for <em>your HRV</em>, and stays correct if <em>either</em> one is right.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it produces:</strong> the <em>ATE</em> (average treatment effect) in ms — the adjusted next-night HRV change — with a 95% CI. It powers the Causal Effects charts; pale bars = the CI crosses zero (inconclusive).
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">E-value</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">SENSITIVITY</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">What it is:</strong> a robustness score for each causal estimate. It answers: &ldquo;how strong would a <em>hidden</em> factor I&apos;m not measuring have to be to fully explain this result away?&rdquo;
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">How to read it:</strong> higher = more robust. An E-value of <strong>2.5</strong> means an unmeasured confounder would have to be linked to <em>both</em> the behavior and HRV by a risk ratio of 2.5× — a large effect — to overturn the finding. An E-value near <strong>1.0</strong> means a weak lurking variable could erase it, so treat it with caution.
+                  </p>
+                </div>
+
+                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-medium text-text-primary">PSM &amp; Block-Bootstrap CI</span>
+                    <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">CROSS-CHECKS</span>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">PSM (Propensity Score Matching):</strong> a second, independent causal estimator that pairs each &ldquo;did-it&rdquo; night with the most similar &ldquo;didn&apos;t&rdquo; nights (1:3 nearest-neighbor on a logit propensity score) and averages the within-pair HRV gap. When PSM and AIPW agree, the causal read is more trustworthy.
+                  </p>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    <strong className="text-text-secondary">Block-bootstrap CI:</strong> the standard CI assumes nights are independent, but HRV is autocorrelated (today resembles yesterday). The block bootstrap resamples <em>contiguous 7-day blocks</em> to respect that, giving an honest interval. The <code className="font-mono text-[10px]">⊕</code> marker flags treatments where this wider interval disagrees with the naive one — trust the block-bootstrap CI there.
                   </p>
                 </div>
               </div>
