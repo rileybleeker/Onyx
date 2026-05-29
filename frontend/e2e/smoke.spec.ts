@@ -27,6 +27,23 @@ import { test, expect, type Page } from "@playwright/test";
 const RECHARTS_SVG = "svg.recharts-surface";
 const RECHARTS_MARKS = "svg.recharts-surface path";
 
+// Production cold-loads (Vercel function spin-up + Supabase round-trips) can run
+// well past 15s, which was the original source of flakiness — assertions raced
+// the data fetch. Give them room.
+const LOAD_TIMEOUT = 30_000;
+
+/**
+ * Best-effort "data settled" wait. Client data fetches (Supabase queries fired
+ * in useEffect) are normal network requests, so once they go quiet the page has
+ * rendered its final state (data OR empty) and the assertions are deterministic
+ * instead of racing the load. /status polls every 60s and never reaches
+ * networkidle, so we swallow the timeout and fall through to the positive
+ * assertion — never hang.
+ */
+async function settle(page: Page) {
+  await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+}
+
 /**
  * Next.js' production client-side error boundary. If a page throws during
  * render (the class of bug the supplements rename would have been, had it
@@ -73,12 +90,13 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
     page,
   }) => {
     await gotoAuthed(page, "/analytics/hrv");
+    await settle(page);
 
     // The page returns ONLY a skeleton while loading; the heading appears once
     // the fetch resolves, so waiting for it gates "load complete".
     await expect(
       page.getByRole("heading", { name: "HRV Deep Analysis" })
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
     // The HRV Correlates (Historical) chart must actually draw bars. The
     // jsonb-double-parse bug left correlations=[] → the empty branch rendered
@@ -93,7 +111,7 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
     await expect(
       bars.first(),
       "HRV Correlates chart drew no bars"
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
     expect(
       await bars.count(),
       "HRV Correlates chart drew no bars"
@@ -137,9 +155,10 @@ test.describe("Supplements — renamed-view-column regression tripwire", () => {
     );
 
     await gotoAuthed(page, "/supplements");
+    await settle(page);
     await expect(
       page.getByRole("heading", { name: "Supplements", exact: true })
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
     const totalsCard = page
       .locator("div.bg-surface-card")
@@ -158,7 +177,7 @@ test.describe("Supplements — renamed-view-column regression tripwire", () => {
     await expect(
       rows.first(),
       "compound totals table rendered no rows"
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
     expect(
       await rows.count(),
       "compound totals row count does not match /api/supplements/today"
@@ -204,9 +223,13 @@ const PAGES: SmokePage[] = [
     route: "/activities",
     heading: "Activities",
     signal: "charts",
-    // "No activities recorded in this range." is range-windowed (a rest week
-    // can be legitimately empty); only the all-data-empty string is a hard fail.
-    hardEmpty: ["No activities found"],
+    // The activities-list empty-state renders "No activities found" AND "No
+    // activities recorded in this range." together whenever the SELECTED range
+    // has no rows (page.tsx:536) — it's range-dependent, not all-data-empty, so
+    // a quiet week legitimately trips it. Not a hard fail. The training-load /
+    // stress charts (from daily summaries, always present) are the real
+    // data-present tripwire for this page.
+    hardEmpty: [],
   },
   {
     route: "/nutrition",
@@ -256,7 +279,7 @@ async function assertDataPresent(page: Page, signal: Signal) {
     await expect(
       page.locator(RECHARTS_SVG).first(),
       "no recharts chart rendered"
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
     expect(
       await page.locator(RECHARTS_MARKS).count(),
       "charts rendered but drew no data marks"
@@ -268,7 +291,7 @@ async function assertDataPresent(page: Page, signal: Signal) {
     await expect(
       lastSync.first(),
       "no source cards rendered (/api/status likely failed)"
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
     expect(
       await lastSync.count(),
       "too few source cards rendered"
@@ -279,7 +302,7 @@ async function assertDataPresent(page: Page, signal: Signal) {
     await expect(
       items.first(),
       "no journal entries rendered"
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
     expect(await items.count(), "journal list is empty").toBeGreaterThan(0);
   }
 }
@@ -287,10 +310,11 @@ async function assertDataPresent(page: Page, signal: Signal) {
 for (const p of PAGES) {
   test(`${p.route} renders with data and no broken panels`, async ({ page }) => {
     await gotoAuthed(page, p.route, p.finalUrl);
+    await settle(page);
     await expect(
       page.getByText(p.heading, { exact: true }).first(),
       `${p.route} did not render its "${p.heading}" heading`
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
     await assertDataPresent(page, p.signal);
 

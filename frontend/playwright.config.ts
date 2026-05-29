@@ -41,7 +41,12 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: 1,
-  workers: process.env.CI ? 2 : undefined,
+  // All tests hit ONE production deployment, so the bottleneck is server-side,
+  // not local CPU. Capping at 2 workers (local + CI) avoids overloading
+  // cold-start functions with 6 simultaneous page loads — that contention, not
+  // a real bug, caused the heaviest page (/bland-altman) to flake. retries: 1
+  // absorbs the occasional genuine transient blip on top of that.
+  workers: 2,
   reporter: process.env.CI
     ? [["html", { open: "never" }], ["list"]]
     : [["list"]],
