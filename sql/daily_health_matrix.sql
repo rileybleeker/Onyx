@@ -185,7 +185,17 @@ SELECT
   mt.first_meal_hour              AS meal_first_hour,
   mt.eating_window_hours          AS meal_eating_window_hours,
   mt.meal_event_count             AS meal_event_count,
-  mt.last_meal_to_bedtime_minutes AS meal_last_meal_to_bedtime_min
+  mt.last_meal_to_bedtime_minutes AS meal_last_meal_to_bedtime_min,
+
+  -- ── Caffeine timing (pds.caffeine_timing_daily) ───────────────────────────
+  -- Bedtime-anchored caffeine_to_bedtime_min is the primary HRV-pipeline
+  -- feature (monotonic across midnight); the clock-hour fields exist for
+  -- descriptive/UI use. See sql/caffeine_timing_daily.sql for rationale.
+  ct.first_caffeine_hour          AS caffeine_first_hour,
+  ct.last_caffeine_hour           AS caffeine_last_hour,
+  ct.caffeine_window_hours        AS caffeine_window_hours,
+  ct.caffeine_intake_count        AS caffeine_intake_count,
+  ct.last_caffeine_to_bedtime_minutes AS caffeine_to_bedtime_min
 
 FROM pds.garmin_daily_summary gds
 
@@ -274,6 +284,11 @@ LEFT JOIN pds.myfitnesspal_nutrition mfp
 -- closes the day; we just join on the behavioral date directly.
 LEFT JOIN pds.meal_timing_daily mt
   ON mt.calendar_date = gds.calendar_date
+
+-- Caffeine timing — keyed by behavioral day (intake_date in
+-- pds.supplement_intake follows the behavioral-day convention).
+LEFT JOIN pds.caffeine_timing_daily ct
+  ON ct.calendar_date = gds.calendar_date
 
 ORDER BY gds.calendar_date DESC;
 

@@ -166,6 +166,7 @@ export default function NutritionPage() {
   const [editingId, setEditingId] = useState<number | null>(null);
 
   const [eventDate, setEventDate] = useState<string>(defaultEventDate());
+  const [mealKind, setMealKind] = useState<"last_meal" | "first_meal">("last_meal");
   const [customTimeOpen, setCustomTimeOpen] = useState(false);
   const [eventTimeLocal, setEventTimeLocal] = useState<string>("");
   const [notes, setNotes] = useState("");
@@ -207,7 +208,7 @@ export default function NutritionPage() {
         body: JSON.stringify({
           event_date: eventDate,
           event_time: explicitTimeIso ?? new Date().toISOString(),
-          kind: "last_meal",
+          kind: mealKind,
           notes: notes.trim() || undefined,
         }),
       });
@@ -564,6 +565,32 @@ export default function NutritionPage() {
 
             <div className="flex flex-wrap items-center gap-2 mb-3">
               <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
+                Kind
+              </label>
+              <button
+                onClick={() => setMealKind("last_meal")}
+                className={`px-2.5 py-1 text-[11px] font-mono rounded-[4px] border transition-colors ${
+                  mealKind === "last_meal"
+                    ? "bg-[#1DB954]/20 border-[#1DB954]/40 text-text-primary"
+                    : "bg-black/20 border-border-subtle text-text-tertiary hover:text-text-secondary"
+                }`}
+              >
+                last meal
+              </button>
+              <button
+                onClick={() => setMealKind("first_meal")}
+                className={`px-2.5 py-1 text-[11px] font-mono rounded-[4px] border transition-colors ${
+                  mealKind === "first_meal"
+                    ? "bg-[#1DB954]/20 border-[#1DB954]/40 text-text-primary"
+                    : "bg-black/20 border-border-subtle text-text-tertiary hover:text-text-secondary"
+                }`}
+              >
+                first meal
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 mb-3">
+              <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
                 Time
               </label>
               {!customTimeOpen ? (
@@ -621,7 +648,7 @@ export default function NutritionPage() {
               disabled={logging}
               className="w-full px-4 py-3 text-[13px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 disabled:opacity-40 disabled:cursor-not-allowed border border-[#1DB954]/40 rounded-[4px] transition-colors"
             >
-              {logging ? "Saving…" : "Log last meal"}
+              {logging ? "Saving…" : mealKind === "first_meal" ? "Log first meal" : "Log last meal"}
             </button>
           </ChartCard>
 

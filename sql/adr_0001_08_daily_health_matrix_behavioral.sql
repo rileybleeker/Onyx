@@ -223,7 +223,17 @@ SELECT
     mt.first_meal_hour AS meal_first_hour,
     mt.eating_window_hours AS meal_eating_window_hours,
     mt.meal_event_count AS meal_event_count,
-    mt.last_meal_to_bedtime_minutes AS meal_last_meal_to_bedtime_min
+    mt.last_meal_to_bedtime_minutes AS meal_last_meal_to_bedtime_min,
+
+    -- Caffeine Timing (pds.caffeine_timing_daily)
+    -- Bedtime-anchored last_caffeine_to_bedtime_min is the primary feature
+    -- the HRV pipeline reads — monotonic across midnight, unlike the raw
+    -- clock-hour fields. See sql/caffeine_timing_daily.sql for full rationale.
+    ct.first_caffeine_hour AS caffeine_first_hour,
+    ct.last_caffeine_hour AS caffeine_last_hour,
+    ct.caffeine_window_hours AS caffeine_window_hours,
+    ct.caffeine_intake_count AS caffeine_intake_count,
+    ct.last_caffeine_to_bedtime_minutes AS caffeine_to_bedtime_min
 
 FROM all_behavioral_dates s
 LEFT JOIN pds.garmin_daily_summary    gds  ON gds.calendar_date  = s.calendar_date
@@ -277,6 +287,8 @@ LEFT JOIN pds.myfitnesspal_nutrition mfp
     ON mfp.onyx_behavioral_date = s.calendar_date
 LEFT JOIN pds.meal_timing_daily mt
     ON mt.calendar_date = s.calendar_date
+LEFT JOIN pds.caffeine_timing_daily ct
+    ON ct.calendar_date = s.calendar_date
 
 ORDER BY s.calendar_date DESC;
 

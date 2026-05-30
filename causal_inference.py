@@ -320,6 +320,19 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     ("meal_last_meal_to_bedtime_min", "nutrition", "Last meal → bedtime minutes above median", "min"),
     ("meal_eating_window_hours",      "nutrition", "Eating window above median",               "h"),
     ("meal_last_hour",                "nutrition", "Last meal clock hour above median",        "ET hr"),
+    ("meal_first_hour",               "nutrition", "First meal clock hour above median",       "ET hr"),
+
+    # ── Caffeine timing (pds.caffeine_timing_daily, joined into the matrix) ──
+    # caffeine_to_bedtime_min is bedtime-anchored — monotonic across midnight,
+    # mirrors meal_last_meal_to_bedtime_min. Clock-hour fields included so
+    # SHAP/causal can compare "afternoon-only caffeine" vs "evening caffeine"
+    # patterns. Family is 'nutrition' so the same lifestyle-clustering
+    # confounder set (alcohol_lag1, caffeine_lag1, etc.) applies.
+    ("caffeine_to_bedtime_min",       "nutrition", "Last caffeine → bedtime minutes above median", "min"),
+    ("caffeine_last_hour",            "nutrition", "Last caffeine clock hour above median",    "ET hr"),
+    ("caffeine_first_hour",           "nutrition", "First caffeine clock hour above median",   "ET hr"),
+    ("caffeine_window_hours",         "nutrition", "Caffeine intake window above median",      "h"),
+    ("caffeine_intake_count",         "nutrition", "Caffeine intakes per day above median",    None),
     # ADR-0001 Phase B travel treatments — magnitude/recovery
     ("offset_delta_hours",            "travel",    "TZ offset shift magnitude above median",   "h"),
     ("days_since_transition",         "travel",    "Days since last transition above median",  "days"),
