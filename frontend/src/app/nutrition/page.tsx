@@ -174,6 +174,7 @@ export default function NutritionPage() {
   const [editDate, setEditDate] = useState("");
   const [editTime, setEditTime] = useState("");
   const [editNotes, setEditNotes] = useState("");
+  const [editKind, setEditKind] = useState<"last_meal" | "first_meal" | "snack" | "other">("last_meal");
 
   const today = etTodayStr();
   const yesterday = etYesterdayStr();
@@ -230,6 +231,8 @@ export default function NutritionPage() {
     setEditDate(ev.event_date);
     setEditTime(isoToLocalInput(ev.event_time));
     setEditNotes(ev.notes ?? "");
+    const k = ev.kind as "last_meal" | "first_meal" | "snack" | "other";
+    setEditKind(["last_meal", "first_meal", "snack", "other"].includes(k) ? k : "other");
   }
 
   async function saveEdit() {
@@ -243,6 +246,7 @@ export default function NutritionPage() {
           event_id: editingId,
           event_date: editDate,
           event_time: localInputToIso(editTime),
+          kind: editKind,
           notes: editNotes,
         }),
       });
@@ -708,7 +712,7 @@ export default function NutritionPage() {
           {/* Raw events — for editing / deleting */}
           <ChartCard
             title="Recent events"
-            subtitle={`${events.length} events · newest first · tap row to edit`}
+            subtitle={`${events.length} events · newest first`}
           >
             {events.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-4 text-center">
@@ -726,24 +730,24 @@ export default function NutritionPage() {
                         {e.event_date.slice(5)} {formatClockET(e.event_time)}
                       </span>
                       <span className="text-text-primary truncate">
-                        {e.kind === "last_meal" ? "last meal" : e.kind}
+                        {e.kind.replace(/_/g, " ")}
                       </span>
                       {e.notes && (
                         <span className="text-text-tertiary truncate">· {e.notes}</span>
                       )}
                     </div>
-                    <div className="flex items-center gap-2 shrink-0">
+                    <div className="flex items-center gap-1.5 shrink-0">
                       <button
                         onClick={() => startEdit(e)}
-                        className="text-[10px] text-text-tertiary hover:text-text-primary transition-colors"
+                        className="px-2 py-1 text-[10px] font-mono text-text-secondary hover:text-text-primary bg-black/20 hover:bg-black/40 border border-border-subtle rounded-[4px] transition-colors"
                       >
-                        edit
+                        Edit
                       </button>
                       <button
                         onClick={() => deleteEvent(e.event_id)}
-                        className="text-[10px] text-text-tertiary hover:text-red-400 transition-colors"
+                        className="px-2 py-1 text-[10px] font-mono text-red-400/80 hover:text-red-400 bg-black/20 hover:bg-red-500/10 border border-red-500/20 hover:border-red-500/40 rounded-[4px] transition-colors"
                       >
-                        delete
+                        Delete
                       </button>
                     </div>
                   </div>
@@ -1105,6 +1109,26 @@ export default function NutritionPage() {
               >
                 Close
               </button>
+            </div>
+
+            <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
+              Kind
+            </label>
+            <div className="flex flex-wrap gap-1.5 mb-3">
+              {(["last_meal", "first_meal", "snack", "other"] as const).map((k) => (
+                <button
+                  key={k}
+                  onClick={() => setEditKind(k)}
+                  disabled={logging}
+                  className={`px-2.5 py-1 text-[11px] font-mono rounded-[4px] border transition-colors disabled:opacity-40 ${
+                    editKind === k
+                      ? "bg-[#1DB954]/20 border-[#1DB954]/40 text-text-primary"
+                      : "bg-black/20 border-border-subtle text-text-tertiary hover:text-text-secondary"
+                  }`}
+                >
+                  {k.replace(/_/g, " ")}
+                </button>
+              ))}
             </div>
 
             <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
