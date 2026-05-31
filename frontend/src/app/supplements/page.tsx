@@ -106,6 +106,23 @@ export default function SupplementsPage() {
   // Edit-intake modal
   const [editing, setEditing] = useState<EditableIntake | null>(null);
 
+  // Center-screen "logged 👍" confirmation toast. Fires on every successful
+  // intake write (quick-tap, seed+log, custom-product log). pointer-events-none
+  // so it never blocks rapid tapping; the timer resets on each fire so a burst
+  // of taps keeps it on screen until ~1.5s after the last one.
+  const [toast, setToast] = useState<{ msg: string; id: number } | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastSeq = useRef(0);
+  const showToast = useCallback((msg = "logged 👍") => {
+    toastSeq.current += 1;
+    setToast({ msg, id: toastSeq.current });
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 1500);
+  }, []);
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+  }, []);
+
   // Date that quick-tap log buttons attribute the intake to. Default seeded
   // with ET-clock-today as a synchronous best-guess, then overridden on
   // mount via /api/behavioral-today which calls pds.behavioral_today_now()
@@ -258,6 +275,9 @@ export default function SupplementsPage() {
     if (logDateIsToday) {
       setIntakes((prev) => [optimistic, ...prev]);
     }
+    // Optimistic confirmation — matches the optimistic row above. A failed POST
+    // rolls the row back below; the brief toast is an acceptable cost.
+    showToast();
 
     try {
       const res = await fetch("/api/supplements/log-intake", {
@@ -350,6 +370,7 @@ export default function SupplementsPage() {
           }),
         });
         if (!logRes.ok) throw new Error(await logRes.text());
+        showToast();
       }
       await refreshAll();
       setAddOpen(false);
@@ -769,6 +790,7 @@ export default function SupplementsPage() {
               <CustomSupplementFlow
                 logDate={logDate}
                 onBack={() => setCustomMode(false)}
+                onLogged={() => showToast()}
                 onSaved={async () => {
                   await refreshAll();
                   setAddOpen(false);
@@ -928,6 +950,22 @@ export default function SupplementsPage() {
         onClose={() => setScannerOpen(false)}
         onDetected={handleBarcodeDetected}
       />
+
+      {/* Center-screen "logged" confirmation. z above the add-product modal (z-50)
+          so seed+log / custom-product logs flash over it; pointer-events-none so
+          it never intercepts taps. Keyed by id to re-run the fade on every fire. */}
+      {toast && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center pointer-events-none">
+          <div
+            key={toast.id}
+            className="animate-fade-in flex items-center gap-2 px-6 py-4 rounded-[10px] bg-surface-raised/95 border border-[#1DB954]/40 shadow-floating backdrop-blur-sm"
+          >
+            <span className="text-[15px] font-medium text-text-primary tracking-tight">
+              {toast.msg}
+            </span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

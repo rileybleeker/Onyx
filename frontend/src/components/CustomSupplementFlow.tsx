@@ -113,11 +113,13 @@ interface Props {
   logDate: string;
   /** Called after a successful save (and optional intake log). */
   onSaved: () => Promise<void> | void;
+  /** Called when an intake was actually logged (doses > 0) — drives the toast. */
+  onLogged?: () => void;
   /** Called when the user cancels back to the DSLD search view. */
   onBack: () => void;
 }
 
-export default function CustomSupplementFlow({ logDate, onSaved, onBack }: Props) {
+export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBack }: Props) {
   const [step, setStep] = useState<Step>("upload");
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const [error, setError] = useState<string | null>(null);
@@ -249,6 +251,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onBack }: Props
           }),
         });
         if (!logRes.ok) throw new Error(await logRes.text());
+        onLogged?.();
       }
 
       await onSaved();
