@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -158,25 +158,31 @@ export default function SupplementsPage() {
   // Custom-product fallback (photo → vision extraction → save).
   const [customMode, setCustomMode] = useState(false);
 
-  const loadAll = useCallback(async () => {
-    setLoading(true);
+  const loadAll = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
+    if (!silent) setLoading(true);
     try {
       const [pRes, tRes] = await Promise.all([
         fetch("/api/supplements/products").then((r) => r.json()),
         fetch("/api/supplements/today").then((r) => r.json()),
       ]);
       setProducts(pRes.products ?? []);
-      setIntakes(tRes.intakes ?? []);
+      // Preserve any still-pending optimistic intake rows (negative intake_id)
+      // so a silent refresh doesn't blow them away mid-POST.
+      const serverIntakes: Intake[] = tRes.intakes ?? [];
+      setIntakes((prev) => {
+        const pending = prev.filter((i) => i.intake_id < 0);
+        return pending.length === 0 ? serverIntakes : [...pending, ...serverIntakes];
+      });
       setCompounds(tRes.compounds ?? []);
     } catch (e) {
       console.error("Supplements load:", e);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
 
-  const loadHistory = useCallback(async () => {
-    setHistoryLoading(true);
+  const loadHistory = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
+    if (!silent) setHistoryLoading(true);
     try {
       const res = await fetch(
         `/api/supplements/history?days=${historyDays}&perPage=100`,
@@ -188,7 +194,7 @@ export default function SupplementsPage() {
     } catch (e) {
       console.error("Supplements history:", e);
     } finally {
-      setHistoryLoading(false);
+      if (!silent) setHistoryLoading(false);
     }
   }, [historyDays]);
 
@@ -200,14 +206,59 @@ export default function SupplementsPage() {
     loadHistory();
   }, [loadHistory]);
 
-  // After any mutation (log, edit, delete, archive) refresh both panes so the
-  // history section stays in sync with today's view.
+  // After any mutation (edit, archive, seed) refresh both panes silently
+  // so the history section stays in sync without flashing "Loading…".
   const refreshAll = useCallback(async () => {
-    await Promise.all([loadAll(), loadHistory()]);
+    await Promise.all([loadAll({ silent: true }), loadHistory({ silent: true })]);
   }, [loadAll, loadHistory]);
 
+  // Debounced silent refresh of /today only — used after rapid log taps so
+  // the compounds-rollup table catches up without re-fetching on every click.
+  // Optimistic intake rows are kept alive by loadAll's pending-merge logic.
+  const todayRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scheduleSilentTodayRefresh = useCallback(() => {
+    if (todayRefreshTimer.current) clearTimeout(todayRefreshTimer.current);
+    todayRefreshTimer.current = setTimeout(async () => {
+      try {
+        const tRes = await fetch("/api/supplements/today").then((r) => r.json());
+        const serverIntakes: Intake[] = tRes.intakes ?? [];
+        setIntakes((prev) => {
+          const pending = prev.filter((i) => i.intake_id < 0);
+          return pending.length === 0 ? serverIntakes : [...pending, ...serverIntakes];
+        });
+        setCompounds(tRes.compounds ?? []);
+      } catch (e) {
+        console.error("Silent today refresh:", e);
+      }
+    }, 400);
+  }, []);
+  useEffect(() => () => {
+    if (todayRefreshTimer.current) clearTimeout(todayRefreshTimer.current);
+  }, []);
+
   async function logIntake(product_id: string) {
-    setBusyProductId(product_id);
+    const product = products.find((p) => p.product_id === product_id);
+    if (!product) return;
+
+    // Negative ID marks this row as optimistic / unconfirmed — replaced with
+    // the real intake_id once POST resolves, or removed on error.
+    const tempId = -(Date.now() + Math.floor(Math.random() * 10000));
+    const stampIso = logTimeIso() ?? new Date().toISOString();
+    const logDateIsToday = logDate === today;
+    const optimistic: Intake = {
+      intake_id: tempId,
+      intake_date: logDate,
+      intake_time: stampIso,
+      product_id,
+      doses: 1,
+      notes: null,
+      brand_name: product.brand_name,
+      full_name: product.full_name,
+    };
+    if (logDateIsToday) {
+      setIntakes((prev) => [optimistic, ...prev]);
+    }
+
     try {
       const res = await fetch("/api/supplements/log-intake", {
         method: "POST",
@@ -215,25 +266,43 @@ export default function SupplementsPage() {
         body: JSON.stringify({
           product_id,
           intake_date: logDate,
-          intake_time: logTimeIso() ?? new Date().toISOString(),
+          intake_time: stampIso,
         }),
       });
       if (!res.ok) throw new Error(await res.text());
-      await refreshAll();
+      const saved = (await res.json()) as { intake_id: number };
+      if (logDateIsToday) {
+        setIntakes((prev) =>
+          prev.map((i) => (i.intake_id === tempId ? { ...i, intake_id: saved.intake_id } : i)),
+        );
+        scheduleSilentTodayRefresh();
+      } else {
+        // Logged to a past date → row shows up in history, not today.
+        void loadHistory({ silent: true });
+      }
     } catch (e) {
+      // Roll back the optimistic row so the UI matches the server.
+      if (logDateIsToday) {
+        setIntakes((prev) => prev.filter((i) => i.intake_id !== tempId));
+      }
       console.error("Log intake:", e);
-    } finally {
-      setBusyProductId(null);
     }
   }
 
   async function undoIntake(intake_id: number) {
-    setBusyProductId(`undo-${intake_id}`);
+    // Optimistic remove — keep refs so we can re-insert on failure.
+    const removedToday = intakes.find((i) => i.intake_id === intake_id);
+    const removedHistory = history.find((i) => i.intake_id === intake_id);
+    setIntakes((prev) => prev.filter((i) => i.intake_id !== intake_id));
+    setHistory((prev) => prev.filter((i) => i.intake_id !== intake_id));
     try {
-      await fetch(`/api/supplements/log-intake?intake_id=${intake_id}`, { method: "DELETE" });
-      await refreshAll();
-    } finally {
-      setBusyProductId(null);
+      const res = await fetch(`/api/supplements/log-intake?intake_id=${intake_id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      scheduleSilentTodayRefresh();
+    } catch (e) {
+      if (removedToday) setIntakes((prev) => [removedToday, ...prev]);
+      if (removedHistory) setHistory((prev) => [removedHistory, ...prev]);
+      console.error("Undo intake:", e);
     }
   }
 
@@ -468,8 +537,7 @@ export default function SupplementsPage() {
                   >
                     <button
                       onClick={() => logIntake(p.product_id)}
-                      disabled={busyProductId === p.product_id}
-                      className="flex-1 flex items-center justify-between gap-3 px-3 py-2 text-left disabled:opacity-50"
+                      className="flex-1 flex items-center justify-between gap-3 px-3 py-2 text-left active:bg-white/[0.06] transition-colors"
                     >
                       <div className="min-w-0">
                         <p className="text-[12px] text-text-primary truncate">{p.full_name ?? "—"}</p>
@@ -537,8 +605,7 @@ export default function SupplementsPage() {
                       </button>
                       <button
                         onClick={() => undoIntake(i.intake_id)}
-                        disabled={busyProductId === `undo-${i.intake_id}`}
-                        className="text-[10px] text-text-tertiary hover:text-red-400 transition-colors disabled:opacity-40"
+                        className="text-[10px] text-text-tertiary hover:text-red-400 transition-colors"
                       >
                         delete
                       </button>
@@ -645,8 +712,7 @@ export default function SupplementsPage() {
                       </button>
                       <button
                         onClick={() => undoIntake(i.intake_id)}
-                        disabled={busyProductId === `undo-${i.intake_id}`}
-                        className="text-[10px] text-text-tertiary hover:text-red-400 transition-colors disabled:opacity-40"
+                        className="text-[10px] text-text-tertiary hover:text-red-400 transition-colors"
                       >
                         delete
                       </button>
