@@ -312,6 +312,7 @@ export default function ActivitiesPage() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [range, setRange] = useState<Range>("30d");
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
     setLoading(true);
@@ -379,6 +380,34 @@ export default function ActivitiesPage() {
       if (next.has(id)) next.delete(id); else next.add(id);
       return next;
     });
+  }
+
+  // Soft-delete an activity: sets is_excluded=true server-side. ETL re-syncs
+  // preserve the flag (column isn't in upsert payload), so the row won't come
+  // back. Optimistic remove with rollback on error.
+  async function deleteActivity(act: ActivityRow) {
+    const sourceId = act.id.split(":")[1];
+    const label = `${act.name} (${new Date(act.display_time).toLocaleDateString()})`;
+    if (!confirm(`Delete this activity from Onyx?\n\n${label}\n\nIt will be hidden from all charts and HRV analytics. Re-syncs won't bring it back. You can restore it by clearing is_excluded in the DB.`)) {
+      return;
+    }
+    setDeletingId(act.id);
+    const before = rows;
+    setRows((prev) => prev.filter((r) => r.id !== act.id));
+    try {
+      const res = await fetch("/api/activities/exclude", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source: act.source, id: Number(sourceId), excluded: true }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+    } catch (e) {
+      setRows(before);
+      console.error("Delete activity:", e);
+      alert(`Failed to delete: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setDeletingId(null);
+    }
   }
 
   const latestSummary = summaries[summaries.length - 1];
@@ -597,6 +626,15 @@ export default function ActivitiesPage() {
                     <span className="text-[11px] text-text-tertiary">
                       {act.display_time ? new Date(act.display_time).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }) : ""}
                     </span>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); deleteActivity(act); }}
+                      disabled={deletingId === act.id}
+                      className="ml-auto text-text-tertiary/60 hover:text-red-400 disabled:opacity-40 transition-colors text-[12px] px-1"
+                      title="Delete activity from Onyx (soft delete; ETL re-syncs won't bring it back)"
+                      aria-label="Delete activity"
+                    >
+                      ✕
+                    </button>
                   </div>
                   <p className="text-text-primary font-medium mt-1 truncate">{act.name}</p>
                 </div>

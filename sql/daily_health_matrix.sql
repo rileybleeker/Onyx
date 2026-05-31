@@ -240,6 +240,7 @@ LEFT JOIN LATERAL (
     AVG(avg_heart_rate)   AS activity_avg_hr
   FROM pds.garmin_activities ga
   WHERE ga.start_time_local::date = gds.calendar_date
+    AND NOT ga.is_excluded
 ) acts ON true
 
 -- WHOOP Cycles — tag each cycle to its "wake day" ET date.
@@ -269,6 +270,7 @@ LEFT JOIN LATERAL (
   FROM pds.whoop_workouts ww
   WHERE (ww.start_time AT TIME ZONE 'America/New_York')::date = gds.calendar_date
     AND ww.score_state = 'SCORED'
+    AND NOT ww.is_excluded
 ) wkts ON true
 
 -- Eight Sleep (left side only)

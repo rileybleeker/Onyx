@@ -567,6 +567,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
                "avg_heart_rate,max_heart_rate,calories,elevation_gain_meters,"
                "aerobic_training_effect,anaerobic_training_effect,training_load,vo2_max,"
                "avg_speed_mps",
+        filters=[("is_excluded", "eq", False)],
     )
     if not data["garmin_acts"].empty:
         data["garmin_acts"]["calendar_date"] = to_date_str(
@@ -611,7 +612,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         select="workout_id,start_time,end_time,sport_name,strain,kilojoule,average_heart_rate,max_heart_rate,"
                "zone_zero_milli,zone_one_milli,zone_two_milli,zone_three_milli,"
                "zone_four_milli,zone_five_milli,score_state",
-        filters=[("score_state", "eq", "SCORED")],
+        filters=[("score_state", "eq", "SCORED"), ("is_excluded", "eq", False)],
     )
     if not data["whoop_wk"].empty:
         # Derive ET calendar_date from true-UTC start_time, matching view logic

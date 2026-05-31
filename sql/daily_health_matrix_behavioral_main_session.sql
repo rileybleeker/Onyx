@@ -219,7 +219,8 @@ CREATE OR REPLACE VIEW pds.daily_health_matrix_behavioral AS
             max(ga.max_heart_rate) AS activity_max_hr,
             avg(ga.avg_heart_rate) AS activity_avg_hr
            FROM pds.garmin_activities ga
-          WHERE ga.onyx_behavioral_date = s.calendar_date) acts ON true
+          WHERE ga.onyx_behavioral_date = s.calendar_date
+            AND NOT ga.is_excluded) acts ON true
      LEFT JOIN LATERAL ( SELECT bool_or(wcx.onyx_is_transition_day) AS any_transition
            FROM pds.whoop_cycles wcx
           WHERE wcx.onyx_behavioral_date = s.calendar_date) tx ON true
@@ -229,7 +230,8 @@ CREATE OR REPLACE VIEW pds.daily_health_matrix_behavioral AS
             sum(ww.strain) AS whoop_workout_strain,
             sum(ww.zone_two_milli) AS whoop_zone2_milli
            FROM pds.whoop_workouts ww
-          WHERE ww.onyx_behavioral_date = s.calendar_date AND ww.score_state = 'SCORED'::text) wkts ON true
+          WHERE ww.onyx_behavioral_date = s.calendar_date AND ww.score_state = 'SCORED'::text
+            AND NOT ww.is_excluded) wkts ON true
      LEFT JOIN pds.eight_sleep_trends es ON es.onyx_behavioral_date = s.calendar_date AND es.bed_side = 'left'::text
      LEFT JOIN pds.myfitnesspal_nutrition mfp ON mfp.onyx_behavioral_date = s.calendar_date
      LEFT JOIN pds.meal_timing_daily mt ON mt.calendar_date = s.calendar_date

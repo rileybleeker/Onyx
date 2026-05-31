@@ -31,6 +31,7 @@ WITH running_activities AS (
              LIMIT 1) AS interval_split_count
       FROM pds.garmin_activities a
      WHERE a.activity_type = ANY (ARRAY['running','track_running','treadmill_running'])
+       AND NOT a.is_excluded
 ), with_targets AS (
     SELECT ra.*, gw.interval_target_pace_low_mps, gw.interval_target_pace_high_mps,
            (gw.interval_target_pace_low_mps + gw.interval_target_pace_high_mps) / 2.0 AS target_pace_mid_mps,

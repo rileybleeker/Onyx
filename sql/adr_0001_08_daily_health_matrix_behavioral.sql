@@ -257,6 +257,7 @@ LEFT JOIN LATERAL (
         AVG(avg_heart_rate) AS activity_avg_hr
     FROM pds.garmin_activities ga
     WHERE ga.onyx_behavioral_date = s.calendar_date
+      AND NOT ga.is_excluded
 ) acts ON true
 
 -- Aggregate any-transition flag across all cycles on the day (so transition
@@ -279,6 +280,7 @@ LEFT JOIN LATERAL (
     FROM pds.whoop_workouts ww
     WHERE ww.onyx_behavioral_date = s.calendar_date
       AND ww.score_state = 'SCORED'
+      AND NOT ww.is_excluded
 ) wkts ON true
 
 LEFT JOIN pds.eight_sleep_trends es

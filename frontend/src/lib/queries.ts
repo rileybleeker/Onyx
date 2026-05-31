@@ -107,6 +107,7 @@ export async function getActivities(days: number = 30) {
     .from("garmin_activities")
     .select("*")
     .gte("start_time_gmt", since.toISOString())
+    .eq("is_excluded", false)
     .order("start_time_gmt", { ascending: false });
 
   if (error) throw error;
@@ -224,6 +225,7 @@ export async function getWhoopWorkouts(days: number = 30) {
     .from("whoop_workouts")
     .select("*")
     .gte("start_time", since.toISOString())
+    .eq("is_excluded", false)
     .order("start_time", { ascending: false });
 
   if (error) throw error;
@@ -258,9 +260,9 @@ export async function getWorkoutSleepGap(days: number = 60): Promise<WorkoutSlee
     supabase.from("whoop_cycles").select("cycle_id,start_time").gte("start_time", sinceISO),
     supabase.from("whoop_recovery").select("cycle_id,hrv_rmssd_milli").eq("score_state", "SCORED"),
     supabase.from("whoop_workouts").select("end_time,strain")
-      .eq("score_state", "SCORED").gte("end_time", sinceISO),
+      .eq("score_state", "SCORED").eq("is_excluded", false).gte("end_time", sinceISO),
     supabase.from("garmin_activities").select("start_time_gmt,duration_seconds,training_load")
-      .gte("start_time_gmt", sinceISO),
+      .eq("is_excluded", false).gte("start_time_gmt", sinceISO),
   ]);
 
   if (sleepRes.error) throw sleepRes.error;
