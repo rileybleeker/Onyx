@@ -39,7 +39,7 @@ import re
 import sys
 import tempfile
 import zipfile
-from datetime import date, datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -201,24 +201,73 @@ def parse_amount(raw: str | None):
     return amount, unit
 
 
-def behavioral_dates(day_iso: str, t: dtime | None):
+def load_tz_log(sb) -> list[tuple[datetime, str]]:
+    """Load pds.user_tz_log — the materialized TZ ladder (manual + GPS-auto +
+    WHOOP-auto entries all land here). Returns [(effective_from_utc, iana_tz), ...]
+    sorted ascending. Empty list (→ ET fallback) on dry-run or any error.
+    """
+    if sb is None:
+        return []
+    try:
+        rows = (
+            sb.schema("pds").table("user_tz_log")
+            .select("effective_from,tz").order("effective_from").execute().data
+        ) or []
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[tuple[datetime, str]] = []
+    for r in rows:
+        try:
+            eff = datetime.fromisoformat(str(r["effective_from"]).replace("Z", "+00:00"))
+            out.append((eff, r["tz"]))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def resolve_tz(tz_log: list[tuple[datetime, str]], day_iso: str) -> str:
+    """IANA TZ Riley was physically in on `day_iso`, via the user_tz_log ladder
+    (latest effective_from <= noon of that day). Defaults to America/New_York (home).
+    Cronometer's export time carries no offset, so this is how we recover the TZ —
+    the same ladder every other source resolves through (Resolution: Manual > GPS > WHOOP).
+    """
+    probe = datetime.strptime(day_iso, "%Y-%m-%d").replace(hour=12, tzinfo=timezone.utc)
+    tz = "America/New_York"
+    for eff, name in tz_log:  # ascending
+        if eff <= probe:
+            tz = name
+        else:
+            break
+    return tz
+
+
+def behavioral_dates(day_iso: str, t: dtime | None, tz_log: list[tuple[datetime, str]] | None = None):
     """Return (event_time, et_date, behavioral_date, local_date, tz_source).
 
-    With no per-entry time (free tier), all three Onyx dates collapse to the
-    clock day (manual-backdate convention). With a Gold time, derive behavioral
-    via the ADR-0001 -6h rule on the ET-localized instant.
+    No per-entry time (free tier / untimed entry) → all three Onyx dates collapse to
+    the clock day (manual-backdate convention). With a Gold time, localize the naive
+    clock time to the TZ Riley was in that day (user_tz_log ladder; ET at home), then
+    derive the ADR-0001 triple:
+      onyx_local_date      = clock day in that TZ (= Cronometer's Day)
+      onyx_et_date         = clock day of the instant in America/New_York (canonical key)
+      onyx_behavioral_date = (local wall-clock instant - 6h)::date (bedtime-to-bedtime)
+    Behavioral attribution is automatic — a 12:30 AM pre-bed entry lands on the prior
+    day with no manual backdating.
     """
     d = datetime.strptime(day_iso, "%Y-%m-%d").date()
     if t is None:
         return None, day_iso, day_iso, day_iso, "cronometer_csv_date"
-    local_dt = datetime.combine(d, t, tzinfo=ET)
+    tz_name = resolve_tz(tz_log or [], day_iso)
+    local_tz = ZoneInfo(tz_name)
+    local_dt = datetime.combine(d, t, tzinfo=local_tz)
+    et_date = local_dt.astimezone(ET).date()
     behavioral = (local_dt - timedelta(hours=6)).date()
     return (
         local_dt.isoformat(),
-        day_iso,
+        et_date.isoformat(),
         behavioral.isoformat(),
         day_iso,
-        "cronometer_gold_time_et",
+        f"cronometer_gold_time:{tz_name}",
     )
 
 
@@ -286,7 +335,7 @@ def _nutrient_cols(row: dict[str, str], col_index: dict[str, int], cells: list[s
     return out
 
 
-def build_serving_rows(csv_path: str) -> list[dict]:
+def build_serving_rows(csv_path: str, tz_log: list[tuple[datetime, str]] | None = None) -> list[dict]:
     with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
         headers = next(reader)
@@ -307,7 +356,7 @@ def build_serving_rows(csv_path: str) -> list[dict]:
         if not day:
             continue
         t = parse_time(cell(cells, "time"))
-        event_time, et_d, beh_d, loc_d, tz_src = behavioral_dates(day, t)
+        event_time, et_d, beh_d, loc_d, tz_src = behavioral_dates(day, t, tz_log)
         amount_raw = (cell(cells, "amount") or "").strip() or None
         amount, unit = parse_amount(amount_raw)
         record = {
@@ -421,6 +470,7 @@ def import_daily(rows: list[dict], dry_run: bool) -> int:
 def run_import(paths: list[str], dry_run: bool = False) -> tuple[int, int]:
     """Return (servings_count, daily_count). Emits a sync_log heartbeat per data_type."""
     sb = None if dry_run else create_client(SUPABASE_URL, SUPABASE_KEY)
+    tz_log = load_tz_log(sb)  # materialized TZ ladder for Gold-timestamp localization
     with tempfile.TemporaryDirectory() as tmp:
         servings_path, daily_path = resolve_inputs(paths, tmp)
         if not servings_path and not daily_path:
@@ -429,7 +479,7 @@ def run_import(paths: list[str], dry_run: bool = False) -> tuple[int, int]:
         # ── servings ──
         t0 = now_epoch()
         try:
-            srows = build_serving_rows(servings_path) if servings_path else []
+            srows = build_serving_rows(servings_path, tz_log) if servings_path else []
             scount = import_servings(srows, dry_run)
             print(f"  servings: {scount} entries {'(dry-run)' if dry_run else 'imported'}"
                   f"{' from ' + os.path.basename(servings_path) if servings_path else ' (no file)'}")
