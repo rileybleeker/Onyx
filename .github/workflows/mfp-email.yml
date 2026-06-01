@@ -1,10 +1,13 @@
-name: MyFitnessPal Email Check
+name: MyFitnessPal Email Check (DISABLED — Cronometer cutover 2026-05-31)
 
+# DISABLED: nutrition ingestion moved to Cronometer on 2026-05-31. The hourly
+# cron is removed so MFP no longer auto-imports; the importer + this workflow are
+# preserved as a runnable fallback. To ingest a forgotten MFP export, re-add the
+# `schedule:` block below (or trigger manually via the Actions tab / workflow_dispatch).
+#   schedule:
+#     - cron: '15 * * * *'
 on:
-  schedule:
-    # Every hour at :15
-    - cron: '15 * * * *'
-  workflow_dispatch: # Manual trigger
+  workflow_dispatch: # Manual trigger only (fallback for a late MFP export)
 
 concurrency:
   group: mfp-email

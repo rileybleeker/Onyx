@@ -10,8 +10,11 @@ import {
   ReferenceLine,
 } from "recharts";
 import {
-  getMfpNutrition,
+  getNutrition,
   getWhoopCaloriesBurnt,
+  getCronometerServings,
+  getDailyVitamins,
+  getDailyNutrientsFull,
   rangeDays,
   rangeLabel,
   type Range,
@@ -25,6 +28,71 @@ import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme"
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
+
+// ─── Vitamins & Minerals reference (US RDA/AI for an adult male) ──────────────
+// `tok` is the unit token used in pds.daily_micronutrient_totals column names
+// (vit_a_total_mcg, vit_d_total_iu, …). `unit` is the display unit.
+type VitaminDef = { key: string; label: string; unit: string; tok: string; rda: number; group: string };
+const VITAMIN_DEFS: VitaminDef[] = [
+  { key: "vit_a", label: "Vitamin A", unit: "µg", tok: "mcg", rda: 900, group: "Fat-soluble" },
+  { key: "vit_d", label: "Vitamin D", unit: "IU", tok: "iu", rda: 600, group: "Fat-soluble" },
+  { key: "vit_e", label: "Vitamin E", unit: "mg", tok: "mg", rda: 15, group: "Fat-soluble" },
+  { key: "vit_k", label: "Vitamin K", unit: "µg", tok: "mcg", rda: 120, group: "Fat-soluble" },
+  { key: "vit_c", label: "Vitamin C", unit: "mg", tok: "mg", rda: 90, group: "Water-soluble" },
+  { key: "b1", label: "B1 Thiamine", unit: "mg", tok: "mg", rda: 1.2, group: "Water-soluble" },
+  { key: "b2", label: "B2 Riboflavin", unit: "mg", tok: "mg", rda: 1.3, group: "Water-soluble" },
+  { key: "b3", label: "B3 Niacin", unit: "mg", tok: "mg", rda: 16, group: "Water-soluble" },
+  { key: "b5", label: "B5 Pantothenic", unit: "mg", tok: "mg", rda: 5, group: "Water-soluble" },
+  { key: "b6", label: "B6 Pyridoxine", unit: "mg", tok: "mg", rda: 1.3, group: "Water-soluble" },
+  { key: "b12", label: "B12 Cobalamin", unit: "µg", tok: "mcg", rda: 2.4, group: "Water-soluble" },
+  { key: "folate", label: "Folate", unit: "µg", tok: "mcg", rda: 400, group: "Water-soluble" },
+  { key: "calcium", label: "Calcium", unit: "mg", tok: "mg", rda: 1000, group: "Minerals" },
+  { key: "iron", label: "Iron", unit: "mg", tok: "mg", rda: 8, group: "Minerals" },
+  { key: "magnesium", label: "Magnesium", unit: "mg", tok: "mg", rda: 420, group: "Minerals" },
+  { key: "phosphorus", label: "Phosphorus", unit: "mg", tok: "mg", rda: 700, group: "Minerals" },
+  { key: "potassium", label: "Potassium", unit: "mg", tok: "mg", rda: 3400, group: "Minerals" },
+  { key: "zinc", label: "Zinc", unit: "mg", tok: "mg", rda: 11, group: "Minerals" },
+  { key: "copper", label: "Copper", unit: "mg", tok: "mg", rda: 0.9, group: "Minerals" },
+  { key: "manganese", label: "Manganese", unit: "mg", tok: "mg", rda: 2.3, group: "Minerals" },
+  { key: "selenium", label: "Selenium", unit: "µg", tok: "mcg", rda: 55, group: "Minerals" },
+  { key: "omega3", label: "Omega-3", unit: "g", tok: "g", rda: 1.6, group: "Fatty acids" },
+  { key: "omega6", label: "Omega-6", unit: "g", tok: "g", rda: 17, group: "Fatty acids" },
+  { key: "epa", label: "EPA", unit: "g", tok: "g", rda: 0.5, group: "Fatty acids" },
+  { key: "dha", label: "DHA", unit: "g", tok: "g", rda: 0.5, group: "Fatty acids" },
+  { key: "ala", label: "ALA", unit: "g", tok: "g", rda: 1.6, group: "Fatty acids" },
+];
+const VITAMIN_GROUPS = ["Fat-soluble", "Water-soluble", "Minerals", "Fatty acids"];
+
+// Remaining Cronometer-only nutrients (no supplement overlap / no RDA tile) shown
+// in the "All tracked nutrients" table — honors the "render everything" choice.
+const EXTRA_NUTRIENT_COLS: { col: string; label: string; unit: string }[] = [
+  { col: "net_carbs_g", label: "Net Carbs", unit: "g" },
+  { col: "added_sugars_g", label: "Added Sugars", unit: "g" },
+  { col: "starch_g", label: "Starch", unit: "g" },
+  { col: "soluble_fiber_g", label: "Soluble Fiber", unit: "g" },
+  { col: "insoluble_fiber_g", label: "Insoluble Fiber", unit: "g" },
+  { col: "cholesterol_mg", label: "Cholesterol", unit: "mg" },
+  { col: "saturated_g", label: "Saturated Fat", unit: "g" },
+  { col: "monounsaturated_g", label: "Monounsaturated", unit: "g" },
+  { col: "polyunsaturated_g", label: "Polyunsaturated", unit: "g" },
+  { col: "trans_fat_g", label: "Trans Fat", unit: "g" },
+  { col: "aa_g", label: "Arachidonic (AA)", unit: "g" },
+  { col: "la_g", label: "Linoleic (LA)", unit: "g" },
+  { col: "oxalate_mg", label: "Oxalate", unit: "mg" },
+  { col: "phytate_mg", label: "Phytate", unit: "mg" },
+  { col: "alcohol_g", label: "Alcohol", unit: "g" },
+  { col: "histidine_g", label: "Histidine", unit: "g" },
+  { col: "isoleucine_g", label: "Isoleucine", unit: "g" },
+  { col: "leucine_g", label: "Leucine", unit: "g" },
+  { col: "lysine_g", label: "Lysine", unit: "g" },
+  { col: "methionine_g", label: "Methionine", unit: "g" },
+  { col: "phenylalanine_g", label: "Phenylalanine", unit: "g" },
+  { col: "threonine_g", label: "Threonine", unit: "g" },
+  { col: "tryptophan_g", label: "Tryptophan", unit: "g" },
+  { col: "tyrosine_g", label: "Tyrosine", unit: "g" },
+  { col: "valine_g", label: "Valine", unit: "g" },
+  { col: "cystine_g", label: "Cystine", unit: "g" },
+];
 
 // ─── Meal-timing types & helpers ─────────────────────────────────────────────
 
@@ -147,6 +215,9 @@ export default function NutritionPage() {
   // ─── Nutrition state ───
   const [nutritionData, setNutritionData] = useState<any[]>([]);
   const [burntData, setBurntData] = useState<any[]>([]);
+  const [vitaminsData, setVitaminsData] = useState<any[]>([]);
+  const [fullNutrients, setFullNutrients] = useState<any[]>([]);
+  const [todayServings, setTodayServings] = useState<any[]>([]);
   const [nutritionLoading, setNutritionLoading] = useState(true);
   const [range, setRange] = useState<Range>("30d");
 
@@ -291,20 +362,31 @@ export default function NutritionPage() {
       return h !== null && (h >= 21 || h < 4);
     }).length;
 
-  // ─── Nutrition + burnt loader (responds to range filter) ───
+  // ─── Nutrition + burnt + micronutrients loader (responds to range filter) ───
   useEffect(() => {
     setNutritionLoading(true);
     Promise.all([
-      getMfpNutrition(rangeDays(range)),
+      getNutrition(rangeDays(range)),
       getWhoopCaloriesBurnt(rangeDays(range)),
+      getDailyVitamins(rangeDays(range)),
+      getDailyNutrientsFull(rangeDays(range)),
     ])
-      .then(([n, b]) => {
+      .then(([n, b, v, f]) => {
         setNutritionData(n);
         setBurntData(b);
+        setVitaminsData(v);
+        setFullNutrients(f);
       })
       .catch(console.error)
       .finally(() => setNutritionLoading(false));
   }, [range]);
+
+  // ─── Today's Cronometer food log ───
+  useEffect(() => {
+    getCronometerServings(1, today)
+      .then(setTodayServings)
+      .catch(console.error);
+  }, [today]);
 
   // ─── Weight loader + default date init ───
   const loadWeight = useCallback(async () => {
@@ -760,8 +842,8 @@ export default function NutritionPage() {
 
       <div className="border-t border-border-subtle mb-8" />
 
-      {/* ─── Daily Macros (MyFitnessPal) ──────────────────────────────────── */}
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">MFP · Daily Macros</p>
+      {/* ─── Daily Macros (Cronometer; MFP fills pre-cutover history) ──────── */}
+      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Cronometer · Daily Macros</p>
 
       {nutritionLoading ? (
         <div className="space-y-6">
@@ -782,33 +864,33 @@ export default function NutritionPage() {
               label="Calories"
               value={latest?.calories ?? null}
               sublabel={avgCalories > 0 ? `avg ${Math.round(avgCalories)} kcal` : undefined}
-              source="MFP"
+              source="CRONOMETER"
             />
             <StatCard
               label="Protein"
               value={latest?.protein_g ? `${Number(latest.protein_g).toFixed(0)}g` : null}
               sublabel={avgProtein > 0 ? `avg ${avgProtein.toFixed(0)}g` : undefined}
-              source="MFP"
+              source="CRONOMETER"
             />
             <StatCard
               label="Carbs"
               value={latest?.carbs_g ? `${Number(latest.carbs_g).toFixed(0)}g` : null}
               sublabel={avgCarbs > 0 ? `avg ${avgCarbs.toFixed(0)}g` : undefined}
-              source="MFP"
+              source="CRONOMETER"
             />
             <StatCard
               label="Fat"
               value={latest?.fat_g ? `${Number(latest.fat_g).toFixed(0)}g` : null}
               sublabel={avgFat > 0 ? `avg ${avgFat.toFixed(0)}g` : undefined}
-              source="MFP"
+              source="CRONOMETER"
             />
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <ChartCard
               title="Calorie Trend — Consumed vs Burnt"
-              subtitle="MFP daily intake against WHOOP cycle energy expenditure (kilojoule → kcal). Net = consumed − burnt."
-              source="MFP + WHOOP"
+              subtitle="Cronometer daily intake against WHOOP cycle energy expenditure (kilojoule → kcal). Net = consumed − burnt."
+              source="CRONOMETER + WHOOP"
               className="lg:col-span-2"
             >
               <ResponsiveContainer width="100%" height={280}>
@@ -830,7 +912,7 @@ export default function NutritionPage() {
                     stroke="#06b6d4"
                     strokeWidth={2}
                     fill="url(#calConsumedGrad)"
-                    name="Consumed (MFP)"
+                    name="Consumed (Cronometer)"
                     connectNulls={false}
                   />
                   <Line
@@ -849,7 +931,7 @@ export default function NutritionPage() {
             <ChartCard
               title="Net Energy Balance"
               subtitle="Consumed − burnt per day. Above zero = surplus, below = deficit."
-              source="MFP + WHOOP"
+              source="CRONOMETER + WHOOP"
               className="lg:col-span-2"
             >
               <ResponsiveContainer width="100%" height={220}>
@@ -871,7 +953,7 @@ export default function NutritionPage() {
               </ResponsiveContainer>
             </ChartCard>
 
-            <ChartCard title="Macro Breakdown (g)" source="MFP" className="lg:col-span-2">
+            <ChartCard title="Macro Breakdown (g)" source="CRONOMETER" className="lg:col-span-2">
               <ResponsiveContainer width="100%" height={260}>
                 <BarChart data={macroData}>
                   <CartesianGrid {...gridStyle} />
@@ -886,7 +968,7 @@ export default function NutritionPage() {
               </ResponsiveContainer>
             </ChartCard>
 
-            <ChartCard title="Protein, Fat, Fiber & Sugar (g)" source="MFP" className="lg:col-span-2">
+            <ChartCard title="Protein, Fat, Fiber & Sugar (g)" source="CRONOMETER" className="lg:col-span-2">
               <ResponsiveContainer width="100%" height={260}>
                 <LineChart data={detailData}>
                   <CartesianGrid {...gridStyle} />
@@ -904,6 +986,128 @@ export default function NutritionPage() {
           </div>
         </>
       )}
+
+      <div className="border-t border-border-subtle my-10" />
+
+      {/* ─── Vitamins & Minerals (Cronometer dietary + Onyx supplement) ─────── */}
+      <div className="flex items-baseline justify-between mb-3">
+        <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">Vitamins &amp; Minerals</p>
+        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + SUPPLEMENTS · latest day · % of RDA</span>
+      </div>
+      {(() => {
+        const vL = vitaminsData[vitaminsData.length - 1];
+        const last7 = vitaminsData.slice(-7);
+        const num = (v: any) => (v == null ? null : Number(v));
+        const fmtN = (v: number | null) =>
+          v == null ? "—" : v >= 100 ? Math.round(v).toString() : v >= 10 ? v.toFixed(0) : v.toFixed(1);
+        return (
+          <div className="space-y-5">
+            {VITAMIN_GROUPS.map((grp) => (
+              <div key={grp}>
+                <p className="text-[10px] font-mono text-text-tertiary mb-2">{grp}</p>
+                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+                  {VITAMIN_DEFS.filter((d) => d.group === grp).map((d) => {
+                    const total = num(vL?.[`${d.key}_total_${d.tok}`]);
+                    const diet = num(vL?.[`${d.key}_dietary_${d.tok}`]);
+                    const supp = num(vL?.[`${d.key}_supplement_${d.tok}`]);
+                    const avg7 = avg(last7, `${d.key}_total_${d.tok}`);
+                    const pct = total != null && d.rda ? (total / d.rda) * 100 : null;
+                    const barColor = pct == null ? "bg-white/10" : pct >= 100 ? "bg-green-500" : pct >= 50 ? "bg-cyan-500" : "bg-amber-500";
+                    return (
+                      <div key={d.key} className="bg-surface-card border border-border-subtle rounded-[6px] p-3">
+                        <div className="flex justify-between items-baseline">
+                          <span className="text-xs text-text-secondary truncate">{d.label}</span>
+                          <span className="text-[10px] font-mono text-text-tertiary shrink-0 ml-1">{pct == null ? "—" : `${Math.round(pct)}%`}</span>
+                        </div>
+                        <div className="text-base font-mono mt-1">
+                          {fmtN(total)}
+                          <span className="text-[10px] text-text-tertiary ml-1">{d.unit}</span>
+                        </div>
+                        <div className="h-1 bg-white/5 rounded mt-2 overflow-hidden">
+                          <div className={`h-full ${barColor}`} style={{ width: `${pct == null ? 0 : Math.min(pct, 100)}%` }} />
+                        </div>
+                        <div className="text-[10px] font-mono text-text-tertiary mt-1.5 truncate">
+                          food {fmtN(diet)} · supp {fmtN(supp)} · 7d {fmtN(avg7 || null)}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+            {!vL && (
+              <p className="text-xs text-text-tertiary">No Cronometer micronutrient data yet — import an export to populate.</p>
+            )}
+          </div>
+        );
+      })()}
+
+      <div className="border-t border-border-subtle my-10" />
+
+      {/* ─── Today's meals (Cronometer per-entry log) ──────────────────────── */}
+      <div className="flex items-baseline justify-between mb-3">
+        <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">Today&apos;s Meals</p>
+        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER · {today}</span>
+      </div>
+      {todayServings.length === 0 ? (
+        <p className="text-xs text-text-tertiary mb-2">
+          No Cronometer entries for today yet. Entries appear after you export from Cronometer and the import runs.
+        </p>
+      ) : (
+        <div className="bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle">
+          {todayServings.map((s) => (
+            <div key={s.serving_id} className="flex items-center gap-3 px-4 py-2.5 text-sm">
+              <span className="text-[11px] font-mono text-text-tertiary w-20 shrink-0">
+                {s.event_time
+                  ? new Date(s.event_time).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })
+                  : (s.meal_group ?? "—")}
+              </span>
+              <span className="flex-1 truncate text-text-secondary">{s.food_name}</span>
+              <span className="text-[11px] font-mono text-text-tertiary shrink-0">{s.amount_raw}</span>
+              <span className="text-[11px] font-mono text-text-tertiary w-16 text-right shrink-0">
+                {s.calories != null ? `${Math.round(Number(s.calories))} kcal` : ""}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="border-t border-border-subtle my-10" />
+
+      {/* ─── All tracked nutrients (Cronometer dietary; latest day + 7d avg) ── */}
+      <details className="group">
+        <summary className="cursor-pointer text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3 list-none flex items-center gap-2">
+          <span className="group-open:rotate-90 transition-transform">▸</span> All Tracked Nutrients
+          <span className="text-text-tertiary/60 normal-case tracking-normal">— amino acids, fat fractions, etc.</span>
+        </summary>
+        {(() => {
+          const fL = fullNutrients[fullNutrients.length - 1];
+          const last7 = fullNutrients.slice(-7);
+          const fmtN = (v: any) => (v == null ? "—" : Number(v) >= 10 ? Number(v).toFixed(0) : Number(v).toFixed(2));
+          return (
+            <div className="bg-surface-card border border-border-subtle rounded-[6px] overflow-hidden">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-[10px] font-mono text-text-tertiary uppercase border-b border-border-subtle">
+                    <th className="text-left px-4 py-2">Nutrient</th>
+                    <th className="text-right px-4 py-2">Latest</th>
+                    <th className="text-right px-4 py-2">7d avg</th>
+                  </tr>
+                </thead>
+                <tbody className="font-mono">
+                  {EXTRA_NUTRIENT_COLS.map((n) => (
+                    <tr key={n.col} className="border-b border-border-subtle/50 last:border-0">
+                      <td className="text-left px-4 py-1.5 text-text-secondary font-sans">{n.label}</td>
+                      <td className="text-right px-4 py-1.5">{fmtN(fL?.[n.col])}<span className="text-text-tertiary text-[10px] ml-1">{n.unit}</span></td>
+                      <td className="text-right px-4 py-1.5 text-text-tertiary">{fmtN(avg(last7, n.col) || null)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
+        })()}
+      </details>
 
       <div className="border-t border-border-subtle my-10" />
 

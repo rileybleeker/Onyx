@@ -205,10 +205,48 @@ HIGH_VALUE_SPARSE_FEATURES = {
     "garmin_hrv_status_ord",
 }
 
+# Cronometer micronutrients promoted into the HRV matrix (MFP→Cronometer migration,
+# 2026-05-31). Canonical short names match the daily_health_matrix_behavioral columns.
+# Vitamins + minerals + omega fractions only — the 11 amino acids and the fat fractions
+# stay in the DB/UI but out of the feature/treatment families so the per-family BH-FDR
+# pools stay sane (nutrition card grows ~13 → ~40, not ~75).
+MICRONUTRIENT_COLS: dict[str, tuple[str, str]] = {
+    "vit_a_rae_mcg":     ("Vitamin A (RAE)", "µg"),
+    "vit_c_mg":          ("Vitamin C", "mg"),
+    "vit_d_iu":          ("Vitamin D", "IU"),
+    "vit_e_mg":          ("Vitamin E", "mg"),
+    "vit_k_mcg":         ("Vitamin K", "µg"),
+    "b1_thiamine_mg":    ("B1 (Thiamine)", "mg"),
+    "b2_riboflavin_mg":  ("B2 (Riboflavin)", "mg"),
+    "b3_niacin_mg":      ("B3 (Niacin)", "mg"),
+    "b5_pantothenic_mg": ("B5 (Pantothenic Acid)", "mg"),
+    "b6_pyridoxine_mg":  ("B6 (Pyridoxine)", "mg"),
+    "b12_cobalamin_mcg": ("B12 (Cobalamin)", "µg"),
+    "folate_mcg":        ("Folate", "µg"),
+    "calcium_mg":        ("Calcium", "mg"),
+    "iron_mg":           ("Iron", "mg"),
+    "magnesium_mg":      ("Magnesium", "mg"),
+    "phosphorus_mg":     ("Phosphorus", "mg"),
+    "potassium_mg":      ("Potassium", "mg"),
+    "zinc_mg":           ("Zinc", "mg"),
+    "copper_mg":         ("Copper", "mg"),
+    "manganese_mg":      ("Manganese", "mg"),
+    "selenium_mcg":      ("Selenium", "µg"),
+    "omega3_g":          ("Omega-3", "g"),
+    "omega6_g":          ("Omega-6", "g"),
+    "epa_g":             ("EPA", "g"),
+    "dha_g":             ("DHA", "g"),
+    "ala_g":             ("ALA", "g"),
+    "nutrition_caffeine_mg": ("Dietary Caffeine", "mg"),
+}
+
 # Controllable / behavioral features for the actionable-only SHAP ranking
 # (audit finding 7.K). Anything here is something Riley can change tomorrow.
+# "nutrition_" covers the COALESCE'd Cronometer/MFP macros; MICRONUTRIENT_COLS keys
+# add the vitamins/minerals (which share no common prefix). "mfp_" kept for the
+# pre-cutover historical archive columns.
 CONTROLLABLE_FEATURE_PREFIXES = (
-    "journal_", "habit_", "mfp_", "supplement_", "whoop_sleep_", "garmin_sleep_",
+    "journal_", "habit_", "mfp_", "nutrition_", "supplement_", "whoop_sleep_", "garmin_sleep_",
     "eight_sleep_", "whoop_workout_", "whoop_day_strain", "garmin_activity_",
     "rolling_3d_training_load", "rolling_7d_training_load", "sleep_debt",
     "moderate_intensity_minutes", "vigorous_intensity_minutes",
@@ -219,7 +257,7 @@ CONTROLLABLE_FEATURE_PREFIXES = (
     "sp_",  # Spotify daily signature (opt-in via ONYX_INCLUDE_SPOTIFY=1)
     "meal_",  # Meal timing: last_hour, first_hour, eating_window, last_meal_to_bedtime_min
     "caffeine_",  # Caffeine timing: first_hour, last_hour, window_hours, intake_count, to_bedtime_min
-)
+) + tuple(MICRONUTRIENT_COLS)  # Cronometer vitamins/minerals (exact column names)
 
 # Computed once per run from the post-prepare_ml_data (X, y) and stamped onto every
 # row written to pds.hrv_predictions / hrv_model_metrics / hrv_analysis_results so
@@ -329,10 +367,10 @@ FEATURE_LABELS: dict[str, str] = {
     "eight_sleep_room_temp": "Room Temperature",
     "bed_room_temp_delta": "Bed-Room Temp Delta",
     "eight_sleep_toss_turns": "Toss & Turns",
-    "mfp_calories": "Calories (MFP)",
-    "mfp_protein_g": "Protein (g)",
-    "mfp_carbs_g": "Carbohydrates (g)",
-    "mfp_fat_g": "Fat (g)",
+    "nutrition_calories": "Calories",
+    "nutrition_protein_g": "Protein (g)",
+    "nutrition_carbs_g": "Carbohydrates (g)",
+    "nutrition_fat_g": "Fat (g)",
     "protein_pct": "Protein % of Calories",
     "net_calories": "Net Calories",
     "day_of_week": "Day of Week",
@@ -635,13 +673,12 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     if not data["eight_sleep"].empty:
         data["eight_sleep"]["calendar_date"] = data["eight_sleep"]["calendar_date"].astype(str)
 
-    log.info("  Loading myfitnesspal_nutrition…")
-    data["mfp"] = fetch_all(
-        "myfitnesspal_nutrition",
-        select="calendar_date,fiber_g,sugar_g,sodium_mg,water_ml,exercise_kcal",
-    )
-    if not data["mfp"].empty:
-        data["mfp"]["calendar_date"] = data["mfp"]["calendar_date"].astype(str)
+    # Nutrition (macros + micros) now comes entirely from the matrix view's
+    # nutrition_* (COALESCE Cronometer→MFP) and Cronometer micronutrient columns
+    # (MFP→Cronometer migration, 2026-05-31). The old direct myfitnesspal_nutrition
+    # fetch (bare fiber_g/sugar_g/sodium_mg/water_ml/exercise_kcal) was redundant
+    # with the view's mfp_*/nutrition_* and is dropped; net_calories now uses the
+    # WHOOP-derived TDEE (canonical) instead of MFP's exercise_kcal.
 
     log.info("  Loading journal (WHOOP + habits)…")
     data["journal"] = fetch_all(
@@ -1134,13 +1171,6 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
             )
         df = df.merge(es, on="calendar_date", how="left", suffixes=("", "_es"))
 
-    # --- Join MFP extra columns ---
-    if not data["mfp"].empty:
-        mfp = data["mfp"].copy()
-        for c in mfp.columns:
-            if c != "calendar_date":
-                mfp[c] = pd.to_numeric(mfp[c], errors="coerce")
-        df = df.merge(mfp, on="calendar_date", how="left", suffixes=("", "_mfp"))
 
     # --- Journal pivot ---
     # Skip if daily_health_matrix already includes journal_ columns (view-level pivot)
@@ -1422,17 +1452,20 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     if "whoop_sleep_duration_milli" in df.columns and "baseline_milli" in df.columns:
         df["sleep_debt_ratio"] = df["whoop_sleep_duration_milli"] / df["baseline_milli"].replace(0, np.nan)
 
-    # Nutrition ratios
-    if "mfp_calories" in df.columns:
-        cals = df["mfp_calories"].replace(0, np.nan)
-        if "mfp_protein_g" in df.columns:
-            df["protein_pct"] = df["mfp_protein_g"] * 4 / cals
-        if "mfp_carbs_g" in df.columns:
-            df["carb_pct"] = df["mfp_carbs_g"] * 4 / cals
-        if "mfp_fat_g" in df.columns:
-            df["fat_pct"] = df["mfp_fat_g"] * 9 / cals
-        if "exercise_kcal" in df.columns:
-            df["net_calories"] = df["mfp_calories"] - df["exercise_kcal"].fillna(0)
+    # Nutrition ratios (reads the COALESCE'd nutrition_* aliases: Cronometer where
+    # present, MFP for pre-cutover history — MFP→Cronometer migration 2026-05-31).
+    if "nutrition_calories" in df.columns:
+        cals = df["nutrition_calories"].replace(0, np.nan)
+        if "nutrition_protein_g" in df.columns:
+            df["protein_pct"] = df["nutrition_protein_g"] * 4 / cals
+        if "nutrition_carbs_g" in df.columns:
+            df["carb_pct"] = df["nutrition_carbs_g"] * 4 / cals
+        if "nutrition_fat_g" in df.columns:
+            df["fat_pct"] = df["nutrition_fat_g"] * 9 / cals
+        # Net energy uses WHOOP-derived expenditure (kJ÷4.184 is Onyx's canonical TDEE;
+        # Cronometer has no MFP-style exercise_kcal, so mfp_exercise_kcal goes NULL).
+        if "whoop_kilojoule" in df.columns:
+            df["net_calories"] = df["nutrition_calories"] - (df["whoop_kilojoule"] / 4.184).fillna(0)
 
     # Journal-derived "days since" features
     j_alcohol_col = next((c for c in df.columns if "alcoholic" in c or c == "journal_have_any_alcoholic_drinks"), None)
@@ -1479,8 +1512,8 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         df["load_x_hrv_lag1"] = df["rolling_7d_training_load"] * df["hrv_lag1"]
     if _has("eight_sleep_room_temp", "whoop_sleep_efficiency"):
         df["room_temp_x_sleep_eff"] = df["eight_sleep_room_temp"] * df["whoop_sleep_efficiency"]
-    if _has("mfp_sodium_mg", "mfp_water_ml"):
-        df["sodium_per_water"] = df["mfp_sodium_mg"] / df["mfp_water_ml"].replace(0, np.nan)
+    if _has("nutrition_sodium_mg", "nutrition_water_ml"):
+        df["sodium_per_water"] = df["nutrition_sodium_mg"] / df["nutrition_water_ml"].replace(0, np.nan)
     # Workout timing × intensity: a hard workout 30 min before bed should
     # depress HRV more than a hard workout 4 hours before bed.
     if _has("last_workout_end_to_sleep_min", "last_workout_whoop_strain"):
@@ -1665,7 +1698,7 @@ def print_completeness(df: pd.DataFrame) -> None:
                         "garmin_sleep_score", "training_readiness_score"],
         "Garmin HRV": [c for c in df.columns if "last_night" in c or "weekly_avg" in c or "baseline_" in c],
         "Eight Sleep": [c for c in df.columns if "eight_sleep" in c],
-        "Nutrition":   [c for c in df.columns if "mfp_" in c],
+        "Nutrition":   [c for c in df.columns if c.startswith("nutrition_") or "mfp_" in c or c in MICRONUTRIENT_COLS],
         "Journal":     [c for c in df.columns if c.startswith("journal_")],
         "Habits":      [c for c in df.columns if c.startswith("habit_")],
         "Supplements": [c for c in df.columns if c.startswith("supplement_")],
@@ -2249,20 +2282,24 @@ def run_statistical_analysis(
     # The audit flagged that the descriptive Spearman chart was a 7-column subset
     # of what the causal layer treats as nutrition treatments, so the dashboard
     # silently understated coverage.
+    # Macros read the COALESCE'd nutrition_* aliases (Cronometer→MFP). mfp_exercise_kcal
+    # dropped — Cronometer has none; net_calories is now WHOOP-based. MICRONUTRIENT_COLS
+    # adds the ~27 Cronometer vitamins/minerals/omega (sparse early, auto-skipped by the
+    # coverage gate below until history accrues).
     NUTRITION_COLS = {
-        "mfp_calories": ("Calories", "kcal"),
-        "mfp_protein_g": ("Protein", "g"),
-        "mfp_carbs_g": ("Carbohydrates", "g"),
-        "mfp_fat_g": ("Fat", "g"),
-        "mfp_fiber_g": ("Fiber", "g"),
-        "mfp_sugar_g": ("Sugar", "g"),
-        "mfp_sodium_mg": ("Sodium", "mg"),
-        "mfp_water_ml": ("Water", "ml"),
-        "mfp_exercise_kcal": ("Exercise kcal (MFP)", "kcal"),
+        "nutrition_calories": ("Calories", "kcal"),
+        "nutrition_protein_g": ("Protein", "g"),
+        "nutrition_carbs_g": ("Carbohydrates", "g"),
+        "nutrition_fat_g": ("Fat", "g"),
+        "nutrition_fiber_g": ("Fiber", "g"),
+        "nutrition_sugar_g": ("Sugar", "g"),
+        "nutrition_sodium_mg": ("Sodium", "mg"),
+        "nutrition_water_ml": ("Water", "ml"),
         "net_calories": ("Net Calories", "kcal"),
         "protein_pct": ("Protein % of Calories", "%"),
         "carb_pct": ("Carb % of Calories", "%"),
         "fat_pct": ("Fat % of Calories", "%"),
+        **MICRONUTRIENT_COLS,
     }
     nutrition_impact: list[dict] = []
     try:
@@ -4179,7 +4216,7 @@ def main() -> None:
         return next((f for f in full_ranked if f.startswith(prefix)), None)
 
     seeds: list[str] = []
-    for prefix in ("journal_", "habit_", "mfp_", "supplement_"):
+    for prefix in ("journal_", "habit_", "nutrition_", "supplement_"):
         f = first_with_prefix(prefix)
         if f and f not in seeds:
             seeds.append(f)

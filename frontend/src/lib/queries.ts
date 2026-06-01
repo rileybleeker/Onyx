@@ -363,10 +363,41 @@ export async function getEightSleepTrends(days: number = 30, side: string = "lef
 }
 
 // ---------------------------------------------------------------------------
-// MyFitnessPal
+// Nutrition (Cronometer → MFP COALESCE; cutover 2026-05-31)
 // ---------------------------------------------------------------------------
 
-export async function getMfpNutrition(days: number = 30) {
+/**
+ * Daily macros, COALESCE'd Cronometer-over-MFP via the behavioral matrix's
+ * nutrition_* columns. Aliased back to the legacy macro keys (calories,
+ * protein_g, …) so existing chart consumers are drop-in. `nutrition_source`
+ * carries provenance ('cronometer' | 'mfp') per day. Reads only days that have
+ * nutrition logged (nutrition_calories not null).
+ */
+export async function getNutrition(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("daily_health_matrix_behavioral")
+    .select(
+      "calendar_date, nutrition_source, " +
+        "calories:nutrition_calories, protein_g:nutrition_protein_g, " +
+        "carbs_g:nutrition_carbs_g, fat_g:nutrition_fat_g, fiber_g:nutrition_fiber_g, " +
+        "sugar_g:nutrition_sugar_g, sodium_mg:nutrition_sodium_mg, water_ml:nutrition_water_ml"
+    )
+    .gte("calendar_date", since.toISOString().split("T")[0])
+    .not("nutrition_calories", "is", null)
+    .order("calendar_date", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+/**
+ * Raw pre-cutover MFP rows, untouched, for a future "historical archive" view.
+ * Reads pds.myfitnesspal_nutrition directly (NOT the COALESCE'd matrix).
+ */
+export async function getMfpNutritionHistorical(days: number = 365) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
@@ -375,6 +406,71 @@ export async function getMfpNutrition(days: number = 30) {
     .select("*")
     .gte("calendar_date", since.toISOString().split("T")[0])
     .order("calendar_date", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+/**
+ * Per-entry Cronometer food log (newest first). Optional `date` (ET behavioral
+ * day, YYYY-MM-DD) narrows to a single day for the "Today's meals" widget.
+ */
+export async function getCronometerServings(days: number = 14, date?: string) {
+  let q = supabase
+    .from("cronometer_servings")
+    .select(
+      "serving_id, calendar_date, event_time, food_name, amount_raw, unit, " +
+        "meal_group, food_category, calories, protein_g, carbs_g, fat_g"
+    )
+    .order("calendar_date", { ascending: false })
+    .order("serving_id", { ascending: false });
+
+  if (date) {
+    q = q.eq("calendar_date", date);
+  } else {
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+    q = q.gte("calendar_date", since.toISOString().split("T")[0]);
+  }
+
+  const { data, error } = await q;
+  if (error) throw error;
+  return data ?? [];
+}
+
+/**
+ * Unified dietary (Cronometer) + supplemental (Onyx UNII rollup) + total
+ * micronutrient intake per behavioral day, from pds.daily_micronutrient_totals.
+ * Powers the "Vitamins & Minerals" card group with the dietary-vs-supplement split.
+ */
+export async function getDailyVitamins(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("daily_micronutrient_totals")
+    .select("*")
+    .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
+    .order("onyx_behavioral_date", { ascending: true });
+
+  if (error) throw error;
+  return data ?? [];
+}
+
+/**
+ * The FULL Cronometer daily nutrient set (all ~62 columns incl. amino acids and
+ * fat fractions) for the "All tracked nutrients" table. Dietary-only (no
+ * supplement merge) — use getDailyVitamins for the dietary+supplement split.
+ */
+export async function getDailyNutrientsFull(days: number = 30) {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("cronometer_nutrition_daily")
+    .select("*")
+    .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
+    .order("onyx_behavioral_date", { ascending: true });
 
   if (error) throw error;
   return data ?? [];

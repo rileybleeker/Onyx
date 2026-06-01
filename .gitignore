@@ -26,6 +26,14 @@ task_result.txt
 journal_inbox/*.csv
 journal_archive/*.csv
 
+# Cronometer CSV/ZIP data (keep folders, ignore data files)
+cronometer_inbox/*.csv
+cronometer_inbox/*.zip
+cronometer_archive/*.csv
+cronometer_archive/*.zip
+# Sample/scratch export drop folder (personal nutrition data)
+Cronometer Exports/
+
 # OS
 .DS_Store
 Thumbs.db

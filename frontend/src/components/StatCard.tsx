@@ -6,7 +6,7 @@ interface StatCardProps {
   unit?: string;
   sublabel?: string;
   trend?: { delta: number; favorable: "up" | "down" };
-  source?: "GARMIN" | "WHOOP" | "8SLP" | "MFP";
+  source?: "GARMIN" | "WHOOP" | "8SLP" | "MFP" | "CRONOMETER";
   className?: string;
 }
 

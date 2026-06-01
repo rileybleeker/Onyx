@@ -205,20 +205,53 @@ class TreatmentSpec:
 #   - Time-of-day "sleep timing" (bedtime_hour, wake_hour, sleep_midpoint_hour).
 #     Measured AT the sleep event, contemporaneous with the outcome.
 CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
-    # ── Nutrition (MyFitnessPal) ─────────────────────────────────────────────
-    ("mfp_calories",        "nutrition", "Calories above median",        "kcal"),
-    ("mfp_protein_g",       "nutrition", "Protein above median",         "g"),
-    ("mfp_carbs_g",         "nutrition", "Carbs above median",           "g"),
-    ("mfp_fat_g",           "nutrition", "Fat above median",             "g"),
-    ("mfp_fiber_g",         "nutrition", "Fiber above median",           "g"),
-    ("mfp_sugar_g",         "nutrition", "Sugar above median",           "g"),
-    ("mfp_sodium_mg",       "nutrition", "Sodium above median",          "mg"),
-    ("mfp_water_ml",        "nutrition", "Water intake above median",    "ml"),
-    ("exercise_kcal",       "nutrition", "Exercise kcal above median",   "kcal"),
+    # ── Nutrition macros (Cronometer→MFP COALESCE via nutrition_* aliases) ────
+    # MFP→Cronometer migration 2026-05-31: mfp_* repointed to nutrition_*;
+    # exercise_kcal dropped (Cronometer has none — net_calories is now WHOOP-based).
+    ("nutrition_calories",  "nutrition", "Calories above median",        "kcal"),
+    ("nutrition_protein_g", "nutrition", "Protein above median",         "g"),
+    ("nutrition_carbs_g",   "nutrition", "Carbs above median",           "g"),
+    ("nutrition_fat_g",     "nutrition", "Fat above median",             "g"),
+    ("nutrition_fiber_g",   "nutrition", "Fiber above median",           "g"),
+    ("nutrition_sugar_g",   "nutrition", "Sugar above median",           "g"),
+    ("nutrition_sodium_mg", "nutrition", "Sodium above median",          "mg"),
+    ("nutrition_water_ml",  "nutrition", "Water intake above median",    "ml"),
     ("net_calories",        "nutrition", "Net calories above median",    "kcal"),
     ("protein_pct",         "nutrition", "Protein % of cals above median", "%"),
     ("carb_pct",            "nutrition", "Carb % of cals above median",  "%"),
     ("fat_pct",             "nutrition", "Fat % of cals above median",   "%"),
+
+    # ── Cronometer micronutrients (vitamins / minerals / omega) ───────────────
+    # MFP→Cronometer migration 2026-05-31. Family='nutrition' → same lifestyle-
+    # clustering confounder routing. Most are dropped via MIN_CONTINUOUS_N=50 (or
+    # flagged low_n) until Cronometer history accrues — intended graceful degradation.
+    ("nutrition_caffeine_mg", "nutrition", "Dietary caffeine above median",  "mg"),
+    ("vit_a_rae_mcg",       "nutrition", "Vitamin A (RAE) above median",  "µg"),
+    ("vit_c_mg",            "nutrition", "Vitamin C above median",        "mg"),
+    ("vit_d_iu",            "nutrition", "Vitamin D above median",        "IU"),
+    ("vit_e_mg",            "nutrition", "Vitamin E above median",        "mg"),
+    ("vit_k_mcg",           "nutrition", "Vitamin K above median",        "µg"),
+    ("b1_thiamine_mg",      "nutrition", "B1 (Thiamine) above median",    "mg"),
+    ("b2_riboflavin_mg",    "nutrition", "B2 (Riboflavin) above median",  "mg"),
+    ("b3_niacin_mg",        "nutrition", "B3 (Niacin) above median",      "mg"),
+    ("b5_pantothenic_mg",   "nutrition", "B5 (Pantothenic) above median", "mg"),
+    ("b6_pyridoxine_mg",    "nutrition", "B6 (Pyridoxine) above median",  "mg"),
+    ("b12_cobalamin_mcg",   "nutrition", "B12 (Cobalamin) above median",  "µg"),
+    ("folate_mcg",          "nutrition", "Folate above median",           "µg"),
+    ("calcium_mg",          "nutrition", "Calcium above median",          "mg"),
+    ("iron_mg",             "nutrition", "Iron above median",             "mg"),
+    ("magnesium_mg",        "nutrition", "Magnesium above median",        "mg"),
+    ("phosphorus_mg",       "nutrition", "Phosphorus above median",       "mg"),
+    ("potassium_mg",        "nutrition", "Potassium above median",        "mg"),
+    ("zinc_mg",             "nutrition", "Zinc above median",             "mg"),
+    ("copper_mg",           "nutrition", "Copper above median",           "mg"),
+    ("manganese_mg",        "nutrition", "Manganese above median",        "mg"),
+    ("selenium_mcg",        "nutrition", "Selenium above median",         "µg"),
+    ("omega3_g",            "nutrition", "Omega-3 above median",          "g"),
+    ("omega6_g",            "nutrition", "Omega-6 above median",          "g"),
+    ("epa_g",               "nutrition", "EPA above median",              "g"),
+    ("dha_g",               "nutrition", "DHA above median",              "g"),
+    ("ala_g",               "nutrition", "ALA above median",              "g"),
 
     # ── Daytime strain / activity (WHOOP + Garmin) ───────────────────────────
     ("whoop_day_strain",            "behavior", "WHOOP day strain above median",      None),

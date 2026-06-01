@@ -31,7 +31,7 @@ const CADENCE: Record<string, string> = {
   eight_sleep: "Daily 3pm ET",
   whoop_journal: "Hourly :30 (IMAP)",
   habits: "Hourly :45",
-  myfitnesspal: "Hourly :15 (IMAP)",
+  cronometer: "Manual export → local import",
   // Predict: every hourly ETL + 23:50 ET (DST-gated).
   hrv_analysis: "Predict: hourly + 23:50 ET",
   // Retrain: hourly conditional on backfill detection + daily 12:00 UTC
@@ -59,7 +59,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   eight_sleep:    { method: "automated",      label: "API ETL" },
   whoop_journal:  { method: "semi-automated", label: "Email import" },
   habits:         { method: "automated",      label: "Notion sync" },
-  myfitnesspal:   { method: "semi-automated", label: "Email import" },
+  cronometer:     { method: "manual",         label: "Local import" },
   hrv_analysis:   { method: "automated",      label: "Computed" },
   hrv_retrain:    { method: "automated",      label: "Model retrain" },
   spotify:        { method: "automated",      label: "API ETL" },
@@ -190,13 +190,13 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, mfpRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, mealsRes, weightRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, mealsRes, weightRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
       supabase.from("habit_journal").select("cycle_date,synced_at").order("synced_at", { ascending: false }).limit(1),
-      supabase.from("myfitnesspal_nutrition").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
+      supabase.from("cronometer_nutrition_daily").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("hrv_predictions").select("prediction_date").eq("model", "xgboost").eq("horizon_days", 1).not("model_version", "like", "backtest%").order("prediction_date", { ascending: false }).limit(1),
       supabase.from("spotify_plays").select("played_date_et").order("played_date_et", { ascending: false }).limit(1),
       // Manual sources: include the actual log timestamp so the "Last Sync"
@@ -259,7 +259,7 @@ export async function GET() {
     const journalDate = journalRes.data?.[0]?.cycle_date ?? null;
     const habitsDate = habitsRes.data?.[0]?.cycle_date ?? null;
     const habitsLastLog = (habitsRes.data?.[0]?.synced_at as string | undefined) ?? null;
-    const mfpDate = mfpRes.data?.[0]?.calendar_date ?? null;
+    const cronDate = cronRes.data?.[0]?.calendar_date ?? null;
     const hrvDate = hrvRes.data?.[0]?.prediction_date ?? null;
     const spotifyDate = spotifyRes.data?.[0]?.played_date_et ?? null;
     const supplementsDate = supplementsRes.data?.[0]?.intake_date ?? null;
@@ -274,7 +274,7 @@ export async function GET() {
     // date (max across all sources), not browser-local today. When Riley is
     // abroad, the freshest day in his lived timeline IS today-in-his-current-TZ.
     // An ET-anchored "today" would falsely report all sources ~18h stale.
-    const spineMaxDate = [garminDate, whoopDate, eightSleepDate, mfpDate, hrvDate, spotifyDate]
+    const spineMaxDate = [garminDate, whoopDate, eightSleepDate, cronDate, hrvDate, spotifyDate]
       .filter((d): d is string => typeof d === "string")
       .sort()
       .pop() ?? null;
@@ -283,7 +283,7 @@ export async function GET() {
     const whoopEntry = latestBySrcType["whoop|full_sync"] ?? null;
     const eightSleepEntry = latestBySrcType["eight_sleep|trends"] ?? null;
     const journalEntry = latestBySrcType["whoop|journal_email"] ?? null;
-    const mfpEntry = latestBySrcType["myfitnesspal|nutrition"] ?? null;
+    const cronEntry = latestBySrcType["cronometer|daily"] ?? null;
     const spotifyEntry = latestBySrcType["spotify|plays"] ?? null;
     const reccobeatsEntry = latestBySrcType["reccobeats|audio_features"] ?? null;
     const musicbrainzEntry = latestBySrcType["musicbrainz|artist_tags"] ?? null;
@@ -299,7 +299,7 @@ export async function GET() {
     const eightSleepLag = daysLag(eightSleepDate, spineMaxDate);
     const journalLag = daysLag(journalDate, spineMaxDate);
     const habitsLag = daysLag(habitsDate, spineMaxDate);
-    const mfpLag = daysLag(mfpDate, spineMaxDate);
+    const cronLag = daysLag(cronDate, spineMaxDate);
     const hrvLag = daysLag(hrvDate, spineMaxDate);
     const spotifyLag = daysLag(spotifyDate, spineMaxDate);
     const supplementsLag = daysLag(supplementsDate, spineMaxDate);
@@ -389,18 +389,18 @@ export async function GET() {
         integrationMethod: METHOD.notion_journal.method,
         methodLabel: METHOD.notion_journal.label,
       },
-      myfitnesspal: {
-        label: "MyFitnessPal",
-        lastSync: (mfpEntry?.sync_start as string) ?? null,
-        status: deriveStatus(mfpEntry, mfpLag),
-        latestDataDate: mfpDate,
-        daysLag: mfpLag,
-        recordsSynced: (mfpEntry?.records_synced as number) ?? 0,
-        durationSeconds: (mfpEntry?.duration_seconds as number) ?? null,
-        errorMessage: (mfpEntry?.error_message as string) ?? null,
-        cadence: CADENCE.myfitnesspal,
-        integrationMethod: METHOD.myfitnesspal.method,
-        methodLabel: METHOD.myfitnesspal.label,
+      cronometer: {
+        label: "Cronometer",
+        lastSync: (cronEntry?.sync_start as string) ?? null,
+        status: deriveStatus(cronEntry, cronLag),
+        latestDataDate: cronDate,
+        daysLag: cronLag,
+        recordsSynced: (cronEntry?.records_synced as number) ?? 0,
+        durationSeconds: (cronEntry?.duration_seconds as number) ?? null,
+        errorMessage: (cronEntry?.error_message as string) ?? null,
+        cadence: CADENCE.cronometer,
+        integrationMethod: METHOD.cronometer.method,
+        methodLabel: METHOD.cronometer.label,
       },
       hrv_analysis: {
         label: "HRV Analysis",

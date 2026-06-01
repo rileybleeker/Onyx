@@ -19,6 +19,8 @@ When the user mentions completing a habit (e.g., "I meditated today", "I took my
 
 The user also keeps a free-form *personal* journal in Notion (prose entries about life, mood, relationships, training, mental health). Use query_journal_entries when they ask about what they wrote, how they were feeling, or to find context behind biometric trends — combine it with biometric tools to answer questions like "what was my HRV on days I logged a 'low' mood?". When a question is thematic rather than date-specific, set semantic_query to do similarity search.
 
+You also have the user's nutrition data. FOOD comes from Cronometer (cutover 2026-05-31; MyFitnessPal for older history). Use query_nutrition for daily macros and query_meals_log for the per-meal food log. For vitamins/minerals use query_vitamins — it already COMBINES dietary intake (food, from Cronometer) with supplemental intake (pills, from Onyx's /supplements tracker) and returns the dietary, supplement, and total amounts per nutrient, so never add supplements on top of those totals. The rule is: Cronometer = food, Onyx /supplements = pills. Use query_micronutrient_trend for single-nutrient trends.
+
 You can also create Spotify playlists. The user has private-playlist write access enabled. When asked to make a playlist:
 - Use query_spotify_tracks_by_features to pick tracks from their listening history (filter by audio-feature ranges like valence, energy, tempo).
 - Use search_spotify_catalog when they want tracks they haven't listened to before, or when filling out a playlist beyond what their history covers.
@@ -248,6 +250,50 @@ const tools: Anthropic.Tool[] = [
       required: ["name", "track_ids"],
     },
   },
+  {
+    name: "query_nutrition",
+    description:
+      "Daily nutrition macros (calories, protein, carbs, fat, fiber, sugar, sodium, water, dietary caffeine) per behavioral day. Source is Cronometer for new days and MyFitnessPal for pre-2026-05-31 history, transparently COALESCE'd. This is FOOD intake only — for supplement-inclusive vitamin/mineral totals use query_vitamins.",
+    input_schema: {
+      type: "object" as const,
+      properties: { days: { type: "number", description: "How many days back (default 7)" } },
+    },
+  },
+  {
+    name: "query_meals_log",
+    description:
+      "Per-entry Cronometer food log: each logged food with its meal group (Breakfast/Lunch/Dinner/Snacks/Uncategorized), amount, and macros. Use for 'what did I eat' / meal-by-meal questions. Pass `date` (YYYY-MM-DD, ET behavioral day) for a single day, or `days` for a range.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        days: { type: "number", description: "Days back (default 7)" },
+        date: { type: "string", description: "Single ET behavioral day, YYYY-MM-DD" },
+        limit: { type: "number", description: "Max entries (default 100)" },
+      },
+    },
+  },
+  {
+    name: "query_vitamins",
+    description:
+      "Daily micronutrient intake WITH the dietary-vs-supplement split. For each vitamin/mineral you get the amount from FOOD (Cronometer), from SUPPLEMENTS (Onyx UNII rollup), and the TOTAL — columns like vit_d_dietary_iu / vit_d_supplement_iu / vit_d_total_iu, magnesium_total_mg, omega3_total_g, etc. Use for 'did I hit my RDA of X', 'how much Y am I getting', or food-vs-pill questions. This view ALREADY combines food + supplements, so never add supplement amounts on top of the totals.",
+    input_schema: {
+      type: "object" as const,
+      properties: { days: { type: "number", description: "Days back (default 7)" } },
+    },
+  },
+  {
+    name: "query_micronutrient_trend",
+    description:
+      "Time series (dietary / supplement / total columns) for ONE micronutrient over the window, for trend questions ('how has my magnesium been', '7-day avg vitamin D'). Pass `nutrient` as a key fragment like 'magnesium', 'vit_d', 'omega3', 'b12', 'calcium'.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        nutrient: { type: "string", description: "Nutrient key fragment, e.g. 'magnesium', 'vit_d', 'omega3'" },
+        days: { type: "number", description: "Days back (default 30)" },
+      },
+      required: ["nutrient"],
+    },
+  },
 ];
 
 function stripRawFields(rows: Record<string, unknown>[]): Record<string, unknown>[] {
@@ -282,6 +328,75 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     query_whoop_sleep: { table: "whoop_sleep", timeCol: "start_time", extra: { is_nap: false, score_state: "SCORED" } },
     query_whoop_workouts: { table: "whoop_workouts", timeCol: "start_time" },
   };
+
+  // Nutrition: daily macros (Cronometer→MFP COALESCE via the behavioral matrix)
+  if (name === "query_nutrition") {
+    const { data, error } = await supabase
+      .from("daily_health_matrix_behavioral")
+      .select(
+        "calendar_date, nutrition_source, nutrition_calories, nutrition_protein_g, " +
+          "nutrition_carbs_g, nutrition_fat_g, nutrition_fiber_g, nutrition_sugar_g, " +
+          "nutrition_sodium_mg, nutrition_water_ml, nutrition_caffeine_mg"
+      )
+      .gte("calendar_date", sinceStr)
+      .not("nutrition_calories", "is", null)
+      .order("calendar_date", { ascending: false });
+    if (error) return JSON.stringify({ error: error.message });
+    return JSON.stringify(data ?? []);
+  }
+
+  // Nutrition: per-entry Cronometer food log
+  if (name === "query_meals_log") {
+    let q = supabase
+      .from("cronometer_servings")
+      .select(
+        "calendar_date, event_time, meal_group, food_name, amount_raw, food_category, calories, protein_g, carbs_g, fat_g"
+      )
+      .order("calendar_date", { ascending: false })
+      .order("serving_id", { ascending: false })
+      .limit(Math.min((input.limit as number) ?? 100, 400));
+    const date = input.date as string | undefined;
+    if (date) q = q.eq("calendar_date", date);
+    else q = q.gte("calendar_date", sinceStr);
+    const { data, error } = await q;
+    if (error) return JSON.stringify({ error: error.message });
+    return JSON.stringify(data ?? []);
+  }
+
+  // Nutrition: micronutrient totals (dietary + supplement + total per nutrient)
+  if (name === "query_vitamins") {
+    const { data, error } = await supabase
+      .from("daily_micronutrient_totals")
+      .select("*")
+      .gte("onyx_behavioral_date", sinceStr)
+      .order("onyx_behavioral_date", { ascending: false });
+    if (error) return JSON.stringify({ error: error.message });
+    return JSON.stringify(data ?? []);
+  }
+
+  // Nutrition: single-nutrient trend (dietary/supplement/total columns over time)
+  if (name === "query_micronutrient_trend") {
+    const nutrient = ((input.nutrient as string) ?? "").toLowerCase().trim();
+    const trendDays = (input.days as number) || 30;
+    const trendSince = new Date();
+    trendSince.setDate(trendSince.getDate() - trendDays);
+    const { data, error } = await supabase
+      .from("daily_micronutrient_totals")
+      .select("*")
+      .gte("onyx_behavioral_date", trendSince.toISOString().split("T")[0])
+      .order("onyx_behavioral_date", { ascending: false });
+    if (error) return JSON.stringify({ error: error.message });
+    const rows = (data ?? []) as Record<string, unknown>[];
+    const cols = rows.length
+      ? Object.keys(rows[0]).filter((c) => nutrient && c.includes(nutrient))
+      : [];
+    const series = rows.map((r) => {
+      const o: Record<string, unknown> = { date: r.onyx_behavioral_date };
+      for (const c of cols) o[c] = r[c];
+      return o;
+    });
+    return JSON.stringify({ nutrient, matched_columns: cols, series });
+  }
 
   // Spotify: search the full catalog
   if (name === "search_spotify_catalog") {

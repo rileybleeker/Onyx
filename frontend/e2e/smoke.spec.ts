@@ -134,6 +134,44 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
   });
 });
 
+test.describe("Nutrition — Cronometer migration tripwire", () => {
+  test("macros charts draw + Vitamins & Minerals panel renders", async ({ page }) => {
+    await gotoAuthed(page, "/nutrition");
+    await settle(page);
+
+    await expect(
+      page.getByRole("heading", { name: "Nutrition / Meal Timing" })
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    // The macros block is now Cronometer-sourced (MFP fills pre-cutover history).
+    // Its charts are the data-present signal — they must draw marks from the
+    // COALESCE'd nutrition_* columns. A broken nutrition query empties them.
+    const marks = page.locator(RECHARTS_MARKS);
+    await expect(
+      marks.first(),
+      "Nutrition charts drew nothing"
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+    expect(
+      await marks.count(),
+      "Nutrition charts drew no marks"
+    ).toBeGreaterThan(0);
+
+    // New Cronometer panels must render (catches a silently-broken nutrition_* /
+    // micronutrient query). Section headings are structural — present even on a
+    // thin day — so this won't false-fail when micronutrient coverage is sparse.
+    await expect(
+      page.getByText("Cronometer · Daily Macros"),
+      "Cronometer macros section missing"
+    ).toBeVisible();
+    await expect(
+      page.getByText("Vitamins & Minerals"),
+      "Vitamins & Minerals panel missing"
+    ).toBeVisible();
+
+    await expectNoClientCrash(page);
+  });
+});
+
 test.describe("Supplements — renamed-view-column regression tripwire", () => {
   test("compound totals table is populated when intakes exist today", async ({
     page,
@@ -236,7 +274,8 @@ const PAGES: SmokePage[] = [
     heading: "Nutrition / Meal Timing",
     signal: "charts",
     // Meal-timing + body-weight are manual-entry sections that can be
-    // legitimately empty; the MFP macro charts are the data-present signal.
+    // legitimately empty; the Cronometer macro charts (COALESCE'd over MFP
+    // history) are the data-present signal. Vitamins panel asserted separately.
     hardEmpty: [],
   },
   {
