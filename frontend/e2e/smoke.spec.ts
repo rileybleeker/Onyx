@@ -140,7 +140,7 @@ test.describe("Nutrition — Cronometer migration tripwire", () => {
     await settle(page);
 
     await expect(
-      page.getByRole("heading", { name: "Nutrition / Meal Timing" })
+      page.getByRole("heading", { name: "Nutrition" })
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
     // The macros block is now Cronometer-sourced (MFP fills pre-cutover history).
@@ -271,7 +271,7 @@ const PAGES: SmokePage[] = [
   },
   {
     route: "/nutrition",
-    heading: "Nutrition / Meal Timing",
+    heading: "Nutrition",
     signal: "charts",
     // Meal-timing + body-weight are manual-entry sections that can be
     // legitimately empty; the Cronometer macro charts (COALESCE'd over MFP
