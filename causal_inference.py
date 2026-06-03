@@ -377,9 +377,23 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
 EXPLICIT_BINARY_TREATMENTS: tuple[tuple[str, str, str], ...] = (
     # (column, family, label)
     ("had_evening_workout", "behavior", "Had evening workout (after 6pm)"),
-    ("is_run_day",          "behavior", "Run day (any run logged)"),
+    # NOTE: is_run_day is intentionally NOT a treatment — superseded by act_run
+    # below. is_run_day is Garmin-only and left NaN on rest days, so its control arm
+    # is "active-but-didn't-run" only (a different counterfactual than act_run's
+    # "any non-run day"). Dropping it here avoids a duplicate, ambiguous forest-plot
+    # row + a redundant FDR-family member. The column still exists in the matrix
+    # (consecutive_run_days and XGBoost use it) — only its treatment is removed.
     ("is_rest_day",         "behavior", "Rest day (no workouts)"),
     ("negative_split",      "behavior", "Negative split (second half faster)"),
+    # Activity taxonomy — auto run/sauna from device sport labels; leg/pull/push
+    # from the manual split_label set on /activities. Derived in hrv_analysis
+    # aggregate_activity_categories (act_ prefix). Sparse until ~3 weeks of labels
+    # accrue (cell-size gates drop them to dropped_low_n meanwhile).
+    ("act_run",             "behavior", "Run day (WHOOP + Garmin)"),
+    ("act_sauna",           "behavior", "Sauna session"),
+    ("act_leg_day",         "behavior", "Leg day"),
+    ("act_pull_day",        "behavior", "Pull day"),
+    ("act_push_day",        "behavior", "Push day"),
     # ADR-0001 Phase B travel treatments
     ("is_transition_day",   "travel",   "Travel transition day"),
     ("is_outbound",         "travel",   "Outbound travel (NY → away)"),

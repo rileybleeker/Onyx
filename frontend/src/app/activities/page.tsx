@@ -24,10 +24,33 @@ type ActivityRow = {
   avg_heart_rate: number | null;
   max_heart_rate: number | null;
   calories: number | null;
+  split_label: "leg" | "pull" | "push" | null;
   raw_json?: any;
 };
 
+type ActivityCategory = "run" | "sauna" | "strength" | "other";
+type SplitLabel = "leg" | "pull" | "push";
+
 const DEDUP_WINDOW_MS = 5 * 60 * 1000;
+
+// Onyx auto-categorizes each activity from its device sport label / name. The
+// leg/pull/push split is the ONLY dimension devices can't distinguish (WHOOP logs
+// all lifting as one generic 'weightlifting_msk'; Garmin records no strength), so
+// it's the one thing reported manually via the toggle on strength rows.
+function deriveCategory(act: ActivityRow): ActivityCategory {
+  const hay = `${act.type} ${act.name}`.toLowerCase();
+  if (hay.includes("sauna")) return "sauna";
+  if (hay.includes("run")) return "run";
+  if (/weightlift|strength|lifting|resistance/.test(hay)) return "strength";
+  return "other";
+}
+
+const CATEGORY_BADGE: Record<ActivityCategory, string> = {
+  run:      "bg-cyan-500/10 text-cyan-300",
+  sauna:    "bg-orange-500/10 text-orange-300",
+  strength: "bg-violet-500/10 text-violet-300",
+  other:    "",
+};
 
 function shiftToLocalIso(utcIso: string, tzOffset: string | null): string {
   if (!tzOffset) return utcIso;
@@ -52,6 +75,7 @@ function normalizeGarmin(a: any): ActivityRow {
     avg_heart_rate: a.avg_heart_rate ?? null,
     max_heart_rate: a.max_heart_rate ?? null,
     calories: a.calories ?? null,
+    split_label: (a.split_label as ActivityRow["split_label"]) ?? null,
     raw_json: a.raw_json,
   };
 }
@@ -78,6 +102,7 @@ function normalizeWhoop(w: any): ActivityRow {
     avg_heart_rate: w.average_heart_rate ?? null,
     max_heart_rate: w.max_heart_rate ?? null,
     calories: kcal,
+    split_label: (w.split_label as ActivityRow["split_label"]) ?? null,
   };
 }
 
@@ -410,6 +435,27 @@ export default function ActivitiesPage() {
     }
   }
 
+  // Set (or clear) the manual leg/pull/push split label on a strength session.
+  // Writes split_label onto the underlying whoop_workouts/garmin_activities row
+  // (ETL-preserving, like is_excluded). Optimistic update with rollback on error.
+  async function setSplit(act: ActivityRow, split: SplitLabel | null) {
+    const sourceId = act.id.slice(act.id.indexOf(":") + 1); // colon-safe: WHOOP ids are opaque TEXT
+    const before = rows;
+    setRows((prev) => prev.map((r) => (r.id === act.id ? { ...r, split_label: split } : r)));
+    try {
+      const res = await fetch("/api/activities/categorize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source: act.source, id: sourceId, split_label: split }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+    } catch (e) {
+      setRows(before);
+      console.error("Categorize activity:", e);
+      alert(`Failed to set split: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   const latestSummary = summaries[summaries.length - 1];
   const stepsData = summaries.map((d) => ({
     date: formatDate(d.calendar_date),
@@ -588,6 +634,7 @@ export default function ActivitiesPage() {
             const sourceBadge = act.source === "whoop"
               ? "bg-emerald-500/10 text-emerald-300"
               : "bg-sky-500/10 text-sky-300";
+            const category = deriveCategory(act);
             const recCtx = recoveryMap[act.id];
             const recColor = recCtx?.recovery == null
               ? "text-text-secondary"
@@ -623,6 +670,11 @@ export default function ActivitiesPage() {
                     <span className="bg-white/5 text-text-secondary text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px]">
                       {act.type}
                     </span>
+                    {category !== "other" && (
+                      <span className={`${CATEGORY_BADGE[category]} text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px]`}>
+                        {category}
+                      </span>
+                    )}
                     <span className="text-[11px] text-text-tertiary">
                       {act.display_time ? new Date(act.display_time).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }) : ""}
                     </span>
@@ -677,6 +729,25 @@ export default function ActivitiesPage() {
                     <div className="flex items-center gap-1">
                       <span className="text-text-tertiary text-[12px]">Recovery </span>
                       <span className={`${recColor} font-mono text-[13px]`}>{recCtx.recovery.toFixed(0)}%</span>
+                    </div>
+                  )}
+                  {category === "strength" && (
+                    <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                      <span className="text-text-tertiary text-[12px]">Split</span>
+                      {(["leg", "pull", "push"] as const).map((s) => (
+                        <button
+                          key={s}
+                          onClick={() => setSplit(act, act.split_label === s ? null : s)}
+                          className={`text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px] border transition-colors ${
+                            act.split_label === s
+                              ? "bg-violet-500/20 border-violet-400/50 text-violet-200"
+                              : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"
+                          }`}
+                          title={`Mark this lifting session as ${s} day`}
+                        >
+                          {s}
+                        </button>
+                      ))}
                     </div>
                   )}
                   {canExpand && (

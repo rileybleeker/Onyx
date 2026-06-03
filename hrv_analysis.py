@@ -257,6 +257,7 @@ CONTROLLABLE_FEATURE_PREFIXES = (
     "sp_",  # Spotify daily signature (opt-in via ONYX_INCLUDE_SPOTIFY=1)
     "meal_",  # Meal timing: last_hour, first_hour, eating_window, last_meal_to_bedtime_min
     "caffeine_",  # Caffeine timing: first_hour, last_hour, window_hours, intake_count, to_bedtime_min
+    "act_",  # Activity taxonomy: run / sauna / leg_day / pull_day / push_day (auto + manual split)
 ) + tuple(MICRONUTRIENT_COLS)  # Cronometer vitamins/minerals (exact column names)
 
 # Computed once per run from the post-prepare_ml_data (X, y) and stamped onto every
@@ -380,6 +381,11 @@ FEATURE_LABELS: dict[str, str] = {
     "days_since_alcohol": "Days Since Alcohol",
     "days_since_last_rest_day": "Days Since Rest Day (Journal)",
     "days_since_sauna": "Days Since Sauna",
+    "act_run": "Run (WHOOP + Garmin)",
+    "act_sauna": "Sauna Session",
+    "act_leg_day": "Leg Day",
+    "act_pull_day": "Pull Day",
+    "act_push_day": "Push Day",
     "weight_kg": "Body Weight (kg)",
     "nj_mood_ord": "Notion Journal Mood (ordinal)",
     "nj_confidence_ord": "Notion Journal Confidence (ordinal)",
@@ -601,7 +607,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     # for the workout-to-sleep gap feature; start_time_local stays for date binning.
     data["garmin_acts"] = fetch_all(
         "garmin_activities",
-        select="activity_id,start_time_local,start_time_gmt,activity_type,duration_seconds,distance_meters,"
+        select="activity_id,start_time_local,start_time_gmt,activity_type,split_label,onyx_behavioral_date,duration_seconds,distance_meters,"
                "avg_heart_rate,max_heart_rate,calories,elevation_gain_meters,"
                "aerobic_training_effect,anaerobic_training_effect,training_load,vo2_max,"
                "avg_speed_mps",
@@ -647,7 +653,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     # end_time added for the workout-to-sleep gap feature (true UTC; 100% populated).
     data["whoop_wk"] = fetch_all(
         "whoop_workouts",
-        select="workout_id,start_time,end_time,sport_name,strain,kilojoule,average_heart_rate,max_heart_rate,"
+        select="workout_id,start_time,end_time,sport_name,split_label,onyx_behavioral_date,strain,kilojoule,average_heart_rate,max_heart_rate,"
                "zone_zero_milli,zone_one_milli,zone_two_milli,zone_three_milli,"
                "zone_four_milli,zone_five_milli,score_state",
         filters=[("score_state", "eq", "SCORED"), ("is_excluded", "eq", False)],
@@ -847,6 +853,82 @@ def aggregate_whoop_workouts(wk: pd.DataFrame, cycles: pd.DataFrame) -> pd.DataF
             aggfunc=lambda x: x.sum() + wk.loc[x.index, "zone_one_milli"].sum()
         ),
     ).reset_index()
+
+
+# User-facing activity taxonomy. run/sauna are auto-categorized from device sport
+# labels; leg/pull/push come from the manual split_label on the lifting session
+# (set from the /activities page — devices can't distinguish the strength split).
+ACT_CATEGORY_COLS = ["act_run", "act_sauna", "act_leg_day", "act_pull_day", "act_push_day"]
+
+
+def aggregate_activity_categories(whoop_wk: pd.DataFrame, garmin_acts: pd.DataFrame) -> pd.DataFrame:
+    """Per-behavioral-day 0/1 flags for the activity taxonomy (one column per
+    ACT_CATEGORY_COLS).
+
+    run + sauna are AUTO-derived from device sport labels (WHOOP sport_name,
+    Garmin activity_type). leg/pull/push come from the manual `split_label` on the
+    lifting workout — WHOOP logs all resistance training as one generic
+    'weightlifting_msk' with no muscle-group detail, and Garmin records no
+    strength, so the split is the one thing only the user holds.
+
+    Keyed on onyx_behavioral_date (= the matrix spine's calendar_date) so a
+    session's category co-locates with its behavioral day and the shift(-1) target
+    alignment holds even for a session that starts after midnight — rather than the
+    ET-of-start key the other workout aggregates inherited (ADR-0001 #1 trap).
+    Falls back to the loader's ET-of-start calendar_date only when the behavioral
+    column is absent/NULL. The caller fills a day with no session to 0 (not NaN).
+    """
+    def _behavioral_key(f: pd.DataFrame) -> pd.Series:
+        # Prefer the behavioral day; coalesce to the ET-of-start calendar_date the
+        # loader sets when behavioral is missing/NULL (shouldn't happen post-ADR).
+        if "onyx_behavioral_date" in f.columns:
+            bd = f["onyx_behavioral_date"]
+            if "calendar_date" in f.columns:
+                bd = bd.fillna(f["calendar_date"])
+            return bd.astype(str)
+        return f["calendar_date"].astype(str)
+
+    LIFT_RE = "weightlift|strength|lifting|resistance"
+    frames: list[pd.DataFrame] = []
+
+    # WHOOP workouts carry running, sauna, AND weightlifting(+split_label).
+    if whoop_wk is not None and not whoop_wk.empty:
+        w = whoop_wk.copy()
+        w["calendar_date"] = _behavioral_key(w)
+        w = w[~w["calendar_date"].isin(["None", "NaT", "nan", ""])]
+        sport = w["sport_name"].astype(str).str.lower()
+        split = (w["split_label"].astype(str).str.lower()
+                 if "split_label" in w.columns else pd.Series("", index=w.index))
+        is_lift = sport.str.contains(LIFT_RE, regex=True, na=False)
+        w["act_run"]      = sport.str.contains("run", na=False).astype(float)
+        w["act_sauna"]    = sport.str.contains("sauna", na=False).astype(float)
+        w["act_leg_day"]  = (is_lift & (split == "leg")).astype(float)
+        w["act_pull_day"] = (is_lift & (split == "pull")).astype(float)
+        w["act_push_day"] = (is_lift & (split == "push")).astype(float)
+        frames.append(w.groupby("calendar_date")[ACT_CATEGORY_COLS].max().reset_index())
+
+    # Garmin activities: runs (auto). split_label is honored too — defensive, since
+    # Garmin carries no strength in the current data, but it keeps the /activities
+    # toggle end-to-end consistent if a strength session is ever Garmin-sourced.
+    if garmin_acts is not None and not garmin_acts.empty:
+        g = garmin_acts.copy()
+        g["calendar_date"] = _behavioral_key(g)
+        g = g[~g["calendar_date"].isin(["None", "NaT", "nan", ""])]
+        gtype = g["activity_type"].astype(str).str.lower()
+        gsplit = (g["split_label"].astype(str).str.lower()
+                  if "split_label" in g.columns else pd.Series("", index=g.index))
+        g_is_lift = gtype.str.contains(LIFT_RE, regex=True, na=False)
+        g["act_run"]      = gtype.str.contains("run", na=False).astype(float)
+        g["act_sauna"]    = gtype.str.contains("sauna", na=False).astype(float)
+        g["act_leg_day"]  = (g_is_lift & (gsplit == "leg")).astype(float)
+        g["act_pull_day"] = (g_is_lift & (gsplit == "pull")).astype(float)
+        g["act_push_day"] = (g_is_lift & (gsplit == "push")).astype(float)
+        frames.append(g.groupby("calendar_date")[ACT_CATEGORY_COLS].max().reset_index())
+
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.groupby("calendar_date")[ACT_CATEGORY_COLS].max().reset_index()
 
 
 def _clean_question_col(prefix: str, question: str) -> str:
@@ -1134,6 +1216,24 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         ww_daily = aggregate_whoop_workouts(data["whoop_wk"], data.get("whoop_cycles", pd.DataFrame()))
         if not ww_daily.empty:
             df = df.merge(ww_daily, on="calendar_date", how="left", suffixes=("", "_ww"))
+
+    # --- Join activity taxonomy (run / sauna / leg / pull / push) ---
+    # Auto from device sport labels (run, sauna) + the manual split_label on
+    # lifting sessions (leg/pull/push, set from /activities). act_* is blanket-
+    # filled to 0 on every spine row (a day with no such session = "didn't do it").
+    # Note this is STRICTER than is_run_day, which stays NaN on non-activity days:
+    # any pre-device-coverage spine rows become structural 0s. That's harmless —
+    # every downstream consumer (Spearman/Welch, XGBoost prepare_ml_data, causal
+    # AIPW) first drops rows lacking the next-night HRV outcome + HRV-derived
+    # confounders, which is exactly the pre-coverage era.
+    act_cat = aggregate_activity_categories(
+        data.get("whoop_wk", pd.DataFrame()), data.get("garmin_acts", pd.DataFrame())
+    )
+    if not act_cat.empty:
+        df = df.merge(act_cat, on="calendar_date", how="left", suffixes=("", "_actcat"))
+        for c in ACT_CATEGORY_COLS:
+            if c in df.columns:
+                df[c] = df[c].fillna(0.0)
 
     # --- Join whoop_body_measurements (forward-fill) ---
     if not data["whoop_body"].empty:
@@ -1469,11 +1569,18 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
 
     # Journal-derived "days since" features
     j_alcohol_col = next((c for c in df.columns if "alcoholic" in c or c == "journal_have_any_alcoholic_drinks"), None)
-    j_sauna_col = next((c for c in df.columns if "sauna" in c), None)
     if j_alcohol_col:
         df["days_since_alcohol"] = _days_since(df[j_alcohol_col].fillna(0))
-    if j_sauna_col:
-        df["days_since_sauna"] = _days_since(df[j_sauna_col].fillna(0))
+    # Days since sauna: prefer the robust device-sourced act_sauna (WHOOP
+    # sport_name='sauna') over the optional WHOOP journal "used a sauna" question,
+    # which is frequently unenabled. Fall back to a journal sauna column only if
+    # act_sauna isn't present (e.g. no WHOOP workout data loaded this run).
+    if "act_sauna" in df.columns:
+        df["days_since_sauna"] = _days_since(df["act_sauna"].fillna(0))
+    else:
+        j_sauna_col = next((c for c in df.columns if "sauna" in c and c.startswith("journal_")), None)
+        if j_sauna_col:
+            df["days_since_sauna"] = _days_since(df[j_sauna_col].fillna(0))
 
     # HR zone percentages from garmin_heart_rate
     for i in range(1, 6):
@@ -4216,7 +4323,7 @@ def main() -> None:
         return next((f for f in full_ranked if f.startswith(prefix)), None)
 
     seeds: list[str] = []
-    for prefix in ("journal_", "habit_", "nutrition_", "supplement_"):
+    for prefix in ("journal_", "habit_", "act_", "nutrition_", "supplement_"):
         f = first_with_prefix(prefix)
         if f and f not in seeds:
             seeds.append(f)
