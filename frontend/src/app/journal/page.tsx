@@ -149,8 +149,8 @@ export default function JournalPage() {
   }
 
   return (
-    <div className="px-4 md:px-6 py-4 md:py-6 max-w-4xl mx-auto pt-[max(1rem,env(safe-area-inset-top))] md:pt-6">
-      <header className="mb-6 ml-12 md:ml-0 flex flex-wrap items-end justify-between gap-3">
+    <div className="px-4 md:px-6 pb-4 md:pb-6 max-w-4xl mx-auto">
+      <header className="mb-6 flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="text-xl md:text-2xl font-semibold text-text-primary tracking-tight">
             Journal

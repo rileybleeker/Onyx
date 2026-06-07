@@ -44,16 +44,23 @@ export default function MobileNav() {
 
   return (
     <>
-      {/* Hamburger button — fixed top-left, mobile only */}
-      <button
-        onClick={() => setOpen(true)}
-        className="md:hidden fixed top-[max(1rem,env(safe-area-inset-top))] left-4 z-40 w-9 h-9 flex items-center justify-center rounded-[6px] bg-surface-card border border-border-subtle text-text-secondary hover:text-text-primary transition-colors shadow-card"
-        aria-label="Open navigation"
-      >
-        <svg className="w-[18px] h-[18px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" />
-        </svg>
-      </button>
+      {/* Mobile top bar — opaque, fills the safe-area inset so scrolled page
+          content no longer bleeds up under the status bar / menu button.
+          Mobile only; desktop uses the persistent Sidebar instead. */}
+      <header className="md:hidden fixed inset-x-0 top-0 z-40 bg-surface-card border-b border-border-subtle pt-[env(safe-area-inset-top)]">
+        <div className="h-12 px-3 flex items-center gap-2.5">
+          <button
+            onClick={() => setOpen(true)}
+            className="w-9 h-9 -ml-1 flex items-center justify-center rounded-[6px] text-text-secondary hover:text-text-primary transition-colors"
+            aria-label="Open navigation"
+          >
+            <svg className="w-[18px] h-[18px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+          </button>
+          <span className="text-[15px] font-semibold text-text-primary tracking-tight">Onyx</span>
+        </div>
+      </header>
 
       {/* Backdrop */}
       {open && (
