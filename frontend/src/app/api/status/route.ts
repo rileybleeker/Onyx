@@ -269,7 +269,15 @@ export async function GET() {
     // date (max across all sources), not browser-local today. When Riley is
     // abroad, the freshest day in his lived timeline IS today-in-his-current-TZ.
     // An ET-anchored "today" would falsely report all sources ~18h stale.
-    const spineMaxDate = [garminDate, whoopDate, eightSleepDate, cronDate, hrvDate, spotifyDate]
+    //
+    // hrvDate is DELIBERATELY EXCLUDED from the anchor: hrv_predictions.prediction_date
+    // is a FORECAST (always today+1, and today+2 on a late-evening run), so including it
+    // pushed the reference date into the future and made every source carrying actual data
+    // for *today* read as 1-2 days behind → false "Degraded". The freshness anchor must be
+    // the most-recent OBSERVED day, never a prediction about the future. The HRV card keeps
+    // its own freshness via hrvLag (prediction_date vs this anchor), so excluding it here
+    // doesn't mask a real prediction outage.
+    const spineMaxDate = [garminDate, whoopDate, eightSleepDate, cronDate, spotifyDate]
       .filter((d): d is string => typeof d === "string")
       .sort()
       .pop() ?? null;
