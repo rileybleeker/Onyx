@@ -48,41 +48,87 @@ function prettifyLabel(raw: string): string {
 }
 
 /**
- * Wrapped YAxis tick — labels in the correlation / journal-impact charts can
- * run 30-40 chars long (e.g. "Learned Something Interesting Or Important").
- * Default Recharts behavior truncates with no overflow indicator; we instead
- * pack words greedily onto up to 2 lines and add a <title> hover so the full
- * label is always recoverable.
+ * Greedy word-wrap a (display) label into up to `maxLines` lines, each kept at
+ * or under `maxChars`. Unlike the previous 2-line-then-hard-truncate approach,
+ * NO line is ever allowed to overflow its width budget — so a right-anchored
+ * YAxis tick can't bleed off the left edge of the chart gutter and get clipped
+ * (the bug that rendered "Inflammatory Drug NSAID" as "…smmatory Drug Nsa…":
+ * line 2 grew unbounded, then the right-anchored text ran past the gutter and
+ * lost characters off BOTH ends).
  *
- * `maxCharsPerLine` is the soft target — a word will spill over by a few
- * characters rather than break mid-word.
+ * Only the final line is ellipsized, and only when words still remain after the
+ * line budget is exhausted. A single word wider than `maxChars` is hard-sliced.
  */
-function WrappedYAxisTick(
-  { x, y, payload, maxCharsPerLine = 24, fontSize = 10 }: {
-    x?: number; y?: number; payload?: { value?: string };
-    maxCharsPerLine?: number; fontSize?: number;
-  }
-) {
-  const raw = String(payload?.value ?? "");
-  const display = prettifyLabel(raw);
-  const words = display.split(/\s+/);
-  const lines: string[] = ["", ""];
-  let cursor = 0;
-  for (const w of words) {
-    const candidate = lines[cursor] ? `${lines[cursor]} ${w}` : w;
-    if (candidate.length <= maxCharsPerLine || cursor === 1) {
-      lines[cursor] = candidate;
+function wrapLabel(text: string, maxChars: number, maxLines = 3): string[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [""];
+  const lines: string[] = [];
+  let cur = "";
+  let p = 0;
+  while (p < words.length && lines.length < maxLines) {
+    const w = words[p];
+    const candidate = cur ? `${cur} ${w}` : w;
+    if (candidate.length <= maxChars) {
+      cur = candidate;
+      p++;
+    } else if (!cur) {
+      // lone word wider than the whole line — hard-slice it onto its own line
+      lines.push(w.slice(0, Math.max(1, maxChars - 1)) + "…");
+      p++;
     } else {
-      cursor = 1;
-      lines[cursor] = w;
+      // commit the current line, retry this word on a fresh one
+      lines.push(cur);
+      cur = "";
     }
   }
-  // If line 2 overflows the budget, truncate with ellipsis so it doesn't
-  // bleed into the bars. Hover (<title>) still shows the full label.
-  const hardCap = maxCharsPerLine + 6;
-  if (lines[1].length > hardCap) lines[1] = lines[1].slice(0, hardCap - 1) + "…";
+  if (cur && lines.length < maxLines) { lines.push(cur); cur = ""; }
+  // Words left unplaced → flag the final line as truncated (hover shows full).
+  if (p < words.length && lines.length) {
+    const last = lines[lines.length - 1];
+    lines[lines.length - 1] = last.endsWith("…")
+      ? last
+      : (last.length >= maxChars ? last.slice(0, maxChars - 1) : last) + "…";
+  }
+  return lines.length ? lines : [""];
+}
 
-  const isWrapped = lines[1].length > 0;
+/**
+ * Container height for a horizontal bar chart whose YAxis ticks wrap with
+ * {@link wrapLabel}. Each row is sized to the deepest label so multi-line names
+ * never overlap their neighbours, while charts with only short labels stay
+ * compact. `maxChars` MUST match the value passed to the chart's tick so the
+ * measured line count matches what actually renders.
+ */
+function chartHeight(
+  labels: (string | undefined)[], maxChars: number, minHeight: number,
+  { maxLines = 3, fontSize = 10 }: { maxLines?: number; fontSize?: number } = {}
+): number {
+  let deepest = 1;
+  for (const l of labels) {
+    deepest = Math.max(deepest, wrapLabel(prettifyLabel(String(l ?? "")), maxChars, maxLines).length);
+  }
+  const perRow = fontSize * (deepest >= 3 ? 3.7 : deepest === 2 ? 2.6 : 2.0);
+  return Math.max(minHeight, labels.length * perRow);
+}
+
+/**
+ * Wrapped YAxis tick — labels in the correlation / journal-impact charts can
+ * run 30-40 chars long (e.g. "Learned Something Interesting Or Important").
+ * Wraps onto up to `maxLines` lines via {@link wrapLabel} (every line within
+ * the gutter width), vertically centers the block on the tick anchor, and adds
+ * a <title> hover so the full label is always recoverable.
+ */
+function WrappedYAxisTick(
+  { x, y, payload, maxCharsPerLine = 24, maxLines = 3, fontSize = 10 }: {
+    x?: number; y?: number; payload?: { value?: string };
+    maxCharsPerLine?: number; maxLines?: number; fontSize?: number;
+  }
+) {
+  const display = prettifyLabel(String(payload?.value ?? ""));
+  const lines = wrapLabel(display, maxCharsPerLine, maxLines);
+  const lineH = fontSize * 1.15;
+  // Vertically center the wrapped block on the tick's y anchor.
+  const firstDy = -((lines.length - 1) / 2) * lineH + fontSize * 0.32;
   return (
     <g transform={`translate(${x},${y})`}>
       <text
@@ -94,14 +140,9 @@ function WrappedYAxisTick(
         fontFamily="var(--font-geist-mono), monospace"
       >
         <title>{display}</title>
-        {isWrapped ? (
-          <>
-            <tspan x={-4} dy={-fontSize * 0.45}>{lines[0]}</tspan>
-            <tspan x={-4} dy={fontSize * 1.1}>{lines[1]}</tspan>
-          </>
-        ) : (
-          <tspan x={-4} dy={fontSize * 0.35}>{lines[0]}</tspan>
-        )}
+        {lines.map((ln, i) => (
+          <tspan key={i} x={-4} dy={i === 0 ? firstDy : lineH}>{ln}</tspan>
+        ))}
       </text>
     </g>
   );
@@ -371,11 +412,16 @@ export default function HrvAnalysisPage() {
     xlong: isMobile ? 110 : 220,  // Dose-Response, Causal Binary
     nutri: isMobile ? 100 : 140,  // Nutrition correlations
   };
+  // Mobile char budgets are sized to the gutter width: a ~110px gutter at
+  // fontSize 10 monospace (~6px/char) holds ~18 chars, so 17 is the safe cap
+  // that leaves no line clipping while fitting one extra word per line. Paired
+  // with WrappedYAxisTick's 3-line wrap, this keeps even 40-char journal labels
+  // fully visible. nutri's gutter is ~100px → 15.
   const chars = {
-    long:  isMobile ? 16 : 28,
-    xlong: isMobile ? 16 : 30,
-    corr:  isMobile ? 16 : 26,
-    nutri: isMobile ? 14 : 20,
+    long:  isMobile ? 17 : 28,
+    xlong: isMobile ? 17 : 30,
+    corr:  isMobile ? 17 : 26,
+    nutri: isMobile ? 15 : 20,
   };
   const sideMarginShort = isMobile ? 4 : 140;  // matches axisW.short when desktop
   const sideMarginMed   = isMobile ? 4 : 160;  // matches axisW.med when desktop
@@ -994,7 +1040,7 @@ export default function HrvAnalysisPage() {
           source="SPEARMAN ρ"
           info="What it shows: how strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises; near −1.0 means the opposite. Long-term pattern, doesn't change day to day. Method: Spearman ρ — a rank-based correlation that's robust to outliers and skewed distributions; scores range −1.0 to +1.0. Journal behaviors and habits appear in separate sub-sections below because Yes/No features have a narrower correlation range than continuous metrics.">
           {correlations.length > 0 ? (
-            <ResponsiveContainer width="100%" height={Math.max(360, correlations.length * 26)}>
+            <ResponsiveContainer width="100%" height={chartHeight(correlations.map((c: any) => c.label), chars.corr, 360)}>
               <BarChart data={correlations} layout="vertical"
                         margin={{ left: 8, right: 20, top: 4, bottom: 4 }}>
                 <CartesianGrid {...gridStyle} horizontal={false} />
@@ -1030,7 +1076,7 @@ export default function HrvAnalysisPage() {
               <strong className="text-text-secondary">Why it&apos;s used:</strong> Rank-based, so it shrugs off outlier nights and skewed distributions that would distort a standard correlation. Scores range from −1.0 to +1.0; because behaviors are Yes/No, expect smaller magnitudes than continuous metrics — a steady ±0.10 across hundreds of nights is still real signal.
             </p>
             {journalCorrelations.length > 0 ? (
-              <ResponsiveContainer width="100%" height={Math.max(160, journalCorrelations.length * 28)}>
+              <ResponsiveContainer width="100%" height={chartHeight(journalCorrelations.map((c: any) => c.label), chars.long, 160)}>
                 <BarChart data={journalCorrelations} layout="vertical"
                           margin={{ left: 8, right: 20, top: 2, bottom: 2 }}>
                   <CartesianGrid {...gridStyle} horizontal={false} />
@@ -1067,7 +1113,7 @@ export default function HrvAnalysisPage() {
               <strong className="text-text-secondary">Why it&apos;s used:</strong> Rank-based, so it shrugs off outlier nights and skewed distributions that would distort a standard correlation. Scores range from −1.0 to +1.0; because habits are Yes/No, expect smaller magnitudes than continuous metrics — a steady ±0.10 across hundreds of nights is still real signal.
             </p>
             {habitCorrelations.length > 0 ? (
-              <ResponsiveContainer width="100%" height={Math.max(160, habitCorrelations.length * 32)}>
+              <ResponsiveContainer width="100%" height={chartHeight(habitCorrelations.map((c: any) => c.label), chars.long, 160)}>
                 <BarChart data={habitCorrelations} layout="vertical"
                           margin={{ left: 8, right: 20, top: 2, bottom: 2 }}>
                   <CartesianGrid {...gridStyle} horizontal={false} />
@@ -1125,7 +1171,7 @@ export default function HrvAnalysisPage() {
               );
             }
             return (
-            <ResponsiveContainer width="100%" height={Math.max(360, ji.length * 30)}>
+            <ResponsiveContainer width="100%" height={chartHeight(ji.map((d: any) => d.displayLabel), chars.long, 360)}>
               <BarChart data={ji} layout="vertical"
                         margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                 <CartesianGrid {...gridStyle} horizontal={false} />
@@ -1194,7 +1240,7 @@ export default function HrvAnalysisPage() {
               );
             }
             return (
-            <ResponsiveContainer width="100%" height={Math.max(260, hi.length * 36)}>
+            <ResponsiveContainer width="100%" height={chartHeight(hi.map((d: any) => d.displayLabel), chars.long, 260)}>
               <BarChart data={hi} layout="vertical"
                         margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                 <CartesianGrid {...gridStyle} horizontal={false} />
@@ -1272,7 +1318,7 @@ export default function HrvAnalysisPage() {
               );
             }
             return (
-            <ResponsiveContainer width="100%" height={Math.max(360, si.length * 30)}>
+            <ResponsiveContainer width="100%" height={chartHeight(si.map((d: any) => d.displayLabel), chars.long, 360)}>
               <BarChart data={si} layout="vertical"
                         margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                 <CartesianGrid {...gridStyle} horizontal={false} />
@@ -1346,7 +1392,7 @@ export default function HrvAnalysisPage() {
                 );
               }
               return (
-                <ResponsiveContainer width="100%" height={Math.max(240, drDecorated.length * 30)}>
+                <ResponsiveContainer width="100%" height={chartHeight(drDecorated.map((d: any) => d.displayLabel), chars.xlong, 240)}>
                   <BarChart data={drDecorated} layout="vertical"
                             margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
                     <CartesianGrid {...gridStyle} horizontal={false} />
@@ -1411,7 +1457,7 @@ export default function HrvAnalysisPage() {
               );
             }
             return (
-            <ResponsiveContainer width="100%" height={Math.max(280, ni.length * 38)}>
+            <ResponsiveContainer width="100%" height={chartHeight(ni.map((d: any) => d.displayLabel), chars.nutri, 280, { fontSize: 11 })}>
               <BarChart data={ni}
                         layout="vertical"
                         margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
@@ -1781,7 +1827,7 @@ export default function HrvAnalysisPage() {
             );
           }
           return (
-            <ResponsiveContainer width="100%" height={Math.max(420, top.length * 32)}>
+            <ResponsiveContainer width="100%" height={chartHeight(top.map((d: any) => d.displayLabel), chars.xlong, 420)}>
               <BarChart data={top} layout="vertical"
                         margin={{ left: 8, right: 32, top: 4, bottom: 24 }}>
                 <CartesianGrid {...gridStyle} horizontal={false} />
@@ -1981,7 +2027,7 @@ export default function HrvAnalysisPage() {
               );
             }
             return (
-              <ResponsiveContainer width="100%" height={Math.max(280, top.length * 36)}>
+              <ResponsiveContainer width="100%" height={chartHeight(top.map((d: any) => d.displayLabel), chars.long, 280)}>
                 <BarChart data={top} layout="vertical"
                           margin={{ left: 8, right: 28, top: 4, bottom: 24 }}>
                   <CartesianGrid {...gridStyle} horizontal={false} />
