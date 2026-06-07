@@ -6,6 +6,7 @@ import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
 import BarcodeScannerModal from "@/components/BarcodeScannerModal";
 import EditIntakeModal, { type EditableIntake } from "@/components/EditIntakeModal";
+import StackEditorModal, { type EditableStack } from "@/components/StackEditorModal";
 import CustomSupplementFlow from "@/components/CustomSupplementFlow";
 import { rangeDays, rangeLabel, type Range } from "@/lib/queries";
 
@@ -53,6 +54,26 @@ interface DsldHit {
   physical_state: string | null;
 }
 
+interface StackItem {
+  product_id: string;
+  doses: number;
+  full_name: string | null;
+  brand_name: string | null;
+  serving_size: number | null;
+  serving_unit: string | null;
+  ingredient_count: number;
+  product_active: boolean;
+}
+
+interface Stack {
+  stack_id: number;
+  name: string;
+  description: string | null;
+  items: StackItem[];
+  item_count: number;
+  total_doses: number;
+}
+
 const CATEGORY_COLORS: Record<string, string> = {
   vitamin: "text-amber-400",
   mineral: "text-cyan-400",
@@ -96,6 +117,14 @@ export default function SupplementsPage() {
   const [compounds, setCompounds] = useState<CompoundRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [busyProductId, setBusyProductId] = useState<string | null>(null);
+
+  // Supplement stacks (BOM-style recurring lists). Editor holds the stack being
+  // created/edited; null = closed.
+  const [stacks, setStacks] = useState<Stack[]>([]);
+  const [busyStackId, setBusyStackId] = useState<number | null>(null);
+  const [editingStack, setEditingStack] = useState<EditableStack | null>(null);
+  // Most-recent stack-log batch, for one-click "undo all".
+  const [lastBatch, setLastBatch] = useState<{ name: string; ids: number[] } | null>(null);
 
   // History (older intakes, paginated). Window driven by the global range filter.
   const [history, setHistory] = useState<Intake[]>([]);
@@ -215,6 +244,16 @@ export default function SupplementsPage() {
     }
   }, [historyDays]);
 
+  const loadStacks = useCallback(async () => {
+    try {
+      const res = await fetch("/api/supplements/stacks");
+      const json = await res.json();
+      setStacks(json.stacks ?? []);
+    } catch (e) {
+      console.error("Stacks load:", e);
+    }
+  }, []);
+
   useEffect(() => {
     loadAll();
   }, [loadAll]);
@@ -223,11 +262,15 @@ export default function SupplementsPage() {
     loadHistory();
   }, [loadHistory]);
 
-  // After any mutation (edit, archive, seed) refresh both panes silently
-  // so the history section stays in sync without flashing "Loading…".
+  useEffect(() => {
+    loadStacks();
+  }, [loadStacks]);
+
+  // After any mutation (edit, archive, seed, stack change) refresh all panes
+  // silently so the page stays in sync without flashing "Loading…".
   const refreshAll = useCallback(async () => {
-    await Promise.all([loadAll({ silent: true }), loadHistory({ silent: true })]);
-  }, [loadAll, loadHistory]);
+    await Promise.all([loadAll({ silent: true }), loadHistory({ silent: true }), loadStacks()]);
+  }, [loadAll, loadHistory, loadStacks]);
 
   // Debounced silent refresh of /today only — used after rapid log taps so
   // the compounds-rollup table catches up without re-fetching on every click.
@@ -323,6 +366,55 @@ export default function SupplementsPage() {
       if (removedToday) setIntakes((prev) => [removedToday, ...prev]);
       if (removedHistory) setHistory((prev) => [removedHistory, ...prev]);
       console.error("Undo intake:", e);
+    }
+  }
+
+  // Log an entire stack — writes one intake per item server-side, honoring the
+  // page's logDate / logTime overrides (so a pre-bed stack can attribute to
+  // yesterday). Records the batch for one-click undo.
+  async function logStack(stack: Stack) {
+    setBusyStackId(stack.stack_id);
+    const stampIso = logTimeIso() ?? new Date().toISOString();
+    showToast(`logged ${stack.name} 👍`);
+    try {
+      const res = await fetch("/api/supplements/stacks/log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stack_id: stack.stack_id,
+          intake_date: logDate,
+          intake_time: stampIso,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const saved = (await res.json()) as { intake_ids: number[] };
+      setLastBatch({ name: stack.name, ids: saved.intake_ids ?? [] });
+      if (logDate === today) {
+        await loadAll({ silent: true });
+      } else {
+        await loadHistory({ silent: true });
+      }
+    } catch (e) {
+      console.error("Log stack:", e);
+    } finally {
+      setBusyStackId(null);
+    }
+  }
+
+  // Undo the most-recent stack-log batch by deleting every intake it wrote.
+  async function undoLastBatch() {
+    if (!lastBatch) return;
+    const { ids } = lastBatch;
+    setLastBatch(null);
+    try {
+      await Promise.all(
+        ids.map((id) =>
+          fetch(`/api/supplements/log-intake?intake_id=${id}`, { method: "DELETE" }),
+        ),
+      );
+      await Promise.all([loadAll({ silent: true }), loadHistory({ silent: true })]);
+    } catch (e) {
+      console.error("Undo stack batch:", e);
     }
   }
 
@@ -460,6 +552,91 @@ export default function SupplementsPage() {
 
       {!loading && (
         <>
+          {/* Stacks — recurring supplement lists (BOM). One tap logs the whole list. */}
+          <ChartCard
+            title="Stacks"
+            subtitle="Reusable supplement lists — tap Log to record every product in the list at once."
+            source="Onyx"
+            info="A stack is a saved list of products + per-product doses, like a bill of materials. Logging a stack writes one ordinary intake event per product (with the stack's doses), attributed to the date/time selected below. Editing a stack never changes anything you've already logged."
+          >
+            <div className="flex items-center justify-end mb-2">
+              <button
+                onClick={() =>
+                  setEditingStack({ stack_id: null, name: "", description: null, items: [] })
+                }
+                className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-text-primary bg-[#1DB954]/15 hover:bg-[#1DB954]/25 border border-[#1DB954]/30 rounded-[4px] transition-colors"
+              >
+                + New stack
+              </button>
+            </div>
+
+            {lastBatch && (
+              <div className="flex items-center justify-between gap-2 mb-2 px-3 py-1.5 bg-[#1DB954]/10 border border-[#1DB954]/25 rounded-[4px] text-[11px] font-mono">
+                <span className="text-text-secondary truncate">
+                  Logged {lastBatch.name} · {lastBatch.ids.length} products
+                </span>
+                <button
+                  onClick={undoLastBatch}
+                  className="text-text-tertiary hover:text-red-400 underline underline-offset-2 shrink-0"
+                >
+                  undo all
+                </button>
+              </div>
+            )}
+
+            {stacks.length === 0 ? (
+              <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
+                No stacks yet. Create one to log your recurring supplements in a single tap.
+              </p>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                {stacks.map((s) => (
+                  <div
+                    key={s.stack_id}
+                    className="flex items-center gap-2 bg-black/30 border border-border-subtle rounded-[4px]"
+                  >
+                    <button
+                      onClick={() => logStack(s)}
+                      disabled={busyStackId === s.stack_id || s.item_count === 0}
+                      className="flex-1 flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-white/[0.03] active:bg-white/[0.06] disabled:opacity-50 rounded-l-[4px] transition-colors"
+                    >
+                      <div className="min-w-0">
+                        <p className="text-[12px] text-text-primary truncate">{s.name}</p>
+                        <p className="text-[10px] text-text-tertiary font-mono truncate">
+                          {s.item_count} product{s.item_count === 1 ? "" : "s"} · {s.total_doses} dose
+                          {s.total_doses === 1 ? "" : "s"}
+                          {s.description ? ` · ${s.description}` : ""}
+                        </p>
+                      </div>
+                      <span className="text-[11px] text-[#1DB954]/90 font-mono shrink-0">
+                        {busyStackId === s.stack_id ? "…" : "Log"}
+                      </span>
+                    </button>
+                    <button
+                      onClick={() =>
+                        setEditingStack({
+                          stack_id: s.stack_id,
+                          name: s.name,
+                          description: s.description,
+                          items: s.items.map((i) => ({
+                            product_id: i.product_id,
+                            doses: Number(i.doses),
+                            full_name: i.full_name,
+                            brand_name: i.brand_name,
+                          })),
+                        })
+                      }
+                      className="px-2 py-2 text-[10px] font-mono text-text-tertiary hover:text-text-primary transition-colors"
+                      title="Edit stack"
+                    >
+                      edit
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </ChartCard>
+
           {/* Log intake — product picker */}
           <ChartCard
             title={isLoggingForToday ? "Log intake today" : `Log intake for ${formatShortDate(logDate)}`}
@@ -753,6 +930,18 @@ export default function SupplementsPage() {
         onSaved={async () => {
           setEditing(null);
           await refreshAll();
+        }}
+      />
+
+      {/* Stack editor (create / edit) */}
+      <StackEditorModal
+        open={editingStack !== null}
+        stack={editingStack}
+        products={products}
+        onClose={() => setEditingStack(null)}
+        onSaved={async () => {
+          setEditingStack(null);
+          await loadStacks();
         }}
       />
 

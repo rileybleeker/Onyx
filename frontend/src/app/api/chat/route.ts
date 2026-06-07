@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist } from "@/lib/spotify-server";
+import { logStackIntake } from "@/lib/supplement-stacks";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
@@ -16,6 +17,8 @@ const SYSTEM_PROMPT = `You are Onyx, a personal data scientist assistant. You he
 You have access to the user's data via function calls. When the user asks about their health metrics, use the appropriate function to fetch real data before answering. You can call multiple tools to cross-reference data across devices. Be concise and insightful — highlight trends, anomalies, and actionable takeaways.
 
 When the user mentions completing a habit (e.g., "I meditated today", "I took my vitamins"), use mark_habit_complete to log it. The habit name should match what's defined in their habits list. Use query_journal to see both WHOOP journal behaviors and habit completions together.
+
+The user keeps reusable supplement "stacks" — named lists of supplements + doses (like a bill of materials). When they say they took a named stack or routine (e.g. "log my morning stack", "I took my evening stack"), use log_supplement_stack with the stack name. It records every supplement in that stack at once. If the name doesn't match, the tool returns the list of available stacks so you can confirm which one they mean.
 
 The user also keeps a free-form *personal* journal in Notion (prose entries about life, mood, relationships, training, mental health). Use query_journal_entries when they ask about what they wrote, how they were feeling, or to find context behind biometric trends — combine it with biometric tools to answer questions like "what was my HRV on days I logged a 'low' mood?". When a question is thematic rather than date-specific, set semantic_query to do similarity search.
 
@@ -177,6 +180,18 @@ const tools: Anthropic.Tool[] = [
         category: { type: "string", description: "Optional: habit category (e.g., 'mindfulness', 'fitness')" },
       },
       required: ["habit"],
+    },
+  },
+  {
+    name: "log_supplement_stack",
+    description: "Record a whole supplement 'stack' (a saved, named list of supplements + doses) as consumed. Use when the user says they took a named stack or routine, e.g. 'log my morning stack' or 'I took my evening stack'. Writes one intake event per supplement in the stack. If the stack name doesn't match, the response lists available stacks — relay them and ask which one.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        stack: { type: "string", description: "The stack name as the user refers to it (e.g. 'Morning', 'Evening stack'). Matched case-insensitively." },
+        date: { type: "string", description: "Date in YYYY-MM-DD format (defaults to the current behavioral day)" },
+      },
+      required: ["stack"],
     },
   },
   {
@@ -620,6 +635,41 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     }
 
     return JSON.stringify({ success: true, entry: data });
+  }
+
+  // Log a whole supplement stack (writes one intake per item)
+  if (name === "log_supplement_stack") {
+    const wanted = (input.stack as string)?.trim();
+    if (!wanted) return JSON.stringify({ error: "stack name is required" });
+    const date = (input.date as string) || undefined;
+
+    // Resolve the stack by case-insensitive name among active stacks.
+    const { data: candidates, error: lookupErr } = await supabase
+      .from("supplement_stack")
+      .select("stack_id,name")
+      .eq("is_active", true);
+    if (lookupErr) return JSON.stringify({ error: lookupErr.message });
+
+    const lc = wanted.toLowerCase();
+    const match =
+      (candidates ?? []).find((s) => s.name.toLowerCase() === lc) ??
+      (candidates ?? []).find((s) => s.name.toLowerCase().includes(lc));
+    if (!match) {
+      return JSON.stringify({
+        error: `No stack named "${wanted}".`,
+        available: (candidates ?? []).map((s) => s.name),
+      });
+    }
+
+    const result = await logStackIntake(supabase, match.stack_id, { intake_date: date });
+    if (!result.ok) return JSON.stringify({ error: result.error });
+    return JSON.stringify({
+      success: true,
+      stack: result.stack_name,
+      products: result.count,
+      total_doses: result.total_doses,
+      date: result.intake_date,
+    });
   }
 
   // Handle timestamp-based tables
