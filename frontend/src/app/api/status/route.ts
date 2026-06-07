@@ -43,7 +43,6 @@ const CADENCE: Record<string, string> = {
   musicbrainz: "With Spotify ETL",
   supplements: "Manual",
   notion_journal: "Hourly :35",
-  meals: "Manual",
   weight: "Manual",
 };
 
@@ -67,7 +66,6 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   musicbrainz:    { method: "automated",      label: "API ETL" },
   supplements:    { method: "manual",         label: "Manual entry" },
   notion_journal: { method: "automated",      label: "Notion sync" },
-  meals:          { method: "manual",         label: "Manual entry" },
   weight:         { method: "manual",         label: "Manual entry" },
 };
 
@@ -190,7 +188,7 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, mealsRes, weightRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, weightRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -201,11 +199,10 @@ export async function GET() {
       supabase.from("spotify_plays").select("played_date_et").order("played_date_et", { ascending: false }).limit(1),
       // Manual sources: include the actual log timestamp so the "Last Sync"
       // row shows real-time "Xm ago" rather than midnight of the latest
-      // entry date. created_at on supplement/meal/weight is the row insert
+      // entry date. created_at on supplement/weight is the row insert
       // time; for weight the user-facing timestamp is updated_at on edits.
       supabase.from("supplement_intake").select("intake_date,created_at").order("intake_time", { ascending: false }).limit(1),
       supabase.from("journal_entries").select("entry_date").eq("archived", false).order("entry_date", { ascending: false }).limit(1),
-      supabase.from("meal_events").select("event_date,created_at").order("event_time", { ascending: false }).limit(1),
       supabase.from("weight_log").select("log_date,updated_at").order("log_date", { ascending: false }).limit(1),
       supabase
         .from("sync_log")
@@ -265,8 +262,6 @@ export async function GET() {
     const supplementsDate = supplementsRes.data?.[0]?.intake_date ?? null;
     const supplementsLastLog = (supplementsRes.data?.[0]?.created_at as string | undefined) ?? null;
     const notionJournalDate = notionJournalRes.data?.[0]?.entry_date ?? null;
-    const mealsDate = mealsRes.data?.[0]?.event_date ?? null;
-    const mealsLastLog = (mealsRes.data?.[0]?.created_at as string | undefined) ?? null;
     const weightDate = weightRes.data?.[0]?.log_date ?? null;
     const weightLastLog = (weightRes.data?.[0]?.updated_at as string | undefined) ?? null;
 
@@ -304,7 +299,6 @@ export async function GET() {
     const spotifyLag = daysLag(spotifyDate, spineMaxDate);
     const supplementsLag = daysLag(supplementsDate, spineMaxDate);
     const notionJournalLag = daysLag(notionJournalDate, spineMaxDate);
-    const mealsLag = daysLag(mealsDate, spineMaxDate);
     const weightLag = daysLag(weightDate, spineMaxDate);
 
     const sources: Record<string, SourceStatus> = {
@@ -497,21 +491,6 @@ export async function GET() {
         cadence: CADENCE.supplements,
         integrationMethod: METHOD.supplements.method,
         methodLabel: METHOD.supplements.label,
-      },
-      // Meals: user-driven; lastSync uses the latest event row's created_at
-      // (insert time) for accurate "Xm ago" rendering.
-      meals: {
-        label: "Meals",
-        lastSync: mealsLastLog ?? mealsDate,
-        status: deriveStatus(null, mealsLag),
-        latestDataDate: mealsDate,
-        daysLag: mealsLag,
-        recordsSynced: 0,
-        durationSeconds: null,
-        errorMessage: null,
-        cadence: CADENCE.meals,
-        integrationMethod: METHOD.meals.method,
-        methodLabel: METHOD.meals.label,
       },
       // Weight: user-driven daily body weight log. lastSync uses updated_at
       // (touched on every POST/PATCH) so an edit-in-place to today's row
