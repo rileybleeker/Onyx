@@ -23,6 +23,7 @@ import sys
 import warnings
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import matplotlib
 matplotlib.use("Agg")  # headless backend
@@ -150,7 +151,18 @@ def log_sync_entry(status: str, records: int = 0, error: str | None = None,
         log.warning(f"Failed to write hrv_analysis sync_log heartbeat: {e}")
 
 
-MODEL_VERSION = f"{date.today().isoformat()}_behavioral_v1"
+ET_TZ = ZoneInfo("America/New_York")
+
+
+def et_today() -> date:
+    """Current date in America/New_York — the canonical Onyx day. Mirrors
+    hrv_predict.py:et_today(). Using a naive UTC date.today() here mis-tags a
+    late-ET-evening run (which is already the next UTC day) as the day after
+    tomorrow — the +2 prediction_date bug fixed 2026-06-06."""
+    return datetime.now(ET_TZ).date()
+
+
+MODEL_VERSION = f"{et_today().isoformat()}_behavioral_v1"
 TARGET = "whoop_hrv_rmssd"
 
 # Stage-1 BH-FDR threshold for promoting features to Stage 2 partial correlations.
@@ -3467,7 +3479,7 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     eval_results: dict = {"backtest_df": bt_df}
 
     model_metrics_rows: list[dict] = []
-    today_str = str(date.today())
+    today_str = str(et_today())
 
     # Aggregate per (model, horizon) so the Accuracy-by-Horizon chart can plot
     # bars for every (model × t+h) combination. The h=1 row of each model is
@@ -3782,11 +3794,11 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
                       prophet_results: dict, eval_results: dict) -> None:
     """Upsert all predictions into pds.hrv_predictions."""
     rows: list[dict] = []
-    today_str = str(date.today())
+    today_str = str(et_today())
 
     # XGBoost tomorrow's prediction
     if xgb_results:
-        tomorrow = str(date.today() + timedelta(days=1))
+        tomorrow = str(et_today() + timedelta(days=1))
         rows.append({
             "prediction_date": tomorrow,
             "model": "xgboost",
@@ -4209,7 +4221,7 @@ def print_summary(df: pd.DataFrame, xgb_results: dict,
                   f"(Yes={h['n_yes']}, No={h['n_no']})")
 
     # Tomorrow's prediction
-    print(f"\nTOMORROW'S PREDICTION ({str(date.today() + timedelta(days=1))})")
+    print(f"\nTOMORROW'S PREDICTION ({str(et_today() + timedelta(days=1))})")
     if xgb_results and xgb_results.get("tomorrow_pred"):
         p = xgb_results["tomorrow_pred"]
         std = xgb_results.get("pred_std", 0)
@@ -4342,7 +4354,7 @@ def main() -> None:
     # Append SARIMAX per-horizon metrics so the frontend horizon chart can render them
     sarimax_horizon_metrics = sarimax_results.get("metrics_by_horizon", {}) if sarimax_results else {}
     if sarimax_horizon_metrics:
-        today_str = str(date.today())
+        today_str = str(et_today())
         for h, m in sarimax_horizon_metrics.items():
             eval_results.setdefault("model_metrics_rows", []).append({
                 "eval_date": today_str, "model": "sarimax", "horizon_days": int(h),
