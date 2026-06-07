@@ -269,7 +269,7 @@ CONTROLLABLE_FEATURE_PREFIXES = (
     "sp_",  # Spotify daily signature (opt-in via ONYX_INCLUDE_SPOTIFY=1)
     "meal_",  # Meal timing: last_hour, first_hour, eating_window, last_meal_to_bedtime_min
     "caffeine_",  # Caffeine timing: first_hour, last_hour, window_hours, intake_count, to_bedtime_min
-    "act_",  # Activity taxonomy: run / sauna / leg_day / pull_day / push_day (auto + manual split)
+    "act_",  # Activity taxonomy: run/sauna (auto) + leg/pull/push split + act_mg_* muscle groups (manual)
 ) + tuple(MICRONUTRIENT_COLS)  # Cronometer vitamins/minerals (exact column names)
 
 # Computed once per run from the post-prepare_ml_data (X, y) and stamped onto every
@@ -398,6 +398,17 @@ FEATURE_LABELS: dict[str, str] = {
     "act_leg_day": "Leg Day",
     "act_pull_day": "Pull Day",
     "act_push_day": "Push Day",
+    "act_mg_chest": "Chest (muscle group)",
+    "act_mg_back": "Back (muscle group)",
+    "act_mg_shoulders": "Shoulders (muscle group)",
+    "act_mg_biceps": "Biceps (muscle group)",
+    "act_mg_triceps": "Triceps (muscle group)",
+    "act_mg_forearms": "Forearms (muscle group)",
+    "act_mg_quads": "Quads (muscle group)",
+    "act_mg_hamstrings": "Hamstrings (muscle group)",
+    "act_mg_glutes": "Glutes (muscle group)",
+    "act_mg_calves": "Calves (muscle group)",
+    "act_mg_core": "Core (muscle group)",
     "weight_kg": "Body Weight (kg)",
     "nj_mood_ord": "Notion Journal Mood (ordinal)",
     "nj_confidence_ord": "Notion Journal Confidence (ordinal)",
@@ -619,7 +630,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     # for the workout-to-sleep gap feature; start_time_local stays for date binning.
     data["garmin_acts"] = fetch_all(
         "garmin_activities",
-        select="activity_id,start_time_local,start_time_gmt,activity_type,split_label,onyx_behavioral_date,duration_seconds,distance_meters,"
+        select="activity_id,start_time_local,start_time_gmt,activity_type,split_label,split_labels,muscle_groups,onyx_behavioral_date,duration_seconds,distance_meters,"
                "avg_heart_rate,max_heart_rate,calories,elevation_gain_meters,"
                "aerobic_training_effect,anaerobic_training_effect,training_load,vo2_max,"
                "avg_speed_mps",
@@ -665,7 +676,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     # end_time added for the workout-to-sleep gap feature (true UTC; 100% populated).
     data["whoop_wk"] = fetch_all(
         "whoop_workouts",
-        select="workout_id,start_time,end_time,sport_name,split_label,onyx_behavioral_date,strain,kilojoule,average_heart_rate,max_heart_rate,"
+        select="workout_id,start_time,end_time,sport_name,split_label,split_labels,muscle_groups,onyx_behavioral_date,strain,kilojoule,average_heart_rate,max_heart_rate,"
                "zone_zero_milli,zone_one_milli,zone_two_milli,zone_three_milli,"
                "zone_four_milli,zone_five_milli,score_state",
         filters=[("score_state", "eq", "SCORED"), ("is_excluded", "eq", False)],
@@ -868,9 +879,17 @@ def aggregate_whoop_workouts(wk: pd.DataFrame, cycles: pd.DataFrame) -> pd.DataF
 
 
 # User-facing activity taxonomy. run/sauna are auto-categorized from device sport
-# labels; leg/pull/push come from the manual split_label on the lifting session
-# (set from the /activities page — devices can't distinguish the strength split).
-ACT_CATEGORY_COLS = ["act_run", "act_sauna", "act_leg_day", "act_pull_day", "act_push_day"]
+# labels; the strength tags come from the manual MULTI-select on the lifting session
+# (set from the /activities page — devices can't distinguish either dimension):
+#   - coarse split  : leg / pull / push  (split_labels TEXT[], non-exclusive — an
+#                     upper day is push + pull, so both flags can fire on one day)
+#   - muscle groups : the 11-tag set below (muscle_groups TEXT[])
+ACT_SPLIT_TAGS = ["leg", "pull", "push"]
+ACT_SPLIT_COLS = [f"act_{t}_day" for t in ACT_SPLIT_TAGS]  # act_leg_day/act_pull_day/act_push_day
+ACT_MUSCLE_TAGS = ["chest", "back", "shoulders", "biceps", "triceps", "forearms",
+                   "quads", "hamstrings", "glutes", "calves", "core"]
+ACT_MUSCLE_COLS = [f"act_mg_{t}" for t in ACT_MUSCLE_TAGS]
+ACT_CATEGORY_COLS = ["act_run", "act_sauna"] + ACT_SPLIT_COLS + ACT_MUSCLE_COLS
 
 
 def aggregate_activity_categories(whoop_wk: pd.DataFrame, garmin_acts: pd.DataFrame) -> pd.DataFrame:
@@ -878,10 +897,14 @@ def aggregate_activity_categories(whoop_wk: pd.DataFrame, garmin_acts: pd.DataFr
     ACT_CATEGORY_COLS).
 
     run + sauna are AUTO-derived from device sport labels (WHOOP sport_name,
-    Garmin activity_type). leg/pull/push come from the manual `split_label` on the
-    lifting workout — WHOOP logs all resistance training as one generic
-    'weightlifting_msk' with no muscle-group detail, and Garmin records no
-    strength, so the split is the one thing only the user holds.
+    Garmin activity_type). The strength tags — coarse split (leg/pull/push) and
+    granular muscle groups — come from the manual MULTI-select on the lifting
+    workout (split_labels / muscle_groups TEXT[]). WHOOP logs all resistance
+    training as one generic 'weightlifting_msk' with no muscle-group detail, and
+    Garmin records no strength, so both dimensions are things only the user holds.
+    Membership is non-exclusive: a push+pull upper day fires BOTH act_push_day and
+    act_pull_day; a chest+triceps day fires act_mg_chest + act_mg_triceps. The
+    legacy single split_label is honored as a fallback when split_labels is absent.
 
     Keyed on onyx_behavioral_date (= the matrix spine's calendar_date) so a
     session's category co-locates with its behavioral day and the shift(-1) target
@@ -900,26 +923,48 @@ def aggregate_activity_categories(whoop_wk: pd.DataFrame, garmin_acts: pd.DataFr
             return bd.astype(str)
         return f["calendar_date"].astype(str)
 
+    def _tag_present(frame: pd.DataFrame, array_col: str, value: str,
+                     scalar_col: str | None = None) -> pd.Series:
+        """Boolean Series: is `value` in this row's tag set? Reads the TEXT[]
+        `array_col` (a Python list per row from supabase-py); falls back to a
+        scalar `scalar_col` (legacy single split_label) only when the array is
+        absent/empty so historical single-value tags still count."""
+        idx = frame.index
+        arr = frame[array_col] if array_col in frame.columns else pd.Series([None] * len(frame), index=idx)
+        scal = (frame[scalar_col] if scalar_col and scalar_col in frame.columns
+                else pd.Series([None] * len(frame), index=idx))
+
+        def _has(xs, sc) -> bool:
+            if isinstance(xs, (list, tuple)) and len(xs) > 0:
+                return value in {str(x).lower() for x in xs}
+            return isinstance(sc, str) and sc.lower() == value
+
+        return pd.Series([_has(xs, sc) for xs, sc in zip(arr, scal)], index=idx)
+
+    def _label_strength_tags(frame: pd.DataFrame, is_lift: pd.Series) -> None:
+        # Coarse split (multi-select array; scalar split_label fallback) + granular
+        # muscle groups. Gated on is_lift so a tag never fires on a non-lift row.
+        for col, tag in zip(ACT_SPLIT_COLS, ACT_SPLIT_TAGS):
+            frame[col] = (is_lift & _tag_present(frame, "split_labels", tag, "split_label")).astype(float)
+        for col, tag in zip(ACT_MUSCLE_COLS, ACT_MUSCLE_TAGS):
+            frame[col] = (is_lift & _tag_present(frame, "muscle_groups", tag)).astype(float)
+
     LIFT_RE = "weightlift|strength|lifting|resistance"
     frames: list[pd.DataFrame] = []
 
-    # WHOOP workouts carry running, sauna, AND weightlifting(+split_label).
+    # WHOOP workouts carry running, sauna, AND weightlifting(+split/muscle tags).
     if whoop_wk is not None and not whoop_wk.empty:
         w = whoop_wk.copy()
         w["calendar_date"] = _behavioral_key(w)
         w = w[~w["calendar_date"].isin(["None", "NaT", "nan", ""])]
         sport = w["sport_name"].astype(str).str.lower()
-        split = (w["split_label"].astype(str).str.lower()
-                 if "split_label" in w.columns else pd.Series("", index=w.index))
         is_lift = sport.str.contains(LIFT_RE, regex=True, na=False)
-        w["act_run"]      = sport.str.contains("run", na=False).astype(float)
-        w["act_sauna"]    = sport.str.contains("sauna", na=False).astype(float)
-        w["act_leg_day"]  = (is_lift & (split == "leg")).astype(float)
-        w["act_pull_day"] = (is_lift & (split == "pull")).astype(float)
-        w["act_push_day"] = (is_lift & (split == "push")).astype(float)
+        w["act_run"]   = sport.str.contains("run", na=False).astype(float)
+        w["act_sauna"] = sport.str.contains("sauna", na=False).astype(float)
+        _label_strength_tags(w, is_lift)
         frames.append(w.groupby("calendar_date")[ACT_CATEGORY_COLS].max().reset_index())
 
-    # Garmin activities: runs (auto). split_label is honored too — defensive, since
+    # Garmin activities: runs (auto). Strength tags honored too — defensive, since
     # Garmin carries no strength in the current data, but it keeps the /activities
     # toggle end-to-end consistent if a strength session is ever Garmin-sourced.
     if garmin_acts is not None and not garmin_acts.empty:
@@ -927,14 +972,10 @@ def aggregate_activity_categories(whoop_wk: pd.DataFrame, garmin_acts: pd.DataFr
         g["calendar_date"] = _behavioral_key(g)
         g = g[~g["calendar_date"].isin(["None", "NaT", "nan", ""])]
         gtype = g["activity_type"].astype(str).str.lower()
-        gsplit = (g["split_label"].astype(str).str.lower()
-                  if "split_label" in g.columns else pd.Series("", index=g.index))
         g_is_lift = gtype.str.contains(LIFT_RE, regex=True, na=False)
-        g["act_run"]      = gtype.str.contains("run", na=False).astype(float)
-        g["act_sauna"]    = gtype.str.contains("sauna", na=False).astype(float)
-        g["act_leg_day"]  = (g_is_lift & (gsplit == "leg")).astype(float)
-        g["act_pull_day"] = (g_is_lift & (gsplit == "pull")).astype(float)
-        g["act_push_day"] = (g_is_lift & (gsplit == "push")).astype(float)
+        g["act_run"]   = gtype.str.contains("run", na=False).astype(float)
+        g["act_sauna"] = gtype.str.contains("sauna", na=False).astype(float)
+        _label_strength_tags(g, g_is_lift)
         frames.append(g.groupby("calendar_date")[ACT_CATEGORY_COLS].max().reset_index())
 
     if not frames:
@@ -1229,10 +1270,11 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         if not ww_daily.empty:
             df = df.merge(ww_daily, on="calendar_date", how="left", suffixes=("", "_ww"))
 
-    # --- Join activity taxonomy (run / sauna / leg / pull / push) ---
-    # Auto from device sport labels (run, sauna) + the manual split_label on
-    # lifting sessions (leg/pull/push, set from /activities). act_* is blanket-
-    # filled to 0 on every spine row (a day with no such session = "didn't do it").
+    # --- Join activity taxonomy (run / sauna / split + muscle groups) ---
+    # Auto from device sport labels (run, sauna) + the manual multi-select strength
+    # tags on lifting sessions (split_labels leg/pull/push + muscle_groups, set from
+    # /activities). act_* / act_mg_* is blanket-filled to 0 on every spine row (a day
+    # with no such session = "didn't do it").
     # Note this is STRICTER than is_run_day, which stays NaN on non-activity days:
     # any pre-device-coverage spine rows become structural 0s. That's harmless —
     # every downstream consumer (Spearman/Welch, XGBoost prepare_ml_data, causal

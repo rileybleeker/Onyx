@@ -385,15 +385,29 @@ EXPLICIT_BINARY_TREATMENTS: tuple[tuple[str, str, str], ...] = (
     # (consecutive_run_days and XGBoost use it) — only its treatment is removed.
     ("is_rest_day",         "behavior", "Rest day (no workouts)"),
     ("negative_split",      "behavior", "Negative split (second half faster)"),
-    # Activity taxonomy — auto run/sauna from device sport labels; leg/pull/push
-    # from the manual split_label set on /activities. Derived in hrv_analysis
-    # aggregate_activity_categories (act_ prefix). Sparse until ~3 weeks of labels
-    # accrue (cell-size gates drop them to dropped_low_n meanwhile).
+    # Activity taxonomy — auto run/sauna from device sport labels; the strength
+    # tags (coarse split leg/pull/push + granular muscle groups) from the manual
+    # multi-select on /activities (split_labels / muscle_groups TEXT[]). Derived in
+    # hrv_analysis aggregate_activity_categories (act_ / act_mg_ prefix, both under
+    # the act_ family). Sparse until ~3 weeks of labels accrue — the muscle groups
+    # especially have no history, so they sit in dropped_low_n until enough tagged
+    # sessions accumulate (cell-size gates), then enter the FDR family.
     ("act_run",             "behavior", "Run day (WHOOP + Garmin)"),
     ("act_sauna",           "behavior", "Sauna session"),
     ("act_leg_day",         "behavior", "Leg day"),
     ("act_pull_day",        "behavior", "Pull day"),
     ("act_push_day",        "behavior", "Push day"),
+    ("act_mg_chest",        "behavior", "Chest (muscle group)"),
+    ("act_mg_back",         "behavior", "Back (muscle group)"),
+    ("act_mg_shoulders",    "behavior", "Shoulders (muscle group)"),
+    ("act_mg_biceps",       "behavior", "Biceps (muscle group)"),
+    ("act_mg_triceps",      "behavior", "Triceps (muscle group)"),
+    ("act_mg_forearms",     "behavior", "Forearms (muscle group)"),
+    ("act_mg_quads",        "behavior", "Quads (muscle group)"),
+    ("act_mg_hamstrings",   "behavior", "Hamstrings (muscle group)"),
+    ("act_mg_glutes",       "behavior", "Glutes (muscle group)"),
+    ("act_mg_calves",       "behavior", "Calves (muscle group)"),
+    ("act_mg_core",         "behavior", "Core (muscle group)"),
     # ADR-0001 Phase B travel treatments
     ("is_transition_day",   "travel",   "Travel transition day"),
     ("is_outbound",         "travel",   "Outbound travel (NY → away)"),

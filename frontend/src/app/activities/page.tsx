@@ -24,12 +24,25 @@ type ActivityRow = {
   avg_heart_rate: number | null;
   max_heart_rate: number | null;
   calories: number | null;
-  split_label: "leg" | "pull" | "push" | null;
+  split_labels: SplitLabel[];
+  muscle_groups: MuscleGroup[];
   raw_json?: any;
 };
 
 type ActivityCategory = "run" | "sauna" | "strength" | "other";
-type SplitLabel = "leg" | "pull" | "push";
+
+// Multi-select tag vocabularies — single source of truth in this file. The union
+// types are DERIVED from these const arrays (via `as const` + indexed access) so the
+// runtime list and the type cannot silently drift — adding a tag to one without the
+// other is a compile error. Must still stay in sync with the DB CHECK constraints
+// (sql/activity_muscle_groups.sql) and the API allow-sets (/api/activities/categorize).
+const SPLIT_LABELS = ["leg", "pull", "push"] as const;
+const MUSCLE_GROUPS = [
+  "chest", "back", "shoulders", "biceps", "triceps", "forearms",
+  "quads", "hamstrings", "glutes", "calves", "core",
+] as const;
+type SplitLabel = (typeof SPLIT_LABELS)[number];
+type MuscleGroup = (typeof MUSCLE_GROUPS)[number];
 
 const DEDUP_WINDOW_MS = 5 * 60 * 1000;
 
@@ -75,7 +88,8 @@ function normalizeGarmin(a: any): ActivityRow {
     avg_heart_rate: a.avg_heart_rate ?? null,
     max_heart_rate: a.max_heart_rate ?? null,
     calories: a.calories ?? null,
-    split_label: (a.split_label as ActivityRow["split_label"]) ?? null,
+    split_labels: (a.split_labels as SplitLabel[] | null) ?? (a.split_label ? [a.split_label as SplitLabel] : []),
+    muscle_groups: (a.muscle_groups as MuscleGroup[] | null) ?? [],
     raw_json: a.raw_json,
   };
 }
@@ -102,7 +116,8 @@ function normalizeWhoop(w: any): ActivityRow {
     avg_heart_rate: w.average_heart_rate ?? null,
     max_heart_rate: w.max_heart_rate ?? null,
     calories: kcal,
-    split_label: (w.split_label as ActivityRow["split_label"]) ?? null,
+    split_labels: (w.split_labels as SplitLabel[] | null) ?? (w.split_label ? [w.split_label as SplitLabel] : []),
+    muscle_groups: (w.muscle_groups as MuscleGroup[] | null) ?? [],
   };
 }
 
@@ -435,25 +450,50 @@ export default function ActivitiesPage() {
     }
   }
 
-  // Set (or clear) the manual leg/pull/push split label on a strength session.
-  // Writes split_label onto the underlying whoop_workouts/garmin_activities row
-  // (ETL-preserving, like is_excluded). Optimistic update with rollback on error.
-  async function setSplit(act: ActivityRow, split: SplitLabel | null) {
+  // Persist the manual strength tags (split_labels and/or muscle_groups) onto the
+  // underlying whoop_workouts/garmin_activities row (ETL-preserving, like
+  // is_excluded). Sends the FULL array for whichever dimension changed (idempotent
+  // set, not a diff). Optimistic update with rollback on error.
+  async function saveTags(
+    act: ActivityRow,
+    next: { split_labels?: SplitLabel[]; muscle_groups?: MuscleGroup[] },
+  ) {
     const sourceId = act.id.slice(act.id.indexOf(":") + 1); // colon-safe: WHOOP ids are opaque TEXT
-    const before = rows;
-    setRows((prev) => prev.map((r) => (r.id === act.id ? { ...r, split_label: split } : r)));
+    // Capture only THIS row's prior values for the dimension(s) we're about to change.
+    // Rollback reverts just those keys on just this row (a functional update), NOT a
+    // whole-array snapshot — with two independently-mutable controls per card and
+    // overlapping in-flight saves, a snapshot revert could silently clobber a
+    // concurrent edit on the other dimension or another row.
+    const prevValues: { split_labels?: SplitLabel[]; muscle_groups?: MuscleGroup[] } = {};
+    if (next.split_labels !== undefined) prevValues.split_labels = act.split_labels;
+    if (next.muscle_groups !== undefined) prevValues.muscle_groups = act.muscle_groups;
+    setRows((prev) => prev.map((r) => (r.id === act.id ? { ...r, ...next } : r)));
     try {
       const res = await fetch("/api/activities/categorize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source: act.source, id: sourceId, split_label: split }),
+        body: JSON.stringify({ source: act.source, id: sourceId, ...next }),
       });
       if (!res.ok) throw new Error(await res.text());
     } catch (e) {
-      setRows(before);
+      setRows((prev) => prev.map((r) => (r.id === act.id ? { ...r, ...prevValues } : r)));
       console.error("Categorize activity:", e);
-      alert(`Failed to set split: ${e instanceof Error ? e.message : String(e)}`);
+      alert(`Failed to save tags: ${e instanceof Error ? e.message : String(e)}`);
     }
+  }
+
+  // Toggle one coarse split (leg/pull/push) on a session — multi-select.
+  function toggleSplit(act: ActivityRow, value: SplitLabel) {
+    const cur = act.split_labels ?? [];
+    const next = cur.includes(value) ? cur.filter((v) => v !== value) : [...cur, value];
+    saveTags(act, { split_labels: next });
+  }
+
+  // Toggle one granular muscle group on a session — multi-select.
+  function toggleMuscle(act: ActivityRow, value: MuscleGroup) {
+    const cur = act.muscle_groups ?? [];
+    const next = cur.includes(value) ? cur.filter((v) => v !== value) : [...cur, value];
+    saveTags(act, { muscle_groups: next });
   }
 
   const latestSummary = summaries[summaries.length - 1];
@@ -650,7 +690,7 @@ export default function ActivitiesPage() {
               ? Number(act.id.split(":")[1])
               : null;
             const laps = activityIdNum != null ? lapsByActivity[activityIdNum] : undefined;
-            const rows = isExpanded && isMultiSeg && recCtx?.segments && laps
+            const segmentRows = isExpanded && isMultiSeg && recCtx?.segments && laps
               ? buildWorkoutRows(recCtx.segments, laps)
               : null;
 
@@ -731,25 +771,6 @@ export default function ActivitiesPage() {
                       <span className={`${recColor} font-mono text-[13px]`}>{recCtx.recovery.toFixed(0)}%</span>
                     </div>
                   )}
-                  {category === "strength" && (
-                    <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
-                      <span className="text-text-tertiary text-[12px]">Split</span>
-                      {(["leg", "pull", "push"] as const).map((s) => (
-                        <button
-                          key={s}
-                          onClick={() => setSplit(act, act.split_label === s ? null : s)}
-                          className={`text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px] border transition-colors ${
-                            act.split_label === s
-                              ? "bg-violet-500/20 border-violet-400/50 text-violet-200"
-                              : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"
-                          }`}
-                          title={`Mark this lifting session as ${s} day`}
-                        >
-                          {s}
-                        </button>
-                      ))}
-                    </div>
-                  )}
                   {canExpand && (
                     <svg className={`w-4 h-4 text-text-tertiary transition-transform ${isExpanded ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
@@ -757,6 +778,58 @@ export default function ActivitiesPage() {
                   )}
                 </div>
               </div>
+
+              {/* Strength tagging: coarse split + granular muscle groups, both
+                  multi-select. Devices can't distinguish either dimension, so the
+                  user holds them. ETL-preserving via /api/activities/categorize. */}
+              {category === "strength" && (
+                <div className="border-t border-border-subtle px-4 py-3 space-y-2.5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-text-tertiary text-[11px] uppercase tracking-wider w-14 shrink-0">Split</span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {SPLIT_LABELS.map((s) => {
+                        const on = (act.split_labels ?? []).includes(s);
+                        return (
+                          <button
+                            key={s}
+                            onClick={() => toggleSplit(act, s)}
+                            className={`text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px] border transition-colors ${
+                              on
+                                ? "bg-violet-500/20 border-violet-400/50 text-violet-200"
+                                : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"
+                            }`}
+                            title={`Tag this session as ${s}`}
+                          >
+                            {s}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="flex items-start gap-2">
+                    <span className="text-text-tertiary text-[11px] uppercase tracking-wider w-14 shrink-0 mt-1">Muscles</span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {MUSCLE_GROUPS.map((m) => {
+                        const on = (act.muscle_groups ?? []).includes(m);
+                        return (
+                          <button
+                            key={m}
+                            onClick={() => toggleMuscle(act, m)}
+                            className={`text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px] border transition-colors ${
+                              on
+                                ? "bg-sky-500/20 border-sky-400/50 text-sky-200"
+                                : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"
+                            }`}
+                            title={`Tag ${m}`}
+                          >
+                            {m}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {canExpand && isExpanded && (
                 <div className="border-t border-border-subtle px-4 py-3 space-y-3">
@@ -784,7 +857,7 @@ export default function ActivitiesPage() {
                   </div>
 
                   {isMultiSeg && (
-                    rows ? (
+                    segmentRows ? (
                       <div className="overflow-x-auto">
                         <table className="w-full text-[12px] font-mono">
                           <thead>
@@ -797,7 +870,7 @@ export default function ActivitiesPage() {
                             </tr>
                           </thead>
                           <tbody>
-                            {rows.map((r, i) => {
+                            {segmentRows.map((r, i) => {
                               const labelColor = r.kind === "rep"
                                 ? "text-text-secondary"
                                 : "text-text-tertiary italic";
