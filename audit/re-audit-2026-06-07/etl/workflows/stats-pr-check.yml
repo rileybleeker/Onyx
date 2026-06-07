@@ -1,0 +1,65 @@
+name: Stats Tests (PR check)
+
+# Audit Tier 4 #37: run the in-repo stats unit tests on every PR that
+# touches hrv_analysis.py, hrv_predict.py, or any tests/ file. Catches
+# regressions in BH-FDR, the workout-to-sleep gap feature, or the habit
+# rename cascade before they merge.
+
+on:
+  pull_request:
+    paths:
+      - "hrv_analysis.py"
+      - "hrv_predict.py"
+      - "garmin_etl.py"
+      - "whoop_etl.py"
+      - "eight_sleep_etl.py"
+      - "tests/**"
+      - "requirements-analysis*.txt"
+      - "requirements-analysis.lock"
+      - ".github/workflows/stats-pr-check.yml"
+  workflow_dispatch:
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  stats-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-stats-${{ hashFiles('requirements-analysis.lock', 'requirements-analysis.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-stats-
+
+      - name: Install (lock first, fall back to txt)
+        run: |
+          if [ -f requirements-analysis.lock ]; then
+            pip install -r requirements-analysis.lock
+          else
+            pip install -r requirements-analysis.txt
+          fi
+          pip install supabase python-dotenv
+
+      - name: Parse-check Python modules
+        run: |
+          python -c "import ast; [ast.parse(open(p).read()) for p in (
+            'hrv_analysis.py','hrv_predict.py',
+            'garmin_etl.py','whoop_etl.py','eight_sleep_etl.py',
+          )]; print('all .py modules parse cleanly')"
+
+      - name: BH-FDR synthetic-data unit test
+        run: python tests/test_fdr_correction.py
+
+      - name: Habit-rename cascade integration test
+        # Uses synthetic test fixtures (uuid-tagged) and cleans up after itself,
+        # so it's safe to run against the live DB.
+        run: python tests/test_habit_rename.py

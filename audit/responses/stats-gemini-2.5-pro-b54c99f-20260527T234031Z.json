@@ -1,0 +1,147 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "b54c99f",
+  "fired_at": "2026-05-27T23:40:31.306377+00:00",
+  "usage": {
+    "promptTokenCount": 108885,
+    "candidatesTokenCount": 2607,
+    "totalTokenCount": 136206,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 108885
+      }
+    ],
+    "thoughtsTokenCount": 24714,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-4o",
+      "review_date": "2026-05-26",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 2,
+        "rationale": "A critical target-alignment bug shifts all predictions and causal estimates to the wrong day, and prediction intervals leak future variance."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "Handles missing data well in XGBoost, but SARIMAX crashes on index mismatches and its diagnostics fail on NaNs."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Vectorized pandas operations and limits on expensive models ensure the pipeline scales well for a single user."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Uses standard sklearn/statsmodels patterns effectively, with minor quirks in time-series cross-validation and index alignment."
+      }
+    },
+    "summary": "The pipeline has strong statistical foundations, including doubly-robust causal estimators, iterative VIF dropping, and proper time-series cross-validation. However, a critical target-alignment bug undermines the correctness of the current outputs. When the matrix spine was migrated to `onyx_behavioral_date` (ADR-0001), behaviors and their resulting next-morning HRV were aligned onto the same row. The pipeline still applies a legacy `shift(-1)` to the target, causing all models and causal estimates to predict HRV two nights ahead instead of next-night. Additionally, prediction intervals in the backtest leak future variance, and the SARIMAX forecast will crash due to a DatetimeIndex mismatch on exogenous variables. Fixing the target alignment and ensuring same-night sleep metrics are properly lagged will restore the pipeline's validity.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Target shift(-1) causes 1-day misalignment with behavioral date spine",
+        "severity": "P0",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:1414-1416",
+        "description": "ADR-0001 changed the matrix spine to `onyx_behavioral_date`. A WHOOP cycle starting at 1 AM Monday has a behavioral date of Sunday, meaning Sunday's behaviors and the sleep ending Monday morning are now on the SAME row (row N). However, the pipeline still applies `df[TARGET].shift(-1)` (a legacy from the wake-day spine), which shifts the sleep ending Tuesday morning onto Sunday's row. Consequently, the entire pipeline predicts HRV two nights ahead instead of next-night.",
+        "evidence": "`df[\"hrv_next\"] = df[TARGET].shift(-1)` and `df[target_col] = df[TARGET].shift(-horizon)` shift the target forward, but `onyx_behavioral_date` already aligns the causal sleep onto the same row as the behaviors.",
+        "recommendation": "Remove `.shift(-1)` for `horizon=1` (use `df[TARGET]` directly). Adjust `horizon=h` to shift by `-(h-1)`. Additionally, exclude same-night sleep metrics (e.g., `whoop_sleep_duration_milli`) from `feat_cols` or shift them by 1 to prevent same-night mediator leakage."
+      },
+      {
+        "id": "F-002",
+        "title": "Prediction interval calibration leaks future variance via full-dataset OOF residuals",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2572-2591",
+        "description": "In the walk-forward backtest, the prediction interval width (`pred_std_by_horizon`) is computed once using `TimeSeriesSplit` on `X_h_full`, which is the entire dataset. This means the prediction intervals for early backtest folds are calibrated using residuals from models trained and evaluated on future data, leaking future variance information.",
+        "evidence": "`_, _, X_h_full, y_h_full = prepare_ml_data(df, horizon=_h)` is used to compute `pred_std_by_horizon[_h]`, which is then applied to all folds in the backtest loop at line 2623.",
+        "recommendation": "Compute `pred_std` dynamically within the backtest loop using only the OOF residuals from the current training fold (`X_tr`), exactly as `train_xgboost` does for the headline model."
+      },
+      {
+        "id": "F-003",
+        "title": "SARIMAX full-data forecast crashes due to DatetimeIndex mismatch on exogenous variables",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "hrv_analysis.py:2740-2741",
+        "description": "For the 7-day future forecast, `fut_exog_all = exog.iloc[-7:]` is passed to `get_forecast(steps=7)`. Because `exog` is a pandas DataFrame with a historical `DatetimeIndex`, statsmodels will attempt to align this past index with the future forecast index, resulting in a `ValueError` because the indices do not overlap.",
+        "evidence": "`fut_exog_all = exog.iloc[-7:]` retains the index of the last 7 training days. `fc_full = full_fit.get_forecast(steps=7, exog=fut_exog_all)` will fail index alignment.",
+        "recommendation": "Strip the index by passing the underlying numpy array: `fut_exog_all = exog.iloc[-7:].values`, or reindex `fut_exog_all` to match the future forecast dates."
+      },
+      {
+        "id": "F-004",
+        "title": "Block bootstrap for AIPW CI breaks autocorrelation by resampling compressed time series",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:382-392",
+        "description": "`_block_bootstrap_ci` is designed to preserve HRV autocorrelation by resampling contiguous 7-day blocks. However, `_prepare_treatment` drops rows with missing treatments before constructing the arrays passed to `estimate_aipw`. Consequently, `psi` represents a compressed time series of only the days the treatment was observed, mixing distant calendar days and breaking the exact temporal structure.",
+        "evidence": "`sub = sub.dropna(subset=[spec.name, OUTCOME_COL])` removes days without the treatment. `psi` is initialized to `np.zeros(n)` where `n = len(T)`.",
+        "recommendation": "Construct `psi` to span the full calendar range (length of the original `df`), placing NaNs on days where the treatment, outcome, or confounders are missing, before passing it to `_block_bootstrap_ci`."
+      },
+      {
+        "id": "F-005",
+        "title": "SARIMAX ADF test silently fails due to NaNs in differenced series",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "hrv_analysis.py:2688-2689",
+        "description": "The pipeline calls `adfuller` on `np.diff(train_endog.values)`. Because `train_endog` was reindexed via `.asfreq(\"D\")` to ensure calendar continuity, it contains NaNs for missing HRV days. `adfuller` does not support NaNs and raises an exception, causing the stationarity diagnostic to silently fail.",
+        "evidence": "`adf = _adf(np.diff(train_endog.values), autolag=\"AIC\")` inside a try-except block. `np.diff` propagates NaNs.",
+        "recommendation": "Drop NaNs from the differenced array before passing it to the ADF test: `_adf(pd.Series(np.diff(train_endog.values)).dropna(), autolag=\"AIC\")`."
+      },
+      {
+        "id": "F-006",
+        "title": "Categorical training status columns are silently dropped instead of encoded",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:642-643",
+        "description": "The audit flagged that `garmin_training_status` and `garmin_training_load_balance` are ordinal/categorical and carry useful information, but they are still being silently dropped during numeric coercion.",
+        "evidence": "`gts = gts.drop(columns=[\"training_status\", \"training_load_balance\", \"training_readiness_level\"], errors=\"ignore\")`",
+        "recommendation": "Apply ordinal or one-hot encoding to `garmin_training_status` and `garmin_training_load_balance` before dropping the original text columns, similar to what was done for `hrv_status`."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Iterative VIF dropping for OLS",
+        "file_ref": "hrv_analysis.py:1555",
+        "why_it_matters": "Iteratively dropping features with VIF > 10 before fitting the standardized OLS model is a robust way to handle multicollinearity in high-dimensional feature spaces, ensuring stable coefficients."
+      },
+      {
+        "title": "Time-respecting cross-fitting in AIPW",
+        "file_ref": "causal_inference.py:402",
+        "why_it_matters": "Using `TimeSeriesSplit` and scaling features per-fold prevents future information from leaking into the propensity and outcome models, which is critical for valid causal inference on autocorrelated time-series data."
+      },
+      {
+        "title": "E-value CI bound selection",
+        "file_ref": "causal_inference.py:500",
+        "why_it_matters": "Correctly selecting the CI bound nearest the null (ci_low for positive ATE, ci_high for negative ATE) ensures the E-value accurately reflects the estimate's robustness to unmeasured confounding."
+      }
+    ],
+    "questions_for_followup": [
+      "Are there any other same-night metrics (e.g., Eight Sleep room temperature) that should be explicitly lagged to prevent mediator leakage once the target alignment is fixed?",
+      "Does the user want to predict HRV for the sleep that starts on day N, or the sleep that starts on day N+1? The current ADR-0001 alignment assumes day N, but clarifying the exact actionable window would ensure the lag logic is perfectly aligned."
+    ]
+  },
+  "bundle": "stats"
+}

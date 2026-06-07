@@ -1,0 +1,115 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "ab8fac2",
+  "fired_at": "2026-05-27T14:58:59.834335+00:00",
+  "usage": {
+    "promptTokenCount": 108885,
+    "candidatesTokenCount": 2030,
+    "totalTokenCount": 138356,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 108885
+      }
+    ],
+    "thoughtsTokenCount": 27441,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "o1-pro",
+      "review_date": "2026-05-26",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 2,
+        "rationale": "Critical off-by-one errors in causal confounder selection and AIPW influence function initialization compromise the ATE estimates."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "Good handling of missing data, sparse features, and cell-size gates, though row-based date math is brittle."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Pipeline is well-suited for n=1 data volumes, though full retraining daily will eventually slow down."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Standard use of pandas, scikit-learn, and statsmodels, with appropriate time-series cross-validation patterns."
+      }
+    },
+    "summary": "The pipeline is generally well-structured and employs advanced techniques (AIPW, SARIMAX, walk-forward backtesting) appropriate for longitudinal n=1 data. However, there are two critical P0 correctness issues in the causal inference layer. First, the `COMMON_CONFOUNDERS` list uses `lag1` variables (e.g., yesterday's strain and yesterday morning's HRV) to adjust for evening behaviors, completely omitting same-day pre-treatment covariates (today's strain and this morning's HRV). This leaves major confounding paths unblocked. Second, the AIPW influence function array is initialized to zeros, and because `TimeSeriesSplit` never evaluates the initial training fold as a test set, these zeros are averaged into the ATE, artificially shrinking the effect sizes. Additionally, there is a P1 target leakage issue in the walk-forward backtest where prediction intervals are constructed using out-of-fold residuals from the entire dataset (including the future). Fixing these three issues will significantly improve the validity of the causal estimates and backtest metrics.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Causal confounders are lagged by one day too many, ignoring same-day covariates",
+        "severity": "P0",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:61-70",
+        "description": "The causal model uses `hrv_lag1`, `whoop_day_strain_lag1`, and `whoop_sleep_duration_milli_lag1` as confounders for day N behaviors. However, row N represents day N, and the outcome is `TARGET.shift(-1)` (night N+1 HRV). Therefore, `TARGET` (morning N HRV), `whoop_day_strain` (day N strain), and `whoop_sleep_duration_milli` (sleep ending morning N) are the correct same-day pre-treatment confounders. By using the `_lag1` versions, the model adjusts for day N-1 covariates and leaves day N covariates as unmeasured confounders.",
+        "evidence": "`COMMON_CONFOUNDERS` explicitly lists `hrv_lag1` and `whoop_day_strain_lag1`. Since the treatment (e.g., evening alcohol) and these same-day covariates both occur on day N, the same-day covariates are pre-treatment and must be adjusted for.",
+        "recommendation": "Update `COMMON_CONFOUNDERS` to use `whoop_hrv_rmssd` (or `TARGET`), `whoop_day_strain`, and `whoop_sleep_duration_milli` instead of their `_lag1` counterparts."
+      },
+      {
+        "id": "F-002",
+        "title": "AIPW influence function array initialized to zeros, biasing ATE",
+        "severity": "P0",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:398",
+        "description": "`psi` is initialized with `np.zeros(n)`. In `TimeSeriesSplit`, the first chunk of data is used only for training the first fold and never appears in any `test_idx`. Consequently, `psi` for these initial rows remains `0.0`. When `psi_valid = psi[~np.isnan(psi)]` is computed, these `0.0` values are included in the mean, artificially shrinking the ATE towards zero.",
+        "evidence": "`psi = np.zeros(n)` followed by `psi_valid = psi[~np.isnan(psi)]` and `ate = float(psi_valid.mean())`. The first fold's training indices are never assigned a value in the loop, so they remain 0.0 and are averaged into the ATE.",
+        "recommendation": "Initialize `psi = np.full(n, np.nan)` so that rows never evaluated as test samples are correctly dropped from the ATE calculation."
+      },
+      {
+        "id": "F-003",
+        "title": "Target leakage in walk-forward prediction intervals via full-dataset OOF residuals",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2570-2590",
+        "description": "In `run_evaluation`, `pred_std_by_horizon` is computed using `TimeSeriesSplit` on `X_h_full`, which is the entire dataset (including the backtest period). This `pred_std` is then used to construct prediction intervals during the walk-forward backtest. This means the prediction interval width at step `t` is informed by residuals from future dates.",
+        "evidence": "`tscv_h.split(X_h_full)` computes OOF residuals over the entire dataset. Later, `residuals_std = pred_std_by_horizon.get(h, ...)` uses this future-informed standard deviation to construct intervals for `X_pred_block`.",
+        "recommendation": "Compute `pred_std` dynamically within the walk-forward loop using only `X_tr` and `y_tr` (e.g., via a quick OOF pass on the training block), or accept the in-sample residual fallback."
+      },
+      {
+        "id": "F-004",
+        "title": "Row-based date math in _days_since and rolling windows undercounts gaps",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "hrv_analysis.py:734-742",
+        "description": "The `_days_since` function calculates elapsed time by subtracting row indices (`i - last`). Because the `daily_health_matrix_behavioral` spine only contains dates where at least one data source was active, any missing calendar days will cause this function to undercount the true number of days elapsed.",
+        "evidence": "`result.iloc[i] = i - last if not np.isnan(last) else np.nan` assumes the DataFrame index perfectly maps to contiguous calendar days without gaps.",
+        "recommendation": "Use the actual `calendar_date` column to compute the difference in days (e.g., `(pd.to_datetime(df['calendar_date']).iloc[i] - pd.to_datetime(df['calendar_date']).iloc[last]).days`). Apply similar time-aware logic to `rolling` windows."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Time-respecting cross-fitting in AIPW",
+        "file_ref": "causal_inference.py:408",
+        "why_it_matters": "Using `TimeSeriesSplit` instead of random K-Folds for the nuisance models prevents the outcome model from memorizing the test set via autocorrelated lag features."
+      },
+      {
+        "title": "Comprehensive multiple testing correction",
+        "file_ref": "causal_inference.py:650-670",
+        "why_it_matters": "Pooling binary and continuous treatments into a single family for BH-FDR correction properly controls the false discovery rate across the entire causal inference surface."
+      }
+    ],
+    "questions_for_followup": [
+      "Are there any plans to implement a time-aware rolling window (e.g., `rolling('7D', on='calendar_date')`) for features like `rolling_7d_training_load` to handle missing days more robustly?"
+    ]
+  },
+  "bundle": "stats"
+}

@@ -23,6 +23,7 @@ import sys
 import warnings
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import matplotlib
 matplotlib.use("Agg")  # headless backend
@@ -150,7 +151,18 @@ def log_sync_entry(status: str, records: int = 0, error: str | None = None,
         log.warning(f"Failed to write hrv_analysis sync_log heartbeat: {e}")
 
 
-MODEL_VERSION = f"{date.today().isoformat()}_behavioral_v1"
+ET_TZ = ZoneInfo("America/New_York")
+
+
+def et_today() -> date:
+    """Current date in America/New_York — the canonical Onyx day. Mirrors
+    hrv_predict.py:et_today(). Using a naive UTC date.today() here mis-tags a
+    late-ET-evening run (which is already the next UTC day) as the day after
+    tomorrow — the +2 prediction_date bug fixed 2026-06-06."""
+    return datetime.now(ET_TZ).date()
+
+
+MODEL_VERSION = f"{et_today().isoformat()}_behavioral_v1"
 TARGET = "whoop_hrv_rmssd"
 
 # Stage-1 BH-FDR threshold for promoting features to Stage 2 partial correlations.
@@ -205,10 +217,48 @@ HIGH_VALUE_SPARSE_FEATURES = {
     "garmin_hrv_status_ord",
 }
 
+# Cronometer micronutrients promoted into the HRV matrix (MFP→Cronometer migration,
+# 2026-05-31). Canonical short names match the daily_health_matrix_behavioral columns.
+# Vitamins + minerals + omega fractions only — the 11 amino acids and the fat fractions
+# stay in the DB/UI but out of the feature/treatment families so the per-family BH-FDR
+# pools stay sane (nutrition card grows ~13 → ~40, not ~75).
+MICRONUTRIENT_COLS: dict[str, tuple[str, str]] = {
+    "vit_a_rae_mcg":     ("Vitamin A (RAE)", "µg"),
+    "vit_c_mg":          ("Vitamin C", "mg"),
+    "vit_d_iu":          ("Vitamin D", "IU"),
+    "vit_e_mg":          ("Vitamin E", "mg"),
+    "vit_k_mcg":         ("Vitamin K", "µg"),
+    "b1_thiamine_mg":    ("B1 (Thiamine)", "mg"),
+    "b2_riboflavin_mg":  ("B2 (Riboflavin)", "mg"),
+    "b3_niacin_mg":      ("B3 (Niacin)", "mg"),
+    "b5_pantothenic_mg": ("B5 (Pantothenic Acid)", "mg"),
+    "b6_pyridoxine_mg":  ("B6 (Pyridoxine)", "mg"),
+    "b12_cobalamin_mcg": ("B12 (Cobalamin)", "µg"),
+    "folate_mcg":        ("Folate", "µg"),
+    "calcium_mg":        ("Calcium", "mg"),
+    "iron_mg":           ("Iron", "mg"),
+    "magnesium_mg":      ("Magnesium", "mg"),
+    "phosphorus_mg":     ("Phosphorus", "mg"),
+    "potassium_mg":      ("Potassium", "mg"),
+    "zinc_mg":           ("Zinc", "mg"),
+    "copper_mg":         ("Copper", "mg"),
+    "manganese_mg":      ("Manganese", "mg"),
+    "selenium_mcg":      ("Selenium", "µg"),
+    "omega3_g":          ("Omega-3", "g"),
+    "omega6_g":          ("Omega-6", "g"),
+    "epa_g":             ("EPA", "g"),
+    "dha_g":             ("DHA", "g"),
+    "ala_g":             ("ALA", "g"),
+    "nutrition_caffeine_mg": ("Dietary Caffeine", "mg"),
+}
+
 # Controllable / behavioral features for the actionable-only SHAP ranking
 # (audit finding 7.K). Anything here is something Riley can change tomorrow.
+# "nutrition_" covers the COALESCE'd Cronometer/MFP macros; MICRONUTRIENT_COLS keys
+# add the vitamins/minerals (which share no common prefix). "mfp_" kept for the
+# pre-cutover historical archive columns.
 CONTROLLABLE_FEATURE_PREFIXES = (
-    "journal_", "habit_", "mfp_", "supplement_", "whoop_sleep_", "garmin_sleep_",
+    "journal_", "habit_", "mfp_", "nutrition_", "supplement_", "whoop_sleep_", "garmin_sleep_",
     "eight_sleep_", "whoop_workout_", "whoop_day_strain", "garmin_activity_",
     "rolling_3d_training_load", "rolling_7d_training_load", "sleep_debt",
     "moderate_intensity_minutes", "vigorous_intensity_minutes",
@@ -218,7 +268,9 @@ CONTROLLABLE_FEATURE_PREFIXES = (
     "nj_",  # Notion Journal: mood / confidence / word_count / topic_count
     "sp_",  # Spotify daily signature (opt-in via ONYX_INCLUDE_SPOTIFY=1)
     "meal_",  # Meal timing: last_hour, first_hour, eating_window, last_meal_to_bedtime_min
-)
+    "caffeine_",  # Caffeine timing: first_hour, last_hour, window_hours, intake_count, to_bedtime_min
+    "act_",  # Activity taxonomy: run / sauna / leg_day / pull_day / push_day (auto + manual split)
+) + tuple(MICRONUTRIENT_COLS)  # Cronometer vitamins/minerals (exact column names)
 
 # Computed once per run from the post-prepare_ml_data (X, y) and stamped onto every
 # row written to pds.hrv_predictions / hrv_model_metrics / hrv_analysis_results so
@@ -328,10 +380,10 @@ FEATURE_LABELS: dict[str, str] = {
     "eight_sleep_room_temp": "Room Temperature",
     "bed_room_temp_delta": "Bed-Room Temp Delta",
     "eight_sleep_toss_turns": "Toss & Turns",
-    "mfp_calories": "Calories (MFP)",
-    "mfp_protein_g": "Protein (g)",
-    "mfp_carbs_g": "Carbohydrates (g)",
-    "mfp_fat_g": "Fat (g)",
+    "nutrition_calories": "Calories",
+    "nutrition_protein_g": "Protein (g)",
+    "nutrition_carbs_g": "Carbohydrates (g)",
+    "nutrition_fat_g": "Fat (g)",
     "protein_pct": "Protein % of Calories",
     "net_calories": "Net Calories",
     "day_of_week": "Day of Week",
@@ -341,6 +393,11 @@ FEATURE_LABELS: dict[str, str] = {
     "days_since_alcohol": "Days Since Alcohol",
     "days_since_last_rest_day": "Days Since Rest Day (Journal)",
     "days_since_sauna": "Days Since Sauna",
+    "act_run": "Run (WHOOP + Garmin)",
+    "act_sauna": "Sauna Session",
+    "act_leg_day": "Leg Day",
+    "act_pull_day": "Pull Day",
+    "act_push_day": "Push Day",
     "weight_kg": "Body Weight (kg)",
     "nj_mood_ord": "Notion Journal Mood (ordinal)",
     "nj_confidence_ord": "Notion Journal Confidence (ordinal)",
@@ -352,6 +409,11 @@ FEATURE_LABELS: dict[str, str] = {
     "meal_eating_window_hours": "Eating Window (h)",
     "meal_event_count": "Meal Events Logged",
     "meal_last_meal_to_bedtime_min": "Minutes from Last Meal to Bedtime",
+    "caffeine_first_hour": "First Caffeine (ET hour)",
+    "caffeine_last_hour": "Last Caffeine (ET hour)",
+    "caffeine_window_hours": "Caffeine Window (h)",
+    "caffeine_intake_count": "Caffeine Intakes Logged",
+    "caffeine_to_bedtime_min": "Minutes from Last Caffeine to Bedtime",
 }
 
 # Journal boolean questions → clean labels
@@ -557,10 +619,11 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     # for the workout-to-sleep gap feature; start_time_local stays for date binning.
     data["garmin_acts"] = fetch_all(
         "garmin_activities",
-        select="activity_id,start_time_local,start_time_gmt,activity_type,duration_seconds,distance_meters,"
+        select="activity_id,start_time_local,start_time_gmt,activity_type,split_label,onyx_behavioral_date,duration_seconds,distance_meters,"
                "avg_heart_rate,max_heart_rate,calories,elevation_gain_meters,"
                "aerobic_training_effect,anaerobic_training_effect,training_load,vo2_max,"
                "avg_speed_mps",
+        filters=[("is_excluded", "eq", False)],
     )
     if not data["garmin_acts"].empty:
         data["garmin_acts"]["calendar_date"] = to_date_str(
@@ -602,10 +665,10 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     # end_time added for the workout-to-sleep gap feature (true UTC; 100% populated).
     data["whoop_wk"] = fetch_all(
         "whoop_workouts",
-        select="workout_id,start_time,end_time,sport_name,strain,kilojoule,average_heart_rate,max_heart_rate,"
+        select="workout_id,start_time,end_time,sport_name,split_label,onyx_behavioral_date,strain,kilojoule,average_heart_rate,max_heart_rate,"
                "zone_zero_milli,zone_one_milli,zone_two_milli,zone_three_milli,"
                "zone_four_milli,zone_five_milli,score_state",
-        filters=[("score_state", "eq", "SCORED")],
+        filters=[("score_state", "eq", "SCORED"), ("is_excluded", "eq", False)],
     )
     if not data["whoop_wk"].empty:
         # Derive ET calendar_date from true-UTC start_time, matching view logic
@@ -628,13 +691,12 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     if not data["eight_sleep"].empty:
         data["eight_sleep"]["calendar_date"] = data["eight_sleep"]["calendar_date"].astype(str)
 
-    log.info("  Loading myfitnesspal_nutrition…")
-    data["mfp"] = fetch_all(
-        "myfitnesspal_nutrition",
-        select="calendar_date,fiber_g,sugar_g,sodium_mg,water_ml,exercise_kcal",
-    )
-    if not data["mfp"].empty:
-        data["mfp"]["calendar_date"] = data["mfp"]["calendar_date"].astype(str)
+    # Nutrition (macros + micros) now comes entirely from the matrix view's
+    # nutrition_* (COALESCE Cronometer→MFP) and Cronometer micronutrient columns
+    # (MFP→Cronometer migration, 2026-05-31). The old direct myfitnesspal_nutrition
+    # fetch (bare fiber_g/sugar_g/sodium_mg/water_ml/exercise_kcal) was redundant
+    # with the view's mfp_*/nutrition_* and is dropped; net_calories now uses the
+    # WHOOP-derived TDEE (canonical) instead of MFP's exercise_kcal.
 
     log.info("  Loading journal (WHOOP + habits)…")
     data["journal"] = fetch_all(
@@ -803,6 +865,82 @@ def aggregate_whoop_workouts(wk: pd.DataFrame, cycles: pd.DataFrame) -> pd.DataF
             aggfunc=lambda x: x.sum() + wk.loc[x.index, "zone_one_milli"].sum()
         ),
     ).reset_index()
+
+
+# User-facing activity taxonomy. run/sauna are auto-categorized from device sport
+# labels; leg/pull/push come from the manual split_label on the lifting session
+# (set from the /activities page — devices can't distinguish the strength split).
+ACT_CATEGORY_COLS = ["act_run", "act_sauna", "act_leg_day", "act_pull_day", "act_push_day"]
+
+
+def aggregate_activity_categories(whoop_wk: pd.DataFrame, garmin_acts: pd.DataFrame) -> pd.DataFrame:
+    """Per-behavioral-day 0/1 flags for the activity taxonomy (one column per
+    ACT_CATEGORY_COLS).
+
+    run + sauna are AUTO-derived from device sport labels (WHOOP sport_name,
+    Garmin activity_type). leg/pull/push come from the manual `split_label` on the
+    lifting workout — WHOOP logs all resistance training as one generic
+    'weightlifting_msk' with no muscle-group detail, and Garmin records no
+    strength, so the split is the one thing only the user holds.
+
+    Keyed on onyx_behavioral_date (= the matrix spine's calendar_date) so a
+    session's category co-locates with its behavioral day and the shift(-1) target
+    alignment holds even for a session that starts after midnight — rather than the
+    ET-of-start key the other workout aggregates inherited (ADR-0001 #1 trap).
+    Falls back to the loader's ET-of-start calendar_date only when the behavioral
+    column is absent/NULL. The caller fills a day with no session to 0 (not NaN).
+    """
+    def _behavioral_key(f: pd.DataFrame) -> pd.Series:
+        # Prefer the behavioral day; coalesce to the ET-of-start calendar_date the
+        # loader sets when behavioral is missing/NULL (shouldn't happen post-ADR).
+        if "onyx_behavioral_date" in f.columns:
+            bd = f["onyx_behavioral_date"]
+            if "calendar_date" in f.columns:
+                bd = bd.fillna(f["calendar_date"])
+            return bd.astype(str)
+        return f["calendar_date"].astype(str)
+
+    LIFT_RE = "weightlift|strength|lifting|resistance"
+    frames: list[pd.DataFrame] = []
+
+    # WHOOP workouts carry running, sauna, AND weightlifting(+split_label).
+    if whoop_wk is not None and not whoop_wk.empty:
+        w = whoop_wk.copy()
+        w["calendar_date"] = _behavioral_key(w)
+        w = w[~w["calendar_date"].isin(["None", "NaT", "nan", ""])]
+        sport = w["sport_name"].astype(str).str.lower()
+        split = (w["split_label"].astype(str).str.lower()
+                 if "split_label" in w.columns else pd.Series("", index=w.index))
+        is_lift = sport.str.contains(LIFT_RE, regex=True, na=False)
+        w["act_run"]      = sport.str.contains("run", na=False).astype(float)
+        w["act_sauna"]    = sport.str.contains("sauna", na=False).astype(float)
+        w["act_leg_day"]  = (is_lift & (split == "leg")).astype(float)
+        w["act_pull_day"] = (is_lift & (split == "pull")).astype(float)
+        w["act_push_day"] = (is_lift & (split == "push")).astype(float)
+        frames.append(w.groupby("calendar_date")[ACT_CATEGORY_COLS].max().reset_index())
+
+    # Garmin activities: runs (auto). split_label is honored too — defensive, since
+    # Garmin carries no strength in the current data, but it keeps the /activities
+    # toggle end-to-end consistent if a strength session is ever Garmin-sourced.
+    if garmin_acts is not None and not garmin_acts.empty:
+        g = garmin_acts.copy()
+        g["calendar_date"] = _behavioral_key(g)
+        g = g[~g["calendar_date"].isin(["None", "NaT", "nan", ""])]
+        gtype = g["activity_type"].astype(str).str.lower()
+        gsplit = (g["split_label"].astype(str).str.lower()
+                  if "split_label" in g.columns else pd.Series("", index=g.index))
+        g_is_lift = gtype.str.contains(LIFT_RE, regex=True, na=False)
+        g["act_run"]      = gtype.str.contains("run", na=False).astype(float)
+        g["act_sauna"]    = gtype.str.contains("sauna", na=False).astype(float)
+        g["act_leg_day"]  = (g_is_lift & (gsplit == "leg")).astype(float)
+        g["act_pull_day"] = (g_is_lift & (gsplit == "pull")).astype(float)
+        g["act_push_day"] = (g_is_lift & (gsplit == "push")).astype(float)
+        frames.append(g.groupby("calendar_date")[ACT_CATEGORY_COLS].max().reset_index())
+
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.groupby("calendar_date")[ACT_CATEGORY_COLS].max().reset_index()
 
 
 def _clean_question_col(prefix: str, question: str) -> str:
@@ -1091,6 +1229,24 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         if not ww_daily.empty:
             df = df.merge(ww_daily, on="calendar_date", how="left", suffixes=("", "_ww"))
 
+    # --- Join activity taxonomy (run / sauna / leg / pull / push) ---
+    # Auto from device sport labels (run, sauna) + the manual split_label on
+    # lifting sessions (leg/pull/push, set from /activities). act_* is blanket-
+    # filled to 0 on every spine row (a day with no such session = "didn't do it").
+    # Note this is STRICTER than is_run_day, which stays NaN on non-activity days:
+    # any pre-device-coverage spine rows become structural 0s. That's harmless —
+    # every downstream consumer (Spearman/Welch, XGBoost prepare_ml_data, causal
+    # AIPW) first drops rows lacking the next-night HRV outcome + HRV-derived
+    # confounders, which is exactly the pre-coverage era.
+    act_cat = aggregate_activity_categories(
+        data.get("whoop_wk", pd.DataFrame()), data.get("garmin_acts", pd.DataFrame())
+    )
+    if not act_cat.empty:
+        df = df.merge(act_cat, on="calendar_date", how="left", suffixes=("", "_actcat"))
+        for c in ACT_CATEGORY_COLS:
+            if c in df.columns:
+                df[c] = df[c].fillna(0.0)
+
     # --- Join whoop_body_measurements (forward-fill) ---
     if not data["whoop_body"].empty:
         bm = data["whoop_body"].copy()
@@ -1127,13 +1283,6 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
             )
         df = df.merge(es, on="calendar_date", how="left", suffixes=("", "_es"))
 
-    # --- Join MFP extra columns ---
-    if not data["mfp"].empty:
-        mfp = data["mfp"].copy()
-        for c in mfp.columns:
-            if c != "calendar_date":
-                mfp[c] = pd.to_numeric(mfp[c], errors="coerce")
-        df = df.merge(mfp, on="calendar_date", how="left", suffixes=("", "_mfp"))
 
     # --- Journal pivot ---
     # Skip if daily_health_matrix already includes journal_ columns (view-level pivot)
@@ -1415,25 +1564,35 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     if "whoop_sleep_duration_milli" in df.columns and "baseline_milli" in df.columns:
         df["sleep_debt_ratio"] = df["whoop_sleep_duration_milli"] / df["baseline_milli"].replace(0, np.nan)
 
-    # Nutrition ratios
-    if "mfp_calories" in df.columns:
-        cals = df["mfp_calories"].replace(0, np.nan)
-        if "mfp_protein_g" in df.columns:
-            df["protein_pct"] = df["mfp_protein_g"] * 4 / cals
-        if "mfp_carbs_g" in df.columns:
-            df["carb_pct"] = df["mfp_carbs_g"] * 4 / cals
-        if "mfp_fat_g" in df.columns:
-            df["fat_pct"] = df["mfp_fat_g"] * 9 / cals
-        if "exercise_kcal" in df.columns:
-            df["net_calories"] = df["mfp_calories"] - df["exercise_kcal"].fillna(0)
+    # Nutrition ratios (reads the COALESCE'd nutrition_* aliases: Cronometer where
+    # present, MFP for pre-cutover history — MFP→Cronometer migration 2026-05-31).
+    if "nutrition_calories" in df.columns:
+        cals = df["nutrition_calories"].replace(0, np.nan)
+        if "nutrition_protein_g" in df.columns:
+            df["protein_pct"] = df["nutrition_protein_g"] * 4 / cals
+        if "nutrition_carbs_g" in df.columns:
+            df["carb_pct"] = df["nutrition_carbs_g"] * 4 / cals
+        if "nutrition_fat_g" in df.columns:
+            df["fat_pct"] = df["nutrition_fat_g"] * 9 / cals
+        # Net energy uses WHOOP-derived expenditure (kJ÷4.184 is Onyx's canonical TDEE;
+        # Cronometer has no MFP-style exercise_kcal, so mfp_exercise_kcal goes NULL).
+        if "whoop_kilojoule" in df.columns:
+            df["net_calories"] = df["nutrition_calories"] - (df["whoop_kilojoule"] / 4.184).fillna(0)
 
     # Journal-derived "days since" features
     j_alcohol_col = next((c for c in df.columns if "alcoholic" in c or c == "journal_have_any_alcoholic_drinks"), None)
-    j_sauna_col = next((c for c in df.columns if "sauna" in c), None)
     if j_alcohol_col:
         df["days_since_alcohol"] = _days_since(df[j_alcohol_col].fillna(0))
-    if j_sauna_col:
-        df["days_since_sauna"] = _days_since(df[j_sauna_col].fillna(0))
+    # Days since sauna: prefer the robust device-sourced act_sauna (WHOOP
+    # sport_name='sauna') over the optional WHOOP journal "used a sauna" question,
+    # which is frequently unenabled. Fall back to a journal sauna column only if
+    # act_sauna isn't present (e.g. no WHOOP workout data loaded this run).
+    if "act_sauna" in df.columns:
+        df["days_since_sauna"] = _days_since(df["act_sauna"].fillna(0))
+    else:
+        j_sauna_col = next((c for c in df.columns if "sauna" in c and c.startswith("journal_")), None)
+        if j_sauna_col:
+            df["days_since_sauna"] = _days_since(df[j_sauna_col].fillna(0))
 
     # HR zone percentages from garmin_heart_rate
     for i in range(1, 6):
@@ -1472,8 +1631,8 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         df["load_x_hrv_lag1"] = df["rolling_7d_training_load"] * df["hrv_lag1"]
     if _has("eight_sleep_room_temp", "whoop_sleep_efficiency"):
         df["room_temp_x_sleep_eff"] = df["eight_sleep_room_temp"] * df["whoop_sleep_efficiency"]
-    if _has("mfp_sodium_mg", "mfp_water_ml"):
-        df["sodium_per_water"] = df["mfp_sodium_mg"] / df["mfp_water_ml"].replace(0, np.nan)
+    if _has("nutrition_sodium_mg", "nutrition_water_ml"):
+        df["sodium_per_water"] = df["nutrition_sodium_mg"] / df["nutrition_water_ml"].replace(0, np.nan)
     # Workout timing × intensity: a hard workout 30 min before bed should
     # depress HRV more than a hard workout 4 hours before bed.
     if _has("last_workout_end_to_sleep_min", "last_workout_whoop_strain"):
@@ -1658,7 +1817,7 @@ def print_completeness(df: pd.DataFrame) -> None:
                         "garmin_sleep_score", "training_readiness_score"],
         "Garmin HRV": [c for c in df.columns if "last_night" in c or "weekly_avg" in c or "baseline_" in c],
         "Eight Sleep": [c for c in df.columns if "eight_sleep" in c],
-        "Nutrition":   [c for c in df.columns if "mfp_" in c],
+        "Nutrition":   [c for c in df.columns if c.startswith("nutrition_") or "mfp_" in c or c in MICRONUTRIENT_COLS],
         "Journal":     [c for c in df.columns if c.startswith("journal_")],
         "Habits":      [c for c in df.columns if c.startswith("habit_")],
         "Supplements": [c for c in df.columns if c.startswith("supplement_")],
@@ -2242,20 +2401,24 @@ def run_statistical_analysis(
     # The audit flagged that the descriptive Spearman chart was a 7-column subset
     # of what the causal layer treats as nutrition treatments, so the dashboard
     # silently understated coverage.
+    # Macros read the COALESCE'd nutrition_* aliases (Cronometer→MFP). mfp_exercise_kcal
+    # dropped — Cronometer has none; net_calories is now WHOOP-based. MICRONUTRIENT_COLS
+    # adds the ~27 Cronometer vitamins/minerals/omega (sparse early, auto-skipped by the
+    # coverage gate below until history accrues).
     NUTRITION_COLS = {
-        "mfp_calories": ("Calories", "kcal"),
-        "mfp_protein_g": ("Protein", "g"),
-        "mfp_carbs_g": ("Carbohydrates", "g"),
-        "mfp_fat_g": ("Fat", "g"),
-        "mfp_fiber_g": ("Fiber", "g"),
-        "mfp_sugar_g": ("Sugar", "g"),
-        "mfp_sodium_mg": ("Sodium", "mg"),
-        "mfp_water_ml": ("Water", "ml"),
-        "mfp_exercise_kcal": ("Exercise kcal (MFP)", "kcal"),
+        "nutrition_calories": ("Calories", "kcal"),
+        "nutrition_protein_g": ("Protein", "g"),
+        "nutrition_carbs_g": ("Carbohydrates", "g"),
+        "nutrition_fat_g": ("Fat", "g"),
+        "nutrition_fiber_g": ("Fiber", "g"),
+        "nutrition_sugar_g": ("Sugar", "g"),
+        "nutrition_sodium_mg": ("Sodium", "mg"),
+        "nutrition_water_ml": ("Water", "ml"),
         "net_calories": ("Net Calories", "kcal"),
         "protein_pct": ("Protein % of Calories", "%"),
         "carb_pct": ("Carb % of Calories", "%"),
         "fat_pct": ("Fat % of Calories", "%"),
+        **MICRONUTRIENT_COLS,
     }
     nutrition_impact: list[dict] = []
     try:
@@ -2692,19 +2855,52 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
             sorted(controllable_importance.items(), key=lambda kv: kv[1], reverse=True)[:20]
         )
 
-    # Tomorrow's prediction (latest available data)
-    tomorrow_pred = float(final_model.predict(X.iloc[[-1]])[0])
+    # ── Production model: refit on the FULL matrix ───────────────────────────
+    # final_model above was trained on only the first 70% (the train slice) — the
+    # right choice for honest backtest metrics / SHAP / early-stopping selection,
+    # but it must NOT be the deployed forecaster. Refit ONE model on ALL rows
+    # (X, y) using the early-stopped tree count, so tomorrow's forecast AND the
+    # pickled model that hrv_predict.py reuses daily actually see the most recent
+    # data. (Bug fixed 2026-06-06: the live forecast + pickle previously came from
+    # the 70% model, so they never saw any data after the train split ~Dec 2025.)
+    _best_iter = getattr(final_model, "best_iteration", None)
+    prod_n_estimators = (_best_iter + 1) if _best_iter is not None else best_params.get("n_estimators", 300)
+    production_model = XGBRegressor(
+        **{k: v for k, v in best_params.items() if k != "n_estimators"},
+        n_estimators=prod_n_estimators,
+    )
+    production_model.fit(X, y, verbose=False)
+    log.info(f"  Production model refit on full data: {len(X)} rows, "
+             f"n_estimators={prod_n_estimators} (held-out final_model kept for metrics/SHAP)")
+
+    # Re-explain the latest observation with the production model so the displayed
+    # drivers match the deployed forecast (overrides the held-out-model drivers).
+    if HAS_SHAP:
+        try:
+            _prod_latest = shap.TreeExplainer(production_model)(X.iloc[[-1]])
+            _td = [
+                {"feature": f, "label": FEATURE_LABELS.get(f, f),
+                 "shap_value": float(_prod_latest.values[0, i])}
+                for i, f in enumerate(feat_cols)
+                if not np.isnan(_prod_latest.values[0, i])
+            ]
+            top_drivers = sorted(_td, key=lambda x: abs(x["shap_value"]), reverse=True)[:10]
+        except Exception as e:
+            log.debug(f"  production-model top_drivers failed, keeping held-out drivers: {e}")
+
+    # Tomorrow's prediction (latest available data) — from the full-data model.
+    tomorrow_pred = float(production_model.predict(X.iloc[[-1]])[0])
     today_hrv = float(df[TARGET].dropna().iloc[-1]) if df[TARGET].dropna().shape[0] > 0 else None
 
     # Save model
     model_path = OUTPUT_DIR / "xgboost_hrv_model.pkl"
     with open(model_path, "wb") as f:
-        pickle.dump({"model": final_model, "feat_cols": feat_cols,
+        pickle.dump({"model": production_model, "feat_cols": feat_cols,
                      "pred_std": pred_std, "model_version": MODEL_VERSION}, f)
     log.info(f"  Model saved: {model_path}")
 
     results = {
-        "model": final_model,
+        "model": production_model,
         "feat_cols": feat_cols,
         "test_pred": test_pred,
         "test_actual": y_test.values,
@@ -2721,14 +2917,19 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
         "today_hrv": today_hrv,
         "pred_std": pred_std,
         "train_start": model_df["calendar_date"].iloc[0],
-        "train_end": model_df["calendar_date"].iloc[train_end - 1],
+        # train_end = the last day the DEPLOYED (full-data) model trained on, NOT
+        # the 70% split (that boundary is kept as backtest_train_end for the
+        # honest test-metric provenance). Without this, the freshly-refit current
+        # model would be mislabeled stale (~Dec 2025) and re-trip the /status alarm.
+        "train_end": model_df["calendar_date"].iloc[-1],
+        "backtest_train_end": model_df["calendar_date"].iloc[train_end - 1],
         "test_start": model_df["calendar_date"].iloc[val_end],
         "test_end": model_df["calendar_date"].iloc[-1],
         # Audit re-2026-05-26 P2 (deepseek stats F-004): high-dim warning.
         "feature_condition_number": feature_condition_number,
         "shap_unstable": shap_unstable,
     }
-    return final_model, results
+    return production_model, results
 
 
 def _fallback_feature_importance(model, feat_cols: list) -> list:
@@ -3316,7 +3517,7 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     eval_results: dict = {"backtest_df": bt_df}
 
     model_metrics_rows: list[dict] = []
-    today_str = str(date.today())
+    today_str = str(et_today())
 
     # Aggregate per (model, horizon) so the Accuracy-by-Horizon chart can plot
     # bars for every (model × t+h) combination. The h=1 row of each model is
@@ -3631,11 +3832,11 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
                       prophet_results: dict, eval_results: dict) -> None:
     """Upsert all predictions into pds.hrv_predictions."""
     rows: list[dict] = []
-    today_str = str(date.today())
+    today_str = str(et_today())
 
     # XGBoost tomorrow's prediction
     if xgb_results:
-        tomorrow = str(date.today() + timedelta(days=1))
+        tomorrow = str(et_today() + timedelta(days=1))
         rows.append({
             "prediction_date": tomorrow,
             "model": "xgboost",
@@ -3736,7 +3937,8 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
                            dm_test: list | None = None,
                            error_modes: list | None = None,
                            error_modes_habits: list | None = None,
-                           causal_results: dict | None = None) -> None:
+                           causal_results: dict | None = None,
+                           xgb_diagnostics: dict | None = None) -> None:
     """Store pre-computed analysis results for the frontend."""
     rows: list[dict] = []
 
@@ -3843,6 +4045,28 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
                 "result_key": "shap_habit",
                 "result_json": habit_fi_list,
             })
+
+    # XGBoost training diagnostics — surfaces the condition number of the
+    # standardized feature matrix that train_xgboost computes (audit commit
+    # 93a7323). When cond(X) > 30, SHAP / permutation importance can over-
+    # credit collinear feature siblings; the frontend reads this row to
+    # render a caveat banner above the Prediction Drivers panel.
+    if xgb_diagnostics:
+        cond_num = xgb_diagnostics.get("feature_condition_number")
+        # JSON can't represent NaN/Inf — coerce them so upsert doesn't fail.
+        if cond_num is None or (isinstance(cond_num, float) and not np.isfinite(cond_num)):
+            cond_num_json = None
+        else:
+            cond_num_json = float(cond_num)
+        rows.append({
+            "result_type": "model_diagnostics",
+            "result_key": "xgboost",
+            "result_json": {
+                "feature_condition_number": cond_num_json,
+                "shap_unstable": bool(xgb_diagnostics.get("shap_unstable", False)),
+                "threshold": 30,  # Belsley et al. 1980 cutoff
+            },
+        })
 
     # Stage 3 standardized OLS results (audit fix 2.C)
     if "stage3_ols" in stat_results:
@@ -4035,7 +4259,7 @@ def print_summary(df: pd.DataFrame, xgb_results: dict,
                   f"(Yes={h['n_yes']}, No={h['n_no']})")
 
     # Tomorrow's prediction
-    print(f"\nTOMORROW'S PREDICTION ({str(date.today() + timedelta(days=1))})")
+    print(f"\nTOMORROW'S PREDICTION ({str(et_today() + timedelta(days=1))})")
     if xgb_results and xgb_results.get("tomorrow_pred"):
         p = xgb_results["tomorrow_pred"]
         std = xgb_results.get("pred_std", 0)
@@ -4149,7 +4373,7 @@ def main() -> None:
         return next((f for f in full_ranked if f.startswith(prefix)), None)
 
     seeds: list[str] = []
-    for prefix in ("journal_", "habit_", "mfp_", "supplement_"):
+    for prefix in ("journal_", "habit_", "act_", "nutrition_", "supplement_"):
         f = first_with_prefix(prefix)
         if f and f not in seeds:
             seeds.append(f)
@@ -4168,7 +4392,7 @@ def main() -> None:
     # Append SARIMAX per-horizon metrics so the frontend horizon chart can render them
     sarimax_horizon_metrics = sarimax_results.get("metrics_by_horizon", {}) if sarimax_results else {}
     if sarimax_horizon_metrics:
-        today_str = str(date.today())
+        today_str = str(et_today())
         for h, m in sarimax_horizon_metrics.items():
             eval_results.setdefault("model_metrics_rows", []).append({
                 "eval_date": today_str, "model": "sarimax", "horizon_days": int(h),
@@ -4196,6 +4420,10 @@ def main() -> None:
         error_modes=eval_results.get("error_modes"),
         error_modes_habits=eval_results.get("error_modes_habits"),
         causal_results=causal_results,
+        xgb_diagnostics={
+            "feature_condition_number": xgb_results.get("feature_condition_number"),
+            "shap_unstable": xgb_results.get("shap_unstable", False),
+        },
     )
 
     # ---------- Run-Manifest Artifact (audit fix 4#38) ----------

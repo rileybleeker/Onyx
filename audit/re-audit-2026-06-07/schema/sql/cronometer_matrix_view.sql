@@ -1,0 +1,68 @@
+-- Cronometer additions to pds.daily_health_matrix_behavioral
+-- Applied via Supabase migration `daily_health_matrix_behavioral_cronometer` (2026-05-31).
+--
+-- This documents the ADDITIVE delta of the MFP→Cronometer migration. The canonical,
+-- full CREATE OR REPLACE lives in the Supabase migration above (and is regenerable with
+-- `SELECT pg_get_viewdef('pds.daily_health_matrix_behavioral'::regclass, true);`). The
+-- base view DDL is sql/adr_0001_08_daily_health_matrix_behavioral.sql.
+--
+-- CREATE OR REPLACE VIEW constraint: existing columns keep their name/type/position;
+-- the new nutrition columns are APPENDED at the tail (after caffeine_to_bedtime_min).
+-- The legacy mfp_* macro columns are left UNTOUCHED for the historical archive.
+--
+-- Three changes:
+--
+-- 1) Spine CTE `all_behavioral_dates` gains a Cronometer member so Cronometer-only
+--    days still produce a matrix row:
+--        UNION
+--        SELECT cronometer_nutrition_daily.onyx_behavioral_date
+--          FROM pds.cronometer_nutrition_daily
+--         WHERE cronometer_nutrition_daily.onyx_behavioral_date IS NOT NULL
+--
+-- 2) New LEFT JOIN (after the mfp join):
+--        LEFT JOIN pds.cronometer_nutrition_daily cn
+--               ON cn.onyx_behavioral_date = s.calendar_date
+--
+-- 3) Appended SELECT columns (Cronometer wins; MFP fills pre-cutover history for macros):
+--        COALESCE(cn.calories,  mfp.calories)  AS nutrition_calories,
+--        COALESCE(cn.protein_g, mfp.protein_g) AS nutrition_protein_g,
+--        COALESCE(cn.carbs_g,   mfp.carbs_g)   AS nutrition_carbs_g,
+--        COALESCE(cn.fat_g,     mfp.fat_g)     AS nutrition_fat_g,
+--        COALESCE(cn.fiber_g,   mfp.fiber_g)   AS nutrition_fiber_g,
+--        COALESCE(cn.sugars_g,  mfp.sugar_g)   AS nutrition_sugar_g,
+--        COALESCE(cn.sodium_mg, mfp.sodium_mg) AS nutrition_sodium_mg,
+--        COALESCE(cn.water_g,   mfp.water_ml)  AS nutrition_water_ml,   -- 1 g water ≈ 1 ml
+--        CASE WHEN cn.onyx_behavioral_date IS NOT NULL THEN 'cronometer'
+--             WHEN mfp.onyx_behavioral_date IS NOT NULL THEN 'mfp'
+--             ELSE NULL END                    AS nutrition_source,
+--        -- extended Cronometer macros / dietary stimulants (no MFP equivalent):
+--        cn.alcohol_g          AS nutrition_alcohol_g,
+--        cn.caffeine_mg        AS nutrition_caffeine_mg,
+--        cn.net_carbs_g        AS nutrition_net_carbs_g,
+--        cn.added_sugars_g     AS nutrition_added_sugars_g,
+--        cn.starch_g           AS nutrition_starch_g,
+--        cn.cholesterol_mg     AS cholesterol_mg,
+--        cn.saturated_g        AS saturated_fat_g,
+--        cn.monounsaturated_g  AS monounsaturated_fat_g,
+--        cn.polyunsaturated_g  AS polyunsaturated_fat_g,
+--        cn.trans_fat_g        AS trans_fat_g,
+--        cn.oxalate_mg, cn.phytate_mg, cn.soluble_fiber_g, cn.insoluble_fiber_g,
+--        -- vitamins (Cronometer only, canonical short names):
+--        cn.vit_a_rae_mcg, cn.vit_c_mg, cn.vit_d_iu, cn.vit_e_mg, cn.vit_k_mcg,
+--        cn.b1_thiamine_mg, cn.b2_riboflavin_mg, cn.b3_niacin_mg, cn.b5_pantothenic_mg,
+--        cn.b6_pyridoxine_mg, cn.b12_cobalamin_mcg, cn.folate_mcg,
+--        -- minerals:
+--        cn.calcium_mg, cn.iron_mg, cn.magnesium_mg, cn.phosphorus_mg, cn.potassium_mg,
+--        cn.zinc_mg, cn.copper_mg, cn.manganese_mg, cn.selenium_mcg,
+--        -- fatty acids:
+--        cn.omega3_g, cn.omega6_g, cn.epa_g, cn.dha_g, cn.ala_g, cn.aa_g, cn.la_g,
+--        -- amino acids:
+--        cn.cystine_g, cn.histidine_g, cn.isoleucine_g, cn.leucine_g, cn.lysine_g,
+--        cn.methionine_g, cn.phenylalanine_g, cn.threonine_g, cn.tryptophan_g,
+--        cn.tyrosine_g, cn.valine_g,
+--        -- future-proof micros (NULL until Cronometer emits them):
+--        cn.beta_carotene_mcg, cn.b7_biotin_mcg, cn.choline_mg, cn.iodine_mcg,
+--        cn.chromium_mcg, cn.molybdenum_mcg
+--
+-- NOTE: the legacy pds.daily_health_matrix (clock-date, Garmin-spine) has NO nutrition
+-- columns and is intentionally left unchanged — there is nothing to COALESCE there.

@@ -3,7 +3,7 @@ Onyx Audit Runner
 =================
 Fires the audit at three external reviewer models in parallel and saves
 their JSON responses to audit/responses/:
-  - OpenAI GPT-5.5-pro (reasoning_effort=high)
+  - OpenAI GPT-5.5-pro via /v1/responses (reasoning.effort=xhigh)
   - Google Gemini 3.1-pro-preview (thinkingBudget=32768)
   - DeepSeek V4-Pro (thinking mode enabled, reasoning_effort=high)
 
@@ -81,18 +81,23 @@ def discover_bundle_files(bundle_dir: Path) -> list[Path]:
     priority.sort(key=lambda t: t[0])
     return [p for _, p in priority] + docs + code
 
-# Bumped 2026-05-26 to the current flagship Pro-tier models.
-#   OpenAI: gpt-5 → gpt-5.5-pro (released 2026-04-23). The 'pro' tier adds
-#     extended-reasoning compute on top of the reasoning_effort='high'
-#     parameter we send. Combined cost is ~3-5x gpt-5 base, justified for
-#     the heavy review task.
-#   Gemini: gemini-2.5-pro → gemini-3.1-pro-preview. gemini-3-pro original
-#     preview was deprecated 2026-03-09; 3.1-pro is current. gemini-2.5-pro
-#     remains available as a stable fallback if 3.1-pro-preview throws.
-OPENAI_MODEL = "gpt-5"
+# Bumped 2026-06-07 to gpt-5.5-pro for the third audit pass.
+#   OpenAI: gpt-5.5-pro (released 2026-04-23). The 'pro' tier adds
+#     extended-reasoning compute on top of the reasoning effort we send.
+#     Requires the /v1/responses endpoint (not /v1/chat/completions —
+#     pro models are not exposed there) and a different payload shape
+#     (`instructions` + `input` instead of `messages`, `reasoning.effort`
+#     nested instead of `reasoning_effort` flat, response in
+#     `output[].content[].text` instead of `choices[0].message.content`).
+#     reasoning.effort='xhigh' is a new tier above 'high', selected for
+#     audit-grade thoroughness. Combined cost is ~3-5x gpt-5 base.
+#   Gemini: gemini-3.1-pro-preview. gemini-3-pro original preview was
+#     deprecated 2026-03-09; 3.1-pro is current. gemini-2.5-pro remains
+#     available as a stable fallback if 3.1-pro-preview throws.
+OPENAI_MODEL = "gpt-5.5-pro"
 GEMINI_MODEL = "gemini-3.1-pro-preview"
 
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_URL = "https://api.openai.com/v1/responses"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # DeepSeek added 2026-05-26 as a 3rd independent reviewer (Chinese training
@@ -140,38 +145,29 @@ def current_commit() -> str:
 # ---------------------------------------------------------------------------
 
 async def call_openai(client: httpx.AsyncClient, bundle_text: str, commit: str) -> dict:
-    """POST the bundle to OpenAI GPT-5 with JSON-object response format."""
+    """POST the bundle to OpenAI gpt-5.5-pro via /v1/responses with JSON output."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set in .env")
 
     payload = {
         "model": OPENAI_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an independent statistical methodology reviewer. "
-                    "Read the entire bundle. Return a single JSON object matching the schema in PROMPT.md. "
-                    "Do not include any text outside the JSON."
-                ),
-            },
-            {"role": "user", "content": bundle_text},
-        ],
-        "response_format": {"type": "json_object"},
-        # High reasoning effort for max thoroughness on the audit task. GPT-5
-        # default is 'medium'; 'high' uses substantially more reasoning tokens
-        # (~2-3x cost) but catches subtler issues. See docs:
-        # https://platform.openai.com/docs/guides/reasoning
-        "reasoning_effort": "high",
+        "instructions": (
+            "You are an independent statistical methodology reviewer. "
+            "Read the entire bundle. Return a single JSON object matching the schema in PROMPT.md. "
+            "Do not include any text outside the JSON."
+        ),
+        "input": bundle_text,
+        "reasoning": {"effort": "xhigh"},
+        "text": {"format": {"type": "json_object"}},
     }
 
-    log.info(f"[openai] firing request to {OPENAI_MODEL} (reasoning=high, bundle size: {len(bundle_text):,} chars)")
+    log.info(f"[openai] firing request to {OPENAI_MODEL} (reasoning=xhigh, bundle size: {len(bundle_text):,} chars)")
     resp = await client.post(
         OPENAI_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json=payload,
-        timeout=600.0,  # 10 minutes; reasoning models can take a while
+        timeout=1800.0,  # 30 minutes — xhigh + pro can be slow on large bundles
     )
 
     if resp.status_code != 200:
@@ -181,18 +177,31 @@ async def call_openai(client: httpx.AsyncClient, bundle_text: str, commit: str) 
     usage = body.get("usage", {})
     log.info(
         f"[openai] response received — "
-        f"prompt={usage.get('prompt_tokens', '?')} tok, "
-        f"completion={usage.get('completion_tokens', '?')} tok"
+        f"input={usage.get('input_tokens', '?')} tok, "
+        f"output={usage.get('output_tokens', '?')} tok "
+        f"(reasoning={usage.get('output_tokens_details', {}).get('reasoning_tokens', '?')})"
     )
 
-    content = body["choices"][0]["message"]["content"]
+    # Responses API: walk output[] to find the assistant message's output_text.
+    content = None
+    for item in body.get("output", []):
+        if item.get("type") == "message":
+            for c in item.get("content", []):
+                if c.get("type") == "output_text" and c.get("text"):
+                    content = c["text"]
+                    break
+            if content:
+                break
+    if not content:
+        raise RuntimeError(f"OpenAI Responses API: no output_text in body: {json.dumps(body)[:500]}")
+
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"OpenAI returned non-JSON content: {e}\n{content[:500]}")
 
     return {
-        "reviewer": "gpt-5",
+        "reviewer": "gpt-5.5-pro",
         "model": OPENAI_MODEL,
         "bundle_commit": commit,
         "fired_at": datetime.now(timezone.utc).isoformat(),

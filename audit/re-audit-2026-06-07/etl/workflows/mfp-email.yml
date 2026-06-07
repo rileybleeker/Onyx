@@ -1,0 +1,33 @@
+name: MyFitnessPal Email Check (DISABLED — Cronometer cutover 2026-05-31)
+
+# DISABLED: nutrition ingestion moved to Cronometer on 2026-05-31. The hourly
+# cron is removed so MFP no longer auto-imports; the importer + this workflow are
+# preserved as a runnable fallback. To ingest a forgotten MFP export, re-add the
+# `schedule:` block below (or trigger manually via the Actions tab / workflow_dispatch).
+#   schedule:
+#     - cron: '15 * * * *'
+on:
+  workflow_dispatch: # Manual trigger only (fallback for a late MFP export)
+
+concurrency:
+  group: mfp-email
+  cancel-in-progress: false
+
+jobs:
+  mfp-email:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests supabase python-dotenv
+      - name: Check MFP export email
+        run: python myfitnesspal_email.py --once
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          IMAP_HOST: ${{ secrets.IMAP_HOST }}
+          IMAP_EMAIL: ${{ secrets.IMAP_EMAIL }}
+          IMAP_APP_PASSWORD: ${{ secrets.IMAP_APP_PASSWORD }}

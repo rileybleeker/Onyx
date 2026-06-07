@@ -1,0 +1,192 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "b54c99f",
+  "fired_at": "2026-05-27T23:39:54.259965+00:00",
+  "usage": {
+    "prompt_tokens": 93291,
+    "completion_tokens": 12253,
+    "total_tokens": 105544,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 9088,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-5",
+      "review_date": "2026-05-27",
+      "bundle_commit": "83f7a0a"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "Core analyses are time-respecting and well-chosen (AIPW with TimeSeriesSplit, embargoed walk-forward, FDR across families), with a few correctness/consistency gaps in feature naming and edge-case handling."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "Missingness, low-N, and autocorrelation are handled thoughtfully (cell-size gates, HAC, block bootstrap), though a couple of brittle code paths could still break on type/schema drift."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "The pipeline uses vectorized libs and incremental folds; causal PSM/AIPW scales to current N but would get slow at 10\u00d7 without further batching/parallelism."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Approach is largely standard for Python stats/ML (sklearn, statsmodels, scipy, xgboost, SHAP); a few ad-hoc computations and minor import issues keep it from a 5."
+      }
+    },
+    "summary": "This is a strong n=1 longitudinal analytics stack with the right emphasis on time alignment, confounding control, and multiplicity. The most important pieces are done correctly: causal AIPW cross-fitting uses TimeSeriesSplit with per-fold scaling and reports block-bootstrapped CIs alongside IF-based ones; the multi-horizon XGBoost backtest uses a 28-day embargo to avoid rolling-window leakage and computes out-of-fold residual std for prediction intervals; and multiple-comparison control is consistently applied (BH-FDR for Spearman, journal/habit/supplement/nutrition, and a single BH family for all AIPW ATEs). SARIMAX is trained on a contiguous daily index with missing handled by the Kalman filter, exogenous regressors are lagged one day, and future exog in backtests/forecasts correctly uses last-known values. Stage-3 OLS limits k to preserve n/k and drops high-VIF features, which is prudent at ~250 features.\n\nRemaining risks are modest but worth fixing: the Nutrition Spearman table refers to column names that don\u2019t exist in the merged frame (mfp_exercise_kcal, mfp_water_ml), silently omitting two variables the causal layer does analyze; the XGBoost condition-number check references StandardScaler without importing it so the SHAP-stability warning path never runs; and the journal/habit pivots assume string answers where the schema is BOOLEAN, which may break if the view stops coercing to text. These won\u2019t invalidate the core results but can mislead dashboards or reduce diagnostics. The causal layer could also log more explicitly when confounder forward-fill causes large row drops.\n\nTop three fixes: (1) Align Nutrition Spearman column names to the actual merged columns (exercise_kcal, water_ml), (2) import StandardScaler in train_xgboost so the feature condition-number/SHAP-stability diagnostics function as intended, and (3) harden journal/habit pivot answer parsing to accept booleans/strings interchangeably. With these addressed, I\u2019d be comfortable calling the methodology production-reliable for Riley\u2019s use case.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Nutrition Spearman uses non-existent column names (silent omissions)",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "hrv_analysis.py:1855-1905",
+        "description": "NUTRITION_COLS includes mfp_exercise_kcal and mfp_water_ml, but build_feature_matrix merges these as exercise_kcal and water_ml (no mfp_ prefix). As a result, the Nutrition Impact card silently skips these variables while the causal layer analyzes exercise_kcal, creating inconsistent coverage.",
+        "evidence": "hrv_analysis.run_statistical_analysis defines NUTRITION_COLS with keys 'mfp_exercise_kcal' and 'mfp_water_ml'; load_all_data/build_feature_matrix merge MyFitnessPal columns as 'exercise_kcal' and 'water_ml'.",
+        "recommendation": "Rename the NUTRITION_COLS keys to match the actual column names (exercise_kcal, water_ml) or rename on merge to mfp_* consistently; add an assertion to log any listed nutrition feature that's missing from the frame."
+      },
+      {
+        "id": "F-002",
+        "title": "SHAP-stability check fails silently due to missing StandardScaler import",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "hrv_analysis.py:2058-2080",
+        "description": "train_xgboost computes a feature-matrix condition number using StandardScaler but never imports StandardScaler in this scope; the NameError is swallowed by a broad except, leaving feature_condition_number NaN and shap_unstable=False even when collinearity is severe.",
+        "evidence": "Within train_xgboost: 'X_train_std = StandardScaler().fit_transform(...)' without a corresponding from sklearn.preprocessing import StandardScaler; except logs only debug, so the warning path never triggers.",
+        "recommendation": "Import StandardScaler at module top or within train_xgboost before use; if the computation fails, log a warning and set shap_unstable=None so downstream surfaces can reflect unknown status."
+      },
+      {
+        "id": "F-003",
+        "title": "Journal/habit pivot assumes string answers; schema is BOOLEAN",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "hrv_analysis.py:534-561",
+        "description": "pivot_journal and pivot_habits coerce answers with .str.lower().isin([...]); if pds.journal.answer stops being a text-cast and remains BOOLEAN, .str will raise and break the run.",
+        "evidence": "SCHEMA shows pds.whoop_journal.answer BOOLEAN; pivot_journal uses journal['answer'].str.lower().isin([...]).astype(float).",
+        "recommendation": "Make parsing type-robust: if dtype is bool, use answer.astype(float); if object, lower/isin; handle {True, 'Yes', 'TRUE', 1} uniformly."
+      },
+      {
+        "id": "F-004",
+        "title": "Causal confounder ffill can drop many rows without explicit surface",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "causal_inference.py:650-707",
+        "description": "Confounders are forward-filled with limit=2 prior to filtering, then rows with any remaining NaN are dropped; while a warning logs when >10% are dropped, the final causal rows used per treatment are not surfaced in results except as counts.",
+        "evidence": "_prepare_treatment ffills confounders then dropna; only a warning is logged. Early-tracking eras or sparse confounders can disproportionately remove days.",
+        "recommendation": "Include per-treatment lists of confounders actually used, n_pre_drop vs n_final, and a boolean 'confounder_loss_driven' flag in the stored result to make losses explicit in the UI; consider increasing limit or making it configurable."
+      },
+      {
+        "id": "F-005",
+        "title": "Stage-3 OLS HAC SEs on gappy rows approximate daily lags",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:1505-1625",
+        "description": "Stage-3 standardized OLS drops rows with any NaN across survivors, then applies HAC(maxlags=7), which is '7 rows' on a non-contiguous series, not '7 days'; this can misstate SEs if missingness is patterned.",
+        "evidence": "Code comment acknowledges gappy index; HAC computed on row index nonetheless.",
+        "recommendation": "Either refit on a reindexed daily frame with explicit missing handled via imputation for survivors, or compute HAC lags in calendar time by grouping contiguous stretches; at minimum, surface a 'gappy_index=true' footnote in stored results."
+      },
+      {
+        "id": "F-006",
+        "title": "AIPW FDR uses IF-based SE p-values even when block CI is wider",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "causal_inference.py:786-854",
+        "description": "The BH-FDR correction uses Wald p-values from IF-based SE, while the code also computes block-bootstrap CIs that can be materially wider under autocorrelation; p-values may be anti-conservative for some treatments.",
+        "evidence": "estimate_aipw returns ci_low_bb/ci_high_bb and bb_width_ratio but FDR uses 2*(1-CDF(|ate/se_if|)).",
+        "recommendation": "Option A: gate FDR inclusion on bb_width_ratio<=1.25; Option B: compute bootstrap p-values (percentile or studentized) and use those in FDR when available."
+      },
+      {
+        "id": "F-007",
+        "title": "Minor mismatch in nutrition family labeling vs causal confounders",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "causal_inference.py:214-274",
+        "description": "Some nutrition-adjacent treatments (meal timing) are tagged 'nutrition' in CONTINUOUS_TREATMENTS but only supplement family adds alcohol/caffeine lag confounders; late meals likely co-occur with those too.",
+        "evidence": "SUPPLEMENT_EXTRA_CONFOUNDERS are only added when family=='supplement'.",
+        "recommendation": "Consider adding alcohol/caffeine lags to nutrition family as well, or document why they are not confounders for meal timing/macros."
+      },
+      {
+        "id": "F-008",
+        "title": "Prophet backtest uses flat ffilled regressors in holdout",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2425-2485",
+        "description": "For the 30\u2011day Prophet holdout, regressors are merged from the training slice and forward-filled across the entire holdout, effectively evaluating a constant\u2011regressor forecast; this can understate realistic uncertainty if regressors are informative.",
+        "evidence": "future_holdout merges only train_df[regressors] and ffill; no last-known update or scenario sampling across the 30 days.",
+        "recommendation": "Either evaluate with rolling origin (update regressors daily in a loop as last-known values advance) or clarify in results metadata that regressors are held constant across the holdout window."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Time-respecting AIPW with per-fold scaling and block-bootstrap CIs",
+        "file_ref": "causal_inference.py:708-854",
+        "why_it_matters": "Cross-fitting with TimeSeriesSplit avoids temporal leakage, and the block bootstrap addresses autocorrelation that can make IF-based SEs too optimistic."
+      },
+      {
+        "title": "Leakage-safe multi-horizon backtest with 28-day embargo",
+        "file_ref": "hrv_analysis.py:2620-2715",
+        "why_it_matters": "The embargo matches the longest rolling window, eliminating overlap leakage in early test blocks and yielding honest generalization error across horizons."
+      },
+      {
+        "title": "Consistent BH-FDR across descriptive and causal layers",
+        "file_ref": "hrv_analysis.py:1438-1460; causal_inference.py:855-919",
+        "why_it_matters": "Controlling FDR across large test families (journal, nutrition, causal ATEs) keeps false-positive interventions in check \u2014 critical for a single-user decision system."
+      },
+      {
+        "title": "SARIMAX exog alignment and forecast hygiene",
+        "file_ref": "hrv_analysis.py:2198-2405",
+        "why_it_matters": "Reindexing to a daily spine, lagging exog by one day, and using last-known exog for backtests/forecasts prevents future-information leaks and preserves causal direction."
+      },
+      {
+        "title": "Prediction-interval calibration via OOF residuals",
+        "file_ref": "hrv_analysis.py:2135-2165; 2527-2585",
+        "why_it_matters": "Using out-of-fold residual std (not in-sample) produces intervals with empirical coverage close to nominal, improving the trustworthiness of uncertainty displays."
+      }
+    ],
+    "questions_for_followup": [
+      "In the pds.journal view, is 'answer' guaranteed to be text for both WHOOP and habit sources, or can it be BOOLEAN? A quick schema/view snippet would confirm whether the .str.lower() path is safe.",
+      "Does daily_health_matrix_behavioral already include water_ml and exercise_kcal with mfp_ prefixes, or are these only merged in build_feature_matrix? A short column list from the view would resolve the naming alignment for Nutrition Spearman.",
+      "For AIPW, roughly how many folds are being skipped due to class imbalance per treatment (distribution of fold_failures)? A small summary table would help decide if further safeguards (e.g., adaptive folds) are needed.",
+      "For SARIMAX, what\u2019s the empirical 80% PI coverage in backtest by horizon? A quick glance at hrv_model_metrics.ci_coverage for sarimax would validate interval calibration.",
+      "Are Notion journal mood/confidence ratings present on enough days to pass the median-split continuous treatment gate (MIN_CONTINUOUS_N=50)? A counts summary by variable would confirm whether these new treatments are active in CI."
+    ]
+  },
+  "bundle": "stats"
+}

@@ -1,0 +1,56 @@
+name: Hourly Health ETL
+
+on:
+  schedule:
+    # Every hour at :00
+    - cron: '0 * * * *'
+  workflow_dispatch: # Manual trigger for testing
+
+concurrency:
+  group: hourly-etl
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  garmin-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install garminconnect supabase python-dotenv garth
+      - name: Download Garmin tokens
+        run: python ci_token_helper.py download garmin
+      - name: Run Garmin ETL
+        run: python garmin_etl.py --days 7
+        env:
+          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+      - name: Upload Garmin tokens
+        if: always()
+        run: python ci_token_helper.py upload garmin
+
+  whoop-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests supabase python-dotenv
+      - name: Download WHOOP tokens
+        run: python ci_token_helper.py download whoop
+      - name: Run WHOOP ETL
+        run: python whoop_etl.py --days 7
+        env:
+          WHOOP_CLIENT_ID: ${{ secrets.WHOOP_CLIENT_ID }}
+          WHOOP_CLIENT_SECRET: ${{ secrets.WHOOP_CLIENT_SECRET }}
+      - name: Upload WHOOP tokens
+        if: always()
+        run: python ci_token_helper.py upload whoop
