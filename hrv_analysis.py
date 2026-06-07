@@ -2855,19 +2855,52 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
             sorted(controllable_importance.items(), key=lambda kv: kv[1], reverse=True)[:20]
         )
 
-    # Tomorrow's prediction (latest available data)
-    tomorrow_pred = float(final_model.predict(X.iloc[[-1]])[0])
+    # ── Production model: refit on the FULL matrix ───────────────────────────
+    # final_model above was trained on only the first 70% (the train slice) — the
+    # right choice for honest backtest metrics / SHAP / early-stopping selection,
+    # but it must NOT be the deployed forecaster. Refit ONE model on ALL rows
+    # (X, y) using the early-stopped tree count, so tomorrow's forecast AND the
+    # pickled model that hrv_predict.py reuses daily actually see the most recent
+    # data. (Bug fixed 2026-06-06: the live forecast + pickle previously came from
+    # the 70% model, so they never saw any data after the train split ~Dec 2025.)
+    _best_iter = getattr(final_model, "best_iteration", None)
+    prod_n_estimators = (_best_iter + 1) if _best_iter is not None else best_params.get("n_estimators", 300)
+    production_model = XGBRegressor(
+        **{k: v for k, v in best_params.items() if k != "n_estimators"},
+        n_estimators=prod_n_estimators,
+    )
+    production_model.fit(X, y, verbose=False)
+    log.info(f"  Production model refit on full data: {len(X)} rows, "
+             f"n_estimators={prod_n_estimators} (held-out final_model kept for metrics/SHAP)")
+
+    # Re-explain the latest observation with the production model so the displayed
+    # drivers match the deployed forecast (overrides the held-out-model drivers).
+    if HAS_SHAP:
+        try:
+            _prod_latest = shap.TreeExplainer(production_model)(X.iloc[[-1]])
+            _td = [
+                {"feature": f, "label": FEATURE_LABELS.get(f, f),
+                 "shap_value": float(_prod_latest.values[0, i])}
+                for i, f in enumerate(feat_cols)
+                if not np.isnan(_prod_latest.values[0, i])
+            ]
+            top_drivers = sorted(_td, key=lambda x: abs(x["shap_value"]), reverse=True)[:10]
+        except Exception as e:
+            log.debug(f"  production-model top_drivers failed, keeping held-out drivers: {e}")
+
+    # Tomorrow's prediction (latest available data) — from the full-data model.
+    tomorrow_pred = float(production_model.predict(X.iloc[[-1]])[0])
     today_hrv = float(df[TARGET].dropna().iloc[-1]) if df[TARGET].dropna().shape[0] > 0 else None
 
     # Save model
     model_path = OUTPUT_DIR / "xgboost_hrv_model.pkl"
     with open(model_path, "wb") as f:
-        pickle.dump({"model": final_model, "feat_cols": feat_cols,
+        pickle.dump({"model": production_model, "feat_cols": feat_cols,
                      "pred_std": pred_std, "model_version": MODEL_VERSION}, f)
     log.info(f"  Model saved: {model_path}")
 
     results = {
-        "model": final_model,
+        "model": production_model,
         "feat_cols": feat_cols,
         "test_pred": test_pred,
         "test_actual": y_test.values,
@@ -2884,14 +2917,19 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
         "today_hrv": today_hrv,
         "pred_std": pred_std,
         "train_start": model_df["calendar_date"].iloc[0],
-        "train_end": model_df["calendar_date"].iloc[train_end - 1],
+        # train_end = the last day the DEPLOYED (full-data) model trained on, NOT
+        # the 70% split (that boundary is kept as backtest_train_end for the
+        # honest test-metric provenance). Without this, the freshly-refit current
+        # model would be mislabeled stale (~Dec 2025) and re-trip the /status alarm.
+        "train_end": model_df["calendar_date"].iloc[-1],
+        "backtest_train_end": model_df["calendar_date"].iloc[train_end - 1],
         "test_start": model_df["calendar_date"].iloc[val_end],
         "test_end": model_df["calendar_date"].iloc[-1],
         # Audit re-2026-05-26 P2 (deepseek stats F-004): high-dim warning.
         "feature_condition_number": feature_condition_number,
         "shap_unstable": shap_unstable,
     }
-    return final_model, results
+    return production_model, results
 
 
 def _fallback_feature_importance(model, feat_cols: list) -> list:
