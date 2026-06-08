@@ -1,0 +1,108 @@
+=== FIRING units at 21:15:36Z ===
+2026-06-07 17:15:38,198 [INFO] Bundle loaded from audit\re-audit-2026-06-07\units: 6 files, 58,891 chars total
+2026-06-07 17:15:38,198 [INFO]   PROMPT.md: 4,073 chars
+2026-06-07 17:15:38,198 [INFO]   CONTEXT.md: 3,953 chars
+2026-06-07 17:15:38,199 [INFO]   README.md: 550 chars
+2026-06-07 17:15:38,199 [INFO]   SQL_UNITS.md: 3,778 chars
+2026-06-07 17:15:38,199 [INFO]   format.ts: 5,774 chars
+2026-06-07 17:15:38,199 [INFO]   queries.ts: 40,763 chars
+2026-06-07 17:15:38,259 [WARNING] Current git HEAD (f9021f8) does not match pinned commit (2f70ba1).
+2026-06-07 17:15:38,260 [WARNING] Audit will be saved under bundle_commit=2f70ba1, but the files on disk are at f9021f8.
+2026-06-07 17:15:39,674 [INFO] [openai] firing request to gpt-5.5-pro (reasoning=xhigh, bundle size: 59,223 chars)
+2026-06-07 17:15:39,711 [INFO] [gemini] firing request to gemini-3.1-pro-preview (thinking_budget=32768, bundle size: 59,223 chars)
+2026-06-07 17:15:39,716 [INFO] [deepseek] firing request to deepseek-v4-pro (thinking=enabled, reasoning=high, bundle size: 59,223 chars)
+2026-06-07 17:15:40,403 [INFO] HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 17:17:17,941 [INFO] [deepseek] response received — prompt=16589 tok, completion=8147 tok, reasoning=5600 tok
+2026-06-07 17:18:19,862 [INFO] HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=AIzaSyCMwF8RKbQZb8F9uAbxSq5EivxBP9WRLtw "HTTP/1.1 200 OK"
+2026-06-07 17:18:19,910 [INFO] [gemini] response received — prompt=18268 tok, completion=1455 tok
+2026-06-07 17:45:39,845 [ERROR] [openai] FAILED: 
+2026-06-07 17:45:39,849 [INFO] [gemini] saved units-gemini-2.5-pro-2f70ba1-20260607T214539Z.json -- 2 findings
+2026-06-07 17:45:39,853 [INFO] [deepseek] saved units-deepseek-v4-pro-2f70ba1-20260607T214539Z.json -- 6 findings
+=== DONE units (exit 1) at 21:45:40Z ===
+=== FIRING stats at 21:45:40Z ===
+2026-06-07 17:45:42,644 [INFO] Bundle loaded from audit\re-audit-2026-06-07\stats: 9 files, 383,082 chars total
+2026-06-07 17:45:42,646 [INFO]   PROMPT.md: 9,879 chars
+2026-06-07 17:45:42,646 [INFO]   CONTEXT.md: 13,463 chars
+2026-06-07 17:45:42,647 [INFO]   DATA_PROFILE.md: 5,712 chars
+2026-06-07 17:45:42,647 [INFO]   SCHEMA.md: 9,115 chars
+2026-06-07 17:45:42,648 [INFO]   README.md: 1,793 chars
+2026-06-07 17:45:42,649 [INFO]   VARIABLE_COVERAGE_AUDIT.md: 38,612 chars
+2026-06-07 17:45:42,649 [INFO]   causal_inference.py: 60,269 chars
+2026-06-07 17:45:42,649 [INFO]   hrv_analysis.py: 226,040 chars
+2026-06-07 17:45:42,649 [INFO]   hrv_predict.py: 18,199 chars
+2026-06-07 17:45:42,838 [WARNING] Current git HEAD (f9021f8) does not match pinned commit (2f70ba1).
+2026-06-07 17:45:42,838 [WARNING] Audit will be saved under bundle_commit=2f70ba1, but the files on disk are at f9021f8.
+2026-06-07 17:45:44,965 [INFO] [openai] firing request to gpt-5.5-pro (reasoning=xhigh, bundle size: 383,656 chars)
+2026-06-07 17:45:45,003 [INFO] [gemini] firing request to gemini-3.1-pro-preview (thinking_budget=32768, bundle size: 383,656 chars)
+2026-06-07 17:45:45,028 [INFO] [deepseek] firing request to deepseek-v4-pro (thinking=enabled, reasoning=high, bundle size: 383,656 chars)
+2026-06-07 17:45:46,277 [INFO] HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 17:47:06,289 [INFO] [deepseek] response received — prompt=104397 tok, completion=6284 tok, reasoning=4269 tok
+2026-06-07 17:47:59,057 [INFO] HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=AIzaSyCMwF8RKbQZb8F9uAbxSq5EivxBP9WRLtw "HTTP/1.1 200 OK"
+2026-06-07 17:47:59,084 [INFO] [gemini] response received — prompt=114327 tok, completion=1998 tok
+2026-06-07 18:15:45,223 [ERROR] [openai] FAILED: 
+2026-06-07 18:15:45,237 [INFO] [gemini] saved stats-gemini-2.5-pro-2f70ba1-20260607T221545Z.json -- 4 findings
+2026-06-07 18:15:45,239 [INFO] [deepseek] saved stats-deepseek-v4-pro-2f70ba1-20260607T221545Z.json -- 4 findings
+=== DONE stats (exit 1) at 22:15:45Z ===
+=== FIRING schema at 22:15:45Z ===
+2026-06-07 18:15:46,813 [INFO] Bundle loaded from audit\re-audit-2026-06-07\schema: 52 files, 294,612 chars total
+2026-06-07 18:15:46,814 [INFO]   PROMPT.md: 8,434 chars
+2026-06-07 18:15:46,814 [INFO]   CONTEXT.md: 7,924 chars
+2026-06-07 18:15:46,814 [INFO]   SCHEMA_DDL.md: 14,038 chars
+2026-06-07 18:15:46,814 [INFO]   README.md: 1,235 chars
+2026-06-07 18:15:46,814 [INFO]   cronometer_schema.sql: 13,499 chars
+2026-06-07 18:15:46,814 [INFO]   eight_sleep_schema.sql: 7,027 chars
+2026-06-07 18:15:46,815 [INFO]   journal_schema.sql: 2,816 chars
+2026-06-07 18:15:46,815 [INFO]   meal_schema.sql: 7,236 chars
+2026-06-07 18:15:46,815 [INFO]   myfitnesspal_schema.sql: 6,385 chars
+2026-06-07 18:15:46,815 [INFO]   spotify_artists_schema.sql: 1,464 chars
+2026-06-07 18:15:46,815 [INFO]   spotify_playlists_schema.sql: 1,512 chars
+2026-06-07 18:15:46,815 [INFO]   spotify_schema.sql: 5,428 chars
+2026-06-07 18:15:46,815 [INFO]   sql/activity_split_label.sql: 2,019 chars
+2026-06-07 18:15:46,815 [INFO]   sql/adr_0001_01_user_tz_log.sql: 12,295 chars
+2026-06-07 18:15:46,815 [INFO]   sql/adr_0001_02_whoop_onyx_dates.sql: 5,466 chars
+2026-06-07 18:15:46,815 [INFO]   sql/adr_0001_03_garmin_onyx_dates.sql: 9,609 chars
+2026-06-07 18:15:46,815 [INFO]   sql/adr_0001_04_other_onyx_dates.sql: 20,231 chars
+2026-06-07 18:15:46,815 [INFO]   sql/adr_0001_05_transition_day_flag.sql: 5,756 chars
+2026-06-07 18:15:46,815 [INFO]   sql/adr_0001_06_tz_log_gaps_view.sql: 4,193 chars
+2026-06-07 18:15:46,815 [INFO]   sql/adr_0001_07_snapshot_daily_health_matrix.sql: 2,103 chars
+2026-06-07 18:15:46,816 [INFO]   sql/adr_0001_08_daily_health_matrix_behavioral.sql: 15,548 chars
+2026-06-07 18:15:46,816 [INFO]   sql/adr_0001_09_trips_view.sql: 2,999 chars
+2026-06-07 18:15:46,816 [INFO]   sql/audit_p1_hrv_predictions_surrogate_pk.sql: 1,447 chars
+2026-06-07 18:15:46,816 [INFO]   sql/audit_p1_unit_unmapped_view.sql: 1,898 chars
+2026-06-07 18:15:46,816 [INFO]   sql/audit_re_2026_05_26_check_constraints_free_text.sql: 2,126 chars
+2026-06-07 18:15:46,816 [INFO]   sql/audit_re_2026_05_26_covering_partial_indexes.sql: 1,816 chars
+2026-06-07 18:15:46,816 [INFO]   sql/audit_re_2026_05_26_drop_redundant_indexes.sql: 1,439 chars
+2026-06-07 18:15:46,816 [INFO]   sql/audit_re_2026_05_26_habit_journal_question_fk.sql: 1,510 chars
+2026-06-07 18:15:46,816 [INFO]   sql/caffeine_timing_daily.sql: 4,606 chars
+2026-06-07 18:15:46,816 [INFO]   sql/ci_tokens.sql: 538 chars
+2026-06-07 18:15:46,816 [INFO]   sql/cronometer_matrix_view.sql: 4,064 chars
+2026-06-07 18:15:46,816 [INFO]   sql/daily_health_matrix.sql: 13,699 chars
+2026-06-07 18:15:46,816 [INFO]   sql/daily_health_matrix_behavioral_main_session.sql: 12,334 chars
+2026-06-07 18:15:46,816 [INFO]   sql/daily_micronutrient_totals.sql: 9,415 chars
+2026-06-07 18:15:46,817 [INFO]   sql/group_c_fks.sql: 2,906 chars
+2026-06-07 18:15:46,817 [INFO]   sql/habit_journal_backfill_trigger.sql: 2,372 chars
+2026-06-07 18:15:46,817 [INFO]   sql/habit_metadata_history.sql: 3,140 chars
+2026-06-07 18:15:46,817 [INFO]   sql/hrv_prediction_gaps.sql: 3,064 chars
+2026-06-07 18:15:46,817 [INFO]   sql/hrv_predictions_eval.sql: 1,537 chars
+2026-06-07 18:15:46,817 [INFO]   sql/hrv_predictions_latest.sql: 4,177 chars
+2026-06-07 18:15:46,817 [INFO]   sql/hrv_predictions_relabel_legacy_v0.sql: 1,392 chars
+2026-06-07 18:15:46,817 [INFO]   sql/legacy_mfp_nutrition_archive.sql: 913 chars
+2026-06-07 18:15:46,817 [INFO]   sql/meal_timing_daily_behavioral_join.sql: 4,340 chars
+2026-06-07 18:15:46,817 [INFO]   sql/meal_timing_from_cronometer.sql: 3,231 chars
+2026-06-07 18:15:46,817 [INFO]   sql/recovery_vs_pace.sql: 5,245 chars
+2026-06-07 18:15:46,817 [INFO]   sql/rls_policies.sql: 11,918 chars
+2026-06-07 18:15:46,817 [INFO]   sql/security_lockdown_2026_06_06.sql: 3,506 chars
+2026-06-07 18:15:46,818 [INFO]   sql/supplements_unii_cleanup.sql: 7,600 chars
+2026-06-07 18:15:46,818 [INFO]   sql/whoop_cycle_fks.sql: 1,216 chars
+2026-06-07 18:15:46,818 [INFO]   supplement_schema.sql: 9,429 chars
+2026-06-07 18:15:46,818 [INFO]   weight_schema.sql: 2,163 chars
+2026-06-07 18:15:46,818 [INFO]   whoop_schema.sql: 14,354 chars
+2026-06-07 18:15:46,893 [WARNING] Current git HEAD (f9021f8) does not match pinned commit (2f70ba1).
+2026-06-07 18:15:46,893 [WARNING] Audit will be saved under bundle_commit=2f70ba1, but the files on disk are at f9021f8.
+2026-06-07 18:15:48,062 [INFO] [openai] firing request to gpt-5.5-pro (reasoning=xhigh, bundle size: 299,632 chars)
+2026-06-07 18:15:48,090 [INFO] [gemini] firing request to gemini-3.1-pro-preview (thinking_budget=32768, bundle size: 299,632 chars)
+2026-06-07 18:15:48,099 [INFO] [deepseek] firing request to deepseek-v4-pro (thinking=enabled, reasoning=high, bundle size: 299,632 chars)
+2026-06-07 18:15:49,140 [INFO] HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 18:16:39,472 [INFO] HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=AIzaSyCMwF8RKbQZb8F9uAbxSq5EivxBP9WRLtw "HTTP/1.1 200 OK"
+2026-06-07 18:16:39,485 [INFO] [gemini] response received — prompt=87567 tok, completion=2438 tok
+2026-06-07 18:17:03,485 [INFO] [deepseek] response received — prompt=80249 tok, completion=6162 tok, reasoning=3065 tok

@@ -1,0 +1,202 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "2f70ba1",
+  "fired_at": "2026-06-07T22:41:41.496578+00:00",
+  "usage": {
+    "input_tokens": 85270,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 15370,
+    "output_tokens_details": {
+      "reasoning_tokens": 11712
+    },
+    "total_tokens": 100640
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-4o-mini",
+      "review_date": "2026-06-07",
+      "bundle_commit": "2f70ba1"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "Most ETLs upsert on stable natural keys and are idempotent. WHOOP cycles/sleep/recovery use primary identifiers; Spotify plays/tracks use correct composite keys; MFP and Cronometer daily rows upsert on date and per-entry servings use delete+insert by date. Notable correctness risk: Eight Sleep\u2019s calendar_date attribution depends on a static TZ env and cannot be corrected downstream, which can mis-assign days on travel; Garmin activities/laps use wider conflict keys than necessary and could allow duplicates if timestamps change."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "Good coverage of failure modes overall: retry_helper for Notion/Spotify; WHOOP handles 401 refresh and 429 backoff; IMAP flows mark-read on bad messages and emit heartbeats on no-op. Spotify logs partials on the 50-play cap and enrichment failures. Gaps: Eight Sleep has no retry/backoff; WHOOP has no generic 5xx retry; Spotify client has a duplicate-request bug that increases rate-limit risk; materialized-view refresh calls likely no-op in two ETLs."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Pagination is implemented where needed (WHOOP next_token, Spotify high-water mark, Supabase paging for backfills). Batch sizes are sane; JSON columns are used to avoid per-column churn. The Spotify duplicate-request bug unnecessarily doubles API calls; artist enrichment is per-id (forced by Spotify Dev Mode), but MusicBrainz is respectfully rate-limited."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Consistent separation of fetch/parse/write; natural-key upserts via supabase-py; shared sync_log helper normalizes heartbeats. Careful comments and defensive checks. Minor deviations: mixed use of sb.rpc vs sb.schema('pds').rpc (likely wrong); Eight Sleep bypasses the shared retry helper; a few conflict keys are wider than necessary."
+      }
+    },
+    "summary": "Overall, this bundle is thoughtfully engineered: conflict keys are mostly correct, backfills are idempotent, and sync_log coverage is strong across scheduled jobs (Garmin, WHOOP, Spotify, Notion, IMAP imports). WHOOP pagination is careful (next_token loop with a repeated-token guard), and Spotify\u2019s ordering (tracks/artists before plays) avoids FK issues. IMAP automations log heartbeats even on no-op runs, preventing silent staleness. The main correctness gap is Eight Sleep\u2019s day attribution: calendar_date depends on a static EIGHTSLEEP_TIMEZONE env at fetch time and becomes the table\u2019s primary key. On travel days, this can mis-assign nights and can\u2019t be corrected downstream because there\u2019s no authoritative event timestamp stored to recompute onyx dates later. Two other notable issues: the Spotify client\u2019s _request method makes each successful call twice (once directly, then again via retry_http), wasting rate budget and increasing 429 risk; and Garmin activities/laps use conflict keys that include timestamps, which could allow duplicates if times change. Robustness is generally strong, but Eight Sleep lacks retry/backoff entirely, and WHOOP doesn\u2019t retry on generic 5xx/network errors.\n\nTop 3 fixes:\n1) Fix SpotifyClient._request to avoid double-calling on success; centralize retries and keep the single 401-refresh path.\n2) Eight Sleep: persist a raw event instant (e.g., presenceStart/sleepStart) and derive calendar_date via pds.tz_for_instant or ADR-0001 triggers; also add retry/backoff.\n3) Tighten Garmin conflict keys to true natural keys (activity_id; activity_id+lap_index) and add/verify unique indexes to enforce them.\n\nSmaller but worthwhile: move rpc calls to sb.rpc(...), add generic retries for WHOOP 5xx/network errors, ensure the spotify_artists migration is applied, and consider a Cronometer no-op heartbeat for consistency.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "SpotifyClient._request issues a duplicate API call on success",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "spotify_etl.py:215",
+        "description": "For non-401 responses, _request first performs a direct httpx request, then unconditionally wraps a second identical request in retry_http and returns that. This doubles all successful GETs (recently_played, track, artists), wasting rate budget and increasing 429 risk.",
+        "evidence": "spotify_etl.py: in SpotifyClient._request, resp = self.http.request(...); if 401 refresh; for all other statuses: return retry_http(lambda: self.http.request(...)). The first successful resp is discarded.",
+        "recommendation": "Refactor _request to call retry_http exactly once for non-401 paths. Pseudocode: try request via retry_http; if 401, refresh then retry once; otherwise return the first (single) successful response."
+      },
+      {
+        "id": "F-002",
+        "title": "Eight Sleep calendar_date hinges on static TZ env; mis-attribution on travel",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "eight_sleep_etl.py:42; eight_sleep_etl.py:238",
+        "description": "calendar_date is derived using EIGHTSLEEP_TIMEZONE at fetch time (and passed to the API). On travel days, if the env isn\u2019t updated, rows can be written under the wrong day. Because no authoritative event timestamp is stored in pds.eight_sleep_trends, this error can\u2019t be deterministically corrected downstream.",
+        "evidence": "Config comment warns about TZ; parse_interval sets calendar_date = dt_utc.astimezone(ZoneInfo(EIGHTSLEEP_TIMEZONE)).date(). Primary key is (calendar_date, bed_side), so wrong keys persist.",
+        "recommendation": "Persist an event instant (e.g., presenceStart/sleepStart) and derive onyx_et_date/behavioral_date in DB via ADR-0001. Alternatively, call pds.tz_for_instant per record to compute the correct day using the user_tz_log ladder. Backfill by recomputing calendar_date from that instant."
+      },
+      {
+        "id": "F-003",
+        "title": "Eight Sleep ETL lacks retry/backoff for HTTP errors",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "eight_sleep_etl.py:100-140",
+        "description": "All Eight Sleep API calls use httpx directly with raise_for_status and no retry. Transient 5xx/429/network errors will drop pages or entire day windows and mark the run partial without retrying.",
+        "evidence": "authenticate/get_me/get_device/get_trends/get_intervals call self.http.* and resp.raise_for_status(); no retry_helper used.",
+        "recommendation": "Wrap all HTTP calls in retry_helper.retry_http with 3\u20135 attempts and honor Retry-After on 429. Optionally add per-chunk retry in the trends loop to avoid losing a 30-day window on a single transient."
+      },
+      {
+        "id": "F-004",
+        "title": "Garmin activities/laps upsert conflicts include ts; risk duplicate rows",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "garmin_etl.py:468; garmin_etl.py:512",
+        "description": "Upserts use ON CONFLICT (activity_id, ts) for activities and (activity_id, lap_index, ts) for laps. The natural keys are activity_id and (activity_id, lap_index). If ts changes (clock corrections, library drift), duplicates could be created.",
+        "evidence": "sync_activities upserts with on_conflict='activity_id,ts'; _sync_laps_for_activity uses 'activity_id,lap_index,ts'.",
+        "recommendation": "Change conflict keys to activity_id and (activity_id, lap_index). Ensure corresponding unique indexes exist. Keep ts as a regular column if needed for ordering."
+      },
+      {
+        "id": "F-005",
+        "title": "spotify_artists table missing in schema; enrichment fails on fresh deploy",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "spotify_etl.py:640; schemas/spotify_schema.sql:1",
+        "description": "The ETL upserts to pds.spotify_artists and later updates it with MusicBrainz tags, but the provided schema bundle defines only spotify_plays and spotify_tracks. On a new environment this will 404 and degrade runs to partial/fail for enrichment.",
+        "evidence": "upsert_artists() writes to pds.spotify_artists and existing_artist_ids() queries it; schemas/spotify_schema.sql lacks a CREATE TABLE for spotify_artists.",
+        "recommendation": "Add a migration for pds.spotify_artists (artist_id PK; name; genres JSONB; popularity; followers; image_url; raw_json; fetched_at; synced_at) + RLS + indexes. Ensure CI applies it before ETL runs."
+      },
+      {
+        "id": "F-006",
+        "title": "WHOOP client has no generic 5xx/network retry",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "whoop_etl.py:111-148",
+        "description": "WhoopClient._request handles 401 refresh and 429 waits, but 5xx and network errors are not retried. A transient 500 during pagination can drop a whole endpoint for the window.",
+        "evidence": "After refresh/429 handling, resp.raise_for_status() is called without retry; get_paginated relies on .get(), which will raise and be caught as an endpoint error.",
+        "recommendation": "Adopt retry_helper-style backoff for all WHOOP requests (wrap session.request in a retry loop for 5xx/RequestException). Keep the existing 401/429 special handling."
+      },
+      {
+        "id": "F-007",
+        "title": "Cronometer watcher/import emits no heartbeat on no-op runs",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "cronometer_watcher.py:66-112",
+        "description": "When the inbox is empty, the watcher returns 0 and logs locally but never writes pds.sync_log. This diverges from other ETLs (IMAP, Spotify) that emit 0-record heartbeats, reducing /status visibility for the Cronometer path.",
+        "evidence": "process_inbox returns 0 without using sync_log_helper; only cronometer_import logs on actual parsed rows.",
+        "recommendation": "On each poll with no files, write a sync_log heartbeat (source='cronometer', data_type='watcher', status='success', records=0)."
+      },
+      {
+        "id": "F-008",
+        "title": "Materialized view refresh likely no-op due to sb.schema('pds').rpc",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "garmin_etl.py:621; whoop_etl.py:362",
+        "description": "supabase-py\u2019s rpc is a top-level method; calling sb.schema('pds').rpc(...).execute() probably fails or is ignored (and is warned in logs). Views won\u2019t refresh post-run.",
+        "evidence": "Garmin/WHOOP use sb.schema('pds').rpc('refresh_materialized_views').execute(); Eight Sleep correctly calls sb.rpc('refresh_materialized_views', {}).",
+        "recommendation": "Call sb.rpc('refresh_materialized_views', {}) consistently (no schema()), and handle errors once. Optionally gate by env var to skip in CI if the function isn\u2019t deployed."
+      },
+      {
+        "id": "F-009",
+        "title": "Spotify high-water mark equal-timestamp edge case may miss plays",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "spotify_etl.py:469; spotify_etl.py:786",
+        "description": "recently_played(after=ms) is strictly greater than the provided ms. If multiple plays share the exact max played_at and a prior run partially wrote them, the remainder won\u2019t be refetched.",
+        "evidence": "get_high_water_mark returns max(played_at) ms; next fetch uses after_ms=hwm_ms; strict > filter can skip siblings at the same millisecond.",
+        "recommendation": "Subtract 1 ms from the high-water mark (after_ms = hwm_ms - 1) or persist a tie-breaker (last (played_at, track_id)) and request a slightly earlier window."
+      },
+      {
+        "id": "F-010",
+        "title": "Upsert-counts rely on PostgREST returning representation",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness",
+          "Robustness"
+        ],
+        "file_ref": "cronometer_import.py:174-207; myfitnesspal_import.py:233-262",
+        "description": "Inserted/updated row counts are computed as len(result.data). If the backend or client defaults change (e.g., returning=minimal), counts log as 0 even on success.",
+        "evidence": "import_servings/import_daily and MFP importer derive counts from result.data without enforcing Prefer: return=representation.",
+        "recommendation": "Explicitly set return=representation via supabase-py (if supported), or compute counts from input batch length and response status. Alternatively, follow with a cheap count(*) range check when needed for /status."
+      }
+    ],
+    "things_done_well": [
+      "Natural-key upserts across ETLs (WHOOP ids, Spotify (played_at,track_id), date PKs) preserve idempotency.",
+      "WHOOP pagination is correct and guarded against infinite loops (seen-token set).",
+      "Spotify pipeline orders writes (tracks/artists \u2192 plays) to avoid FK issues and logs partials for ReccoBeats/MusicBrainz separately.",
+      "IMAP automations are robust: multi-stage search (FROM + SUBJECT), mark-read on irrecoverable cases, and 0-record heartbeats.",
+      "Shared sync_log helper standardizes start/end timestamps and durations; most jobs emit heartbeats on success and failure.",
+      "Cronometer importer thoughtfully handles utf-8-sig, unit-stripping, future-proof nutrient columns, and ADR-0001 behavioral attribution using user_tz_log.",
+      "Garmin ETL includes a comprehensive future-date guard using ET-local time and per-dataset checks.",
+      "WHOOP/Spotify token rotation is handled safely via local file + ci_token_helper upload in finally/always steps."
+    ],
+    "questions_for_followup": [
+      "Can you confirm a deployed migration for pds.spotify_artists exists in production? If so, please link its DDL; if not, shall I draft one?",
+      "For Eight Sleep, which event instant(s) can we rely on per night (presenceStart, sleepStart, session times) to backfill a canonical instant for ADR-0001?",
+      "Is refresh_materialized_views a SQL function deployed without schema qualification? If it lives under pds, should we expose a public alias so sb.rpc works uniformly?",
+      "Garmin: do we have unique indexes on (activity_id) and (activity_id, lap_index)? If not, can we add them before tightening conflict keys?",
+      "Spotify: are you okay with the HWM change to after_ms = hwm_ms - 1 to close the equal-timestamp hole? Any evidence of ms-collisions in your data?",
+      "WHOOP: do we observe intermittent 5xx on any endpoints in logs? If yes, I can wire retry_helper into WhoopClient with jittered backoff.",
+      "Cronometer: should the watcher write a 0-record sync_log heartbeat for consistency with other sources, or do you prefer freshness to be derived solely from MAX(calendar_date)?"
+    ]
+  },
+  "bundle": "etl"
+}

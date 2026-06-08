@@ -1,0 +1,86 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "2f70ba1",
+  "fired_at": "2026-06-07T21:18:19.910560+00:00",
+  "usage": {
+    "promptTokenCount": 18268,
+    "candidatesTokenCount": 1455,
+    "totalTokenCount": 43012,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 18268
+      }
+    ],
+    "thoughtsTokenCount": 23289,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "o3-mini",
+      "review_date": "2026-06-07",
+      "bundle_commit": "2f70ba1"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "Most unit conversions and semantic boundaries are handled correctly, including a robust defense against Garmin/WHOOP calorie conflation. However, a database-level unit conversion function silently drops rows for unrecognized or compound units."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "The system generally handles nulls and edge cases well, but the SQL unit conversion function fails silently on unrecognized inputs, leading to silent data loss in rollup views."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Conversions are centralized in canonical helper functions (`format.ts`) and at the query layer, preventing drift across multiple chart components."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "The codebase uses named constants for conversion factors, includes clear comments explaining unit conventions, and explicitly renames ambiguous fields to prevent misuse."
+      }
+    },
+    "summary": "The unit conversion and semantic conflation handling in Onyx is generally well-designed and centralized. The codebase successfully avoids conflating Garmin and WHOOP calories by explicitly renaming Garmin's `total_kilocalories` to `garmin_total_kcal_NOT_TDEE` and providing a dedicated `getWhoopCaloriesBurnt` function that correctly converts kilojoules to kilocalories. Duration units are handled carefully, with explicit comments and helper functions (`formatDuration` vs `formatDurationMs`) to prevent off-by-1000 errors. Timezone and timestamp handling for Garmin activities correctly uses `start_time_gmt` to avoid local-time shifts.\n\nHowever, there is a significant silent-loss bug in the database-level `unit_to_mg_factor` function. It uses a strict regex that strips non-alphabetic characters, causing compound units like `mg/mL` to collapse into unrecognized strings (`mgml`) and fall through to `NULL`. Furthermore, it lacks support for common supplement units like `IU`, `oz`, `mL`, `drops`, and `capsules`. Because this function is used in a rollup view, unrecognized units are silently dropped from the aggregation, leading to underreported supplement intake. Fixing this requires expanding the unit dictionary and adjusting the regex to preserve slashes for compound units.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "`unit_to_mg_factor` silently drops rows for unrecognized and compound units",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+        "description": "The SQL function `pds.unit_to_mg_factor` returns `NULL` for unrecognized units like `IU`, `oz`, `mL`, `drops`, `scoops`, and `capsules`. Because it uses `REGEXP_REPLACE` to strip non-alphabetic characters, compound units like `mg/mL` are collapsed to `mgml` and also fall through to `NULL`. This causes the `supplement_intake_by_compound` rollup view to silently drop these rows, leading to underreported supplement intake.",
+        "evidence": "The `CASE` statement only handles variations of mg, g, mcg, and kg. The regex `[^a-z\u00b5]` removes the slash in `mg/mL`.",
+        "recommendation": "Add support for common units like `IU` (with compound-specific conversion factors if necessary, or pass them through un-converted if they can't be normalized to mg). Fix the regex to handle or preserve slashes for compound units like `mg/mL`, or add `mgml` to the `CASE` statement. Log or store a fallback for unrecognized units instead of silently returning `NULL`."
+      },
+      {
+        "id": "F-002",
+        "title": "`formatDuration` truncates instead of rounding to the nearest minute",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "format.ts:46",
+        "description": "The `formatDuration` function uses `Math.floor` for both hours and minutes. This means that a duration of 3599 seconds (59 minutes and 59 seconds) will be formatted as `59m` instead of `1h 0m`. Similarly, 59 seconds will be formatted as `0m`. This truncation can lead to slightly unintuitive display values compared to standard rounding.",
+        "evidence": "`const h = Math.floor(seconds / 3600); const m = Math.floor((seconds % 3600) / 60);`",
+        "recommendation": "Use `Math.round(seconds / 60)` to get the total minutes, then calculate hours and minutes from that rounded total to ensure durations are rounded to the nearest minute."
+      }
+    ],
+    "things_done_well": [
+      "Explicit renaming of `total_kilocalories` to `garmin_total_kcal_NOT_TDEE` prevents accidental conflation of Garmin and WHOOP calories.",
+      "`getWhoopCaloriesBurnt` correctly converts kilojoules to kilocalories and preserves exact precision for downstream averaging.",
+      "`format.ts` provides a centralized, canonical set of conversion constants and formatting helpers.",
+      "`getWorkoutSleepGap` correctly normalizes Garmin's `duration_seconds` to milliseconds before comparing with WHOOP's millisecond timestamps."
+    ],
+    "questions_for_followup": [
+      "Are there any other supplement units besides `IU`, `oz`, `mL`, `drops`, `scoops`, and `capsules` that need to be added to `unit_to_mg_factor`?",
+      "Should `formatDuration` round to the nearest minute instead of truncating (e.g., 3599 seconds currently formats as '59m' instead of '1h 0m')?"
+    ]
+  },
+  "bundle": "units"
+}

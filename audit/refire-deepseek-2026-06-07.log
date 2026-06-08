@@ -1,0 +1,94 @@
+=== FIRING tz (deepseek only) at 23:06:54Z ===
+2026-06-07 19:06:55,865 [INFO] Bundle loaded from audit\re-audit-2026-06-07\tz: 15 files, 146,349 chars total
+2026-06-07 19:06:55,865 [INFO]   PROMPT.md: 5,025 chars
+2026-06-07 19:06:55,866 [INFO]   CONTEXT.md: 4,786 chars
+2026-06-07 19:06:55,866 [INFO]   README.md: 593 chars
+2026-06-07 19:06:55,866 [INFO]   ADR_0001.md: 37,103 chars
+2026-06-07 19:06:55,866 [INFO]   sql/adr_0001_01_user_tz_log.sql: 12,295 chars
+2026-06-07 19:06:55,866 [INFO]   sql/adr_0001_02_whoop_onyx_dates.sql: 5,466 chars
+2026-06-07 19:06:55,866 [INFO]   sql/adr_0001_03_garmin_onyx_dates.sql: 9,609 chars
+2026-06-07 19:06:55,866 [INFO]   sql/adr_0001_04_other_onyx_dates.sql: 20,231 chars
+2026-06-07 19:06:55,867 [INFO]   sql/adr_0001_05_transition_day_flag.sql: 5,756 chars
+2026-06-07 19:06:55,867 [INFO]   sql/adr_0001_06_tz_log_gaps_view.sql: 4,193 chars
+2026-06-07 19:06:55,867 [INFO]   sql/adr_0001_07_snapshot_daily_health_matrix.sql: 2,103 chars
+2026-06-07 19:06:55,867 [INFO]   sql/adr_0001_08_daily_health_matrix_behavioral.sql: 15,548 chars
+2026-06-07 19:06:55,867 [INFO]   sql/adr_0001_09_trips_view.sql: 2,999 chars
+2026-06-07 19:06:55,867 [INFO]   gps_tz_backfill.py: 7,874 chars
+2026-06-07 19:06:55,867 [INFO]   whoop_tz_backfill.py: 12,768 chars
+2026-06-07 19:06:55,927 [WARNING] Current git HEAD (f9021f8) does not match pinned commit (2f70ba1).
+2026-06-07 19:06:55,927 [WARNING] Audit will be saved under bundle_commit=2f70ba1, but the files on disk are at f9021f8.
+2026-06-07 19:06:57,022 [INFO] [deepseek] firing request to deepseek-v4-pro (thinking=enabled, reasoning=high, bundle size: 147,727 chars)
+2026-06-07 19:06:57,827 [INFO] HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 19:09:28,369 [INFO] [deepseek] response received — prompt=39709 tok, completion=13265 tok, reasoning=9706 tok
+2026-06-07 19:09:28,370 [ERROR] [deepseek] FAILED: DeepSeek returned non-JSON content: Extra data: line 26 column 4 (char 4409)
+{
+  "reviewer_metadata": {
+    "model": "independent audit",
+    "review_date": "2026-06-07",
+    "bundle_commit": "2f70ba1"
+  },
+  "domain_scores": {
+    "correctness": {
+      "score": 4,
+      "rationale": "The implementation largely follows ADR-0001. Date derivation for instants with clear TZ signals (WHOOP, Garmin activities) is correct. Trigger logic and the derivation function handle nulls, edge cases, and provenance. However, several tables without real instants (supplement_intake, meal_
+=== DONE tz (exit 1) at 23:09:28Z ===
+=== FIRING etl (deepseek only) at 23:09:28Z ===
+2026-06-07 19:09:29,517 [INFO] Bundle loaded from audit\re-audit-2026-06-07\etl: 40 files, 351,217 chars total
+2026-06-07 19:09:29,518 [INFO]   PROMPT.md: 5,935 chars
+2026-06-07 19:09:29,518 [INFO]   CONTEXT.md: 5,798 chars
+2026-06-07 19:09:29,518 [INFO]   README.md: 546 chars
+2026-06-07 19:09:29,518 [INFO]   schemas/ci_tokens.sql: 538 chars
+2026-06-07 19:09:29,519 [INFO]   schemas/cronometer_schema.sql: 13,499 chars
+2026-06-07 19:09:29,519 [INFO]   schemas/eight_sleep_schema.sql: 7,027 chars
+2026-06-07 19:09:29,519 [INFO]   schemas/journal_schema.sql: 2,816 chars
+2026-06-07 19:09:29,519 [INFO]   schemas/myfitnesspal_schema.sql: 6,385 chars
+2026-06-07 19:09:29,519 [INFO]   schemas/spotify_schema.sql: 5,428 chars
+2026-06-07 19:09:29,519 [INFO]   schemas/supplement_schema.sql: 9,429 chars
+2026-06-07 19:09:29,519 [INFO]   schemas/whoop_schema.sql: 14,354 chars
+2026-06-07 19:09:29,519 [INFO]   workflows/daily-etl.yml: 1,665 chars
+2026-06-07 19:09:29,519 [INFO]   workflows/eight-sleep-etl.yml: 1,062 chars
+2026-06-07 19:09:29,520 [INFO]   workflows/habits-sync.yml: 481 chars
+2026-06-07 19:09:29,520 [INFO]   workflows/hrv-prediction.yml: 3,938 chars
+2026-06-07 19:09:29,520 [INFO]   workflows/hrv-retrain-on-backfill.yml: 3,228 chars
+2026-06-07 19:09:29,520 [INFO]   workflows/journal-sync.yml: 925 chars
+2026-06-07 19:09:29,520 [INFO]   workflows/mfp-email.yml: 1,241 chars
+2026-06-07 19:09:29,520 [INFO]   workflows/monthly-audit.yml: 4,224 chars
+2026-06-07 19:09:29,520 [INFO]   workflows/smoke-test.yml: 1,596 chars
+2026-06-07 19:09:29,520 [INFO]   workflows/spotify-etl.yml: 1,609 chars
+2026-06-07 19:09:29,521 [INFO]   workflows/stats-pr-check.yml: 2,106 chars
+2026-06-07 19:09:29,521 [INFO]   workflows/whoop-journal-email.yml: 875 chars
+2026-06-07 19:09:29,521 [INFO]   ci_token_helper.py: 5,776 chars
+2026-06-07 19:09:29,521 [INFO]   cronometer_import.py: 20,093 chars
+2026-06-07 19:09:29,521 [INFO]   cronometer_watcher.py: 4,730 chars
+2026-06-07 19:09:29,521 [INFO]   eight_sleep_etl.py: 27,244 chars
+2026-06-07 19:09:29,521 [INFO]   garmin_etl.py: 41,783 chars
+2026-06-07 19:09:29,521 [INFO]   hrv_backfill_check.py: 5,450 chars
+2026-06-07 19:09:29,521 [INFO]   journal_etl.py: 15,260 chars
+2026-06-07 19:09:29,522 [INFO]   myfitnesspal_email.py: 18,577 chars
+2026-06-07 19:09:29,522 [INFO]   myfitnesspal_import.py: 10,474 chars
+2026-06-07 19:09:29,522 [INFO]   retry_helper.py: 3,798 chars
+2026-06-07 19:09:29,522 [INFO]   spotify_etl.py: 36,894 chars
+2026-06-07 19:09:29,522 [INFO]   supplement_lookup.py: 8,791 chars
+2026-06-07 19:09:29,522 [INFO]   sync_log_helper.py: 2,716 chars
+2026-06-07 19:09:29,522 [INFO]   whoop_etl.py: 23,704 chars
+2026-06-07 19:09:29,522 [INFO]   whoop_journal_email.py: 15,867 chars
+2026-06-07 19:09:29,523 [INFO]   whoop_journal_import.py: 11,149 chars
+2026-06-07 19:09:29,523 [INFO]   whoop_journal_watcher.py: 4,206 chars
+2026-06-07 19:09:29,590 [WARNING] Current git HEAD (f9021f8) does not match pinned commit (2f70ba1).
+2026-06-07 19:09:29,590 [WARNING] Audit will be saved under bundle_commit=2f70ba1, but the files on disk are at f9021f8.
+2026-06-07 19:09:30,559 [INFO] [deepseek] firing request to deepseek-v4-pro (thinking=enabled, reasoning=high, bundle size: 354,431 chars)
+2026-06-07 19:09:31,616 [INFO] HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 19:10:55,585 [INFO] [deepseek] response received — prompt=91206 tok, completion=7366 tok, reasoning=4106 tok
+2026-06-07 19:10:55,587 [ERROR] [deepseek] FAILED: DeepSeek returned non-JSON content: Extra data: line 26 column 4 (char 2941)
+{
+  "reviewer_metadata": {
+    "model": "independent statistical methodology reviewer",
+    "review_date": "2026-06-07",
+    "bundle_commit": "2f70ba1"
+  },
+  "domain_scores": {
+    "correctness": {
+      "score": 4,
+      "rationale": "Upsert conflict keys are correct across all ETLs, backfills produce idempotent state, and data types are preserved. Minor edge cases exist in cross-ETL ordering (WHOOP cycles vs journal) and Cronometer's non-atomic delete-then-insert, but no silent data corruptio
+=== DONE etl (exit 1) at 23:10:55Z ===
+DEEPSEEK REFIRE COMPLETE at 23:10:56Z

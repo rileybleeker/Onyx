@@ -1,0 +1,164 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "2f70ba1",
+  "fired_at": "2026-06-07T22:43:15.422375+00:00",
+  "usage": {
+    "promptTokenCount": 101874,
+    "candidatesTokenCount": 2865,
+    "totalTokenCount": 132868,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 101874
+      }
+    ],
+    "thoughtsTokenCount": 28129,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "o3-mini",
+      "review_date": "2026-06-07",
+      "bundle_commit": "2f70ba1"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "Most ETLs correctly use upserts for idempotency, but critical bugs exist: Spotify silently drops plays when track fetches fail, and the backfill detector misses updates because `synced_at` is not updated on upsert."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "Good retry logic for HTTP requests and token rotation. However, the Journal ETL fails the entire sync on a single embedding error, and local folder watchers loop infinitely on malformed files."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Pagination is handled well across APIs. However, WHOOP body measurements insert 24 identical rows per day, and Garmin nested repeats are ignored."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Code is generally clean, modular, and uses standard idioms. The shared `sync_log_helper` and `retry_helper` are excellent patterns."
+      }
+    },
+    "summary": "The Onyx ETL pipeline is generally well-architected, leveraging idempotent upserts, robust token rotation, and comprehensive `sync_log` heartbeats. However, there are a few critical correctness issues that need addressing. The Spotify ETL can permanently lose plays if a track fetch fails, because it advances the high-water mark past the skipped play. The HRV backfill detector is currently blind to updates because several ETLs fail to bump `synced_at` during upserts. Additionally, the WHOOP journal importer lacks the `export_received_at` guard present in the MFP importer, risking stale data overwrites. Fixing the Spotify high-water mark logic and adding `synced_at` to upsert payloads are the top priorities.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Spotify ETL advances high-water mark past skipped plays",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "spotify_etl.py:461",
+        "description": "If a track fails to fetch, its corresponding play is filtered out of `safe_items` and skipped. However, the remaining `safe_items` are upserted, and the next run's high-water mark (`MAX(played_at)`) will advance past the skipped play's timestamp. The skipped play will never be retried and is permanently lost.",
+        "evidence": "In `spotify_etl.py`, `safe_items` excludes plays with missing tracks, but `upsert_plays(sb, safe_items)` still runs. The next run queries `MAX(played_at)` from the database, which will now be newer than the skipped play.",
+        "recommendation": "Do not advance the high-water mark past the first skipped play, or fail the entire batch if any track fails to fetch so the whole batch is retried on the next cron run."
+      },
+      {
+        "id": "F-002",
+        "title": "Backfill detector misses updates because synced_at is not updated",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_backfill_check.py:53",
+        "description": "`hrv_backfill_check.py` relies on `synced_at` to detect backfills for `garmin_daily_summary`, `eight_sleep_trends`, `myfitnesspal_nutrition`, and `whoop_journal`. However, these ETLs do not include `synced_at` in their upsert payloads. Consequently, `synced_at` is only set on `INSERT` (via `DEFAULT NOW()`) and is never updated on `UPDATE`. Backfills that modify existing rows will be completely missed by the detector.",
+        "evidence": "In `garmin_etl.py`, `eight_sleep_etl.py`, etc., the `row` dict passed to `upsert_to_supabase` does not contain `synced_at`. Postgres `ON CONFLICT DO UPDATE` only updates the columns provided in the payload.",
+        "recommendation": "Explicitly include `\"synced_at\": datetime.now(timezone.utc).isoformat()` in the upsert payloads for all ETLs, or add an `ON UPDATE` trigger to the `synced_at` columns in the database schema."
+      },
+      {
+        "id": "F-003",
+        "title": "WHOOP journal import lacks export_received_at guard",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "whoop_journal_import.py:221",
+        "description": "Unlike `myfitnesspal_import.py`, `whoop_journal_import.py` does not check an `export_received_at` timestamp before upserting. If an older export email is processed after a newer one (e.g., due to a previous transient failure or IMAP ordering), it will silently overwrite the newer data with stale answers for overlapping dates.",
+        "evidence": "`whoop_journal_email.py` calls `import_journal(csv_path)` without passing the email's `Date` header, and `import_journal` blindly upserts all rows.",
+        "recommendation": "Pass the email's `Date` header to `import_journal` and skip upserting dates where the existing row's `synced_at` is newer than the export's received time, matching the MFP implementation."
+      },
+      {
+        "id": "F-004",
+        "title": "Journal ETL fails entire sync on single embedding error",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "journal_etl.py:276",
+        "description": "If Voyage AI embedding fails for a single batch of pages, the script returns 2 and exits immediately. None of the pages processed so far (including those that didn't need embedding) are upserted to Supabase. This blocks the entire journal sync until the embedding API recovers.",
+        "evidence": "In `journal_etl.py`, `except httpx.HTTPStatusError as e:` logs the error and calls `return 2`, bypassing the `upsert` block at the end of the script.",
+        "recommendation": "Catch the embedding error, log it, and continue to upsert the pages that succeeded or didn't require embedding. The failed pages will naturally be retried next run since their `notion_edited_at` in the DB won't have been updated."
+      },
+      {
+        "id": "F-005",
+        "title": "Garmin ETL ignores nested RepeatGroupDTOs in workouts",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Robustness"
+        ],
+        "file_ref": "garmin_etl.py:388",
+        "description": "`parse_interval_targets` only checks one level deep for `RepeatGroupDTO`. Garmin workouts can have nested repeats (e.g., Repeat 2x (Repeat 3x (Run, Rest))). If `sub` is another `RepeatGroupDTO`, `_maybe_capture_segment` will ignore it because its `stepType` is not in `_PACED_STEP_KINDS`, resulting in missing segment targets for nested intervals.",
+        "evidence": "The loop `for sub in step.get(\"workoutSteps\", []): _maybe_capture_segment(...)` does not recurse if `sub` is itself a `RepeatGroupDTO`.",
+        "recommendation": "Make the segment extraction recursive to handle arbitrarily nested `RepeatGroupDTO`s."
+      },
+      {
+        "id": "F-006",
+        "title": "Journal ETL stores expiring Notion image URLs",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "journal_etl.py:128",
+        "description": "When converting Notion blocks to markdown, `_block_to_md` extracts the `url` from image blocks. For images hosted by Notion (the `file` object), these are signed S3 URLs that expire after 1 hour. Storing them directly in `content_md` means the images will be broken when viewed later in the Onyx frontend.",
+        "evidence": "`url = (img.get(\"file\") or img.get(\"external\") or {}).get(\"url\", \"\")` captures the ephemeral AWS S3 URL provided by the Notion API.",
+        "recommendation": "Download the images and upload them to Supabase Storage, replacing the URL in the markdown with the permanent Supabase URL, or have the frontend re-fetch the block dynamically."
+      },
+      {
+        "id": "F-007",
+        "title": "WHOOP body measurement sync creates 24 identical rows per day",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "whoop_etl.py:343",
+        "description": "`sync_body_measurement` uses `datetime.now(timezone.utc).isoformat()` as the `measured_at` primary key for every upsert. Since the ETL runs hourly, this creates 24 new rows per day containing the exact same height, weight, and max HR data, bloating the table unnecessarily.",
+        "evidence": "The `row` dict sets `\"measured_at\": datetime.now(timezone.utc).isoformat()`, ensuring it never conflicts with an existing row during the `upsert_to_supabase` call.",
+        "recommendation": "Use the current calendar date as the primary key (or truncate `NOW()` to the day), or query the latest row and only insert a new one if the values have actually changed."
+      },
+      {
+        "id": "F-008",
+        "title": "Local folder watchers loop infinitely on malformed files",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "whoop_journal_watcher.py:72",
+        "description": "If `import_journal` or `run_import` raises an exception (e.g., due to a malformed CSV), the file is left in the inbox. The watcher scripts poll every 10 seconds and will repeatedly try to import the same broken file forever, spamming the logs.",
+        "evidence": "In `whoop_journal_watcher.py` and `cronometer_watcher.py`, the `except Exception:` block logs the error and returns, bypassing the `archive_file` step. The file remains in `INBOX` for the next poll.",
+        "recommendation": "Move files that fail to import to an `error/` directory, or implement a retry limit/backoff."
+      }
+    ],
+    "things_done_well": [
+      "Excellent use of `sync_log` heartbeats across all ETLs, ensuring visibility into both successes and failures.",
+      "Robust handling of OAuth token rotation and persistence via `ci_token_helper.py` and GitHub Actions `always()` steps.",
+      "Idempotent design for most ETLs (e.g., `ON CONFLICT DO UPDATE`, delete-and-insert for Cronometer servings).",
+      "Smart use of GitHub Actions features, like the DST-aware cron gating in `hrv-prediction.yml`."
+    ],
+    "questions_for_followup": [
+      "How are Notion image URLs currently handled by the frontend given their 1-hour expiration? Is there a client-side re-fetch mechanism?",
+      "For `whoop_body_measurements`, is there a reason to capture hourly snapshots even when the data hasn't changed, or was this just an oversight in the PK design?"
+    ]
+  },
+  "bundle": "etl"
+}

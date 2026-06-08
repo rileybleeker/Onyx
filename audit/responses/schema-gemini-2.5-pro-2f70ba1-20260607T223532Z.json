@@ -1,0 +1,171 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "2f70ba1",
+  "fired_at": "2026-06-07T22:34:50.914808+00:00",
+  "usage": {
+    "promptTokenCount": 87567,
+    "candidatesTokenCount": 2874,
+    "totalTokenCount": 94533,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 87567
+      }
+    ],
+    "thoughtsTokenCount": 4092,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "o3-mini",
+      "review_date": "2026-06-07",
+      "bundle_commit": "2f70ba1"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "RLS policies targeting the public role and missing intended foreign keys create write-time vulnerabilities and potential orphan records."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "Production schema is out of sync with intended DDL (missing helper views, missing indexes), and maintaining two parallel 130+ column matrix views is a drift liability."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Excellent avoidance of premature partitioning and smart JSONB usage, though a critical composite index for the HRV predictions tiebreak is missing in production."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Strong use of Postgres features (LATERAL joins, GIN/HNSW indexes, trigger-based derivations), but marred slightly by redundant single-column indexes on primary keys."
+      }
+    },
+    "summary": "The Onyx `pds` schema demonstrates a mature, pragmatic approach to n=1 health analytics. The choice to use a long-format EAV pattern for journal entries and JSONB for highly variable supplement ingredients is excellent, avoiding brittle schema migrations. The trigger-based ADR-0001 attribution is a robust way to enforce timezone logic at write-time without burdening the application layer. Furthermore, the decision to avoid partitioning for tables under 100K rows is the correct, pragmatic choice for this scale.\n\nHowever, there is a significant drift between the intended DDL (the `.sql` files) and the actual production state (`SCHEMA_DDL.md`). Several critical improvements\u2014such as the `idx_hrv_predictions_tiebreak` index, the `habit_journal` foreign key, and the refactored helper views for the behavioral matrix\u2014exist in the codebase but are missing in production. \n\nThe riskiest design choices hide in the RLS policies and the parallel matrix views. Granting `ALL` to the `public` role instead of `service_role` is a latent security hole, even in a single-user system. Additionally, keeping the legacy `daily_health_matrix` alive alongside the behavioral version guarantees that new features (like Cronometer data) will only be added to one, causing silent discrepancies for any downstream consumer still querying the legacy view.\n\nIf I could only fix three things, I would: 1) Deploy the missing `idx_hrv_predictions_tiebreak` index to prevent the `hrv_predictions_latest` view from full-scanning and sorting the heaviest table in the database. 2) Normalize all RLS `service_full_access` policies to explicitly target `service_role` and remove reliance on Supabase's RLS bypass. 3) Apply the missing `habit_journal` foreign key to enforce referential integrity against Notion renames.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Missing composite index for hrv_predictions_latest tiebreak",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Correctness"
+        ],
+        "file_ref": "pds.hrv_predictions",
+        "description": "The `hrv_predictions_latest` view relies on a complex `DISTINCT ON` with a `CASE` statement tiebreak. The supporting index `idx_hrv_predictions_tiebreak` defined in the SQL files is missing in production, causing full table sorts on the fastest-growing table.",
+        "evidence": "`sql/hrv_predictions_latest.sql` defines `idx_hrv_predictions_tiebreak`, but `SCHEMA_DDL.md` shows it is absent from `pds.hrv_predictions`.",
+        "recommendation": "Execute the `CREATE INDEX idx_hrv_predictions_tiebreak` statement from `sql/hrv_predictions_latest.sql` in production."
+      },
+      {
+        "id": "F-002",
+        "title": "RLS service policies target public role instead of service_role",
+        "severity": "P0",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "SCHEMA_DDL.md",
+        "description": "Several tables (e.g., `whoop_cycles`, `garmin_*`) have `service_full_access` policies that grant `ALL` to the `{public}` role. This technically allows the `anon` role to write data if they bypass the frontend.",
+        "evidence": "SCHEMA_DDL.md notes: 'Several (whoop_cycles, whoop_recovery... garmin_*) target {public} instead.'",
+        "recommendation": "Run `DROP POLICY` and recreate these policies to explicitly target `TO service_role` as defined in `sql/rls_policies.sql`."
+      },
+      {
+        "id": "F-003",
+        "title": "Missing foreign key for habit_journal.question",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "pds.habit_journal",
+        "description": "The foreign key linking `habit_journal.question` to `habit_name_map.habit_name` is missing in production, allowing Notion renames or typos to silently orphan journal entries.",
+        "evidence": "`sql/audit_re_2026_05_26_habit_journal_question_fk.sql` exists in the repo, but `SCHEMA_DDL.md` explicitly lists this FK as 'Notably absent'.",
+        "recommendation": "Apply `sql/audit_re_2026_05_26_habit_journal_question_fk.sql` to production to enforce `ON UPDATE CASCADE ON DELETE RESTRICT`."
+      },
+      {
+        "id": "F-004",
+        "title": "Production behavioral matrix view uses inline LATERALs instead of helper views",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "pds.daily_health_matrix_behavioral",
+        "description": "The intended DDL refactored the 135-column behavioral matrix to use helper views (e.g., `garmin_sleep_best_per_behavioral_date`) to remove repeated `LATERAL+LIMIT 1` blocks. These helper views are missing in production.",
+        "evidence": "`SCHEMA_DDL.md` lists 14 views, none of which are the helper views defined in `sql/adr_0001_08_daily_health_matrix_behavioral.sql`.",
+        "recommendation": "Apply `sql/adr_0001_08_daily_health_matrix_behavioral.sql` to create the helper views and update the main view definition."
+      },
+      {
+        "id": "F-005",
+        "title": "Legacy daily_health_matrix view is a drift liability",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "pds.daily_health_matrix",
+        "description": "Maintaining two parallel 130+ column matrix views guarantees drift. For example, Cronometer data was added to the behavioral view but not the legacy view, meaning consumers of the legacy view will silently miss nutrition data post-cutover.",
+        "evidence": "`sql/cronometer_matrix_view.sql` notes: 'the legacy pds.daily_health_matrix... is intentionally left unchanged'.",
+        "recommendation": "Deprecate `pds.daily_health_matrix`, migrate remaining consumers (like MFP energy-balance and /status) to the behavioral view, and drop the legacy view."
+      },
+      {
+        "id": "F-006",
+        "title": "Redundant single-column indexes duplicate primary keys",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness",
+          "Scalability"
+        ],
+        "file_ref": "pds.myfitnesspal_nutrition",
+        "description": "Tables like `myfitnesspal_nutrition` and `weight_log` have single-column indexes on their primary key columns. Postgres automatically creates a B-tree index for primary keys, making these explicit indexes redundant write overhead.",
+        "evidence": "`SCHEMA_DDL.md` shows `pds.myfitnesspal_nutrition` has `PK (calendar_date)` and `idx (calendar_date)`. `pds.weight_log` has `PK (log_date)` and `idx (log_date DESC)`.",
+        "recommendation": "Drop `idx_mfp_nutrition_date` and `idx_weight_log_date`."
+      },
+      {
+        "id": "F-007",
+        "title": "Missing explicit service_role RLS policies on multiple tables",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "SCHEMA_DDL.md",
+        "description": "Several tables have `anon_read` policies but no explicit `service_full_access` policy, relying entirely on Supabase's `service_role` bypass-RLS privilege. This breaks portability and schema consistency.",
+        "evidence": "`SCHEMA_DDL.md` notes `garmin_workouts`, `journal_entries`, `spotify_*`, and others lack a `service_*` policy.",
+        "recommendation": "Create explicit `service_full_access` policies for these tables targeting `service_role` to match the rest of the schema."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Long-format EAV pattern for journal entries",
+        "file_ref": "pds.whoop_journal",
+        "why_it_matters": "Storing `(date, question, answer)` instead of wide columns prevents brittle schema migrations every time a new habit or WHOOP journal question is added. At n=1 scale, the row count is trivial to pivot in pandas."
+      },
+      {
+        "title": "Judicious use of JSONB for variable schemas",
+        "file_ref": "pds.supplement_products",
+        "why_it_matters": "Supplement ingredients are deeply nested and highly variable. Using a GIN-indexed JSONB column allows flexible storage while the `supplement_intake_by_compound` view cleanly explodes it into a relational format for analytics."
+      },
+      {
+        "title": "Trigger-based ADR-0001 timezone attribution",
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql",
+        "why_it_matters": "Centralizing the complex timezone and behavioral-day logic in Postgres triggers ensures that data is correctly attributed regardless of whether it was written by the Python ETL, a Next.js API, or a manual SQL insert."
+      },
+      {
+        "title": "Pragmatic avoidance of partitioning",
+        "file_ref": "pds.hrv_predictions",
+        "why_it_matters": "Recognizing that 11K rows (growing at 36/day) does not require Postgres partitioning saves significant maintenance overhead and complexity. Standard B-tree indexes are more than sufficient for this scale."
+      }
+    ],
+    "questions_for_followup": [
+      "Are there any plans to migrate off Supabase? If so, relying on the `service_role` bypass-RLS privilege for tables missing explicit service policies will break writes on standard Postgres.",
+      "Why does `SCHEMA_DDL.md` show the `habit_journal` foreign key and `idx_hrv_predictions_tiebreak` index as missing when the migration SQL files exist in the repository? Is the deployment pipeline failing to apply new migrations?"
+    ]
+  },
+  "bundle": "schema"
+}

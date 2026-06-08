@@ -1,0 +1,122 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "2f70ba1",
+  "fired_at": "2026-06-07T21:47:59.084675+00:00",
+  "usage": {
+    "promptTokenCount": 114327,
+    "candidatesTokenCount": 1998,
+    "totalTokenCount": 133534,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 114327
+      }
+    ],
+    "thoughtsTokenCount": 17209,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "o1",
+      "review_date": "2026-06-07",
+      "bundle_commit": "2f70ba1"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "Solid foundations (AIPW cross-fitting, OOF residuals, FDR correction), but critical errors exist in specific tests like Granger causality on non-contiguous data and mediator bias for rolling treatments."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "Handles missing data well, enforces strict cell-size gates, checks condition numbers for multicollinearity, and provides graceful fallbacks for failed models."
+      },
+      "scalability": {
+        "score": 5,
+        "rationale": "Designed appropriately for n=1 longitudinal data, utilizing vectorized pandas operations and standard ML libraries with plenty of headroom for years of daily data."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Uses standard libraries (scikit-learn, statsmodels, scipy) correctly for the most part, and the custom block bootstrap implementation is statistically sound."
+      }
+    },
+    "summary": "The Onyx statistics pipeline is a sophisticated and generally well-designed system for n=1 longitudinal analysis. It correctly applies advanced techniques like doubly robust AIPW with time-respecting cross-fitting, out-of-fold residuals for prediction intervals, and Benjamini-Hochberg FDR correction across multiple testing families. The robustness is commendable, with proper cell-size gates, multicollinearity checks, and graceful fallbacks.\n\nHowever, there are a few critical statistical methodology errors that need addressing. First, the Granger causality test is applied to a DataFrame where missing rows have been dropped, creating a non-contiguous time series that invalidates the AR lags. Second, the Propensity Score Matching (PSM) bootstrap only resamples the final matched differences, ignoring the variance of the propensity model and matching process, which leads to artificially narrow confidence intervals. Third, the causal DAG includes `hrv_lag1` as a confounder for all treatments, which acts as a mediator for multi-day rolling treatments (like 7-day training load) and induces bias. Finally, the walk-forward backtest unnecessarily discards 28 days of training data per fold due to a misunderstanding of how rolling features interact with target leakage.\n\nFixing these issues will significantly improve the correctness and reliability of the causal estimates and statistical tests.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Granger causality applied to non-contiguous time series",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:1946",
+        "description": "The `grangercausalitytests` function is applied to a DataFrame where rows with NaNs have been dropped. This creates a non-contiguous time series where AR lags align incorrect calendar days, invalidating the F-test.",
+        "evidence": "`sub = hrv_valid[[STAT_TARGET, feat]].dropna()` removes missing days. The resulting `sub` is passed to `grangercausalitytests(sub[[STAT_TARGET, feat]], maxlag=3)`. If day 3 is missing, lag 1 for day 4 will incorrectly be day 2.",
+        "recommendation": "Reindex the series to a daily frequency (`asfreq('D')`) and impute missing values before running the test, or skip Granger causality if contiguous missingness is too high."
+      },
+      {
+        "id": "F-002",
+        "title": "PSM bootstrap ignores matching uncertainty",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:321-325",
+        "description": "The bootstrap for Propensity Score Matching only resamples the final `matched_diffs` array. It does not re-estimate the propensity score or re-perform the nearest-neighbor matching on each bootstrap sample, leading to artificially narrow confidence intervals.",
+        "evidence": "`sample = RNG.choice(matched_diffs, size=n, replace=True)` is inside the bootstrap loop, but `_fit_propensity` and the nearest-neighbor matching logic are outside.",
+        "recommendation": "Move the propensity model fitting and the nearest-neighbor matching steps inside the `for _ in range(n_boot):` loop to properly capture the variance of the entire matching process."
+      },
+      {
+        "id": "F-003",
+        "title": "Mediator adjustment bias for rolling treatments",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:485-491",
+        "description": "`COMMON_CONFOUNDERS` includes `hrv_lag1` (HRV on night N-1). For treatments that aggregate past days (e.g., `rolling_7d_training_load`), `hrv_lag1` acts as a mediator for the earlier days in the window, inducing bias when conditioned on.",
+        "evidence": "`rolling_7d_training_load` is a continuous treatment. `_confounders_for` assigns `COMMON_CONFOUNDERS` to it, which includes `hrv_lag1`. Training load on day N-2 affects HRV on night N-1, making `hrv_lag1` a mediator.",
+        "recommendation": "Dynamically exclude `hrv_lag1` and other intermediate variables from the confounder set when the treatment is a multi-day rolling aggregate."
+      },
+      {
+        "id": "F-004",
+        "title": "Walk-forward backtest unnecessarily drops 28 days of training data",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Scalability"
+        ],
+        "file_ref": "hrv_analysis.py:2585-2586",
+        "description": "`GAP_DAYS = 28` creates a 28-day gap between the training and test sets to prevent leakage from 28-day rolling features. However, rolling features only look backward and do not leak future targets, so this gap unnecessarily discards valid training data.",
+        "evidence": "`test_start = start + GAP_DAYS` skips 28 days. The comment claims \"the first ~21 test rows still overlapped the train tail via the 28d windows\", which misunderstands rolling windows. Using past targets to compute features for the test set is not target leakage.",
+        "recommendation": "Set `GAP_DAYS = 0`. To prevent target leakage for `h > 1`, set the training end index to `test_start - h + 1` so the latest training target is fully observed before the test prediction date."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "AIPW Cross-fitting with TimeSeriesSplit",
+        "file_ref": "causal_inference.py:402",
+        "why_it_matters": "Correctly uses `TimeSeriesSplit` instead of `KFold` to prevent target leakage via autocorrelated features, and fits the `StandardScaler` only on the training fold."
+      },
+      {
+        "title": "OOF Residuals for Prediction Intervals",
+        "file_ref": "hrv_analysis.py:2180",
+        "why_it_matters": "Computes prediction intervals using out-of-fold residuals via `TimeSeriesSplit` rather than in-sample residuals, providing much better empirical coverage."
+      },
+      {
+        "title": "Block Bootstrap for AIPW CI",
+        "file_ref": "causal_inference.py:280",
+        "why_it_matters": "Implements a custom block bootstrap to account for the autocorrelation of the influence function values, which the standard IF-based standard error assumes are i.i.d."
+      }
+    ],
+    "questions_for_followup": [
+      "For the Stage 3 OLS regression, the code documents that HAC standard errors are applied to a non-contiguous time series due to `dropna()`. Has the impact of this approximation on the standard errors been quantified empirically?",
+      "Are there plans to implement the dose-response causal estimator mentioned in the dead constants (`MIN_DISTINCT_DOSES = 3`)?"
+    ]
+  },
+  "bundle": "stats"
+}

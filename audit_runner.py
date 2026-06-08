@@ -94,7 +94,7 @@ def discover_bundle_files(bundle_dir: Path) -> list[Path]:
 #   Gemini: gemini-3.1-pro-preview. gemini-3-pro original preview was
 #     deprecated 2026-03-09; 3.1-pro is current. gemini-2.5-pro remains
 #     available as a stable fallback if 3.1-pro-preview throws.
-OPENAI_MODEL = "gpt-5.5-pro"
+OPENAI_MODEL = "gpt-5"
 GEMINI_MODEL = "gemini-3.1-pro-preview"
 
 OPENAI_URL = "https://api.openai.com/v1/responses"
@@ -144,6 +144,27 @@ def current_commit() -> str:
 # API callers
 # ---------------------------------------------------------------------------
 
+def _coerce_json_object(content: str) -> dict:
+    """Parse a JSON object from model content, tolerating two common LLM quirks:
+    a ```json ... ``` markdown fence, and trailing 'Extra data' after an
+    otherwise-complete object. Raises json.JSONDecodeError if no leading JSON
+    value parses (genuinely malformed output — the caller should retry)."""
+    s = content.strip()
+    if s.startswith("```"):
+        s = s[3:]
+        if s[:4].lower() == "json":
+            s = s[4:]
+        if "```" in s:
+            s = s[: s.rindex("```")]
+        s = s.strip()
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        # Tolerate trailing junk after a complete leading JSON value.
+        obj, _ = json.JSONDecoder().raw_decode(s)
+        return obj
+
+
 async def call_openai(client: httpx.AsyncClient, bundle_text: str, commit: str) -> dict:
     """POST the bundle to OpenAI gpt-5.5-pro via /v1/responses with JSON output."""
     api_key = os.getenv("OPENAI_API_KEY")
@@ -158,11 +179,11 @@ async def call_openai(client: httpx.AsyncClient, bundle_text: str, commit: str) 
             "Do not include any text outside the JSON."
         ),
         "input": bundle_text,
-        "reasoning": {"effort": "xhigh"},
+        "reasoning": {"effort": "high"},
         "text": {"format": {"type": "json_object"}},
     }
 
-    log.info(f"[openai] firing request to {OPENAI_MODEL} (reasoning=xhigh, bundle size: {len(bundle_text):,} chars)")
+    log.info(f"[openai] firing request to {OPENAI_MODEL} (reasoning=high, bundle size: {len(bundle_text):,} chars)")
     resp = await client.post(
         OPENAI_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -201,7 +222,7 @@ async def call_openai(client: httpx.AsyncClient, bundle_text: str, commit: str) 
         raise RuntimeError(f"OpenAI returned non-JSON content: {e}\n{content[:500]}")
 
     return {
-        "reviewer": "gpt-5.5-pro",
+        "reviewer": "gpt-5",
         "model": OPENAI_MODEL,
         "bundle_commit": commit,
         "fired_at": datetime.now(timezone.utc).isoformat(),
@@ -309,33 +330,56 @@ async def call_deepseek(client: httpx.AsyncClient, bundle_text: str, commit: str
         "thinking": {"type": "enabled"},
     }
 
-    log.info(f"[deepseek] firing request to {DEEPSEEK_MODEL} (thinking=enabled, reasoning=high, bundle size: {len(bundle_text):,} chars)")
-    resp = await client.post(
-        DEEPSEEK_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=600.0,
-    )
+    # DeepSeek's json_object mode is intermittently unreliable on large bundles
+    # — it usually returns clean JSON but occasionally emits a malformed sample
+    # (trailing 'Extra data', or a missing delimiter mid-object). _coerce_json_object
+    # absorbs the recoverable cases (fences, trailing junk); a bounded retry handles
+    # the genuinely-malformed ones, since re-sampling almost always lands clean.
+    MAX_ATTEMPTS = 3
+    content = None
+    last_err = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        log.info(
+            f"[deepseek] firing request to {DEEPSEEK_MODEL} "
+            f"(thinking=enabled, reasoning=high, bundle size: {len(bundle_text):,} chars, "
+            f"attempt {attempt}/{MAX_ATTEMPTS})"
+        )
+        resp = await client.post(
+            DEEPSEEK_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=600.0,
+        )
 
-    if resp.status_code != 200:
-        raise RuntimeError(f"DeepSeek returned {resp.status_code}: {resp.text[:500]}")
+        if resp.status_code != 200:
+            raise RuntimeError(f"DeepSeek returned {resp.status_code}: {resp.text[:500]}")
 
-    body = resp.json()
-    usage = body.get("usage", {})
-    log.info(
-        f"[deepseek] response received — "
-        f"prompt={usage.get('prompt_tokens', '?')} tok, "
-        f"completion={usage.get('completion_tokens', '?')} tok, "
-        f"reasoning={usage.get('reasoning_tokens', usage.get('completion_tokens_details', {}).get('reasoning_tokens', '?'))} tok"
-    )
+        body = resp.json()
+        usage = body.get("usage", {})
+        log.info(
+            f"[deepseek] response received — "
+            f"prompt={usage.get('prompt_tokens', '?')} tok, "
+            f"completion={usage.get('completion_tokens', '?')} tok, "
+            f"reasoning={usage.get('reasoning_tokens', usage.get('completion_tokens_details', {}).get('reasoning_tokens', '?'))} tok"
+        )
 
-    msg = body["choices"][0]["message"]
-    content = msg["content"]
-    reasoning_content = msg.get("reasoning_content")  # CoT, may be present
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"DeepSeek returned non-JSON content: {e}\n{content[:500]}")
+        msg = body["choices"][0]["message"]
+        content = msg["content"]
+        reasoning_content = msg.get("reasoning_content")  # CoT, may be present
+        try:
+            parsed = _coerce_json_object(content)
+            break
+        except json.JSONDecodeError as e:
+            last_err = e
+            log.warning(
+                f"[deepseek] non-JSON content on attempt {attempt}/{MAX_ATTEMPTS} ({e}); "
+                f"{'retrying' if attempt < MAX_ATTEMPTS else 'giving up'}"
+            )
+    else:
+        raise RuntimeError(
+            f"DeepSeek returned non-JSON content after {MAX_ATTEMPTS} attempts: "
+            f"{last_err}\n{(content or '')[:800]}"
+        )
 
     return {
         "reviewer": "deepseek-v4-pro",

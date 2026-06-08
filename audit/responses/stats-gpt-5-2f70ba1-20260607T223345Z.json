@@ -1,0 +1,193 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "2f70ba1",
+  "fired_at": "2026-06-07T22:33:45.945655+00:00",
+  "usage": {
+    "input_tokens": 98100,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 13591,
+    "output_tokens_details": {
+      "reasoning_tokens": 10432
+    },
+    "total_tokens": 111691
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-5",
+      "review_date": "2026-06-07",
+      "bundle_commit": "2f70ba1"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "Most analyses are methodologically sound and time-respecting, with BH-FDR applied broadly and leakage guards in place; one notable leak remains in SARIMAX exog imputation."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "Good NaN handling, gates for low-N, fold-local scaling for AIPW, embargoed backtests, and diagnostics; a few procedures (PSM bootstrap, SARIMAX exog fill) could better address temporal dependence."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Vectorized pandas/NumPy, scikit-learn/statsmodels usage, and batched DB upserts should handle multi-year growth; causal battery is O(treatments\u00d7n) but acceptable for single-user scale."
+      },
+      "idiomaticness": {
+        "score": 5,
+        "rationale": "Appropriately uses sklearn, statsmodels, xgboost, SHAP, BH-FDR, and TimeSeriesSplit; patterns are standard and clearly recognizable."
+      }
+    },
+    "summary": "This pipeline is impressively careful for a single-user HRV analytics stack: next-night alignment is enforced end-to-end, descriptive statistics apply BH-FDR at the right granularity, AIPW cross-fitting uses time-ordered folds with fold-local scaling, and the XGBoost backtest has a 28-day embargo to prevent rolling-window leakage. Stage-3 OLS includes VIF-based pruning and HAC SEs; SARIMAX and Prophet both address causal alignment by shifting exogenous series and avoiding lookahead in forecast exog, and XGBoost prediction intervals are calibrated with out-of-fold residuals. The causal layer is particularly well thought through: confounders are pre-treatment lags, mediators are excluded, cell-size gates are enforced, and E-values are reported.\n\nThe riskiest remaining assumptions concentrate in two places. First, SARIMAX constructs exogenous regressors by forward-then-backward filling over the full series before splitting; this backfills future values into earlier rows, leaking information into both training and holdout and biasing metrics. Second, while AIPW provides block-bootstrap CIs, the BH-FDR correction is still keyed to IF-based Wald p-values that assume i.i.d. influence values; under autocorrelation these p-values can be anti-conservative, so the multiple-testing screen may admit too many marginal signals. Smaller issues include using i.i.d. bootstrap for PSM on a time series, the numeric treatment of day_of_week in causal models (ordinal rather than cyclic/one-hot), and using full-sample OOF residuals to set backtest prediction-interval widths per horizon rather than estimating \u03c3 within each expanding window.\n\nIf I could only fix three things: (1) remove bfill from SARIMAX exog construction and compute train/test exog fills using only past data; (2) base the causal BH-FDR on block-bootstrap p-values (or at least suppress FDR pass where block vs IF CIs diverge materially); and (3) compute backtest PI \u03c3 within each expanding window (OOF on the training slice), not from the full series, so coverage metrics are strictly time-respecting.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "SARIMAX exog backfill leaks future info into training and holdout",
+        "severity": "P0",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2425-2450",
+        "description": "Exogenous regressors are built with ffill().bfill() over the full series before the train/test split, then shifted. Backward-filling uses future values to impute earlier rows, leaking information into both model fitting and the walk-forward evaluation.",
+        "evidence": "original_exog = (hrv_valid[exog_feats].copy().ffill().bfill().asfreq('D')); exog = original_exog.shift(1).ffill().bfill()",
+        "recommendation": "Drop bfill; construct exog with ffill only and perform filling on the training slice per split. For holdout/backtest, impute using last-known historical exog (as already done for forecast steps), not future rows."
+      },
+      {
+        "id": "F-002",
+        "title": "Backtest PIs use \u03c3 estimated from full-series OOF, not fold-local",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "hrv_analysis.py:2125-2160",
+        "description": "In run_evaluation, pred_std_by_horizon is estimated via TimeSeriesSplit OOF over the full series and then reused in every fold, giving PI widths that benefit from information not available at the time each expanding-window model was fit.",
+        "evidence": "for _h in HORIZONS: _, _, X_h_full, y_h_full = prepare_ml_data(df, horizon=_h); TimeSeriesSplit on X_h_full \u2192 pred_std_by_horizon[_h]; reused in all folds.",
+        "recommendation": "Within each expanding-window fold, estimate \u03c3 via OOF residuals on the training slice only, and use that fold-local \u03c3 for that fold\u2019s PIs and coverage."
+      },
+      {
+        "id": "F-003",
+        "title": "Causal BH-FDR uses IF-Wald p-values that assume i.i.d.",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:644-690",
+        "description": "The FDR screen is based on AIPW |ate/se_if| normal p-values even though HRV exhibits autocorrelation; while block-bootstrap CIs are computed, their information is not used in the p-values, making BH-FDR anti-conservative when temporal dependence inflates variance.",
+        "evidence": "p_raw = 2*(1 - norm.cdf(|ate/se_if|)); block-bootstrap CI is computed earlier but not used in p-value calculation or FDR gating.",
+        "recommendation": "Derive p-values from a block-bootstrap test (e.g., percentile or studentized) and use those in BH-FDR; at minimum, suppress passes_fdr when bb_width_ratio >> 1 or fold_failures are high."
+      },
+      {
+        "id": "F-004",
+        "title": "Day-of-week encoded as ordinal in causal confounders",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "causal_inference.py:36-62",
+        "description": "Using an integer 0\u20136 for day_of_week assumes a linear effect across weekdays in both the propensity and outcome models, which is misspecified for cyclic/categorical structure and can bias adjustment.",
+        "evidence": "COMMON_CONFOUNDERS includes 'day_of_week', 'is_weekend'; no one-hot or cyclic sin/cos expansion before LogisticRegression/Ridge.",
+        "recommendation": "One-hot encode weekdays or use sin/cos cyclic terms for day-of-week in the causal layer before fitting PS and outcome models."
+      },
+      {
+        "id": "F-005",
+        "title": "PSM bootstrap ignores temporal dependence",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "causal_inference.py:184-243",
+        "description": "The ATT CI is computed via i.i.d. resampling of matched_diffs; for a daily time series this underestimates uncertainty when residuals are autocorrelated.",
+        "evidence": "for _ in range(n_boot): sample = RNG.choice(matched_diffs, size=n, replace=True) \u2192 CI from percentiles of i.i.d. resamples.",
+        "recommendation": "Use block bootstrap on matched pairs (e.g., 7-day blocks over calendar order) to form CIs, in line with the AIPW block-bootstrap approach."
+      },
+      {
+        "id": "F-006",
+        "title": "Top-20 correlation heatmap not filtered by BH-FDR",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:1470-1495",
+        "description": "The visualization selects the top 20 by |r| regardless of whether those correlations survive BH-FDR, potentially highlighting noise as signal.",
+        "evidence": "top20 = corr_df.head(20); no filter on corr_df['passes_fdr'] before plotting the heatmap.",
+        "recommendation": "Limit the heatmap to FDR survivors (or visually flag non-survivors) to avoid overstating spurious associations."
+      },
+      {
+        "id": "F-007",
+        "title": "Causal confounder ffill window is hard-coded and short",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "causal_inference.py:510-548",
+        "description": "Confounders are forward-filled with limit=2 before dropna; early tracking gaps can force disproportionate row loss or brittle fills that vary by feature sparsity.",
+        "evidence": "sub[list(confounders)] = sub[list(confounders)].ffill(limit=2); meta tracks substantial row loss when confounders are sparse.",
+        "recommendation": "Make ffill horizon configurable per confounder (e.g., 7 days for weekly aggregates), and prefer explicit missingness handling to avoid silent bias from overly short fills."
+      },
+      {
+        "id": "F-008",
+        "title": "Backtest DM variance uses fixed 7-lag kernel across all series",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2205-2255",
+        "description": "The Newey\u2013West long-run variance uses a triangular kernel with fixed max lag=7 for all comparisons; if loss-differential autocorrelation extends beyond a week, test size can be mis-calibrated.",
+        "evidence": "for k in range(1, min(7, n_d - 1)): long_run += 2*(1 - k/7)*cov_k",
+        "recommendation": "Select the NW lag data-dependently (e.g., floor(4(n/100)^(2/9))) or test several lags and report sensitivity; alternatively use a package implementation."
+      },
+      {
+        "id": "F-009",
+        "title": "Prophet/SARIMAX feature selection may still admit mediator-like signals",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "hrv_analysis.py:2330-2360",
+        "description": "Exogenous features are drawn from SHAP top features plus category seeds; while TARGET itself is excluded, some same-night sleep composites can slip in if not carefully filtered, risking over-attribution in interpretive plots (though exog is shifted by 1 for alignment).",
+        "evidence": "top_features composed from SHAP plus seeds; SARIMAX exog excludes TARGET but not necessarily all mediator composites unless absent/sparse.",
+        "recommendation": "Explicitly exclude same-night sleep/recovery composites from exog/regressor candidate lists (keep only day-N features that are truly pre-treatment for HRV(N+1))."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Time-respecting AIPW cross-fitting with fold-local scaling",
+        "file_ref": "causal_inference.py:524-583",
+        "why_it_matters": "Using TimeSeriesSplit and fitting the scaler on the training fold avoids leakage from adjacent days and yields valid influence-function estimates for autocorrelated outcomes."
+      },
+      {
+        "title": "28-day embargo in walk-forward to block rolling-window leakage",
+        "file_ref": "hrv_analysis.py:2032-2045",
+        "why_it_matters": "Ensures that 28-day rolling baselines and z-scores do not overlap train and test, preventing subtle but material lookahead in backtests."
+      },
+      {
+        "title": "OOF residuals for XGBoost prediction intervals",
+        "file_ref": "hrv_analysis.py:1900-1935",
+        "why_it_matters": "Calibrating \u03c3 from out-of-fold residuals yields honest PI coverage that tracks actual forecast uncertainty better than in-sample residuals."
+      },
+      {
+        "title": "Consistent BH-FDR across major descriptive families",
+        "file_ref": "hrv_analysis.py:1405-1470",
+        "why_it_matters": "Controls false discoveries across large multiple-comparison surfaces (journal, habits, supplements, nutrition), reducing the chance of spurious actionable claims."
+      }
+    ],
+    "questions_for_followup": [
+      "For SARIMAX exog: which specific features typically populate exog_feats at runtime, and what is their non-null coverage profile by year? A short printout from a representative run would clarify how often bfill currently affects holdout rows.",
+      "AIPW FDR: How frequently does bb_width_ratio materially exceed 1 (e.g., >1.5) among FDR-pass treatments? A summary table would inform whether IF-based p-values systematically understate uncertainty.",
+      "PSM matching: Are there treatments where common-support trimming or caliper drops exceed, say, 20% of treated days? A per-treatment diagnostic would help decide when to de-emphasize PSM.",
+      "Stage-3 OLS: What is the typical max VIF after pruning and the final obs/predictor ratio for survivors? Exporting these with the stored stage3 payload would help downstream interpretation.",
+      "Prediction intervals: What is the empirical 80% coverage for XGBoost in the backtest by year (to guard for concept drift in \u03c3)? A yearly breakdown would validate stability."
+    ]
+  },
+  "bundle": "stats"
+}

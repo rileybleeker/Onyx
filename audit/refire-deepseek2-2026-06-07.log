@@ -1,0 +1,78 @@
+=== FIRING tz (deepseek, hardened) at 23:16:40Z ===
+2026-06-07 19:16:42,414 [INFO] Bundle loaded from audit\re-audit-2026-06-07\tz: 15 files, 146,349 chars total
+2026-06-07 19:16:42,415 [INFO]   PROMPT.md: 5,025 chars
+2026-06-07 19:16:42,415 [INFO]   CONTEXT.md: 4,786 chars
+2026-06-07 19:16:42,415 [INFO]   README.md: 593 chars
+2026-06-07 19:16:42,415 [INFO]   ADR_0001.md: 37,103 chars
+2026-06-07 19:16:42,416 [INFO]   sql/adr_0001_01_user_tz_log.sql: 12,295 chars
+2026-06-07 19:16:42,416 [INFO]   sql/adr_0001_02_whoop_onyx_dates.sql: 5,466 chars
+2026-06-07 19:16:42,416 [INFO]   sql/adr_0001_03_garmin_onyx_dates.sql: 9,609 chars
+2026-06-07 19:16:42,417 [INFO]   sql/adr_0001_04_other_onyx_dates.sql: 20,231 chars
+2026-06-07 19:16:42,417 [INFO]   sql/adr_0001_05_transition_day_flag.sql: 5,756 chars
+2026-06-07 19:16:42,417 [INFO]   sql/adr_0001_06_tz_log_gaps_view.sql: 4,193 chars
+2026-06-07 19:16:42,417 [INFO]   sql/adr_0001_07_snapshot_daily_health_matrix.sql: 2,103 chars
+2026-06-07 19:16:42,417 [INFO]   sql/adr_0001_08_daily_health_matrix_behavioral.sql: 15,548 chars
+2026-06-07 19:16:42,417 [INFO]   sql/adr_0001_09_trips_view.sql: 2,999 chars
+2026-06-07 19:16:42,418 [INFO]   gps_tz_backfill.py: 7,874 chars
+2026-06-07 19:16:42,418 [INFO]   whoop_tz_backfill.py: 12,768 chars
+2026-06-07 19:16:42,512 [WARNING] Current git HEAD (f9021f8) does not match pinned commit (2f70ba1).
+2026-06-07 19:16:42,512 [WARNING] Audit will be saved under bundle_commit=2f70ba1, but the files on disk are at f9021f8.
+2026-06-07 19:16:44,416 [INFO] [deepseek] firing request to deepseek-v4-pro (thinking=enabled, reasoning=high, bundle size: 147,727 chars, attempt 1/3)
+2026-06-07 19:16:45,334 [INFO] HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 19:18:54,558 [INFO] [deepseek] response received — prompt=39709 tok, completion=11030 tok, reasoning=6518 tok
+2026-06-07 19:18:54,561 [INFO] [deepseek] saved tz-deepseek-v4-pro-2f70ba1-20260607T231854Z.json -- 10 findings
+=== DONE tz (exit 0) at 23:18:54Z ===
+=== FIRING etl (deepseek, hardened) at 23:18:54Z ===
+2026-06-07 19:18:55,632 [INFO] Bundle loaded from audit\re-audit-2026-06-07\etl: 40 files, 351,217 chars total
+2026-06-07 19:18:55,633 [INFO]   PROMPT.md: 5,935 chars
+2026-06-07 19:18:55,633 [INFO]   CONTEXT.md: 5,798 chars
+2026-06-07 19:18:55,633 [INFO]   README.md: 546 chars
+2026-06-07 19:18:55,633 [INFO]   schemas/ci_tokens.sql: 538 chars
+2026-06-07 19:18:55,633 [INFO]   schemas/cronometer_schema.sql: 13,499 chars
+2026-06-07 19:18:55,633 [INFO]   schemas/eight_sleep_schema.sql: 7,027 chars
+2026-06-07 19:18:55,633 [INFO]   schemas/journal_schema.sql: 2,816 chars
+2026-06-07 19:18:55,633 [INFO]   schemas/myfitnesspal_schema.sql: 6,385 chars
+2026-06-07 19:18:55,633 [INFO]   schemas/spotify_schema.sql: 5,428 chars
+2026-06-07 19:18:55,633 [INFO]   schemas/supplement_schema.sql: 9,429 chars
+2026-06-07 19:18:55,633 [INFO]   schemas/whoop_schema.sql: 14,354 chars
+2026-06-07 19:18:55,633 [INFO]   workflows/daily-etl.yml: 1,665 chars
+2026-06-07 19:18:55,633 [INFO]   workflows/eight-sleep-etl.yml: 1,062 chars
+2026-06-07 19:18:55,633 [INFO]   workflows/habits-sync.yml: 481 chars
+2026-06-07 19:18:55,634 [INFO]   workflows/hrv-prediction.yml: 3,938 chars
+2026-06-07 19:18:55,634 [INFO]   workflows/hrv-retrain-on-backfill.yml: 3,228 chars
+2026-06-07 19:18:55,634 [INFO]   workflows/journal-sync.yml: 925 chars
+2026-06-07 19:18:55,634 [INFO]   workflows/mfp-email.yml: 1,241 chars
+2026-06-07 19:18:55,634 [INFO]   workflows/monthly-audit.yml: 4,224 chars
+2026-06-07 19:18:55,634 [INFO]   workflows/smoke-test.yml: 1,596 chars
+2026-06-07 19:18:55,634 [INFO]   workflows/spotify-etl.yml: 1,609 chars
+2026-06-07 19:18:55,634 [INFO]   workflows/stats-pr-check.yml: 2,106 chars
+2026-06-07 19:18:55,634 [INFO]   workflows/whoop-journal-email.yml: 875 chars
+2026-06-07 19:18:55,634 [INFO]   ci_token_helper.py: 5,776 chars
+2026-06-07 19:18:55,634 [INFO]   cronometer_import.py: 20,093 chars
+2026-06-07 19:18:55,634 [INFO]   cronometer_watcher.py: 4,730 chars
+2026-06-07 19:18:55,634 [INFO]   eight_sleep_etl.py: 27,244 chars
+2026-06-07 19:18:55,634 [INFO]   garmin_etl.py: 41,783 chars
+2026-06-07 19:18:55,634 [INFO]   hrv_backfill_check.py: 5,450 chars
+2026-06-07 19:18:55,634 [INFO]   journal_etl.py: 15,260 chars
+2026-06-07 19:18:55,635 [INFO]   myfitnesspal_email.py: 18,577 chars
+2026-06-07 19:18:55,635 [INFO]   myfitnesspal_import.py: 10,474 chars
+2026-06-07 19:18:55,635 [INFO]   retry_helper.py: 3,798 chars
+2026-06-07 19:18:55,635 [INFO]   spotify_etl.py: 36,894 chars
+2026-06-07 19:18:55,635 [INFO]   supplement_lookup.py: 8,791 chars
+2026-06-07 19:18:55,635 [INFO]   sync_log_helper.py: 2,716 chars
+2026-06-07 19:18:55,635 [INFO]   whoop_etl.py: 23,704 chars
+2026-06-07 19:18:55,635 [INFO]   whoop_journal_email.py: 15,867 chars
+2026-06-07 19:18:55,635 [INFO]   whoop_journal_import.py: 11,149 chars
+2026-06-07 19:18:55,635 [INFO]   whoop_journal_watcher.py: 4,206 chars
+2026-06-07 19:18:55,700 [WARNING] Current git HEAD (f9021f8) does not match pinned commit (2f70ba1).
+2026-06-07 19:18:55,700 [WARNING] Audit will be saved under bundle_commit=2f70ba1, but the files on disk are at f9021f8.
+2026-06-07 19:18:56,515 [INFO] [deepseek] firing request to deepseek-v4-pro (thinking=enabled, reasoning=high, bundle size: 354,431 chars, attempt 1/3)
+2026-06-07 19:18:57,752 [INFO] HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 19:19:29,901 [INFO] [deepseek] response received — prompt=91206 tok, completion=2704 tok, reasoning=2704 tok
+2026-06-07 19:19:29,901 [WARNING] [deepseek] non-JSON content on attempt 1/3 (Expecting value: line 1 column 1 (char 0)); retrying
+2026-06-07 19:19:29,901 [INFO] [deepseek] firing request to deepseek-v4-pro (thinking=enabled, reasoning=high, bundle size: 354,431 chars, attempt 2/3)
+2026-06-07 19:19:30,795 [INFO] HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 19:21:32,080 [INFO] [deepseek] response received — prompt=91206 tok, completion=10165 tok, reasoning=6338 tok
+2026-06-07 19:21:32,083 [INFO] [deepseek] saved etl-deepseek-v4-pro-2f70ba1-20260607T232132Z.json -- 10 findings
+=== DONE etl (exit 0) at 23:21:32Z ===
+DEEPSEEK HARDENED REFIRE COMPLETE at 23:21:32Z

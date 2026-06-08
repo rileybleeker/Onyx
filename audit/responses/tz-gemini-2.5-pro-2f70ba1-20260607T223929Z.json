@@ -1,0 +1,140 @@
+{
+  "reviewer": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
+  "bundle_commit": "2f70ba1",
+  "fired_at": "2026-06-07T22:38:29.880145+00:00",
+  "usage": {
+    "promptTokenCount": 43208,
+    "candidatesTokenCount": 2476,
+    "totalTokenCount": 66522,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 43208
+      }
+    ],
+    "thoughtsTokenCount": 20838,
+    "serviceTier": "standard"
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "o3-mini",
+      "review_date": "2026-06-07",
+      "bundle_commit": "2f70ba1"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "The core design is sound, but several P1 bugs in trigger logic (especially the 6-hour bound on cycle anchors and local date derivations for date-only tables) cause daytime events and journals to be misattributed or fall back to ET incorrectly."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "Handles edge cases like DST artifacts and same-offset travel very well in the Python scripts. However, implicit timezone casting in timestamp subtraction and brittle noon-ET anchors reduce robustness."
+      },
+      "scalability": {
+        "score": 5,
+        "rationale": "Trigger-based approach is O(1) per write. Backfills use efficient window functions instead of O(N^2) trigger cascades. Python scripts paginate and maintain state efficiently."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Excellent use of Postgres features like DISTINCT ON, window functions, and BEFORE triggers. Minor deductions for unsafe timestamp math."
+      }
+    },
+    "summary": "The implementation faithfully translates the ambitious ADR-0001 design into a working system. The tiered timezone resolution, the Python auto-population scripts, and the matrix view refactoring are exceptionally well executed. The `tz_log_gaps` view and the stateful `current_tz` tracking in the backfill scripts show a deep understanding of edge cases like DST artifacts and same-offset travel. However, there are a few load-bearing bugs in the SQL triggers. The most critical is a 6-hour bound in `cycle_offset_for_instant` that accidentally excludes almost all daytime events from the WHOOP cycle anchor, causing them to fall back to ET. Additionally, date-only tables (`journal_entries`, `habit_journal`, `whoop_journal`) struggle to project local dates correctly across the dateline due to brittle ET-clock assumptions. Fixing these trigger heuristics will bring the implementation to full correctness.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "WHOOP cycle anchor fails for daytime events due to strict 6h start_time bound",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql:92",
+        "description": "The `dist_sec` calculation measures distance strictly to the cycle's `start_time` (bedtime). The `<= 6 * 60 * 60` filter means any event occurring more than 6 hours after bedtime (which includes almost all waking daytime hours) will fail to match the cycle, causing daytime events like meals and supplements to fall back to ET.",
+        "evidence": "abs(extract(epoch from (start_time - ts))) <= 6 * 60 * 60",
+        "recommendation": "Remove the 6-hour filter and rely on `ORDER BY dist_sec ASC LIMIT 1` with a larger bound (e.g., 24 hours), or calculate distance to the closest of `start_time` or `end_time`."
+      },
+      {
+        "id": "F-002",
+        "title": "Unsafe TIMESTAMP minus TIMESTAMPTZ subtraction in garmin_activities",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql:75",
+        "description": "The trigger subtracts `start_time_gmt` (TIMESTAMPTZ) from `start_time_local` (TIMESTAMP). This implicitly casts the TIMESTAMP to TIMESTAMPTZ using the server's `TimeZone` setting, which produces an incorrect interval if the server is not set to UTC.",
+        "evidence": "tzd := pds.interval_to_tzd(NEW.start_time_local - NEW.start_time_gmt);",
+        "recommendation": "Explicitly cast the GMT timestamp to UTC before subtracting: `NEW.start_time_local - (NEW.start_time_gmt AT TIME ZONE 'UTC')`."
+      },
+      {
+        "id": "F-003",
+        "title": "journal_entries backdating check compares local date to ET clock date",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:161",
+        "description": "The trigger tries to prevent overwriting dates on backdated entries by checking if `entry_date` matches the ET date of `notion_created_at`. Since `entry_date` is typed in local time, real-time entries made in distant timezones (e.g., Tokyo) will fail this check and incorrectly fall back to ET.",
+        "evidence": "NEW.entry_date = (NEW.notion_created_at AT TIME ZONE 'America/New_York')::date",
+        "recommendation": "Call `derive_onyx_dates` first, then check if `NEW.entry_date` matches `d.onyx_behavioral_date` or `d.onyx_local_date` to determine if it was backdated."
+      },
+      {
+        "id": "F-004",
+        "title": "whoop_journal onyx_local_date is inconsistent for pre/post-midnight bedtimes",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness"
+        ],
+        "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:280",
+        "description": "The trigger derives dates using the cycle's `start_time` (bedtime). While `onyx_behavioral_date` correctly uses the -6h rule, `onyx_local_date` is set to the literal clock date of the bedtime. This splits a single behavioral day's journals across two local dates depending on whether bedtime was before or after midnight.",
+        "evidence": "NEW.onyx_local_date := d.onyx_local_date; (where d is derived from cycle_start_time)",
+        "recommendation": "For date-only behavioral tables, `onyx_local_date` should either mirror `onyx_behavioral_date` or be explicitly derived from the wake time, rather than the bedtime instant."
+      },
+      {
+        "id": "F-005",
+        "title": "habit_journal noon ET anchor shifts local dates in distant timezones",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness"
+        ],
+        "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:206",
+        "description": "When deriving `onyx_local_date` for a habit tap, the trigger anchors at noon ET of the `cycle_date` and converts to the local TZ. For timezones far from ET (like Tokyo +13h), noon ET falls into the next calendar day locally, shifting `onyx_local_date` forward by a day.",
+        "evidence": "noon_et := (NEW.cycle_date::timestamp + INTERVAL '12 hours') AT TIME ZONE 'America/New_York'; NEW.onyx_local_date := (noon_et AT TIME ZONE log_tz)::date;",
+        "recommendation": "Date-only sources cannot reliably project local dates across the dateline. Consider adding a `TIMESTAMPTZ` column to `habit_journal` to capture the exact tap instant."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "Stateful current_tz tracking in Python backfills",
+        "file_ref": "gps_tz_backfill.py:82",
+        "why_it_matters": "Seeding `current_tz` once and updating it in-memory prevents the script from missing return flights on the first run, and drastically reduces RPC round-trips to the database."
+      },
+      {
+        "title": "Clever DST artifact detection in tz_log_gaps",
+        "file_ref": "sql/adr_0001_06_tz_log_gaps_view.sql:56",
+        "why_it_matters": "By checking if the WHOOP offset matches the log offset at EITHER the start or end of the cycle, the view correctly identifies cycles that straddled a DST transition and hides them from the travel banner."
+      },
+      {
+        "title": "Synthesizing noon NY time for garmin_hrv fallback",
+        "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql:138",
+        "why_it_matters": "This elegant trick ensures `onyx_behavioral_date` matches the pre-attributed `calendar_date` across almost all timezones, while still allowing `user_tz_log` to resolve the correct provenance and ET date."
+      },
+      {
+        "title": "Elegant trips_view segmentation",
+        "file_ref": "sql/adr_0001_09_trips_view.sql:35",
+        "why_it_matters": "Using `generate_series` and window functions to group consecutive non-NY dates into trips is a highly idiomatic and efficient way to build a travel log from a continuous timezone series."
+      }
+    ],
+    "questions_for_followup": [
+      "For date-only tables like `habit_journal` and `myfitnesspal_nutrition`, is there any plan to capture the actual `TIMESTAMPTZ` of the event in the future to avoid brittle noon-ET heuristics?",
+      "If a user travels to a timezone with an offset not present in `GENERIC_OFFSET_IANA` or their history, `whoop_tz_backfill.py` skips it. Is the expectation that the user will see the `/status` banner and manually add the entry, thereby teaching the script the new offset for future runs?"
+    ]
+  },
+  "bundle": "tz"
+}

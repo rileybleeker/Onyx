@@ -1,0 +1,254 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "2f70ba1",
+  "fired_at": "2026-06-07T22:35:32.858309+00:00",
+  "usage": {
+    "input_tokens": 73857,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 11257,
+    "output_tokens_details": {
+      "reasoning_tokens": 7488
+    },
+    "total_tokens": 85114
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-4o",
+      "review_date": "2026-06-07",
+      "bundle_commit": "2f70ba1"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 3,
+        "rationale": "Core facts and date-attribution logic are mostly sound, but RLS inconsistencies and a few missing/uneven constraints (e.g., Cronometer onyx_* triggers, missing FK in prod) leave room for incorrect states."
+      },
+      "robustness": {
+        "score": 4,
+        "rationale": "Good use of constraints, CHECKs, and helper views; ADR-0001 trigger ladder is thorough, though scattered per-table triggers create drift risk."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Indexes generally align with query patterns and volumes are modest; a few missing/duplicate indexes and a heavy \u201cgod view\u201d could be tuned but won\u2019t block 3\u20135\u00d7 growth."
+      },
+      "idiomaticness": {
+        "score": 4,
+        "rationale": "Largely idiomatic Postgres (partial indexes, DEFERRABLE FKs, vector HNSW), marred by earlier public-targeted RLS policies and some duplicated trigger logic."
+      }
+    },
+    "summary": "Overall this schema is in good shape for a single-user analytics stack: behavioral-day attribution is enforced by database triggers rather than application code; key WHOOP and Spotify relationships are now FK-enforced; and the HRV predictions table and views have been hardened with a surrogate PK and a clear tiebreak. The heavy-lift daily matrix switched to a behavioral spine and extracted dedup logic into helper views, improving clarity and testability.\n\nWhere it wobbles is consistency and enforcement. Production (as captured 2026-05-25) still shows RLS policies granting ALL to public on some tables and, more seriously, a pre-lockdown state where authenticated could write habit tables; the lockdown SQL in this bundle closes that, but it must be applied. Referential integrity remains selective in production (e.g., no FK from habit_journal.question to habit_name_map.habit_name), despite an included migration to add it. Cronometer tables were introduced without the ADR-0001 set_onyx_dates triggers, relying on the importer to populate onyx_* \u2014 that\u2019s brittle and inconsistent with the rest of the design.\n\nThe riskiest choices are: (1) RLS policy drift and past overbroad grants; (2) absent FK(s) that should be present to prevent silent orphaning; (3) wide views that accumulate complexity. If I could only fix three things: (1) apply the security_lockdown and rls_policies migrations to normalize RLS (service_role-only writes); (2) add and validate the habit_journal.question \u2192 habit_name_map.habit_name FK in production; (3) add Cronometer set_onyx_dates triggers so the onyx_* invariants are enforced at write-time, not by ETL convention. Secondary cleanups: drop duplicate indexes, ensure the HRV tiebreak index exists, and remove garmin_daily_summary from the behavioral spine once consumers are migrated.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Pre-lockdown RLS allowed habit writes via authenticated role",
+        "severity": "P0",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/security_lockdown_2026_06_06.sql",
+        "description": "Before the lockdown migration, habit_journal and habit_name_map had FOR ALL policies to authenticated plus table-level write grants, enabling public-key writes. This is a direct integrity and security risk if not already applied in prod.",
+        "evidence": "sql/security_lockdown_2026_06_06.sql comments: 'habit_journal / habit_name_map had ... FOR ALL to authenticated + anon/authenticated table-level write grants, so the public key could INSERT/UPDATE/DELETE...'.",
+        "recommendation": "Ensure the lockdown migration is applied: scope service_full_access to service_role only and revoke anon/authenticated writes on both tables as in sql/security_lockdown_2026_06_06.sql."
+      },
+      {
+        "id": "F-002",
+        "title": "Missing FK: habit_journal.question \u2192 habit_name_map.habit_name (prod)",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "SCHEMA_DDL.md \u2014 Referential integrity; sql/audit_re_2026_05_26_habit_journal_question_fk.sql",
+        "description": "Production snapshot lists only six FKs and explicitly calls out this relationship as absent; the migration to add the FK exists but appears not applied. Without the FK, typos/renames can orphan rows.",
+        "evidence": "SCHEMA_DDL.md: 'Notably absent foreign keys \u2014 habit_journal.question \u2194 habit_name_map.name'; migration present in sql/audit_re_2026_05_26_habit_journal_question_fk.sql.",
+        "recommendation": "Apply sql/audit_re_2026_05_26_habit_journal_question_fk.sql (adds UNIQUE on habit_name and FK with ON UPDATE CASCADE, ON DELETE RESTRICT). Validate no orphans exist first."
+      },
+      {
+        "id": "F-003",
+        "title": "Cronometer tables lack set_onyx_dates triggers",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "cronometer_schema.sql",
+        "description": "New Cronometer tables define onyx_* columns but no BEFORE triggers to populate them, diverging from ADR-0001\u2019s trigger-enforced invariant and risking drift if ETL forgets to set them.",
+        "evidence": "cronometer_schema.sql creates onyx_* columns and indexes but no pds.set_onyx_dates_* triggers; SCHEMA_DDL lists 11 set_onyx_dates triggers for other sources, not Cronometer.",
+        "recommendation": "Add BEFORE INSERT/UPDATE triggers: for daily, set all onyx_* = calendar_date; for servings, call derive_onyx_dates(event_time) when present else default to calendar_date with explicit tz_source."
+      },
+      {
+        "id": "F-004",
+        "title": "Inconsistent RLS: service_full_access granted TO public on some tables",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Idiomaticness"
+        ],
+        "file_ref": "SCHEMA_DDL.md \u2014 Row-Level Security policies",
+        "description": "Several service_full_access policies target the public role instead of service_role, widening the trust boundary and creating future risk if table grants change.",
+        "evidence": "SCHEMA_DDL.md: 'Several (whoop_*, garmin_*, sync_log) target {public} instead [of] {service_role}'.",
+        "recommendation": "Normalize to service_role-only per sql/rls_policies.sql; drop any public-targeted write policies."
+      },
+      {
+        "id": "F-005",
+        "title": "Redundant single-column indexes that duplicate PKs",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "SCHEMA_DDL.md (myfitnesspal_nutrition, weight_log, whoop_journal)",
+        "description": "Indexes like idx_mfp_nutrition_date, idx_weight_log_date, and whoop_journal(cycle_date) duplicate the PK\u2019s leading column and add maintenance/plan noise.",
+        "evidence": "SCHEMA_DDL.md flags 'duplicate?' next to these indexes.",
+        "recommendation": "Drop the redundant indexes; keep only the PK or a truly different composite/partial index. Use sql/audit_re_2026_05_26_drop_redundant_indexes.sql as a pattern."
+      },
+      {
+        "id": "F-006",
+        "title": "garmin_activity_laps has redundant (activity_id, lap_index) index",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness"
+        ],
+        "file_ref": "SCHEMA_DDL.md \u2014 pds.garmin_activity_laps",
+        "description": "A separate index on (activity_id, lap_index) duplicates the leftmost prefix of the UNIQUE (activity_id, lap_index, ts) index and is likely unnecessary.",
+        "evidence": "SCHEMA_DDL.md shows UNIQUE(activity_id, lap_index, ts) and a separate idx(activity_id, lap_index).",
+        "recommendation": "Drop the two-column index unless you can show a measurable plan benefit; the UNIQUE index supports scans on the leftmost prefix."
+      },
+      {
+        "id": "F-007",
+        "title": "Behavioral-spine view still unions garmin_daily_summary.calendar_date",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "sql/daily_health_matrix_behavioral_main_session.sql",
+        "description": "The behavioral matrix spine unions GDS calendar_date (watch-local), which can diverge from onyx_behavioral_date on travel days. A comment notes a pending removal, but prod state suggests it\u2019s still included.",
+        "evidence": "sql/daily_health_matrix_behavioral_main_session.sql NOTE: migration to remove GDS from UNION is pending; current UNION includes garmin_daily_summary.calendar_date.",
+        "recommendation": "Remove garmin_daily_summary from the UNION and regenerate the spine from behavioral onyx_* dates only; backfill any gaps via other sources."
+      },
+      {
+        "id": "F-008",
+        "title": "Missing/uncertain HRV tiebreak index may force full scans",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability",
+          "Correctness"
+        ],
+        "file_ref": "SCHEMA_DDL.md \u2014 pds.hrv_predictions; sql/hrv_predictions_latest.sql",
+        "description": "The view orders by a CASE tiebreak; production index list only shows idx(input_data_hash). Without idx_hrv_predictions_tiebreak, DISTINCT ON queries may scan/sort the whole table.",
+        "evidence": "SCHEMA_DDL.md index list omits the composite tiebreak index; sql/hrv_predictions_latest.sql creates it explicitly.",
+        "recommendation": "Ensure sql/hrv_predictions_latest.sql has been applied and idx_hrv_predictions_tiebreak exists; ANALYZE the table after creation."
+      },
+      {
+        "id": "F-009",
+        "title": "Hot-path partial/composite indexes not present in prod snapshot",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Scalability"
+        ],
+        "file_ref": "sql/audit_re_2026_05_26_covering_partial_indexes.sql",
+        "description": "Indexes tailored to frequent filters (WHOOP score_state='SCORED', non-nap sleep, Garmin sleep best-of-day, Spotify featurized-join) aren\u2019t listed in production.",
+        "evidence": "SCHEMA_DDL.md index inventory lacks idx_whoop_recovery_cycle_scored, idx_whoop_sleep_cycle_scored_main, idx_garmin_sleep_behavioral_score, idx_spotify_tracks_featurized.",
+        "recommendation": "Apply sql/audit_re_2026_05_26_covering_partial_indexes.sql to tighten join and aggregate performance."
+      },
+      {
+        "id": "F-010",
+        "title": "Duplication in 11+ set_onyx_dates triggers invites drift",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "SCHEMA_DDL.md \u2014 Functions and triggers",
+        "description": "Each source table has a bespoke trigger function that mirrors the same ladder; fixes must be repeated across many functions, risking skew over time.",
+        "evidence": "SCHEMA_DDL.md: '11 of these' set_onyx_dates_* functions; ADR-0001 edits had to be repeated.",
+        "recommendation": "Refactor to a single generic trigger function with TG_ARGs (instant column, provenance) or a small set of shared helpers to centralize logic and reduce maintenance."
+      },
+      {
+        "id": "F-011",
+        "title": "Legacy daily_health_matrix likely ready for deprecation",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "sql/daily_health_matrix.sql; SCHEMA_DDL.md \u2014 Views",
+        "description": "Two parallel matrix views increase maintenance surface and confusion; the behavioral one is canonical and already powers downstream methods.",
+        "evidence": "CONTEXT.md: legacy retained for migration; SCHEMA_DDL.md lists both; behavioral view has helper refactors and richer semantics.",
+        "recommendation": "Migrate remaining consumers and deprecate/drop the legacy view; keep a frozen snapshot if historical A/B comparisons are still needed."
+      },
+      {
+        "id": "F-012",
+        "title": "Several tables lack explicit service_role write policies in prod",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "SCHEMA_DDL.md \u2014 Row-Level Security policies",
+        "description": "Production notes tables with only anon_read and no service policy, relying on service-role bypass. This is brittle and non-idiomatic.",
+        "evidence": "SCHEMA_DDL.md: 'A few tables have RLS enabled with anon_read but no service_* policy... rely on the service-role\u2019s bypass-RLS privilege.'",
+        "recommendation": "Apply sql/rls_policies.sql to add explicit FOR ALL TO service_role policies consistently across all writeable tables."
+      }
+    ],
+    "things_done_well": [
+      {
+        "title": "WHOOP cycle hub and Spotify FKs with sensible ON DELETE actions",
+        "file_ref": "SCHEMA_DDL.md \u2014 Referential integrity",
+        "why_it_matters": "Enforcing recovery/sleep\u2192cycle and plays\u2192track/artist at write-time prevents silent join-corruption and preserves ETL idempotency; DEFERRABLE aids ingest ordering."
+      },
+      {
+        "title": "Behavioral-day attribution enforced in the database",
+        "file_ref": "sql/adr_0001_01_user_tz_log.sql",
+        "why_it_matters": "Putting the TZ ladder and -6h boundary in triggers removes application ambiguity and catches attribution mistakes early, which is critical for downstream analytics."
+      },
+      {
+        "title": "hrv_predictions hardened with surrogate PK and tiebreak index",
+        "file_ref": "sql/audit_p1_hrv_predictions_surrogate_pk.sql",
+        "why_it_matters": "Allows multiple versions per (date,model,horizon) while keeping latest selection deterministic and efficient; avoids silent overwrites."
+      },
+      {
+        "title": "Supplement JSONB + per-compound rollup with unit normalization",
+        "file_ref": "sql/supplements_unii_cleanup.sql",
+        "why_it_matters": "Combines flexibility (JSONB) with analytical clarity (UNII-based rollups, mg normalization) and surfaces unmapped units to avoid silent data loss."
+      },
+      {
+        "title": "Helper views for per-day dedup in behavioral matrix",
+        "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql",
+        "why_it_matters": "Moving LATERAL+LIMIT patterns into reusable views clarifies intent, reduces duplication, and makes testing per-source selection logic tractable."
+      },
+      {
+        "title": "Vector HNSW index on journal embeddings",
+        "file_ref": "journal_schema.sql",
+        "why_it_matters": "Using the right operator class and index type enables fast semantic search without custom infrastructure."
+      }
+    ],
+    "questions_for_followup": [
+      "Have sql/security_lockdown_2026_06_06.sql and sql/rls_policies.sql been applied to production? If not, is there any reason to defer?",
+      "Was sql/audit_re_2026_05_26_habit_journal_question_fk.sql applied (and validated) in prod? If blocked, what data issue prevents it?",
+      "Do the Cronometer importers currently populate onyx_* consistently, or should we add the recommended set_onyx_dates triggers to the two new tables?",
+      "Can we confirm idx_hrv_predictions_tiebreak and the partial indexes in sql/audit_re_2026_05_26_covering_partial_indexes.sql exist in prod (pg_indexes) after deployment?",
+      "Are there any remaining consumers of the legacy pds.daily_health_matrix, and what\u2019s the plan/timeline to deprecate it?",
+      "Is removing garmin_daily_summary from the behavioral spine blocked by any downstream consumer or can we safely cut it now?"
+    ]
+  },
+  "bundle": "schema"
+}

@@ -1,0 +1,2223 @@
+{
+  "meta": {
+    "etl|deepseek-v4-pro": {
+      "scores": {
+        "correctness": 4,
+        "robustness": 3,
+        "scalability": 4,
+        "idiomaticness": 4
+      },
+      "summary": "The ETL suite is operationally solid for its n=1 context. Upsert idempotency is correctly implemented with natural keys across all sources; data attribution follows ADR-0001 conventions. Token rotation and IMAP-based imports are handled safely with ordering guards and concurrency controls. The primary weakness is robustness against transient failures: several ETLs (Garmin, WHOOP, Eight Sleep) lack HTTP retry logic, and most do not guarantee a sync_log heartbeat on fatal crashes. Standalone modes (backfill-laps, sync-workouts, refresh-genres) also skip heartbeat writes, creating blind spots in monitoring. Top fixes: add retry with backoff to all HTTP calls, wrap every ETL's main() in a try/except that logs a failure heartbeat, and standardize on the shared sync_log_helper. These changes would improve failure visibility and recovery without altering data correctness.",
+      "things_done_well": [
+        "All upsert conflict keys are natural and correct, ensuring idempotent writes.",
+        "Spotify ETL includes cap-hit detection with partial sync_log status, providing clear visibility into data loss windows.",
+        "MFP import includes an ordering guard that prevents an older export from overwriting newer data.",
+        "The shared retry_helper module is well-designed with exponential backoff, jitter, and Retry-After support.",
+        "WHOOP pagination includes a token-repeat guard to prevent infinite loops.",
+        "The shared sync_log_helper now consistently populates both sync_start and sync_end, fixing earlier reporting gaps.",
+        "ET-local date guards in Garmin ETL prevent future-dated entries from polluting the database.",
+        "IMAP email handling only marks messages as read on successful import, allowing automatic retry of transient download/import errors."
+      ],
+      "questions": [
+        "Are there plans to add HTTP retry with backoff to the Garmin, WHOOP, and Eight Sleep ETLs to match Spotify/Journal?",
+        "Should the Cronometer import use a transaction or a natural-key upsert to eliminate the concurrent deletion race?",
+        "Does the WHOOP journal email FROM filter cover all possible sender domains (e.g., `email.whoop.com`), or should it be broadened?",
+        "Is the lack of a top-level exception catcher in most ETLs intentional (relying on workflow failure alerts), or should we add heartbeat-on-crash for better /status visibility?",
+        "Have we verified that the `user_tz_log` ladder is populated correctly for all travel periods covered by Eight Sleep data?"
+      ],
+      "fname": "etl-deepseek-v4-pro-2f70ba1-20260607T232132Z.json"
+    },
+    "etl|gemini-2.5-pro": {
+      "scores": {
+        "correctness": 3,
+        "robustness": 3,
+        "scalability": 4,
+        "idiomaticness": 4
+      },
+      "summary": "The Onyx ETL pipeline is generally well-architected, leveraging idempotent upserts, robust token rotation, and comprehensive `sync_log` heartbeats. However, there are a few critical correctness issues that need addressing. The Spotify ETL can permanently lose plays if a track fetch fails, because it advances the high-water mark past the skipped play. The HRV backfill detector is currently blind to updates because several ETLs fail to bump `synced_at` during upserts. Additionally, the WHOOP journal importer lacks the `export_received_at` guard present in the MFP importer, risking stale data overwrites. Fixing the Spotify high-water mark logic and adding `synced_at` to upsert payloads are the top priorities.",
+      "things_done_well": [
+        "Excellent use of `sync_log` heartbeats across all ETLs, ensuring visibility into both successes and failures.",
+        "Robust handling of OAuth token rotation and persistence via `ci_token_helper.py` and GitHub Actions `always()` steps.",
+        "Idempotent design for most ETLs (e.g., `ON CONFLICT DO UPDATE`, delete-and-insert for Cronometer servings).",
+        "Smart use of GitHub Actions features, like the DST-aware cron gating in `hrv-prediction.yml`."
+      ],
+      "questions": [
+        "How are Notion image URLs currently handled by the frontend given their 1-hour expiration? Is there a client-side re-fetch mechanism?",
+        "For `whoop_body_measurements`, is there a reason to capture hourly snapshots even when the data hasn't changed, or was this just an oversight in the PK design?"
+      ],
+      "fname": "etl-gemini-2.5-pro-2f70ba1-20260607T224315Z.json"
+    },
+    "etl|gpt-5": {
+      "scores": {
+        "correctness": 4,
+        "robustness": 4,
+        "scalability": 4,
+        "idiomaticness": 4
+      },
+      "summary": "Overall, this bundle is thoughtfully engineered: conflict keys are mostly correct, backfills are idempotent, and sync_log coverage is strong across scheduled jobs (Garmin, WHOOP, Spotify, Notion, IMAP imports). WHOOP pagination is careful (next_token loop with a repeated-token guard), and Spotify’s ordering (tracks/artists before plays) avoids FK issues. IMAP automations log heartbeats even on no-op runs, preventing silent staleness. The main correctness gap is Eight Sleep’s day attribution: calendar_date depends on a static EIGHTSLEEP_TIMEZONE env at fetch time and becomes the table’s primary key. On travel days, this can mis-assign nights and can’t be corrected downstream because there’s no authoritative event timestamp stored to recompute onyx dates later. Two other notable issues: the Spotify client’s _request method makes each successful call twice (once directly, then again via retry_http), wasting rate budget and increasing 429 risk; and Garmin activities/laps use conflict keys that include timestamps, which could allow duplicates if times change. Robustness is generally strong, but Eight Sleep lacks retry/backoff entirely, and WHOOP doesn’t retry on generic 5xx/network errors.\n\nTop 3 fixes:\n1) Fix SpotifyClient._request to avoid double-calling on success; centralize retries and keep the single 401-refresh path.\n2) Eight Sleep: persist a raw event instant (e.g., presenceStart/sleepStart) and derive calendar_date via pds.tz_for_instant or ADR-0001 triggers; also add retry/backoff.\n3) Tighten Garmin conflict keys to true natural keys (activity_id; activity_id+lap_index) and add/verify unique indexes to enforce them.\n\nSmaller but worthwhile: move rpc calls to sb.rpc(...), add generic retries for WHOOP 5xx/network errors, ensure the spotify_artists migration is applied, and consider a Cronometer no-op heartbeat for consistency.",
+      "things_done_well": [
+        "Natural-key upserts across ETLs (WHOOP ids, Spotify (played_at,track_id), date PKs) preserve idempotency.",
+        "WHOOP pagination is correct and guarded against infinite loops (seen-token set).",
+        "Spotify pipeline orders writes (tracks/artists → plays) to avoid FK issues and logs partials for ReccoBeats/MusicBrainz separately.",
+        "IMAP automations are robust: multi-stage search (FROM + SUBJECT), mark-read on irrecoverable cases, and 0-record heartbeats.",
+        "Shared sync_log helper standardizes start/end timestamps and durations; most jobs emit heartbeats on success and failure.",
+        "Cronometer importer thoughtfully handles utf-8-sig, unit-stripping, future-proof nutrient columns, and ADR-0001 behavioral attribution using user_tz_log.",
+        "Garmin ETL includes a comprehensive future-date guard using ET-local time and per-dataset checks.",
+        "WHOOP/Spotify token rotation is handled safely via local file + ci_token_helper upload in finally/always steps."
+      ],
+      "questions": [
+        "Can you confirm a deployed migration for pds.spotify_artists exists in production? If so, please link its DDL; if not, shall I draft one?",
+        "For Eight Sleep, which event instant(s) can we rely on per night (presenceStart, sleepStart, session times) to backfill a canonical instant for ADR-0001?",
+        "Is refresh_materialized_views a SQL function deployed without schema qualification? If it lives under pds, should we expose a public alias so sb.rpc works uniformly?",
+        "Garmin: do we have unique indexes on (activity_id) and (activity_id, lap_index)? If not, can we add them before tightening conflict keys?",
+        "Spotify: are you okay with the HWM change to after_ms = hwm_ms - 1 to close the equal-timestamp hole? Any evidence of ms-collisions in your data?",
+        "WHOOP: do we observe intermittent 5xx on any endpoints in logs? If yes, I can wire retry_helper into WhoopClient with jittered backoff.",
+        "Cronometer: should the watcher write a 0-record sync_log heartbeat for consistency with other sources, or do you prefer freshness to be derived solely from MAX(calendar_date)?"
+      ],
+      "fname": "etl-gpt-5-2f70ba1-20260607T224315Z.json"
+    },
+    "schema|deepseek-v4-pro": {
+      "scores": {
+        "correctness": 4,
+        "robustness": 4,
+        "scalability": 4,
+        "idiomaticness": 4
+      },
+      "summary": "The Onyx pds schema is well‑structured for a single‑user health‑analytics platform. Recent audit‑driven migrations have fixed many earlier issues: FKs were added on habit_journal→habit_name_map, Garmin laps→activities, and Spotify plays→tracks/artists; RLS policies were consolidated to target service_role; redundant indexes were pruned; and the behavioural matrix view was refactored to use helper views instead of repeated LATERAL+LIMIT‑1 blocks. The trigger‑based ADR‑0001 attribution via derive_onyx_dates is a robust, centralised mechanism that correctly handles variable timezones. The dim/fact isolation for Spotify, supplements, and journal entries avoids a combinatorial explosion in the matrix view and is a sound design choice. JSONB is employed selectively where schema flexibility is needed (supplement ingredients, raw API payloads) and is properly indexed.\n\nThe remaining concerns are low‑severity but worth addressing for long‑term maintainability. A few legacy RLS policies still target public role instead of service_role, and some tables lack an explicit service policy, relying on the service_role’s bypass‑RLS privilege – this works on Supabase but would break if the database were migrated elsewhere. The growth of hrv_predictions (≈36 rows/day) will eventually require date‑based partitioning, though not urgently. The legacy daily_health_matrix view is still present and should be formally deprecated. The behavioural matrix, while now cleaner, remains a large view that any new data source must touch. Overall, the schema is substantially correct and efficient for its current scale; the top‑three fixes are (1) normalise all RLS policies to target service_role, (2) add a partitioning plan for hrv_predictions, and (3) deprecate the legacy matrix view.",
+      "things_done_well": [
+        {
+          "title": "Centralised ADR‑0001 derivation function",
+          "file_ref": "pds.derive_onyx_dates()",
+          "why_it_matters": "The function consolidates all timezone‑aware date computation (ET, local, behavioural) with a clear tiered fallback (source field → WHOOP cycle → user_tz_log → ET) and applies the −6h bedtime rule consistently.  This prevents per‑table TZ logic duplication."
+        },
+        {
+          "title": "Helper views factor out LATERAL dedup patterns",
+          "file_ref": "pds.garmin_sleep_best_per_behavioral_date, pds.whoop_main_cycle_per_behavioral_date",
+          "why_it_matters": "Extracting the ‘best per behavioural day’ logic into reusable views makes the complex daily matrix readable and independently testable, eliminating repeated LATERAL+LIMIT‑1 blocks."
+        },
+        {
+          "title": "Partial indexes target high‑selectivity filters",
+          "file_ref": "pds.whoop_recovery (idx_whoop_recovery_cycle_scored), pds.whoop_sleep (idx_whoop_sleep_cycle_scored_main)",
+          "why_it_matters": "Partial indexes on cycle_id WHERE score_state='SCORED' exactly match the JOIN filters in the matrix view, keeping the index small and fast while avoiding whole‑table scans for the most common queries."
+        }
+      ],
+      "questions": [
+        "Is there a plan to migrate off Supabase? If so, reliance on service_role bypass‑RLS must be eliminated.",
+        "What is the expected growth rate of supplement_intake and its compounds? Could the current view‑based rollup become a bottleneck?",
+        "Are there any plans to use foreign key enforcement on hrv_model_metrics.input_data_hash, or is the implicit orphan protection via application code considered sufficient?",
+        "Should the legacy daily_health_matrix view be dropped now, or is it still referenced by any dashboard / notebook?",
+        "Is partitioning of hrv_predictions or whoop_journal scheduled for a future maintenance cycle?"
+      ],
+      "fname": "schema-deepseek-v4-pro-2f70ba1-20260607T223532Z.json"
+    },
+    "schema|gemini-2.5-pro": {
+      "scores": {
+        "correctness": 3,
+        "robustness": 3,
+        "scalability": 4,
+        "idiomaticness": 4
+      },
+      "summary": "The Onyx `pds` schema demonstrates a mature, pragmatic approach to n=1 health analytics. The choice to use a long-format EAV pattern for journal entries and JSONB for highly variable supplement ingredients is excellent, avoiding brittle schema migrations. The trigger-based ADR-0001 attribution is a robust way to enforce timezone logic at write-time without burdening the application layer. Furthermore, the decision to avoid partitioning for tables under 100K rows is the correct, pragmatic choice for this scale.\n\nHowever, there is a significant drift between the intended DDL (the `.sql` files) and the actual production state (`SCHEMA_DDL.md`). Several critical improvements—such as the `idx_hrv_predictions_tiebreak` index, the `habit_journal` foreign key, and the refactored helper views for the behavioral matrix—exist in the codebase but are missing in production. \n\nThe riskiest design choices hide in the RLS policies and the parallel matrix views. Granting `ALL` to the `public` role instead of `service_role` is a latent security hole, even in a single-user system. Additionally, keeping the legacy `daily_health_matrix` alive alongside the behavioral version guarantees that new features (like Cronometer data) will only be added to one, causing silent discrepancies for any downstream consumer still querying the legacy view.\n\nIf I could only fix three things, I would: 1) Deploy the missing `idx_hrv_predictions_tiebreak` index to prevent the `hrv_predictions_latest` view from full-scanning and sorting the heaviest table in the database. 2) Normalize all RLS `service_full_access` policies to explicitly target `service_role` and remove reliance on Supabase's RLS bypass. 3) Apply the missing `habit_journal` foreign key to enforce referential integrity against Notion renames.",
+      "things_done_well": [
+        {
+          "title": "Long-format EAV pattern for journal entries",
+          "file_ref": "pds.whoop_journal",
+          "why_it_matters": "Storing `(date, question, answer)` instead of wide columns prevents brittle schema migrations every time a new habit or WHOOP journal question is added. At n=1 scale, the row count is trivial to pivot in pandas."
+        },
+        {
+          "title": "Judicious use of JSONB for variable schemas",
+          "file_ref": "pds.supplement_products",
+          "why_it_matters": "Supplement ingredients are deeply nested and highly variable. Using a GIN-indexed JSONB column allows flexible storage while the `supplement_intake_by_compound` view cleanly explodes it into a relational format for analytics."
+        },
+        {
+          "title": "Trigger-based ADR-0001 timezone attribution",
+          "file_ref": "sql/adr_0001_01_user_tz_log.sql",
+          "why_it_matters": "Centralizing the complex timezone and behavioral-day logic in Postgres triggers ensures that data is correctly attributed regardless of whether it was written by the Python ETL, a Next.js API, or a manual SQL insert."
+        },
+        {
+          "title": "Pragmatic avoidance of partitioning",
+          "file_ref": "pds.hrv_predictions",
+          "why_it_matters": "Recognizing that 11K rows (growing at 36/day) does not require Postgres partitioning saves significant maintenance overhead and complexity. Standard B-tree indexes are more than sufficient for this scale."
+        }
+      ],
+      "questions": [
+        "Are there any plans to migrate off Supabase? If so, relying on the `service_role` bypass-RLS privilege for tables missing explicit service policies will break writes on standard Postgres.",
+        "Why does `SCHEMA_DDL.md` show the `habit_journal` foreign key and `idx_hrv_predictions_tiebreak` index as missing when the migration SQL files exist in the repository? Is the deployment pipeline failing to apply new migrations?"
+      ],
+      "fname": "schema-gemini-2.5-pro-2f70ba1-20260607T223532Z.json"
+    },
+    "schema|gpt-5": {
+      "scores": {
+        "correctness": 3,
+        "robustness": 4,
+        "scalability": 4,
+        "idiomaticness": 4
+      },
+      "summary": "Overall this schema is in good shape for a single-user analytics stack: behavioral-day attribution is enforced by database triggers rather than application code; key WHOOP and Spotify relationships are now FK-enforced; and the HRV predictions table and views have been hardened with a surrogate PK and a clear tiebreak. The heavy-lift daily matrix switched to a behavioral spine and extracted dedup logic into helper views, improving clarity and testability.\n\nWhere it wobbles is consistency and enforcement. Production (as captured 2026-05-25) still shows RLS policies granting ALL to public on some tables and, more seriously, a pre-lockdown state where authenticated could write habit tables; the lockdown SQL in this bundle closes that, but it must be applied. Referential integrity remains selective in production (e.g., no FK from habit_journal.question to habit_name_map.habit_name), despite an included migration to add it. Cronometer tables were introduced without the ADR-0001 set_onyx_dates triggers, relying on the importer to populate onyx_* — that’s brittle and inconsistent with the rest of the design.\n\nThe riskiest choices are: (1) RLS policy drift and past overbroad grants; (2) absent FK(s) that should be present to prevent silent orphaning; (3) wide views that accumulate complexity. If I could only fix three things: (1) apply the security_lockdown and rls_policies migrations to normalize RLS (service_role-only writes); (2) add and validate the habit_journal.question → habit_name_map.habit_name FK in production; (3) add Cronometer set_onyx_dates triggers so the onyx_* invariants are enforced at write-time, not by ETL convention. Secondary cleanups: drop duplicate indexes, ensure the HRV tiebreak index exists, and remove garmin_daily_summary from the behavioral spine once consumers are migrated.",
+      "things_done_well": [
+        {
+          "title": "WHOOP cycle hub and Spotify FKs with sensible ON DELETE actions",
+          "file_ref": "SCHEMA_DDL.md — Referential integrity",
+          "why_it_matters": "Enforcing recovery/sleep→cycle and plays→track/artist at write-time prevents silent join-corruption and preserves ETL idempotency; DEFERRABLE aids ingest ordering."
+        },
+        {
+          "title": "Behavioral-day attribution enforced in the database",
+          "file_ref": "sql/adr_0001_01_user_tz_log.sql",
+          "why_it_matters": "Putting the TZ ladder and -6h boundary in triggers removes application ambiguity and catches attribution mistakes early, which is critical for downstream analytics."
+        },
+        {
+          "title": "hrv_predictions hardened with surrogate PK and tiebreak index",
+          "file_ref": "sql/audit_p1_hrv_predictions_surrogate_pk.sql",
+          "why_it_matters": "Allows multiple versions per (date,model,horizon) while keeping latest selection deterministic and efficient; avoids silent overwrites."
+        },
+        {
+          "title": "Supplement JSONB + per-compound rollup with unit normalization",
+          "file_ref": "sql/supplements_unii_cleanup.sql",
+          "why_it_matters": "Combines flexibility (JSONB) with analytical clarity (UNII-based rollups, mg normalization) and surfaces unmapped units to avoid silent data loss."
+        },
+        {
+          "title": "Helper views for per-day dedup in behavioral matrix",
+          "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql",
+          "why_it_matters": "Moving LATERAL+LIMIT patterns into reusable views clarifies intent, reduces duplication, and makes testing per-source selection logic tractable."
+        },
+        {
+          "title": "Vector HNSW index on journal embeddings",
+          "file_ref": "journal_schema.sql",
+          "why_it_matters": "Using the right operator class and index type enables fast semantic search without custom infrastructure."
+        }
+      ],
+      "questions": [
+        "Have sql/security_lockdown_2026_06_06.sql and sql/rls_policies.sql been applied to production? If not, is there any reason to defer?",
+        "Was sql/audit_re_2026_05_26_habit_journal_question_fk.sql applied (and validated) in prod? If blocked, what data issue prevents it?",
+        "Do the Cronometer importers currently populate onyx_* consistently, or should we add the recommended set_onyx_dates triggers to the two new tables?",
+        "Can we confirm idx_hrv_predictions_tiebreak and the partial indexes in sql/audit_re_2026_05_26_covering_partial_indexes.sql exist in prod (pg_indexes) after deployment?",
+        "Are there any remaining consumers of the legacy pds.daily_health_matrix, and what’s the plan/timeline to deprecate it?",
+        "Is removing garmin_daily_summary from the behavioral spine blocked by any downstream consumer or can we safely cut it now?"
+      ],
+      "fname": "schema-gpt-5-2f70ba1-20260607T223532Z.json"
+    },
+    "stats|deepseek-v4-pro": {
+      "scores": {
+        "correctness": 4,
+        "robustness": 5,
+        "scalability": 5,
+        "idiomaticness": 5
+      },
+      "summary": "The pipeline does an impressive job of applying rigorous statistical methodology to a personal longitudinal dataset.  Every test family from global Spearman down to individual treatment effects is covered by Benjamini‑Hochberg correction, stationarity is verified before SARIMAX modelling, and the doubly‑robust AIPW estimator uses time‑ordered cross‑fitting to respect temporal structure.  Missing data is handled gracefully through forward‑fill within tracking windows and Kalman‑filter gaps in SARIMAX, while cell‑size gates prevent spurious reporting of underpowered treatments.  The walk‑forward backtest enforces a 28‑day embargo to eliminate leakage from rolling features, and prediction intervals are calibrated using out‑of‑fold residuals.\n\nRiskiest assumptions lie in the causal layer.  AIPW p‑values are derived from influence‑function standard errors that assume independence; the provided block‑bootstrap CI shows these SEs can be too narrow due to HRV autocorrelation, yet the FDR step relies on the naive p‑values.  This could lead to an inflated false‑discovery rate in the forest plot, especially for treatments with moderate effects.  The continuous‑treatment median‑split discards dose‑response information and yields ATE estimates that answer a different question than the binary treatments, though the documentation is transparent about this trade‑off.\n\nIf I could fix only three things: (1) replace the IF‑based p‑values in the causal BH‑FDR step with block‑bootstrap p‑values or use a robust covariance estimator for the SE, (2) implement continuous versions of the doubly‑robust estimator for the CONTINUOUS_TREATMENTS list to avoid the median‑split information loss, and (3) validate the SARIMAX exog shift contract with an automated test to prevent a silent regression after future code changes.",
+      "things_done_well": [
+        {
+          "title": "Comprehensive BH‑FDR across all test families",
+          "file_ref": "hrv_analysis.py:1500-1700",
+          "why_it_matters": "With 59+ journal questions and hundreds of features, false positives would otherwise dominate the dashboard; the consistent application of FDR at the family level is a critical guardrail."
+        },
+        {
+          "title": "Time‑serial cross‑fitting in AIPW",
+          "file_ref": "causal_inference.py:480-520",
+          "why_it_matters": "Using TimeSeriesSplit instead of random shuffling prevents leakage from future autocorrelated HRV values into the outcome model, preserving the validity of standard errors."
+        },
+        {
+          "title": "Caliper matching and common‑support trimming in PSM",
+          "file_ref": "causal_inference.py:280-310",
+          "why_it_matters": "The 0.2·SD caliper and 5‑95% propensity trim prevent poor matches and extrapolation, making the PSM estimates much more trustworthy than a naive nearest‑neighbour approach."
+        }
+      ],
+      "questions": [
+        "What is the empirical coverage of the AIPW confidence intervals (both IF‑based and block‑bootstrap) across all treatments when using the time‑series cross‑validation?  A simulation study using historical data could quantify the risk of anti‑conservatism.",
+        "How does the walk‑forward gap of 28 days perform when future rolling features with longer windows are added (e.g., 60‑day rolling averages)?  Is the gap parameterised or hard‑coded?",
+        "Were any checks done to verify that the `behaviors_date` feed into the pivot functions aligns perfectly with the ADR‑0001 behavioral‑day definition for all journal sources, including Notion journal entries?  A unit test with known transaction dates would confirm."
+      ],
+      "fname": "stats-deepseek-v4-pro-2f70ba1-20260607T221545Z.json"
+    },
+    "stats|gemini-2.5-pro": {
+      "scores": {
+        "correctness": 3,
+        "robustness": 4,
+        "scalability": 5,
+        "idiomaticness": 4
+      },
+      "summary": "The Onyx statistics pipeline is a sophisticated and generally well-designed system for n=1 longitudinal analysis. It correctly applies advanced techniques like doubly robust AIPW with time-respecting cross-fitting, out-of-fold residuals for prediction intervals, and Benjamini-Hochberg FDR correction across multiple testing families. The robustness is commendable, with proper cell-size gates, multicollinearity checks, and graceful fallbacks.\n\nHowever, there are a few critical statistical methodology errors that need addressing. First, the Granger causality test is applied to a DataFrame where missing rows have been dropped, creating a non-contiguous time series that invalidates the AR lags. Second, the Propensity Score Matching (PSM) bootstrap only resamples the final matched differences, ignoring the variance of the propensity model and matching process, which leads to artificially narrow confidence intervals. Third, the causal DAG includes `hrv_lag1` as a confounder for all treatments, which acts as a mediator for multi-day rolling treatments (like 7-day training load) and induces bias. Finally, the walk-forward backtest unnecessarily discards 28 days of training data per fold due to a misunderstanding of how rolling features interact with target leakage.\n\nFixing these issues will significantly improve the correctness and reliability of the causal estimates and statistical tests.",
+      "things_done_well": [
+        {
+          "title": "AIPW Cross-fitting with TimeSeriesSplit",
+          "file_ref": "causal_inference.py:402",
+          "why_it_matters": "Correctly uses `TimeSeriesSplit` instead of `KFold` to prevent target leakage via autocorrelated features, and fits the `StandardScaler` only on the training fold."
+        },
+        {
+          "title": "OOF Residuals for Prediction Intervals",
+          "file_ref": "hrv_analysis.py:2180",
+          "why_it_matters": "Computes prediction intervals using out-of-fold residuals via `TimeSeriesSplit` rather than in-sample residuals, providing much better empirical coverage."
+        },
+        {
+          "title": "Block Bootstrap for AIPW CI",
+          "file_ref": "causal_inference.py:280",
+          "why_it_matters": "Implements a custom block bootstrap to account for the autocorrelation of the influence function values, which the standard IF-based standard error assumes are i.i.d."
+        }
+      ],
+      "questions": [
+        "For the Stage 3 OLS regression, the code documents that HAC standard errors are applied to a non-contiguous time series due to `dropna()`. Has the impact of this approximation on the standard errors been quantified empirically?",
+        "Are there plans to implement the dose-response causal estimator mentioned in the dead constants (`MIN_DISTINCT_DOSES = 3`)?"
+      ],
+      "fname": "stats-gemini-2.5-pro-2f70ba1-20260607T221545Z.json"
+    },
+    "stats|gpt-5": {
+      "scores": {
+        "correctness": 4,
+        "robustness": 4,
+        "scalability": 4,
+        "idiomaticness": 5
+      },
+      "summary": "This pipeline is impressively careful for a single-user HRV analytics stack: next-night alignment is enforced end-to-end, descriptive statistics apply BH-FDR at the right granularity, AIPW cross-fitting uses time-ordered folds with fold-local scaling, and the XGBoost backtest has a 28-day embargo to prevent rolling-window leakage. Stage-3 OLS includes VIF-based pruning and HAC SEs; SARIMAX and Prophet both address causal alignment by shifting exogenous series and avoiding lookahead in forecast exog, and XGBoost prediction intervals are calibrated with out-of-fold residuals. The causal layer is particularly well thought through: confounders are pre-treatment lags, mediators are excluded, cell-size gates are enforced, and E-values are reported.\n\nThe riskiest remaining assumptions concentrate in two places. First, SARIMAX constructs exogenous regressors by forward-then-backward filling over the full series before splitting; this backfills future values into earlier rows, leaking information into both training and holdout and biasing metrics. Second, while AIPW provides block-bootstrap CIs, the BH-FDR correction is still keyed to IF-based Wald p-values that assume i.i.d. influence values; under autocorrelation these p-values can be anti-conservative, so the multiple-testing screen may admit too many marginal signals. Smaller issues include using i.i.d. bootstrap for PSM on a time series, the numeric treatment of day_of_week in causal models (ordinal rather than cyclic/one-hot), and using full-sample OOF residuals to set backtest prediction-interval widths per horizon rather than estimating σ within each expanding window.\n\nIf I could only fix three things: (1) remove bfill from SARIMAX exog construction and compute train/test exog fills using only past data; (2) base the causal BH-FDR on block-bootstrap p-values (or at least suppress FDR pass where block vs IF CIs diverge materially); and (3) compute backtest PI σ within each expanding window (OOF on the training slice), not from the full series, so coverage metrics are strictly time-respecting.",
+      "things_done_well": [
+        {
+          "title": "Time-respecting AIPW cross-fitting with fold-local scaling",
+          "file_ref": "causal_inference.py:524-583",
+          "why_it_matters": "Using TimeSeriesSplit and fitting the scaler on the training fold avoids leakage from adjacent days and yields valid influence-function estimates for autocorrelated outcomes."
+        },
+        {
+          "title": "28-day embargo in walk-forward to block rolling-window leakage",
+          "file_ref": "hrv_analysis.py:2032-2045",
+          "why_it_matters": "Ensures that 28-day rolling baselines and z-scores do not overlap train and test, preventing subtle but material lookahead in backtests."
+        },
+        {
+          "title": "OOF residuals for XGBoost prediction intervals",
+          "file_ref": "hrv_analysis.py:1900-1935",
+          "why_it_matters": "Calibrating σ from out-of-fold residuals yields honest PI coverage that tracks actual forecast uncertainty better than in-sample residuals."
+        },
+        {
+          "title": "Consistent BH-FDR across major descriptive families",
+          "file_ref": "hrv_analysis.py:1405-1470",
+          "why_it_matters": "Controls false discoveries across large multiple-comparison surfaces (journal, habits, supplements, nutrition), reducing the chance of spurious actionable claims."
+        }
+      ],
+      "questions": [
+        "For SARIMAX exog: which specific features typically populate exog_feats at runtime, and what is their non-null coverage profile by year? A short printout from a representative run would clarify how often bfill currently affects holdout rows.",
+        "AIPW FDR: How frequently does bb_width_ratio materially exceed 1 (e.g., >1.5) among FDR-pass treatments? A summary table would inform whether IF-based p-values systematically understate uncertainty.",
+        "PSM matching: Are there treatments where common-support trimming or caliper drops exceed, say, 20% of treated days? A per-treatment diagnostic would help decide when to de-emphasize PSM.",
+        "Stage-3 OLS: What is the typical max VIF after pruning and the final obs/predictor ratio for survivors? Exporting these with the stored stage3 payload would help downstream interpretation.",
+        "Prediction intervals: What is the empirical 80% coverage for XGBoost in the backtest by year (to guard for concept drift in σ)? A yearly breakdown would validate stability."
+      ],
+      "fname": "stats-gpt-5-2f70ba1-20260607T223345Z.json"
+    },
+    "tz|deepseek-v4-pro": {
+      "scores": {
+        "correctness": 4,
+        "robustness": 4,
+        "scalability": 5,
+        "idiomaticness": 4
+      },
+      "summary": "The ADR-0001 implementation is carefully constructed and largely aligns with the design. The tiered TZ resolution and -6h behavioral-day rule are correctly applied across all triggers. Provenance tracking with clear labels (source_field, cycle_anchor, user_tz_log, default_et_fallback) is a major improvement over the previous implicit calendar_date. The matrix view now provides a proper behavioral-day spine, and the transition-day flag gives consumers a way to handle ambiguous travel cycles. Backfill scripts for GPS and WHOOP are well-thought-out, with same-offset deduplication and in-memory state to reduce round-trips.\n\nHowever, a few cracks remain. The cycle_offset_for_instant function prefers the nearest cycle, which on a transition day with a nap could resolve to the wrong TZ for daytime events. The garmin_hrv fallback synthesizes a noon-ET instant that can misattribute by a day if the actual bedtime was before midnight local. Date-only tables (habits, whoop_journal) use a noon-ET probe into user_tz_log; if a TZ change occurs after noon on the same day, the lookup may return the old zone. None of these are showstoppers for a single-user platform, but they should be documented and possibly addressed in a later iteration.\n\nTop 3 fixes: 1) make derive_onyx_dates cycle anchor pick the longest cycle of the day (matching whoop_journal’s logic). 2) For garmin_hrv, use the actual sleep start time from garmin_sleep if available (to avoid synthesis). 3) For habit/journal triggers, handle same-day TZ shifts by inspecting both start- and end-of-day effective_from entries, or store a tap-instant timestamptz to sidestep the problem entirely.",
+      "things_done_well": [
+        {
+          "title": "Provenance tracking is thorough",
+          "file_ref": "sql/adr_0001_01_user_tz_log.sql derive function & all trigger files",
+          "why_it_matters": "Every row carries an onyx_tz_source label, making it easy to audit which resolution path was used. This directly addresses ADR D6 and enables downstream consumers to filter or weight fallback rows."
+        },
+        {
+          "title": "Backfill scripts are idempotent and efficient",
+          "file_ref": "gps_tz_backfill.py, whoop_tz_backfill.py",
+          "why_it_matters": "Both scripts safely re-run without duplicating entries, use in-memory state to avoid redundant DB calls, and include same-offset deduplication. This keeps the user_tz_log clean with minimal maintenance burden."
+        },
+        {
+          "title": "Transition day flag surfaces ambiguity",
+          "file_ref": "sql/adr_0001_05_transition_day_flag.sql",
+          "why_it_matters": "Instead of silently letting consumers treat ambiguous travel-day data as normal, the onyx_is_transition_day flag makes the ambiguity queryable. This matches the ADR’s goal of visibility over silent failure."
+        },
+        {
+          "title": "Helper views for matrix dedup are clean and testable",
+          "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql",
+          "why_it_matters": "Pulling out per-source dedup logic (longest cycle, best sleep) into separate views improves readability and allows independent testing. The matrix view itself stays a straightforward set of joins."
+        }
+      ],
+      "questions": [
+        "Does Eight Sleep’s calendar_date always align with the -6h bedtime rule? The trigger sets behavioral_date := calendar_date; if Eight Sleep attributes sleep to the wake-day, the behavioral date could be off.",
+        "What is the plan for handling Garmin daily summary dates when the watch stays on home TZ during travel? The matrix spine uses Garmin calendar_date which may be ET-attributed, causing mismatches with behavioral days.",
+        "Should the habit_journal/whoop_journal fallback be updated to consider multiple effective_from entries on the same day to handle mid-day TZ changes?",
+        "Can the cycle anchor in derive_onyx_dates be made to use the same ‘longest cycle’ logic as the matrix view, to unify behavior across triggers?"
+      ],
+      "fname": "tz-deepseek-v4-pro-2f70ba1-20260607T231854Z.json"
+    },
+    "tz|gemini-2.5-pro": {
+      "scores": {
+        "correctness": 3,
+        "robustness": 4,
+        "scalability": 5,
+        "idiomaticness": 4
+      },
+      "summary": "The implementation faithfully translates the ambitious ADR-0001 design into a working system. The tiered timezone resolution, the Python auto-population scripts, and the matrix view refactoring are exceptionally well executed. The `tz_log_gaps` view and the stateful `current_tz` tracking in the backfill scripts show a deep understanding of edge cases like DST artifacts and same-offset travel. However, there are a few load-bearing bugs in the SQL triggers. The most critical is a 6-hour bound in `cycle_offset_for_instant` that accidentally excludes almost all daytime events from the WHOOP cycle anchor, causing them to fall back to ET. Additionally, date-only tables (`journal_entries`, `habit_journal`, `whoop_journal`) struggle to project local dates correctly across the dateline due to brittle ET-clock assumptions. Fixing these trigger heuristics will bring the implementation to full correctness.",
+      "things_done_well": [
+        {
+          "title": "Stateful current_tz tracking in Python backfills",
+          "file_ref": "gps_tz_backfill.py:82",
+          "why_it_matters": "Seeding `current_tz` once and updating it in-memory prevents the script from missing return flights on the first run, and drastically reduces RPC round-trips to the database."
+        },
+        {
+          "title": "Clever DST artifact detection in tz_log_gaps",
+          "file_ref": "sql/adr_0001_06_tz_log_gaps_view.sql:56",
+          "why_it_matters": "By checking if the WHOOP offset matches the log offset at EITHER the start or end of the cycle, the view correctly identifies cycles that straddled a DST transition and hides them from the travel banner."
+        },
+        {
+          "title": "Synthesizing noon NY time for garmin_hrv fallback",
+          "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql:138",
+          "why_it_matters": "This elegant trick ensures `onyx_behavioral_date` matches the pre-attributed `calendar_date` across almost all timezones, while still allowing `user_tz_log` to resolve the correct provenance and ET date."
+        },
+        {
+          "title": "Elegant trips_view segmentation",
+          "file_ref": "sql/adr_0001_09_trips_view.sql:35",
+          "why_it_matters": "Using `generate_series` and window functions to group consecutive non-NY dates into trips is a highly idiomatic and efficient way to build a travel log from a continuous timezone series."
+        }
+      ],
+      "questions": [
+        "For date-only tables like `habit_journal` and `myfitnesspal_nutrition`, is there any plan to capture the actual `TIMESTAMPTZ` of the event in the future to avoid brittle noon-ET heuristics?",
+        "If a user travels to a timezone with an offset not present in `GENERIC_OFFSET_IANA` or their history, `whoop_tz_backfill.py` skips it. Is the expectation that the user will see the `/status` banner and manually add the entry, thereby teaching the script the new offset for future runs?"
+      ],
+      "fname": "tz-gemini-2.5-pro-2f70ba1-20260607T223929Z.json"
+    },
+    "tz|gpt-5": {
+      "scores": {
+        "correctness": 4,
+        "robustness": 4,
+        "scalability": 4,
+        "idiomaticness": 4
+      },
+      "summary": "Overall, the implementation closely realizes ADR-0001: three onyx_* date columns are populated via consistent triggers; pds.derive_onyx_dates applies the −6h behavioral rule uniformly; tz resolution follows the intended ladder (source offset → cycle anchor → user_tz_log → ET fallback); and important diagnostics are present (transition-day flag and tz_log_gaps view). The behavioral daily matrix view consolidates per-source dedup and surfaces the transition flag appropriately. WHOOP- and GPS-based auto-population scripts sensibly avoid same-offset noise and respect manual entries in practice by comparing effective offsets. The main areas to improve are taxonomy consistency and some heuristics. onyx_tz_source values drift beyond the ADR’s documented set, complicating downstream logic that may assume a closed vocabulary; standardizing and documenting all emissions would reduce ambiguity. whoop_journal.behaviors_date still picks the earliest cycle on a day, whereas other parts (e.g., daily_health_matrix_behavioral and whoop_journal’s own onyx_* derivation) correctly prefer the longest/main cycle; aligning this would remove a remaining transition-day edge case. Finally, the ±6h tolerance in cycle_offset_for_instant may be too narrow for midday events, causing unnecessary user_tz_log fallbacks. Top three fixes: 1) normalize onyx_tz_source to the ADR’s set (and add a small companion mapping for special cases), 2) change whoop_journal.behaviors_date to prefer the longest cycle, and 3) widen or reframe the cycle-anchoring window (e.g., nearest start_time within ±18h) to capture more daytime events without resorting to user_tz_log.",
+      "things_done_well": [
+        {
+          "title": "Centralized derivation with the −6h behavioral-day rule",
+          "file_ref": "sql/adr_0001_01_user_tz_log.sql:98",
+          "why_it_matters": "pds.derive_onyx_dates cleanly encodes the ADR’s core semantics and prevents per-table drift in date computations; NULL-safe and tier-aware."
+        },
+        {
+          "title": "Transition-day flag on cycles with efficient backfill",
+          "file_ref": "sql/adr_0001_05_transition_day_flag.sql:47",
+          "why_it_matters": "Surface-level ambiguity at TZ transitions is made explicit; the LAG()-based backfill avoids quadratic trigger cascades."
+        },
+        {
+          "title": "tz_log_gaps view distinguishes travel from DST artifacts",
+          "file_ref": "sql/adr_0001_06_tz_log_gaps_view.sql:41",
+          "why_it_matters": "Prevents false alarms around DST nights and provides a concrete canary for missing user_tz_log entries."
+        },
+        {
+          "title": "Garmin activities derive per-row offset from local−GMT",
+          "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql:26",
+          "why_it_matters": "Leverages available source fields to treat Garmin activities as tier-1, eliminating guesswork and improving attribution on travel days."
+        },
+        {
+          "title": "WHOOP/GPS backfills avoid same-offset noise and deduplicate proposals",
+          "file_ref": "gps_tz_backfill.py:88",
+          "why_it_matters": "Prevents cluttering user_tz_log with redundant entries where behavioral attribution would be identical; reduces operational noise."
+        },
+        {
+          "title": "Behavioral daily matrix splits per-source dedup into helper views",
+          "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql:14",
+          "why_it_matters": "Improves clarity, testability, and reusability of main-cycle and best-sleep selection logic."
+        }
+      ],
+      "questions": [
+        "Should onyx_tz_source be constrained to a documented enum (with a small explicit extension list) to avoid taxonomy drift?",
+        "Do we want to widen the cycle-anchor window (e.g., nearest start within ±18h) to cover more daytime events and reduce reliance on user_tz_log?",
+        "Is it acceptable for garmin_hrv.onxy_local_date to remain watch-local, or should it reflect physical local via derive_onyx_dates’ noon-ET anchor?",
+        "Can whoop_journal.behaviors_date switch to the longest-cycle heuristic to align with other components and eliminate remaining transition-day ambiguity?",
+        "For first-time offsets in whoop_tz_backfill, should we require manual confirmation rather than using GENERIC_OFFSET_IANA defaults?"
+      ],
+      "fname": "tz-gpt-5-2f70ba1-20260607T223929Z.json"
+    },
+    "units|deepseek-v4-pro": {
+      "scores": {
+        "correctness": 4,
+        "robustness": 3,
+        "scalability": 4,
+        "idiomaticness": 4
+      },
+      "summary": "The codebase demonstrates strong awareness of unit-conversion pitfalls through centralization of constants and formatters in format.ts, and by explicitly guarding the TDEE source (WHOOP kJ divided by 4.184, with Garmin's total_kilocalories renamed to prevent misuse). HRV columns from different vendors are kept strictly separate, and TZ-sensitive sleep timestamps use the true UTC sleep_start with correct behavioral-day attribution. Duration handling is well-documented, with separate formatDuration (seconds) and formatDurationMs (milliseconds) functions to reduce off-by-1000 errors. Display formatters handle null/NaN gracefully.\n\nThe most significant flaw is the SQL function `unit_to_mg_factor`, which returns NULL for common supplement units like IU, oz, mL, drops, scoops, and capsules, causing silent row exclusion from the `supplement_intake_by_compound` rollup view. Compound unit strings such as 'mg/mL' are also mishandled and dropped. This will produce incorrect micronutrient totals as soon as such products are logged—a foreseeable and likely scenario. Additionally, `getWhoopCaloriesBurnt` does not guard against non-numeric kJ values after `Number()` conversion, potentially injecting NaN into downstream averages, and it silently overwrites duplicated cycle dates. A hard-coded 18-hour window constant could be named for clarity. Distance and pace conversions rely on the chart layer calling formatDistance/formatPace, which is acceptable given the centralized helpers but introduces a minor risk of omission.\n\nOverall, the unit-conversion paths are largely correct and well-organized; the supplement normalization gap is the main area requiring attention.",
+      "things_done_well": [
+        "Centralized unit constants and conversion helpers in format.ts (METERS_PER_MILE, KJ_PER_KCAL, KG_PER_LB/LB_PER_KG).",
+        "Intentional TDEE source guard: Garmin's `total_kilocalories` is renamed to `garmin_total_kcal_NOT_TDEE` to prevent accidental misuse.",
+        "Clear, documented duration unit conventions at the top of queries.ts.",
+        "HRV sources (WHOOP RMSSD, Garmin time-weighted avg, Eight Sleep) are kept separate—no cross-source averaging or substitution.",
+        "TZ-aware behavioral date computations: `whoopSleepDay` and `etDate` correctly handle ET and WHOOP's biological day rule.",
+        "Defensive null/NaN guards in all formatter functions (formatDuration, formatDistance, formatPace, etc.).",
+        "Garmin sleep timestamps correctly use the true UTC `sleep_start`; activities filter on `start_time_gmt`."
+      ],
+      "questions": [
+        "Are there any supplement entries in the current database with units like IU, oz, or mL that are being silently dropped from the rollup?",
+        "Do any chart components currently display raw distance in meters, bypassing formatDistance?",
+        "Has the user ever logged a product labeled with a compound unit such as 'mg/mL' or 'mcg per drop'?",
+        "Are there other unit conversions needed for health metrics not covered (e.g., blood pressure, temperature, SpO2)?",
+        "Should the query layer pre-convert all distance values to miles to eliminate display-side drift completely?"
+      ],
+      "fname": "units-deepseek-v4-pro-2f70ba1-20260607T214539Z.json"
+    },
+    "units|gemini-2.5-pro": {
+      "scores": {
+        "correctness": 4,
+        "robustness": 3,
+        "scalability": 4,
+        "idiomaticness": 4
+      },
+      "summary": "The unit conversion and semantic conflation handling in Onyx is generally well-designed and centralized. The codebase successfully avoids conflating Garmin and WHOOP calories by explicitly renaming Garmin's `total_kilocalories` to `garmin_total_kcal_NOT_TDEE` and providing a dedicated `getWhoopCaloriesBurnt` function that correctly converts kilojoules to kilocalories. Duration units are handled carefully, with explicit comments and helper functions (`formatDuration` vs `formatDurationMs`) to prevent off-by-1000 errors. Timezone and timestamp handling for Garmin activities correctly uses `start_time_gmt` to avoid local-time shifts.\n\nHowever, there is a significant silent-loss bug in the database-level `unit_to_mg_factor` function. It uses a strict regex that strips non-alphabetic characters, causing compound units like `mg/mL` to collapse into unrecognized strings (`mgml`) and fall through to `NULL`. Furthermore, it lacks support for common supplement units like `IU`, `oz`, `mL`, `drops`, and `capsules`. Because this function is used in a rollup view, unrecognized units are silently dropped from the aggregation, leading to underreported supplement intake. Fixing this requires expanding the unit dictionary and adjusting the regex to preserve slashes for compound units.",
+      "things_done_well": [
+        "Explicit renaming of `total_kilocalories` to `garmin_total_kcal_NOT_TDEE` prevents accidental conflation of Garmin and WHOOP calories.",
+        "`getWhoopCaloriesBurnt` correctly converts kilojoules to kilocalories and preserves exact precision for downstream averaging.",
+        "`format.ts` provides a centralized, canonical set of conversion constants and formatting helpers.",
+        "`getWorkoutSleepGap` correctly normalizes Garmin's `duration_seconds` to milliseconds before comparing with WHOOP's millisecond timestamps."
+      ],
+      "questions": [
+        "Are there any other supplement units besides `IU`, `oz`, `mL`, `drops`, `scoops`, and `capsules` that need to be added to `unit_to_mg_factor`?",
+        "Should `formatDuration` round to the nearest minute instead of truncating (e.g., 3599 seconds currently formats as '59m' instead of '1h 0m')?"
+      ],
+      "fname": "units-gemini-2.5-pro-2f70ba1-20260607T214539Z.json"
+    },
+    "units|gpt-5": {
+      "scores": {
+        "correctness": 4,
+        "robustness": 3,
+        "scalability": 4,
+        "idiomaticness": 5
+      },
+      "summary": "This bundle handles the historically tricky energy, distance, pace, and duration units with care. The formatter centralizes exact constants (1609.344 m/mi; 4.184 kJ/kcal; 0.45359237 kg/lb), defers rounding to display, and provides ms/seconds helpers to avoid the WHOOP 1000× mistake. The query layer cleanly distinguishes Garmin vs WHOOP calories, even renaming Garmin’s total_kilocalories to make misuse fail loudly, and computes WHOOP TDEE with correct kJ→kcal conversion while preserving an exact field for aggregation. Garmin activity and sleep paths consistently use true-UTC fields or behavioral dates, reducing timestamp pitfalls.\n\nThe largest gap is at the SQL supplement normalizer. The unit_to_mg_factor function covers only mass units and returns NULL for anything else (IU, mL, oz, fl-oz, drops, scoops, capsules), silently excluding those ingredients from downstream rollups. It also normalizes by stripping non-[a–zµ], which mishandles the common Greek mu character (μg) by collapsing it to g, causing a million-fold overstatement if encountered. Concentration units like mg/mL also collapse to mgml and drop. These create correctness and coverage risks in micronutrient totals.\n\nTo tighten the system: expand the supplement unit dictionary (including IU per-compound rules), treat unknown units explicitly (flag and surface rather than NULL-drop), recognize both µg and μg, and introduce branded TS types or explicit interfaces to reduce unit-misuse risk. Consider renaming formatKcal to make its kJ input requirement unmistakable. Overall, the codebase demonstrates strong intent and sound practices, with a focused fix needed in SQL supplement unit handling.",
+      "things_done_well": [
+        "Correct, named conversion constants (exact values) and centralized helpers; rounding only at display time.",
+        "Clear documentation of duration-unit conventions and safe wrappers to avoid ms↔s mistakes.",
+        "Explicit kJ→kcal conversion for WHOOP TDEE with both rounded and precise fields preserved.",
+        "Defensive renaming of Garmin total_kilocalories to prevent conflation with WHOOP-derived TDEE.",
+        "Consistent use of GMT/behavioral dates for Garmin sleep/activities avoids the local-as-UTC trap.",
+        "HRV sources are kept separate; no cross-source averaging/substitution observed in this code.",
+        "Null/NaN guards across formatters (including treating 0 durations intentionally)."
+      ],
+      "questions": [
+        "Do any supplement_products.ingredients rows use the Greek mu (μg) character? If so, quantify affected compounds and backfill corrections.",
+        "What is the unit distribution in supplement_product ingredients (IU, mL, oz, capsules, drops, mg/mL, etc.)? Provide a coverage table vs unit_to_mg_factor.",
+        "Does daily_micronutrient_totals currently omit IU-labeled vitamins A/D/E from supplement totals? If yes, estimate the undercount and plan a migration.",
+        "Does any DB view (e.g., daily_health_matrix_behavioral) COALESCE different HRV sources into one column? If so, separate them or tag provenance.",
+        "Audit UI call sites: is formatKcal ever passed dietary kcal instead of kJ? If so, rename the helper and fix usage.",
+        "Confirm Cronometer energy is stored as kcal everywhere it surfaces — any possibility of kJ from certain entries or exports?",
+        "Are there any lingering consumers of Garmin sleep start_time_local? If yes, migrate to sleep_start (GMT-derived) or onyx_behavioral_date.",
+        "Should the distance formatting threshold be standardized to miles-only for consistency with the UI’s mile/lb/kcal convention?",
+        "Add an exception log or QA view listing supplement rows dropped by unit_to_mg_factor (unit unknown) — can we implement this quickly?",
+        "Would branded unit types (Seconds, Milliseconds, Kilojoule, Kilocalorie) be acceptable in the codebase to prevent future unit regressions?"
+      ],
+      "fname": "units-gpt-5-2f70ba1-20260607T223052Z.json"
+    }
+  },
+  "findings": [
+    {
+      "bundle": "etl",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-001",
+      "title": "Missing sync_log heartbeat on fatal exceptions in most ETLs",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "garmin_etl.py:761 (end of file); eight_sleep_etl.py:561; spotify_etl.py:502; journal_etl.py:332",
+      "description": "If an unhandled exception occurs in main() (e.g., import error, network failure after retries are exhausted), the script exits without writing a sync_log row. The status page then sees no heartbeat and reports staleness, even though the workflow run failed visibly. WHOOP ETL is the only one with a top-level try/except that writes a failure heartbeat.",
+      "evidence": "In garmin_etl.py, the entry point is `if __name__ == '__main__': main()` with no surrounding try/except. An uncaught exception propagates to the runner and no sync_log insert occurs. Contrast with whoop_etl.py lines 442-458 where a similar guard is present.",
+      "recommendation": "Add a `try: main() except Exception: log_failure_sync_log()` wrapper in every ETL's `__name__ == '__main__'` block. Use the shared sync_log_helper or a minimal inline insert."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-002",
+      "title": "Garmin standalone modes (--backfill-laps, --sync-workouts) do not write sync_log entries",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "garmin_etl.py:650-668 (backfill-laps block), 671-690 (sync-workouts block)",
+      "description": "When invoked with --backfill-laps or --sync-workouts, the script performs database writes but never calls log_sync(). This means the /status page won't reflect that lap backfill or workout sync ran successfully.",
+      "evidence": "In the conditional block for `args.backfill_laps`, the code calls `backfill_laps()`, prints a summary, and returns without any sync_log insert. Same for `args.sync_workouts`.",
+      "recommendation": "Add a log_sync() call at the end of each standalone mode, using appropriate source/data_type (e.g., 'garmin'/'lap_backfill')."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-003",
+      "title": "Spotify --refresh-genres mode lacks sync_log entry",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "spotify_etl.py:502-512 (run_refresh_genres function)",
+      "description": "The --refresh-genres command performs MusicBrainz updates but does not write any sync_log row. The main Spotify ETL flow writes heartbeats for plays, tracks, reccobeats, and musicbrainz; this auxiliary path is invisible to /status.",
+      "evidence": "run_refresh_genres() prints log lines but does not call log_sync_entry().",
+      "recommendation": "Call log_sync_entry(sb, source='musicbrainz', data_type='genre_refresh', status='success', ...) before returning."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-004",
+      "title": "Inconsistent use of sync_log_helper across ETLs",
+      "severity": "P3",
+      "effort": "M",
+      "dimensions": [
+        "Idiomaticness"
+      ],
+      "file_ref": "garmin_etl.py:142, whoop_etl.py:168, eight_sleep_etl.py:182, spotify_etl.py:306",
+      "description": "Some ETLs define their own log_sync() functions (copy-pasted) instead of importing sync_log_helper. This risks future drift (e.g., forgetting to populate sync_end). Currently all bespoke versions are correct, but consolidation would reduce maintenance.",
+      "evidence": "garmin_etl.py defines its own `log_sync` (lines 142-163), whoop_etl.py has another (lines 168-190), eight_sleep_etl.py another (lines 182-206). spotify_etl.py uses the shared helper via log_sync_entry but still has a thin wrapper.",
+      "recommendation": "Replace all bespoke log_sync functions with imports of sync_log_helper.log_sync. Ensure every call passes started_at."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-005",
+      "title": "Cronometer serving import race condition if run concurrently",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "cronometer_import.py:334-337 (delete-by-date + insert)",
+      "description": "The import for servings deletes all rows for the affected dates and then inserts fresh data. If two instances of the importer run at the same time (e.g., manual watcher and a cron job), they could interleave: Run A deletes date X's rows, Run B deletes date X's rows (no-op), then both insert, leading to duplicate rows because the PK is SERIAL and not unique on natural keys. This is unlikely but possible for a user who triggers import while the watcher is active.",
+      "evidence": "`sb.schema('pds').table('cronometer_servings').delete().in_('calendar_date', chunk).execute()` followed by batch insert. The primary key serving_id is BIGSERIAL, so concurrent inserts will create new IDs with overlapping (calendar_date, food_name, amount_raw) data.",
+      "recommendation": "Wrap the delete+insert in a transaction using supabase-py's DB functions, or change deletion to use `on_conflict` upsert with a natural key (e.g., calendar_date, food_name, amount_raw, event_time)."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-006",
+      "title": "Eight Sleep TZ binding may mis-attribute travel days",
+      "severity": "P3",
+      "effort": "L",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "eight_sleep_etl.py:30-41 (EIGHTSLEEP_TIMEZONE env var)",
+      "description": "The ETL uses a constant timezone for all date attribution, both in API queries and interval timestamp conversion. When Riley travels, non-ET sleeps may be attributed to the wrong calendar_date in the upsert row. The downstream ADR-0001 trigger on `start_time` corrects behavioral attributions for joins, but the raw `calendar_date` field remains wrong and could mislead direct queries. This is a known limitation documented in comments.",
+      "evidence": "`EIGHTSLEEP_TIMEZONE = os.environ.get('EIGHTSLEEP_TIMEZONE', 'America/New_York')` is used in both trend fetch params and interval conversion. Travel days will store the home TZ date, not the actual local date.",
+      "recommendation": "Consider calling the pds.tz_for_instant function for each fetch date to dynamically resolve the timezone, or derive calendar_date from the interval timestamps after localization via the user_tz_log ladder."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-007",
+      "title": "Lack of HTTP retry with backoff in Garmin, WHOOP, Eight Sleep ETLs",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "garmin_etl.py:75-92 (login retries only), whoop_etl.py:123-142 (manual 429 sleep, no 5xx retry), eight_sleep_etl.py:106-141 (no explicit retry)",
+      "description": "Transient 5xx errors or network timeouts from Garmin, WHOOP, or Eight Sleep APIs will cause the ETL to fail immediately without retry. Some libraries may have internal retries, but the WHOOP client only retries on 401 (token refresh) and 429 (rate limit), not on 500/502/503. This can cause avoidable sync failures.",
+      "evidence": "In WhoopClient._request, a 429 triggers a sleep-then-retry, but 500-599 are not handled; they raise HTTPError. Garmin's get_garmin_client has a login retry loop but all other API calls via the garminconnect library may not retry. Eight Sleep's EightSleepClient uses httpx directly without retry decorators.",
+      "recommendation": "Wrap all API calls with the shared retry_helper.retry_http, or add similar exponential backoff logic for 5xx and network errors in each ETL's client."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-008",
+      "title": "MFP import ordering guard depends on potentially inaccurate email Date header",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "myfitnesspal_email.py:128-131 (email_received_at parsing), myfitnesspal_import.py:219-235 (ordering check)",
+      "description": "The guard that prevents an older export from overwriting a newer one uses the email's Date header as the received-at time. If the email was delayed (e.g., MFP sends export email but it sits in a queue), the Date header may be hours old, causing the guard to reject the export even if it is the newest data.",
+      "evidence": "`email_received_at = parsedate_to_datetime(raw_date)` is used to compare against synced_at of existing rows. An old Date header could make the guard think the export is stale.",
+      "recommendation": "Use the IMAP internaldate (msg.get('date') is often the MDN date) or the time the email was fetched. IMAP FETCH provides an INTERNALDATE field."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-009",
+      "title": "WHOOP journal email subject matching fragility",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "whoop_journal_email.py:99-102 (find_whoop_emails), 103-110 (fallback subject check)",
+      "description": "The email search relies on a fallback FROM filter and a subject keyword check. If WHOOP changes the subject (e.g., 'Your WHOOP Data Export is Ready' vs current 'Your WHOOP Export is Ready'), the subject filter may fail, but the FROM filter catches it. However, if the email is forwarded from a personal inbox, the FROM may be masked, leaving only subject matching. The code already includes a diagnostic warning if FROM-unseen emails don't match subject, which is good, but the subject match itself is brittle.",
+      "evidence": "`find_whoop_emails` uses `'(UNSEEN SUBJECT \"WHOOP Export\")'` and checks for `'whoop' in s_lower and 'export' in s_lower`. A minor wording change could break both.",
+      "recommendation": "Broaden the subject check to `'whoop' in s_lower and ('export' in s_lower or 'data' in s_lower)`. Monitor the diagnostic warning to adjust if needed."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-010",
+      "title": "WHOOP body measurement uses write time instead of API timestamp",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "whoop_etl.py:397 (sync_body_measurement)",
+      "description": "The sync_body_measurement function sets measured_at to datetime.now(timezone.utc) instead of using a timestamp from the WHOOP API response. If the measurement was taken hours or days ago (e.g., during a backfill), this stores an incorrect timestamp, potentially misaligning the weight/height record with the true measurement date.",
+      "evidence": "`row = { 'measured_at': datetime.now(timezone.utc).isoformat(), ... }` — no attempt to extract a field like `bm.get('updated_at')` or `bm.get('created_at')`.",
+      "recommendation": "Check the API response for a timestamp field (e.g., 'updated_at', 'created_at') and use it if available. Fall back to now() only if absent."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-001",
+      "title": "Spotify ETL advances high-water mark past skipped plays",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "spotify_etl.py:461",
+      "description": "If a track fails to fetch, its corresponding play is filtered out of `safe_items` and skipped. However, the remaining `safe_items` are upserted, and the next run's high-water mark (`MAX(played_at)`) will advance past the skipped play's timestamp. The skipped play will never be retried and is permanently lost.",
+      "evidence": "In `spotify_etl.py`, `safe_items` excludes plays with missing tracks, but `upsert_plays(sb, safe_items)` still runs. The next run queries `MAX(played_at)` from the database, which will now be newer than the skipped play.",
+      "recommendation": "Do not advance the high-water mark past the first skipped play, or fail the entire batch if any track fails to fetch so the whole batch is retried on the next cron run."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-002",
+      "title": "Backfill detector misses updates because synced_at is not updated",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "hrv_backfill_check.py:53",
+      "description": "`hrv_backfill_check.py` relies on `synced_at` to detect backfills for `garmin_daily_summary`, `eight_sleep_trends`, `myfitnesspal_nutrition`, and `whoop_journal`. However, these ETLs do not include `synced_at` in their upsert payloads. Consequently, `synced_at` is only set on `INSERT` (via `DEFAULT NOW()`) and is never updated on `UPDATE`. Backfills that modify existing rows will be completely missed by the detector.",
+      "evidence": "In `garmin_etl.py`, `eight_sleep_etl.py`, etc., the `row` dict passed to `upsert_to_supabase` does not contain `synced_at`. Postgres `ON CONFLICT DO UPDATE` only updates the columns provided in the payload.",
+      "recommendation": "Explicitly include `\"synced_at\": datetime.now(timezone.utc).isoformat()` in the upsert payloads for all ETLs, or add an `ON UPDATE` trigger to the `synced_at` columns in the database schema."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-003",
+      "title": "WHOOP journal import lacks export_received_at guard",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "whoop_journal_import.py:221",
+      "description": "Unlike `myfitnesspal_import.py`, `whoop_journal_import.py` does not check an `export_received_at` timestamp before upserting. If an older export email is processed after a newer one (e.g., due to a previous transient failure or IMAP ordering), it will silently overwrite the newer data with stale answers for overlapping dates.",
+      "evidence": "`whoop_journal_email.py` calls `import_journal(csv_path)` without passing the email's `Date` header, and `import_journal` blindly upserts all rows.",
+      "recommendation": "Pass the email's `Date` header to `import_journal` and skip upserting dates where the existing row's `synced_at` is newer than the export's received time, matching the MFP implementation."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-004",
+      "title": "Journal ETL fails entire sync on single embedding error",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "journal_etl.py:276",
+      "description": "If Voyage AI embedding fails for a single batch of pages, the script returns 2 and exits immediately. None of the pages processed so far (including those that didn't need embedding) are upserted to Supabase. This blocks the entire journal sync until the embedding API recovers.",
+      "evidence": "In `journal_etl.py`, `except httpx.HTTPStatusError as e:` logs the error and calls `return 2`, bypassing the `upsert` block at the end of the script.",
+      "recommendation": "Catch the embedding error, log it, and continue to upsert the pages that succeeded or didn't require embedding. The failed pages will naturally be retried next run since their `notion_edited_at` in the DB won't have been updated."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-005",
+      "title": "Garmin ETL ignores nested RepeatGroupDTOs in workouts",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Scalability",
+        "Robustness"
+      ],
+      "file_ref": "garmin_etl.py:388",
+      "description": "`parse_interval_targets` only checks one level deep for `RepeatGroupDTO`. Garmin workouts can have nested repeats (e.g., Repeat 2x (Repeat 3x (Run, Rest))). If `sub` is another `RepeatGroupDTO`, `_maybe_capture_segment` will ignore it because its `stepType` is not in `_PACED_STEP_KINDS`, resulting in missing segment targets for nested intervals.",
+      "evidence": "The loop `for sub in step.get(\"workoutSteps\", []): _maybe_capture_segment(...)` does not recurse if `sub` is itself a `RepeatGroupDTO`.",
+      "recommendation": "Make the segment extraction recursive to handle arbitrarily nested `RepeatGroupDTO`s."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-006",
+      "title": "Journal ETL stores expiring Notion image URLs",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "journal_etl.py:128",
+      "description": "When converting Notion blocks to markdown, `_block_to_md` extracts the `url` from image blocks. For images hosted by Notion (the `file` object), these are signed S3 URLs that expire after 1 hour. Storing them directly in `content_md` means the images will be broken when viewed later in the Onyx frontend.",
+      "evidence": "`url = (img.get(\"file\") or img.get(\"external\") or {}).get(\"url\", \"\")` captures the ephemeral AWS S3 URL provided by the Notion API.",
+      "recommendation": "Download the images and upload them to Supabase Storage, replacing the URL in the markdown with the permanent Supabase URL, or have the frontend re-fetch the block dynamically."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-007",
+      "title": "WHOOP body measurement sync creates 24 identical rows per day",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Scalability",
+        "Idiomaticness"
+      ],
+      "file_ref": "whoop_etl.py:343",
+      "description": "`sync_body_measurement` uses `datetime.now(timezone.utc).isoformat()` as the `measured_at` primary key for every upsert. Since the ETL runs hourly, this creates 24 new rows per day containing the exact same height, weight, and max HR data, bloating the table unnecessarily.",
+      "evidence": "The `row` dict sets `\"measured_at\": datetime.now(timezone.utc).isoformat()`, ensuring it never conflicts with an existing row during the `upsert_to_supabase` call.",
+      "recommendation": "Use the current calendar date as the primary key (or truncate `NOW()` to the day), or query the latest row and only insert a new one if the values have actually changed."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-008",
+      "title": "Local folder watchers loop infinitely on malformed files",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "whoop_journal_watcher.py:72",
+      "description": "If `import_journal` or `run_import` raises an exception (e.g., due to a malformed CSV), the file is left in the inbox. The watcher scripts poll every 10 seconds and will repeatedly try to import the same broken file forever, spamming the logs.",
+      "evidence": "In `whoop_journal_watcher.py` and `cronometer_watcher.py`, the `except Exception:` block logs the error and returns, bypassing the `archive_file` step. The file remains in `INBOX` for the next poll.",
+      "recommendation": "Move files that fail to import to an `error/` directory, or implement a retry limit/backoff."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gpt-5",
+      "id": "F-001",
+      "title": "SpotifyClient._request issues a duplicate API call on success",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Scalability",
+        "Idiomaticness"
+      ],
+      "file_ref": "spotify_etl.py:215",
+      "description": "For non-401 responses, _request first performs a direct httpx request, then unconditionally wraps a second identical request in retry_http and returns that. This doubles all successful GETs (recently_played, track, artists), wasting rate budget and increasing 429 risk.",
+      "evidence": "spotify_etl.py: in SpotifyClient._request, resp = self.http.request(...); if 401 refresh; for all other statuses: return retry_http(lambda: self.http.request(...)). The first successful resp is discarded.",
+      "recommendation": "Refactor _request to call retry_http exactly once for non-401 paths. Pseudocode: try request via retry_http; if 401, refresh then retry once; otherwise return the first (single) successful response."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gpt-5",
+      "id": "F-002",
+      "title": "Eight Sleep calendar_date hinges on static TZ env; mis-attribution on travel",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "eight_sleep_etl.py:42; eight_sleep_etl.py:238",
+      "description": "calendar_date is derived using EIGHTSLEEP_TIMEZONE at fetch time (and passed to the API). On travel days, if the env isn’t updated, rows can be written under the wrong day. Because no authoritative event timestamp is stored in pds.eight_sleep_trends, this error can’t be deterministically corrected downstream.",
+      "evidence": "Config comment warns about TZ; parse_interval sets calendar_date = dt_utc.astimezone(ZoneInfo(EIGHTSLEEP_TIMEZONE)).date(). Primary key is (calendar_date, bed_side), so wrong keys persist.",
+      "recommendation": "Persist an event instant (e.g., presenceStart/sleepStart) and derive onyx_et_date/behavioral_date in DB via ADR-0001. Alternatively, call pds.tz_for_instant per record to compute the correct day using the user_tz_log ladder. Backfill by recomputing calendar_date from that instant."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gpt-5",
+      "id": "F-003",
+      "title": "Eight Sleep ETL lacks retry/backoff for HTTP errors",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "eight_sleep_etl.py:100-140",
+      "description": "All Eight Sleep API calls use httpx directly with raise_for_status and no retry. Transient 5xx/429/network errors will drop pages or entire day windows and mark the run partial without retrying.",
+      "evidence": "authenticate/get_me/get_device/get_trends/get_intervals call self.http.* and resp.raise_for_status(); no retry_helper used.",
+      "recommendation": "Wrap all HTTP calls in retry_helper.retry_http with 3–5 attempts and honor Retry-After on 429. Optionally add per-chunk retry in the trends loop to avoid losing a 30-day window on a single transient."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gpt-5",
+      "id": "F-004",
+      "title": "Garmin activities/laps upsert conflicts include ts; risk duplicate rows",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Idiomaticness"
+      ],
+      "file_ref": "garmin_etl.py:468; garmin_etl.py:512",
+      "description": "Upserts use ON CONFLICT (activity_id, ts) for activities and (activity_id, lap_index, ts) for laps. The natural keys are activity_id and (activity_id, lap_index). If ts changes (clock corrections, library drift), duplicates could be created.",
+      "evidence": "sync_activities upserts with on_conflict='activity_id,ts'; _sync_laps_for_activity uses 'activity_id,lap_index,ts'.",
+      "recommendation": "Change conflict keys to activity_id and (activity_id, lap_index). Ensure corresponding unique indexes exist. Keep ts as a regular column if needed for ordering."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gpt-5",
+      "id": "F-005",
+      "title": "spotify_artists table missing in schema; enrichment fails on fresh deploy",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "spotify_etl.py:640; schemas/spotify_schema.sql:1",
+      "description": "The ETL upserts to pds.spotify_artists and later updates it with MusicBrainz tags, but the provided schema bundle defines only spotify_plays and spotify_tracks. On a new environment this will 404 and degrade runs to partial/fail for enrichment.",
+      "evidence": "upsert_artists() writes to pds.spotify_artists and existing_artist_ids() queries it; schemas/spotify_schema.sql lacks a CREATE TABLE for spotify_artists.",
+      "recommendation": "Add a migration for pds.spotify_artists (artist_id PK; name; genres JSONB; popularity; followers; image_url; raw_json; fetched_at; synced_at) + RLS + indexes. Ensure CI applies it before ETL runs."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gpt-5",
+      "id": "F-006",
+      "title": "WHOOP client has no generic 5xx/network retry",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "whoop_etl.py:111-148",
+      "description": "WhoopClient._request handles 401 refresh and 429 waits, but 5xx and network errors are not retried. A transient 500 during pagination can drop a whole endpoint for the window.",
+      "evidence": "After refresh/429 handling, resp.raise_for_status() is called without retry; get_paginated relies on .get(), which will raise and be caught as an endpoint error.",
+      "recommendation": "Adopt retry_helper-style backoff for all WHOOP requests (wrap session.request in a retry loop for 5xx/RequestException). Keep the existing 401/429 special handling."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gpt-5",
+      "id": "F-007",
+      "title": "Cronometer watcher/import emits no heartbeat on no-op runs",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "cronometer_watcher.py:66-112",
+      "description": "When the inbox is empty, the watcher returns 0 and logs locally but never writes pds.sync_log. This diverges from other ETLs (IMAP, Spotify) that emit 0-record heartbeats, reducing /status visibility for the Cronometer path.",
+      "evidence": "process_inbox returns 0 without using sync_log_helper; only cronometer_import logs on actual parsed rows.",
+      "recommendation": "On each poll with no files, write a sync_log heartbeat (source='cronometer', data_type='watcher', status='success', records=0)."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gpt-5",
+      "id": "F-008",
+      "title": "Materialized view refresh likely no-op due to sb.schema('pds').rpc",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "garmin_etl.py:621; whoop_etl.py:362",
+      "description": "supabase-py’s rpc is a top-level method; calling sb.schema('pds').rpc(...).execute() probably fails or is ignored (and is warned in logs). Views won’t refresh post-run.",
+      "evidence": "Garmin/WHOOP use sb.schema('pds').rpc('refresh_materialized_views').execute(); Eight Sleep correctly calls sb.rpc('refresh_materialized_views', {}).",
+      "recommendation": "Call sb.rpc('refresh_materialized_views', {}) consistently (no schema()), and handle errors once. Optionally gate by env var to skip in CI if the function isn’t deployed."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gpt-5",
+      "id": "F-009",
+      "title": "Spotify high-water mark equal-timestamp edge case may miss plays",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "spotify_etl.py:469; spotify_etl.py:786",
+      "description": "recently_played(after=ms) is strictly greater than the provided ms. If multiple plays share the exact max played_at and a prior run partially wrote them, the remainder won’t be refetched.",
+      "evidence": "get_high_water_mark returns max(played_at) ms; next fetch uses after_ms=hwm_ms; strict > filter can skip siblings at the same millisecond.",
+      "recommendation": "Subtract 1 ms from the high-water mark (after_ms = hwm_ms - 1) or persist a tie-breaker (last (played_at, track_id)) and request a slightly earlier window."
+    },
+    {
+      "bundle": "etl",
+      "reviewer": "gpt-5",
+      "id": "F-010",
+      "title": "Upsert-counts rely on PostgREST returning representation",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Idiomaticness",
+        "Robustness"
+      ],
+      "file_ref": "cronometer_import.py:174-207; myfitnesspal_import.py:233-262",
+      "description": "Inserted/updated row counts are computed as len(result.data). If the backend or client defaults change (e.g., returning=minimal), counts log as 0 even on success.",
+      "evidence": "import_servings/import_daily and MFP importer derive counts from result.data without enforcing Prefer: return=representation.",
+      "recommendation": "Explicitly set return=representation via supabase-py (if supported), or compute counts from input batch length and response status. Alternatively, follow with a cheap count(*) range check when needed for /status."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-001",
+      "title": "Redundant indexes duplicate primary key columns",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Scalability"
+      ],
+      "file_ref": "pds.myfitnesspal_nutrition / pds.weight_log",
+      "description": "Indexes idx_mfp_nutrition_date on calendar_date and idx_weight_log_date on log_date both duplicate the leading column of the primary key, providing no query benefit and wasting write overhead.",
+      "evidence": "SCHEMA_DDL.md shows idx_mfp_nutrition_date (calendar_date) where PK is (calendar_date); idx_weight_log_date (log_date DESC) where PK is (log_date).  These were not dropped by the previous cleanup script.",
+      "recommendation": "Drop both indexes: DROP INDEX IF EXISTS pds.idx_mfp_nutrition_date; DROP INDEX IF EXISTS pds.idx_weight_log_date;"
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-002",
+      "title": "Legacy service_full_access policies target public role",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "pds.whoop_cycles, pds.whoop_sleep, pds.garmin_activities (and others)",
+      "description": "Several WHOOP and Garmin tables still have service_full_access policies defined for role public, not service_role.  This semantics grants full access to any user with the public role (including anon), which violates the intended trust boundary.",
+      "evidence": "SCHEMA_DDL.md section ‘Row‑Level Security policies’ notes: “Several … target {public} instead … granting ALL to public is semantically broader than service_role.”",
+      "recommendation": "Alter each affected policy to target service_role, e.g.: DROP POLICY service_full_access ON pds.whoop_cycles; CREATE POLICY service_full_access ON pds.whoop_cycles FOR ALL TO service_role USING (true) WITH CHECK (true);"
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-003",
+      "title": "Missing FK on hrv_model_metrics.input_data_hash → hrv_predictions.input_data_hash",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "pds.hrv_model_metrics",
+      "description": "The cross‑reference between model metrics and prediction data is solely through an application‑level hash; no FK prevents orphaned metrics rows after a prediction batch is deleted, nor does it guarantee that the hash refers to a valid row in hrv_predictions.",
+      "evidence": "SCHEMA_DDL.md lists hrv_model_metrics with an index on input_data_hash but no FK to hrv_predictions.",
+      "recommendation": "Add a foreign key: ALTER TABLE pds.hrv_model_metrics ADD CONSTRAINT fk_hrv_model_metrics_input_hash FOREIGN KEY (input_data_hash) REFERENCES pds.hrv_predictions(input_data_hash) ON UPDATE CASCADE ON DELETE CASCADE; (after verifying no orphans)."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-004",
+      "title": "Some tables lack explicit service_role policy, relying on RLS bypass",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "pds.garmin_workouts, pds.habit_metadata_history, pds.meal_events, pds.myfitnesspal_nutrition, etc.",
+      "description": "Tables like garmin_workouts, habit_metadata_history, meal_events, and myfitnesspal_nutrition have RLS enabled with an anon_read policy but no explicit service_full_access; writes succeed only because service_role has the BypassRLS attribute on Supabase.  This is inconsistent and would break in a non‑Supabase environment.",
+      "evidence": "SCHEMA_DDL.md notes ‘A few tables have RLS enabled with… no service_* policy’ and the live production state confirms these tables lack an ALL TO service_role policy.",
+      "recommendation": "Create explicit service_full_access policies for each affected table: CREATE POLICY service_full_access ON pds.<table> FOR ALL TO service_role USING (true) WITH CHECK (true);"
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-005",
+      "title": "Daily_health_matrix (legacy) should be formally deprecated",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Scalability"
+      ],
+      "file_ref": "pds.daily_health_matrix",
+      "description": "The original clock‑day matrix view still exists alongside the canonical behavioural matrix.  It confuses maintainers and consumes resources; all current consumers are on the behavioural view.",
+      "evidence": "The file sql/adr_0001_08_daily_health_matrix_behavioral.sql documents that the legacy view is frozen, and sql/daily_health_matrix.sql is still present.",
+      "recommendation": "Add a deprecation comment on the legacy view, announce a removal timeline, and eventually DROP VIEW pds.daily_health_matrix; after verifying no remaining dependencies."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-006",
+      "title": "No partitioning plan for fastest‑growing tables",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Scalability"
+      ],
+      "file_ref": "pds.hrv_predictions, pds.whoop_journal",
+      "description": "hrv_predictions grows ≈36 rows/day and will double in 9 months; whoop_journal is already 12K rows.  Without partitioning, maintenance operations and some query plans will gradually degrade.",
+      "evidence": "Table sizes from CONTEXT.md and SCHEMA_DDL.md; no partition declaration exists in the schema.",
+      "recommendation": "Implement range partitioning on prediction_date for hrv_predictions (monthly) and on cycle_date for whoop_journal in the next maintenance window."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-007",
+      "title": "ADR‑0001 trigger functions nearly identical, leading to maintenance drift",
+      "severity": "P3",
+      "effort": "M",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "sql/adr_0001_02_whoop_onyx_dates.sql, sql/adr_0001_03_garmin_onyx_dates.sql, sql/adr_0001_04_other_onyx_dates.sql",
+      "description": "Eleven BEFORE trigger functions exist (set_onyx_dates_whoop_cycles, set_onyx_dates_garmin_activities, etc.) that all call derive_onyx_dates with slightly different parameters.  Future changes to the derivation logic must be replicated across all of them, risking inconsistent behaviour.",
+      "evidence": "The files listed contain near‑identical trigger body patterns; the set of tables affected is enumerated in sql/adr_0001_04_other_onyx_dates.sql (lines 1–8).",
+      "recommendation": "Consolidate into a single generic trigger function that uses TG_TABLE_NAME and a mapping source_field → column name; register it on each table via a loop in a migration script.  This reduces the risk of drift."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-008",
+      "title": "JSONB in meal_events and supplement_intake views forces repeated casting",
+      "severity": "P3",
+      "effort": "M",
+      "dimensions": [
+        "Scalability"
+      ],
+      "file_ref": "pds.supplement_intake_by_compound, pds.daily_supplement_matrix",
+      "description": "The supplement_intake_by_compound view repeatedly casts JSONB fields to numeric and filters on regex matches; while correct, these operations add per‑query overhead.  As supplement data grows, materialising a derived table or adding CHECK constraints on underlying JSONB might be beneficial.",
+      "evidence": "supplement_schema.sql lines 105‑115 perform casts and regex checks; no index can assist the inline filtering inside the view.",
+      "recommendation": "Consider creating a materialised view for the most common compound rollups, refreshing it after supplement data changes; alternatively, promote highly‑filtered fields (quantity, unit) to typed columns in a new intake_detail table."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-001",
+      "title": "Missing composite index for hrv_predictions_latest tiebreak",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Scalability",
+        "Correctness"
+      ],
+      "file_ref": "pds.hrv_predictions",
+      "description": "The `hrv_predictions_latest` view relies on a complex `DISTINCT ON` with a `CASE` statement tiebreak. The supporting index `idx_hrv_predictions_tiebreak` defined in the SQL files is missing in production, causing full table sorts on the fastest-growing table.",
+      "evidence": "`sql/hrv_predictions_latest.sql` defines `idx_hrv_predictions_tiebreak`, but `SCHEMA_DDL.md` shows it is absent from `pds.hrv_predictions`.",
+      "recommendation": "Execute the `CREATE INDEX idx_hrv_predictions_tiebreak` statement from `sql/hrv_predictions_latest.sql` in production."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-002",
+      "title": "RLS service policies target public role instead of service_role",
+      "severity": "P0",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "SCHEMA_DDL.md",
+      "description": "Several tables (e.g., `whoop_cycles`, `garmin_*`) have `service_full_access` policies that grant `ALL` to the `{public}` role. This technically allows the `anon` role to write data if they bypass the frontend.",
+      "evidence": "SCHEMA_DDL.md notes: 'Several (whoop_cycles, whoop_recovery... garmin_*) target {public} instead.'",
+      "recommendation": "Run `DROP POLICY` and recreate these policies to explicitly target `TO service_role` as defined in `sql/rls_policies.sql`."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-003",
+      "title": "Missing foreign key for habit_journal.question",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "pds.habit_journal",
+      "description": "The foreign key linking `habit_journal.question` to `habit_name_map.habit_name` is missing in production, allowing Notion renames or typos to silently orphan journal entries.",
+      "evidence": "`sql/audit_re_2026_05_26_habit_journal_question_fk.sql` exists in the repo, but `SCHEMA_DDL.md` explicitly lists this FK as 'Notably absent'.",
+      "recommendation": "Apply `sql/audit_re_2026_05_26_habit_journal_question_fk.sql` to production to enforce `ON UPDATE CASCADE ON DELETE RESTRICT`."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-004",
+      "title": "Production behavioral matrix view uses inline LATERALs instead of helper views",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "pds.daily_health_matrix_behavioral",
+      "description": "The intended DDL refactored the 135-column behavioral matrix to use helper views (e.g., `garmin_sleep_best_per_behavioral_date`) to remove repeated `LATERAL+LIMIT 1` blocks. These helper views are missing in production.",
+      "evidence": "`SCHEMA_DDL.md` lists 14 views, none of which are the helper views defined in `sql/adr_0001_08_daily_health_matrix_behavioral.sql`.",
+      "recommendation": "Apply `sql/adr_0001_08_daily_health_matrix_behavioral.sql` to create the helper views and update the main view definition."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-005",
+      "title": "Legacy daily_health_matrix view is a drift liability",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "pds.daily_health_matrix",
+      "description": "Maintaining two parallel 130+ column matrix views guarantees drift. For example, Cronometer data was added to the behavioral view but not the legacy view, meaning consumers of the legacy view will silently miss nutrition data post-cutover.",
+      "evidence": "`sql/cronometer_matrix_view.sql` notes: 'the legacy pds.daily_health_matrix... is intentionally left unchanged'.",
+      "recommendation": "Deprecate `pds.daily_health_matrix`, migrate remaining consumers (like MFP energy-balance and /status) to the behavioral view, and drop the legacy view."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-006",
+      "title": "Redundant single-column indexes duplicate primary keys",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Idiomaticness",
+        "Scalability"
+      ],
+      "file_ref": "pds.myfitnesspal_nutrition",
+      "description": "Tables like `myfitnesspal_nutrition` and `weight_log` have single-column indexes on their primary key columns. Postgres automatically creates a B-tree index for primary keys, making these explicit indexes redundant write overhead.",
+      "evidence": "`SCHEMA_DDL.md` shows `pds.myfitnesspal_nutrition` has `PK (calendar_date)` and `idx (calendar_date)`. `pds.weight_log` has `PK (log_date)` and `idx (log_date DESC)`.",
+      "recommendation": "Drop `idx_mfp_nutrition_date` and `idx_weight_log_date`."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-007",
+      "title": "Missing explicit service_role RLS policies on multiple tables",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "SCHEMA_DDL.md",
+      "description": "Several tables have `anon_read` policies but no explicit `service_full_access` policy, relying entirely on Supabase's `service_role` bypass-RLS privilege. This breaks portability and schema consistency.",
+      "evidence": "`SCHEMA_DDL.md` notes `garmin_workouts`, `journal_entries`, `spotify_*`, and others lack a `service_*` policy.",
+      "recommendation": "Create explicit `service_full_access` policies for these tables targeting `service_role` to match the rest of the schema."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-001",
+      "title": "Pre-lockdown RLS allowed habit writes via authenticated role",
+      "severity": "P0",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Idiomaticness"
+      ],
+      "file_ref": "sql/security_lockdown_2026_06_06.sql",
+      "description": "Before the lockdown migration, habit_journal and habit_name_map had FOR ALL policies to authenticated plus table-level write grants, enabling public-key writes. This is a direct integrity and security risk if not already applied in prod.",
+      "evidence": "sql/security_lockdown_2026_06_06.sql comments: 'habit_journal / habit_name_map had ... FOR ALL to authenticated + anon/authenticated table-level write grants, so the public key could INSERT/UPDATE/DELETE...'.",
+      "recommendation": "Ensure the lockdown migration is applied: scope service_full_access to service_role only and revoke anon/authenticated writes on both tables as in sql/security_lockdown_2026_06_06.sql."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-002",
+      "title": "Missing FK: habit_journal.question → habit_name_map.habit_name (prod)",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "SCHEMA_DDL.md — Referential integrity; sql/audit_re_2026_05_26_habit_journal_question_fk.sql",
+      "description": "Production snapshot lists only six FKs and explicitly calls out this relationship as absent; the migration to add the FK exists but appears not applied. Without the FK, typos/renames can orphan rows.",
+      "evidence": "SCHEMA_DDL.md: 'Notably absent foreign keys — habit_journal.question ↔ habit_name_map.name'; migration present in sql/audit_re_2026_05_26_habit_journal_question_fk.sql.",
+      "recommendation": "Apply sql/audit_re_2026_05_26_habit_journal_question_fk.sql (adds UNIQUE on habit_name and FK with ON UPDATE CASCADE, ON DELETE RESTRICT). Validate no orphans exist first."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-003",
+      "title": "Cronometer tables lack set_onyx_dates triggers",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": [
+        "Correctness",
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "cronometer_schema.sql",
+      "description": "New Cronometer tables define onyx_* columns but no BEFORE triggers to populate them, diverging from ADR-0001’s trigger-enforced invariant and risking drift if ETL forgets to set them.",
+      "evidence": "cronometer_schema.sql creates onyx_* columns and indexes but no pds.set_onyx_dates_* triggers; SCHEMA_DDL lists 11 set_onyx_dates triggers for other sources, not Cronometer.",
+      "recommendation": "Add BEFORE INSERT/UPDATE triggers: for daily, set all onyx_* = calendar_date; for servings, call derive_onyx_dates(event_time) when present else default to calendar_date with explicit tz_source."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-004",
+      "title": "Inconsistent RLS: service_full_access granted TO public on some tables",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Idiomaticness"
+      ],
+      "file_ref": "SCHEMA_DDL.md — Row-Level Security policies",
+      "description": "Several service_full_access policies target the public role instead of service_role, widening the trust boundary and creating future risk if table grants change.",
+      "evidence": "SCHEMA_DDL.md: 'Several (whoop_*, garmin_*, sync_log) target {public} instead [of] {service_role}'.",
+      "recommendation": "Normalize to service_role-only per sql/rls_policies.sql; drop any public-targeted write policies."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-005",
+      "title": "Redundant single-column indexes that duplicate PKs",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Scalability",
+        "Idiomaticness"
+      ],
+      "file_ref": "SCHEMA_DDL.md (myfitnesspal_nutrition, weight_log, whoop_journal)",
+      "description": "Indexes like idx_mfp_nutrition_date, idx_weight_log_date, and whoop_journal(cycle_date) duplicate the PK’s leading column and add maintenance/plan noise.",
+      "evidence": "SCHEMA_DDL.md flags 'duplicate?' next to these indexes.",
+      "recommendation": "Drop the redundant indexes; keep only the PK or a truly different composite/partial index. Use sql/audit_re_2026_05_26_drop_redundant_indexes.sql as a pattern."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-006",
+      "title": "garmin_activity_laps has redundant (activity_id, lap_index) index",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Scalability",
+        "Idiomaticness"
+      ],
+      "file_ref": "SCHEMA_DDL.md — pds.garmin_activity_laps",
+      "description": "A separate index on (activity_id, lap_index) duplicates the leftmost prefix of the UNIQUE (activity_id, lap_index, ts) index and is likely unnecessary.",
+      "evidence": "SCHEMA_DDL.md shows UNIQUE(activity_id, lap_index, ts) and a separate idx(activity_id, lap_index).",
+      "recommendation": "Drop the two-column index unless you can show a measurable plan benefit; the UNIQUE index supports scans on the leftmost prefix."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-007",
+      "title": "Behavioral-spine view still unions garmin_daily_summary.calendar_date",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "sql/daily_health_matrix_behavioral_main_session.sql",
+      "description": "The behavioral matrix spine unions GDS calendar_date (watch-local), which can diverge from onyx_behavioral_date on travel days. A comment notes a pending removal, but prod state suggests it’s still included.",
+      "evidence": "sql/daily_health_matrix_behavioral_main_session.sql NOTE: migration to remove GDS from UNION is pending; current UNION includes garmin_daily_summary.calendar_date.",
+      "recommendation": "Remove garmin_daily_summary from the UNION and regenerate the spine from behavioral onyx_* dates only; backfill any gaps via other sources."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-008",
+      "title": "Missing/uncertain HRV tiebreak index may force full scans",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Scalability",
+        "Correctness"
+      ],
+      "file_ref": "SCHEMA_DDL.md — pds.hrv_predictions; sql/hrv_predictions_latest.sql",
+      "description": "The view orders by a CASE tiebreak; production index list only shows idx(input_data_hash). Without idx_hrv_predictions_tiebreak, DISTINCT ON queries may scan/sort the whole table.",
+      "evidence": "SCHEMA_DDL.md index list omits the composite tiebreak index; sql/hrv_predictions_latest.sql creates it explicitly.",
+      "recommendation": "Ensure sql/hrv_predictions_latest.sql has been applied and idx_hrv_predictions_tiebreak exists; ANALYZE the table after creation."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-009",
+      "title": "Hot-path partial/composite indexes not present in prod snapshot",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Scalability"
+      ],
+      "file_ref": "sql/audit_re_2026_05_26_covering_partial_indexes.sql",
+      "description": "Indexes tailored to frequent filters (WHOOP score_state='SCORED', non-nap sleep, Garmin sleep best-of-day, Spotify featurized-join) aren’t listed in production.",
+      "evidence": "SCHEMA_DDL.md index inventory lacks idx_whoop_recovery_cycle_scored, idx_whoop_sleep_cycle_scored_main, idx_garmin_sleep_behavioral_score, idx_spotify_tracks_featurized.",
+      "recommendation": "Apply sql/audit_re_2026_05_26_covering_partial_indexes.sql to tighten join and aggregate performance."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-010",
+      "title": "Duplication in 11+ set_onyx_dates triggers invites drift",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "SCHEMA_DDL.md — Functions and triggers",
+      "description": "Each source table has a bespoke trigger function that mirrors the same ladder; fixes must be repeated across many functions, risking skew over time.",
+      "evidence": "SCHEMA_DDL.md: '11 of these' set_onyx_dates_* functions; ADR-0001 edits had to be repeated.",
+      "recommendation": "Refactor to a single generic trigger function with TG_ARGs (instant column, provenance) or a small set of shared helpers to centralize logic and reduce maintenance."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-011",
+      "title": "Legacy daily_health_matrix likely ready for deprecation",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "sql/daily_health_matrix.sql; SCHEMA_DDL.md — Views",
+      "description": "Two parallel matrix views increase maintenance surface and confusion; the behavioral one is canonical and already powers downstream methods.",
+      "evidence": "CONTEXT.md: legacy retained for migration; SCHEMA_DDL.md lists both; behavioral view has helper refactors and richer semantics.",
+      "recommendation": "Migrate remaining consumers and deprecate/drop the legacy view; keep a frozen snapshot if historical A/B comparisons are still needed."
+    },
+    {
+      "bundle": "schema",
+      "reviewer": "gpt-5",
+      "id": "F-012",
+      "title": "Several tables lack explicit service_role write policies in prod",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "SCHEMA_DDL.md — Row-Level Security policies",
+      "description": "Production notes tables with only anon_read and no service policy, relying on service-role bypass. This is brittle and non-idiomatic.",
+      "evidence": "SCHEMA_DDL.md: 'A few tables have RLS enabled with anon_read but no service_* policy... rely on the service-role’s bypass-RLS privilege.'",
+      "recommendation": "Apply sql/rls_policies.sql to add explicit FOR ALL TO service_role policies consistently across all writeable tables."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-001",
+      "title": "AIPW FDR p‑values rely on IF‑based SE that may be too narrow",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "causal_inference.py:600-615",
+      "description": "BH‑FDR p‑values are computed as 2*(1‑Φ(|ATE|/SE_if)), but the IF‑based SE assumes i.i.d. influence values.  HRV autocorrelation can shrink this SE, producing artificially low p‑values.  The block‑bootstrap CI, reported in the same function, often shows wider CIs, indicating the IF SE is underestimated.",
+      "evidence": "z = abs(float(ate) / float(se)); p_raws.append(2.0 * (1.0 - norm.cdf(z))).  The accompanying block‑bootstrap CI (ci_low_bb / ci_high_bb) is not used for inference.",
+      "recommendation": "Use the block‑bootstrap distribution to compute p‑values (e.g., percentiles of the bootstrap ATE distribution) or employ a Newey‑West type correction on the influence function before computing the SE used for FDR."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-002",
+      "title": "Median‑split continuous treatments discard dose‑response information",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "causal_inference.py:182-265",
+      "description": "All continuous treatments are dichotomised at the personal median, reducing power and changing the estimand from a dose‑response to an 'above‑median' contrast.  The resulting ATEs are not directly comparable to the binary treatments and may obscure genuine dose‑dependent effects.",
+      "evidence": "T = (sub[spec.name] > med).astype(int).values",
+      "recommendation": "Implement a continuous doubly‑robust estimator (e.g., AIPW with a linear outcome model) to retain the full continuous scale, and report the average derivative effect per unit of the treatment."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-003",
+      "title": "SARIMAX walk‑forward reuses full‑sample fitted parameters, risking optimistic forecast intervals",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "hrv_analysis.py:2700-2720",
+      "description": "During the SARIMAX 7‑step ahead walk‑forward, each retrained model is initialised with `fit.params` from the full‑sample fit.  This transfers variance estimates that are not recalibrated from the smaller training windows, potentially making forecast intervals too narrow at longer horizons.",
+      "evidence": "m_step = SARIMAX(...); f_step = m_step.filter(fit.params)",
+      "recommendation": "Re‑estimate the model from scratch on each training window (without filtering previous parameters) or at least recompute the covariance matrix for the forecast intervals."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-004",
+      "title": "Continuous treatment E‑value uses approximate d→RR transformation",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "causal_inference.py:370-380",
+      "description": "The E‑value relies on Cohen's d → RR ≈ exp(0.91·d) (Chinn 2000).  This approximation is intended for binary outcomes and may introduce bias when applied to a continuous outcome like HRV, especially for small effect sizes.",
+      "evidence": "rr = np.exp(0.91 * d)",
+      "recommendation": "Document the approximation more prominently and consider a sensitivity analysis that directly uses the continuous‑outcome guidelines from VanderWeele & Ding (2017) Appendix."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-001",
+      "title": "Granger causality applied to non-contiguous time series",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "hrv_analysis.py:1946",
+      "description": "The `grangercausalitytests` function is applied to a DataFrame where rows with NaNs have been dropped. This creates a non-contiguous time series where AR lags align incorrect calendar days, invalidating the F-test.",
+      "evidence": "`sub = hrv_valid[[STAT_TARGET, feat]].dropna()` removes missing days. The resulting `sub` is passed to `grangercausalitytests(sub[[STAT_TARGET, feat]], maxlag=3)`. If day 3 is missing, lag 1 for day 4 will incorrectly be day 2.",
+      "recommendation": "Reindex the series to a daily frequency (`asfreq('D')`) and impute missing values before running the test, or skip Granger causality if contiguous missingness is too high."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-002",
+      "title": "PSM bootstrap ignores matching uncertainty",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "causal_inference.py:321-325",
+      "description": "The bootstrap for Propensity Score Matching only resamples the final `matched_diffs` array. It does not re-estimate the propensity score or re-perform the nearest-neighbor matching on each bootstrap sample, leading to artificially narrow confidence intervals.",
+      "evidence": "`sample = RNG.choice(matched_diffs, size=n, replace=True)` is inside the bootstrap loop, but `_fit_propensity` and the nearest-neighbor matching logic are outside.",
+      "recommendation": "Move the propensity model fitting and the nearest-neighbor matching steps inside the `for _ in range(n_boot):` loop to properly capture the variance of the entire matching process."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-003",
+      "title": "Mediator adjustment bias for rolling treatments",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "causal_inference.py:485-491",
+      "description": "`COMMON_CONFOUNDERS` includes `hrv_lag1` (HRV on night N-1). For treatments that aggregate past days (e.g., `rolling_7d_training_load`), `hrv_lag1` acts as a mediator for the earlier days in the window, inducing bias when conditioned on.",
+      "evidence": "`rolling_7d_training_load` is a continuous treatment. `_confounders_for` assigns `COMMON_CONFOUNDERS` to it, which includes `hrv_lag1`. Training load on day N-2 affects HRV on night N-1, making `hrv_lag1` a mediator.",
+      "recommendation": "Dynamically exclude `hrv_lag1` and other intermediate variables from the confounder set when the treatment is a multi-day rolling aggregate."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-004",
+      "title": "Walk-forward backtest unnecessarily drops 28 days of training data",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Scalability"
+      ],
+      "file_ref": "hrv_analysis.py:2585-2586",
+      "description": "`GAP_DAYS = 28` creates a 28-day gap between the training and test sets to prevent leakage from 28-day rolling features. However, rolling features only look backward and do not leak future targets, so this gap unnecessarily discards valid training data.",
+      "evidence": "`test_start = start + GAP_DAYS` skips 28 days. The comment claims \"the first ~21 test rows still overlapped the train tail via the 28d windows\", which misunderstands rolling windows. Using past targets to compute features for the test set is not target leakage.",
+      "recommendation": "Set `GAP_DAYS = 0`. To prevent target leakage for `h > 1`, set the training end index to `test_start - h + 1` so the latest training target is fully observed before the test prediction date."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gpt-5",
+      "id": "F-001",
+      "title": "SARIMAX exog backfill leaks future info into training and holdout",
+      "severity": "P0",
+      "effort": "M",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "hrv_analysis.py:2425-2450",
+      "description": "Exogenous regressors are built with ffill().bfill() over the full series before the train/test split, then shifted. Backward-filling uses future values to impute earlier rows, leaking information into both model fitting and the walk-forward evaluation.",
+      "evidence": "original_exog = (hrv_valid[exog_feats].copy().ffill().bfill().asfreq('D')); exog = original_exog.shift(1).ffill().bfill()",
+      "recommendation": "Drop bfill; construct exog with ffill only and perform filling on the training slice per split. For holdout/backtest, impute using last-known historical exog (as already done for forecast steps), not future rows."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gpt-5",
+      "id": "F-002",
+      "title": "Backtest PIs use σ estimated from full-series OOF, not fold-local",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "hrv_analysis.py:2125-2160",
+      "description": "In run_evaluation, pred_std_by_horizon is estimated via TimeSeriesSplit OOF over the full series and then reused in every fold, giving PI widths that benefit from information not available at the time each expanding-window model was fit.",
+      "evidence": "for _h in HORIZONS: _, _, X_h_full, y_h_full = prepare_ml_data(df, horizon=_h); TimeSeriesSplit on X_h_full → pred_std_by_horizon[_h]; reused in all folds.",
+      "recommendation": "Within each expanding-window fold, estimate σ via OOF residuals on the training slice only, and use that fold-local σ for that fold’s PIs and coverage."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gpt-5",
+      "id": "F-003",
+      "title": "Causal BH-FDR uses IF-Wald p-values that assume i.i.d.",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "causal_inference.py:644-690",
+      "description": "The FDR screen is based on AIPW |ate/se_if| normal p-values even though HRV exhibits autocorrelation; while block-bootstrap CIs are computed, their information is not used in the p-values, making BH-FDR anti-conservative when temporal dependence inflates variance.",
+      "evidence": "p_raw = 2*(1 - norm.cdf(|ate/se_if|)); block-bootstrap CI is computed earlier but not used in p-value calculation or FDR gating.",
+      "recommendation": "Derive p-values from a block-bootstrap test (e.g., percentile or studentized) and use those in BH-FDR; at minimum, suppress passes_fdr when bb_width_ratio >> 1 or fold_failures are high."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gpt-5",
+      "id": "F-004",
+      "title": "Day-of-week encoded as ordinal in causal confounders",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "causal_inference.py:36-62",
+      "description": "Using an integer 0–6 for day_of_week assumes a linear effect across weekdays in both the propensity and outcome models, which is misspecified for cyclic/categorical structure and can bias adjustment.",
+      "evidence": "COMMON_CONFOUNDERS includes 'day_of_week', 'is_weekend'; no one-hot or cyclic sin/cos expansion before LogisticRegression/Ridge.",
+      "recommendation": "One-hot encode weekdays or use sin/cos cyclic terms for day-of-week in the causal layer before fitting PS and outcome models."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gpt-5",
+      "id": "F-005",
+      "title": "PSM bootstrap ignores temporal dependence",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "causal_inference.py:184-243",
+      "description": "The ATT CI is computed via i.i.d. resampling of matched_diffs; for a daily time series this underestimates uncertainty when residuals are autocorrelated.",
+      "evidence": "for _ in range(n_boot): sample = RNG.choice(matched_diffs, size=n, replace=True) → CI from percentiles of i.i.d. resamples.",
+      "recommendation": "Use block bootstrap on matched pairs (e.g., 7-day blocks over calendar order) to form CIs, in line with the AIPW block-bootstrap approach."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gpt-5",
+      "id": "F-006",
+      "title": "Top-20 correlation heatmap not filtered by BH-FDR",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "hrv_analysis.py:1470-1495",
+      "description": "The visualization selects the top 20 by |r| regardless of whether those correlations survive BH-FDR, potentially highlighting noise as signal.",
+      "evidence": "top20 = corr_df.head(20); no filter on corr_df['passes_fdr'] before plotting the heatmap.",
+      "recommendation": "Limit the heatmap to FDR survivors (or visually flag non-survivors) to avoid overstating spurious associations."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gpt-5",
+      "id": "F-007",
+      "title": "Causal confounder ffill window is hard-coded and short",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "causal_inference.py:510-548",
+      "description": "Confounders are forward-filled with limit=2 before dropna; early tracking gaps can force disproportionate row loss or brittle fills that vary by feature sparsity.",
+      "evidence": "sub[list(confounders)] = sub[list(confounders)].ffill(limit=2); meta tracks substantial row loss when confounders are sparse.",
+      "recommendation": "Make ffill horizon configurable per confounder (e.g., 7 days for weekly aggregates), and prefer explicit missingness handling to avoid silent bias from overly short fills."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gpt-5",
+      "id": "F-008",
+      "title": "Backtest DM variance uses fixed 7-lag kernel across all series",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "hrv_analysis.py:2205-2255",
+      "description": "The Newey–West long-run variance uses a triangular kernel with fixed max lag=7 for all comparisons; if loss-differential autocorrelation extends beyond a week, test size can be mis-calibrated.",
+      "evidence": "for k in range(1, min(7, n_d - 1)): long_run += 2*(1 - k/7)*cov_k",
+      "recommendation": "Select the NW lag data-dependently (e.g., floor(4(n/100)^(2/9))) or test several lags and report sensitivity; alternatively use a package implementation."
+    },
+    {
+      "bundle": "stats",
+      "reviewer": "gpt-5",
+      "id": "F-009",
+      "title": "Prophet/SARIMAX feature selection may still admit mediator-like signals",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "hrv_analysis.py:2330-2360",
+      "description": "Exogenous features are drawn from SHAP top features plus category seeds; while TARGET itself is excluded, some same-night sleep composites can slip in if not carefully filtered, risking over-attribution in interpretive plots (though exog is shifted by 1 for alignment).",
+      "evidence": "top_features composed from SHAP plus seeds; SARIMAX exog excludes TARGET but not necessarily all mediator composites unless absent/sparse.",
+      "recommendation": "Explicitly exclude same-night sleep/recovery composites from exog/regressor candidate lists (keep only day-N features that are truly pre-treatment for HRV(N+1))."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-001",
+      "title": "cycle_offset_for_instant can return a nap on transition days, picking wrong TZ",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "sql/adr_0001_01_user_tz_log.sql: cycle_offset_for_instant function",
+      "description": "When an event occurs during the day on a transition day, the nearest cycle within ±6h might be a short nap that still carries the old timezone_offset, not the main night sleep that has the new zone. This can silently attribute the event to the wrong TZ, causing incorrect behavioral and local dates.",
+      "evidence": "The function orders by in_window DESC, dist_sec ASC, effectively picking the nearest cycle. A 20-minute nap starting at 14:00 with offset -05:00 (old TZ) will be chosen over a main cycle starting at 23:00 with offset -08:00 (new TZ) if the event is at 15:00.",
+      "recommendation": "Modify the ordering to first prefer cycles within a 24-hour window of the same onyx_behavioral_date (using longest cycle as tiebreak), then fall back to nearest. Alternatively, restrict the search to cycles whose end_time–start_time exceed a minimum threshold to filter out naps."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-002",
+      "title": "derive_onyx_dates does not prefer the longest cycle for tier-2 anchor",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "sql/adr_0001_01_user_tz_log.sql: pds.cycle_offset_for_instant called by pds.derive_onyx_dates",
+      "description": "When no source offset is given, derive_onyx_dates falls back to cycle_offset_for_instant, which can select a nap instead of the main sleep cycle. This may confuse behavioral date attribution for events inserted after the nap but before the main sleep, especially on travel days.",
+      "evidence": "Lines 173-186 in the function: IF cycle_offset_text IS NOT NULL THEN uses cycle_offset_for_instant without any preference for the longest cycle. The cycle_offset_for_instant function itself (as described in F-001) can return a nap.",
+      "recommendation": "Either wrap the call with a preference for the longest cycle of the day (matching whoop_journal’s approach) or change cycle_offset_for_instant to filter out cycles where duration < a minimum (e.g., 2 hours) before considering them."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-003",
+      "title": "garmin_hrv fallback uses noon-ET instant, may misattribute behavioral date",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql: set_onyx_dates_garmin_hrv ELSE branch",
+      "description": "When start_timestamp is NULL, the trigger synthesizes an instant at noon ET on the calendar_date. For travel days, this midpoint is in the user's local afternoon/evening, so the -6h rule pushes behavioral_date to same day, but the HRV reading is actually from the previous night. For example, a bed at 22:00 PT on May 19 would yield a calendar_date of May 20 (Garmin watch local). Using noon ET on May 20 and applying PT -6h gives May 20 behavioral, when the correct behavioral date is May 19.",
+      "evidence": "Lines: SELECT * INTO d FROM pds.derive_onyx_dates( (NEW.calendar_date + INTERVAL '12 hours') AT TIME ZONE 'America/New_York', NULL, 'garmin_calendar_date' ); The resulting behavioral_date can be off by one day.",
+      "recommendation": "If the garmin_sleep table is available, join to get the actual sleep_start instant for that night and use it instead of the synthesized noon. Fall back to noon only when no sleep data exists. This would fix the attribution for the majority of nights."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-004",
+      "title": "Date-only triggers use a single noon-ET probe, can miss same‐day TZ changes",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "sql/adr_0001_04_other_onyx_dates.sql: habit_journal & whoop_journal fallback",
+      "description": "Both habit_journal and whoop_journal (when no cycle matches) compute noon_et on the given date and look up user_tz_log where effective_from <= noon_et. If a TZ change (e.g., a flight landing) occurs at 15:00 local on that same day, the noon probe will still return the old TZ. The habit/journal entries for that day would be labeled with the wrong local_date.",
+      "evidence": "noon_et := (NEW.cycle_date::timestamp + INTERVAL '12 hours') AT TIME ZONE 'America/New_York'; SELECT tz … WHERE effective_from <= noon_et. This ignores any log row that starts later on the same calendar date.",
+      "recommendation": "If the source table had an actual instant (e.g., a tap timestamp), use it directly. Otherwise, consider probing at both start and end of the day (e.g., noon and 23:59:59 ET) and pick the most recent effective_from; or mark the date as ambiguous when multiple log rows exist on that day."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-005",
+      "title": "Whoop journal behavioral_date double-assignment can hide a derivation mismatch",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "sql/adr_0001_04_other_onyx_dates.sql: set_onyx_dates_whoop_journal",
+      "description": "The trigger sets NEW.onyx_behavioral_date := COALESCE(NEW.behaviors_date, d.onyx_behavioral_date). Both values are computed from the same cycle offset, so they will always be identical. This coalesce gives a false sense of alternative source; if behaviors_date later diverges due to a logic change, it could silently replace the derived value without audit.",
+      "evidence": "Lines: SELECT (((c.start_time AT TIME ZONE 'UTC') + (c.timezone_offset)::interval - INTERVAL '6 hours'))::date INTO NEW.behaviors_date … ; later NEW.onyx_behavioral_date := COALESCE(NEW.behaviors_date, d.onyx_behavioral_date).",
+      "recommendation": "Since behaviors_date is always set in the same function, remove the COALESCE and assign directly from behaviors_date, or keep it but add a check/warning if they ever differ (impossible currently). This cleans up the intent."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-006",
+      "title": "Same-offset GPS proposals may still insert ‘noise’ entries when IANA name differs but offset is identical",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "gps_tz_backfill.py: same-offset filter uses offset equality at the instant",
+      "description": "The script skips proposals when inferred TZ yields the same UTC offset as the logged TZ at the activity instant. However, if the logged TZ is a generic ‘America/New_York’ and the inferred TZ is ‘America/Toronto’, the offset will be equal, so the proposal is skipped. This is correct for now, but if a manual entry later changes the logged TZ to ‘America/Toronto’ (same offset), the same-offset check could inadvertently prevent a needed entry on a trip where the IANA name matters (though for behavioral attribution it doesn’t). No immediate harm.",
+      "evidence": "Code: off_inf = ts_aware.astimezone(ZoneInfo(inferred)).utcoffset(); off_log = ts_aware.astimezone(ZoneInfo(log_says)).utcoffset(); if off_inf == off_log: continue.",
+      "recommendation": "No fix needed; current behaviour avoids clutter. For full compliance, you could allow the proposal but mark it as soft. The current same-offset filter is intentional and documented."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-007",
+      "title": "User_tz_log_et provenance label not recognized elsewhere",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Consistency"
+      ],
+      "file_ref": "sql/adr_0001_04_other_onyx_dates.sql: habit_journal and whoop_journal fallback",
+      "description": "When the log_tz is 'America/New_York', the triggers set onyx_tz_source = 'user_tz_log_et'. This is a new provenance value not listed in ADR-0001's D6 enum (which only lists source_field, cycle_anchor, user_tz_log, gps_inferred, default_et_fallback). Dashboards filtering on 'user_tz_log' would miss these rows.",
+      "evidence": "NEW.onyx_tz_source := 'user_tz_log_et'; in both habit_journal and whoop_journal ELSE IF branches.",
+      "recommendation": "Either update the ADR to include this value, or map it to 'user_tz_log' with a note that the TZ is explicitly ET (the log confirmed it). The latter is simpler and keeps the enum closed."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-008",
+      "title": "interval_to_tzd may round sub-minute offsets up, but Postgres intervals from wall-clock subtraction are already minute-aligned",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql: interval_to_tzd function",
+      "description": "The function uses ROUND(EXTRACT(EPOCH FROM diff)::numeric / 60.0)::int to avoid truncation. This is defensive, but Garmin’s start_time_local and start_time_gmt are timestamptz values with second precision, so the difference is already an integer number of seconds, and division by 60 yields an integer. Rounding is harmless but unnecessary and could mask a real sub-minute offset that shouldn’t exist.",
+      "evidence": "total_min := ROUND(EXTRACT(EPOCH FROM diff)::numeric / 60.0)::int;",
+      "recommendation": "Change to a simple FLOOR or ::int after ensuring the diff is an exact number of seconds; or keep the round but add a comment that it’s purely defensive."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-009",
+      "title": "Transition day flag trigger may miss update of next cycle on a DST-shift insert",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "sql/adr_0001_05_transition_day_flag.sql: refresh_next_transition_day trigger",
+      "description": "The AFTER trigger refreshes the immediately following cycle’s transition flag. If a cycle is inserted that straddles a DST transition and its offset differs from both the preceding and following cycles, the next cycle’s flag will be updated. However, if the insert causes a chain where the next cycle’s flag changes, the propagation stops there (pg_trigger_depth check). If the next after that also should change, it won’t. In practice, cycles are chronological, so the true cascade is one hop; but if out-of-order inserts occur repeatedly, it could leave stale flags.",
+      "evidence": "Trigger uses pg_trigger_depth() > 1 to stop recursion. The update to the next cycle fires its BEFORE trigger, which recalculates its own flag based on preceding cycle (the newly inserted one). That’s correct. If the flag of that next cycle changes and it has a next cycle that was previously a transition, it would not be updated because the AFTER trigger does not fire again (depth >1).",
+      "recommendation": "If backfill is complete and inserts are chronological, this is not a problem. For extra safety, run the window-function backfill after any batch of out-of-order inserts."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-010",
+      "title": "tz_log_gaps view uses ROUND on EPOCH which is redundant for standard offsets",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Consistency"
+      ],
+      "file_ref": "sql/adr_0001_06_tz_log_gaps_view.sql: offset-minute calculations",
+      "description": "The view computes log_offset_minutes with ROUND(…::numeric / 60.0)::int, but the extracted epoch from a timestamptz difference is an integer number of seconds for any real IANA offset, so division by 60 yields an integer after rounding. It works but adds unnecessary complexity.",
+      "evidence": "Multiple lines like ROUND(EXTRACT(EPOCH FROM …)::numeric / 60.0)::int",
+      "recommendation": "Use EXTRACT(EPOCH …)::int / 60 directly, as done in the whoop_tz_backfill.py. This keeps the integer division safe and avoids potential confusion."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-001",
+      "title": "WHOOP cycle anchor fails for daytime events due to strict 6h start_time bound",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "sql/adr_0001_01_user_tz_log.sql:92",
+      "description": "The `dist_sec` calculation measures distance strictly to the cycle's `start_time` (bedtime). The `<= 6 * 60 * 60` filter means any event occurring more than 6 hours after bedtime (which includes almost all waking daytime hours) will fail to match the cycle, causing daytime events like meals and supplements to fall back to ET.",
+      "evidence": "abs(extract(epoch from (start_time - ts))) <= 6 * 60 * 60",
+      "recommendation": "Remove the 6-hour filter and rely on `ORDER BY dist_sec ASC LIMIT 1` with a larger bound (e.g., 24 hours), or calculate distance to the closest of `start_time` or `end_time`."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-002",
+      "title": "Unsafe TIMESTAMP minus TIMESTAMPTZ subtraction in garmin_activities",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql:75",
+      "description": "The trigger subtracts `start_time_gmt` (TIMESTAMPTZ) from `start_time_local` (TIMESTAMP). This implicitly casts the TIMESTAMP to TIMESTAMPTZ using the server's `TimeZone` setting, which produces an incorrect interval if the server is not set to UTC.",
+      "evidence": "tzd := pds.interval_to_tzd(NEW.start_time_local - NEW.start_time_gmt);",
+      "recommendation": "Explicitly cast the GMT timestamp to UTC before subtracting: `NEW.start_time_local - (NEW.start_time_gmt AT TIME ZONE 'UTC')`."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-003",
+      "title": "journal_entries backdating check compares local date to ET clock date",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:161",
+      "description": "The trigger tries to prevent overwriting dates on backdated entries by checking if `entry_date` matches the ET date of `notion_created_at`. Since `entry_date` is typed in local time, real-time entries made in distant timezones (e.g., Tokyo) will fail this check and incorrectly fall back to ET.",
+      "evidence": "NEW.entry_date = (NEW.notion_created_at AT TIME ZONE 'America/New_York')::date",
+      "recommendation": "Call `derive_onyx_dates` first, then check if `NEW.entry_date` matches `d.onyx_behavioral_date` or `d.onyx_local_date` to determine if it was backdated."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-004",
+      "title": "whoop_journal onyx_local_date is inconsistent for pre/post-midnight bedtimes",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:280",
+      "description": "The trigger derives dates using the cycle's `start_time` (bedtime). While `onyx_behavioral_date` correctly uses the -6h rule, `onyx_local_date` is set to the literal clock date of the bedtime. This splits a single behavioral day's journals across two local dates depending on whether bedtime was before or after midnight.",
+      "evidence": "NEW.onyx_local_date := d.onyx_local_date; (where d is derived from cycle_start_time)",
+      "recommendation": "For date-only behavioral tables, `onyx_local_date` should either mirror `onyx_behavioral_date` or be explicitly derived from the wake time, rather than the bedtime instant."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-005",
+      "title": "habit_journal noon ET anchor shifts local dates in distant timezones",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:206",
+      "description": "When deriving `onyx_local_date` for a habit tap, the trigger anchors at noon ET of the `cycle_date` and converts to the local TZ. For timezones far from ET (like Tokyo +13h), noon ET falls into the next calendar day locally, shifting `onyx_local_date` forward by a day.",
+      "evidence": "noon_et := (NEW.cycle_date::timestamp + INTERVAL '12 hours') AT TIME ZONE 'America/New_York'; NEW.onyx_local_date := (noon_et AT TIME ZONE log_tz)::date;",
+      "recommendation": "Date-only sources cannot reliably project local dates across the dateline. Consider adding a `TIMESTAMPTZ` column to `habit_journal` to capture the exact tap instant."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gpt-5",
+      "id": "F-001",
+      "title": "onyx_tz_source taxonomy drifts beyond ADR enum and is inconsistent",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Idiomaticness",
+        "Robustness"
+      ],
+      "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql:120",
+      "description": "Several triggers emit onyx_tz_source values not in the ADR’s documented set (e.g., 'garmin_calendar_date', 'missing_gmt_instant', 'user_tz_log_et'). This inconsistency can break consumers that expect the ADR-defined vocabulary.",
+      "evidence": "Examples: garmin_hrv sets 'garmin_calendar_date' (sql/adr_0001_03_garmin_onyx_dates.sql, set_onyx_dates_garmin_hrv); garmin_activities uses 'missing_gmt_instant' when start_time_gmt is NULL (same file); habit_journal and whoop_journal use 'user_tz_log_et' (sql/adr_0001_04_other_onyx_dates.sql).",
+      "recommendation": "Standardize on the ADR set and add a mapping: map 'garmin_calendar_date' → 'user_tz_log' (or a documented 'calendar_anchor'), 'missing_gmt_instant' → a documented 'missing_instant', and fold 'user_tz_log_et' into 'user_tz_log' with an auxiliary boolean if needed. Document all allowed values."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gpt-5",
+      "id": "F-002",
+      "title": "whoop_journal behaviors_date picks earliest cycle, not longest/main",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:166",
+      "description": "behaviors_date is computed from the earliest cycle on a given cycle_date. On transition days with an arrival nap and a main sleep, this can anchor behaviors_date to the nap’s TZ instead of the main cycle’s TZ.",
+      "evidence": "ORDER BY c.start_time LIMIT 1 in pds.set_onyx_dates_whoop_journal; elsewhere in the same function and in pds.whoop_main_cycle_per_behavioral_date the 'longest' cycle is preferred.",
+      "recommendation": "Switch behaviors_date cycle selection to match the 'longest (main) cycle' heuristic used elsewhere (ORDER BY (end_time - start_time) DESC, start_time DESC)."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gpt-5",
+      "id": "F-003",
+      "title": "Cycle-anchor window (±6h) may miss many daytime events",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Correctness"
+      ],
+      "file_ref": "sql/adr_0001_01_user_tz_log.sql:79",
+      "description": "pds.cycle_offset_for_instant uses a narrow ±6h tolerance around cycle start when ts is outside [start,end). Midday/afternoon events commonly lie >6h from bedtime and thus fall back to user_tz_log/ET.",
+      "evidence": "Function pds.cycle_offset_for_instant conditions: abs(start_time - ts) <= 6h.",
+      "recommendation": "Increase the tolerance (e.g., ±18h or nearest start within 24h) or prefer the nearest adjacent cycle by absolute difference, to reduce unnecessary fallbacks on typical daytime events."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gpt-5",
+      "id": "F-004",
+      "title": "garmin_hrv local_date overridden to watch-local, not physical local",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "sql/adr_0001_03_garmin_onyx_dates.sql:93",
+      "description": "When start_timestamp is NULL, onyx_local_date is hard-set to Garmin’s calendar_date, which may not reflect the physical local day if the watch TZ lagged. ADR defines local_date as the clock day in the user’s actual TZ.",
+      "evidence": "In set_onyx_dates_garmin_hrv, onyx_local_date := NEW.calendar_date after derive_onyx_dates; provenance 'garmin_calendar_date'.",
+      "recommendation": "Prefer d.onyx_local_date (derived via noon-ET anchor and user_tz_log) for local_date; keep watch-local in a separate column if needed for provenance."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gpt-5",
+      "id": "F-005",
+      "title": "Inconsistent fallback labeling between derive_onyx_dates and ad-hoc fallbacks",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:118",
+      "description": "Some tables use pds.derive_onyx_dates (with standardized labeling), others implement custom noon-ET + user_tz_log fallbacks and emit 'user_tz_log_et' or 'default_et_fallback'. This fragmentation complicates auditing.",
+      "evidence": "habit_journal and the whoop_journal orphan branch implement their own noon-ET logic and special-case labels; other tables rely on derive_onyx_dates.",
+      "recommendation": "Centralize all noon-ET/user_tz_log fallback paths inside derive_onyx_dates (e.g., add a safe helper) so labels and behavior are uniform across tables."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gpt-5",
+      "id": "F-006",
+      "title": "WHOOP backfill IANA inference silently uses generic defaults",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "whoop_tz_backfill.py:31",
+      "description": "GENERIC_OFFSET_IANA maps broad offsets to specific IANA zones (e.g., +02:00 → Europe/Berlin). While better than UTC, this can mislabel travel to different +02:00 locales without historical hints.",
+      "evidence": "GENERIC_OFFSET_IANA literal dict; infer_iana falls back to this when history has no match.",
+      "recommendation": "Log a clear warning and prefer skipping the insert unless a strong prior exists (history map); optionally prompt for manual confirmation for first-time offsets."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gpt-5",
+      "id": "F-007",
+      "title": "Potential performance hotspot: cycle lookup lacks explicit index hint",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Scalability"
+      ],
+      "file_ref": "sql/adr_0001_01_user_tz_log.sql:61",
+      "description": "pds.cycle_offset_for_instant scans whoop_cycles by start_time and end_time predicates. No explicit index on start_time is created in this bundle; at scale, repeated calls from triggers could degrade.",
+      "evidence": "WHERE ts >= start_time AND ts < end_time OR abs(start_time - ts) <= 6h without a declared index in this migration set.",
+      "recommendation": "Ensure a BTREE index exists on whoop_cycles(start_time) (and possibly (start_time,end_time)) to support this lookup pattern."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gpt-5",
+      "id": "F-008",
+      "title": "gps_tz_backfill RPC return handling may be fragile",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "gps_tz_backfill.py:64",
+      "description": "tz_for_instant_via_pg returns res.data directly; supabase-py RPC responses can vary (scalar vs list). A mismatch could default to ET silently.",
+      "evidence": "return res.data or 'America/New_York' without type normalization.",
+      "recommendation": "Normalize RPC results (expect a scalar TEXT, or handle single-row list) and raise on unexpected shapes to avoid silent ET fallbacks."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gpt-5",
+      "id": "F-009",
+      "title": "daily_health_matrix_behavioral spine includes gds.calendar_date",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Correctness"
+      ],
+      "file_ref": "sql/adr_0001_08_daily_health_matrix_behavioral.sql:69",
+      "description": "The behavioral spine unions Garmin Daily Summary’s calendar_date, which is watch-local, not strictly behavioral. This can introduce dates absent from behavioral events and slightly dilute semantics.",
+      "evidence": "UNION … SELECT calendar_date FROM pds.garmin_daily_summary",
+      "recommendation": "Document this explicitly in the view comment and/or gate inclusion behind presence of at least one behavioral-anchored source that day, or add a flag indicating 'spine_from_gds'."
+    },
+    {
+      "bundle": "tz",
+      "reviewer": "gpt-5",
+      "id": "F-010",
+      "title": "Derivation for date-only tables diverges from ADR D3 tiering",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Correctness",
+        "Idiomaticness"
+      ],
+      "file_ref": "sql/adr_0001_04_other_onyx_dates.sql:83",
+      "description": "For habit_journal and journal_entries with backdated entries, ad-hoc logic sets et/local dates. Some cases bypass cycle-anchor opportunities that exist (e.g., deriving from main cycle of cycle_date).",
+      "evidence": "habit_journal uses noon-ET + user_tz_log only; journal_entries conditions treat backdating specially.",
+      "recommendation": "Where feasible, prefer a cycle-anchor lookup (longest cycle for that cycle_date) before falling back to noon-ET user_tz_log; centralize this in derive_onyx_dates or a helper to ensure uniformity."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-001",
+      "title": "Supplement unit silent drop – unknown units (IU, oz, mL, etc.)",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+      "description": "The `pds.unit_to_mg_factor` function returns NULL for units not explicitly in its CASE statement, including IU (Vitamin D/E), oz, mL, drops, scoops, capsules. The consuming view `supplement_intake_by_compound` relies on this factor and silently excludes rows with NULL factor, causing underestimated nutrient totals.",
+      "evidence": "Function body contains CASE covering only mg, g, mcg/µg, kg; all other units fall through to ELSE NULL. No logging occurs. IU is a common label unit for fat-soluble vitamins; the user may log such products.",
+      "recommendation": "Extend the function to handle these units (e.g., IU to mg conversion factors per compound, oz/m to volume with density assumption, or flagging for manual check). Add logging/notification when an unrecognized unit is encountered."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-002",
+      "title": "Compound unit parsing failure (e.g., 'mg/mL')",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+      "description": "The regex `[^a-zµ]` strips all non-alphabetic characters (except 'µ') from the unit string. A product labeled 'mg/mL' becomes 'mgml', which does not match any branch and returns NULL, causing the row to be dropped.",
+      "evidence": "REGEXP_REPLACE(LOWER(COALESCE(u, '')), '[^a-zµ]', '', 'g') collapses 'mg/mL' to 'mgml'; no entry in the CASE map for 'mgml'. Same fate for 'g/100ml', etc.",
+      "recommendation": "Parse compound units by splitting on '/' or other delimiters and returning a valid factor (e.g., 'mg/mL' means 1 mg per 1 mL, so factor is 1 if the view handles volume separately). Alternatively, add explicit mappings for common per-volume units."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-003",
+      "title": "Hard-coded 18-hour window constant in workout-sleep gap calculation",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Idiomaticness"
+      ],
+      "file_ref": "queries.ts (getWorkoutSleepGap, around eighteenHrMs)",
+      "description": "The maximum gap between a workout and a sleep onset is defined as `18 * 60 * 60 * 1000` directly in code with a descriptive variable name but no named constant.",
+      "evidence": "`const eighteenHrMs = 18 * 60 * 60 * 1000;`",
+      "recommendation": "Define a named constant (e.g., `WORKOUT_SLEEP_GAP_MAX_MS`) at the top of the file to make the intent explicit and allow easy adjustment."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-004",
+      "title": "Distance conversion left solely to display layer",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Scalability"
+      ],
+      "file_ref": "queries.ts (getActivities) & format.ts (formatDistance)",
+      "description": "Query functions such as `getActivities` return distance in meters without converting to miles; any consuming chart must call `formatDistance` or use `METERS_PER_MILE`. While centralization minimizes risk, a new chart could omit the conversion and display meters as miles.",
+      "evidence": "The comment in format.ts states 'format.ts is the canonical formatter' and queries.ts exports raw metrics; no `distance_miles` field is added at the query layer.",
+      "recommendation": "Consider adding a precomputed `distance_miles` column in the query layer (or a transform wrapper) so that all consumers receive a miles value by default, reducing drift risk."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-005",
+      "title": "Lack of NaN guard after Number() conversion in getWhoopCaloriesBurnt",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "queries.ts (getWhoopCaloriesBurnt)",
+      "description": "The function calls `Number(c.kilojoule)` and then `kjToKcal(kj)`. If `kilojoule` is a non-numeric string (e.g., 'NaN', 'N/A'), `Number()` returns NaN, which propagates through `kjToKcal` and into `Math.round`, producing NaN. There is no `isNaN` check after the Number conversion.",
+      "evidence": "`const kj = Number(c.kilojoule); const kcalExact = kjToKcal(kj);` with no `isNaN(kj)` guard. The earlier check `c.kilojoule == null` only catches null/undefined.",
+      "recommendation": "Add `if (isNaN(kj)) continue;` after the Number conversion to skip malformed rows."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "deepseek-v4-pro",
+      "id": "F-006",
+      "title": "Silent duplicate-cycle overwrite in getWhoopCaloriesBurnt",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Robustness"
+      ],
+      "file_ref": "queries.ts (getWhoopCaloriesBurnt)",
+      "description": "When two WHOOP cycles map to the same calendar date (rare but possible), the last-write-wins logic of `byDate.set` silently overwrites the earlier entry. No warning or decision log is emitted.",
+      "evidence": "`byDate.set(calendar_date, { ... })` without checking whether a value already exists for the key.",
+      "recommendation": "Log a warning when overwriting, and consider selecting the cycle with the more complete dataset (e.g., non-zero kJ) or averaging if both are valid."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-001",
+      "title": "`unit_to_mg_factor` silently drops rows for unrecognized and compound units",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+      "description": "The SQL function `pds.unit_to_mg_factor` returns `NULL` for unrecognized units like `IU`, `oz`, `mL`, `drops`, `scoops`, and `capsules`. Because it uses `REGEXP_REPLACE` to strip non-alphabetic characters, compound units like `mg/mL` are collapsed to `mgml` and also fall through to `NULL`. This causes the `supplement_intake_by_compound` rollup view to silently drop these rows, leading to underreported supplement intake.",
+      "evidence": "The `CASE` statement only handles variations of mg, g, mcg, and kg. The regex `[^a-zµ]` removes the slash in `mg/mL`.",
+      "recommendation": "Add support for common units like `IU` (with compound-specific conversion factors if necessary, or pass them through un-converted if they can't be normalized to mg). Fix the regex to handle or preserve slashes for compound units like `mg/mL`, or add `mgml` to the `CASE` statement. Log or store a fallback for unrecognized units instead of silently returning `NULL`."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "gemini-2.5-pro",
+      "id": "F-002",
+      "title": "`formatDuration` truncates instead of rounding to the nearest minute",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Idiomaticness"
+      ],
+      "file_ref": "format.ts:46",
+      "description": "The `formatDuration` function uses `Math.floor` for both hours and minutes. This means that a duration of 3599 seconds (59 minutes and 59 seconds) will be formatted as `59m` instead of `1h 0m`. Similarly, 59 seconds will be formatted as `0m`. This truncation can lead to slightly unintuitive display values compared to standard rounding.",
+      "evidence": "`const h = Math.floor(seconds / 3600); const m = Math.floor((seconds % 3600) / 60);`",
+      "recommendation": "Use `Math.round(seconds / 60)` to get the total minutes, then calculate hours and minutes from that rounded total to ensure durations are rounded to the nearest minute."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "gpt-5",
+      "id": "F-001",
+      "title": "Greek mu (μg) is misparsed as g, causing 1,000,000× overstatement of microgram doses",
+      "severity": "P1",
+      "effort": "S",
+      "dimensions": [
+        "Correctness",
+        "Robustness"
+      ],
+      "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+      "description": "The SQL cleaner keeps only [a–zµ] before matching. It includes the micro sign (µ, U+00B5) but not the Greek letter mu (μ, U+03BC). Labels using μg are common; 'μg' becomes 'g' after sanitization and maps to 1000 mg instead of 0.001 mg.",
+      "evidence": "REGEXP_REPLACE(..., '[^a-zµ]', '', 'g'); WHEN 'mcg'...'µg'...ELSE NULL. No explicit handling of 'μ' (Greek mu).",
+      "recommendation": "Add 'μ' to the retained charset and explicit 'μg' branch: REGEXP_REPLACE(..., '[^a-zµμ]', '', 'g'); treat 'μg' like 'mcg'/'µg'. Add unit-level regression tests for 'µg' and 'μg'."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "gpt-5",
+      "id": "F-002",
+      "title": "Supplement unit coverage is narrow and silently drops common real-world units (IU, mL, oz, capsules, mg/mL)",
+      "severity": "P1",
+      "effort": "M",
+      "dimensions": [
+        "Correctness",
+        "Robustness",
+        "Scalability"
+      ],
+      "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+      "description": "unit_to_mg_factor returns NULL for many packaging units, removing those ingredients from pds.supplement_intake_by_compound and downstream totals. Vitamins A/D/E often labeled in IU; liquids in mL/fl-oz; forms like drops/capsules; concentrations like mg/mL normalize to 'mgml' and fall through.",
+      "evidence": "Function only maps mg, g, mcg/µg, kg. Docs note IU, oz, mL, fl-oz, drops, scoops, capsules become NULL; mg/mL collapses to mgml.",
+      "recommendation": "Expand mapping and/or stage a two-step normalization: (1) parse numeric + unit, (2) convert via per-compound IU↔mass crosswalk where defined (A, D, E), (3) support volume units with density when available, (4) preserve unknowns with a flag rather than NULL-drop, and (5) add a QA view listing unrecognized units so coverage gaps are visible."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "gpt-5",
+      "id": "F-003",
+      "title": "Ambiguous helper name: formatKcal expects kJ input, inviting accidental double-conversion",
+      "severity": "P2",
+      "effort": "S",
+      "dimensions": [
+        "Idiomaticness",
+        "Robustness"
+      ],
+      "file_ref": "format.ts:formatKcal",
+      "description": "formatKcal(kj) converts kJ→kcal and formats the result. The name suggests it formats an already-kcal value, increasing the risk that dietary kcal values are mistakenly divided by 4.184.",
+      "evidence": "export function formatKcal(kj: number | null | undefined): string { return `${Math.round(kjToKcal(kj))} kcal`; }",
+      "recommendation": "Rename to formatKjAsKcal or energyKjToKcalStr. Consider branded types (type Kilojoule = number & {__unit:'kJ'}) to catch misuse at compile time."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "gpt-5",
+      "id": "F-004",
+      "title": "Opaque select('*') increases semantic-conflation risk as schemas evolve",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Scalability",
+        "Idiomaticness",
+        "Robustness"
+      ],
+      "file_ref": "queries.ts:getHealthMatrix",
+      "description": "Several queries use select('*'), pulling many similarly named fields (e.g., multiple HRV variants, calories from different sources). While current consumers appear disciplined, this pattern makes future conflation more likely as new columns are added.",
+      "evidence": "getHealthMatrix, getDailySummaries (pre-rename), getSleepData, etc. use select('*').",
+      "recommendation": "Prefer explicit column lists and typed interfaces per query, exposing only canonical fields needed by each consumer. Continue defensive renaming (as done for Garmin kcal) where overlap exists."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "gpt-5",
+      "id": "F-005",
+      "title": "Lack of branded unit types for seconds vs milliseconds and kJ vs kcal",
+      "severity": "P2",
+      "effort": "M",
+      "dimensions": [
+        "Robustness",
+        "Idiomaticness"
+      ],
+      "file_ref": "format.ts + queries.ts (module-wide)",
+      "description": "The code relies on naming conventions ('_seconds', '_milli') and comments. This is good practice but still allows unit mistakes at call sites that TypeScript can’t catch.",
+      "evidence": "Comments in queries.ts header and separate formatDuration/formatDurationMs helpers; no branded types to enforce units.",
+      "recommendation": "Introduce branded types (e.g., type Seconds = number & {__unit:'s'}; Milliseconds; Kilojoule; Kilocalorie) and annotate key APIs. This will surface unit mismatches at compile time."
+    },
+    {
+      "bundle": "units",
+      "reviewer": "gpt-5",
+      "id": "F-006",
+      "title": "Distance formatter switches to meters for short distances, diverging from mile-oriented UI",
+      "severity": "P3",
+      "effort": "S",
+      "dimensions": [
+        "Idiomaticness"
+      ],
+      "file_ref": "format.ts:formatDistance",
+      "description": "For distances <0.5 mi, the formatter shows rounded meters, which may feel inconsistent in a mile/lb/kcal UI. Not a unit error, but a presentation inconsistency.",
+      "evidence": "if (miles >= 0.5) return `${miles.toFixed(1)} mi`; else `${Math.round(meters)} m`.",
+      "recommendation": "Consider always showing miles (e.g., two decimals below 1 mi) to keep display units consistent, or make threshold configurable."
+    }
+  ]
+}

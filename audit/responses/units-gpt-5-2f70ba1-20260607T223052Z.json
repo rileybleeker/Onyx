@@ -1,0 +1,152 @@
+{
+  "reviewer": "gpt-5",
+  "model": "gpt-5",
+  "bundle_commit": "2f70ba1",
+  "fired_at": "2026-06-07T22:30:52.354851+00:00",
+  "usage": {
+    "input_tokens": 15922,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 10342,
+    "output_tokens_details": {
+      "reasoning_tokens": 7680
+    },
+    "total_tokens": 26264
+  },
+  "response": {
+    "reviewer_metadata": {
+      "model": "gpt-4o",
+      "review_date": "2026-06-07",
+      "bundle_commit": "2f70ba1"
+    },
+    "domain_scores": {
+      "correctness": {
+        "score": 4,
+        "rationale": "Core conversions (kJ\u2192kcal, m\u2194mi, kg\u2194lb) are correct and centralized. Queries explicitly prevent Garmin kcal from being mistaken for TDEE. HRV sources are not coalesced in code shown. The main correctness risk is in SQL supplement-unit handling: unrecognized units are dropped and one microgram variant can be catastrophically mis-parsed."
+      },
+      "robustness": {
+        "score": 3,
+        "rationale": "Frontend formatters guard null/NaN and avoid premature rounding. Query layer uses canonical UTC fields for Garmin. However, the SQL unit normalization returns NULL for many real-world units (IU, mL, oz, mg/mL, capsules), silently excluding them. Lack of typed units increases misuse risk at call sites."
+      },
+      "scalability": {
+        "score": 4,
+        "rationale": "Conversions live in one helper module and in a single WHOOP TDEE query. Garmin kcal is intentionally renamed to avoid drift. Remaining risk is broad use of select('*') and untyped payloads, which can reintroduce conflation as surface area grows."
+      },
+      "idiomaticness": {
+        "score": 5,
+        "rationale": "Clear named constants with correct exact factors, strong comments citing decisions, and defensive renaming to prevent semantic conflation. Only small naming nit (formatKcal expects kJ) detracts."
+      }
+    },
+    "summary": "This bundle handles the historically tricky energy, distance, pace, and duration units with care. The formatter centralizes exact constants (1609.344 m/mi; 4.184 kJ/kcal; 0.45359237 kg/lb), defers rounding to display, and provides ms/seconds helpers to avoid the WHOOP 1000\u00d7 mistake. The query layer cleanly distinguishes Garmin vs WHOOP calories, even renaming Garmin\u2019s total_kilocalories to make misuse fail loudly, and computes WHOOP TDEE with correct kJ\u2192kcal conversion while preserving an exact field for aggregation. Garmin activity and sleep paths consistently use true-UTC fields or behavioral dates, reducing timestamp pitfalls.\n\nThe largest gap is at the SQL supplement normalizer. The unit_to_mg_factor function covers only mass units and returns NULL for anything else (IU, mL, oz, fl-oz, drops, scoops, capsules), silently excluding those ingredients from downstream rollups. It also normalizes by stripping non-[a\u2013z\u00b5], which mishandles the common Greek mu character (\u03bcg) by collapsing it to g, causing a million-fold overstatement if encountered. Concentration units like mg/mL also collapse to mgml and drop. These create correctness and coverage risks in micronutrient totals.\n\nTo tighten the system: expand the supplement unit dictionary (including IU per-compound rules), treat unknown units explicitly (flag and surface rather than NULL-drop), recognize both \u00b5g and \u03bcg, and introduce branded TS types or explicit interfaces to reduce unit-misuse risk. Consider renaming formatKcal to make its kJ input requirement unmistakable. Overall, the codebase demonstrates strong intent and sound practices, with a focused fix needed in SQL supplement unit handling.",
+    "findings": [
+      {
+        "id": "F-001",
+        "title": "Greek mu (\u03bcg) is misparsed as g, causing 1,000,000\u00d7 overstatement of microgram doses",
+        "severity": "P1",
+        "effort": "S",
+        "dimensions": [
+          "Correctness",
+          "Robustness"
+        ],
+        "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+        "description": "The SQL cleaner keeps only [a\u2013z\u00b5] before matching. It includes the micro sign (\u00b5, U+00B5) but not the Greek letter mu (\u03bc, U+03BC). Labels using \u03bcg are common; '\u03bcg' becomes 'g' after sanitization and maps to 1000 mg instead of 0.001 mg.",
+        "evidence": "REGEXP_REPLACE(..., '[^a-z\u00b5]', '', 'g'); WHEN 'mcg'...'\u00b5g'...ELSE NULL. No explicit handling of '\u03bc' (Greek mu).",
+        "recommendation": "Add '\u03bc' to the retained charset and explicit '\u03bcg' branch: REGEXP_REPLACE(..., '[^a-z\u00b5\u03bc]', '', 'g'); treat '\u03bcg' like 'mcg'/'\u00b5g'. Add unit-level regression tests for '\u00b5g' and '\u03bcg'."
+      },
+      {
+        "id": "F-002",
+        "title": "Supplement unit coverage is narrow and silently drops common real-world units (IU, mL, oz, capsules, mg/mL)",
+        "severity": "P1",
+        "effort": "M",
+        "dimensions": [
+          "Correctness",
+          "Robustness",
+          "Scalability"
+        ],
+        "file_ref": "SQL_UNITS.md:unit_to_mg_factor",
+        "description": "unit_to_mg_factor returns NULL for many packaging units, removing those ingredients from pds.supplement_intake_by_compound and downstream totals. Vitamins A/D/E often labeled in IU; liquids in mL/fl-oz; forms like drops/capsules; concentrations like mg/mL normalize to 'mgml' and fall through.",
+        "evidence": "Function only maps mg, g, mcg/\u00b5g, kg. Docs note IU, oz, mL, fl-oz, drops, scoops, capsules become NULL; mg/mL collapses to mgml.",
+        "recommendation": "Expand mapping and/or stage a two-step normalization: (1) parse numeric + unit, (2) convert via per-compound IU\u2194mass crosswalk where defined (A, D, E), (3) support volume units with density when available, (4) preserve unknowns with a flag rather than NULL-drop, and (5) add a QA view listing unrecognized units so coverage gaps are visible."
+      },
+      {
+        "id": "F-003",
+        "title": "Ambiguous helper name: formatKcal expects kJ input, inviting accidental double-conversion",
+        "severity": "P2",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness",
+          "Robustness"
+        ],
+        "file_ref": "format.ts:formatKcal",
+        "description": "formatKcal(kj) converts kJ\u2192kcal and formats the result. The name suggests it formats an already-kcal value, increasing the risk that dietary kcal values are mistakenly divided by 4.184.",
+        "evidence": "export function formatKcal(kj: number | null | undefined): string { return `${Math.round(kjToKcal(kj))} kcal`; }",
+        "recommendation": "Rename to formatKjAsKcal or energyKjToKcalStr. Consider branded types (type Kilojoule = number & {__unit:'kJ'}) to catch misuse at compile time."
+      },
+      {
+        "id": "F-004",
+        "title": "Opaque select('*') increases semantic-conflation risk as schemas evolve",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Scalability",
+          "Idiomaticness",
+          "Robustness"
+        ],
+        "file_ref": "queries.ts:getHealthMatrix",
+        "description": "Several queries use select('*'), pulling many similarly named fields (e.g., multiple HRV variants, calories from different sources). While current consumers appear disciplined, this pattern makes future conflation more likely as new columns are added.",
+        "evidence": "getHealthMatrix, getDailySummaries (pre-rename), getSleepData, etc. use select('*').",
+        "recommendation": "Prefer explicit column lists and typed interfaces per query, exposing only canonical fields needed by each consumer. Continue defensive renaming (as done for Garmin kcal) where overlap exists."
+      },
+      {
+        "id": "F-005",
+        "title": "Lack of branded unit types for seconds vs milliseconds and kJ vs kcal",
+        "severity": "P2",
+        "effort": "M",
+        "dimensions": [
+          "Robustness",
+          "Idiomaticness"
+        ],
+        "file_ref": "format.ts + queries.ts (module-wide)",
+        "description": "The code relies on naming conventions ('_seconds', '_milli') and comments. This is good practice but still allows unit mistakes at call sites that TypeScript can\u2019t catch.",
+        "evidence": "Comments in queries.ts header and separate formatDuration/formatDurationMs helpers; no branded types to enforce units.",
+        "recommendation": "Introduce branded types (e.g., type Seconds = number & {__unit:'s'}; Milliseconds; Kilojoule; Kilocalorie) and annotate key APIs. This will surface unit mismatches at compile time."
+      },
+      {
+        "id": "F-006",
+        "title": "Distance formatter switches to meters for short distances, diverging from mile-oriented UI",
+        "severity": "P3",
+        "effort": "S",
+        "dimensions": [
+          "Idiomaticness"
+        ],
+        "file_ref": "format.ts:formatDistance",
+        "description": "For distances <0.5 mi, the formatter shows rounded meters, which may feel inconsistent in a mile/lb/kcal UI. Not a unit error, but a presentation inconsistency.",
+        "evidence": "if (miles >= 0.5) return `${miles.toFixed(1)} mi`; else `${Math.round(meters)} m`.",
+        "recommendation": "Consider always showing miles (e.g., two decimals below 1 mi) to keep display units consistent, or make threshold configurable."
+      }
+    ],
+    "things_done_well": [
+      "Correct, named conversion constants (exact values) and centralized helpers; rounding only at display time.",
+      "Clear documentation of duration-unit conventions and safe wrappers to avoid ms\u2194s mistakes.",
+      "Explicit kJ\u2192kcal conversion for WHOOP TDEE with both rounded and precise fields preserved.",
+      "Defensive renaming of Garmin total_kilocalories to prevent conflation with WHOOP-derived TDEE.",
+      "Consistent use of GMT/behavioral dates for Garmin sleep/activities avoids the local-as-UTC trap.",
+      "HRV sources are kept separate; no cross-source averaging/substitution observed in this code.",
+      "Null/NaN guards across formatters (including treating 0 durations intentionally)."
+    ],
+    "questions_for_followup": [
+      "Do any supplement_products.ingredients rows use the Greek mu (\u03bcg) character? If so, quantify affected compounds and backfill corrections.",
+      "What is the unit distribution in supplement_product ingredients (IU, mL, oz, capsules, drops, mg/mL, etc.)? Provide a coverage table vs unit_to_mg_factor.",
+      "Does daily_micronutrient_totals currently omit IU-labeled vitamins A/D/E from supplement totals? If yes, estimate the undercount and plan a migration.",
+      "Does any DB view (e.g., daily_health_matrix_behavioral) COALESCE different HRV sources into one column? If so, separate them or tag provenance.",
+      "Audit UI call sites: is formatKcal ever passed dietary kcal instead of kJ? If so, rename the helper and fix usage.",
+      "Confirm Cronometer energy is stored as kcal everywhere it surfaces \u2014 any possibility of kJ from certain entries or exports?",
+      "Are there any lingering consumers of Garmin sleep start_time_local? If yes, migrate to sleep_start (GMT-derived) or onyx_behavioral_date.",
+      "Should the distance formatting threshold be standardized to miles-only for consistency with the UI\u2019s mile/lb/kcal convention?",
+      "Add an exception log or QA view listing supplement rows dropped by unit_to_mg_factor (unit unknown) \u2014 can we implement this quickly?",
+      "Would branded unit types (Seconds, Milliseconds, Kilojoule, Kilocalorie) be acceptable in the codebase to prevent future unit regressions?"
+    ]
+  },
+  "bundle": "units"
+}
