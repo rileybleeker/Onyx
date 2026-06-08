@@ -98,10 +98,14 @@ COMMENT ON FUNCTION pds.tz_for_instant(TIMESTAMPTZ) IS
 -- authoritative TZ source available without manual user_tz_log entries.
 -- Audit re-2026-05-26 P2 (F-004): widen the cycle anchor. Midday/daytime
 -- events fall OUTSIDE any sleep cycle [start_time, end_time) window. Fall
--- back to the nearest cycle within ±6h so they still get a per-cycle offset
+-- back to the nearest cycle within ±18h so they still get a per-cycle offset
 -- (a midday event sits between the evening's just-ended cycle and the
 -- upcoming bedtime — either is a good TZ signal). NULL only when no cycle
--- is within ±6h, at which point the caller falls through to user_tz_log.
+-- is within ±18h, at which point the caller falls through to user_tz_log.
+-- Re-audit 2026-06-07: widened the fallback window from ±6h to ±18h and added
+-- an is_main_sleep tiebreak (cycles ≥3h long = real night sleep) so a short
+-- "arrival nap" with the OLD-zone offset doesn't outrank the night cycle that
+-- actually establishes the day's TZ. Applied via Supabase migration 2026-06-07.
 CREATE OR REPLACE FUNCTION pds.cycle_offset_for_instant(ts TIMESTAMPTZ)
 RETURNS TEXT
 LANGUAGE sql
@@ -111,20 +115,21 @@ AS $$
         SELECT
             timezone_offset,
             (ts >= start_time AND (end_time IS NULL OR ts < end_time)) AS in_window,
+            (COALESCE(end_time, start_time) - start_time) >= INTERVAL '3 hours' AS is_main_sleep,
             abs(extract(epoch from (start_time - ts))) AS dist_sec
           FROM pds.whoop_cycles
          WHERE timezone_offset IS NOT NULL
            AND (
                 (ts >= start_time AND (end_time IS NULL OR ts < end_time))
-                OR abs(extract(epoch from (start_time - ts))) <= 6 * 60 * 60
+                OR abs(extract(epoch from (start_time - ts))) <= 18 * 60 * 60
            )
     ) candidates
-    ORDER BY in_window DESC, dist_sec ASC
+    ORDER BY in_window DESC, is_main_sleep DESC, dist_sec ASC
     LIMIT 1;
 $$;
 
 COMMENT ON FUNCTION pds.cycle_offset_for_instant(TIMESTAMPTZ) IS
-'Per ADR-0001 D3 tier 2: returns the WHOOP cycle.timezone_offset for ts. Prefers cycles whose [start, end) bracket ts; falls back to the nearest cycle within ±6h so midday events still get an offset. NULL when no cycle is within ±6h — caller falls through to user_tz_log.';
+'Per ADR-0001 D3 tier 2: returns the WHOOP cycle.timezone_offset for ts. Prefers cycles whose [start, end) bracket ts; falls back to the nearest main-sleep cycle within ±18h so midday events still get an offset. NULL when no cycle is within ±18h — caller falls through to user_tz_log.';
 
 -- ---------------------------------------------------------------------------
 -- 3. pds.derive_onyx_dates — pure derivation function

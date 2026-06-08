@@ -26,8 +26,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlencode, urlparse, parse_qs
 
 import requests
+import httpx
 from dotenv import load_dotenv
 from supabase import create_client, Client
+
+from retry_helper import retry_http
 
 # ---------------------------------------------------------------------------
 # Config
@@ -176,33 +179,37 @@ class WhoopClient:
 
     def __init__(self):
         self.tokens = load_tokens()
-        self.session = requests.Session()
+        # Re-audit 2026-06-07 (etl/gpt-5/F-006): client uses httpx (not requests)
+        # so requests flow through retry_helper.retry_http, whose response /
+        # exception types are httpx-native.
+        self.session = httpx.Client(timeout=30)
         self._set_auth_header()
 
     def _set_auth_header(self):
         self.session.headers["Authorization"] = f"Bearer {self.tokens['access_token']}"
 
-    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         url = f"{WHOOP_API_BASE}{path}"
-        resp = self.session.request(method, url, **kwargs)
+        # Re-audit 2026-06-07 (etl/gpt-5/F-006): route every request through
+        # retry_http so 5xx / network errors / 429 are retried with backoff
+        # (429 honoring Retry-After). Modeled on spotify_etl.py's _request:
+        # exactly ONE network request per attempt. 401 is an expired access token
+        # (not a transient error) — refresh once and reissue WITHIN the attempt.
+        # retry_http calls .raise_for_status() itself, so do() must not, and we
+        # must not issue a raw pre-request that would double every successful GET.
+        refreshed = {"done": False}
 
-        # Auto-refresh on 401
-        if resp.status_code == 401:
-            log.info("Access token expired, refreshing...")
-            self.tokens = refresh_access_token(self.tokens)
-            self._set_auth_header()
+        def do() -> httpx.Response:
             resp = self.session.request(method, url, **kwargs)
+            if resp.status_code == 401 and not refreshed["done"]:
+                log.info("Access token expired, refreshing...")
+                self.tokens = refresh_access_token(self.tokens)
+                self._set_auth_header()
+                refreshed["done"] = True
+                resp = self.session.request(method, url, **kwargs)
+            return resp
 
-        # Rate limit handling
-        if resp.status_code == 429:
-            remaining = resp.headers.get("X-RateLimit-Remaining", "0")
-            reset = int(resp.headers.get("X-RateLimit-Reset", "60"))
-            log.warning(f"Rate limited. Waiting {reset}s...")
-            time.sleep(reset)
-            resp = self.session.request(method, url, **kwargs)
-
-        resp.raise_for_status()
-        return resp
+        return retry_http(do, max_attempts=3, log=log)
 
     def get(self, path: str, **kwargs) -> dict:
         return self._request("GET", path, **kwargs).json()
@@ -487,8 +494,16 @@ def sync_body_measurement(whoop: WhoopClient, sb: Client) -> int:
     if not bm:
         return 0
 
+    # Re-audit 2026-06-07 (etl/gemini/F-007 + deepseek/F-010): body measurement is a
+    # slowly-changing singleton. Keying on datetime.now() made the hourly ETL insert 24
+    # identical rows/day. Anchor measured_at to 12:00 UTC of the current day (≈07-08:00 ET,
+    # same ET calendar day, so hrv_analysis's to_et_date_str maps it to today) → one row/day
+    # that upserts in place when the snapshot is unchanged.
+    measured_at = datetime.now(timezone.utc).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    ).isoformat()
     row = {
-        "measured_at": datetime.now(timezone.utc).isoformat(),
+        "measured_at": measured_at,
         "height_meter": bm.get("height_meter"),
         "weight_kilogram": bm.get("weight_kilogram"),
         "max_heart_rate": bm.get("max_heart_rate"),
@@ -583,7 +598,10 @@ def main():
     # Refresh materialized views
     log.info("Refreshing materialized views...")
     try:
-        sb.schema("pds").rpc("refresh_materialized_views").execute()
+        # Re-audit 2026-06-07 (etl/gpt-5/F-008): the schema-scoped .rpc() requires an
+        # explicit params arg — omitting it raised "missing 1 required positional
+        # argument: 'params'", silently failing every matview refresh. Pass {}.
+        sb.schema("pds").rpc("refresh_materialized_views", {}).execute()
         log.info("  Materialized views refreshed")
     except Exception as e:
         log.warning(f"  Materialized view refresh failed: {e}")

@@ -54,8 +54,11 @@ export function formatDuration(seconds: number | null | undefined): string {
   // duration (e.g. a logged "rest" or "warm-up only") renders as "0m" instead
   // of being swallowed as "—".
   if (seconds == null || Number.isNaN(seconds)) return "—";
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
+  // Re-audit 2026-06-07 (units/gemini/F-002): round to the nearest minute first,
+  // then derive h/m — otherwise Math.floor renders 3599s as "59m" instead of "1h 0m".
+  const totalMinutes = Math.round(seconds / 60);
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
 }
@@ -110,8 +113,12 @@ export const lbToKg = (lb: number): number => lb * KG_PER_LB;
  * Format a kJ value as kcal for display. Rounds to the integer at the
  * boundary — pass the raw kJ; the helper handles the conversion AND the
  * rounding, so consumers can't accidentally pre-round and lose precision.
+ *
+ * Re-audit 2026-06-07 (units/gpt-5/F-003): renamed from `formatKcal` →
+ * `formatKjAsKcal`. Input is kJ, not kcal — the old name suggested an
+ * already-kcal value, inviting an accidental second /4.184 division.
  */
-export function formatKcal(kj: number | null | undefined): string {
+export function formatKjAsKcal(kj: number | null | undefined): string {
   if (kj == null || Number.isNaN(kj)) return "—";
   return `${Math.round(kjToKcal(kj))} kcal`;
 }

@@ -62,7 +62,9 @@ RETURNS NUMERIC
 LANGUAGE sql
 IMMUTABLE
 AS $$
-    SELECT CASE REGEXP_REPLACE(LOWER(COALESCE(u, '')), '[^a-zµ]', '', 'g')
+    -- Normalize Greek small mu (μ, U+03BC) → micro sign (µ, U+00B5) before stripping,
+    -- else "μg" collapses to "g" (×1000mg) — re-audit 2026-06-07 units/gpt-5/F-001.
+    SELECT CASE REGEXP_REPLACE(LOWER(REPLACE(COALESCE(u, ''), 'μ', 'µ')), '[^a-zµ]', '', 'g')
         WHEN 'mg'          THEN 1
         WHEN 'milligram'   THEN 1
         WHEN 'milligrams'  THEN 1

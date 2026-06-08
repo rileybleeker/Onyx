@@ -189,15 +189,19 @@ def test_tracks_upsert_before_plays_and_fk_invariant() -> None:
     )
 
 
-def test_play_with_unfetchable_track_is_skipped() -> None:
+def test_play_with_unfetchable_track_defers_newer_plays() -> None:
     """If client.track(tid) raises, that play must NOT be passed to upsert_plays
-    (would FK-violate). The good play in the same batch still goes through."""
+    (would FK-violate). Re-audit 2026-06-07 (etl/gemini/F-001): a *newer* good play in
+    the same batch is ALSO deferred — upserting it would advance the high-water mark
+    (MAX(played_at)) past the un-upserted bad play, permanently losing it (the bug this
+    fix addresses). The good track itself still lands in spotify_tracks; only its play
+    row waits for the next cron run (when the bad track is re-fetched)."""
     import httpx
     bad_tid = "BAD_TRACK"
     good_tid = "GOOD_TRACK"
     items = [
         _make_play(bad_tid, "ART_A", "2026-05-27T15:00:00.000Z"),
-        _make_play(good_tid, "ART_B", "2026-05-27T15:05:00.000Z"),
+        _make_play(good_tid, "ART_B", "2026-05-27T15:05:00.000Z"),  # NEWER than the gap
     ]
 
     def _track_side_effect(tid: str) -> dict:
@@ -213,14 +217,50 @@ def test_play_with_unfetchable_track_is_skipped() -> None:
 
     played = set(captured["plays_upserted"])
     assert bad_tid not in played, (
-        f"bad track {bad_tid} should have been skipped from plays; got {played}"
+        f"bad track {bad_tid} play should have been skipped; got {played}"
     )
-    assert good_tid in played, (
-        f"good track {good_tid} should have been kept; got {played}"
+    # The good play is NEWER than the skipped bad play, so it is deferred to keep the
+    # high-water mark from advancing past (and thus losing) the bad play.
+    assert good_tid not in played, (
+        f"good play newer than the gap must be deferred to protect the HWM; got {played}"
     )
+    # ...but its track WAS fetched fine and still lands in the dim table.
     landed = set(captured["tracks_upserted"])
     assert good_tid in landed and bad_tid not in landed, (
-        f"only good_tid should have landed in tracks; got {landed}"
+        f"good track should land in tracks, bad should not; got {landed}"
+    )
+
+
+def test_good_play_older_than_gap_is_kept() -> None:
+    """Re-audit 2026-06-07 (etl/gemini/F-001): a good play OLDER than the earliest
+    track-fetch gap IS safe to upsert — the high-water mark stays at/below it, so the
+    bad play is still re-fetched next run. This is the forward-progress half of the fix:
+    we defer only what's newer than the gap, not the whole batch."""
+    import httpx
+    bad_tid = "BAD_TRACK"
+    good_tid = "GOOD_TRACK"
+    items = [
+        _make_play(good_tid, "ART_B", "2026-05-27T15:00:00.000Z"),  # OLDER than the gap
+        _make_play(bad_tid, "ART_A", "2026-05-27T15:05:00.000Z"),   # newer, fails
+    ]
+
+    def _track_side_effect(tid: str) -> dict:
+        if tid == bad_tid:
+            raise httpx.HTTPError(f"simulated network failure for {tid}")
+        return _track_obj(tid)
+
+    captured = _run_etl_with_mocks(
+        items=items,
+        existing_tracks=set(),
+        track_side_effect=_track_side_effect,
+    )
+
+    played = set(captured["plays_upserted"])
+    assert good_tid in played, (
+        f"good play older than the gap should be kept; got {played}"
+    )
+    assert bad_tid not in played, (
+        f"bad track {bad_tid} play should have been skipped; got {played}"
     )
 
 

@@ -36,6 +36,7 @@ from html.parser import HTMLParser
 
 import requests
 from dotenv import load_dotenv
+from email.utils import parsedate_to_datetime
 from supabase import create_client, Client
 
 from sync_log_helper import log_sync as _shared_log_sync
@@ -188,7 +189,10 @@ def find_whoop_emails(imap: imaplib.IMAP4_SSL) -> list[tuple[bytes, email.messag
         msg = email.message_from_bytes(raw)
         subject = decode_subject(msg)
         s_lower = subject.lower()
-        if "whoop" in s_lower and "export" in s_lower:
+        # Re-audit 2026-06-07 (etl/deepseek/F-009): broaden the subject fallback so a
+        # rebrand like "Your WHOOP Data is Ready" still matches — 'whoop' plus either
+        # 'export' or 'data' rather than requiring both 'whoop' AND 'export'.
+        if "whoop" in s_lower and ("export" in s_lower or "data" in s_lower):
             results.append((uid, msg))
         elif uid in by_from_uids:
             other_from_subjects.append(subject[:80])
@@ -293,6 +297,17 @@ def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
     email_date = msg.get("Date", "unknown")
     log.info(f"Processing: \"{subject}\" ({email_date})")
 
+    # Re-audit 2026-06-07 (etl/gemini/F-003): parse the email's Date header so the
+    # importer can refuse to overwrite a newer row with stale data from an older
+    # export. Falls back to None (no guard) if unparseable — same as old behaviour.
+    email_received_at: datetime | None = None
+    raw_date = msg.get("Date")
+    if raw_date:
+        try:
+            email_received_at = parsedate_to_datetime(raw_date)
+        except (TypeError, ValueError):
+            email_received_at = None
+
     t0 = time.time()
 
     # Step 1: Extract download URL
@@ -328,7 +343,10 @@ def process_email(imap: imaplib.IMAP4_SSL, uid: bytes,
 
         # Step 3: Import journal entries
         try:
-            count = import_journal(csv_path, dry_run=dry_run)
+            count = import_journal(
+                csv_path, dry_run=dry_run,
+                export_received_at=email_received_at,
+            )
         except Exception as e:
             log.error(f"Import failed: {e} — will retry next cycle")
             log_sync(sb, "whoop", "journal_email", "error",

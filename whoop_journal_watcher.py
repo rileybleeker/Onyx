@@ -37,6 +37,9 @@ log = logging.getLogger("whoop_journal_watcher")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INBOX = os.path.join(SCRIPT_DIR, "journal_inbox")
 ARCHIVE = os.path.join(SCRIPT_DIR, "journal_archive")
+# Re-audit 2026-06-07 (etl/gemini/F-008): files whose import raises are moved here
+# instead of being left in the inbox to be retried (and re-fail) on every poll.
+ERROR_DIR = os.path.join(SCRIPT_DIR, "journal_error")
 
 # Import the journal importer
 sys.path.insert(0, SCRIPT_DIR)
@@ -47,6 +50,7 @@ def ensure_dirs():
     """Create inbox/archive folders if they don't exist."""
     os.makedirs(INBOX, exist_ok=True)
     os.makedirs(ARCHIVE, exist_ok=True)
+    os.makedirs(ERROR_DIR, exist_ok=True)
 
 
 def get_csv_files() -> list[str]:
@@ -63,6 +67,17 @@ def archive_file(csv_path: str):
     dest = os.path.join(ARCHIVE, archive_name)
     shutil.move(csv_path, dest)
     log.info(f"Archived → {archive_name}")
+
+
+def error_file(csv_path: str):
+    """Move a CSV whose import failed into the error/ subdir so it isn't retried forever."""
+    basename = os.path.basename(csv_path)
+    name, ext = os.path.splitext(basename)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    error_name = f"{name}_{timestamp}{ext}"
+    dest = os.path.join(ERROR_DIR, error_name)
+    shutil.move(csv_path, dest)
+    log.info(f"Moved to error/ → {error_name}")
 
 
 def process_inbox() -> int:
@@ -91,7 +106,11 @@ def process_inbox() -> int:
             archive_file(csv_path)
             processed += 1
         except Exception as e:
-            log.error(f"Failed to import {basename}: {e}")
+            # Re-audit 2026-06-07 (etl/gemini/F-008): move the failed file to error/
+            # instead of leaving it in the inbox to be retried (and re-fail) forever.
+            log.error(f"Failed to import {basename}, moving to error/: {e}")
+            if os.path.exists(csv_path):
+                error_file(csv_path)
 
     return processed
 

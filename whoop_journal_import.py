@@ -22,7 +22,7 @@ import sys
 import csv
 import argparse
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -233,8 +233,21 @@ def parse_long_format(reader, headers: list[str]) -> list[dict]:
     return rows
 
 
-def import_journal(csv_path: str, dry_run: bool = False) -> int:
-    """Parse a WHOOP journal CSV and upsert into Supabase."""
+def import_journal(
+    csv_path: str,
+    dry_run: bool = False,
+    export_received_at: datetime | None = None,
+) -> int:
+    """Parse a WHOOP journal CSV and upsert into Supabase.
+
+    If `export_received_at` is supplied (typically the email's Date header from
+    whoop_journal_email.process_email), (cycle_date, question) rows whose existing
+    DB row was synced AFTER that timestamp are skipped — protects against an older
+    WHOOP export overwriting a newer one when Riley triggers multiple exports in
+    quick succession (re-audit 2026-06-07 etl/gemini/F-003, mirrors the
+    myfitnesspal_import ordering guard). When unset (direct CLI use), nothing is
+    skipped and all rows are upserted as before.
+    """
     log.info(f"Reading {csv_path}...")
 
     with open(csv_path, "r", encoding="utf-8-sig") as f:
@@ -276,6 +289,53 @@ def import_journal(csv_path: str, dry_run: bool = False) -> int:
 
     # Upsert to Supabase in batches
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    # Ordering guard (re-audit 2026-06-07 etl/gemini/F-003): skip (cycle_date,
+    # question) rows whose existing DB row was synced AFTER this export was
+    # received, so a stale older export can't clobber newer data. Batched select
+    # over the affected cycle_dates keeps round-trips small; the per-row decision
+    # is made on the (cycle_date, question) conflict key. Mirrors
+    # myfitnesspal_import.import_nutrition.
+    if export_received_at is not None and rows:
+        if export_received_at.tzinfo is None:
+            export_received_at = export_received_at.replace(tzinfo=timezone.utc)
+        affected_dates = sorted({r["cycle_date"] for r in rows})
+        existing_synced: dict[tuple[str, str], datetime] = {}
+        for j in range(0, len(affected_dates), 100):
+            chunk = affected_dates[j:j + 100]
+            existing = (
+                sb.schema("pds")
+                .table("whoop_journal")
+                .select("cycle_date, question, synced_at")
+                .in_("cycle_date", chunk)
+                .execute()
+            )
+            for row in existing.data or []:
+                d = row.get("cycle_date")
+                q = row.get("question")
+                s = row.get("synced_at")
+                if not d or q is None or not s:
+                    continue
+                try:
+                    existing_synced[(d, q)] = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    continue
+        original_count = len(rows)
+        rows = [
+            r for r in rows
+            if (r["cycle_date"], r["question"]) not in existing_synced
+            or existing_synced[(r["cycle_date"], r["question"])] <= export_received_at
+        ]
+        skipped_newer = original_count - len(rows)
+        if skipped_newer:
+            log.info(
+                f"Ordering guard: skipped {skipped_newer} entr(ies) whose existing "
+                f"row was synced after this export's received-at ({export_received_at.isoformat()})."
+            )
+        if not rows:
+            log.info("All entries in this export are stale vs DB — nothing to upsert.")
+            return 0
+
     batch_size = 500
     total = 0
 

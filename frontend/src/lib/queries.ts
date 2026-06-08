@@ -1,6 +1,11 @@
 import { supabase } from "./supabase";
 import { whoopSleepDay, kjToKcal } from "./format";
 
+// Re-audit 2026-06-07 (units/deepseek/F-003): promoted the workout→sleep gap
+// window from a function-local literal to a named module-level const. The pairing
+// only considers a workout "before" a sleep if it ended within this many ms.
+const WORKOUT_SLEEP_GAP_MAX_MS = 18 * 60 * 60 * 1000; // 18 hours
+
 /**
  * Duration unit convention across this module:
  *   - Garmin daily summary / sleep / activities → SECONDS (`*_seconds`,
@@ -292,17 +297,16 @@ export async function getWorkoutSleepGap(days: number = 60): Promise<WorkoutSlee
   }
   workouts.sort((a, b) => a.end - b.end);
 
-  const eighteenHrMs = 18 * 60 * 60 * 1000;
   const out: WorkoutSleepGap[] = [];
   for (const s of sleeps) {
     const sleepMs = new Date(s.start_time as string).getTime();
     // Binary-search-ish: find the latest workout with end <= sleepMs
     let last: W | null = null;
     for (let i = workouts.length - 1; i >= 0; i--) {
-      if (workouts[i].end <= sleepMs && sleepMs - workouts[i].end <= eighteenHrMs) {
+      if (workouts[i].end <= sleepMs && sleepMs - workouts[i].end <= WORKOUT_SLEEP_GAP_MAX_MS) {
         last = workouts[i]; break;
       }
-      if (workouts[i].end < sleepMs - eighteenHrMs) break;
+      if (workouts[i].end < sleepMs - WORKOUT_SLEEP_GAP_MAX_MS) break;
     }
     // pred_date = behavioral date (day the workout/strain "belongs to" for the
     // following sleep). Use whoopSleepDay() — `(cycle_start − 6h)::ET date` —
@@ -508,12 +512,25 @@ export async function getWhoopCaloriesBurnt(days: number = 30) {
     const midday = new Date(start.getTime() + 12 * 3600 * 1000);
     const calendar_date = midday.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
     const kj = Number(c.kilojoule);
+    // Re-audit 2026-06-07 (units/deepseek/F-005): the `kilojoule == null` check
+    // above doesn't catch a non-numeric string (e.g. ""), which Number() turns
+    // into NaN and would poison kcal_exact / averages downstream. Skip it.
+    if (isNaN(kj)) continue;
     const kcalExact = kjToKcal(kj);
     // `kcal_exact` carries precision for downstream weekly/monthly averaging;
     // `calories_burnt` keeps the rounded value for backwards-compat with
     // existing chart consumers.
     // Ascending order means last-write-wins picks the later cycle on the rare
     // day with two; in practice there's one cycle per ET date.
+    // Re-audit 2026-06-07 (units/deepseek/F-006): surface the rare two-cycles-on-
+    // one-ET-date case so a silent overwrite is at least observable. Selection
+    // logic (last-write-wins, later cycle) is unchanged.
+    if (byDate.has(calendar_date)) {
+      console.warn(
+        `getWhoopCaloriesBurnt: two WHOOP cycles map to ${calendar_date}; ` +
+          `overwriting cycle ${byDate.get(calendar_date)?.kilojoule}kJ with ${kj}kJ (last-write-wins).`,
+      );
+    }
     byDate.set(calendar_date, {
       calendar_date,
       kilojoule: kj,

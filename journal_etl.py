@@ -380,6 +380,12 @@ def main(full: bool, reembed: bool) -> int:
                 rows_needing_embed.append((idx, head))
 
         # 4. Embed in batches of 64.
+        # Re-audit 2026-06-07 (etl/gemini/F-004): a single failed embedding batch must not
+        # abort the whole sync. Track the failed rows, skip only those at upsert time (so
+        # their notion_edited_at stays stale in the DB → retried next run), and still
+        # persist everything that succeeded or didn't need embedding.
+        embed_failed_idx: set[int] = set()
+        embed_error: str | None = None
         if rows_needing_embed:
             BATCH = 64
             for i in range(0, len(rows_needing_embed), BATCH):
@@ -388,18 +394,22 @@ def main(full: bool, reembed: bool) -> int:
                 try:
                     vectors = embed_documents(nc, texts)
                 except httpx.HTTPStatusError as e:
-                    log.error(f"Voyage embedding failed: {e.response.status_code} {e.response.text[:200]}")
-                    log_sync(sb, "partial", len(rows_to_upsert), started, str(e))
-                    return 2
+                    log.error(f"Voyage embedding failed for batch {i // BATCH}: "
+                              f"{e.response.status_code} {e.response.text[:200]}")
+                    embed_failed_idx.update(idx for idx, _ in batch)
+                    embed_error = str(e)
+                    continue
                 for (idx, _), vec in zip(batch, vectors):
                     rows_to_upsert[idx]["embedding"] = vec
                     rows_to_upsert[idx]["embedding_model"] = VOYAGE_MODEL
                     embedded += 1
 
-    # 5. Upsert in chunks of 25 (vectors are large).
+    # 5. Upsert in chunks of 25 (vectors are large). Skip rows whose embedding failed this
+    #    run so their notion_edited_at stays stale in the DB and they retry next run.
+    upsertable = [r for i, r in enumerate(rows_to_upsert) if i not in embed_failed_idx]
     CHUNK = 25
-    for i in range(0, len(rows_to_upsert), CHUNK):
-        chunk = rows_to_upsert[i:i + CHUNK]
+    for i in range(0, len(upsertable), CHUNK):
+        chunk = upsertable[i:i + CHUNK]
         # supabase-py serializes lists fine; pgvector accepts JSON arrays.
         sb.schema("pds").table("journal_entries").upsert(
             chunk, on_conflict="notion_page_id"
@@ -415,10 +425,16 @@ def main(full: bool, reembed: bool) -> int:
             ).eq("notion_page_id", pid).execute()
             archived += 1
 
+    n_skipped = len(rows_to_upsert) - len(upsertable)
     log.info(
-        f"Done: synced={len(rows_to_upsert)} edited={edited} embedded={embedded} archived={archived}"
+        f"Done: synced={len(upsertable)} skipped_embed_fail={n_skipped} "
+        f"edited={edited} embedded={embedded} archived={archived}"
     )
-    log_sync(sb, "success", len(rows_to_upsert), started)
+    if embed_error is not None:
+        log_sync(sb, "partial", len(upsertable), started,
+                 f"embedding failed for {n_skipped} row(s): {embed_error}")
+        return 2
+    log_sync(sb, "success", len(upsertable), started)
     return 0
 
 
@@ -429,4 +445,17 @@ if __name__ == "__main__":
     parser.add_argument("--reembed", action="store_true",
                         help="Regenerate every embedding, even if content unchanged")
     args = parser.parse_args()
-    sys.exit(main(full=args.full, reembed=args.reembed))
+    # Re-audit 2026-06-07 (etl/deepseek/F-001): top-level failure heartbeat so an
+    # uncaught exception surfaces on /status instead of silently going stale.
+    _t_main_start = time.time()
+    try:
+        sys.exit(main(full=args.full, reembed=args.reembed))
+    except SystemExit:
+        raise  # normal exit code path — not a crash
+    except Exception as exc:  # noqa: BLE001 — top-level safety net
+        try:
+            log_sync(create_client(SUPABASE_URL, SUPABASE_KEY), "failed", 0, _t_main_start,
+                     error=f"Uncaught exception: {exc}")
+        except Exception as log_exc:  # noqa: BLE001
+            log.error(f"Could not write failure sync_log row: {log_exc}")
+        raise

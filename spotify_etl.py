@@ -240,26 +240,26 @@ class SpotifyClient:
         return {"Authorization": f"Bearer {self.tokens['access_token']}"}
 
     def _request(self, method: str, url: str, **kwargs):
-        # 401 path: explicit refresh-and-retry once. Spotify uses 401 for
-        # expired access tokens; that's not a transient error, it's "rotate the
-        # token then call again." Done outside retry_http so we don't waste an
-        # attempt on a known-stale token.
-        resp = self.http.request(method, url, headers=self._headers(), **kwargs)
-        if resp.status_code == 401:
-            log.info("Access token expired; refreshing.")
-            self.tokens = refresh_access_token(self.tokens)
+        # Exactly ONE network request per attempt. Spotify uses 401 for an expired
+        # access token (not a transient error), so on 401 we refresh once and reissue
+        # within the same attempt. retry_http wraps the whole callable so 5xx / 429 /
+        # network errors get up to 3 attempts with backoff (honoring Retry-After), and
+        # it calls .raise_for_status() itself — so do() must not.
+        # Re-audit 2026-06-07 (etl/gpt-5/F-001): the previous version issued a raw
+        # request AND then a second identical one inside retry_http, doubling every
+        # successful GET (wasting rate budget / inflating 429 risk).
+        refreshed = {"done": False}
+
+        def do() -> httpx.Response:
             resp = self.http.request(method, url, headers=self._headers(), **kwargs)
-            resp.raise_for_status()
+            if resp.status_code == 401 and not refreshed["done"]:
+                log.info("Access token expired; refreshing.")
+                self.tokens = refresh_access_token(self.tokens)
+                refreshed["done"] = True
+                resp = self.http.request(method, url, headers=self._headers(), **kwargs)
             return resp
-        # All other paths: wrap in retry_http so 5xx / 429 / network errors
-        # get up to 3 attempts with exponential backoff (honoring Retry-After
-        # on 429). retry_http calls .raise_for_status() so non-retryable 4xx
-        # propagates immediately.
-        return retry_http(
-            lambda: self.http.request(method, url, headers=self._headers(), **kwargs),
-            max_attempts=3,
-            log=log,
-        )
+
+        return retry_http(do, max_attempts=3, log=log)
 
     def recently_played(self, after_ms: int | None = None, limit: int = 50) -> list[dict]:
         """GET /me/player/recently-played. `after_ms` is a Unix ms timestamp."""
@@ -678,8 +678,16 @@ def run_refresh_genres():
     log.info(f"Refreshing genres for {len(needs)} artists with empty genres")
     if not needs:
         log.info("Nothing to refresh — exiting.")
+        # Re-audit 2026-06-07 (etl/deepseek/F-003): heartbeat even on the no-op
+        # path so /status sees this manually-triggered run happened.
+        log_sync_entry(sb, source="musicbrainz", data_type="genre_refresh",
+                       status="success", records=0, started_at=started)
         return
     count = enrich_genres_via_musicbrainz(sb, needs)
+    # Re-audit 2026-06-07 (etl/deepseek/F-003): run_refresh_genres wrote no sync_log
+    # row at all — add one so the MusicBrainz enrichment subsystem stays monitorable.
+    log_sync_entry(sb, source="musicbrainz", data_type="genre_refresh",
+                   status="success", records=count, started_at=started)
     log.info(f"Updated {count}/{len(needs)} artists with MusicBrainz tags in {int(time.time()-started)}s")
 
 
@@ -700,7 +708,12 @@ def run_etl(refeaturize: bool = False):
         hwm_ms = get_high_water_mark(sb)
         log.info(f"High-water mark: {hwm_ms} ({datetime.fromtimestamp(hwm_ms/1000, tz=timezone.utc) if hwm_ms else 'none'})")
 
-        items = client.recently_played(after_ms=hwm_ms, limit=50)
+        # Re-audit 2026-06-07 (etl/gpt-5/F-009): `after` is strictly greater-than, so
+        # plays sharing the exact max played_at as a prior partial run would be skipped.
+        # Step back 1 ms; the (played_at, track_id) PK makes the re-fetch idempotent.
+        items = client.recently_played(
+            after_ms=(hwm_ms - 1) if hwm_ms is not None else None, limit=50
+        )
         log.info(f"Spotify returned {len(items)} recently-played items")
 
         # Cap-hit detection: Spotify's /me/player/recently-played stores at most
@@ -804,10 +817,31 @@ def run_etl(refeaturize: bool = False):
         # plays here; they'll be retried next run because the high-water mark
         # only advances on a successful run.
         landed_track_ids = set(already_tracks) | {t.get("id") for t in track_objs if t and t.get("id")}
-        safe_items = [it for it in items if (it.get("track") or {}).get("id") in landed_track_ids]
-        skipped = len(items) - len(safe_items)
-        if skipped:
-            log.warning(f"Skipping {skipped} plays whose track failed to upsert this run (will retry next cron).")
+
+        def _played_at_ms(it: dict) -> int:
+            return int(datetime.fromisoformat(it["played_at"].replace("Z", "+00:00")).timestamp() * 1000)
+
+        skipped_items = [it for it in items if (it.get("track") or {}).get("id") not in landed_track_ids]
+        if skipped_items:
+            # Re-audit 2026-06-07 (etl/gemini/F-001): the high-water mark is MAX(played_at)
+            # of what we upsert. If we upserted a play NEWER than a skipped (track-failed)
+            # play, next run's `after` would jump past the skipped play and it'd be lost
+            # forever. So only upsert plays strictly OLDER than the earliest gap; the
+            # skipped play and everything newer is deferred and re-fetched next cron.
+            earliest_gap_ms = min(_played_at_ms(it) for it in skipped_items)
+            safe_items = [
+                it for it in items
+                if (it.get("track") or {}).get("id") in landed_track_ids
+                and _played_at_ms(it) < earliest_gap_ms
+            ]
+            deferred = len(items) - len(skipped_items) - len(safe_items)
+            log.warning(
+                f"{len(skipped_items)} plays had a track that failed to upsert; deferring "
+                f"them + {deferred} newer plays past the earliest gap so the high-water mark "
+                f"doesn't skip them (will retry next cron)."
+            )
+        else:
+            safe_items = items
         plays_count = upsert_plays(sb, safe_items)
         log.info(f"Upserted {plays_count} plays")
 
@@ -894,4 +928,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Re-audit 2026-06-07 (etl/deepseek/F-001): top-level failure heartbeat so an
+    # uncaught exception surfaces on /status instead of silently going stale.
+    _t_main_start = time.time()
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001 — top-level safety net
+        try:
+            log_sync(get_supabase(), "failed", 0, _t_main_start,
+                     error=f"Uncaught exception: {exc}")
+        except Exception as log_exc:  # noqa: BLE001
+            log.error(f"Could not write failure sync_log row: {log_exc}")
+        raise

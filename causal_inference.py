@@ -120,6 +120,60 @@ SUPPLEMENT_EXTRA_CONFOUNDERS = (
     "journal_consumed_caffeine_lag1",
 )
 
+# Re-audit 2026-06-07 (stats/gemini/F-003): mediator exclusion for multi-day
+# rolling/aggregate treatments. For a treatment that aggregates several past
+# days (e.g. rolling_7d_training_load spans days N-7..N), HRV on night N-1
+# (hrv_lag1) lies on the causal path from the EARLIER days of that window to
+# the outcome — training load on day N-2 affects HRV on night N-1, so hrv_lag1
+# is a MEDIATOR for those days, not a pre-treatment confounder. Conditioning on
+# a mediator induces collider/over-control bias. For these treatments we drop
+# the intermediate (post-window-start) variables from the confounder set.
+# hrv_7d_mean is likewise a window-overlapping aggregate of the same days, so it
+# is dropped too. We keep day_of_week / is_weekend / sleep_debt_7d (the latter
+# is a slow-moving deficit that is reasonable to treat as a baseline covariate).
+ROLLING_AGGREGATE_TREATMENTS = frozenset({
+    "rolling_3d_training_load",
+    "rolling_7d_training_load",
+    "acute_training_load",
+    "chronic_training_load",
+    "atl_ctl_ratio",
+    "total_training_load",
+})
+# Confounders that become mediators (or window-overlapping aggregates) once the
+# treatment spans multiple past days. Dropped from the adjustment set for any
+# treatment in ROLLING_AGGREGATE_TREATMENTS.
+ROLLING_TREATMENT_MEDIATOR_CONFOUNDERS = frozenset({
+    "hrv_lag1",
+    "hrv_7d_mean",
+    "whoop_day_strain_lag1",
+})
+
+# Re-audit 2026-06-07 (stats/gpt-5/F-007): forward-fill horizon for confounders,
+# configurable per family instead of the prior hard-coded limit=2. Weekly /
+# multi-day aggregate confounders (rolling load, sleep debt) are slow-moving and
+# legitimately stable across a week, so a 2-day fill needlessly drops rows in
+# early-tracking or sparse periods. We use a longer fill for confounder columns
+# whose name marks them as multi-day aggregates, and keep the conservative
+# 2-day fill for genuinely daily confounders (lag1 strain/sleep) where a long
+# carry-forward would smear stale values across real gaps.
+CONFOUNDER_FFILL_DEFAULT = 2
+CONFOUNDER_FFILL_WEEKLY = 7
+# Substrings that mark a confounder column as a multi-day / weekly aggregate.
+_WEEKLY_CONFOUNDER_MARKERS = ("7d", "rolling", "debt", "ctl", "chronic", "7_mean", "7d_mean")
+
+
+def _confounder_ffill_limit(col: str) -> int:
+    """Re-audit 2026-06-07 (stats/gpt-5/F-007): per-confounder ffill horizon.
+
+    Weekly/multi-day aggregate confounders get a 7-day carry-forward; daily
+    confounders keep the conservative 2-day default so a stale value can't be
+    smeared across a long gap.
+    """
+    name = col.lower()
+    if any(m in name for m in _WEEKLY_CONFOUNDER_MARKERS):
+        return CONFOUNDER_FFILL_WEEKLY
+    return CONFOUNDER_FFILL_DEFAULT
+
 # Minimum cell sizes
 MIN_BINARY_PER_ARM_FULL = 20      # full causal estimates require this many in each arm
 MIN_BINARY_PER_ARM_REPORT = 10    # below this we don't run estimators at all
@@ -438,6 +492,34 @@ def _standardize(X: np.ndarray) -> np.ndarray:
     return scaler.fit_transform(X)
 
 
+# Re-audit 2026-06-07 (stats/gpt-5/F-004): day_of_week was an ordinal 0-6 in
+# COMMON_CONFOUNDERS, which forces both the logistic propensity model and the
+# Ridge outcome models to assume a LINEAR effect across weekdays (Monday→Sunday
+# differ by a constant slope) — misspecified for what is a cyclic/categorical
+# structure. We expand day_of_week into cyclic sin/cos terms before any model
+# sees it. Two smooth terms capture the weekly cycle (Sunday adjacent to Monday)
+# without the dimensionality blow-up of a 6-column one-hot, and they keep the
+# confounder design matrix purely numeric for the existing ndarray flow.
+DOW_COL = "day_of_week"
+
+
+def _expand_cyclic_day_of_week(X_df: pd.DataFrame) -> pd.DataFrame:
+    """Replace an ordinal ``day_of_week`` column with cyclic sin/cos terms.
+
+    No-op if the column is absent. Returns a new frame; the original column is
+    dropped and ``day_of_week_sin`` / ``day_of_week_cos`` appended in its place.
+    """
+    if DOW_COL not in X_df.columns:
+        return X_df
+    out = X_df.copy()
+    dow = pd.to_numeric(out[DOW_COL], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    angle = 2.0 * np.pi * dow / 7.0
+    out = out.drop(columns=[DOW_COL])
+    out[f"{DOW_COL}_sin"] = np.sin(angle)
+    out[f"{DOW_COL}_cos"] = np.cos(angle)
+    return out
+
+
 def estimate_naive(T: np.ndarray, Y: np.ndarray) -> dict:
     """Mean(Y|T=1) − Mean(Y|T=0) with Welch's CI."""
     y1 = Y[T == 1]
@@ -454,19 +536,24 @@ def estimate_naive(T: np.ndarray, Y: np.ndarray) -> dict:
     }
 
 
-def estimate_psm(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
-                 k: int = PSM_K, n_boot: int = N_BOOTSTRAP_PSM) -> dict:
-    """1:k nearest-neighbor propensity matching. Returns ATT + bootstrap CI.
+def _psm_match_once(X: np.ndarray, T: np.ndarray, Y: np.ndarray, k: int) -> dict | None:
+    """Run the FULL PSM procedure once: standardize → fit propensity →
+    common-support trim → caliper NN matching → ATT.
 
-    Unlike AIPW, PSM has no train/validate fold structure — the propensity
-    model is fit and consumed on the SAME rows (matching is performed within
-    that set). Standardizing on the full X here is therefore not the same kind
-    of leakage AIPW suffers from; there is no held-out fold whose statistics
-    we are peeking at. The audit re-2026-05-26 fold-local scaling fix is
-    consequently scoped to AIPW. Documented for the next reviewer.
+    Returns a dict with att / matched_diffs / caliper / caliper_drops /
+    n_treated_matched / n_dropped, or None when there is not enough material to
+    match (caller decides what to do). Factored out of estimate_psm so the
+    bootstrap can re-run the ENTIRE estimation (propensity fit + matching) on
+    each resample rather than just resampling the final matched_diffs.
     """
-    X_std = _standardize(X)
-    p_hat = _fit_propensity(X_std, T)
+    # Need both arms present to fit a propensity model at all.
+    if int(T.sum()) < 2 or int((T == 0).sum()) < 2:
+        return None
+    try:
+        X_std = _standardize(X)
+        p_hat = _fit_propensity(X_std, T)
+    except Exception:
+        return None
     logit_p = np.log(p_hat / (1 - p_hat))
 
     treated_idx = np.where(T == 1)[0]
@@ -474,33 +561,25 @@ def estimate_psm(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
 
     # Common-support filter: drop treated above 0.95 propensity (no real
     # comparable controls); drop controls below 0.05.
-    in_support = (p_hat[treated_idx] < PROPENSITY_TRIM_HIGH)
-    treated_idx = treated_idx[in_support]
-    control_in_support = (p_hat[control_idx] > PROPENSITY_TRIM_LOW)
-    control_idx = control_idx[control_in_support]
+    treated_idx = treated_idx[p_hat[treated_idx] < PROPENSITY_TRIM_HIGH]
+    control_idx = control_idx[p_hat[control_idx] > PROPENSITY_TRIM_LOW]
+    n_dropped = int(np.sum(T) - len(treated_idx) + (T == 0).sum() - len(control_idx))
 
     if len(treated_idx) < 5 or len(control_idx) < k:
-        return {"ate": float("nan"), "ci_low": float("nan"),
-                "ci_high": float("nan"), "se": float("nan"),
-                "n_treated_matched": 0, "n_dropped_common_support": 0,
-                "caliper_value": float("nan"), "caliper_drops": 0}
+        return {"att": float("nan"), "matched_diffs": np.array([]),
+                "caliper": float("nan"), "caliper_drops": 0,
+                "n_treated_matched": 0, "n_dropped": n_dropped}
 
-    # Audit re-2026-05-26 P2 (gpt-5 stats F-006): PSM previously matched the
-    # NEAREST k controls on logit propensity with no caliper, so under
-    # propensity misspecification a treated unit could pair with controls at
-    # materially different propensities. Standard caliper = 0.2·SD(logit p)
-    # over the analysis sample. A treated unit whose NEAREST control sits
-    # outside the caliper is dropped (counted as caliper_drop) instead of
-    # being forced to match.
+    # Audit re-2026-05-26 P2 (gpt-5 stats F-006): caliper = 0.2·SD(logit p);
+    # a treated unit whose nearest control sits outside the caliper is dropped
+    # rather than force-matched to a materially different propensity.
     caliper = float(0.2 * np.std(logit_p))
 
-    # For each treated, k nearest controls on logit propensity WITHIN caliper.
     matched_diffs: list[float] = []
     caliper_drops = 0
     for ti in treated_idx:
         dists = np.abs(logit_p[control_idx] - logit_p[ti])
         order = np.argsort(dists)
-        # Take up to k nearest whose distance is within the caliper.
         in_cal = dists[order] <= caliper
         nn_idx = order[in_cal][:k]
         if len(nn_idx) == 0:
@@ -509,40 +588,92 @@ def estimate_psm(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
         nn = control_idx[nn_idx]
         matched_diffs.append(Y[ti] - Y[nn].mean())
     matched_diffs = np.array(matched_diffs)
+    att = float(matched_diffs.mean()) if len(matched_diffs) else float("nan")
+    return {"att": att, "matched_diffs": matched_diffs, "caliper": caliper,
+            "caliper_drops": int(caliper_drops),
+            "n_treated_matched": int(len(matched_diffs)), "n_dropped": n_dropped}
 
-    if len(matched_diffs) < 5:
+
+def _block_resample_indices(n: int, block_len: int, rng: np.random.Generator) -> np.ndarray:
+    """Re-audit 2026-06-07 (stats/gpt-5/F-005): moving-block bootstrap index
+    sampler. Returns ~n row indices assembled from contiguous blocks of length
+    block_len drawn (with replacement) over calendar order, preserving the
+    short-range temporal dependence an i.i.d. resample destroys."""
+    if n < block_len:
+        return rng.integers(0, n, size=n)
+    n_blocks = int(np.ceil(n / block_len))
+    starts = rng.integers(0, n - block_len + 1, size=n_blocks)
+    idx = (starts[:, None] + np.arange(block_len)[None, :]).reshape(-1)[:n]
+    return idx
+
+
+def estimate_psm(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
+                 k: int = PSM_K, n_boot: int = N_BOOTSTRAP_PSM) -> dict:
+    """1:k nearest-neighbor propensity matching. Returns ATT + bootstrap CI.
+
+    Re-audit 2026-06-07 (stats/gemini/F-002 + stats/gpt-5/F-005): the bootstrap
+    now re-estimates the ENTIRE procedure — propensity fit AND nearest-neighbor
+    matching — on each resample, instead of resampling only the final
+    matched_diffs. Resampling matched_diffs alone treated the matching and
+    propensity model as fixed/known, which ignores their sampling variability
+    and produced artificially narrow CIs. In addition, the resample is now a
+    7-day BLOCK bootstrap over calendar order (rows arrive in calendar order
+    from _prepare_treatment), so the autocorrelation in daily HRV/behavior is
+    preserved rather than destroyed by i.i.d. row sampling.
+    """
+    # Point estimate: full procedure on the observed sample.
+    point = _psm_match_once(X, T, Y, k)
+    if point is None or point["n_treated_matched"] < 5:
+        nm = 0 if point is None else point["n_treated_matched"]
+        nd = 0 if point is None else point["n_dropped"]
+        cal = float("nan") if point is None else point["caliper"]
+        cdr = 0 if point is None else point["caliper_drops"]
         return {"ate": float("nan"), "ci_low": float("nan"),
                 "ci_high": float("nan"), "se": float("nan"),
-                "n_treated_matched": int(len(matched_diffs)),
-                "n_dropped_common_support": int(np.sum(T) - len(treated_idx)
-                                                + (T == 0).sum() - len(control_idx)),
-                "caliper_value": caliper, "caliper_drops": int(caliper_drops)}
+                "n_treated_matched": int(nm), "n_dropped_common_support": int(nd),
+                "caliper_value": cal, "caliper_drops": int(cdr)}
 
-    att = float(matched_diffs.mean())
+    att = point["att"]
 
-    # Paired bootstrap on matched pairs
-    boot_ates = []
-    n = len(matched_diffs)
+    # Block bootstrap: resample contiguous 7-day blocks of ROWS, then re-run
+    # propensity + matching on each resampled dataset. Bootstrap draws that
+    # collapse to one arm (or otherwise fail to match) are skipped.
+    n = len(T)
+    rng = np.random.default_rng(42)
+    boot_ates: list[float] = []
     for _ in range(n_boot):
-        sample = RNG.choice(matched_diffs, size=n, replace=True)
-        boot_ates.append(sample.mean())
+        idx = _block_resample_indices(n, AIPW_BOOTSTRAP_BLOCK_LEN, rng)
+        res = _psm_match_once(X[idx], T[idx], Y[idx], k)
+        if res is None or res["n_treated_matched"] < 1 or np.isnan(res["att"]):
+            continue
+        boot_ates.append(res["att"])
+
+    if len(boot_ates) < 100:
+        # Too few valid bootstrap draws for a trustworthy CI — report the point
+        # estimate with NaN interval rather than a misleadingly tight one.
+        return {"ate": att, "ci_low": float("nan"), "ci_high": float("nan"),
+                "se": float("nan"),
+                "n_treated_matched": point["n_treated_matched"],
+                "n_dropped_common_support": point["n_dropped"],
+                "caliper_value": point["caliper"],
+                "caliper_drops": point["caliper_drops"],
+                "n_boot_valid": int(len(boot_ates))}
+
     boot_ates = np.array(boot_ates)
     ci_low = float(np.percentile(boot_ates, 2.5))
     ci_high = float(np.percentile(boot_ates, 97.5))
     se = float(boot_ates.std(ddof=1))
 
-    n_dropped = int(np.sum(T) - len(treated_idx) + (T == 0).sum() - len(control_idx))
     return {
         "ate": att,
         "ci_low": ci_low,
         "ci_high": ci_high,
         "se": se,
-        # n_treated_matched now counts treated units that found at least one
-        # in-caliper control (post-caliper sample), not the pre-caliper count.
-        "n_treated_matched": int(len(matched_diffs)),
-        "n_dropped_common_support": n_dropped,
-        "caliper_value": caliper,
-        "caliper_drops": int(caliper_drops),
+        "n_treated_matched": point["n_treated_matched"],
+        "n_dropped_common_support": point["n_dropped"],
+        "caliper_value": point["caliper"],
+        "caliper_drops": point["caliper_drops"],
+        "n_boot_valid": int(len(boot_ates)),
     }
 
 
@@ -568,11 +699,33 @@ def _block_bootstrap_ci(psi: np.ndarray, block_len: int = AIPW_BOOTSTRAP_BLOCK_L
     Returns (NaN, NaN) when fewer than 2*block_len non-NaN psi values exist
     (not enough material for a meaningful block bootstrap).
     """
+    ci_low, ci_high, _ = _block_bootstrap_stats(psi, block_len, n_boot, seed, alpha)
+    return (ci_low, ci_high)
+
+
+def _block_bootstrap_stats(psi: np.ndarray, block_len: int = AIPW_BOOTSTRAP_BLOCK_LEN,
+                           n_boot: int = N_BOOTSTRAP_AIPW, seed: int = 42,
+                           alpha: float = 0.05) -> tuple[float, float, float]:
+    """Re-audit 2026-06-07 (stats/gpt-5/F-003 + stats/deepseek/F-001): block
+    bootstrap of the IF mean returning (ci_low, ci_high, p_value).
+
+    The p-value is the 2-sided autocorrelation-aware significance level for
+    H0: ATE = 0, computed by INVERTING the block-bootstrap distribution of the
+    influence-function mean. We recentre the bootstrap means on the observed
+    ATE (psi mean) so the distribution approximates the sampling distribution
+    of the estimator UNDER THE NULL, then measure the tail mass at/under zero:
+
+        p = 2 · min( P(centred_mean <= 0), P(centred_mean >= 0) ),  clipped to [~0,1].
+
+    This replaces the IF-Wald p (2·(1-Φ(|ate/se_if|))) used by the FDR screen,
+    which assumes i.i.d. influence values and is anti-conservative under HRV
+    autocorrelation. Returns (NaN, NaN, NaN) when there isn't enough material.
+    """
     psi = np.asarray(psi, dtype=float)
     n = len(psi)
     n_valid = int((~np.isnan(psi)).sum())
     if n < 2 * block_len or n_valid < 2 * block_len:
-        return (float("nan"), float("nan"))
+        return (float("nan"), float("nan"), float("nan"))
     rng = np.random.default_rng(seed)
     n_blocks = int(np.ceil(n / block_len))
     # Vectorized block resample: pick n_blocks random starting indices, gather contiguous slices.
@@ -585,9 +738,22 @@ def _block_bootstrap_ci(psi: np.ndarray, block_len: int = AIPW_BOOTSTRAP_BLOCK_L
         boot_means = np.nanmean(boot_samples, axis=1)
     boot_means = boot_means[~np.isnan(boot_means)]
     if len(boot_means) < 100:
-        return (float("nan"), float("nan"))
-    return (float(np.quantile(boot_means, alpha / 2)),
-            float(np.quantile(boot_means, 1 - alpha / 2)))
+        return (float("nan"), float("nan"), float("nan"))
+    ci_low = float(np.quantile(boot_means, alpha / 2))
+    ci_high = float(np.quantile(boot_means, 1 - alpha / 2))
+
+    # 2-sided bootstrap p-value via distribution inversion. Recentre on the
+    # observed ATE so the reference distribution is null-consistent, then take
+    # the smaller tail at zero. Floor at 1/(B+1) so a p of exactly 0 (no
+    # bootstrap draw crossed zero) isn't reported as impossibly significant.
+    ate_obs = float(np.nanmean(psi))
+    centred = boot_means - ate_obs
+    b = len(centred)
+    p_left = float(np.mean(centred <= -abs(ate_obs)))
+    p_right = float(np.mean(centred >= abs(ate_obs)))
+    p_val = 2.0 * min(p_left, p_right)
+    p_val = float(min(1.0, max(p_val, 1.0 / (b + 1))))
+    return (ci_low, ci_high, p_val)
 
 
 def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
@@ -681,7 +847,11 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
     # NaN gaps preserved) so the 7-day blocks correspond to calendar-
     # contiguous days. Densifying via psi_valid would glue non-adjacent days
     # and break the autocorrelation structure the bootstrap relies on.
-    ci_low_bb, ci_high_bb = _block_bootstrap_ci(psi)
+    # Re-audit 2026-06-07 (stats/gpt-5/F-003 + deepseek/F-001): also derive an
+    # autocorrelation-aware 2-sided p-value from the block-bootstrap distribution
+    # so the BH-FDR screen no longer relies on the i.i.d. IF-Wald p (which is
+    # anti-conservative under HRV autocorrelation). The IF numbers are kept too.
+    ci_low_bb, ci_high_bb, p_bb = _block_bootstrap_stats(psi)
 
     # Compare CI widths. If they diverge meaningfully, the IF SE is unreliable.
     width_if = ci_high_if - ci_low_if
@@ -702,6 +872,9 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
         "ci_low_bb": ci_low_bb,
         "ci_high_bb": ci_high_bb,
         "bb_width_ratio": bb_width_ratio,  # bb_width / if_width; >1 means BB is wider (IF too narrow)
+        # Re-audit 2026-06-07 (stats/gpt-5/F-003 + deepseek/F-001): block-
+        # bootstrap 2-sided p-value (autocorrelation-aware) — the FDR-preferred p.
+        "p_bb": p_bb,
         "fold_failures": int(fold_failures),
         "n_folds": int(n_folds),
         "unreliable": bool(unreliable),
@@ -887,6 +1060,17 @@ def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarra
     # confounder set, which would perfectly separate the propensity model.
     confounders = tuple(c for c in spec.confounders if c != spec.name)
 
+    # Re-audit 2026-06-07 (stats/gemini/F-003): for multi-day rolling/aggregate
+    # treatments, the lagged-HRV / lagged-strain / weekly-HRV-mean confounders
+    # are MEDIATORS (training load on day N-2 → HRV on night N-1 → outcome), or
+    # are window-overlapping aggregates of the treatment's own days. Adjusting
+    # for a mediator blocks part of the effect being estimated. Drop those
+    # intermediate variables from the confounder set for these treatments only.
+    if spec.name in ROLLING_AGGREGATE_TREATMENTS:
+        confounders = tuple(
+            c for c in confounders if c not in ROLLING_TREATMENT_MEDIATOR_CONFOUNDERS
+        )
+
     cols_needed = [spec.name, OUTCOME_COL] + list(confounders)
     sub = df[cols_needed].copy()
 
@@ -901,7 +1085,15 @@ def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarra
     # AIPW identification, audit finding F-003) while making the ffill window
     # mean what it says.
     if confounders:
-        sub[list(confounders)] = sub[list(confounders)].ffill(limit=2)
+        # Re-audit 2026-06-07 (stats/gpt-5/F-007): ffill horizon is now per-
+        # confounder (was hard-coded limit=2). Weekly aggregates (rolling load,
+        # sleep debt, hrv_7d_mean) get a 7-day carry-forward since they're slow-
+        # moving and legitimately stable across a week; daily lag-1 confounders
+        # keep the conservative 2-day fill so stale values aren't smeared across
+        # long gaps. Filling each column with its own limit rather than one
+        # global value avoids dropping rows in early-tracking/sparse periods.
+        for c in confounders:
+            sub[c] = sub[c].ffill(limit=_confounder_ffill_limit(c))
 
     n_pre_drop = int(len(sub))
     # Drop rows with missing outcome or treatment
@@ -922,6 +1114,12 @@ def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarra
     X_df = sub[list(confounders)].copy()
     keep_mask = X_df.notna().all(axis=1).values
     n_dropped_confounder = int((~keep_mask).sum())
+    # Re-audit 2026-06-07 (stats/gpt-5/F-004): replace the ordinal day_of_week
+    # column with cyclic sin/cos terms AFTER the completeness mask is computed
+    # from the raw confounders (so the mask still reflects original missingness)
+    # but BEFORE handing X to the propensity / outcome models. This removes the
+    # implicit "weekdays differ by a constant linear step" assumption.
+    X_df = _expand_cyclic_day_of_week(X_df)
     X_df = X_df.loc[keep_mask]
     T = T[keep_mask]
     Y = Y[keep_mask]
@@ -1078,6 +1276,9 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             "aipw_ci_low_bb": est["aipw"].get("ci_low_bb"),
             "aipw_ci_high_bb": est["aipw"].get("ci_high_bb"),
             "aipw_bb_width_ratio": est["aipw"].get("bb_width_ratio"),
+            # Re-audit 2026-06-07 (stats/gpt-5/F-003 + deepseek/F-001): block-
+            # bootstrap p-value (autocorrelation-aware), the FDR-preferred p.
+            "aipw_p_bb": est["aipw"].get("p_bb"),
             # Audit re-2026-05-26 P2 (gpt-5 F-007): per-treatment fold-failure
             # accounting + unreliable flag for AIPW cross-fitting.
             "aipw_fold_failures": est["aipw"].get("fold_failures", 0),
@@ -1110,14 +1311,25 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
     # Welch tests in hrv_analysis.py have been BH-corrected since 2026-05-21;
     # the causal layer was the last uncorrected test family.
     #
-    # Per-treatment p comes from the AIPW Wald statistic |ate / se| against
-    # a standard normal (the IF-based SE the layer already reports). We pool
-    # binary + continuous into one family because both arms answer the same
-    # decision question ("which intervention should I make?"); separating
-    # them would relax the correction artificially.
+    # Re-audit 2026-06-07 (stats/gpt-5/F-003 + deepseek/F-001): the FDR screen
+    # now derives each per-treatment p from the BLOCK-BOOTSTRAP distribution of
+    # the ATE (aipw_p_bb), which preserves the HRV autocorrelation the IF-based
+    # Wald p (2·(1-Φ(|ate/se_if|))) wrongly assumes away. The IF-Wald p is still
+    # computed and stored (p_raw_if) for comparison, and is used as a FALLBACK
+    # only when the bootstrap p couldn't be formed (too few valid bootstrap
+    # draws). We pool binary + continuous into one family because both answer
+    # the same decision question ("which intervention should I make?").
     all_results = binary_results + continuous_results
+    # Suppress an FDR pass when the block-bootstrap CI is much wider than the IF
+    # CI (aipw_bb_width_ratio >> 1): that signals the IF SE — and any inference
+    # leaning on it — is too narrow because of temporal dependence. Even with a
+    # bootstrap p, a ratio this extreme means the estimate is fragile; we keep
+    # the q-value but withhold the binary "passes" flag.
+    BB_WIDTH_RATIO_SUPPRESS = 2.0
     if HAS_FDR and all_results:
-        p_raws: list[float] = []
+        p_raws: list[float] = []       # p used for FDR (bootstrap-preferred)
+        p_raws_if: list[float] = []    # IF-Wald p, stored alongside for comparison
+        p_sources: list[str] = []
         for r in all_results:
             ate = r.get("aipw_ate")
             se = r.get("aipw_se")
@@ -1125,10 +1337,20 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
                     or (isinstance(ate, float) and np.isnan(ate))
                     or (isinstance(se, float) and np.isnan(se))
                     or se <= 0):
-                p_raws.append(float("nan"))
+                p_if = float("nan")
             else:
                 z = abs(float(ate) / float(se))
-                p_raws.append(float(2.0 * (1.0 - norm.cdf(z))))
+                p_if = float(2.0 * (1.0 - norm.cdf(z)))
+            p_raws_if.append(p_if)
+
+            # Prefer the autocorrelation-aware bootstrap p; fall back to IF-Wald.
+            p_bb = r.get("aipw_p_bb")
+            if p_bb is not None and not (isinstance(p_bb, float) and np.isnan(p_bb)):
+                p_raws.append(float(p_bb))
+                p_sources.append("block_bootstrap")
+            else:
+                p_raws.append(p_if)
+                p_sources.append("if_wald_fallback")
 
         valid_idx = [i for i, p in enumerate(p_raws) if not np.isnan(p)]
         if valid_idx:
@@ -1141,16 +1363,29 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             adj_by_idx = {}
 
         n_pass = 0
+        n_suppressed = 0
         for i, r in enumerate(all_results):
-            p_raw = p_raws[i]
             q, ok = adj_by_idx.get(i, (float("nan"), False))
-            r["p_raw"] = p_raw
+            r["p_raw"] = p_raws[i]
+            r["p_raw_if"] = p_raws_if[i]
+            r["p_source"] = p_sources[i]
             r["p_fdr_adjusted"] = q
+            # Width-ratio suppression: a hugely wider bootstrap CI means the
+            # inference is unreliable regardless of which p won — withhold pass.
+            ratio = r.get("aipw_bb_width_ratio")
+            suppress = (ratio is not None
+                        and not (isinstance(ratio, float) and np.isnan(ratio))
+                        and float(ratio) >= BB_WIDTH_RATIO_SUPPRESS)
+            if ok and suppress:
+                ok = False
+                n_suppressed += 1
             r["passes_fdr"] = ok
+            r["fdr_suppressed_by_bb_width"] = bool(suppress)
             if ok:
                 n_pass += 1
-        log.info(f"  Causal BH-FDR (q<={FDR_Q_THRESHOLD}): "
-                 f"{n_pass}/{len(all_results)} treatments survive")
+        log.info(f"  Causal BH-FDR (q<={FDR_Q_THRESHOLD}, p=block-bootstrap): "
+                 f"{n_pass}/{len(all_results)} treatments survive "
+                 f"({n_suppressed} suppressed by bb_width_ratio>={BB_WIDTH_RATIO_SUPPRESS})")
     else:
         # No statsmodels/scipy available — mark every row as un-evaluated so
         # downstream consumers can detect the gap explicitly.
@@ -1176,7 +1411,27 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             "lie on the causal path from treatment to outcome; adjusting for "
             "them would block the very effect we are estimating (mediator-"
             "adjustment bias).",
+            # Re-audit 2026-06-07 (stats/gemini/F-003)
+            "For multi-day rolling/aggregate treatments (rolling_3d/7d load, "
+            "acute/chronic load, ATL/CTL ratio, total training load), hrv_lag1, "
+            "hrv_7d_mean and whoop_day_strain_lag1 are dropped from the "
+            "confounder set: they are mediators for the earlier days inside the "
+            "treatment window (load on day N-2 → HRV on night N-1 → outcome) or "
+            "window-overlapping aggregates of the treatment's own days.",
         ],
+        # Re-audit 2026-06-07 (stats/gpt-5/F-004): day_of_week is expanded into
+        # cyclic sin/cos terms before the propensity + outcome models, replacing
+        # the previous ordinal 0-6 encoding (which assumed a linear weekday effect).
+        "encoding_notes": [
+            "day_of_week entered as cyclic (sin, cos) terms, not an ordinal 0-6.",
+        ],
+        # Re-audit 2026-06-07 (stats/gpt-5/F-007): confounder ffill horizon is
+        # per-family — 7 days for weekly aggregates (rolling load, sleep debt,
+        # hrv_7d_mean), 2 days for daily lag-1 confounders.
+        "confounder_ffill_horizon_days": {
+            "weekly_aggregates": CONFOUNDER_FFILL_WEEKLY,
+            "daily_lag1": CONFOUNDER_FFILL_DEFAULT,
+        },
         "estimand": "ATE (population average) for AIPW; ATT (effect on the treated) for PSM",
         "identifying_assumptions": [
             "Conditional ignorability: treatment is independent of potential outcomes given the listed confounders.",
@@ -1197,6 +1452,10 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
         "estimators": ["naive_welch", "psm_nn_propensity", "aipw_cross_fit"],
         "psm_k": PSM_K,
         "psm_bootstrap_reps": N_BOOTSTRAP_PSM,
+        # Re-audit 2026-06-07 (stats/gemini/F-002 + stats/gpt-5/F-005): PSM CI is
+        # now a 7-day BLOCK bootstrap that re-fits propensity + re-runs matching
+        # on each resample (not an i.i.d. resample of the final matched_diffs).
+        "psm_bootstrap": "block(7d)_refit_propensity_and_match",
         "aipw_n_folds": N_FOLDS_AIPW,
         "propensity_trim": [PROPENSITY_TRIM_LOW, PROPENSITY_TRIM_HIGH],
         "min_per_arm_full": MIN_BINARY_PER_ARM_FULL,
@@ -1206,7 +1465,12 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             "method": "BH-FDR",
             "family": "binary + continuous (one family)",
             "q_threshold": FDR_Q_THRESHOLD,
-            "p_source": "AIPW Wald |ate/se_if| vs N(0,1)",
+            # Re-audit 2026-06-07 (stats/gpt-5/F-003 + deepseek/F-001)
+            "p_source": "block-bootstrap 2-sided p of the AIPW ATE (7d blocks); "
+                        "IF-Wald |ate/se_if| vs N(0,1) kept as p_raw_if and used "
+                        "only as fallback when the bootstrap p is unavailable",
+            "passes_fdr_suppressed_when": "aipw_bb_width_ratio >= 2.0 "
+                        "(IF inference too narrow under temporal dependence)",
         },
     }
 

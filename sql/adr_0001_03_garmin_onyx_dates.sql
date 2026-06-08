@@ -83,8 +83,11 @@ BEGIN
         RETURN NEW;
     END IF;
 
+    -- Re-audit 2026-06-07: subtract the GMT instant cast AT TIME ZONE 'UTC' so
+    -- the delta is a plain wall-clock interval (start_time_local is stored as a
+    -- naive local timestamp). Applied via Supabase migration 2026-06-07.
     IF NEW.start_time_local IS NOT NULL THEN
-        tzd := pds.interval_to_tzd(NEW.start_time_local - NEW.start_time_gmt);
+        tzd := pds.interval_to_tzd(NEW.start_time_local - (NEW.start_time_gmt AT TIME ZONE 'UTC'));
     ELSE
         tzd := NULL;
     END IF;

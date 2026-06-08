@@ -25,6 +25,8 @@ import httpx
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
+from retry_helper import retry_http
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -76,6 +78,11 @@ class EightSleepClient:
 
     def authenticate(self):
         """Obtain bearer token via OAuth2 password grant."""
+        # Re-audit 2026-06-07 (etl/gpt-5/F-003): the auth/token POST is left
+        # un-retried deliberately. retry_http would re-issue the password grant
+        # on a 5xx, and a 4xx (bad creds / locked account) must surface
+        # immediately rather than be masked behind retry latency; the data-fetch
+        # GET calls below carry the retry/backoff that the finding is about.
         resp = self.http.post(AUTH_URL, json={
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
@@ -94,45 +101,59 @@ class EightSleepClient:
 
     def get_me(self) -> dict:
         """Get current user profile to discover device & bed sides."""
-        resp = self.http.get(
-            f"{CLIENT_API_URL}/users/me", headers=self._headers()
+        # Re-audit 2026-06-07 (etl/gpt-5/F-003): wrap the data-fetch GET in
+        # retry_http (5xx / 429 / network retried, up to 3 attempts). retry_http
+        # calls .raise_for_status() itself, so the explicit call is dropped.
+        resp = retry_http(
+            lambda: self.http.get(
+                f"{CLIENT_API_URL}/users/me", headers=self._headers()
+            ),
+            max_attempts=3, log=log,
         )
-        resp.raise_for_status()
         return resp.json()
 
     def get_device(self, device_id: str) -> dict:
         """Get device info."""
-        resp = self.http.get(
-            f"{CLIENT_API_URL}/devices/{device_id}",
-            headers=self._headers(),
+        # Re-audit 2026-06-07 (etl/gpt-5/F-003): wrap in retry_http.
+        resp = retry_http(
+            lambda: self.http.get(
+                f"{CLIENT_API_URL}/devices/{device_id}",
+                headers=self._headers(),
+            ),
+            max_attempts=3, log=log,
         )
-        resp.raise_for_status()
         return resp.json()
 
     def get_trends(self, user_id: str, start: str, end: str) -> list[dict]:
         """Fetch trend data for a date range. Returns list of day dicts."""
-        resp = self.http.get(
-            f"{CLIENT_API_URL}/users/{user_id}/trends",
-            headers=self._headers(),
-            params={
-                "tz": self.timezone,
-                "from": start,
-                "to": end,
-                "include-main": "false",
-                "include-all-sessions": "true",
-                "model-version": "v2",
-            },
+        # Re-audit 2026-06-07 (etl/gpt-5/F-003): wrap in retry_http.
+        resp = retry_http(
+            lambda: self.http.get(
+                f"{CLIENT_API_URL}/users/{user_id}/trends",
+                headers=self._headers(),
+                params={
+                    "tz": self.timezone,
+                    "from": start,
+                    "to": end,
+                    "include-main": "false",
+                    "include-all-sessions": "true",
+                    "model-version": "v2",
+                },
+            ),
+            max_attempts=3, log=log,
         )
-        resp.raise_for_status()
         return resp.json().get("days", [])
 
     def get_intervals(self, user_id: str) -> list[dict]:
         """Fetch all available interval/session data."""
-        resp = self.http.get(
-            f"{CLIENT_API_URL}/users/{user_id}/intervals",
-            headers=self._headers(),
+        # Re-audit 2026-06-07 (etl/gpt-5/F-003): wrap in retry_http.
+        resp = retry_http(
+            lambda: self.http.get(
+                f"{CLIENT_API_URL}/users/{user_id}/intervals",
+                headers=self._headers(),
+            ),
+            max_attempts=3, log=log,
         )
-        resp.raise_for_status()
         return resp.json().get("intervals", [])
 
     def close(self):
@@ -676,4 +697,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Re-audit 2026-06-07 (etl/deepseek/F-001): top-level failure heartbeat so an
+    # uncaught exception surfaces on /status instead of silently going stale.
+    import time as _time
+    _t_main_start = _time.time()
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001 — top-level safety net
+        try:
+            _sb_for_log = get_supabase_client()
+            log_sync(_sb_for_log, "eight_sleep", "trends", "failed",
+                     records=0, error=f"Uncaught exception: {exc}",
+                     duration=_time.time() - _t_main_start)
+        except Exception as log_exc:  # noqa: BLE001
+            log.error(f"Could not write failure sync_log row: {log_exc}")
+        raise

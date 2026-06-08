@@ -832,6 +832,11 @@ def main():
         t0 = time.time()
         count = backfill_laps(garmin, sb)
         duration = time.time() - t0
+        # Re-audit 2026-06-07 (etl/deepseek/F-002): this standalone mode does DB
+        # writes but never wrote a sync_log heartbeat — /status saw the laps work
+        # but had no record the run happened. Emit one like the full_sync path.
+        log_sync(sb, "garmin", "lap_backfill", "success",
+                 records=count, duration=duration)
         log.info(f"Lap backfill done: {count} activities | {duration:.1f}s")
         return
 
@@ -858,6 +863,10 @@ def main():
                 continue
         count = sync_workout_definitions(garmin, sb, workout_ids)
         duration = time.time() - t0
+        # Re-audit 2026-06-07 (etl/deepseek/F-002): this standalone mode does DB
+        # writes but never wrote a sync_log heartbeat — emit one like full_sync.
+        log_sync(sb, "garmin", "workout_sync", "success",
+                 records=count, duration=duration)
         log.info(f"Workout sync done: {count} definitions | {duration:.1f}s")
         return
 
@@ -938,7 +947,10 @@ def main():
     # Refresh materialized views
     log.info("Refreshing materialized views...")
     try:
-        sb.schema("pds").rpc("refresh_materialized_views").execute()
+        # Re-audit 2026-06-07 (etl/gpt-5/F-008): the schema-scoped .rpc() requires an
+        # explicit params arg — omitting it raised "missing 1 required positional
+        # argument: 'params'", silently failing every matview refresh. Pass {}.
+        sb.schema("pds").rpc("refresh_materialized_views", {}).execute()
         log.info("  Materialized views refreshed")
     except Exception as e:
         log.warning(f"  Materialized view refresh failed: {e}")
@@ -987,4 +999,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Re-audit 2026-06-07 (etl/deepseek/F-001): top-level heartbeat so an uncaught
+    # exception (token/import/config error before the per-endpoint guards) writes a
+    # sync_log failure row — otherwise /status silently goes stale on a hard crash.
+    import time as _time
+    _t_main_start = _time.time()
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001 — top-level safety net
+        try:
+            _sb_for_log = get_supabase_client()
+            log_sync(_sb_for_log, "garmin", "full_sync", "failed",
+                     records=0, error=f"Uncaught exception: {exc}",
+                     duration=_time.time() - _t_main_start)
+        except Exception as log_exc:  # noqa: BLE001
+            log.error(f"Could not write failure sync_log row: {log_exc}")
+        raise

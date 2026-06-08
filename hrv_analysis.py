@@ -272,6 +272,41 @@ CONTROLLABLE_FEATURE_PREFIXES = (
     "act_",  # Activity taxonomy: run/sauna (auto) + leg/pull/push split + act_mg_* muscle groups (manual)
 ) + tuple(MICRONUTRIENT_COLS)  # Cronometer vitamins/minerals (exact column names)
 
+# Re-audit 2026-06-07 (stats/gpt-5/F-009): same-night sleep / recovery / HRV-
+# derived composites must NOT enter the SARIMAX/Prophet exogenous-regressor
+# candidate list. The exog is shifted by 1 to model HRV(N+1) from day-N signals,
+# but a same-night sleep score / recovery composite is contemporaneous with the
+# very HRV being forecast (it is measured FROM that night's sleep), so admitting
+# it risks over-attribution in the interpretive forecasts even after the shift.
+# We keep ONLY truly pre-treatment day-N behavioral features. This mirrors the
+# mediator-exclusion list the causal layer already enforces (causal_inference.py
+# docstring). Matched by prefix OR exact name.
+EXOG_MEDIATOR_PREFIXES = (
+    "whoop_sleep_", "garmin_sleep_", "eight_sleep_",
+    "whoop_deep", "garmin_deep", "whoop_rem", "garmin_rem", "whoop_light", "garmin_light",
+    "sleep_debt", "sleep_performance", "sleep_efficiency", "sleep_consistency",
+    "hrv_lag", "hrv_z", "hrv_28d", "hrv_7d", "hrv_3d", "hrv_vs_baseline",
+    "delta_hrv", "delta_rhr",
+)
+EXOG_MEDIATOR_EXACT = frozenset({
+    "whoop_hrv_rmssd",          # the endogenous target itself
+    "whoop_recovery_score",     # derived from the same sleep's HRV
+    "whoop_rhr", "garmin_rhr",  # overnight resting HR — recovery-side
+    "whoop_skin_temp",
+    "eight_sleep_hrv", "eight_sleep_hr", "eight_sleep_score",
+    "bedtime_hour", "wake_hour", "sleep_midpoint_hour",  # measured at the sleep event
+    "garmin_hrv_status_ord",
+})
+
+
+def _is_exog_mediator(col: str) -> bool:
+    """Re-audit 2026-06-07 (stats/gpt-5/F-009): True if `col` is a same-night
+    sleep/recovery/HRV-derived composite that must be kept out of the
+    SARIMAX/Prophet exog candidate list (not a pre-treatment day-N feature)."""
+    if col in EXOG_MEDIATOR_EXACT:
+        return True
+    return any(col.startswith(p) for p in EXOG_MEDIATOR_PREFIXES)
+
 # Computed once per run from the post-prepare_ml_data (X, y) and stamped onto every
 # row written to pds.hrv_predictions / hrv_model_metrics / hrv_analysis_results so
 # we can detect when a stored result was produced from a different snapshot of the
@@ -1957,20 +1992,27 @@ def run_statistical_analysis(
 
     # --- Correlation heatmap (top 20 by abs correlation) ---
     try:
-        top20 = corr_df.head(20)["feature"].tolist()
-        heat_df = hrv_valid[[STAT_TARGET] + [c for c in top20 if c in hrv_valid.columns]].dropna(how="all")
-        pearson_mat = heat_df.corr(method="pearson")
-        fig, ax = plt.subplots(figsize=(12, 10))
-        sns.heatmap(pearson_mat, cmap="RdBu_r", center=0, vmin=-1, vmax=1,
-                    annot=True, fmt=".2f", annot_kws={"size": 7},
-                    xticklabels=[FEATURE_LABELS.get(c, c) for c in pearson_mat.columns],
-                    yticklabels=[FEATURE_LABELS.get(c, c) for c in pearson_mat.index],
-                    ax=ax)
-        ax.set_title("Pearson Correlation Heatmap (Top-20 HRV Features)")
-        plt.tight_layout()
-        fig.savefig(OUTPUT_DIR / "correlation_heatmap.png", dpi=120)
-        plt.close(fig)
-        log.info("  Saved: correlation_heatmap.png")
+        # Re-audit 2026-06-07 (stats/gpt-5/F-006): restrict the heatmap to BH-FDR
+        # survivors so it doesn't elevate noise (high |r| that didn't survive multiple-
+        # comparison correction) to apparent signal.
+        fdr_df = corr_df[corr_df["passes_fdr"]] if "passes_fdr" in corr_df.columns else corr_df
+        top20 = fdr_df.head(20)["feature"].tolist()
+        if len(top20) < 2:
+            log.info(f"  Correlation heatmap skipped: only {len(top20)} BH-FDR survivor(s)")
+        else:
+            heat_df = hrv_valid[[STAT_TARGET] + [c for c in top20 if c in hrv_valid.columns]].dropna(how="all")
+            pearson_mat = heat_df.corr(method="pearson")
+            fig, ax = plt.subplots(figsize=(12, 10))
+            sns.heatmap(pearson_mat, cmap="RdBu_r", center=0, vmin=-1, vmax=1,
+                        annot=True, fmt=".2f", annot_kws={"size": 7},
+                        xticklabels=[FEATURE_LABELS.get(c, c) for c in pearson_mat.columns],
+                        yticklabels=[FEATURE_LABELS.get(c, c) for c in pearson_mat.index],
+                        ax=ax)
+            ax.set_title("Pearson Correlation Heatmap (BH-FDR Survivors, Top 20)")
+            plt.tight_layout()
+            fig.savefig(OUTPUT_DIR / "correlation_heatmap.png", dpi=120)
+            plt.close(fig)
+            log.info("  Saved: correlation_heatmap.png")
     except Exception as e:
         log.warning(f"  Heatmap failed: {e}")
 
@@ -2534,8 +2576,21 @@ def run_statistical_analysis(
             except Exception:
                 _mt = None
             for feat in top10:
-                sub = hrv_valid[[STAT_TARGET, feat]].dropna()
-                if len(sub) < 50:
+                # Re-audit 2026-06-07 (stats/gemini/F-001): Granger requires a CONTIGUOUS
+                # daily series. The old .dropna() removed missing days, so AR lag-k aligned
+                # to the k-th prior *observation* rather than k calendar days back,
+                # invalidating the F-test. Reindex to a daily index, fill only short
+                # (<=2-day) interior gaps, and require the joint span to be gap-free
+                # afterwards — else skip (imputing a sparse behavioral feature heavily
+                # would be worse than running no test).
+                pair = hrv_valid[[STAT_TARGET, feat]].asfreq("D")
+                joint = pair.dropna()
+                if len(joint) < 50:
+                    continue
+                span = pair.loc[joint.index.min():joint.index.max()]
+                sub = span.interpolate(method="time", limit=2, limit_area="inside")
+                if sub.isna().any().any() or len(sub) < 50:
+                    log.debug(f"  Granger skipped for {feat}: gaps >2 days remain after fill")
                     continue
                 try:
                     gc = grangercausalitytests(sub[[STAT_TARGET, feat]], maxlag=3, verbose=False)
@@ -3032,15 +3087,23 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                       and f != TARGET
                       and hrv_valid[f].notna().mean() >= 0.2][:7]
         log.info(f"  SARIMAX exog features ({len(exog_feats)}): {exog_feats}")
-        original_exog = (hrv_valid[exog_feats].copy().ffill().bfill().asfreq("D")
-                          if exog_feats else None)
+        # Re-audit 2026-06-07 (stats/gpt-5/F-001, P0): build exog with CAUSAL fill only.
+        # The prior `.ffill().bfill()` back-filled early/gap rows with FUTURE feature values
+        # (including the holdout), leaking information into both the SARIMAX fit and the
+        # walk-forward backtest. ffill carries the last *known* value forward (past→present,
+        # causal); remaining leading NaNs (before a feature's first observation, where no past
+        # value exists) get a fixed 0.0 — a constant, never future data.
+        original_exog = (hrv_valid[exog_feats].copy().asfreq("D") if exog_feats else None)
+        if original_exog is not None:
+            original_exog = original_exog.ffill().fillna(0.0)
         # Shift forward 1 row: exog for row N = original feature values from row N-1.
         # Audit P1 contract assertion (paired with the full-data forecast fix
         # below): for k >= 1, exog.iloc[k] must equal original_exog.iloc[k-1].
         # Everything else in this function — walk-forward future-exog slicing
         # at line ~2710, full-data future-exog at line ~2740 — relies on this
         # invariant. If shift semantics ever change, this assertion catches it.
-        exog = original_exog.shift(1).ffill().bfill() if original_exog is not None else None
+        # Only row 0 is NaN after the shift (no row -1); fill it with a constant, not bfill.
+        exog = original_exog.shift(1).fillna(0.0) if original_exog is not None else None
         if original_exog is not None and exog is not None and len(exog) >= 3:
             chk = min(max(1, len(exog) // 2), len(exog) - 1)
             if not np.allclose(
@@ -3099,6 +3162,20 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
         preds_by_horizon: dict[int, list] = {h: [] for h in range(1, 8)}
         actuals_by_horizon: dict[int, list] = {h: [] for h in range(1, 8)}
 
+        # Re-audit 2026-06-07 (stats/deepseek/F-003): each walk-forward step now
+        # RE-ESTIMATES the SARIMAX parameters (and hence the state covariance
+        # used for forecast intervals) on its own training window, instead of
+        # freezing the full-sample fit.params via `m_step.filter(fit.params)`.
+        # Filtering with full-sample params transfers variance estimates that
+        # were never recalibrated to the smaller window, biasing forecast
+        # intervals optimistically at longer horizons. To keep the MLE cheap we
+        # warm-start from the previous window's params and cap iterations; we
+        # only re-fit every `refit_every` steps and `.filter`-update the params
+        # in between (the endog/exog history still grows each step, so the
+        # Kalman state is always current — only the *parameters* are held for a
+        # few steps). On any fit failure we fall back to the warm-start params.
+        refit_every = 5
+        cur_params = fit.params
         for i in range(len(test_endog)):
             hist_endog = hrv_series.iloc[: split + i]
             hist_exog = exog.iloc[: split + i] if exog is not None else None
@@ -3106,7 +3183,17 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                 m_step = SARIMAX(hist_endog, exog=hist_exog, order=(1, 1, 1),
                                  seasonal_order=(1, 0, 1, 7),
                                  enforce_stationarity=False, enforce_invertibility=False)
-                f_step = m_step.filter(fit.params)
+                if i % refit_every == 0:
+                    try:
+                        refit = m_step.fit(disp=False, maxiter=50,
+                                           start_params=cur_params)
+                        cur_params = refit.params
+                        f_step = refit
+                    except Exception:
+                        # Window re-fit didn't converge — reuse last good params.
+                        f_step = m_step.filter(cur_params)
+                else:
+                    f_step = m_step.filter(cur_params)
                 # Audit re-2026-05-26 P1 (gemini F-003, gpt-5 F-004): the
                 # walk-forward previously passed ACTUAL future shifted-exog
                 # values (`exog.iloc[split+i : split+i+h]`) into get_forecast,
@@ -3368,13 +3455,29 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     n = len(X)
     min_train = min(200, int(n * 0.5))
     step = 7  # retrain every 7 days
-    # Embargo gap (audit finding 7.A + follow-up self-review): the largest
-    # feature lag is 28 days (hrv_28d_mean/std + the personal z-score block
-    # added in Tier 3 #26). 7 days only covered the rolling-7 features and
-    # was a real leakage bug — the first ~21 test rows still overlapped the
-    # train tail via the 28d windows. Trade ~28 test points per fold for
-    # genuinely leakage-free generalization.
-    GAP_DAYS = 28
+    # Re-audit 2026-06-07 (stats/gemini/F-004, DISPUTED — investigated & accepted):
+    # GAP_DAYS was 28, on the theory that 28-day rolling features (hrv_28d_mean/
+    # std, the personal z-score block) leaked the train tail into early test rows.
+    # That conflated two different things. The ONLY leakage that matters in a
+    # walk-forward backtest is FUTURE-TARGET leakage: a training row whose target
+    # (the value the model is fit to predict) is not yet observable as of the
+    # test prediction's decision time. Rolling features are functions of PAST
+    # observed targets only; using them on a test row is not leakage — the live
+    # model has the same past HRV available at inference. For the headline h=1
+    # model, the latest training target is HRV at day (train_end), and the test
+    # feature row at the same calendar position predicts HRV at day+1 — strictly
+    # later — so there is NO future-target leakage even with GAP_DAYS=0. The
+    # 28-day gap therefore discarded ~28 valid training/test rows per fold for no
+    # leakage benefit at h=1.
+    #
+    # The real exposure is at h>1: with an expanding train set ending at index
+    # `start-1`, that row's target is HRV at day (start-1+h), which for h>1 has
+    # NOT happened yet as of the test feature date (day = test_start). So instead
+    # of an indiscriminate 28-day embargo we set GAP_DAYS=0 and TRIM the train
+    # end per horizon to `test_start - h + 1`, guaranteeing every training target
+    # is observed before the test prediction date. For h=1 this is a no-op
+    # (train_end = test_start); for h=7 it drops the last 6 train rows only.
+    GAP_DAYS = 0
 
     all_preds: list[dict] = []
 
@@ -3394,50 +3497,17 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     # train_xgboost().
     # -----------------------------------------------------------------------
     if HAS_XGB and xgb_model is not None:
-        # Audit P1 fix: PIs previously used in-sample training residuals which
-        # are over-tight by construction (the model is fit to those points),
-        # producing CIs that under-cover the nominal level. Compute an OOF-
-        # honest σ per horizon via TimeSeriesSplit on the full feature matrix
-        # once, then reuse across every backtest fold at that h. For h=1 reuse
-        # the value train_xgboost already computed (same OOF method).
-        pred_std_by_horizon: dict[int, float] = {}
-        headline_pred_std = xgb_results.get("pred_std") if xgb_results else None
-        if headline_pred_std and headline_pred_std > 0:
-            pred_std_by_horizon[1] = float(headline_pred_std)
-        try:
-            from sklearn.model_selection import TimeSeriesSplit
-            for _h in HORIZONS:
-                if _h in pred_std_by_horizon:
-                    continue
-                try:
-                    _, _, X_h_full, y_h_full = prepare_ml_data(df, horizon=_h)
-                    if len(X_h_full) < 60:
-                        continue
-                    tscv_h = TimeSeriesSplit(n_splits=5)
-                    oof_resid: list[float] = []
-                    for tr_idx, va_idx in tscv_h.split(X_h_full):
-                        if len(tr_idx) < 30 or len(va_idx) < 5:
-                            continue
-                        fm = XGBRegressor(
-                            max_depth=4, learning_rate=0.05, n_estimators=200,
-                            min_child_weight=3, subsample=0.8, colsample_bytree=0.8,
-                            tree_method="hist", random_state=42,
-                        )
-                        fm.fit(X_h_full.iloc[tr_idx], y_h_full.iloc[tr_idx], verbose=False)
-                        oof_resid.extend(
-                            (y_h_full.iloc[va_idx].values
-                             - fm.predict(X_h_full.iloc[va_idx])).tolist()
-                        )
-                    if len(oof_resid) >= 30:
-                        pred_std_by_horizon[_h] = float(np.std(oof_resid))
-                except Exception as _e:
-                    log.debug(f"  pred_std OOF for h={_h} failed: {_e}")
-        except Exception:
-            pass
-        if pred_std_by_horizon:
-            log.info("  Walk-forward pred_std by horizon: " +
-                     ", ".join(f"h={h}:{s:.2f}"
-                               for h, s in sorted(pred_std_by_horizon.items())))
+        # Re-audit 2026-06-07 (stats/gpt-5/F-002): PI sigma is FOLD-LOCAL and CAUSAL.
+        # Previously sigma was estimated ONCE via TimeSeriesSplit OOF over the FULL
+        # series (incl. data AFTER each fold's train-end) and reused everywhere, so a
+        # fold's PI width borrowed future information. We now set each fold's sigma to
+        # the std of the ACCUMULATED out-of-sample residuals of PRIOR folds: the walk-
+        # forward already produces an honest OOF residual per test row (the model never
+        # saw its own test block), so this is causal (only past folds) AND free — no
+        # extra model fits. Early folds, before >=30 OOF residuals accrue, fall back to
+        # the current model's in-sample residual std.
+        # NOTE: an earlier implementation did a 3-split OOF *refit* inside every fold,
+        # which made the backtest ~50x slower (h=1 alone took ~48 min) — unusable in CI.
 
         for h in HORIZONS:
             model_df_h, feat_cols_h, X_h, y_h = prepare_ml_data(df, horizon=h)
@@ -3447,12 +3517,21 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                 continue
             log.info(f"  XGBoost h={h} expanding-window backtest "
                      f"(n={n_h}, step={step}, gap={GAP_DAYS}d)…")
+            oof_residuals_h: list[float] = []  # accumulating OOF residuals → causal, free σ
             for start in range(min_train, n_h - 1, step):
                 test_start = start + GAP_DAYS
                 if test_start >= n_h - 1:
                     break
                 end = min(test_start + step, n_h - 1)
-                X_tr, y_tr = X_h.iloc[:start], y_h.iloc[:start]
+                # Re-audit 2026-06-07 (stats/gemini/F-004): per-horizon train-end
+                # trim replaces the blanket 28-day embargo. The training window
+                # ends at `test_start - h + 1` so its latest target (HRV at day
+                # train_end_idx-1+h) is observed no later than the test feature
+                # date (day test_start). For h=1 this equals `start` (no change);
+                # for h>1 it drops the final h-1 rows whose targets would still
+                # be in the future at the test prediction moment.
+                train_end_idx = max(1, test_start - h + 1)
+                X_tr, y_tr = X_h.iloc[:train_end_idx], y_h.iloc[:train_end_idx]
                 X_pred_block = X_h.iloc[test_start:end]
                 y_actual_block = y_h.iloc[test_start:end]
                 # Target dates = feature dates + h (y is shifted(-h), so y.iloc[i]
@@ -3462,7 +3541,7 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                     + pd.Timedelta(days=h)
                 ).dt.strftime("%Y-%m-%d").values
                 train_start_d = model_df_h["calendar_date"].iloc[0]
-                train_end_d = model_df_h["calendar_date"].iloc[start - 1]
+                train_end_d = model_df_h["calendar_date"].iloc[train_end_idx - 1]
 
                 try:
                     m = XGBRegressor(
@@ -3472,12 +3551,13 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                     )
                     m.fit(X_tr, y_tr, verbose=False)
                     preds = m.predict(X_pred_block)
-                    # Use the OOF-honest σ computed once per horizon above.
-                    # Fall back to in-sample residuals only if OOF failed at
-                    # this h (insufficient data / TSS error).
-                    residuals_std = pred_std_by_horizon.get(
-                        h, float(np.std(y_tr.values - m.predict(X_tr)))
-                    )
+                    # Re-audit 2026-06-07 (stats/gpt-5/F-002): fold-local σ from PRIOR
+                    # folds' accumulated OOF residuals (causal + free). Fall back to the
+                    # model's in-sample residual std until >=30 OOF residuals accrue.
+                    if len(oof_residuals_h) >= 30:
+                        residuals_std = float(np.std(oof_residuals_h))
+                    else:
+                        residuals_std = float(np.std(y_tr.values - m.predict(X_tr)))
                     for pred, actual, d in zip(
                             preds, y_actual_block.values, dates_block):
                         all_preds.append({
@@ -3493,6 +3573,9 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                             "training_window_start": str(train_start_d),
                             "training_window_end": str(train_end_d),
                         })
+                    # Append THIS fold's out-of-sample residuals AFTER using prior
+                    # folds' σ above, so a fold's PI never sees its own residuals.
+                    oof_residuals_h.extend((y_actual_block.values - preds).tolist())
                 except Exception:
                     pass
 
@@ -3626,14 +3709,24 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                 loss_b = (joined["actual_hrv"] - joined["pred_b"]).abs().values
                 d = loss_a - loss_b
                 d_mean = float(np.mean(d))
-                # Newey-West variance with h-1 lags (h=1 step ahead -> lag 0,
-                # but allow up to 7 for weekly autocorrelation in residuals)
+                # Newey-West long-run variance for the DM statistic.
+                # Re-audit 2026-06-07 (stats/gpt-5/F-008): the maxlag is now
+                # DATA-DEPENDENT — the standard automatic Bartlett-kernel
+                # bandwidth L = floor(4·(n/100)^(2/9)) (Newey-West 1994 plug-in
+                # rule) — instead of a fixed 7. A fixed 7-lag kernel mis-
+                # calibrates DM size when the loss-differential autocorrelation
+                # extends beyond (or falls well short of) a week. The Bartlett
+                # weight uses this same L as its taper denominator.
                 n_d = len(d)
+                nw_lag = int(np.floor(4.0 * (n_d / 100.0) ** (2.0 / 9.0)))
+                nw_lag = max(1, min(nw_lag, n_d - 1))
                 gamma0 = float(np.var(d, ddof=1))
                 long_run = gamma0
-                for k in range(1, min(7, n_d - 1)):
+                for k in range(1, nw_lag + 1):
+                    if k >= n_d:
+                        break
                     cov_k = float(np.mean((d[:-k] - d_mean) * (d[k:] - d_mean)))
-                    long_run += 2 * (1 - k / 7) * cov_k
+                    long_run += 2 * (1 - k / (nw_lag + 1)) * cov_k
                 if long_run <= 0:
                     continue
                 dm_stat = d_mean / np.sqrt(long_run / n_d)
@@ -3972,6 +4065,21 @@ def store_metrics(eval_results: dict) -> None:
         upsert_batch("hrv_model_metrics", rows, "eval_date,model,horizon_days")
 
 
+def _json_safe(obj):
+    """Recursively replace non-finite floats (NaN/Inf) with None so a payload is
+    JSON-serializable — httpx/PostgREST encode with allow_nan=False and otherwise crash.
+    Re-audit 2026-06-07: the causal PSM block-bootstrap can yield a NaN psm_ate (too few
+    valid bootstrap draws); without this it crashed the entire results-store at the end."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (float, np.floating)):
+        f = float(obj)
+        return f if np.isfinite(f) else None
+    return obj
+
+
 def store_analysis_results(stat_results: dict, feature_importance: dict,
                            feature_importance_full: dict | None = None,
                            controllable_importance: dict | None = None,
@@ -4216,8 +4324,11 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
         log.info(f"  Storing {len(rows)} analysis result rows…")
         # Upsert each row individually to avoid bulk insert dropping rows
         for row in rows:
+            # Re-audit 2026-06-07: sanitize NaN/Inf → None so one non-finite value
+            # (e.g. a NaN psm_ate from the PSM block-bootstrap) can't crash the store.
+            safe_row = _json_safe(row)
             supa.schema("pds").from_("hrv_analysis_results").upsert(
-                row, on_conflict="result_type,result_key"
+                safe_row, on_conflict="result_type,result_key"
             ).execute()
             log.info(f"    Upserted: {row['result_type']}/{row['result_key']}")
 
@@ -4420,7 +4531,17 @@ def main() -> None:
         if f and f not in seeds:
             seeds.append(f)
 
-    top_features = list(dict.fromkeys(seeds + top10_global))[:12]
+    # Re-audit 2026-06-07 (stats/gpt-5/F-009): drop same-night sleep/recovery/
+    # HRV-derived composites from the exog candidate list — these are mediators
+    # contemporaneous with HRV(N+1), not pre-treatment day-N features. We filter
+    # BEFORE truncating to 12 so a behavioral feature ranked just below a
+    # dropped mediator still gets a slot.
+    candidate_features = list(dict.fromkeys(seeds + top10_global))
+    excluded_mediators = [f for f in candidate_features if _is_exog_mediator(f)]
+    top_features = [f for f in candidate_features if not _is_exog_mediator(f)][:12]
+    if excluded_mediators:
+        log.info(f"  Excluded {len(excluded_mediators)} same-night mediator(s) "
+                 f"from exog candidates: {excluded_mediators}")
     log.info(f"  Model exog/regressor candidates ({len(top_features)}): "
              f"seeded={seeds}, top10_global={top10_global}")
 

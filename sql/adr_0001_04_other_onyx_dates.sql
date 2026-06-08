@@ -245,16 +245,18 @@ BEGIN
      ORDER BY effective_from DESC
      LIMIT 1;
 
-    -- Audit re-2026-05-26 P2 (F-007): distinguish explicit-NY ('user_tz_log_et')
-    -- from non-NY ('user_tz_log') from no-log-row ('default_et_fallback').
-    -- Previously the explicit-NY case was indistinguishable from non-NY in
-    -- onyx_tz_source.
+    -- Re-audit 2026-06-07: prod collapsed the explicit-NY case back to
+    -- 'user_tz_log' (a user_tz_log row matched, NY or not); the
+    -- 'user_tz_log_et' sub-label was dropped. Three branches remain:
+    -- non-NY log row → shift local date + 'user_tz_log'; NY log row →
+    -- cycle_date + 'user_tz_log'; no log row → cycle_date +
+    -- 'default_et_fallback'. Applied via Supabase migration 2026-06-07.
     IF log_tz IS NOT NULL AND log_tz <> 'America/New_York' THEN
         NEW.onyx_local_date := (noon_et AT TIME ZONE log_tz)::date;
         NEW.onyx_tz_source  := 'user_tz_log';
     ELSIF log_tz = 'America/New_York' THEN
         NEW.onyx_local_date := NEW.cycle_date;
-        NEW.onyx_tz_source  := 'user_tz_log_et';
+        NEW.onyx_tz_source  := 'user_tz_log';
     ELSE
         NEW.onyx_local_date := NEW.cycle_date;
         NEW.onyx_tz_source  := 'default_et_fallback';
@@ -292,11 +294,15 @@ BEGIN
     -- longer depend on alphabetical BEFORE-trigger ordering. The formula
     -- is the same as the dropped pds.compute_journal_behaviors_date so
     -- behaviors_date values are preserved verbatim.
+    -- Re-audit 2026-06-07: order by longest cycle (real night sleep) DESC, not
+    -- earliest start, so a transition-day arrival nap doesn't win the behaviors
+    -- date. Matches the longest-cycle pick used for the onyx_* anchor below.
+    -- Applied via Supabase migration 2026-06-07.
     SELECT (((c.start_time AT TIME ZONE 'UTC') + (c.timezone_offset)::interval - INTERVAL '6 hours'))::date
       INTO NEW.behaviors_date
       FROM pds.whoop_cycles c
      WHERE (((c.start_time AT TIME ZONE 'UTC') + (c.timezone_offset)::interval))::date = NEW.cycle_date
-     ORDER BY c.start_time
+     ORDER BY (c.end_time - c.start_time) DESC NULLS LAST, c.start_time DESC
      LIMIT 1;
 
     IF NEW.behaviors_date IS NULL THEN
@@ -364,14 +370,16 @@ BEGIN
              ORDER BY effective_from DESC
              LIMIT 1;
 
-            -- Audit re-2026-05-26 P2 (F-007): same label distinction as
-            -- habit_journal's fallback above.
+            -- Re-audit 2026-06-07: prod collapsed the explicit-NY case back to
+            -- 'user_tz_log' (a user_tz_log row matched, NY or not) — the
+            -- 'user_tz_log_et' sub-label was dropped here. Applied via Supabase
+            -- migration 2026-06-07.
             IF log_tz IS NOT NULL AND log_tz <> 'America/New_York' THEN
                 NEW.onyx_local_date := (noon_et AT TIME ZONE log_tz)::date;
                 NEW.onyx_tz_source  := 'user_tz_log';
             ELSIF log_tz = 'America/New_York' THEN
                 NEW.onyx_local_date := NEW.cycle_date;
-                NEW.onyx_tz_source  := 'user_tz_log_et';
+                NEW.onyx_tz_source  := 'user_tz_log';
             ELSE
                 NEW.onyx_local_date := NEW.cycle_date;
                 NEW.onyx_tz_source  := 'default_et_fallback';
