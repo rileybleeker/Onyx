@@ -505,3 +505,25 @@ Tracking every file/route/component **moved, renamed, consolidated, split, added
 - **Hero explanatory paragraphs condensed.** The three verbose per-card captions ("An AI model trained on…") were dropped from the tiles (KpiTile is a tight glance component); the same information remains reachable in **Models & Methods** and each chart's `info` tooltip. Not in the no-data-loss enumerated set (metric/chart/table/modal/button/chat-tool/PWA).
 
 **No-data-loss:** every one of the 14 sections, all KPIs, charts, tables, the Naive-vs-Adjusted + Model-Comparison + coverage tables, the DAG card, the FDR toggle, the RangeFilter, the env axis selectors, and every empty-state string survive unchanged. Verified against the Stage-0 inventory catalog.
+
+### Stage 5 moves — roll Direction A across the remaining routes (one commit per route)
+
+Stages 1–3 already propagated the Direction A design system globally (tokens, JetBrains Mono, restyled `ChartCard`/`StatCard`, new `Sidebar`/`MobileNav`/`nav.ts`, bottom tab bar, ⌘K). Stage 5 finishes each route by **routing every remaining raw chart-color hex literal through `chart-theme` tokens** so series colors are on-palette and semantically consistent. A parallel analysis workflow (11 agents, one per page) produced semantically-aware per-page edit plans (hex→token, `replaceAll` flags, imports, headings/empty-states to preserve); I applied them with 3 corrections (spotify `[#1DB954]`→`source-spotify` not `spotify`; nutrition collapsed to one `[#1DB954]`→`accent` replaceAll; habits' dead `#71717a` CSS-var fallback dropped rather than template-literal-interpolated).
+
+**Per route (color-only; every heading, chart, table, modal, button, and empty-state string preserved; `chartColors as C` added to the existing `@/lib/chart-theme` import where charts use it):**
+- **`/sleep`** — 26 edits: `recoveryColor`/`latencyColor` + all Sleep-Debt/Hours/Consistency cell ternaries → up/down/whoop/neutral; every gradient/area/line (strain, sleep-scores, RHR/HRV, biometrics, bed/room temp, stages, snoring, latency) → source/semantic tokens; stage-bar fills (`#1e40af`/`#60a5fa`/`#a78bfa`/`#f87171`) → garmin/categorical[6]/eightsleep/down.
+- **`/spotify`** — `GENRE_PALETTE` + `spotifyGreen` + the 8 sound-evolution lines → tokens; all `bg/border/text-[#1DB954]/*` arbitrary classes → `*-source-spotify/*`. (Two `stroke="#ffffff"` radar grid-hairlines intentionally kept — they're grid lines using the same white-with-opacity convention as the theme's own `gridStyle.stroke`.)
+- **`/nutrition`** — calorie/macro/detail series → up/down/whoop/garmin/eightsleep/accent; net-balance cell ternary → whoop/up; weight-trend line+dot → eightsleep; weight-log `[#1DB954]` focus/CTA classes → `accent`.
+- **`/whoop`** — `recoveryColor` + recovery bar + HRV/RHR lines + strain gradient/area + 4 sleep-stage bars + performance/efficiency/SpO2/skin-temp lines → tokens.
+- **`/heart`** — HR gradient stops + max/min/RHR/HRV/stress series → down/up/garmin/eightsleep/whoop.
+- **`/activities`** — HR/stress gradient stops + strokes → down/up/whoop.
+- **`/habits`** — `CATEGORY_COLORS` (8) → up/garmin/eightsleep/whoop/accent/categorical/neutral; completion-rate accent area → accent; dead `#71717a` CSS-var fallback removed.
+- **`/bland-altman`** — `PAIRS` series colors → garmin/eightsleep/up; bias line/label → whoop; LoA lines/labels → down; zero line → `zeroLine`.
+- **`/analytics/travel`** (`TravelCharts.tsx`) — tooltip card fill → `cardBg`; HRV-trajectory line+dot → garmin; destination bar → eightsleep.
+- **`/status`** — Spotify-family source-badge classes (`spotify`/`reccobeats`/`musicbrainz`) → `text-source-spotify[/70]`.
+- **`/supplements`** — every `[#1DB954]` accent-affordance arbitrary class (buttons, focus rings, log/toast) → `accent` (it's a generic accent on a non-Spotify page, not brand or success).
+- **`/account`** — error/success text → `text-down`/`text-up`.
+- **`/journal`** — mood badges (low/neutral/good/great) → down/secondary/source-garmin/up; error → down.
+- **`/chat`** — already fully on-palette (no charts, no raw hex, no off-palette classes); inherits Direction A from the shared components — **no change needed, no commit**.
+
+**No-data-loss:** Stage 5 is color-routing only. No route, chart, KPI, table, modal, button, chat tool, or PWA capability was moved, consolidated, renamed, or removed on any page. All page/section headings and empty-state strings are byte-for-byte unchanged (the smoke `PAGES` list + heading assertions still match). `/eight-sleep` is a pure server redirect to `/sleep` (untouched).

@@ -10,17 +10,17 @@ import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
-import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
 
 function recoveryColor(score: number | null): string {
-  if (!score) return "#71717a";
-  if (score >= 67) return "#22c55e";
-  if (score >= 34) return "#f59e0b";
-  return "#ef4444";
+  if (!score) return C.neutral;
+  if (score >= 67) return C.up;
+  if (score >= 34) return C.source.whoop;
+  return C.down;
 }
 
 export default function WhoopPage() {
@@ -122,7 +122,7 @@ export default function WhoopPage() {
               <YAxis tick={axisTick} width={40} domain={[0, 100]} />
               <Tooltip {...chartTooltip} />
               <Bar dataKey="recovery" name="Recovery %" radius={[3, 3, 0, 0]}
-                fill="#22c55e"
+                fill={C.up}
                 shape={(props: any) => {
                   const { x, y, width, height, payload } = props;
                   return <rect x={x} y={y} width={width} height={height} rx={3} fill={recoveryColor(payload.recovery)} />;
@@ -141,8 +141,8 @@ export default function WhoopPage() {
               <YAxis yAxisId="rhr" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={2} dot={false} name="HRV (ms)" />
-              <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke="#ef4444" strokeWidth={2} dot={false} name="RHR (bpm)" />
+              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.up} strokeWidth={2} dot={false} name="HRV (ms)" />
+              <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke={C.down} strokeWidth={2} dot={false} name="RHR (bpm)" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -152,15 +152,15 @@ export default function WhoopPage() {
             <AreaChart data={strainData}>
               <defs>
                 <linearGradient id="whoopStrainGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.15} />
-                  <stop offset="100%" stopColor="#3b82f6" stopOpacity={0} />
+                  <stop offset="0%" stopColor={C.source.whoop} stopOpacity={0.15} />
+                  <stop offset="100%" stopColor={C.source.whoop} stopOpacity={0} />
                 </linearGradient>
               </defs>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} domain={[0, 21]} label={axisLabel("strain", "y")} />
               <Tooltip {...chartTooltip} />
-              <Area type="monotone" dataKey="strain" stroke="#3b82f6" fill="url(#whoopStrainGrad)" strokeWidth={2} name="Strain" />
+              <Area type="monotone" dataKey="strain" stroke={C.source.whoop} fill="url(#whoopStrainGrad)" strokeWidth={2} name="Strain" />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -173,10 +173,10 @@ export default function WhoopPage() {
               <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Bar dataKey="deep" stackId="a" fill="#1e40af" name="Deep" />
-              <Bar dataKey="light" stackId="a" fill="#60a5fa" name="Light" />
-              <Bar dataKey="rem" stackId="a" fill="#a78bfa" name="REM" />
-              <Bar dataKey="awake" stackId="a" fill="#f87171" name="Awake" radius={[3, 3, 0, 0]} />
+              <Bar dataKey="deep" stackId="a" fill={C.source.garmin} name="Deep" />
+              <Bar dataKey="light" stackId="a" fill={C.categorical[6]} name="Light" />
+              <Bar dataKey="rem" stackId="a" fill={C.source.eightsleep} name="REM" />
+              <Bar dataKey="awake" stackId="a" fill={C.down} name="Awake" radius={[3, 3, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -189,8 +189,8 @@ export default function WhoopPage() {
               <YAxis tick={axisTick} width={40} domain={[0, 100]} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line type="monotone" dataKey="performance" stroke="#8b5cf6" strokeWidth={2} dot={false} name="Performance %" />
-              <Line type="monotone" dataKey="efficiency" stroke="#f59e0b" strokeWidth={2} dot={false} name="Efficiency %" />
+              <Line type="monotone" dataKey="performance" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Performance %" />
+              <Line type="monotone" dataKey="efficiency" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Efficiency %" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -204,8 +204,8 @@ export default function WhoopPage() {
               <YAxis yAxisId="temp" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line yAxisId="spo2" type="monotone" dataKey="spo2" stroke="#06b6d4" strokeWidth={2} dot={false} name="SpO2 %" />
-              <Line yAxisId="temp" type="monotone" dataKey="skinTemp" stroke="#f97316" strokeWidth={2} dot={false} name="Skin Temp (\u00b0C)" />
+              <Line yAxisId="spo2" type="monotone" dataKey="spo2" stroke={C.accent} strokeWidth={2} dot={false} name="SpO2 %" />
+              <Line yAxisId="temp" type="monotone" dataKey="skinTemp" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Skin Temp (\u00b0C)" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
