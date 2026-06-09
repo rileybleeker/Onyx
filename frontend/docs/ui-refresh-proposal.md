@@ -466,3 +466,23 @@ Tracking every file/route/component **moved, renamed, consolidated, split, added
 - `StatCard.tsx` — added `sparkline` (`{values,color?,favorable?}`) and `band` (`{low,high,unit?}`); value face → `font-display` (JetBrains ss01 tabular); trend colors → `text-up`/`text-down` tokens; source map extended with `CRONOMETER` + `SPOTIFY`; 6px→4px radius, flat. All prior props (`label/value/unit/sublabel/trend/source`) unchanged.
 
 **No-data-loss:** zero — Stage 2 adds reusable components and extends two shells with optional props. No page consumes the new components yet (Stages 4–5 do), so no route/chart/KPI/table/modal/button/chat-tool/PWA surface moved or removed. Pages already using `ChartCard`/`StatCard` inherit the Direction A restyle (visual diff only); all their headings, data marks, and empty-state strings are unchanged.
+
+### Stage 3 moves — shared chrome (AppShell / Sidebar / MobileNav + nav.ts)
+
+**Added:**
+- `frontend/src/lib/nav.ts` — **the single source of truth for primary navigation** (the "free win"). `NAV_SECTIONS` (Logging / Insights / Tools) + flat `NAV_ITEMS`, each entry carrying `href`, `label`, `shortcut`, a `lucide-react` `icon`, and palette `keywords`. **Retires the two hand-maintained `nav` arrays** that the CLAUDE.md "Sidebar + MobileNav must stay in sync" convention previously policed by manual two-file edits — they now import from here, so the drift class of bug is gone for Stage 5.
+- `frontend/src/components/CommandPalette.tsx` — global ⌘K / Ctrl+K palette. Navigation-only (existing routes, no new fetches); fuzzy-matches `NAV_ITEMS` label/href/keywords; arrow + Enter + Esc; also opens on the `OPEN_COMMAND_PALETTE` window event (used by the sidebar + mobile search triggers).
+
+**Rewritten (same 12 routes, now grouped — no nav entries added/removed):**
+- `Sidebar.tsx` — renders from `NAV_SECTIONS` with section labels, `lucide-react` icons (replacing the hand-pasted inline SVG `path` strings), wider hit areas, `focus-visible` accent rings, and a ⌘K "Search…" trigger button. Active-route 2px cyan tick preserved; shortcut hints preserved.
+- `MobileNav.tsx` — **adds the bottom tab bar** (`data-testid="mobile-tab-bar"`, `md:hidden`, safe-area-inset-bottom): five tabs **Today→/sleep · Trends→/analytics/hrv · Log→sheet · Chat→/chat · More→drawer**. The **Log sheet** is a bottom sheet of one-tap entries to the four logging surfaces (Supplement→/supplements, Meal→/nutrition, Habit→/habits, Weight→/nutrition). The full-nav **drawer** now renders from `NAV_SECTIONS` and is opened by the **More** tab. The top bar is slimmed to wordmark + a search (⌘K) button; the safe-area-inset-top fill is retained.
+- `AppShell.tsx` — mounts `<CommandPalette/>` globally; adds mobile bottom padding (`pb-[calc(env(safe-area-inset-bottom)+5rem)]`) so page content clears the new tab bar (desktop unchanged).
+
+**Smoke test:**
+- `frontend/e2e/smoke.spec.ts` — added the required **"Mobile chrome — bottom tab bar"** test: at a 390×844 phone viewport the `data-testid="mobile-tab-bar"` element is visible and exposes all five tab labels; at 1280×900 it's hidden (`md:hidden`). Targets `data-testid`, not classes/colors. Spec compiles (`npx playwright test --list` → 16 tests).
+
+**Deviations (surfaced):**
+- The Log sheet uses **navigation links** to the four logging surfaces rather than an **embedded inline weight form** (proposal wording). Rationale: an embedded form would duplicate the `/nutrition` `/api/weight` POST UI and risk divergence; the brief forbids changing request shapes. All four logging surfaces remain one tap from anywhere. (If an inline weight form is wanted later it's a small, isolated add.)
+- "Today" points to `/sleep` per the proposal's tab mapping (the root `/` itself still redirects to `/status`, unchanged).
+
+**No-data-loss:** the navigation **set** is unchanged — the same 12 routes, now grouped into Logging/Insights/Tools and reachable from the sidebar, the mobile drawer (via More), the bottom tab bar (Today/Trends/Chat), the Log sheet, and the new ⌘K palette. Nothing removed; several new ways to reach the same routes added. The old top hamburger's only function (open drawer) is preserved via the More tab.
