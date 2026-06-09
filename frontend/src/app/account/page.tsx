@@ -96,8 +96,8 @@ export default function AccountPage() {
             />
           </div>
 
-          {error && <p className="text-red-400 text-sm">{error}</p>}
-          {success && <p className="text-green-400 text-sm">Password updated.</p>}
+          {error && <p className="text-down text-sm">{error}</p>}
+          {success && <p className="text-up text-sm">Password updated.</p>}
 
           <button
             type="submit"
