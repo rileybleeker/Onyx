@@ -452,3 +452,17 @@ Tracking every file/route/component **moved, renamed, consolidated, split, added
 **Deviation from brief (surfaced, not silently absorbed):** wiring the lint gate exposed exactly one pre-existing **error** (`queries.ts:902` `prefer-const`) — fixed (the variable is `.add()`-mutated, never reassigned, so `const` is correct). It is outside the Stage-1 file set but is a prerequisite for "lint must pass". The remaining ~9 pre-existing `no-unused-vars` **warnings** are non-failing and left untouched (not introduced by this refresh).
 
 **No-data-loss:** zero — Stage 1 is tokens/theme/fonts only. No route, component, chart, KPI, table, modal, button, chat tool, or PWA capability added, moved, consolidated, or removed. Visual diff only.
+
+### Stage 2 moves — shared component layer
+
+**Components added (`frontend/src/components/`):**
+- `Sparkline.tsx` — 60×20 inline Recharts sparkline (no axes/grid, 1px stroke, hidden domain pinned to dataMin/dataMax). Auto-colors via `directionalColor()` (last-vs-mean) unless an explicit color is passed. Adopts `chart-theme.ts`.
+- `MetadataRow.tsx` — Bloomberg-style monospace `·`-joined metadata strip (the 4-slot card header vocabulary: title · age · source · confidence). Tone-aware segments; falsy entries dropped.
+- `SectionHeader.tsx` — 1px divider + 12px colored left-edge tick keyed to section function (forecast/descriptive/causal/calibration or raw color) + 18px Geist title + kicker + right-aligned actions slot + anchor `id` for the Stage-4 TOC.
+- `KpiTile.tsx` — Direction A hero KPI (min-h-88px): cyan left tick, uppercase label, 34→40px JetBrains-Mono display value, inline sparkline, CI/sub line, signed delta (color via `directionalColor`), mono metadata footer, `testId` passthrough (for the Stage-4 `data-testid="hero-tomorrow-hrv"` assertion).
+
+**Components modified (backwards-compatible — every existing prop/behavior preserved):**
+- `ChartCard.tsx` — added `variant` (`primary`/`secondary`/`compact` → p-5/p-4/p-3), `freshness` (client-computed "Xh ago", hydration-safe via effect), `actions` (right header slot, rendered outside the collapse `<button>` to avoid nested-button HTML), `confidence` (`n=` + `FDR✓` badge), `tick` (colored left edge), `id` (anchor). Header now composes a `MetadataRow` (age · source · confidence) under an uppercased 12px `h3` **whose text content is unchanged** (CSS-only uppercase ⇒ accessible name preserved ⇒ smoke `getByRole("heading", …)` selectors still match). Root keeps `bg-surface-card` (smoke `div.bg-surface-card` filter), 6px→4px radius, flat (no shadow). Collapse + `storageKey` + `info` + `subtitle` + `source` all intact.
+- `StatCard.tsx` — added `sparkline` (`{values,color?,favorable?}`) and `band` (`{low,high,unit?}`); value face → `font-display` (JetBrains ss01 tabular); trend colors → `text-up`/`text-down` tokens; source map extended with `CRONOMETER` + `SPOTIFY`; 6px→4px radius, flat. All prior props (`label/value/unit/sublabel/trend/source`) unchanged.
+
+**No-data-loss:** zero — Stage 2 adds reusable components and extends two shells with optional props. No page consumes the new components yet (Stages 4–5 do), so no route/chart/KPI/table/modal/button/chat-tool/PWA surface moved or removed. Pages already using `ChartCard`/`StatCard` inherit the Direction A restyle (visual diff only); all their headings, data marks, and empty-state strings are unchanged.
