@@ -9,7 +9,7 @@ import { getHealthMatrix, rangeDays, rangeLabel, type Range } from "@/lib/querie
 import { blandAltman } from "@/lib/stats";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
-import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -23,9 +23,9 @@ interface BAResult {
 }
 
 const PAIRS: [string, string, string][] = [
-  ["Garmin", "WHOOP", "#3b82f6"],
-  ["Garmin", "Eight Sleep", "#8b5cf6"],
-  ["WHOOP", "Eight Sleep", "#22c55e"],
+  ["Garmin", "WHOOP", C.source.garmin],
+  ["Garmin", "Eight Sleep", C.source.eightsleep],
+  ["WHOOP", "Eight Sleep", C.up],
 ];
 
 function fmtBA(ba: BAResult | null): string {
@@ -87,19 +87,19 @@ function BAPlot({
             formatter={(value: any, name: any) => [(+value).toFixed(1), name]}
           />
           {/* Bias line */}
-          <ReferenceLine y={result.bias} stroke="#f59e0b" strokeDasharray="6 3" strokeWidth={2}>
-            <Label value={`Bias ${result.bias.toFixed(1)}`} fill="#f59e0b" fontSize={10} position="right" />
+          <ReferenceLine y={result.bias} stroke={C.source.whoop} strokeDasharray="6 3" strokeWidth={2}>
+            <Label value={`Bias ${result.bias.toFixed(1)}`} fill={C.source.whoop} fontSize={10} position="right" />
           </ReferenceLine>
           {/* Upper LoA */}
-          <ReferenceLine y={result.upperLoA} stroke="#ef4444" strokeDasharray="4 4" strokeWidth={1.5}>
-            <Label value={`+1.96 SD (${result.upperLoA.toFixed(1)})`} fill="#ef4444" fontSize={10} position="right" />
+          <ReferenceLine y={result.upperLoA} stroke={C.down} strokeDasharray="4 4" strokeWidth={1.5}>
+            <Label value={`+1.96 SD (${result.upperLoA.toFixed(1)})`} fill={C.down} fontSize={10} position="right" />
           </ReferenceLine>
           {/* Lower LoA */}
-          <ReferenceLine y={result.lowerLoA} stroke="#ef4444" strokeDasharray="4 4" strokeWidth={1.5}>
-            <Label value={`-1.96 SD (${result.lowerLoA.toFixed(1)})`} fill="#ef4444" fontSize={10} position="right" />
+          <ReferenceLine y={result.lowerLoA} stroke={C.down} strokeDasharray="4 4" strokeWidth={1.5}>
+            <Label value={`-1.96 SD (${result.lowerLoA.toFixed(1)})`} fill={C.down} fontSize={10} position="right" />
           </ReferenceLine>
           {/* Zero line */}
-          <ReferenceLine y={0} stroke="#3f3f46" strokeWidth={1} />
+          <ReferenceLine y={0} stroke={C.zeroLine} strokeWidth={1} />
           <Scatter data={result.points} fill={color} fillOpacity={0.7} r={4} />
         </ScatterChart>
       </ResponsiveContainer>
