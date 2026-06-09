@@ -9,7 +9,7 @@ import {
 import ChartCard from "@/components/ChartCard";
 import StatCard from "@/components/StatCard";
 import RangeFilter from "@/components/RangeFilter";
-import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel, chartColors as C } from "@/lib/chart-theme";
 import {
   getSpotifyKpis,
   getSpotifyDailyVolume,
@@ -31,14 +31,14 @@ import {
 const LEDGER_PER_PAGE = 50;
 
 const GENRE_PALETTE = [
-  "#1DB954", // spotify green
-  "#F59E0B", // amber (valence)
-  "#06B6D4", // cyan (energy)
-  "#8B5CF6", // purple (danceability)
-  "#EC4899", // pink
-  "#10B981", // emerald
-  "#F97316", // orange
-  "#3B82F6", // blue
+  C.source.spotify, // spotify green
+  C.source.whoop, // amber (valence)
+  C.accent, // cyan (energy)
+  C.source.eightsleep, // purple (danceability)
+  C.categorical[4], // pink
+  C.up, // emerald
+  C.source.whoop, // orange
+  C.source.garmin, // blue
 ];
 
 function applyRollingMean<T extends object>(
@@ -70,7 +70,7 @@ function applyRollingMean<T extends object>(
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
 
-const spotifyGreen = "#1DB954";
+const spotifyGreen = C.source.spotify;
 
 type Kpis = Awaited<ReturnType<typeof getSpotifyKpis>>;
 type TopArtists = Awaited<ReturnType<typeof getSpotifyTopArtists>>;
@@ -123,8 +123,8 @@ function chipClass(active: boolean, disabled = false): string {
   const base =
     "px-2.5 py-1 text-[11px] font-mono rounded-[4px] border transition-colors whitespace-nowrap";
   if (disabled) return `${base} opacity-40 cursor-not-allowed border-border-subtle text-text-tertiary`;
-  if (active) return `${base} bg-[#1DB954]/25 border-[#1DB954]/50 text-text-primary`;
-  return `${base} bg-black/20 border-border-subtle text-text-secondary hover:border-[#1DB954]/40 hover:text-text-primary`;
+  if (active) return `${base} bg-source-spotify/25 border-source-spotify/50 text-text-primary`;
+  return `${base} bg-black/20 border-border-subtle text-text-secondary hover:border-source-spotify/40 hover:text-text-primary`;
 }
 
 export default function SpotifyPage() {
@@ -362,7 +362,7 @@ export default function SpotifyPage() {
         <div className="flex items-center gap-2 flex-wrap">
           <button
             onClick={() => setGenOpen(true)}
-            className="px-3 py-1.5 text-[11px] font-mono font-medium tracking-wide text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 border border-[#1DB954]/40 rounded-[4px] transition-colors whitespace-nowrap"
+            className="px-3 py-1.5 text-[11px] font-mono font-medium tracking-wide text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-[4px] transition-colors whitespace-nowrap"
           >
             Generate playlist
           </button>
@@ -370,7 +370,7 @@ export default function SpotifyPage() {
         </div>
       </header>
 
-      <p className="text-[11px] text-text-tertiary leading-relaxed border-l-2 border-[#1DB954]/30 pl-3">
+      <p className="text-[11px] text-text-tertiary leading-relaxed border-l-2 border-source-spotify/30 pl-3">
         <span className="text-text-secondary">Coverage note:</span> Only plays that Spotify&apos;s
         backend knows about appear here. Offline playback from Spotify-licensed partner devices
         (Garmin watches, some car head units, older standalone wearables) isn&apos;t reported to
@@ -403,7 +403,7 @@ export default function SpotifyPage() {
                   type="text"
                   value={playlistName}
                   onChange={(e) => setPlaylistName(e.target.value)}
-                  className="w-full mb-3 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none transition-colors"
+                  className="w-full mb-3 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors"
                   disabled={creating}
                 />
                 <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">Description</label>
@@ -411,7 +411,7 @@ export default function SpotifyPage() {
                   value={playlistDesc}
                   onChange={(e) => setPlaylistDesc(e.target.value)}
                   rows={3}
-                  className="w-full mb-3 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none transition-colors resize-none"
+                  className="w-full mb-3 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors resize-none"
                   disabled={creating}
                 />
                 {createError && (
@@ -428,7 +428,7 @@ export default function SpotifyPage() {
                   <button
                     onClick={submitCreatePlaylist}
                     disabled={creating || !playlistName.trim()}
-                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 disabled:opacity-40 disabled:cursor-not-allowed border border-[#1DB954]/40 rounded-[4px] transition-colors"
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/40 rounded-[4px] transition-colors"
                   >
                     {creating ? "Creating…" : "Create"}
                   </button>
@@ -453,7 +453,7 @@ export default function SpotifyPage() {
                     href={createResult.spotify_url}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 border border-[#1DB954]/40 rounded-[4px] transition-colors"
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-[4px] transition-colors"
                   >
                     Open in Spotify
                   </a>
@@ -493,7 +493,7 @@ export default function SpotifyPage() {
                   onChange={(e) => setGenPrompt(e.target.value)}
                   rows={3}
                   placeholder="e.g. Late-night drive through the rain, heavy on synths and slow burn. Mostly instrumental."
-                  className="w-full mb-4 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none transition-colors resize-none"
+                  className="w-full mb-4 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors resize-none"
                   disabled={genRunning}
                 />
 
@@ -579,7 +579,7 @@ export default function SpotifyPage() {
                     }}
                     placeholder="Add custom genre (e.g. ambient)"
                     disabled={genRunning}
-                    className="flex-1 px-3 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none transition-colors"
+                    className="flex-1 px-3 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors"
                   />
                   <button
                     onClick={addCustomGenre}
@@ -597,7 +597,7 @@ export default function SpotifyPage() {
                         key={g}
                         onClick={() => toggleGenre(g)}
                         disabled={genRunning}
-                        className="px-2 py-0.5 text-[10px] font-mono bg-[#1DB954]/15 border border-[#1DB954]/30 rounded-[3px] text-text-primary hover:bg-[#1DB954]/25 disabled:opacity-40"
+                        className="px-2 py-0.5 text-[10px] font-mono bg-source-spotify/15 border border-source-spotify/30 rounded-[3px] text-text-primary hover:bg-source-spotify/25 disabled:opacity-40"
                       >
                         {g} ×
                       </button>
@@ -628,7 +628,7 @@ export default function SpotifyPage() {
                       genRunning ||
                       (!genPrompt.trim() && genVibes.length === 0 && genGenres.length === 0)
                     }
-                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 disabled:opacity-40 disabled:cursor-not-allowed border border-[#1DB954]/40 rounded-[4px] transition-colors"
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/40 rounded-[4px] transition-colors"
                   >
                     {genRunning ? "Generating…" : "Generate"}
                   </button>
@@ -647,7 +647,7 @@ export default function SpotifyPage() {
                             entry.kind === "status"
                               ? "text-text-tertiary"
                               : entry.kind === "tool_use"
-                              ? "text-[#1DB954]/80"
+                              ? "text-source-spotify/80"
                               : entry.kind === "tool_result"
                               ? "text-text-secondary"
                               : "text-text-primary"
@@ -700,7 +700,7 @@ export default function SpotifyPage() {
                     href={genResult.spotify_url}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 border border-[#1DB954]/40 rounded-[4px] transition-colors"
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-[4px] transition-colors"
                   >
                     Open in Spotify
                   </a>
@@ -780,7 +780,7 @@ export default function SpotifyPage() {
 
           {/* Taste evolution — three trend charts */}
           <section className="space-y-4">
-            <div className="border-l-2 border-[#1DB954]/40 pl-3">
+            <div className="border-l-2 border-source-spotify/40 pl-3">
               <h2 className="text-[14px] font-medium text-text-primary">Taste evolution</h2>
               <p className="text-[11px] text-text-tertiary mt-0.5">
                 How your listening has changed across {rangeLabel(range)}. Each chart is smoothed
@@ -819,13 +819,13 @@ export default function SpotifyPage() {
                     <YAxis tick={axisTick} domain={[0, 1]} />
                     <Tooltip {...chartTooltip} formatter={(v) => (typeof v === "number" ? v.toFixed(3) : String(v))} />
                     <Legend wrapperStyle={legendStyle} />
-                    <Line type="monotone" dataKey="avg_valence" stroke="#F59E0B" strokeWidth={1.3} dot={false} name="valence" />
+                    <Line type="monotone" dataKey="avg_valence" stroke={C.source.whoop} strokeWidth={1.3} dot={false} name="valence" />
                     <Line type="monotone" dataKey="avg_energy" stroke={accentColor} strokeWidth={1.3} dot={false} name="energy" />
-                    <Line type="monotone" dataKey="avg_danceability" stroke="#8B5CF6" strokeWidth={1.3} dot={false} name="danceability" />
-                    <Line type="monotone" dataKey="avg_acousticness" stroke="#10B981" strokeWidth={1.3} dot={false} name="acousticness" />
-                    <Line type="monotone" dataKey="avg_instrumentalness" stroke="#EC4899" strokeWidth={1.3} dot={false} name="instrumentalness" />
-                    <Line type="monotone" dataKey="avg_liveness" stroke="#F97316" strokeWidth={1.3} dot={false} name="liveness" />
-                    <Line type="monotone" dataKey="avg_speechiness" stroke="#A1A1AA" strokeWidth={1.3} dot={false} name="speechiness" />
+                    <Line type="monotone" dataKey="avg_danceability" stroke={C.source.eightsleep} strokeWidth={1.3} dot={false} name="danceability" />
+                    <Line type="monotone" dataKey="avg_acousticness" stroke={C.up} strokeWidth={1.3} dot={false} name="acousticness" />
+                    <Line type="monotone" dataKey="avg_instrumentalness" stroke={C.categorical[4]} strokeWidth={1.3} dot={false} name="instrumentalness" />
+                    <Line type="monotone" dataKey="avg_liveness" stroke={C.source.whoop} strokeWidth={1.3} dot={false} name="liveness" />
+                    <Line type="monotone" dataKey="avg_speechiness" stroke={C.neutral} strokeWidth={1.3} dot={false} name="speechiness" />
                   </LineChart>
                 </ResponsiveContainer>
               )}
@@ -866,8 +866,8 @@ export default function SpotifyPage() {
                       type="monotone"
                       dataKey="other"
                       stackId="1"
-                      stroke="#52525B"
-                      fill="#52525B"
+                      stroke={C.neutral}
+                      fill={C.neutral}
                       fillOpacity={0.4}
                       name="other"
                     />
@@ -1007,7 +1007,7 @@ export default function SpotifyPage() {
               <button
                 onClick={() => setModalOpen(true)}
                 disabled={topTracks.length === 0}
-                className="mb-3 w-full px-3 py-2 text-[11px] font-mono font-medium tracking-wide text-text-primary bg-[#1DB954]/15 hover:bg-[#1DB954]/25 disabled:opacity-40 disabled:cursor-not-allowed border border-[#1DB954]/30 rounded-[4px] transition-colors"
+                className="mb-3 w-full px-3 py-2 text-[11px] font-mono font-medium tracking-wide text-text-primary bg-source-spotify/15 hover:bg-source-spotify/25 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/30 rounded-[4px] transition-colors"
               >
                 Create private Spotify playlist from these {topTracks.length} tracks
               </button>
