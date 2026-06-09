@@ -89,20 +89,35 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Ambient gradient backdrop — Eight Sleep Pod aesthetic. A fixed, non-scrolling
-   cool aura (indigo top glow + violet bottom) painted behind the app on the deep
-   base surface; opaque cards sit on top, so the gradient shows through the page
-   background, gaps, and margins. pointer-events:none keeps it purely decorative. */
+/* Ambient gradient backdrop — Eight Sleep Pod aesthetic with a little personality.
+   A fixed multi-hue aurora mesh (indigo · cyan · a faint WHOOP-green core · violet ·
+   warm magenta) painted behind the app on the deep base surface, drifting very
+   slowly so it feels alive rather than static. Oversized via negative inset so the
+   drift never exposes a viewport edge; opaque cards sit on top, so it reads through
+   the page background, gaps, and margins. pointer-events:none keeps it decorative. */
 body::before {
   content: "";
   position: fixed;
-  inset: 0;
+  inset: -20%;
   z-index: -1;
   pointer-events: none;
   background:
-    radial-gradient(125% 80% at 50% -12%, rgba(82, 96, 255, 0.14), transparent 56%),
-    radial-gradient(85% 60% at 88% 4%, rgba(56, 189, 248, 0.06), transparent 52%),
-    radial-gradient(95% 70% at 85% 112%, rgba(124, 92, 250, 0.08), transparent 60%);
+    radial-gradient(60% 50% at 18% 4%,  rgba(82, 96, 255, 0.16), transparent 60%),   /* indigo, top-left */
+    radial-gradient(55% 45% at 92% 10%, rgba(56, 189, 248, 0.10), transparent 58%),  /* cyan, top-right */
+    radial-gradient(52% 46% at 50% 42%, rgba(22, 224, 122, 0.06), transparent 62%),  /* faint WHOOP-green core */
+    radial-gradient(60% 55% at 86% 96%, rgba(124, 92, 250, 0.13), transparent 60%),  /* violet, bottom-right */
+    radial-gradient(55% 50% at 10% 98%, rgba(236, 72, 153, 0.07), transparent 60%);  /* warm magenta, bottom-left */
+  animation: aura-drift 34s ease-in-out infinite alternate;
+}
+
+@keyframes aura-drift {
+  from { transform: translate3d(-1.5%, -1%, 0) scale(1.02); }
+  to   { transform: translate3d(1.5%, 1.5%, 0) scale(1.06); }
+}
+
+/* Respect reduced-motion: keep the aura, drop the drift. */
+@media (prefers-reduced-motion: reduce) {
+  body::before { animation: none; }
 }
 
 /* Chart tooltip override */
