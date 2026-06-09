@@ -899,7 +899,7 @@ export async function getSpotifyDiscoveryRate(
   // the range's plays in chronological order.
   const since = sinceFor(range);
 
-  let prior: Set<string> = new Set();
+  const prior: Set<string> = new Set();
   if (since) {
     // Fetch every track_id played before `since`. This can be large, so we page.
     let from = 0;

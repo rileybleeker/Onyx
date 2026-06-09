@@ -1,0 +1,4 @@
+{
+  "extends": ["next/core-web-vitals", "next/typescript"],
+  "ignorePatterns": ["e2e/**", "playwright.config.ts", ".next/**", "node_modules/**"]
+}

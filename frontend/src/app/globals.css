@@ -1,37 +1,63 @@
 @import "tailwindcss";
 
+/*
+ * Onyx design tokens — Direction A ("Terminal").
+ * Dark-only. Bloomberg-meets-Linear: deep cool-slate surfaces, a single rationed
+ * cyan accent, consistent HRV-direction encoding (up=green / down=red), and a
+ * mono+sans split (JetBrains Mono for numerics, Geist Sans for prose).
+ */
 @theme {
-  /* Backgrounds */
-  --color-surface: #0A0A0B;
-  --color-surface-card: #111113;
-  --color-surface-raised: #1A1A1D;
+  /* Surfaces — Surface 0 (page) → Surface 3 (hover / row stripe) */
+  --color-surface: #08090B;        /* Surface 0 — page background */
+  --color-surface-card: #0E1014;   /* Surface 1 — card body */
+  --color-surface-raised: #15181E; /* Surface 2 — tooltip / popover / sticky header */
+  --color-surface-hover: #1A1E26;  /* Surface 3 — hover / row stripe */
 
   /* Borders */
-  --color-border-subtle: rgba(255, 255, 255, 0.06);
-  --color-border-hover: rgba(255, 255, 255, 0.10);
+  --color-border-subtle: rgba(255, 255, 255, 0.05);
+  --color-border-default: rgba(255, 255, 255, 0.08);
+  --color-border-hover: rgba(255, 255, 255, 0.08);   /* legacy name, mapped to default */
+  --color-border-emphasis: rgba(120, 200, 255, 0.30); /* active row / selected */
 
-  /* Accent */
-  --color-accent: #06B6D4;
-  --color-accent-muted: rgba(6, 182, 212, 0.15);
+  /* Accent — the ONLY accent (active nav, focus ring, selected row, one CTA/screen) */
+  --color-accent: #7DD3FC;
+  --color-accent-muted: rgba(125, 211, 252, 0.15);
 
   /* Text */
-  --color-text-primary: #F4F4F5;
-  --color-text-secondary: #A1A1AA;
-  --color-text-tertiary: #71717A;
+  --color-text-primary: #E8EAED;
+  --color-text-secondary: #9AA0A6;
+  --color-text-tertiary: #5F6368;
+  --color-text-disabled: #3C4043;
 
-  /* Source colors */
-  --color-source-garmin: #3B82F6;
-  --color-source-whoop: #F59E0B;
-  --color-source-eightsleep: #8B5CF6;
+  /* Semantic — HRV-direction encoding (used consistently everywhere) */
+  --color-up: #34D399;        /* good / favorable */
+  --color-down: #F87171;      /* bad / unfavorable */
+  --color-neutral: #9AA0A6;   /* no direction */
+  --color-low-conf: rgba(154, 160, 166, 0.45); /* dimmed / low-confidence */
 
-  /* Shadows */
-  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4);
-  --shadow-elevated: 0 4px 12px rgba(0, 0, 0, 0.5);
+  /* Source colors (desaturated ~15% from the prior palette) */
+  --color-source-garmin: #5B8DF6;
+  --color-source-whoop: #F5A623;
+  --color-source-eightsleep: #9A7BFA;
+  --color-source-cronometer: #22D3A6;
+  --color-source-spotify: #1ED760;
+
+  /* Section-tick colors (colored left-edge ticks keyed to section function) */
+  --color-tick-forecast: #7DD3FC;     /* forecast / prediction */
+  --color-tick-descriptive: #9AA0A6;  /* descriptive stats */
+  --color-tick-causal: #F5A623;       /* causal inference */
+  --color-tick-calibration: #34D399;  /* calibration / accuracy */
+
+  /* Shadows — Direction A cards are nearly flat (border-only, no float) */
+  --shadow-card: none;
+  --shadow-elevated: 0 4px 16px rgba(0, 0, 0, 0.45);
   --shadow-floating: 0 8px 30px rgba(0, 0, 0, 0.6);
 
-  /* Fonts — CSS vars set by next/font via geist package */
+  /* Fonts — CSS vars set by next/font.
+     Mono leads with JetBrains Mono (Direction A numerics), Geist Mono as fallback. */
   --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
-  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+  --font-mono: var(--font-jetbrains-mono), var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+  --font-display: var(--font-jetbrains-mono), var(--font-geist-mono), ui-monospace, monospace;
 
   /* Animation */
   --animate-fade-in: fade-in 150ms ease-out both;
@@ -50,6 +76,13 @@
 @keyframes fade-in-up {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+/* JetBrains Mono display numerics get the ss01 stylistic set (slashed zero etc.) */
+.font-display {
+  font-family: var(--font-display);
+  font-feature-settings: "ss01", "tnum";
+  font-variant-numeric: tabular-nums;
 }
 
 /* Chart tooltip override */
