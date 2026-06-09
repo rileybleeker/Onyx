@@ -16,8 +16,8 @@ const MONO = "var(--font-mono)";
 
 /* ── Core palette ─────────────────────────────────────────────────────────── */
 
-/** The single rationed accent (cyan). */
-export const accentColor = "#7DD3FC";
+/** The single rationed accent — WHOOP recovery green. */
+export const accentColor = "#16E07A";
 
 /** Source colors for multi-device charts (desaturated ~15% for Direction A). */
 export const sourceColors = {
@@ -35,10 +35,14 @@ export const sourceColors = {
  */
 export const chartColors = {
   accent: accentColor,
-  /** HRV-direction encoding — used everywhere consistently. */
-  up: "#34D399",
-  down: "#F87171",
+  /** WHOOP zone encoding — green / yellow / red, used everywhere consistently. */
+  up: "#16E07A",
+  down: "#FF4159",
+  mid: "#FFD23F",
   neutral: "#9AA0A6",
+  /** WHOOP strain — blue 0–21 scale (kept distinct from the recovery zones). */
+  strain: "#0093E7",
+  strainBright: "#33B5F5",
   /** Pale up/down — significant-by-IF but block-bootstrap CI crosses zero. */
   paleUp: "#86EFAC",
   paleDown: "#FCA5A5",
@@ -59,10 +63,10 @@ export const chartColors = {
   source: sourceColors,
   /** Section-tick colors keyed to section function. */
   tick: {
-    forecast: "#7DD3FC",
+    forecast: "#0093E7",
     descriptive: "#9AA0A6",
     causal: "#F5A623",
-    calibration: "#34D399",
+    calibration: "#16E07A",
   },
 } as const;
 
@@ -159,4 +163,17 @@ export function directionalColor(
   if (!Number.isFinite(value) || Math.abs(value) <= eps) return chartColors.neutral;
   const good = opts?.favorable === "down" ? value < 0 : value > 0;
   return good ? chartColors.up : chartColors.down;
+}
+
+/**
+ * WHOOP recovery-zone color for a 0..max score: ≥67% green, ≥34% yellow, else red.
+ * The single source of the 3-zone system used by rings, status dots, and
+ * zone-keyed KPI values across the app.
+ */
+export function zoneColor(value: number, max = 100): string {
+  if (!Number.isFinite(value)) return chartColors.neutral;
+  const pct = (value / max) * 100;
+  if (pct >= 67) return chartColors.up;
+  if (pct >= 34) return chartColors.mid;
+  return chartColors.down;
 }

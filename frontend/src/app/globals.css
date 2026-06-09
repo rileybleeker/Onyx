@@ -17,11 +17,11 @@
   --color-border-subtle: rgba(255, 255, 255, 0.05);
   --color-border-default: rgba(255, 255, 255, 0.08);
   --color-border-hover: rgba(255, 255, 255, 0.08);   /* legacy name, mapped to default */
-  --color-border-emphasis: rgba(120, 200, 255, 0.30); /* active row / selected */
+  --color-border-emphasis: rgba(22, 224, 122, 0.30); /* active row / selected */
 
-  /* Accent — the ONLY accent (active nav, focus ring, selected row, one CTA/screen) */
-  --color-accent: #7DD3FC;
-  --color-accent-muted: rgba(125, 211, 252, 0.15);
+  /* Accent — WHOOP recovery green (active nav, focus ring, selected row, primary CTA) */
+  --color-accent: #16E07A;
+  --color-accent-muted: rgba(22, 224, 122, 0.15);
 
   /* Text */
   --color-text-primary: #E8EAED;
@@ -29,11 +29,15 @@
   --color-text-tertiary: #5F6368;
   --color-text-disabled: #3C4043;
 
-  /* Semantic — HRV-direction encoding (used consistently everywhere) */
-  --color-up: #34D399;        /* good / favorable */
-  --color-down: #F87171;      /* bad / unfavorable */
+  /* Semantic — WHOOP zone encoding (green/yellow/red) used consistently everywhere */
+  --color-up: #16E07A;        /* good / high recovery (WHOOP green) */
+  --color-down: #FF4159;      /* bad / low recovery (WHOOP red) */
+  --color-mid: #FFD23F;       /* caution / mid recovery (WHOOP yellow) */
   --color-neutral: #9AA0A6;   /* no direction */
   --color-low-conf: rgba(154, 160, 166, 0.45); /* dimmed / low-confidence */
+  /* Strain — WHOOP's blue 0–21 scale (kept distinct from the recovery zones) */
+  --color-strain: #0093E7;
+  --color-strain-bright: #33B5F5;
 
   /* Source colors (desaturated ~15% from the prior palette) */
   --color-source-garmin: #5B8DF6;
@@ -43,10 +47,10 @@
   --color-source-spotify: #1ED760;
 
   /* Section-tick colors (colored left-edge ticks keyed to section function) */
-  --color-tick-forecast: #7DD3FC;     /* forecast / prediction */
+  --color-tick-forecast: #0093E7;     /* forecast / prediction (strain blue) */
   --color-tick-descriptive: #9AA0A6;  /* descriptive stats */
   --color-tick-causal: #F5A623;       /* causal inference */
-  --color-tick-calibration: #34D399;  /* calibration / accuracy */
+  --color-tick-calibration: #16E07A;  /* calibration / accuracy (recovery green) */
 
   /* Shadows — Direction A cards are nearly flat (border-only, no float) */
   --shadow-card: none;
