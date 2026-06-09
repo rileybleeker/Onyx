@@ -98,6 +98,13 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
       page.getByRole("heading", { name: "HRV Deep Analysis" })
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
+    // Stage 4 (Direction A): the Tomorrow's-HRV hero KpiTile must render.
+    // data-testid (not class/color) so it survives further restyles.
+    await expect(
+      page.getByTestId("hero-tomorrow-hrv"),
+      "Tomorrow's HRV hero tile did not render"
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
     // The HRV Correlates (Historical) chart must actually draw bars. The
     // jsonb-double-parse bug left correlations=[] → the empty branch rendered
     // instead of this chart.

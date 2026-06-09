@@ -39,8 +39,17 @@ export const chartColors = {
   up: "#34D399",
   down: "#F87171",
   neutral: "#9AA0A6",
+  /** Pale up/down — significant-by-IF but block-bootstrap CI crosses zero. */
+  paleUp: "#86EFAC",
+  paleDown: "#FCA5A5",
   lowConf: "rgba(154,160,166,0.45)",
   grid: "rgba(255,255,255,0.04)",
+  /** Stronger-than-grid hairline for a zero reference line. */
+  zeroLine: "rgba(255,255,255,0.15)",
+  /** Error-bar / whisker stroke (visible but on-palette). */
+  whisker: "#9AA0A6",
+  /** Card body — used to mask the lower half of a stacked CI band. */
+  cardBg: "#0E1014",
   axis: "#5F6368",
   /** Low-chroma categorical 8-step (habit / journal / supplement category bars). */
   categorical: [
@@ -75,6 +84,9 @@ export const chartTooltip = {
 
 /** Shared axis tick style (mono, tertiary tone). */
 export const axisTick = { fill: "#5F6368", fontSize: 11, fontFamily: MONO };
+
+/** Shared Recharts <Legend> wrapper style (mono). */
+export const legendStyle = { fontSize: 11, fontFamily: MONO };
 
 /**
  * Shared grid style. Horizontal-only is set per-call via `vertical={false}`;
