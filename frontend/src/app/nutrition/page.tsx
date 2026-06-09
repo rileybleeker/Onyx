@@ -23,7 +23,7 @@ import { formatDate, kgToLb, lbToKg } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
-import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -377,8 +377,8 @@ export default function NutritionPage() {
                 <ComposedChart data={calorieData}>
                   <defs>
                     <linearGradient id="calConsumedGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.18} />
-                      <stop offset="95%" stopColor="#06b6d4" stopOpacity={0} />
+                      <stop offset="5%" stopColor={C.accent} stopOpacity={0.18} />
+                      <stop offset="95%" stopColor={C.accent} stopOpacity={0} />
                     </linearGradient>
                   </defs>
                   <CartesianGrid {...gridStyle} />
@@ -389,7 +389,7 @@ export default function NutritionPage() {
                   <Area
                     type="monotone"
                     dataKey="consumed"
-                    stroke="#06b6d4"
+                    stroke={C.accent}
                     strokeWidth={2}
                     fill="url(#calConsumedGrad)"
                     name="Consumed (Cronometer)"
@@ -398,7 +398,7 @@ export default function NutritionPage() {
                   <Line
                     type="monotone"
                     dataKey="burnt"
-                    stroke="#f59e0b"
+                    stroke={C.source.whoop}
                     strokeWidth={2}
                     dot={false}
                     name="Burnt (WHOOP)"
@@ -425,7 +425,7 @@ export default function NutritionPage() {
                     {calorieData.map((d, i) => (
                       <Cell
                         key={i}
-                        fill={(d.net ?? 0) >= 0 ? "#f59e0b" : "#22c55e"}
+                        fill={(d.net ?? 0) >= 0 ? C.source.whoop : C.up}
                       />
                     ))}
                   </Bar>
@@ -441,9 +441,9 @@ export default function NutritionPage() {
                   <YAxis tick={axisTick} width={48} />
                   <Tooltip {...chartTooltip} />
                   <Legend wrapperStyle={legendStyle} />
-                  <Bar dataKey="protein" stackId="macros" fill="#22c55e" name="Protein (g)" />
-                  <Bar dataKey="carbs" stackId="macros" fill="#3b82f6" name="Carbs (g)" />
-                  <Bar dataKey="fat" stackId="macros" fill="#f59e0b" name="Fat (g)" radius={[3, 3, 0, 0]} />
+                  <Bar dataKey="protein" stackId="macros" fill={C.up} name="Protein (g)" />
+                  <Bar dataKey="carbs" stackId="macros" fill={C.source.garmin} name="Carbs (g)" />
+                  <Bar dataKey="fat" stackId="macros" fill={C.source.whoop} name="Fat (g)" radius={[3, 3, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             </ChartCard>
@@ -456,10 +456,10 @@ export default function NutritionPage() {
                   <YAxis tick={axisTick} width={40} />
                   <Tooltip {...chartTooltip} />
                   <Legend wrapperStyle={legendStyle} />
-                  <Line type="monotone" dataKey="protein" stroke="#22c55e" strokeWidth={2} dot={false} name="Protein (g)" connectNulls={false} />
-                  <Line type="monotone" dataKey="fat" stroke="#f59e0b" strokeWidth={2} dot={false} name="Fat (g)" connectNulls={false} />
-                  <Line type="monotone" dataKey="fiber" stroke="#a78bfa" strokeWidth={2} dot={false} name="Fiber (g)" connectNulls={false} />
-                  <Line type="monotone" dataKey="sugar" stroke="#f87171" strokeWidth={2} dot={false} name="Sugar (g)" connectNulls={false} />
+                  <Line type="monotone" dataKey="protein" stroke={C.up} strokeWidth={2} dot={false} name="Protein (g)" connectNulls={false} />
+                  <Line type="monotone" dataKey="fat" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Fat (g)" connectNulls={false} />
+                  <Line type="monotone" dataKey="fiber" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Fiber (g)" connectNulls={false} />
+                  <Line type="monotone" dataKey="sugar" stroke={C.down} strokeWidth={2} dot={false} name="Sugar (g)" connectNulls={false} />
                 </LineChart>
               </ResponsiveContainer>
             </ChartCard>
@@ -641,7 +641,7 @@ export default function NutritionPage() {
               max={etTodayStr()}
               onChange={(e) => setWeightDate(e.target.value || etTodayStr())}
               disabled={savingWeight}
-              className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none disabled:opacity-40"
+              className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
             />
             {weightDate !== etTodayStr() && (
               <>
@@ -670,7 +670,7 @@ export default function NutritionPage() {
               onChange={(e) => setWeightInput(e.target.value)}
               placeholder="e.g. 178.4"
               disabled={savingWeight}
-              className="w-[120px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none disabled:opacity-40"
+              className="w-[120px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
             />
             <span className="text-[10px] font-mono text-text-tertiary">lb</span>
             {weightInput && !isNaN(parseFloat(weightInput)) && (
@@ -690,14 +690,14 @@ export default function NutritionPage() {
               onChange={(e) => setWeightNotes(e.target.value)}
               placeholder="optional — e.g. 'morning, post-bathroom', 'after workout'"
               disabled={savingWeight}
-              className="flex-1 min-w-[200px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none disabled:opacity-40"
+              className="flex-1 min-w-[200px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
             />
           </div>
 
           <button
             onClick={saveWeight}
             disabled={savingWeight || !weightInput}
-            className="w-full px-4 py-3 text-[13px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 disabled:opacity-40 disabled:cursor-not-allowed border border-[#1DB954]/40 rounded-[4px] transition-colors"
+            className="w-full px-4 py-3 text-[13px] font-medium text-text-primary bg-accent/20 hover:bg-accent/30 disabled:opacity-40 disabled:cursor-not-allowed border border-accent/40 rounded-[4px] transition-colors"
           >
             {savingWeight ? "Saving…" : "Save weight"}
           </button>
@@ -724,9 +724,9 @@ export default function NutritionPage() {
                 <Line
                   type="monotone"
                   dataKey="weight_lb"
-                  stroke="#a78bfa"
+                  stroke={C.source.eightsleep}
                   strokeWidth={2}
-                  dot={{ r: 3, fill: "#a78bfa" }}
+                  dot={{ r: 3, fill: C.source.eightsleep }}
                   name="Weight (lb)"
                   connectNulls={false}
                 />
