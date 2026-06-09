@@ -34,9 +34,9 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   cronometer: "text-text-tertiary",
   hrv_analysis: "text-blue-400",
   hrv_retrain: "text-blue-400/70",
-  spotify: "text-[#1DB954]",
-  reccobeats: "text-[#1DB954]/70",
-  musicbrainz: "text-[#1DB954]/70",
+  spotify: "text-source-spotify",
+  reccobeats: "text-source-spotify/70",
+  musicbrainz: "text-source-spotify/70",
   supplements: "text-amber-400",
   weight: "text-amber-500",
 };
