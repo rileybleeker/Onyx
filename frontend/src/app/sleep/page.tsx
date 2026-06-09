@@ -12,6 +12,7 @@ import {
 } from "@/lib/queries";
 import { formatDate, formatDuration, formatDurationMs, etDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
+import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
@@ -344,15 +345,29 @@ export default function SleepPage() {
 
       {/* ── WHOOP Recovery ──────────────────────────────────────────────────── */}
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Recovery</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <StatCard
-          label="Recovery"
-          value={avgRecoveryScore != null ? `${avgRecoveryScore.toFixed(0)}%` : null}
-          sublabel={avgRecoveryScore != null ? `${avgRecoveryScore >= 67 ? "Green" : avgRecoveryScore >= 34 ? "Yellow" : "Red"} · ${rangeNote}` : rangeNote}
-          source="WHOOP"
-        />
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6 items-stretch">
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing
+            label="Recovery"
+            value={avgRecoveryScore ?? NaN}
+            zone
+            centerUnit="%"
+            sublabel={avgRecoveryScore != null
+              ? (avgRecoveryScore >= 67 ? "Green" : avgRecoveryScore >= 34 ? "Yellow" : "Red")
+              : rangeNote}
+          />
+        </div>
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing
+            label="Day Strain"
+            value={avgStrain ?? NaN}
+            max={21}
+            strain
+            centerValue={avgStrain != null ? avgStrain.toFixed(1) : "—"}
+            sublabel="of 21"
+          />
+        </div>
         <StatCard label="HRV" value={avgWhoopHrv != null ? avgWhoopHrv.toFixed(0) : null} unit="ms" sublabel={rangeNote} source="WHOOP" />
-        <StatCard label="Day Strain" value={avgStrain != null ? avgStrain.toFixed(1) : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="Resting HR" value={avgWhoopRhr != null ? avgWhoopRhr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="WHOOP" />
       </div>
 

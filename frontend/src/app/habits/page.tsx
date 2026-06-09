@@ -6,6 +6,7 @@ import { getHabitJournal, getHabitMetadataHistory, rangeDays, rangeLabel, type R
 import { axisTick, gridStyle, chartTooltip, chartColors as C } from "@/lib/chart-theme";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
+import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
 
@@ -471,8 +472,14 @@ export default function HabitsPage() {
 
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <StatCard label="Today" value={`${todayCompleted}/${requiredHabits.length}`} sublabel="required habits" />
-        <StatCard label="7-Day Rate" value={`${completionRate}%`} sublabel={`${completedLast7} of ${possibleLast7} check-ins`} />
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing label="Today" value={todayCompleted} max={requiredHabits.length || 1} zone
+            centerValue={`${todayCompleted}/${requiredHabits.length}`} sublabel="required habits" size={120} />
+        </div>
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing label="7-Day Rate" value={completionRate} zone centerUnit="%"
+            sublabel={`${completedLast7}/${possibleLast7}`} size={120} />
+        </div>
         <StatCard label="Longest Streak" value={longestStreak} unit={longestUnit} sublabel={bestHabit?.name} />
         <StatCard
           label="vs Prior Week"

@@ -9,6 +9,7 @@ import {
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
 import KpiTile from "@/components/KpiTile";
+import MetricRing from "@/components/MetricRing";
 import SectionHeader from "@/components/SectionHeader";
 import {
   chartTooltip, axisTick, gridStyle, axisLabel, legendStyle,
@@ -338,13 +339,6 @@ function rolling7(data: number[], i: number): number {
   return slice.length ? slice.reduce((a, b) => a + b, 0) / slice.length : NaN;
 }
 
-function hrvColor(hrv: number | null): string {
-  if (!hrv) return C.neutral;
-  if (hrv >= 100) return C.up;
-  if (hrv >= 60) return C.source.whoop;
-  return C.down;
-}
-
 // Custom dot for prediction vs actual line
 const HrvDot = (props: any) => {
   const { cx, cy, payload } = props;
@@ -571,6 +565,13 @@ export default function HrvAnalysisPage() {
   // day per ADR-0001 Phase 3 — pre-midnight bedtimes now plot under the
   // bedtime-day, matching the prediction/causal panels.
   const hrvValues = historicalHrv.map(d => Number(d.whoop_hrv_rmssd));
+  // Percentile of tomorrow's predicted HRV within the observed range — drives the
+  // WHOOP-style recovery ring (zone-colored: higher percentile = greener).
+  const hrvPercentile = (() => {
+    const vals = hrvValues.filter((v) => Number.isFinite(v));
+    if (!tomorrowPred || !vals.length) return null;
+    return Math.round((vals.filter((v) => v <= Number(tomorrowPred.predicted_hrv)).length / vals.length) * 100);
+  })();
   const trendData = historicalHrv.map((d, i) => ({
     date: fmtDate(d.onyx_behavioral_date),
     hrv: Number(d.whoop_hrv_rmssd),
@@ -713,23 +714,30 @@ export default function HrvAnalysisPage() {
 
       {/* ── Row 1: Hero KPI tiles (horizontal scroll-snap on mobile) ── */}
       <div className="flex gap-3 overflow-x-auto snap-x snap-mandatory pb-1 -mx-1 px-1 [scrollbar-width:none] sm:mx-0 sm:px-0 sm:grid sm:grid-cols-3 sm:gap-4 sm:overflow-visible">
-        <KpiTile
-          className="min-w-[78%] snap-start sm:min-w-0"
-          testId="hero-tomorrow-hrv"
-          label="Tomorrow's HRV"
-          value={tomorrowPred ? Number(tomorrowPred.predicted_hrv).toFixed(0) : "—"}
-          unit={tomorrowPred ? "ms" : undefined}
-          valueColor={tomorrowPred ? hrvColor(tomorrowPred.predicted_hrv) : undefined}
-          sub={tomorrowPred
-            ? `80% CI ${Number(tomorrowPred.prediction_lower).toFixed(0)}–${Number(tomorrowPred.prediction_upper).toFixed(0)} ms`
-            : undefined}
-          delta={tomorrowPred && todayActualHrv
-            ? { value: Number(tomorrowPred.predicted_hrv) - todayActualHrv, favorable: "up", suffix: "vs today" }
-            : undefined}
-          spark={hrvValues.slice(-14)}
-          sparkFavorable="up"
-          meta={[{ text: "XGBOOST" }]}
-        />
+        <div className="min-w-[78%] snap-start sm:min-w-0 relative bg-surface-card border border-border-subtle rounded-[4px] px-4 py-4 flex flex-col items-center">
+          <span aria-hidden className="absolute left-0 top-0 bottom-0 w-[3px] rounded-l-[4px]" style={{ backgroundColor: "var(--color-accent)" }} />
+          <MetricRing
+            testId="hero-tomorrow-hrv"
+            label="Tomorrow"
+            value={hrvPercentile ?? NaN}
+            zone
+            centerValue={tomorrowPred ? Number(tomorrowPred.predicted_hrv).toFixed(0) : "—"}
+            centerUnit="ms"
+            sublabel={hrvPercentile != null ? `${hrvPercentile}th pctile` : undefined}
+          />
+          {tomorrowPred && (
+            <p className="mt-2 text-center text-[11px] font-mono text-text-tertiary">
+              80% CI {Number(tomorrowPred.prediction_lower).toFixed(0)}–{Number(tomorrowPred.prediction_upper).toFixed(0)} ms
+              {todayActualHrv != null && (
+                <span style={{ color: directionalColor(Number(tomorrowPred.predicted_hrv) - todayActualHrv, { favorable: "up" }) }}>
+                  {" · "}{Number(tomorrowPred.predicted_hrv) > todayActualHrv ? "↑" : "↓"}{" "}
+                  {Math.abs(Number(tomorrowPred.predicted_hrv) - todayActualHrv).toFixed(1)} vs today
+                </span>
+              )}
+            </p>
+          )}
+          <p className="mt-1 font-mono text-[10px] uppercase tracking-[0.06em] text-text-tertiary/70">XGBOOST</p>
+        </div>
         <KpiTile
           className="min-w-[78%] snap-start sm:min-w-0"
           label="Model Accuracy (30d)"

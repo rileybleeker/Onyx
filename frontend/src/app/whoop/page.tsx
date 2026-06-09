@@ -8,6 +8,7 @@ import {
 import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getWhoopJournal, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
+import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
@@ -99,17 +100,39 @@ export default function WhoopPage() {
         <RangeFilter value={range} onChange={setRange} />
       </div>
 
-      {/* KPIs */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <StatCard
-          label="Recovery"
-          value={latestRecovery?.recovery_score != null ? `${latestRecovery.recovery_score}%` : null}
-          sublabel={latestRecovery?.recovery_score != null ? (latestRecovery.recovery_score >= 67 ? "Green" : latestRecovery.recovery_score >= 34 ? "Yellow" : "Red") : undefined}
-          source="WHOOP"
-        />
+      {/* Ring-led hero — WHOOP recovery / strain / sleep triad */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8 items-stretch">
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing
+            label="Recovery"
+            value={latestRecovery?.recovery_score ?? NaN}
+            zone
+            centerUnit="%"
+            sublabel={latestRecovery?.recovery_score != null
+              ? (latestRecovery.recovery_score >= 67 ? "Green" : latestRecovery.recovery_score >= 34 ? "Yellow" : "Red")
+              : undefined}
+          />
+        </div>
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing
+            label="Day Strain"
+            value={latestCycle?.strain ?? NaN}
+            max={21}
+            strain
+            centerValue={latestCycle?.strain != null ? Number(latestCycle.strain).toFixed(1) : "—"}
+            sublabel="of 21"
+          />
+        </div>
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing
+            label="Sleep"
+            value={latestSleep?.sleep_performance_percentage ?? NaN}
+            zone
+            centerUnit="%"
+            sublabel="performance"
+          />
+        </div>
         <StatCard label="HRV" value={latestRecovery?.hrv_rmssd_milli ? Number(latestRecovery.hrv_rmssd_milli).toFixed(0) : null} unit="ms" source="WHOOP" />
-        <StatCard label="Day Strain" value={latestCycle?.strain ? Number(latestCycle.strain).toFixed(1) : null} source="WHOOP" />
-        <StatCard label="Sleep Performance" value={latestSleep?.sleep_performance_percentage != null ? `${latestSleep.sleep_performance_percentage}%` : null} source="WHOOP" />
       </div>
 
       {/* Charts */}

@@ -527,3 +527,27 @@ Stages 1–3 already propagated the Direction A design system globally (tokens, 
 - **`/chat`** — already fully on-palette (no charts, no raw hex, no off-palette classes); inherits Direction A from the shared components — **no change needed, no commit**.
 
 **No-data-loss:** Stage 5 is color-routing only. No route, chart, KPI, table, modal, button, chat tool, or PWA capability was moved, consolidated, renamed, or removed on any page. All page/section headings and empty-state strings are byte-for-byte unchanged (the smoke `PAGES` list + heading assertions still match). `/eight-sleep` is a pure server redirect to `/sleep` (untouched).
+
+---
+
+## WHOOP re-theme (follow-up direction — "Full WHOOP")
+
+Per Riley's request after reviewing the Terminal build: pivot the aesthetic toward **WHOOP** — green recovery accent, strain blue, a green→yellow→red 3-zone status system everywhere, and **ring-led heroes**. Built on the same `ui-refresh` branch.
+
+**Why it's cheap:** Stages 4–5 routed *every* chart color through `chart-theme` tokens, so re-pointing the token values re-themes all charts app-wide automatically — the only hand-work is the ring component + the page heroes.
+
+**Palette pivot (`globals.css` + `chart-theme.ts`):**
+- `--color-accent` cyan `#7DD3FC` → **WHOOP green `#16E07A`** (active nav, focus rings, primary CTAs, section ticks, every chart series that resolved to `accent`).
+- `--color-up` → `#16E07A`, `--color-down` → WHOOP red `#FF4159`, **new `--color-mid` `#FFD23F`** (zone yellow), **new `--color-strain`/`--color-strain-bright`** (`#0093E7`/`#33B5F5`). `border-emphasis` + `tick-forecast`/`tick-calibration` re-pointed. `chartColors` gains `mid`/`strain`/`strainBright`; **new `zoneColor(value, max)` helper** is the single source of the ≥67 green / ≥34 yellow / red logic.
+
+**`MetricRing.tsx` (new):** the WHOOP signature — an SVG gauge (subtle track + arc from 12 o'clock, clockwise, 600ms fill), colored by recovery `zone`, `strain` blue, or an explicit color, with the centered value adopting the zone color. Props: `value/max/size/thickness/color/zone/strain/label/centerValue/centerUnit/sublabel/testId`.
+
+**Ring-led heroes (data preserved — demoted metrics stay as stats in the same row):**
+- **`/whoop`** — Recovery (zone) + Day Strain (blue, 0–21) + Sleep Performance (zone) rings; HRV kept as a stat.
+- **`/sleep`** — Recovery + Day Strain rings lead the WHOOP·Recovery row; HRV + Resting HR kept as stats.
+- **`/analytics/hrv`** — "Tomorrow's HRV" KpiTile → a recovery ring filled by the prediction's **percentile within the observed range** (zone-colored), value = ms, with CI + vs-today below; keeps `data-testid="hero-tomorrow-hrv"`. (Dead `hrvColor` helper removed.)
+- **`/status`** — Sources-Online ring (online / total, zone). **`/habits`** — Today + 7-Day-Rate rings (zone).
+
+**Not ring-led (no bounded recovery-style score):** the logging/feed pages (`/nutrition`, `/supplements`, `/activities`, `/spotify`, `/journal`, `/chat`, `/heart`, `/analytics/travel`, `/account`, `/bland-altman`) keep their KPI tiles + charts — but all inherit the WHOOP palette (green accent, zone colors, strain blue) automatically via the token pivot. `/heart` is a candidate for a stress ring if wanted.
+
+**No-data-loss:** every metric demoted from a KpiTile/StatCard into a ring is still shown (ring center value + sublabel, or retained alongside as a stat). Build + lint pass; smoke spec unchanged (the HRV hero still carries `data-testid="hero-tomorrow-hrv"`).
