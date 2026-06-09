@@ -89,6 +89,22 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Ambient gradient backdrop — Eight Sleep Pod aesthetic. A fixed, non-scrolling
+   cool aura (indigo top glow + violet bottom) painted behind the app on the deep
+   base surface; opaque cards sit on top, so the gradient shows through the page
+   background, gaps, and margins. pointer-events:none keeps it purely decorative. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(125% 80% at 50% -12%, rgba(82, 96, 255, 0.14), transparent 56%),
+    radial-gradient(85% 60% at 88% 4%, rgba(56, 189, 248, 0.06), transparent 52%),
+    radial-gradient(95% 70% at 85% 112%, rgba(124, 92, 250, 0.08), transparent 60%);
+}
+
 /* Chart tooltip override */
 .recharts-tooltip-wrapper {
   outline: none !important;
