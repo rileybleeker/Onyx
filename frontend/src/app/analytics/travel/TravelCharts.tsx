@@ -1,6 +1,7 @@
 "use client";
 
 import ChartCard from "@/components/ChartCard";
+import { chartColors as C } from "@/lib/chart-theme";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine,
   ResponsiveContainer, BarChart, Bar, LabelList,
@@ -31,14 +32,14 @@ export default function TravelCharts({ meanTrajectory, destBreakdown }: Props) {
               label={{ value: "Mean HRV (ms)", angle: -90, position: "insideLeft", fill: "rgba(255,255,255,0.5)", fontSize: 11 }}
             />
             <Tooltip
-              contentStyle={{ backgroundColor: "#1a1a1a", border: "1px solid rgba(255,255,255,0.1)" }}
+              contentStyle={{ backgroundColor: C.cardBg, border: "1px solid rgba(255,255,255,0.1)" }}
               formatter={(v, _name, p) => [
                 `${typeof v === "number" ? v.toFixed(1) : v} ms (n=${(p as { payload?: { n?: number } }).payload?.n ?? "?"})`,
                 "Mean HRV",
               ]}
             />
             <ReferenceLine x={0} stroke="rgba(255, 200, 0, 0.4)" strokeDasharray="3 3" label={{ value: "Trip start", position: "top", fill: "rgba(255,200,0,0.7)", fontSize: 10 }} />
-            <Line type="monotone" dataKey="mean_hrv" stroke="#60a5fa" strokeWidth={2} dot={{ fill: "#60a5fa", r: 3 }} />
+            <Line type="monotone" dataKey="mean_hrv" stroke={C.source.garmin} strokeWidth={2} dot={{ fill: C.source.garmin, r: 3 }} />
           </LineChart>
         </ResponsiveContainer>
       </ChartCard>
@@ -56,13 +57,13 @@ export default function TravelCharts({ meanTrajectory, destBreakdown }: Props) {
             />
             <YAxis tick={{ fill: "rgba(255,255,255,0.5)", fontSize: 12 }} />
             <Tooltip
-              contentStyle={{ backgroundColor: "#1a1a1a", border: "1px solid rgba(255,255,255,0.1)" }}
+              contentStyle={{ backgroundColor: C.cardBg, border: "1px solid rgba(255,255,255,0.1)" }}
               formatter={(v, _name, p) => [
                 `${v} days (${(p as { payload?: { count?: number } }).payload?.count ?? "?"} trips)`,
                 "Days abroad",
               ]}
             />
-            <Bar dataKey="days" fill="#a78bfa">
+            <Bar dataKey="days" fill={C.source.eightsleep}>
               <LabelList dataKey="days" position="top" fill="rgba(255,255,255,0.6)" fontSize={10} />
             </Bar>
           </BarChart>
