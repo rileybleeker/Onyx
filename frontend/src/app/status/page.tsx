@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import StatCard from "@/components/StatCard";
+import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import type { DriftAlert, SourceStatus, StatusResponse, TzGapRow } from "@/app/api/status/route";
 
@@ -34,9 +35,9 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   cronometer: "text-text-tertiary",
   hrv_analysis: "text-blue-400",
   hrv_retrain: "text-blue-400/70",
-  spotify: "text-[#1DB954]",
-  reccobeats: "text-[#1DB954]/70",
-  musicbrainz: "text-[#1DB954]/70",
+  spotify: "text-source-spotify",
+  reccobeats: "text-source-spotify/70",
+  musicbrainz: "text-source-spotify/70",
   supplements: "text-amber-400",
   weight: "text-amber-500",
 };
@@ -400,11 +401,17 @@ export default function StatusPage() {
 
       {/* KPI row */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <StatCard
-          label="Sources Online"
-          value={`${sourcesOnline} / ${sourceList.length}`}
-          sublabel="fresh within 24h"
-        />
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing
+            label="Sources Online"
+            value={sourcesOnline}
+            max={sourceList.length || 1}
+            zone
+            centerValue={`${sourcesOnline}/${sourceList.length}`}
+            sublabel="fresh within 24h"
+            size={120}
+          />
+        </div>
         <StatCard
           label="Last ETL Run"
           value={mostRecentSync ? formatRelativeTime(mostRecentSync) : "—"}

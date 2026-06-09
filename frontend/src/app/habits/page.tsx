@@ -3,23 +3,24 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { getHabitJournal, getHabitMetadataHistory, rangeDays, rangeLabel, type Range, type HabitMetadataInterval } from "@/lib/queries";
-import { axisTick, gridStyle, chartTooltip } from "@/lib/chart-theme";
+import { axisTick, gridStyle, chartTooltip, chartColors as C } from "@/lib/chart-theme";
 import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
+import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 const CATEGORY_COLORS: Record<string, string> = {
-  health: "#22c55e",
-  fitness: "#3b82f6",
-  mindfulness: "#a78bfa",
-  productivity: "#f59e0b",
-  nutrition: "#06b6d4",
-  learning: "#ec4899",
-  social: "#f97316",
-  general: "#71717a",
+  health: C.up,
+  fitness: C.source.garmin,
+  mindfulness: C.source.eightsleep,
+  productivity: C.source.whoop,
+  nutrition: C.accent,
+  learning: C.categorical[4],
+  social: C.categorical[1],
+  general: C.neutral,
 };
 
 interface NotionHabit {
@@ -471,8 +472,14 @@ export default function HabitsPage() {
 
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <StatCard label="Today" value={`${todayCompleted}/${requiredHabits.length}`} sublabel="required habits" />
-        <StatCard label="7-Day Rate" value={`${completionRate}%`} sublabel={`${completedLast7} of ${possibleLast7} check-ins`} />
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing label="Today" value={todayCompleted} max={requiredHabits.length || 1} zone
+            centerValue={`${todayCompleted}/${requiredHabits.length}`} sublabel="required habits" size={120} />
+        </div>
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing label="7-Day Rate" value={completionRate} zone centerUnit="%"
+            sublabel={`${completedLast7}/${possibleLast7}`} size={120} />
+        </div>
         <StatCard label="Longest Streak" value={longestStreak} unit={longestUnit} sublabel={bestHabit?.name} />
         <StatCard
           label="vs Prior Week"
@@ -520,8 +527,8 @@ export default function HabitsPage() {
             <AreaChart data={trendData}>
               <defs>
                 <linearGradient id="habitRateGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.2} />
-                  <stop offset="95%" stopColor="#06b6d4" stopOpacity={0} />
+                  <stop offset="5%" stopColor={C.accent} stopOpacity={0.2} />
+                  <stop offset="95%" stopColor={C.accent} stopOpacity={0} />
                 </linearGradient>
               </defs>
               <CartesianGrid {...gridStyle} />
@@ -531,7 +538,7 @@ export default function HabitsPage() {
               <Area
                 type="monotone"
                 dataKey="rate"
-                stroke="#06b6d4"
+                stroke={C.accent}
                 strokeWidth={2}
                 fill="url(#habitRateGrad)"
                 name="Completion %"
@@ -674,7 +681,7 @@ export default function HabitsPage() {
                           </span>
                         )}
                       </p>
-                      <p className="text-[11px] font-mono" style={{ color: isAdHoc ? "var(--color-text-tertiary, #71717a)" : color }}>
+                      <p className="text-[11px] font-mono" style={{ color: isAdHoc ? "var(--color-text-tertiary)" : color }}>
                         {label}
                       </p>
                     </div>

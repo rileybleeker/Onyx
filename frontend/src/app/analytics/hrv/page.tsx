@@ -8,13 +8,17 @@ import {
 } from "recharts";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
-import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
+import KpiTile from "@/components/KpiTile";
+import MetricRing from "@/components/MetricRing";
+import SectionHeader from "@/components/SectionHeader";
+import {
+  chartTooltip, axisTick, gridStyle, axisLabel, legendStyle,
+  chartColors as C, directionalColor,
+} from "@/lib/chart-theme";
 import { supabase } from "@/lib/supabase";
 import { getWorkoutSleepGap, rangeDays, rangeLabel, type Range, type WorkoutSleepGap } from "@/lib/queries";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-
-const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
 
 // YAxis width on horizontal bar charts is a hardcoded Recharts prop, so mobile
 // scaling needs JS state — without it, the 200-220px label column crushes the
@@ -135,9 +139,9 @@ function WrappedYAxisTick(
         x={-4}
         y={0}
         textAnchor="end"
-        fill="#71717A"
+        fill={C.axis}
         fontSize={fontSize}
-        fontFamily="var(--font-geist-mono), monospace"
+        fontFamily="var(--font-mono)"
       >
         <title>{display}</title>
         {lines.map((ln, i) => (
@@ -335,21 +339,29 @@ function rolling7(data: number[], i: number): number {
   return slice.length ? slice.reduce((a, b) => a + b, 0) / slice.length : NaN;
 }
 
-function hrvColor(hrv: number | null): string {
-  if (!hrv) return "#71717a";
-  if (hrv >= 100) return "#22c55e";
-  if (hrv >= 60) return "#f59e0b";
-  return "#ef4444";
-}
-
 // Custom dot for prediction vs actual line
 const HrvDot = (props: any) => {
   const { cx, cy, payload } = props;
   if (!payload?.actual || !payload?.predicted) return null;
   const diff = Math.abs(payload.actual - payload.predicted);
-  const color = diff > 15 ? "#ef4444" : "transparent";
-  return <circle cx={cx} cy={cy} r={4} fill={color} stroke="#ef4444" strokeWidth={1} />;
+  const color = diff > 15 ? C.down : "transparent";
+  return <circle cx={cx} cy={cy} r={4} fill={color} stroke={C.down} strokeWidth={1} />;
 };
+
+// In-page section anchors — drives the sticky right-rail TOC and the
+// SectionHeader ids below. Keep ids in sync with the SectionHeader id props.
+const SECTIONS = [
+  { id: "forecast", label: "Forecast & Drivers" },
+  { id: "accuracy", label: "Model Accuracy" },
+  { id: "trend", label: "HRV Trend" },
+  { id: "associations", label: "Associations" },
+  { id: "impact", label: "Behavior Impact" },
+  { id: "supplements", label: "Supplements" },
+  { id: "lifestyle", label: "Lifestyle" },
+  { id: "causal", label: "Causal Inference" },
+  { id: "environment", label: "Environment" },
+  { id: "methods", label: "Methods & Eval" },
+] as const;
 
 // ---------------------------------------------------------------------------
 // Page Component
@@ -553,11 +565,26 @@ export default function HrvAnalysisPage() {
   // day per ADR-0001 Phase 3 — pre-midnight bedtimes now plot under the
   // bedtime-day, matching the prediction/causal panels.
   const hrvValues = historicalHrv.map(d => Number(d.whoop_hrv_rmssd));
+  // Percentile of tomorrow's predicted HRV within the observed range — drives the
+  // WHOOP-style recovery ring (zone-colored: higher percentile = greener).
+  const hrvPercentile = (() => {
+    const vals = hrvValues.filter((v) => Number.isFinite(v));
+    if (!tomorrowPred || !vals.length) return null;
+    return Math.round((vals.filter((v) => v <= Number(tomorrowPred.predicted_hrv)).length / vals.length) * 100);
+  })();
   const trendData = historicalHrv.map((d, i) => ({
     date: fmtDate(d.onyx_behavioral_date),
     hrv: Number(d.whoop_hrv_rmssd),
     rolling7: rolling7(hrvValues, i),
   }));
+  // Day-context strip (weekend) aligned with trendData — derived from the date
+  // itself, so no extra fetch. Richer day-context stripes (alcohol / hard-workout
+  // / travel) would require adding columns to the HRV queries (a data-fetch
+  // change deliberately out of scope for this frontend-only refresh).
+  const trendWeekend = historicalHrv.map((d) => {
+    const wd = new Date(d.onyx_behavioral_date + "T00:00:00").getDay();
+    return wd === 0 || wd === 6;
+  });
 
   // Prediction vs actual overlay (last 60 days)
   const predActualData = accuracy.map(d => ({
@@ -604,11 +631,11 @@ export default function HrvAnalysisPage() {
   // eval_date so a partial backfill that wrote some horizons today and
   // others yesterday still composes a coherent row.
   const HORIZON_MODELS = [
-    { key: "xgboost",           label: "XGBoost",        color: "#3b82f6" },
-    { key: "sarimax",           label: "SARIMAX",        color: "#8b5cf6" },
-    { key: "baseline_naive",    label: "Naive",          color: "#f59e0b" },
-    { key: "baseline_7d_avg",   label: "7d Avg",         color: "#06b6d4" },
-    { key: "baseline_dow",      label: "Day-of-week",    color: "#a1a1aa" },
+    { key: "xgboost",           label: "XGBoost",        color: C.source.garmin },
+    { key: "sarimax",           label: "SARIMAX",        color: C.source.eightsleep },
+    { key: "baseline_naive",    label: "Naive",          color: C.source.whoop },
+    { key: "baseline_7d_avg",   label: "7d Avg",         color: C.accent },
+    { key: "baseline_dow",      label: "Day-of-week",    color: C.neutral },
   ] as const;
   const horizonData = [1, 2, 3, 4, 5, 6, 7].map(h => {
     const row: Record<string, number | string | null> = { horizon: `t+${h}` };
@@ -648,7 +675,8 @@ export default function HrvAnalysisPage() {
   const hasData = tomorrowPred || predActualData.length > 0 || trendData.length > 0;
 
   return (
-    <div className="space-y-6">
+    <div className="xl:flex xl:gap-6 xl:items-start">
+    <div className="flex-1 min-w-0 space-y-6">
       {/* Header */}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
@@ -684,89 +712,61 @@ export default function HrvAnalysisPage() {
         </div>
       </div>
 
-      {/* ── Row 1: Hero Cards ── */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        {/* Tomorrow's Predicted HRV */}
-        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card relative">
-          <p className="text-[10px] text-text-tertiary font-medium uppercase tracking-[0.1em]">Tomorrow&apos;s Predicted HRV</p>
-          {tomorrowPred ? (
-            <>
-              <p className="text-[36px] leading-none font-medium font-mono tabular-nums mt-2"
-                 style={{ color: hrvColor(tomorrowPred.predicted_hrv) }}>
-                {Number(tomorrowPred.predicted_hrv).toFixed(0)}
-                <span className="text-base font-normal text-text-secondary ml-1">ms</span>
-              </p>
-              <p className="text-[11px] text-text-tertiary mt-1.5">
-                80% CI: {Number(tomorrowPred.prediction_lower).toFixed(0)}–{Number(tomorrowPred.prediction_upper).toFixed(0)} ms
-              </p>
-              {todayActualHrv && (
-                <p className="text-[11px] mt-1" style={{
-                  color: tomorrowPred.predicted_hrv > todayActualHrv ? "#22c55e" : "#ef4444"
-                }}>
-                  {tomorrowPred.predicted_hrv > todayActualHrv ? "↑" : "↓"}
-                  {" "}{Math.abs(tomorrowPred.predicted_hrv - todayActualHrv).toFixed(1)} ms from today
-                </p>
+      {/* ── Row 1: Hero KPI tiles (horizontal scroll-snap on mobile) ── */}
+      <div className="flex gap-3 overflow-x-auto snap-x snap-mandatory pb-1 -mx-1 px-1 [scrollbar-width:none] sm:mx-0 sm:px-0 sm:grid sm:grid-cols-3 sm:gap-4 sm:overflow-visible">
+        <div className="min-w-[78%] snap-start sm:min-w-0 relative bg-surface-card border border-border-subtle rounded-[4px] px-4 py-4 flex flex-col items-center">
+          <span aria-hidden className="absolute left-0 top-0 bottom-0 w-[3px] rounded-l-[4px]" style={{ backgroundColor: "var(--color-accent)" }} />
+          <MetricRing
+            testId="hero-tomorrow-hrv"
+            label="Tomorrow"
+            value={hrvPercentile ?? NaN}
+            zone
+            centerValue={tomorrowPred ? Number(tomorrowPred.predicted_hrv).toFixed(0) : "—"}
+            centerUnit="ms"
+            sublabel={hrvPercentile != null ? `${hrvPercentile}th pctile` : undefined}
+          />
+          {tomorrowPred && (
+            <p className="mt-2 text-center text-[11px] font-mono text-text-tertiary">
+              80% CI {Number(tomorrowPred.prediction_lower).toFixed(0)}–{Number(tomorrowPred.prediction_upper).toFixed(0)} ms
+              {todayActualHrv != null && (
+                <span style={{ color: directionalColor(Number(tomorrowPred.predicted_hrv) - todayActualHrv, { favorable: "up" }) }}>
+                  {" · "}{Number(tomorrowPred.predicted_hrv) > todayActualHrv ? "↑" : "↓"}{" "}
+                  {Math.abs(Number(tomorrowPred.predicted_hrv) - todayActualHrv).toFixed(1)} vs today
+                </span>
               )}
-            </>
-          ) : (
-            <p className="text-[28px] font-mono text-text-tertiary mt-2">—</p>
+            </p>
           )}
-          <p className="text-[10px] text-text-tertiary mt-2 leading-relaxed">
-            An AI model trained on your own workout, sleep, and behavior data to predict next-night HRV. The range below the number is where it expects your HRV to land 9 out of 10 nights.
-          </p>
-          <span className="absolute top-3 right-3 text-[9px] font-mono text-text-tertiary">XGBOOST</span>
+          <p className="mt-1 font-mono text-[10px] uppercase tracking-[0.06em] text-text-tertiary/70">XGBOOST</p>
         </div>
-
-        {/* Model Accuracy */}
-        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card relative">
-          <p className="text-[10px] text-text-tertiary font-medium uppercase tracking-[0.1em]">Model Accuracy (30d)</p>
-          {xgbMetrics ? (
-            <>
-              <p className="text-[28px] leading-none font-medium font-mono tabular-nums mt-2 text-text-primary">
-                {Number(xgbMetrics.mae).toFixed(1)}<span className="text-xs text-text-secondary ml-1">ms MAE</span>
-              </p>
-              <p className="text-[11px] text-text-tertiary mt-1.5">
-                Directional accuracy: {xgbMetrics.directional_accuracy ? `${Number(xgbMetrics.directional_accuracy).toFixed(0)}%` : "—"}
-              </p>
-              {naiveMetrics && (
-                <p className="text-[11px] text-text-tertiary">
-                  vs naive: {Number(naiveMetrics.mae).toFixed(1)} ms (
-                  <span style={{ color: Number(xgbMetrics.mae) < Number(naiveMetrics.mae) ? "#22c55e" : "#ef4444" }}>
-                    {Number(xgbMetrics.mae) < Number(naiveMetrics.mae) ? "better" : "worse"}
-                  </span>)
-                </p>
-              )}
-              <p className="text-[10px] text-text-tertiary mt-2 leading-relaxed">
-                On average, the model was off by this many ms. Directional accuracy is how often it correctly called whether HRV would go up or down. The &ldquo;naive&rdquo; comparison just uses yesterday&apos;s HRV as the guess — beating it means the model is actually learning something.
-              </p>
-            </>
-          ) : (
-            <p className="text-[28px] font-mono text-text-tertiary mt-2">—</p>
-          )}
-          <span className="absolute top-3 right-3 text-[9px] font-mono text-text-tertiary">XGBOOST</span>
-        </div>
-
-        {/* Top Driver Today */}
-        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card">
-          <p className="text-[10px] text-text-tertiary font-medium uppercase tracking-[0.1em]">Top Driver Today</p>
-          {topDrivers[0] ? (
-            <>
-              <p className="text-[16px] font-medium text-text-primary mt-2 leading-tight">
-                {topDrivers[0].label}
-              </p>
-              <p className="text-[24px] font-mono tabular-nums mt-1"
-                 style={{ color: (topDrivers[0].shap_value ?? topDrivers[0].importance) > 0 ? "#22c55e" : "#ef4444" }}>
-                {(topDrivers[0].shap_value ?? topDrivers[0].importance) > 0 ? "+" : ""}
-                {Number(topDrivers[0].shap_value ?? topDrivers[0].importance).toFixed(1)} ms
-              </p>
-              <p className="text-[10px] text-text-tertiary mt-1">SHAP contribution to prediction</p>
-            </>
-          ) : (
-            <p className="text-[28px] font-mono text-text-tertiary mt-2">—</p>
-          )}
-        </div>
+        <KpiTile
+          className="min-w-[78%] snap-start sm:min-w-0"
+          label="Model Accuracy (30d)"
+          value={xgbMetrics ? Number(xgbMetrics.mae).toFixed(1) : "—"}
+          unit={xgbMetrics ? "ms MAE" : undefined}
+          sub={xgbMetrics?.directional_accuracy
+            ? `${Number(xgbMetrics.directional_accuracy).toFixed(0)}% directional`
+            : undefined}
+          delta={xgbMetrics && naiveMetrics
+            ? { value: Number(naiveMetrics.mae) - Number(xgbMetrics.mae), favorable: "up", suffix: "vs naive" }
+            : undefined}
+          meta={[{ text: "XGBOOST" }]}
+        />
+        <KpiTile
+          className="min-w-[78%] snap-start sm:min-w-0"
+          label="Top Driver Today"
+          value={topDrivers[0]
+            ? `${(topDrivers[0].shap_value ?? topDrivers[0].importance) > 0 ? "+" : ""}${Number(topDrivers[0].shap_value ?? topDrivers[0].importance).toFixed(1)}`
+            : "—"}
+          unit={topDrivers[0] ? "ms" : undefined}
+          valueColor={topDrivers[0]
+            ? directionalColor(Number(topDrivers[0].shap_value ?? topDrivers[0].importance), { favorable: "up" })
+            : undefined}
+          sub={topDrivers[0] ? topDrivers[0].label : undefined}
+          meta={[{ text: "XGBOOST · SHAP" }]}
+        />
       </div>
 
+      <SectionHeader id="forecast" tick="forecast" title="Forecast & Drivers" kicker="What tomorrow looks like, and why" />
       {/* ── Forward-looking: what's predicted and why (today) ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* 30-Day Prophet Forecast */}
@@ -776,8 +776,8 @@ export default function HrvAnalysisPage() {
             <AreaChart data={prophetData}>
               <defs>
                 <linearGradient id="prophetGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#f59e0b" stopOpacity={0.15} />
-                  <stop offset="100%" stopColor="#f59e0b" stopOpacity={0} />
+                  <stop offset="0%" stopColor={C.source.whoop} stopOpacity={0.15} />
+                  <stop offset="100%" stopColor={C.source.whoop} stopOpacity={0} />
                 </linearGradient>
               </defs>
               <CartesianGrid {...gridStyle} />
@@ -788,12 +788,12 @@ export default function HrvAnalysisPage() {
               <Area type="monotone" dataKey="upper" name="Upper CI" stroke="none"
                     fill="url(#prophetGrad)" stackId="ci" />
               <Area type="monotone" dataKey="lower" name="Lower CI" stroke="none"
-                    fill="#0a0a0b" stackId="ci" />
-              <Line type="monotone" dataKey="actual" stroke="#22c55e" strokeWidth={2}
+                    fill={C.cardBg} stackId="ci" />
+              <Line type="monotone" dataKey="actual" stroke={C.up} strokeWidth={2}
                     dot={false} name="Actual HRV" connectNulls />
-              <Line type="monotone" dataKey="forecast" stroke="#f59e0b" strokeWidth={2}
+              <Line type="monotone" dataKey="forecast" stroke={C.source.whoop} strokeWidth={2}
                     strokeDasharray="5 3" dot={false} name="Prophet" connectNulls />
-              <Line type="monotone" dataKey="sarimax" stroke="#8b5cf6" strokeWidth={2}
+              <Line type="monotone" dataKey="sarimax" stroke={C.source.eightsleep} strokeWidth={2}
                     strokeDasharray="2 3" dot={false} name="SARIMAX (7d)" connectNulls />
             </AreaChart>
           </ResponsiveContainer>
@@ -833,11 +833,11 @@ export default function HrvAnalysisPage() {
                   {...chartTooltip}
                   formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)} ms`, "Impact"]}
                 />
-                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <ReferenceLine x={0} stroke={C.zeroLine} />
                 <Bar dataKey="shap_value" radius={[0, 3, 3, 0]}>
                   {topDrivers.slice(0, 10).map((d, i) => (
                     <Cell key={i}
-                      fill={(d.shap_value ?? d.importance) > 0 ? "#22c55e" : "#ef4444"}
+                      fill={(d.shap_value ?? d.importance) > 0 ? C.up : C.down}
                       fillOpacity={0.85}
                     />
                   ))}
@@ -857,7 +857,7 @@ export default function HrvAnalysisPage() {
               <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">XGBOOST · SHAP</span>
             </div>
             <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
-              Your logged Yes/No behaviors are part of the model. A <span className="text-[#22c55e]">green</span> bar means that behavior <em>raised</em> tomorrow&apos;s predicted HRV today; a <span className="text-[#ef4444]">red</span> bar means it <em>lowered</em> it. Binary features have smaller ms impact than continuous metrics but still shift the forecast.
+              Your logged Yes/No behaviors are part of the model. A <span className="text-up">green</span> bar means that behavior <em>raised</em> tomorrow&apos;s predicted HRV today; a <span className="text-down">red</span> bar means it <em>lowered</em> it. Binary features have smaller ms impact than continuous metrics but still shift the forecast.
             </p>
             {journalDriversToday.length > 0 ? (
               <ResponsiveContainer width="100%" height={Math.max(120, journalDriversToday.length * 22)}>
@@ -870,10 +870,10 @@ export default function HrvAnalysisPage() {
                          tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
                   <Tooltip {...chartTooltip}
                            formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(3)} ms`, Number(v) > 0 ? "Raised forecast" : "Lowered forecast"]} />
-                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                  <ReferenceLine x={0} stroke={C.zeroLine} />
                   <Bar dataKey="shap_value" radius={[0, 3, 3, 0]}>
                     {journalDriversToday.map((d, i) => (
-                      <Cell key={i} fill={d.shap_value > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.85} />
+                      <Cell key={i} fill={d.shap_value > 0 ? C.up : C.down} fillOpacity={0.85} />
                     ))}
                   </Bar>
                 </BarChart>
@@ -892,10 +892,10 @@ export default function HrvAnalysisPage() {
                            tickFormatter={(v: string) => v.replace(/^journal_/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())} />
                     <Tooltip {...chartTooltip}
                              formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
-                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                    <ReferenceLine x={0} stroke={C.zeroLine} />
                     <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
                       {journalShap.map((d, i) => (
-                        <Cell key={i} fill="#8b5cf6" fillOpacity={0.75} />
+                        <Cell key={i} fill={C.source.eightsleep} fillOpacity={0.75} />
                       ))}
                     </Bar>
                   </BarChart>
@@ -926,10 +926,10 @@ export default function HrvAnalysisPage() {
                   <YAxis type="category" dataKey="label" tick={{ ...axisTick, fontSize: isMobile ? 9 : 10 }} width={axisW.med} />
                   <Tooltip {...chartTooltip}
                            formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
-                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                  <ReferenceLine x={0} stroke={C.zeroLine} />
                   <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
                     {habitShap.map((d, i) => (
-                      <Cell key={i} fill="#06b6d4" fillOpacity={0.75} />
+                      <Cell key={i} fill={C.accent} fillOpacity={0.75} />
                     ))}
                   </Bar>
                 </BarChart>
@@ -943,6 +943,7 @@ export default function HrvAnalysisPage() {
         </ChartCard>
       </div>
 
+      <SectionHeader id="accuracy" tick="calibration" title="Model Accuracy" kicker="Backtested next-day prediction error" />
       {/* ── How well does the model actually predict? ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Prediction vs Actual */}
@@ -956,9 +957,9 @@ export default function HrvAnalysisPage() {
               <YAxis tick={axisTick} width={55} domain={["auto", "auto"]} label={axisLabel("HRV (ms)", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line type="monotone" dataKey="actual" stroke="#22c55e" strokeWidth={2}
+              <Line type="monotone" dataKey="actual" stroke={C.up} strokeWidth={2}
                     dot={false} name="Actual HRV" />
-              <Line type="monotone" dataKey="predicted" stroke="#3b82f6" strokeWidth={2}
+              <Line type="monotone" dataKey="predicted" stroke={C.source.garmin} strokeWidth={2}
                     dot={<HrvDot />} name="XGBoost Pred" strokeDasharray="4 2" />
             </LineChart>
           </ResponsiveContainer>
@@ -1008,6 +1009,7 @@ export default function HrvAnalysisPage() {
         </ChartCard>
       </div>
 
+      <SectionHeader id="trend" tick="descriptive" title="HRV Trend" />
       {/* ── Where is HRV trending overall? ── */}
       <ChartCard collapsible storageKey="hrv-trend" title={`HRV Trend (${rangeLabel(range)})`}
                  subtitle="WHOOP HRV + 7-day rolling average"
@@ -1019,14 +1021,28 @@ export default function HrvAnalysisPage() {
             <YAxis tick={axisTick} width={55} domain={["auto", "auto"]} label={axisLabel("HRV (ms)", "y")} />
             <Tooltip {...chartTooltip} />
             <Legend wrapperStyle={legendStyle} />
-            <Line type="monotone" dataKey="hrv" stroke="#22c55e" strokeWidth={1.5}
+            <Line type="monotone" dataKey="hrv" stroke={C.up} strokeWidth={1.5}
                   dot={false} name="WHOOP HRV" strokeOpacity={0.5} />
-            <Line type="monotone" dataKey="rolling7" stroke="#22c55e" strokeWidth={2.5}
+            <Line type="monotone" dataKey="rolling7" stroke={C.up} strokeWidth={2.5}
                   dot={false} name="7-Day Avg" />
           </LineChart>
         </ResponsiveContainer>
+        {trendWeekend.length > 6 && (
+          <div className="mt-1.5 flex items-center gap-2">
+            <div className="ml-[55px] mr-[5px] flex h-[6px] flex-1 overflow-hidden rounded-sm" aria-hidden>
+              {trendWeekend.map((wknd, i) => (
+                <div key={i} className={`flex-1 ${wknd ? "bg-accent/20" : ""}`} />
+              ))}
+            </div>
+            <span className="shrink-0 font-mono text-[9px] text-text-tertiary">
+              <span className="mr-1 inline-block h-2 w-2 translate-y-[1px] rounded-[1px] bg-accent/30" />
+              weekend
+            </span>
+          </div>
+        )}
       </ChartCard>
 
+      <SectionHeader id="associations" tick="descriptive" title="Associations" kicker="What historically moves with your HRV" />
       {/* ── What's associated with your HRV ── */}
       <div className="space-y-4">
         <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card">
@@ -1049,10 +1065,10 @@ export default function HrvAnalysisPage() {
                        tick={<WrappedYAxisTick maxCharsPerLine={chars.corr} fontSize={10} />} />
                 <Tooltip {...chartTooltip}
                          formatter={(v: any) => [Number(v).toFixed(3), "Spearman ρ"]} />
-                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <ReferenceLine x={0} stroke={C.zeroLine} />
                 <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
                   {correlations.map((d, i) => (
-                    <Cell key={i} fill={d.spearman_r > 0 ? "#22c55e" : "#ef4444"} fillOpacity={0.8} />
+                    <Cell key={i} fill={d.spearman_r > 0 ? C.up : C.down} fillOpacity={0.8} />
                   ))}
                 </Bar>
               </BarChart>
@@ -1085,10 +1101,10 @@ export default function HrvAnalysisPage() {
                          tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                   <Tooltip {...chartTooltip}
                            formatter={(v: any) => [Number(v).toFixed(3), "Spearman ρ"]} />
-                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                  <ReferenceLine x={0} stroke={C.zeroLine} />
                   <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
                     {journalCorrelations.map((d, i) => (
-                      <Cell key={i} fill={d.spearman_r > 0 ? "#8b5cf6" : "#a855f7"} fillOpacity={0.75} />
+                      <Cell key={i} fill={d.spearman_r > 0 ? C.source.eightsleep : C.categorical[3]} fillOpacity={0.75} />
                     ))}
                   </Bar>
                 </BarChart>
@@ -1122,10 +1138,10 @@ export default function HrvAnalysisPage() {
                          tick={<WrappedYAxisTick maxCharsPerLine={chars.long} fontSize={10} />} />
                   <Tooltip {...chartTooltip}
                            formatter={(v: any) => [Number(v).toFixed(3), "Spearman ρ"]} />
-                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                  <ReferenceLine x={0} stroke={C.zeroLine} />
                   <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
                     {habitCorrelations.map((d, i) => (
-                      <Cell key={i} fill={d.spearman_r > 0 ? "#06b6d4" : "#0ea5e9"} fillOpacity={0.75} />
+                      <Cell key={i} fill={d.spearman_r > 0 ? C.accent : C.categorical[6]} fillOpacity={0.75} />
                     ))}
                   </Bar>
                 </BarChart>
@@ -1139,6 +1155,7 @@ export default function HrvAnalysisPage() {
         </ChartCard>
       </div>
 
+      <SectionHeader id="impact" tick="descriptive" title="Behavior Impact" kicker="Mean next-night HRV difference (Welch's t-test)" />
       {/* ── Behavior t-tests: Journal + Habit Impact ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Journal Impact */}
@@ -1191,15 +1208,15 @@ export default function HrvAnalysisPage() {
                              "HRV Δ",
                            ];
                          }} />
-                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <ReferenceLine x={0} stroke={C.zeroLine} />
                 <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
                   {ji.map((d: any, i: number) => (
                     <Cell key={i}
-                          fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"}
+                          fill={d.diff_ms > 0 ? C.up : C.down}
                           fillOpacity={d.passes_fdr ? 0.8 : 0.5} />
                   ))}
                   <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
-                            stroke="#f4f4f5" direction="x" />
+                            stroke={C.whisker} direction="x" />
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
@@ -1260,15 +1277,15 @@ export default function HrvAnalysisPage() {
                              "HRV Δ",
                            ];
                          }} />
-                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <ReferenceLine x={0} stroke={C.zeroLine} />
                 <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
                   {hi.map((d: any, i: number) => (
                     <Cell key={i}
-                          fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"}
+                          fill={d.diff_ms > 0 ? C.up : C.down}
                           fillOpacity={d.passes_fdr ? 0.8 : 0.5} />
                   ))}
                   <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
-                            stroke="#f4f4f5" direction="x" />
+                            stroke={C.whisker} direction="x" />
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
@@ -1283,6 +1300,7 @@ export default function HrvAnalysisPage() {
         </ChartCard>
       </div>
 
+      <SectionHeader id="supplements" tick="descriptive" title="Supplements" />
       {/* ── Supplements: Yes/No impact + Dose-Response ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Supplement Yes/No Impact */}
@@ -1338,14 +1356,14 @@ export default function HrvAnalysisPage() {
                              "HRV Δ",
                            ];
                          }} />
-                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <ReferenceLine x={0} stroke={C.zeroLine} />
                 <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
                   {si.map((d: any, i: number) => (
-                    <Cell key={i} fill={d.diff_ms > 0 ? "#22c55e" : "#ef4444"}
+                    <Cell key={i} fill={d.diff_ms > 0 ? C.up : C.down}
                           fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.8 : 0.5)} />
                   ))}
                   <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
-                            stroke="#f4f4f5" direction="x" />
+                            stroke={C.whisker} direction="x" />
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
@@ -1411,10 +1429,10 @@ export default function HrvAnalysisPage() {
                                  "Spearman ρ",
                                ];
                              }} />
-                    <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                    <ReferenceLine x={0} stroke={C.zeroLine} />
                     <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
                       {drDecorated.map((d: any, i: number) => (
-                        <Cell key={i} fill={d.spearman_r > 0 ? "#06b6d4" : "#f97316"}
+                        <Cell key={i} fill={d.spearman_r > 0 ? C.accent : C.source.whoop}
                               fillOpacity={d.low_n ? 0.3 : (d.passes_fdr === false ? 0.5 : 0.8)} />
                       ))}
                     </Bar>
@@ -1426,6 +1444,7 @@ export default function HrvAnalysisPage() {
         )}
       </div>
 
+      <SectionHeader id="lifestyle" tick="descriptive" title="Lifestyle" />
       {/* ── Lifestyle: Nutrition + Workout-to-Bed Gap ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Nutrition Spearman */}
@@ -1476,10 +1495,10 @@ export default function HrvAnalysisPage() {
                              "Spearman ρ",
                            ];
                          }} />
-                <ReferenceLine x={0} stroke="rgba(255,255,255,0.1)" />
+                <ReferenceLine x={0} stroke={C.zeroLine} />
                 <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
                   {ni.map((d: any, i: number) => (
-                    <Cell key={i} fill={d.spearman_r > 0 ? "#22c55e" : "#ef4444"}
+                    <Cell key={i} fill={d.spearman_r > 0 ? C.up : C.down}
                           fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.8 : 0.5)} />
                   ))}
                 </Bar>
@@ -1548,8 +1567,8 @@ export default function HrvAnalysisPage() {
                                ? [`${(value as number).toFixed(1)} ms`, "Mean HRV"]
                                : [value, String(name)]
                            } />
-                  <Line type="monotone" dataKey="hrv_mean" stroke="#22c55e" strokeWidth={2.5}
-                        dot={{ r: 5, fill: "#22c55e" }} name="Mean HRV per gap-hour bin" />
+                  <Line type="monotone" dataKey="hrv_mean" stroke={C.up} strokeWidth={2.5}
+                        dot={{ r: 5, fill: C.up }} name="Mean HRV per gap-hour bin" />
                 </LineChart>
               </ResponsiveContainer>
             );
@@ -1570,6 +1589,7 @@ export default function HrvAnalysisPage() {
         </ChartCard>
       </div>
 
+      <SectionHeader id="causal" tick="causal" title="Causal Inference" kicker="Adjusted effects — from association to causation" />
       {/* ── Causal Inference: from association to causation ── */}
       {/*
         Where the other charts on this page measure ASSOCIATION (Spearman, Welch),
@@ -1807,10 +1827,10 @@ export default function HrvAnalysisPage() {
                   Math.max(0, (d.aipw_ci_high ?? 0) - (d.aipw_ate ?? 0)),
                 ],
                 barColor: !d.significant
-                  ? "#71717a"
+                  ? C.neutral
                   : bbHidesSig
-                    ? (d.aipw_ate > 0 ? "#86efac" : "#fca5a5")   // pale: IF says sig, BB doesn't
-                    : d.aipw_ate > 0 ? "#22c55e" : "#ef4444",
+                    ? (d.aipw_ate > 0 ? C.paleUp : C.paleDown)   // pale: IF says sig, BB doesn't
+                    : d.aipw_ate > 0 ? C.up : C.down,
               };
             });
           if (top.length === 0) {
@@ -1850,14 +1870,14 @@ export default function HrvAnalysisPage() {
                              "AIPW ATE",
                            ];
                          }} />
-                <ReferenceLine x={0} stroke="rgba(255,255,255,0.15)" />
+                <ReferenceLine x={0} stroke={C.zeroLine} />
                 <Bar dataKey="aipw_ate" radius={[0, 3, 3, 0]}>
                   {top.map((d: any, i: number) => (
                     <Cell key={i} fill={d.barColor}
                           fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.85 : 0.5)} />
                   ))}
                   <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
-                            stroke="#f4f4f5" direction="x" />
+                            stroke={C.whisker} direction="x" />
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
@@ -2007,10 +2027,10 @@ export default function HrvAnalysisPage() {
                     Math.max(0, (d.aipw_ci_high ?? 0) - (d.aipw_ate ?? 0)),
                   ],
                   barColor: !d.significant
-                    ? "#71717a"
+                    ? C.neutral
                     : bbHidesSig
-                      ? (d.aipw_ate > 0 ? "#86efac" : "#fca5a5")
-                      : d.aipw_ate > 0 ? "#22c55e" : "#ef4444",
+                      ? (d.aipw_ate > 0 ? C.paleUp : C.paleDown)
+                      : d.aipw_ate > 0 ? C.up : C.down,
                 };
               });
             if (top.length === 0) {
@@ -2050,14 +2070,14 @@ export default function HrvAnalysisPage() {
                                "AIPW ATE",
                              ];
                            }} />
-                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.15)" />
+                  <ReferenceLine x={0} stroke={C.zeroLine} />
                   <Bar dataKey="aipw_ate" radius={[0, 3, 3, 0]}>
                     {top.map((d: any, i: number) => (
                       <Cell key={i} fill={d.barColor}
                             fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.85 : 0.5)} />
                     ))}
                     <ErrorBar dataKey="errorRange" width={4} strokeWidth={1.5}
-                              stroke="#f4f4f5" direction="x" />
+                              stroke={C.whisker} direction="x" />
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
@@ -2251,6 +2271,7 @@ export default function HrvAnalysisPage() {
         </ChartCard>
       </div>
 
+      <SectionHeader id="environment" tick="descriptive" title="Environment" />
       {/* ── Environment Sweet Spot: dose-response for controllable inputs ── */}
       {/*
         The causal layer above answers "does warmer/cooler than usual move HRV?"
@@ -2318,7 +2339,7 @@ export default function HrvAnalysisPage() {
                 key={k}
                 onClick={() => setEnvXAxis(k)}
                 className={`px-2 py-0.5 rounded-[3px] border ${envXAxis === k
-                  ? "bg-[#06b6d4]/15 border-[#06b6d4]/40 text-text-primary"
+                  ? "bg-accent/15 border-accent/40 text-text-primary"
                   : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"}`}
               >
                 {X_AXIS_META[k].label}
@@ -2332,7 +2353,7 @@ export default function HrvAnalysisPage() {
                 key={k}
                 onClick={() => setEnvOutcome(k)}
                 className={`px-2 py-0.5 rounded-[3px] border ${envOutcome === k
-                  ? "bg-[#22c55e]/15 border-[#22c55e]/40 text-text-primary"
+                  ? "bg-up/15 border-up/40 text-text-primary"
                   : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"}`}
               >
                 {Y_OUTCOMES[k].label}
@@ -2454,13 +2475,13 @@ export default function HrvAnalysisPage() {
                         `Mean ${yMeta.label}`,
                       ];
                     }} />
-                  <Bar dataKey="meanY" radius={[3, 3, 0, 0]}>
+                  <Bar dataKey="meanY" radius={[2, 2, 0, 0]}>
                     {rows.map((r, i) => (
                       <Cell key={i}
-                        fill={r.bucket === peakRow.bucket ? "#22c55e" : "#06b6d4"}
+                        fill={r.bucket === peakRow.bucket ? C.up : C.accent}
                         fillOpacity={r.n < 5 ? 0.35 : 0.85} />
                     ))}
-                    <ErrorBar dataKey="sem" width={4} strokeWidth={1.5} stroke="#f59e0b" />
+                    <ErrorBar dataKey="sem" width={4} strokeWidth={1.5} stroke={C.source.whoop} />
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
@@ -2484,6 +2505,7 @@ export default function HrvAnalysisPage() {
       );
       })()}
 
+      <SectionHeader id="methods" tick="calibration" title="Methods & Evaluation" />
       {/* ── Models & Methods ── */}
       <div className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card overflow-hidden">
         <button
@@ -2737,8 +2759,8 @@ export default function HrvAnalysisPage() {
                              height={45} label={axisLabel("residual (ms)", "x")} />
                       <YAxis tick={axisTick} width={45} label={axisLabel("nights", "y")} />
                       <Tooltip {...chartTooltip} />
-                      <ReferenceLine x="0" stroke="#ef4444" strokeWidth={1.5} />
-                      <Bar dataKey="count" fill="#3b82f6" fillOpacity={0.8} />
+                      <ReferenceLine x="0" stroke={C.down} strokeWidth={1.5} />
+                      <Bar dataKey="count" fill={C.source.garmin} fillOpacity={0.8} />
                     </BarChart>
                   </ResponsiveContainer>
                 ) : (
@@ -2759,7 +2781,7 @@ export default function HrvAnalysisPage() {
                     <span className="text-[36px] font-mono font-medium tabular-nums"
                           style={{
                             color: Number(xgbMetrics.ci_coverage) >= 85 && Number(xgbMetrics.ci_coverage) <= 95
-                              ? "#22c55e" : "#f59e0b"
+                              ? C.up : C.source.whoop
                           }}>
                       {Number(xgbMetrics.ci_coverage).toFixed(0)}%
                     </span>
@@ -2815,7 +2837,7 @@ export default function HrvAnalysisPage() {
                       <tr key={row.model} className="border-b border-white/5 hover:bg-white/[0.02]">
                         <td className="py-2 pr-4 font-mono text-text-secondary">{row.model}</td>
                         <td className="py-2 pr-4 tabular-nums"
-                            style={{ color: row.model === "xgboost" ? "#22c55e" : "#a1a1aa" }}>
+                            style={{ color: row.model === "xgboost" ? C.up : C.neutral }}>
                           {row.mae ? Number(row.mae).toFixed(1) : "—"}
                         </td>
                         <td className="py-2 pr-4 tabular-nums text-text-tertiary">
@@ -2848,6 +2870,21 @@ export default function HrvAnalysisPage() {
           </div>
         )}
       </div>
+    </div>
+    <aside className="hidden xl:block w-[170px] shrink-0">
+      <nav className="sticky top-[88px] space-y-0.5" aria-label="On this page">
+        <p className="text-[10px] font-medium uppercase tracking-[0.12em] text-text-tertiary/70 px-2 pb-1">On this page</p>
+        {SECTIONS.map((s) => (
+          <a
+            key={s.id}
+            href={`#${s.id}`}
+            className="block px-2 py-1 text-[12px] text-text-tertiary hover:text-text-primary rounded-[3px] hover:bg-white/[0.03] transition-colors"
+          >
+            {s.label}
+          </a>
+        ))}
+      </nav>
+    </aside>
     </div>
   );
 }

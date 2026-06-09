@@ -98,6 +98,13 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
       page.getByRole("heading", { name: "HRV Deep Analysis" })
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
+    // Stage 4 (Direction A): the Tomorrow's-HRV hero KpiTile must render.
+    // data-testid (not class/color) so it survives further restyles.
+    await expect(
+      page.getByTestId("hero-tomorrow-hrv"),
+      "Tomorrow's HRV hero tile did not render"
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
     // The HRV Correlates (Historical) chart must actually draw bars. The
     // jsonb-double-parse bug left correlations=[] → the empty branch rendered
     // instead of this chart.
@@ -367,3 +374,39 @@ for (const p of PAGES) {
     await expectNoClientCrash(page);
   });
 }
+
+// ---------------------------------------------------------------------------
+// Shared chrome (Stage 3): the mobile bottom tab bar must mount on a phone-sized
+// viewport (primary nav surface) and stay hidden on desktop (where the Sidebar
+// is primary). Targets data-testid, not classes/colors, so it survives restyles.
+// ---------------------------------------------------------------------------
+test.describe("Mobile chrome — bottom tab bar", () => {
+  test("present on a phone viewport, hidden on desktop", async ({ page }) => {
+    // iPhone 14-ish portrait — below Tailwind's md breakpoint (768px).
+    await page.setViewportSize({ width: 390, height: 844 });
+    await gotoAuthed(page, "/sleep");
+    await settle(page);
+
+    const tabBar = page.getByTestId("mobile-tab-bar");
+    await expect(
+      tabBar,
+      "bottom tab bar not visible on a mobile viewport"
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+    // The five primary tabs.
+    for (const label of ["Today", "Trends", "Log", "Chat", "More"]) {
+      await expect(
+        tabBar.getByText(label, { exact: true }),
+        `tab "${label}" missing from the bottom tab bar`
+      ).toBeVisible();
+    }
+
+    // On a desktop viewport the same element is display:none (md:hidden).
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await expect(
+      page.getByTestId("mobile-tab-bar"),
+      "bottom tab bar should be hidden on desktop"
+    ).toBeHidden();
+
+    await expectNoClientCrash(page);
+  });
+});

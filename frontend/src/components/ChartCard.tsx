@@ -2,6 +2,23 @@
 
 import { ReactNode, useEffect, useState } from "react";
 import clsx from "clsx";
+import MetadataRow, { type MetaItem } from "./MetadataRow";
+
+type Variant = "primary" | "secondary" | "compact";
+type TickKey = "forecast" | "descriptive" | "causal" | "calibration";
+
+const TICK_VARS: Record<TickKey, string> = {
+  forecast: "var(--color-tick-forecast)",
+  descriptive: "var(--color-tick-descriptive)",
+  causal: "var(--color-tick-causal)",
+  calibration: "var(--color-tick-calibration)",
+};
+
+const PADDING: Record<Variant, string> = {
+  primary: "p-5",
+  secondary: "p-4",
+  compact: "p-3",
+};
 
 interface ChartCardProps {
   title: string;
@@ -12,6 +29,28 @@ interface ChartCardProps {
   className?: string;
   collapsible?: boolean;
   storageKey?: string;
+  // ── Stage 2 (Direction A) additions — all optional / additive ─────────────
+  variant?: Variant;
+  /** Renders a relative "Xh ago" in the metadata strip (client-computed). */
+  freshness?: { lastUpdate: Date | string | number };
+  /** Right-aligned header slot (overflow menu, export, link-to-section). */
+  actions?: ReactNode;
+  /** Sample size + FDR-survival badge in the metadata strip. */
+  confidence?: { n?: number; fdrPasses?: boolean };
+  /** Color-keyed left-edge tick (forecast/descriptive/causal/calibration or raw color). */
+  tick?: TickKey | string;
+  id?: string;
+}
+
+function formatAge(d: Date): string | null {
+  const ms = Date.now() - d.getTime();
+  if (!Number.isFinite(ms)) return null;
+  if (ms < 60_000) return "just now";
+  const m = Math.floor(ms / 60_000);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
 export default function ChartCard({
@@ -23,8 +62,15 @@ export default function ChartCard({
   className,
   collapsible,
   storageKey,
+  variant = "secondary",
+  freshness,
+  actions,
+  confidence,
+  tick,
+  id,
 }: ChartCardProps) {
   const [collapsed, setCollapsed] = useState(false);
+  const [ageStr, setAgeStr] = useState<string | null>(null);
   const key = storageKey ?? title;
 
   useEffect(() => {
@@ -34,6 +80,16 @@ export default function ChartCard({
       if (stored === "true") setCollapsed(true);
     } catch {}
   }, [collapsible, key]);
+
+  // Compute relative freshness client-side only (avoids hydration mismatch).
+  useEffect(() => {
+    if (!freshness) return setAgeStr(null);
+    const { lastUpdate } = freshness;
+    if (typeof lastUpdate === "string" && Number.isNaN(Date.parse(lastUpdate))) {
+      return setAgeStr(lastUpdate); // already a pre-formatted label
+    }
+    setAgeStr(formatAge(new Date(lastUpdate)));
+  }, [freshness]);
 
   const toggle = () => {
     setCollapsed((prev) => {
@@ -45,57 +101,70 @@ export default function ChartCard({
     });
   };
 
-  const headerInner = (
-    <>
-      <div>
-        <h3 className={clsx("text-[13px] font-medium text-text-secondary", subtitle ? "mb-0.5" : "")}>
-          {title}
-        </h3>
-        {subtitle && <p className="text-[11px] text-text-tertiary">{subtitle}</p>}
-      </div>
-      <div className="flex items-center gap-2 shrink-0">
-        {source && (
-          <span className="text-[9px] font-mono font-medium tracking-wider text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">
-            {source}
-          </span>
-        )}
-        {collapsible && (
-          <svg
-            className={`w-4 h-4 text-text-tertiary transition-transform ${collapsed ? "" : "rotate-180"}`}
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            strokeWidth={2}
-          >
-            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-          </svg>
-        )}
-      </div>
-    </>
+  const metaItems: Array<MetaItem | null | undefined | false> = [
+    ageStr ? { text: ageStr, tone: "tertiary" } : undefined,
+    source ? { text: source, tone: "secondary" } : undefined,
+    confidence?.n != null ? { text: `n=${confidence.n}`, tone: "tertiary" } : undefined,
+    confidence?.fdrPasses ? { text: "FDR✓", tone: "up" } : undefined,
+  ];
+  const hasMeta = metaItems.some(Boolean);
+  const tickColor = tick ? TICK_VARS[tick as TickKey] ?? tick : undefined;
+
+  const titleBlock = (
+    <div className="min-w-0">
+      <h3 className="text-[12px] font-semibold uppercase tracking-[0.07em] text-text-secondary">
+        {title}
+      </h3>
+      {subtitle && <p className="text-[11px] text-text-tertiary mt-0.5 normal-case tracking-normal">{subtitle}</p>}
+      {hasMeta && <MetadataRow items={metaItems} className="mt-1" />}
+    </div>
+  );
+
+  const chevron = collapsible && (
+    <svg
+      className={`w-4 h-4 text-text-tertiary transition-transform shrink-0 ${collapsed ? "" : "rotate-180"}`}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2}
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+    </svg>
   );
 
   return (
     <div
+      id={id}
       className={clsx(
-        "bg-surface-card border border-border-subtle rounded-[6px] p-5 shadow-card transition-colors hover:border-border-hover",
+        "relative bg-surface-card border border-border-subtle rounded-[4px] transition-colors hover:border-border-hover",
+        PADDING[variant],
+        id && "scroll-mt-24",
         className,
       )}
     >
-      {collapsible ? (
-        <button
-          type="button"
-          onClick={toggle}
-          aria-expanded={!collapsed}
-          className={clsx(
-            "w-full flex items-start justify-between text-left cursor-pointer",
-            collapsed ? "" : "mb-3",
-          )}
-        >
-          {headerInner}
-        </button>
-      ) : (
-        <div className="flex items-start justify-between mb-3">{headerInner}</div>
+      {tickColor && (
+        <span
+          aria-hidden
+          className="absolute left-0 top-0 bottom-0 w-[3px] rounded-l-[4px]"
+          style={{ backgroundColor: tickColor }}
+        />
       )}
+      <div className={clsx("flex items-start justify-between gap-2", collapsed ? "" : "mb-3")}>
+        {collapsible ? (
+          <button
+            type="button"
+            onClick={toggle}
+            aria-expanded={!collapsed}
+            className="flex-1 min-w-0 flex items-start justify-between gap-2 text-left cursor-pointer"
+          >
+            {titleBlock}
+            {chevron}
+          </button>
+        ) : (
+          titleBlock
+        )}
+        {actions && <div className="shrink-0 flex items-center gap-1.5">{actions}</div>}
+      </div>
       {!collapsed && (
         <>
           {info && (

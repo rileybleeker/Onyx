@@ -26,10 +26,10 @@ const MOODS = ["low", "neutral", "good", "great"] as const;
 type Mood = (typeof MOODS)[number];
 
 const MOOD_BADGE: Record<string, string> = {
-  low: "bg-red-500/10 text-red-300 border-red-500/30",
-  neutral: "bg-zinc-500/10 text-zinc-300 border-zinc-500/30",
-  good: "bg-blue-500/10 text-blue-300 border-blue-500/30",
-  great: "bg-emerald-500/10 text-emerald-300 border-emerald-500/30",
+  low: "bg-down/10 text-down border-down/30",
+  neutral: "bg-white/5 text-text-secondary border-border-default",
+  good: "bg-source-garmin/10 text-source-garmin border-source-garmin/30",
+  great: "bg-up/10 text-up border-up/30",
 };
 
 function formatDate(iso: string): string {
@@ -226,7 +226,7 @@ export default function JournalPage() {
       {loading ? (
         <div className="text-text-tertiary text-sm">Loading…</div>
       ) : error ? (
-        <div className="text-red-300 text-sm">Error: {error}</div>
+        <div className="text-down text-sm">Error: {error}</div>
       ) : entries.length === 0 ? (
         <div className="text-text-tertiary text-sm">No entries match these filters.</div>
       ) : (

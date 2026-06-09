@@ -10,7 +10,7 @@ import { formatDate } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
-import { chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
+import { chartColors as C, chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -93,12 +93,12 @@ export default function HeartPage() {
             <AreaChart data={hrData}>
               <defs>
                 <linearGradient id="heartMaxGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#ef4444" stopOpacity={0.15} />
-                  <stop offset="100%" stopColor="#ef4444" stopOpacity={0} />
+                  <stop offset="0%" stopColor={C.down} stopOpacity={0.15} />
+                  <stop offset="100%" stopColor={C.down} stopOpacity={0} />
                 </linearGradient>
                 <linearGradient id="heartMinGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#22c55e" stopOpacity={0.15} />
-                  <stop offset="100%" stopColor="#22c55e" stopOpacity={0} />
+                  <stop offset="0%" stopColor={C.up} stopOpacity={0.15} />
+                  <stop offset="100%" stopColor={C.up} stopOpacity={0} />
                 </linearGradient>
               </defs>
               <CartesianGrid {...gridStyle} />
@@ -106,8 +106,8 @@ export default function HeartPage() {
               <YAxis tick={axisTick} width={55} label={axisLabel("bpm", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
-              <Area type="monotone" dataKey="max" stroke="#ef4444" fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max" />
-              <Area type="monotone" dataKey="min" stroke="#22c55e" fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min" />
+              <Area type="monotone" dataKey="max" stroke={C.down} fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max" />
+              <Area type="monotone" dataKey="min" stroke={C.up} fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min" />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -121,8 +121,8 @@ export default function HeartPage() {
               <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
-              <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke="#3b82f6" strokeWidth={2} dot={false} name="RHR (bpm)" />
-              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke="#8b5cf6" strokeWidth={2} dot={false} name="HRV RMSSD (ms)" />
+              <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke={C.source.garmin} strokeWidth={2} dot={false} name="RHR (bpm)" />
+              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="HRV RMSSD (ms)" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -132,15 +132,15 @@ export default function HeartPage() {
             <AreaChart data={stressData}>
               <defs>
                 <linearGradient id="heartStressGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#f97316" stopOpacity={0.15} />
-                  <stop offset="100%" stopColor="#f97316" stopOpacity={0} />
+                  <stop offset="0%" stopColor={C.source.whoop} stopOpacity={0.15} />
+                  <stop offset="100%" stopColor={C.source.whoop} stopOpacity={0} />
                 </linearGradient>
               </defs>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} domain={[0, 100]} label={axisLabel("stress (0–100)", "y")} />
               <Tooltip {...chartTooltip} />
-              <Area type="monotone" dataKey="overall" stroke="#f97316" fill="url(#heartStressGrad)" strokeWidth={2} name="Stress Level" />
+              <Area type="monotone" dataKey="overall" stroke={C.source.whoop} fill="url(#heartStressGrad)" strokeWidth={2} name="Stress Level" />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
