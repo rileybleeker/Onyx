@@ -21,6 +21,7 @@ analysis_output/
 
 # Misc
 task_result.txt
+perf-run.log
 
 # Journal CSV data (keep folders, ignore data files)
 journal_inbox/*.csv
