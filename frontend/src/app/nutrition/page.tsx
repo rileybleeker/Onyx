@@ -121,6 +121,9 @@ interface WeightRow {
   weight_kg: number;
   notes: string | null;
   logged_at: string;
+  // 'tanita' = rolled up from the scale by tanita_etl.py (overwritable by the
+  // ETL); 'manual' = quick-log below (takes precedence, ETL never touches it).
+  source: "manual" | "tanita";
 }
 
 export default function NutritionPage() {
@@ -265,6 +268,13 @@ export default function NutritionPage() {
   }));
   const latestWeight = weightRows[weightRows.length - 1];
   const latestWeightLb = latestWeight ? kgToLb(Number(latestWeight.weight_kg)) : null;
+  const weightTanitaCount = weightRows.filter((w) => w.source === "tanita").length;
+  const weightTrendSource =
+    weightTanitaCount === 0
+      ? undefined
+      : weightTanitaCount === weightRows.length
+        ? "TANITA"
+        : "TANITA + MANUAL";
   const sevenDayWeightAvg = (() => {
     const last7 = weightRows.slice(-7);
     if (last7.length === 0) return null;
@@ -599,6 +609,7 @@ export default function NutritionPage() {
           label="Latest"
           value={latestWeightLb !== null ? `${latestWeightLb.toFixed(1)} lb` : "—"}
           sublabel={latestWeight ? formatShortDate(latestWeight.log_date) : "no entries"}
+          source={latestWeight?.source === "tanita" ? "TANITA" : undefined}
         />
         <StatCard
           label="7d avg"
@@ -707,6 +718,7 @@ export default function NutritionPage() {
         <ChartCard
           title="Weight Trend"
           subtitle="One row per ET day · displayed in pounds (stored as kg)"
+          source={weightTrendSource}
         >
           {weightLoading ? (
             <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">Loading…</p>
@@ -757,6 +769,9 @@ export default function NutritionPage() {
                     <span className="text-text-tertiary tabular-nums">
                       ({Number(w.weight_kg).toFixed(2)} kg)
                     </span>
+                    {w.source === "tanita" && (
+                      <span className="text-[9px] text-amber-500/80 tracking-wider shrink-0">TANITA</span>
+                    )}
                     {w.notes && (
                       <span className="text-text-tertiary truncate">· {w.notes}</span>
                     )}

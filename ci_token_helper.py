@@ -9,6 +9,8 @@ Usage:
     python ci_token_helper.py download whoop
     python ci_token_helper.py upload garmin
     python ci_token_helper.py upload whoop
+    python ci_token_helper.py download tanita
+    python ci_token_helper.py upload tanita
 """
 
 import os
@@ -28,6 +30,7 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 GARMIN_TOKEN_DIR = os.path.expanduser("~/.garminconnect")
 WHOOP_TOKEN_FILE = os.path.expanduser("~/.whoop_tokens.json")
 SPOTIFY_TOKEN_FILE = os.path.expanduser("~/.spotify_tokens.json")
+TANITA_TOKEN_FILE = os.path.expanduser("~/.tanita_tokens.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,6 +124,30 @@ def download_spotify():
     log.info(f"Spotify tokens written to {SPOTIFY_TOKEN_FILE}")
 
 
+def download_tanita():
+    """Download Tanita Health Planet tokens from Supabase and write to ~/.tanita_tokens.json."""
+    sb = get_supabase()
+    row = (
+        sb.schema("pds")
+        .table("ci_tokens")
+        .select("token_data")
+        .eq("service", "tanita")
+        .single()
+        .execute()
+    )
+
+    if not row.data:
+        log.error("No Tanita tokens found in ci_tokens table")
+        sys.exit(1)
+
+    token_data = row.data["token_data"]
+
+    with open(TANITA_TOKEN_FILE, "w") as f:
+        f.write(token_data)
+
+    log.info(f"Tanita tokens written to {TANITA_TOKEN_FILE}")
+
+
 # ---------------------------------------------------------------------------
 # Upload
 # ---------------------------------------------------------------------------
@@ -185,6 +212,25 @@ def upload_spotify():
     log.info("Spotify tokens uploaded to Supabase")
 
 
+def upload_tanita():
+    """Read Tanita tokens from ~/.tanita_tokens.json and upload to Supabase."""
+    if not os.path.exists(TANITA_TOKEN_FILE):
+        log.error(f"Tanita token file not found: {TANITA_TOKEN_FILE}")
+        sys.exit(1)
+
+    with open(TANITA_TOKEN_FILE, "r") as f:
+        token_data = f.read()
+
+    sb = get_supabase()
+    sb.schema("pds").table("ci_tokens").upsert({
+        "service": "tanita",
+        "token_data": token_data,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+
+    log.info("Tanita tokens uploaded to Supabase")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -193,15 +239,17 @@ COMMANDS = {
     ("download", "garmin"): download_garmin,
     ("download", "whoop"): download_whoop,
     ("download", "spotify"): download_spotify,
+    ("download", "tanita"): download_tanita,
     ("upload", "garmin"): upload_garmin,
     ("upload", "whoop"): upload_whoop,
     ("upload", "spotify"): upload_spotify,
+    ("upload", "tanita"): upload_tanita,
 }
 
 
 def main():
     if len(sys.argv) != 3 or (sys.argv[1], sys.argv[2]) not in COMMANDS:
-        print("Usage: python ci_token_helper.py <download|upload> <garmin|whoop|spotify>")
+        print("Usage: python ci_token_helper.py <download|upload> <garmin|whoop|spotify|tanita>")
         sys.exit(1)
 
     action, service = sys.argv[1], sys.argv[2]

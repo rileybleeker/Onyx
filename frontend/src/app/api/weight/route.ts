@@ -24,7 +24,7 @@ export async function GET(req: NextRequest) {
 
   const { data, error } = await supabase
     .from("weight_log")
-    .select("log_date, weight_kg, notes, logged_at")
+    .select("log_date, weight_kg, notes, logged_at, source")
     .gte("log_date", cutoffStr)
     .order("log_date", { ascending: true });
 
@@ -60,12 +60,17 @@ export async function POST(req: NextRequest) {
     weight_kg: body.weight_kg,
     notes: body.notes?.trim() ? body.notes.trim() : null,
     logged_at: new Date().toISOString(),
+    // Explicit, not just the column default: on the UPDATE branch of the
+    // upsert only payload columns are written, so manually re-logging a day
+    // tanita owns must flip ownership to 'manual' (manual takes precedence —
+    // tanita_etl.py never touches non-tanita rows afterward).
+    source: "manual",
   };
 
   const { data, error } = await supabase
     .from("weight_log")
     .upsert(row, { onConflict: "log_date" })
-    .select("log_date, weight_kg, notes, logged_at")
+    .select("log_date, weight_kg, notes, logged_at, source")
     .single();
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
@@ -108,7 +113,7 @@ export async function PATCH(req: NextRequest) {
     .from("weight_log")
     .update(patch)
     .eq("log_date", body.log_date)
-    .select("log_date, weight_kg, notes, logged_at")
+    .select("log_date, weight_kg, notes, logged_at, source")
     .single();
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
@@ -117,6 +122,12 @@ export async function PATCH(req: NextRequest) {
 
 /**
  * DELETE /api/weight?log_date=YYYY-MM-DD
+ *
+ * Caveat for tanita-owned days: the underlying measurement still exists in
+ * Health Planet, so the next ETL run re-inserts the same value (delete is
+ * not a tombstone). To override a bogus scale reading (guest on the scale,
+ * weigh-in holding something), manually re-log the correct weight for that
+ * date instead — that flips source to 'manual', which the ETL never touches.
  */
 export async function DELETE(req: NextRequest) {
   const log_date = req.nextUrl.searchParams.get("log_date");

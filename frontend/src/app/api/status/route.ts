@@ -43,7 +43,7 @@ const CADENCE: Record<string, string> = {
   musicbrainz: "With Spotify ETL",
   supplements: "Manual",
   notion_journal: "Hourly :35",
-  weight: "Manual",
+  tanita: "Daily 10am + 1:30pm ET",
 };
 
 // Integration method per source.
@@ -66,7 +66,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   musicbrainz:    { method: "automated",      label: "API ETL" },
   supplements:    { method: "manual",         label: "Manual entry" },
   notion_journal: { method: "automated",      label: "Notion sync" },
-  weight:         { method: "manual",         label: "Manual entry" },
+  tanita:         { method: "automated",      label: "API ETL" },
 };
 
 export interface DriftAlert {
@@ -188,7 +188,7 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, weightRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -203,7 +203,22 @@ export async function GET() {
       // time; for weight the user-facing timestamp is updated_at on edits.
       supabase.from("supplement_intake").select("intake_date,created_at").order("intake_time", { ascending: false }).limit(1),
       supabase.from("journal_entries").select("entry_date").eq("archived", false).order("entry_date", { ascending: false }).limit(1),
-      supabase.from("weight_log").select("log_date,updated_at").order("log_date", { ascending: false }).limit(1),
+      // Body weight via Tanita: freshness = the newest scale measurement.
+      // onyx_et_date is the trigger-derived ET day; measured_at gives the
+      // real-time "Xm ago" anchor when no sync_log heartbeat exists yet.
+      supabase.from("tanita_measurements").select("onyx_et_date,measured_at").order("measured_at", { ascending: false }).limit(1),
+      // Tanita's heartbeat needs a dedicated fetch: hourly sources write
+      // ~8 sync_log rows/h, so the 100-row window above covers only ~13h —
+      // but the 1:30pm → 10am gap between tanita runs is ~20h. Without this,
+      // a FAILED afternoon run ages out of the window overnight and the card
+      // reads Healthy off data-lag alone until the lag itself crosses 1d.
+      supabase
+        .from("sync_log")
+        .select("*")
+        .eq("source", "tanita")
+        .eq("data_type", "weight")
+        .order("sync_start", { ascending: false })
+        .limit(1),
       supabase
         .from("sync_log")
         .select("id, created_at, sync_start, error_message, source, data_type")
@@ -262,8 +277,8 @@ export async function GET() {
     const supplementsDate = supplementsRes.data?.[0]?.intake_date ?? null;
     const supplementsLastLog = (supplementsRes.data?.[0]?.created_at as string | undefined) ?? null;
     const notionJournalDate = notionJournalRes.data?.[0]?.entry_date ?? null;
-    const weightDate = weightRes.data?.[0]?.log_date ?? null;
-    const weightLastLog = (weightRes.data?.[0]?.updated_at as string | undefined) ?? null;
+    const tanitaDate = tanitaRes.data?.[0]?.onyx_et_date ?? null;
+    const tanitaLastMeasure = (tanitaRes.data?.[0]?.measured_at as string | undefined) ?? null;
 
     // Per ADR-0001 Phase 3 step 5: anchor freshness to the spine's most-recent
     // date (max across all sources), not browser-local today. When Riley is
@@ -296,6 +311,9 @@ export async function GET() {
     // below for historical signal).
     const hrvRetrainEntry = latestBySrcType["hrv_analysis|retrain"] ?? null;
     const hrvRetrainComputedAt = (hrvRetrainRes.data?.[0]?.computed_at as string | undefined) ?? null;
+    const tanitaEntry = latestBySrcType["tanita|weight"]
+      ?? (tanitaSyncRes.data?.[0] as Record<string, unknown> | undefined)
+      ?? null;
 
     const garminLag = daysLag(garminDate, spineMaxDate);
     const whoopLag = daysLag(whoopDate, spineMaxDate);
@@ -307,7 +325,7 @@ export async function GET() {
     const spotifyLag = daysLag(spotifyDate, spineMaxDate);
     const supplementsLag = daysLag(supplementsDate, spineMaxDate);
     const notionJournalLag = daysLag(notionJournalDate, spineMaxDate);
-    const weightLag = daysLag(weightDate, spineMaxDate);
+    const tanitaLag = daysLag(tanitaDate, spineMaxDate);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -500,21 +518,26 @@ export async function GET() {
         integrationMethod: METHOD.supplements.method,
         methodLabel: METHOD.supplements.label,
       },
-      // Weight: user-driven daily body weight log. lastSync uses updated_at
-      // (touched on every POST/PATCH) so an edit-in-place to today's row
-      // refreshes the "Xm ago" reading; falls back to log_date as before.
-      weight: {
-        label: "Weight",
-        lastSync: weightLastLog ?? weightDate,
-        status: deriveStatus(null, weightLag),
-        latestDataDate: weightDate,
-        daysLag: weightLag,
-        recordsSynced: 0,
-        durationSeconds: null,
-        errorMessage: null,
-        cadence: CADENCE.weight,
-        integrationMethod: METHOD.weight.method,
-        methodLabel: METHOD.weight.label,
+      // Body weight via Tanita Health Planet (tanita_etl.py): scale → phone
+      // app → Health Planet cloud → twice-daily ETL → tanita_measurements,
+      // rolled up into weight_log (source='tanita'). This card REPLACED the
+      // manual "Weight" card (2026-06-09) — weight is now an automated
+      // ingestion source; the /nutrition quick-log remains as the manual
+      // fallback/override (source='manual', never overwritten by the ETL)
+      // and needs no card of its own. Daily cadence like Eight Sleep →
+      // shared deriveStatus thresholds (>1d partial, >3d failed vs spine).
+      tanita: {
+        label: "Tanita",
+        lastSync: (tanitaEntry?.sync_start as string) ?? tanitaLastMeasure ?? null,
+        status: deriveStatus(tanitaEntry, tanitaLag),
+        latestDataDate: tanitaDate,
+        daysLag: tanitaLag,
+        recordsSynced: (tanitaEntry?.records_synced as number) ?? 0,
+        durationSeconds: (tanitaEntry?.duration_seconds as number) ?? null,
+        errorMessage: (tanitaEntry?.error_message as string) ?? null,
+        cadence: CADENCE.tanita,
+        integrationMethod: METHOD.tanita.method,
+        methodLabel: METHOD.tanita.label,
       },
     };
 

@@ -1,0 +1,46 @@
+name: Tanita ETL
+
+on:
+  schedule:
+    # Two daily runs (the scale only produces ~1 measurement/day, so hourly
+    # would be waste): mid-morning ET after the weigh-in has synced through
+    # the HealthPlanet phone app, plus an early-afternoon catch-up for days
+    # the app syncs late. Fixed UTC crons (same convention as eight-sleep-etl):
+    #   0 14 → 10:00 AM EDT / 9:00 AM EST
+    #  30 17 →  1:30 PM EDT / 12:30 PM EST
+    - cron: '0 14 * * *'
+    - cron: '30 17 * * *'
+  workflow_dispatch: # Manual trigger for testing
+
+concurrency:
+  group: tanita-etl
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  tanita-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install httpx supabase python-dotenv
+
+      - name: Download Tanita tokens from Supabase
+        run: python ci_token_helper.py download tanita
+
+      - name: Run Tanita ETL
+        run: python tanita_etl.py
+        env:
+          TANITA_CLIENT_ID: ${{ secrets.TANITA_CLIENT_ID }}
+          TANITA_CLIENT_SECRET: ${{ secrets.TANITA_CLIENT_SECRET }}
+
+      - name: Upload refreshed tokens to Supabase
+        # Health Planet may rotate refresh tokens — persist whatever's on disk
+        if: always()
+        run: python ci_token_helper.py upload tanita

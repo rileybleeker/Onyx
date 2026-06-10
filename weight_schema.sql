@@ -3,8 +3,11 @@
 -- ============================================================
 -- Deployed to Supabase (Postgres 17) in the pds schema.
 --
--- One row per ET date. The user logs daily weight via the /nutrition
--- page (body composition lives alongside calories + macros). Storage
+-- One row per ET date. Primary path since 2026-06: tanita_etl.py rolls
+-- up the earliest Tanita Health Planet measurement per ET day
+-- (source='tanita'; see tanita_schema.sql). The /nutrition quick-log
+-- remains as the manual fallback/override (source='manual') — manual
+-- rows take precedence and are never overwritten by the ETL. Storage
 -- canonical unit is kg (matches whoop_body_measurements); the frontend
 -- accepts and displays pounds via a kg↔lb conversion.
 --
@@ -18,14 +21,15 @@ CREATE TABLE IF NOT EXISTS pds.weight_log (
     log_date    DATE         NOT NULL,
     weight_kg   NUMERIC(6,3) NOT NULL CHECK (weight_kg > 0 AND weight_kg < 500),
     notes       TEXT,
+    source      TEXT         NOT NULL DEFAULT 'manual',  -- 'manual' | 'tanita' (added via tanita_schema.sql)
     logged_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     PRIMARY KEY (log_date)
 );
 
-CREATE INDEX IF NOT EXISTS idx_weight_log_date
-    ON pds.weight_log (log_date DESC);
+-- (idx_weight_log_date was dropped 2026-06-07 — it duplicated the PK's
+-- btree, which serves ASC and DESC scans equally. Audit re-2026-06-07.)
 
 -- Touch updated_at on row update (matches meal_events pattern).
 CREATE OR REPLACE FUNCTION pds.weight_log_touch_updated_at()
