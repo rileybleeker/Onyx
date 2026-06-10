@@ -26,7 +26,16 @@ export async function GET() {
       const fallback = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
       return NextResponse.json({ behavioral_today: fallback, fallback: true });
     }
-    return NextResponse.json({ behavioral_today: data });
+    return NextResponse.json(
+      { behavioral_today: data },
+      {
+        headers: {
+          // Changes at most twice a day (day rollover / awake-tail close);
+          // 60s edge caching shaves an RPC round trip off /nutrition loads.
+          "Cache-Control": "public, s-maxage=60, stale-while-revalidate=60",
+        },
+      }
+    );
   } catch {
     const fallback = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
     return NextResponse.json({ behavioral_today: fallback, fallback: true });

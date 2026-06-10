@@ -565,7 +565,17 @@ export async function GET() {
       deltaMinutes: (r.delta_minutes as number) ?? 0,
     }));
 
-    return NextResponse.json({ sources, recentHistory, driftAlerts, tzGaps, fetchedAt: new Date().toISOString() } satisfies StatusResponse);
+    return NextResponse.json(
+      { sources, recentHistory, driftAlerts, tzGaps, fetchedAt: new Date().toISOString() } satisfies StatusResponse,
+      {
+        headers: {
+          // The /status page polls every 60s and tolerates ~60s staleness.
+          // s-maxage=30 + swr=30 lets Vercel's edge serve repeat hits without
+          // re-running the ~16 Supabase queries, worst-case ~60s stale.
+          "Cache-Control": "public, s-maxage=30, stale-while-revalidate=30",
+        },
+      }
+    );
   } catch (err) {
     console.error("Status API error:", err);
     return NextResponse.json({ error: "Failed to fetch status" }, { status: 500 });
