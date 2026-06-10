@@ -1,6 +1,9 @@
 -- pds.daily_micronutrient_totals — unified dietary (Cronometer) + supplemental (Onyx UNII
 -- rollup) micronutrient intake per behavioral day, with per-nutrient unit reconciliation.
--- Applied via Supabase migration `daily_micronutrient_totals` (2026-05-31).
+-- Applied via Supabase migration `daily_micronutrient_totals` (2026-05-31); dietary side
+-- repointed to pds.cronometer_nutrition_behavioral_daily (servings summed by true
+-- behavioral day) via migration `daily_micronutrient_totals_behavioral` (2026-06-09) so
+-- both sides of the dietary+supplement merge key on the same behavioral-day semantics.
 --
 -- Supplement amounts come from pds.supplement_intake_by_compound, which normalizes every
 -- compound to MASS (mg). Cronometer uses mixed units, so supplement mg is converted to the
@@ -73,7 +76,7 @@ CREATE OR REPLACE VIEW pds.daily_micronutrient_totals AS
     cn.omega3_g AS omega3_dietary_g,         supp.omega3_g AS omega3_supplement_g,         COALESCE(cn.omega3_g,0) + COALESCE(supp.omega3_g,0) AS omega3_total_g,
     cn.epa_g AS epa_dietary_g,               supp.epa_g AS epa_supplement_g,               COALESCE(cn.epa_g,0) + COALESCE(supp.epa_g,0) AS epa_total_g,
     cn.dha_g AS dha_dietary_g,               supp.dha_g AS dha_supplement_g,               COALESCE(cn.dha_g,0) + COALESCE(supp.dha_g,0) AS dha_total_g
- FROM pds.cronometer_nutrition_daily cn
+ FROM pds.cronometer_nutrition_behavioral_daily cn
  FULL JOIN supp ON supp.d = cn.onyx_behavioral_date
  ORDER BY 1 DESC;
 

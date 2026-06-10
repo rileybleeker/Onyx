@@ -22,6 +22,12 @@
 -- 2) New LEFT JOIN (after the mfp join):
 --        LEFT JOIN pds.cronometer_nutrition_daily cn
 --               ON cn.onyx_behavioral_date = s.calendar_date
+--    ⚠ SUPERSEDED 2026-06-09: the `cn` relation (join + spine member) was repointed
+--    to pds.cronometer_nutrition_behavioral_daily — Cronometer servings summed by
+--    TRUE behavioral day from Gold timestamps, so post-midnight pre-bed meals count
+--    toward the behavioral day the HRV pipeline analyzes. See
+--    sql/cronometer_nutrition_behavioral_daily.sql + migration
+--    daily_health_matrix_behavioral_cronometer_behavioral_totals. Column set unchanged.
 --
 -- 3) Appended SELECT columns (Cronometer wins; MFP fills pre-cutover history for macros):
 --        COALESCE(cn.calories,  mfp.calories)  AS nutrition_calories,

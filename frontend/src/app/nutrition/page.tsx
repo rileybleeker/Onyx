@@ -144,7 +144,20 @@ export default function NutritionPage() {
   const [weightNotes, setWeightNotes] = useState<string>("");
   const [savingWeight, setSavingWeight] = useState(false);
 
-  const today = etTodayStr();
+  // Behavioral "today" for the Today's Meals widget — seeded with ET-clock-today
+  // as a synchronous best-guess, then overridden on mount via /api/behavioral-today
+  // (pds.behavioral_today_now(): TZ-aware + awake-tail-aware via the -6h rule).
+  // Keeps the widget on yesterday's behavioral day during a post-midnight awake
+  // tail instead of flipping to an empty new day at the stroke of midnight.
+  const [behavioralToday, setBehavioralToday] = useState<string>(etTodayStr());
+  useEffect(() => {
+    fetch("/api/behavioral-today")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (j?.behavioral_today) setBehavioralToday(j.behavioral_today);
+      })
+      .catch(() => {});
+  }, []);
 
   // ─── Nutrition + burnt + micronutrients loader (responds to range filter) ───
   useEffect(() => {
@@ -165,12 +178,12 @@ export default function NutritionPage() {
       .finally(() => setNutritionLoading(false));
   }, [range]);
 
-  // ─── Today's Cronometer food log ───
+  // ─── Today's Cronometer food log (behavioral day, not clock day) ───
   useEffect(() => {
-    getCronometerServings(1, today)
+    getCronometerServings(1, behavioralToday)
       .then(setTodayServings)
       .catch(console.error);
-  }, [today]);
+  }, [behavioralToday]);
 
   // ─── Weight loader + default date init ───
   const loadWeight = useCallback(async () => {
@@ -537,7 +550,7 @@ export default function NutritionPage() {
       {/* ─── Today's meals (Cronometer per-entry log) ──────────────────────── */}
       <div className="flex items-baseline justify-between mb-3">
         <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">Today&apos;s Meals</p>
-        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER · {today}</span>
+        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER · {behavioralToday}</span>
       </div>
       {todayServings.length === 0 ? (
         <p className="text-xs text-text-tertiary mb-2">

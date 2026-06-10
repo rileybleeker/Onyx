@@ -418,19 +418,22 @@ export async function getMfpNutritionHistorical(days: number = 365) {
 /**
  * Per-entry Cronometer food log (newest first). Optional `date` (ET behavioral
  * day, YYYY-MM-DD) narrows to a single day for the "Today's meals" widget.
+ * The single-day filter keys on onyx_behavioral_date (not the diary calendar
+ * day) so a post-midnight pre-bed entry shows under the behavioral day it
+ * belongs to — matching the matrix / HRV attribution.
  */
 export async function getCronometerServings(days: number = 14, date?: string) {
   let q = supabase
     .from("cronometer_servings")
     .select(
-      "serving_id, calendar_date, event_time, food_name, amount_raw, unit, " +
-        "meal_group, food_category, calories, protein_g, carbs_g, fat_g"
+      "serving_id, calendar_date, onyx_behavioral_date, event_time, food_name, " +
+        "amount_raw, unit, meal_group, food_category, calories, protein_g, carbs_g, fat_g"
     )
     .order("calendar_date", { ascending: false })
     .order("serving_id", { ascending: false });
 
   if (date) {
-    q = q.eq("calendar_date", date);
+    q = q.eq("onyx_behavioral_date", date);
   } else {
     const since = new Date();
     since.setDate(since.getDate() - days);
@@ -465,13 +468,15 @@ export async function getDailyVitamins(days: number = 30) {
  * The FULL Cronometer daily nutrient set (all ~62 columns incl. amino acids and
  * fat fractions) for the "All tracked nutrients" table. Dietary-only (no
  * supplement merge) — use getDailyVitamins for the dietary+supplement split.
+ * Reads the behavioral-day rollup (servings summed by onyx_behavioral_date) so
+ * post-midnight pre-bed meals count toward the day they behaviorally belong to.
  */
 export async function getDailyNutrientsFull(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
   const { data, error } = await supabase
-    .from("cronometer_nutrition_daily")
+    .from("cronometer_nutrition_behavioral_daily")
     .select("*")
     .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
     .order("onyx_behavioral_date", { ascending: true });
