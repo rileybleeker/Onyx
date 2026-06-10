@@ -60,8 +60,10 @@ trying to measure (mediator-adjustment bias).
     rolling_7d_training_load, sleep_debt_7d
 
   Extra confounders for SUPPLEMENT treatments:
-    journal_have_any_alcoholic_drinks_lag1, journal_consumed_caffeine_lag1
-    (supplement-conscious days tend to differ in lifestyle)
+    journal_have_any_alcoholic_drinks_lag1, caffeine_total_mg_lag1
+    (supplement-conscious days tend to differ in lifestyle; the caffeine
+    term uses the unified log — the WHOOP caffeine checkbox is disregarded
+    by policy as of 2026-06-10)
 
 We DO NOT adjust for any same-night sleep, recovery, or HRV variables —
 those are mediators (the pathway by which most behaviors affect HRV) and
@@ -117,7 +119,11 @@ COMMON_CONFOUNDERS = (
 )
 SUPPLEMENT_EXTRA_CONFOUNDERS = (
     "journal_have_any_alcoholic_drinks_lag1",
-    "journal_consumed_caffeine_lag1",
+    # journal_consumed_caffeine_lag1 → caffeine_total_mg_lag1 (2026-06-10):
+    # the WHOOP caffeine checkbox is disregarded by policy; the unified-log
+    # quantity carries the same "supplement-conscious days differ in caffeine
+    # lifestyle" adjustment with real mg instead of a yes/no.
+    "caffeine_total_mg_lag1",
 )
 
 # Re-audit 2026-06-07 (stats/gemini/F-003): mediator exclusion for multi-day

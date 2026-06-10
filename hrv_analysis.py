@@ -478,7 +478,9 @@ JOURNAL_LABELS: dict[str, str] = {
     "wore_ear_plugs": "Ear Plugs",
     "took_melatonin": "Melatonin",
     "have_any_alcoholic_drinks": "Alcohol",
-    "consumed_caffeine": "Caffeine",
+    # "consumed_caffeine" removed 2026-06-10: the WHOOP caffeine checkbox is
+    # disregarded by policy (column dropped at the journal merge) — caffeine
+    # truth is the unified log (caffeine_total_mg and friends).
     "consumed_magnesium": "Magnesium",
     "took_anti-inflammatory_nsaids": "NSAIDs",
     "used_a_sauna": "Sauna",
@@ -1378,6 +1380,14 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         jdf = pivot_journal(data["journal"])
         if not jdf.empty:
             df = df.merge(jdf, on="calendar_date", how="left")
+    # POLICY (Riley, 2026-06-10): the WHOOP journal "Consumed caffeine?"
+    # checkbox is DISREGARDED for all caffeine analysis. Two of its ~50 "No"
+    # nights carried 800-1000 mg of logged caffeine, and the unified event
+    # log (Cronometer servings + supplement intakes) is the caffeine source
+    # of truth. Dropping the column here removes it from every downstream
+    # family at once: Stage-1 Spearman, Welch journal_impact, SHAP,
+    # error-modes-by-journal, and the causal binary auto-enumeration.
+    df = df.drop(columns=["journal_consumed_caffeine"], errors="ignore")
 
     # --- Habit pivot ---
     # Habits flow through the same pds.journal view as WHOOP journal entries
@@ -1537,52 +1547,60 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         if col in df.columns:
             df[f"{col}_lag1"] = df[col].shift(1)
             df[f"{col}_lag2"] = df[col].shift(2)
-    for jcol in ("journal_have_any_alcoholic_drinks", "journal_consumed_caffeine",
+    # journal_consumed_caffeine removed from this lag list 2026-06-10 — the
+    # checkbox is disregarded by policy; caffeine_total_mg_lag1 (below) is the
+    # multi-day caffeine signal now.
+    for jcol in ("journal_have_any_alcoholic_drinks",
                  "journal_ate_food_close_to_bedtime"):
         if jcol in df.columns:
             df[f"{jcol}_lag1"] = df[jcol].shift(1)
 
     # Unified caffeine quantity (pds.caffeine_timing_daily, dietary+supplement).
     # Zero-anchor first: caffeine_total_mg is NULL on days with no logged
-    # caffeine event, which conflates "none consumed" with "not logged". When
-    # the WHOOP journal explicitly answered No to "Consumed caffeine?", a
-    # missing total is a true zero — anchoring it gives dose-response analyses
-    # a real zero arm instead of dropping every caffeine-free day. Days WITH
-    # logged events keep their summed mg even if the journal said No (the
-    # event log is harder evidence than the checkbox — a journal-No day with
-    # 150 mg of logged coffee exists in history).
+    # caffeine event, which conflates "none consumed" with "not logged".
     #
-    # ERA GATE (verification finding 2026-06-09): only anchor journal-No days
-    # ON/AFTER the first day with a logged caffeine event. Journal-No days go
-    # back to 2024-12 but quantitative tracking started 2026-05-19; anchoring
-    # the pre-era days would build a zero arm that is ~96% "old epoch" while
-    # every positive-mg day is "new epoch", aliasing caffeine dose onto
-    # secular HRV drift (the same period-confound the dose-bucket audit
-    # caught). Within-era the features may fail the n>=20 gates for a while —
-    # that graceful skip is the correct outcome until caffeine-free days
-    # accrue inside the quantitative era.
+    # POLICY (Riley, 2026-06-10): caffeine truth = the LOGGED record only.
+    # The WHOOP journal caffeine checkbox is disregarded (column dropped at
+    # the journal merge above), so the zero arm is log-derived: inside the
+    # quantitative era (on/after the first logged caffeine event), a day with
+    # no caffeine event is a true 0 mg PROVIDED the day shows other logging
+    # activity (any supplement dose logged, or a Cronometer nutrition entry).
+    # The activity gate keeps a lapsed-logging stretch (vacation, dead phone)
+    # from manufacturing fake zeros.
+    #
+    # ERA GATE (verification finding 2026-06-09, still in force): never
+    # anchor pre-era days — a 2024-25 zero arm with all positive-mg days in
+    # 2026 would alias caffeine dose onto secular HRV drift (the same
+    # period-confound the dose-bucket audit caught). Within-era the features
+    # may fail the n>=20 gates until caffeine-free days accrue — that
+    # graceful skip is the correct outcome.
     if "caffeine_total_mg" in df.columns:
-        if "journal_consumed_caffeine" in df.columns:
-            logged = df["caffeine_total_mg"].notna()
-            if logged.any():
-                era_start = df.loc[logged, "calendar_date"].min()
-                zero_anchor = (
-                    (df["journal_consumed_caffeine"] == 0)
-                    & df["caffeine_total_mg"].isna()
-                    & (df["calendar_date"] >= era_start)
-                )
-                df.loc[zero_anchor, "caffeine_total_mg"] = 0.0
-                if "caffeine_mg_at_bedtime" in df.columns:
-                    df.loc[zero_anchor, "caffeine_mg_at_bedtime"] = 0.0
-        else:
-            log.warning(
-                "caffeine_total_mg present but journal_consumed_caffeine missing — "
-                "zero-anchoring silently disabled (did the WHOOP question label change?)"
+        logged = df["caffeine_total_mg"].notna()
+        if logged.any():
+            era_start = df.loc[logged, "calendar_date"].min()
+            tracked_day = pd.Series(False, index=df.index)
+            supp_cols = [c for c in df.columns
+                         if c.startswith("supplement_") and c.endswith("_amount")]
+            if supp_cols:
+                # >0 (not notna) — within the supplement tracking window the
+                # untaken compounds are 0-filled, so >0 means "actually
+                # logged a dose today".
+                tracked_day |= (df[supp_cols] > 0).any(axis=1)
+            if "nutrition_calories" in df.columns:
+                tracked_day |= pd.to_numeric(
+                    df["nutrition_calories"], errors="coerce"
+                ).notna()
+            zero_anchor = (
+                df["caffeine_total_mg"].isna()
+                & (df["calendar_date"] >= era_start)
+                & tracked_day
             )
-        # Same t-1 lag treatment as the journal boolean — multi-day caffeine
-        # load (slow clearance, adenosine rebound) is invisible without it.
-        # Timing features stay lag-free: their effect is same-night by
-        # construction.
+            df.loc[zero_anchor, "caffeine_total_mg"] = 0.0
+            if "caffeine_mg_at_bedtime" in df.columns:
+                df.loc[zero_anchor, "caffeine_mg_at_bedtime"] = 0.0
+        # t-1 lag — multi-day caffeine load (slow clearance, adenosine
+        # rebound) is invisible without it. Timing features stay lag-free:
+        # their effect is same-night by construction.
         df["caffeine_total_mg_lag1"] = df["caffeine_total_mg"].shift(1)
         # 7-day rolling mean: the multi-day caffeine-load trend. Feature-only
         # (Spearman/SHAP via the caffeine_ prefix) — deliberately NOT a causal
@@ -1761,10 +1779,15 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
             df["journal_have_any_alcoholic_drinks"].fillna(0) *
             df["whoop_sleep_duration_milli"]
         )
-    if _has("whoop_day_strain", "journal_consumed_caffeine"):
+    # Repointed 2026-06-10 from the disregarded WHOOP caffeine checkbox to the
+    # unified log: indicator = any logged caffeine that day. Runs after the
+    # zero-anchor, so in-era tracked no-caffeine days contribute 0 and pre-era
+    # (NaN) days stay NaN rather than being treated as caffeine-free.
+    if _has("whoop_day_strain", "caffeine_total_mg"):
         df["strain_x_caffeine"] = (
             df["whoop_day_strain"] *
-            df["journal_consumed_caffeine"].fillna(0)
+            (df["caffeine_total_mg"] > 0).astype(float)
+            .where(df["caffeine_total_mg"].notna())
         )
     if _has("rolling_7d_training_load", "hrv_lag1"):
         df["load_x_hrv_lag1"] = df["rolling_7d_training_load"] * df["hrv_lag1"]

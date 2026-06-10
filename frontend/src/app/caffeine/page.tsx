@@ -34,16 +34,14 @@ const BEDTIME_GAP_GUIDELINE_MIN = 360;
 const DIETARY_COLOR = C.source.cronometer;
 const SUPPLEMENT_COLOR = C.categorical[3];
 
-// Data-quality flag chips (pds.caffeine_data_quality).
+// Data-quality flag chips (pds.caffeine_data_quality). Journal-comparison
+// flags removed 2026-06-10 — the WHOOP caffeine checkbox is disregarded by
+// policy; the logged record (Cronometer + supplements) is the only source.
 const QUALITY_FLAG_LABEL: Record<string, string> = {
-  journal_no_but_logged: "journal conflict",
-  journal_yes_but_unlogged: "unlogged day",
   untrusted_timestamps: "retro-log",
   possible_double_log: "double log?",
 };
 const QUALITY_FLAG_STYLE: Record<string, string> = {
-  journal_no_but_logged: "text-amber-300 border-amber-500/40",
-  journal_yes_but_unlogged: "text-sky-300 border-sky-500/40",
   untrusted_timestamps: "text-amber-300 border-amber-500/40",
   possible_double_log: "text-red-300 border-red-500/40",
 };
@@ -210,9 +208,10 @@ export default function CaffeinePage() {
       <p className="text-[11px] text-text-tertiary leading-relaxed border-l-2 border-amber-500/30 pl-3 mb-8">
         <span className="text-text-secondary">Coverage note:</span> Quantitative caffeine tracking
         began 2026-05-19 (timestamped supplement doses) and 2026-05-31 (Cronometer dietary
-        caffeine). The WHOOP journal&apos;s yes/no caffeine question goes back to Oct 2024 but
-        carries no mg, so these charts cover the recent era only. The FDA&apos;s 400 mg/day
-        guidance is marked on the intake chart.
+        caffeine), so these charts cover the recent era only. The logged record is the sole
+        caffeine source — the WHOOP journal&apos;s yes/no caffeine question is disregarded by
+        policy (it proved unreliable). The FDA&apos;s 400 mg/day guidance is marked on the
+        intake chart.
       </p>
 
       {loading ? (
@@ -469,9 +468,9 @@ export default function CaffeinePage() {
           {/* ─── Data quality ─────────────────────────────────────────────── */}
           <ChartCard
             title="Data Quality"
-            subtitle="journal vs log conflicts, retro-logged timestamps, double-log checks · last 45 days"
-            source="WHOOP JOURNAL + CRONOMETER + SUPPLEMENTS"
-            info="The caffeine record is assembled from three sources that can disagree. Each flag marks a day worth a second look — resolving them sharpens every chart above and the HRV analysis."
+            subtitle="retro-logged timestamps + cross-channel double-log checks · last 45 days"
+            source="CRONOMETER + SUPPLEMENTS"
+            info="Each flag marks a day worth a second look — resolving them sharpens every chart above and the HRV analysis. Retro-logs keep their mg but their timestamps are quarantined from timing features."
           >
             {quality.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">

@@ -618,20 +618,17 @@ export async function getCaffeineHrvPairs(days: number = 90): Promise<CaffeineHr
 
 export interface CaffeineQualityFlag {
   behavioral_date: string;
-  flag:
-    | "journal_no_but_logged"
-    | "journal_yes_but_unlogged"
-    | "untrusted_timestamps"
-    | "possible_double_log"
-    | string;
+  // Journal-comparison flags removed 2026-06-10 — the WHOOP caffeine checkbox
+  // is disregarded by policy; the logged record is the only caffeine source.
+  flag: "untrusted_timestamps" | "possible_double_log" | string;
   detail: string;
 }
 
 /**
  * QA flags for the caffeine record from pds.caffeine_data_quality — days where
- * the WHOOP journal and the event log disagree, retro-logged timestamps were
- * quarantined, or a dietary serving name-matches a same-day supplement
- * (possible double-count). Long format, one row per (day, flag).
+ * retro-logged timestamps were quarantined, or a dietary serving name-matches
+ * a same-day supplement (possible double-count). Long format, one row per
+ * (day, flag).
  */
 export async function getCaffeineDataQuality(days: number = 45): Promise<CaffeineQualityFlag[]> {
   const since = new Date();

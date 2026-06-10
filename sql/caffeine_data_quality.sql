@@ -1,21 +1,22 @@
 -- ============================================
 -- Personal Data Scientist — Caffeine Data Quality
 -- ============================================
--- Applied via Supabase migration `caffeine_data_quality` (2026-06-09).
+-- Applied via Supabase migrations `caffeine_data_quality` (2026-06-09) and
+-- `caffeine_data_quality_drop_journal_flags` (2026-06-10).
 --
 -- One row per (behavioral day, flag) where the caffeine record looks
 -- inconsistent. Long format so new flag types append without DDL churn.
--- Surfaced on the /caffeine page ("Data Quality" card). Flags:
+-- Surfaced on the /caffeine page ("Data Quality" card).
 --
---   journal_no_but_logged    WHOOP journal answered No but caffeine events
---                            exist (the event log outranks the checkbox; the
---                            day still counts as caffeinated — but the
---                            283-day binary control group is contaminated,
---                            so these days are worth re-checking in WHOOP).
---   journal_yes_but_unlogged Journal answered Yes inside the quantitative
---                            era but NO event was logged — a coffee missing
---                            from Cronometer or a pill missing from Onyx.
---                            Coverage QA: these days weaken dose-response.
+-- POLICY (Riley, 2026-06-10): the WHOOP journal "Consumed caffeine?" checkbox
+-- is DISREGARDED everywhere — the unified event log (Cronometer servings +
+-- supplement intakes) is the caffeine source of truth. The original
+-- journal_no_but_logged / journal_yes_but_unlogged flags compared the log
+-- against that checkbox and were removed with the policy (they had served
+-- their purpose: proving the checkbox unreliable — two "No" nights carried
+-- 800-1000 mg of logged caffeine).
+--
+-- Remaining flags:
 --   untrusted_timestamps     Retro-logged events that day (timestamp's own
 --                            behavioral attribution disagrees with the
 --                            claimed day). Timing features use the trusted
@@ -27,17 +28,7 @@
 -- ============================================
 
 CREATE OR REPLACE VIEW pds.caffeine_data_quality AS
-WITH era AS (
-    SELECT MIN(behavioral_date) AS era_start FROM pds.caffeine_events
-),
-journal AS (
-    SELECT behaviors_date AS behavioral_date,
-           BOOL_OR(answer = 'Yes') AS journal_yes
-    FROM pds.whoop_journal
-    WHERE question = 'Consumed caffeine?'
-    GROUP BY behaviors_date
-),
-daily AS (
+WITH daily AS (
     SELECT behavioral_date,
            SUM(caffeine_mg)                         AS total_mg,
            COUNT(*)                                 AS event_n,
@@ -46,31 +37,10 @@ daily AS (
     GROUP BY behavioral_date
 )
 
-SELECT j.behavioral_date,
-       'journal_no_but_logged'::text AS flag,
-       ROUND(d.total_mg) || ' mg logged on a journal-No day — re-check the WHOOP journal answer' AS detail
-FROM journal j
-JOIN daily d ON d.behavioral_date = j.behavioral_date
-WHERE NOT j.journal_yes
-
-UNION ALL
-
-SELECT j.behavioral_date,
-       'journal_yes_but_unlogged',
-       'journal says caffeine but nothing was logged — coffee missing from Cronometer or pill missing from /supplements?'
-FROM journal j
-CROSS JOIN era e
-LEFT JOIN daily d ON d.behavioral_date = j.behavioral_date
-WHERE j.journal_yes
-  AND d.behavioral_date IS NULL
-  AND j.behavioral_date >= e.era_start
-
-UNION ALL
-
 SELECT d.behavioral_date,
-       'untrusted_timestamps',
+       'untrusted_timestamps'::text AS flag,
        d.untrusted_n || ' of ' || d.event_n ||
-       ' events retro-logged (timestamp belongs to a different behavioral day); timing uses the trusted subset, mg totals unaffected'
+       ' events retro-logged (timestamp belongs to a different behavioral day); timing uses the trusted subset, mg totals unaffected' AS detail
 FROM daily d
 WHERE d.untrusted_n > 0
 
@@ -117,4 +87,4 @@ ORDER BY 1 DESC;
 GRANT SELECT ON pds.caffeine_data_quality TO anon, authenticated;
 
 COMMENT ON VIEW pds.caffeine_data_quality IS
-'QA flags for the unified caffeine record, one row per (behavioral day, flag): journal_no_but_logged, journal_yes_but_unlogged (in quantitative era only), untrusted_timestamps (retro-logs), possible_double_log (cross-channel name-match heuristic). Surfaced on /caffeine.';
+'QA flags for the unified caffeine record, one row per (behavioral day, flag): untrusted_timestamps (retro-logs), possible_double_log (cross-channel name-match heuristic). Journal-comparison flags removed 2026-06-10 — the WHOOP caffeine checkbox is disregarded by policy. Surfaced on /caffeine.';
