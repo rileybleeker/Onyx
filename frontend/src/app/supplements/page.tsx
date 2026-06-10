@@ -1,10 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
-import BarcodeScannerModal from "@/components/BarcodeScannerModal";
+// @zxing/browser is ~120 kB of route JS but only needed once the user taps
+// "Scan barcode" — load it lazily on first open instead of on page load.
+const BarcodeScannerModal = dynamic(() => import("@/components/BarcodeScannerModal"), { ssr: false });
 import EditIntakeModal, { type EditableIntake } from "@/components/EditIntakeModal";
 import StackEditorModal, { type EditableStack } from "@/components/StackEditorModal";
 import CustomSupplementFlow from "@/components/CustomSupplementFlow";
@@ -1144,11 +1147,16 @@ export default function SupplementsPage() {
         </div>
       )}
 
-      <BarcodeScannerModal
-        open={scannerOpen}
-        onClose={() => setScannerOpen(false)}
-        onDetected={handleBarcodeDetected}
-      />
+      {/* Conditional render so the @zxing chunk is only fetched when the
+          scanner is actually opened (the component self-handles open=true
+          on mount). */}
+      {scannerOpen && (
+        <BarcodeScannerModal
+          open={scannerOpen}
+          onClose={() => setScannerOpen(false)}
+          onDetected={handleBarcodeDetected}
+        />
+      )}
 
       {/* Center-screen "logged" confirmation. z above the add-product modal (z-50)
           so seed+log / custom-product logs flash over it; pointer-events-none so
