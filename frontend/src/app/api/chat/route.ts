@@ -268,7 +268,7 @@ const tools: Anthropic.Tool[] = [
   {
     name: "query_nutrition",
     description:
-      "Daily nutrition macros (calories, protein, carbs, fat, fiber, sugar, sodium, water, dietary caffeine) per behavioral day. Source is Cronometer for new days and MyFitnessPal for pre-2026-05-31 history, transparently COALESCE'd. This is FOOD intake only — for supplement-inclusive vitamin/mineral totals use query_vitamins.",
+      "Daily nutrition macros (calories, protein, carbs, fat, fiber, sugar, sodium, water) plus caffeine per behavioral day. caffeine_total_mg (diet + supplement) is the canonical total caffeine — nutrition_caffeine_mg is the dietary-only archive. Also returns caffeine_supplement_mg, caffeine_mg_at_bedtime (5h half-life residual at sleep onset; null without trusted timestamps), and caffeine_to_bedtime_min. Source is Cronometer for new days and MyFitnessPal for pre-2026-05-31 history, transparently COALESCE'd. Macros are FOOD intake only — for supplement-inclusive vitamin/mineral totals use query_vitamins.",
     input_schema: {
       type: "object" as const,
       properties: { days: { type: "number", description: "How many days back (default 7)" } },
@@ -351,7 +351,8 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       .select(
         "calendar_date, nutrition_source, nutrition_calories, nutrition_protein_g, " +
           "nutrition_carbs_g, nutrition_fat_g, nutrition_fiber_g, nutrition_sugar_g, " +
-          "nutrition_sodium_mg, nutrition_water_ml, nutrition_caffeine_mg"
+          "nutrition_sodium_mg, nutrition_water_ml, nutrition_caffeine_mg, " +
+          "caffeine_total_mg, caffeine_supplement_mg, caffeine_mg_at_bedtime, caffeine_to_bedtime_min"
       )
       .gte("calendar_date", sinceStr)
       .not("nutrition_calories", "is", null)

@@ -249,7 +249,11 @@ MICRONUTRIENT_COLS: dict[str, tuple[str, str]] = {
     "epa_g":             ("EPA", "g"),
     "dha_g":             ("DHA", "g"),
     "ala_g":             ("ALA", "g"),
-    "nutrition_caffeine_mg": ("Dietary Caffeine", "mg"),
+    # nutrition_caffeine_mg (dietary-only) removed 2026-06-09: superseded by the
+    # unified caffeine_total_mg / caffeine_mg_at_bedtime columns (dietary +
+    # supplement, pds.caffeine_timing_daily) added to NUTRITION_COLS directly.
+    # The dietary-only column stays in the matrix as an archive but is no
+    # longer a tested feature — testing both would double-count one signal.
 }
 
 # Controllable / behavioral features for the actionable-only SHAP ranking
@@ -458,8 +462,13 @@ FEATURE_LABELS: dict[str, str] = {
     "caffeine_first_hour": "First Caffeine (ET hour)",
     "caffeine_last_hour": "Last Caffeine (ET hour)",
     "caffeine_window_hours": "Caffeine Window (h)",
-    "caffeine_intake_count": "Caffeine Intakes Logged",
+    "caffeine_intake_count": "Caffeine Events Logged",
     "caffeine_to_bedtime_min": "Minutes from Last Caffeine to Bedtime",
+    "caffeine_total_mg": "Total Caffeine (mg)",
+    "caffeine_dietary_mg": "Dietary Caffeine (mg)",
+    "caffeine_supplement_mg": "Supplement Caffeine (mg)",
+    "caffeine_mg_at_bedtime": "Caffeine at Bedtime (mg)",
+    "caffeine_total_mg_lag1": "Total Caffeine (mg, prev day)",
 }
 
 # Journal boolean questions → clean labels
@@ -1531,6 +1540,49 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
                  "journal_ate_food_close_to_bedtime"):
         if jcol in df.columns:
             df[f"{jcol}_lag1"] = df[jcol].shift(1)
+
+    # Unified caffeine quantity (pds.caffeine_timing_daily, dietary+supplement).
+    # Zero-anchor first: caffeine_total_mg is NULL on days with no logged
+    # caffeine event, which conflates "none consumed" with "not logged". When
+    # the WHOOP journal explicitly answered No to "Consumed caffeine?", a
+    # missing total is a true zero — anchoring it gives dose-response analyses
+    # a real zero arm instead of dropping every caffeine-free day. Days WITH
+    # logged events keep their summed mg even if the journal said No (the
+    # event log is harder evidence than the checkbox — a journal-No day with
+    # 150 mg of logged coffee exists in history).
+    #
+    # ERA GATE (verification finding 2026-06-09): only anchor journal-No days
+    # ON/AFTER the first day with a logged caffeine event. Journal-No days go
+    # back to 2024-12 but quantitative tracking started 2026-05-19; anchoring
+    # the pre-era days would build a zero arm that is ~96% "old epoch" while
+    # every positive-mg day is "new epoch", aliasing caffeine dose onto
+    # secular HRV drift (the same period-confound the dose-bucket audit
+    # caught). Within-era the features may fail the n>=20 gates for a while —
+    # that graceful skip is the correct outcome until caffeine-free days
+    # accrue inside the quantitative era.
+    if "caffeine_total_mg" in df.columns:
+        if "journal_consumed_caffeine" in df.columns:
+            logged = df["caffeine_total_mg"].notna()
+            if logged.any():
+                era_start = df.loc[logged, "calendar_date"].min()
+                zero_anchor = (
+                    (df["journal_consumed_caffeine"] == 0)
+                    & df["caffeine_total_mg"].isna()
+                    & (df["calendar_date"] >= era_start)
+                )
+                df.loc[zero_anchor, "caffeine_total_mg"] = 0.0
+                if "caffeine_mg_at_bedtime" in df.columns:
+                    df.loc[zero_anchor, "caffeine_mg_at_bedtime"] = 0.0
+        else:
+            log.warning(
+                "caffeine_total_mg present but journal_consumed_caffeine missing — "
+                "zero-anchoring silently disabled (did the WHOOP question label change?)"
+            )
+        # Same t-1 lag treatment as the journal boolean — multi-day caffeine
+        # load (slow clearance, adenosine rebound) is invisible without it.
+        # Timing features stay lag-free: their effect is same-night by
+        # construction.
+        df["caffeine_total_mg_lag1"] = df["caffeine_total_mg"].shift(1)
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships
     # without us having to hardcode habit names (they're user-defined in Notion).
@@ -2502,6 +2554,10 @@ def run_statistical_analysis(
         "protein_pct": ("Protein % of Calories", "%"),
         "carb_pct": ("Carb % of Calories", "%"),
         "fat_pct": ("Fat % of Calories", "%"),
+        # Unified caffeine (dietary + supplement, pds.caffeine_timing_daily) —
+        # replaces the dietary-only nutrition_caffeine_mg (2026-06-09).
+        "caffeine_total_mg": ("Total Caffeine", "mg"),
+        "caffeine_mg_at_bedtime": ("Caffeine at Bedtime", "mg"),
         **MICRONUTRIENT_COLS,
     }
     nutrition_impact: list[dict] = []

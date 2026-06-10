@@ -543,6 +543,80 @@ export async function getWhoopCaloriesBurnt(days: number = 30) {
 
 
 // ---------------------------------------------------------------------------
+// Caffeine (pds.caffeine_timing_daily + behavioral matrix)
+// ---------------------------------------------------------------------------
+
+export interface CaffeineDailyRow {
+  calendar_date: string;
+  /** ET decimal hours; from trusted-timestamp events only (null if none). */
+  first_caffeine_hour: number | null;
+  last_caffeine_hour: number | null;
+  /** Null on single-dose days (no window to measure). */
+  caffeine_window_hours: number | null;
+  /** ALL events, both channels (timed or not). */
+  caffeine_intake_count: number | null;
+  last_caffeine_to_bedtime_minutes: number | null;
+  total_caffeine_mg: number | null;
+  dietary_caffeine_mg: number | null;
+  supplement_caffeine_mg: number | null;
+  /** 5h half-life residual at sleep onset; NULL unless every event that day had a trusted timestamp. */
+  caffeine_mg_at_bedtime: number | null;
+  timed_event_count: number | null;
+}
+
+/**
+ * One row per behavioral day with caffeine, from pds.caffeine_timing_daily.
+ * Timing fields (first/last hour, window, bedtime gap, mg-at-bedtime) come from
+ * trusted-timestamp events only; mg totals and intake_count cover all events.
+ */
+export async function getCaffeineDaily(days: number = 60): Promise<CaffeineDailyRow[]> {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("caffeine_timing_daily")
+    .select(
+      "calendar_date,first_caffeine_hour,last_caffeine_hour,caffeine_window_hours,caffeine_intake_count,last_caffeine_to_bedtime_minutes,total_caffeine_mg,dietary_caffeine_mg,supplement_caffeine_mg,caffeine_mg_at_bedtime,timed_event_count"
+    )
+    .gte("calendar_date", since.toISOString().split("T")[0])
+    .order("calendar_date", { ascending: true });
+
+  if (error) throw error;
+  return (data ?? []) as CaffeineDailyRow[];
+}
+
+export interface CaffeineHrvPair {
+  calendar_date: string;
+  caffeine_total_mg: number;
+  caffeine_to_bedtime_min: number | null;
+  whoop_hrv_rmssd: number;
+}
+
+/**
+ * Caffeine (behavioral day N) paired with the recovery of the WHOOP cycle that
+ * STARTS at the bedtime closing day N — i.e. the same-row whoop_hrv_rmssd is
+ * the NEXT-NIGHT HRV relative to that day's caffeine (see CLAUDE.md matrix
+ * semantics). Same-row pairing IS the correct "caffeine day → following
+ * night's HRV" comparison; label it "next-night HRV" in any UI. Only rows
+ * where both sides are non-null.
+ */
+export async function getCaffeineHrvPairs(days: number = 90): Promise<CaffeineHrvPair[]> {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("daily_health_matrix_behavioral")
+    .select("calendar_date,caffeine_total_mg,caffeine_to_bedtime_min,whoop_hrv_rmssd")
+    .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
+    .not("caffeine_total_mg", "is", null)
+    .not("whoop_hrv_rmssd", "is", null)
+    .order("onyx_behavioral_date", { ascending: true });
+
+  if (error) throw error;
+  return (data ?? []) as CaffeineHrvPair[];
+}
+
+// ---------------------------------------------------------------------------
 // Recovery context for running activities (merged into /activities row cards)
 // ---------------------------------------------------------------------------
 

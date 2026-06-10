@@ -279,7 +279,9 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     # MFP→Cronometer migration 2026-05-31. Family='nutrition' → same lifestyle-
     # clustering confounder routing. Most are dropped via MIN_CONTINUOUS_N=50 (or
     # flagged low_n) until Cronometer history accrues — intended graceful degradation.
-    ("nutrition_caffeine_mg", "nutrition", "Dietary caffeine above median",  "mg"),
+    # nutrition_caffeine_mg (dietary-only) replaced 2026-06-09 by the unified
+    # caffeine_total_mg treatment in the caffeine block below — keeping both
+    # would put two copies of one signal into the FDR family.
     ("vit_a_rae_mcg",       "nutrition", "Vitamin A (RAE) above median",  "µg"),
     ("vit_c_mg",            "nutrition", "Vitamin C above median",        "mg"),
     ("vit_d_iu",            "nutrition", "Vitamin D above median",        "IU"),
@@ -419,7 +421,15 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     ("caffeine_last_hour",            "nutrition", "Last caffeine clock hour above median",    "ET hr"),
     ("caffeine_first_hour",           "nutrition", "First caffeine clock hour above median",   "ET hr"),
     ("caffeine_window_hours",         "nutrition", "Caffeine intake window above median",      "h"),
-    ("caffeine_intake_count",         "nutrition", "Caffeine intakes per day above median",    None),
+    ("caffeine_intake_count",         "nutrition", "Caffeine events per day above median",     None),
+    # Unified caffeine quantity (2026-06-09): dietary (Cronometer servings) +
+    # supplement (UNII rollup) merged in pds.caffeine_timing_daily.
+    # caffeine_total_mg is THE canonical caffeine dose treatment;
+    # caffeine_mg_at_bedtime is the dose-x-timing composite (5h half-life
+    # residual at sleep onset) — the best single proxy for "caffeine still
+    # on board when sleep started".
+    ("caffeine_total_mg",             "nutrition", "Total caffeine (diet+suppl) above median", "mg"),
+    ("caffeine_mg_at_bedtime",        "nutrition", "Caffeine load at bedtime above median",    "mg"),
     # ADR-0001 Phase B travel treatments — magnitude/recovery
     ("offset_delta_hours",            "travel",    "TZ offset shift magnitude above median",   "h"),
     ("days_since_transition",         "travel",    "Days since last transition above median",  "days"),

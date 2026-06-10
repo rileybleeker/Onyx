@@ -286,6 +286,15 @@ const PAGES: SmokePage[] = [
     hardEmpty: [],
   },
   {
+    route: "/caffeine",
+    heading: "Caffeine",
+    signal: "charts",
+    // Quantitative caffeine rows exist daily since 2026-05-19, so the intake
+    // chart must draw marks. The HRV scatter / window chart can be legitimately
+    // thin (trusted-timestamp coverage) — not hard-asserted.
+    hardEmpty: ["No caffeine days in the database yet."],
+  },
+  {
     route: "/spotify",
     heading: "Spotify",
     signal: "charts",

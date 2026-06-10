@@ -1,0 +1,33 @@
+-- Unified-caffeine additions to pds.daily_health_matrix_behavioral
+-- Applied via Supabase migration `daily_health_matrix_behavioral_caffeine_unified` (2026-06-09).
+--
+-- This documents the ADDITIVE delta (mirrors the sql/cronometer_matrix_view.sql pattern).
+-- The migration rebuilt the view from its own pg_get_viewdef() with the new columns
+-- spliced in just before `FROM all_behavioral_dates s`, so every pre-existing column
+-- is byte-identical. Regenerate the live DDL with:
+--   SELECT pg_get_viewdef('pds.daily_health_matrix_behavioral'::regclass, true);
+--
+-- Two effects:
+--
+-- 1) The five EXISTING caffeine_* timing columns changed semantics in place (no DDL
+--    delta here — the underlying pds.caffeine_timing_daily view was replaced, see
+--    sql/caffeine_timing_daily.sql):
+--      caffeine_first_hour / caffeine_last_hour / caffeine_window_hours — now built
+--        from trusted-timestamp events of BOTH channels (supplement intakes +
+--        Cronometer Gold-timestamped caffeinated servings), not supplements only.
+--      caffeine_intake_count — now counts ALL caffeine events on the behavioral day
+--        (both channels, timestamped or not; previously timestamped supplements only).
+--      caffeine_to_bedtime_min — unchanged formula, but retro-logged doses (timestamp
+--        attributing to a different behavioral day) are quarantined, eliminating the
+--        negative-gap artifacts.
+--
+-- 2) Four columns APPENDED at the tail (after cn.molybdenum_mcg):
+--      ct.total_caffeine_mg      AS caffeine_total_mg,      -- dietary + supplement, THE canonical caffeine quantity
+--      ct.dietary_caffeine_mg    AS caffeine_dietary_mg,    -- Cronometer servings (coffee/tea/chocolate)
+--      ct.supplement_caffeine_mg AS caffeine_supplement_mg, -- UNII 3G6A5W338E rollup (pills/pre-workout)
+--      ct.caffeine_mg_at_bedtime AS caffeine_mg_at_bedtime  -- 5h half-life decay residual at sleep onset
+--
+-- HRV pipeline contract: caffeine_total_mg REPLACES nutrition_caffeine_mg as the
+-- caffeine quantity used in analysis (nutrition_caffeine_mg stays in the view as the
+-- dietary-only archive column but is no longer a tested feature/treatment).
+-- caffeine_mg_at_bedtime is the preferred dose-x-timing feature.
