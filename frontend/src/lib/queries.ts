@@ -835,15 +835,157 @@ function sinceFor(range: Range): string | null {
   return days == null ? null : dateNDaysAgo(days);
 }
 
-export async function getSpotifyKpis(range: SpotifyRange = "30d") {
-  let q = supabase
-    .from("spotify_plays")
-    .select("track_id,artist_id,duration_ms,track_name,artist_name");
+// ---------------------------------------------------------------------------
+// Shared Spotify fetch layer (perf pass 2026-06-10).
+//
+// The /spotify dashboard previously fired ~8 independent scans of
+// spotify_plays (one per aggregate), each silently capped at PostgREST's
+// 1000-row default, plus two separate sequential chunk-loops over
+// spotify_artists. Everything below fetches each dataset ONCE — plays are
+// paged past the 1000-row cap with the pages requested in parallel — and the
+// aggregates are computed from the shared rows by pure functions. The
+// per-aggregate exports (getSpotifyKpis, getSpotifyTopArtists, …) keep their
+// signatures and return shapes as thin wrappers; getSpotifyDashboard() is the
+// one-call path the page uses.
+// ---------------------------------------------------------------------------
+
+interface SpotifyPlayFull {
+  played_at: string;
+  played_date_et: string;
+  track_id: string | null;
+  track_name: string | null;
+  artist_id: string | null;
+  artist_name: string | null;
+  duration_ms: number | null;
+}
+
+const SPOTIFY_PAGE_SIZE = 1000;
+const SPOTIFY_CHUNK = 200;
+
+/** All plays in range (chronological), paged past the 1000-row PostgREST cap. */
+async function fetchSpotifyPlays(range: SpotifyRange): Promise<SpotifyPlayFull[]> {
   const since = sinceFor(range);
-  if (since) q = q.gte("played_date_et", since);
-  const { data, error } = await q;
-  if (error) throw error;
-  const rows = data ?? [];
+  let countQ = supabase
+    .from("spotify_plays")
+    .select("played_at", { count: "exact", head: true });
+  if (since) countQ = countQ.gte("played_date_et", since);
+  const { count, error: countErr } = await countQ;
+  if (countErr) throw countErr;
+  const total = count ?? 0;
+  if (total === 0) return [];
+
+  const pages = Math.ceil(total / SPOTIFY_PAGE_SIZE);
+  const results = await Promise.all(
+    Array.from({ length: pages }, (_, i) => {
+      let q = supabase
+        .from("spotify_plays")
+        .select("played_at,played_date_et,track_id,track_name,artist_id,artist_name,duration_ms")
+        .order("played_at", { ascending: true })
+        .range(i * SPOTIFY_PAGE_SIZE, (i + 1) * SPOTIFY_PAGE_SIZE - 1);
+      if (since) q = q.gte("played_date_et", since);
+      return q;
+    })
+  );
+  const rows: SpotifyPlayFull[] = [];
+  for (const r of results) {
+    if (r.error) throw r.error;
+    rows.push(...((r.data ?? []) as SpotifyPlayFull[]));
+  }
+  return rows;
+}
+
+/** Genres per artist_id, chunked .in() requests fired in parallel. */
+async function fetchArtistGenres(artistIds: string[]): Promise<Map<string, string[]>> {
+  const genresByArtist = new Map<string, string[]>();
+  if (artistIds.length === 0) return genresByArtist;
+  const chunks: string[][] = [];
+  for (let i = 0; i < artistIds.length; i += SPOTIFY_CHUNK) {
+    chunks.push(artistIds.slice(i, i + SPOTIFY_CHUNK));
+  }
+  const results = await Promise.all(
+    chunks.map((batch) =>
+      supabase.from("spotify_artists").select("artist_id,genres").in("artist_id", batch)
+    )
+  );
+  for (const r of results) {
+    if (r.error) throw r.error;
+    for (const a of (r.data ?? []) as Array<{ artist_id: string; genres: string[] | null }>) {
+      if (a.genres && a.genres.length > 0) genresByArtist.set(a.artist_id, a.genres);
+    }
+  }
+  return genresByArtist;
+}
+
+interface SpotifyTrackFeatureRow {
+  track_id: string;
+  valence: number | null;
+  energy: number | null;
+  danceability: number | null;
+  acousticness: number | null;
+  instrumentalness: number | null;
+  liveness: number | null;
+  speechiness: number | null;
+}
+
+/** Audio features per track_id, chunked .in() requests fired in parallel. */
+async function fetchTrackFeatures(trackIds: string[]): Promise<SpotifyTrackFeatureRow[]> {
+  if (trackIds.length === 0) return [];
+  const chunks: string[][] = [];
+  for (let i = 0; i < trackIds.length; i += SPOTIFY_CHUNK) {
+    chunks.push(trackIds.slice(i, i + SPOTIFY_CHUNK));
+  }
+  const results = await Promise.all(
+    chunks.map((batch) =>
+      supabase
+        .from("spotify_tracks")
+        .select("track_id,valence,energy,danceability,acousticness,instrumentalness,liveness,speechiness")
+        .in("track_id", batch)
+    )
+  );
+  const rows: SpotifyTrackFeatureRow[] = [];
+  for (const r of results) {
+    if (r.error) throw r.error;
+    rows.push(...((r.data ?? []) as SpotifyTrackFeatureRow[]));
+  }
+  return rows;
+}
+
+/**
+ * Every track_id played before `since` (for the discovery-rate "is this track
+ * new" check). Pages fetched in parallel after a count request — the old
+ * implementation paged sequentially.
+ */
+async function fetchPriorTrackIds(since: string | null): Promise<Set<string>> {
+  const prior = new Set<string>();
+  if (!since) return prior; // "all time": every first occurrence is new
+  const { count, error: countErr } = await supabase
+    .from("spotify_plays")
+    .select("track_id", { count: "exact", head: true })
+    .lt("played_date_et", since);
+  if (countErr) throw countErr;
+  const total = count ?? 0;
+  if (total === 0) return prior;
+  const pages = Math.ceil(total / SPOTIFY_PAGE_SIZE);
+  const results = await Promise.all(
+    Array.from({ length: pages }, (_, i) =>
+      supabase
+        .from("spotify_plays")
+        .select("track_id")
+        .lt("played_date_et", since)
+        .order("played_at", { ascending: true })
+        .range(i * SPOTIFY_PAGE_SIZE, (i + 1) * SPOTIFY_PAGE_SIZE - 1)
+    )
+  );
+  for (const r of results) {
+    if (r.error) throw r.error;
+    for (const row of r.data ?? []) if (row.track_id) prior.add(row.track_id);
+  }
+  return prior;
+}
+
+// --- pure aggregate computations over the shared plays rows ---
+
+function computeSpotifyKpis(rows: SpotifyPlayFull[]) {
   const uniqueTracks = new Set(rows.map((r) => r.track_id).filter(Boolean)).size;
   const uniqueArtists = new Set(rows.map((r) => r.artist_id).filter(Boolean)).size;
   const totalMs = rows.reduce((s, r) => s + (r.duration_ms ?? 0), 0);
@@ -868,6 +1010,10 @@ export async function getSpotifyKpis(range: SpotifyRange = "30d") {
     uniqueArtists,
     topTrack,
   };
+}
+
+export async function getSpotifyKpis(range: SpotifyRange = "30d") {
+  return computeSpotifyKpis(await fetchSpotifyPlays(range));
 }
 
 export async function getSpotifyDailyVolume(range: SpotifyRange = "90d"): Promise<SpotifyDailySignatureRow[]> {
@@ -902,40 +1048,12 @@ export interface SpotifyGenreRotationRow {
   [genre: string]: string | number;
 }
 
-export async function getSpotifyGenreRotation(
-  range: SpotifyRange = "30d",
-  topN: number = 8,
-): Promise<{ rows: SpotifyGenreRotationRow[]; topGenres: string[] }> {
-  let pq = supabase
-    .from("spotify_plays")
-    .select("played_date_et,artist_id");
-  const since = sinceFor(range);
-  if (since) pq = pq.gte("played_date_et", since);
-  const { data: plays, error: pErr } = await pq.order("played_date_et", { ascending: true });
-  if (pErr) throw pErr;
-  if (!plays || plays.length === 0) return { rows: [], topGenres: [] };
-
-  const artistIds = Array.from(
-    new Set(plays.map((p) => p.artist_id).filter(Boolean) as string[]),
-  );
-  type ArtistGenresRow = { artist_id: string; genres: string[] | null };
-  const artists: ArtistGenresRow[] = [];
-  const CHUNK = 200;
-  for (let i = 0; i < artistIds.length; i += CHUNK) {
-    const batch = artistIds.slice(i, i + CHUNK);
-    const { data, error } = await supabase
-      .from("spotify_artists")
-      .select("artist_id,genres")
-      .in("artist_id", batch);
-    if (error) throw error;
-    artists.push(...((data ?? []) as ArtistGenresRow[]));
-  }
-  const genresByArtist = new Map<string, string[]>();
-  for (const a of artists) {
-    if (a.genres && a.genres.length > 0) {
-      genresByArtist.set(a.artist_id, a.genres);
-    }
-  }
+function computeGenreRotation(
+  plays: Pick<SpotifyPlayFull, "played_date_et" | "artist_id">[],
+  genresByArtist: Map<string, string[]>,
+  topN: number,
+): { rows: SpotifyGenreRotationRow[]; topGenres: string[] } {
+  if (plays.length === 0) return { rows: [], topGenres: [] };
 
   // First pass: compute global genre totals so we can decide top-N.
   const totals = new Map<string, number>();
@@ -990,6 +1108,16 @@ export async function getSpotifyGenreRotation(
   return { rows, topGenres };
 }
 
+export async function getSpotifyGenreRotation(
+  range: SpotifyRange = "30d",
+  topN: number = 8,
+): Promise<{ rows: SpotifyGenreRotationRow[]; topGenres: string[] }> {
+  const plays = await fetchSpotifyPlays(range);
+  const artistIds = Array.from(new Set(plays.map((p) => p.artist_id).filter(Boolean) as string[]));
+  const genresByArtist = await fetchArtistGenres(artistIds);
+  return computeGenreRotation(plays, genresByArtist, topN);
+}
+
 export interface SpotifyDiscoveryRow {
   calendar_date: string;
   new_tracks: number;
@@ -997,46 +1125,16 @@ export interface SpotifyDiscoveryRow {
   pct_new: number;
 }
 
-export async function getSpotifyDiscoveryRate(
-  range: SpotifyRange = "30d",
-): Promise<SpotifyDiscoveryRow[]> {
-  // For each play in the range, "new" = track_id not seen in any previous play
-  // (across all-time, not just the range — otherwise picking a wider range would
-  // flip familiar tracks back to "new"). Two queries: all prior track_ids, plus
-  // the range's plays in chronological order.
-  const since = sinceFor(range);
-
-  const prior: Set<string> = new Set();
-  if (since) {
-    // Fetch every track_id played before `since`. This can be large, so we page.
-    let from = 0;
-    const PAGE = 1000;
-    while (true) {
-      const { data, error } = await supabase
-        .from("spotify_plays")
-        .select("track_id")
-        .lt("played_date_et", since)
-        .range(from, from + PAGE - 1);
-      if (error) throw error;
-      const rows = data ?? [];
-      for (const r of rows) if (r.track_id) prior.add(r.track_id);
-      if (rows.length < PAGE) break;
-      from += PAGE;
-    }
-  }
-  // else: "all time" — nothing prior, every first occurrence is "new"
-
-  let q = supabase
-    .from("spotify_plays")
-    .select("played_date_et,track_id,played_at")
-    .order("played_at", { ascending: true });
-  if (since) q = q.gte("played_date_et", since);
-  const { data: rangePlays, error: rErr } = await q;
-  if (rErr) throw rErr;
-
+// For each play in the range, "new" = track_id not seen in any previous play
+// (across all-time, not just the range — otherwise picking a wider range would
+// flip familiar tracks back to "new"). `plays` must be in chronological order.
+function computeDiscoveryRate(
+  plays: Pick<SpotifyPlayFull, "played_date_et" | "track_id">[],
+  prior: Set<string>,
+): SpotifyDiscoveryRow[] {
   const buckets = new Map<string, { new_tracks: number; total_plays: number }>();
   const seenInRange = new Set<string>();
-  for (const p of rangePlays ?? []) {
+  for (const p of plays) {
     const date = p.played_date_et as string;
     if (!date) continue;
     const b = buckets.get(date) ?? { new_tracks: 0, total_plays: 0 };
@@ -1058,16 +1156,22 @@ export async function getSpotifyDiscoveryRate(
     }));
 }
 
-export async function getSpotifyTopArtists(range: SpotifyRange = "30d", limit: number = 10) {
-  let q = supabase
-    .from("spotify_plays")
-    .select("artist_id,artist_name,duration_ms");
-  const since = sinceFor(range);
-  if (since) q = q.gte("played_date_et", since);
-  const { data, error } = await q;
-  if (error) throw error;
+export async function getSpotifyDiscoveryRate(
+  range: SpotifyRange = "30d",
+): Promise<SpotifyDiscoveryRow[]> {
+  const [plays, prior] = await Promise.all([
+    fetchSpotifyPlays(range),
+    fetchPriorTrackIds(sinceFor(range)),
+  ]);
+  return computeDiscoveryRate(plays, prior);
+}
+
+function computeTopArtists(
+  rows: Pick<SpotifyPlayFull, "artist_id" | "artist_name" | "duration_ms">[],
+  limit: number,
+) {
   const agg = new Map<string, { name: string; plays: number; minutes: number }>();
-  for (const r of data ?? []) {
+  for (const r of rows) {
     const key = r.artist_id ?? r.artist_name ?? "—";
     const entry = agg.get(key) ?? { name: r.artist_name ?? "—", plays: 0, minutes: 0 };
     entry.plays++;
@@ -1079,41 +1183,29 @@ export async function getSpotifyTopArtists(range: SpotifyRange = "30d", limit: n
     .slice(0, limit);
 }
 
-export async function getSpotifyTopGenres(range: SpotifyRange = "30d", limit: number = 10) {
-  let pq = supabase.from("spotify_plays").select("artist_id");
-  const since = sinceFor(range);
-  if (since) pq = pq.gte("played_date_et", since);
-  const { data: plays, error: pErr } = await pq;
-  if (pErr) throw pErr;
+export async function getSpotifyTopArtists(range: SpotifyRange = "30d", limit: number = 10) {
+  return computeTopArtists(await fetchSpotifyPlays(range), limit);
+}
 
+// Each play contributes one tally to every genre the artist has.
+// Heavy-rotation artists naturally weight their genres more.
+function computeTopGenres(
+  plays: Pick<SpotifyPlayFull, "artist_id">[],
+  genresByArtist: Map<string, string[]>,
+  limit: number,
+) {
   const playsByArtist = new Map<string, number>();
-  for (const p of plays ?? []) {
+  for (const p of plays) {
     if (!p.artist_id) continue;
     playsByArtist.set(p.artist_id, (playsByArtist.get(p.artist_id) ?? 0) + 1);
   }
   if (playsByArtist.size === 0) return [];
 
-  const ids = Array.from(playsByArtist.keys());
-  type ArtistGenresRow = { artist_id: string; genres: string[] | null };
-  const artists: ArtistGenresRow[] = [];
-  const CHUNK = 200;
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const batch = ids.slice(i, i + CHUNK);
-    const { data, error } = await supabase
-      .from("spotify_artists")
-      .select("artist_id,genres")
-      .in("artist_id", batch);
-    if (error) throw error;
-    artists.push(...((data ?? []) as ArtistGenresRow[]));
-  }
-
-  // Each play contributes one tally to every genre the artist has.
-  // Heavy-rotation artists naturally weight their genres more.
   const counts = new Map<string, number>();
-  for (const a of artists) {
-    const w = playsByArtist.get(a.artist_id) ?? 0;
-    if (!w || !a.genres) continue;
-    for (const g of a.genres) {
+  for (const [artistId, genres] of genresByArtist) {
+    const w = playsByArtist.get(artistId) ?? 0;
+    if (!w) continue;
+    for (const g of genres) {
       if (!g) continue;
       counts.set(g, (counts.get(g) ?? 0) + w);
     }
@@ -1125,16 +1217,19 @@ export async function getSpotifyTopGenres(range: SpotifyRange = "30d", limit: nu
     .slice(0, limit);
 }
 
-export async function getSpotifyTopTracks(range: SpotifyRange = "30d", limit: number = 10) {
-  let q = supabase
-    .from("spotify_plays")
-    .select("track_id,track_name,artist_name,duration_ms");
-  const since = sinceFor(range);
-  if (since) q = q.gte("played_date_et", since);
-  const { data, error } = await q;
-  if (error) throw error;
+export async function getSpotifyTopGenres(range: SpotifyRange = "30d", limit: number = 10) {
+  const plays = await fetchSpotifyPlays(range);
+  const ids = Array.from(new Set(plays.map((p) => p.artist_id).filter(Boolean) as string[]));
+  const genresByArtist = await fetchArtistGenres(ids);
+  return computeTopGenres(plays, genresByArtist, limit);
+}
+
+function computeTopTracks(
+  rows: Pick<SpotifyPlayFull, "track_id" | "track_name" | "artist_name" | "duration_ms">[],
+  limit: number,
+) {
   const agg = new Map<string, { track_id: string; name: string; artist: string; plays: number; minutes: number }>();
-  for (const r of data ?? []) {
+  for (const r of rows) {
     if (!r.track_id) continue;
     const entry = agg.get(r.track_id) ?? {
       track_id: r.track_id,
@@ -1152,51 +1247,29 @@ export async function getSpotifyTopTracks(range: SpotifyRange = "30d", limit: nu
     .slice(0, limit);
 }
 
+export async function getSpotifyTopTracks(range: SpotifyRange = "30d", limit: number = 10) {
+  return computeTopTracks(await fetchSpotifyPlays(range), limit);
+}
+
 export interface SonicProfileRow {
   feature: "valence" | "energy" | "danceability" | "acousticness" | "instrumentalness" | "liveness" | "speechiness";
   value: number;
 }
 
-export async function getSpotifySonicProfile(range: SpotifyRange = "30d"): Promise<{
+function computeSonicProfile(
+  plays: Pick<SpotifyPlayFull, "track_id">[],
+  features: SpotifyTrackFeatureRow[],
+): {
   profile: SonicProfileRow[];
   totalPlays: number;
   featurizedPlays: number;
-} | null> {
-  let pq = supabase.from("spotify_plays").select("track_id");
-  const since = sinceFor(range);
-  if (since) pq = pq.gte("played_date_et", since);
-  const { data: plays, error: pErr } = await pq;
-  if (pErr) throw pErr;
-
+} | null {
   const playCounts = new Map<string, number>();
-  for (const p of plays ?? []) {
+  for (const p of plays) {
     if (!p.track_id) continue;
     playCounts.set(p.track_id, (playCounts.get(p.track_id) ?? 0) + 1);
   }
   if (playCounts.size === 0) return null;
-
-  const uniqueIds = Array.from(playCounts.keys());
-  type FeatureRow = {
-    track_id: string;
-    valence: number | null;
-    energy: number | null;
-    danceability: number | null;
-    acousticness: number | null;
-    instrumentalness: number | null;
-    liveness: number | null;
-    speechiness: number | null;
-  };
-  const features: FeatureRow[] = [];
-  const CHUNK = 200;
-  for (let i = 0; i < uniqueIds.length; i += CHUNK) {
-    const batch = uniqueIds.slice(i, i + CHUNK);
-    const { data, error } = await supabase
-      .from("spotify_tracks")
-      .select("track_id,valence,energy,danceability,acousticness,instrumentalness,liveness,speechiness")
-      .in("track_id", batch);
-    if (error) throw error;
-    features.push(...((data ?? []) as FeatureRow[]));
-  }
 
   const featureNames = [
     "valence",
@@ -1234,6 +1307,17 @@ export async function getSpotifySonicProfile(range: SpotifyRange = "30d"): Promi
   return { profile, totalPlays, featurizedPlays };
 }
 
+export async function getSpotifySonicProfile(range: SpotifyRange = "30d"): Promise<{
+  profile: SonicProfileRow[];
+  totalPlays: number;
+  featurizedPlays: number;
+} | null> {
+  const plays = await fetchSpotifyPlays(range);
+  const trackIds = Array.from(new Set(plays.map((p) => p.track_id).filter(Boolean) as string[]));
+  const features = await fetchTrackFeatures(trackIds);
+  return computeSonicProfile(plays, features);
+}
+
 export interface SpotifyLedgerRow {
   played_at: string;
   track_id: string;
@@ -1262,12 +1346,7 @@ export async function getSpotifyLedger(
   return { rows: (data ?? []) as SpotifyLedgerRow[], totalCount: count ?? 0 };
 }
 
-export async function getSpotifyHourOfDay(range: SpotifyRange = "30d") {
-  let q = supabase.from("spotify_plays").select("played_at");
-  const since = sinceFor(range);
-  if (since) q = q.gte("played_date_et", since);
-  const { data, error } = await q;
-  if (error) throw error;
+function computeHourOfDay(rows: Pick<SpotifyPlayFull, "played_at">[]) {
   const buckets = Array.from({ length: 24 }, (_, h) => ({ hour: h, plays: 0 }));
   // hourCycle: 'h23' returns 0..23 always; the old `hour12: false` config
   // returns '24' for midnight in V8/Node and the h<24 guard would drop every
@@ -1277,9 +1356,44 @@ export async function getSpotifyHourOfDay(range: SpotifyRange = "30d") {
     hour: "2-digit",
     hourCycle: "h23",
   });
-  for (const r of data ?? []) {
+  for (const r of rows) {
     const h = parseInt(fmt.format(new Date(r.played_at)), 10);
     if (!Number.isNaN(h) && h >= 0 && h < 24) buckets[h].plays++;
   }
   return buckets;
+}
+
+export async function getSpotifyHourOfDay(range: SpotifyRange = "30d") {
+  return computeHourOfDay(await fetchSpotifyPlays(range));
+}
+
+/**
+ * One-call data path for the /spotify dashboard: fetches the range's plays
+ * ONCE (paged in parallel past the 1000-row cap), the artist-genre map ONCE,
+ * and the track features ONCE, then computes every aggregate from the shared
+ * rows. Replaces 8 independent plays scans + 2 sequential artist chunk-loops
+ * (~17+ requests, several silently truncated at 1000 rows) with ~4 request
+ * waves.
+ */
+export async function getSpotifyDashboard(range: SpotifyRange = "30d", topN: { genres?: number; artists?: number; tracks?: number } = {}) {
+  const [plays, prior] = await Promise.all([
+    fetchSpotifyPlays(range),
+    fetchPriorTrackIds(sinceFor(range)),
+  ]);
+  const artistIds = Array.from(new Set(plays.map((p) => p.artist_id).filter(Boolean) as string[]));
+  const trackIds = Array.from(new Set(plays.map((p) => p.track_id).filter(Boolean) as string[]));
+  const [genresByArtist, features] = await Promise.all([
+    fetchArtistGenres(artistIds),
+    fetchTrackFeatures(trackIds),
+  ]);
+  return {
+    kpis: computeSpotifyKpis(plays),
+    topArtists: computeTopArtists(plays, topN.artists ?? 10),
+    topTracks: computeTopTracks(plays, topN.tracks ?? 10),
+    hours: computeHourOfDay(plays),
+    sonic: computeSonicProfile(plays, features),
+    genreRotation: computeGenreRotation(plays, genresByArtist, 8),
+    topGenres: computeTopGenres(plays, genresByArtist, topN.genres ?? 10),
+    discovery: computeDiscoveryRate(plays, prior),
+  };
 }

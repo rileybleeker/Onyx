@@ -11,17 +11,10 @@ import StatCard from "@/components/StatCard";
 import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel, chartColors as C } from "@/lib/chart-theme";
 import {
-  getSpotifyKpis,
+  getSpotifyDashboard,
   getSpotifyDailyVolume,
   getSpotifyAudioFeatureDrift,
-  getSpotifyGenreRotation,
-  getSpotifyDiscoveryRate,
-  getSpotifyTopArtists,
-  getSpotifyTopTracks,
-  getSpotifyHourOfDay,
-  getSpotifySonicProfile,
   getSpotifyLedger,
-  getSpotifyTopGenres,
   rangeLabel,
   type SpotifyDailySignatureRow,
   type SpotifyLedgerRow,
@@ -72,15 +65,16 @@ const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospa
 
 const spotifyGreen = C.source.spotify;
 
-type Kpis = Awaited<ReturnType<typeof getSpotifyKpis>>;
-type TopArtists = Awaited<ReturnType<typeof getSpotifyTopArtists>>;
-type TopTracks = Awaited<ReturnType<typeof getSpotifyTopTracks>>;
-type HourBuckets = Awaited<ReturnType<typeof getSpotifyHourOfDay>>;
-type SonicProfile = Awaited<ReturnType<typeof getSpotifySonicProfile>>;
-type TopGenres = Awaited<ReturnType<typeof getSpotifyTopGenres>>;
+type Dashboard = Awaited<ReturnType<typeof getSpotifyDashboard>>;
+type Kpis = Dashboard["kpis"];
+type TopArtists = Dashboard["topArtists"];
+type TopTracks = Dashboard["topTracks"];
+type HourBuckets = Dashboard["hours"];
+type SonicProfile = Dashboard["sonic"];
+type TopGenres = Dashboard["topGenres"];
 type FeatureDrift = Awaited<ReturnType<typeof getSpotifyAudioFeatureDrift>>;
-type GenreRotation = Awaited<ReturnType<typeof getSpotifyGenreRotation>>;
-type DiscoveryRate = Awaited<ReturnType<typeof getSpotifyDiscoveryRate>>;
+type GenreRotation = Dashboard["genreRotation"];
+type DiscoveryRate = Dashboard["discovery"];
 
 function defaultPlaylistName(): string {
   const fmt = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" });
@@ -308,28 +302,24 @@ export default function SpotifyPage() {
   useEffect(() => {
     setLoading(true);
     Promise.all([
-      getSpotifyKpis(range),
+      // One shared fetch of the range's plays + artist genres + track
+      // features, computing all 8 aggregates — replaces 8 independent
+      // spotify_plays scans (see getSpotifyDashboard in lib/queries.ts).
+      getSpotifyDashboard(range),
       getSpotifyDailyVolume(range),
       getSpotifyAudioFeatureDrift(range),
-      getSpotifyGenreRotation(range, 8),
-      getSpotifyDiscoveryRate(range),
-      getSpotifyTopArtists(range, 10),
-      getSpotifyTopTracks(range, 10),
-      getSpotifyHourOfDay(range),
-      getSpotifySonicProfile(range),
-      getSpotifyTopGenres(range, 10),
     ])
-      .then(([k, v, d, gr, disc, ta, tt, h, sp, g]) => {
-        setKpis(k);
+      .then(([dash, v, d]) => {
+        setKpis(dash.kpis);
         setVolume(v);
         setDrift(d);
-        setGenreRotation(gr);
-        setDiscovery(disc);
-        setTopArtists(ta);
-        setTopTracks(tt);
-        setHours(h);
-        setSonic(sp);
-        setGenres(g);
+        setGenreRotation(dash.genreRotation);
+        setDiscovery(dash.discovery);
+        setTopArtists(dash.topArtists);
+        setTopTracks(dash.topTracks);
+        setHours(dash.hours);
+        setSonic(dash.sonic);
+        setGenres(dash.topGenres);
       })
       .catch((err) => console.error("Spotify page load:", err))
       .finally(() => setLoading(false));
