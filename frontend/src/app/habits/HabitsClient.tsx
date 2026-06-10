@@ -1,0 +1,852 @@
+"use client";
+
+import { useEffect, useState, useCallback, useRef } from "react";
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import { getHabitJournal, getHabitMetadataHistory, rangeDays, rangeLabel, type Range, type HabitMetadataInterval } from "@/lib/queries";
+import { axisTick, gridStyle, chartTooltip, chartColors as C } from "@/lib/chart-theme";
+import { formatDate } from "@/lib/format";
+import StatCard from "@/components/StatCard";
+import MetricRing from "@/components/MetricRing";
+import ChartCard from "@/components/ChartCard";
+import RangeFilter from "@/components/RangeFilter";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+const CATEGORY_COLORS: Record<string, string> = {
+  health: C.up,
+  fitness: C.source.garmin,
+  mindfulness: C.source.eightsleep,
+  productivity: C.source.whoop,
+  nutrition: C.accent,
+  learning: C.categorical[4],
+  social: C.categorical[1],
+  general: C.neutral,
+};
+
+interface NotionHabit {
+  id: string;
+  name: string;
+  category: string;
+  frequency: string;
+  active: boolean;
+  lastCompleted: string | null;
+}
+
+interface JournalEntry {
+  cycle_date: string;
+  question: string;
+  category: string | null;
+  answer: string | null;
+}
+
+function todayStr() {
+  return new Date().toLocaleDateString("en-CA");
+}
+
+function getDatesArray(days: number): string[] {
+  const dates: string[] = [];
+  const now = new Date();
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    dates.push(d.toLocaleDateString("en-CA"));
+  }
+  return dates;
+}
+
+function isAdHocFrequency(frequency: string): boolean {
+  const f = frequency.trim().toLowerCase();
+  return f === "ad hoc" || f === "adhoc" || f === "ad-hoc";
+}
+
+function isEligibleDay(frequency: string, dateStr: string): boolean {
+  if (isAdHocFrequency(frequency)) return false; // ad hoc never has expected days
+  if (frequency !== "weekdays") return true;
+  const dow = new Date(dateStr + "T00:00:00").getDay();
+  return dow !== 0 && dow !== 6;
+}
+
+// Find the metadata interval covering `date` for this habit. Falls back to
+// the current Notion values when no history row exists yet (matches the
+// pre-history-table behavior — see sql/habit_metadata_history.sql).
+function resolveMetadata(
+  pageId: string,
+  date: string,
+  history: HabitMetadataInterval[],
+  fallback: { frequency: string; category: string },
+): { frequency: string; category: string } {
+  for (const h of history) {
+    if (h.notion_page_id !== pageId) continue;
+    if (date < h.valid_from) continue;
+    if (h.valid_to !== null && date > h.valid_to) continue;
+    return { frequency: h.frequency, category: h.category ?? fallback.category };
+  }
+  return fallback;
+}
+
+// For ad hoc habits, the "streak" concept doesn't apply — instead show recency.
+// Returns days-ago of most recent completion (0 = today), or null if never completed.
+function daysSinceLastCompletion(habitName: string, completionSet: Set<string>): number | null {
+  const now = new Date();
+  for (let i = 0; i < 365; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toLocaleDateString("en-CA");
+    if (completionSet.has(`${habitName}|${dateStr}`)) return i;
+  }
+  return null;
+}
+
+// Streak is anchored to the habit's CURRENT frequency (the one in effect
+// today) — that's the meaningful answer to "how many consecutive periods
+// have I kept this going?" Changing a habit from daily to weekly resets
+// the lens, but past completions still count if they satisfy the new
+// cadence. Eligibility/category lookups inside the loop are per-date so
+// retroactive prop changes don't silently rewrite history.
+function calculateStreak(
+  habit: { id: string; name: string; frequency: string; category: string },
+  completionSet: Set<string>,
+  history: HabitMetadataInterval[],
+): number {
+  if (isAdHocFrequency(habit.frequency)) return 0;
+
+  const now = new Date();
+
+  if (habit.frequency === "weekly") {
+    let streak = 0;
+    for (let weekIdx = 0; weekIdx < 52; weekIdx++) {
+      let hasCompletion = false;
+      for (let d = 0; d < 7; d++) {
+        const dt = new Date(now);
+        dt.setDate(dt.getDate() - (weekIdx * 7 + d));
+        const dateStr = dt.toLocaleDateString("en-CA");
+        if (completionSet.has(`${habit.name}|${dateStr}`)) {
+          hasCompletion = true;
+          break;
+        }
+      }
+      if (hasCompletion) {
+        streak++;
+      } else {
+        if (weekIdx === 0) continue;
+        break;
+      }
+    }
+    return streak;
+  }
+
+  let streak = 0;
+  for (let i = 0; i < 365; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toLocaleDateString("en-CA");
+
+    const freqOnDate = resolveMetadata(habit.id, dateStr, history, habit).frequency;
+    if (!isEligibleDay(freqOnDate, dateStr)) continue;
+
+    if (completionSet.has(`${habit.name}|${dateStr}`)) {
+      streak++;
+    } else {
+      if (i === 0) continue; // Allow today to be incomplete
+      break;
+    }
+  }
+  return streak;
+}
+
+export default function HabitsPage() {
+  const [habits, setHabits] = useState<NotionHabit[]>([]);
+  const [journal, setJournal] = useState<JournalEntry[]>([]);
+  const [history, setHistory] = useState<HabitMetadataInterval[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [toggling, setToggling] = useState<Set<string>>(new Set());
+  const [range, setRange] = useState<Range>("30d");
+
+  const load = useCallback(async (days: number) => {
+    setLoading(true);
+    try {
+      const [habitsRes, journalData, historyData] = await Promise.all([
+        fetch("/api/habits/list").then((r) => r.json()),
+        getHabitJournal(Math.max(days, 365)),
+        getHabitMetadataHistory(),
+      ]);
+      setHabits(habitsRes.habits || []);
+      setJournal(journalData);
+      setHistory(historyData);
+
+      // Sync from Notion (Last Completed + metadata-history diff). The sync
+      // route may insert new history rows on a property change, so refetch
+      // history after it returns.
+      setSyncing(true);
+      const syncRes = await fetch("/api/habits/sync", { method: "POST" });
+      if (syncRes.ok) {
+        const { count } = await syncRes.json();
+        if (count > 0) {
+          const updated = await getHabitJournal(Math.max(days, 365));
+          setJournal(updated);
+        }
+        setHistory(await getHabitMetadataHistory());
+      }
+      setSyncing(false);
+    } catch (e) {
+      console.error(e);
+      setSyncing(false);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(rangeDays(range)); }, [load, range]);
+
+  // Build a set of "habitName|date" for completed entries
+  const completionSet = new Set<string>();
+  journal.forEach((j) => {
+    if (j.answer?.toLowerCase() === "yes") {
+      completionSet.add(`${j.question}|${j.cycle_date}`);
+    }
+  });
+
+  const today = todayStr();
+
+  async function toggleCompletion(habit: NotionHabit, date: string) {
+    if (date > today) return; // never log future dates
+    const key = `${habit.name}|${date}`;
+    const isCompleted = completionSet.has(key);
+    setToggling((prev) => new Set(prev).add(key));
+
+    try {
+      const res = await fetch("/api/habits/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          habit: habit.name,
+          date,
+          category: habit.category,
+          notionPageId: habit.id,
+          undo: isCompleted,
+        }),
+      });
+
+      if (res.ok) {
+        if (isCompleted) {
+          setJournal((prev) =>
+            prev.filter((j) => !(j.question === habit.name && j.cycle_date === date))
+          );
+        } else {
+          setJournal((prev) => [
+            ...prev.filter((j) => !(j.question === habit.name && j.cycle_date === date)),
+            { cycle_date: date, question: habit.name, category: habit.category, answer: "Yes" },
+          ]);
+        }
+      }
+    } catch (e) {
+      console.error("Failed to toggle habit:", e);
+    } finally {
+      setToggling((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="space-y-6">
+        <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          {[...Array(4)].map((_, i) => (
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+              <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
+              <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const requiredHabits = habits.filter((h) => !isAdHocFrequency(h.frequency));
+  const todayCompleted = requiredHabits.filter((h) => completionSet.has(`${h.name}|${today}`)).length;
+  const streaks = habits.map((h) => {
+    const adHoc = isAdHocFrequency(h.frequency);
+    const streak = calculateStreak(h, completionSet, history);
+    const isWeekly = h.frequency === "weekly";
+    return {
+      habit: h,
+      streak,
+      unit: isWeekly ? "weeks" : "days",
+      shortUnit: isWeekly ? "w" : "d",
+      isAdHoc: adHoc,
+      daysSince: adHoc ? daysSinceLastCompletion(h.name, completionSet) : null,
+      // Days-equivalent for cross-frequency comparison (a 4-week weekly streak ≈ 28 days sustained).
+      // Ad hoc habits have rankValue 0 so they never win Longest Streak.
+      rankValue: adHoc ? 0 : (isWeekly ? streak * 7 : streak),
+    };
+  });
+  const longestEntry = streaks.length > 0
+    ? streaks.reduce((best, curr) => (curr.rankValue > best.rankValue ? curr : best))
+    : null;
+  const longestStreak = longestEntry && longestEntry.rankValue > 0 ? longestEntry.streak : 0;
+  const longestUnit = longestEntry && longestEntry.rankValue > 0 ? longestEntry.unit : "days";
+  const bestHabit = longestEntry && longestEntry.rankValue > 0 ? longestEntry.habit : undefined;
+
+  const heatmapDates = getDatesArray(Math.min(rangeDays(range), 365));
+  const rangeStart = heatmapDates[0];
+
+  // Recent metadata changes — surfaced as a small banner so the user knows
+  // KPIs span a period when a habit's Frequency or Category was different.
+  // A change is a non-seed interval starting on/after the visible range
+  // (seed = the EARLIEST interval per pageId, which represents the initial
+  // capture, not a real edit).
+  const recentChanges: Array<{
+    habitName: string;
+    from: string;
+    to: string;
+    field: "frequency" | "category";
+    fromVal: string;
+    toVal: string;
+  }> = [];
+  const habitNameById = new Map(habits.map((h) => [h.id, h.name]));
+  const intervalsByPage = new Map<string, HabitMetadataInterval[]>();
+  history.forEach((row) => {
+    const list = intervalsByPage.get(row.notion_page_id) ?? [];
+    list.push(row);
+    intervalsByPage.set(row.notion_page_id, list);
+  });
+  intervalsByPage.forEach((rows, pageId) => {
+    const sorted = [...rows].sort((a, b) => a.valid_from.localeCompare(b.valid_from));
+    for (let i = 1; i < sorted.length; i++) {
+      const curr = sorted[i];
+      const prev = sorted[i - 1];
+      if (curr.valid_from < rangeStart) continue;
+      if (prev.frequency !== curr.frequency) {
+        recentChanges.push({
+          habitName: habitNameById.get(pageId) ?? pageId.slice(0, 8),
+          from: prev.valid_from,
+          to: curr.valid_from,
+          field: "frequency",
+          fromVal: prev.frequency,
+          toVal: curr.frequency,
+        });
+      }
+      if ((prev.category || "") !== (curr.category || "")) {
+        recentChanges.push({
+          habitName: habitNameById.get(pageId) ?? pageId.slice(0, 8),
+          from: prev.valid_from,
+          to: curr.valid_from,
+          field: "category",
+          fromVal: prev.category || "—",
+          toVal: curr.category || "—",
+        });
+      }
+    }
+  });
+
+  // Per-habit frequency-aware rate aggregator.
+  // daily: 1 slot per day. weekdays: 1 slot per Mon-Fri. weekly: 1 slot per 7-day chunk
+  // (chunked from the END of `dates`; leftover days <7 still get 1 slot so short ranges
+  // don't drop weekly habits entirely). ad hoc: skipped entirely (never expected).
+  function rateOver(dates: string[]): { possible: number; completed: number; rate: number } {
+    let possible = 0;
+    let completed = 0;
+    habits.forEach((h) => {
+      // Skip habits that are ad-hoc TODAY but check per-date frequency below
+      // for the eligibility test. Weekly cadence is anchored to today's
+      // frequency because the 7-day-window concept doesn't translate
+      // mid-stream if the cadence flipped.
+      if (isAdHocFrequency(h.frequency)) return;
+      if (h.frequency === "weekly") {
+        const slots = Math.max(1, Math.floor(dates.length / 7));
+        for (let i = 0; i < slots; i++) {
+          const end = dates.length - i * 7;
+          const start = Math.max(0, end - 7);
+          const slot = dates.slice(start, end);
+          possible++;
+          if (slot.some((d) => completionSet.has(`${h.name}|${d}`))) completed++;
+        }
+        return;
+      }
+      dates.forEach((d) => {
+        const freqOnDate = resolveMetadata(h.id, d, history, h).frequency;
+        if (!isEligibleDay(freqOnDate, d)) return;
+        possible++;
+        if (completionSet.has(`${h.name}|${d}`)) completed++;
+      });
+    });
+    return { possible, completed, rate: possible > 0 ? Math.round((completed / possible) * 100) : 0 };
+  }
+
+  const last7 = getDatesArray(7);
+  const prev7 = getDatesArray(14).slice(0, 7); // days -14..-8
+  const last7Stats = rateOver(last7);
+  const prev7Stats = rateOver(prev7);
+  const completionRate = last7Stats.rate;
+  const completedLast7 = last7Stats.completed;
+  const possibleLast7 = last7Stats.possible;
+  const deltaVsPrior = completionRate - prev7Stats.rate;
+
+  // 7-day rolling completion rate across the active range (for trend chart)
+  const activeRangeDates = heatmapDates;
+  const trendData = activeRangeDates.map((d, idx) => {
+    const window = activeRangeDates.slice(Math.max(0, idx - 6), idx + 1);
+    return { date: formatDate(d), rate: rateOver(window).rate };
+  });
+
+  // Per-category completion rate over the active range. Ad hoc habits don't count
+  // toward any denominator, so they neither add to nor reduce a category's rate.
+  // Categories that contain only ad hoc habits are filtered out below.
+  const categoryAgg: Record<string, { possible: number; completed: number; count: number }> = {};
+  habits.forEach((h) => {
+    if (isAdHocFrequency(h.frequency)) return;
+    // habitCount keyed on current category — the "13 habits in fitness" line
+    // describes the present, not the union of every historical category.
+    const currentCat = h.category || "general";
+    if (!categoryAgg[currentCat]) categoryAgg[currentCat] = { possible: 0, completed: 0, count: 0 };
+    categoryAgg[currentCat].count++;
+
+    activeRangeDates.forEach((d) => {
+      const meta = resolveMetadata(h.id, d, history, h);
+      if (!isEligibleDay(meta.frequency, d)) return;
+      // Use per-date category so a habit that was 'general' last month and
+      // 'fitness' this month contributes to the correct bucket per day.
+      const catOnDate = meta.category || "general";
+      if (!categoryAgg[catOnDate]) categoryAgg[catOnDate] = { possible: 0, completed: 0, count: 0 };
+      categoryAgg[catOnDate].possible++;
+      if (completionSet.has(`${h.name}|${d}`)) categoryAgg[catOnDate].completed++;
+    });
+  });
+  const categoryRates = Object.entries(categoryAgg)
+    .filter(([, m]) => m.possible > 0)
+    .map(([cat, m]) => ({
+      category: cat,
+      rate: Math.round((m.completed / m.possible) * 100),
+      habitCount: m.count,
+      color: CATEGORY_COLORS[cat] || CATEGORY_COLORS.general,
+    }))
+    .sort((a, b) => b.rate - a.rate);
+
+  return (
+    <>
+      <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
+        <div>
+          <h2 className="text-[28px] font-medium text-text-primary">Habits</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">
+            Track daily behaviors and build streaks — {rangeLabel(range)}
+            {syncing && <span className="ml-2 text-accent animate-pulse">syncing from Notion...</span>}
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <RangeFilter value={range} onChange={setRange} />
+          <a
+            href="https://www.notion.so/29cc936fd5e14ae8b10a4fe5c5f7a6cd"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-[6px] hover:bg-white/10 transition-colors"
+          >
+            Manage in Notion
+          </a>
+        </div>
+      </div>
+
+      {recentChanges.length > 0 && (
+        <div className="mb-6 px-3 py-2.5 rounded-[6px] border border-amber-500/30 bg-amber-500/[0.04]">
+          <p className="text-[11px] font-mono uppercase tracking-wider text-amber-300/80 mb-1.5">
+            Metadata changed within this range — rates reflect each day&apos;s in-effect values
+          </p>
+          <ul className="text-[12px] text-text-secondary space-y-0.5">
+            {recentChanges.slice(0, 6).map((c, i) => (
+              <li key={i}>
+                <span className="text-text-primary">{c.habitName}</span>
+                {": "}
+                {c.field} {c.fromVal} → {c.toVal} on {c.to}
+              </li>
+            ))}
+            {recentChanges.length > 6 && (
+              <li className="text-text-tertiary">+{recentChanges.length - 6} more</li>
+            )}
+          </ul>
+        </div>
+      )}
+
+      {/* KPIs */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing label="Today" value={todayCompleted} max={requiredHabits.length || 1} zone
+            centerValue={`${todayCompleted}/${requiredHabits.length}`} sublabel="required habits" size={120} />
+        </div>
+        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+          <MetricRing label="7-Day Rate" value={completionRate} zone centerUnit="%"
+            sublabel={`${completedLast7}/${possibleLast7}`} size={120} />
+        </div>
+        <StatCard label="Longest Streak" value={longestStreak} unit={longestUnit} sublabel={bestHabit?.name} />
+        <StatCard
+          label="vs Prior Week"
+          value={prev7Stats.possible > 0 ? `${deltaVsPrior >= 0 ? "+" : ""}${deltaVsPrior}` : "—"}
+          unit={prev7Stats.possible > 0 ? "%" : undefined}
+          sublabel={prev7Stats.possible > 0 ? `prior 7d was ${prev7Stats.rate}%` : "no prior data"}
+        />
+      </div>
+
+      {/* Today's Checklist */}
+      {habits.length > 0 && (
+        <ChartCard title="Today's Habits" subtitle={new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}>
+          <div className="space-y-1">
+            {habits.map((h) => {
+              const done = completionSet.has(`${h.name}|${today}`);
+              const isToggling = toggling.has(`${h.name}|${today}`);
+              const streak = calculateStreak(h, completionSet, history);
+              const color = CATEGORY_COLORS[h.category] || CATEGORY_COLORS.general;
+
+              return (
+                <HabitRow
+                  key={h.id}
+                  habit={h}
+                  done={done}
+                  isToggling={isToggling}
+                  streak={streak}
+                  color={color}
+                  today={today}
+                  onToggle={(d) => toggleCompletion(h, d)}
+                />
+              );
+            })}
+          </div>
+        </ChartCard>
+      )}
+
+      {/* Completion-rate trend */}
+      {habits.length > 0 && (
+        <ChartCard
+          title="7-Day Rolling Completion Rate"
+          subtitle={`Across ${rangeLabel(range)} — frequency-aware denominator`}
+          className="mt-6"
+        >
+          <ResponsiveContainer width="100%" height={240}>
+            <AreaChart data={trendData}>
+              <defs>
+                <linearGradient id="habitRateGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={C.accent} stopOpacity={0.2} />
+                  <stop offset="95%" stopColor={C.accent} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <YAxis tick={axisTick} width={40} domain={[0, 100]} unit="%" />
+              <Tooltip {...chartTooltip} />
+              <Area
+                type="monotone"
+                dataKey="rate"
+                stroke={C.accent}
+                strokeWidth={2}
+                fill="url(#habitRateGrad)"
+                name="Completion %"
+                connectNulls={false}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        </ChartCard>
+      )}
+
+      {/* Per-category breakdown */}
+      {habits.length > 0 && categoryRates.length > 0 && (
+        <ChartCard
+          title="By Category"
+          subtitle={`Completion rate across ${rangeLabel(range)}`}
+          className="mt-6"
+        >
+          <div className="space-y-2.5">
+            {categoryRates.map(({ category, rate, habitCount, color }) => (
+              <div key={category} className="flex items-center gap-3">
+                <div className="w-28 shrink-0 flex items-center gap-2">
+                  <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: color }} />
+                  <span className="text-[12px] text-text-secondary capitalize truncate">{category}</span>
+                </div>
+                <div className="flex-1 h-2.5 bg-white/5 rounded-full overflow-hidden">
+                  <div
+                    className="h-full rounded-full transition-all"
+                    style={{ width: `${rate}%`, backgroundColor: color }}
+                  />
+                </div>
+                <span className="text-[12px] font-mono tabular-nums text-text-primary w-12 text-right">
+                  {rate}%
+                </span>
+                <span className="text-[10px] font-mono text-text-tertiary w-16 text-right">
+                  {habitCount} habit{habitCount === 1 ? "" : "s"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </ChartCard>
+      )}
+
+      {/* Heatmap */}
+      {habits.length > 0 && (
+        <ChartCard title={`Heatmap — ${rangeLabel(range)}`} className="mt-6">
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr>
+                  <th className="text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal pr-3 py-1 sticky left-0 bg-surface-card min-w-[140px] align-bottom">
+                    Habit
+                  </th>
+                  {heatmapDates.map((d) => {
+                    const [, m, day] = d.split("-");
+                    return (
+                      <th key={d} className="text-text-tertiary text-[10px] font-mono font-normal px-0.5 pb-1 min-w-[28px] align-bottom">
+                        <span className="block whitespace-nowrap leading-tight tabular-nums">
+                          {Number(m)}/{Number(day)}
+                        </span>
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {habits.map((h) => {
+                  const color = CATEGORY_COLORS[h.category] || CATEGORY_COLORS.general;
+                  return (
+                    <tr key={h.id} className="border-b border-white/5 hover:bg-white/[0.02]">
+                      <td className="text-text-secondary pr-3 py-1 sticky left-0 bg-surface-card truncate max-w-[160px]" title={h.name}>
+                        {h.name}
+                      </td>
+                      {heatmapDates.map((d) => {
+                        const done = completionSet.has(`${h.name}|${d}`);
+                        const isFuture = d > today;
+                        const cellToggling = toggling.has(`${h.name}|${d}`);
+                        return (
+                          <td key={d} className="px-0.5 py-1 text-center">
+                            <button
+                              onClick={() => toggleCompletion(h, d)}
+                              disabled={isFuture || cellToggling}
+                              className={`w-5 h-5 rounded-sm mx-auto block transition-all ${
+                                isFuture
+                                  ? "cursor-not-allowed"
+                                  : "hover:ring-1 hover:ring-white/30 cursor-pointer"
+                              } ${cellToggling ? "opacity-50" : ""}`}
+                              style={{ backgroundColor: done ? `${color}cc` : "rgba(255,255,255,0.03)" }}
+                              title={`${h.name}: ${d} — ${done ? "Done (click to undo)" : isFuture ? "Future" : "Click to log"}`}
+                              aria-label={`Toggle ${h.name} for ${d}`}
+                            />
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </ChartCard>
+      )}
+
+      {/* Streaks */}
+      {habits.length > 0 && (
+        <ChartCard title="Current Streaks" className="mt-6">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+            {streaks
+              .slice()
+              .sort((a, b) => {
+                // Ad hoc habits sort to the bottom, then by recency (more recent first; never = last).
+                if (a.isAdHoc !== b.isAdHoc) return a.isAdHoc ? 1 : -1;
+                if (a.isAdHoc && b.isAdHoc) {
+                  const ax = a.daysSince ?? Infinity;
+                  const bx = b.daysSince ?? Infinity;
+                  return ax - bx;
+                }
+                return b.rankValue - a.rankValue;
+              })
+              .map(({ habit, streak, unit, rankValue, isAdHoc, daysSince }) => {
+                const color = CATEGORY_COLORS[habit.category] || CATEGORY_COLORS.general;
+                const unitSingular = unit === "weeks" ? "week" : "day";
+                let label: string;
+                if (isAdHoc) {
+                  if (daysSince === null) label = "never logged";
+                  else if (daysSince === 0) label = "logged today";
+                  else if (daysSince === 1) label = "1 day ago";
+                  else label = `${daysSince} days ago`;
+                } else {
+                  label = streak > 0 ? `${streak} ${unitSingular}${streak !== 1 ? "s" : ""}` : "No streak";
+                }
+                return (
+                  <div key={habit.id} className="flex items-center gap-3 px-3 py-2.5 rounded-[4px] bg-white/[0.02]">
+                    <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: color }} />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-text-primary font-medium truncate">
+                        {habit.name}
+                        {isAdHoc && (
+                          <span className="ml-1.5 text-[9px] font-mono uppercase tracking-wider text-text-tertiary/70">
+                            ad hoc
+                          </span>
+                        )}
+                      </p>
+                      <p className="text-[11px] font-mono" style={{ color: isAdHoc ? "var(--color-text-tertiary)" : color }}>
+                        {label}
+                      </p>
+                    </div>
+                    {!isAdHoc && (
+                      <div className="w-12 h-2 bg-white/5 rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all"
+                          style={{ width: `${Math.min(100, (rankValue / 30) * 100)}%`, backgroundColor: color }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+          </div>
+        </ChartCard>
+      )}
+
+      {/* Scoring legend */}
+      {habits.length > 0 && (
+        <ChartCard title="How rates & streaks are scored" className="mt-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-3 text-[12px] leading-relaxed">
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">daily</span>
+              <span className="text-text-tertiary">
+                Counts every day. Streak resets if you miss a day (today is grace).
+              </span>
+            </div>
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">weekdays</span>
+              <span className="text-text-tertiary">
+                Counts Mon–Fri only; weekends are skipped. Streak resets if you miss a weekday.
+              </span>
+            </div>
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">weekly</span>
+              <span className="text-text-tertiary">
+                Done at least once in any 7-day window = 100% for that window. Streak resets if you skip a whole week.
+              </span>
+            </div>
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">Ad Hoc</span>
+              <span className="text-text-tertiary">
+                Never required. Excluded from every rate. Shown with recency only (&ldquo;3 days ago&rdquo;).
+              </span>
+            </div>
+          </div>
+          <p className="text-[11px] text-text-tertiary/70 mt-4 pt-3 border-t border-border-subtle">
+            Frequency is set per habit in Notion. Longest Streak compares across frequencies by days-equivalent (a weekly streak counts as 7 days per week kept).
+          </p>
+        </ChartCard>
+      )}
+
+      {habits.length === 0 && (
+        <div className="text-center py-20">
+          <p className="text-text-secondary text-sm mb-3">No active habits found.</p>
+          <a
+            href="https://www.notion.so/29cc936fd5e14ae8b10a4fe5c5f7a6cd"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-accent text-sm hover:underline"
+          >
+            Add habits in Notion
+          </a>
+        </div>
+      )}
+    </>
+  );
+}
+
+interface HabitRowProps {
+  habit: NotionHabit;
+  done: boolean;
+  isToggling: boolean;
+  streak: number;
+  color: string;
+  today: string;
+  onToggle: (date: string) => void;
+}
+
+function HabitRow({ habit, done, isToggling, streak, color, today, onToggle }: HabitRowProps) {
+  const dateInputRef = useRef<HTMLInputElement>(null);
+
+  function openDatePicker(e: React.MouseEvent) {
+    e.stopPropagation();
+    const input = dateInputRef.current;
+    if (!input) return;
+    if (typeof input.showPicker === "function") {
+      input.showPicker();
+    } else {
+      input.focus();
+      input.click();
+    }
+  }
+
+  function onDateChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const picked = e.target.value;
+    if (picked && picked <= today) onToggle(picked);
+    e.target.value = "";
+  }
+
+  return (
+    <div
+      className={`w-full flex items-center gap-3 px-4 py-3 rounded-[4px] transition-all group ${
+        done ? "bg-white/[0.03]" : "hover:bg-white/[0.03]"
+      } ${isToggling ? "opacity-50" : ""}`}
+    >
+      <button
+        onClick={() => onToggle(today)}
+        disabled={isToggling}
+        className="flex items-center gap-3 flex-1 text-left min-w-0"
+        aria-label={`Toggle ${habit.name} for today`}
+      >
+        <div
+          className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all shrink-0 ${
+            done ? "border-transparent" : "border-white/20 group-hover:border-white/40"
+          }`}
+          style={done ? { backgroundColor: color } : {}}
+        >
+          {done && (
+            <svg className="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+            </svg>
+          )}
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <span className={`text-sm font-medium transition-colors ${done ? "text-text-tertiary line-through" : "text-text-primary"}`}>
+            {habit.name}
+          </span>
+        </div>
+      </button>
+
+      {streak > 0 && (
+        <span
+          className="text-[11px] font-mono font-medium px-2 py-0.5 rounded-full"
+          style={{ backgroundColor: `${color}20`, color }}
+        >
+          {streak}{habit.frequency === "weekly" ? "w" : "d"} streak
+        </span>
+      )}
+
+      <span className="text-[10px] font-mono text-text-tertiary/60 uppercase tracking-wider hidden sm:inline">
+        {habit.category}
+      </span>
+
+      <button
+        onClick={openDatePicker}
+        className="relative p-1.5 rounded-[4px] text-text-tertiary hover:text-text-primary hover:bg-white/5 transition-colors"
+        title="Log on a past date"
+        aria-label={`Backdate ${habit.name}`}
+      >
+        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+        </svg>
+        <input
+          ref={dateInputRef}
+          type="date"
+          max={today}
+          onChange={onDateChange}
+          className="absolute inset-0 opacity-0 pointer-events-none"
+          tabIndex={-1}
+          aria-hidden="true"
+        />
+      </button>
+    </div>
+  );
+}

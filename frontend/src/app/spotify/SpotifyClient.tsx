@@ -1,0 +1,1141 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import {
+  LineChart, Line, BarChart, Bar, AreaChart, Area,
+  RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
+  XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
+} from "recharts";
+import ChartCard from "@/components/ChartCard";
+import StatCard from "@/components/StatCard";
+import RangeFilter from "@/components/RangeFilter";
+import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel, chartColors as C } from "@/lib/chart-theme";
+import {
+  getSpotifyDashboard,
+  getSpotifyDailyVolume,
+  getSpotifyAudioFeatureDrift,
+  getSpotifyLedger,
+  rangeLabel,
+  type SpotifyDailySignatureRow,
+  type SpotifyLedgerRow,
+  type SpotifyRange,
+} from "@/lib/queries";
+
+const LEDGER_PER_PAGE = 50;
+
+const GENRE_PALETTE = [
+  C.source.spotify, // spotify green
+  C.source.whoop, // amber (valence)
+  C.accent, // cyan (energy)
+  C.source.eightsleep, // purple (danceability)
+  C.categorical[4], // pink
+  C.up, // emerald
+  C.source.whoop, // orange
+  C.source.garmin, // blue
+];
+
+function applyRollingMean<T extends object>(
+  rows: T[],
+  keys: (keyof T & string)[],
+  window: number = 7,
+): T[] {
+  if (rows.length < 2) return rows;
+  const w = Math.min(window, rows.length);
+  return rows.map((row, i) => {
+    const start = Math.max(0, i - w + 1);
+    const slice = rows.slice(start, i + 1);
+    const smoothed = { ...row } as Record<string, unknown>;
+    for (const k of keys) {
+      let sum = 0;
+      let n = 0;
+      for (const r of slice) {
+        const v = (r as Record<string, unknown>)[k];
+        if (typeof v === "number" && !Number.isNaN(v)) {
+          sum += v;
+          n += 1;
+        }
+      }
+      smoothed[k] = n > 0 ? sum / n : null;
+    }
+    return smoothed as T;
+  });
+}
+
+const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
+
+const spotifyGreen = C.source.spotify;
+
+type Dashboard = Awaited<ReturnType<typeof getSpotifyDashboard>>;
+type Kpis = Dashboard["kpis"];
+type TopArtists = Dashboard["topArtists"];
+type TopTracks = Dashboard["topTracks"];
+type HourBuckets = Dashboard["hours"];
+type SonicProfile = Dashboard["sonic"];
+type TopGenres = Dashboard["topGenres"];
+type FeatureDrift = Awaited<ReturnType<typeof getSpotifyAudioFeatureDrift>>;
+type GenreRotation = Dashboard["genreRotation"];
+type DiscoveryRate = Dashboard["discovery"];
+
+function defaultPlaylistName(): string {
+  const fmt = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" });
+  return `Onyx — Top tracks ${fmt.format(new Date())}`;
+}
+
+const VIBE_PRESETS = [
+  "Chill",
+  "Focus",
+  "Workout",
+  "Late night",
+  "Upbeat",
+  "Melancholic",
+  "Driving",
+] as const;
+
+const SOURCE_POOLS = [
+  { value: "mix", label: "Mix", desc: "Both history + catalog" },
+  { value: "history", label: "History", desc: "Tracks you've played" },
+  { value: "discovery", label: "Discovery", desc: "New from catalog" },
+] as const;
+
+type SourcePool = (typeof SOURCE_POOLS)[number]["value"];
+
+const ERAS = ["Any", "2020s", "2010s", "2000s", "1990s", "1980s"] as const;
+
+interface GenResult {
+  playlist_id: string;
+  spotify_url: string;
+  name: string;
+  track_count: number;
+}
+
+interface GenLogEntry {
+  kind: "status" | "tool_use" | "tool_result" | "message";
+  text: string;
+}
+
+function chipClass(active: boolean, disabled = false): string {
+  const base =
+    "px-2.5 py-1 text-[11px] font-mono rounded-[4px] border transition-colors whitespace-nowrap";
+  if (disabled) return `${base} opacity-40 cursor-not-allowed border-border-subtle text-text-tertiary`;
+  if (active) return `${base} bg-source-spotify/25 border-source-spotify/50 text-text-primary`;
+  return `${base} bg-black/20 border-border-subtle text-text-secondary hover:border-source-spotify/40 hover:text-text-primary`;
+}
+
+export default function SpotifyPage() {
+  const [kpis, setKpis] = useState<Kpis | null>(null);
+  const [volume, setVolume] = useState<SpotifyDailySignatureRow[]>([]);
+  const [drift, setDrift] = useState<FeatureDrift>([]);
+  const [genreRotation, setGenreRotation] = useState<GenreRotation>({ rows: [], topGenres: [] });
+  const [discovery, setDiscovery] = useState<DiscoveryRate>([]);
+  const [topArtists, setTopArtists] = useState<TopArtists>([]);
+  const [topTracks, setTopTracks] = useState<TopTracks>([]);
+  const [hours, setHours] = useState<HourBuckets>([]);
+  const [sonic, setSonic] = useState<SonicProfile>(null);
+  const [genres, setGenres] = useState<TopGenres>([]);
+  const [loading, setLoading] = useState(true);
+  const [range, setRange] = useState<SpotifyRange>("30d");
+
+  // Ledger pagination is separate from the main page fetch so paging through
+  // doesn't re-load the charts.
+  const [ledgerPage, setLedgerPage] = useState(0);
+  const [ledger, setLedger] = useState<SpotifyLedgerRow[]>([]);
+  const [ledgerTotal, setLedgerTotal] = useState(0);
+  const [ledgerLoading, setLedgerLoading] = useState(true);
+
+  // Create-playlist modal state (existing: top-tracks one-click flow)
+  const [modalOpen, setModalOpen] = useState(false);
+  const [playlistName, setPlaylistName] = useState(defaultPlaylistName());
+  const [playlistDesc, setPlaylistDesc] = useState("Created from Onyx — most-played tracks from the last 30 days.");
+  const [creating, setCreating] = useState(false);
+  const [createResult, setCreateResult] = useState<{ spotify_url: string; name: string; track_count: number } | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
+
+  // Generate-playlist modal state (new: prompt-driven, agentic, streamed)
+  const [genOpen, setGenOpen] = useState(false);
+  const [genPrompt, setGenPrompt] = useState("");
+  const [genVibes, setGenVibes] = useState<string[]>([]);
+  const [genSource, setGenSource] = useState<SourcePool>("mix");
+  const [genEra, setGenEra] = useState<string>("Any");
+  const [genGenres, setGenGenres] = useState<string[]>([]);
+  const [genCustomGenre, setGenCustomGenre] = useState("");
+  const [genRunning, setGenRunning] = useState(false);
+  const [genLog, setGenLog] = useState<GenLogEntry[]>([]);
+  const [genResult, setGenResult] = useState<GenResult | null>(null);
+  const [genError, setGenError] = useState<string | null>(null);
+  const logBottomRef = useRef<HTMLDivElement | null>(null);
+
+  async function submitCreatePlaylist() {
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const trackIds = topTracks.map((t) => t.track_id).filter(Boolean);
+      const resp = await fetch("/api/spotify/create-playlist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: playlistName,
+          description: playlistDesc,
+          track_ids: trackIds,
+          public: false,
+          created_via: "button",
+        }),
+      });
+      const json = await resp.json();
+      if (!resp.ok) throw new Error(json.error ?? `HTTP ${resp.status}`);
+      setCreateResult(json);
+    } catch (e) {
+      setCreateError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  function closeModal() {
+    setModalOpen(false);
+    setCreateResult(null);
+    setCreateError(null);
+    // Reset name to a fresh default for next time
+    setPlaylistName(defaultPlaylistName());
+  }
+
+  function closeGen() {
+    if (genRunning) return;
+    setGenOpen(false);
+    setGenResult(null);
+    setGenError(null);
+    setGenLog([]);
+  }
+
+  function toggleVibe(v: string) {
+    setGenVibes((prev) => (prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v]));
+  }
+
+  function toggleGenre(g: string) {
+    setGenGenres((prev) => (prev.includes(g) ? prev.filter((x) => x !== g) : [...prev, g]));
+  }
+
+  function addCustomGenre() {
+    const g = genCustomGenre.trim().toLowerCase();
+    if (!g) return;
+    if (!genGenres.includes(g)) setGenGenres((prev) => [...prev, g]);
+    setGenCustomGenre("");
+  }
+
+  async function submitGenerate() {
+    setGenRunning(true);
+    setGenLog([]);
+    setGenResult(null);
+    setGenError(null);
+
+    try {
+      const resp = await fetch("/api/spotify/generate-playlist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: genPrompt,
+          vibes: genVibes,
+          source_pool: genSource,
+          era: genEra === "Any" ? null : genEra,
+          genres: genGenres,
+        }),
+      });
+
+      if (!resp.ok || !resp.body) {
+        const txt = await resp.text().catch(() => "");
+        throw new Error(txt || `HTTP ${resp.status}`);
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE events delimited by blank lines
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith("data:")) continue;
+          const json = line.slice(5).trim();
+          if (!json) continue;
+          try {
+            handleSseEvent(JSON.parse(json));
+          } catch (err) {
+            console.error("SSE parse error:", err, json);
+          }
+        }
+      }
+    } catch (e) {
+      setGenError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGenRunning(false);
+    }
+  }
+
+  function handleSseEvent(evt: { type: string; [k: string]: unknown }) {
+    if (evt.type === "status") {
+      setGenLog((prev) => [...prev, { kind: "status", text: String(evt.message ?? "") }]);
+    } else if (evt.type === "tool_use") {
+      setGenLog((prev) => [...prev, { kind: "tool_use", text: `→ ${String(evt.tool ?? "tool")}` }]);
+    } else if (evt.type === "tool_result") {
+      setGenLog((prev) => [...prev, { kind: "tool_result", text: String(evt.summary ?? "") }]);
+    } else if (evt.type === "message") {
+      setGenLog((prev) => [...prev, { kind: "message", text: String(evt.text ?? "") }]);
+    } else if (evt.type === "done") {
+      setGenResult(evt.result as GenResult);
+    } else if (evt.type === "error") {
+      setGenError(String(evt.message ?? "Unknown error"));
+    }
+  }
+
+  useEffect(() => {
+    if (logBottomRef.current) {
+      logBottomRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
+  }, [genLog, genRunning, genResult, genError]);
+
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([
+      // One shared fetch of the range's plays + artist genres + track
+      // features, computing all 8 aggregates — replaces 8 independent
+      // spotify_plays scans (see getSpotifyDashboard in lib/queries.ts).
+      getSpotifyDashboard(range),
+      getSpotifyDailyVolume(range),
+      getSpotifyAudioFeatureDrift(range),
+    ])
+      .then(([dash, v, d]) => {
+        setKpis(dash.kpis);
+        setVolume(v);
+        setDrift(d);
+        setGenreRotation(dash.genreRotation);
+        setDiscovery(dash.discovery);
+        setTopArtists(dash.topArtists);
+        setTopTracks(dash.topTracks);
+        setHours(dash.hours);
+        setSonic(dash.sonic);
+        setGenres(dash.topGenres);
+      })
+      .catch((err) => console.error("Spotify page load:", err))
+      .finally(() => setLoading(false));
+    // Reset ledger to page 0 whenever the range changes
+    setLedgerPage(0);
+  }, [range]);
+
+  useEffect(() => {
+    setLedgerLoading(true);
+    getSpotifyLedger(range, ledgerPage, LEDGER_PER_PAGE)
+      .then(({ rows, totalCount }) => {
+        setLedger(rows);
+        setLedgerTotal(totalCount);
+      })
+      .catch((err) => console.error("Spotify ledger:", err))
+      .finally(() => setLedgerLoading(false));
+  }, [range, ledgerPage]);
+
+  const hasData = (kpis?.totalPlays ?? 0) > 0;
+
+  return (
+    <div className="space-y-6">
+      <header className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-[20px] font-medium text-text-primary tracking-tight">Spotify</h1>
+          <p className="text-[12px] text-text-tertiary mt-0.5">
+            Listening behavior — {rangeLabel(range)}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            onClick={() => setGenOpen(true)}
+            className="px-3 py-1.5 text-[11px] font-mono font-medium tracking-wide text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-[4px] transition-colors whitespace-nowrap"
+          >
+            Generate playlist
+          </button>
+          <RangeFilter value={range} onChange={setRange} accent={spotifyGreen} />
+        </div>
+      </header>
+
+      <p className="text-[11px] text-text-tertiary leading-relaxed border-l-2 border-source-spotify/30 pl-3">
+        <span className="text-text-secondary">Coverage note:</span> Only plays that Spotify&apos;s
+        backend knows about appear here. Offline playback from Spotify-licensed partner devices
+        (Garmin watches, some car head units, older standalone wearables) isn&apos;t reported to
+        the API and won&apos;t show up — even after the device reconnects. If you listen heavily
+        on Garmin during workouts, this dashboard under-counts that listening.
+      </p>
+
+      {modalOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={closeModal}
+        >
+          <div
+            className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card p-5 w-full max-w-md"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {!createResult && (
+              <>
+                <h2 className="text-[15px] font-medium text-text-primary mb-1">Create Spotify playlist</h2>
+                <p className="text-[11px] text-text-tertiary mb-2">
+                  {topTracks.length} tracks · private · added to your Spotify account
+                </p>
+                <p className="text-[10px] text-amber-300/80 mb-4 leading-relaxed">
+                  Heads up: Spotify Dev-mode apps ignore the private flag — the
+                  playlist may land Public. Toggle to private in the Spotify
+                  app if needed. (Server logs warn when this happens.)
+                </p>
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">Name</label>
+                <input
+                  type="text"
+                  value={playlistName}
+                  onChange={(e) => setPlaylistName(e.target.value)}
+                  className="w-full mb-3 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors"
+                  disabled={creating}
+                />
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">Description</label>
+                <textarea
+                  value={playlistDesc}
+                  onChange={(e) => setPlaylistDesc(e.target.value)}
+                  rows={3}
+                  className="w-full mb-3 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors resize-none"
+                  disabled={creating}
+                />
+                {createError && (
+                  <p className="text-[11px] text-red-400 font-mono mb-3 break-all">{createError}</p>
+                )}
+                <div className="flex gap-2 justify-end">
+                  <button
+                    onClick={closeModal}
+                    disabled={creating}
+                    className="px-3 py-2 text-[12px] text-text-secondary hover:text-text-primary disabled:opacity-40 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={submitCreatePlaylist}
+                    disabled={creating || !playlistName.trim()}
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/40 rounded-[4px] transition-colors"
+                  >
+                    {creating ? "Creating…" : "Create"}
+                  </button>
+                </div>
+              </>
+            )}
+            {createResult && (
+              <>
+                <h2 className="text-[15px] font-medium text-text-primary mb-1">Playlist created</h2>
+                <p className="text-[12px] text-text-secondary mb-1 break-words">{createResult.name}</p>
+                <p className="text-[11px] text-text-tertiary font-mono mb-4">
+                  {createResult.track_count} tracks · private
+                </p>
+                <div className="flex gap-2 justify-end">
+                  <button
+                    onClick={closeModal}
+                    className="px-3 py-2 text-[12px] text-text-secondary hover:text-text-primary transition-colors"
+                  >
+                    Close
+                  </button>
+                  <a
+                    href={createResult.spotify_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-[4px] transition-colors"
+                  >
+                    Open in Spotify
+                  </a>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {genOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={closeGen}
+        >
+          <div
+            className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card p-5 w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {!genResult && (
+              <>
+                <h2 className="text-[15px] font-medium text-text-primary mb-1">Generate playlist</h2>
+                <p className="text-[11px] text-text-tertiary mb-2">
+                  Free-text prompt + structured constraints. Claude picks tracks and creates the playlist in your Spotify account.
+                </p>
+                <p className="text-[10px] text-amber-300/80 mb-4 leading-relaxed">
+                  Heads up: Spotify Dev-mode apps ignore the private flag — the
+                  playlist may land Public. Toggle to private in the Spotify
+                  app if needed.
+                </p>
+
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
+                  Prompt
+                </label>
+                <textarea
+                  value={genPrompt}
+                  onChange={(e) => setGenPrompt(e.target.value)}
+                  rows={3}
+                  placeholder="e.g. Late-night drive through the rain, heavy on synths and slow burn. Mostly instrumental."
+                  className="w-full mb-4 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors resize-none"
+                  disabled={genRunning}
+                />
+
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1.5">
+                  Source pool
+                </label>
+                <div className="flex gap-2 mb-4 flex-wrap">
+                  {SOURCE_POOLS.map((s) => (
+                    <button
+                      key={s.value}
+                      onClick={() => setGenSource(s.value)}
+                      disabled={genRunning}
+                      title={s.desc}
+                      className={chipClass(genSource === s.value, genRunning)}
+                    >
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1.5">
+                  Vibe <span className="text-text-tertiary/60 normal-case">(multi-select)</span>
+                </label>
+                <div className="flex gap-2 mb-4 flex-wrap">
+                  {VIBE_PRESETS.map((v) => (
+                    <button
+                      key={v}
+                      onClick={() => toggleVibe(v)}
+                      disabled={genRunning}
+                      className={chipClass(genVibes.includes(v), genRunning)}
+                    >
+                      {v}
+                    </button>
+                  ))}
+                </div>
+
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1.5">
+                  Era
+                </label>
+                <div className="flex gap-2 mb-4 flex-wrap">
+                  {ERAS.map((e) => (
+                    <button
+                      key={e}
+                      onClick={() => setGenEra(e)}
+                      disabled={genRunning}
+                      className={chipClass(genEra === e, genRunning)}
+                    >
+                      {e}
+                    </button>
+                  ))}
+                </div>
+
+                <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1.5">
+                  Genres <span className="text-text-tertiary/60 normal-case">
+                    (from your top {rangeLabel(range)} — click to bias selection)
+                  </span>
+                </label>
+                <div className="flex gap-2 mb-2 flex-wrap">
+                  {genres.slice(0, 12).map((g) => (
+                    <button
+                      key={g.genre}
+                      onClick={() => toggleGenre(g.genre)}
+                      disabled={genRunning}
+                      className={chipClass(genGenres.includes(g.genre), genRunning)}
+                    >
+                      {g.genre}
+                    </button>
+                  ))}
+                  {genres.length === 0 && (
+                    <p className="text-[11px] text-text-tertiary font-mono">No top genres yet.</p>
+                  )}
+                </div>
+                <div className="flex gap-2 mb-4">
+                  <input
+                    type="text"
+                    value={genCustomGenre}
+                    onChange={(e) => setGenCustomGenre(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        addCustomGenre();
+                      }
+                    }}
+                    placeholder="Add custom genre (e.g. ambient)"
+                    disabled={genRunning}
+                    className="flex-1 px-3 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors"
+                  />
+                  <button
+                    onClick={addCustomGenre}
+                    disabled={genRunning || !genCustomGenre.trim()}
+                    className="px-3 py-1.5 text-[11px] font-mono text-text-secondary hover:text-text-primary border border-border-subtle rounded-[4px] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                  >
+                    Add
+                  </button>
+                </div>
+                {genGenres.length > 0 && (
+                  <div className="flex gap-1.5 mb-4 flex-wrap">
+                    <span className="text-[10px] font-mono text-text-tertiary self-center">selected:</span>
+                    {genGenres.map((g) => (
+                      <button
+                        key={g}
+                        onClick={() => toggleGenre(g)}
+                        disabled={genRunning}
+                        className="px-2 py-0.5 text-[10px] font-mono bg-source-spotify/15 border border-source-spotify/30 rounded-[3px] text-text-primary hover:bg-source-spotify/25 disabled:opacity-40"
+                      >
+                        {g} ×
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                <p className="text-[10px] text-text-tertiary leading-relaxed border-l-2 border-amber-500/40 pl-2 mb-4">
+                  Playlists are requested private — Spotify&apos;s Dev-mode API may still publish them
+                  as Public; toggle to Private from the Spotify app if needed.
+                </p>
+
+                {genError && (
+                  <p className="text-[11px] text-red-400 font-mono mb-3 break-all">{genError}</p>
+                )}
+
+                <div className="flex gap-2 justify-end">
+                  <button
+                    onClick={closeGen}
+                    disabled={genRunning}
+                    className="px-3 py-2 text-[12px] text-text-secondary hover:text-text-primary disabled:opacity-40 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={submitGenerate}
+                    disabled={
+                      genRunning ||
+                      (!genPrompt.trim() && genVibes.length === 0 && genGenres.length === 0)
+                    }
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/40 rounded-[4px] transition-colors"
+                  >
+                    {genRunning ? "Generating…" : "Generate"}
+                  </button>
+                </div>
+
+                {(genRunning || genLog.length > 0) && (
+                  <div className="mt-4 border-t border-border-subtle pt-3">
+                    <p className="text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-2">
+                      Progress
+                    </p>
+                    <div className="bg-black/30 border border-border-subtle rounded-[4px] p-2.5 max-h-40 overflow-y-auto space-y-1">
+                      {genLog.map((entry, i) => (
+                        <div
+                          key={i}
+                          className={`text-[11px] font-mono leading-relaxed ${
+                            entry.kind === "status"
+                              ? "text-text-tertiary"
+                              : entry.kind === "tool_use"
+                              ? "text-source-spotify/80"
+                              : entry.kind === "tool_result"
+                              ? "text-text-secondary"
+                              : "text-text-primary"
+                          }`}
+                        >
+                          {entry.text}
+                        </div>
+                      ))}
+                      {genRunning && (
+                        <div className="text-[11px] font-mono text-text-tertiary animate-pulse">…</div>
+                      )}
+                      <div ref={logBottomRef} />
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+
+            {genResult && (
+              <>
+                <h2 className="text-[15px] font-medium text-text-primary mb-1">Playlist created</h2>
+                <p className="text-[12px] text-text-secondary mb-1 break-words">{genResult.name}</p>
+                <p className="text-[11px] text-text-tertiary font-mono mb-4">
+                  {genResult.track_count} tracks
+                </p>
+                {genLog.length > 0 && (
+                  <div className="mb-4 bg-black/30 border border-border-subtle rounded-[4px] p-2.5 max-h-32 overflow-y-auto space-y-1">
+                    {genLog
+                      .filter((e) => e.kind === "message" || e.kind === "tool_result")
+                      .map((entry, i) => (
+                        <div
+                          key={i}
+                          className={`text-[11px] font-mono leading-relaxed ${
+                            entry.kind === "message" ? "text-text-primary" : "text-text-secondary"
+                          }`}
+                        >
+                          {entry.text}
+                        </div>
+                      ))}
+                  </div>
+                )}
+                <div className="flex gap-2 justify-end">
+                  <button
+                    onClick={closeGen}
+                    className="px-3 py-2 text-[12px] text-text-secondary hover:text-text-primary transition-colors"
+                  >
+                    Close
+                  </button>
+                  <a
+                    href={genResult.spotify_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-[4px] transition-colors"
+                  >
+                    Open in Spotify
+                  </a>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {loading && (
+        <p className="text-[12px] text-text-tertiary font-mono">Loading…</p>
+      )}
+
+      {!loading && !hasData && (
+        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-8 text-center">
+          <p className="text-[13px] text-text-secondary">No Spotify plays in the database yet.</p>
+          <p className="text-[11px] text-text-tertiary mt-2 font-mono">
+            Run the OAuth bootstrap: <code>python spotify_etl.py --auth</code>
+          </p>
+          <p className="text-[11px] text-text-tertiary mt-1 font-mono">
+            Then: <code>python ci_token_helper.py upload spotify</code>, then <code>python spotify_etl.py</code>
+          </p>
+        </div>
+      )}
+
+      {!loading && hasData && (
+        <>
+          {/* KPI Row */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <StatCard label="Plays" value={kpis!.totalPlays} sublabel={rangeLabel(range)} />
+            <StatCard
+              label="Listening"
+              value={kpis!.totalHours.toFixed(1)}
+              unit="hrs"
+              sublabel={rangeLabel(range)}
+            />
+            <StatCard
+              label="Unique Tracks"
+              value={kpis!.uniqueTracks}
+              sublabel={`${kpis!.uniqueArtists} artists`}
+            />
+            <StatCard
+              label="Top Track"
+              value={kpis!.topTrack ? `${kpis!.topTrack.count}×` : "—"}
+              sublabel={
+                kpis!.topTrack
+                  ? `${kpis!.topTrack.name ?? "—"} · ${kpis!.topTrack.artist ?? "—"}`
+                  : undefined
+              }
+            />
+          </div>
+
+          {/* Listening volume over time */}
+          <ChartCard
+            title="Listening volume"
+            subtitle={`plays per day, ${rangeLabel(range)}`}
+            source="SPOTIFY"
+          >
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart data={volume} margin={{ top: 8, right: 8, left: 4, bottom: 0 }}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="calendar_date" tick={axisTick} tickFormatter={(v) => v.slice(5)} />
+                <YAxis tick={axisTick} width={50} label={axisLabel("plays", "y")} />
+                <Tooltip {...chartTooltip} />
+                <Line
+                  type="monotone"
+                  dataKey="play_count"
+                  stroke={spotifyGreen}
+                  strokeWidth={1.5}
+                  dot={false}
+                  name="plays"
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartCard>
+
+          {/* Taste evolution — three trend charts */}
+          <section className="space-y-4">
+            <div className="border-l-2 border-source-spotify/40 pl-3">
+              <h2 className="text-[14px] font-medium text-text-primary">Taste evolution</h2>
+              <p className="text-[11px] text-text-tertiary mt-0.5">
+                How your listening has changed across {rangeLabel(range)}. Each chart is smoothed
+                with a 7-day rolling mean (where the range is long enough) so daily noise doesn&apos;t
+                drown out the trend.
+              </p>
+            </div>
+
+            {/* Sound evolution — audio feature drift */}
+            <ChartCard
+              title="Sound evolution"
+              subtitle={`7 audio features over time — ${rangeLabel(range)}`}
+              source="RECCOBEATS"
+              info="Daily mean of each feature, smoothed with a 7-day right-aligned rolling mean. All features are normalized 0–1. Days with no featurized plays are dropped before smoothing so gaps don't pull the line. Rising acousticness + falling energy is the classic 'going introspective' signature; rising danceability + speechiness leans into hip-hop / dance territory."
+            >
+              {drift.length === 0 ? (
+                <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
+                  No featurized plays in this range.
+                </p>
+              ) : (
+                <ResponsiveContainer width="100%" height={300}>
+                  <LineChart
+                    data={applyRollingMean(drift, [
+                      "avg_valence",
+                      "avg_energy",
+                      "avg_danceability",
+                      "avg_acousticness",
+                      "avg_instrumentalness",
+                      "avg_liveness",
+                      "avg_speechiness",
+                    ])}
+                    margin={{ top: 8, right: 8, left: -16, bottom: 0 }}
+                  >
+                    <CartesianGrid {...gridStyle} />
+                    <XAxis dataKey="calendar_date" tick={axisTick} tickFormatter={(v) => v.slice(5)} />
+                    <YAxis tick={axisTick} domain={[0, 1]} />
+                    <Tooltip {...chartTooltip} formatter={(v) => (typeof v === "number" ? v.toFixed(3) : String(v))} />
+                    <Legend wrapperStyle={legendStyle} />
+                    <Line type="monotone" dataKey="avg_valence" stroke={C.source.whoop} strokeWidth={1.3} dot={false} name="valence" />
+                    <Line type="monotone" dataKey="avg_energy" stroke={accentColor} strokeWidth={1.3} dot={false} name="energy" />
+                    <Line type="monotone" dataKey="avg_danceability" stroke={C.source.eightsleep} strokeWidth={1.3} dot={false} name="danceability" />
+                    <Line type="monotone" dataKey="avg_acousticness" stroke={C.up} strokeWidth={1.3} dot={false} name="acousticness" />
+                    <Line type="monotone" dataKey="avg_instrumentalness" stroke={C.categorical[4]} strokeWidth={1.3} dot={false} name="instrumentalness" />
+                    <Line type="monotone" dataKey="avg_liveness" stroke={C.source.whoop} strokeWidth={1.3} dot={false} name="liveness" />
+                    <Line type="monotone" dataKey="avg_speechiness" stroke={C.neutral} strokeWidth={1.3} dot={false} name="speechiness" />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </ChartCard>
+
+            {/* Genre rotation — stacked area */}
+            <ChartCard
+              title="Genre rotation"
+              subtitle={`daily play composition, top ${genreRotation.topGenres.length} genres + other — ${rangeLabel(range)}`}
+              source="MUSICBRAINZ"
+              info="Stacked area shows how many plays each day came from each top genre. Each artist's full tag set contributes — heavy-rotation artists weight their genres more. Tracks whose artist had no MusicBrainz match fall into 'other'."
+            >
+              {genreRotation.rows.length === 0 ? (
+                <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
+                  No plays in this range.
+                </p>
+              ) : (
+                <ResponsiveContainer width="100%" height={300}>
+                  <AreaChart data={genreRotation.rows} margin={{ top: 8, right: 8, left: 4, bottom: 0 }}>
+                    <CartesianGrid {...gridStyle} />
+                    <XAxis dataKey="calendar_date" tick={axisTick} tickFormatter={(v: string) => v.slice(5)} />
+                    <YAxis tick={axisTick} width={50} label={axisLabel("plays", "y")} />
+                    <Tooltip {...chartTooltip} />
+                    <Legend wrapperStyle={legendStyle} />
+                    {genreRotation.topGenres.map((g, i) => (
+                      <Area
+                        key={g}
+                        type="monotone"
+                        dataKey={g}
+                        stackId="1"
+                        stroke={GENRE_PALETTE[i % GENRE_PALETTE.length]}
+                        fill={GENRE_PALETTE[i % GENRE_PALETTE.length]}
+                        fillOpacity={0.6}
+                        name={g}
+                      />
+                    ))}
+                    <Area
+                      type="monotone"
+                      dataKey="other"
+                      stackId="1"
+                      stroke={C.neutral}
+                      fill={C.neutral}
+                      fillOpacity={0.4}
+                      name="other"
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
+              )}
+            </ChartCard>
+
+            {/* Discovery rate */}
+            <ChartCard
+              title="Discovery rate"
+              subtitle={`% of plays that were brand-new tracks — ${rangeLabel(range)}`}
+              source="SPOTIFY"
+              info="For each day, the % of plays that were tracks you'd never played before (across all-time history, not just this range). The 7-day rolling mean smooths the daily spikes. Sustained high = exploration mode; sustained low = comfort-zone listening."
+            >
+              {discovery.length === 0 ? (
+                <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
+                  No plays in this range.
+                </p>
+              ) : (
+                <ResponsiveContainer width="100%" height={260}>
+                  <LineChart
+                    data={applyRollingMean(discovery, ["pct_new"])}
+                    margin={{ top: 8, right: 8, left: -16, bottom: 0 }}
+                  >
+                    <CartesianGrid {...gridStyle} />
+                    <XAxis dataKey="calendar_date" tick={axisTick} tickFormatter={(v) => v.slice(5)} />
+                    <YAxis tick={axisTick} domain={[0, 100]} tickFormatter={(v) => `${v}%`} />
+                    <Tooltip {...chartTooltip} formatter={(v) => (typeof v === "number" ? `${v.toFixed(1)}%` : String(v))} />
+                    <Line type="monotone" dataKey="pct_new" stroke={spotifyGreen} strokeWidth={1.6} dot={false} name="% new tracks" />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </ChartCard>
+          </section>
+
+          {/* Current sonic profile */}
+          <ChartCard
+            title="Current sonic profile"
+            subtitle={`play-weighted mean of 7 audio features — ${rangeLabel(range)}`}
+            source="RECCOBEATS"
+            info="All values normalized 0–1. Valence = positivity. Energy = intensity. Danceability = rhythmic regularity. Acousticness = acoustic vs. electronic. Instrumentalness = lack of vocals. Liveness = live-recording probability. Speechiness = spoken-word content. Weighted by play count so heavy rotation moves the shape."
+          >
+            {sonic ? (
+              <ResponsiveContainer width="100%" height={320}>
+                <RadarChart
+                  data={sonic.profile}
+                  margin={{ top: 12, right: 24, left: 24, bottom: 12 }}
+                >
+                  <PolarGrid stroke="#ffffff" strokeOpacity={0.08} />
+                  <PolarAngleAxis
+                    dataKey="feature"
+                    tick={{ ...axisTick, fontSize: 11 }}
+                    tickFormatter={(v: string) => v.charAt(0).toUpperCase() + v.slice(1)}
+                  />
+                  <PolarRadiusAxis
+                    angle={90}
+                    domain={[0, 1]}
+                    tick={{ ...axisTick, fontSize: 9 }}
+                    tickCount={5}
+                    stroke="#ffffff"
+                    strokeOpacity={0.1}
+                  />
+                  <Radar
+                    name="profile"
+                    dataKey="value"
+                    stroke={spotifyGreen}
+                    fill={spotifyGreen}
+                    fillOpacity={0.25}
+                    strokeWidth={1.5}
+                    isAnimationActive={false}
+                  />
+                  <Tooltip
+                    {...chartTooltip}
+                    formatter={(value) => (typeof value === "number" ? value.toFixed(3) : String(value))}
+                  />
+                </RadarChart>
+              </ResponsiveContainer>
+            ) : (
+              <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
+                No featurized plays in the last 30 days.
+              </p>
+            )}
+            {sonic && (
+              <p className="text-[10px] text-text-tertiary font-mono mt-2 text-center">
+                {sonic.featurizedPlays} / {sonic.totalPlays} plays featurized · {rangeLabel(range)}
+              </p>
+            )}
+          </ChartCard>
+
+          {/* Top genres + top artists + top tracks side by side */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <ChartCard
+              title="Top genres"
+              subtitle={`${rangeLabel(range)}, by play count`}
+              source="MUSICBRAINZ"
+              info="Each play counts once toward every genre tag MusicBrainz has for that artist, so heavy-rotation artists weight their genres more. Genres come from MusicBrainz (Spotify Dev Mode strips genres post-Feb 2026)."
+            >
+              <ol className="space-y-1.5">
+                {genres.map((g, i) => (
+                  <li key={`${g.genre}-${i}`} className="flex items-baseline justify-between text-[12px] font-mono">
+                    <span className="text-text-secondary truncate pr-3">
+                      <span className="text-text-tertiary mr-2">{String(i + 1).padStart(2, "0")}</span>
+                      {g.genre}
+                    </span>
+                    <span className="text-text-primary tabular-nums">
+                      {g.plays} <span className="text-text-tertiary text-[10px]">plays</span>
+                    </span>
+                  </li>
+                ))}
+                {genres.length === 0 && (
+                  <li className="text-[11px] text-text-tertiary">No genres yet.</li>
+                )}
+              </ol>
+            </ChartCard>
+
+            <ChartCard title="Top artists" subtitle={`${rangeLabel(range)}, by play count`} source="SPOTIFY">
+              <ol className="space-y-1.5">
+                {topArtists.map((a, i) => (
+                  <li key={`${a.name}-${i}`} className="flex items-baseline justify-between text-[12px] font-mono">
+                    <span className="text-text-secondary truncate pr-3">
+                      <span className="text-text-tertiary mr-2">{String(i + 1).padStart(2, "0")}</span>
+                      {a.name}
+                    </span>
+                    <span className="text-text-primary tabular-nums">
+                      {a.plays} <span className="text-text-tertiary text-[10px]">plays</span>
+                    </span>
+                  </li>
+                ))}
+                {topArtists.length === 0 && (
+                  <li className="text-[11px] text-text-tertiary">No artists yet.</li>
+                )}
+              </ol>
+            </ChartCard>
+
+            <ChartCard title="Top tracks" subtitle={`${rangeLabel(range)}, by play count`} source="SPOTIFY">
+              <button
+                onClick={() => setModalOpen(true)}
+                disabled={topTracks.length === 0}
+                className="mb-3 w-full px-3 py-2 text-[11px] font-mono font-medium tracking-wide text-text-primary bg-source-spotify/15 hover:bg-source-spotify/25 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/30 rounded-[4px] transition-colors"
+              >
+                Create private Spotify playlist from these {topTracks.length} tracks
+              </button>
+              <ol className="space-y-1.5">
+                {topTracks.map((t, i) => (
+                  <li key={`${t.name}-${i}`} className="flex items-baseline justify-between text-[12px] font-mono">
+                    <span className="text-text-secondary truncate pr-3">
+                      <span className="text-text-tertiary mr-2">{String(i + 1).padStart(2, "0")}</span>
+                      {t.name}
+                      <span className="text-text-tertiary"> · {t.artist}</span>
+                    </span>
+                    <span className="text-text-primary tabular-nums">
+                      {t.plays} <span className="text-text-tertiary text-[10px]">plays</span>
+                    </span>
+                  </li>
+                ))}
+                {topTracks.length === 0 && (
+                  <li className="text-[11px] text-text-tertiary">No tracks yet.</li>
+                )}
+              </ol>
+            </ChartCard>
+          </div>
+
+          {/* Hour of day */}
+          <ChartCard
+            title="Listening by hour of day"
+            subtitle={`ET, ${rangeLabel(range)}`}
+            source="SPOTIFY"
+            info="Bars are play counts grouped by hour-of-day (America/New_York). Reveals chronotype patterns — heavy late-night listening shows up here."
+          >
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={hours} margin={{ top: 8, right: 8, left: 4, bottom: 20 }}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="hour" tick={axisTick} height={45} label={axisLabel("hour of day (ET)", "x")} />
+                <YAxis tick={axisTick} width={50} label={axisLabel("plays", "y")} />
+                <Tooltip {...chartTooltip} />
+                <Bar dataKey="plays" fill={spotifyGreen} radius={[2, 2, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+
+          {/* Play ledger */}
+          <ChartCard
+            title="Play ledger"
+            subtitle={`every play, newest first · ${rangeLabel(range)}${ledgerTotal > 0 ? ` · ${ledgerTotal.toLocaleString()} plays` : ""}`}
+            source="SPOTIFY"
+            info="Every track that registered in Spotify's recently-played feed for the selected range. Spotify's 30-second minimum applies — anything skipped sooner doesn't appear."
+          >
+            {ledgerLoading && ledger.length === 0 && (
+              <p className="text-[11px] text-text-tertiary font-mono py-8 text-center">Loading…</p>
+            )}
+            {!ledgerLoading && ledger.length === 0 && (
+              <p className="text-[11px] text-text-tertiary font-mono py-8 text-center">
+                No plays in this range.
+              </p>
+            )}
+            {ledger.length > 0 && (
+              <>
+                <div className="overflow-x-auto -mx-1">
+                  <table className="w-full text-[12px] font-mono">
+                    <thead>
+                      <tr className="text-[10px] uppercase tracking-wide text-text-tertiary border-b border-border-subtle">
+                        <th className="text-left py-2 px-1 font-normal w-[140px]">When (ET)</th>
+                        <th className="text-left py-2 px-1 font-normal">Track</th>
+                        <th className="text-left py-2 px-1 font-normal">Artist</th>
+                        <th className="text-right py-2 px-1 font-normal w-[60px]">Dur</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ledger.map((r) => (
+                        <tr
+                          key={`${r.played_at}-${r.track_id}`}
+                          className="border-b border-border-subtle/50 hover:bg-white/[0.02]"
+                        >
+                          <td className="py-1.5 px-1 text-text-tertiary tabular-nums whitespace-nowrap">
+                            {formatPlayedAt(r.played_at)}
+                          </td>
+                          <td className="py-1.5 px-1 text-text-primary truncate max-w-[260px]" title={r.track_name ?? ""}>
+                            {r.track_name ?? "—"}
+                          </td>
+                          <td className="py-1.5 px-1 text-text-secondary truncate max-w-[200px]" title={r.artist_name ?? ""}>
+                            {r.artist_name ?? "—"}
+                          </td>
+                          <td className="py-1.5 px-1 text-right text-text-tertiary tabular-nums">
+                            {formatDuration(r.duration_ms)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="flex items-center justify-between mt-3 text-[11px] font-mono">
+                  <span className="text-text-tertiary">
+                    Page {ledgerPage + 1} of {Math.max(1, Math.ceil(ledgerTotal / LEDGER_PER_PAGE))}
+                  </span>
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => setLedgerPage((p) => Math.max(0, p - 1))}
+                      disabled={ledgerPage === 0 || ledgerLoading}
+                      className="px-2.5 py-1 text-[11px] text-text-secondary hover:text-text-primary disabled:opacity-30 disabled:cursor-not-allowed border border-border-subtle rounded-[4px] transition-colors"
+                    >
+                      ← Prev
+                    </button>
+                    <button
+                      onClick={() => setLedgerPage((p) => p + 1)}
+                      disabled={(ledgerPage + 1) * LEDGER_PER_PAGE >= ledgerTotal || ledgerLoading}
+                      className="px-2.5 py-1 text-[11px] text-text-secondary hover:text-text-primary disabled:opacity-30 disabled:cursor-not-allowed border border-border-subtle rounded-[4px] transition-colors"
+                    >
+                      Next →
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
+          </ChartCard>
+        </>
+      )}
+    </div>
+  );
+}
+
+const playedAtFmt = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+  hour12: true,
+});
+
+function formatPlayedAt(iso: string): string {
+  return playedAtFmt.format(new Date(iso));
+}
+
+function formatDuration(ms: number | null): string {
+  if (ms == null) return "—";
+  const totalSec = Math.round(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
