@@ -469,6 +469,7 @@ FEATURE_LABELS: dict[str, str] = {
     "caffeine_supplement_mg": "Supplement Caffeine (mg)",
     "caffeine_mg_at_bedtime": "Caffeine at Bedtime (mg)",
     "caffeine_total_mg_lag1": "Total Caffeine (mg, prev day)",
+    "caffeine_total_mg_7d_mean": "Total Caffeine (mg, 7d mean)",
 }
 
 # Journal boolean questions → clean labels
@@ -1583,6 +1584,15 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         # Timing features stay lag-free: their effect is same-night by
         # construction.
         df["caffeine_total_mg_lag1"] = df["caffeine_total_mg"].shift(1)
+        # 7-day rolling mean: the multi-day caffeine-load trend. Feature-only
+        # (Spearman/SHAP via the caffeine_ prefix) — deliberately NOT a causal
+        # treatment: as a multi-day aggregate it would need the
+        # ROLLING_AGGREGATE_TREATMENTS mediator-drop set (re-audit F-003) and
+        # the in-era history is far too thin to estimate it anyway. Revisit
+        # once months of in-era data accrue.
+        df["caffeine_total_mg_7d_mean"] = (
+            df["caffeine_total_mg"].rolling(7, min_periods=4).mean()
+        )
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships
     # without us having to hardcode habit names (they're user-defined in Notion).

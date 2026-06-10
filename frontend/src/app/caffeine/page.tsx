@@ -10,9 +10,11 @@ import {
 } from "recharts";
 import {
   getCaffeineDaily,
+  getCaffeineDataQuality,
   getCaffeineHrvPairs,
   type CaffeineDailyRow,
   type CaffeineHrvPair,
+  type CaffeineQualityFlag,
 } from "@/lib/queries";
 import { formatDate, formatDuration } from "@/lib/format";
 import StatCard from "@/components/StatCard";
@@ -31,6 +33,20 @@ const BEDTIME_GAP_GUIDELINE_MIN = 360;
 // supplement channel uses the categorical purple (distinct from every source).
 const DIETARY_COLOR = C.source.cronometer;
 const SUPPLEMENT_COLOR = C.categorical[3];
+
+// Data-quality flag chips (pds.caffeine_data_quality).
+const QUALITY_FLAG_LABEL: Record<string, string> = {
+  journal_no_but_logged: "journal conflict",
+  journal_yes_but_unlogged: "unlogged day",
+  untrusted_timestamps: "retro-log",
+  possible_double_log: "double log?",
+};
+const QUALITY_FLAG_STYLE: Record<string, string> = {
+  journal_no_but_logged: "text-amber-300 border-amber-500/40",
+  journal_yes_but_unlogged: "text-sky-300 border-sky-500/40",
+  untrusted_timestamps: "text-amber-300 border-amber-500/40",
+  possible_double_log: "text-red-300 border-red-500/40",
+};
 
 /** YYYY-MM-DD string `days` before `anchor`, for slicing daily rows client-side.
  * Anchored to the latest behavioral row (not the browser clock) so KPI windows
@@ -74,14 +90,16 @@ function fmtHourTick(h: number): string {
 export default function CaffeinePage() {
   const [daily, setDaily] = useState<CaffeineDailyRow[]>([]);
   const [hrvPairs, setHrvPairs] = useState<CaffeineHrvPair[]>([]);
+  const [quality, setQuality] = useState<CaffeineQualityFlag[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     setLoading(true);
-    Promise.all([getCaffeineDaily(60), getCaffeineHrvPairs(90)])
-      .then(([d, p]) => {
+    Promise.all([getCaffeineDaily(60), getCaffeineHrvPairs(90), getCaffeineDataQuality(45)])
+      .then(([d, p, q]) => {
         setDaily(d);
         setHrvPairs(p);
+        setQuality(q);
       })
       .catch((err) => console.error("Caffeine page load:", err))
       .finally(() => setLoading(false));
@@ -447,6 +465,38 @@ export default function CaffeinePage() {
               </ChartCard>
             </div>
           </section>
+
+          {/* ─── Data quality ─────────────────────────────────────────────── */}
+          <ChartCard
+            title="Data Quality"
+            subtitle="journal vs log conflicts, retro-logged timestamps, double-log checks · last 45 days"
+            source="WHOOP JOURNAL + CRONOMETER + SUPPLEMENTS"
+            info="The caffeine record is assembled from three sources that can disagree. Each flag marks a day worth a second look — resolving them sharpens every chart above and the HRV analysis."
+          >
+            {quality.length === 0 ? (
+              <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
+                No data-quality flags in the last 45 days.
+              </p>
+            ) : (
+              <ul className="divide-y divide-border-subtle">
+                {quality.map((q) => (
+                  <li key={`${q.behavioral_date}-${q.flag}`} className="py-2.5 flex items-start gap-3">
+                    <span className="text-[11px] font-mono text-text-secondary shrink-0 w-[72px]">
+                      {formatDate(q.behavioral_date)}
+                    </span>
+                    <span
+                      className={`text-[9px] font-mono uppercase tracking-wide px-1.5 py-0.5 rounded-[3px] border shrink-0 ${
+                        QUALITY_FLAG_STYLE[q.flag] ?? "text-text-tertiary border-border-subtle"
+                      }`}
+                    >
+                      {QUALITY_FLAG_LABEL[q.flag] ?? q.flag}
+                    </span>
+                    <span className="text-[11px] text-text-tertiary leading-relaxed">{q.detail}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </ChartCard>
         </div>
       )}
     </>

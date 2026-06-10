@@ -616,6 +616,37 @@ export async function getCaffeineHrvPairs(days: number = 90): Promise<CaffeineHr
   return (data ?? []) as CaffeineHrvPair[];
 }
 
+export interface CaffeineQualityFlag {
+  behavioral_date: string;
+  flag:
+    | "journal_no_but_logged"
+    | "journal_yes_but_unlogged"
+    | "untrusted_timestamps"
+    | "possible_double_log"
+    | string;
+  detail: string;
+}
+
+/**
+ * QA flags for the caffeine record from pds.caffeine_data_quality — days where
+ * the WHOOP journal and the event log disagree, retro-logged timestamps were
+ * quarantined, or a dietary serving name-matches a same-day supplement
+ * (possible double-count). Long format, one row per (day, flag).
+ */
+export async function getCaffeineDataQuality(days: number = 45): Promise<CaffeineQualityFlag[]> {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const { data, error } = await supabase
+    .from("caffeine_data_quality")
+    .select("behavioral_date,flag,detail")
+    .gte("behavioral_date", since.toISOString().split("T")[0])
+    .order("behavioral_date", { ascending: false });
+
+  if (error) throw error;
+  return (data ?? []) as CaffeineQualityFlag[];
+}
+
 // ---------------------------------------------------------------------------
 // Recovery context for running activities (merged into /activities row cards)
 // ---------------------------------------------------------------------------

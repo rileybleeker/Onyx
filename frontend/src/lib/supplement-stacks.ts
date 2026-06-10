@@ -60,7 +60,12 @@ export async function logStackIntake(
       intake_date = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
     }
   }
-  const intake_time = opts.intake_time ?? new Date().toISOString();
+  // undefined = caller didn't think about time → default to now (chat tool,
+  // legacy callers). EXPLICIT null = "no clock time" (backdated /supplements
+  // logs) and must be preserved — `??` would coerce it back to now, which is
+  // exactly how 7 retro-logged intakes got next-day timestamps that the
+  // caffeine timing layer then had to quarantine.
+  const intake_time = opts.intake_time !== undefined ? opts.intake_time : new Date().toISOString();
 
   const rows = items.map((it) => ({
     product_id: it.product_id,

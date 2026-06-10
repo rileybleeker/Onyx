@@ -303,8 +303,13 @@ export default function SupplementsPage() {
     // Negative ID marks this row as optimistic / unconfirmed — replaced with
     // the real intake_id once POST resolves, or removed on error.
     const tempId = -(Date.now() + Math.floor(Math.random() * 10000));
-    const stampIso = logTimeIso() ?? new Date().toISOString();
     const logDateIsToday = logDate === today;
+    // Backdated logs get NO timestamp unless the user set one explicitly:
+    // stamping "now" on a past intake_date produced retro-log artifacts the
+    // caffeine timing layer had to quarantine (timestamp attributing to a
+    // different behavioral day than claimed). NULL = "took it that day, time
+    // unspecified" — mg totals still count, timing aggregates stay clean.
+    const stampIso = logTimeIso() ?? (logDateIsToday ? new Date().toISOString() : null);
     const optimistic: Intake = {
       intake_id: tempId,
       intake_date: logDate,
@@ -374,7 +379,9 @@ export default function SupplementsPage() {
   // yesterday). Records the batch for one-click undo.
   async function logStack(stack: Stack) {
     setBusyStackId(stack.stack_id);
-    const stampIso = logTimeIso() ?? new Date().toISOString();
+    // Same backdate rule as addIntake: no explicit time + past date → null
+    // timestamp (the server passes null through; it no longer coerces to now).
+    const stampIso = logTimeIso() ?? (isLoggingForToday ? new Date().toISOString() : null);
     showToast(`logged ${stack.name} 👍`);
     try {
       const res = await fetch("/api/supplements/stacks/log", {
@@ -458,7 +465,9 @@ export default function SupplementsPage() {
             product_id: seeded.product_id,
             doses,
             intake_date: logDate,
-            intake_time: logTimeIso() ?? new Date().toISOString(),
+            // Same backdate rule as addIntake/logStack: past date + no
+            // explicit time → null timestamp, never a misleading "now".
+            intake_time: logTimeIso() ?? (logDate === today ? new Date().toISOString() : null),
           }),
         });
         if (!logRes.ok) throw new Error(await logRes.text());
@@ -661,6 +670,7 @@ export default function SupplementsPage() {
                 <>
                   <span className="text-[10px] font-mono text-amber-400/90">
                     logging to {formatShortDate(logDate)} — not today
+                    {!logTimeLocal && " · no clock time will be stored (set one below if you know it)"}
                   </span>
                   <button
                     onClick={() => setLogDate(today)}
