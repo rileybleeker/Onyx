@@ -44,6 +44,11 @@ const CADENCE: Record<string, string> = {
   supplements: "Manual",
   notion_journal: "Hourly :35",
   tanita: "Daily 10am + 1:30pm ET",
+  // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
+  // the frontend matrix reads hit since 2026-06-11). The heartbeat also
+  // carries the schema-drift tripwire — a 'failed' here can mean the view
+  // gained columns the matview is missing.
+  matrix_mat: "Every 15 min (:10/:25/:40/:55)",
 };
 
 // Integration method per source.
@@ -67,6 +72,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   supplements:    { method: "manual",         label: "Manual entry" },
   notion_journal: { method: "automated",      label: "Notion sync" },
   tanita:         { method: "automated",      label: "API ETL" },
+  matrix_mat:     { method: "automated",      label: "Matview refresh" },
 };
 
 export interface DriftAlert {
@@ -177,10 +183,14 @@ function enrichmentSource({
 
 export async function GET() {
   try {
-    // Fetch last 100 sync_log rows (enough to cover all sources with history)
+    // Fetch last 100 sync_log rows (enough to cover all sources with history).
+    // matrix_mat refreshes 4x/hour (~96 rows/day) and would flood this window,
+    // drowning every other source's history — it gets a dedicated limit-1
+    // fetch below instead.
     const { data: syncRows, error: syncErr } = await supabase
       .from("sync_log")
       .select("*")
+      .neq("source", "matrix_mat")
       .order("sync_start", { ascending: false })
       .limit(100);
 
@@ -188,7 +198,7 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -253,6 +263,14 @@ export async function GET() {
         .from("hrv_analysis_results")
         .select("computed_at")
         .order("computed_at", { ascending: false })
+        .limit(1),
+      // Matview refresh heartbeat (excluded from the main window above).
+      supabase
+        .from("sync_log")
+        .select("*")
+        .eq("source", "matrix_mat")
+        .eq("data_type", "refresh")
+        .order("sync_start", { ascending: false })
         .limit(1),
     ]);
 
@@ -539,6 +557,39 @@ export async function GET() {
         integrationMethod: METHOD.tanita.method,
         methodLabel: METHOD.tanita.label,
       },
+      // Materialized matrix view refresh (pg_cron, every 15 min). Frontend
+      // matrix reads (/analytics/hrv, /caffeine, /nutrition, /bland-altman,
+      // /analytics/travel) hit the matview since 2026-06-11; a stuck refresh
+      // means those pages silently serve aging data while the live view (and
+      // the Python pipeline) move on — exactly the silent-staleness failure
+      // mode the heartbeat convention exists to catch. Freshness is heartbeat
+      // age in MINUTES (like the enrichment cards but tighter): >20 min = one
+      // missed refresh (partial), >45 min = three missed (failed). A 'failed'
+      // heartbeat can also be the schema-drift tripwire — the error message
+      // names the columns the matview is missing.
+      matrix_mat: (() => {
+        const entry = (matrixMatRes.data?.[0] as Record<string, unknown> | undefined) ?? null;
+        const lastSync = (entry?.sync_start as string) ?? null;
+        const ageMin = lastSync ? Math.round((Date.now() - new Date(lastSync).getTime()) / 60000) : null;
+        let status: SourceStatus["status"];
+        if (!entry) status = "unknown";
+        else if (entry.status === "failed" || ageMin === null || ageMin > 45) status = "failed";
+        else if (ageMin > 20) status = "partial";
+        else status = "success";
+        return {
+          label: "Matrix Matview",
+          lastSync,
+          status,
+          latestDataDate: null,
+          daysLag: ageMin === null ? 999 : Math.floor(ageMin / 1440),
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string) ?? null,
+          cadence: CADENCE.matrix_mat,
+          integrationMethod: METHOD.matrix_mat.method,
+          methodLabel: METHOD.matrix_mat.label,
+        };
+      })(),
     };
 
     const recentHistory = (syncRows ?? []).slice(0, 20).map((r) => ({

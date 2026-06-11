@@ -26,7 +26,9 @@ type ActivityRow = {
   calories: number | null;
   split_labels: SplitLabel[];
   muscle_groups: MuscleGroup[];
-  raw_json?: any;
+  // Garmin only: raw_json->workoutId, selected as a JSON subfield so the query
+  // doesn't ship the whole ~7 kB/row raw_json blob just for this pairing key.
+  planned_workout_id?: string | null;
 };
 
 type ActivityCategory = "run" | "sauna" | "strength" | "other";
@@ -90,7 +92,7 @@ function normalizeGarmin(a: any): ActivityRow {
     calories: a.calories ?? null,
     split_labels: (a.split_labels as SplitLabel[] | null) ?? (a.split_label ? [a.split_label as SplitLabel] : []),
     muscle_groups: (a.muscle_groups as MuscleGroup[] | null) ?? [],
-    raw_json: a.raw_json,
+    planned_workout_id: a.planned_workout_id != null ? String(a.planned_workout_id) : null,
   };
 }
 
@@ -660,12 +662,8 @@ export default function ActivitiesPage() {
         <div className="space-y-3">
           {rows.map((act) => {
             let workout: any = null;
-            if (act.source === "garmin") {
-              try {
-                const raw = typeof act.raw_json === "string" ? JSON.parse(act.raw_json) : act.raw_json;
-                const wid = raw?.workoutId;
-                if (wid) workout = workoutMap[String(wid)];
-              } catch { /* ignore */ }
+            if (act.source === "garmin" && act.planned_workout_id) {
+              workout = workoutMap[act.planned_workout_id] ?? null;
             }
 
             const targetLow = workout?.interval_target_pace_low_mps;

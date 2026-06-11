@@ -23,6 +23,7 @@ const SOURCE_BADGE: Record<string, string> = {
   musicbrainz: "MUSICBRAINZ",
   supplements: "DSLD",
   tanita: "TANITA",
+  matrix_mat: "DB",
 };
 
 const SOURCE_BADGE_COLOR: Record<string, string> = {
@@ -40,6 +41,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   musicbrainz: "text-source-spotify/70",
   supplements: "text-amber-400",
   tanita: "text-amber-500",
+  matrix_mat: "text-cyan-400/70",
 };
 
 const STATUS_DOT: Record<string, string> = {
@@ -88,6 +90,7 @@ const SOURCE_ORDER = [
   "musicbrainz",
   "supplements",
   "tanita",
+  "matrix_mat",
 ];
 
 function formatRelativeTime(isoStr: string | null): string {
@@ -204,6 +207,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   notion_journal: "Notion Journal",
   hrv_analysis: "HRV Retrain",
   tanita: "Tanita",
+  matrix_mat: "Matrix Matview",
 };
 
 const HISTORY_TYPE_LABELS: Record<string, string> = {
@@ -219,6 +223,7 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   entries: "Entries",
   retrain: "Retrain",
   weight: "Weight",
+  refresh: "Refresh",
 };
 
 export default function StatusPage() {

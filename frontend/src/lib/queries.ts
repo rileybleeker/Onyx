@@ -25,13 +25,40 @@ const WORKOUT_SLEEP_GAP_MAX_MS = 18 * 60 * 60 * 1000; // 18 hours
  * every consumer.
  */
 
+// Explicit column lists = every scalar column EXCEPT the raw jsonb blobs
+// (raw_json / raw_hr_values / raw_stress_values / raw_hrv_readings /
+// load_focus). The Garmin tables ship the full API response as jsonb —
+// garmin_sleep is ~19 kB/row, garmin_stress carries minute-level samples —
+// and no chart reads any of it, so select("*") wasted most of the transfer.
+// "All scalars" rather than minimal per-consumer lists so future chart
+// additions don't silently read undefined; if the ETL adds a scalar column,
+// append it here too. (Same convention as the WHOOP_*_COLS lists below.)
+const GARMIN_DAILY_COLS =
+  "ts, calendar_date, total_steps, daily_step_goal, total_distance_meters, floors_ascended, floors_descended, total_kilocalories, active_kilocalories, bmr_kilocalories, resting_heart_rate, min_heart_rate, max_heart_rate, last_seven_days_avg_rhr, avg_stress_level, max_stress_level, stress_duration_minutes, rest_stress_duration_min, low_stress_duration_min, medium_stress_duration_min, high_stress_duration_min, stress_qualifier, body_battery_charged, body_battery_drained, body_battery_highest, body_battery_lowest, body_battery_most_recent, avg_spo2, lowest_spo2, avg_waking_respiration, highest_respiration, lowest_respiration, moderate_intensity_minutes, vigorous_intensity_minutes, intensity_minutes_goal, highly_active_seconds, active_seconds, sedentary_seconds, sleeping_seconds, abnormal_hr_count, min_avg_heart_rate, max_avg_heart_rate, source, synced_at";
+const GARMIN_SLEEP_COLS =
+  "ts, calendar_date, sleep_id, sleep_start, sleep_end, sleep_duration_seconds, unmeasurable_seconds, deep_sleep_seconds, light_sleep_seconds, rem_sleep_seconds, awake_seconds, overall_sleep_score, quality_score, duration_score, recovery_score, rem_score, light_score, deep_score, restlessness_score, avg_sleep_heart_rate, avg_respiration_rate, avg_spo2, lowest_spo2, avg_hrv, hrv_status, avg_sleep_stress, sleep_need_seconds, sleep_debt_seconds, is_nap, auto_detected, sleep_result_type, source, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source";
+const GARMIN_HR_COLS =
+  "ts, calendar_date, resting_heart_rate, min_heart_rate, max_heart_rate, last_seven_days_avg_rhr, zone_1_seconds, zone_2_seconds, zone_3_seconds, zone_4_seconds, zone_5_seconds, source, synced_at";
+const GARMIN_HRV_COLS =
+  "ts, calendar_date, weekly_avg_ms, last_night_avg_ms, last_night_5min_high_ms, baseline_low_upper_ms, baseline_balanced_low_ms, baseline_balanced_upper_ms, baseline_marker_upper_ms, hrv_status, start_timestamp, end_timestamp, create_timestamp, source, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source";
+// garmin_activities: scalars + ONLY the raw_json subfield the UI reads
+// (raw_json->workoutId pairs an execution with its planned-workout targets).
+const GARMIN_ACTIVITY_COLS =
+  "ts, activity_id, activity_type, activity_type_id, activity_name, sport_type, start_time_local, start_time_gmt, duration_seconds, elapsed_duration_seconds, moving_duration_seconds, distance_meters, avg_speed_mps, max_speed_mps, avg_heart_rate, max_heart_rate, avg_running_cadence, max_running_cadence, avg_pace_min_per_km, avg_cycling_cadence, max_cycling_cadence, avg_power_watts, max_power_watts, normalized_power, elevation_gain_meters, elevation_loss_meters, min_elevation_meters, max_elevation_meters, calories, avg_stress, aerobic_training_effect, anaerobic_training_effect, training_effect_label, training_load, vo2_max, avg_temperature_c, max_temperature_c, min_temperature_c, start_latitude, start_longitude, performance_condition, total_sets, total_reps, avg_strokes_per_length, pool_length_meters, total_lengths, manual_activity, has_splits, has_polyline, source, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source, is_excluded, split_label, split_labels, muscle_groups, planned_workout_id:raw_json->workoutId";
+const GARMIN_STRESS_COLS =
+  "ts, calendar_date, overall_stress_level, rest_stress_duration_sec, low_stress_duration_sec, medium_stress_duration_sec, high_stress_duration_sec, stress_qualifier, source, synced_at";
+const GARMIN_TRAINING_COLS =
+  "ts, calendar_date, training_readiness_score, training_readiness_level, sleep_score_factor, recovery_time_factor, hrv_factor, sleep_history_factor, stress_history_factor, training_load_factor, training_status, training_status_message, acute_training_load, chronic_training_load, training_load_balance, vo2_max_running, vo2_max_cycling, fitness_age, recovery_time_hours, recovery_heart_rate, source, synced_at";
+const EIGHT_SLEEP_TRENDS_COLS =
+  "calendar_date, bed_side, sleep_score, sleep_fitness_score, sleep_quality_score, sleep_duration_score, latency_asleep_score, latency_out_score, wakeup_consistency_score, sleep_routine_score, avg_heart_rate, avg_hrv, avg_breath_rate, median_bed_temp, median_room_temp, time_slept_seconds, awake_seconds, light_sleep_seconds, deep_sleep_seconds, rem_sleep_seconds, toss_and_turns, session_date, synced_at, latency_asleep_seconds, snore_duration_seconds, heavy_snore_duration_seconds, time_slept_main_session_seconds, awake_main_session_seconds, light_sleep_main_session_seconds, deep_sleep_main_session_seconds, rem_sleep_main_session_seconds, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source";
+
 export async function getDailySummaries(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
   const { data, error } = await supabase
     .from("garmin_daily_summary")
-    .select("*")
+    .select(GARMIN_DAILY_COLS)
     .gte("calendar_date", since.toISOString().split("T")[0])
     .order("calendar_date", { ascending: true });
 
@@ -62,7 +89,7 @@ export async function getSleepData(days: number = 30) {
   // watch's labeling.
   const { data, error } = await supabase
     .from("garmin_sleep")
-    .select("*")
+    .select(GARMIN_SLEEP_COLS)
     .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
     .order("onyx_behavioral_date", { ascending: true });
 
@@ -76,7 +103,7 @@ export async function getHeartRateData(days: number = 30) {
 
   const { data, error } = await supabase
     .from("garmin_heart_rate")
-    .select("*")
+    .select(GARMIN_HR_COLS)
     .gte("calendar_date", since.toISOString().split("T")[0])
     .order("calendar_date", { ascending: true });
 
@@ -90,7 +117,7 @@ export async function getHrvData(days: number = 30) {
 
   const { data, error } = await supabase
     .from("garmin_hrv")
-    .select("*")
+    .select(GARMIN_HRV_COLS)
     .gte("calendar_date", since.toISOString().split("T")[0])
     .order("calendar_date", { ascending: true });
 
@@ -110,7 +137,7 @@ export async function getActivities(days: number = 30) {
   // calendar days UTC", which start_time_gmt provides cleanly.
   const { data, error } = await supabase
     .from("garmin_activities")
-    .select("*")
+    .select(GARMIN_ACTIVITY_COLS)
     .gte("start_time_gmt", since.toISOString())
     .eq("is_excluded", false)
     .order("start_time_gmt", { ascending: false });
@@ -134,7 +161,7 @@ export async function getStressData(days: number = 30) {
 
   const { data, error } = await supabase
     .from("garmin_stress")
-    .select("*")
+    .select(GARMIN_STRESS_COLS)
     .gte("calendar_date", since.toISOString().split("T")[0])
     .order("calendar_date", { ascending: true });
 
@@ -148,7 +175,7 @@ export async function getTrainingStatus(days: number = 30) {
 
   const { data, error } = await supabase
     .from("garmin_training_status")
-    .select("*")
+    .select(GARMIN_TRAINING_COLS)
     .gte("calendar_date", since.toISOString().split("T")[0])
     .order("calendar_date", { ascending: true });
 
@@ -160,13 +187,28 @@ export async function getTrainingStatus(days: number = 30) {
 // WHOOP
 // ---------------------------------------------------------------------------
 
+// Explicit column lists = every scalar column EXCEPT raw_json. The WHOOP
+// tables carry the full API response as jsonb (whoop_cycles is 42 MB for
+// ~600 rows — ~70 kB/row, ~99% of it raw_json), so select("*") shipped
+// megabytes per page load that no chart reads. "All scalars" rather than a
+// minimal per-consumer list so future chart additions don't silently get
+// undefined; if the ETL adds a new scalar column, append it here too.
+const WHOOP_CYCLE_COLS =
+  "cycle_id, user_id, created_at, updated_at, start_time, end_time, timezone_offset, score_state, strain, kilojoule, average_heart_rate, max_heart_rate, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source, onyx_is_transition_day";
+const WHOOP_RECOVERY_COLS =
+  "cycle_id, sleep_id, user_id, created_at, updated_at, score_state, recovery_score, resting_heart_rate, hrv_rmssd_milli, spo2_percentage, skin_temp_celsius, user_calibrating, synced_at";
+const WHOOP_SLEEP_COLS =
+  "sleep_id, cycle_id, user_id, created_at, updated_at, start_time, end_time, timezone_offset, is_nap, score_state, total_in_bed_time_milli, total_awake_time_milli, total_no_data_time_milli, total_light_sleep_time_milli, total_slow_wave_sleep_time_milli, total_rem_sleep_time_milli, sleep_cycle_count, disturbance_count, baseline_milli, need_from_sleep_debt_milli, need_from_recent_strain_milli, need_from_recent_nap_milli, respiratory_rate, sleep_performance_percentage, sleep_consistency_percentage, sleep_efficiency_percentage, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source";
+const WHOOP_WORKOUT_COLS =
+  "workout_id, user_id, created_at, updated_at, start_time, end_time, timezone_offset, sport_id, sport_name, score_state, strain, average_heart_rate, max_heart_rate, kilojoule, percent_recorded, distance_meter, altitude_gain_meter, altitude_change_meter, zone_zero_milli, zone_one_milli, zone_two_milli, zone_three_milli, zone_four_milli, zone_five_milli, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source, is_excluded, split_label, split_labels, muscle_groups";
+
 export async function getWhoopCycles(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
   const { data, error } = await supabase
     .from("whoop_cycles")
-    .select("*")
+    .select(WHOOP_CYCLE_COLS)
     .gte("start_time", since.toISOString())
     .order("start_time", { ascending: true });
 
@@ -180,7 +222,7 @@ export async function getWhoopRecovery(days: number = 30) {
 
   const { data, error } = await supabase
     .from("whoop_recovery")
-    .select("*")
+    .select(WHOOP_RECOVERY_COLS)
     .gte("created_at", since.toISOString())
     .eq("score_state", "SCORED")
     .order("created_at", { ascending: true });
@@ -195,7 +237,7 @@ export async function getWhoopSleep(days: number = 30) {
 
   const { data, error } = await supabase
     .from("whoop_sleep")
-    .select("*")
+    .select(WHOOP_SLEEP_COLS)
     .gte("start_time", since.toISOString())
     .eq("is_nap", false)
     .eq("score_state", "SCORED")
@@ -213,7 +255,7 @@ export async function getWhoopSleepAll(days: number = 30) {
 
   const { data, error } = await supabase
     .from("whoop_sleep")
-    .select("*")
+    .select(WHOOP_SLEEP_COLS)
     .gte("start_time", since.toISOString())
     .eq("score_state", "SCORED")
     .order("start_time", { ascending: true });
@@ -228,7 +270,7 @@ export async function getWhoopWorkouts(days: number = 30) {
 
   const { data, error } = await supabase
     .from("whoop_workouts")
-    .select("*")
+    .select(WHOOP_WORKOUT_COLS)
     .gte("start_time", since.toISOString())
     .eq("is_excluded", false)
     .order("start_time", { ascending: false });
@@ -357,7 +399,7 @@ export async function getEightSleepTrends(days: number = 30, side: string = "lef
   // formats display labels off the row's own calendar_date.
   const { data, error } = await supabase
     .from("eight_sleep_trends")
-    .select("*")
+    .select(EIGHT_SLEEP_TRENDS_COLS)
     .eq("bed_side", side)
     .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
     .order("onyx_behavioral_date", { ascending: true });
@@ -381,8 +423,12 @@ export async function getNutrition(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
+  // Matview read (15-min refresh): Cronometer data lands via the manual local
+  // importer, not in-app writes, so the only staleness case is opening
+  // /nutrition within ~15 min of running an import. (The Today's Meals widget
+  // reads the LIVE cronometer_servings table and stays instant.)
   const { data, error } = await supabase
-    .from("daily_health_matrix_behavioral")
+    .from("daily_health_matrix_behavioral_mat")
     .select(
       "calendar_date, nutrition_source, " +
         "calories:nutrition_calories, protein_g:nutrition_protein_g, " +
@@ -610,7 +656,11 @@ export async function getCaffeineHrvPairs(days: number = 90): Promise<CaffeineHr
   since.setDate(since.getDate() - days);
 
   const { data, error } = await supabase
-    .from("daily_health_matrix_behavioral")
+    // Matview read (15-min refresh): the whoop_hrv_rmssd NOT NULL filter
+    // already excludes today's row until tomorrow's ETL scores the night, so
+    // matview staleness is invisible here even though caffeine columns are
+    // write-coupled. (The /caffeine KPI tiles read the LIVE caffeine views.)
+    .from("daily_health_matrix_behavioral_mat")
     .select("calendar_date,caffeine_total_mg,caffeine_to_bedtime_min,whoop_hrv_rmssd")
     .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
     .not("caffeine_total_mg", "is", null)
@@ -684,23 +734,42 @@ export async function getActivityLaps(activityIds: number[]) {
 // Unified Health Matrix view
 // ---------------------------------------------------------------------------
 
+// Columns the Bland-Altman device-comparison page actually plots (+ both date
+// keys). The matrix has 200+ columns at ~5 kB/row serialized — select("*")
+// cost ~170 kB for 30d and ~4.8 MB at the ALL range. The eight_sleep_*_main_*
+// columns are the MAIN-SESSION values (nap-inclusion convention: cross-device
+// comparison must exclude naps); they were appended to the view 2026-06-11 —
+// before that the page referenced them against select("*") and silently got
+// undefined, leaving three Eight Sleep comparisons empty.
+const HEALTH_MATRIX_COLS =
+  "calendar_date, onyx_behavioral_date, garmin_sleep_score, whoop_sleep_performance, eight_sleep_score, garmin_hrv_last_night, whoop_hrv_rmssd, eight_sleep_hrv, garmin_rhr, whoop_rhr, eight_sleep_hr, garmin_sleep_respiration, whoop_respiratory_rate, eight_sleep_breath_rate, garmin_sleep_duration_sec, whoop_sleep_duration_milli, eight_sleep_duration_main_sec, garmin_deep_sleep_sec, whoop_deep_sleep_milli, eight_sleep_deep_main_sec, garmin_rem_sleep_sec, whoop_rem_sleep_milli, eight_sleep_rem_main_sec";
+
 export async function getHealthMatrix(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
+  const sinceStr = since.toISOString().split("T")[0];
 
-  // ADR-0001 Phase 3: filter/order by onyx_behavioral_date so the window
-  // and ordering use the bedtime-day attribution that the rest of the HRV
-  // pipeline assumes. The view exposes BOTH onyx_behavioral_date and
-  // calendar_date (watch-local clock-day) — `select *` keeps the latter
-  // available for any consumer that still wants clock-day labeling.
-  const { data, error } = await supabase
-    .from("daily_health_matrix_behavioral")
-    .select("*")
-    .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
-    .order("onyx_behavioral_date", { ascending: true });
+  // ADR-0001 Phase 3: filter/order by onyx_behavioral_date so the window and
+  // ordering use the bedtime-day attribution the HRV pipeline assumes.
+  // Reads the 15-min-refreshed matview (perf migration 2026-06-11), not the
+  // live view — this page is pure ETL history, staleness is invisible.
+  // Paged via .range(): the matrix is at 850+ rows (one/day) and the ALL
+  // range would silently truncate at PostgREST's 1000-row cap in ~5 months.
+  const PAGE = 1000;
+  const rows: Record<string, unknown>[] = [];
+  for (let fromIdx = 0; ; fromIdx += PAGE) {
+    const { data, error } = await supabase
+      .from("daily_health_matrix_behavioral_mat")
+      .select(HEALTH_MATRIX_COLS)
+      .gte("onyx_behavioral_date", sinceStr)
+      .order("onyx_behavioral_date", { ascending: true })
+      .range(fromIdx, fromIdx + PAGE - 1);
 
-  if (error) throw error;
-  return data ?? [];
+    if (error) throw error;
+    rows.push(...((data ?? []) as Record<string, unknown>[]));
+    if (!data || data.length < PAGE) break;
+  }
+  return rows;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,92 @@
+-- ============================================================================
+-- Materialized matrix view for frontend reads + Eight Sleep main-session cols
+-- Applied as Supabase migrations:
+--   perf_matrix_matview_and_eight_sleep_main_cols (2026-06-11)
+--   fix_matview_drift_check_pg_attribute          (2026-06-11)
+-- ============================================================================
+--
+-- WHY
+-- ---
+-- pds.daily_health_matrix_behavioral evaluates a ~30-relation join tree per
+-- query. Warm EXPLAIN is cheap (~10 ms plan + 8-30 ms exec) but production
+-- reality via PostgREST/anon was mean 150-650 ms with 1.5-2.7 s tails
+-- (pg_stat_statements, 2026-06-11 audit): sporadic page loads pay fresh
+-- planning on cold catalog caches, cold buffer reads across ~20 relations,
+-- and json serialization — and several hash joins build over FULL base tables
+-- regardless of the requested window, so cost grows with total history.
+--
+-- pds.daily_health_matrix_behavioral_mat is a physical copy refreshed every
+-- 15 minutes. Frontend page-load reads converge to plain-table profile
+-- (~19 ms production mean for an equivalent table).
+--
+-- WHO READS WHAT (do not change casually)
+-- ---------------------------------------
+-- MATVIEW (frontend page loads only):
+--   lib/queries.ts            getHealthMatrix        [/bland-altman]
+--   lib/queries.ts            getNutrition           [/nutrition]
+--   lib/queries.ts            getCaffeineHrvPairs    [/caffeine]
+--   lib/queries-hrv.ts        getHistoricalHrv, getEnvDoseResponseData
+--                                                    [/analytics/hrv]
+--   analytics/travel/page.tsx getHRVData             [/analytics/travel]
+-- LIVE VIEW (canonical — must stay untouched by this optimization):
+--   hrv_analysis.py, causal_inference.py, hrv_predict.py (Python pipeline)
+--   frontend api/chat/route.ts query_health_data (chat must see live data)
+--
+-- FRESHNESS AUDIT (2026-06-11): no matview consumer visibly breaks at <=15 min
+-- staleness. /caffeine's matrix read filters whoop_hrv_rmssd IS NOT NULL,
+-- which excludes today's row until tomorrow's ETL anyway; /nutrition's
+-- Today's-Meals widget reads the LIVE cronometer_servings table. The
+-- user-write-coupled views (caffeine_timing_daily, daily_micronutrient_totals,
+-- supplement_intake_by_compound, cronometer_*) are NOT materialized.
+--
+-- ⚠ SCHEMA-DRIFT RULE (mechanically enforced)
+-- -------------------------------------------
+-- The matview's SELECT * is frozen at creation. EVERY future migration that
+-- changes pds.daily_health_matrix_behavioral MUST, in the same migration:
+--   DROP MATERIALIZED VIEW pds.daily_health_matrix_behavioral_mat;
+--   <CREATE OR REPLACE VIEW ...>;
+--   CREATE MATERIALIZED VIEW pds.daily_health_matrix_behavioral_mat AS
+--     SELECT * FROM pds.daily_health_matrix_behavioral WITH DATA;
+--   CREATE UNIQUE INDEX uq_dhmb_mat_behavioral_date
+--     ON pds.daily_health_matrix_behavioral_mat (onyx_behavioral_date);
+--   CREATE INDEX idx_dhmb_mat_calendar_date
+--     ON pds.daily_health_matrix_behavioral_mat (calendar_date);
+--   GRANT SELECT ON pds.daily_health_matrix_behavioral_mat TO anon, authenticated;
+-- NEVER use DROP VIEW ... CASCADE on the canonical view (it would silently
+-- destroy the matview and 404 every repointed frontend read).
+-- Enforcement: the refresh function diffs pg_attribute column sets between
+-- view and matview on every run and writes a FAILED pds.sync_log heartbeat
+-- ('matrix_mat'|'refresh') naming the missing columns — surfaces on /status.
+--
+-- EIGHT SLEEP MAIN-SESSION COLUMNS (appended to the canonical view's tail)
+-- ------------------------------------------------------------------------
+-- es.time_slept_main_session_seconds AS eight_sleep_duration_main_sec
+-- es.deep_sleep_main_session_seconds AS eight_sleep_deep_main_sec
+-- es.rem_sleep_main_session_seconds  AS eight_sleep_rem_main_sec
+-- /bland-altman referenced these names before they existed (silently undefined
+-- under select("*") — three empty Eight Sleep comparisons). Cross-device
+-- comparison must use MAIN-SESSION values per the nap-inclusion convention.
+--
+-- REFRESH MACHINERY
+-- -----------------
+-- pds.refresh_daily_health_matrix_behavioral_mat()
+--   SECURITY DEFINER, search_path = pds, pg_catalog. Plain REFRESH (not
+--   CONCURRENTLY — disallowed inside a function); the rebuild takes ~0.4 s
+--   during which matview reads briefly wait. The UNIQUE index doubles as a
+--   duplicate-date tripwire: a spine anomaly fails the refresh -> failed
+--   heartbeat, instead of silently shipping duplicate rows.
+--   Heartbeat on success AND failure: pds.sync_log source='matrix_mat',
+--   data_type='refresh' (repo convention: every pipeline writes a heartbeat
+--   every run). Column-drift check via pg_attribute (information_schema does
+--   NOT expose matview columns — caused a false drift failure on first run,
+--   fixed in the second migration).
+--
+-- pg_cron (enabled by this migration; was available, not installed):
+--   refresh_daily_health_matrix_behavioral_mat  '10,25,40,55 * * * *'
+--     (Garmin/WHOOP hourly ETL at :00 lands ~:02-:06 -> :10 catches it;
+--      journal :35 / habits :45 / spotify :50 do not feed the matrix)
+--   purge_cron_job_run_details                  '0 8 * * *' (keep 7 days)
+--
+-- The canonical DDL of both migrations lives in the Supabase migration
+-- history; this file is the repo-side reference. To re-apply by hand, run the
+-- two migrations named at the top via the Supabase dashboard or MCP.
