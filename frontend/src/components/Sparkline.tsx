@@ -1,6 +1,3 @@
-"use client";
-
-import { LineChart, Line, XAxis, YAxis } from "recharts";
 import { directionalColor } from "@/lib/chart-theme";
 
 interface SparklineProps {
@@ -17,8 +14,13 @@ interface SparklineProps {
 /**
  * 60×20 inline sparkline (Direction A "Terminal" KPI widget). No axes, no grid,
  * 1px stroke. Color is keyed up/down by the latest value vs the series mean
- * unless an explicit `color` is given. Hidden axes pin the domain to
+ * unless an explicit `color` is given. The domain is pinned to
  * [dataMin, dataMax] so the trace fills the available height.
+ *
+ * Hand-rolled <svg><polyline> rather than a recharts LineChart: Sparkline sits
+ * in StatCard's synchronous import chain, and recharts here dragged ~110 kB of
+ * chart runtime into the First Load JS of every non-chart page that shows a
+ * KPI tile (/status most importantly — it's the post-login landing page).
  */
 export default function Sparkline({
   values,
@@ -34,20 +36,33 @@ export default function Sparkline({
   }
   const mean = clean.reduce((a, b) => a + b, 0) / clean.length;
   const stroke = color ?? directionalColor(clean[clean.length - 1] - mean, { favorable });
-  const data = clean.map((v, i) => ({ i, v }));
+
+  // Mirror the old recharts margins: { top: 2, right: 1, bottom: 2, left: 1 }.
+  const margin = { top: 2, right: 1, bottom: 2, left: 1 };
+  const innerW = width - margin.left - margin.right;
+  const innerH = height - margin.top - margin.bottom;
+  const min = Math.min(...clean);
+  const max = Math.max(...clean);
+  const span = max - min;
+  const points = clean
+    .map((v, i) => {
+      const x = margin.left + (i / (clean.length - 1)) * innerW;
+      // Flat series renders as a centered horizontal line.
+      const y = span === 0 ? margin.top + innerH / 2 : margin.top + (1 - (v - min) / span) * innerH;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(" ");
 
   return (
-    <LineChart
-      width={width}
-      height={height}
-      data={data}
-      margin={{ top: 2, right: 1, bottom: 2, left: 1 }}
-      className={className}
-      aria-hidden
-    >
-      <XAxis dataKey="i" hide />
-      <YAxis hide domain={["dataMin", "dataMax"]} />
-      <Line type="monotone" dataKey="v" stroke={stroke} strokeWidth={1} dot={false} isAnimationActive={false} />
-    </LineChart>
+    <svg width={width} height={height} className={className} aria-hidden>
+      <polyline
+        points={points}
+        fill="none"
+        stroke={stroke}
+        strokeWidth={1}
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
   );
 }

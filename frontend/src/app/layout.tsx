@@ -1,6 +1,5 @@
 import type { Metadata, Viewport } from "next";
 import { GeistSans } from "geist/font/sans";
-import { GeistMono } from "geist/font/mono";
 import { JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import AppShell from "@/components/AppShell";
@@ -41,8 +40,18 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={`dark ${GeistSans.variable} ${GeistMono.variable} ${jetbrainsMono.variable}`}>
+    <html lang="en" className={`dark ${GeistSans.variable} ${jetbrainsMono.variable}`}>
       <body className="bg-surface text-text-primary antialiased font-sans">
+        {/* Browser-side Supabase queries hit this origin right after hydration;
+            preconnecting overlaps DNS+TCP+TLS with shell load instead of paying
+            it serially in front of the first data fetch. React hoists these
+            into <head>. */}
+        <link
+          rel="preconnect"
+          href={process.env.NEXT_PUBLIC_SUPABASE_URL}
+          crossOrigin="anonymous"
+        />
+        <link rel="dns-prefetch" href={process.env.NEXT_PUBLIC_SUPABASE_URL} />
         <AppShell>{children}</AppShell>
       </body>
     </html>

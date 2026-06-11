@@ -58,10 +58,13 @@
   --shadow-floating: 0 8px 30px rgba(0, 0, 0, 0.6);
 
   /* Fonts — CSS vars set by next/font.
-     Mono leads with JetBrains Mono (Direction A numerics), Geist Mono as fallback. */
+     Mono is JetBrains Mono (Direction A numerics); ui-monospace is the system
+     fallback. (Geist Mono was removed 2026-06-11: it sat behind the
+     always-loaded JetBrains Mono in both stacks, so its font files downloaded
+     on every page without ever rendering a glyph.) */
   --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
-  --font-mono: var(--font-jetbrains-mono), var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
-  --font-display: var(--font-jetbrains-mono), var(--font-geist-mono), ui-monospace, monospace;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, monospace;
+  --font-display: var(--font-jetbrains-mono), ui-monospace, monospace;
 
   /* Animation */
   --animate-fade-in: fade-in 150ms ease-out both;
