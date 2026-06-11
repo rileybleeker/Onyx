@@ -261,6 +261,23 @@ def extract_metadata(page: dict) -> dict:
     }
 
 
+def _ts_norm(value: str | None) -> datetime | str | None:
+    """Normalize an ISO-8601 timestamp string for equality comparison.
+
+    Notion emits '2026-06-08T19:25:00.000Z' while PostgREST returns the stored
+    TIMESTAMPTZ as '2026-06-08T19:25:00+00:00' — raw string equality NEVER
+    matches, which made every page look edited on every run (and re-embedded
+    the whole journal hourly until Voyage's reduced rate limits exposed it,
+    2026-06-11).
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+
+
 # ---------------------------------------------------------------------------
 # Voyage embeddings
 # ---------------------------------------------------------------------------
@@ -287,6 +304,10 @@ def embed_documents(client: httpx.Client, texts: list[str]) -> list[list[float]]
             timeout=60,
         ),
         max_attempts=3,
+        # Voyage's 429s carry no Retry-After, and the no-payment-method tier is
+        # 3 requests/MINUTE — the default 1s/2s backoff can never clear it.
+        base_wait=21.0,
+        max_wait=45.0,
         log=log,
     )
     data = r.json()
@@ -349,7 +370,7 @@ def main(full: bool, reembed: bool) -> int:
             edited_changed = (
                 full
                 or stored is None
-                or stored.get("notion_edited_at") != meta["notion_edited_at"]
+                or _ts_norm(stored.get("notion_edited_at")) != _ts_norm(meta["notion_edited_at"])
             )
 
             if edited_changed:
@@ -379,7 +400,11 @@ def main(full: bool, reembed: bool) -> int:
                 head = (meta["title"] or "") + "\n\n" + meta["content_md"]
                 rows_needing_embed.append((idx, head))
 
-        # 4. Embed in batches of 64.
+        # 4. Embed in small batches, paced for Voyage's reduced rate limits
+        # (3 RPM / 10K TPM without a payment method — a 45-doc batch 429s
+        # unconditionally because it exceeds the whole TPM bucket). A normal
+        # incremental run embeds 0-2 docs = one small request; the pacing only
+        # engages on bulk runs (--reembed / --full / model upgrade).
         # Re-audit 2026-06-07 (etl/gemini/F-004): a single failed embedding batch must not
         # abort the whole sync. Track the failed rows, skip only those at upsert time (so
         # their notion_edited_at stays stale in the DB → retried next run), and still
@@ -387,8 +412,10 @@ def main(full: bool, reembed: bool) -> int:
         embed_failed_idx: set[int] = set()
         embed_error: str | None = None
         if rows_needing_embed:
-            BATCH = 64
+            BATCH = 8
             for i in range(0, len(rows_needing_embed), BATCH):
+                if i > 0:
+                    time.sleep(21)  # 3 requests/minute
                 batch = rows_needing_embed[i:i + BATCH]
                 texts = [t for _, t in batch]
                 try:
