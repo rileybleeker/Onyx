@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AreaChart, Area, BarChart, Bar, LineChart, Line, CartesianGrid,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, ReferenceLine, Cell,
@@ -33,19 +33,33 @@ function recoveryColor(score: number | null): string {
   return C.down;
 }
 
-export default function SleepPage() {
-  const [whoopSleep, setWhoopSleep]     = useState<any[]>([]);
-  const [whoopSleepAll, setWhoopSleepAll] = useState<any[]>([]);
-  const [whoopRecovery, setWhoopRecovery] = useState<any[]>([]);
-  const [whoopCycles, setWhoopCycles]   = useState<any[]>([]);
-  const [journal, setJournal]           = useState<any[]>([]);
-  const [eightSleep, setEightSleep]     = useState<any[]>([]);
-  const [summaries, setSummaries]       = useState<any[]>([]);
-  const [loading, setLoading]           = useState(true);
+import type { SleepInitial } from "./SleepLoader";
+
+export default function SleepPage({ initial }: { initial?: SleepInitial | null }) {
+  // Server-prefetched initial data (ISR, default 30d range) seeds the charts
+  // so they paint immediately; the mount effect still runs as a SILENT
+  // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
+  // stale — single-user traffic means the morning's first visit usually
+  // lands on a cache regenerated last evening.
+  const [whoopSleep, setWhoopSleep]     = useState<any[]>(initial?.whoopSleep ?? []);
+  const [whoopSleepAll, setWhoopSleepAll] = useState<any[]>(initial?.whoopSleepAll ?? []);
+  const [whoopRecovery, setWhoopRecovery] = useState<any[]>(initial?.whoopRecovery ?? []);
+  const [whoopCycles, setWhoopCycles]   = useState<any[]>(initial?.whoopCycles ?? []);
+  const [journal, setJournal]           = useState<any[]>(initial?.journal ?? []);
+  const [eightSleep, setEightSleep]     = useState<any[]>(initial?.eightSleep ?? []);
+  const [summaries, setSummaries]       = useState<any[]>(initial?.summaries ?? []);
+  const [loading, setLoading]           = useState(!initial);
   const [range, setRange]               = useState<Range>("30d");
+  const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
-    setLoading(true);
+    // Silent only on the very first run when seeded — range changes show the
+    // loading state as before. The cancelled flag stops a superseded slow
+    // response from overwriting a newer range's data (out-of-order resolve).
+    let cancelled = false;
+    const silent = firstRunWithInitial.current;
+    firstRunWithInitial.current = false;
+    if (!silent) setLoading(true);
     const days = rangeDays(range);
     Promise.all([
       getWhoopSleep(days),
@@ -57,6 +71,7 @@ export default function SleepPage() {
       getDailySummaries(days),
     ])
       .then(([s, sAll, r, c, j, e, sum]) => {
+        if (cancelled) return;
         setWhoopSleep(s);
         setWhoopSleepAll(sAll);
         setWhoopRecovery(r);
@@ -66,7 +81,10 @@ export default function SleepPage() {
         setSummaries(sum);
       })
       .catch(console.error)
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled && !silent) setLoading(false);
+      });
+    return () => { cancelled = true; };
   }, [range]);
 
   if (loading) {
