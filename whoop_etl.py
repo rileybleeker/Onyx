@@ -159,6 +159,11 @@ def refresh_access_token(tokens: dict) -> dict:
         "refresh_token": refresh_token,
         "client_id": WHOOP_CLIENT_ID,
         "client_secret": WHOOP_CLIENT_SECRET,
+        # Per WHOOP's documented refresh example. Note their token endpoint
+        # returns 400 invalid_request (not invalid_grant) for refresh tokens it
+        # can no longer parse — seen 2026-06-11 when a WHOOP-side migration
+        # invalidated all previously-issued tokens; that needs --auth, not retry.
+        "scope": "offline",
     }
     resp = requests.post(WHOOP_TOKEN_URL, data=token_data)
     resp.raise_for_status()
@@ -570,7 +575,9 @@ def main():
             records=0, error=msg,
             duration=time.time() - profile_started,
         )
-        return
+        # Exit non-zero so the GitHub Actions run goes red — a swallowed return
+        # kept CI green through 22h of token failures on 2026-06-11.
+        sys.exit(1)
 
     # Sync all data types
     t0 = time.time()
