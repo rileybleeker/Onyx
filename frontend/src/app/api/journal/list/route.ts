@@ -55,5 +55,12 @@ export async function GET(req: NextRequest) {
     truncated: (row.content_md ?? "").length > SNIPPET_LEN,
   }));
 
-  return NextResponse.json({ entries });
+  // Edge-cache (same pattern as /api/status, perf 2026-06-10/11): the journal
+  // only changes via the hourly Notion sync at :35, so a 5-min CDN snapshot
+  // (+5-min SWR) is far inside the data cadence. Read-only route — no
+  // write-coupled freshness concern.
+  return NextResponse.json(
+    { entries },
+    { headers: { "Cache-Control": "public, s-maxage=300, stale-while-revalidate=300" } }
+  );
 }
