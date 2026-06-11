@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AreaChart, Area, LineChart, Line, CartesianGrid,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
@@ -14,21 +14,41 @@ import { chartColors as C, chartTooltip, axisTick, gridStyle, axisLabel } from "
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-export default function HeartPage() {
-  const [recovery, setRecovery] = useState<any[]>([]);
-  const [cycles, setCycles] = useState<any[]>([]);
-  const [hr, setHr] = useState<any[]>([]);
-  const [summaries, setSummaries] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+import type { HeartInitial } from "./HeartLoader";
+
+export default function HeartPage({ initial }: { initial?: HeartInitial | null }) {
+  // Server-prefetched initial data (ISR, default 30d range) seeds the charts
+  // so they paint immediately; the mount effect still runs as a SILENT
+  // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
+  // stale — single-user traffic means the morning's first visit usually
+  // lands on a cache regenerated last evening.
+  const [recovery, setRecovery] = useState<any[]>(initial?.recovery ?? []);
+  const [cycles, setCycles] = useState<any[]>(initial?.cycles ?? []);
+  const [hr, setHr] = useState<any[]>(initial?.hr ?? []);
+  const [summaries, setSummaries] = useState<any[]>(initial?.summaries ?? []);
+  const [loading, setLoading] = useState(!initial);
   const [range, setRange] = useState<Range>("30d");
+  const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
-    setLoading(true);
+    // Silent only on the very first run when seeded — range changes show the
+    // loading state as before. The cancelled flag stops a superseded slow
+    // response from overwriting a newer range's data (out-of-order resolve).
+    let cancelled = false;
+    const silent = firstRunWithInitial.current;
+    firstRunWithInitial.current = false;
+    if (!silent) setLoading(true);
     const days = rangeDays(range);
     Promise.all([getWhoopRecovery(days), getWhoopCycles(days), getHeartRateData(days), getDailySummaries(days)])
-      .then(([rec, cyc, h, s]) => { setRecovery(rec); setCycles(cyc); setHr(h); setSummaries(s); })
+      .then(([rec, cyc, h, s]) => {
+        if (cancelled) return;
+        setRecovery(rec); setCycles(cyc); setHr(h); setSummaries(s);
+      })
       .catch(console.error)
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled && !silent) setLoading(false);
+      });
+    return () => { cancelled = true; };
   }, [range]);
 
   if (loading) {

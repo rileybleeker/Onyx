@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AreaChart, Area, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, getRunningRecoveryContext, getActivityLaps, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDuration, formatShortDuration, formatDistance, formatPace, formatDate } from "@/lib/format";
@@ -133,6 +133,43 @@ function mergeAndDedup(garmin: ActivityRow[], whoop: ActivityRow[]): ActivityRow
     const bT = new Date(b.display_time).getTime();
     return bT - aT;
   });
+}
+
+// Pure transforms from raw query results → page state. Shared by the
+// server-prefetch useState seeds and the mount effect's fetch path so the
+// two can't drift (ISR perf pass 2026-06-11).
+function buildActivityRows(garmin: any[], whoop: any[]): ActivityRow[] {
+  return mergeAndDedup(garmin.map(normalizeGarmin), whoop.map(normalizeWhoop));
+}
+
+function buildWorkoutMap(wkts: any[]): Record<string, any> {
+  const map: Record<string, any> = {};
+  for (const w of wkts) map[String(w.workout_id)] = w;
+  return map;
+}
+
+type RecoveryInfo = {
+  recovery: number | null;
+  hrv: number | null;
+  sleepPerf: number | null;
+  paceDelta: number | null;
+  segments: SegmentTarget[] | null;
+  segmentCount: number;
+};
+
+function buildRecoveryMap(recCtx: any[]): Record<string, RecoveryInfo> {
+  const recMap: Record<string, RecoveryInfo> = {};
+  for (const r of recCtx) {
+    recMap[`garmin:${r.activity_id}`] = {
+      recovery:  r.whoop_recovery != null ? +r.whoop_recovery : null,
+      hrv:       r.whoop_hrv_rmssd_ms != null ? +Number(r.whoop_hrv_rmssd_ms).toFixed(1) : null,
+      sleepPerf: r.whoop_sleep_performance != null ? +r.whoop_sleep_performance : null,
+      paceDelta: r.pace_delta_pct != null ? +r.pace_delta_pct : null,
+      segments:  Array.isArray(r.segment_targets) ? r.segment_targets as SegmentTarget[] : null,
+      segmentCount: r.segment_target_count ?? 0,
+    };
+  }
+  return recMap;
 }
 
 type SegmentTarget = {
@@ -343,48 +380,58 @@ function buildWorkoutRows(segments: SegmentTarget[], laps: Lap[]): WorkoutRow[] 
   return rows;
 }
 
-export default function ActivitiesPage() {
-  const [rows, setRows] = useState<ActivityRow[]>([]);
-  const [workoutMap, setWorkoutMap] = useState<Record<string, any>>({});
-  const [summaries, setSummaries] = useState<any[]>([]);
-  const [whoopCycles, setWhoopCycles] = useState<any[]>([]);
-  const [hr, setHr] = useState<any[]>([]);
-  const [recoveryMap, setRecoveryMap] = useState<Record<string, { recovery: number | null; hrv: number | null; sleepPerf: number | null; paceDelta: number | null; segments: SegmentTarget[] | null; segmentCount: number }>>({});
+import type { ActivitiesInitial } from "./ActivitiesLoader";
+
+export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitial | null }) {
+  // Server-prefetched initial data (ISR, default 30d range) seeds the page so
+  // it paints immediately; the mount effect still runs as a SILENT
+  // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
+  // stale. Seeds apply the exact same pure transforms (buildActivityRows /
+  // buildWorkoutMap / buildRecoveryMap) the effect applies to fresh fetches.
+  // lapsByActivity is NOT server-prefetched — it's a derived second-stage
+  // fetch (ids come from recoveryContext), so it seeds empty and fills when
+  // the silent first run's full chain completes.
+  const [rows, setRows] = useState<ActivityRow[]>(() =>
+    initial ? buildActivityRows(initial.garmin as any[], initial.whoop as any[]) : [],
+  );
+  const [workoutMap, setWorkoutMap] = useState<Record<string, any>>(() =>
+    initial ? buildWorkoutMap(initial.workouts as any[]) : {},
+  );
+  const [summaries, setSummaries] = useState<any[]>(initial?.summaries ?? []);
+  const [whoopCycles, setWhoopCycles] = useState<any[]>(initial?.cycles ?? []);
+  const [hr, setHr] = useState<any[]>(initial?.hr ?? []);
+  const [recoveryMap, setRecoveryMap] = useState<Record<string, RecoveryInfo>>(() =>
+    initial ? buildRecoveryMap(initial.recoveryContext as any[]) : {},
+  );
   const [lapsByActivity, setLapsByActivity] = useState<Record<number, Lap[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!initial);
   const [range, setRange] = useState<Range>("30d");
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
-    setLoading(true);
+    // Silent only on the very first run when seeded — range changes show the
+    // loading state as before. The FULL chain still runs on the silent first
+    // run, including the derived second-stage laps fetch (never skipped —
+    // the server prefetch covers only the first-stage Promise.all). The
+    // cancelled flag stops a superseded slow response from overwriting a
+    // newer range's data (out-of-order resolve) at either stage.
+    let cancelled = false;
+    const silent = firstRunWithInitial.current;
+    firstRunWithInitial.current = false;
+    if (!silent) setLoading(true);
     setExpanded(new Set());
     const days = rangeDays(range);
     Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts(), getDailySummaries(days), getWhoopCycles(days), getHeartRateData(days), getRunningRecoveryContext(days)])
       .then(([garmin, whoop, wkts, sums, cycles, h, recCtx]) => {
-        const merged = mergeAndDedup(
-          garmin.map(normalizeGarmin),
-          whoop.map(normalizeWhoop),
-        );
-        setRows(merged);
-        const map: Record<string, any> = {};
-        for (const w of wkts) map[String(w.workout_id)] = w;
-        setWorkoutMap(map);
+        if (cancelled) return;
+        setRows(buildActivityRows(garmin, whoop));
+        setWorkoutMap(buildWorkoutMap(wkts));
         setSummaries(sums);
         setWhoopCycles(cycles);
         setHr(h);
-        const recMap: Record<string, { recovery: number | null; hrv: number | null; sleepPerf: number | null; paceDelta: number | null; segments: SegmentTarget[] | null; segmentCount: number }> = {};
-        for (const r of recCtx) {
-          recMap[`garmin:${r.activity_id}`] = {
-            recovery:  r.whoop_recovery != null ? +r.whoop_recovery : null,
-            hrv:       r.whoop_hrv_rmssd_ms != null ? +Number(r.whoop_hrv_rmssd_ms).toFixed(1) : null,
-            sleepPerf: r.whoop_sleep_performance != null ? +r.whoop_sleep_performance : null,
-            paceDelta: r.pace_delta_pct != null ? +r.pace_delta_pct : null,
-            segments:  Array.isArray(r.segment_targets) ? r.segment_targets as SegmentTarget[] : null,
-            segmentCount: r.segment_target_count ?? 0,
-          };
-        }
-        setRecoveryMap(recMap);
+        setRecoveryMap(buildRecoveryMap(recCtx));
 
         // Batch-fetch laps for every Garmin running activity with a multi-segment plan
         const multiSegIds = recCtx
@@ -393,6 +440,7 @@ export default function ActivitiesPage() {
           .filter((n) => !Number.isNaN(n));
         if (multiSegIds.length > 0) {
           getActivityLaps(multiSegIds).then((laps) => {
+            if (cancelled) return;
             const grouped: Record<number, Lap[]> = {};
             for (const l of laps) {
               const aid = Number(l.activity_id);
@@ -413,7 +461,10 @@ export default function ActivitiesPage() {
         }
       })
       .catch(console.error)
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled && !silent) setLoading(false);
+      });
+    return () => { cancelled = true; };
   }, [range]);
 
   function toggleExpanded(id: string) {

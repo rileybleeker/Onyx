@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
@@ -15,8 +15,9 @@ import {
   chartTooltip, axisTick, gridStyle, axisLabel, legendStyle,
   chartColors as C, directionalColor,
 } from "@/lib/chart-theme";
-import { supabase } from "@/lib/supabase";
-import { getWorkoutSleepGap, rangeDays, rangeLabel, type Range, type WorkoutSleepGap } from "@/lib/queries";
+import { rangeDays, rangeLabel, type Range, type WorkoutSleepGap } from "@/lib/queries";
+import { loadHrvDashboard, loadHrvRangeDependent, parseJsonb } from "@/lib/queries-hrv";
+import type { HrvInitial } from "./HrvLoader";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -153,179 +154,10 @@ function WrappedYAxisTick(
 }
 
 // ---------------------------------------------------------------------------
-// Data fetching
-//
-// All forecast queries read from pds.hrv_predictions_latest — a DISTINCT ON
-// view that returns one row per (prediction_date, model, horizon_days), always
-// the freshest and excluding backtest rows. Readers do not reason about
-// run-history or model_version freshness.
-// ---------------------------------------------------------------------------
-
-// ET tomorrow as YYYY-MM-DD. ET is canonical for all calendar_date joins in
-// this pipeline; browser-local would drift for users outside ET.
-function etTomorrowStr(): string {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/New_York",
-    year: "numeric", month: "2-digit", day: "2-digit",
-  }).formatToParts(new Date());
-  const y = parts.find(p => p.type === "year")!.value;
-  const m = parts.find(p => p.type === "month")!.value;
-  const d = parts.find(p => p.type === "day")!.value;
-  const t = new Date(`${y}-${m}-${d}T00:00:00Z`);
-  t.setUTCDate(t.getUTCDate() + 1);
-  return t.toISOString().split("T")[0];
-}
-
-async function getTomorrowPrediction() {
-  const tomorrow = etTomorrowStr();
-  const cols = "prediction_date,model,predicted_hrv,prediction_lower,prediction_upper,actual_hrv,horizon_days,top_drivers,model_version";
-  const primary = await supabase
-    .from("hrv_predictions_latest")
-    .select(cols)
-    .eq("model", "xgboost")
-    .eq("horizon_days", 1)
-    .eq("prediction_date", tomorrow)
-    .is("actual_hrv", null)
-    .limit(1);
-  if (primary.data?.[0]) return primary.data[0];
-  // Fallback: earliest unscored XGBoost h=1 on or after ET tomorrow.
-  const fb = await supabase
-    .from("hrv_predictions_latest")
-    .select(cols)
-    .eq("model", "xgboost")
-    .eq("horizon_days", 1)
-    .gte("prediction_date", tomorrow)
-    .is("actual_hrv", null)
-    .order("prediction_date", { ascending: true })
-    .limit(1);
-  return fb.data?.[0] ?? null;
-}
-
-async function getHrvPredictionAccuracy(days: number = 60) {
-  const since = new Date();
-  since.setDate(since.getDate() - days);
-  const { data } = await supabase
-    .from("hrv_predictions_latest")
-    .select("prediction_date,model,predicted_hrv,actual_hrv,residual,prediction_lower,prediction_upper")
-    .eq("model", "xgboost")
-    .eq("horizon_days", 1)
-    .not("actual_hrv", "is", null)
-    .gte("prediction_date", since.toISOString().split("T")[0])
-    .order("prediction_date", { ascending: true });
-  return data ?? [];
-}
-
-async function getHrvModelMetrics() {
-  // Latest eval_date now writes ~36 rows (xgboost + 3 baselines + sarimax all at
-  // h=1..7 = 35, plus prophet h=1 = 36). Limit must cover the full latest sweep
-  // so the Accuracy-by-Forecast-Horizon chart sees every (model × horizon) cell.
-  const { data } = await supabase
-    .from("hrv_model_metrics")
-    .select("*")
-    .order("eval_date", { ascending: false })
-    .limit(100);
-  return data ?? [];
-}
-
-async function getHrvAnalysisResults(resultType: string, resultKey?: string) {
-  let query = supabase
-    .from("hrv_analysis_results")
-    .select("result_type,result_key,result_json,computed_at")
-    .eq("result_type", resultType);
-  if (resultKey) query = query.eq("result_key", resultKey);
-  const { data } = await query.order("computed_at", { ascending: false }).limit(1);
-  return data?.[0] ?? null;
-}
-
-// hrv_analysis_results.result_json is a jsonb column, so supabase-js returns it
-// already-parsed — calling JSON.parse() on the object throws (silently, via the
-// bare catch blocks below) and the chart renders empty. Pre-2026-05-26 rows were
-// double-encoded strings (the JSONB-audit bug), so still handle the string case.
-function parseJsonb(v: unknown): any {
-  return typeof v === "string" ? JSON.parse(v) : (v ?? null);
-}
-
-async function getHistoricalHrv(days = 180) {
-  const since = new Date();
-  since.setDate(since.getDate() - days);
-  // ADR-0001 Phase 3: HRV is the morning-after measurement that "belongs to"
-  // the prior night's behaviors, so the trend line should sit on the
-  // bedtime-day (onyx_behavioral_date), not the watch-local clock-day. The
-  // difference is invisible most nights, but a pre-midnight bedtime shifts
-  // calendar_date one day earlier than the behavioral attribution; charts
-  // that key on calendar_date drift relative to the prediction/causal
-  // panels which are already behavioral-day-keyed.
-  const { data } = await supabase
-    .from("daily_health_matrix_behavioral")
-    .select("onyx_behavioral_date,whoop_hrv_rmssd")
-    .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
-    .not("whoop_hrv_rmssd", "is", null)
-    .order("onyx_behavioral_date", { ascending: true });
-  return data ?? [];
-}
-
-// All-time pull (no date filter) of nights that have a temperature reading
-// AND any of the next-night outcomes. Powers the Environment Sweet Spot
-// dose-response chart, which buckets nights by selected temperature and
-// shows mean of the selected outcome per bucket. Filters at "any temp + HRV"
-// so we don't drop nights where bed_temp is present but room_temp isn't.
-// Per-row null-check happens client-side per selected axis pair.
-async function getEnvDoseResponseData() {
-  // ADR-0001 Phase 3: order by onyx_behavioral_date so the sweet-spot
-  // buckets pair each temperature reading with the HRV/recovery measured
-  // the morning of the same bedtime-day, not the clock-day calendar slot
-  // that pre-midnight bedtimes would mis-attribute by ±1 day.
-  const { data } = await supabase
-    .from("daily_health_matrix_behavioral")
-    .select(
-      "onyx_behavioral_date,eight_sleep_room_temp,eight_sleep_bed_temp,whoop_hrv_rmssd," +
-      "whoop_recovery_score,whoop_sleep_efficiency,whoop_deep_sleep_milli"
-    )
-    .or("eight_sleep_room_temp.not.is.null,eight_sleep_bed_temp.not.is.null")
-    .not("whoop_hrv_rmssd", "is", null)
-    .order("onyx_behavioral_date", { ascending: true });
-  return data ?? [];
-}
-
-async function getHrvResiduals() {
-  // Use the *_eval view (sibling of hrv_predictions_latest) so backtest
-  // model_versions are included. The latest view excludes them, which
-  // would render this chart nearly empty since most XGBoost evaluation
-  // history is stored as backtest_initial rows.
-  const { data } = await supabase
-    .from("hrv_predictions_eval")
-    .select("prediction_date,model,predicted_hrv,actual_hrv,residual")
-    .in("model", ["xgboost", "baseline_naive", "baseline_7d_avg"])
-    .not("residual", "is", null)
-    .eq("horizon_days", 1)
-    .order("prediction_date", { ascending: true });
-  return data ?? [];
-}
-
-async function getProphetForecast() {
-  const today = new Date().toISOString().split("T")[0];
-  const { data } = await supabase
-    .from("hrv_predictions_latest")
-    .select("prediction_date,predicted_hrv,prediction_lower,prediction_upper,actual_hrv")
-    .eq("model", "prophet")
-    .gte("prediction_date", today)
-    .order("prediction_date", { ascending: true })
-    .limit(30);
-  return data ?? [];
-}
-
-async function getSarimaxForecast() {
-  const today = new Date().toISOString().split("T")[0];
-  const { data } = await supabase
-    .from("hrv_predictions_latest")
-    .select("prediction_date,predicted_hrv,prediction_lower,prediction_upper")
-    .eq("model", "sarimax")
-    .gte("prediction_date", today)
-    .order("prediction_date", { ascending: true })
-    .limit(7);
-  return data ?? [];
-}
-
+// Data fetching lives in lib/queries-hrv.ts (perf pass 2026-06-11) so the
+// SAME functions run server-side for the ISR prefetch in page.tsx and here
+// for the silent mount revalidation + range changes. loadHrvDashboard /
+// loadHrvRangeDependent are the shared entry points.
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -366,34 +198,45 @@ const SECTIONS = [
 // ---------------------------------------------------------------------------
 // Page Component
 // ---------------------------------------------------------------------------
-export default function HrvAnalysisPage() {
-  const [loading, setLoading] = useState(true);
-  const [tomorrowPred, setTomorrowPred] = useState<any | null>(null);
-  const [accuracy, setAccuracy] = useState<any[]>([]);
-  const [metrics, setMetrics] = useState<any[]>([]);
-  const [historicalHrv, setHistoricalHrv] = useState<any[]>([]);
-  const [correlations, setCorrelations] = useState<any[]>([]);
-  const [journalImpact, setJournalImpact] = useState<any[]>([]);
-  const [featureImportance, setFeatureImportance] = useState<any[]>([]);
-  const [residuals, setResiduals] = useState<any[]>([]);
-  const [prophetForecast, setProphetForecast] = useState<any[]>([]);
-  const [sarimaxForecast, setSarimaxForecast] = useState<any[]>([]);
-  const [journalCorrelations, setJournalCorrelations] = useState<any[]>([]);
-  const [journalShap, setJournalShap] = useState<any[]>([]);
-  const [habitImpact, setHabitImpact] = useState<any[]>([]);
-  const [habitCorrelations, setHabitCorrelations] = useState<any[]>([]);
-  const [habitShap, setHabitShap] = useState<any[]>([]);
-  const [supplementImpact, setSupplementImpact] = useState<any[]>([]);
-  const [supplementDoseResponse, setSupplementDoseResponse] = useState<any[]>([]);
-  const [nutritionImpact, setNutritionImpact] = useState<any[]>([]);
-  const [workoutGap, setWorkoutGap] = useState<WorkoutSleepGap[]>([]);
-  const [causalBinary, setCausalBinary] = useState<any[]>([]);
-  const [causalContinuous, setCausalContinuous] = useState<any[]>([]);
-  const [causalDag, setCausalDag] = useState<any | null>(null);
-  const [causalMeta, setCausalMeta] = useState<any | null>(null);
-  const [causalDropped, setCausalDropped] = useState<any[]>([]);
-  const [envMatrix, setEnvMatrix] = useState<any[]>([]);
-  const [xgbDiagnostics, setXgbDiagnostics] = useState<any | null>(null);
+
+// Default range — MUST stay in sync with page.tsx's server prefetch
+// (loadHrvDashboard(rangeDays("30d"))), which produced `initial` for exactly
+// this window. A mismatch would silently render wrong-window data.
+const DEFAULT_RANGE: Range = "30d";
+
+export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | null }) {
+  // Server-prefetched initial data (ISR, default 30d range) seeds the charts
+  // so they paint immediately; the mount effect still runs as a SILENT
+  // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
+  // stale — single-user traffic means the morning's first visit usually
+  // lands on a cache regenerated last evening.
+  const [loading, setLoading] = useState(!initial);
+  const [tomorrowPred, setTomorrowPred] = useState<any | null>(initial?.tomorrowPred ?? null);
+  const [accuracy, setAccuracy] = useState<any[]>(initial?.accuracy ?? []);
+  const [metrics, setMetrics] = useState<any[]>(initial?.metrics ?? []);
+  const [historicalHrv, setHistoricalHrv] = useState<any[]>(initial?.historicalHrv ?? []);
+  const [correlations, setCorrelations] = useState<any[]>(initial?.correlations ?? []);
+  const [journalImpact, setJournalImpact] = useState<any[]>(initial?.journalImpact ?? []);
+  const [featureImportance, setFeatureImportance] = useState<any[]>(initial?.featureImportance ?? []);
+  const [residuals, setResiduals] = useState<any[]>(initial?.residuals ?? []);
+  const [prophetForecast, setProphetForecast] = useState<any[]>(initial?.prophetForecast ?? []);
+  const [sarimaxForecast, setSarimaxForecast] = useState<any[]>(initial?.sarimaxForecast ?? []);
+  const [journalCorrelations, setJournalCorrelations] = useState<any[]>(initial?.journalCorrelations ?? []);
+  const [journalShap, setJournalShap] = useState<any[]>(initial?.journalShap ?? []);
+  const [habitImpact, setHabitImpact] = useState<any[]>(initial?.habitImpact ?? []);
+  const [habitCorrelations, setHabitCorrelations] = useState<any[]>(initial?.habitCorrelations ?? []);
+  const [habitShap, setHabitShap] = useState<any[]>(initial?.habitShap ?? []);
+  const [supplementImpact, setSupplementImpact] = useState<any[]>(initial?.supplementImpact ?? []);
+  const [supplementDoseResponse, setSupplementDoseResponse] = useState<any[]>(initial?.supplementDoseResponse ?? []);
+  const [nutritionImpact, setNutritionImpact] = useState<any[]>(initial?.nutritionImpact ?? []);
+  const [workoutGap, setWorkoutGap] = useState<WorkoutSleepGap[]>(initial?.workoutGap ?? []);
+  const [causalBinary, setCausalBinary] = useState<any[]>(initial?.causalBinary ?? []);
+  const [causalContinuous, setCausalContinuous] = useState<any[]>(initial?.causalContinuous ?? []);
+  const [causalDag, setCausalDag] = useState<any | null>(initial?.causalDag ?? null);
+  const [causalMeta, setCausalMeta] = useState<any | null>(initial?.causalMeta ?? null);
+  const [causalDropped, setCausalDropped] = useState<any[]>(initial?.causalDropped ?? []);
+  const [envMatrix, setEnvMatrix] = useState<any[]>(initial?.envMatrix ?? []);
+  const [xgbDiagnostics, setXgbDiagnostics] = useState<any | null>(initial?.xgbDiagnostics ?? null);
   // Environment Sweet Spot dual-axis selectors. X axis is which temp sensor
   // to bucket by (Pod room vs bed surface); Y axis is which next-night
   // outcome to plot. Defaults preserve the original chart (room × HRV).
@@ -401,7 +244,11 @@ export default function HrvAnalysisPage() {
   const [envOutcome, setEnvOutcome] = useState<"hrv" | "recovery" | "efficiency" | "deep">("hrv");
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
-  const [range, setRange] = useState<Range>("30d");
+  const [range, setRange] = useState<Range>(DEFAULT_RANGE);
+  // Narrow loading flag for range changes — only the 3 range-dependent series
+  // refetch, and the stale charts stay visible while they do (no page-wide
+  // skeleton; see the range effect below).
+  const [rangeLoading, setRangeLoading] = useState(false);
   // Global FDR filter — when ON (default), every chart whose rows carry a
   // `passes_fdr` flag hides the non-survivors. BH-FDR is applied per family
   // in the pipeline (causal binary/continuous, journal/habit/supplement
@@ -438,107 +285,101 @@ export default function HrvAnalysisPage() {
   const sideMarginShort = isMobile ? 4 : 140;  // matches axisW.short when desktop
   const sideMarginMed   = isMobile ? 4 : 160;  // matches axisW.med when desktop
 
+  const firstRunWithInitial = useRef(!!initial);
+  const firstRangeRun = useRef(true);
+  // Tracks the most recently requested range so the mount effect (which can
+  // resolve AFTER a quick range flip's narrower fetch) knows whether it still
+  // owns the 3 range-dependent state slices.
+  const latestRange = useRef<Range>(DEFAULT_RANGE);
+
+  // Mount effect: the full dashboard load (all 26 fetches via the shared
+  // loadHrvDashboard — same function + args the server prefetch uses). Runs
+  // exactly once. Silent when seeded from the server — no skeleton flip, the
+  // ISR snapshot stays painted while fresh data swaps in underneath. When
+  // initial is null (pre-ISR path) it behaves exactly as before: skeleton
+  // until the first fetch resolves. The cancelled flag stops a superseded
+  // slow response from committing stale state after unmount.
   useEffect(() => {
-    setLoading(true);
-    const days = rangeDays(range);
-    Promise.all([
-      getTomorrowPrediction(),
-      getHrvPredictionAccuracy(days),
-      getHrvModelMetrics(),
-      getHistoricalHrv(days),
-      getHrvAnalysisResults("correlation", "spearman_top50"),
-      getHrvAnalysisResults("journal_impact"),
-      getHrvAnalysisResults("feature_importance", "shap_mean_abs"),
-      getHrvResiduals(),
-      getProphetForecast(),
-      getHrvAnalysisResults("correlation", "spearman_journal"),
-      getHrvAnalysisResults("feature_importance", "shap_journal"),
-      getSarimaxForecast(),
-      getWorkoutSleepGap(days),
-      getHrvAnalysisResults("supplement_impact", "yes_no"),
-      getHrvAnalysisResults("supplement_impact", "dose_response"),
-      getHrvAnalysisResults("nutrition_impact", "spearman"),
-      getHrvAnalysisResults("habit_impact"),
-      getHrvAnalysisResults("correlation", "spearman_habit"),
-      getHrvAnalysisResults("feature_importance", "shap_habit"),
-      getHrvAnalysisResults("causal", "binary_treatments"),
-      getHrvAnalysisResults("causal", "continuous_treatments"),
-      getHrvAnalysisResults("causal", "dag"),
-      getHrvAnalysisResults("causal", "meta"),
-      getHrvAnalysisResults("causal", "dropped_low_n"),
-      getEnvDoseResponseData(),
-      getHrvAnalysisResults("model_diagnostics", "xgboost"),
-    ]).then(([tomorrow, acc, m, hist, corr, ji, fi, res, prophet, jCorr, jShap, sarimax, wkGap, suppImp, suppDose, nutImp, hi, hCorr, hShap, cBin, cCont, cDag, cMeta, cDrop, envM, xgbDiag]) => {
-      setTomorrowPred(tomorrow);
-      setAccuracy(acc);
-      setMetrics(m);
-      setHistoricalHrv(hist);
-      if (corr?.result_json) {
-        try { setCorrelations(parseJsonb(corr.result_json).slice(0, 15)); } catch {}
-      }
-      if (ji?.result_json) {
-        try { setJournalImpact(parseJsonb(ji.result_json).slice(0, 15)); } catch {}
-      }
-      if (fi?.result_json) {
-        try { setFeatureImportance(parseJsonb(fi.result_json).slice(0, 10)); } catch {}
-      }
-      if (jCorr?.result_json) {
-        try { setJournalCorrelations(parseJsonb(jCorr.result_json)); } catch {}
-      }
-      if (jShap?.result_json) {
-        try { setJournalShap(parseJsonb(jShap.result_json)); } catch {}
-      }
-      setResiduals(res);
-      setProphetForecast(prophet);
-      setSarimaxForecast(sarimax);
-      setWorkoutGap(wkGap);
-      if (suppImp?.result_json) {
-        try { setSupplementImpact(parseJsonb(suppImp.result_json)); } catch {}
-      }
-      if (suppDose?.result_json) {
-        try { setSupplementDoseResponse(parseJsonb(suppDose.result_json)); } catch {}
-      }
-      if (nutImp?.result_json) {
-        try { setNutritionImpact(parseJsonb(nutImp.result_json)); } catch {}
-      }
-      if (hi?.result_json) {
-        try { setHabitImpact(parseJsonb(hi.result_json)); } catch {}
-      }
-      if (hCorr?.result_json) {
-        try { setHabitCorrelations(parseJsonb(hCorr.result_json)); } catch {}
-      }
-      if (hShap?.result_json) {
-        try { setHabitShap(parseJsonb(hShap.result_json)); } catch {}
-      }
-      if (cBin?.result_json) {
-        try { setCausalBinary(parseJsonb(cBin.result_json)); } catch {}
-      }
-      if (cCont?.result_json) {
-        try { setCausalContinuous(parseJsonb(cCont.result_json)); } catch {}
-      }
-      if (cDag?.result_json) {
-        try { setCausalDag(parseJsonb(cDag.result_json)); } catch {}
-      }
-      if (cMeta?.result_json) {
-        try { setCausalMeta(parseJsonb(cMeta.result_json)); } catch {}
-      }
-      if (cDrop?.result_json) {
-        try { setCausalDropped(parseJsonb(cDrop.result_json)); } catch {}
-      }
-      setEnvMatrix(envM);
-      // model_diagnostics/xgboost row carries feature_condition_number +
-      // shap_unstable from the latest train_xgboost run; the banner above
-      // Prediction Drivers reads it to flag SHAP attributions as unreliable
-      // when the training matrix is heavily collinear.
-      if (xgbDiag?.result_json) {
-        try {
-          const parsed = typeof xgbDiag.result_json === "string"
-            ? JSON.parse(xgbDiag.result_json)
-            : xgbDiag.result_json;
-          setXgbDiagnostics(parsed);
-        } catch {}
-      }
-    }).catch(console.error).finally(() => setLoading(false));
+    let cancelled = false;
+    const silent = firstRunWithInitial.current;
+    firstRunWithInitial.current = false;
+    if (!silent) setLoading(true);
+    // DEFAULT_RANGE, not `range`: this effect runs once on mount, before the
+    // user can possibly change the range filter (range changes are handled by
+    // the narrower effect below).
+    loadHrvDashboard(rangeDays(DEFAULT_RANGE))
+      .then((d) => {
+        if (cancelled) return;
+        // The 3 range-dependent slices are guarded: if the user flipped the
+        // range while this full load was in flight, the range effect below
+        // owns them now — committing this default-window data would label
+        // e.g. 30d points as "last 90 days" (the pre-split single effect
+        // avoided this by cancelling the whole run on any range change).
+        if (latestRange.current === DEFAULT_RANGE) {
+          setAccuracy(d.accuracy);
+          setHistoricalHrv(d.historicalHrv);
+          setWorkoutGap(d.workoutGap);
+        }
+        setTomorrowPred(d.tomorrowPred);
+        setMetrics(d.metrics);
+        setCorrelations(d.correlations);
+        setJournalImpact(d.journalImpact);
+        setFeatureImportance(d.featureImportance);
+        setJournalCorrelations(d.journalCorrelations);
+        setJournalShap(d.journalShap);
+        setResiduals(d.residuals);
+        setProphetForecast(d.prophetForecast);
+        setSarimaxForecast(d.sarimaxForecast);
+        setSupplementImpact(d.supplementImpact);
+        setSupplementDoseResponse(d.supplementDoseResponse);
+        setNutritionImpact(d.nutritionImpact);
+        setHabitImpact(d.habitImpact);
+        setHabitCorrelations(d.habitCorrelations);
+        setHabitShap(d.habitShap);
+        setCausalBinary(d.causalBinary);
+        setCausalContinuous(d.causalContinuous);
+        setCausalDag(d.causalDag);
+        setCausalMeta(d.causalMeta);
+        setCausalDropped(d.causalDropped);
+        setEnvMatrix(d.envMatrix);
+        setXgbDiagnostics(d.xgbDiagnostics);
+      })
+      .catch(console.error)
+      .finally(() => {
+        if (!cancelled && !silent) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Range effect: only 3 of the 26 calls actually vary with the range filter
+  // (prediction accuracy window, HRV trend, workout→sleep gap), so range
+  // changes refetch ONLY those and update just their state slices under the
+  // narrow rangeLoading flag — the stale charts stay visible while
+  // revalidating instead of flipping the page-wide skeleton. The first run
+  // (mount) is skipped: the mount effect above already covers the default
+  // range, and re-fetching here would duplicate the triple. The cancelled
+  // flag stops a superseded slow response from overwriting a newer range's
+  // data (out-of-order resolve).
+  useEffect(() => {
+    latestRange.current = range;
+    if (firstRangeRun.current) {
+      firstRangeRun.current = false;
+      return;
+    }
+    let cancelled = false;
+    setRangeLoading(true);
+    loadHrvRangeDependent(rangeDays(range))
+      .then((d) => {
+        if (cancelled) return;
+        setAccuracy(d.accuracy);
+        setHistoricalHrv(d.historicalHrv);
+        setWorkoutGap(d.workoutGap);
+      })
+      .catch(console.error)
+      .finally(() => {
+        if (!cancelled) setRangeLoading(false);
+      });
+    return () => { cancelled = true; };
   }, [range]);
 
   // ---------------------------------------------------------------------------
@@ -703,6 +544,9 @@ export default function HrvAnalysisPage() {
           >
             FDR-significant only {fdrOnly ? "✓" : "○"}
           </button>
+          {rangeLoading && (
+            <span className="text-[11px] font-mono text-text-tertiary animate-pulse">updating…</span>
+          )}
           <RangeFilter value={range} onChange={setRange} />
           {!hasData && (
             <div className="text-sm text-text-tertiary bg-amber-500/10 border border-amber-500/20 rounded px-3 py-1.5">

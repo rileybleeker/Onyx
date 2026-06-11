@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ScatterChart, Scatter, XAxis, YAxis, Tooltip, ResponsiveContainer,
   ReferenceLine, CartesianGrid, Label,
@@ -107,17 +107,37 @@ function BAPlot({
   );
 }
 
-export default function BlandAltmanPage() {
-  const [data, setData] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+import type { BlandAltmanInitial } from "./BlandAltmanLoader";
+
+export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInitial | null }) {
+  // Server-prefetched initial data (ISR, default 30d range) seeds the charts
+  // so they paint immediately; the mount effect still runs as a SILENT
+  // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
+  // stale — single-user traffic means the morning's first visit usually
+  // lands on a cache regenerated last evening.
+  const [data, setData] = useState<any[]>(initial?.data ?? []);
+  const [loading, setLoading] = useState(!initial);
   const [range, setRange] = useState<Range>("30d");
+  const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
-    setLoading(true);
+    // Silent only on the very first run when seeded — range changes show the
+    // loading state as before. The cancelled flag stops a superseded slow
+    // response from overwriting a newer range's data (out-of-order resolve).
+    let cancelled = false;
+    const silent = firstRunWithInitial.current;
+    firstRunWithInitial.current = false;
+    if (!silent) setLoading(true);
     getHealthMatrix(rangeDays(range))
-      .then(setData)
+      .then((rows) => {
+        if (cancelled) return;
+        setData(rows);
+      })
       .catch(console.error)
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled && !silent) setLoading(false);
+      });
+    return () => { cancelled = true; };
   }, [range]);
 
   if (loading) {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   BarChart, Bar,
   LineChart, Line,
@@ -85,22 +85,41 @@ function fmtHourTick(h: number): string {
   return `${hr12}${ampm}${h >= 24 ? " +1" : ""}`;
 }
 
-export default function CaffeinePage() {
-  const [daily, setDaily] = useState<CaffeineDailyRow[]>([]);
-  const [hrvPairs, setHrvPairs] = useState<CaffeineHrvPair[]>([]);
-  const [quality, setQuality] = useState<CaffeineQualityFlag[]>([]);
-  const [loading, setLoading] = useState(true);
+import type { CaffeineInitial } from "./CaffeineLoader";
+
+export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | null }) {
+  // Server-prefetched initial data (ISR, fixed 60/90/45-day windows) seeds the
+  // charts so they paint immediately; the mount effect still runs as a SILENT
+  // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
+  // stale — single-user traffic means the morning's first visit usually
+  // lands on a cache regenerated last evening.
+  const [daily, setDaily] = useState<CaffeineDailyRow[]>(initial?.daily ?? []);
+  const [hrvPairs, setHrvPairs] = useState<CaffeineHrvPair[]>(initial?.hrvPairs ?? []);
+  const [quality, setQuality] = useState<CaffeineQualityFlag[]>(initial?.quality ?? []);
+  const [loading, setLoading] = useState(!initial);
+  const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
-    setLoading(true);
+    // Silent only on the very first run when seeded — there is no range
+    // picker on this page, so this effect runs exactly once with the fixed
+    // windows. The cancelled flag stops an unmounted/superseded run from
+    // committing stale state.
+    let cancelled = false;
+    const silent = firstRunWithInitial.current;
+    firstRunWithInitial.current = false;
+    if (!silent) setLoading(true);
     Promise.all([getCaffeineDaily(60), getCaffeineHrvPairs(90), getCaffeineDataQuality(45)])
       .then(([d, p, q]) => {
+        if (cancelled) return;
         setDaily(d);
         setHrvPairs(p);
         setQuality(q);
       })
       .catch((err) => console.error("Caffeine page load:", err))
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled && !silent) setLoading(false);
+      });
+    return () => { cancelled = true; };
   }, []);
 
   // ─── KPI derivations ────────────────────────────────────────────────────

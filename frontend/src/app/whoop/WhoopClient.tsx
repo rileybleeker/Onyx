@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AreaChart, Area, BarChart, Bar, LineChart, Line,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
@@ -24,21 +24,41 @@ function recoveryColor(score: number | null): string {
   return C.down;
 }
 
-export default function WhoopPage() {
-  const [recovery, setRecovery] = useState<any[]>([]);
-  const [cycles, setCycles] = useState<any[]>([]);
-  const [sleep, setSleep] = useState<any[]>([]);
-  const [journal, setJournal] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+import type { WhoopInitial } from "./WhoopLoader";
+
+export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }) {
+  // Server-prefetched initial data (ISR, default 30d range) seeds the charts
+  // so they paint immediately; the mount effect still runs as a SILENT
+  // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
+  // stale — single-user traffic means the morning's first visit usually
+  // lands on a cache regenerated last evening.
+  const [recovery, setRecovery] = useState<any[]>(initial?.recovery ?? []);
+  const [cycles, setCycles] = useState<any[]>(initial?.cycles ?? []);
+  const [sleep, setSleep] = useState<any[]>(initial?.sleep ?? []);
+  const [journal, setJournal] = useState<any[]>(initial?.journal ?? []);
+  const [loading, setLoading] = useState(!initial);
   const [range, setRange] = useState<Range>("30d");
+  const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
-    setLoading(true);
+    // Silent only on the very first run when seeded — range changes show the
+    // loading state as before. The cancelled flag stops a superseded slow
+    // response from overwriting a newer range's data (out-of-order resolve).
+    let cancelled = false;
+    const silent = firstRunWithInitial.current;
+    firstRunWithInitial.current = false;
+    if (!silent) setLoading(true);
     const days = rangeDays(range);
     Promise.all([getWhoopRecovery(days), getWhoopCycles(days), getWhoopSleep(days), getWhoopJournal(days)])
-      .then(([r, c, s, j]) => { setRecovery(r); setCycles(c); setSleep(s); setJournal(j); })
+      .then(([r, c, s, j]) => {
+        if (cancelled) return;
+        setRecovery(r); setCycles(c); setSleep(s); setJournal(j);
+      })
       .catch(console.error)
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled && !silent) setLoading(false);
+      });
+    return () => { cancelled = true; };
   }, [range]);
 
   if (loading) {

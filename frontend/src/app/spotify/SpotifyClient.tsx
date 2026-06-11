@@ -121,19 +121,30 @@ function chipClass(active: boolean, disabled = false): string {
   return `${base} bg-black/20 border-border-subtle text-text-secondary hover:border-source-spotify/40 hover:text-text-primary`;
 }
 
-export default function SpotifyPage() {
-  const [kpis, setKpis] = useState<Kpis | null>(null);
-  const [volume, setVolume] = useState<SpotifyDailySignatureRow[]>([]);
-  const [drift, setDrift] = useState<FeatureDrift>([]);
-  const [genreRotation, setGenreRotation] = useState<GenreRotation>({ rows: [], topGenres: [] });
-  const [discovery, setDiscovery] = useState<DiscoveryRate>([]);
-  const [topArtists, setTopArtists] = useState<TopArtists>([]);
-  const [topTracks, setTopTracks] = useState<TopTracks>([]);
-  const [hours, setHours] = useState<HourBuckets>([]);
-  const [sonic, setSonic] = useState<SonicProfile>(null);
-  const [genres, setGenres] = useState<TopGenres>([]);
-  const [loading, setLoading] = useState(true);
+import type { SpotifyInitial } from "./SpotifyLoader";
+
+export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | null }) {
+  // Server-prefetched initial data (ISR, default 30d range) seeds the charts
+  // so they paint immediately; the mount effect still runs as a SILENT
+  // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
+  // stale — single-user traffic means the morning's first visit usually
+  // lands on a cache regenerated last evening. The ledger is NOT seeded —
+  // its user-paginated effect stays client-only with its own loading state.
+  const [kpis, setKpis] = useState<Kpis | null>(initial?.dashboard.kpis ?? null);
+  const [volume, setVolume] = useState<SpotifyDailySignatureRow[]>(initial?.volume ?? []);
+  const [drift, setDrift] = useState<FeatureDrift>(initial?.drift ?? []);
+  const [genreRotation, setGenreRotation] = useState<GenreRotation>(
+    initial?.dashboard.genreRotation ?? { rows: [], topGenres: [] },
+  );
+  const [discovery, setDiscovery] = useState<DiscoveryRate>(initial?.dashboard.discovery ?? []);
+  const [topArtists, setTopArtists] = useState<TopArtists>(initial?.dashboard.topArtists ?? []);
+  const [topTracks, setTopTracks] = useState<TopTracks>(initial?.dashboard.topTracks ?? []);
+  const [hours, setHours] = useState<HourBuckets>(initial?.dashboard.hours ?? []);
+  const [sonic, setSonic] = useState<SonicProfile>(initial?.dashboard.sonic ?? null);
+  const [genres, setGenres] = useState<TopGenres>(initial?.dashboard.topGenres ?? []);
+  const [loading, setLoading] = useState(!initial);
   const [range, setRange] = useState<SpotifyRange>("30d");
+  const firstRunWithInitial = useRef(!!initial);
 
   // Ledger pagination is separate from the main page fetch so paging through
   // doesn't re-load the charts.
@@ -300,7 +311,13 @@ export default function SpotifyPage() {
   }, [genLog, genRunning, genResult, genError]);
 
   useEffect(() => {
-    setLoading(true);
+    // Silent only on the very first run when seeded — range changes show the
+    // loading state as before. The cancelled flag stops a superseded slow
+    // response from overwriting a newer range's data (out-of-order resolve).
+    let cancelled = false;
+    const silent = firstRunWithInitial.current;
+    firstRunWithInitial.current = false;
+    if (!silent) setLoading(true);
     Promise.all([
       // One shared fetch of the range's plays + artist genres + track
       // features, computing all 8 aggregates — replaces 8 independent
@@ -310,6 +327,7 @@ export default function SpotifyPage() {
       getSpotifyAudioFeatureDrift(range),
     ])
       .then(([dash, v, d]) => {
+        if (cancelled) return;
         setKpis(dash.kpis);
         setVolume(v);
         setDrift(d);
@@ -322,9 +340,12 @@ export default function SpotifyPage() {
         setGenres(dash.topGenres);
       })
       .catch((err) => console.error("Spotify page load:", err))
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled && !silent) setLoading(false);
+      });
     // Reset ledger to page 0 whenever the range changes
     setLedgerPage(0);
+    return () => { cancelled = true; };
   }, [range]);
 
   useEffect(() => {

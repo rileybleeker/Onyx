@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AreaChart, Area,
   BarChart, Bar, Cell,
@@ -126,15 +126,24 @@ interface WeightRow {
   source: "manual" | "tanita";
 }
 
-export default function NutritionPage() {
+import type { NutritionInitial } from "./NutritionLoader";
+
+export default function NutritionPage({ initial }: { initial?: NutritionInitial | null }) {
   // ─── Nutrition state ───
-  const [nutritionData, setNutritionData] = useState<any[]>([]);
-  const [burntData, setBurntData] = useState<any[]>([]);
-  const [vitaminsData, setVitaminsData] = useState<any[]>([]);
-  const [fullNutrients, setFullNutrients] = useState<any[]>([]);
+  // Server-prefetched initial data (ISR, default 30d range) seeds the analytics
+  // charts so they paint immediately; the range effect still runs as a SILENT
+  // revalidation (no skeleton) because the ISR snapshot can be up to ~1h stale.
+  // PARTIAL seed by design: only the analytics block is prefetched — the
+  // behavioral-today / servings / weight effects below keep their pre-ISR
+  // client-side behavior untouched.
+  const [nutritionData, setNutritionData] = useState<any[]>(initial?.nutritionData ?? []);
+  const [burntData, setBurntData] = useState<any[]>(initial?.burntData ?? []);
+  const [vitaminsData, setVitaminsData] = useState<any[]>(initial?.vitaminsData ?? []);
+  const [fullNutrients, setFullNutrients] = useState<any[]>(initial?.fullNutrients ?? []);
   const [todayServings, setTodayServings] = useState<any[]>([]);
-  const [nutritionLoading, setNutritionLoading] = useState(true);
+  const [nutritionLoading, setNutritionLoading] = useState(!initial);
   const [range, setRange] = useState<Range>("30d");
+  const firstRunWithInitial = useRef(!!initial);
 
   // ─── Weight state ───
   const [weightRows, setWeightRows] = useState<WeightRow[]>([]);
@@ -161,7 +170,13 @@ export default function NutritionPage() {
 
   // ─── Nutrition + burnt + micronutrients loader (responds to range filter) ───
   useEffect(() => {
-    setNutritionLoading(true);
+    // Silent only on the very first run when seeded — range changes show the
+    // loading state as before. The cancelled flag stops a superseded slow
+    // response from overwriting a newer range's data (out-of-order resolve).
+    let cancelled = false;
+    const silent = firstRunWithInitial.current;
+    firstRunWithInitial.current = false;
+    if (!silent) setNutritionLoading(true);
     Promise.all([
       getNutrition(rangeDays(range)),
       getWhoopCaloriesBurnt(rangeDays(range)),
@@ -169,13 +184,17 @@ export default function NutritionPage() {
       getDailyNutrientsFull(rangeDays(range)),
     ])
       .then(([n, b, v, f]) => {
+        if (cancelled) return;
         setNutritionData(n);
         setBurntData(b);
         setVitaminsData(v);
         setFullNutrients(f);
       })
       .catch(console.error)
-      .finally(() => setNutritionLoading(false));
+      .finally(() => {
+        if (!cancelled && !silent) setNutritionLoading(false);
+      });
+    return () => { cancelled = true; };
   }, [range]);
 
   // ─── Today's Cronometer food log (behavioral day, not clock day) ───

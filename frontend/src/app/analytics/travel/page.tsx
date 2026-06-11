@@ -1,15 +1,13 @@
-import { createClient } from "@supabase/supabase-js";
+import { supabase } from "@/lib/supabase";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import TravelCharts from "./TravelCharts";
 
-export const dynamic = "force-dynamic";
-
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!,
-  { db: { schema: "pds" } }
-);
+// ISR (perf pass 2026-06-11): was force-dynamic with a service-role client and
+// an unbounded full-view scan on every visit. Now revalidated hourly to match
+// the ETL cadence, reading via the shared anon client (RLS grants anon
+// read-only; it already sets db.schema = "pds") and the 15-min matview.
+export const revalidate = 3600;
 
 interface Trip {
   trip_id: number;
@@ -28,19 +26,52 @@ interface HRVRow {
 }
 
 async function getTrips(): Promise<Trip[]> {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("trips")
     .select("*")
     .order("start_date", { ascending: false });
+  if (error) throw error;
   return (data ?? []) as Trip[];
 }
 
-async function getHRVData(): Promise<HRVRow[]> {
-  const { data } = await supabase
-    .from("daily_health_matrix_behavioral")
-    .select("calendar_date, whoop_hrv_rmssd, onyx_is_transition_day")
-    .order("calendar_date", { ascending: true });
-  return (data ?? []) as HRVRow[];
+// Earliest calendar_date this page actually consumes: directionAsymmetry's
+// 7-day pre-trip baseline (offset −7 from the earliest trip start) — wider
+// than trajectoryAroundTrips' −3. No trips → trailing 365 days.
+function hrvSinceDate(trips: Trip[]): string {
+  if (trips.length > 0) {
+    const earliest = trips.reduce(
+      (min, t) => (t.start_date < min ? t.start_date : min),
+      trips[0].start_date
+    );
+    const d = new Date(earliest + "T00:00:00");
+    d.setDate(d.getDate() - 7);
+    return d.toISOString().slice(0, 10);
+  }
+  const d = new Date();
+  d.setDate(d.getDate() - 365);
+  return d.toISOString().slice(0, 10);
+}
+
+async function getHRVData(sinceStr: string): Promise<HRVRow[]> {
+  // 15-min matview, not the live view — this page is pure ETL history, so
+  // staleness is invisible. Paged via .range() (getHealthMatrix pattern): the
+  // matrix is at 850+ rows and an unpaged read would silently truncate at
+  // PostgREST's 1000-row default cap as history grows.
+  const PAGE = 1000;
+  const rows: HRVRow[] = [];
+  for (let fromIdx = 0; ; fromIdx += PAGE) {
+    const { data, error } = await supabase
+      .from("daily_health_matrix_behavioral_mat")
+      .select("calendar_date, whoop_hrv_rmssd, onyx_is_transition_day")
+      .gte("calendar_date", sinceStr)
+      .order("calendar_date", { ascending: true })
+      .range(fromIdx, fromIdx + PAGE - 1);
+
+    if (error) throw error;
+    rows.push(...((data ?? []) as HRVRow[]));
+    if (!data || data.length < PAGE) break;
+  }
+  return rows;
 }
 
 function classifyDirection(prevTrip: Trip | null, trip: Trip): "outbound" | "return" {
@@ -138,7 +169,25 @@ function meanOrNaN(arr: number[]): number {
 }
 
 export default async function TravelPage() {
-  const [trips, hrvData] = await Promise.all([getTrips(), getHRVData()]);
+  // Per-fetch fail-open: each section renders from whatever succeeded, the
+  // failed one renders empty, and the error is logged (previously errors were
+  // silently swallowed into `data ?? []`). Trade-off, chosen for simplicity on
+  // this low-traffic page: a transient failure can be cached as an empty
+  // section for up to an hour — acceptable now that it's at least observable.
+  // Sequential (not Promise.all) because the HRV window is derived from trips.
+  let trips: Trip[] = [];
+  try {
+    trips = await getTrips();
+  } catch (e) {
+    console.error("[/analytics/travel] trips fetch failed; rendering empty trip list", e);
+  }
+
+  let hrvData: HRVRow[] = [];
+  try {
+    hrvData = await getHRVData(hrvSinceDate(trips));
+  } catch (e) {
+    console.error("[/analytics/travel] HRV fetch failed; rendering empty trajectory", e);
+  }
 
   // KPI calcs
   const totalTrips = trips.length;
