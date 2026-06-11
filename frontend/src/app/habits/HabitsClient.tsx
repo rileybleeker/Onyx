@@ -163,6 +163,8 @@ export default function HabitsPage() {
   const [toggling, setToggling] = useState<Set<string>>(new Set());
   const [range, setRange] = useState<Range>("30d");
 
+  const hasSyncedRef = useRef(false);
+
   const load = useCallback(async (days: number) => {
     setLoading(true);
     try {
@@ -174,11 +176,24 @@ export default function HabitsPage() {
       setHabits(habitsRes.habits || []);
       setJournal(journalData);
       setHistory(historyData);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
 
-      // Sync from Notion (Last Completed + metadata-history diff). The sync
-      // route may insert new history rows on a property change, so refetch
-      // history after it returns.
-      setSyncing(true);
+    // Sync from Notion (Last Completed + metadata-history diff) AFTER first
+    // paint — the sync route runs a full Notion DB query plus diff writes
+    // (1.5-4s) and used to gate the skeleton, making /habits the slowest page
+    // in the app. The `syncing` chip covers the window. Once per mount: range
+    // changes re-run load(), but a second Notion pull buys nothing within one
+    // visit (the hourly habits-sync.yml cron bounds staleness anyway), and the
+    // sync route may insert new history rows, so journal + history are
+    // refetched when it reports changes.
+    if (hasSyncedRef.current) return;
+    hasSyncedRef.current = true;
+    setSyncing(true);
+    try {
       const syncRes = await fetch("/api/habits/sync", { method: "POST" });
       if (syncRes.ok) {
         const { count } = await syncRes.json();
@@ -188,12 +203,10 @@ export default function HabitsPage() {
         }
         setHistory(await getHabitMetadataHistory());
       }
-      setSyncing(false);
     } catch (e) {
       console.error(e);
-      setSyncing(false);
     } finally {
-      setLoading(false);
+      setSyncing(false);
     }
   }, []);
 
