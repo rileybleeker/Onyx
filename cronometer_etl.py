@@ -236,24 +236,29 @@ def _load_session() -> dict | None:
         return None
 
 
-def get_export_token(client: httpx.Client, email: str, password: str) -> str:
-    """Mint an export token, reusing the saved session and only logging in if it's
-    expired. Returns the token and leaves a fresh session saved on disk."""
+def authenticate_session(client: httpx.Client, email: str, password: str) -> tuple[str, str, int]:
+    """Establish a valid Cronometer session and return (permutation, policy, user_id).
+
+    Reuses the saved cookie jar when possible (Cronometer rate-limits logins),
+    validating it with a GWT `authenticate` call — which also refreshes the
+    sesnonce — and only does a fresh form login when that fails. Leaves the
+    client's cookie jar holding a live sesnonce ready for token minting.
+    """
     sess = _load_session()
     permutation, policy = (sess.get("permutation"), sess.get("policy")) if sess else (None, None)
     if not permutation or not policy:
         permutation, policy = resolve_gwt_values(client)
 
-    # Try the saved cookie + user id first (skips the rate-limited login).
-    if sess and sess.get("cookies", {}).get("sesnonce") and sess.get("user_id"):
+    # Try the saved cookies first; `authenticate` both validates them and
+    # rotates the sesnonce, so a success means the session is live.
+    if sess and sess.get("cookies", {}).get("sesnonce"):
         for name, value in sess["cookies"].items():
             client.cookies.set(name, value, domain="cronometer.com")
         try:
-            token = gwt_generate_token(client, permutation, policy,
-                                       sess["cookies"]["sesnonce"], sess["user_id"])
-            _save_session(client, sess["user_id"], permutation, policy)
+            user_id = gwt_authenticate(client, permutation, policy)
+            _save_session(client, user_id, permutation, policy)
             log.info("Reused saved Cronometer session (no login needed)")
-            return token
+            return permutation, policy, user_id
         except Exception as e:  # noqa: BLE001
             log.info("Saved session unusable (%s); logging in fresh", e)
             client.cookies.clear()
@@ -261,12 +266,18 @@ def get_export_token(client: httpx.Client, email: str, password: str) -> str:
     # Fresh login path.
     permutation, policy = resolve_gwt_values(client)
     login(client, email, password)
-    sesnonce = client.cookies.get("sesnonce")
     user_id = gwt_authenticate(client, permutation, policy)
-    token = gwt_generate_token(client, permutation, policy, sesnonce, user_id)
     _save_session(client, user_id, permutation, policy)
     log.info("Fresh Cronometer login OK (user_id=%s)", user_id)
-    return token
+    return permutation, policy, user_id
+
+
+def mint_token(client: httpx.Client, permutation: str, policy: str, user_id: int) -> str:
+    """Mint a fresh export nonce. Export tokens are SINGLE-USE — one per
+    /export call — so this is called once per `generate` type. The sesnonce
+    rotates after each GWT call, so it's re-read from the cookie jar each time."""
+    sesnonce = client.cookies.get("sesnonce")
+    return gwt_generate_token(client, permutation, policy, sesnonce, user_id)
 
 
 # ── Orchestration ────────────────────────────────────────────────────────────
@@ -280,10 +291,14 @@ def fetch_and_import(days: int, dry_run: bool, auth_only: bool = False) -> tuple
     start = end - timedelta(days=1 if auth_only else days)
 
     with httpx.Client(follow_redirects=True, headers={"User-Agent": UA}) as client:
-        token = get_export_token(client, email, password)
+        permutation, policy, user_id = authenticate_session(client, email, password)
         log.info("Exporting %s .. %s", start.isoformat(), end.isoformat())
-        servings_csv = export_csv(client, token, "servings", start.isoformat(), end.isoformat())
-        daily_csv = export_csv(client, token, "dailySummary", start.isoformat(), end.isoformat())
+        # Export tokens are single-use — mint one per /export call.
+        servings_csv = export_csv(client, mint_token(client, permutation, policy, user_id),
+                                  "servings", start.isoformat(), end.isoformat())
+        daily_csv = export_csv(client, mint_token(client, permutation, policy, user_id),
+                               "dailySummary", start.isoformat(), end.isoformat())
+        _save_session(client, user_id, permutation, policy)
 
     if auth_only:
         s_lines = servings_csv.count("\n")
