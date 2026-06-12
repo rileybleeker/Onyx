@@ -1380,6 +1380,28 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         jdf = pivot_journal(data["journal"])
         if not jdf.empty:
             df = df.merge(jdf, on="calendar_date", how="left")
+            # Post-cutover fill (WHOOP journal → habits merge, 2026-06-11):
+            # the in-app WHOOP journal was replaced by habit-channel logging,
+            # which writes a row only when tapped. From 2026-06-09 onward
+            # (the first behaviors-day after the final export — whose coverage
+            # ends at behaviors-day 2026-06-07; 2026-06-08 has no data and
+            # deliberately stays NaN) a missing answer means "yes was not
+            # marked = No" (Riley, 2026-06-11), so fill 0. Without this, every
+            # journal_* Welch No-arm would freeze at the cutover, Spearman/
+            # XGBoost would see permanent NaN on un-tapped days, and the
+            # journal_have_any_alcoholic_drinks_lag1 causal confounder would
+            # go missing exactly where supplement tracking is densest.
+            # Only questions still ACTIVE at the cutover are filled — zeroing
+            # the ~29 retired questions would manufacture fake "No" days for
+            # behaviors Riley no longer tracks at all.
+            _journal_cols = [c for c in jdf.columns if c != "calendar_date"]
+            _active_jcols = [
+                c for c in _journal_cols
+                if jdf.loc[jdf["calendar_date"] >= "2026-06-01", c].notna().any()
+            ]
+            _post_cutover = df["calendar_date"] >= "2026-06-09"
+            for _jcol in _active_jcols:
+                df.loc[_post_cutover, _jcol] = df.loc[_post_cutover, _jcol].fillna(0)
     # POLICY (Riley, 2026-06-10): the WHOOP journal "Consumed caffeine?"
     # checkbox is DISREGARDED for all caffeine analysis. Two of its ~50 "No"
     # nights carried 800-1000 mg of logged caffeine, and the unified event

@@ -25,6 +25,14 @@ DECLARE
     affected_date DATE;
     today_et      DATE;
 BEGIN
+    -- No-op UPDATE suppression (2026-06-11): the hourly Notion sync upserts
+    -- each habit's Last-Completed row idempotently; before this guard every
+    -- such no-op fired a signal — 3/hour, scheduling a full HRV retrain
+    -- EVERY hour (31 retrains in 48h observed).
+    IF TG_OP = 'UPDATE' AND NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN NEW;
+    END IF;
+
     -- Pick the cycle_date from NEW (INSERT/UPDATE) or OLD (DELETE).
     affected_date := COALESCE(NEW.cycle_date, OLD.cycle_date);
     today_et      := (NOW() AT TIME ZONE 'America/New_York')::date;

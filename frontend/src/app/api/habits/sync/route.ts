@@ -49,10 +49,17 @@ export async function POST() {
   const renamed: string[] = [];
   const metadataChanged: string[] = [];
 
-  // Load existing name map
+  // Load existing name map (channel routes WHOOP-derived habits: their names
+  // are frozen pipeline variable identities — see sql/whoop_journal_merge.sql)
   const { data: nameMap } = await supabase.from("habit_name_map").select("*");
-  const mapByPageId = new Map<string, string>();
-  (nameMap || []).forEach((row: any) => mapByPageId.set(row.notion_page_id, row.habit_name));
+  const mapByPageId = new Map<string, { name: string; channel: string }>();
+  (nameMap || []).forEach((row: any) =>
+    mapByPageId.set(row.notion_page_id, { name: row.habit_name, channel: row.channel || "habit" })
+  );
+
+  // Last WHOOP export day — rows at or before this date for whoop-channel
+  // habits are the frozen historical record; the sync must never write there.
+  const WHOOP_JOURNAL_FROZEN_THROUGH = "2026-06-08";
 
   // Today (ET) — used as the boundary when closing/opening intervals
   const todayET = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
@@ -66,22 +73,53 @@ export async function POST() {
 
     if (!name) continue;
 
-    // Check for rename
-    const oldName = mapByPageId.get(pageId);
+    // Check for rename. WHOOP-derived habit names are FROZEN (they are the
+    // HRV pipeline's journal_* variable identities); DB guard triggers would
+    // also reject the write — skip cleanly and surface it instead.
+    const mapped = mapByPageId.get(pageId);
+    const channel = mapped?.channel ?? "habit";
+    const oldName = mapped?.name;
     if (oldName && oldName !== name) {
+      if (channel === "whoop") {
+        renamed.push(
+          `BLOCKED: "${oldName}" → "${name}" — WHOOP-derived habit names are frozen (pipeline variable identity). Revert the Notion title to "${oldName}".`
+        );
+        continue; // skip map upsert too, or the FK cascade would rename history
+      }
+      // Rename happens through the map: fk_habit_journal_question is
+      // ON UPDATE CASCADE, so renaming habit_name_map.habit_name migrates all
+      // historical habit_journal rows atomically. (A direct journal UPDATE to
+      // the new name would violate the FK — the name isn't mapped yet.)
+      const { error: renameErr } = await supabase
+        .from("habit_name_map")
+        .update({ habit_name: name, updated_at: new Date().toISOString() })
+        .eq("notion_page_id", pageId);
+      if (renameErr) {
+        renamed.push(`FAILED: "${oldName}" → "${name}": ${renameErr.message}`);
+        continue;
+      }
+      // Cascade moved the rows to the new name; refresh their category.
       const { count } = await supabase
         .from("habit_journal")
-        .update({ question: name, category })
-        .eq("question", oldName);
+        .update({ category })
+        .eq("question", name);
       renamed.push(`"${oldName}" → "${name}" (${count ?? 0} entries updated)`);
     }
 
-    await supabase
+    const { error: mapErr } = await supabase
       .from("habit_name_map")
       .upsert(
         { notion_page_id: pageId, habit_name: name, updated_at: new Date().toISOString() },
         { onConflict: "notion_page_id" }
       );
+    if (mapErr) {
+      // E.g. a NEW Notion habit whose title collides with an existing habit
+      // name — including an archived WHOOP question ('Meditated?') — trips
+      // UNIQUE(habit_name). Skip the habit entirely: letting it proceed would
+      // silently route its completions into the colliding variable.
+      renamed.push(`BLOCKED: cannot map "${name}" (${pageId}): ${mapErr.message}`);
+      continue;
+    }
 
     // Metadata-history diff. Pre-2026-05-25 habits won't have an open
     // interval yet — seed one with valid_from = earliest completion date
@@ -148,15 +186,35 @@ export async function POST() {
       );
     }
 
-    // Sync Last Completed to habit_journal
+    // Sync Last Completed to habit_journal. For WHOOP-derived habits, dates
+    // inside the frozen WHOOP era are the historical record (explicit Yes/No
+    // answers) — upserting 'Yes' there would corrupt history. Future dates
+    // (manually mis-edited in Notion) are skipped too. Already-recorded
+    // completions are not re-upserted: the no-op upsert used to fire the
+    // backfill trigger on every hourly run (signal storm → hourly retrains).
     if (lastCompleted) {
-      const { error } = await supabase
-        .from("habit_journal")
-        .upsert(
-          { cycle_date: lastCompleted, question: name, category, answer: "Yes", notes: "Completed via Notion" },
-          { onConflict: "cycle_date,question" }
-        );
-      if (!error) synced.push(`${name} (${lastCompleted})`);
+      const lcDate = String(lastCompleted).slice(0, 10); // Notion may return a datetime
+      if (channel === "whoop" && lcDate <= WHOOP_JOURNAL_FROZEN_THROUGH) {
+        synced.push(`${name}: SKIPPED (Last Completed ${lcDate} is inside the frozen WHOOP era)`);
+      } else if (lcDate > todayET) {
+        synced.push(`${name}: SKIPPED (Last Completed ${lcDate} is in the future)`);
+      } else {
+        const { data: existingRows } = await supabase
+          .from("habit_journal")
+          .select("answer")
+          .eq("cycle_date", lcDate)
+          .eq("question", name)
+          .limit(1);
+        if (existingRows?.[0]?.answer !== "Yes") {
+          const { error } = await supabase
+            .from("habit_journal")
+            .upsert(
+              { cycle_date: lcDate, question: name, category, answer: "Yes", notes: "Completed via Notion" },
+              { onConflict: "cycle_date,question" }
+            );
+          if (!error) synced.push(`${name} (${lcDate})`);
+        }
+      }
     }
   }
 

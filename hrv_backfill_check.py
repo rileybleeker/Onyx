@@ -38,7 +38,9 @@ HISTORICAL_DAYS = 2
 
 TABLES_TO_CHECK = [
     # (table, date_col, sync_col)
-    ("whoop_journal", "cycle_date", "synced_at"),
+    # whoop_journal removed 2026-06-11: frozen archive post-merge — all
+    # behavior rows (incl. WHOOP history) live in habit_journal, whose
+    # backfill trigger + row scan below cover them.
     ("habit_journal", "cycle_date", "synced_at"),
     ("myfitnesspal_nutrition", "calendar_date", "synced_at"),
     ("garmin_daily_summary", "calendar_date", "synced_at"),

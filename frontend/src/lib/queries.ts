@@ -375,14 +375,21 @@ export async function getWhoopJournal(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
+  // 2026-06-11 merge: WHOOP journal history + ongoing WHOOP-derived habit
+  // logs live in pds.habit_journal, exposed through the pds.journal view.
+  // source='whoop' selects exactly the WHOOP-question variable family
+  // (historical export rows AND new habit-channel taps for those questions).
+  // Ordered DESCENDING so PostgREST's 1000-row cap drops the OLDEST rows at
+  // large ranges (365d ≈ 3.9k rows), then re-sorted ascending for consumers.
   const { data, error } = await supabase
-    .from("whoop_journal")
+    .from("journal")
     .select("*")
+    .eq("source", "whoop")
     .gte("cycle_date", since.toISOString().split("T")[0])
-    .order("cycle_date", { ascending: true });
+    .order("cycle_date", { ascending: false });
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).reverse();
 }
 
 // ---------------------------------------------------------------------------
@@ -780,14 +787,35 @@ export async function getHabitJournal(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
-  const { data, error } = await supabase
-    .from("habit_journal")
-    .select("*")
-    .gte("cycle_date", since.toISOString().split("T")[0])
-    .order("cycle_date", { ascending: true });
+  // Post-merge (2026-06-11) habit_journal also holds the 12k-row frozen WHOOP
+  // journal history (source='whoop', explicit Yes/No answers). The /habits
+  // page only consumes completions, so fetch answer='Yes' with explicit
+  // columns, paged via .range() — an unpaged select would silently truncate
+  // at PostgREST's 1000-row cap (365d of merged rows is well past it) and,
+  // ordered ascending, drop the most RECENT completions first.
+  type HabitJournalRow = {
+    cycle_date: string;
+    question: string;
+    category: string | null;
+    answer: string | null;
+    notes: string | null;
+  };
+  const PAGE = 1000;
+  const rows: HabitJournalRow[] = [];
+  for (let fromIdx = 0; ; fromIdx += PAGE) {
+    const { data, error } = await supabase
+      .from("habit_journal")
+      .select("cycle_date,question,category,answer,notes")
+      .eq("answer", "Yes")
+      .gte("cycle_date", since.toISOString().split("T")[0])
+      .order("cycle_date", { ascending: true })
+      .range(fromIdx, fromIdx + PAGE - 1);
 
-  if (error) throw error;
-  return data ?? [];
+    if (error) throw error;
+    rows.push(...((data ?? []) as HabitJournalRow[]));
+    if (!data || data.length < PAGE) break;
+  }
+  return rows;
 }
 
 export interface HabitMetadataInterval {

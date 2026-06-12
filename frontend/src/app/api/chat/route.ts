@@ -497,9 +497,14 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     const journalDays = (input.days as number) || 30;
     const jSince = new Date();
     jSince.setDate(jSince.getDate() - journalDays);
-    let query = supabase.from("whoop_journal").select("*")
+    // 2026-06-11 merge: WHOOP journal rows live in habit_journal via the
+    // pds.journal view (source='whoop'); pds.whoop_journal is a frozen archive.
+    // Descending so the 200-row cap keeps the most RECENT entries (ascending
+    // returned the oldest week of the window).
+    let query = supabase.from("journal").select("*")
+      .eq("source", "whoop")
       .gte("cycle_date", jSince.toISOString().split("T")[0])
-      .order("cycle_date", { ascending: true })
+      .order("cycle_date", { ascending: false })
       .limit(200);
     if (input.question) query = query.ilike("question", `%${input.question}%`);
     if (input.category) query = query.ilike("category", `%${input.category}%`);
@@ -513,9 +518,11 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     const journalDays = (input.days as number) || 30;
     const jSince = new Date();
     jSince.setDate(jSince.getDate() - journalDays);
+    // Descending so the 500-row cap keeps the most RECENT entries (the merged
+    // table is ~12k rows; ascending returned only the oldest slice).
     let query = supabase.from("journal").select("*")
       .gte("cycle_date", jSince.toISOString().split("T")[0])
-      .order("cycle_date", { ascending: true })
+      .order("cycle_date", { ascending: false })
       .limit(500);
     if (input.source) query = query.eq("source", input.source as string);
     if (input.question) query = query.ilike("question", `%${input.question}%`);
@@ -598,8 +605,37 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
   // Mark a habit as complete (writes to both Supabase and Notion)
   if (name === "mark_habit_complete") {
     const habit = input.habit as string;
-    const date = (input.date as string) || new Date().toISOString().split("T")[0];
     const category = (input.category as string) || null;
+
+    // Default to the behavioral day (TZ + awake-tail aware) — the previous
+    // naive-UTC default tagged late-evening ET logs with TOMORROW's date.
+    let date = input.date as string | undefined;
+    if (!date) {
+      try {
+        const { data: bday } = await supabase.rpc("behavioral_today_now");
+        date = (bday as string) || new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+      } catch {
+        date = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+      }
+    }
+
+    // WHOOP-era rows (cycle_date <= 2026-06-08, the last WHOOP export) are a
+    // frozen historical record carrying explicit Yes/No answers. A backdated
+    // completion into that era would overwrite real history for WHOOP-derived
+    // habits — reject it (post-merge guard, see sql/whoop_journal_merge.sql).
+    const WHOOP_JOURNAL_FROZEN_THROUGH = "2026-06-08";
+    const { data: mapRow } = await supabase
+      .from("habit_name_map")
+      .select("channel")
+      .eq("habit_name", habit)
+      .maybeSingle();
+    const isWhoopChannel = mapRow?.channel === "whoop";
+    if (isWhoopChannel && date <= WHOOP_JOURNAL_FROZEN_THROUGH) {
+      return JSON.stringify({
+        error: `"${habit}" has frozen WHOOP-journal history through ${WHOOP_JOURNAL_FROZEN_THROUGH}; completions can only be logged for later dates.`,
+      });
+    }
+
     const { data, error } = await supabase
       .from("habit_journal")
       .upsert(
@@ -623,10 +659,26 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
         if (searchRes.ok) {
           const searchData = await searchRes.json();
           if (searchData.results.length > 0) {
+            // Recompute Last Completed from the actual max completion (mirrors
+            // /api/habits/complete) — direct-setting the supplied date moved
+            // LC BACKWARD on backdated logs. Yes-only, and post-freeze-era
+            // for WHOOP-derived habits.
+            let lcQuery = supabase
+              .from("habit_journal")
+              .select("cycle_date")
+              .eq("question", habit)
+              .eq("answer", "Yes")
+              .order("cycle_date", { ascending: false })
+              .limit(1);
+            if (isWhoopChannel) {
+              lcQuery = lcQuery.gt("cycle_date", WHOOP_JOURNAL_FROZEN_THROUGH);
+            }
+            const { data: latest } = await lcQuery;
+            const latestDate = latest?.[0]?.cycle_date ?? null;
             await fetch(`https://api.notion.com/v1/pages/${searchData.results[0].id}`, {
               method: "PATCH",
               headers: { Authorization: `Bearer ${notionKey}`, "Content-Type": "application/json", "Notion-Version": "2022-06-28" },
-              body: JSON.stringify({ properties: { "Last Completed": { date: { start: date } } } }),
+              body: JSON.stringify({ properties: { "Last Completed": { date: latestDate ? { start: latestDate } : null } } }),
             });
           }
         }

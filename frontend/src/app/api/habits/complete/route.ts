@@ -37,6 +37,24 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "habit is required" }, { status: 400 });
   }
 
+  // 2026-06-11 merge guard: rows with cycle_date <= 2026-06-08 for
+  // WHOOP-derived habits (habit_name_map.channel='whoop') are the frozen
+  // WHOOP-journal historical record (explicit Yes/No answers). Writing or
+  // deleting inside that era would corrupt real history — reject.
+  const WHOOP_JOURNAL_FROZEN_THROUGH = "2026-06-08";
+  const { data: mapRow } = await supabase
+    .from("habit_name_map")
+    .select("channel")
+    .eq("habit_name", habit)
+    .maybeSingle();
+  const isWhoopChannel = mapRow?.channel === "whoop";
+  if (isWhoopChannel && completionDate <= WHOOP_JOURNAL_FROZEN_THROUGH) {
+    return NextResponse.json(
+      { error: `"${habit}" has frozen WHOOP-journal history through ${WHOOP_JOURNAL_FROZEN_THROUGH}; completions can only be logged for later dates.` },
+      { status: 400 }
+    );
+  }
+
   // 1. Write to Supabase
   if (undo) {
     await supabase
@@ -82,12 +100,21 @@ export async function POST(req: NextRequest) {
       if (pageId) {
         // Derive Notion's "Last Completed" from the actual max cycle_date in habit_journal
         // (so backdating or undoing doesn't overwrite a more recent completion).
-        const { data: latest } = await supabase
+        // Post-merge: only count actual completions (answer='Yes' — the table
+        // now also carries explicit 'No' rows), and for WHOOP-derived habits
+        // only the post-freeze era — pointing Notion LC at a frozen-era date
+        // would make the hourly sync re-upsert over historical rows forever.
+        let latestQuery = supabase
           .from("habit_journal")
           .select("cycle_date")
           .eq("question", habit)
+          .eq("answer", "Yes")
           .order("cycle_date", { ascending: false })
           .limit(1);
+        if (isWhoopChannel) {
+          latestQuery = latestQuery.gt("cycle_date", WHOOP_JOURNAL_FROZEN_THROUGH);
+        }
+        const { data: latest } = await latestQuery;
 
         const latestDate = latest && latest.length > 0 ? latest[0].cycle_date : null;
         const notionDate = latestDate ? { start: latestDate } : null;

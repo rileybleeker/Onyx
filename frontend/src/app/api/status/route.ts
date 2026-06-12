@@ -29,7 +29,6 @@ const CADENCE: Record<string, string> = {
   garmin: "Hourly :00",
   whoop: "Hourly :00",
   eight_sleep: "Daily 3pm ET",
-  whoop_journal: "Hourly :30 (IMAP)",
   habits: "Hourly :45",
   cronometer: "Manual export → local import",
   // Predict: every hourly ETL + 23:50 ET (DST-gated).
@@ -61,7 +60,6 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   garmin:         { method: "automated",      label: "API ETL" },
   whoop:          { method: "automated",      label: "API ETL" },
   eight_sleep:    { method: "automated",      label: "API ETL" },
-  whoop_journal:  { method: "semi-automated", label: "Email import" },
   habits:         { method: "automated",      label: "Notion sync" },
   cronometer:     { method: "manual",         label: "Local import" },
   hrv_analysis:   { method: "automated",      label: "Computed" },
@@ -198,11 +196,10 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, journalRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
-      supabase.from("whoop_journal").select("cycle_date").order("cycle_date", { ascending: false }).limit(1),
       supabase.from("habit_journal").select("cycle_date,synced_at").order("synced_at", { ascending: false }).limit(1),
       supabase.from("cronometer_nutrition_daily").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("hrv_predictions").select("prediction_date").eq("model", "xgboost").eq("horizon_days", 1).not("model_version", "like", "backtest%").order("prediction_date", { ascending: false }).limit(1),
@@ -286,7 +283,6 @@ export async function GET() {
     const garminDate = garminRes.data?.[0]?.calendar_date ?? null;
     const whoopDate = whoopRes.data?.[0]?.start_time?.split("T")[0] ?? null;
     const eightSleepDate = eightSleepRes.data?.[0]?.calendar_date ?? null;
-    const journalDate = journalRes.data?.[0]?.cycle_date ?? null;
     const habitsDate = habitsRes.data?.[0]?.cycle_date ?? null;
     const habitsLastLog = (habitsRes.data?.[0]?.synced_at as string | undefined) ?? null;
     const cronDate = cronRes.data?.[0]?.calendar_date ?? null;
@@ -318,7 +314,6 @@ export async function GET() {
     const garminEntry = latestBySrcType["garmin|full_sync"] ?? null;
     const whoopEntry = latestBySrcType["whoop|full_sync"] ?? null;
     const eightSleepEntry = latestBySrcType["eight_sleep|trends"] ?? null;
-    const journalEntry = latestBySrcType["whoop|journal_email"] ?? null;
     const cronEntry = latestBySrcType["cronometer|daily"] ?? null;
     const spotifyEntry = latestBySrcType["spotify|plays"] ?? null;
     const reccobeatsEntry = latestBySrcType["reccobeats|audio_features"] ?? null;
@@ -336,7 +331,6 @@ export async function GET() {
     const garminLag = daysLag(garminDate, spineMaxDate);
     const whoopLag = daysLag(whoopDate, spineMaxDate);
     const eightSleepLag = daysLag(eightSleepDate, spineMaxDate);
-    const journalLag = daysLag(journalDate, spineMaxDate);
     const habitsLag = daysLag(habitsDate, spineMaxDate);
     const cronLag = daysLag(cronDate, spineMaxDate);
     const hrvLag = daysLag(hrvDate, spineMaxDate);
@@ -385,19 +379,9 @@ export async function GET() {
         integrationMethod: METHOD.eight_sleep.method,
         methodLabel: METHOD.eight_sleep.label,
       },
-      whoop_journal: {
-        label: "WHOOP Journal",
-        lastSync: (journalEntry?.sync_start as string) ?? null,
-        status: deriveStatus(journalEntry, journalLag),
-        latestDataDate: journalDate,
-        daysLag: journalLag === 999 ? 999 : journalLag,
-        recordsSynced: (journalEntry?.records_synced as number) ?? 0,
-        durationSeconds: (journalEntry?.duration_seconds as number) ?? null,
-        errorMessage: (journalEntry?.error_message as string) ?? null,
-        cadence: CADENCE.whoop_journal,
-        integrationMethod: METHOD.whoop_journal.method,
-        methodLabel: METHOD.whoop_journal.label,
-      },
+      // WHOOP Journal card retired 2026-06-11: the email ETL is decommissioned
+      // and WHOOP journal behaviors merged into habit_journal (the Habits card
+      // covers the merged table's freshness). See sql/whoop_journal_merge.sql.
       habits: {
         label: "Habits",
         // Habits is bi-directional Notion sync; synced_at fires on every
