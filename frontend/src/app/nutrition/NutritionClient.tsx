@@ -19,7 +19,7 @@ import {
   rangeLabel,
   type Range,
 } from "@/lib/queries";
-import { formatDate, kgToLb, lbToKg } from "@/lib/format";
+import { formatDate, kgToLb, lbToKg, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -185,10 +185,13 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     ])
       .then(([n, b, v, f]) => {
         if (cancelled) return;
-        setNutritionData(n);
-        setBurntData(b);
-        setVitaminsData(v);
-        setFullNutrients(f);
+        // sameJson bail-out: the silent revalidation's data is usually
+        // byte-identical to the server-seeded state — returning the previous
+        // reference lets React skip the commit (and a full chart re-render).
+        setNutritionData((prev) => (sameJson(prev, n) ? prev : n));
+        setBurntData((prev) => (sameJson(prev, b) ? prev : b));
+        setVitaminsData((prev) => (sameJson(prev, v) ? prev : v));
+        setFullNutrients((prev) => (sameJson(prev, f) ? prev : f));
       })
       .catch(console.error)
       .finally(() => {
@@ -436,6 +439,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                     fill="url(#calConsumedGrad)"
                     name="Consumed (Cronometer)"
                     connectNulls={false}
+                    isAnimationActive={false}
                   />
                   <Line
                     type="monotone"
@@ -445,6 +449,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                     dot={false}
                     name="Burnt (WHOOP)"
                     connectNulls={false}
+                    isAnimationActive={false}
                   />
                 </ComposedChart>
               </ResponsiveContainer>
@@ -463,7 +468,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                   <YAxis tick={axisTick} width={60} label={axisLabel("kcal", "y")} />
                   <Tooltip {...chartTooltip} />
                   <ReferenceLine y={0} stroke="rgba(255,255,255,0.25)" />
-                  <Bar dataKey="net" name="Net (kcal)" radius={[2, 2, 0, 0]}>
+                  <Bar dataKey="net" name="Net (kcal)" radius={[2, 2, 0, 0]} isAnimationActive={false}>
                     {calorieData.map((d, i) => (
                       <Cell
                         key={i}
@@ -483,9 +488,9 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                   <YAxis tick={axisTick} width={48} />
                   <Tooltip {...chartTooltip} />
                   <Legend wrapperStyle={legendStyle} />
-                  <Bar dataKey="protein" stackId="macros" fill={C.up} name="Protein (g)" />
-                  <Bar dataKey="carbs" stackId="macros" fill={C.source.garmin} name="Carbs (g)" />
-                  <Bar dataKey="fat" stackId="macros" fill={C.source.whoop} name="Fat (g)" radius={[3, 3, 0, 0]} />
+                  <Bar dataKey="protein" stackId="macros" fill={C.up} name="Protein (g)" isAnimationActive={false} />
+                  <Bar dataKey="carbs" stackId="macros" fill={C.source.garmin} name="Carbs (g)" isAnimationActive={false} />
+                  <Bar dataKey="fat" stackId="macros" fill={C.source.whoop} name="Fat (g)" radius={[3, 3, 0, 0]} isAnimationActive={false} />
                 </BarChart>
               </ResponsiveContainer>
             </ChartCard>
@@ -498,10 +503,10 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                   <YAxis tick={axisTick} width={40} />
                   <Tooltip {...chartTooltip} />
                   <Legend wrapperStyle={legendStyle} />
-                  <Line type="monotone" dataKey="protein" stroke={C.up} strokeWidth={2} dot={false} name="Protein (g)" connectNulls={false} />
-                  <Line type="monotone" dataKey="fat" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Fat (g)" connectNulls={false} />
-                  <Line type="monotone" dataKey="fiber" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Fiber (g)" connectNulls={false} />
-                  <Line type="monotone" dataKey="sugar" stroke={C.down} strokeWidth={2} dot={false} name="Sugar (g)" connectNulls={false} />
+                  <Line type="monotone" dataKey="protein" stroke={C.up} strokeWidth={2} dot={false} name="Protein (g)" connectNulls={false} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="fat" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Fat (g)" connectNulls={false} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="fiber" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Fiber (g)" connectNulls={false} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="sugar" stroke={C.down} strokeWidth={2} dot={false} name="Sugar (g)" connectNulls={false} isAnimationActive={false} />
                 </LineChart>
               </ResponsiveContainer>
             </ChartCard>
@@ -773,6 +778,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                   dot={{ r: 3, fill: C.source.eightsleep }}
                   name="Weight (lb)"
                   connectNulls={false}
+                  isAnimationActive={false}
                 />
               </LineChart>
             </ResponsiveContainer>

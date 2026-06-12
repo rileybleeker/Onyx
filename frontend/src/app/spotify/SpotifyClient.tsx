@@ -10,6 +10,7 @@ import ChartCard from "@/components/ChartCard";
 import StatCard from "@/components/StatCard";
 import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel, chartColors as C } from "@/lib/chart-theme";
+import { sameJson } from "@/lib/format";
 import {
   getSpotifyDashboard,
   getSpotifyDailyVolume,
@@ -328,16 +329,19 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
     ])
       .then(([dash, v, d]) => {
         if (cancelled) return;
-        setKpis(dash.kpis);
-        setVolume(v);
-        setDrift(d);
-        setGenreRotation(dash.genreRotation);
-        setDiscovery(dash.discovery);
-        setTopArtists(dash.topArtists);
-        setTopTracks(dash.topTracks);
-        setHours(dash.hours);
-        setSonic(dash.sonic);
-        setGenres(dash.topGenres);
+        // sameJson bail-out: the silent revalidation's data is usually
+        // byte-identical to the server-seeded state — returning the previous
+        // reference lets React skip the commit (and a full chart re-render).
+        setKpis((prev) => (sameJson(prev, dash.kpis) ? prev : dash.kpis));
+        setVolume((prev) => (sameJson(prev, v) ? prev : v));
+        setDrift((prev) => (sameJson(prev, d) ? prev : d));
+        setGenreRotation((prev) => (sameJson(prev, dash.genreRotation) ? prev : dash.genreRotation));
+        setDiscovery((prev) => (sameJson(prev, dash.discovery) ? prev : dash.discovery));
+        setTopArtists((prev) => (sameJson(prev, dash.topArtists) ? prev : dash.topArtists));
+        setTopTracks((prev) => (sameJson(prev, dash.topTracks) ? prev : dash.topTracks));
+        setHours((prev) => (sameJson(prev, dash.hours) ? prev : dash.hours));
+        setSonic((prev) => (sameJson(prev, dash.sonic) ? prev : dash.sonic));
+        setGenres((prev) => (sameJson(prev, dash.topGenres) ? prev : dash.topGenres));
       })
       .catch((err) => console.error("Spotify page load:", err))
       .finally(() => {
@@ -784,6 +788,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                   strokeWidth={1.5}
                   dot={false}
                   name="plays"
+                  isAnimationActive={false}
                 />
               </LineChart>
             </ResponsiveContainer>
@@ -830,13 +835,13 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                     <YAxis tick={axisTick} domain={[0, 1]} />
                     <Tooltip {...chartTooltip} formatter={(v) => (typeof v === "number" ? v.toFixed(3) : String(v))} />
                     <Legend wrapperStyle={legendStyle} />
-                    <Line type="monotone" dataKey="avg_valence" stroke={C.source.whoop} strokeWidth={1.3} dot={false} name="valence" />
-                    <Line type="monotone" dataKey="avg_energy" stroke={accentColor} strokeWidth={1.3} dot={false} name="energy" />
-                    <Line type="monotone" dataKey="avg_danceability" stroke={C.source.eightsleep} strokeWidth={1.3} dot={false} name="danceability" />
-                    <Line type="monotone" dataKey="avg_acousticness" stroke={C.up} strokeWidth={1.3} dot={false} name="acousticness" />
-                    <Line type="monotone" dataKey="avg_instrumentalness" stroke={C.categorical[4]} strokeWidth={1.3} dot={false} name="instrumentalness" />
-                    <Line type="monotone" dataKey="avg_liveness" stroke={C.source.whoop} strokeWidth={1.3} dot={false} name="liveness" />
-                    <Line type="monotone" dataKey="avg_speechiness" stroke={C.neutral} strokeWidth={1.3} dot={false} name="speechiness" />
+                    <Line type="monotone" dataKey="avg_valence" stroke={C.source.whoop} strokeWidth={1.3} dot={false} name="valence" isAnimationActive={false} />
+                    <Line type="monotone" dataKey="avg_energy" stroke={accentColor} strokeWidth={1.3} dot={false} name="energy" isAnimationActive={false} />
+                    <Line type="monotone" dataKey="avg_danceability" stroke={C.source.eightsleep} strokeWidth={1.3} dot={false} name="danceability" isAnimationActive={false} />
+                    <Line type="monotone" dataKey="avg_acousticness" stroke={C.up} strokeWidth={1.3} dot={false} name="acousticness" isAnimationActive={false} />
+                    <Line type="monotone" dataKey="avg_instrumentalness" stroke={C.categorical[4]} strokeWidth={1.3} dot={false} name="instrumentalness" isAnimationActive={false} />
+                    <Line type="monotone" dataKey="avg_liveness" stroke={C.source.whoop} strokeWidth={1.3} dot={false} name="liveness" isAnimationActive={false} />
+                    <Line type="monotone" dataKey="avg_speechiness" stroke={C.neutral} strokeWidth={1.3} dot={false} name="speechiness" isAnimationActive={false} />
                   </LineChart>
                 </ResponsiveContainer>
               )}
@@ -871,6 +876,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                         fill={GENRE_PALETTE[i % GENRE_PALETTE.length]}
                         fillOpacity={0.6}
                         name={g}
+                        isAnimationActive={false}
                       />
                     ))}
                     <Area
@@ -881,6 +887,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                       fill={C.neutral}
                       fillOpacity={0.4}
                       name="other"
+                      isAnimationActive={false}
                     />
                   </AreaChart>
                 </ResponsiveContainer>
@@ -908,7 +915,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                     <XAxis dataKey="calendar_date" tick={axisTick} tickFormatter={(v) => v.slice(5)} />
                     <YAxis tick={axisTick} domain={[0, 100]} tickFormatter={(v) => `${v}%`} />
                     <Tooltip {...chartTooltip} formatter={(v) => (typeof v === "number" ? `${v.toFixed(1)}%` : String(v))} />
-                    <Line type="monotone" dataKey="pct_new" stroke={spotifyGreen} strokeWidth={1.6} dot={false} name="% new tracks" />
+                    <Line type="monotone" dataKey="pct_new" stroke={spotifyGreen} strokeWidth={1.6} dot={false} name="% new tracks" isAnimationActive={false} />
                   </LineChart>
                 </ResponsiveContainer>
               )}
@@ -1055,7 +1062,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                 <XAxis dataKey="hour" tick={axisTick} height={45} label={axisLabel("hour of day (ET)", "x")} />
                 <YAxis tick={axisTick} width={50} label={axisLabel("plays", "y")} />
                 <Tooltip {...chartTooltip} />
-                <Bar dataKey="plays" fill={spotifyGreen} radius={[2, 2, 0, 0]} />
+                <Bar dataKey="plays" fill={spotifyGreen} radius={[2, 2, 0, 0]} isAnimationActive={false} />
               </BarChart>
             </ResponsiveContainer>
           </ChartCard>

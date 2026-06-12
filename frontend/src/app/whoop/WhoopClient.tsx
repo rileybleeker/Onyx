@@ -6,7 +6,7 @@ import {
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
 import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getWhoopJournal, rangeDays, rangeLabel, type Range } from "@/lib/queries";
-import { formatDate } from "@/lib/format";
+import { formatDate, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
@@ -52,7 +52,13 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
     Promise.all([getWhoopRecovery(days), getWhoopCycles(days), getWhoopSleep(days), getWhoopJournal(days)])
       .then(([r, c, s, j]) => {
         if (cancelled) return;
-        setRecovery(r); setCycles(c); setSleep(s); setJournal(j);
+        // sameJson bail-out: the silent revalidation's data is usually
+        // byte-identical to the server-seeded state — returning the previous
+        // reference lets React skip the commit (and a full chart re-render).
+        setRecovery((prev) => (sameJson(prev, r) ? prev : r));
+        setCycles((prev) => (sameJson(prev, c) ? prev : c));
+        setSleep((prev) => (sameJson(prev, s) ? prev : s));
+        setJournal((prev) => (sameJson(prev, j) ? prev : j));
       })
       .catch(console.error)
       .finally(() => {
@@ -164,7 +170,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={40} domain={[0, 100]} />
               <Tooltip {...chartTooltip} />
-              <Bar dataKey="recovery" name="Recovery %" radius={[3, 3, 0, 0]}
+              <Bar dataKey="recovery" name="Recovery %" radius={[3, 3, 0, 0]} isAnimationActive={false}
                 fill={C.up}
                 shape={(props: any) => {
                   const { x, y, width, height, payload } = props;
@@ -184,8 +190,8 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
               <YAxis yAxisId="rhr" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.up} strokeWidth={2} dot={false} name="HRV (ms)" />
-              <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke={C.down} strokeWidth={2} dot={false} name="RHR (bpm)" />
+              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.up} strokeWidth={2} dot={false} name="HRV (ms)" isAnimationActive={false} />
+              <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke={C.down} strokeWidth={2} dot={false} name="RHR (bpm)" isAnimationActive={false} />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -203,7 +209,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} domain={[0, 21]} label={axisLabel("strain", "y")} />
               <Tooltip {...chartTooltip} />
-              <Area type="monotone" dataKey="strain" stroke={C.source.whoop} fill="url(#whoopStrainGrad)" strokeWidth={2} name="Strain" />
+              <Area type="monotone" dataKey="strain" stroke={C.source.whoop} fill="url(#whoopStrainGrad)" strokeWidth={2} name="Strain" isAnimationActive={false} />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -216,10 +222,10 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
               <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Bar dataKey="deep" stackId="a" fill={C.source.garmin} name="Deep" />
-              <Bar dataKey="light" stackId="a" fill={C.categorical[6]} name="Light" />
-              <Bar dataKey="rem" stackId="a" fill={C.source.eightsleep} name="REM" />
-              <Bar dataKey="awake" stackId="a" fill={C.down} name="Awake" radius={[3, 3, 0, 0]} />
+              <Bar dataKey="deep" stackId="a" fill={C.source.garmin} name="Deep" isAnimationActive={false} />
+              <Bar dataKey="light" stackId="a" fill={C.categorical[6]} name="Light" isAnimationActive={false} />
+              <Bar dataKey="rem" stackId="a" fill={C.source.eightsleep} name="REM" isAnimationActive={false} />
+              <Bar dataKey="awake" stackId="a" fill={C.down} name="Awake" radius={[3, 3, 0, 0]} isAnimationActive={false} />
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -232,8 +238,8 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
               <YAxis tick={axisTick} width={40} domain={[0, 100]} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line type="monotone" dataKey="performance" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Performance %" />
-              <Line type="monotone" dataKey="efficiency" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Efficiency %" />
+              <Line type="monotone" dataKey="performance" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Performance %" isAnimationActive={false} />
+              <Line type="monotone" dataKey="efficiency" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Efficiency %" isAnimationActive={false} />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -247,8 +253,8 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
               <YAxis yAxisId="temp" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line yAxisId="spo2" type="monotone" dataKey="spo2" stroke={C.accent} strokeWidth={2} dot={false} name="SpO2 %" />
-              <Line yAxisId="temp" type="monotone" dataKey="skinTemp" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Skin Temp (\u00b0C)" />
+              <Line yAxisId="spo2" type="monotone" dataKey="spo2" stroke={C.accent} strokeWidth={2} dot={false} name="SpO2 %" isAnimationActive={false} />
+              <Line yAxisId="temp" type="monotone" dataKey="skinTemp" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Skin Temp (\u00b0C)" isAnimationActive={false} />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>

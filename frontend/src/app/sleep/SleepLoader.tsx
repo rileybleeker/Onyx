@@ -15,9 +15,10 @@ const SleepClient = dynamic(() => import("./SleepClient"), {
 
 // Shape of the server-prefetched initial data. MUST mirror the Promise.all in
 // SleepClient's mount effect (same functions, same args) — the client seeds
-// its state from this and then silently revalidates on mount.
+// its state from this and then silently revalidates on mount. The main-only
+// whoopSleep rows are derived client-side from whoopSleepAll (is_nap filter),
+// so they're deliberately NOT a field here.
 export interface SleepInitial {
-  whoopSleep: unknown[];
   whoopSleepAll: unknown[];
   whoopRecovery: unknown[];
   whoopCycles: unknown[];

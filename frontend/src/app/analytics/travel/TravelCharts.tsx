@@ -39,7 +39,7 @@ export default function TravelCharts({ meanTrajectory, destBreakdown }: Props) {
               ]}
             />
             <ReferenceLine x={0} stroke="rgba(255, 200, 0, 0.4)" strokeDasharray="3 3" label={{ value: "Trip start", position: "top", fill: "rgba(255,200,0,0.7)", fontSize: 10 }} />
-            <Line type="monotone" dataKey="mean_hrv" stroke={C.source.garmin} strokeWidth={2} dot={{ fill: C.source.garmin, r: 3 }} />
+            <Line type="monotone" dataKey="mean_hrv" stroke={C.source.garmin} strokeWidth={2} dot={{ fill: C.source.garmin, r: 3 }} isAnimationActive={false} />
           </LineChart>
         </ResponsiveContainer>
       </ChartCard>
@@ -63,7 +63,7 @@ export default function TravelCharts({ meanTrajectory, destBreakdown }: Props) {
                 "Days abroad",
               ]}
             />
-            <Bar dataKey="days" fill={C.source.eightsleep}>
+            <Bar dataKey="days" fill={C.source.eightsleep} isAnimationActive={false}>
               <LabelList dataKey="days" position="top" fill="rgba(255,255,255,0.6)" fontSize={10} />
             </Bar>
           </BarChart>

@@ -3,6 +3,25 @@ export function formatDate(dateStr: string): string {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+// Reference-stable setState guard for the ISR silent revalidation (perf round
+// 3, 2026-06-11): profiling showed the refetched data is byte-identical to
+// the server-seeded state in the common case, yet the fresh array identities
+// forced a full re-render (and re-animation) of every chart ~1s after first
+// paint. Use as `setX(prev => sameJson(prev, next) ? prev : next)` — React
+// bails out of the commit entirely when every setter returns its previous
+// reference, while genuinely-changed data still heals. Comparison cost is a
+// few ms off the paint-critical path. Requires DETERMINISTIC query ordering
+// (secondary .order() on any non-unique sort key) or identical data can
+// serialize differently and defeat the guard.
+export function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
 // Convert a UTC instant to its ET (America/New_York) calendar date (YYYY-MM-DD).
 // WHOOP's app labels each sleep by its wake-day, so callers should pass
 // `sleep.end_time` (not start_time). For post-midnight bedtimes bedtime and wake

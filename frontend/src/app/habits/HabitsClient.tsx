@@ -595,6 +595,7 @@ export default function HabitsPage() {
                 fill="url(#habitRateGrad)"
                 name="Completion %"
                 connectNulls={false}
+                isAnimationActive={false}
               />
             </AreaChart>
           </ResponsiveContainer>

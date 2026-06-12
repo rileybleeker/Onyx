@@ -1,6 +1,6 @@
 import SleepLoader, { type SleepInitial } from "./SleepLoader";
 import {
-  getWhoopSleep, getWhoopSleepAll, getWhoopRecovery, getWhoopCycles,
+  getWhoopSleepAll, getWhoopRecovery, getWhoopCycles,
   getWhoopJournal, getEightSleepTrends, getDailySummaries, rangeDays,
 } from "@/lib/queries";
 
@@ -20,9 +20,12 @@ export default async function SleepPage() {
     // charts from this without re-labeling, so a mismatch would silently
     // render wrong-window data.
     const days = rangeDays("30d");
-    const [whoopSleep, whoopSleepAll, whoopRecovery, whoopCycles, journal, eightSleep, summaries] =
+    // Single whoop_sleep fetch (perf round 3): getWhoopSleep was a strict
+    // subset of getWhoopSleepAll (same columns, minus the is_nap filter), so
+    // the client derives the main-only rows from whoopSleepAll — shipping
+    // both duplicated ~33kB of rows in the RSC payload.
+    const [whoopSleepAll, whoopRecovery, whoopCycles, journal, eightSleep, summaries] =
       await Promise.all([
-        getWhoopSleep(days),
         getWhoopSleepAll(days),
         getWhoopRecovery(days),
         getWhoopCycles(days),
@@ -30,7 +33,7 @@ export default async function SleepPage() {
         getEightSleepTrends(days),
         getDailySummaries(days),
       ]);
-    initial = { whoopSleep, whoopSleepAll, whoopRecovery, whoopCycles, journal, eightSleep, summaries };
+    initial = { whoopSleepAll, whoopRecovery, whoopCycles, journal, eightSleep, summaries };
   } catch (e) {
     // Fail open: ship initial=null and the client fetches exactly as it did
     // pre-ISR. Never let a Supabase error break the build or the page.

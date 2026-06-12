@@ -7,6 +7,7 @@ import {
 } from "recharts";
 import { getHealthMatrix, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { blandAltman } from "@/lib/stats";
+import { sameJson } from "@/lib/format";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
@@ -100,7 +101,7 @@ function BAPlot({
           </ReferenceLine>
           {/* Zero line */}
           <ReferenceLine y={0} stroke={C.zeroLine} strokeWidth={1} />
-          <Scatter data={result.points} fill={color} fillOpacity={0.7} r={4} />
+          <Scatter data={result.points} fill={color} fillOpacity={0.7} r={4} isAnimationActive={false} />
         </ScatterChart>
       </ResponsiveContainer>
     </ChartCard>
@@ -131,7 +132,10 @@ export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInit
     getHealthMatrix(rangeDays(range))
       .then((rows) => {
         if (cancelled) return;
-        setData(rows);
+        // sameJson bail-out: the silent revalidation's data is usually
+        // byte-identical to the server-seeded state — returning the previous
+        // reference lets React skip the commit (and a full chart re-render).
+        setData((prev) => (sameJson(prev, rows) ? prev : rows));
       })
       .catch(console.error)
       .finally(() => {

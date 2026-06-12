@@ -7,10 +7,12 @@ import {
   CartesianGrid, ReferenceLine, Cell, ErrorBar,
 } from "recharts";
 import ChartCard from "@/components/ChartCard";
+import DeferredMount from "@/components/DeferredMount";
 import RangeFilter from "@/components/RangeFilter";
 import KpiTile from "@/components/KpiTile";
 import MetricRing from "@/components/MetricRing";
 import SectionHeader from "@/components/SectionHeader";
+import { sameJson } from "@/lib/format";
 import {
   chartTooltip, axisTick, gridStyle, axisLabel, legendStyle,
   chartColors as C, directionalColor,
@@ -25,11 +27,18 @@ import type { HrvInitial } from "./HrvLoader";
 // scaling needs JS state — without it, the 200-220px label column crushes the
 // bar area into the right ~80px of a 320px mobile card.
 function useIsMobile(breakpoint = 640) {
-  const [isMobile, setIsMobile] = useState(false);
+  // Lazy init reads the media query at first render instead of defaulting to
+  // false and correcting in an effect — that correction re-rendered EVERY
+  // chart on mobile right after first paint (perf round 3, 2026-06-11). Safe
+  // here because this chunk is dynamic(ssr:false): there is no server markup
+  // to hydration-mismatch against. The effect remains for change-listening
+  // only (rotation / window resize across the breakpoint).
+  const [isMobile, setIsMobile] = useState(
+    () => typeof window !== "undefined" && window.matchMedia(`(max-width: ${breakpoint}px)`).matches
+  );
   useEffect(() => {
     const mq = window.matchMedia(`(max-width: ${breakpoint}px)`);
     const update = () => setIsMobile(mq.matches);
-    update();
     mq.addEventListener("change", update);
     return () => mq.removeEventListener("change", update);
   }, [breakpoint]);
@@ -310,39 +319,47 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
     loadHrvDashboard(rangeDays(DEFAULT_RANGE))
       .then((d) => {
         if (cancelled) return;
+        // Every setter uses the sameJson functional bail-out (perf round 3,
+        // 2026-06-11): the silent revalidation's refetched data is byte-
+        // identical to the server-seeded state in the common case, but fresh
+        // array identities forced a full re-render (and animation replay) of
+        // every chart ~1s after first paint. Returning the previous reference
+        // when the JSON matches lets React bail out of the commit entirely;
+        // genuinely-changed data still heals.
+        //
         // The 3 range-dependent slices are guarded: if the user flipped the
         // range while this full load was in flight, the range effect below
         // owns them now — committing this default-window data would label
         // e.g. 30d points as "last 90 days" (the pre-split single effect
         // avoided this by cancelling the whole run on any range change).
         if (latestRange.current === DEFAULT_RANGE) {
-          setAccuracy(d.accuracy);
-          setHistoricalHrv(d.historicalHrv);
-          setWorkoutGap(d.workoutGap);
+          setAccuracy(prev => sameJson(prev, d.accuracy) ? prev : d.accuracy);
+          setHistoricalHrv(prev => sameJson(prev, d.historicalHrv) ? prev : d.historicalHrv);
+          setWorkoutGap(prev => sameJson(prev, d.workoutGap) ? prev : d.workoutGap);
         }
-        setTomorrowPred(d.tomorrowPred);
-        setMetrics(d.metrics);
-        setCorrelations(d.correlations);
-        setJournalImpact(d.journalImpact);
-        setFeatureImportance(d.featureImportance);
-        setJournalCorrelations(d.journalCorrelations);
-        setJournalShap(d.journalShap);
-        setResiduals(d.residuals);
-        setProphetForecast(d.prophetForecast);
-        setSarimaxForecast(d.sarimaxForecast);
-        setSupplementImpact(d.supplementImpact);
-        setSupplementDoseResponse(d.supplementDoseResponse);
-        setNutritionImpact(d.nutritionImpact);
-        setHabitImpact(d.habitImpact);
-        setHabitCorrelations(d.habitCorrelations);
-        setHabitShap(d.habitShap);
-        setCausalBinary(d.causalBinary);
-        setCausalContinuous(d.causalContinuous);
-        setCausalDag(d.causalDag);
-        setCausalMeta(d.causalMeta);
-        setCausalDropped(d.causalDropped);
-        setEnvMatrix(d.envMatrix);
-        setXgbDiagnostics(d.xgbDiagnostics);
+        setTomorrowPred((prev: any) => sameJson(prev, d.tomorrowPred) ? prev : d.tomorrowPred);
+        setMetrics(prev => sameJson(prev, d.metrics) ? prev : d.metrics);
+        setCorrelations(prev => sameJson(prev, d.correlations) ? prev : d.correlations);
+        setJournalImpact(prev => sameJson(prev, d.journalImpact) ? prev : d.journalImpact);
+        setFeatureImportance(prev => sameJson(prev, d.featureImportance) ? prev : d.featureImportance);
+        setJournalCorrelations(prev => sameJson(prev, d.journalCorrelations) ? prev : d.journalCorrelations);
+        setJournalShap(prev => sameJson(prev, d.journalShap) ? prev : d.journalShap);
+        setResiduals(prev => sameJson(prev, d.residuals) ? prev : d.residuals);
+        setProphetForecast(prev => sameJson(prev, d.prophetForecast) ? prev : d.prophetForecast);
+        setSarimaxForecast(prev => sameJson(prev, d.sarimaxForecast) ? prev : d.sarimaxForecast);
+        setSupplementImpact(prev => sameJson(prev, d.supplementImpact) ? prev : d.supplementImpact);
+        setSupplementDoseResponse(prev => sameJson(prev, d.supplementDoseResponse) ? prev : d.supplementDoseResponse);
+        setNutritionImpact(prev => sameJson(prev, d.nutritionImpact) ? prev : d.nutritionImpact);
+        setHabitImpact(prev => sameJson(prev, d.habitImpact) ? prev : d.habitImpact);
+        setHabitCorrelations(prev => sameJson(prev, d.habitCorrelations) ? prev : d.habitCorrelations);
+        setHabitShap(prev => sameJson(prev, d.habitShap) ? prev : d.habitShap);
+        setCausalBinary(prev => sameJson(prev, d.causalBinary) ? prev : d.causalBinary);
+        setCausalContinuous(prev => sameJson(prev, d.causalContinuous) ? prev : d.causalContinuous);
+        setCausalDag((prev: any) => sameJson(prev, d.causalDag) ? prev : d.causalDag);
+        setCausalMeta((prev: any) => sameJson(prev, d.causalMeta) ? prev : d.causalMeta);
+        setCausalDropped(prev => sameJson(prev, d.causalDropped) ? prev : d.causalDropped);
+        setEnvMatrix(prev => sameJson(prev, d.envMatrix) ? prev : d.envMatrix);
+        setXgbDiagnostics((prev: any) => sameJson(prev, d.xgbDiagnostics) ? prev : d.xgbDiagnostics);
       })
       .catch(console.error)
       .finally(() => {
@@ -371,9 +388,12 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
     loadHrvRangeDependent(rangeDays(range))
       .then((d) => {
         if (cancelled) return;
-        setAccuracy(d.accuracy);
-        setHistoricalHrv(d.historicalHrv);
-        setWorkoutGap(d.workoutGap);
+        // Range data usually genuinely differs, but the sameJson guard also
+        // covers the flip-back-to-default-range case (identical payload) for
+        // a few ms of comparison — cheap insurance against a full re-render.
+        setAccuracy(prev => sameJson(prev, d.accuracy) ? prev : d.accuracy);
+        setHistoricalHrv(prev => sameJson(prev, d.historicalHrv) ? prev : d.historicalHrv);
+        setWorkoutGap(prev => sameJson(prev, d.workoutGap) ? prev : d.workoutGap);
       })
       .catch(console.error)
       .finally(() => {
@@ -630,15 +650,15 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Area type="monotone" dataKey="upper" name="Upper CI" stroke="none"
-                    fill="url(#prophetGrad)" stackId="ci" />
+                    fill="url(#prophetGrad)" stackId="ci" isAnimationActive={false} />
               <Area type="monotone" dataKey="lower" name="Lower CI" stroke="none"
-                    fill={C.cardBg} stackId="ci" />
+                    fill={C.cardBg} stackId="ci" isAnimationActive={false} />
               <Line type="monotone" dataKey="actual" stroke={C.up} strokeWidth={2}
-                    dot={false} name="Actual HRV" connectNulls />
+                    dot={false} name="Actual HRV" connectNulls isAnimationActive={false} />
               <Line type="monotone" dataKey="forecast" stroke={C.source.whoop} strokeWidth={2}
-                    strokeDasharray="5 3" dot={false} name="Prophet" connectNulls />
+                    strokeDasharray="5 3" dot={false} name="Prophet" connectNulls isAnimationActive={false} />
               <Line type="monotone" dataKey="sarimax" stroke={C.source.eightsleep} strokeWidth={2}
-                    strokeDasharray="2 3" dot={false} name="SARIMAX (7d)" connectNulls />
+                    strokeDasharray="2 3" dot={false} name="SARIMAX (7d)" connectNulls isAnimationActive={false} />
             </AreaChart>
           </ResponsiveContainer>
           {prophetForecast.length === 0 && (
@@ -678,7 +698,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)} ms`, "Impact"]}
                 />
                 <ReferenceLine x={0} stroke={C.zeroLine} />
-                <Bar dataKey="shap_value" radius={[0, 3, 3, 0]}>
+                <Bar dataKey="shap_value" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                   {topDrivers.slice(0, 10).map((d, i) => (
                     <Cell key={i}
                       fill={(d.shap_value ?? d.importance) > 0 ? C.up : C.down}
@@ -715,7 +735,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   <Tooltip {...chartTooltip}
                            formatter={(v: any) => [`${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(3)} ms`, Number(v) > 0 ? "Raised forecast" : "Lowered forecast"]} />
                   <ReferenceLine x={0} stroke={C.zeroLine} />
-                  <Bar dataKey="shap_value" radius={[0, 3, 3, 0]}>
+                  <Bar dataKey="shap_value" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                     {journalDriversToday.map((d, i) => (
                       <Cell key={i} fill={d.shap_value > 0 ? C.up : C.down} fillOpacity={0.85} />
                     ))}
@@ -737,7 +757,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                     <Tooltip {...chartTooltip}
                              formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
                     <ReferenceLine x={0} stroke={C.zeroLine} />
-                    <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
+                    <Bar dataKey="importance" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                       {journalShap.map((d, i) => (
                         <Cell key={i} fill={C.source.eightsleep} fillOpacity={0.75} />
                       ))}
@@ -771,7 +791,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   <Tooltip {...chartTooltip}
                            formatter={(v: any) => [`${Number(v).toFixed(3)} ms`, "Avg |Impact|"]} />
                   <ReferenceLine x={0} stroke={C.zeroLine} />
-                  <Bar dataKey="importance" radius={[0, 3, 3, 0]}>
+                  <Bar dataKey="importance" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                     {habitShap.map((d, i) => (
                       <Cell key={i} fill={C.accent} fillOpacity={0.75} />
                     ))}
@@ -787,8 +807,17 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         </ChartCard>
       </div>
 
+      {/* Below-fold sections are wrapped in <DeferredMount> (perf round 3,
+          2026-06-11) so the first commit builds only the above-fold hero +
+          forecast charts; each later section mounts one-per-frame in document
+          order (everything is mounted within ~a dozen frames — no scroll
+          dependency, the Playwright below-fold assertions still pass).
+          SectionHeader anchors stay OUTSIDE the wrappers so #fragment nav
+          finds its targets before the section content mounts. minHeight
+          approximates each section's rendered height to limit scroll shift. */}
       <SectionHeader id="accuracy" tick="calibration" title="Model Accuracy" kicker="Backtested next-day prediction error" />
       {/* ── How well does the model actually predict? ── */}
+      <DeferredMount minHeight={420}>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Prediction vs Actual */}
         <ChartCard collapsible storageKey="prediction-vs-actual" title={`Prediction vs Actual (${rangeLabel(range)})`}
@@ -802,9 +831,9 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
               <Line type="monotone" dataKey="actual" stroke={C.up} strokeWidth={2}
-                    dot={false} name="Actual HRV" />
+                    dot={false} name="Actual HRV" isAnimationActive={false} />
               <Line type="monotone" dataKey="predicted" stroke={C.source.garmin} strokeWidth={2}
-                    dot={<HrvDot />} name="XGBoost Pred" strokeDasharray="4 2" />
+                    dot={<HrvDot />} name="XGBoost Pred" strokeDasharray="4 2" isAnimationActive={false} />
             </LineChart>
           </ResponsiveContainer>
           {predActualData.length === 0 && (
@@ -843,7 +872,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                     <Legend wrapperStyle={legendStyle} />
                     {activeModels.map(m => (
                       <Bar key={m.key} dataKey={m.key} name={m.label}
-                           fill={m.color} radius={[2, 2, 0, 0]} />
+                           fill={m.color} radius={[2, 2, 0, 0]} isAnimationActive={false} />
                     ))}
                   </BarChart>
                 </ResponsiveContainer>
@@ -852,9 +881,11 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           })()}
         </ChartCard>
       </div>
+      </DeferredMount>
 
       <SectionHeader id="trend" tick="descriptive" title="HRV Trend" />
       {/* ── Where is HRV trending overall? ── */}
+      <DeferredMount minHeight={420}>
       <ChartCard collapsible storageKey="hrv-trend" title={`HRV Trend (${rangeLabel(range)})`}
                  subtitle="WHOOP HRV + 7-day rolling average"
                  info="Your daily WHOOP HRV (faint line) swings a lot day-to-day — that's normal. The brighter line averages the last 7 days to show your real trend.">
@@ -866,9 +897,9 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
             <Tooltip {...chartTooltip} />
             <Legend wrapperStyle={legendStyle} />
             <Line type="monotone" dataKey="hrv" stroke={C.up} strokeWidth={1.5}
-                  dot={false} name="WHOOP HRV" strokeOpacity={0.5} />
+                  dot={false} name="WHOOP HRV" strokeOpacity={0.5} isAnimationActive={false} />
             <Line type="monotone" dataKey="rolling7" stroke={C.up} strokeWidth={2.5}
-                  dot={false} name="7-Day Avg" />
+                  dot={false} name="7-Day Avg" isAnimationActive={false} />
           </LineChart>
         </ResponsiveContainer>
         {trendWeekend.length > 6 && (
@@ -885,9 +916,11 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           </div>
         )}
       </ChartCard>
+      </DeferredMount>
 
       <SectionHeader id="associations" tick="descriptive" title="Associations" kicker="What historically moves with your HRV" />
       {/* ── What's associated with your HRV ── */}
+      <DeferredMount minHeight={1400}>
       <div className="space-y-4">
         <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card">
           <h3 className="text-[13px] font-medium text-text-secondary mb-2">What&apos;s associated with your HRV</h3>
@@ -910,7 +943,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                 <Tooltip {...chartTooltip}
                          formatter={(v: any) => [Number(v).toFixed(3), "Spearman ρ"]} />
                 <ReferenceLine x={0} stroke={C.zeroLine} />
-                <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                   {correlations.map((d, i) => (
                     <Cell key={i} fill={d.spearman_r > 0 ? C.up : C.down} fillOpacity={0.8} />
                   ))}
@@ -946,7 +979,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   <Tooltip {...chartTooltip}
                            formatter={(v: any) => [Number(v).toFixed(3), "Spearman ρ"]} />
                   <ReferenceLine x={0} stroke={C.zeroLine} />
-                  <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                  <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                     {journalCorrelations.map((d, i) => (
                       <Cell key={i} fill={d.spearman_r > 0 ? C.source.eightsleep : C.categorical[3]} fillOpacity={0.75} />
                     ))}
@@ -983,7 +1016,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   <Tooltip {...chartTooltip}
                            formatter={(v: any) => [Number(v).toFixed(3), "Spearman ρ"]} />
                   <ReferenceLine x={0} stroke={C.zeroLine} />
-                  <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                  <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                     {habitCorrelations.map((d, i) => (
                       <Cell key={i} fill={d.spearman_r > 0 ? C.accent : C.categorical[6]} fillOpacity={0.75} />
                     ))}
@@ -998,9 +1031,11 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           </div>
         </ChartCard>
       </div>
+      </DeferredMount>
 
       <SectionHeader id="impact" tick="descriptive" title="Behavior Impact" kicker="Mean next-night HRV difference (Welch's t-test)" />
       {/* ── Behavior t-tests: Journal + Habit Impact ── */}
+      <DeferredMount minHeight={480}>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Journal Impact */}
         <ChartCard collapsible title="Journal Behavior Impact" subtitle="Mean HRV difference: Yes vs No"
@@ -1053,7 +1088,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                            ];
                          }} />
                 <ReferenceLine x={0} stroke={C.zeroLine} />
-                <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
+                <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                   {ji.map((d: any, i: number) => (
                     <Cell key={i}
                           fill={d.diff_ms > 0 ? C.up : C.down}
@@ -1122,7 +1157,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                            ];
                          }} />
                 <ReferenceLine x={0} stroke={C.zeroLine} />
-                <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
+                <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                   {hi.map((d: any, i: number) => (
                     <Cell key={i}
                           fill={d.diff_ms > 0 ? C.up : C.down}
@@ -1143,9 +1178,11 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           )}
         </ChartCard>
       </div>
+      </DeferredMount>
 
       <SectionHeader id="supplements" tick="descriptive" title="Supplements" />
       {/* ── Supplements: Yes/No impact + Dose-Response ── */}
+      <DeferredMount minHeight={460}>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Supplement Yes/No Impact */}
         <ChartCard collapsible
@@ -1201,7 +1238,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                            ];
                          }} />
                 <ReferenceLine x={0} stroke={C.zeroLine} />
-                <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]}>
+                <Bar dataKey="diff_ms" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                   {si.map((d: any, i: number) => (
                     <Cell key={i} fill={d.diff_ms > 0 ? C.up : C.down}
                           fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.8 : 0.5)} />
@@ -1274,7 +1311,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                                ];
                              }} />
                     <ReferenceLine x={0} stroke={C.zeroLine} />
-                    <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                    <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                       {drDecorated.map((d: any, i: number) => (
                         <Cell key={i} fill={d.spearman_r > 0 ? C.accent : C.source.whoop}
                               fillOpacity={d.low_n ? 0.3 : (d.passes_fdr === false ? 0.5 : 0.8)} />
@@ -1287,9 +1324,11 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           </ChartCard>
         )}
       </div>
+      </DeferredMount>
 
       <SectionHeader id="lifestyle" tick="descriptive" title="Lifestyle" />
       {/* ── Lifestyle: Nutrition + Workout-to-Bed Gap ── */}
+      <DeferredMount minHeight={440}>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Nutrition Spearman */}
         <ChartCard collapsible
@@ -1340,7 +1379,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                            ];
                          }} />
                 <ReferenceLine x={0} stroke={C.zeroLine} />
-                <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]}>
+                <Bar dataKey="spearman_r" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                   {ni.map((d: any, i: number) => (
                     <Cell key={i} fill={d.spearman_r > 0 ? C.up : C.down}
                           fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.8 : 0.5)} />
@@ -1412,7 +1451,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                                : [value, String(name)]
                            } />
                   <Line type="monotone" dataKey="hrv_mean" stroke={C.up} strokeWidth={2.5}
-                        dot={{ r: 5, fill: C.up }} name="Mean HRV per gap-hour bin" />
+                        dot={{ r: 5, fill: C.up }} name="Mean HRV per gap-hour bin" isAnimationActive={false} />
                 </LineChart>
               </ResponsiveContainer>
             );
@@ -1432,6 +1471,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           </div>
         </ChartCard>
       </div>
+      </DeferredMount>
 
       <SectionHeader id="causal" tick="causal" title="Causal Inference" kicker="Adjusted effects — from association to causation" />
       {/* ── Causal Inference: from association to causation ── */}
@@ -1442,7 +1482,13 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         reader can see how much of each apparent effect survives adjustment.
         Empty unless `python hrv_analysis.py` has populated the causal/* rows
         in pds.hrv_analysis_results.
+
+        One DeferredMount spans the section's 5 sibling blocks (explainer,
+        coverage callout, forest plot, comparison table, continuous+DAG grid) —
+        after mount the fragment's children land directly in the space-y-6
+        parent, so the inter-block spacing is unchanged.
       */}
+      <DeferredMount minHeight={2400}>
       <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 shadow-card">
         <div className="flex items-start justify-between gap-3 mb-4">
           <div>
@@ -1715,7 +1761,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                            ];
                          }} />
                 <ReferenceLine x={0} stroke={C.zeroLine} />
-                <Bar dataKey="aipw_ate" radius={[0, 3, 3, 0]}>
+                <Bar dataKey="aipw_ate" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                   {top.map((d: any, i: number) => (
                     <Cell key={i} fill={d.barColor}
                           fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.85 : 0.5)} />
@@ -1915,7 +1961,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                              ];
                            }} />
                   <ReferenceLine x={0} stroke={C.zeroLine} />
-                  <Bar dataKey="aipw_ate" radius={[0, 3, 3, 0]}>
+                  <Bar dataKey="aipw_ate" radius={[0, 3, 3, 0]} isAnimationActive={false}>
                     {top.map((d: any, i: number) => (
                       <Cell key={i} fill={d.barColor}
                             fillOpacity={d.low_n ? 0.3 : (d.passes_fdr ? 0.85 : 0.5)} />
@@ -2114,6 +2160,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           )}
         </ChartCard>
       </div>
+      </DeferredMount>
 
       <SectionHeader id="environment" tick="descriptive" title="Environment" />
       {/* ── Environment Sweet Spot: dose-response for controllable inputs ── */}
@@ -2133,6 +2180,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         sleep — surfacing that lets you pick a target based on the metric
         you actually want to optimize.
       */}
+      <DeferredMount minHeight={780}>
       {(() => {
         const X_AXIS_META = {
           room: {
@@ -2319,7 +2367,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                         `Mean ${yMeta.label}`,
                       ];
                     }} />
-                  <Bar dataKey="meanY" radius={[2, 2, 0, 0]}>
+                  <Bar dataKey="meanY" radius={[2, 2, 0, 0]} isAnimationActive={false}>
                     {rows.map((r, i) => (
                       <Cell key={i}
                         fill={r.bucket === peakRow.bucket ? C.up : C.accent}
@@ -2348,9 +2396,13 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       </div>
       );
       })()}
+      </DeferredMount>
 
       <SectionHeader id="methods" tick="calibration" title="Methods & Evaluation" />
       {/* ── Models & Methods ── */}
+      {/* Both methods/eval cards render collapsed by default (just their
+          toggle headers), hence the small minHeight. */}
+      <DeferredMount minHeight={180}>
       <div className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card overflow-hidden">
         <button
           onClick={() => setExpandedModels(!expandedModels)}
@@ -2604,7 +2656,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                       <YAxis tick={axisTick} width={45} label={axisLabel("nights", "y")} />
                       <Tooltip {...chartTooltip} />
                       <ReferenceLine x="0" stroke={C.down} strokeWidth={1.5} />
-                      <Bar dataKey="count" fill={C.source.garmin} fillOpacity={0.8} />
+                      <Bar dataKey="count" fill={C.source.garmin} fillOpacity={0.8} isAnimationActive={false} />
                     </BarChart>
                   </ResponsiveContainer>
                 ) : (
@@ -2714,6 +2766,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           </div>
         )}
       </div>
+      </DeferredMount>
     </div>
     <aside className="hidden xl:block w-[170px] shrink-0">
       <nav className="sticky top-[88px] space-y-0.5" aria-label="On this page">

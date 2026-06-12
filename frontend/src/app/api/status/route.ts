@@ -48,6 +48,10 @@ const CADENCE: Record<string, string> = {
   // carries the schema-drift tripwire — a 'failed' here can mean the view
   // gained columns the matview is missing.
   matrix_mat: "Every 15 min (:10/:25/:40/:55)",
+  // pg_cron refresh of the perf matviews (tz_log_gaps_mat +
+  // hrv_prediction_gaps_mat) that THIS endpoint reads for the travel banner
+  // and the HRV-gap check.
+  perf_mats: "Every 15 min (:12/:27/:42/:57)",
 };
 
 // Integration method per source.
@@ -71,6 +75,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   notion_journal: { method: "automated",      label: "Notion sync" },
   tanita:         { method: "automated",      label: "API ETL" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
+  perf_mats:      { method: "automated",      label: "Matview refresh" },
 };
 
 export interface DriftAlert {
@@ -182,13 +187,13 @@ function enrichmentSource({
 export async function GET() {
   try {
     // Fetch last 100 sync_log rows (enough to cover all sources with history).
-    // matrix_mat refreshes 4x/hour (~96 rows/day) and would flood this window,
-    // drowning every other source's history — it gets a dedicated limit-1
-    // fetch below instead.
+    // matrix_mat and perf_mats each refresh 4x/hour (~96 heartbeat rows/day
+    // apiece) and would flood this window, drowning every other source's
+    // history — each gets a dedicated limit-1 fetch below instead.
     const { data: syncRows, error: syncErr } = await supabase
       .from("sync_log")
       .select("*")
-      .neq("source", "matrix_mat")
+      .not("source", "in", '("matrix_mat","perf_mats")')
       .order("sync_start", { ascending: false })
       .limit(100);
 
@@ -196,7 +201,7 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -238,8 +243,9 @@ export async function GET() {
       // artifact rows (single NY DST-transition nights) don't surface as
       // false-positive "Travel detected" banner entries. DST rows remain
       // in the view for analytical queries that want them.
+      // tz_log_gaps_mat = 15-min pg_cron matview of the live view (which was the slowest query here, ~503ms mean); a fixed travel gap can linger on the banner up to 15 min.
       supabase
-        .from("tz_log_gaps")
+        .from("tz_log_gaps_mat")
         .select("cycle_id, gap_et_date, source_offset, log_resolved_tz, delta_minutes")
         .eq("gap_type", "travel")
         .order("gap_et_date", { ascending: false })
@@ -247,8 +253,9 @@ export async function GET() {
       // HRV prediction drift monitor — any expected_date in the last 30 days
       // where no live xgboost forecast was written. Backtest fills don't
       // count. Empty array = healthy.
+      // hrv_prediction_gaps_mat = 15-min pg_cron matview of the live view (2nd-slowest query here, ~363ms mean); a healed gap can keep the card degraded up to 15 min.
       supabase
-        .from("hrv_prediction_gaps")
+        .from("hrv_prediction_gaps_mat")
         .select("expected_date, gap_type")
         .order("expected_date", { ascending: false }),
       // HRV RETRAIN freshness — most recent computed_at in hrv_analysis_results.
@@ -266,6 +273,15 @@ export async function GET() {
         .from("sync_log")
         .select("*")
         .eq("source", "matrix_mat")
+        .eq("data_type", "refresh")
+        .order("sync_start", { ascending: false })
+        .limit(1),
+      // Perf-matview refresh heartbeat (tz_log_gaps_mat + hrv_prediction_gaps_mat;
+      // also excluded from the main window above).
+      supabase
+        .from("sync_log")
+        .select("*")
+        .eq("source", "perf_mats")
         .eq("data_type", "refresh")
         .order("sync_start", { ascending: false })
         .limit(1),
@@ -572,6 +588,35 @@ export async function GET() {
           cadence: CADENCE.matrix_mat,
           integrationMethod: METHOD.matrix_mat.method,
           methodLabel: METHOD.matrix_mat.label,
+        };
+      })(),
+      // Perf matviews (pg_cron, every 15 min): tz_log_gaps_mat +
+      // hrv_prediction_gaps_mat — the matviews THIS endpoint reads for the
+      // travel banner and the HRV-gap check (perf round 3, 2026-06-11; the
+      // live views were the two slowest Promise.all members). Same heartbeat
+      // semantics + thresholds as matrix_mat: >20 min = one missed refresh
+      // (partial), >45 min = three missed (failed).
+      perf_mats: (() => {
+        const entry = (perfMatsRes.data?.[0] as Record<string, unknown> | undefined) ?? null;
+        const lastSync = (entry?.sync_start as string) ?? null;
+        const ageMin = lastSync ? Math.round((Date.now() - new Date(lastSync).getTime()) / 60000) : null;
+        let status: SourceStatus["status"];
+        if (!entry) status = "unknown";
+        else if (entry.status === "failed" || ageMin === null || ageMin > 45) status = "failed";
+        else if (ageMin > 20) status = "partial";
+        else status = "success";
+        return {
+          label: "Perf Matviews",
+          lastSync,
+          status,
+          latestDataDate: null,
+          daysLag: ageMin === null ? 999 : Math.floor(ageMin / 1440),
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string) ?? null,
+          cadence: CADENCE.perf_mats,
+          integrationMethod: METHOD.perf_mats.method,
+          methodLabel: METHOD.perf_mats.label,
         };
       })(),
     };

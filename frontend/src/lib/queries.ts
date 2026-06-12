@@ -296,6 +296,14 @@ export async function getWorkoutSleepGap(days: number = 60): Promise<WorkoutSlee
   const since = new Date();
   since.setDate(since.getDate() - days);
   const sinceISO = since.toISOString();
+  // Perf round 3: the recovery sub-query was unbounded (all-time, growing —
+  // ~589 rows today) and would silently truncate at PostgREST's 1000-row cap.
+  // Bound it on created_at like getWhoopRecovery, padded a few days before
+  // sinceISO to cover scoring lag. Semantics preserved: the recovery map is
+  // only consulted for sleeps already window-filtered.
+  const recSince = new Date(since);
+  recSince.setDate(recSince.getDate() - 3);
+  const recSinceISO = recSince.toISOString();
 
   // Fetch WHOOP sleep starts + cycles + recovery + workouts, plus Garmin
   // activities. Compute the join client-side so we don't add a server view
@@ -305,7 +313,8 @@ export async function getWorkoutSleepGap(days: number = 60): Promise<WorkoutSlee
       .eq("is_nap", false).eq("score_state", "SCORED")
       .gte("start_time", sinceISO).order("start_time", { ascending: true }),
     supabase.from("whoop_cycles").select("cycle_id,start_time").gte("start_time", sinceISO),
-    supabase.from("whoop_recovery").select("cycle_id,hrv_rmssd_milli").eq("score_state", "SCORED"),
+    supabase.from("whoop_recovery").select("cycle_id,hrv_rmssd_milli")
+      .eq("score_state", "SCORED").gte("created_at", recSinceISO),
     supabase.from("whoop_workouts").select("end_time,strain")
       .eq("score_state", "SCORED").eq("is_excluded", false).gte("end_time", sinceISO),
     supabase.from("garmin_activities").select("start_time_gmt,duration_seconds,training_load")
@@ -381,12 +390,18 @@ export async function getWhoopJournal(days: number = 30) {
   // (historical export rows AND new habit-channel taps for those questions).
   // Ordered DESCENDING so PostgREST's 1000-row cap drops the OLDEST rows at
   // large ranges (365d ≈ 3.9k rows), then re-sorted ascending for consumers.
+  // Perf round 3: explicit column list — consumers (/sleep heatmap, /whoop)
+  // read only these five fields; select("*") shipped ~179 kB for 30d. The
+  // secondary .order("question") makes within-day row order deterministic,
+  // which is load-bearing: the silent revalidation's sameJson guard compares
+  // serialized state, so nondeterministic ordering would defeat the bailout.
   const { data, error } = await supabase
     .from("journal")
-    .select("*")
+    .select("cycle_date, behaviors_date, question, category, answer")
     .eq("source", "whoop")
     .gte("cycle_date", since.toISOString().split("T")[0])
-    .order("cycle_date", { ascending: false });
+    .order("cycle_date", { ascending: false })
+    .order("question");
 
   if (error) throw error;
   return (data ?? []).reverse();
@@ -714,8 +729,11 @@ export async function getRunningRecoveryContext(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
+  // Matview read (15-min refresh, 2026-06-11): is_excluded toggles reach this
+  // recovery overlay at the next refresh (the activity list itself reads base
+  // tables live, so exclusions disappear from the list immediately).
   const { data, error } = await supabase
-    .from("recovery_vs_pace")
+    .from("recovery_vs_pace_mat")
     .select("activity_id, whoop_recovery, whoop_hrv_rmssd_ms, whoop_sleep_performance, pace_delta_pct, segment_targets, segment_target_count")
     .gte("activity_date", since.toISOString().split("T")[0]);
 
@@ -1115,8 +1133,9 @@ export async function getSpotifyKpis(range: SpotifyRange = "30d") {
 }
 
 export async function getSpotifyDailyVolume(range: SpotifyRange = "90d"): Promise<SpotifyDailySignatureRow[]> {
+  // Matview read (15-min refresh, 2026-06-11): plays only ingest hourly at :50, so staleness is invisible.
   let q = supabase
-    .from("spotify_daily_signature")
+    .from("spotify_daily_signature_mat")
     .select("calendar_date,play_count,unique_tracks,unique_artists,total_minutes,featurized_plays");
   const since = sinceFor(range);
   if (since) q = q.gte("calendar_date", since);
@@ -1126,8 +1145,9 @@ export async function getSpotifyDailyVolume(range: SpotifyRange = "90d"): Promis
 }
 
 export async function getSpotifyAudioFeatureDrift(range: SpotifyRange = "60d"): Promise<SpotifyDailySignatureRow[]> {
+  // Matview read (15-min refresh, 2026-06-11): plays only ingest hourly at :50, so staleness is invisible.
   let q = supabase
-    .from("spotify_daily_signature")
+    .from("spotify_daily_signature_mat")
     .select(
       "calendar_date,avg_valence,avg_energy,avg_danceability,avg_acousticness,avg_instrumentalness,avg_liveness,avg_speechiness,featurized_plays,play_count",
     );

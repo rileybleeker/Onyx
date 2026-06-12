@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AreaChart, Area, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, getRunningRecoveryContext, getActivityLaps, rangeDays, rangeLabel, type Range } from "@/lib/queries";
-import { formatDuration, formatShortDuration, formatDistance, formatPace, formatDate } from "@/lib/format";
+import { formatDuration, formatShortDuration, formatDistance, formatPace, formatDate, sameJson } from "@/lib/format";
 import RangeFilter from "@/components/RangeFilter";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -426,12 +426,20 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts(), getDailySummaries(days), getWhoopCycles(days), getHeartRateData(days), getRunningRecoveryContext(days)])
       .then(([garmin, whoop, wkts, sums, cycles, h, recCtx]) => {
         if (cancelled) return;
-        setRows(buildActivityRows(garmin, whoop));
-        setWorkoutMap(buildWorkoutMap(wkts));
-        setSummaries(sums);
-        setWhoopCycles(cycles);
-        setHr(h);
-        setRecoveryMap(buildRecoveryMap(recCtx));
+        // sameJson bail-out: the silent revalidation's data is usually
+        // byte-identical to the server-seeded state — returning the previous
+        // reference lets React skip the commit (and a full chart re-render).
+        // Compared AFTER the derived transforms so identical raw data still
+        // bails out (the transforms always mint fresh object identities).
+        const nextRows = buildActivityRows(garmin, whoop);
+        setRows((prev) => (sameJson(prev, nextRows) ? prev : nextRows));
+        const nextWorkoutMap = buildWorkoutMap(wkts);
+        setWorkoutMap((prev) => (sameJson(prev, nextWorkoutMap) ? prev : nextWorkoutMap));
+        setSummaries((prev) => (sameJson(prev, sums) ? prev : sums));
+        setWhoopCycles((prev) => (sameJson(prev, cycles) ? prev : cycles));
+        setHr((prev) => (sameJson(prev, h) ? prev : h));
+        const nextRecoveryMap = buildRecoveryMap(recCtx);
+        setRecoveryMap((prev) => (sameJson(prev, nextRecoveryMap) ? prev : nextRecoveryMap));
 
         // Batch-fetch laps for every Garmin running activity with a multi-segment plan
         const multiSegIds = recCtx
@@ -456,7 +464,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
                 wkt_index:        l.wkt_index ?? null,
               });
             }
-            setLapsByActivity(grouped);
+            setLapsByActivity((prev) => (sameJson(prev, grouped) ? prev : grouped));
           }).catch(console.error);
         }
       })
@@ -635,7 +643,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} label={axisLabel("steps", "y")} />
               <Tooltip {...chartTooltip} />
-              <Bar dataKey="steps" fill={accentColor} radius={[2, 2, 0, 0]} fillOpacity={0.85} />
+              <Bar dataKey="steps" fill={accentColor} radius={[2, 2, 0, 0]} fillOpacity={0.85} isAnimationActive={false} />
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -653,7 +661,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} label={axisLabel("bpm", "y")} />
               <Tooltip {...chartTooltip} />
-              <Area type="monotone" dataKey="hr" stroke={C.down} fill="url(#cycleHrGrad)" strokeWidth={2} name="Avg HR" />
+              <Area type="monotone" dataKey="hr" stroke={C.down} fill="url(#cycleHrGrad)" strokeWidth={2} name="Avg HR" isAnimationActive={false} />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -676,8 +684,8 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
               <YAxis tick={axisTick} width={55} label={axisLabel("bpm", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
-              <Area type="monotone" dataKey="max" stroke={C.down} fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max HR" />
-              <Area type="monotone" dataKey="min" stroke={C.up} fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min HR" />
+              <Area type="monotone" dataKey="max" stroke={C.down} fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max HR" isAnimationActive={false} />
+              <Area type="monotone" dataKey="min" stroke={C.up} fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min HR" isAnimationActive={false} />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -695,7 +703,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} domain={[0, 100]} label={axisLabel("stress (0–100)", "y")} />
               <Tooltip {...chartTooltip} />
-              <Area type="monotone" dataKey="overall" stroke={C.source.whoop} fill="url(#heartStressGrad)" strokeWidth={2} name="Stress Level" />
+              <Area type="monotone" dataKey="overall" stroke={C.source.whoop} fill="url(#heartStressGrad)" strokeWidth={2} name="Stress Level" isAnimationActive={false} />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>

@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef, type RefObject } from "react";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
+import { sameJson } from "@/lib/format";
 import type { DriftAlert, SourceStatus, StatusResponse, TzGapRow } from "@/app/api/status/route";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -23,6 +24,7 @@ const SOURCE_BADGE: Record<string, string> = {
   supplements: "DSLD",
   tanita: "TANITA",
   matrix_mat: "DB",
+  perf_mats: "DB",
 };
 
 const SOURCE_BADGE_COLOR: Record<string, string> = {
@@ -40,6 +42,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   supplements: "text-amber-400",
   tanita: "text-amber-500",
   matrix_mat: "text-cyan-400/70",
+  perf_mats: "text-cyan-400/70",
 };
 
 const STATUS_DOT: Record<string, string> = {
@@ -88,6 +91,7 @@ const SOURCE_ORDER = [
   "supplements",
   "tanita",
   "matrix_mat",
+  "perf_mats",
 ];
 
 function formatRelativeTime(isoStr: string | null): string {
@@ -205,6 +209,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   hrv_analysis: "HRV Retrain",
   tanita: "Tanita",
   matrix_mat: "Matrix Matview",
+  perf_mats: "Perf Matviews",
 };
 
 const HISTORY_TYPE_LABELS: Record<string, string> = {
@@ -223,18 +228,46 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   refresh: "Refresh",
 };
 
+// "refreshed Xm ago" label, isolated from the page render cycle (perf round
+// 3, 2026-06-11): refreshedAt lives in a REF in the parent — a successful
+// poll whose payload is unchanged must not re-render the whole page just to
+// move this label. The label still has to age (and pick up new refresh
+// instants), so this tiny component re-reads the ref on its own 10s tick;
+// only this one <span> re-renders, never the cards/table above it.
+function RefreshedLabel({ refreshedAtRef }: { refreshedAtRef: RefObject<Date | null> }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick((n) => n + 1), 10000);
+    return () => clearInterval(t);
+  }, []);
+  const refreshedAt = refreshedAtRef.current;
+  if (!refreshedAt) return null;
+  return (
+    <span className="ml-2 text-text-tertiary/60">· refreshed {formatRelativeTime(refreshedAt.toISOString())}</span>
+  );
+}
+
 export default function StatusPage() {
   const [data, setData] = useState<StatusResponse | null>(null);
   const [loading, setLoading] = useState(true);
-  const [refreshedAt, setRefreshedAt] = useState<Date | null>(null);
+  const refreshedAtRef = useRef<Date | null>(null);
 
   const load = useCallback(async () => {
     try {
       const res = await fetch("/api/status");
       if (res.ok) {
-        const json = await res.json();
-        setData(json);
-        setRefreshedAt(new Date());
+        const fresh: StatusResponse = await res.json();
+        // Bail out of the commit when the poll returned the same payload
+        // (perf round 3): fetchedAt is volatile — the server stamps it on
+        // every response — so compare everything EXCEPT it, or the guard
+        // would never fire. Returning `prev` keeps the state reference
+        // stable and React skips the re-render entirely.
+        setData((prev) =>
+          prev && sameJson({ ...prev, fetchedAt: null }, { ...fresh, fetchedAt: null })
+            ? prev
+            : fresh
+        );
+        refreshedAtRef.current = new Date();
       }
     } catch (e) {
       console.error("Failed to fetch status:", e);
@@ -245,8 +278,21 @@ export default function StatusPage() {
 
   useEffect(() => {
     load();
-    const interval = setInterval(load, 60000);
-    return () => clearInterval(interval);
+    // Visibility-gated poll (perf round 3): a backgrounded tab kept hitting
+    // /api/status every 60s for nothing — skip the tick while hidden, and
+    // refresh immediately on return to visible so the page never shows a
+    // stale snapshot after a long time away.
+    const interval = setInterval(() => {
+      if (document.visibilityState !== "hidden") load();
+    }, 60000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") load();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, [load]);
 
   if (loading) {
@@ -337,9 +383,7 @@ export default function StatusPage() {
           <h2 className="text-[28px] font-medium text-text-primary">System Status</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
             ETL pipeline health and data freshness
-            {refreshedAt && (
-              <span className="ml-2 text-text-tertiary/60">· refreshed {formatRelativeTime(refreshedAt.toISOString())}</span>
-            )}
+            <RefreshedLabel refreshedAtRef={refreshedAtRef} />
           </p>
         </div>
         <button

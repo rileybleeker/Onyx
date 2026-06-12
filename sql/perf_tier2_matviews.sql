@@ -1,0 +1,93 @@
+-- ============================================================================
+-- Tier-2 performance matviews (perf round 3, 2026-06-11)
+-- Applied as Supabase migration: perf_tier2_matviews
+-- ============================================================================
+--
+-- WHY
+-- ---
+-- After round 2 materialized the behavioral matrix, the remaining expensive
+-- frontend reads were (pg_stat_statements means / fresh EXPLAIN, 2026-06-11):
+--   hrv_prediction_gaps      503 ms mean, 2.9 s max  — /api/status's slowest member
+--   tz_log_gaps              363 ms mean, 1.8 s max  — tz_for_instant() runs 2-3x
+--                            per row over ALL whoop_cycles; grows with history
+--   spotify_daily_signature  ~240 ms mean            — /spotify regen + revalidation
+--   recovery_vs_pace         ~190 ms mean            — /activities regen + revalidation
+--   hrv_predictions_eval     634 ms mean             — getHrvResiduals, every
+--                            /analytics/hrv regen + revalidation
+--
+-- WHAT
+-- ----
+-- Five matviews, refreshed every 15 min by pg_cron ('12,27,42,57 * * * *' —
+-- +2 min after matrix_mat's tick so the two never compete; :12/:57 land just
+-- after the hourly :00 health ETL and :50 Spotify ETL):
+--   pds.tz_log_gaps_mat              1:1 SELECT * copy   (unique: cycle_id)
+--   pds.hrv_prediction_gaps_mat      1:1 SELECT * copy   (unique: expected_date)
+--   pds.spotify_daily_signature_mat  1:1 SELECT * copy   (unique: calendar_date)
+--   pds.recovery_vs_pace_mat         1:1 SELECT * copy   (unique: activity_id)
+--   pds.hrv_residuals_mat            NARROW SLICE of hrv_predictions_eval
+--                                    (h=1, 3 models, residual NOT NULL; cols
+--                                    prediction_date, model, predicted_hrv,
+--                                    actual_hrv, residual; unique:
+--                                    (prediction_date, model)) — a 1:1 copy
+--                                    would rewrite ~4 MB 96x/day for a chart
+--                                    that reads one column of one model. The
+--                                    old all-time read was ALSO silently
+--                                    truncated at PostgREST's 1000-row cap
+--                                    (1,153 rows existed); the narrowed
+--                                    consumer (~384 xgboost rows) fixes that.
+--
+-- REJECTED ALTERNATIVES (evidence in docs/perf_report_2026-06-11.md round 3):
+--   partial index on hrv_predictions WHERE horizon_days=1 — 484 of 493 buffers
+--     are heap pages; h=1 rows interleave with h=2..7 per date, so an index
+--     scan touches ~the same cold pages. No real win.
+--   180d window in getHrvResiduals — discards 54% of the accuracy history;
+--     not visually lossless. The chart's purpose is all-time evaluation.
+--
+-- REFRESH MACHINERY
+-- -----------------
+-- pds.refresh_perf_matviews(): SECURITY DEFINER; loops the five matviews with
+-- per-matview BEGIN/EXCEPTION isolation (one failure can't block the rest);
+-- runs the pg_attribute column-diff drift tripwire for the four 1:1 copies;
+-- plain REFRESH (CONCURRENTLY is disallowed in functions; these mats are
+-- <=1.2k rows so the exclusive lock is ms-scale); ONE pds.sync_log heartbeat
+-- per run, source='perf_mats', data_type='refresh' — success only when ALL
+-- five refreshed clean, error_message itemizes per-matview failures.
+-- Surfaced as the "Perf Matviews" card on /status (>20 min = partial,
+-- >45 min = failed — same thresholds as the Matrix Matview card).
+--
+-- The UNIQUE index on each mat doubles as a duplicate-natural-key tripwire:
+-- e.g. recovery_vs_pace joins whoop_cycles on bare ET-date equality with no
+-- LATERAL dedupe, so a future two-cycle transition day would duplicate an
+-- activity_id → the refresh FAILS (mat freezes at last-good, heartbeat goes
+-- red) instead of silently serving duplicate rows. Runbook: fix the live
+-- view's join (matrix-style LATERAL LIMIT 1), then drop+recreate the mat.
+--
+-- ⚠ SCHEMA-DRIFT RULE (same as sql/perf_matrix_matview.sql): any migration
+-- changing tz_log_gaps / hrv_prediction_gaps / spotify_daily_signature /
+-- recovery_vs_pace MUST drop + recreate the matching _mat (+ unique index +
+-- grants) in the same migration. NEVER DROP VIEW ... CASCADE on these views.
+--
+-- WHO READS WHAT
+-- --------------
+-- MATVIEWS (frontend only):
+--   api/status/route.ts        tz_log_gaps_mat, hrv_prediction_gaps_mat
+--   lib/queries.ts             spotify_daily_signature_mat (getSpotifyDailyVolume,
+--                              getSpotifyAudioFeatureDrift), recovery_vs_pace_mat
+--                              (getRunningRecoveryContext)
+--   lib/queries-hrv.ts         hrv_residuals_mat (getHrvResiduals)
+-- LIVE VIEWS (unchanged): Python pipeline, chat tools, any ad-hoc SQL.
+--
+-- STALENESS AUDIT (<=15 min added staleness everywhere):
+--   tz_log_gaps — travel canary; signal grain is ~1 WHOOP cycle/day arriving
+--     via the hourly ETL; banner action is hours-to-days urgent. One cosmetic
+--     lag: a FIXED gap lingers on the banner <=15 min + <=60 s edge cache.
+--   hrv_prediction_gaps — day-grain drift monitor; 15 min is 1% of grain.
+--   spotify_daily_signature — plays ingest hourly at :50; :57 refresh beats
+--     the page's own 1h ISR window.
+--   recovery_vs_pace — new runs land hourly; is_excluded toggles reach the
+--     recovery OVERLAY at the next tick (the activity list reads base tables).
+--   hrv_residuals_mat — changes on hourly actual-backfill / retrain; the
+--     all-time evaluation chart is indifferent to 15 min.
+--
+-- The canonical DDL lives in the Supabase migration history (migration
+-- perf_tier2_matviews); this file is the repo-side reference.

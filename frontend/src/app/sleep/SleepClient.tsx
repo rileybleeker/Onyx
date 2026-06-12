@@ -6,14 +6,15 @@ import {
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, ReferenceLine, Cell,
 } from "recharts";
 import {
-  getWhoopSleep, getWhoopSleepAll, getWhoopRecovery, getWhoopCycles, getWhoopJournal,
+  getWhoopSleepAll, getWhoopRecovery, getWhoopCycles, getWhoopJournal,
   getEightSleepTrends, getDailySummaries,
   rangeDays, rangeLabel, type Range,
 } from "@/lib/queries";
-import { formatDate, formatDuration, formatDurationMs, etDate } from "@/lib/format";
+import { formatDate, formatDuration, formatDurationMs, etDate, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
+import DeferredMount from "@/components/DeferredMount";
 import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
@@ -41,28 +42,35 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
   // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
   // stale — single-user traffic means the morning's first visit usually
   // lands on a cache regenerated last evening.
-  const [whoopSleep, setWhoopSleep]     = useState<any[]>(initial?.whoopSleep ?? []);
   const [whoopSleepAll, setWhoopSleepAll] = useState<any[]>(initial?.whoopSleepAll ?? []);
   const [whoopRecovery, setWhoopRecovery] = useState<any[]>(initial?.whoopRecovery ?? []);
   const [whoopCycles, setWhoopCycles]   = useState<any[]>(initial?.whoopCycles ?? []);
   const [journal, setJournal]           = useState<any[]>(initial?.journal ?? []);
   const [eightSleep, setEightSleep]     = useState<any[]>(initial?.eightSleep ?? []);
   const [summaries, setSummaries]       = useState<any[]>(initial?.summaries ?? []);
+  // `loading` only gates the no-initial COLD path (skeleton until the first
+  // fetch resolves — same behavior as pre-ISR). Range changes flip the narrow
+  // `rangeLoading` flag instead (perf round 3): the stale charts stay visible
+  // and re-render in place when the new window lands, with a small
+  // "updating…" hint next to the RangeFilter rather than a page-wide skeleton.
   const [loading, setLoading]           = useState(!initial);
+  const [rangeLoading, setRangeLoading] = useState(false);
   const [range, setRange]               = useState<Range>("30d");
+  const firstRun = useRef(true);
   const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
-    // Silent only on the very first run when seeded — range changes show the
-    // loading state as before. The cancelled flag stops a superseded slow
-    // response from overwriting a newer range's data (out-of-order resolve).
+    // Silent only on the very first run when seeded. The cancelled flag stops
+    // a superseded slow response from overwriting a newer range's data
+    // (out-of-order resolve).
     let cancelled = false;
-    const silent = firstRunWithInitial.current;
+    const isFirst = firstRun.current;
+    firstRun.current = false;
+    const silent = isFirst && firstRunWithInitial.current;
     firstRunWithInitial.current = false;
-    if (!silent) setLoading(true);
+    if (!isFirst) setRangeLoading(true);
     const days = rangeDays(range);
     Promise.all([
-      getWhoopSleep(days),
       getWhoopSleepAll(days),
       getWhoopRecovery(days),
       getWhoopCycles(days),
@@ -70,19 +78,26 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
       getEightSleepTrends(days),
       getDailySummaries(days),
     ])
-      .then(([s, sAll, r, c, j, e, sum]) => {
+      .then(([sAll, r, c, j, e, sum]) => {
         if (cancelled) return;
-        setWhoopSleep(s);
-        setWhoopSleepAll(sAll);
-        setWhoopRecovery(r);
-        setWhoopCycles(c);
-        setJournal(j);
-        setEightSleep(e);
-        setSummaries(sum);
+        // Deep-equal bail-out (perf round 3): the silent revalidation's
+        // refetched data is usually byte-identical to the server-seeded
+        // state — returning the previous reference lets React skip the
+        // commit entirely instead of re-rendering every chart ~1s after
+        // first paint. Range-change data genuinely differs, so the guard
+        // passes it straight through.
+        setWhoopSleepAll((prev) => (sameJson(prev, sAll) ? prev : sAll));
+        setWhoopRecovery((prev) => (sameJson(prev, r) ? prev : r));
+        setWhoopCycles((prev) => (sameJson(prev, c) ? prev : c));
+        setJournal((prev) => (sameJson(prev, j) ? prev : j));
+        setEightSleep((prev) => (sameJson(prev, e) ? prev : e));
+        setSummaries((prev) => (sameJson(prev, sum) ? prev : sum));
       })
       .catch(console.error)
       .finally(() => {
-        if (!cancelled && !silent) setLoading(false);
+        if (cancelled) return;
+        if (!isFirst) setRangeLoading(false);
+        else if (!silent) setLoading(false);
       });
     return () => { cancelled = true; };
   }, [range]);
@@ -114,6 +129,13 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
   const rangeNote = range === "1d" ? "today" : `${rangeLabel(range)} avg`;
 
   // ── WHOOP ────────────────────────────────────────────────────────────────────
+  // Main-only sleep rows derived from the nap-inclusive set (perf round 3):
+  // getWhoopSleep(days) was a strict subset of getWhoopSleepAll(days) — same
+  // columns, same window/order, just minus the is_nap=false filter — so the
+  // page now runs ONE whoop_sleep query (client + server prefetch) and
+  // filters here. Saves a query per load plus ~33kB of duplicated rows in the
+  // ISR HTML payload.
+  const whoopSleep = whoopSleepAll.filter((d: any) => !d.is_nap);
   const avgRecoveryScore = avg(whoopRecovery, "recovery_score");
   const avgWhoopHrv      = avg(whoopRecovery, "hrv_rmssd_milli");
   const avgWhoopRhr      = avg(whoopRecovery, "resting_heart_rate");
@@ -358,7 +380,12 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
           <h2 className="text-[28px] font-medium text-text-primary">Sleep &amp; Recovery</h2>
           <p className="text-sm text-text-tertiary mt-0.5">Sleep, recovery, and cardiac trends — {rangeLabel(range)}</p>
         </div>
-        <RangeFilter value={range} onChange={setRange} />
+        <div className="flex items-center gap-3">
+          {rangeLoading && (
+            <span className="text-[11px] font-mono text-text-tertiary animate-pulse">updating…</span>
+          )}
+          <RangeFilter value={range} onChange={setRange} />
+        </div>
       </div>
 
       {/* ── WHOOP Recovery ──────────────────────────────────────────────────── */}
@@ -397,7 +424,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
               <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={40} domain={[0, 100]} />
               <Tooltip {...chartTooltip} />
-              <Bar dataKey="recovery" name="Recovery %" radius={[3, 3, 0, 0]}
+              <Bar isAnimationActive={false} dataKey="recovery" name="Recovery %" radius={[3, 3, 0, 0]}
                 fill={C.up}
                 shape={(props: any) => {
                   const { x, y, width, height, payload } = props;
@@ -421,7 +448,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
               <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
               <YAxis tick={axisTick} width={55} domain={[0, 21]} label={axisLabel("strain", "y")} />
               <Tooltip {...chartTooltip} />
-              <Area type="monotone" dataKey="strain" stroke={C.source.garmin} fill="url(#recStrainGrad)" strokeWidth={2} name="Strain" />
+              <Area isAnimationActive={false} type="monotone" dataKey="strain" stroke={C.source.garmin} fill="url(#recStrainGrad)" strokeWidth={2} name="Strain" />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -436,9 +463,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
               <YAxis yAxisId="resp" orientation="right" hide domain={[10, 22]} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={legendStyle} />
-              <Line yAxisId="spo2" type="monotone" dataKey="spo2" stroke={C.accent} strokeWidth={2} dot={false} name="SpO2 %" />
-              <Line yAxisId="temp" type="monotone" dataKey="skinTemp" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Skin Temp (°F)" />
-              <Line yAxisId="resp" type="monotone" dataKey="respRate" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Resp Rate (br/min)" />
+              <Line isAnimationActive={false} yAxisId="spo2" type="monotone" dataKey="spo2" stroke={C.accent} strokeWidth={2} dot={false} name="SpO2 %" />
+              <Line isAnimationActive={false} yAxisId="temp" type="monotone" dataKey="skinTemp" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Skin Temp (°F)" />
+              <Line isAnimationActive={false} yAxisId="resp" type="monotone" dataKey="respRate" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Resp Rate (br/min)" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -465,154 +492,168 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
       </div>
 
       <div className="mb-6">
-        <ChartCard title="Time in Bed" source="WHOOP">
-          <ResponsiveContainer width="100%" height={280}>
-            <BarChart data={inBedData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis tick={axisTick} width={45} label={axisLabel("hours", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}h`, "Time in Bed"]} />
-              <Bar dataKey="hours" name="Time in Bed" radius={[3, 3, 0, 0]} fill={C.source.eightsleep} />
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={345}>
+          <ChartCard title="Time in Bed" source="WHOOP">
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={inBedData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis tick={axisTick} width={45} label={axisLabel("hours", "y")} />
+                <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}h`, "Time in Bed"]} />
+                <Bar isAnimationActive={false} dataKey="hours" name="Time in Bed" radius={[3, 3, 0, 0]} fill={C.source.eightsleep} />
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
-        <ChartCard title="Sleep Debt" source="WHOOP">
-          <ResponsiveContainer width="100%" height={280}>
-            <BarChart data={sleepDebtData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis tick={axisTick} width={45} label={axisLabel("hours", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: any) => [`${v} h`, "Sleep Debt"]} />
-              <Bar dataKey="debt" name="Sleep Debt" radius={[3, 3, 0, 0]}>
-                {sleepDebtData.map((d, i) => (
-                  <Cell key={i} fill={d.debt == null ? C.neutral : d.debt < 1 ? C.up : d.debt < 2 ? C.source.whoop : C.down} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={345}>
+          <ChartCard title="Sleep Debt" source="WHOOP">
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={sleepDebtData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis tick={axisTick} width={45} label={axisLabel("hours", "y")} />
+                <Tooltip {...chartTooltip} formatter={(v: any) => [`${v} h`, "Sleep Debt"]} />
+                <Bar isAnimationActive={false} dataKey="debt" name="Sleep Debt" radius={[3, 3, 0, 0]}>
+                  {sleepDebtData.map((d, i) => (
+                    <Cell key={i} fill={d.debt == null ? C.neutral : d.debt < 1 ? C.up : d.debt < 2 ? C.source.whoop : C.down} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
 
-        <ChartCard title="Hours vs Needed" source="WHOOP">
-          <ResponsiveContainer width="100%" height={280}>
-            <BarChart data={whoopScoreData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis tick={axisTick} width={45} domain={[0, (max: number) => Math.max(110, Math.ceil(max / 10) * 10)]} label={axisLabel("% of need met", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}%`, "Hours vs Needed"]} />
-              <ReferenceLine y={100} stroke={C.up} strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "100%", position: "right", fill: C.up, fontSize: 10 }} />
-              <Bar dataKey="hoursNeeded" name="Hours vs Needed" radius={[3, 3, 0, 0]}>
-                {whoopScoreData.map((d, i) => (
-                  <Cell key={i} fill={d.hoursNeeded == null ? C.neutral : d.hoursNeeded >= 100 ? C.up : d.hoursNeeded >= 85 ? C.source.whoop : C.down} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={345}>
+          <ChartCard title="Hours vs Needed" source="WHOOP">
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={whoopScoreData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis tick={axisTick} width={45} domain={[0, (max: number) => Math.max(110, Math.ceil(max / 10) * 10)]} label={axisLabel("% of need met", "y")} />
+                <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}%`, "Hours vs Needed"]} />
+                <ReferenceLine y={100} stroke={C.up} strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "100%", position: "right", fill: C.up, fontSize: 10 }} />
+                <Bar isAnimationActive={false} dataKey="hoursNeeded" name="Hours vs Needed" radius={[3, 3, 0, 0]}>
+                  {whoopScoreData.map((d, i) => (
+                    <Cell key={i} fill={d.hoursNeeded == null ? C.neutral : d.hoursNeeded >= 100 ? C.up : d.hoursNeeded >= 85 ? C.source.whoop : C.down} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
 
-        <ChartCard title="Sleep Consistency" source="WHOOP">
-          <ResponsiveContainer width="100%" height={280}>
-            <BarChart data={whoopScoreData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis tick={axisTick} width={45} domain={[0, 100]} label={axisLabel("consistency %", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}%`, "Sleep Consistency"]} />
-              <Bar dataKey="consistency" name="Sleep Consistency" radius={[3, 3, 0, 0]}>
-                {whoopScoreData.map((d, i) => (
-                  <Cell key={i} fill={d.consistency == null ? C.neutral : d.consistency >= 70 ? C.up : d.consistency >= 50 ? C.source.whoop : C.down} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={345}>
+          <ChartCard title="Sleep Consistency" source="WHOOP">
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={whoopScoreData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis tick={axisTick} width={45} domain={[0, 100]} label={axisLabel("consistency %", "y")} />
+                <Tooltip {...chartTooltip} formatter={(v: any) => [`${v}%`, "Sleep Consistency"]} />
+                <Bar isAnimationActive={false} dataKey="consistency" name="Sleep Consistency" radius={[3, 3, 0, 0]}>
+                  {whoopScoreData.map((d, i) => (
+                    <Cell key={i} fill={d.consistency == null ? C.neutral : d.consistency >= 70 ? C.up : d.consistency >= 50 ? C.source.whoop : C.down} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-10">
-        <ChartCard title="Sleep Stages" source="WHOOP">
-          <ResponsiveContainer width="100%" height={260}>
-            <BarChart data={whoopDurationData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
-              <Legend wrapperStyle={legendStyle} />
-              <Bar dataKey="deep"  stackId="a" fill={C.source.garmin} name="Deep" />
-              <Bar dataKey="light" stackId="a" fill={C.categorical[6]} name="Light" />
-              <Bar dataKey="rem"   stackId="a" fill={C.source.eightsleep} name="REM" />
-              <Bar dataKey="awake" stackId="a" fill={C.down} name="Awake" />
-              <Bar dataKey="nap_deep"  stackId="a" fill={C.source.garmin} fillOpacity={0.5} name="Deep (nap)" />
-              <Bar dataKey="nap_light" stackId="a" fill={C.categorical[6]} fillOpacity={0.5} name="Light (nap)" />
-              <Bar dataKey="nap_rem"   stackId="a" fill={C.source.eightsleep} fillOpacity={0.5} name="REM (nap)" />
-              <Bar dataKey="nap_awake" stackId="a" fill={C.down} fillOpacity={0.5} name="Awake (nap)" radius={[3, 3, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={325}>
+          <ChartCard title="Sleep Stages" source="WHOOP">
+            <ResponsiveContainer width="100%" height={260}>
+              <BarChart data={whoopDurationData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
+                <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
+                <Legend wrapperStyle={legendStyle} />
+                <Bar isAnimationActive={false} dataKey="deep"  stackId="a" fill={C.source.garmin} name="Deep" />
+                <Bar isAnimationActive={false} dataKey="light" stackId="a" fill={C.categorical[6]} name="Light" />
+                <Bar isAnimationActive={false} dataKey="rem"   stackId="a" fill={C.source.eightsleep} name="REM" />
+                <Bar isAnimationActive={false} dataKey="awake" stackId="a" fill={C.down} name="Awake" />
+                <Bar isAnimationActive={false} dataKey="nap_deep"  stackId="a" fill={C.source.garmin} fillOpacity={0.5} name="Deep (nap)" />
+                <Bar isAnimationActive={false} dataKey="nap_light" stackId="a" fill={C.categorical[6]} fillOpacity={0.5} name="Light (nap)" />
+                <Bar isAnimationActive={false} dataKey="nap_rem"   stackId="a" fill={C.source.eightsleep} fillOpacity={0.5} name="REM (nap)" />
+                <Bar isAnimationActive={false} dataKey="nap_awake" stackId="a" fill={C.down} fillOpacity={0.5} name="Awake (nap)" radius={[3, 3, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
 
-        <ChartCard title="Sleep Scores" source="WHOOP">
-          <ResponsiveContainer width="100%" height={260}>
-            <AreaChart data={whoopScoreData}>
-              <defs>
-                <linearGradient id="sleepPerfGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={C.source.whoop} stopOpacity={0.15} />
-                  <stop offset="100%" stopColor={C.source.whoop} stopOpacity={0} />
-                </linearGradient>
-                <linearGradient id="sleepNeededGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={C.categorical[4]} stopOpacity={0.15} />
-                  <stop offset="100%" stopColor={C.categorical[4]} stopOpacity={0} />
-                </linearGradient>
-                <linearGradient id="sleepEffGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={C.up} stopOpacity={0.15} />
-                  <stop offset="100%" stopColor={C.up} stopOpacity={0} />
-                </linearGradient>
-                <linearGradient id="sleepConsGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={C.source.garmin} stopOpacity={0.15} />
-                  <stop offset="100%" stopColor={C.source.garmin} stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis tick={axisTick} width={35} domain={[0, 100]} />
-              <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={legendStyle} />
-              <Area type="monotone" dataKey="performance" stroke={C.source.whoop} fill="url(#sleepPerfGrad)" strokeWidth={2} name="Performance" />
-              <Area type="monotone" dataKey="hoursNeeded" stroke={C.categorical[4]} fill="url(#sleepNeededGrad)" strokeWidth={2} name="Hours vs Needed" />
-              <Area type="monotone" dataKey="efficiency" stroke={C.up} fill="url(#sleepEffGrad)" strokeWidth={1.5} name="Efficiency" />
-              <Area type="monotone" dataKey="consistency" stroke={C.source.garmin} fill="url(#sleepConsGrad)" strokeWidth={1.5} name="Consistency" />
-            </AreaChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={325}>
+          <ChartCard title="Sleep Scores" source="WHOOP">
+            <ResponsiveContainer width="100%" height={260}>
+              <AreaChart data={whoopScoreData}>
+                <defs>
+                  <linearGradient id="sleepPerfGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={C.source.whoop} stopOpacity={0.15} />
+                    <stop offset="100%" stopColor={C.source.whoop} stopOpacity={0} />
+                  </linearGradient>
+                  <linearGradient id="sleepNeededGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={C.categorical[4]} stopOpacity={0.15} />
+                    <stop offset="100%" stopColor={C.categorical[4]} stopOpacity={0} />
+                  </linearGradient>
+                  <linearGradient id="sleepEffGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={C.up} stopOpacity={0.15} />
+                    <stop offset="100%" stopColor={C.up} stopOpacity={0} />
+                  </linearGradient>
+                  <linearGradient id="sleepConsGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={C.source.garmin} stopOpacity={0.15} />
+                    <stop offset="100%" stopColor={C.source.garmin} stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis tick={axisTick} width={35} domain={[0, 100]} />
+                <Tooltip {...chartTooltip} />
+                <Legend wrapperStyle={legendStyle} />
+                <Area isAnimationActive={false} type="monotone" dataKey="performance" stroke={C.source.whoop} fill="url(#sleepPerfGrad)" strokeWidth={2} name="Performance" />
+                <Area isAnimationActive={false} type="monotone" dataKey="hoursNeeded" stroke={C.categorical[4]} fill="url(#sleepNeededGrad)" strokeWidth={2} name="Hours vs Needed" />
+                <Area isAnimationActive={false} type="monotone" dataKey="efficiency" stroke={C.up} fill="url(#sleepEffGrad)" strokeWidth={1.5} name="Efficiency" />
+                <Area isAnimationActive={false} type="monotone" dataKey="consistency" stroke={C.source.garmin} fill="url(#sleepConsGrad)" strokeWidth={1.5} name="Consistency" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
 
-        <ChartCard title="Resting HR, HRV & Respiratory Rate" source="WHOOP">
-          <ResponsiveContainer width="100%" height={260}>
-            <AreaChart data={whoopHrData}>
-              <defs>
-                <linearGradient id="sleepRhrGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={C.down} stopOpacity={0.15} />
-                  <stop offset="100%" stopColor={C.down} stopOpacity={0} />
-                </linearGradient>
-                <linearGradient id="sleepHrvGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={C.up} stopOpacity={0.15} />
-                  <stop offset="100%" stopColor={C.up} stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis yAxisId="hr" tick={axisTick} width={40} />
-              <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
-              <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={legendStyle} />
-              <Area yAxisId="hr" type="monotone" dataKey="hr" stroke={C.down} fill="url(#sleepRhrGrad)" strokeWidth={2} name="RHR (bpm)" />
-              <Area yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.up} fill="url(#sleepHrvGrad)" strokeWidth={2} name="HRV (ms)" />
-              <Area yAxisId="hr" type="monotone" dataKey="respRate" stroke={C.source.eightsleep} fill="transparent" strokeWidth={1.5} name="Resp Rate" />
-            </AreaChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={325}>
+          <ChartCard title="Resting HR, HRV & Respiratory Rate" source="WHOOP">
+            <ResponsiveContainer width="100%" height={260}>
+              <AreaChart data={whoopHrData}>
+                <defs>
+                  <linearGradient id="sleepRhrGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={C.down} stopOpacity={0.15} />
+                    <stop offset="100%" stopColor={C.down} stopOpacity={0} />
+                  </linearGradient>
+                  <linearGradient id="sleepHrvGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={C.up} stopOpacity={0.15} />
+                    <stop offset="100%" stopColor={C.up} stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis yAxisId="hr" tick={axisTick} width={40} />
+                <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
+                <Tooltip {...chartTooltip} />
+                <Legend wrapperStyle={legendStyle} />
+                <Area isAnimationActive={false} yAxisId="hr" type="monotone" dataKey="hr" stroke={C.down} fill="url(#sleepRhrGrad)" strokeWidth={2} name="RHR (bpm)" />
+                <Area isAnimationActive={false} yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.up} fill="url(#sleepHrvGrad)" strokeWidth={2} name="HRV (ms)" />
+                <Area isAnimationActive={false} yAxisId="hr" type="monotone" dataKey="respRate" stroke={C.source.eightsleep} fill="transparent" strokeWidth={1.5} name="Resp Rate" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
       </div>
 
       {/* ── Journal ─────────────────────────────────────────────────────────── */}
-      {journal.length > 0 && (() => {
+      {journal.length > 0 && <DeferredMount minHeight={1100}>{(() => {
         // `behaviors_date` is the calendar day the journal answer describes
         // (the day the user was awake leading into bedtime). Computed at the
         // DB layer via trigger from each cycle's start_time − 6h in local TZ;
@@ -695,7 +736,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ChartCard>
           </>
         );
-      })()}
+      })()}</DeferredMount>}
 
       <div className="border-t border-border-subtle mb-8" />
 
@@ -726,115 +767,127 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
-        <ChartCard title="Sleep Scores" source="8SLP">
-          <ResponsiveContainer width="100%" height={260}>
-            <LineChart data={eightScoreData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis tick={axisTick} width={55} domain={[0, 100]} label={axisLabel("score (0–100)", "y")} />
-              <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={legendStyle} />
-              <Line type="monotone" dataKey="sleep" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Sleep" />
-              <Line type="monotone" dataKey="quality" stroke={C.source.garmin} strokeWidth={1.5} dot={false} name="Quality" />
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={325}>
+          <ChartCard title="Sleep Scores" source="8SLP">
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart data={eightScoreData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis tick={axisTick} width={55} domain={[0, 100]} label={axisLabel("score (0–100)", "y")} />
+                <Tooltip {...chartTooltip} />
+                <Legend wrapperStyle={legendStyle} />
+                <Line isAnimationActive={false} type="monotone" dataKey="sleep" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Sleep" />
+                <Line isAnimationActive={false} type="monotone" dataKey="quality" stroke={C.source.garmin} strokeWidth={1.5} dot={false} name="Quality" />
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
 
-        <ChartCard title="Sleep Stages" source="8SLP">
-          <ResponsiveContainer width="100%" height={260}>
-            <BarChart data={eightStagesData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
-              <Legend wrapperStyle={legendStyle} />
-              <Bar dataKey="deep"  stackId="a" fill={C.source.garmin} name="Deep" />
-              <Bar dataKey="light" stackId="a" fill={C.categorical[6]} name="Light" />
-              <Bar dataKey="rem"   stackId="a" fill={C.source.eightsleep} name="REM" />
-              <Bar dataKey="awake" stackId="a" fill={C.down} name="Awake" />
-              <Bar dataKey="nap_deep"  stackId="a" fill={C.source.garmin} fillOpacity={0.5} name="Deep (nap)" />
-              <Bar dataKey="nap_light" stackId="a" fill={C.categorical[6]} fillOpacity={0.5} name="Light (nap)" />
-              <Bar dataKey="nap_rem"   stackId="a" fill={C.source.eightsleep} fillOpacity={0.5} name="REM (nap)" />
-              <Bar dataKey="nap_awake" stackId="a" fill={C.down} fillOpacity={0.5} name="Awake (nap)" radius={[3, 3, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={325}>
+          <ChartCard title="Sleep Stages" source="8SLP">
+            <ResponsiveContainer width="100%" height={260}>
+              <BarChart data={eightStagesData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
+                <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
+                <Legend wrapperStyle={legendStyle} />
+                <Bar isAnimationActive={false} dataKey="deep"  stackId="a" fill={C.source.garmin} name="Deep" />
+                <Bar isAnimationActive={false} dataKey="light" stackId="a" fill={C.categorical[6]} name="Light" />
+                <Bar isAnimationActive={false} dataKey="rem"   stackId="a" fill={C.source.eightsleep} name="REM" />
+                <Bar isAnimationActive={false} dataKey="awake" stackId="a" fill={C.down} name="Awake" />
+                <Bar isAnimationActive={false} dataKey="nap_deep"  stackId="a" fill={C.source.garmin} fillOpacity={0.5} name="Deep (nap)" />
+                <Bar isAnimationActive={false} dataKey="nap_light" stackId="a" fill={C.categorical[6]} fillOpacity={0.5} name="Light (nap)" />
+                <Bar isAnimationActive={false} dataKey="nap_rem"   stackId="a" fill={C.source.eightsleep} fillOpacity={0.5} name="REM (nap)" />
+                <Bar isAnimationActive={false} dataKey="nap_awake" stackId="a" fill={C.down} fillOpacity={0.5} name="Awake (nap)" radius={[3, 3, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
 
-        <ChartCard title="Heart Rate, HRV & Resp Rate" source="8SLP">
-          <ResponsiveContainer width="100%" height={260}>
-            <LineChart data={eightBiometricsData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis yAxisId="hr" tick={axisTick} width={40} />
-              <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
-              <YAxis yAxisId="resp" orientation="right" hide domain={[10, 22]} />
-              <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={legendStyle} />
-              <Line yAxisId="hr" type="monotone" dataKey="hr" stroke={C.down} strokeWidth={2} dot={false} name="RHR (bpm)" />
-              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.up} strokeWidth={2} dot={false} name="HRV (ms)" />
-              <Line yAxisId="resp" type="monotone" dataKey="breathRate" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Resp Rate (br/min)" />
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={325}>
+          <ChartCard title="Heart Rate, HRV & Resp Rate" source="8SLP">
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart data={eightBiometricsData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis yAxisId="hr" tick={axisTick} width={40} />
+                <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
+                <YAxis yAxisId="resp" orientation="right" hide domain={[10, 22]} />
+                <Tooltip {...chartTooltip} />
+                <Legend wrapperStyle={legendStyle} />
+                <Line isAnimationActive={false} yAxisId="hr" type="monotone" dataKey="hr" stroke={C.down} strokeWidth={2} dot={false} name="RHR (bpm)" />
+                <Line isAnimationActive={false} yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.up} strokeWidth={2} dot={false} name="HRV (ms)" />
+                <Line isAnimationActive={false} yAxisId="resp" type="monotone" dataKey="breathRate" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="Resp Rate (br/min)" />
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
 
-        <ChartCard title="Bed & Room Temperature" source="8SLP">
-          <ResponsiveContainer width="100%" height={260}>
-            <LineChart data={eightEnvData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis yAxisId="temp" tick={axisTick} width={40} />
-              <YAxis yAxisId="toss" orientation="right" tick={axisTick} width={40} />
-              <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={legendStyle} />
-              <Line yAxisId="temp" type="monotone" dataKey="bedTemp" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Bed Temp (°F)" />
-              <Line yAxisId="temp" type="monotone" dataKey="roomTemp" stroke={C.accent} strokeWidth={2} dot={false} name="Room Temp (°F)" />
-              <Line yAxisId="toss" type="monotone" dataKey="tossTurns" stroke={C.neutral} strokeWidth={1.5} dot={false} name="Toss & Turns" />
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={325}>
+          <ChartCard title="Bed & Room Temperature" source="8SLP">
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart data={eightEnvData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis yAxisId="temp" tick={axisTick} width={40} />
+                <YAxis yAxisId="toss" orientation="right" tick={axisTick} width={40} />
+                <Tooltip {...chartTooltip} />
+                <Legend wrapperStyle={legendStyle} />
+                <Line isAnimationActive={false} yAxisId="temp" type="monotone" dataKey="bedTemp" stroke={C.source.whoop} strokeWidth={2} dot={false} name="Bed Temp (°F)" />
+                <Line isAnimationActive={false} yAxisId="temp" type="monotone" dataKey="roomTemp" stroke={C.accent} strokeWidth={2} dot={false} name="Room Temp (°F)" />
+                <Line isAnimationActive={false} yAxisId="toss" type="monotone" dataKey="tossTurns" stroke={C.neutral} strokeWidth={1.5} dot={false} name="Toss & Turns" />
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
 
-        <ChartCard
-          title="Snoring"
-          source="8SLP"
-          subtitle={
-            snoreNightsTracked > 0
-              ? `${snoreNightsWithAny}/${snoreNightsTracked} nights · avg ${avgSnoreMinutes?.toFixed(1) ?? "0"} min`
-              : "no data"
-          }
-        >
-          <ResponsiveContainer width="100%" height={260}>
-            <BarChart data={eightSnoreData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [`${v} min`, name]} />
-              <Legend wrapperStyle={legendStyle} />
-              <Bar dataKey="light" stackId="snore" fill={C.categorical[6]} name="Snoring" />
-              <Bar dataKey="heavy" stackId="snore" fill={C.down} name="Heavy snoring" radius={[3, 3, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={340}>
+          <ChartCard
+            title="Snoring"
+            source="8SLP"
+            subtitle={
+              snoreNightsTracked > 0
+                ? `${snoreNightsWithAny}/${snoreNightsTracked} nights · avg ${avgSnoreMinutes?.toFixed(1) ?? "0"} min`
+                : "no data"
+            }
+          >
+            <ResponsiveContainer width="100%" height={260}>
+              <BarChart data={eightSnoreData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
+                <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [`${v} min`, name]} />
+                <Legend wrapperStyle={legendStyle} />
+                <Bar isAnimationActive={false} dataKey="light" stackId="snore" fill={C.categorical[6]} name="Snoring" />
+                <Bar isAnimationActive={false} dataKey="heavy" stackId="snore" fill={C.down} name="Heavy snoring" radius={[3, 3, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
 
-        <ChartCard
-          title="Time to Fall Asleep"
-          source="8SLP"
-          subtitle={avgEightLatency != null ? `avg ${formatDuration(Math.round(avgEightLatency))}` : undefined}
-        >
-          <ResponsiveContainer width="100%" height={260}>
-            <BarChart data={eightLatencyData}>
-              <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
-              <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
-              <Tooltip {...chartTooltip} formatter={(v: any) => [formatDuration(Math.round(Number(v) * 60)), "Latency"]} />
-              <ReferenceLine y={15} stroke={C.up} strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "15 min", position: "right", fill: C.up, fontSize: 10 }} />
-              <Bar dataKey="minutes" name="Latency" radius={[3, 3, 0, 0]}>
-                {eightLatencyData.map((d, i) => (
-                  <Cell key={i} fill={latencyColor(d.minutes)} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
+        <DeferredMount minHeight={340}>
+          <ChartCard
+            title="Time to Fall Asleep"
+            source="8SLP"
+            subtitle={avgEightLatency != null ? `avg ${formatDuration(Math.round(avgEightLatency))}` : undefined}
+          >
+            <ResponsiveContainer width="100%" height={260}>
+              <BarChart data={eightLatencyData}>
+                <CartesianGrid {...gridStyle} />
+                <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
+                <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
+                <Tooltip {...chartTooltip} formatter={(v: any) => [formatDuration(Math.round(Number(v) * 60)), "Latency"]} />
+                <ReferenceLine y={15} stroke={C.up} strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "15 min", position: "right", fill: C.up, fontSize: 10 }} />
+                <Bar isAnimationActive={false} dataKey="minutes" name="Latency" radius={[3, 3, 0, 0]}>
+                  {eightLatencyData.map((d, i) => (
+                    <Cell key={i} fill={latencyColor(d.minutes)} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </DeferredMount>
       </div>
     </>
   );

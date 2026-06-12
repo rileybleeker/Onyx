@@ -94,10 +94,19 @@ export async function getHrvModelMetrics() {
   // Latest eval_date now writes ~36 rows (xgboost + 3 baselines + sarimax all at
   // h=1..7 = 35, plus prophet h=1 = 36). Limit must cover the full latest sweep
   // so the Accuracy-by-Forecast-Horizon chart sees every (model × horizon) cell.
+  //
+  // Secondary .order()s (perf round 3, 2026-06-11): eval_date alone is a
+  // non-unique sort key, so Postgres was free to return the ~36 tied rows per
+  // eval_date in ANY order — which (a) made the LIMIT 100 cut the boundary
+  // eval_date's rows nondeterministically and (b) defeated the client's
+  // sameJson revalidation bailout (identical data, different serialization).
+  // model + horizon_days make the ordering fully deterministic.
   const { data, error } = await supabase
     .from("hrv_model_metrics")
     .select("*")
     .order("eval_date", { ascending: false })
+    .order("model")
+    .order("horizon_days")
     .limit(100);
   if (error) throw error;
   return data ?? [];
@@ -173,16 +182,24 @@ export async function getEnvDoseResponseData() {
 }
 
 export async function getHrvResiduals() {
-  // Use the *_eval view (sibling of hrv_predictions_latest) so backtest
-  // model_versions are included. The latest view excludes them, which
-  // would render this chart nearly empty since most XGBoost evaluation
-  // history is stored as backtest_initial rows.
+  // Reads pds.hrv_residuals_mat (perf round 3, 2026-06-11) — a 5-col narrow
+  // matview (prediction_date, model, predicted_hrv, actual_hrv, residual)
+  // over the h=1 *_eval rows, refreshed every 15 min. The matview has NO
+  // horizon_days column (h=1 is baked in), so do not re-add that filter —
+  // it would 400.
+  //
+  // Narrowed to xgboost only: the single consumer (HrvAnalysisClient's
+  // 20-bin residual histogram) filters to model === "xgboost" client-side
+  // anyway, so fetching the baselines was pure dead weight. With the column
+  // list trimmed too, the payload drops from ~168kB to ~12kB. Bonus
+  // correctness fix: the old wide query was silently capped at PostgREST's
+  // 1000-row default (1,153 rows existed); the narrowed ~387-row result is
+  // complete.
   const { data, error } = await supabase
-    .from("hrv_predictions_eval")
-    .select("prediction_date,model,predicted_hrv,actual_hrv,residual")
-    .in("model", ["xgboost", "baseline_naive", "baseline_7d_avg"])
+    .from("hrv_residuals_mat")
+    .select("prediction_date,model,residual")
+    .eq("model", "xgboost")
     .not("residual", "is", null)
-    .eq("horizon_days", 1)
     .order("prediction_date", { ascending: true });
   if (error) throw error;
   return data ?? [];
@@ -352,7 +369,19 @@ async function loadHrvStatic(): Promise<Omit<HrvDashboardData, keyof HrvRangeDep
     causalContinuous: parsedArray(cCont),
     causalDag: parsedObject(cDag),
     causalMeta: parsedObject(cMeta),
-    causalDropped: parsedArray(cDrop),
+    // Project dropped_low_n rows to ONLY the 5 keys the client reads
+    // (HrvAnalysisClient: supplements-coverage callout ~1563-1569/1606-1619 +
+    // DAG card dropped-treatments list ~2062-2099 — treatment is the React
+    // key, label/family render, n_treated/n_control sort + display). The raw
+    // rows carry verbose reason/diagnostic fields that cost ~48kB of ISR
+    // payload; the projection is ~9kB. (perf round 3, 2026-06-11)
+    causalDropped: parsedArray(cDrop).map((d: any) => ({
+      treatment: d.treatment,
+      label: d.label,
+      family: d.family,
+      n_treated: d.n_treated,
+      n_control: d.n_control,
+    })),
     envMatrix: envM,
     // model_diagnostics/xgboost row carries feature_condition_number +
     // shap_unstable from the latest train_xgboost run; the banner above

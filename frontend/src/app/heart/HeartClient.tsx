@@ -6,7 +6,7 @@ import {
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
 } from "recharts";
 import { getWhoopRecovery, getWhoopCycles, getHeartRateData, getDailySummaries, rangeDays, rangeLabel, type Range } from "@/lib/queries";
-import { formatDate } from "@/lib/format";
+import { formatDate, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
@@ -42,7 +42,13 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
     Promise.all([getWhoopRecovery(days), getWhoopCycles(days), getHeartRateData(days), getDailySummaries(days)])
       .then(([rec, cyc, h, s]) => {
         if (cancelled) return;
-        setRecovery(rec); setCycles(cyc); setHr(h); setSummaries(s);
+        // sameJson bail-out: the silent revalidation's data is usually
+        // byte-identical to the server-seeded state — returning the previous
+        // reference lets React skip the commit (and a full chart re-render).
+        setRecovery((prev) => (sameJson(prev, rec) ? prev : rec));
+        setCycles((prev) => (sameJson(prev, cyc) ? prev : cyc));
+        setHr((prev) => (sameJson(prev, h) ? prev : h));
+        setSummaries((prev) => (sameJson(prev, s) ? prev : s));
       })
       .catch(console.error)
       .finally(() => {
@@ -126,8 +132,8 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
               <YAxis tick={axisTick} width={55} label={axisLabel("bpm", "y")} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
-              <Area type="monotone" dataKey="max" stroke={C.down} fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max" />
-              <Area type="monotone" dataKey="min" stroke={C.up} fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min" />
+              <Area type="monotone" dataKey="max" stroke={C.down} fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max" isAnimationActive={false} />
+              <Area type="monotone" dataKey="min" stroke={C.up} fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min" isAnimationActive={false} />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -141,8 +147,8 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
               <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
               <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
-              <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke={C.source.garmin} strokeWidth={2} dot={false} name="RHR (bpm)" />
-              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="HRV RMSSD (ms)" />
+              <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke={C.source.garmin} strokeWidth={2} dot={false} name="RHR (bpm)" isAnimationActive={false} />
+              <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="HRV RMSSD (ms)" isAnimationActive={false} />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -160,7 +166,7 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} domain={[0, 100]} label={axisLabel("stress (0–100)", "y")} />
               <Tooltip {...chartTooltip} />
-              <Area type="monotone" dataKey="overall" stroke={C.source.whoop} fill="url(#heartStressGrad)" strokeWidth={2} name="Stress Level" />
+              <Area type="monotone" dataKey="overall" stroke={C.source.whoop} fill="url(#heartStressGrad)" strokeWidth={2} name="Stress Level" isAnimationActive={false} />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>

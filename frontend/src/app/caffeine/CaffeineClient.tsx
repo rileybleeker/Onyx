@@ -16,7 +16,7 @@ import {
   type CaffeineHrvPair,
   type CaffeineQualityFlag,
 } from "@/lib/queries";
-import { formatDate, formatDuration } from "@/lib/format";
+import { formatDate, formatDuration, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
@@ -111,9 +111,12 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
     Promise.all([getCaffeineDaily(60), getCaffeineHrvPairs(90), getCaffeineDataQuality(45)])
       .then(([d, p, q]) => {
         if (cancelled) return;
-        setDaily(d);
-        setHrvPairs(p);
-        setQuality(q);
+        // sameJson bail-out: the silent revalidation's data is usually
+        // byte-identical to the server-seeded state — returning the previous
+        // reference lets React skip the commit (and a full chart re-render).
+        setDaily((prev) => (sameJson(prev, d) ? prev : d));
+        setHrvPairs((prev) => (sameJson(prev, p) ? prev : p));
+        setQuality((prev) => (sameJson(prev, q) ? prev : q));
       })
       .catch((err) => console.error("Caffeine page load:", err))
       .finally(() => {
@@ -315,8 +318,8 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
                   strokeDasharray="4 4"
                   label={{ value: "FDA 400 mg/day", fill: C.source.whoop, fontSize: 10, position: "insideTopRight" }}
                 />
-                <Bar dataKey="dietary" stackId="mg" fill={DIETARY_COLOR} name="Dietary (mg)" />
-                <Bar dataKey="supplement" stackId="mg" fill={SUPPLEMENT_COLOR} name="Supplement (mg)" radius={[2, 2, 0, 0]} />
+                <Bar dataKey="dietary" stackId="mg" fill={DIETARY_COLOR} name="Dietary (mg)" isAnimationActive={false} />
+                <Bar dataKey="supplement" stackId="mg" fill={SUPPLEMENT_COLOR} name="Supplement (mg)" radius={[2, 2, 0, 0]} isAnimationActive={false} />
               </BarChart>
             </ResponsiveContainer>
           </ChartCard>
@@ -354,8 +357,8 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
                   />
                   <Legend wrapperStyle={legendStyle} />
                   {/* Transparent base lifts the visible bar to the first-dose hour. */}
-                  <Bar dataKey="base" stackId="window" fill="transparent" name="First dose" legendType="none" />
-                  <Bar dataKey="window" stackId="window" fill={C.accent} fillOpacity={0.75} name="Window (h)" radius={[2, 2, 2, 2]} />
+                  <Bar dataKey="base" stackId="window" fill="transparent" name="First dose" legendType="none" isAnimationActive={false} />
+                  <Bar dataKey="window" stackId="window" fill={C.accent} fillOpacity={0.75} name="Window (h)" radius={[2, 2, 2, 2]} isAnimationActive={false} />
                 </BarChart>
               </ResponsiveContainer>
             )}
@@ -388,6 +391,7 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
                   dot={{ r: 3, fill: C.accent }}
                   name="Gap (min)"
                   connectNulls={false}
+                  isAnimationActive={false}
                 />
               </LineChart>
             </ResponsiveContainer>
@@ -437,7 +441,7 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
                         label={axisLabel("next-night HRV (ms)", "y")}
                       />
                       <Tooltip {...chartTooltip} cursor={{ strokeDasharray: "3 3" }} />
-                      <Scatter data={scatterData} fill={C.accent} fillOpacity={0.8} name="day" />
+                      <Scatter data={scatterData} fill={C.accent} fillOpacity={0.8} name="day" isAnimationActive={false} />
                     </ScatterChart>
                   </ResponsiveContainer>
                 )}
