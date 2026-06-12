@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import { after } from "next/server";
 import { NextRequest, NextResponse } from "next/server";
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
@@ -103,68 +104,73 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // 2. Update Notion "Last Completed" date
+  // 2. Update Notion "Last Completed" date — after the response is sent.
+  // The tap's contract is the Supabase write; the Notion LC mirror is best-
+  // effort (the hourly habits-sync recomputes it anyway), so it shouldn't
+  // cost the client the Notion roundtrips (~0.5-1.5s per tap).
   if (NOTION_API_KEY) {
-    try {
-      // Find the Notion page ID if not provided
-      let pageId = notionPageId;
-      if (!pageId) {
-        const searchRes = await fetch(`https://api.notion.com/v1/databases/${NOTION_HABITS_DB}/query`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${NOTION_API_KEY}`,
-            "Content-Type": "application/json",
-            "Notion-Version": "2022-06-28",
-          },
-          body: JSON.stringify({
-            filter: { property: "Habit", title: { equals: habit } },
-          }),
-        });
-        if (searchRes.ok) {
-          const data = await searchRes.json();
-          if (data.results.length > 0) pageId = data.results[0].id;
-        }
-      }
-
-      if (pageId) {
-        // Derive Notion's "Last Completed" from the actual max cycle_date in habit_journal
-        // (so backdating or undoing doesn't overwrite a more recent completion).
-        // Post-merge: only count actual completions (answer='Yes' — the table
-        // now also carries explicit 'No' rows), and for WHOOP-derived habits
-        // only the post-freeze era — pointing Notion LC at a frozen-era date
-        // would make the hourly sync re-upsert over historical rows forever.
-        let latestQuery = supabase
-          .from("habit_journal")
-          .select("cycle_date")
-          .eq("question", habit)
-          .eq("answer", "Yes")
-          .order("cycle_date", { ascending: false })
-          .limit(1);
-        if (isWhoopChannel) {
-          latestQuery = latestQuery.gt("cycle_date", WHOOP_JOURNAL_FROZEN_THROUGH);
-        }
-        const { data: latest } = await latestQuery;
-
-        const latestDate = latest && latest.length > 0 ? latest[0].cycle_date : null;
-        const notionDate = latestDate ? { start: latestDate } : null;
-
-        await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
-          method: "PATCH",
-          headers: {
-            Authorization: `Bearer ${NOTION_API_KEY}`,
-            "Content-Type": "application/json",
-            "Notion-Version": "2022-06-28",
-          },
-          body: JSON.stringify({
-            properties: {
-              "Last Completed": { date: notionDate },
+    after(async () => {
+      try {
+        // Find the Notion page ID if not provided
+        let pageId = notionPageId;
+        if (!pageId) {
+          const searchRes = await fetch(`https://api.notion.com/v1/databases/${NOTION_HABITS_DB}/query`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${NOTION_API_KEY}`,
+              "Content-Type": "application/json",
+              "Notion-Version": "2022-06-28",
             },
-          }),
-        });
+            body: JSON.stringify({
+              filter: { property: "Habit", title: { equals: habit } },
+            }),
+          });
+          if (searchRes.ok) {
+            const data = await searchRes.json();
+            if (data.results.length > 0) pageId = data.results[0].id;
+          }
+        }
+
+        if (pageId) {
+          // Derive Notion's "Last Completed" from the actual max cycle_date in habit_journal
+          // (so backdating or undoing doesn't overwrite a more recent completion).
+          // Post-merge: only count actual completions (answer='Yes' — the table
+          // now also carries explicit 'No' rows), and for WHOOP-derived habits
+          // only the post-freeze era — pointing Notion LC at a frozen-era date
+          // would make the hourly sync re-upsert over historical rows forever.
+          let latestQuery = supabase
+            .from("habit_journal")
+            .select("cycle_date")
+            .eq("question", habit)
+            .eq("answer", "Yes")
+            .order("cycle_date", { ascending: false })
+            .limit(1);
+          if (isWhoopChannel) {
+            latestQuery = latestQuery.gt("cycle_date", WHOOP_JOURNAL_FROZEN_THROUGH);
+          }
+          const { data: latest } = await latestQuery;
+
+          const latestDate = latest && latest.length > 0 ? latest[0].cycle_date : null;
+          const notionDate = latestDate ? { start: latestDate } : null;
+
+          await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+            method: "PATCH",
+            headers: {
+              Authorization: `Bearer ${NOTION_API_KEY}`,
+              "Content-Type": "application/json",
+              "Notion-Version": "2022-06-28",
+            },
+            body: JSON.stringify({
+              properties: {
+                "Last Completed": { date: notionDate },
+              },
+            }),
+          });
+        }
+      } catch (e) {
+        console.error("Notion sync failed (Supabase still updated):", e);
       }
-    } catch (e) {
-      console.error("Notion sync failed (Supabase still updated):", e);
-    }
+    });
   }
 
   return NextResponse.json({ success: true, habit, date: completionDate, answer, undo: answer === null });

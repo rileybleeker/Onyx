@@ -46,12 +46,6 @@ interface JournalEntry {
 // null-answer row.
 type HabitAnswer = "Yes" | "No" | null;
 
-function nextAnswer(current: HabitAnswer): HabitAnswer {
-  if (current === null) return "Yes";
-  if (current === "Yes") return "No";
-  return null;
-}
-
 function todayStr() {
   return new Date().toLocaleDateString("en-CA");
 }
@@ -176,15 +170,19 @@ export default function HabitsPage() {
   const [toggling, setToggling] = useState<Set<string>>(new Set());
   const [range, setRange] = useState<Range>("30d");
   const [actionError, setActionError] = useState<string | null>(null);
+  const [openCell, setOpenCell] = useState<{ habit: NotionHabit; date: string; x: number; y: number } | null>(null);
 
   const hasSyncedRef = useRef(false);
+  // Monotonic per-cell sequence so a stale response (rapid re-tap on the same
+  // cell) can't revert or clear the in-flight state of a newer optimistic write.
+  const answerSeq = useRef(new Map<string, number>());
 
-  const load = useCallback(async (days: number) => {
+  const load = useCallback(async () => {
     setLoading(true);
     try {
       const [habitsRes, journalData, historyData] = await Promise.all([
         fetch("/api/habits/list").then((r) => r.json()),
-        getHabitJournal(Math.max(days, 365)),
+        getHabitJournal(365),
         getHabitMetadataHistory(),
       ]);
       setHabits(habitsRes.habits || []);
@@ -212,7 +210,7 @@ export default function HabitsPage() {
       if (syncRes.ok) {
         const { count } = await syncRes.json();
         if (count > 0) {
-          const updated = await getHabitJournal(Math.max(days, 365));
+          const updated = await getHabitJournal(365);
           setJournal(updated);
         }
         setHistory(await getHabitMetadataHistory());
@@ -224,7 +222,11 @@ export default function HabitsPage() {
     }
   }, []);
 
-  useEffect(() => { load(rangeDays(range)); }, [load, range]);
+  // Journal is always fetched at 365d and history/habits are range-independent,
+  // so a range change needs NO refetch — heatmapDates and every KPI re-derive
+  // locally. Loading on every range switch used to re-run all three fetches
+  // and flash the skeleton for zero new data.
+  useEffect(() => { load(); }, [load]);
 
   // Tri-state lookup of "habitName|date" → explicit answer. completionSet
   // stays Yes-only on purpose: every KPI, rate, and streak treats explicit
@@ -244,11 +246,28 @@ export default function HabitsPage() {
 
   const today = todayStr();
 
-  // Each tap advances the cell one step: not logged → Yes → No → not logged.
-  async function toggleCompletion(habit: NotionHabit, date: string) {
+  function applyLocalAnswer(habit: NotionHabit, date: string, answer: HabitAnswer) {
+    setJournal((prev) => {
+      const rest = prev.filter((j) => !(j.question === habit.name && j.cycle_date === date));
+      return answer === null
+        ? rest
+        : [...rest, { cycle_date: date, question: habit.name, category: habit.category, answer }];
+    });
+  }
+
+  // Sets a cell's answer directly (Yes / No / null = clear), optimistically:
+  // the UI updates immediately and reverts only if the server rejects the
+  // write. Tapping is no longer blocked on the API roundtrip.
+  async function setAnswer(habit: NotionHabit, date: string, answer: HabitAnswer) {
     if (date > today) return; // never log future dates
     const key = `${habit.name}|${date}`;
-    const answer = nextAnswer(answerMap.get(key) ?? null);
+    const previous = answerMap.get(key) ?? null;
+    if (previous === answer) return;
+    const seq = (answerSeq.current.get(key) ?? 0) + 1;
+    answerSeq.current.set(key, seq);
+
+    setActionError(null);
+    applyLocalAnswer(habit, date, answer);
     setToggling((prev) => new Set(prev).add(key));
 
     try {
@@ -264,29 +283,27 @@ export default function HabitsPage() {
         }),
       });
 
-      if (res.ok) {
-        setActionError(null);
-        setJournal((prev) => {
-          const rest = prev.filter((j) => !(j.question === habit.name && j.cycle_date === date));
-          return answer === null
-            ? rest
-            : [...rest, { cycle_date: date, question: habit.name, category: habit.category, answer }];
-        });
-      } else {
-        // E.g. the frozen-WHOOP-era guard (400) — surface it instead of a
-        // silent no-op so a click that "didn't work" explains itself.
+      if (!res.ok && answerSeq.current.get(key) === seq) {
+        // E.g. the frozen-WHOOP-era guard (400) — revert the optimistic state
+        // and surface it so a click that "didn't work" explains itself.
         const { error } = await res.json().catch(() => ({ error: `Request failed (${res.status})` }));
+        applyLocalAnswer(habit, date, previous);
         setActionError(error || `Request failed (${res.status})`);
       }
     } catch (e) {
-      console.error("Failed to toggle habit:", e);
-      setActionError("Network error — the change was not saved.");
+      console.error("Failed to set habit answer:", e);
+      if (answerSeq.current.get(key) === seq) {
+        applyLocalAnswer(habit, date, previous);
+        setActionError("Network error — the change was not saved.");
+      }
     } finally {
-      setToggling((prev) => {
-        const next = new Set(prev);
-        next.delete(key);
-        return next;
-      });
+      if (answerSeq.current.get(key) === seq) {
+        setToggling((prev) => {
+          const next = new Set(prev);
+          next.delete(key);
+          return next;
+        });
+      }
     }
   }
 
@@ -543,7 +560,7 @@ export default function HabitsPage() {
 
       {/* Today's Checklist */}
       {habits.length > 0 && (
-        <ChartCard title="Today's Habits" subtitle={`${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })} — tap cycles blank → done → not done`}>
+        <ChartCard title="Today's Habits" subtitle={`${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })} — tap ✓ done or ✕ not done; tap again to clear`}>
           <div className="space-y-1">
             {habits.map((h) => {
               const answer = answerMap.get(`${h.name}|${today}`) ?? null;
@@ -560,7 +577,7 @@ export default function HabitsPage() {
                   streak={streak}
                   color={color}
                   today={today}
-                  onToggle={(d) => toggleCompletion(h, d)}
+                  onSetAnswer={(d, a) => setAnswer(h, d, a)}
                 />
               );
             })}
@@ -638,7 +655,7 @@ export default function HabitsPage() {
       {habits.length > 0 && (
         <ChartCard
           title={`Heatmap — ${rangeLabel(range)}`}
-          subtitle="Click cycles each cell: blank (not logged) → filled (yes) → red ✕ (no) → blank"
+          subtitle="Click a cell to set it: filled (yes) / red ✕ (no) / blank (not logged)"
           className="mt-6"
         >
           <div className="overflow-x-auto">
@@ -674,16 +691,15 @@ export default function HabitsPage() {
                         const cellToggling = toggling.has(`${h.name}|${d}`);
                         const cellTitle = isFuture
                           ? "Future"
-                          : answer === "Yes"
-                            ? "Yes (click → No)"
-                            : answer === "No"
-                              ? "No (click to clear)"
-                              : "Not logged (click → Yes)";
+                          : `${answer ?? "Not logged"} (click to set yes / no / clear)`;
                         return (
                           <td key={d} className="px-0.5 py-1 text-center">
                             <button
-                              onClick={() => toggleCompletion(h, d)}
-                              disabled={isFuture || cellToggling}
+                              onClick={(e) => {
+                                const rect = e.currentTarget.getBoundingClientRect();
+                                setOpenCell({ habit: h, date: d, x: rect.left + rect.width / 2, y: rect.top });
+                              }}
+                              disabled={isFuture}
                               className={`w-5 h-5 rounded-sm mx-auto flex items-center justify-center transition-all ${
                                 isFuture
                                   ? "cursor-not-allowed"
@@ -698,7 +714,7 @@ export default function HabitsPage() {
                                       : "rgba(255,255,255,0.03)",
                               }}
                               title={`${h.name}: ${d} — ${cellTitle}`}
-                              aria-label={`Toggle ${h.name} for ${d}`}
+                              aria-label={`Set ${h.name} for ${d}`}
                             >
                               {answer === "No" && (
                                 <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke={C.down} strokeWidth={2.5}>
@@ -717,6 +733,65 @@ export default function HabitsPage() {
           </div>
         </ChartCard>
       )}
+
+      {/* Heatmap cell answer picker — fixed-position popover anchored to the
+          clicked cell, with a transparent backdrop that closes it. */}
+      {openCell && (() => {
+        const current = answerMap.get(`${openCell.habit.name}|${openCell.date}`) ?? null;
+        const pick = (a: HabitAnswer) => {
+          setAnswer(openCell.habit, openCell.date, a);
+          setOpenCell(null);
+        };
+        const clampedX = typeof window !== "undefined"
+          ? Math.min(Math.max(openCell.x, 90), window.innerWidth - 90)
+          : openCell.x;
+        return (
+          <>
+            <div className="fixed inset-0 z-40" onClick={() => setOpenCell(null)} />
+            <div
+              className="fixed z-50 -translate-x-1/2 -translate-y-full pb-1.5"
+              style={{ left: clampedX, top: openCell.y }}
+            >
+              <div className="rounded-[6px] border border-border-subtle bg-surface-card shadow-xl px-2 py-1.5">
+                <p className="text-[10px] font-mono text-text-tertiary mb-1 max-w-[180px] truncate">
+                  {openCell.habit.name} · {openCell.date}
+                </p>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => pick("Yes")}
+                    className={`px-2.5 py-1 text-[12px] font-medium rounded-[4px] transition-colors ${
+                      current === "Yes"
+                        ? "bg-white/15 text-text-primary"
+                        : "text-text-secondary hover:bg-white/10"
+                    }`}
+                  >
+                    ✓ Yes
+                  </button>
+                  <button
+                    onClick={() => pick("No")}
+                    className={`px-2.5 py-1 text-[12px] font-medium rounded-[4px] transition-colors ${
+                      current === "No"
+                        ? "bg-white/15"
+                        : "hover:bg-white/10"
+                    }`}
+                    style={{ color: C.down }}
+                  >
+                    ✕ No
+                  </button>
+                  {current !== null && (
+                    <button
+                      onClick={() => pick(null)}
+                      className="px-2.5 py-1 text-[12px] font-medium rounded-[4px] text-text-tertiary hover:bg-white/10 transition-colors"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          </>
+        );
+      })()}
 
       {/* Streaks */}
       {habits.length > 0 && (
@@ -838,10 +913,10 @@ interface HabitRowProps {
   streak: number;
   color: string;
   today: string;
-  onToggle: (date: string) => void;
+  onSetAnswer: (date: string, answer: HabitAnswer) => void;
 }
 
-function HabitRow({ habit, answer, isToggling, streak, color, today, onToggle }: HabitRowProps) {
+function HabitRow({ habit, answer, isToggling, streak, color, today, onSetAnswer }: HabitRowProps) {
   const done = answer === "Yes";
   const declined = answer === "No";
   const dateInputRef = useRef<HTMLInputElement>(null);
@@ -860,7 +935,7 @@ function HabitRow({ habit, answer, isToggling, streak, color, today, onToggle }:
 
   function onDateChange(e: React.ChangeEvent<HTMLInputElement>) {
     const picked = e.target.value;
-    if (picked && picked <= today) onToggle(picked);
+    if (picked && picked <= today) onSetAnswer(picked, "Yes");
     e.target.value = "";
   }
 
@@ -870,41 +945,61 @@ function HabitRow({ habit, answer, isToggling, streak, color, today, onToggle }:
         done || declined ? "bg-white/[0.03]" : "hover:bg-white/[0.03]"
       } ${isToggling ? "opacity-50" : ""}`}
     >
+      {/* Direct one-tap answers: ✓ sets Yes, ✕ sets No; tapping the active one clears. */}
       <button
-        onClick={() => onToggle(today)}
-        disabled={isToggling}
-        className="flex items-center gap-3 flex-1 text-left min-w-0"
-        aria-label={`Toggle ${habit.name} for today (blank → yes → no)`}
-        title={done ? "Yes (click → No)" : declined ? "No (click to clear)" : "Not logged (click → Yes)"}
+        onClick={() => onSetAnswer(today, done ? null : "Yes")}
+        className="shrink-0"
+        aria-label={done ? `Clear ${habit.name} for today` : `Mark ${habit.name} done for today`}
+        title={done ? "Yes (click to clear)" : "Mark done"}
       >
         <div
-          className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all shrink-0 ${
-            done ? "border-transparent" : declined ? "" : "border-white/20 group-hover:border-white/40"
+          className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all ${
+            done ? "border-transparent" : "border-white/20 hover:border-white/50"
           }`}
-          style={done ? { backgroundColor: color } : declined ? { borderColor: `${C.down}99`, backgroundColor: `${C.down}1a` } : {}}
+          style={done ? { backgroundColor: color } : {}}
         >
           {done && (
             <svg className="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
             </svg>
           )}
-          {declined && (
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke={C.down} strokeWidth={3}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          )}
         </div>
+      </button>
+      <button
+        onClick={() => onSetAnswer(today, declined ? null : "No")}
+        className="shrink-0"
+        aria-label={declined ? `Clear ${habit.name} for today` : `Mark ${habit.name} not done for today`}
+        title={declined ? "No (click to clear)" : "Mark not done"}
+      >
+        <div
+          className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all ${
+            declined ? "" : "border-white/20 hover:border-white/50"
+          }`}
+          style={declined ? { borderColor: `${C.down}99`, backgroundColor: `${C.down}1a` } : {}}
+        >
+          <svg
+            className={`w-3.5 h-3.5 transition-opacity ${declined ? "" : "opacity-25 group-hover:opacity-60"}`}
+            fill="none" viewBox="0 0 24 24" stroke={declined ? C.down : "currentColor"} strokeWidth={3}
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </div>
+      </button>
 
-        <div className="flex-1 min-w-0">
-          <span className={`text-sm font-medium transition-colors ${done ? "text-text-tertiary line-through" : declined ? "text-text-tertiary" : "text-text-primary"}`}>
-            {habit.name}
+      <button
+        onClick={() => onSetAnswer(today, done ? null : "Yes")}
+        className="flex-1 text-left min-w-0"
+        aria-label={done ? `Clear ${habit.name} for today` : `Mark ${habit.name} done for today`}
+        title={done ? "Yes (click to clear)" : "Mark done"}
+      >
+        <span className={`text-sm font-medium transition-colors ${done ? "text-text-tertiary line-through" : declined ? "text-text-tertiary" : "text-text-primary"}`}>
+          {habit.name}
+        </span>
+        {declined && (
+          <span className="ml-2 text-[10px] font-mono uppercase tracking-wider" style={{ color: C.down }}>
+            not done
           </span>
-          {declined && (
-            <span className="ml-2 text-[10px] font-mono uppercase tracking-wider" style={{ color: C.down }}>
-              not done
-            </span>
-          )}
-        </div>
+        )}
       </button>
 
       {streak > 0 && (
@@ -923,7 +1018,7 @@ function HabitRow({ habit, answer, isToggling, streak, color, today, onToggle }:
       <button
         onClick={openDatePicker}
         className="relative p-1.5 rounded-[4px] text-text-tertiary hover:text-text-primary hover:bg-white/5 transition-colors"
-        title="Log on a past date"
+        title="Log a past date as done (use the heatmap for a backdated No)"
         aria-label={`Backdate ${habit.name}`}
       >
         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>

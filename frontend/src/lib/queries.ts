@@ -811,7 +811,10 @@ export async function getHabitJournal(days: number = 30) {
   // distinctly from "not logged" (row absence = null). Explicit columns,
   // paged via .range() — an unpaged select would silently truncate at
   // PostgREST's 1000-row cap (365d of merged rows is well past it) and,
-  // ordered ascending, drop the most RECENT completions first.
+  // ordered ascending, drop the most RECENT completions first. The first
+  // request carries count:"exact" so the remaining pages are known up front
+  // and fetched in PARALLEL — 365d is ~9-10 pages, and serial paging cost
+  // ~1-3s of stacked roundtrips on /habits load.
   type HabitJournalRow = {
     cycle_date: string;
     question: string;
@@ -820,19 +823,28 @@ export async function getHabitJournal(days: number = 30) {
     notes: string | null;
   };
   const PAGE = 1000;
-  const rows: HabitJournalRow[] = [];
-  for (let fromIdx = 0; ; fromIdx += PAGE) {
-    const { data, error } = await supabase
+  const sinceStr = since.toISOString().split("T")[0];
+  const pageQuery = (fromIdx: number, withCount: boolean) =>
+    supabase
       .from("habit_journal")
-      .select("cycle_date,question,category,answer,notes")
+      .select("cycle_date,question,category,answer,notes", withCount ? { count: "exact" } : undefined)
       .in("answer", ["Yes", "No"])
-      .gte("cycle_date", since.toISOString().split("T")[0])
+      .gte("cycle_date", sinceStr)
       .order("cycle_date", { ascending: true })
       .range(fromIdx, fromIdx + PAGE - 1);
 
-    if (error) throw error;
-    rows.push(...((data ?? []) as HabitJournalRow[]));
-    if (!data || data.length < PAGE) break;
+  const { data: first, error, count } = await pageQuery(0, true);
+  if (error) throw error;
+  const rows: HabitJournalRow[] = [...((first ?? []) as HabitJournalRow[])];
+
+  const total = count ?? rows.length;
+  if (total > PAGE) {
+    const restIdx = Array.from({ length: Math.ceil(total / PAGE) - 1 }, (_, i) => (i + 1) * PAGE);
+    const rest = await Promise.all(restIdx.map((fromIdx) => pageQuery(fromIdx, false)));
+    for (const { data, error: pageErr } of rest) {
+      if (pageErr) throw pageErr;
+      rows.push(...((data ?? []) as HabitJournalRow[]));
+    }
   }
   return rows;
 }
