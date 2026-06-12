@@ -30,7 +30,7 @@ const CADENCE: Record<string, string> = {
   whoop: "Hourly :00",
   eight_sleep: "Daily 3pm ET",
   habits: "Hourly :45",
-  cronometer: "Manual export → local import",
+  cronometer: "Daily 10:30pm + 11am ET",
   // Predict: every hourly ETL + 23:50 ET (DST-gated).
   hrv_analysis: "Predict: hourly + 23:50 ET",
   // Retrain: hourly conditional on backfill detection + daily 12:00 UTC
@@ -61,7 +61,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   whoop:          { method: "automated",      label: "API ETL" },
   eight_sleep:    { method: "automated",      label: "API ETL" },
   habits:         { method: "automated",      label: "Notion sync" },
-  cronometer:     { method: "manual",         label: "Local import" },
+  cronometer:     { method: "automated",      label: "Web export ETL" },
   hrv_analysis:   { method: "automated",      label: "Computed" },
   hrv_retrain:    { method: "automated",      label: "Model retrain" },
   spotify:        { method: "automated",      label: "API ETL" },

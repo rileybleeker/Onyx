@@ -1,0 +1,52 @@
+name: Cronometer ETL
+
+# Automated Cronometer nutrition export (replaces the manual web-export click,
+# 2026-06-11). Replays Cronometer's own export endpoints; see cronometer_etl.py.
+# Two daily runs (nutrition is daily-grained; session reuse means each run is a
+# single token mint, not a fresh login, so this stays well clear of Cronometer's
+# login rate limiting):
+#   30 2  UTC -> ~10:30 PM EDT / 9:30 PM EST — captures the full eating day
+#                before the 23:50 ET HRV finalization run.
+#   0  16 UTC -> 12:00 PM EDT / 11:00 AM EST — midday catch-up, also picks up
+#                post-midnight pre-bed meals logged the next morning.
+on:
+  schedule:
+    - cron: '30 2 * * *'
+    - cron: '0 16 * * *'
+  workflow_dispatch: # Manual trigger for testing
+
+concurrency:
+  group: cronometer-etl
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  cronometer-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install httpx supabase python-dotenv
+
+      - name: Download Cronometer session from Supabase
+        run: python ci_token_helper.py download cronometer
+
+      - name: Run Cronometer ETL
+        run: python cronometer_etl.py --days 30
+        env:
+          CRONOMETER_EMAIL: ${{ secrets.CRONOMETER_EMAIL }}
+          CRONOMETER_PASSWORD: ${{ secrets.CRONOMETER_PASSWORD }}
+
+      - name: Upload refreshed session to Supabase
+        # The ETL rotates the sesnonce cookie / GWT values each run — persist
+        # whatever's on disk so the next run reuses the session (avoids a
+        # rate-limited fresh login). Skipped automatically if the run failed
+        # before writing a session file.
+        if: always()
+        run: python ci_token_helper.py upload cronometer

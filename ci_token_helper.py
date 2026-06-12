@@ -11,6 +11,8 @@ Usage:
     python ci_token_helper.py upload whoop
     python ci_token_helper.py download tanita
     python ci_token_helper.py upload tanita
+    python ci_token_helper.py download cronometer
+    python ci_token_helper.py upload cronometer
 """
 
 import os
@@ -31,6 +33,7 @@ GARMIN_TOKEN_DIR = os.path.expanduser("~/.garminconnect")
 WHOOP_TOKEN_FILE = os.path.expanduser("~/.whoop_tokens.json")
 SPOTIFY_TOKEN_FILE = os.path.expanduser("~/.spotify_tokens.json")
 TANITA_TOKEN_FILE = os.path.expanduser("~/.tanita_tokens.json")
+CRONOMETER_SESSION_FILE = os.path.expanduser("~/.cronometer_session.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,6 +151,29 @@ def download_tanita():
     log.info(f"Tanita tokens written to {TANITA_TOKEN_FILE}")
 
 
+def download_cronometer():
+    """Download the Cronometer session (cookie jar + user id + GWT values) and
+    write to ~/.cronometer_session.json. Missing is non-fatal: cronometer_etl.py
+    falls back to a fresh login when no session file exists."""
+    sb = get_supabase()
+    row = (
+        sb.schema("pds")
+        .table("ci_tokens")
+        .select("token_data")
+        .eq("service", "cronometer")
+        .execute()
+    )
+
+    if not row.data:
+        log.warning("No Cronometer session in ci_tokens — ETL will log in fresh")
+        return
+
+    with open(CRONOMETER_SESSION_FILE, "w") as f:
+        f.write(row.data[0]["token_data"])
+
+    log.info(f"Cronometer session written to {CRONOMETER_SESSION_FILE}")
+
+
 # ---------------------------------------------------------------------------
 # Upload
 # ---------------------------------------------------------------------------
@@ -231,6 +257,27 @@ def upload_tanita():
     log.info("Tanita tokens uploaded to Supabase")
 
 
+def upload_cronometer():
+    """Read the Cronometer session from ~/.cronometer_session.json and upload to
+    Supabase. The ETL refreshes this file every run (rotating sesnonce / GWT
+    values), so CI re-uploads it after each run with `if: always()`."""
+    if not os.path.exists(CRONOMETER_SESSION_FILE):
+        log.error(f"Cronometer session file not found: {CRONOMETER_SESSION_FILE}")
+        sys.exit(1)
+
+    with open(CRONOMETER_SESSION_FILE, "r") as f:
+        token_data = f.read()
+
+    sb = get_supabase()
+    sb.schema("pds").table("ci_tokens").upsert({
+        "service": "cronometer",
+        "token_data": token_data,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+
+    log.info("Cronometer session uploaded to Supabase")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -240,16 +287,18 @@ COMMANDS = {
     ("download", "whoop"): download_whoop,
     ("download", "spotify"): download_spotify,
     ("download", "tanita"): download_tanita,
+    ("download", "cronometer"): download_cronometer,
     ("upload", "garmin"): upload_garmin,
     ("upload", "whoop"): upload_whoop,
     ("upload", "spotify"): upload_spotify,
     ("upload", "tanita"): upload_tanita,
+    ("upload", "cronometer"): upload_cronometer,
 }
 
 
 def main():
     if len(sys.argv) != 3 or (sys.argv[1], sys.argv[2]) not in COMMANDS:
-        print("Usage: python ci_token_helper.py <download|upload> <garmin|whoop|spotify|tanita>")
+        print("Usage: python ci_token_helper.py <download|upload> <garmin|whoop|spotify|tanita|cronometer>")
         sys.exit(1)
 
     action, service = sys.argv[1], sys.argv[2]
