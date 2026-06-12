@@ -3,14 +3,13 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { House, BarChart3, Plus, MessageSquare, Menu, X, LogOut, Search, Pill, Utensils, CircleCheck, Scale } from "lucide-react";
+import { House, BarChart3, Plus, MessageSquare, Menu, X, LogOut, Search, Pill, CircleCheck, Scale } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS } from "@/lib/nav";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 
 const LOG_ACTIONS = [
   { label: "Supplement", href: "/supplements", icon: Pill },
-  { label: "Meal", href: "/nutrition", icon: Utensils },
   { label: "Habit", href: "/habits", icon: CircleCheck },
   { label: "Weight", href: "/nutrition", icon: Scale },
 ];
@@ -96,7 +95,7 @@ export default function MobileNav() {
         </div>
       </nav>
 
-      {/* Log sheet — quick entry to the four logging surfaces. */}
+      {/* Log sheet — quick entry to the three logging surfaces. */}
       {logOpen && (
         <div className="md:hidden fixed inset-0 z-50 flex flex-col justify-end" role="dialog" aria-modal="true" aria-label="Quick log">
           <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setLogOpen(false)} />
