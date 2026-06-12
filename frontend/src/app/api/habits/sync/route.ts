@@ -189,9 +189,12 @@ export async function POST() {
     // Sync Last Completed to habit_journal. For WHOOP-derived habits, dates
     // inside the frozen WHOOP era are the historical record (explicit Yes/No
     // answers) — upserting 'Yes' there would corrupt history. Future dates
-    // (manually mis-edited in Notion) are skipped too. Already-recorded
-    // completions are not re-upserted: the no-op upsert used to fire the
-    // backfill trigger on every hourly run (signal storm → hourly retrains).
+    // (manually mis-edited in Notion) are skipped too. Any EXISTING explicit
+    // row wins over the Notion LC date: re-upserting 'Yes' over 'Yes' used to
+    // fire the backfill trigger on every hourly run (signal storm → hourly
+    // retrains), and overwriting an explicit 'No' (tri-state, 2026-06-11)
+    // would silently flip a deliberate in-Onyx answer — Notion only carries
+    // a completion date, so it can never out-rank a direct answer.
     if (lastCompleted) {
       const lcDate = String(lastCompleted).slice(0, 10); // Notion may return a datetime
       if (channel === "whoop" && lcDate <= WHOOP_JOURNAL_FROZEN_THROUGH) {
@@ -205,7 +208,10 @@ export async function POST() {
           .eq("cycle_date", lcDate)
           .eq("question", name)
           .limit(1);
-        if (existingRows?.[0]?.answer !== "Yes") {
+        const existing = existingRows?.[0]?.answer;
+        if (existing === "No") {
+          synced.push(`${name}: SKIPPED (${lcDate} is explicitly marked No in Onyx — clear it there first)`);
+        } else if (existing !== "Yes") {
           const { error } = await supabase
             .from("habit_journal")
             .upsert(

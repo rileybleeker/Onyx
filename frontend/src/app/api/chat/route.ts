@@ -171,13 +171,14 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "mark_habit_complete",
-    description: "Mark a habit as completed for a given date. The habit name must match one defined in the user's Notion Habits database (e.g., 'Meditated', 'Exercised', 'Read'). Defaults to today.",
+    description: "Record a habit answer for a given date — 'Yes' (did it, default) or 'No' (explicitly did NOT do it, e.g. 'I skipped meditation today'). The habit name must match one defined in the user's Notion Habits database (e.g., 'Meditated', 'Exercised', 'Read'). Defaults to today. Only record 'No' when the user explicitly says they didn't do the habit — an unmentioned habit should stay unlogged.",
     input_schema: {
       type: "object" as const,
       properties: {
         habit: { type: "string", description: "The habit name exactly as defined in Notion (e.g., 'Meditated', 'Exercised')" },
         date: { type: "string", description: "Date in YYYY-MM-DD format (defaults to today)" },
         category: { type: "string", description: "Optional: habit category (e.g., 'mindfulness', 'fitness')" },
+        answer: { type: "string", enum: ["Yes", "No"], description: "'Yes' = completed (default); 'No' = explicitly not done" },
       },
       required: ["habit"],
     },
@@ -602,10 +603,12 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     return JSON.stringify(out);
   }
 
-  // Mark a habit as complete (writes to both Supabase and Notion)
+  // Record a habit answer — Yes (default) or explicit No (tri-state,
+  // 2026-06-11). Writes to both Supabase and Notion.
   if (name === "mark_habit_complete") {
     const habit = input.habit as string;
     const category = (input.category as string) || null;
+    const answer = (input.answer as string)?.toLowerCase() === "no" ? "No" : "Yes";
 
     // Default to the behavioral day (TZ + awake-tail aware) — the previous
     // naive-UTC default tagged late-evening ET logs with TOMORROW's date.
@@ -639,7 +642,13 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     const { data, error } = await supabase
       .from("habit_journal")
       .upsert(
-        { cycle_date: date, question: habit, category, answer: "Yes", notes: "Completed via Claude chat" },
+        {
+          cycle_date: date,
+          question: habit,
+          category,
+          answer,
+          notes: answer === "Yes" ? "Completed via Claude chat" : "Marked not done via Claude chat",
+        },
         { onConflict: "cycle_date,question" }
       )
       .select()

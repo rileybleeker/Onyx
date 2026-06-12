@@ -788,10 +788,11 @@ export async function getHabitJournal(days: number = 30) {
   since.setDate(since.getDate() - days);
 
   // Post-merge (2026-06-11) habit_journal also holds the 12k-row frozen WHOOP
-  // journal history (source='whoop', explicit Yes/No answers). The /habits
-  // page only consumes completions, so fetch answer='Yes' with explicit
-  // columns, paged via .range() — an unpaged select would silently truncate
-  // at PostgREST's 1000-row cap (365d of merged rows is well past it) and,
+  // journal history (source='whoop', explicit Yes/No answers). Tri-state UI
+  // (2026-06-11): fetch BOTH Yes and No rows — the page renders explicit No
+  // distinctly from "not logged" (row absence = null). Explicit columns,
+  // paged via .range() — an unpaged select would silently truncate at
+  // PostgREST's 1000-row cap (365d of merged rows is well past it) and,
   // ordered ascending, drop the most RECENT completions first.
   type HabitJournalRow = {
     cycle_date: string;
@@ -806,7 +807,7 @@ export async function getHabitJournal(days: number = 30) {
     const { data, error } = await supabase
       .from("habit_journal")
       .select("cycle_date,question,category,answer,notes")
-      .eq("answer", "Yes")
+      .in("answer", ["Yes", "No"])
       .gte("cycle_date", since.toISOString().split("T")[0])
       .order("cycle_date", { ascending: true })
       .range(fromIdx, fromIdx + PAGE - 1);

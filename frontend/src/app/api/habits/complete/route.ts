@@ -12,11 +12,37 @@ const supabase = createClient(
 
 /**
  * POST /api/habits/complete
- * Writes a habit completion to BOTH Supabase and Notion.
- * Body: { habit: string, date?: string, category?: string, notionPageId?: string, undo?: boolean }
+ * Writes a habit journal answer to BOTH Supabase and Notion.
+ * Body: { habit: string, date?: string, category?: string, notionPageId?: string,
+ *         answer?: 'Yes' | 'No' | null, undo?: boolean }
+ *
+ * Tri-state semantics (2026-06-11): answer 'Yes'/'No' upserts an explicit row;
+ * answer null DELETES the row (null = "not logged" — row absence is the
+ * canonical null so the PK, the pipeline's missing=No fill, and the backfill
+ * trigger all keep working unchanged). Back-compat: `undo: true` → null;
+ * neither field present → 'Yes' (the original tap-to-complete contract).
  */
 export async function POST(req: NextRequest) {
-  const { habit, date, category, notionPageId, undo } = await req.json();
+  const body = await req.json();
+  const { habit, date, category, notionPageId, undo } = body;
+
+  // Resolve the requested answer: explicit `answer` wins over legacy `undo`.
+  let answer: "Yes" | "No" | null;
+  if ("answer" in body) {
+    const raw = body.answer;
+    if (raw === null) {
+      answer = null;
+    } else if (typeof raw === "string" && ["yes", "no"].includes(raw.toLowerCase())) {
+      answer = raw.toLowerCase() === "yes" ? "Yes" : "No";
+    } else {
+      return NextResponse.json(
+        { error: `answer must be 'Yes', 'No', or null — got ${JSON.stringify(raw)}` },
+        { status: 400 }
+      );
+    }
+  } else {
+    answer = undo ? null : "Yes";
+  }
   // Default to Riley's CURRENT behavioral day via pds.behavioral_today_now()
   // — TZ-aware (handles travel) + awake-tail-aware (-6h rule). The previous
   // hardcoded ET default broke for westbound trips: 10 PM PDT in LA = 1 AM
@@ -56,17 +82,20 @@ export async function POST(req: NextRequest) {
   }
 
   // 1. Write to Supabase
-  if (undo) {
-    await supabase
+  if (answer === null) {
+    const { error } = await supabase
       .from("habit_journal")
       .delete()
       .eq("question", habit)
       .eq("cycle_date", completionDate);
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
   } else {
     const { error } = await supabase
       .from("habit_journal")
       .upsert(
-        { cycle_date: completionDate, question: habit, category: category || null, answer: "Yes" },
+        { cycle_date: completionDate, question: habit, category: category || null, answer },
         { onConflict: "cycle_date,question" }
       );
     if (error) {
@@ -138,5 +167,5 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  return NextResponse.json({ success: true, habit, date: completionDate, undo: !!undo });
+  return NextResponse.json({ success: true, habit, date: completionDate, answer, undo: answer === null });
 }
