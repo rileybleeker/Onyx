@@ -48,9 +48,11 @@ const CADENCE: Record<string, string> = {
   // carries the schema-drift tripwire — a 'failed' here can mean the view
   // gained columns the matview is missing.
   matrix_mat: "Every 15 min (:10/:25/:40/:55)",
-  // pg_cron refresh of the perf matviews (tz_log_gaps_mat +
-  // hrv_prediction_gaps_mat) that THIS endpoint reads for the travel banner
-  // and the HRV-gap check.
+  // pg_cron refresh of ALL FIVE tier-2 perf matviews (tz_log_gaps_mat +
+  // hrv_prediction_gaps_mat read by this endpoint, plus
+  // spotify_daily_signature_mat, recovery_vs_pace_mat and hrv_residuals_mat
+  // read by /spotify, /activities and /analytics/hrv). A failed heartbeat
+  // therefore flags staleness beyond this endpoint's own reads.
   perf_mats: "Every 15 min (:12/:27/:42/:57)",
 };
 
@@ -276,8 +278,8 @@ export async function GET() {
         .eq("data_type", "refresh")
         .order("sync_start", { ascending: false })
         .limit(1),
-      // Perf-matview refresh heartbeat (tz_log_gaps_mat + hrv_prediction_gaps_mat;
-      // also excluded from the main window above).
+      // Perf-matview refresh heartbeat — covers all five tier-2 matviews
+      // (see CADENCE comment above); also excluded from the main window.
       supabase
         .from("sync_log")
         .select("*")

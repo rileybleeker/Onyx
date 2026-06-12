@@ -96,8 +96,14 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
       .catch(console.error)
       .finally(() => {
         if (cancelled) return;
-        if (!isFirst) setRangeLoading(false);
-        else if (!silent) setLoading(false);
+        // Clear BOTH flags unconditionally (no-op setState bails when the
+        // value is unchanged). Gating setLoading on `isFirst` left a hole
+        // under dev StrictMode: the doubled mount consumed the firstRun ref
+        // on the cancelled first invocation, so the second run never reached
+        // the only setLoading(false) site and a cold (initial=null) load
+        // showed the skeleton forever.
+        setRangeLoading(false);
+        setLoading(false);
       });
     return () => { cancelled = true; };
   }, [range]);
@@ -135,7 +141,10 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
   // page now runs ONE whoop_sleep query (client + server prefetch) and
   // filters here. Saves a query per load plus ~33kB of duplicated rows in the
   // ISR HTML payload.
-  const whoopSleep = whoopSleepAll.filter((d: any) => !d.is_nap);
+  // === false (not !d.is_nap): the old getWhoopSleep used .eq("is_nap", false),
+  // which excludes NULL rows — the column is nullable with DEFAULT FALSE, so
+  // keep exact parity rather than letting a future NULL flow into the charts.
+  const whoopSleep = whoopSleepAll.filter((d: any) => d.is_nap === false);
   const avgRecoveryScore = avg(whoopRecovery, "recovery_score");
   const avgWhoopHrv      = avg(whoopRecovery, "hrv_rmssd_milli");
   const avgWhoopRhr      = avg(whoopRecovery, "resting_heart_rate");

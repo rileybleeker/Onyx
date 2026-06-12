@@ -22,13 +22,19 @@ let draining = false;
 
 function drain() {
   const next = queue.shift();
-  if (next) next();
-  if (queue.length > 0) {
-    // One section per frame: each mounts in its own small commit instead of
-    // contributing to one long task. setTimeout(0) after rAF yields to paint.
-    requestAnimationFrame(() => setTimeout(drain, 0));
-  } else {
-    draining = false;
+  try {
+    if (next) next();
+  } finally {
+    // Exception-safe: a throwing callback must not strand `draining=true`
+    // with a never-drained queue (which would freeze every deferred section
+    // on every subsequently visited page).
+    if (queue.length > 0) {
+      // One section per frame: each mounts in its own small commit instead of
+      // contributing to one long task. setTimeout(0) after rAF yields to paint.
+      requestAnimationFrame(() => setTimeout(drain, 0));
+    } else {
+      draining = false;
+    }
   }
 }
 

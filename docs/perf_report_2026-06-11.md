@@ -125,14 +125,70 @@ and after implementation; all verification green before push: `tsc`,
   navigation start, median of 3 cold authed loads — same gate class as
   the baseline's data-complete.
 
+---
+
+# Round 3 addendum (same day, 2026-06-11 evening)
+
+CDP-profiled the remaining costs, then shipped (commit 9938e81 + review
+fixes):
+
+- **The render burst, attributed and fixed.** ONE React commit built all
+  chart SVG before anything became visible — /sleep: 1.9 s for 5,260 SVG
+  nodes (~0.36 ms/node), /analytics/hrv: 0.85 s + 460 ms layout. New
+  `<DeferredMount>` (one-section-per-frame module scheduler, NOT
+  viewport-based — everything still mounts unconditionally, so the smoke
+  suite's below-fold assertions hold) wraps below-fold sections on both
+  pages. Within-session controls: /sleep was 2.4x slower than /whoop
+  pre-fix and measures ~33% FASTER than it post-fix; /analytics/hrv went
+  from 1.9x slower than control to par. (Absolute medians across sessions
+  aren't comparable — machine-load skew; the profiler's phase shares and
+  same-session relatives are the transferable result.)
+- **Mount animations off app-wide** (~116 series). Measured: they never
+  delayed first paint (post-paint rAF work), but cost ~820 ms of 70-220 ms
+  jank tasks on /sleep, delayed main-thread settle by ~1.2 s, and FULLY
+  REPLAYED on every revalidation commit. Convention: every recharts series
+  sets `isAnimationActive={false}`.
+- **Deep-equal revalidation bailout.** The silent refetch returned
+  byte-identical data in 18/18 measurements yet re-rendered (and
+  re-animated) every chart ~1 s after paint (~620-870 ms commit on
+  /sleep). All ISR clients now use
+  `setX(prev => sameJson(prev, next) ? prev : next)` (lib/format.ts);
+  required deterministic secondary ORDER BYs on getWhoopJournal
+  (question) and getHrvModelMetrics (model, horizon_days).
+- **Tier-2 matviews** (sql/perf_tier2_matviews.sql): tz_log_gaps_mat,
+  hrv_prediction_gaps_mat (the two slowest /api/status members: 503/363 ms
+  means → ~5-20 ms), spotify_daily_signature_mat, recovery_vs_pace_mat,
+  and hrv_residuals_mat (narrow slice — the old all-time read was ALSO
+  silently truncated at PostgREST's 1000-row cap, 1,153 rows existed;
+  partial-index and date-window alternatives rejected with EXPLAIN
+  evidence). One shared refresh fn (per-matview failure isolation + drift
+  tripwires), pg_cron :12/:27/:42/:57, ONE 'perf_mats' heartbeat + /status
+  card. sql/hrv_prediction_gaps.sql refreshed — the repo copy had DRIFTED
+  from production (live 36 h timeliness gate); re-applying the stale file
+  would have reverted semantics.
+- **Payload trims**: getHrvResiduals 168 kB → ~12 kB; causal dropped_low_n
+  projected to its 5 read keys (~48 → 9 kB); /sleep single whoop_sleep
+  fetch (main-only derived client-side, −1 query/−33 kB); getWhoopJournal
+  explicit 5-column list (−38%); getWorkoutSleepGap recovery sub-query
+  date-bounded (was all-time, ~5 months from its own 1000-row truncation).
+  These also shrink what the sidebar/tab-bar Link prefetch sweeps.
+- **/sleep range changes** keep stale charts visible under a narrow
+  "updating…" flag (was: full-page skeleton remounting all charts);
+  **useIsMobile** lazy-initializes (was: desktop-width first render then a
+  full re-render on phones); **/status poll** is visibility-gated, skips
+  the commit on unchanged payloads, and the freshness label self-ticks.
+- **Verified non-wins documented** (don't re-investigate): JetBrains Mono
+  weight array (variable font — all weights alias the same woff2),
+  recharts tree-shaking (sideEffects:false works; unused chart types
+  absent from the chunk), the aura-drift background animation
+  (compositor-only).
+- Verification: tsc/build/lint clean, smoke 17/17 (twice), adversarial
+  diff review (caught a dev-only StrictMode stuck-skeleton on /sleep cold
+  loads + DeferredMount exception-safety — both fixed pre-push).
+
 ## Known remaining work (created as roadmap items)
 
-1. **Chart-render burst** — /sleep (33 ResponsiveContainers) and
-   /analytics/hrv (43) now spend most of their remaining 1.4-1.6 s in a
-   single React commit mounting every chart at once. Fix direction:
-   staggered/below-fold deferred mounting (must keep the smoke suite's
-   below-fold assertions in mind). This is now the dominant cost on
-   those two pages — data fetching no longer is.
+1. ~~**Chart-render burst**~~ — SHIPPED in round 3 (see addendum).
 2. **Security: /api/habits/\* is fully unauthenticated** on the public
    internet (pre-existing; middleware exempts it for the hourly GitHub
    Actions curl and the routes run service-role with no caller auth).
