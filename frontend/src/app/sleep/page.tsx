@@ -1,7 +1,7 @@
 import SleepLoader, { type SleepInitial } from "./SleepLoader";
 import {
   getWhoopSleepAll, getWhoopRecovery, getWhoopCycles,
-  getWhoopJournal, getEightSleepTrends, getDailySummaries, rangeDays,
+  getBehaviorLog, getEightSleepTrends, getDailySummaries, rangeDays,
 } from "@/lib/queries";
 
 // ISR (perf pass 2026-06-11): prerender the page with the default range's
@@ -29,7 +29,7 @@ export default async function SleepPage() {
         getWhoopSleepAll(days),
         getWhoopRecovery(days),
         getWhoopCycles(days),
-        getWhoopJournal(days),
+        getBehaviorLog(days),
         getEightSleepTrends(days),
         getDailySummaries(days),
       ]);

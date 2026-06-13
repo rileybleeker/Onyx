@@ -198,7 +198,7 @@ export async function POST() {
     if (lastCompleted) {
       const lcDate = String(lastCompleted).slice(0, 10); // Notion may return a datetime
       if (channel === "whoop" && lcDate <= WHOOP_JOURNAL_FROZEN_THROUGH) {
-        synced.push(`${name}: SKIPPED (Last Completed ${lcDate} is inside the frozen WHOOP era)`);
+        synced.push(`${name}: SKIPPED (Last Completed ${lcDate} is inside the frozen historical era)`);
       } else if (lcDate > todayET) {
         synced.push(`${name}: SKIPPED (Last Completed ${lcDate} is in the future)`);
       } else {

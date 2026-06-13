@@ -16,7 +16,7 @@ const SYSTEM_PROMPT = `You are Onyx, a personal data scientist assistant. You he
 
 You have access to the user's data via function calls. When the user asks about their health metrics, use the appropriate function to fetch real data before answering. You can call multiple tools to cross-reference data across devices. Be concise and insightful — highlight trends, anomalies, and actionable takeaways.
 
-When the user mentions completing a habit (e.g., "I meditated today", "I took my vitamins"), use mark_habit_complete to log it. The habit name should match what's defined in their habits list. Use query_journal to see both WHOOP journal behaviors and habit completions together.
+When the user mentions completing a habit (e.g., "I meditated today", "I took my vitamins"), use mark_habit_complete to log it. The habit name should match what's defined in their habits list. Use query_journal to see both self-reported behaviors and habit completions together.
 
 The user keeps reusable supplement "stacks" — named lists of supplements + doses (like a bill of materials). When they say they took a named stack or routine (e.g. "log my morning stack", "I took my evening stack"), use log_supplement_stack with the stack name. It records every supplement in that stack at once. If the name doesn't match, the tool returns the list of available stacks so you can confirm which one they mean.
 
@@ -144,8 +144,8 @@ const tools: Anthropic.Tool[] = [
     },
   },
   {
-    name: "query_whoop_journal",
-    description: "Get WHOOP Journal entries — self-reported behaviors like caffeine, alcohol, supplements, sleep habits, recovery activities, and more. Each entry has a date, question/behavior name, category, and answer (Yes/No or a value).",
+    name: "query_behaviors",
+    description: "Get self-reported behavior entries — caffeine, alcohol, supplements, sleep habits, recovery activities, and more. Each entry has a date, behavior name, category, and answer (Yes/No or a value).",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -158,7 +158,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "query_journal",
-    description: "Get the unified journal view combining both WHOOP journal behaviors AND habit completions. Each entry has a date, question/behavior name, category, answer, and source ('whoop' or 'habit'). Use this for cross-analysis of habits and self-reported behaviors.",
+    description: "Get the unified behavior journal combining self-reported behaviors AND habit completions. Each entry has a date, behavior/habit name, category, answer, and source ('whoop' = imported behavior history, 'habit' = tracked habit). Use this for cross-analysis of habits and self-reported behaviors.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -239,7 +239,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "query_journal_entries",
-    description: "Search the user's personal Notion journal (free-form prose entries about their life — relationships, mental health, work, training, etc., distinct from the WHOOP/habit behavior journal). Use this when the user asks about how they were feeling, what they wrote about, or to find context behind health data. Supports filters and optional semantic search via 'semantic_query'. Returns entries sorted by similarity (when semantic_query given) or by date desc.",
+    description: "Search the user's personal Notion journal (free-form prose entries about their life — relationships, mental health, work, training, etc., distinct from the behavior journal of self-reported behaviors and habits). Use this when the user asks about how they were feeling, what they wrote about, or to find context behind health data. Supports filters and optional semantic search via 'semantic_query'. Returns entries sorted by similarity (when semantic_query given) or by date desc.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -493,13 +493,13 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     }
   }
 
-  // Handle whoop journal (special: calendar_date + optional filters)
-  if (name === "query_whoop_journal") {
+  // Handle self-reported behaviors (special: calendar_date + optional filters)
+  if (name === "query_behaviors") {
     const journalDays = (input.days as number) || 30;
     const jSince = new Date();
     jSince.setDate(jSince.getDate() - journalDays);
-    // 2026-06-11 merge: WHOOP journal rows live in habit_journal via the
-    // pds.journal view (source='whoop'); pds.whoop_journal is a frozen archive.
+    // Self-reported behavior rows live in habit_journal via the pds.journal
+    // view (source='whoop'); pds.whoop_journal is a frozen archive.
     // Descending so the 200-row cap keeps the most RECENT entries (ascending
     // returned the oldest week of the window).
     let query = supabase.from("journal").select("*")
@@ -514,7 +514,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     return JSON.stringify(data ?? []);
   }
 
-  // Unified journal view (WHOOP + habits)
+  // Unified behavior journal (imported behaviors + habits)
   if (name === "query_journal") {
     const journalDays = (input.days as number) || 30;
     const jSince = new Date();
@@ -635,7 +635,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     const isWhoopChannel = mapRow?.channel === "whoop";
     if (isWhoopChannel && date <= WHOOP_JOURNAL_FROZEN_THROUGH) {
       return JSON.stringify({
-        error: `"${habit}" has frozen WHOOP-journal history through ${WHOOP_JOURNAL_FROZEN_THROUGH}; completions can only be logged for later dates.`,
+        error: `"${habit}" has frozen historical entries through ${WHOOP_JOURNAL_FROZEN_THROUGH}; completions can only be logged for later dates.`,
       });
     }
 

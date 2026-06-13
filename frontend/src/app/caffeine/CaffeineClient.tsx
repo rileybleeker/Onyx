@@ -231,7 +231,7 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
         <span className="text-text-secondary">Coverage note:</span> Quantitative caffeine tracking
         began 2026-05-19 (timestamped supplement doses) and 2026-05-31 (Cronometer dietary
         caffeine), so these charts cover the recent era only. The logged record is the sole
-        caffeine source — the WHOOP journal&apos;s yes/no caffeine question is disregarded by
+        caffeine source — the self-reported yes/no caffeine behavior is disregarded by
         policy (it proved unreliable). The FDA&apos;s 400 mg/day guidance is marked on the
         intake chart.
       </p>

@@ -380,21 +380,24 @@ export async function getWorkoutSleepGap(days: number = 60): Promise<WorkoutSlee
   return out;
 }
 
-export async function getWhoopJournal(days: number = 30) {
+export async function getBehaviorLog(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
-  // 2026-06-11 merge: WHOOP journal history + ongoing WHOOP-derived habit
-  // logs live in pds.habit_journal, exposed through the pds.journal view.
-  // source='whoop' selects exactly the WHOOP-question variable family
-  // (historical export rows AND new habit-channel taps for those questions).
+  // Self-reported behavior family — the yes/no behavior answers logged through
+  // the habits system. They live in pds.habit_journal, exposed through the
+  // pds.journal view; source='whoop' is the frozen pipeline identity for this
+  // question family (historical imported rows AND new habit-channel taps for
+  // those same questions), so it stays as the filter value even though the
+  // surface no longer brands them as a WHOOP feature.
   // Ordered DESCENDING so PostgREST's 1000-row cap drops the OLDEST rows at
   // large ranges (365d ≈ 3.9k rows), then re-sorted ascending for consumers.
-  // Perf round 3: explicit column list — consumers (/sleep heatmap, /whoop)
-  // read only these five fields; select("*") shipped ~179 kB for 30d. The
-  // secondary .order("question") makes within-day row order deterministic,
-  // which is load-bearing: the silent revalidation's sameJson guard compares
-  // serialized state, so nondeterministic ordering would defeat the bailout.
+  // Perf round 3: explicit column list — consumers (/sleep + /whoop behavior
+  // heatmaps) read only these five fields; select("*") shipped ~179 kB for
+  // 30d. The secondary .order("question") makes within-day row order
+  // deterministic, which is load-bearing: the silent revalidation's sameJson
+  // guard compares serialized state, so nondeterministic ordering would defeat
+  // the bailout.
   const { data, error } = await supabase
     .from("journal")
     .select("cycle_date, behaviors_date, question, category, answer")

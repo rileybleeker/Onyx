@@ -77,7 +77,7 @@ export async function POST(req: NextRequest) {
   const isWhoopChannel = mapRow?.channel === "whoop";
   if (isWhoopChannel && completionDate <= WHOOP_JOURNAL_FROZEN_THROUGH) {
     return NextResponse.json(
-      { error: `"${habit}" has frozen WHOOP-journal history through ${WHOOP_JOURNAL_FROZEN_THROUGH}; completions can only be logged for later dates.` },
+      { error: `"${habit}" has frozen historical entries through ${WHOOP_JOURNAL_FROZEN_THROUGH}; completions can only be logged for later dates.` },
       { status: 400 }
     );
   }

@@ -1,6 +1,6 @@
 import WhoopLoader, { type WhoopInitial } from "./WhoopLoader";
 import {
-  getWhoopRecovery, getWhoopCycles, getWhoopSleep, getWhoopJournal, rangeDays,
+  getWhoopRecovery, getWhoopCycles, getWhoopSleep, getBehaviorLog, rangeDays,
 } from "@/lib/queries";
 
 // ISR (perf pass 2026-06-11): prerender the page with the default range's
@@ -23,7 +23,7 @@ export default async function WhoopPage() {
       getWhoopRecovery(days),
       getWhoopCycles(days),
       getWhoopSleep(days),
-      getWhoopJournal(days),
+      getBehaviorLog(days),
     ]);
     initial = { recovery, cycles, sleep, journal };
   } catch (e) {

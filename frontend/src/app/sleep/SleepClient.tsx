@@ -6,7 +6,7 @@ import {
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, ReferenceLine, Cell,
 } from "recharts";
 import {
-  getWhoopSleepAll, getWhoopRecovery, getWhoopCycles, getWhoopJournal,
+  getWhoopSleepAll, getWhoopRecovery, getWhoopCycles, getBehaviorLog,
   getEightSleepTrends, getDailySummaries,
   rangeDays, rangeLabel, type Range,
 } from "@/lib/queries";
@@ -74,7 +74,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
       getWhoopSleepAll(days),
       getWhoopRecovery(days),
       getWhoopCycles(days),
-      getWhoopJournal(days),
+      getBehaviorLog(days),
       getEightSleepTrends(days),
       getDailySummaries(days),
     ])
@@ -661,7 +661,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
         </DeferredMount>
       </div>
 
-      {/* ── Journal ─────────────────────────────────────────────────────────── */}
+      {/* ── Behaviors ───────────────────────────────────────────────────────── */}
       {journal.length > 0 && <DeferredMount minHeight={1100}>{(() => {
         // `behaviors_date` is the calendar day the journal answer describes
         // (the day the user was awake leading into bedtime). Computed at the
@@ -678,7 +678,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
 
         const categoryMap = new Map<string, string[]>();
         journal.forEach((j: any) => {
-          const cat = j.category || "WHOOP Journal";
+          const cat = j.category || "Other";
           if (!categoryMap.has(cat)) categoryMap.set(cat, []);
           const list = categoryMap.get(cat)!;
           if (!list.includes(j.question)) list.push(j.question);
@@ -692,7 +692,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
 
         return (
           <>
-            <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-4">WHOOP · Journal</p>
+            <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-4">Behaviors</p>
 
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
               {[...categoryMap.entries()].map(([cat, qs]) => (
@@ -704,7 +704,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
               ))}
             </div>
 
-            <ChartCard title="Journal Heatmap" source="WHOOP">
+            <ChartCard title="Behavior Heatmap">
               <div className="overflow-x-auto">
                 <table className="w-full text-xs">
                   <thead>

@@ -5,7 +5,7 @@ import {
   AreaChart, Area, BarChart, Bar, LineChart, Line,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
-import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getWhoopJournal, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getBehaviorLog, rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { formatDate, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
@@ -49,7 +49,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
     firstRunWithInitial.current = false;
     if (!silent) setLoading(true);
     const days = rangeDays(range);
-    Promise.all([getWhoopRecovery(days), getWhoopCycles(days), getWhoopSleep(days), getWhoopJournal(days)])
+    Promise.all([getWhoopRecovery(days), getWhoopCycles(days), getWhoopSleep(days), getBehaviorLog(days)])
       .then(([r, c, s, j]) => {
         if (cancelled) return;
         // sameJson bail-out: the silent revalidation's data is usually
@@ -260,7 +260,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
         </ChartCard>
       </div>
 
-      {/* Journal Section */}
+      {/* Behaviors Section */}
       {journal.length > 0 && (() => {
         // Build a heatmap: for each behavior, show which days it was logged as "Yes" or had a value
         const behaviors = [...new Set(journal.map((j: any) => j.question))].sort();
@@ -287,7 +287,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
 
         return (
           <>
-            <h3 className="text-xl font-medium text-text-primary mt-10 mb-4">Journal</h3>
+            <h3 className="text-xl font-medium text-text-primary mt-10 mb-4">Behaviors</h3>
 
             {/* Category summary cards */}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
@@ -301,7 +301,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
             </div>
 
             {/* Heatmap grid */}
-            <ChartCard title="Journal Heatmap" source="WHOOP">
+            <ChartCard title="Behavior Heatmap">
               <div className="overflow-x-auto">
                 <table className="w-full text-xs">
                   <thead>
