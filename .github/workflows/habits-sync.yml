@@ -15,8 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Call habits sync endpoint
+        env:
+          ONYX_CI_TOKEN: ${{ secrets.ONYX_CI_TOKEN }}
         run: |
           curl -sS -X POST \
             -H "Content-Type: application/json" \
+            -H "x-onyx-ci-token: $ONYX_CI_TOKEN" \
             --fail-with-body \
             "https://frontend-six-alpha-69.vercel.app/api/habits/sync"
