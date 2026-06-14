@@ -56,13 +56,13 @@ jobs:
        github.event_name == 'schedule' ||
        github.event.workflow_run.conclusion == 'success')
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-hrv-${{ hashFiles('requirements-analysis.txt') }}
@@ -79,7 +79,7 @@ jobs:
         # retrain workflows can save a new cache without "already exists"
         # collisions; restore-keys matches the most recently saved model.
         id: model-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: analysis_output/xgboost_hrv_model.pkl
           key: hrv-model-${{ runner.os }}-v1-${{ github.run_id }}
@@ -99,7 +99,7 @@ jobs:
         run: python hrv_predict.py --predict
 
       - name: Upload model artifact
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         if: always()
         with:
           path: analysis_output/xgboost_hrv_model.pkl

@@ -24,8 +24,8 @@ jobs:
   check-and-retrain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -59,7 +59,7 @@ jobs:
 
       - name: Cache pip (analysis deps)
         if: steps.decide.outputs.retrain == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-hrv-${{ hashFiles('requirements-analysis.txt') }}
@@ -79,7 +79,7 @@ jobs:
         # companion restore step in hrv-prediction.yml uses restore-keys to
         # find the most recently saved pickle regardless of exact key.
         if: steps.decide.outputs.retrain == 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: analysis_output/xgboost_hrv_model.pkl
           key: hrv-model-${{ runner.os }}-v1-${{ github.run_id }}
