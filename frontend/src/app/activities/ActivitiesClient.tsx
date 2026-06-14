@@ -26,6 +26,10 @@ type ActivityRow = {
   calories: number | null;
   split_labels: SplitLabel[];
   muscle_groups: MuscleGroup[];
+  // Manual sauna override (whoop_workouts/garmin_activities.is_sauna). Lets a
+  // non-weightlifting WHOOP activity be hand-marked as a sauna; OR'd into act_sauna
+  // in the HRV pipeline. Replaces the deactivated "Used a sauna?" habit.
+  is_sauna: boolean;
   // Garmin only: raw_json->workoutId, selected as a JSON subfield so the query
   // doesn't ship the whole ~7 kB/row raw_json blob just for this pairing key.
   planned_workout_id?: string | null;
@@ -92,6 +96,7 @@ function normalizeGarmin(a: any): ActivityRow {
     calories: a.calories ?? null,
     split_labels: (a.split_labels as SplitLabel[] | null) ?? (a.split_label ? [a.split_label as SplitLabel] : []),
     muscle_groups: (a.muscle_groups as MuscleGroup[] | null) ?? [],
+    is_sauna: !!a.is_sauna,
     planned_workout_id: a.planned_workout_id != null ? String(a.planned_workout_id) : null,
   };
 }
@@ -120,6 +125,7 @@ function normalizeWhoop(w: any): ActivityRow {
     calories: kcal,
     split_labels: (w.split_labels as SplitLabel[] | null) ?? (w.split_label ? [w.split_label as SplitLabel] : []),
     muscle_groups: (w.muscle_groups as MuscleGroup[] | null) ?? [],
+    is_sauna: !!w.is_sauna,
   };
 }
 
@@ -517,17 +523,18 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
   // set, not a diff). Optimistic update with rollback on error.
   async function saveTags(
     act: ActivityRow,
-    next: { split_labels?: SplitLabel[]; muscle_groups?: MuscleGroup[] },
+    next: { split_labels?: SplitLabel[]; muscle_groups?: MuscleGroup[]; is_sauna?: boolean },
   ) {
     const sourceId = act.id.slice(act.id.indexOf(":") + 1); // colon-safe: WHOOP ids are opaque TEXT
     // Capture only THIS row's prior values for the dimension(s) we're about to change.
     // Rollback reverts just those keys on just this row (a functional update), NOT a
-    // whole-array snapshot — with two independently-mutable controls per card and
+    // whole-array snapshot — with multiple independently-mutable controls per card and
     // overlapping in-flight saves, a snapshot revert could silently clobber a
     // concurrent edit on the other dimension or another row.
-    const prevValues: { split_labels?: SplitLabel[]; muscle_groups?: MuscleGroup[] } = {};
+    const prevValues: { split_labels?: SplitLabel[]; muscle_groups?: MuscleGroup[]; is_sauna?: boolean } = {};
     if (next.split_labels !== undefined) prevValues.split_labels = act.split_labels;
     if (next.muscle_groups !== undefined) prevValues.muscle_groups = act.muscle_groups;
+    if (next.is_sauna !== undefined) prevValues.is_sauna = act.is_sauna;
     setRows((prev) => prev.map((r) => (r.id === act.id ? { ...r, ...next } : r)));
     try {
       const res = await fetch("/api/activities/categorize", {
@@ -555,6 +562,12 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     const cur = act.muscle_groups ?? [];
     const next = cur.includes(value) ? cur.filter((v) => v !== value) : [...cur, value];
     saveTags(act, { muscle_groups: next });
+  }
+
+  // Flip the manual sauna flag on a session (single boolean override). Replaces
+  // the old "Used a sauna?" habit — OR's into act_sauna in the HRV pipeline.
+  function toggleSauna(act: ActivityRow) {
+    saveTags(act, { is_sauna: !act.is_sauna });
   }
 
   const latestSummary = summaries[summaries.length - 1];
@@ -884,6 +897,30 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
                         );
                       })}
                     </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Manual sauna flag. WHOOP auto-detects saunas as sport_name='sauna',
+                  but some sauna sessions get logged under a generic sport (or none).
+                  This toggle marks any non-'weightlifting_msk' WHOOP activity as a
+                  sauna; it OR's into act_sauna in the HRV pipeline. ETL-preserving via
+                  /api/activities/categorize. Replaces the old "Used a sauna?" habit. */}
+              {act.source === "whoop" && act.name !== "weightlifting_msk" && (
+                <div className="border-t border-border-subtle px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-text-tertiary text-[11px] uppercase tracking-wider w-14 shrink-0">Sauna</span>
+                    <button
+                      onClick={() => toggleSauna(act)}
+                      className={`text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px] border transition-colors ${
+                        act.is_sauna
+                          ? "bg-orange-500/20 border-orange-400/50 text-orange-200"
+                          : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"
+                      }`}
+                      title="Mark this session as a sauna (counts as a sauna in HRV analytics)"
+                    >
+                      {act.is_sauna ? "sauna ✓" : "sauna"}
+                    </button>
                   </div>
                 </div>
               )}
