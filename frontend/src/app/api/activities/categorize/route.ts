@@ -22,14 +22,16 @@ const ALLOWED_MUSCLES = new Set([
  *   id: string | number,
  *   split_labels?: string[],   // multi-select coarse split (⊆ leg/pull/push)
  *   muscle_groups?: string[],  // multi-select granular muscles (⊆ ALLOWED_MUSCLES)
- *   split_label?: string | null // legacy single-value form — accepted for BC
+ *   split_label?: string | null, // legacy single-value form — accepted for BC
+ *   is_sauna?: boolean         // manual sauna override (OR'd into act_sauna)
  * }
  *
- * Sets the manual strength tags on a workout. Mirrors /api/activities/exclude:
- * writes directly onto the underlying garmin_activities / whoop_workouts row.
- * Neither array is in the Garmin/WHOOP ETL upsert payloads, so hourly re-syncs
- * preserve them. The full array is sent on every save (idempotent set, not a diff);
- * an empty array clears the dimension (stored as NULL).
+ * Sets the manual strength tags and/or the sauna flag on a workout. Mirrors
+ * /api/activities/exclude: writes directly onto the underlying garmin_activities /
+ * whoop_workouts row. None of these columns are in the Garmin/WHOOP ETL upsert
+ * payloads, so hourly re-syncs preserve them. The full array is sent on every save
+ * (idempotent set, not a diff); an empty array clears the dimension (stored as NULL).
+ * At least one of split_labels / muscle_groups / is_sauna must be present.
  *
  * split_labels is canonical; the legacy scalar split_label column is kept in sync
  * as split_labels[0] (primary split) so un-migrated readers + rollbacks stay safe.
@@ -61,6 +63,7 @@ export async function POST(req: NextRequest) {
     split_labels?: unknown;
     muscle_groups?: unknown;
     split_label?: string | null;
+    is_sauna?: unknown;
   };
 
   if (body.source !== "garmin" && body.source !== "whoop") {
@@ -83,9 +86,18 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: `tag validation failed: ${msg}` }, { status: 400 });
   }
 
-  if (splits === null && muscles === null) {
+  // Sauna is a plain boolean override (null = not provided this request).
+  let sauna: boolean | null = null;
+  if (body.is_sauna !== undefined && body.is_sauna !== null) {
+    if (typeof body.is_sauna !== "boolean") {
+      return NextResponse.json({ error: "is_sauna must be a boolean" }, { status: 400 });
+    }
+    sauna = body.is_sauna;
+  }
+
+  if (splits === null && muscles === null && sauna === null) {
     return NextResponse.json(
-      { error: "provide split_labels and/or muscle_groups (arrays)" },
+      { error: "provide split_labels, muscle_groups, and/or is_sauna" },
       { status: 400 },
     );
   }
@@ -99,6 +111,9 @@ export async function POST(req: NextRequest) {
   if (muscles !== null) {
     patch.muscle_groups = muscles.length ? muscles : null;
   }
+  if (sauna !== null) {
+    patch.is_sauna = sauna;
+  }
 
   const table = body.source === "garmin" ? "garmin_activities" : "whoop_workouts";
   const pk = body.source === "garmin" ? "activity_id" : "workout_id";
@@ -107,7 +122,7 @@ export async function POST(req: NextRequest) {
     .from(table)
     .update(patch)
     .eq(pk, String(body.id))
-    .select("split_labels, muscle_groups, split_label")
+    .select("split_labels, muscle_groups, split_label, is_sauna")
     // maybeSingle (not single): a zero-match UPDATE returns {data:null,error:null}
     // so the 404 below is reachable — single() would surface a cryptic PGRST116 500.
     .maybeSingle();
@@ -127,5 +142,6 @@ export async function POST(req: NextRequest) {
     split_labels: data.split_labels ?? [],
     muscle_groups: data.muscle_groups ?? [],
     split_label: data.split_label ?? null,
+    is_sauna: data.is_sauna ?? false,
   });
 }

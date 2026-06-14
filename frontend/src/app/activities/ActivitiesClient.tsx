@@ -58,7 +58,9 @@ const DEDUP_WINDOW_MS = 5 * 60 * 1000;
 // it's the one thing reported manually via the toggle on strength rows.
 function deriveCategory(act: ActivityRow): ActivityCategory {
   const hay = `${act.type} ${act.name}`.toLowerCase();
-  if (hay.includes("sauna")) return "sauna";
+  // act.is_sauna is the manual override (set on a WHOOP session the device didn't
+  // label 'sauna'); honoring it keeps the category badge consistent with the toggle.
+  if (act.is_sauna || hay.includes("sauna")) return "sauna";
   if (hay.includes("run")) return "run";
   if (/weightlift|strength|lifting|resistance/.test(hay)) return "strength";
   return "other";

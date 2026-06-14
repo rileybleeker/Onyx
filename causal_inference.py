@@ -399,6 +399,12 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     # Stack volume — independent of per-compound effects.
     ("supplement_distinct_compounds", "behavior", "Distinct supplements taken above median", None),
     ("supplement_total_doses",      "behavior", "Total supplement doses above median", None),
+    # Melatonin dose (2026-06-14): the mg granularity from the journal<->supplement
+    # bridge (pds.melatonin_unified). NaN on non-dose days, so this median-splits
+    # the dose AMONG melatonin nights (dose-response), distinct from the taken/not
+    # binary supplement_melatonin_amount. Family='supplement' → supplement
+    # confounder set. Lands in dropped_low_n until ~50 in-window obs accrue.
+    ("melatonin_dose_mg",           "supplement", "Melatonin dose above median",     "mg"),
     # Eight Sleep ambient bedroom temp — genuinely upstream (a control input), not a mediator.
     ("eight_sleep_room_temp",       "behavior", "Bedroom temperature above median",    "C"),
     # Notion Journal structured metadata (audit Finding #8). Family='behavior'

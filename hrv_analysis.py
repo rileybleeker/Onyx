@@ -476,14 +476,20 @@ FEATURE_LABELS: dict[str, str] = {
 JOURNAL_LABELS: dict[str, str] = {
     "wore_mouth_tape": "Mouth Tape",
     "wore_ear_plugs": "Ear Plugs",
-    "took_melatonin": "Melatonin",
+    # "took_melatonin" removed 2026-06-14: this key was always dead (the real
+    # clean_name was "took_a_melatonin_supplement"). Melatonin is now handled as a
+    # supplement — journal_took_a_melatonin_supplement is dropped in
+    # build_feature_matrix and re-sourced via the pds.melatonin_unified bridge
+    # (labels live in FEATURE_LABELS: "supplement_melatonin_amount" -> "Melatonin").
     "have_any_alcoholic_drinks": "Alcohol",
     # "consumed_caffeine" removed 2026-06-10: the WHOOP caffeine checkbox is
     # disregarded by policy (column dropped at the journal merge) — caffeine
     # truth is the unified log (caffeine_total_mg and friends).
     "consumed_magnesium": "Magnesium",
     "took_anti-inflammatory_nsaids": "NSAIDs",
-    "used_a_sauna": "Sauna",
+    # "used_a_sauna" removed 2026-06-14: the WHOOP "Used a sauna?" checkbox is
+    # dropped (duplicative) — sauna is sourced from the WHOOP sauna activity
+    # (act_sauna: sport_name='sauna' OR the manual is_sauna toggle) instead.
     "took_a_cold_shower": "Cold Shower",
     "took_an_ice_bath": "Ice Bath",
     "did_zone_2_cardio": "Zone 2 Cardio",
@@ -679,7 +685,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     # for the workout-to-sleep gap feature; start_time_local stays for date binning.
     data["garmin_acts"] = fetch_all(
         "garmin_activities",
-        select="activity_id,start_time_local,start_time_gmt,activity_type,split_label,split_labels,muscle_groups,onyx_behavioral_date,duration_seconds,distance_meters,"
+        select="activity_id,start_time_local,start_time_gmt,activity_type,split_label,split_labels,muscle_groups,is_sauna,onyx_behavioral_date,duration_seconds,distance_meters,"
                "avg_heart_rate,max_heart_rate,calories,elevation_gain_meters,"
                "aerobic_training_effect,anaerobic_training_effect,training_load,vo2_max,"
                "avg_speed_mps",
@@ -725,7 +731,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     # end_time added for the workout-to-sleep gap feature (true UTC; 100% populated).
     data["whoop_wk"] = fetch_all(
         "whoop_workouts",
-        select="workout_id,start_time,end_time,sport_name,split_label,split_labels,muscle_groups,onyx_behavioral_date,strain,kilojoule,average_heart_rate,max_heart_rate,"
+        select="workout_id,start_time,end_time,sport_name,split_label,split_labels,muscle_groups,is_sauna,onyx_behavioral_date,strain,kilojoule,average_heart_rate,max_heart_rate,"
                "zone_zero_milli,zone_one_milli,zone_two_milli,zone_three_milli,"
                "zone_four_milli,zone_five_milli,score_state",
         filters=[("score_state", "eq", "SCORED"), ("is_excluded", "eq", False)],
@@ -733,6 +739,25 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     if not data["whoop_wk"].empty:
         # Derive ET calendar_date from true-UTC start_time, matching view logic
         data["whoop_wk"]["calendar_date"] = to_et_date_str(data["whoop_wk"]["start_time"])
+
+    log.info("  Loading whoop_workouts manual sauna overrides…")
+    # The whoop_wk load above filters score_state='SCORED' + is_excluded=False
+    # (correct for the strain/gap consumers). But the manual is_sauna toggle exists
+    # precisely to catch saunas WHOOP logged under a generic/short session — exactly
+    # the kind that can come back UNSCORABLE/PENDING. So a hand-flagged sauna could
+    # be silently dropped before reaching act_sauna. Fetch is_sauna=true rows
+    # UNCONDITIONALLY (any score_state, even excluded) and union them in only for the
+    # activity-category aggregation (NOT the strain/gap consumers, which keep the
+    # filtered frame). Only the columns aggregate_activity_categories reads.
+    data["whoop_sauna_override"] = fetch_all(
+        "whoop_workouts",
+        select="workout_id,start_time,sport_name,split_label,split_labels,muscle_groups,is_sauna,onyx_behavioral_date",
+        filters=[("is_sauna", "eq", True)],
+    )
+    if not data["whoop_sauna_override"].empty:
+        data["whoop_sauna_override"]["calendar_date"] = to_et_date_str(
+            data["whoop_sauna_override"]["start_time"]
+        )
 
     log.info("  Loading whoop_body_measurements…")
     data["whoop_body"] = fetch_all(
@@ -778,6 +803,24 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         # for downstream use. Multi-category compounds get comma-joined.
         data["supplements"]["category"] = data["supplements"]["categories"].apply(
             lambda c: ", ".join(c) if isinstance(c, list) and c else None
+        )
+
+    # Melatonin journal<->supplement bridge (pds.melatonin_unified, 2026-06-14):
+    # one row per behavioral day unifying the frozen WHOOP journal Yes/No history
+    # with the /supplements mg dose. Consumed by build_feature_matrix so melatonin
+    # is handled as a supplement (not a journal checkbox) without losing history.
+    log.info("  Loading melatonin_unified (journal<->supplement bridge)…")
+    data["melatonin"] = fetch_all(
+        "melatonin_unified",
+        select="calendar_date,melatonin_present,melatonin_dose_mg,source_flag",
+    )
+    if not data["melatonin"].empty:
+        data["melatonin"]["calendar_date"] = data["melatonin"]["calendar_date"].astype(str)
+        data["melatonin"]["melatonin_present"] = pd.to_numeric(
+            data["melatonin"]["melatonin_present"], errors="coerce"
+        )
+        data["melatonin"]["melatonin_dose_mg"] = pd.to_numeric(
+            data["melatonin"]["melatonin_dose_mg"], errors="coerce"
         )
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
@@ -945,8 +988,12 @@ def aggregate_activity_categories(whoop_wk: pd.DataFrame, garmin_acts: pd.DataFr
     """Per-behavioral-day 0/1 flags for the activity taxonomy (one column per
     ACT_CATEGORY_COLS).
 
-    run + sauna are AUTO-derived from device sport labels (WHOOP sport_name,
-    Garmin activity_type). The strength tags — coarse split (leg/pull/push) and
+    run is AUTO-derived from device sport labels (WHOOP sport_name, Garmin
+    activity_type). sauna is auto-derived the same way OR set manually via the
+    is_sauna override toggle on the /activities page (WHOOP sometimes logs a sauna
+    under a generic sport, or bundled with another activity) — act_sauna fires if
+    EITHER signal is true. is_sauna replaced the old "Used a sauna?" habit. The
+    strength tags — coarse split (leg/pull/push) and
     granular muscle groups — come from the manual MULTI-select on the lifting
     workout (split_labels / muscle_groups TEXT[]). WHOOP logs all resistance
     training as one generic 'weightlifting_msk' with no muscle-group detail, and
@@ -971,6 +1018,14 @@ def aggregate_activity_categories(whoop_wk: pd.DataFrame, garmin_acts: pd.DataFr
                 bd = bd.fillna(f["calendar_date"])
             return bd.astype(str)
         return f["calendar_date"].astype(str)
+
+    def _bool_col(frame: pd.DataFrame, col: str) -> pd.Series:
+        """Boolean Series for a nullable bool column; all-False when the column is
+        absent (older loader select) or NULL. Used to OR the manual is_sauna
+        override into the auto-detected sauna signal."""
+        if col not in frame.columns:
+            return pd.Series(False, index=frame.index)
+        return frame[col].fillna(False).astype(bool)
 
     def _tag_present(frame: pd.DataFrame, array_col: str, value: str,
                      scalar_col: str | None = None) -> pd.Series:
@@ -1009,7 +1064,8 @@ def aggregate_activity_categories(whoop_wk: pd.DataFrame, garmin_acts: pd.DataFr
         sport = w["sport_name"].astype(str).str.lower()
         is_lift = sport.str.contains(LIFT_RE, regex=True, na=False)
         w["act_run"]   = sport.str.contains("run", na=False).astype(float)
-        w["act_sauna"] = sport.str.contains("sauna", na=False).astype(float)
+        # sauna = auto (sport_name='sauna') OR the manual is_sauna override toggle.
+        w["act_sauna"] = (sport.str.contains("sauna", na=False) | _bool_col(w, "is_sauna")).astype(float)
         _label_strength_tags(w, is_lift)
         frames.append(w.groupby("calendar_date")[ACT_CATEGORY_COLS].max().reset_index())
 
@@ -1023,7 +1079,8 @@ def aggregate_activity_categories(whoop_wk: pd.DataFrame, garmin_acts: pd.DataFr
         gtype = g["activity_type"].astype(str).str.lower()
         g_is_lift = gtype.str.contains(LIFT_RE, regex=True, na=False)
         g["act_run"]   = gtype.str.contains("run", na=False).astype(float)
-        g["act_sauna"] = gtype.str.contains("sauna", na=False).astype(float)
+        # sauna = auto (activity_type~'sauna') OR the manual is_sauna override toggle.
+        g["act_sauna"] = (gtype.str.contains("sauna", na=False) | _bool_col(g, "is_sauna")).astype(float)
         _label_strength_tags(g, g_is_lift)
         frames.append(g.groupby("calendar_date")[ACT_CATEGORY_COLS].max().reset_index())
 
@@ -1329,8 +1386,21 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # every downstream consumer (Spearman/Welch, XGBoost prepare_ml_data, causal
     # AIPW) first drops rows lacking the next-night HRV outcome + HRV-derived
     # confounders, which is exactly the pre-coverage era.
+    # Union the unconditional is_sauna=true override rows into the WHOOP frame used
+    # for the activity taxonomy ONLY (so a hand-flagged sauna that came back
+    # non-SCORED/excluded still reaches act_sauna). Dedup on workout_id keeps the
+    # fully-columned SCORED row when a sauna is both flagged AND scored. The shared
+    # data["whoop_wk"] (strain + gap consumers) is deliberately left filtered.
+    _wk_for_acts = data.get("whoop_wk", pd.DataFrame())
+    _sauna_ovr = data.get("whoop_sauna_override", pd.DataFrame())
+    if not _sauna_ovr.empty:
+        _wk_for_acts = (
+            _sauna_ovr if _wk_for_acts.empty
+            else pd.concat([_wk_for_acts, _sauna_ovr], ignore_index=True)
+                   .drop_duplicates(subset="workout_id", keep="first")
+        )
     act_cat = aggregate_activity_categories(
-        data.get("whoop_wk", pd.DataFrame()), data.get("garmin_acts", pd.DataFrame())
+        _wk_for_acts, data.get("garmin_acts", pd.DataFrame())
     )
     if not act_cat.empty:
         df = df.merge(act_cat, on="calendar_date", how="left", suffixes=("", "_actcat"))
@@ -1421,6 +1491,25 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # journal, and the causal binary auto-enumeration. Meal timing is covered by
     # the meal_* features instead (Notion habit deactivated 2026-06-14).
     df = df.drop(columns=["journal_ate_food_close_to_bedtime"], errors="ignore")
+    # POLICY (Riley, 2026-06-14): the WHOOP journal "Used a sauna?" checkbox is
+    # DROPPED from all HRV analysis. It duplicates the WHOOP sauna ACTIVITY
+    # (whoop_workouts sport_name='sauna' OR the manual is_sauna toggle), surfaced
+    # as act_sauna / days_since_sauna. Going forward sauna is sourced from the
+    # activity, not the habit. Dropping the column here removes it from every
+    # downstream family at once: Stage-1 Spearman, Welch journal_impact, SHAP,
+    # error-modes-by-journal, and the causal binary auto-enumeration. (Notion
+    # habit deactivated 2026-06-14; history preserved. No _lag1 entry existed.)
+    df = df.drop(columns=["journal_used_a_sauna"], errors="ignore")
+    # POLICY (Riley, 2026-06-14): melatonin is handled as a SUPPLEMENT, not a
+    # WHOOP-journal checkbox (duplicative with the /supplements tracker; HAB-39
+    # deactivated). Drop journal_took_a_melatonin_supplement here so it leaves
+    # every journal family at once (Stage-1 Spearman, Welch journal_impact, SHAP,
+    # error-modes-by-journal, causal binary auto-enumeration). The ~288 frozen
+    # observations are NOT lost: they are re-introduced below via the melatonin
+    # bridge (pds.melatonin_unified) as a single supplement-family feature that
+    # carries the history AND the going-forward mg dose. Runs AFTER the post-
+    # cutover 0-fill loop above so that loop never errors on a missing column.
+    df = df.drop(columns=["journal_took_a_melatonin_supplement"], errors="ignore")
 
     # --- Habit pivot ---
     # Habits flow through the same pds.journal view as WHOOP journal entries
@@ -1458,6 +1547,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # non-null floor in prepare_ml_data will drop sparse compounds until
     # tracking history accumulates, so this addition is a no-op for the
     # current model run but plumbs supplements through for the future.
+    supp_tracking_start = None  # set below; referenced by the melatonin bridge
     supp_data = data.get("supplements")
     if supp_data is not None and not supp_data.empty:
         sdf, supp_tracking_start = pivot_supplements(supp_data)
@@ -1469,6 +1559,51 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
                 df.loc[in_window, col] = df.loc[in_window, col].fillna(0)
             log.info(f"  Supplements pivoted: {len(supp_cols)} compound columns "
                      f"(tracking window from {supp_tracking_start})")
+
+    # --- Melatonin: unified journal-history + supplement-dose bridge ---
+    # Counterpart to the journal_took_a_melatonin_supplement drop above. The
+    # bridge view (pds.melatonin_unified) carries the ~288 frozen journal Yes/No
+    # observations spliced with the supplement-tracker mg dose, on the shared
+    # behavioral-day axis. We route it into the SUPPLEMENT family:
+    #   - melatonin_present (binary, history + supplement-override) is merged as
+    #     `supplement_melatonin_amount` so the supplement_*_amount causal scan,
+    #     confounders, and FEATURE_LABELS pick it up, while it stays >5% non-null
+    #     (~49% on the HRV-valid basis) so it never vanishes from the matrix-gated
+    #     families at cutover.
+    #   - melatonin_dose_mg (continuous) is the going-forward mg granularity;
+    #     NaN on days with no logged dose (incl. the whole pre-tracking era) so we
+    #     never fabricate a zero where a journal-Yes night had an unknown dose —
+    #     it reads as a dose-response *among melatonin nights*, registered as a
+    #     continuous supplement treatment in causal_inference.py.
+    # The raw pivot_supplements melatonin column (if any) is dropped first so
+    # there is exactly ONE melatonin column. Only the binary gets the supplement
+    # tracking-window 0-fill; the dose keeps its NaN-where-unknown semantics.
+    mel_data = data.get("melatonin")
+    if mel_data is not None and not mel_data.empty:
+        df = df.drop(columns=["supplement_melatonin_amount"], errors="ignore")
+        mel_bridge = (
+            mel_data[["calendar_date", "melatonin_present", "melatonin_dose_mg"]]
+            .rename(columns={"melatonin_present": "supplement_melatonin_amount"})
+        )
+        df = df.merge(mel_bridge, on="calendar_date", how="left")
+        if supp_tracking_start is not None:
+            _mel_win = df["calendar_date"] >= supp_tracking_start
+            df.loc[_mel_win, "supplement_melatonin_amount"] = (
+                df.loc[_mel_win, "supplement_melatonin_amount"].fillna(0)
+            )
+        # Guards: exactly one melatonin column, and the binary domain is {0,1}
+        # (the causal supplement_*_amount binarizer does NOT range-check its input).
+        assert list(df.columns).count("supplement_melatonin_amount") == 1, \
+            "melatonin bridge produced a duplicate supplement_melatonin_amount column"
+        _mel_dom = set(df["supplement_melatonin_amount"].dropna().unique())
+        assert _mel_dom <= {0.0, 1.0}, f"melatonin binary outside {{0,1}}: {_mel_dom}"
+        FEATURE_LABELS["supplement_melatonin_amount"] = "Melatonin"
+        FEATURE_LABELS["melatonin_dose_mg"] = "Melatonin Dose (mg)"
+        log.info(
+            f"  Melatonin bridge: {int(df['supplement_melatonin_amount'].notna().sum())} "
+            f"binary obs, {int(df['melatonin_dose_mg'].notna().sum())} dose-days "
+            f"(journal history unified with supplement dose)"
+        )
 
     # --- Join Notion personal Journal (mood / confidence / word_count) ---
     # Audit Finding #8: structured journal metadata was previously isolated from
@@ -1776,10 +1911,10 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     j_alcohol_col = next((c for c in df.columns if "alcoholic" in c or c == "journal_have_any_alcoholic_drinks"), None)
     if j_alcohol_col:
         df["days_since_alcohol"] = _days_since(df[j_alcohol_col].fillna(0))
-    # Days since sauna: prefer the robust device-sourced act_sauna (WHOOP
-    # sport_name='sauna') over the optional WHOOP journal "used a sauna" question,
-    # which is frequently unenabled. Fall back to a journal sauna column only if
-    # act_sauna isn't present (e.g. no WHOOP workout data loaded this run).
+    # Days since sauna: read the device-sourced act_sauna (WHOOP sport_name='sauna'
+    # OR the manual is_sauna override toggle), which replaced the WHOOP journal
+    # "Used a sauna?" question (dropped 2026-06-14). Fall back to a journal sauna
+    # column only if act_sauna isn't present (e.g. no WHOOP workout data this run).
     if "act_sauna" in df.columns:
         df["days_since_sauna"] = _days_since(df["act_sauna"].fillna(0))
     else:
