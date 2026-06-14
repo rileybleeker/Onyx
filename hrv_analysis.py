@@ -496,7 +496,9 @@ JOURNAL_LABELS: dict[str, str] = {
     "hydrated_sufficiently": "Hydrated Sufficiently",
     "spent_time_stretching": "Stretching",
     "meditated": "Meditation",
-    "ate_food_close_to_bedtime": "Ate Near Bedtime",
+    # "ate_food_close_to_bedtime" removed 2026-06-14: the WHOOP "ate food close
+    # to bedtime" checkbox is dropped at the journal merge (duplicative) —
+    # meal timing is covered by the Cronometer meal_* features instead.
     "viewed_screen_in_bed": "Screen in Bed",
     "worked_late": "Worked Late",
 }
@@ -1410,6 +1412,15 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # family at once: Stage-1 Spearman, Welch journal_impact, SHAP,
     # error-modes-by-journal, and the causal binary auto-enumeration.
     df = df.drop(columns=["journal_consumed_caffeine"], errors="ignore")
+    # POLICY (Riley, 2026-06-14): the WHOOP journal "Ate food close to bedtime?"
+    # checkbox is DROPPED from all HRV analysis. It duplicates the Cronometer
+    # meal-timing features (meal_last_meal_to_bedtime_min and the other meal_*
+    # columns), which are quantitative and bedtime-anchored rather than a coarse
+    # boolean. Dropping the column here removes it from every downstream family
+    # at once: Stage-1 Spearman, Welch journal_impact, SHAP, error-modes-by-
+    # journal, and the causal binary auto-enumeration. Meal timing is covered by
+    # the meal_* features instead (Notion habit deactivated 2026-06-14).
+    df = df.drop(columns=["journal_ate_food_close_to_bedtime"], errors="ignore")
 
     # --- Habit pivot ---
     # Habits flow through the same pds.journal view as WHOOP journal entries
@@ -1572,8 +1583,11 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # journal_consumed_caffeine removed from this lag list 2026-06-10 — the
     # checkbox is disregarded by policy; caffeine_total_mg_lag1 (below) is the
     # multi-day caffeine signal now.
-    for jcol in ("journal_have_any_alcoholic_drinks",
-                 "journal_ate_food_close_to_bedtime"):
+    # journal_ate_food_close_to_bedtime dropped from this lag list 2026-06-14 —
+    # the checkbox is superseded by the Cronometer meal_* timing features (see
+    # the drop above); journal_have_any_alcoholic_drinks_lag1 stays (causal
+    # confounder for the supplement family).
+    for jcol in ("journal_have_any_alcoholic_drinks",):
         if jcol in df.columns:
             df[f"{jcol}_lag1"] = df[jcol].shift(1)
 
