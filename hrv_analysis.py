@@ -1452,28 +1452,18 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         jdf = pivot_journal(data["journal"])
         if not jdf.empty:
             df = df.merge(jdf, on="calendar_date", how="left")
-            # Post-cutover fill (WHOOP journal → habits merge, 2026-06-11):
-            # the in-app WHOOP journal was replaced by habit-channel logging,
-            # which writes a row only when tapped. From 2026-06-09 onward
-            # (the first behaviors-day after the final export — whose coverage
-            # ends at behaviors-day 2026-06-07; 2026-06-08 has no data and
-            # deliberately stays NaN) a missing answer means "yes was not
-            # marked = No" (Riley, 2026-06-11), so fill 0. Without this, every
-            # journal_* Welch No-arm would freeze at the cutover, Spearman/
-            # XGBoost would see permanent NaN on un-tapped days, and the
-            # journal_have_any_alcoholic_drinks_lag1 causal confounder would
-            # go missing exactly where supplement tracking is densest.
-            # Only questions still ACTIVE at the cutover are filled — zeroing
-            # the ~29 retired questions would manufacture fake "No" days for
-            # behaviors Riley no longer tracks at all.
-            _journal_cols = [c for c in jdf.columns if c != "calendar_date"]
-            _active_jcols = [
-                c for c in _journal_cols
-                if jdf.loc[jdf["calendar_date"] >= "2026-06-01", c].notna().any()
-            ]
-            _post_cutover = df["calendar_date"] >= "2026-06-09"
-            for _jcol in _active_jcols:
-                df.loc[_post_cutover, _jcol] = df.loc[_post_cutover, _jcol].fillna(0)
+            # POLICY (Riley, 2026-07-19): unlogged days stay NaN — no 0-fill.
+            # This REVERSES the 2026-06-11 post-cutover missing=No fill, which
+            # predated reliable explicit-No capture: back then a habit channel
+            # could only write a row on tap, so absence was the only "No"
+            # available. With tri-state answers (explicit Yes/No rows, incl.
+            # backdated grids), a missing row now means "not logged = unknown",
+            # and zero-filling it would manufacture fake No days for every gap
+            # week Riley didn't log. Explicit No rows still map to 0.0 via
+            # pivot_journal's is_yes. Consequences accepted with the change:
+            # Welch No-arms, Spearman coverage, and causal confounders draw
+            # only on explicitly answered days post-cutover, so families with
+            # sparse explicit answers shrink until logging accumulates.
     # POLICY (Riley, 2026-06-10): the WHOOP journal "Consumed caffeine?"
     # checkbox is DISREGARDED for all caffeine analysis. Two of its ~50 "No"
     # nights carried 800-1000 mg of logged caffeine, and the unified event
@@ -1507,8 +1497,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # error-modes-by-journal, causal binary auto-enumeration). The ~288 frozen
     # observations are NOT lost: they are re-introduced below via the melatonin
     # bridge (pds.melatonin_unified) as a single supplement-family feature that
-    # carries the history AND the going-forward mg dose. Runs AFTER the post-
-    # cutover 0-fill loop above so that loop never errors on a missing column.
+    # carries the history AND the going-forward mg dose.
     df = df.drop(columns=["journal_took_a_melatonin_supplement"], errors="ignore")
 
     # --- Habit pivot ---
@@ -1517,13 +1506,12 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # downstream analyses can break them out separately from WHOOP behaviors.
     # Labels are populated dynamically from the Notion-managed habit names.
     #
-    # Tracking-window semantics (mirrors pivot_supplements): a habit_journal
-    # row only exists for dates Riley logged a completion, so a NaN after the
-    # merge means "no completion logged" — which behaviorally is "did NOT do
-    # the habit that day", i.e. should be 0 for the t-test/correlation. We
-    # fill per-habit from the first completion forward; rows *before* a
-    # habit's first completion stay NaN so we don't manufacture "No"s for
-    # a habit that didn't exist yet.
+    # POLICY (Riley, 2026-07-19): unlogged days stay NaN — the per-habit
+    # first-completion-forward 0-fill is removed (same reversal as the
+    # journal_* fill above). A habit_journal row exists only where Riley
+    # answered: explicit Yes → 1.0, explicit No → 0.0 (via is_yes), no row →
+    # NaN = "not logged = unknown". XGBoost handles NaN natively; the Welch
+    # t-test No-arm and Spearman coverage now count only explicit answers.
     existing_habit = [c for c in df.columns if c.startswith("habit_")]
     if not existing_habit and not data["journal"].empty:
         hdf, habit_label_map = pivot_habits(data["journal"])
@@ -1531,12 +1519,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
             df = df.merge(hdf, on="calendar_date", how="left")
             HABIT_LABELS.update(habit_label_map)
             FEATURE_LABELS.update(habit_label_map)
-            habit_cols = list(habit_label_map.keys())
             df = df.sort_values("calendar_date").reset_index(drop=True)
-            for hcol in habit_cols:
-                first_done_idx = df[hcol].first_valid_index()
-                if first_done_idx is not None:
-                    df.loc[first_done_idx:, hcol] = df.loc[first_done_idx:, hcol].fillna(0)
             log.info(f"  Habits pivoted: {len(habit_label_map)} habit columns "
                      f"({', '.join(habit_label_map.values())})")
 
@@ -1907,7 +1890,10 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         if "whoop_kilojoule" in df.columns:
             df["net_calories"] = df["nutrition_calories"] - (df["whoop_kilojoule"] / 4.184).fillna(0)
 
-    # Journal-derived "days since" features
+    # Journal-derived "days since" features. The fillna(0) here is counter
+    # mechanics only — _days_since needs a dense series, so this reads as
+    # "days since last KNOWN alcohol day". It does not re-assert missing=No
+    # for the treatment column itself, which stays NaN upstream (2026-07-19).
     j_alcohol_col = next((c for c in df.columns if "alcoholic" in c or c == "journal_have_any_alcoholic_drinks"), None)
     if j_alcohol_col:
         df["days_since_alcohol"] = _days_since(df[j_alcohol_col].fillna(0))
@@ -1945,9 +1931,11 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # by short sleep, late caffeine blunts post-strain recovery, hot bedroom
     # shortens deep sleep, ATL/CTL ratio matters more when HRV baseline is low.
     def _has(*cols): return all(c in df.columns for c in cols)
+    # Unlogged journal days stay NaN in the interaction (policy 2026-07-19) —
+    # NaN * sleep = NaN, mirroring strain_x_caffeine's where(notna()) pattern.
     if _has("journal_have_any_alcoholic_drinks", "whoop_sleep_duration_milli"):
         df["alcohol_x_sleep_duration"] = (
-            df["journal_have_any_alcoholic_drinks"].fillna(0) *
+            df["journal_have_any_alcoholic_drinks"] *
             df["whoop_sleep_duration_milli"]
         )
     # Repointed 2026-06-10 from the disregarded WHOOP caffeine checkbox to the
