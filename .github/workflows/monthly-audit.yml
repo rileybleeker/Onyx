@@ -40,15 +40,18 @@ jobs:
             resp=$(gh api "repos/${{ github.repository }}/actions/runs?per_page=100&created=>${since}&page=${page}")
             n=$(echo "$resp" | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('workflow_runs', [])))")
             if [ "$n" -eq 0 ]; then break; fi
+            # The -c program must sit at the block-scalar baseline (10 spaces):
+            # extra indentation reaches Python and raises IndentationError
+            # (this failed every run until 2026-10).
             echo "$resp" | python -c "
-            import sys, json
-            for r in json.load(sys.stdin)['workflow_runs']:
-                print(json.dumps({'name': r['name'], 'conclusion': r['conclusion'],
-                                  'event': r['event'], 'created_at': r['created_at'],
-                                  'run_started_at': r.get('run_started_at'),
-                                  'updated_at': r['updated_at'],
-                                  'workflow_id': r['workflow_id']}))
-            " >> audit/all_runs.jsonl
+          import sys, json
+          for r in json.load(sys.stdin)['workflow_runs']:
+              print(json.dumps({'name': r['name'], 'conclusion': r['conclusion'],
+                                'event': r['event'], 'created_at': r['created_at'],
+                                'run_started_at': r.get('run_started_at'),
+                                'updated_at': r['updated_at'],
+                                'workflow_id': r['workflow_id']}))
+          " >> audit/all_runs.jsonl
             page=$((page + 1))
             if [ "$page" -gt 30 ]; then break; fi  # safety cap
           done

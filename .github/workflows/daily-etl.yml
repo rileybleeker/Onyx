@@ -4,7 +4,12 @@ on:
   schedule:
     # Every hour at :00
     - cron: '0 * * * *'
-  workflow_dispatch: # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Lookback window in days (raise for catch-up after an outage)'
+        type: number
+        default: 7
 
 concurrency:
   group: hourly-etl
@@ -27,7 +32,7 @@ jobs:
       - name: Download Garmin tokens
         run: python ci_token_helper.py download garmin
       - name: Run Garmin ETL
-        run: python garmin_etl.py --days 7
+        run: python garmin_etl.py --days ${{ inputs.days || 7 }}
         env:
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
@@ -47,7 +52,7 @@ jobs:
       - name: Download WHOOP tokens
         run: python ci_token_helper.py download whoop
       - name: Run WHOOP ETL
-        run: python whoop_etl.py --days 7
+        run: python whoop_etl.py --days ${{ inputs.days || 7 }}
         env:
           WHOOP_CLIENT_ID: ${{ secrets.WHOOP_CLIENT_ID }}
           WHOOP_CLIENT_SECRET: ${{ secrets.WHOOP_CLIENT_SECRET }}

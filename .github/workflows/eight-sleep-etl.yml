@@ -4,7 +4,12 @@ on:
   schedule:
     # 19:00 UTC = 3:00 PM EDT (3 PM Eastern during DST, 2 PM EST in winter)
     - cron: '0 19 * * *'
-  workflow_dispatch: # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Lookback window in days (raise for catch-up after an outage)'
+        type: number
+        default: 7
 
 concurrency:
   group: eight-sleep-etl
@@ -25,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: pip install httpx supabase python-dotenv
       - name: Run Eight Sleep ETL
-        run: python eight_sleep_etl.py --days 7
+        run: python eight_sleep_etl.py --days ${{ inputs.days || 7 }}
         env:
           EIGHTSLEEP_EMAIL: ${{ secrets.EIGHTSLEEP_EMAIL }}
           EIGHTSLEEP_PASSWORD: ${{ secrets.EIGHTSLEEP_PASSWORD }}
