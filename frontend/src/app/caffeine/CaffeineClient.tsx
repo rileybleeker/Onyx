@@ -87,12 +87,38 @@ function fmtHourTick(h: number): string {
 
 import type { CaffeineInitial } from "./CaffeineLoader";
 
-export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | null }) {
+const DEFAULT_DAYS = 60;
+const DEFAULT_HRV_DAYS = 90;
+const DEFAULT_QUALITY_DAYS = 45;
+
+/**
+ * Optional `?days=N` window override (7–730). The page has no range picker;
+ * this exists so a wider window can be inspected after a logging pause (and so
+ * the smoke suite can verify the charts against real historical rows instead
+ * of skipping when the default window is empty). Read from window.location
+ * because this chunk is dynamic(ssr:false) — no Suspense boundary needed.
+ */
+function windowDaysFromUrl(): number {
+  if (typeof window === "undefined") return DEFAULT_DAYS;
+  const raw = new URLSearchParams(window.location.search).get("days");
+  const n = raw ? Number.parseInt(raw, 10) : NaN;
+  if (!Number.isFinite(n)) return DEFAULT_DAYS;
+  return Math.min(730, Math.max(7, n));
+}
+
+export default function CaffeinePage({ initial: initialProp }: { initial?: CaffeineInitial | null }) {
   // Server-prefetched initial data (ISR, fixed 60/90/45-day windows) seeds the
   // charts so they paint immediately; the mount effect still runs as a SILENT
   // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
   // stale — single-user traffic means the morning's first visit usually
   // lands on a cache regenerated last evening.
+  //
+  // With a `?days=` override the ISR seed describes the WRONG window, so it is
+  // discarded and the mount fetch runs as a normal (skeleton) load.
+  const [windowDays] = useState<number>(windowDaysFromUrl);
+  const hrvDays = Math.max(DEFAULT_HRV_DAYS, windowDays);
+  const qualityDays = Math.max(DEFAULT_QUALITY_DAYS, windowDays);
+  const initial = windowDays === DEFAULT_DAYS ? initialProp : null;
   const [daily, setDaily] = useState<CaffeineDailyRow[]>(initial?.daily ?? []);
   const [hrvPairs, setHrvPairs] = useState<CaffeineHrvPair[]>(initial?.hrvPairs ?? []);
   const [quality, setQuality] = useState<CaffeineQualityFlag[]>(initial?.quality ?? []);
@@ -108,7 +134,7 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
     const silent = firstRunWithInitial.current;
     firstRunWithInitial.current = false;
     if (!silent) setLoading(true);
-    Promise.all([getCaffeineDaily(60), getCaffeineHrvPairs(90), getCaffeineDataQuality(45)])
+    Promise.all([getCaffeineDaily(windowDays), getCaffeineHrvPairs(hrvDays), getCaffeineDataQuality(qualityDays)])
       .then(([d, p, q]) => {
         if (cancelled) return;
         // sameJson bail-out: the silent revalidation's data is usually
@@ -123,7 +149,7 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
         if (!cancelled && !silent) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, []);
+  }, [windowDays, hrvDays, qualityDays]);
 
   // ─── KPI derivations ────────────────────────────────────────────────────
   const latest = daily[daily.length - 1];
@@ -222,7 +248,7 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Caffeine</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Intake, timing windows &amp; next-night HRV — supplements + Cronometer dietary — last 60 days
+            Intake, timing windows &amp; next-night HRV — supplements + Cronometer dietary — last {windowDays} days
           </p>
         </div>
       </div>
@@ -301,7 +327,7 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
           {/* ─── Daily intake, stacked by channel ────────────────────────── */}
           <ChartCard
             title="Daily Caffeine Intake"
-            subtitle="mg per behavioral day, dietary (Cronometer) vs supplement (Onyx) stacked · last 60 days"
+            subtitle={`mg per behavioral day, dietary (Cronometer) vs supplement (Onyx) stacked · last ${windowDays} days`}
             source="CRONOMETER + SUPPLEMENTS"
             info="Days with no logged caffeine are omitted (no row in the view). The amber line is the FDA's 400 mg/day guidance for healthy adults."
           >
@@ -411,7 +437,7 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <ChartCard
                 title="Total Caffeine vs Next-Night HRV"
-                subtitle="one point per day · last 90 days"
+                subtitle={`one point per day · last ${hrvDays} days`}
                 source="SUPPLEMENTS + CRONOMETER + WHOOP"
                 confidence={{ n: scatterData.length }}
               >
@@ -449,7 +475,7 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
 
               <ChartCard
                 title="Late vs Early Last Dose"
-                subtitle="mean next-night HRV by last-dose→bedtime gap · last 90 days"
+                subtitle={`mean next-night HRV by last-dose→bedtime gap · last ${hrvDays} days`}
                 source="SUPPLEMENTS + CRONOMETER + WHOOP"
               >
                 <div className="grid grid-cols-2 gap-3">
@@ -491,13 +517,13 @@ export default function CaffeinePage({ initial }: { initial?: CaffeineInitial | 
           {/* ─── Data quality ─────────────────────────────────────────────── */}
           <ChartCard
             title="Data Quality"
-            subtitle="retro-logged timestamps + cross-channel double-log checks · last 45 days"
+            subtitle={`retro-logged timestamps + cross-channel double-log checks · last ${qualityDays} days`}
             source="CRONOMETER + SUPPLEMENTS"
             info="Each flag marks a day worth a second look — resolving them sharpens every chart above and the HRV analysis. Retro-logs keep their mg but their timestamps are quarantined from timing features."
           >
             {quality.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
-                No data-quality flags in the last 45 days.
+                No data-quality flags in the last {qualityDays} days.
               </p>
             ) : (
               <ul className="divide-y divide-border-subtle">

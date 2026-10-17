@@ -408,6 +408,48 @@ for (const p of PAGES) {
 }
 
 // ---------------------------------------------------------------------------
+// /caffeine with REAL rows: the default 60-day window is legitimately empty
+// during a logging pause (the PAGES entry above skips), so this widens the
+// window via the page's `?days=` override to a range that holds the recorded
+// May–July 2026 caffeine days and asserts the intake chart actually draws.
+// Verifies rendering against real data without fabricating any. If this ever
+// skips too, there is no quantitative caffeine data in ~2 years — investigate.
+// ---------------------------------------------------------------------------
+test.describe("Caffeine — renders real historical rows", () => {
+  test("/caffeine?days=720 draws intake bars and shows no empty-state", async ({ page }) => {
+    await gotoAuthed(page, "/caffeine?days=720", /\/caffeine\?days=720/);
+    await settle(page);
+    await expect(
+      page.getByText("Caffeine", { exact: true }).first()
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    // Wait for the non-silent fetch to land (the ISR seed is discarded for a
+    // non-default window, so the page goes skeleton → data).
+    await expect(
+      page.getByText("No caffeine days in the database yet."),
+      "no caffeine rows in a 720-day window"
+    ).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+    await expect(
+      page.getByText("last 720 days").first(),
+      "window override did not apply"
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    const mgChart = page
+      .locator("div.bg-surface-card")
+      .filter({ has: page.getByText("Daily Caffeine Intake", { exact: false }) })
+      .first();
+    await expect(mgChart.locator(RECHARTS_SVG).first(), "intake chart did not render")
+      .toBeVisible({ timeout: LOAD_TIMEOUT });
+    expect(
+      await mgChart.locator(RECHARTS_MARKS).count(),
+      "intake chart drew no bars"
+    ).toBeGreaterThan(0);
+
+    await expectNoClientCrash(page);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Shared chrome (Stage 3): the mobile bottom tab bar must mount on a phone-sized
 // viewport (primary nav surface) and stay hidden on desktop (where the Sidebar
 // is primary). Targets data-testid, not classes/colors, so it survives restyles.
