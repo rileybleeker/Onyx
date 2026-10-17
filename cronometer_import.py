@@ -483,11 +483,15 @@ def run_import(paths: list[str], dry_run: bool = False) -> tuple[int, int]:
             scount = import_servings(srows, dry_run)
             print(f"  servings: {scount} entries {'(dry-run)' if dry_run else 'imported'}"
                   f"{' from ' + os.path.basename(servings_path) if servings_path else ' (no file)'}")
-            if sb and srows:
-                dr = sorted({r["calendar_date"] for r in srows})
+            # Heartbeat on EVERY run, including a zero-row export (no food logged
+            # in the window). Without this the /status card read "no heartbeat
+            # since July" while the workflow itself was green (2026-10-17).
+            if sb:
+                dr = sorted({r["calendar_date"] for r in srows}) if srows else []
                 log_sync(sb, "cronometer", "servings", "success", records=scount,
-                         started_at=t0, date_range_start=date.fromisoformat(dr[0]),
-                         date_range_end=date.fromisoformat(dr[-1]))
+                         started_at=t0,
+                         date_range_start=date.fromisoformat(dr[0]) if dr else None,
+                         date_range_end=date.fromisoformat(dr[-1]) if dr else None)
         except Exception as e:  # noqa: BLE001
             if sb:
                 log_sync(sb, "cronometer", "servings", "error", error=str(e)[:500], started_at=t0)
@@ -500,11 +504,12 @@ def run_import(paths: list[str], dry_run: bool = False) -> tuple[int, int]:
             dcount = import_daily(drows, dry_run)
             print(f"  daily:    {dcount} days   {'(dry-run)' if dry_run else 'imported'}"
                   f"{' from ' + os.path.basename(daily_path) if daily_path else ' (no file)'}")
-            if sb and drows:
-                dd = sorted(r["calendar_date"] for r in drows)
+            if sb:
+                dd = sorted(r["calendar_date"] for r in drows) if drows else []
                 log_sync(sb, "cronometer", "daily", "success", records=dcount,
-                         started_at=t1, date_range_start=date.fromisoformat(dd[0]),
-                         date_range_end=date.fromisoformat(dd[-1]))
+                         started_at=t1,
+                         date_range_start=date.fromisoformat(dd[0]) if dd else None,
+                         date_range_end=date.fromisoformat(dd[-1]) if dd else None)
         except Exception as e:  # noqa: BLE001
             if sb:
                 log_sync(sb, "cronometer", "daily", "error", error=str(e)[:500], started_at=t1)

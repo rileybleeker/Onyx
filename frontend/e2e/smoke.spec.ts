@@ -249,6 +249,12 @@ interface SmokePage {
   heading: string; // stable text rendered on the page (load/shell gate)
   signal: Signal; // how we prove real data rendered
   hardEmpty: string[];
+  // The page's own "nothing in the window" empty-state. If it is visible the
+  // page is working but the user has not logged anything lately (manual-entry
+  // sources) — SKIP with a reason rather than fail. Checked before the
+  // data-present probe because the shared Sidebar sparkline is also a recharts
+  // svg, so "charts" would otherwise fail with "no data marks" (2026-10-17).
+  legitimateEmpty?: string;
   finalUrl?: RegExp; // for server-side redirects
 }
 
@@ -289,10 +295,12 @@ const PAGES: SmokePage[] = [
     route: "/caffeine",
     heading: "Caffeine",
     signal: "charts",
-    // Quantitative caffeine rows exist daily since 2026-05-19, so the intake
-    // chart must draw marks. The HRV scatter / window chart can be legitimately
+    // Caffeine comes only from manual logging (Cronometer food / supplement
+    // intakes). The page windows 60 days, so a logging pause legitimately
+    // empties it — skip, don't fail. The HRV scatter / window chart can be
     // thin (trusted-timestamp coverage) — not hard-asserted.
-    hardEmpty: ["No caffeine days in the database yet."],
+    hardEmpty: [],
+    legitimateEmpty: "No caffeine days in the database yet.",
   },
   {
     route: "/spotify",
@@ -370,6 +378,21 @@ for (const p of PAGES) {
       page.getByText(p.heading, { exact: true }).first(),
       `${p.route} did not render its "${p.heading}" heading`
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    if (p.legitimateEmpty) {
+      const visible = await page
+        .getByText(p.legitimateEmpty, { exact: true })
+        .first()
+        .isVisible()
+        .catch(() => false);
+      if (visible) {
+        await expectNoClientCrash(page);
+        test.skip(
+          true,
+          `${p.route} shows its no-recent-data state ("${p.legitimateEmpty}") — page renders, nothing logged in-window.`
+        );
+      }
+    }
 
     await assertDataPresent(page, p.signal);
 

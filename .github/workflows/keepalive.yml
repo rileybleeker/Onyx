@@ -1,0 +1,32 @@
+name: Workflow Keepalive
+
+# GitHub disables every scheduled workflow after 60 days without a push to the
+# repo (it did so on 2026-09-18; nothing synced until 2026-10-03). Re-enabling a
+# workflow through the Actions API resets that clock without needing a dummy
+# commit, so this runs weekly and touches every workflow in the repo. It is
+# itself a scheduled workflow, so it keeps itself alive too.
+
+on:
+  schedule:
+    - cron: "0 12 * * 1"  # Mondays 12:00 UTC
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-enable every workflow (resets the 60-day inactivity clock)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ids=$(gh api "repos/${REPO}/actions/workflows?per_page=100" --jq '.workflows[] | select(.state != "deleted") | "\(.id)\t\(.name)\t\(.state)"')
+          echo "$ids"
+          echo "$ids" | while IFS=$'\t' read -r id name state; do
+            gh api -X PUT "repos/${REPO}/actions/workflows/${id}/enable" >/dev/null
+            echo "enabled: ${name} (was ${state})"
+          done
