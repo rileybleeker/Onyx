@@ -118,6 +118,8 @@ python tanita_etl.py --auth             # One-time Health Planet OAuth bootstrap
 python tanita_etl.py --inspect          # Print newest raw measurement (timestamp TZ verification)
 python tanita_etl.py                    # Sync last 14 days of Tanita weigh-ins
 python tanita_etl.py --backfill N       # Backfill N days (paged in <=80-day API windows)
+gh workflow run tanita-etl.yml -f days=120      # Same backfill from Actions (local box has no .env)
+gh workflow run cronometer-etl.yml -f days=125  # Wide-window Cronometer re-import from Actions
 
 # Cronometer (automated web-export ETL — runs 2x daily via GitHub Actions)
 python cronometer_etl.py --auth         # One-time bootstrap: fresh login + 1-day export, validates creds/flow
