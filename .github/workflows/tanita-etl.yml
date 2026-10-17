@@ -10,7 +10,12 @@ on:
     #  30 17 →  1:30 PM EDT / 12:30 PM EST
     - cron: '0 14 * * *'
     - cron: '30 17 * * *'
-  workflow_dispatch: # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Window in days (backfill); default 30 for Cronometer, 14 for Tanita'
+        required: false
+        type: string
 
 concurrency:
   group: tanita-etl
@@ -35,7 +40,7 @@ jobs:
         run: python ci_token_helper.py download tanita
 
       - name: Run Tanita ETL
-        run: python tanita_etl.py
+        run: python tanita_etl.py ${{ inputs.days && format('--backfill {0}', inputs.days) || '' }}
         env:
           TANITA_CLIENT_ID: ${{ secrets.TANITA_CLIENT_ID }}
           TANITA_CLIENT_SECRET: ${{ secrets.TANITA_CLIENT_SECRET }}

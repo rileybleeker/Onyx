@@ -13,7 +13,12 @@ on:
   schedule:
     - cron: '30 2 * * *'
     - cron: '0 16 * * *'
-  workflow_dispatch: # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Window in days (backfill); default 30 for Cronometer, 14 for Tanita'
+        required: false
+        type: string
 
 concurrency:
   group: cronometer-etl
@@ -38,7 +43,7 @@ jobs:
         run: python ci_token_helper.py download cronometer
 
       - name: Run Cronometer ETL
-        run: python cronometer_etl.py --days 30
+        run: python cronometer_etl.py --days ${{ inputs.days || 30 }}
         env:
           CRONOMETER_EMAIL: ${{ secrets.CRONOMETER_EMAIL }}
           CRONOMETER_PASSWORD: ${{ secrets.CRONOMETER_PASSWORD }}
