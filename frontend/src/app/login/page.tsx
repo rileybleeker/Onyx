@@ -34,7 +34,8 @@ export default function LoginPage() {
       }
       // Return to the page that sent us here (middleware adds ?next=), e.g. the Agents chat; same-origin paths only.
       const next = new URLSearchParams(window.location.search).get("next") || "";
-      router.replace(/^\/(?![\/\])/.test(next) && !next.startsWith("/login") ? next : "/status");
+      const safe = next.startsWith("/") && !next.startsWith("//") && !next.startsWith("/\\") && !next.startsWith("/login");
+      router.replace(safe ? next : "/status");
       router.refresh();
       return;
     }
