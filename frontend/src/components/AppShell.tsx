@@ -13,6 +13,18 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     return <>{children}</>;
   }
 
+  // The Agents chat is a full-screen conversation (like a thread in Messages): its own header and composer,
+  // no mobile top bar or tab bar. The desktop sidebar stays.
+  if (pathname.startsWith("/agents")) {
+    return (
+      <>
+        <Sidebar />
+        {children}
+        <CommandPalette />
+      </>
+    );
+  }
+
   return (
     <>
       <Sidebar />

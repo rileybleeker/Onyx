@@ -98,7 +98,7 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  // Excluded beyond Next statics: manifest.json (the PWA manifest is fetched
+  // Excluded beyond Next statics: sw.js (the push service worker; static, no data) and manifest.json (the PWA manifest is fetched
   // credential-less, so auth can never succeed — it was being 307'd to /login)
   // and ico/woff2 assets. api/habits is INTENTIONALLY NOT excluded anymore:
   // middleware must run on it to enforce the session-or-CI-token check (the CI
@@ -106,6 +106,6 @@ export const config = {
   // exclude any /api route — middleware is the sole authentication boundary for
   // the service-role API routes.
   matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|manifest.json|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico|woff2?)$).*)",
+    "/((?!_next/static|_next/image|favicon.ico|manifest.json|sw.js|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico|woff2?)$).*)",
   ],
 };

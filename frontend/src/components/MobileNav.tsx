@@ -43,7 +43,7 @@ export default function MobileNav() {
     { key: "today", label: "Today", icon: House, href: "/sleep", isActive: pathname === "/sleep" },
     { key: "trends", label: "Trends", icon: BarChart3, href: "/analytics/hrv", isActive: pathname.startsWith("/analytics") },
     { key: "log", label: "Log", icon: Plus, action: () => setLogOpen(true), isActive: logOpen },
-    { key: "chat", label: "Chat", icon: MessageSquare, href: "/chat", isActive: pathname === "/chat" },
+    { key: "chat", label: "Chat", icon: MessageSquare, href: "/agents", isActive: pathname.startsWith("/agents") },
     { key: "more", label: "More", icon: Menu, action: () => setDrawerOpen(true), isActive: drawerOpen },
   ];
 

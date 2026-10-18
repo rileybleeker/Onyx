@@ -13,6 +13,7 @@ import {
   Music,
   MessageSquare,
   ShieldCheck,
+  Bot,
 } from "lucide-react";
 
 /**
@@ -63,7 +64,8 @@ export const NAV_SECTIONS: NavSection[] = [
   {
     title: "Tools",
     items: [
-      { href: "/chat", label: "Chat", shortcut: "C", icon: MessageSquare, keywords: ["ask", "claude", "assistant", "query"] },
+      { href: "/agents", label: "Agents", shortcut: "G", icon: Bot, keywords: ["chat", "messages", "briefing", "approvals", "leads", "reminders", "inbox", "notifications"] },
+      { href: "/chat", label: "Health Q&A", shortcut: "C", icon: MessageSquare, keywords: ["ask", "claude", "assistant", "query", "chat"] },
       { href: "/status", label: "Status", shortcut: "U", icon: ShieldCheck, keywords: ["system", "sync", "etl", "health", "freshness"] },
     ],
   },
