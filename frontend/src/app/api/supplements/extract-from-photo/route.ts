@@ -11,7 +11,7 @@ const supabase = createClient(
   { db: { schema: "pds" } },
 );
 
-const MODEL = "claude-sonnet-4-20250514";
+const MODEL = "claude-sonnet-5-5";
 
 // Cap reference list at ~120 entries so the prompt stays small. The full DSLD
 // universe is larger but the user's library is the realistic intersection.
