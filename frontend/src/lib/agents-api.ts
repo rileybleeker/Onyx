@@ -24,12 +24,35 @@ export interface AgentMessage {
   body: string;
   cards: AgentCard[] | null;
   created_at: string; // UTC "YYYY-MM-DD HH:MM:SS"
+  thread: string; // conversation: an agent name, "briefing" or "onyx"
 }
+
+/** Where a card stands on the server: open = still needs Riley. */
+export type CardState = "open" | "approve" | "decline" | "answer" | "complete" | "closed" | "expired";
 
 export interface MessagesResponse {
   messages: AgentMessage[];
   lastRead: number;
   typing: boolean;
+  cardStates: Record<string, CardState>;
+}
+
+export interface ThreadSummary {
+  id: string;
+  last: { id: number; role: "user" | "assistant"; preview: string; created_at: string };
+  unread: number;
+  open: number;
+}
+
+export type InboxItem =
+  | { kind: "card"; thread: string; messageId: number; created_at: string; card: AgentCard }
+  | { kind: "message"; thread: string; messageId: number; created_at: string; body: string };
+
+export interface InboxResponse {
+  threads: ThreadSummary[];
+  items: InboxItem[];
+  badge: number;
+  typing: string | null;
 }
 
 export class AuthError extends Error {}
@@ -64,15 +87,19 @@ async function call<T>(path: string, init: RequestInit = {}, retried = false): P
 }
 
 export const agentsApi = {
-  messages: (q: { after?: number; before?: number; limit?: number } = {}) => {
+  messages: (q: { after?: number; before?: number; limit?: number; thread?: string } = {}) => {
     const p = new URLSearchParams();
+    if (q.thread) p.set("thread", q.thread);
     if (q.after) p.set("after", String(q.after));
     if (q.before) p.set("before", String(q.before));
     if (q.limit) p.set("limit", String(q.limit));
     return call<MessagesResponse>(`/onyx/messages?${p}`);
   },
-  send: (text: string) => call<{ message: AgentMessage }>("/onyx/send", { method: "POST", body: JSON.stringify({ text }) }),
-  read: (id: number) => call<{ ok: boolean }>("/onyx/read", { method: "POST", body: JSON.stringify({ id }) }),
+  inbox: () => call<InboxResponse>("/onyx/inbox"),
+  send: (text: string, thread?: string) => call<{ message: AgentMessage }>("/onyx/send", { method: "POST", body: JSON.stringify({ text, thread }) }),
+  /** Mark one conversation read up to `id`; `all` marks every conversation. Returns the new unread count. */
+  read: (id: number, opts: { thread?: string; all?: boolean } = {}) =>
+    call<{ ok: boolean; badge: number }>("/onyx/read", { method: "POST", body: JSON.stringify({ id, ...opts }) }),
   subscribe: (sub: PushSubscriptionJSON) => call<{ ok: boolean; pushed: number }>("/onyx/subscribe", { method: "POST", body: JSON.stringify(sub) }),
   config: async (): Promise<{ vapidPublicKey: string | null }> => {
     const res = await fetch(`${AGENTS_API}/onyx/config`, { cache: "no-store" });
@@ -132,4 +159,10 @@ export async function refreshPushSubscription(): Promise<void> {
   const reg = await registerServiceWorker();
   const sub = await reg?.pushManager.getSubscription();
   if (sub) await agentsApi.subscribe(sub.toJSON()).catch(() => {});
+}
+
+/** Home-screen icon badge = what the Unread list shows. */
+export function setBadge(n: number): void {
+  const nav = navigator as unknown as { setAppBadge?: (n: number) => Promise<void>; clearAppBadge?: () => Promise<void> };
+  (n > 0 ? nav.setAppBadge?.(n) : nav.clearAppBadge?.())?.catch(() => {});
 }
