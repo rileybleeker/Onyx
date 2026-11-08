@@ -28,7 +28,8 @@ const TOKEN_FILE = join(homedir(), ".onyx_ci_token");
 const PROFILE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "Onyx", "kindle-harvest-profile");
 const LOG = join(HERE, "harvest.log");
 const STATE = join(HERE, "state.json");
-const LOGIN_MODE = process.argv.includes("--login");
+const PROBE = process.argv.includes("--probe"); // 20-second look at the page + screenshot, for debugging sign-in
+const LOGIN_MODE = process.argv.includes("--login") || PROBE;
 const DRY = process.argv.includes("--dry-run");
 
 let state = { lastRun: null, books: {} };
@@ -142,21 +143,37 @@ try {
   await page.waitForTimeout(2000);
 
   if (LOGIN_MODE) {
-    log("LOGIN: sign in to Amazon in the Chrome window. Waiting up to 10 minutes for the Notebook library…");
-    const deadline = Date.now() + 10 * 60_000;
-    while (Date.now() < deadline) {
-      if (await page.locator(".kp-notebook-library-each-book").first().isVisible({ timeout: 1000 }).catch(() => false)) break;
-      await page.waitForTimeout(2000);
+    log("LOGIN: sign in to Amazon in the Chrome window. Waiting up to 10 minutes for the Notebook page…");
+    // Signed in = back on /notebook, no sign-in form, and the Notebook app shell rendered. An EMPTY
+    // library (nothing highlighted yet) is a valid signed-in state, so don't require a book entry.
+    const signedIn = async () =>
+      /read\.amazon\.com\/notebook/i.test(page.url()) &&
+      !(await signedOut(page)) &&
+      // count(), not isVisible(): the first kp-notebook-* match is often a hidden input.
+      (await page.locator("[id^='kp-notebook'], [class*='kp-notebook']").count().catch(() => 0)) > 0;
+    const deadline = Date.now() + (PROBE ? 20_000 : 10 * 60_000);
+    let ok = false;
+    while (Date.now() < deadline && !(ok = await signedIn())) await page.waitForTimeout(2000);
+    const books = ok ? await page.locator(".kp-notebook-library-each-book").count() : 0;
+    log(ok ? `LOGIN OK — profile saved; ${books} book(s) in the Kindle library; scheduled runs will reuse it.` : "LOGIN not completed; run --login again.");
+    // Diagnostics for a failed/probe run: where did Chrome end up, and what does the page say?
+    if (!ok || PROBE) {
+      const title = await page.title().catch(() => "?");
+      const kp = await page.locator("[id^='kp-notebook'], [class*='kp-notebook']").count().catch(() => -1);
+      log(`DIAG url=${page.url()} title="${title}" signedOut=${await signedOut(page)} kpNotebookEls=${kp}`);
+      await page.screenshot({ path: join(HERE, "probe.png"), fullPage: false }).catch((e) => log(`screenshot failed: ${e.message}`));
+      log(`DIAG screenshot -> ${join(HERE, "probe.png")}`);
     }
-    const ok = await page.locator(".kp-notebook-library-each-book").first().isVisible().catch(() => false);
-    log(ok ? "LOGIN OK — profile saved; scheduled runs will reuse it." : "LOGIN not completed; run --login again.");
     exitCode = ok ? 0 : 2;
   } else if (await signedOut(page)) {
     log("SIGNED OUT: Amazon wants a fresh sign-in. Run: node harvest.mjs --login");
     log(`heartbeat -> ${await post({ error: "Amazon session expired; run tools/kindle_harvest/harvest.mjs --login on the PC" })}`);
     exitCode = 2;
   } else {
-    await page.waitForSelector(".kp-notebook-library-each-book", { timeout: 30000 });
+    // Wait for the Notebook shell, not for a book: an empty library (nothing highlighted yet)
+    // is normal and each book below reports "not in the library yet" with a heartbeat.
+    await page.waitForSelector("[id^='kp-notebook'], [class*='kp-notebook']", { state: "attached", timeout: 30000 });
+    await page.waitForTimeout(2500);
     for (const book of cfg.books) {
       try {
         const r = await harvestBook(page, book);
