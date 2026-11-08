@@ -40,7 +40,11 @@ BEGIN
     -- Only signal for historical writes. Today's mutations are picked up
     -- by the daily safety-net retrain at 12:00 UTC; an hourly retrain
     -- for every today-tap would be wasteful.
-    IF affected_date < today_et THEN
+    -- 2026-11-07: yesterday is exempt too. The evening /check-in is often
+    -- finished after midnight or the next morning, so every check-in would
+    -- otherwise schedule an extra full retrain on top of the daily one,
+    -- which picks yesterday up anyway.
+    IF affected_date < today_et - 1 THEN
         INSERT INTO pds.sync_log (
             source, data_type, sync_start, sync_end, status,
             records_synced, date_range_start, date_range_end

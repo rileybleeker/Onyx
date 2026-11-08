@@ -100,6 +100,8 @@ export const agentsApi = {
   /** Mark one conversation read up to `id`; `all` marks every conversation. Returns the new unread count. */
   read: (id: number, opts: { thread?: string; all?: boolean } = {}) =>
     call<{ ok: boolean; badge: number }>("/onyx/read", { method: "POST", body: JSON.stringify({ id, ...opts }) }),
+  /** The /check-in screen saved a day: settle that day's check-in card and skip its evening send / morning nudge. */
+  checkinDone: (date: string) => call<{ ok: boolean; badge: number }>("/onyx/checkin/done", { method: "POST", body: JSON.stringify({ date }) }),
   subscribe: (sub: PushSubscriptionJSON) => call<{ ok: boolean; pushed: number }>("/onyx/subscribe", { method: "POST", body: JSON.stringify(sub) }),
   config: async (): Promise<{ vapidPublicKey: string | null }> => {
     const res = await fetch(`${AGENTS_API}/onyx/config`, { cache: "no-store" });

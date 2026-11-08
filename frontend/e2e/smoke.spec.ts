@@ -507,3 +507,19 @@ test.describe("/nyc apartment search", () => {
     await expectNoClientCrash(page);
   });
 });
+
+// ---------------------------------------------------------------------------
+// /check-in (2026-11-07): the daily habit check-in must load today's questions
+// from Notion + Supabase. A Notion/API failure renders "Couldn't load…" with no
+// question rows. Read-only: never taps or saves.
+// ---------------------------------------------------------------------------
+test("/check-in lists today's habit questions", async ({ page }) => {
+  await gotoAuthed(page, "/check-in");
+  await settle(page);
+  await expect(page.getByText("Check-in", { exact: true }).first()).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(page.getByText(/Couldn't load|Couldn't reach Onyx/)).toHaveCount(0);
+  const yesButtons = page.getByRole("button", { name: /: yes$/ });
+  await expect(yesButtons.first()).toBeVisible({ timeout: LOAD_TIMEOUT });
+  expect(await yesButtons.count(), "expected the core check-in questions").toBeGreaterThanOrEqual(10);
+  await expectNoClientCrash(page);
+});

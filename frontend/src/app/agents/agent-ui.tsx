@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { Check, ExternalLink } from "lucide-react";
 import type { AgentCard, CardState } from "@/lib/agents-api";
 
@@ -8,6 +9,7 @@ import type { AgentCard, CardState } from "@/lib/agents-api";
 const AGENTS: Record<string, { name: string; about: string; color: string }> = {
   onyx: { name: "Onyx", about: "reminders, questions, anything", color: "#16E07A" },
   briefing: { name: "Morning briefing", about: "your day at 8:30", color: "#FFD23F" },
+  "check-in": { name: "Daily check-in", about: "habits, every evening", color: "#16E07A" },
   coordinator: { name: "Coordinator", about: "goals and tasks", color: "#9A7BFA" },
   "nyc-scout": { name: "NYC scout", about: "apartment leads", color: "#5B8DF6" },
   devops: { name: "DevOps", about: "apps, deploys, fixes", color: "#F5A623" },
@@ -91,10 +93,11 @@ export function Linkified({ text }: { text: string }) {
   );
 }
 
-export type CardAction = { label: string; text?: string; reply?: boolean; primary?: boolean };
+export type CardAction = { label: string; text?: string; reply?: boolean; primary?: boolean; href?: string };
 
 export function cardActions(card: AgentCard): CardAction[] {
   const t = card.type.toLowerCase();
+  if (t === "checkin") return [{ label: "Open check-in", href: card.link, primary: true }];
   if (t === "approval") return [{ label: "Approve", text: `${card.code} yes`, primary: true }, { label: "Decline", text: `${card.code} no` }, { label: "Reply", reply: true }];
   if (t === "lead") return [{ label: "Interested", text: `${card.code} interested`, primary: true }, { label: "Pass", text: `${card.code} no` }, { label: "Reply", reply: true }];
   if (t === "question") return [{ label: "Reply", reply: true, primary: true }, { label: "Done", text: `${card.code} done` }];
@@ -118,7 +121,7 @@ export function settledLabel(reply: string | undefined, state: CardState | undef
     case "answer":
       return "Answered";
     case "complete":
-      return "Marked done";
+      return "Done";
     case "closed":
       return "Closed by the agent";
     case "expired":
@@ -140,7 +143,7 @@ export function CardBody({ card, clamp = false }: { card: AgentCard; clamp?: boo
       )}
       {(card.link || (exp && !Number.isNaN(exp.getTime()))) && (
         <div className="mt-2 flex items-center gap-3 text-[12px] text-text-tertiary">
-          {card.link && (
+          {card.link && card.type !== "checkin" && (
             <a href={card.link} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-accent" onClick={(e) => e.stopPropagation()}>
               Open <ExternalLink className="w-3 h-3" />
             </a>
@@ -161,20 +164,31 @@ export function CardButtons({ card, settled, onSend, onReply }: { card: AgentCar
     );
   return (
     <div className="flex border-t border-border-subtle divide-x divide-border-subtle">
-      {cardActions(card).map((a) => (
-        <button
-          key={a.label}
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            if (a.reply) onReply(card.code);
-            else if (a.text) onSend(a.text);
-          }}
-          className={`flex-1 py-3 text-[14px] font-medium active:bg-surface-hover transition-colors ${a.primary ? "text-accent" : "text-text-secondary"}`}
-        >
-          {a.label}
-        </button>
-      ))}
+      {cardActions(card).map((a) =>
+        a.href ? (
+          <Link
+            key={a.label}
+            href={a.href}
+            onClick={(e) => e.stopPropagation()}
+            className={`flex-1 py-3 text-center text-[14px] font-medium active:bg-surface-hover transition-colors ${a.primary ? "text-accent" : "text-text-secondary"}`}
+          >
+            {a.label}
+          </Link>
+        ) : (
+          <button
+            key={a.label}
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (a.reply) onReply(card.code);
+              else if (a.text) onSend(a.text);
+            }}
+            className={`flex-1 py-3 text-[14px] font-medium active:bg-surface-hover transition-colors ${a.primary ? "text-accent" : "text-text-secondary"}`}
+          >
+            {a.label}
+          </button>
+        )
+      )}
     </div>
   );
 }
