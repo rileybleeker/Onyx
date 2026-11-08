@@ -864,16 +864,34 @@ def _fetch_chunks(imap: imaplib.IMAP4_SSL, uids: list[bytes], item: str, chunk: 
                     yield m.group(1), d[1]
 
 
+def search_uids(imap: imaplib.IMAP4_SSL, since: date) -> tuple[list[bytes], str]:
+    """Gmail's native search first (X-GM-RAW: same semantics as the web UI, so
+    `from:delta.com` matches the t./g./o. subdomains), then plain IMAP FROM."""
+    try:
+        status, data = imap.uid("SEARCH", None, "X-GM-RAW", f'"from:{SENDER_DOMAIN} after:{since:%Y/%m/%d}"')
+        if status == "OK":
+            return (data[0].split() if data and data[0] else []), "X-GM-RAW"
+    except imaplib.IMAP4.error as e:
+        log.info(f"X-GM-RAW search unavailable ({e}); using IMAP FROM")
+    status, data = imap.uid("SEARCH", None, f'(FROM "{SENDER_DOMAIN}" SINCE {_imap_date(since)})')
+    return (data[0].split() if status == "OK" and data and data[0] else []), "FROM"
+
+
+def account_fingerprint(account: str) -> str:
+    """Short hash so CI logs (which mask the secret) still say WHICH mailbox ran."""
+    import hashlib
+    return hashlib.sha256(account.strip().lower().encode()).hexdigest()[:8]
+
+
 def process_account(account: str, password: str, store: Store, since: date, reprocess: bool) -> dict:
     stats = {"account": account, "candidates": 0, "operational": 0, "parsed": 0, "segments": 0, "errors": 0, "skipped_done": 0}
     imap = imaplib.IMAP4_SSL(IMAP_HOST)
     try:
         imap.login(account, password)
         box = select_all_mail(imap)
-        status, data = imap.uid("SEARCH", None, f'(FROM "{SENDER_DOMAIN}" SINCE {_imap_date(since)})')
-        uids = data[0].split() if status == "OK" and data and data[0] else []
+        uids, how = search_uids(imap, since)
         stats["candidates"] = len(uids)
-        log.info(f"[{account}] {len(uids)} email(s) from {SENDER_DOMAIN} since {since} in {box}")
+        log.info(f"[{account}] fp={account_fingerprint(account)} {len(uids)} email(s) from {SENDER_DOMAIN} since {since} in {box} via {how}")
         if not uids:
             return stats
         done = set() if reprocess else store.processed_ids(account)
