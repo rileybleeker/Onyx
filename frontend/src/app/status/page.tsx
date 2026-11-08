@@ -23,6 +23,7 @@ const SOURCE_BADGE: Record<string, string> = {
   musicbrainz: "MUSICBRAINZ",
   supplements: "DSLD",
   tanita: "TANITA",
+  nyc_scout: "AGENT",
   matrix_mat: "DB",
   perf_mats: "DB",
 };
@@ -41,6 +42,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   musicbrainz: "text-source-spotify/70",
   supplements: "text-amber-400",
   tanita: "text-amber-500",
+  nyc_scout: "text-sky-400",
   matrix_mat: "text-cyan-400/70",
   perf_mats: "text-cyan-400/70",
 };
@@ -90,6 +92,7 @@ const SOURCE_ORDER = [
   "musicbrainz",
   "supplements",
   "tanita",
+  "nyc_scout",
   "matrix_mat",
   "perf_mats",
 ];

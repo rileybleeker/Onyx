@@ -14,6 +14,7 @@ import {
   MessageSquare,
   ShieldCheck,
   Bot,
+  Building2,
 } from "lucide-react";
 
 /**
@@ -65,6 +66,7 @@ export const NAV_SECTIONS: NavSection[] = [
     title: "Tools",
     items: [
       { href: "/agents", label: "Agents", shortcut: "G", icon: Bot, keywords: ["chat", "messages", "briefing", "approvals", "leads", "reminders", "inbox", "notifications"] },
+      { href: "/nyc", label: "NYC Search", shortcut: "Y", icon: Building2, keywords: ["apartment", "move", "new york", "listings", "leads", "rent", "scout", "manhattan"] },
       { href: "/chat", label: "Health Q&A", shortcut: "C", icon: MessageSquare, keywords: ["ask", "claude", "assistant", "query", "chat"] },
       { href: "/status", label: "Status", shortcut: "U", icon: ShieldCheck, keywords: ["system", "sync", "etl", "health", "freshness"] },
     ],

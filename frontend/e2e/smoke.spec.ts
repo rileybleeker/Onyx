@@ -484,3 +484,26 @@ test.describe("Mobile chrome — bottom tab bar", () => {
     await expectNoClientCrash(page);
   });
 });
+
+// ---------------------------------------------------------------------------
+// /nyc — the apartment search (2026-11-07). Data comes from the Notion "NYC
+// Leads" database, not Supabase, so the generic recharts probe doesn't apply.
+// A broken Notion share/key surfaces as the "Couldn't load leads" banner; an
+// empty database as the "No leads yet" state — both are failures while the
+// search is running. The default "Active" view can legitimately be empty
+// (everything gone or passed), so the row check uses "All incl. gone".
+// ---------------------------------------------------------------------------
+test.describe("/nyc apartment search", () => {
+  test("loads leads from Notion and plots them on the map", async ({ page }) => {
+    await gotoAuthed(page, "/nyc");
+    await settle(page);
+    await expect(page.getByText("NYC Apartment Search", { exact: true }).first()).toBeVisible({ timeout: LOAD_TIMEOUT });
+    await expect(page.getByText("Couldn't load leads", { exact: false }), "Notion read failed on /nyc").toHaveCount(0);
+    await expect(page.getByText("No leads yet. nyc-scout fills this every morning."), "NYC Leads database is empty").toHaveCount(0);
+
+    await page.getByRole("button", { name: "All incl. gone" }).click();
+    await expect(page.locator('[data-testid="nyc-leads-table"] tbody tr').first()).toBeVisible({ timeout: LOAD_TIMEOUT });
+    await expect(page.locator(".leaflet-interactive").first(), "no lead markers on the map").toBeAttached({ timeout: LOAD_TIMEOUT });
+    await expectNoClientCrash(page);
+  });
+});

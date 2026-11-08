@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { getNycScoutFreshness } from "@/lib/nyc";
 import { createClient } from "@supabase/supabase-js";
 
 const supabase = createClient(
@@ -43,6 +44,7 @@ const CADENCE: Record<string, string> = {
   supplements: "Manual",
   notion_journal: "Hourly :35",
   tanita: "Daily 10am + 1:30pm ET",
+  nyc_scout: "Daily 6:10am ET",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
   // the frontend matrix reads hit since 2026-06-11). The heartbeat also
   // carries the schema-drift tripwire — a 'failed' here can mean the view
@@ -76,6 +78,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   supplements:    { method: "manual",         label: "Manual entry" },
   notion_journal: { method: "automated",      label: "Notion sync" },
   tanita:         { method: "automated",      label: "API ETL" },
+  nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
   perf_mats:      { method: "automated",      label: "Matview refresh" },
 };
@@ -203,6 +206,14 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+    // NYC scout freshness lives in Notion (the "NYC Leads" database the
+    // nyc-scout agent upserts every run), not in sync_log. Started here so the
+    // one Notion call overlaps the Supabase reads; a Notion failure turns the
+    // card red but never breaks /status.
+    const nycPromise = getNycScoutFreshness().then(
+      (v) => ({ ok: true as const, ...v }),
+      (e: Error) => ({ ok: false as const, error: e.message }),
+    );
     const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
@@ -356,6 +367,9 @@ export async function GET() {
     const supplementsLag = daysLag(supplementsDate, spineMaxDate);
     const notionJournalLag = daysLag(notionJournalDate, spineMaxDate);
     const tanitaLag = daysLag(tanitaDate, spineMaxDate);
+    const nyc = await nycPromise;
+    const nycDate = nyc.ok ? nyc.lastVerified : null;
+    const nycLag = daysLag(nycDate, spineMaxDate);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -558,6 +572,23 @@ export async function GET() {
         cadence: CADENCE.tanita,
         integrationMethod: METHOD.tanita.method,
         methodLabel: METHOD.tanita.label,
+      },
+      // NYC apartment scout (personal-agents cloud routine). Freshness = the
+      // newest "Last verified" date on a Live lead — the scout re-verifies
+      // every live lead each morning, so a stalled agent shows as lag. Daily
+      // cadence → shared deriveStatus thresholds (>1d partial, >3d failed).
+      nyc_scout: {
+        label: "NYC Scout",
+        lastSync: nycDate,
+        status: nyc.ok ? deriveStatus(null, nycLag) : "failed",
+        latestDataDate: nycDate,
+        daysLag: nycLag,
+        recordsSynced: nyc.ok ? nyc.liveCount : 0,
+        durationSeconds: null,
+        errorMessage: nyc.ok ? null : nyc.error,
+        cadence: CADENCE.nyc_scout,
+        integrationMethod: METHOD.nyc_scout.method,
+        methodLabel: METHOD.nyc_scout.label,
       },
       // Materialized matrix view refresh (pg_cron, every 15 min). Frontend
       // matrix reads (/analytics/hrv, /caffeine, /nutrition, /bland-altman,
