@@ -40,10 +40,12 @@ export default function NycMap({
   useEffect(() => {
     if (!el.current || map.current) return;
     map.current = L.map(el.current, { zoomControl: true, attributionControl: true }).setView(CENTRAL_PARK, 13);
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+    // Standard OSM tiles (keyless; CARTO's basemaps started demanding an API
+    // key), darkened to match the app with a CSS filter on the tile pane.
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 19,
-      subdomains: "abcd",
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+      className: "nyc-dark-tiles",
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     }).addTo(map.current);
     layer.current = L.layerGroup().addTo(map.current);
     return () => {
@@ -92,7 +94,12 @@ export default function NycMap({
     }
   }, [selectedId, leads]);
 
-  return <div ref={el} className="h-[420px] w-full rounded-[4px] overflow-hidden bg-surface" aria-label="Map of leads" />;
+  return (
+    <>
+      <style>{`.nyc-dark-tiles { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9) saturate(0.6); }`}</style>
+      <div ref={el} className="h-[420px] w-full rounded-[4px] overflow-hidden bg-surface" aria-label="Map of leads" />
+    </>
+  );
 }
 
 function escapeHtml(s: string): string {
