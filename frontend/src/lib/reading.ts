@@ -30,7 +30,23 @@ export interface Book {
   finished_on: string | null;
   notion_page_id: string | null;
   habit_name: string | null;
+  /** Kindle identity + Whispersync position (filled by the harvester; see lib/reading-kindle.ts). */
+  asin: string | null;
+  last_position: number | null;
+  last_position_at: string | null;
+  total_positions: number | null;
 }
+
+/** Chapter → Kindle position span (pds.book_chapters). */
+export interface ChapterSpan {
+  chapter: number;
+  start_position: number;
+  end_position: number | null;
+  start_page: number | null;
+  end_page: number | null;
+}
+
+export type SessionSource = "manual" | "chat" | "kindle";
 
 export interface ReadingSession {
   session_id: number;
@@ -44,6 +60,10 @@ export interface ReadingSession {
   question: string | null;
   notion_block_id: string | null;
   created_at: string;
+  source: SessionSource;
+  /** Kindle-derived sessions: the chapter being read when no chapter was completed that day. */
+  in_chapter: number | null;
+  highlight_count: number | null;
 }
 
 export interface Highlight {
@@ -63,6 +83,13 @@ export interface Highlight {
   archived: boolean;
   notion_block_id: string | null;
   created_at: string;
+  /** Kindle position span + print page + timestamps (harvester-filled; null for manual rows). */
+  position: number | null;
+  position_end: number | null;
+  page: number | null;
+  highlighted_at: string | null;
+  note_at: string | null;
+  behavioral_date: string | null;
 }
 
 export interface Review {
@@ -136,6 +163,9 @@ export interface ReadingOverview {
   quizzes: Quiz[];
   burnup: Array<{ date: string; actual: number | null; target: number }>;
   minutesTotal: number;
+  /** Where the Kindle says Riley is (Whispersync position mapped through the chapter table), null until harvested. */
+  position: { chapter: number | null; page: number | null; percent: number | null; at: string | null } | null;
+  chapters: ChapterSpan[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -227,7 +257,7 @@ export async function getOverview(supabase: Supa, slug?: string | null): Promise
   if (!book) return null;
   const today = await behavioralToday(supabase);
 
-  const [sessionsRes, highlightsRes, quizzesRes] = await Promise.all([
+  const [sessionsRes, highlightsRes, quizzesRes, chaptersRes] = await Promise.all([
     supabase
       .from("reading_sessions")
       .select("*")
@@ -242,13 +272,15 @@ export async function getOverview(supabase: Supa, slug?: string | null): Promise
       .order("created_at", { ascending: false })
       .order("highlight_id", { ascending: false }),
     supabase.from("reading_quizzes").select("*").eq("book_id", book.book_id).order("taken_at", { ascending: false }),
+    supabase.from("book_chapters").select("chapter,start_position,end_position,start_page,end_page").eq("book_id", book.book_id).order("start_position"),
   ]);
-  for (const r of [sessionsRes, highlightsRes, quizzesRes]) {
+  for (const r of [sessionsRes, highlightsRes, quizzesRes, chaptersRes]) {
     if (r.error) throw new Error(r.error.message);
   }
   const sessions = (sessionsRes.data ?? []) as ReadingSession[];
   const highlights = ((highlightsRes.data ?? []) as Highlight[]).map((h) => ({ ...h, ease: Number(h.ease) }));
   const quizzes = (quizzesRes.data ?? []) as Quiz[];
+  const chapters = (chaptersRes.data ?? []) as ChapterSpan[];
 
   const highlightIds = highlights.map((h) => h.highlight_id);
   let reviews: Review[] = [];
@@ -261,7 +293,7 @@ export async function getOverview(supabase: Supa, slug?: string | null): Promise
     reviews = (data ?? []) as Review[];
   }
 
-  return computeOverview({ book, today, sessions, highlights, reviews, quizzes });
+  return computeOverview({ book, today, sessions, highlights, reviews, quizzes, chapters });
 }
 
 /* ------------------------------------------------------------------ */
@@ -275,8 +307,10 @@ export function computeOverview(input: {
   highlights: Highlight[];
   reviews: Review[];
   quizzes: Quiz[];
+  chapters?: ChapterSpan[];
 }): ReadingOverview {
   const { book, today, sessions, highlights, reviews, quizzes } = input;
+  const chapters = input.chapters ?? [];
   const totalChapters = book.total_chapters ?? 0;
   const chaptersDone = Math.min(
     totalChapters || Infinity,
@@ -366,6 +400,27 @@ export function computeOverview(input: {
   const atRisk = !loggedToday && current > 0;
   const minutesTotal = sessions.reduce((a, s) => a + (s.minutes ?? 0), 0);
 
+  // Whispersync position → chapter / page / percent.
+  let position: ReadingOverview["position"] = null;
+  if (book.last_position != null) {
+    let ch: ChapterSpan | null = null;
+    for (const c of chapters) {
+      if (c.start_position <= book.last_position) ch = c;
+      else break;
+    }
+    let page: number | null = null;
+    if (ch && ch.start_page != null && ch.end_page != null && ch.end_position != null && ch.end_position > ch.start_position) {
+      const frac = (book.last_position - ch.start_position) / (ch.end_position - ch.start_position);
+      page = Math.min(ch.end_page, ch.start_page + Math.floor(frac * (ch.end_page - ch.start_page + 1)));
+    }
+    position = {
+      chapter: ch?.chapter ?? null,
+      page,
+      percent: book.total_positions ? Math.round((book.last_position / book.total_positions) * 100) : null,
+      at: book.last_position_at,
+    };
+  }
+
   return {
     book,
     today,
@@ -385,6 +440,8 @@ export function computeOverview(input: {
     quizzes,
     burnup,
     minutesTotal,
+    position,
+    chapters,
   };
 }
 
@@ -474,6 +531,8 @@ export interface LogSessionInput {
   medium?: Medium | null;
   recall?: string | null;
   question?: string | null;
+  /** 'manual' (the /reading form) or 'chat' (the Claude tool). Kindle-derived sessions are written by lib/reading-kindle.ts only. */
+  source?: "manual" | "chat" | null;
 }
 
 export interface LogSessionResult {
@@ -520,6 +579,7 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
     medium,
     recall: input.recall?.trim() || null,
     question: input.question?.trim() || null,
+    source: input.source === "chat" ? "chat" : "manual",
   };
   const { data, error } = await supabase.from("reading_sessions").insert(row).select("*").single();
   if (error) return { ok: false, error: error.message };
@@ -559,6 +619,12 @@ export interface AddHighlightInput {
   concept?: string | null;
   source?: HighlightSource | null;
   date?: string | null; // behavioral day used to schedule the first review
+  /** Kindle position span / print page / timestamps (harvester only). */
+  position?: number | null;
+  position_end?: number | null;
+  page?: number | null;
+  highlighted_at?: string | null;
+  note_at?: string | null;
 }
 
 export async function addHighlight(
@@ -583,9 +649,14 @@ export async function addHighlight(
     concept: input.concept?.trim() || null,
     source,
     next_review: addDays(today, 1),
+    ...(input.position != null ? { position: Math.round(input.position) } : {}),
+    ...(input.position_end != null ? { position_end: Math.round(input.position_end) } : {}),
+    ...(input.page != null ? { page: Math.round(input.page) } : {}),
+    ...(input.highlighted_at ? { highlighted_at: input.highlighted_at } : {}),
+    ...(input.note_at ? { note_at: input.note_at } : {}),
   };
 
-  // Idempotent on (book_id, passage): a re-import updates comment/chapter/concept only when provided.
+  // Idempotent on (book_id, passage): a re-import updates comment/chapter/concept/position only when provided.
   const { data: existing } = await supabase
     .from("book_highlights")
     .select("*")
@@ -593,11 +664,16 @@ export async function addHighlight(
     .eq("passage", passage)
     .maybeSingle();
   if (existing) {
+    const ex = existing as Highlight;
     const patch: Record<string, unknown> = {};
-    if (row.comment) patch.comment = row.comment;
-    if (row.chapter != null) patch.chapter = row.chapter;
-    if (row.location) patch.location = row.location;
-    if (row.concept) patch.concept = row.concept;
+    if (row.comment && row.comment !== ex.comment) patch.comment = row.comment;
+    if (row.chapter != null && row.chapter !== ex.chapter) patch.chapter = row.chapter;
+    if (row.location && row.location !== ex.location) patch.location = row.location;
+    if (row.concept && row.concept !== ex.concept) patch.concept = row.concept;
+    for (const k of ["position", "position_end", "page", "highlighted_at", "note_at"] as const) {
+      const v = (row as Record<string, unknown>)[k];
+      if (v != null && v !== ex[k]) patch[k] = v;
+    }
     if (Object.keys(patch).length) {
       const { data, error } = await supabase.from("book_highlights").update(patch).eq("highlight_id", existing.highlight_id).select("*").single();
       if (error) return { ok: false, error: error.message };
@@ -698,7 +774,16 @@ export function summarizeForChat(o: ReadingOverview) {
     level: o.level,
     badges_earned: o.badges.filter((b) => b.earned).map((b) => b.label),
     checkpoints: o.checkpoints.map((c) => ({ key: c.key, chapter: c.chapter, due: c.due, reached: c.reached, on_time: c.onTime, quiz: c.quiz ? `${c.quiz.score}/${c.quiz.total}` : null })),
-    recent_sessions: o.sessions.slice(0, 10).map((s) => ({ date: s.session_date, chapters: `${s.chapter_from ?? "?"}-${s.chapter_through ?? "?"}`, minutes: s.minutes, medium: s.medium, recall: s.recall, question: s.question })),
+    position: o.position,
+    recent_sessions: o.sessions.slice(0, 10).map((s) => ({
+      date: s.session_date,
+      chapters: s.chapter_through != null ? `${s.chapter_from ?? "?"}-${s.chapter_through}` : s.in_chapter != null ? `reading ch ${s.in_chapter} (no chapter completed)` : "?",
+      source: s.source,
+      minutes: s.minutes,
+      medium: s.medium,
+      recall: s.recall,
+      question: s.question,
+    })),
     highlights: o.highlights.slice(0, 40).map((h) => ({ id: h.highlight_id, chapter: h.chapter, concept: h.concept, passage: h.passage, comment: h.comment })),
     due_reviews: o.dueReviews.map((h) => ({ id: h.highlight_id, passage: h.passage, comment: h.comment })),
     quizzes: o.quizzes.map((q) => ({ checkpoint: q.checkpoint, score: `${q.score}/${q.total}`, date: q.quiz_date })),

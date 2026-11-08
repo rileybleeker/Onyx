@@ -241,6 +241,13 @@ function QuestCard({ o }: { o: ReadingOverview }) {
         <span>{o.minutesTotal} min</span>
         <span>{o.highlights.length} highlights</span>
         <span>{o.badges.filter((b) => b.earned).length}/{o.badges.length} badges</span>
+        {o.position?.chapter != null && (
+          <span className="text-amber-300/80" title="Kindle reading position (Whispersync), as of the last harvest">
+            Kindle: ch {o.position.chapter}
+            {o.position.page != null ? ` · p. ${o.position.page}` : ""}
+            {o.position.percent != null ? ` · ${o.position.percent}%` : ""}
+          </span>
+        )}
         <span className="ml-auto">target {fmtDate(o.book.target_date, { month: "short", day: "numeric" })}</span>
       </div>
     </section>
@@ -744,11 +751,14 @@ function SessionsList({ o }: { o: ReadingOverview }) {
               <div key={s.session_id} className="px-3 py-2.5">
                 <div className="flex items-center gap-2 text-[12px] font-mono text-text-secondary">
                   <span className="text-text-primary">{fmtDate(s.session_date, { weekday: "short", month: "short", day: "numeric" })}</span>
-                  <span>
-                    ch {s.chapter_from ?? "?"}–{s.chapter_through ?? "?"}
-                  </span>
+                  <span>{s.chapter_through != null ? `ch ${s.chapter_from ?? "?"}–${s.chapter_through}` : s.in_chapter != null ? `in ch ${s.in_chapter}` : "ch ?"}</span>
                   {s.minutes ? <span>{s.minutes} min</span> : null}
-                  {s.medium && <span className="uppercase text-[10px]">{s.medium}</span>}
+                  {s.medium && s.source !== "kindle" && <span className="uppercase text-[10px]">{s.medium}</span>}
+                  {s.source === "kindle" && (
+                    <span className="uppercase text-[10px] text-amber-300/80" title="Derived from your Kindle highlights, notes and reading position">
+                      kindle · auto{s.highlight_count ? ` · ${s.highlight_count} hl` : ""}
+                    </span>
+                  )}
                   <span className={`ml-auto text-[10px] ${s.notion_block_id ? "text-accent/70" : "text-text-tertiary"}`}>{s.notion_block_id ? "notion ✓" : ""}</span>
                 </div>
                 {s.recall && <p className="mt-1 text-[13px] text-text-primary leading-relaxed">{s.recall}</p>}

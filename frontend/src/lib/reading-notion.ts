@@ -113,7 +113,13 @@ async function highlightsAnchor(pageId: string, blocks: NotionBlock[]): Promise<
 }
 
 function sessionBlock(s: ReadingSession): Record<string, unknown> {
-  const head = `${s.session_date} · ch ${s.chapter_from ?? "?"}–${s.chapter_through ?? "?"}${s.minutes ? ` · ${s.minutes} min` : ""}${s.medium ? ` · ${s.medium}` : ""}`;
+  const span =
+    s.chapter_through != null
+      ? `ch ${s.chapter_from ?? "?"}–${s.chapter_through}`
+      : s.in_chapter != null
+        ? `in ch ${s.in_chapter} (notes, no chapter completed)`
+        : "ch ?";
+  const head = `${s.session_date} · ${span}${s.minutes ? ` · ${s.minutes} min` : ""}${s.medium ? ` · ${s.medium}` : ""}${s.source === "kindle" ? " · auto from Kindle" : ""}`;
   const rich: RichText[] = [text(head, { bold: true })];
   if (s.recall) rich.push(text(`\n${s.recall}`));
   if (s.question) rich.push(text(`\nQ: ${s.question}`, { italic: true }));
@@ -151,6 +157,19 @@ export async function mirrorHighlight(book: Book, h: Highlight): Promise<string 
   } catch (e) {
     console.error("reading-notion: mirrorHighlight failed:", e);
     return null;
+  }
+}
+
+/** Update an already-mirrored session block in place (Kindle-derived sessions grow as notes arrive). */
+export async function updateMirroredSession(s: ReadingSession): Promise<boolean> {
+  if (!s.notion_block_id || !NOTION_API_KEY) return false;
+  try {
+    const block = sessionBlock(s);
+    const res = await notion(`/blocks/${s.notion_block_id}`, { method: "PATCH", body: JSON.stringify({ quote: block.quote }) });
+    return res.ok;
+  } catch (e) {
+    console.error("reading-notion: updateMirroredSession failed:", e);
+    return false;
   }
 }
 

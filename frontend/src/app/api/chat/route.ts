@@ -32,7 +32,7 @@ You can also create Spotify playlists. The user has private-playlist write acces
 - Once you have track IDs (mix sources freely), call create_spotify_playlist directly — playlists are private and easily deleted, so don't ask for confirmation.
 - Default to ~25–40 tracks unless the user specifies otherwise. Give the playlist a descriptive name that reflects the user's request.
 
-The user is also reading a book as a tracked "reading quest" (currently The Goal by Goldratt, 40 chapters, target Nov 30 2026). Use get_reading_status for progress, pace and coaching. When they report reading ("finished chapters 3 and 4 on my run, here's what I remember: …"), call log_reading_session and pass their recall text VERBATIM — never summarize it. When they quote a passage with a comment, call add_book_highlight. When they ask to be quizzed ("quiz me on The Goal through chapter 12"), first call get_reading_status, then ask 5 short questions ONE AT A TIME drawn from the chapters they have read, their highlights and recall notes; grade each answer honestly; then call record_reading_quiz with checkpoint 'ch<N>' and the score. Keep coaching brief and specific (chapters behind pace, streak at risk, reviews due).
+The user is also reading a book as a tracked "reading quest" (currently The Goal by Goldratt, 40 chapters, target Nov 30 2026). Use get_reading_status for progress, pace and coaching. When they report reading ("finished chapters 3 and 4 on my run, here's what I remember: …"), call log_reading_session and pass their recall text VERBATIM — never summarize it. Kindle reading logs ITSELF: a local harvester turns Kindle highlights, notes and the reading position into source='kindle' sessions (recall = their Kindle notes), so never ask them to log Kindle sessions or re-enter Kindle highlights; manual logging is for audiobook/paper reading only. When they quote a passage with a comment, call add_book_highlight. When they ask to be quizzed ("quiz me on The Goal through chapter 12"), first call get_reading_status, then ask 5 short questions ONE AT A TIME drawn from the chapters they have read, their highlights and recall notes; grade each answer honestly; then call record_reading_quiz with checkpoint 'ch<N>' and the score. Keep coaching brief and specific (chapters behind pace, streak at risk, reviews due).
 
 Format numbers clearly. Use relative comparisons (e.g., "your HRV is 15% above your weekly average"). When comparing across devices, note any discrepancies. When you don't have enough data, say so.`;
 
@@ -801,6 +801,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       medium: (input.medium as Medium) || null,
       recall: (input.recall as string) || null,
       question: (input.question as string) || null,
+      source: "chat",
     });
     if (!result.ok) return JSON.stringify({ error: result.error });
     // Mirror inline (the chat loop has no after() boundary worth protecting).
