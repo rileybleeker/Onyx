@@ -928,7 +928,7 @@ export async function POST(req: NextRequest) {
 
     // Initial Claude call with tools
     let response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-sonnet-5-5",
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
       tools,
@@ -957,7 +957,7 @@ export async function POST(req: NextRequest) {
       allMessages.push({ role: "user", content: toolResults });
 
       response = await anthropic.messages.create({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-sonnet-5-5",
         max_tokens: 1024,
         system: SYSTEM_PROMPT,
         tools,

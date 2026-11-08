@@ -30,7 +30,7 @@ const supabase = createClient(
   { db: { schema: "pds" } }
 );
 
-const MODEL = "claude-sonnet-4-20250514";
+const MODEL = "claude-sonnet-5-5";
 const MAX_ITERATIONS = 8;
 
 interface GenerateRequest {
