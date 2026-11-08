@@ -71,7 +71,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("flights_email_etl")
 
 IMAP_HOST = os.environ.get("IMAP_HOST", "imap.gmail.com")
-EXPECTED_ACCOUNTS = 2          # rileybleeklm@ + rileybleeker@ — fewer configured = partial heartbeat
+# Both of Riley's Gmail accounts must be wired in (Riley, 2026-11-08). Any of
+# these missing from the IMAP_EMAIL* env pairs → the heartbeat is 'partial' and
+# names the account, so /status shows the gap instead of a quiet green card.
+REQUIRED_ACCOUNTS = ("rileybleeklm@gmail.com", "rileybleeker@gmail.com")
 SENDER_DOMAIN = "delta.com"
 DEFAULT_DAYS = 60
 
@@ -789,7 +792,8 @@ def imap_accounts() -> list[tuple[str, str]]:
     accts: list[tuple[str, str]] = []
     for suffix in ("", "_2", "_3", "_4", "_5"):
         e = (os.environ.get(f"IMAP_EMAIL{suffix}") or "").strip()
-        p = (os.environ.get(f"IMAP_APP_PASSWORD{suffix}") or "").strip()
+        # Google shows app passwords in 4-char groups; the spaces are display-only.
+        p = (os.environ.get(f"IMAP_APP_PASSWORD{suffix}") or "").strip().replace(" ", "")
         if e and p:
             accts.append((e, p))
         elif e or p:
@@ -1031,9 +1035,11 @@ def main() -> int:
     else:
         if failures:
             status, notes = "partial", failures
-        if len(accounts) < EXPECTED_ACCOUNTS:
+        configured = {a.lower() for a, _ in accounts}
+        missing = [a for a in REQUIRED_ACCOUNTS if a not in configured]
+        if missing:
             status = "partial"
-            notes.append(f"only {len(accounts)} of {EXPECTED_ACCOUNTS} Gmail accounts configured (set IMAP_EMAIL_2/IMAP_APP_PASSWORD_2)")
+            notes.append(f"Gmail account(s) not configured: {', '.join(missing)} (add IMAP_EMAIL_n/IMAP_APP_PASSWORD_n secrets)")
         if errors:
             status = "partial"
             notes.append(f"{errors} email(s) failed to parse — see pds.flight_email_log status='error'")
