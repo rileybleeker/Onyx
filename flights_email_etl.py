@@ -100,7 +100,18 @@ CITY_TO_IATA = {
     "SEATTLE": "SEA", "MINNEAPOLIS/ST PAUL": "MSP", "DETROIT": "DTW", "SALT LAKE CITY": "SLC",
     "WASHINGTON-REAGAN": "DCA", "WASHINGTON-DULLES": "IAD", "MIAMI": "MIA", "ORLANDO": "MCO",
     "DENVER": "DEN", "LONDON-HEATHROW": "LHR", "PARIS-DE GAULLE": "CDG", "AMSTERDAM": "AMS",
+    # cities seen in Riley's check-in emails ("City, State" → first token)
+    "NASHVILLE": "BNA", "MOLINE": "MLI", "SACRAMENTO": "SMF", "COLORADO SPRINGS": "COS", "LOUISVILLE": "SDF",
+    "CHARLOTTE": "CLT", "DALLAS-FORT WORTH": "DFW", "DALLAS/FORT WORTH": "DFW", "DALLAS": "DFW",
+    "NEW YORK-LAGUARDIA": "LGA", "NEW YORK-LA GUARDIA": "LGA", "RALEIGH/DURHAM": "RDU", "RALEIGH-DURHAM": "RDU",
+    "TAMPA": "TPA", "FORT LAUDERDALE": "FLL", "PHOENIX": "PHX", "LAS VEGAS": "LAS", "AUSTIN": "AUS",
+    "HOUSTON-INTERCONTINENTAL": "IAH", "PHILADELPHIA": "PHL", "BALTIMORE": "BWI", "CINCINNATI": "CVG",
+    "INDIANAPOLIS": "IND", "COLUMBUS": "CMH", "PITTSBURGH": "PIT", "SAN DIEGO": "SAN", "PORTLAND": "PDX",
+    "NEW ORLEANS": "MSY", "SAVANNAH": "SAV", "JACKSONVILLE": "JAX", "RICHMOND": "RIC", "BIRMINGHAM": "BHM",
 }
+# Regional operators that fly Delta Connection under their own 2-char code in the
+# check-in email ("9E 4958"); the receipt lists the same leg as "DELTA 4958".
+DELTA_CONNECTION_CODES = {"9E", "OO", "YX", "CP", "EV", "XJ", "G7", "9L", "DL"}
 
 _AIRPORTS: dict[str, dict] | None = None
 
@@ -345,6 +356,47 @@ def parse_receipt(lines: list[str], email_date: datetime, kind: str = "receipt")
     return out
 
 
+def parse_trip_details_old(lines: list[str], email_date: datetime, out: dict) -> dict:
+    """Pre-Oct-2026 Trip Details template:
+        DEPARTURE / YYZ / "6:30 PM Thu, May 07 DL2714" / Boarding closes… / DESTINATION / ATL / "8:55 PM Thu, May 07"
+    An event line with a flight number is a departure; one without is an arrival. Events are
+    paired in order, so a connection (DEPARTURE…CONNECTION…DESTINATION) yields one segment per leg."""
+    anchor = email_date.date()
+    ev_re = re.compile(rf"^(\d{{1,2}}:\d{{2}}\s*[AP]M)\s+{DOW},\s*({MONTH_ABBR})\s+(\d{{1,2}})(?:\s+([A-Z0-9]{{2}})\s?(\d{{1,4}}))?$", re.I)
+    events: list[dict] = []
+    last_iata: Optional[str] = None
+    last_city: Optional[str] = None
+    for i, l in enumerate(lines):
+        if re.match(r"^[A-Z]{3}$", l):
+            last_iata = l
+            continue
+        m = ev_re.match(l)
+        if not m:
+            continue
+        clk = parse_clock(m.group(1))
+        if not clk:
+            continue
+        d = resolve_year(MONTHS[m.group(2).upper()], int(m.group(3)), anchor)
+        events.append({"clock": clk, "date": d, "iata": last_iata,
+                       "flight": (f"{m.group(4).upper()}{int(m.group(5))}" if m.group(4) else None),
+                       "carrier": m.group(4).upper() if m.group(4) else None})
+    segments: list[dict] = []
+    pending: Optional[dict] = None
+    for ev in events:
+        if ev["flight"]:
+            pending = ev
+        elif pending:
+            code = pending["carrier"] if pending["carrier"] not in DELTA_CONNECTION_CODES else "DL"
+            segments.append({"flight_number": f"{code}{pending['flight'][2:]}" if code != pending["carrier"] else pending["flight"],
+                             "carrier_code": code, "cabin": None, "seat": None, "operated_by": None,
+                             "dep_city": None, "arr_city": None, "dep_iata": pending["iata"], "arr_iata": ev["iata"],
+                             "dep_local_date": pending["date"], "arr_local_date": ev["date"],
+                             "dep_clock": pending["clock"], "arr_clock": ev["clock"], "duration_min": None})
+            pending = None
+    out["segments"] = segments
+    return out
+
+
 def parse_trip_details(lines: list[str], email_date: datetime) -> dict:
     text = "\n".join(lines)
     out = _empty("trip_details")
@@ -354,6 +406,8 @@ def parse_trip_details(lines: list[str], email_date: datetime) -> dict:
     header_date = resolve_year(MONTHS_FULL[hdr.group(2).upper()], int(hdr.group(3)), anchor) if hdr else None
 
     seg_idx = [i for i, l in enumerate(lines) if re.match(r"^Flight \d+ of \d+$", l)]
+    if not seg_idx:
+        return parse_trip_details_old(lines, email_date, out)
     flight_re = re.compile(r"^([A-Z]{2})\s?(\d{1,4})$")
     date_re = re.compile(rf"^{DOW},\s*({MONTH_ABBR})\s+(\d{{1,2}})$")
     segments: list[dict] = []
@@ -422,60 +476,91 @@ def parse_trip_details(lines: list[str], email_date: datetime) -> dict:
 
 
 def parse_checkin(lines: list[str], email_date: datetime) -> dict:
+    """Check-in reminder. The itinerary is a series of TRIP blocks, each with its own date:
+        TRIP ONE / Tuesday / March 10 / DEPART / ARRIVE / SEAT / "9E 4958" (or "DL 2714", or bare "904")
+        / Operated by … / Atlanta, Georgia / 03:33 pm / Moline, Illinois / 04:32 pm / 18C
+    Overnight arrivals print "Madrid**" and "12:15 pm on April 30". Cities only, so IATA
+    comes from the city map (or the learned map of airports already in pds.flights)."""
     text = "\n".join(lines)
     out = _empty("checkin")
     out["confirmation"] = find_confirmation(text)
     anchor = email_date.date()
     m = re.search(rf"Your flight on\s+{DOW_FULL},\s*({MONTH_FULL})\s+(\d{{1,2}})", text)
-    dep_date = resolve_year(MONTHS_FULL[m.group(1).upper()], int(m.group(2)), anchor, lo_days=-5, hi_days=10) if m else None
-    flight_re = re.compile(r"^([A-Z]{2})\s?(\d{1,4})$")
-    segments: list[dict] = []
-    # Checkin bodies glue "Atlanta, Georgia<br>08:52 pm" in plain text → split on a time at end of line
-    split: list[str] = []
+    header_date = resolve_year(MONTHS_FULL[m.group(1).upper()], int(m.group(2)), anchor, lo_days=-5, hi_days=10) if m else None
+
+    # Normalize: split "City<br>08:52 pm" glue and "02:15 pm on April 30" suffixes into separate lines.
+    norm: list[str] = []
     for l in lines:
-        mm = re.match(r"^(.*?)(\d{1,2}:\d{2}\s*[AaPp][Mm])$", l)
+        mm = re.match(r"^(.*?)(\d{1,2}:\d{2}\s*[AaPp][Mm](?:\s+on\s+[A-Z][a-z]+\s+\d{1,2})?)$", l)
         if mm and mm.group(1).strip() and not re.match(r"^\d{1,2}:\d{2}", l):
-            split.extend([mm.group(1).strip(), mm.group(2)])
+            norm.extend([mm.group(1).strip(), mm.group(2)])
         else:
-            split.append(l)
-    lines = split
-    idx = [i for i, l in enumerate(lines) if flight_re.match(l)]
-    for n, i in enumerate(idx):
-        end = idx[n + 1] if n + 1 < len(idx) else min(len(lines), i + 14)
-        block = lines[i + 1:end]
-        fm = flight_re.match(lines[i])
-        seg: dict[str, Any] = {"flight_number": f"{fm.group(1)}{int(fm.group(2))}", "carrier_code": fm.group(1),
-                               "cabin": None, "seat": None, "operated_by": None, "dep_city": None, "arr_city": None,
-                               "dep_iata": None, "arr_iata": None, "arr_local_date": None,
-                               "dep_local_date": dep_date}
+            norm.append(l)
+    lines = norm
+
+    time_re = re.compile(rf"^(\d{{1,2}}:\d{{2}}\s*[AaPp][Mm])(?:\s+on\s+({MONTH_FULL})\s+(\d{{1,2}}))?$")
+    # "DL 2714" / "9E 4958" / bare "904" — a carrier code has at least one letter, so "904" is not "90"+"4".
+    flight_re = re.compile(r"^(?:([A-Z][A-Z0-9]|\d[A-Z])\s?)?(\d{1,4})$")
+    date_re = re.compile(rf"^({MONTH_FULL})\s+(\d{{1,2}})(?:\s*DEPART.*)?$")
+    trip_idx = [i for i, l in enumerate(lines) if re.match(r"^TRIP(\s+[A-Z]+)?$", l) or re.match(rf"^{DOW_FULL}$", l)]
+    # Fall back to one block starting at the first flight-looking line if no TRIP markers.
+    if not trip_idx:
+        trip_idx = [i for i, l in enumerate(lines) if flight_re.match(l) and l.lower() != l]
+    segments: list[dict] = []
+    for n, i in enumerate(trip_idx):
+        end = trip_idx[n + 1] if n + 1 < len(trip_idx) else min(len(lines), i + 24)
+        block = lines[i:end]
+        dep_date: Optional[date] = None
+        seg: dict[str, Any] = {"flight_number": None, "carrier_code": None, "cabin": None, "seat": None,
+                               "operated_by": None, "dep_city": None, "arr_city": None, "dep_iata": None,
+                               "arr_iata": None, "arr_local_date": None}
         times: list[tuple[int, int]] = []
         for j, l in enumerate(block):
+            dm = date_re.match(l)
+            if dm and dep_date is None:
+                dep_date = resolve_year(MONTHS_FULL[dm.group(1).upper()], int(dm.group(2)), anchor, lo_days=-5, hi_days=400)
+                continue
+            if l in ("DEPART", "ARRIVE", "SEAT") or re.match(r"^TRIP", l) or re.match(rf"^{DOW_FULL}$", l):
+                continue
             om = re.match(r"^Operated by\s+(.+)$", l, flags=re.I)
             if om:
                 seg["operated_by"] = om.group(1).strip()
                 continue
-            clk = parse_clock(l)
-            if clk and len(times) < 2:
+            fm = flight_re.match(l)
+            if fm and seg["flight_number"] is None and not times:
+                code = (fm.group(1) or "DL").upper()
+                code = "DL" if code in DELTA_CONNECTION_CODES else code
+                seg["carrier_code"] = code
+                seg["flight_number"] = f"{code}{int(fm.group(2))}"
+                continue
+            tm = time_re.match(l)
+            if tm and len(times) < 2 and seg["flight_number"]:
+                clk = parse_clock(tm.group(1))
+                if not clk:
+                    continue
                 times.append(clk)
                 city = block[j - 1] if j > 0 else ""
-                if parse_clock(city) or city.lower().startswith("operated by"):
+                if time_re.match(city) or city.lower().startswith("operated by") or flight_re.match(city):
                     city = ""
+                city = city.rstrip("*").strip()
                 if len(times) == 1:
                     seg["dep_city"] = city or None
                 else:
                     seg["arr_city"] = city or None
+                    if tm.group(2):
+                        seg["arr_local_date"] = resolve_year(MONTHS_FULL[tm.group(2).upper()], int(tm.group(3)), anchor, lo_days=-5, hi_days=400)
                 continue
             if len(times) == 2 and re.match(r"^\d{1,2}[A-K]$", l):
                 seg["seat"] = l
                 break
-        if len(times) < 2 or dep_date is None:
+        if seg["flight_number"] is None or len(times) < 2:
+            continue
+        seg["dep_local_date"] = dep_date or (segments[-1]["arr_local_date"] or segments[-1]["dep_local_date"] if segments else header_date)
+        if seg["dep_local_date"] is None:
             continue
         seg["dep_clock"], seg["arr_clock"] = times[0], times[1]
         seg["dep_iata"] = city_to_iata(seg["dep_city"])
         seg["arr_iata"] = city_to_iata(seg["arr_city"])
-        if n > 0 and segments:
-            # connecting leg: assume it departs on the previous leg's day (times decide the rest)
-            seg["dep_local_date"] = segments[-1]["dep_local_date"]
         segments.append(seg)
     out["segments"] = segments
     return out
@@ -622,16 +707,44 @@ class Store:
         res = self.pds("flights").select("*").eq("confirmation_number", confirmation).execute()
         return {(r["flight_number"], r["dep_local_date"]): r for r in (res.data or [])}
 
-    def apply_segments(self, parsed: dict, meta: dict) -> int:
-        """Upsert the parsed segments; returns the number written. 'latest email wins'."""
+    _learned_cities: dict[str, str] | None = None
+
+    def learned_city_map(self) -> dict[str, str]:
+        """City-text → IATA learned from rows that receipts / trip-details already labeled
+        (e.g. 'Atlanta, Georgia' and 'ATLANTA' both key to 'ATLANTA' → ATL). Lets a check-in
+        email create a row for an airport Riley has flown through before."""
+        if self._learned_cities is None:
+            m: dict[str, str] = {}
+            try:
+                res = self.pds("flights").select("dep_city,dep_iata,arr_city,arr_iata").execute()
+                for r in res.data or []:
+                    for city, iata in ((r["dep_city"], r["dep_iata"]), (r["arr_city"], r["arr_iata"])):
+                        if city and iata:
+                            m.setdefault(city.split(",")[0].strip().upper(), iata)
+            except Exception as e:
+                log.warning(f"learned_city_map failed: {e}")
+            self._learned_cities = m
+        return self._learned_cities
+
+    def resolve_iata(self, city: str | None) -> Optional[str]:
+        if not city:
+            return None
+        return city_to_iata(city) or self.learned_city_map().get(city.split(",")[0].strip().upper())
+
+    def apply_segments(self, parsed: dict, meta: dict) -> tuple[int, int, int]:
+        """Upsert the parsed segments. Returns (written, skipped_newer, unplaced).
+        'latest email wins': a row is only overwritten by an email at least as new."""
         conf = parsed["confirmation"]
         if not conf or not parsed["segments"]:
-            return 0
+            return 0, 0, len(parsed.get("segments") or [])
         existing = self.existing_for(conf)
         email_date = meta["email_date"]
-        written = 0
+        written = skipped = unplaced = 0
         new_keys: set[tuple[str, str]] = set()
         for seg in parsed["segments"]:
+            if parsed["kind"] == "checkin":
+                seg = dict(seg, dep_iata=seg.get("dep_iata") or self.resolve_iata(seg.get("dep_city")),
+                           arr_iata=seg.get("arr_iata") or self.resolve_iata(seg.get("arr_city")))
             row = build_row(seg, parsed, meta)
             key = (row["flight_number"], row["dep_local_date"])
             new_keys.add(key)
@@ -640,6 +753,7 @@ class Store:
                 old_date = datetime.fromisoformat(old["source_email_date"].replace("Z", "+00:00"))
                 if old_date > email_date:
                     log.info(f"    {conf} {key[0]} {key[1]}: skipped (newer email already applied)")
+                    skipped += 1
                     continue
                 # keep what the new email doesn't carry
                 for col in ("dep_iata", "arr_iata", "dep_city", "arr_city", "cabin", "seat", "passenger_name",
@@ -653,8 +767,11 @@ class Store:
                     for col in ("dep_tz", "arr_tz", "dep_utc_offset", "dep_time", "arr_time", "arr_local",
                                 "arr_local_date", "arr_behavioral_date", "duration_min"):
                         row[col] = row2[col]
-            elif parsed["kind"] == "checkin":
-                log.info(f"    {conf} {key[0]} {key[1]}: check-in email with no matching segment (city-only, skipped)")
+            elif parsed["kind"] == "checkin" and not (row["dep_iata"] and row["arr_iata"]):
+                # No receipt/trip-details row to update and the cities can't be resolved to airports.
+                log.info(f"    {conf} {key[0]} {key[1]}: check-in only, airports unresolved "
+                         f"({row['dep_city']!r} → {row['arr_city']!r}) — skipped")
+                unplaced += 1
                 continue
             if self.dry_run:
                 log.info(f"    DRY {conf} {row['flight_number']} {row['dep_iata']}→{row['arr_iata']} "
@@ -673,7 +790,9 @@ class Store:
                     if not self.dry_run:
                         self.pds("flights").update({"status": "superseded"}).eq("flight_id", old["flight_id"]).execute()
         self.upserted += written
-        return written
+        if written and self._learned_cities is not None:
+            self._learned_cities = None  # new labeled rows → relearn lazily
+        return written, skipped, unplaced
 
     def mark_schedule_change(self, parsed: dict, meta: dict) -> int:
         conf = parsed["confirmation"]
@@ -953,9 +1072,13 @@ def process_account(account: str, password: str, store: Store, since: date, repr
                     if not parsed["confirmation"] or not parsed["segments"]:
                         store.log_email(meta, kind, parsed, 0, "unmatched", "no confirmation or no segments parsed")
                         continue
-                    n = store.apply_segments(parsed, meta)
+                    n, skipped, unplaced = store.apply_segments(parsed, meta)
                     stats["segments"] += n
-                    store.log_email(meta, kind, parsed, n, "parsed" if n else "unmatched")
+                    if n or (skipped and not unplaced):
+                        status, note = "parsed", (f"{skipped} segment(s) already covered by a newer email" if skipped else None)
+                    else:
+                        status, note = "unmatched", f"{unplaced} segment(s) could not be placed (airports unresolved)"
+                    store.log_email(meta, kind, parsed, n, status, note)
                 elif kind == "schedule_change":
                     n = store.mark_schedule_change(parsed, meta)
                     store.log_email(meta, kind, parsed, n, "parsed" if n else "unmatched")
@@ -993,7 +1116,7 @@ def run_file(path: str) -> None:
     print(json.dumps(parsed, indent=2, default=str))
     for seg in parsed["segments"]:
         row = build_row(seg, parsed, {"message_id": "<file>", "email_date": datetime.now(timezone.utc), "account": "file", "subject": path})
-        print(json.dumps({k: v for k, v in row.items() if k != "raw_json"}, indent=2, default=str))
+        print(json.dumps({k: v for k, v in row.items() if k not in ("raw_json", "source_message_id", "source_email_date", "source_account")}, indent=2, default=str))
 
 
 def main() -> int:
