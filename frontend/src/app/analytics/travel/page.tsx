@@ -34,6 +34,63 @@ async function getTrips(): Promise<Trip[]> {
   return (data ?? []) as Trip[];
 }
 
+// Flight segments parsed from Delta's emails by flights_email_etl.py (receipt →
+// trip details → check-in converge on one row per segment; latest email wins).
+// Unlike pds.trips, this includes same-offset trips (ATL↔YYZ) and future bookings.
+interface Flight {
+  flight_id: number;
+  confirmation_number: string;
+  flight_number: string;
+  dep_iata: string | null;
+  arr_iata: string | null;
+  dep_city: string | null;
+  arr_city: string | null;
+  dep_local: string | null;      // naive local wall clock at the departure airport
+  arr_local: string | null;
+  dep_local_date: string;
+  duration_min: number | null;
+  seat: string | null;
+  status: string;
+  operated_by: string | null;
+}
+
+async function getFlights(): Promise<Flight[]> {
+  const { data, error } = await supabase
+    .from("flights")
+    .select("flight_id, confirmation_number, flight_number, dep_iata, arr_iata, dep_city, arr_city, dep_local, arr_local, dep_local_date, duration_min, seat, status, operated_by")
+    .neq("status", "superseded")
+    .order("dep_local", { ascending: false })
+    .order("flight_id", { ascending: false })
+    .limit(300);
+  if (error) throw error;
+  return (data ?? []) as Flight[];
+}
+
+const MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// "2026-11-06T18:33:00" (naive local time) → "Fri, Nov 6" / "6:33 PM" without any
+// timezone conversion — the string already IS the airport's local clock.
+function fmtLocalDate(naive: string | null): string {
+  if (!naive) return "—";
+  const [y, m, d] = naive.slice(0, 10).split("-").map(Number);
+  const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][new Date(Date.UTC(y, m - 1, d)).getUTCDay()];
+  return `${dow}, ${MONTHS_SHORT[m - 1]} ${d}, ${y}`;
+}
+function fmtLocalTime(naive: string | null): string {
+  if (!naive || naive.length < 16) return "—";
+  const h = Number(naive.slice(11, 13));
+  const mi = naive.slice(14, 16);
+  const ap = h >= 12 ? "PM" : "AM";
+  return `${((h + 11) % 12) + 1}:${mi} ${ap}`;
+}
+function fmtDuration(min: number | null): string {
+  if (min == null) return "—";
+  return `${Math.floor(min / 60)}h ${String(min % 60).padStart(2, "0")}m`;
+}
+function todayET(): string {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
 // Earliest calendar_date this page actually consumes: directionAsymmetry's
 // 7-day pre-trip baseline (offset −7 from the earliest trip start) — wider
 // than trajectoryAroundTrips' −3. No trips → trailing 365 days.
@@ -189,6 +246,17 @@ export default async function TravelPage() {
     console.error("[/analytics/travel] HRV fetch failed; rendering empty trajectory", e);
   }
 
+  let flights: Flight[] = [];
+  try {
+    flights = await getFlights();
+  } catch (e) {
+    console.error("[/analytics/travel] flights fetch failed; rendering empty flight list", e);
+  }
+  const today = todayET();
+  const upcoming = flights.filter((f) => f.dep_local_date >= today && f.status !== "cancelled").reverse(); // soonest first
+  const past = flights.filter((f) => f.dep_local_date < today || f.status === "cancelled");
+  const pnrCount = new Set(flights.map((f) => f.confirmation_number)).size;
+
   // KPI calcs
   const totalTrips = trips.length;
   const totalDaysAbroad = trips.reduce((sum, t) => sum + t.duration_days, 0);
@@ -217,7 +285,7 @@ export default async function TravelPage() {
       <div className="mb-8">
         <h2 className="text-[28px] font-medium text-text-primary">Travel Analysis</h2>
         <p className="text-sm text-text-tertiary mt-0.5">
-          HRV impact and recovery patterns across {totalTrips} trips · {totalDaysAbroad} days abroad
+          HRV impact and recovery patterns across {totalTrips} trips · {totalDaysAbroad} days abroad · {flights.length} flights on record
         </p>
       </div>
 
@@ -236,6 +304,75 @@ export default async function TravelPage() {
           sublabel={`vs 7-day baseline (n=${direction.return_home.length})`}
         />
       </div>
+
+      {/* Flights (from Delta confirmation emails) */}
+      <ChartCard
+        title="Flights"
+        subtitle={`${flights.length} segments across ${pnrCount} bookings, parsed from Delta emails · ${upcoming.length} upcoming`}
+        source="DELTA EMAIL"
+        className="mb-6"
+      >
+        {flights.length === 0 ? (
+          <p className="text-sm text-text-tertiary py-6 text-center">No flights parsed yet — the Flights Email ETL runs every 3 hours.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-text-tertiary text-left border-b border-border-subtle">
+                  <th className="py-2 px-3 font-medium">Date</th>
+                  <th className="py-2 px-3 font-medium">Flight</th>
+                  <th className="py-2 px-3 font-medium">Route</th>
+                  <th className="py-2 px-3 font-medium">Departs</th>
+                  <th className="py-2 px-3 font-medium">Arrives</th>
+                  <th className="py-2 px-3 font-medium">Duration</th>
+                  <th className="py-2 px-3 font-medium">Seat</th>
+                  <th className="py-2 px-3 font-medium">Conf #</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...upcoming, ...past].map((f, i) => {
+                  const isUpcoming = i < upcoming.length;
+                  const overnight = f.arr_local && f.dep_local && f.arr_local.slice(0, 10) !== f.dep_local.slice(0, 10);
+                  return (
+                    <tr
+                      key={f.flight_id}
+                      className={`border-b border-border-subtle/50 ${isUpcoming ? "text-text-primary" : "text-text-secondary"} ${i === upcoming.length && upcoming.length > 0 ? "border-t-2 border-t-border-subtle" : ""}`}
+                    >
+                      <td className="py-2 px-3 font-mono whitespace-nowrap">
+                        {fmtLocalDate(f.dep_local ?? f.dep_local_date)}
+                        {isUpcoming && <span className="ml-2 text-[10px] uppercase tracking-wide text-indigo-400">upcoming</span>}
+                      </td>
+                      <td className="py-2 px-3 font-mono">
+                        {f.flight_number}
+                        {f.operated_by && !/Delta Air Lines/i.test(f.operated_by) && (
+                          <span className="block text-[10px] text-text-tertiary">{f.operated_by.replace(/ DBA Delta Connection/i, "")}</span>
+                        )}
+                      </td>
+                      <td className="py-2 px-3 whitespace-nowrap">
+                        <span className="font-mono">{f.dep_iata ?? "?"} → {f.arr_iata ?? "?"}</span>
+                        <span className="block text-[11px] text-text-tertiary">{(f.dep_city ?? "").split(",")[0]} → {(f.arr_city ?? "").split(",")[0]}</span>
+                      </td>
+                      <td className="py-2 px-3 font-mono whitespace-nowrap">{fmtLocalTime(f.dep_local)}</td>
+                      <td className="py-2 px-3 font-mono whitespace-nowrap">
+                        {fmtLocalTime(f.arr_local)}
+                        {overnight && <span className="ml-1 text-[10px] text-amber-400">+1</span>}
+                      </td>
+                      <td className="py-2 px-3 font-mono text-text-tertiary">{fmtDuration(f.duration_min)}</td>
+                      <td className="py-2 px-3 font-mono text-text-tertiary">{f.seat ?? "—"}</td>
+                      <td className="py-2 px-3 font-mono text-text-tertiary whitespace-nowrap">
+                        {f.confirmation_number}
+                        {f.status !== "confirmed" && (
+                          <span className={`ml-2 text-[10px] uppercase tracking-wide ${f.status === "cancelled" ? "text-red-400" : "text-amber-400"}`}>{f.status}</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </ChartCard>
 
       {/* Trip list */}
       <ChartCard title="All trips" subtitle="Auto-segmented from pds.trips">
