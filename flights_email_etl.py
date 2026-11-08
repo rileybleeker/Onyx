@@ -108,6 +108,15 @@ CITY_TO_IATA = {
     "HOUSTON-INTERCONTINENTAL": "IAH", "PHILADELPHIA": "PHL", "BALTIMORE": "BWI", "CINCINNATI": "CVG",
     "INDIANAPOLIS": "IND", "COLUMBUS": "CMH", "PITTSBURGH": "PIT", "SAN DIEGO": "SAN", "PORTLAND": "PDX",
     "NEW ORLEANS": "MSY", "SAVANNAH": "SAV", "JACKSONVILLE": "JAX", "RICHMOND": "RIC", "BIRMINGHAM": "BHM",
+    "ST LOUIS": "STL", "SPRINGFIELD, MISSOURI": "SGF", "SPRINGFIELD, ILLINOIS": "SPI",
+    "WASHINGTON DULLES": "IAD", "WASHINGTON-DULLES": "IAD", "WASHINGTON REAGAN": "DCA", "WASHINGTON-REAGAN NATIONAL": "DCA",
+    "CHICAGO-O'HARE": "ORD", "CHICAGO O'HARE": "ORD", "CHICAGO-MIDWAY": "MDW", "KANSAS CITY": "MCI",
+    "MINNEAPOLIS": "MSP", "MINNEAPOLIS-ST PAUL": "MSP", "MEMPHIS": "MEM", "OKLAHOMA CITY": "OKC", "OMAHA": "OMA",
+    "DES MOINES": "DSM", "MILWAUKEE": "MKE", "CLEVELAND": "CLE", "BUFFALO": "BUF", "HARTFORD": "BDL",
+    "PROVIDENCE": "PVD", "NORFOLK": "ORF", "GREENVILLE": "GSP", "KNOXVILLE": "TYS", "CHATTANOOGA": "CHA",
+    "PENSACOLA": "PNS", "WEST PALM BEACH": "PBI", "FORT MYERS": "RSW", "SAN ANTONIO": "SAT", "ALBUQUERQUE": "ABQ",
+    "SAN JOSE": "SJC", "OAKLAND": "OAK", "HONOLULU": "HNL", "ANCHORAGE": "ANC", "CANCUN": "CUN", "MEXICO CITY": "MEX",
+    "LONDON": "LHR", "PARIS": "CDG", "ROME": "FCO", "DUBLIN": "DUB", "LISBON": "LIS", "BARCELONA": "BCN",
 }
 # Regional operators that fly Delta Connection under their own 2-char code in the
 # check-in email ("9E 4958"); the receipt lists the same leg as "DELTA 4958".
@@ -234,10 +243,18 @@ def carrier_code(name: str) -> str:
     return CARRIER_CODES.get(n, n[:2])
 
 
+def normalize_city(city: str) -> str:
+    """'Chicago-o'hare Intl, Illinois' → "CHICAGO-O'HARE, ILLINOIS"; 'St. Louis' → 'ST LOUIS'."""
+    c = re.sub(r"\s+", " ", city).strip().upper().rstrip("*").rstrip(",").strip()
+    c = re.sub(r"\s+(INTL\.?|INTERNATIONAL|AIRPORT)\b", "", c)
+    c = c.replace("ST. ", "ST ")
+    return c
+
+
 def city_to_iata(city: str | None) -> Optional[str]:
     if not city:
         return None
-    c = re.sub(r"\s+", " ", city).strip().upper().rstrip(",")
+    c = normalize_city(city)
     if c in CITY_TO_IATA:
         return CITY_TO_IATA[c]
     base = c.split(",")[0].strip()
