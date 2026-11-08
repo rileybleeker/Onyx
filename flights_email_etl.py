@@ -762,6 +762,20 @@ def propose_tz_entries(store: Store, since: date) -> list[dict]:
                 continue  # same offset (e.g. Toronto vs New York) — no behavioral difference
         except Exception:
             continue
+        # Manual > GPS-auto > WHOOP-auto > flight-auto: if ANY log row within ±36h of the
+        # landing already records this TZ (a hand-entered "Returned to NY" at a rounder
+        # instant, or an earlier auto path), the transition is known — don't add a
+        # second, slightly different row for the same trip leg.
+        try:
+            lo = (arr_time - timedelta(hours=36)).isoformat()
+            hi = (arr_time + timedelta(hours=36)).isoformat()
+            near = (store.pds("user_tz_log").select("effective_from,tz").gte("effective_from", lo)
+                    .lte("effective_from", hi).execute().data or [])
+            if any(r["tz"] == arr_tz for r in near):
+                continue
+        except Exception as e:
+            log.warning(f"user_tz_log window lookup failed: {e}")
+            continue
         proposals.append({
             "effective_from": arr_time.isoformat(),
             "tz": arr_tz,
