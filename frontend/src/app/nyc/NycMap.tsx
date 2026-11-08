@@ -39,7 +39,12 @@ export default function NycMap({
   // Create the map once.
   useEffect(() => {
     if (!el.current || map.current) return;
-    map.current = L.map(el.current, { zoomControl: true, attributionControl: true }).setView(CENTRAL_PARK, 13);
+    // Wheel zoom only after a click on the map, and off again when the pointer
+    // leaves: otherwise scrolling the page past the map zooms it out to
+    // half the state.
+    map.current = L.map(el.current, { zoomControl: true, attributionControl: true, scrollWheelZoom: false }).setView(CENTRAL_PARK, 13);
+    map.current.on("click", () => map.current?.scrollWheelZoom.enable());
+    map.current.on("mouseout", () => map.current?.scrollWheelZoom.disable());
     // Standard OSM tiles (keyless; CARTO's basemaps started demanding an API
     // key), darkened to match the app with a CSS filter on the tile pane.
     L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
