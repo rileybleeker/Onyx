@@ -191,6 +191,8 @@ Upload uses `if: always()` so tokens are saved even if the ETL fails partway thr
 
 ### Unified View: `daily_health_matrix`
 
+> **Historical (dropped 2026-11-08).** This clock-date view no longer exists; the canonical matrix is `pds.daily_health_matrix_behavioral` (ADR-0001), with `pds.daily_health_matrix_behavioral_mat` for frontend reads. Rollback DDL: `sql/deprecated/daily_health_matrix_live_2026-11-07.sql`.
+
 Joins all three device sources by `calendar_date` (~40 columns):
 - Garmin: steps, calories, RHR, stress, body battery, sleep score, HRV
 - WHOOP: recovery score, RHR, HRV RMSSD, SpO2, skin temp, sleep performance, strain
