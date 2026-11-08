@@ -42,6 +42,7 @@ const CADENCE: Record<string, string> = {
   reccobeats: "With Spotify ETL",
   musicbrainz: "With Spotify ETL",
   supplements: "Manual",
+  reading: "Manual",
   notion_journal: "Hourly :35",
   tanita: "Daily 10am + 1:30pm ET",
   nyc_scout: "Daily 6:10am ET",
@@ -76,6 +77,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   reccobeats:     { method: "automated",      label: "API ETL" },
   musicbrainz:    { method: "automated",      label: "API ETL" },
   supplements:    { method: "manual",         label: "Manual entry" },
+  reading:        { method: "manual",         label: "Manual entry" },
   notion_journal: { method: "automated",      label: "Notion sync" },
   tanita:         { method: "automated",      label: "API ETL" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
@@ -214,7 +216,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -227,6 +229,8 @@ export async function GET() {
       // entry date. created_at on supplement/weight is the row insert
       // time; for weight the user-facing timestamp is updated_at on edits.
       supabase.from("supplement_intake").select("intake_date,created_at").order("intake_time", { ascending: false }).limit(1),
+      // Reading module (/reading): freshness = the newest logged session. Manual source.
+      supabase.from("reading_sessions").select("session_date,created_at").order("created_at", { ascending: false }).limit(1),
       supabase.from("journal_entries").select("entry_date").eq("archived", false).order("entry_date", { ascending: false }).limit(1),
       // Body weight via Tanita: freshness = the newest scale measurement.
       // onyx_et_date is the trigger-derived ET day; measured_at gives the
@@ -319,6 +323,8 @@ export async function GET() {
     const spotifyDate = spotifyRes.data?.[0]?.played_date_et ?? null;
     const supplementsDate = supplementsRes.data?.[0]?.intake_date ?? null;
     const supplementsLastLog = (supplementsRes.data?.[0]?.created_at as string | undefined) ?? null;
+    const readingDate = readingRes.data?.[0]?.session_date ?? null;
+    const readingLastLog = (readingRes.data?.[0]?.created_at as string | undefined) ?? null;
     const notionJournalDate = notionJournalRes.data?.[0]?.entry_date ?? null;
     const tanitaDate = tanitaRes.data?.[0]?.onyx_et_date ?? null;
     const tanitaLastMeasure = (tanitaRes.data?.[0]?.measured_at as string | undefined) ?? null;
@@ -365,6 +371,7 @@ export async function GET() {
     const hrvLag = daysLag(hrvDate, spineMaxDate);
     const spotifyLag = daysLag(spotifyDate, spineMaxDate);
     const supplementsLag = daysLag(supplementsDate, spineMaxDate);
+    const readingLag = daysLag(readingDate, spineMaxDate);
     const notionJournalLag = daysLag(notionJournalDate, spineMaxDate);
     const tanitaLag = daysLag(tanitaDate, spineMaxDate);
     const nyc = await nycPromise;
@@ -551,6 +558,22 @@ export async function GET() {
         cadence: CADENCE.supplements,
         integrationMethod: METHOD.supplements.method,
         methodLabel: METHOD.supplements.label,
+      },
+      // Reading quest (/reading, 2026-11-07): sessions + highlights logged by hand,
+      // mirrored to the book's Notion reading-log page. Freshness = newest session
+      // (daily cadence while a book is in progress).
+      reading: {
+        label: "Reading",
+        lastSync: readingLastLog ?? readingDate,
+        status: deriveStatus(null, readingLag),
+        latestDataDate: readingDate,
+        daysLag: readingLag,
+        recordsSynced: 0,
+        durationSeconds: null,
+        errorMessage: null,
+        cadence: CADENCE.reading,
+        integrationMethod: METHOD.reading.method,
+        methodLabel: METHOD.reading.label,
       },
       // Body weight via Tanita Health Planet (tanita_etl.py): scale → phone
       // app → Health Planet cloud → twice-daily ETL → tanita_measurements,

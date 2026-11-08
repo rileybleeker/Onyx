@@ -3,6 +3,8 @@ import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist } from "@/lib/spotify-server";
 import { logStackIntake } from "@/lib/supplement-stacks";
+import { addHighlight, getOverview, logSession, recordQuiz, summarizeForChat, type HighlightSource, type Medium } from "@/lib/reading";
+import { mirrorHighlight, mirrorProgress, mirrorSession } from "@/lib/reading-notion";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
@@ -29,6 +31,8 @@ You can also create Spotify playlists. The user has private-playlist write acces
 - Use search_spotify_catalog when they want tracks they haven't listened to before, or when filling out a playlist beyond what their history covers.
 - Once you have track IDs (mix sources freely), call create_spotify_playlist directly — playlists are private and easily deleted, so don't ask for confirmation.
 - Default to ~25–40 tracks unless the user specifies otherwise. Give the playlist a descriptive name that reflects the user's request.
+
+The user is also reading a book as a tracked "reading quest" (currently The Goal by Goldratt, 40 chapters, target Nov 30 2026). Use get_reading_status for progress, pace and coaching. When they report reading ("finished chapters 3 and 4 on my run, here's what I remember: …"), call log_reading_session and pass their recall text VERBATIM — never summarize it. When they quote a passage with a comment, call add_book_highlight. When they ask to be quizzed ("quiz me on The Goal through chapter 12"), first call get_reading_status, then ask 5 short questions ONE AT A TIME drawn from the chapters they have read, their highlights and recall notes; grade each answer honestly; then call record_reading_quiz with checkpoint 'ch<N>' and the score. Keep coaching brief and specific (chapters behind pace, streak at risk, reviews due).
 
 Format numbers clearly. Use relative comparisons (e.g., "your HRV is 15% above your weekly average"). When comparing across devices, note any discrepancies. When you don't have enough data, say so.`;
 
@@ -193,6 +197,66 @@ const tools: Anthropic.Tool[] = [
         date: { type: "string", description: "Date in YYYY-MM-DD format (defaults to the current behavioral day)" },
       },
       required: ["stack"],
+    },
+  },
+  {
+    name: "get_reading_status",
+    description: "Get the user's reading quest for the book in progress (default: the active book): chapters done vs total, pace vs target date, streak, XP/level, badges, checkpoints with quiz results, recent sessions WITH their from-memory recall notes, highlights WITH comments, and highlights due for review. Use it for 'how is my reading going', to coach pace, and as the source material when the user asks to be quizzed on the book.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        book: { type: "string", description: "Book slug (e.g. 'the-goal'). Omit for the active book." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "log_reading_session",
+    description: "Record a reading session for the active book: the chapter reached, minutes, medium, and the user's from-memory recall note (what happened, what principle, where it shows up in a BC implementation) plus one question. Use when the user says they read/listened to chapters ('I finished chapters 5 and 6 on my run', 'log my reading: through chapter 8, here is what I remember…'). Pass their recall text VERBATIM as `recall`. Also marks the book's habit for that day and mirrors the entry to Notion. Returns XP gained.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        chapter_through: { type: "number", description: "Last chapter completed (cumulative, e.g. 6)" },
+        chapter_from: { type: "number", description: "First chapter of this session (optional; defaults to previous max + 1)" },
+        minutes: { type: "number", description: "Minutes spent (optional)" },
+        medium: { type: "string", enum: ["audio", "kindle", "paper", "other"], description: "How they read (optional)" },
+        recall: { type: "string", description: "The user's own words, verbatim: what happened, the principle, the BC mapping" },
+        question: { type: "string", description: "One question they'd ask a plant manager / client (optional)" },
+        date: { type: "string", description: "YYYY-MM-DD (defaults to the current behavioral day)" },
+        book: { type: "string", description: "Book slug (optional; defaults to the active book)" },
+      },
+      required: ["chapter_through"],
+    },
+  },
+  {
+    name: "add_book_highlight",
+    description: "Save a highlighted passage from the book with the user's comment, chapter and concept tag (e.g. 'Bottleneck / capacity-constrained resource'). Use when the user quotes or paraphrases a passage they want to keep ('highlight this: …', 'save this quote and note that …'). Idempotent on passage. Mirrors to Notion and enters the spaced-repetition review queue.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        passage: { type: "string", description: "The passage text" },
+        comment: { type: "string", description: "The user's comment / annotation (optional but encouraged)" },
+        chapter: { type: "number", description: "Chapter number (optional)" },
+        concept: { type: "string", description: "Concept tag for the TOC→BC mapping (optional)" },
+        source: { type: "string", enum: ["manual", "kindle", "audible", "paper", "photo"], description: "Where it came from (optional)" },
+        book: { type: "string", description: "Book slug (optional)" },
+      },
+      required: ["passage"],
+    },
+  },
+  {
+    name: "record_reading_quiz",
+    description: "Record the result of a checkpoint quiz you just ran with the user about the book. Call it AFTER asking the questions one at a time and grading the answers. checkpoint is 'ch<N>' for the chapter checkpoints (e.g. 'ch12', 'ch26', 'ch40') or 'review' for a later spaced review. 80%+ passes and earns the Quiz Master badge.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        checkpoint: { type: "string", description: "'ch12' | 'ch26' | 'ch40' | 'review' | other label" },
+        score: { type: "number", description: "Correct answers" },
+        total: { type: "number", description: "Questions asked" },
+        notes: { type: "string", description: "What they missed, in one or two lines (optional)" },
+        book: { type: "string", description: "Book slug (optional)" },
+      },
+      required: ["checkpoint", "score", "total"],
     },
   },
   {
@@ -716,6 +780,81 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
   }
 
   // Log a whole supplement stack (writes one intake per item)
+  // ---- Reading quest tools (lib/reading.ts) ----
+  if (name === "get_reading_status") {
+    try {
+      const o = await getOverview(supabase, (input.book as string) || null);
+      if (!o) return JSON.stringify({ error: "No book in progress" });
+      return JSON.stringify(summarizeForChat(o));
+    } catch (e) {
+      return JSON.stringify({ error: e instanceof Error ? e.message : "failed" });
+    }
+  }
+
+  if (name === "log_reading_session") {
+    const result = await logSession(supabase, {
+      slug: (input.book as string) || null,
+      date: (input.date as string) || null,
+      chapter_through: Number(input.chapter_through),
+      chapter_from: input.chapter_from != null ? Number(input.chapter_from) : null,
+      minutes: input.minutes != null ? Number(input.minutes) : null,
+      medium: (input.medium as Medium) || null,
+      recall: (input.recall as string) || null,
+      question: (input.question as string) || null,
+    });
+    if (!result.ok) return JSON.stringify({ error: result.error });
+    // Mirror inline (the chat loop has no after() boundary worth protecting).
+    const blockId = await mirrorSession(result.book, result.session);
+    if (blockId) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
+    const o = await getOverview(supabase, result.book.slug).catch(() => null);
+    await mirrorProgress(result.book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
+    return JSON.stringify({
+      success: true,
+      xp_gained: result.xpGained,
+      finished: result.finished,
+      habit_marked: result.habitMarked,
+      chapters_done: o?.chaptersDone,
+      total_chapters: o?.totalChapters,
+      pace: o?.pace,
+      streak: o?.streak,
+      level: o?.level,
+      notion_mirrored: !!blockId,
+    });
+  }
+
+  if (name === "add_book_highlight") {
+    const result = await addHighlight(supabase, {
+      slug: (input.book as string) || null,
+      passage: String(input.passage ?? ""),
+      comment: (input.comment as string) || null,
+      chapter: input.chapter != null ? Number(input.chapter) : null,
+      concept: (input.concept as string) || null,
+      source: (input.source as HighlightSource) || null,
+    });
+    if (!result.ok) return JSON.stringify({ error: result.error });
+    let mirrored = false;
+    if (result.created) {
+      const blockId = await mirrorHighlight(result.book, result.highlight);
+      if (blockId) {
+        await supabase.from("book_highlights").update({ notion_block_id: blockId }).eq("highlight_id", result.highlight.highlight_id);
+        mirrored = true;
+      }
+    }
+    return JSON.stringify({ success: true, created: result.created, highlight_id: result.highlight.highlight_id, next_review: result.highlight.next_review, notion_mirrored: mirrored });
+  }
+
+  if (name === "record_reading_quiz") {
+    const result = await recordQuiz(supabase, {
+      slug: (input.book as string) || null,
+      checkpoint: String(input.checkpoint ?? ""),
+      score: Number(input.score),
+      total: Number(input.total),
+      notes: (input.notes as string) || null,
+    });
+    if (!result.ok) return JSON.stringify({ error: result.error });
+    return JSON.stringify({ success: true, passed: result.passed, score: `${result.quiz.score}/${result.quiz.total}`, checkpoint: result.quiz.checkpoint });
+  }
+
   if (name === "log_supplement_stack") {
     const wanted = (input.stack as string)?.trim();
     if (!wanted) return JSON.stringify({ error: "stack name is required" });

@@ -303,6 +303,15 @@ const PAGES: SmokePage[] = [
     legitimateEmpty: "No caffeine days in the database yet.",
   },
   {
+    route: "/reading",
+    heading: "Reading",
+    signal: "charts",
+    // The burn-up chart always draws the pace line from books.start/target_date,
+    // so a fresh book with zero sessions still has data marks. The session and
+    // highlight lists are write-coupled and legitimately empty.
+    hardEmpty: [],
+  },
+  {
     route: "/spotify",
     heading: "Spotify",
     signal: "charts",

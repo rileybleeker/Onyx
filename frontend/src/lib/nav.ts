@@ -16,6 +16,7 @@ import {
   ShieldCheck,
   Bot,
   Building2,
+  BookMarked,
 } from "lucide-react";
 
 /**
@@ -51,6 +52,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { href: "/caffeine", label: "Caffeine", shortcut: "F", icon: Coffee, keywords: ["coffee", "espresso", "energy drink", "stimulant", "mg", "half-life", "bedtime", "window"] },
       { href: "/check-in", label: "Check-in", shortcut: "K", icon: ClipboardCheck, keywords: ["daily", "evening", "habits", "journal", "questions", "yes", "no"] },
       { href: "/habits", label: "Habits", shortcut: "T", icon: CircleCheck, keywords: ["routine", "streak", "complete", "notion"] },
+      { href: "/reading", label: "Reading", shortcut: "L", icon: BookMarked, keywords: ["book", "quest", "highlights", "the goal", "kindle", "audiobook", "xp", "badges", "review"] },
     ],
   },
   {
