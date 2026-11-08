@@ -35,7 +35,7 @@ Format numbers clearly. Use relative comparisons (e.g., "your HRV is 15% above y
 const tools: Anthropic.Tool[] = [
   {
     name: "query_daily_summary",
-    description: "Get daily summary stats (steps, calories, heart rate, stress, body battery, SpO2) for a date range. Use this for general health questions.",
+    description: "Get Garmin daily summary stats (steps, heart rate, stress, body battery, SpO2) for a date range. Use this for general health questions. Garmin's calorie estimate is returned as garmin_total_kcal_NOT_TDEE and must NOT be reported as calories burned — use query_whoop_cycles (tdee_kcal) for daily energy expenditure.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -112,7 +112,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "query_whoop_cycles",
-    description: "Get WHOOP daily cycle data including strain, kilojoules, average and max heart rate.",
+    description: "Get WHOOP daily cycle data including strain, kilojoules, average and max heart rate. tdee_kcal (kilojoule / 4.184) is THE canonical daily calories-burned / TDEE figure — always use it for 'calories burned' questions.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -318,6 +318,22 @@ function stripRawFields(rows: Record<string, unknown>[]): Record<string, unknown
     void raw_json; void raw_hr_values; void raw_stress_values; void raw_hrv_readings;
     return rest;
   });
+}
+
+// TDEE guard (mirrors queries.ts:getDailySummaries): WHOOP kJ / 4.184 is the
+// canonical calories-burned figure. Rename Garmin's estimate so the model
+// can't mistake it for TDEE, and hand WHOOP rows a ready-made tdee_kcal.
+function tagCalorieSources(table: string, rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  if (table === "garmin_daily_summary") {
+    return rows.map(({ total_kilocalories, ...rest }) => ({ ...rest, garmin_total_kcal_NOT_TDEE: total_kilocalories }));
+  }
+  if (table === "whoop_cycles") {
+    return rows.map((r) => ({
+      ...r,
+      tdee_kcal: typeof r.kilojoule === "number" ? Math.round(r.kilojoule / 4.184) : null,
+    }));
+  }
+  return rows;
 }
 
 async function executeTool(name: string, input: Record<string, unknown>): Promise<string> {
@@ -745,7 +761,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     }
     const { data, error } = await query;
     if (error) return JSON.stringify({ error: error.message });
-    return JSON.stringify(stripRawFields(data ?? []));
+    return JSON.stringify(tagCalorieSources(table, stripRawFields(data ?? [])));
   }
 
   // Handle calendar_date-based tables
@@ -760,7 +776,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     .limit(60);
 
   if (error) return JSON.stringify({ error: error.message });
-  return JSON.stringify(stripRawFields(data ?? []));
+  return JSON.stringify(tagCalorieSources(table, stripRawFields(data ?? [])));
 }
 
 export async function POST(req: NextRequest) {

@@ -14,6 +14,7 @@ on:
       - "whoop_etl.py"
       - "eight_sleep_etl.py"
       - "tests/**"
+      - "frontend/src/**"
       - "requirements-analysis*.txt"
       - "requirements-analysis.lock"
       - ".github/workflows/stats-pr-check.yml"
@@ -63,3 +64,6 @@ jobs:
         # Uses synthetic test fixtures (uuid-tagged) and cleans up after itself,
         # so it's safe to run against the live DB.
         run: python tests/test_habit_rename.py
+
+      - name: TDEE source guard (WHOOP kJ is canonical, never Garmin kcal)
+        run: python tests/test_tdee_source_guard.py
