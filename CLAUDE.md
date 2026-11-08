@@ -33,6 +33,7 @@ Onyx/
 ├── meal_schema.sql          # meal_events + meal_timing_daily view (clock-time meal events for HRV timing analysis)
 ├── weight_schema.sql        # weight_log: one row per ET day, kg-stored body weight (tanita rollup primary + manual /nutrition override)
 ├── tanita_etl.py            # Tanita Health Planet → Supabase (tanita_measurements raw + weight_log daily rollup)
+├── flights_email_etl.py     # Delta confirmation/trip-details/check-in emails (IMAP, BOTH Gmail accounts) → pds.flights (+ user_tz_log flight-auto)
 ├── tanita_schema.sql        # tanita_measurements DDL (ADR-0001 quad trigger, RLS) + weight_log.source column
 ├── spotify_schema.sql       # Spotify table DDL + spotify_daily_signature view
 ├── spotify_playlists_schema.sql  # Spotify playlists audit table DDL
@@ -65,7 +66,8 @@ Onyx/
 │   ├── journal-sync.yml         # Notion personal Journal sync (`35 * * * *`)
 │   ├── habits-sync.yml          # Habits sync from Notion (`45 * * * *`)
 │   ├── spotify-etl.yml          # Spotify recently-played (`50 * * * *`)
-│   ├── tanita-etl.yml           # Tanita weight ETL — daily 10am + 1:30pm ET catch-up
+│   ├── tanita-etl.yml           # Tanita weight ETL — daily 10am + 1:30pm ET
+│   ├── flights-email.yml        # Flights Email ETL — every 3h at :25 (`25 */3 * * *`) catch-up
 │   ├── hrv-prediction.yml       # HRV prediction — auto-runs after each ETL via workflow_run, plus guaranteed 23:50 ET finalization (DST-safe)
 │   └── hrv-retrain-on-backfill.yml  # HRV Analysis Retrain — hourly backfill check + daily 12:00 UTC safety-net
 ├── whoop_schema.sql         # WHOOP table DDL
@@ -73,6 +75,7 @@ Onyx/
 ├── sql/
 │   ├── rls_policies.sql     # Row-Level Security policies
 │   ├── ci_tokens.sql        # CI token storage table
+│   ├── flights_schema.sql   # pds.flights (one row per flight segment) + pds.flight_email_log (parse ledger)
 │   └── reading_schema.sql   # Reading module: books, reading_sessions, book_highlights (SM-2 review), reading_reviews, reading_quizzes
 ├── ARCHITECTURE.md          # Full system architecture reference
 ├── .env                     # Secrets (NEVER commit)
@@ -403,6 +406,7 @@ All data sources run **hourly** on a staggered schedule to spread load and avoid
 | Spotify ETL | `spotify-etl.yml` | `50 * * * *` | Pulls recently-played; upserts plays + tracks; featurizes new tracks via ReccoBeats. Hourly (was 2h) to minimize loss from Spotify's 50-track server-side cap; emits `partial` sync_log status when a run returns exactly 50 items so /status surfaces cap-hit incidents. |
 | Cronometer ETL | `cronometer-etl.yml` | `30 2 * * *` + `0 16 * * *` | Automated web-export of Cronometer nutrition (unofficial endpoints) → `run_import` → `cronometer_*` tables. Twice daily; session in `ci_tokens`. |
 | Tanita ETL | `tanita-etl.yml` | `0 14 * * *` + `30 17 * * *` | Health Planet weigh-ins → tanita_measurements + weight_log rollup. Mid-morning ET (post weigh-in + phone-app sync) + early-afternoon catch-up; daily cadence — the scale yields ~1 measurement/day. |
+| Flights Email ETL | `flights-email.yml` | `25 */3 * * *` | Parses Delta operational emails from BOTH Gmail accounts over IMAP (read-only, All Mail) → `pds.flights`; proposes `user_tz_log` rows for landed segments; `flights\|email` heartbeat. `workflow_dispatch` inputs `days` (backfill window) + `reprocess`. |
 | HRV prediction | `hrv-prediction.yml` | `workflow_run` after hourly ETL + `50 3 * * *` + `50 4 * * *` | Backfills actuals + predicts next day. Hourly workflow_run runs give intra-day monitoring; the two scheduled crons land on 23:50 ET year-round (one per DST state — the `dst-gate` job skips the wrong-season run by checking `TZ=America/New_York date +%H == 23`). The 23:50 ET run captures the final day's imports (Habits at :45, journal at :30, MFP at :15) before ET midnight closes the day. **`hrv_predict.py` uses `et_today()` (`zoneinfo.ZoneInfo("America/New_York")`) for all date arithmetic** — a UTC `date.today()` on the runner would mis-tag the late-ET-evening run as the day-after-next. |
 | HRV Analysis Retrain | `hrv-retrain-on-backfill.yml` | `20 * * * *` + `0 12 * * *` | Two triggers: (1) hourly backfill check via `hrv_backfill_check.py` — runs full `hrv_analysis.py` only if any row with `calendar_date < today-2` was updated since last `hrv_analysis_results.computed_at`. (2) Daily unconditional retrain at 12:00 UTC (~8am ET) — safety net so correlations stay fresh even if no backfill ever fires. The decision is made by the "Decide whether to retrain" step that branches on `github.event.schedule` / `github.event_name`. |
 
