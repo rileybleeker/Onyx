@@ -12,11 +12,16 @@ function safeEqual(a: string, b: string): boolean {
 
 // Routes that accept the x-onyx-ci-token shared secret instead of a session:
 // the hourly habits-sync Action (/api/habits/*) and the local Kindle Notebook
-// harvester (tools/kindle_harvest → /api/reading/highlights/import, 2026-11-07).
-// Keep this list tiny — every entry is a service-role write reachable without
-// a login, gated only by the constant-time token check below.
+// harvester (tools/kindle_harvest → /api/reading/highlights/import, 2026-11-07),
+// and the iPhone Shortcuts screen-time automation (/api/screen-time/event,
+// 2026-11-08). Keep this list tiny — every entry is a service-role write
+// reachable without a login, gated only by the constant-time token check below.
 function isCiRoute(pathname: string): boolean {
-  return pathname.startsWith("/api/habits") || pathname === "/api/reading/highlights/import";
+  return (
+    pathname.startsWith("/api/habits") ||
+    pathname === "/api/reading/highlights/import" ||
+    pathname === "/api/screen-time/event"
+  );
 }
 
 export async function middleware(request: NextRequest) {

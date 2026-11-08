@@ -44,6 +44,7 @@ const CADENCE: Record<string, string> = {
   supplements: "Manual",
   reading: "Manual",
   kindle: "Every 3h (Riley's PC, while logged on)",
+  screen_time: "Real-time (iPhone app open/close)",
   notion_journal: "Hourly :35",
   tanita: "Daily 10am + 1:30pm ET",
   flights: "Every 3h :25 (both Gmail accounts)",
@@ -81,6 +82,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   supplements:    { method: "manual",         label: "Manual entry" },
   reading:        { method: "manual",         label: "Manual entry" },
   kindle:         { method: "automated",      label: "Local Chrome harvest" },
+  screen_time:    { method: "automated",      label: "iOS Shortcuts events" },
   notion_journal: { method: "automated",      label: "Notion sync" },
   tanita:         { method: "automated",      label: "API ETL" },
   flights:        { method: "automated",      label: "IMAP email parser" },
@@ -220,7 +222,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -306,6 +308,10 @@ export async function GET() {
         .eq("data_type", "refresh")
         .order("sync_start", { ascending: false })
         .limit(1),
+      // Phone screen time: newest app open/close event posted by the iPhone
+      // Shortcuts automation. No sync_log heartbeat — events arrive in real
+      // time, so the newest event IS the freshness signal.
+      supabase.from("phone_app_events").select("event_time,onyx_behavioral_date").order("event_time", { ascending: false }).limit(1),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -607,6 +613,37 @@ export async function GET() {
           cadence: CADENCE.kindle,
           integrationMethod: METHOD.kindle.method,
           methodLabel: METHOD.kindle.label,
+        };
+      })(),
+      // Phone screen time (/api/screen-time/event): an iOS Shortcuts automation
+      // posts every app open/close in real time. Freshness = hours since the
+      // newest event. The phone sits idle overnight, so >12h = degraded and
+      // >36h = red (automation disabled, token wrong, or iOS stopped firing it).
+      screen_time: (() => {
+        const last = (screenTimeRes.data?.[0]?.event_time as string | undefined) ?? null;
+        const ageH = last ? (Date.now() - new Date(last).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = screenTimeRes.error
+          ? "failed"
+          : !last
+            ? "unknown"
+            : ageH > 36
+              ? "failed"
+              : ageH > 12
+                ? "partial"
+                : "success";
+        return {
+          label: "Screen Time",
+          lastSync: last,
+          status,
+          latestDataDate: (screenTimeRes.data?.[0]?.onyx_behavioral_date as string | undefined) ?? null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: 0,
+          durationSeconds: null,
+          errorMessage: screenTimeRes.error?.message
+            ?? (ageH > 36 && last ? `No app events for ${Math.floor(ageH)}h — check the iPhone Shortcuts automation.` : null),
+          cadence: CADENCE.screen_time,
+          integrationMethod: METHOD.screen_time.method,
+          methodLabel: METHOD.screen_time.label,
         };
       })(),
       // Flights (flights_email_etl.py): Delta confirmation / trip-details / check-in
