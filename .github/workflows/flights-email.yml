@@ -1,0 +1,55 @@
+name: Flights Email ETL
+
+on:
+  schedule:
+    # Every 3 hours at :25 — Delta's operational emails (receipt at purchase,
+    # trip details ~3 days out, check-in reminder the day before) are not
+    # time-critical, and the /status card tolerates a 12h gap before going red.
+    # :25 keeps clear of the hourly ETL (:00), retrain check (:20), journal
+    # (:35), habits (:45) and Spotify (:50) minutes.
+    - cron: '25 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Look-back window in days (default 60; use e.g. 730 for a history backfill)'
+        required: false
+        type: string
+      reprocess:
+        description: 'Re-parse emails already in pds.flight_email_log'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: flights-email
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  flights-email:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install supabase python-dotenv airportsdata
+
+      - name: Parse Delta emails from both Gmail accounts
+        run: >
+          python flights_email_etl.py
+          ${{ inputs.days && format('--days {0}', inputs.days) || '' }}
+          ${{ inputs.reprocess && '--reprocess' || '' }}
+        env:
+          IMAP_HOST: ${{ secrets.IMAP_HOST }}
+          # Account 1 — the pre-existing IMAP pair (shared with the MFP/WHOOP email importers)
+          IMAP_EMAIL: ${{ secrets.IMAP_EMAIL }}
+          IMAP_APP_PASSWORD: ${{ secrets.IMAP_APP_PASSWORD }}
+          # Account 2 — the second Gmail. Leave unset until the app password exists;
+          # the ETL logs a warning and runs with account 1 only.
+          IMAP_EMAIL_2: ${{ secrets.IMAP_EMAIL_2 }}
+          IMAP_APP_PASSWORD_2: ${{ secrets.IMAP_APP_PASSWORD_2 }}

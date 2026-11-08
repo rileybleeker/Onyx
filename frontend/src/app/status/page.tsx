@@ -25,6 +25,7 @@ const SOURCE_BADGE: Record<string, string> = {
   reading: "BOOK",
   kindle: "KINDLE",
   tanita: "TANITA",
+  flights: "DELTA",
   nyc_scout: "AGENT",
   matrix_mat: "DB",
   perf_mats: "DB",
@@ -46,6 +47,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   reading: "text-amber-300",
   kindle: "text-amber-300/70",
   tanita: "text-amber-500",
+  flights: "text-indigo-400",
   nyc_scout: "text-sky-400",
   matrix_mat: "text-cyan-400/70",
   perf_mats: "text-cyan-400/70",
@@ -98,6 +100,7 @@ const SOURCE_ORDER = [
   "reading",
   "kindle",
   "tanita",
+  "flights",
   "nyc_scout",
   "matrix_mat",
   "perf_mats",
@@ -218,6 +221,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   hrv_analysis: "HRV Retrain",
   tanita: "Tanita",
   kindle: "Kindle",
+  flights: "Flights",
   matrix_mat: "Matrix Matview",
   perf_mats: "Perf Matviews",
 };
@@ -236,6 +240,7 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   retrain: "Retrain",
   weight: "Weight",
   highlights: "Highlights",
+  email: "Email Parse",
   refresh: "Refresh",
 };
 

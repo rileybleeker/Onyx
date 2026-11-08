@@ -106,12 +106,28 @@ async function suggestionsFor(date: string, names: Set<string>): Promise<Record<
   if (names.has(Q_PLANE)) {
     tasks.push(
       (async () => {
-        // Behavior day ≈ 06:00 that day → 06:00 the next (the −6h rule); ET offsets are close enough for this check.
-        const [a, b] = await Promise.all([
+        // 1) A parsed Delta segment departing or landing on this behavior day (pds.flights, from the
+        //    confirmation-email ETL). This also catches same-offset trips (ATL↔YYZ) the tz diff can't see.
+        // 2) Fallback: the time zone the user_tz_log ladder resolves changed across the day.
+        //    Behavior day ≈ 06:00 that day → 06:00 the next (the −6h rule); ET offsets are close enough.
+        const [f, a, b] = await Promise.all([
+          supabase
+            .from("flights")
+            .select("flight_number, dep_iata, arr_iata")
+            .in("status", ["confirmed", "changed"])
+            .or(`onyx_behavioral_date.eq.${date},arr_behavioral_date.eq.${date},dep_local_date.eq.${date}`)
+            .order("dep_local_date")
+            .limit(3),
           supabase.rpc("tz_for_instant", { ts: `${date}T10:00:00Z` }),
           supabase.rpc("tz_for_instant", { ts: `${addDays(date, 1)}T10:00:00Z` }),
         ]);
-        if (a.data && b.data && a.data !== b.data) out[Q_PLANE] = { answer: "Yes", source: `Time zone changed to ${String(b.data).split("/").pop()?.replace(/_/g, " ")}` };
+        const flights = (f.data ?? []) as { flight_number: string; dep_iata: string | null; arr_iata: string | null }[];
+        if (flights.length) {
+          const route = flights.map((x) => `${x.flight_number} ${x.dep_iata ?? "?"}→${x.arr_iata ?? "?"}`).join(", ");
+          out[Q_PLANE] = { answer: "Yes", source: `Flight: ${route}` };
+        } else if (a.data && b.data && a.data !== b.data) {
+          out[Q_PLANE] = { answer: "Yes", source: `Time zone changed to ${String(b.data).split("/").pop()?.replace(/_/g, " ")}` };
+        }
       })()
     );
   }

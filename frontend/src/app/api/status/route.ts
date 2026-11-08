@@ -46,6 +46,7 @@ const CADENCE: Record<string, string> = {
   kindle: "Every 3h (Riley's PC, while logged on)",
   notion_journal: "Hourly :35",
   tanita: "Daily 10am + 1:30pm ET",
+  flights: "Every 3h :25 (both Gmail accounts)",
   nyc_scout: "Daily 6:10am ET",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
   // the frontend matrix reads hit since 2026-06-11). The heartbeat also
@@ -82,6 +83,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   kindle:         { method: "automated",      label: "Local Chrome harvest" },
   notion_journal: { method: "automated",      label: "Notion sync" },
   tanita:         { method: "automated",      label: "API ETL" },
+  flights:        { method: "automated",      label: "IMAP email parser" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
   perf_mats:      { method: "automated",      label: "Matview refresh" },
@@ -605,6 +607,37 @@ export async function GET() {
           cadence: CADENCE.kindle,
           integrationMethod: METHOD.kindle.method,
           methodLabel: METHOD.kindle.label,
+        };
+      })(),
+      // Flights (flights_email_etl.py): Delta confirmation / trip-details / check-in
+      // emails parsed over IMAP from BOTH Gmail accounts → pds.flights. Delta has no
+      // bookings API and its emails carry no FlightReservation markup, so this is a
+      // text parser. Freshness = heartbeat age (a quiet travel month is healthy, not
+      // stale): cron every 3h → >4h partial, >12h or an error row = red. A 'partial'
+      // heartbeat also means only one of the two accounts is configured, or an email
+      // failed to parse (pds.flight_email_log status='error').
+      flights: (() => {
+        const entry = latestBySrcType["flights|email"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 12
+            ? "failed"
+            : entry.status === "partial" || ageH > 4
+              ? "partial"
+              : "success";
+        return {
+          label: "Flights",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string) ?? null,
+          cadence: CADENCE.flights,
+          integrationMethod: METHOD.flights.method,
+          methodLabel: METHOD.flights.label,
         };
       })(),
       // Body weight via Tanita Health Planet (tanita_etl.py): scale → phone
