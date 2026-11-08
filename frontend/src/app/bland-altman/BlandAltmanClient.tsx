@@ -217,6 +217,15 @@ export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInit
   const whoopRemMin = data.map((d) => d.whoop_rem_sleep_milli ? +d.whoop_rem_sleep_milli / 60000 : null);
   const eightRemMin = data.map((d) => d.eight_sleep_rem_main_sec ? +d.eight_sleep_rem_main_sec / 60 : null);
 
+  const garminLightMin = data.map((d) => d.garmin_light_sleep_sec ? +d.garmin_light_sleep_sec / 60 : null);
+  const whoopLightMin = data.map((d) => d.whoop_light_sleep_milli ? +d.whoop_light_sleep_milli / 60000 : null);
+  const eightLightMin = data.map((d) => d.eight_sleep_light_main_sec ? +d.eight_sleep_light_main_sec / 60 : null);
+
+  // Awake keeps true zeros (a night with no recorded wake time is real data).
+  const garminAwakeMin = data.map((d) => d.garmin_awake_sec != null ? +d.garmin_awake_sec / 60 : null);
+  const whoopAwakeMin = data.map((d) => d.whoop_awake_milli != null ? +d.whoop_awake_milli / 60000 : null);
+  const eightAwakeMin = data.map((d) => d.eight_sleep_awake_main_sec != null ? +d.eight_sleep_awake_main_sec / 60 : null);
+
   // Compute all Bland-Altman comparisons
   const sleepBA = [
     blandAltman(garminSleep, whoopSleep),
@@ -237,6 +246,16 @@ export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInit
     blandAltman(garminRemMin, whoopRemMin),
     blandAltman(garminRemMin, eightRemMin),
     blandAltman(whoopRemMin, eightRemMin),
+  ];
+  const lightBA = [
+    blandAltman(garminLightMin, whoopLightMin),
+    blandAltman(garminLightMin, eightLightMin),
+    blandAltman(whoopLightMin, eightLightMin),
+  ];
+  const awakeBA = [
+    blandAltman(garminAwakeMin, whoopAwakeMin),
+    blandAltman(garminAwakeMin, eightAwakeMin),
+    blandAltman(whoopAwakeMin, eightAwakeMin),
   ];
   const hrvBA = [
     blandAltman(garminHrv, whoopHrv),
@@ -279,7 +298,24 @@ export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInit
       results: remBA,
       footnote: "REM duration. Same main-only sourcing as Deep. Detection-algorithm differences are larger for REM than for Deep across consumer wearables — interpret narrow LoA as a coincidence rather than method agreement.",
     },
-    { label: "HRV", unit: "ms", results: hrvBA },
+    {
+      label: "Light Sleep Duration",
+      unit: "min",
+      results: lightBA,
+      footnote: "Light sleep, main session only on all three sides (light_sleep_main_session_seconds on Eight Sleep). Light is the residual stage once deep and REM are classified, so it inherits both of their detection biases.",
+    },
+    {
+      label: "Awake Time",
+      unit: "min",
+      results: awakeBA,
+      footnote: "Time awake inside the sleep window, main session only. Devices disagree on where the window starts and ends (in-bed vs. sleep onset), which shows up here as bias more than in the stage totals.",
+    },
+    {
+      label: "HRV",
+      unit: "ms",
+      results: hrvBA,
+      footnote: "Each device uses a different HRV algorithm (WHOOP RMSSD, Garmin's averaged 5-min readings, Eight Sleep undocumented), so read this as 'do they track the same physiology', not a calibration.",
+    },
     {
       label: "Resting Heart Rate",
       unit: "bpm",

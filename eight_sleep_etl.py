@@ -546,6 +546,15 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
             "light_sleep_seconds": _prefer_trend(trend, interval, "light_sleep_seconds"),
             "deep_sleep_seconds": _prefer_trend(trend, interval, "deep_sleep_seconds"),
             "rem_sleep_seconds": _prefer_trend(trend, interval, "rem_sleep_seconds"),
+            # Main-session-only stages (trends only). These were computed in
+            # parse_trend_day but dropped here until 2026-11-07, leaving the
+            # columns NULL from 2026-05-24 and the Eight Sleep side of
+            # /bland-altman empty.
+            "time_slept_main_session_seconds": trend.get("time_slept_main_session_seconds"),
+            "awake_main_session_seconds": trend.get("awake_main_session_seconds"),
+            "light_sleep_main_session_seconds": trend.get("light_sleep_main_session_seconds"),
+            "deep_sleep_main_session_seconds": trend.get("deep_sleep_main_session_seconds"),
+            "rem_sleep_main_session_seconds": trend.get("rem_sleep_main_session_seconds"),
             # Other
             "toss_and_turns": _prefer_trend(trend, interval, "toss_and_turns"),
             "latency_asleep_seconds": trend.get("latency_asleep_seconds"),

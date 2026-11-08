@@ -770,7 +770,7 @@ export async function getActivityLaps(activityIds: number[]) {
 // before that the page referenced them against select("*") and silently got
 // undefined, leaving three Eight Sleep comparisons empty.
 const HEALTH_MATRIX_COLS =
-  "calendar_date, onyx_behavioral_date, garmin_sleep_score, whoop_sleep_performance, eight_sleep_score, garmin_hrv_last_night, whoop_hrv_rmssd, eight_sleep_hrv, garmin_rhr, whoop_rhr, eight_sleep_hr, garmin_sleep_respiration, whoop_respiratory_rate, eight_sleep_breath_rate, garmin_sleep_duration_sec, whoop_sleep_duration_milli, eight_sleep_duration_main_sec, garmin_deep_sleep_sec, whoop_deep_sleep_milli, eight_sleep_deep_main_sec, garmin_rem_sleep_sec, whoop_rem_sleep_milli, eight_sleep_rem_main_sec";
+  "calendar_date, onyx_behavioral_date, garmin_sleep_score, whoop_sleep_performance, eight_sleep_score, garmin_hrv_last_night, whoop_hrv_rmssd, eight_sleep_hrv, garmin_rhr, whoop_rhr, eight_sleep_hr, garmin_sleep_respiration, whoop_respiratory_rate, eight_sleep_breath_rate, garmin_sleep_duration_sec, whoop_sleep_duration_milli, eight_sleep_duration_main_sec, garmin_deep_sleep_sec, whoop_deep_sleep_milli, eight_sleep_deep_main_sec, garmin_rem_sleep_sec, whoop_rem_sleep_milli, eight_sleep_rem_main_sec, garmin_light_sleep_sec, whoop_light_sleep_milli, eight_sleep_light_main_sec, garmin_awake_sec, whoop_awake_milli, eight_sleep_awake_main_sec";
 
 export async function getHealthMatrix(days: number = 30) {
   const since = new Date();
