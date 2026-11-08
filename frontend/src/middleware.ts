@@ -10,6 +10,15 @@ function safeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+// Routes that accept the x-onyx-ci-token shared secret instead of a session:
+// the hourly habits-sync Action (/api/habits/*) and the local Kindle Notebook
+// harvester (tools/kindle_harvest → /api/reading/highlights/import, 2026-11-07).
+// Keep this list tiny — every entry is a service-role write reachable without
+// a login, gated only by the constant-time token check below.
+function isCiRoute(pathname: string): boolean {
+  return pathname.startsWith("/api/habits") || pathname === "/api/reading/highlights/import";
+}
+
 export async function middleware(request: NextRequest) {
   // CI shared-secret carve-out for /api/habits/*. The hourly habits-sync
   // GitHub Action authenticates server-to-server with the x-onyx-ci-token
@@ -18,7 +27,7 @@ export async function middleware(request: NextRequest) {
   // cookie and fall through to the getClaims() check below. Fail-closed: if
   // ONYX_CI_TOKEN is unset in the environment, this branch never matches and a
   // valid session is required.
-  if (request.nextUrl.pathname.startsWith("/api/habits")) {
+  if (isCiRoute(request.nextUrl.pathname)) {
     const ciToken = process.env.ONYX_CI_TOKEN;
     const provided = request.headers.get("x-onyx-ci-token");
     if (ciToken && provided && safeEqual(provided, ciToken)) {
@@ -79,7 +88,7 @@ export async function middleware(request: NextRequest) {
     !request.nextUrl.pathname.startsWith("/login") &&
     !request.nextUrl.pathname.startsWith("/auth")
   ) {
-    if (request.nextUrl.pathname.startsWith("/api/habits")) {
+    if (isCiRoute(request.nextUrl.pathname)) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
     const url = request.nextUrl.clone();

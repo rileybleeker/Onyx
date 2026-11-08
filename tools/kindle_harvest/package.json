@@ -1,0 +1,12 @@
+{
+  "name": "onyx-kindle-harvester",
+  "private": true,
+  "type": "module",
+  "description": "Runs on Riley's PC on a schedule: reads highlights + notes from the Kindle Notebook web app in a signed-in Chrome profile and posts them to Onyx /api/reading/highlights/import.",
+  "scripts": {
+    "harvest": "node harvest.mjs",
+    "login": "node harvest.mjs --login",
+    "dry-run": "node harvest.mjs --dry-run"
+  },
+  "dependencies": { "playwright": "^1.50.0" }
+}

@@ -1,0 +1,7 @@
+{
+  "$comment": "Books to harvest from read.amazon.com/notebook. slug = pds.books.slug in Onyx; titleMatch = case-insensitive regex tested against the Kindle library title.",
+  "onyx_url": "https://frontend-six-alpha-69.vercel.app",
+  "books": [
+    { "slug": "the-goal", "titleMatch": "^The Goal\\b" }
+  ]
+}

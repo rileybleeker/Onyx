@@ -23,6 +23,7 @@ const SOURCE_BADGE: Record<string, string> = {
   musicbrainz: "MUSICBRAINZ",
   supplements: "DSLD",
   reading: "BOOK",
+  kindle: "KINDLE",
   tanita: "TANITA",
   nyc_scout: "AGENT",
   matrix_mat: "DB",
@@ -43,6 +44,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   musicbrainz: "text-source-spotify/70",
   supplements: "text-amber-400",
   reading: "text-amber-300",
+  kindle: "text-amber-300/70",
   tanita: "text-amber-500",
   nyc_scout: "text-sky-400",
   matrix_mat: "text-cyan-400/70",
@@ -94,6 +96,7 @@ const SOURCE_ORDER = [
   "musicbrainz",
   "supplements",
   "reading",
+  "kindle",
   "tanita",
   "nyc_scout",
   "matrix_mat",
@@ -214,6 +217,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   notion_journal: "Notion Journal",
   hrv_analysis: "HRV Retrain",
   tanita: "Tanita",
+  kindle: "Kindle",
   matrix_mat: "Matrix Matview",
   perf_mats: "Perf Matviews",
 };
@@ -231,6 +235,7 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   entries: "Entries",
   retrain: "Retrain",
   weight: "Weight",
+  highlights: "Highlights",
   refresh: "Refresh",
 };
 

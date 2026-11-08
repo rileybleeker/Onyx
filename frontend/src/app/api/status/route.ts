@@ -43,6 +43,7 @@ const CADENCE: Record<string, string> = {
   musicbrainz: "With Spotify ETL",
   supplements: "Manual",
   reading: "Manual",
+  kindle: "Every 3h (Riley's PC, while logged on)",
   notion_journal: "Hourly :35",
   tanita: "Daily 10am + 1:30pm ET",
   nyc_scout: "Daily 6:10am ET",
@@ -78,6 +79,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   musicbrainz:    { method: "automated",      label: "API ETL" },
   supplements:    { method: "manual",         label: "Manual entry" },
   reading:        { method: "manual",         label: "Manual entry" },
+  kindle:         { method: "automated",      label: "Local Chrome harvest" },
   notion_journal: { method: "automated",      label: "Notion sync" },
   tanita:         { method: "automated",      label: "API ETL" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
@@ -575,6 +577,36 @@ export async function GET() {
         integrationMethod: METHOD.reading.method,
         methodLabel: METHOD.reading.label,
       },
+      // Kindle Notebook harvester (tools/kindle_harvest): a Task Scheduler job on
+      // Riley's PC scrapes read.amazon.com/notebook in a signed-in Chrome and posts
+      // to /api/reading/highlights/import, which writes a kindle|highlights heartbeat
+      // on every call. Like the StreetEasy harvester it only runs while the PC is on,
+      // so the thresholds are loose: >12h degraded, >48h or an error row = red. An
+      // expired Amazon session arrives as a failed heartbeat with the fix in the text.
+      kindle: (() => {
+        const entry = latestBySrcType["kindle|highlights"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 48
+            ? "failed"
+            : entry.status === "partial" || ageH > 12
+              ? "partial"
+              : "success";
+        return {
+          label: "Kindle",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string) ?? null,
+          cadence: CADENCE.kindle,
+          integrationMethod: METHOD.kindle.method,
+          methodLabel: METHOD.kindle.label,
+        };
+      })(),
       // Body weight via Tanita Health Planet (tanita_etl.py): scale → phone
       // app → Health Planet cloud → twice-daily ETL → tanita_measurements,
       // rolled up into weight_log (source='tanita'). This card REPLACED the
