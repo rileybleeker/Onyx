@@ -1,0 +1,15 @@
+-- =============================================================================
+-- Drop the legacy clock-date pds.daily_health_matrix view (2026-11-07)
+-- =============================================================================
+-- Superseded by pds.daily_health_matrix_behavioral (ADR-0001). Before dropping:
+--   * 0 code consumers (grep of Onyx, sms-reminders, personal-agents)
+--   * 0 DB dependents (pg_depend)
+--   * 0 REST calls in the last 24h of edge logs (vs 83 for the behavioral view)
+-- Its WHOOP join keyed on the UTC date of cycle start, which mis-attributed
+-- travel days (audit P1).
+--
+-- Rollback: sql/deprecated/daily_health_matrix_live_2026-11-07.sql holds the
+-- exact live definition + grants. The frozen pre-ADR snapshot
+-- pds_legacy.daily_health_matrix_v0 is untouched.
+-- =============================================================================
+DROP VIEW IF EXISTS pds.daily_health_matrix;
