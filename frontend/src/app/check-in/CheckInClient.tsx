@@ -7,7 +7,7 @@ import { agentsApi } from "@/lib/agents-api";
 import type { CheckinAnswer, CheckinItem, CheckinPayload } from "@/lib/checkin";
 
 // Daily habit check-in (2026-11-07). One screen per behavior day: Yes / No per question, one Save.
-// - Saved answers load as-is; questions another source can answer (alcohol, rest day, plane) start pre-filled and
+// - Saved answers load as-is; questions another source can answer (alcohol, rest day) start pre-filled and
 //   labeled with that source; everything else starts blank. Blank on save = not logged (never a "No").
 // - Taps are kept as a local draft per day, so leaving the page (or the app being killed) loses nothing.
 // - Save writes the whole day in one request, then tells the Agents chat the day is done so the card settles.

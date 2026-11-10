@@ -36,7 +36,7 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
 // Questions with a data-backed pre-fill. Titles are the frozen WHOOP question text.
 const Q_ALCOHOL = "Have any alcoholic drinks?";
 const Q_REST = "Took a rest day?";
-const Q_PLANE = "Traveled on a plane?";
+// "Traveled on a plane?" was retired 2026-11-09 — flights come from pds.flights (sql/flight_day_unified.sql).
 // WHOOP sports that don't make a day "not a rest day" on their own (yoga, auto-detected activity, sauna, ...).
 const LIGHT_SPORTS = new Set(["yoga", "activity", "other", "walking", "sauna", "meditation", "stretching", "breathwork"]);
 
@@ -99,35 +99,6 @@ async function suggestionsFor(date: string, names: Set<string>): Promise<Record<
         const training = [...whoop.filter((s) => !LIGHT_SPORTS.has(s)), ...garmin.filter((s) => s && !s.includes("walk"))];
         if (training.length) out[Q_REST] = { answer: "No", source: `Workout: ${training[0].replace(/_/g, " ")}` };
         else if (!whoop.length && !garmin.length && !w.error && !g.error) out[Q_REST] = { answer: "Yes", source: "No workouts recorded" };
-      })()
-    );
-  }
-
-  if (names.has(Q_PLANE)) {
-    tasks.push(
-      (async () => {
-        // 1) A parsed Delta segment departing or landing on this behavior day (pds.flights, from the
-        //    confirmation-email ETL). This also catches same-offset trips (ATL↔YYZ) the tz diff can't see.
-        // 2) Fallback: the time zone the user_tz_log ladder resolves changed across the day.
-        //    Behavior day ≈ 06:00 that day → 06:00 the next (the −6h rule); ET offsets are close enough.
-        const [f, a, b] = await Promise.all([
-          supabase
-            .from("flights")
-            .select("flight_number, dep_iata, arr_iata")
-            .in("status", ["confirmed", "changed"])
-            .or(`onyx_behavioral_date.eq.${date},arr_behavioral_date.eq.${date},dep_local_date.eq.${date}`)
-            .order("dep_local_date")
-            .limit(3),
-          supabase.rpc("tz_for_instant", { ts: `${date}T10:00:00Z` }),
-          supabase.rpc("tz_for_instant", { ts: `${addDays(date, 1)}T10:00:00Z` }),
-        ]);
-        const flights = (f.data ?? []) as { flight_number: string; dep_iata: string | null; arr_iata: string | null }[];
-        if (flights.length) {
-          const route = flights.map((x) => `${x.flight_number} ${x.dep_iata ?? "?"}→${x.arr_iata ?? "?"}`).join(", ");
-          out[Q_PLANE] = { answer: "Yes", source: `Flight: ${route}` };
-        } else if (a.data && b.data && a.data !== b.data) {
-          out[Q_PLANE] = { answer: "Yes", source: `Time zone changed to ${String(b.data).split("/").pop()?.replace(/_/g, " ")}` };
-        }
       })()
     );
   }

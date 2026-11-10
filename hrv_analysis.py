@@ -823,6 +823,19 @@ def load_all_data() -> dict[str, pd.DataFrame]:
             data["melatonin"]["melatonin_dose_mg"], errors="coerce"
         )
 
+    # Flight-day bridge (pds.flight_day_unified, 2026-11-09): one row per
+    # behavioral day splicing the frozen "Traveled on a plane?" answers with the
+    # Delta flight tracker (pds.flights). Overwrites journal_traveled_on_a_plane
+    # in build_feature_matrix (the habit was retired in favor of the tracker).
+    log.info("  Loading flight_day_unified (plane habit <-> flight tracker bridge)…")
+    data["flight_day"] = fetch_all(
+        "flight_day_unified",
+        select="calendar_date,flew,source_flag",
+    )
+    if not data["flight_day"].empty:
+        data["flight_day"]["calendar_date"] = data["flight_day"]["calendar_date"].astype(str)
+        data["flight_day"]["flew"] = pd.to_numeric(data["flight_day"]["flew"], errors="coerce")
+
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
     # topic_count) joined into the matrix per the audit's Finding #8. The textual
     # content + embedding stay out (handled by the chat tool, not HRV analysis).
@@ -1499,6 +1512,27 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # bridge (pds.melatonin_unified) as a single supplement-family feature that
     # carries the history AND the going-forward mg dose.
     df = df.drop(columns=["journal_took_a_melatonin_supplement"], errors="ignore")
+    # POLICY (Riley, 2026-11-09): the "Traveled on a plane?" habit is RETIRED
+    # (Notion Active=false; history preserved) — the Delta flight tracker
+    # (pds.flights) is the source of truth going forward. Unlike the drops above
+    # the feature IDENTITY is kept: journal_traveled_on_a_plane (label "Air
+    # Travel", journal family, causal binary enumeration) is OVERWRITTEN with
+    # pds.flight_day_unified.flew = tracked flight OR habit Yes; 0 inside tracker
+    # coverage (which also fills the days the habit was never answered and fixes
+    # the habit-No days that had a tracked flight); NaN before coverage when
+    # unanswered. Known gap: non-Delta flights after retirement read 0.
+    fd = data.get("flight_day")
+    if fd is not None and not fd.empty:
+        df = df.drop(columns=["journal_traveled_on_a_plane"], errors="ignore")
+        df = df.merge(
+            fd[["calendar_date", "flew"]].rename(columns={"flew": "journal_traveled_on_a_plane"}),
+            on="calendar_date", how="left",
+        )
+        assert set(df["journal_traveled_on_a_plane"].dropna().unique()) <= {0.0, 1.0}
+        log.info(
+            f"  Flight-day bridge: {int(df['journal_traveled_on_a_plane'].notna().sum())} obs, "
+            f"{int((df['journal_traveled_on_a_plane'] == 1).sum())} flight days"
+        )
 
     # --- Habit pivot ---
     # Habits flow through the same pds.journal view as WHOOP journal entries
