@@ -36,7 +36,7 @@ final class AppModel: ObservableObject {
         busy = true
         defer { busy = false }
         do {
-            try await AuthorizationCenter.shared.requestAuthorization(for: .individual)
+            try await ScreenTimeExporter.requestAccess()
             append("Authorization request finished.")
         } catch {
             append("Authorization failed: \(error.localizedDescription) (\(error))")
@@ -175,6 +175,13 @@ struct ContentView: View {
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active { model.refreshStatus() }
+            }
+            // A new process always starts at "notDetermined"; asking again on
+            // launch restores the granted status (and shows the system prompt
+            // on the very first launch, as Apple recommends).
+            .task {
+                _ = await ScreenTimeExporter.restoreDataAccess()
+                model.refreshStatus()
             }
         }
     }

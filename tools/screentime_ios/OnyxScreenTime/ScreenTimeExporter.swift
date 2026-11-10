@@ -47,12 +47,46 @@ private actor SegmentStore {
 }
 
 enum ScreenTimeExporter {
+    // Apple: "Only access the authorizationStatus property on the main queue."
+    @MainActor
     static var authorizationStatus: AuthorizationStatus {
         AuthorizationCenter.shared.authorizationStatus
     }
 
+    @MainActor
     static var hasDataAccess: Bool {
         authorizationStatus == .approvedWithDataAccess
+    }
+
+    /// The status can lag behind requestAuthorization, so give it a moment.
+    @MainActor
+    private static func waitForDataAccess(seconds: TimeInterval = 3) async {
+        let giveUp = Date().addingTimeInterval(seconds)
+        while AuthorizationCenter.shared.authorizationStatus != .approvedWithDataAccess && Date() < giveUp {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    /// The "Grant access" button: asks, and lets the caller show the error.
+    @MainActor
+    static func requestAccess() async throws {
+        try await AuthorizationCenter.shared.requestAuthorization(for: .individual)
+        await waitForDataAccess()
+    }
+
+    /// Apple: the status "is always notDetermined" in a new process and is set
+    /// only after requestAuthorization(for:) succeeds in THAT process. So every
+    /// launch — including the background launch a Shortcuts automation causes —
+    /// has to call it again; once the person has approved, it shows no UI.
+    @MainActor
+    static func restoreDataAccess() async -> (granted: Bool, status: String) {
+        let center = AuthorizationCenter.shared
+        if center.authorizationStatus != .approvedWithDataAccess {
+            try? await center.requestAuthorization(for: .individual)
+            await waitForDataAccess()
+        }
+        let status = center.authorizationStatus
+        return (status == .approvedWithDataAccess, status.description)
     }
 
     /// Reads hourly Screen Time segments for the last `days` days (today included).
@@ -66,17 +100,18 @@ enum ScreenTimeExporter {
         timeout: TimeInterval = 25,
         idle: TimeInterval = 4
     ) async throws -> ExportResult {
-        guard hasDataAccess else {
-            throw ExportError.noDataAccess(authorizationStatus.description)
-        }
+        // Not a hard stop: the in-process status is a cache that can lag, and
+        // the export call itself throws when access is really missing.
+        let access = await restoreDataAccess()
 
         let now = Date()
         let calendar = Calendar.current
         let firstDay = calendar.date(byAdding: .day, value: -(max(1, days) - 1), to: calendar.startOfDay(for: now)) ?? now
+        // users / devices left at their defaults = the current user on THIS
+        // device only. (Asking for every iPhone would let a second phone on the
+        // same Apple Account overwrite this phone's hours.)
         let filter = DeviceActivityFilter(
-            segment: .hourly(during: DateInterval(start: firstDay, end: now)),
-            users: .all,
-            devices: .init([.iPhone])
+            segment: .hourly(during: DateInterval(start: firstDay, end: now))
         )
 
         let store = SegmentStore()
@@ -99,12 +134,18 @@ enum ScreenTimeExporter {
             if count > 0 && Date().timeIntervalSince(last) > idle { break }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
+        // Snapshot BEFORE cancelling: cancellation can end the stream, which
+        // would flip `finished` and could still store a half-read hour.
+        let ended = await store.finished
+        let segments = await store.segments
+        let failure = await store.failure
         reader.cancel()
 
-        let segments = await store.segments
-        let ended = await store.finished
         if segments.isEmpty {
-            if let failure = await store.failure, !(failure is CancellationError) { throw failure }
+            if !access.granted {
+                throw ExportError.noDataAccess(access.status + (failure.map { "; \($0)" } ?? ""))
+            }
+            if let failure, !(failure is CancellationError) { throw failure }
             throw ExportError.noData
         }
         return ExportResult(

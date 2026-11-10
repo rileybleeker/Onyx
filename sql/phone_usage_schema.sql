@@ -80,18 +80,21 @@ CREATE TRIGGER phone_usage_segments_set_onyx_dates
     BEFORE INSERT OR UPDATE OF segment_start ON pds.phone_usage_segments
     FOR EACH ROW EXECUTE FUNCTION pds.set_onyx_dates_phone_usage_segments();
 
+-- SERVICE ROLE ONLY. Unlike most pds tables these are NOT anon-readable: they
+-- hold every app and web domain used, hour by hour, and the anon key ships in
+-- the site's public JavaScript. Read them through a server route.
+-- (The DROPs + REVOKE also undo the anon grants of the first version of this
+-- file, and pds default privileges re-grant SELECT on every new relation.)
 ALTER TABLE pds.phone_usage_segments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.phone_usage_items    ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "anon_read"           ON pds.phone_usage_segments;
 DROP POLICY IF EXISTS "service_full_access" ON pds.phone_usage_segments;
 DROP POLICY IF EXISTS "anon_read"           ON pds.phone_usage_items;
 DROP POLICY IF EXISTS "service_full_access" ON pds.phone_usage_items;
-CREATE POLICY "anon_read"           ON pds.phone_usage_segments FOR SELECT TO anon         USING (true);
 CREATE POLICY "service_full_access" ON pds.phone_usage_segments FOR ALL    TO service_role USING (true) WITH CHECK (true);
-CREATE POLICY "anon_read"           ON pds.phone_usage_items    FOR SELECT TO anon         USING (true);
 CREATE POLICY "service_full_access" ON pds.phone_usage_items    FOR ALL    TO service_role USING (true) WITH CHECK (true);
-GRANT SELECT ON pds.phone_usage_segments, pds.phone_usage_items TO anon, authenticated;
-GRANT ALL    ON pds.phone_usage_segments, pds.phone_usage_items TO service_role;
+REVOKE ALL ON pds.phone_usage_segments, pds.phone_usage_items FROM anon, authenticated;
+GRANT ALL  ON pds.phone_usage_segments, pds.phone_usage_items TO service_role;
 
 -- ----------------------------------------------------------------------------
 -- Daily rollup on the behavioral day of each hour's START (the −6h rule lands
@@ -101,9 +104,13 @@ GRANT ALL    ON pds.phone_usage_segments, pds.phone_usage_items TO service_role;
 -- Sleep-anchored columns use the WHOOP main sleep closing the day (same join
 -- as pds.phone_screen_daily / caffeine). An hour that straddles sleep onset
 -- contributes in proportion to its overlap — an estimate, hence the _est
--- suffix. NULL until that sleep is scored.
+-- suffix. NULL until that sleep is scored. They are matched to the sleep BY
+-- TIME (sleep_use), not by behavioral day: hours from 06:00 on belong to the
+-- next behavioral day, and about half of a typical night's sleep falls there.
+-- security_invoker: a plain view runs as its owner and would bypass the
+-- service-role-only RLS above.
 -- ----------------------------------------------------------------------------
-CREATE OR REPLACE VIEW pds.phone_usage_daily AS
+CREATE OR REPLACE VIEW pds.phone_usage_daily WITH (security_invoker = true) AS
 WITH seg AS (
     SELECT s.*,
            EXTRACT(HOUR FROM (s.segment_start AT TIME ZONE pds.tz_for_instant(s.segment_start)))::int AS local_hour
@@ -154,6 +161,26 @@ cats AS (
     ) y
     GROUP BY behavioral_date
 ),
+sleep_use AS (
+    SELECT sl.behavioral_date,
+           SUM(s.total_seconds
+               * GREATEST(0, EXTRACT(EPOCH FROM (
+                     LEAST(s.segment_end, sl.sleep_start)
+                   - GREATEST(s.segment_start, sl.sleep_start - INTERVAL '60 minutes'))))
+               / EXTRACT(EPOCH FROM (s.segment_end - s.segment_start))) / 60.0
+                                                                        AS minutes_last_hour_before_sleep_est,
+           SUM(s.total_seconds
+               * GREATEST(0, EXTRACT(EPOCH FROM (
+                     LEAST(s.segment_end, sl.sleep_end)
+                   - GREATEST(s.segment_start, sl.sleep_start))))
+               / EXTRACT(EPOCH FROM (s.segment_end - s.segment_start))) / 60.0
+                                                                        AS minutes_during_sleep_est
+    FROM sleep sl
+    JOIN pds.phone_usage_segments s
+      ON s.segment_end   > sl.sleep_start - INTERVAL '60 minutes'
+     AND s.segment_start < sl.sleep_end
+    GROUP BY sl.behavioral_date
+),
 agg AS (
     SELECT
         seg.onyx_behavioral_date                                        AS behavioral_date,
@@ -166,18 +193,6 @@ agg AS (
         MIN(seg.first_pickup)                                           AS first_pickup,
         MAX(seg.segment_end) FILTER (WHERE seg.total_seconds > 0)       AS last_active_hour_end,
         MIN(sl.sleep_start)                                             AS sleep_start,
-        SUM(seg.total_seconds
-            * GREATEST(0, EXTRACT(EPOCH FROM (
-                  LEAST(seg.segment_end, sl.sleep_start)
-                - GREATEST(seg.segment_start, sl.sleep_start - INTERVAL '60 minutes'))))
-            / EXTRACT(EPOCH FROM (seg.segment_end - seg.segment_start))) / 60.0
-                                                                        AS minutes_last_hour_before_sleep_est,
-        SUM(seg.total_seconds
-            * GREATEST(0, EXTRACT(EPOCH FROM (
-                  LEAST(seg.segment_end, sl.sleep_end)
-                - GREATEST(seg.segment_start, sl.sleep_start))))
-            / EXTRACT(EPOCH FROM (seg.segment_end - seg.segment_start))) / 60.0
-                                                                        AS minutes_during_sleep_est,
         MAX(seg.synced_at)                                              AS synced_at
     FROM seg
     LEFT JOIN sleep sl ON sl.behavioral_date = seg.onyx_behavioral_date
@@ -197,14 +212,16 @@ SELECT
     a.sleep_start,
     -- GREATEST(0, NULL) = 0 in Postgres, so gate on the sleep anchor explicitly.
     CASE WHEN a.sleep_start IS NOT NULL
-         THEN ROUND(a.minutes_last_hour_before_sleep_est::numeric, 1) END AS minutes_last_hour_before_sleep_est,
+         THEN ROUND(COALESCE(su.minutes_last_hour_before_sleep_est, 0)::numeric, 1) END AS minutes_last_hour_before_sleep_est,
     CASE WHEN a.sleep_start IS NOT NULL
-         THEN ROUND(a.minutes_during_sleep_est::numeric, 1) END           AS minutes_during_sleep_est,
+         THEN ROUND(COALESCE(su.minutes_during_sleep_est, 0)::numeric, 1) END           AS minutes_during_sleep_est,
     ap.minutes_by_app,
     c.minutes_by_category,
     a.synced_at
 FROM agg a
-LEFT JOIN apps ap ON ap.behavioral_date = a.behavioral_date
-LEFT JOIN cats c  ON c.behavioral_date  = a.behavioral_date;
+LEFT JOIN apps ap      ON ap.behavioral_date = a.behavioral_date
+LEFT JOIN cats c       ON c.behavioral_date  = a.behavioral_date
+LEFT JOIN sleep_use su ON su.behavioral_date = a.behavioral_date;
 
-GRANT SELECT ON pds.phone_usage_daily TO anon, authenticated, service_role;
+REVOKE ALL   ON pds.phone_usage_daily FROM anon, authenticated;
+GRANT SELECT ON pds.phone_usage_daily TO service_role;

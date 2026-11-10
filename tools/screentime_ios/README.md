@@ -16,8 +16,19 @@ on the Onyx page `/install`, behind the normal login.
 - Outside the EU the export API works only in a **development-signed** build
   (not TestFlight, App Store or Ad Hoc).
 - Only one app per device can hold data access (`approvedWithDataAccess`).
-- The certificate and profile last about a year: re-run the signed job and
-  reinstall before `profile_expires` (shown on `/install`).
+- The certificate and the profile each last about a year. Treat the earlier
+  date as the deadline (`/install` shows it). Apple does not document what an
+  expired development certificate does to an installed app; reports say it
+  stops opening.
+  - Portal path: re-running the job renews nothing. Create a new Apple
+    Development certificate (upload the same `onyx_dev.certSigningRequest`)
+    and a new profile, update `IOS_DEV_CERT_B64` and `IOS_PROFILE_B64`, then
+    run the job and reinstall.
+  - API path: run the job during the last 30 days; it then makes a new
+    certificate and profile.
+- A new process always starts with Screen Time access "not determined", so
+  the app asks again on every launch (silent once approved). If the daily
+  sync stops, open the app once.
 
 ## One-time setup
 
@@ -29,8 +40,12 @@ In the developer portal (`developer.apple.com/account` → Certificates,
 Identifiers & Profiles):
 
 1. **Identifiers → + → App IDs → App.** Explicit Bundle ID
-   `com.rileybleeker.onyxscreentime`. Tick **Family Controls (Development)** and
-   **Family Controls App And Website Usage**. The API cannot tick these.
+   `com.rileybleeker.onyxscreentime`. Tick **Family Controls (Development)** and,
+   if the list shows it, **Family Controls App And Website Usage** (not yet
+   confirmed that the portal lists it separately). The API cannot tick these.
+   If it is not listed, create the profile anyway and run the job: the
+   "Install provisioning profile" step reports, before the build starts,
+   whether the profile carries both entitlements.
 2. **Devices → +.** Register the iPhone by its UDID. On Windows, with the phone
    plugged in and unlocked:
    ```powershell
@@ -53,6 +68,12 @@ $d = "$HOME\.onyx-ios-signing"
 
 Optional: `gh secret set IPHONE_UDID` lets the job confirm the phone is in the
 profile.
+
+Database: `sql/phone_usage_schema.sql` (tables `phone_usage_segments`,
+`phone_usage_items`, view `phone_usage_daily`). Service role only: they hold
+every app and web domain used, so unlike most `pds` tables they are not
+anon-readable. The file is safe to re-run. `/status` card: "Screen Time app"
+(heartbeat `screen_time|usage`).
 
 ### Alternative: App Store Connect API (no portal downloads)
 

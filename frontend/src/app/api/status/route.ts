@@ -45,6 +45,7 @@ const CADENCE: Record<string, string> = {
   reading: "Manual",
   kindle: "Every 3h (Riley's PC, while logged on)",
   screen_time: "Real-time (iPhone app open/close)",
+  screen_usage: "Daily (iPhone Shortcuts automation)",
   notion_journal: "Hourly :35",
   tanita: "Daily 10am + 1:30pm ET",
   flights: "Every 3h :25 (both Gmail accounts)",
@@ -85,6 +86,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   reading:        { method: "manual",         label: "Manual entry" },
   kindle:         { method: "automated",      label: "Local Chrome harvest" },
   screen_time:    { method: "automated",      label: "iOS Shortcuts events" },
+  screen_usage:   { method: "automated",      label: "iPhone app export" },
   notion_journal: { method: "automated",      label: "Notion sync" },
   tanita:         { method: "automated",      label: "API ETL" },
   flights:        { method: "automated",      label: "IMAP email parser" },
@@ -226,7 +228,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, ubereatsSyncRes, kindleSyncRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -324,6 +326,9 @@ export async function GET() {
       supabase.from("sync_log").select("*").eq("source", "ubereats").eq("data_type", "items")
         .order("sync_start", { ascending: false }).limit(1),
       supabase.from("sync_log").select("*").eq("source", "kindle").eq("data_type", "highlights")
+        .order("sync_start", { ascending: false }).limit(1),
+      // Onyx Screen Time iPhone app: one heartbeat a day, so it also needs its own fetch.
+      supabase.from("sync_log").select("*").eq("source", "screen_time").eq("data_type", "usage")
         .order("sync_start", { ascending: false }).limit(1),
     ]);
 
@@ -659,6 +664,39 @@ export async function GET() {
           cadence: CADENCE.screen_time,
           integrationMethod: METHOD.screen_time.method,
           methodLabel: METHOD.screen_time.label,
+        };
+      })(),
+      // Onyx Screen Time iPhone app (tools/screentime_ios -> /api/screen-time/usage):
+      // a daily Shortcuts automation runs the app's "Sync Screen Time to Onyx"
+      // intent, and every POST writes a screen_time|usage heartbeat. Kept separate
+      // from the card above (the older open/close events path) while both exist.
+      // A failure on the phone never reaches the route, so this card has to age
+      // out: >26h degraded, >36h or a failed row = red. "unknown" until first sync.
+      screen_usage: (() => {
+        const entry = latestBySrcType["screen_time|usage"]
+          ?? (screenUsageSyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 36
+            ? "failed"
+            : ageH > 26
+              ? "partial"
+              : "success";
+        return {
+          label: "Screen Time app",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (entry && ageH > 36 ? `No sync for ${Math.floor(ageH)}h - open the Onyx Screen Time app on the iPhone (it must re-confirm access) and check the daily Shortcuts automation.` : null),
+          cadence: CADENCE.screen_usage,
+          integrationMethod: METHOD.screen_usage.method,
+          methodLabel: METHOD.screen_usage.label,
         };
       })(),
       // Flights (flights_email_etl.py): Delta confirmation / trip-details / check-in

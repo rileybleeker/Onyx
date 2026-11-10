@@ -178,8 +178,10 @@ jobs:
           # the certificate must belong to our key
           CERT_MOD="$(/usr/bin/openssl x509 -inform DER -in "$CERT_DER" -noout -modulus | /usr/bin/openssl sha256)"
           KEY_MOD="$(/usr/bin/openssl rsa -in "$KEY_PEM" -noout -modulus | /usr/bin/openssl sha256)"
-          [ "$CERT_MOD" = "$KEY_MOD" ] || fail "Signing identity" "The certificate was not issued for the private key in IOS_DEV_KEY_B64. Upload ~/.onyx-ios-signing/onyx_dev.certSigningRequest when creating the certificate."
+          [ "$CERT_MOD" = "$KEY_MOD" ] || fail "Signing identity" "The certificate was not issued for the private key in IOS_DEV_KEY_B64. Create the certificate from ~/.onyx-ios-signing/onyx_dev.certSigningRequest, re-create the profile with that certificate, then set IOS_DEV_CERT_B64 and IOS_PROFILE_B64 again."
           /usr/bin/openssl x509 -inform DER -in "$CERT_DER" -noout -enddate
+          /usr/bin/openssl x509 -inform DER -in "$CERT_DER" -noout -checkend $((30*86400)) > /dev/null \
+            || echo "::warning title=Signing certificate::The signing certificate expires within 30 days (date above). Create a new Apple Development certificate and profile before relying on this build."
 
           KEYCHAIN_PATH="$RUNNER_TEMP/onyx-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(uuidgen)"
@@ -202,7 +204,9 @@ jobs:
 
           read_identity() {
             IDENTITIES="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")"
-            echo "$IDENTITIES" | tail -n 1    # the count line only: public logs
+            # count line only. The identity name, its SHA-1 and the team ID are not secret;
+            # they do appear in later steps (env headers, showBuildSettings).
+            echo "$IDENTITIES" | tail -n 1
             IDENTITY_SHA1="$(sed -n 's/^ *1) \([0-9A-F]\{40\}\) ".*"$/\1/p' <<< "$IDENTITIES")"
             IDENTITY_NAME="$(sed -n 's/^ *1) [0-9A-F]\{40\} "\(.*\)"$/\1/p' <<< "$IDENTITIES")"
           }
@@ -243,6 +247,10 @@ jobs:
           APP_ID="$($PB -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST")"
           PROFILE_EXPIRES="$(plutil -extract ExpirationDate raw -o - "$PROFILE_PLIST")"
           echo "profile: $PROFILE_NAME, expires $PROFILE_EXPIRES"
+          # the app stops opening when the EARLIER of profile and certificate expires; publish that date
+          CERT_END="$(/usr/bin/openssl x509 -inform DER -in "$SIGN_DIR/onyx_dev.cer" -noout -enddate | sed 's/^notAfter=//')"
+          PROFILE_EXPIRES="$(CERT_END="$CERT_END" P="$PROFILE_EXPIRES" python3 -c 'import os, datetime as d; c = d.datetime.strptime(" ".join(os.environ["CERT_END"].split()), "%b %d %H:%M:%S %Y %Z"); p = d.datetime.strptime(os.environ["P"], "%Y-%m-%dT%H:%M:%SZ"); print(min(c, p).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+          echo "build stops opening: $PROFILE_EXPIRES"
           [ "$APP_ID" = "$TEAM_ID.$BUNDLE_ID" ] || fail "Provisioning profile" "Profile is for $APP_ID, expected $TEAM_ID.$BUNDLE_ID."
           [ "$($PB -c 'Print :Entitlements:get-task-allow' "$PROFILE_PLIST" 2>/dev/null || true)" = "true" ] \
             || fail "Provisioning profile" "Not a development profile (get-task-allow is not true). Family Controls (Development) needs an 'iOS App Development' profile."
@@ -251,7 +259,7 @@ jobs:
           IFS=',' read -r -a ENTS <<< "$REQUIRED_ENTITLEMENTS"
           for ENT in "${ENTS[@]}"; do
             VAL="$($PB -c "Print :Entitlements:$ENT" "$PROFILE_PLIST" 2>/dev/null || true)"
-            [ "$VAL" = "true" ] || fail "Provisioning profile lacks $ENT" "Tick the Family Controls capabilities on the App ID in the developer portal, then delete and re-create the development profile."
+            [ "$VAL" = "true" ] || fail "Provisioning profile lacks $ENT" "Tick Family Controls (Development) and, if listed, Family Controls App And Website Usage on the App ID in the developer portal, then delete and re-create the development profile. If the profile comes from the IOS_PROFILE_B64 secret, download the new .mobileprovision and set that secret again before re-running. If the boxes are already ticked, or the second one is not listed, re-creating the profile will not help: stop and check the current Apple instructions for this entitlement."
           done
 
           # Xcode 16+ location, plus the legacy one; file name = <UUID>.mobileprovision
@@ -372,7 +380,7 @@ jobs:
             || fail "Embedded profile" "No decodable embedded.mobileprovision in the app."
           for ENT in "${ENTS[@]}"; do
             VAL="$($PB -c "Print :Entitlements:$ENT" "$V/embedded.plist" 2>/dev/null || true)"
-            [ "$VAL" = "true" ] || fail "Entitlement missing from the embedded profile" "$ENT is not allowed by the embedded profile. Tick the capability on the App ID and re-create the profile."
+            [ "$VAL" = "true" ] || fail "Entitlement missing from the embedded profile" "$ENT is not allowed by the embedded profile. Tick the capability on the App ID, re-create the profile and, on the portal path, update the IOS_PROFILE_B64 secret."
             echo "profile allows $ENT"
           done
           [ "$($PB -c 'Print :Entitlements:get-task-allow' "$V/embedded.plist" 2>/dev/null || true)" = "true" ] \
@@ -382,11 +390,13 @@ jobs:
           DEVICES="$($PB -c 'Print :ProvisionedDevices' "$V/embedded.plist" 2>/dev/null || true)"
           [ -n "$DEVICES" ] || fail "Profile type" "The embedded profile lists no devices."
           if [ -n "${IPHONE_UDID:-}" ]; then
-            WANT="$(tr '[:lower:]' '[:upper:]' <<< "$IPHONE_UDID")"
-            HAVE="$(tr '[:lower:]' '[:upper:]' <<< "$DEVICES")"
+            # same normalisation as ci/asc_signing.py norm_udid(): ignore case, hyphens and stray whitespace
+            WANT="$(printf '%s' "$IPHONE_UDID" | tr -d '[:space:]' | sed 's/-//g' | tr '[:lower:]' '[:upper:]')"
+            HAVE="$(printf '%s' "$DEVICES" | sed 's/-//g' | tr '[:lower:]' '[:upper:]')"
+            [ -n "$WANT" ] || fail "Device check" "The IPHONE_UDID secret is blank."
             case "$HAVE" in
               *"$WANT"*) echo "the iPhone is in the profile's device list" ;;
-              *) fail "Device not in profile" "The iPhone is not in the profile's device list. Register the device, then re-create the profile." ;;
+              *) fail "Device not in profile" "The iPhone is not in the profile's device list. Register the device, re-create the profile and, on the portal path, update the IOS_PROFILE_B64 secret." ;;
             esac
           else
             echo "IPHONE_UDID secret not set; skipped the device-list check"

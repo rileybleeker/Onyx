@@ -7,6 +7,7 @@ Makes sure these exist, creating what is missing:
   1. the App ID (bundle ID)
   2. the registered iPhone
   3. an "Apple Development" certificate that matches the private key we hold
+     (reused until 30 days before it expires, then a new one is created)
   4. a fresh iOS App Development provisioning profile (deleted and recreated
      every run so it always reflects the App ID's current capabilities and
      the current device list)
@@ -22,8 +23,9 @@ Environment:
   REQUIRED_ENTITLEMENTS         comma-separated keys the profile must allow
   OUT_DIR                       where the .cer / .mobileprovision / signing.json go
   OPENSSL_BIN                   optional: path of the openssl binary to use
-  ASC_REVOKE_UNMATCHED_DEV_CERTS=1   opt-in: revoke development certificates that
-                                do not match our key when the limit blocks creation
+  ASC_REVOKE_UNMATCHED_DEV_CERTS=1   opt-in (not wired into the workflow): revoke
+                                development certificates that do not match our key
+                                when the limit blocks creation
 """
 import base64
 import datetime
@@ -315,7 +317,7 @@ def ensure_certificate(c, key_pem_path):
         content = a.get("certificateContent")
         if content:
             der = base64.b64decode(content)
-            if spki_sha256_of_cert(der) == want and parse_time(a["expirationDate"]) > now + datetime.timedelta(days=2):
+            if spki_sha256_of_cert(der) == want and parse_time(a["expirationDate"]) > now + datetime.timedelta(days=30):
                 log(f"reusing certificate {cert['id']} ({a.get('name')}, serial {a.get('serialNumber')}, "
                     f"expires {a['expirationDate']})")
                 return cert, der
@@ -338,8 +340,7 @@ def ensure_certificate(c, key_pem_path):
                             f"expires {x['attributes'].get('expirationDate')}" for x in unmatched) or "(none listed)"
         if os.environ.get("ASC_REVOKE_UNMATCHED_DEV_CERTS") != "1":
             die(f"Apple refused a new development certificate ({err}). None of the existing ones match our "
-                f"private key: {listing}. Revoke one in the portal, or re-run with "
-                "ASC_REVOKE_UNMATCHED_DEV_CERTS=1.")
+                f"private key: {listing}. Revoke one in the developer portal, then re-run.")
         for x in unmatched:
             log(f"revoking certificate {x['id']} ({x['attributes'].get('name')})")
             c.request("DELETE", f"/v1/certificates/{x['id']}")

@@ -138,12 +138,13 @@ export default function InstallPage() {
                     hint="Use this if the first button does nothing."
                     href={build.link_b}
                   />
-                  <p className="text-text-tertiary text-xs">
-                    Links expire {fmt(build.links_expire_at)}. The app itself stops opening when its signing profile
-                    expires: {fmt(build.profile_expires)}.
-                  </p>
+                  <p className="text-text-tertiary text-xs">Links expire {fmt(build.links_expire_at)}.</p>
                 </>
               )}
+              <p className="text-text-tertiary text-xs">
+                The installed app keeps opening until its signing certificate and profile expire:{" "}
+                {fmt(build.profile_expires)}.
+              </p>
             </div>
 
             <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 space-y-2">

@@ -23,7 +23,8 @@ Environment:
   EXPECT_BUNDLE_ID                refuse to publish anything else
   PRIVATE_BUCKET, PUBLIC_BUCKET   default ios-builds / ios-builds-public
   EXPIRES_IN                      signed-URL lifetime in seconds (default 30 days)
-  PROFILE_EXPIRES                 optional, recorded for the /install page
+  PROFILE_EXPIRES                 optional: when the build stops opening (the earlier of
+                                  profile and certificate expiry), shown on /install
   GITHUB_RUN_NUMBER, GITHUB_SHA   used for the storage path
 """
 import datetime
@@ -58,6 +59,9 @@ class Storage:
     def call(self, method, route, body=None, headers=None, ok_statuses=(200, 201)):
         """Returns (status, bytes). Raises RuntimeError with Supabase's own message otherwise."""
         req = urllib.request.Request(self.base + route, data=body, method=method)
+        # Public log: never show the unguessable folder of the public manifest (the
+        # upload may have landed even when the answer was lost).
+        shown = re.sub(r"/screentime/[0-9a-f]{32}/", "/screentime/<slug>/", route)
         req.add_header("apikey", self.key)
         req.add_header("Authorization", "Bearer " + self.key)
         req.add_header("User-Agent", USER_AGENT)
@@ -69,9 +73,9 @@ class Storage:
         except urllib.error.HTTPError as err:
             status, raw = err.code, err.read()
         except (urllib.error.URLError, TimeoutError, ConnectionError) as err:
-            raise RuntimeError(f"{method} {route}: no response from Supabase ({err})") from None
+            raise RuntimeError(f"{method} {shown}: no response from Supabase ({err})") from None
         if status not in ok_statuses:
-            raise RuntimeError(f"{method} {route} -> HTTP {status}: {raw[:400].decode('utf-8', 'replace')}")
+            raise RuntimeError(f"{method} {shown} -> HTTP {status}: {raw[:400].decode('utf-8', 'replace')}")
         return status, raw
 
     def ensure_bucket(self, bucket, public):
