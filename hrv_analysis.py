@@ -274,6 +274,7 @@ CONTROLLABLE_FEATURE_PREFIXES = (
     "meal_",  # Meal timing: last_hour, first_hour, eating_window, last_meal_to_bedtime_min
     "caffeine_",  # Caffeine timing: first_hour, last_hour, window_hours, intake_count, to_bedtime_min
     "act_",  # Activity taxonomy: run/sauna (auto) + leg/pull/push split + act_mg_* muscle groups (manual)
+    "delivery_",  # Uber Eats deliveries: meal count, late-meal flag, last delivery → sleep minutes
 ) + tuple(MICRONUTRIENT_COLS)  # Cronometer vitamins/minerals (exact column names)
 
 # Re-audit 2026-06-07 (stats/gpt-5/F-009): same-night sleep / recovery / HRV-
@@ -459,6 +460,10 @@ FEATURE_LABELS: dict[str, str] = {
     "meal_eating_window_hours": "Eating Window (h)",
     "meal_event_count": "Meal Events Logged",
     "meal_last_meal_to_bedtime_min": "Minutes from Last Meal to Bedtime",
+    "delivery_meal_count": "Delivered Meals (Uber Eats)",
+    "delivery_any_meal": "Had a Meal Delivered",
+    "delivery_late_meal": "Late Delivered Meal (after 10 PM)",
+    "delivery_last_meal_to_sleep_min": "Minutes from Last Delivered Meal to Sleep",
     "caffeine_first_hour": "First Caffeine (ET hour)",
     "caffeine_last_hour": "Last Caffeine (ET hour)",
     "caffeine_window_hours": "Caffeine Window (h)",
@@ -835,6 +840,20 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     if not data["flight_day"].empty:
         data["flight_day"]["calendar_date"] = data["flight_day"]["calendar_date"].astype(str)
         data["flight_day"]["flew"] = pd.to_numeric(data["flight_day"]["flew"], errors="coerce")
+
+    # Delivery orders (pds.delivery_daily, 2026-11-09): one row per behavioral
+    # day with a delivered Uber Eats order (parsed from receipt emails). Loaded
+    # fail-open — it is a brand-new source and must never sink the retrain.
+    log.info("  Loading delivery_daily (Uber Eats receipt emails)…")
+    try:
+        data["delivery"] = fetch_all(
+            "delivery_daily",
+            select="behavioral_date,meal_order_count,late_meal_delivery,"
+                   "last_meal_delivery_to_sleep_minutes",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  delivery_daily load failed ({e!r}); continuing without delivery features")
+        data["delivery"] = pd.DataFrame()
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
     # topic_count) joined into the matrix per the audit's Finding #8. The textual
@@ -1248,6 +1267,66 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
         cols = ["calendar_date"] + [c for c in wide.columns if c != "calendar_date"]
         wide = wide[cols]
     return wide, tracking_start
+
+
+def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None) -> pd.DataFrame:
+    """Uber Eats delivery features, keyed on the behavioral day (pds.delivery_daily).
+
+      delivery_meal_count             restaurant orders delivered that day
+      delivery_any_meal               1 = at least one meal delivered; 0 = none
+      delivery_late_meal              1 = a meal was delivered at/after 22:00 or before
+                                      06:00 local; 0 = no late delivery
+      delivery_last_meal_to_sleep_min WHOOP sleep onset − last meal delivery (NaN on
+                                      days without a timed delivery or a scored sleep)
+
+    The view has a row only for days WITH an order, so "no row" must be told apart
+    from "not tracked". Inside coverage (first → last delivery day the ETL has
+    seen) a missing day is a true zero — the receipts are parsed automatically, no
+    logging can lapse. Outside coverage everything stays NaN, so a broken ETL
+    cannot manufacture fake zero days. A day whose only meals have no clock time
+    (date-only receipts) keeps its count but an unknown (NaN) late flag.
+    Pre-Nov-2025 delivery times are estimates (card charge − 70 min); see
+    sql/delivery_orders_schema.sql.
+
+    Fail-open: any problem here logs a warning and returns df untouched.
+    """
+    if delivery is None or delivery.empty:
+        return df
+    try:
+        d = delivery.copy()
+        d["calendar_date"] = d["behavioral_date"].astype(str)
+        d["delivery_meal_count"] = pd.to_numeric(d["meal_order_count"], errors="coerce")
+        d["delivery_late_meal"] = d["late_meal_delivery"].map(
+            lambda v: np.nan if v is None or (isinstance(v, float) and np.isnan(v)) else float(bool(v))
+        )
+        d["delivery_last_meal_to_sleep_min"] = pd.to_numeric(
+            d["last_meal_delivery_to_sleep_minutes"], errors="coerce"
+        )
+        cols = ["delivery_meal_count", "delivery_late_meal", "delivery_last_meal_to_sleep_min"]
+        d = d[["calendar_date"] + cols].drop_duplicates("calendar_date")
+        cov_start, cov_end = d["calendar_date"].min(), d["calendar_date"].max()
+        out = df.drop(columns=cols + ["delivery_any_meal"], errors="ignore").merge(
+            d, on="calendar_date", how="left")
+        in_cov = (out["calendar_date"] >= cov_start) & (out["calendar_date"] <= cov_end)
+        no_order = in_cov & out["delivery_meal_count"].isna()
+        out.loc[no_order, "delivery_meal_count"] = 0.0
+        # no meal delivered (no order at all, or only store / alcohol runs) → no late meal
+        out.loc[in_cov & (out["delivery_meal_count"] == 0), "delivery_late_meal"] = 0.0
+        out["delivery_any_meal"] = (out["delivery_meal_count"] > 0).astype(float).where(
+            out["delivery_meal_count"].notna()
+        )
+        assert len(out) == len(df), "delivery merge changed the row count"
+        assert set(out["delivery_late_meal"].dropna().unique()) <= {0.0, 1.0}
+        log.info(
+            f"  Delivery features: coverage {cov_start} → {cov_end}, "
+            f"{int((out['delivery_meal_count'] > 0).sum())} delivery days, "
+            f"{int((out['delivery_late_meal'] == 1).sum())} late-meal days, "
+            f"{int(out['delivery_last_meal_to_sleep_min'].notna().sum())} with a gap to sleep"
+        )
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Delivery feature merge failed ({e!r}); continuing without delivery features")
+        return df
 
 
 def build_feature_matrix(data: dict) -> pd.DataFrame:
@@ -1799,6 +1878,8 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         df["caffeine_total_mg_7d_mean"] = (
             df["caffeine_total_mg"].rolling(7, min_periods=4).mean()
         )
+    df = merge_delivery_features(df, data.get("delivery"))
+
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships
     # without us having to hardcode habit names (they're user-defined in Notion).
@@ -2784,6 +2865,9 @@ def run_statistical_analysis(
         # replaces the dietary-only nutrition_caffeine_mg (2026-06-09).
         "caffeine_total_mg": ("Total Caffeine", "mg"),
         "caffeine_mg_at_bedtime": ("Caffeine at Bedtime", "mg"),
+        # Uber Eats deliveries (pds.delivery_daily) — timing + counts, no calories.
+        "delivery_meal_count": ("Delivered Meals", "orders"),
+        "delivery_last_meal_to_sleep_min": ("Last Delivered Meal → Sleep", "min"),
         **MICRONUTRIENT_COLS,
     }
     nutrition_impact: list[dict] = []

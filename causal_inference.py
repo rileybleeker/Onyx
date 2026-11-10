@@ -419,6 +419,9 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     # is 'nutrition' so the causal layer attaches the supplement-style
     # confounders (lifestyle clustering around late meals).
     ("meal_last_meal_to_bedtime_min", "nutrition", "Last meal → bedtime minutes above median", "min"),
+    # Uber Eats deliveries (pds.delivery_daily, 2026-11-09). Timing + counts from
+    # receipt emails; pre-Nov-2025 times are estimates (card charge − 70 min).
+    ("delivery_last_meal_to_sleep_min", "nutrition", "Last delivered meal → sleep minutes above median", "min"),
     ("meal_eating_window_hours",      "nutrition", "Eating window above median",               "h"),
     ("meal_last_hour",                "nutrition", "Last meal clock hour above median",        "ET hr"),
     ("meal_first_hour",               "nutrition", "First meal clock hour above median",       "ET hr"),
@@ -470,6 +473,9 @@ EXPLICIT_BINARY_TREATMENTS: tuple[tuple[str, str, str], ...] = (
     # sessions accumulate (cell-size gates), then enter the FDR family.
     ("act_run",             "behavior", "Run day (WHOOP + Garmin)"),
     ("act_sauna",           "behavior", "Sauna session"),
+    ("delivery_late_meal",  "nutrition", "Late delivered meal (after 10 PM)"),
+    # binary, not a median split: the count is 0/1/2, so "above median" would mean 2+
+    ("delivery_any_meal",   "nutrition", "Had a meal delivered"),
     ("act_leg_day",         "behavior", "Leg day"),
     ("act_pull_day",        "behavior", "Pull day"),
     ("act_push_day",        "behavior", "Push day"),
