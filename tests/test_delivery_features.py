@@ -85,6 +85,21 @@ def test_etl_heartbeat_extends_coverage():
     assert _merged("2026-01-04").equals(_merged())
 
 
+def test_unread_receipt_days_are_never_zero_filled():
+    # A receipt the ETL could not read may hide a delivery on day 01-04 (row 01-03): that row
+    # must stay unknown instead of reading as a no-delivery day, even inside coverage.
+    out = h.merge_delivery_features(_matrix(), _delivery(), "2026-01-10",
+                                    [pd.Timestamp("2026-01-04")]).set_index("calendar_date")
+    for col in ("delivery_meal_count", "delivery_late_meal", "delivery_any_meal"):
+        assert np.isnan(out.loc["2026-01-03", col])
+    # a day WITH a parsed order keeps its values even if it is on the unread list
+    out2 = h.merge_delivery_features(_matrix(), _delivery(), None,
+                                     [pd.Timestamp("2026-01-03")]).set_index("calendar_date")
+    assert out2.loc["2026-01-02", "delivery_late_meal"] == 1
+    # other in-coverage days are unaffected
+    assert out.loc["2026-01-08", "delivery_meal_count"] == 0
+
+
 def test_unknown_times():
     out = _merged()
     # day 01-06 (row 01-05): date-only meal → counted, late flag unknown

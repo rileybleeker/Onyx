@@ -337,10 +337,12 @@ class Store:
         ids: set[str] = set()
         offset = 0
         while True:
-            # Rows logged as 'error' are NOT done: a one-off database or IMAP hiccup must be
-            # retried on the next run, not skipped forever behind a green heartbeat.
+            # Only 'parsed' rows are done. An 'error' (a one-off database or IMAP hiccup) or an
+            # 'unmatched' receipt (Uber changed the layout) is looked at again on every run while
+            # it is inside the search window, so the heartbeat stays 'partial' until it is read
+            # instead of turning green three hours later with the order still missing.
             res = (self.pds("delivery_email_log").select("message_id")
-                   .eq("account", account).neq("status", "error")
+                   .eq("account", account).eq("status", "parsed")
                    .range(offset, offset + 999).execute())
             rows = res.data or []
             ids.update(r["message_id"] for r in rows)
@@ -355,6 +357,18 @@ class Store:
         res = (self.pds("delivery_orders").select("order_id,total,status,source_email_date")
                .eq("provider", row["provider"]).eq("order_key", row["order_key"]).execute())
         return (res.data or [None])[0]
+
+    def oldest_error_day(self, account: str) -> Optional[date]:
+        """Receive day of the oldest email still logged 'error'. The mailbox search must reach
+        back to it, or an error from a wide backfill would never be retried by the 30-day cron."""
+        if self.supa is None:
+            return None
+        res = (self.pds("delivery_email_log").select("received_at")
+               .eq("account", account).eq("status", "error")
+               .not_.is_("received_at", "null")
+               .order("received_at").limit(1).execute())
+        rows = res.data or []
+        return date.fromisoformat(rows[0]["received_at"][:10]) if rows else None
 
     def known_merchant_tz(self, name: str) -> Optional[str]:
         """Zone this merchant's other receipts resolved to, when they all agree on one
@@ -456,6 +470,11 @@ def process_account(account: str, password: str, store: Store, since: date, repr
     try:
         imap.login(account, password)
         box = select_all_mail(imap)
+        if not reprocess:
+            oldest = store.oldest_error_day(account)
+            if oldest and oldest - timedelta(days=1) < since:
+                since = oldest - timedelta(days=1)   # one day of slack: the search is date-granular
+                log.info(f"[{account_fingerprint(account)}] widening the search to {since} to retry an errored email")
         uids, how = search_uids(imap, since)
         stats["candidates"] = len(uids)
         log.info(f"[{account}] fp={account_fingerprint(account)} {len(uids)} candidate email(s) since {since} in {box} via {how}")

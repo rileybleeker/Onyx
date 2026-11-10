@@ -855,10 +855,17 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["delivery"] = pd.DataFrame()
     # How far the receipt ETL has verifiably looked: the view has a row only on days WITH an
     # order, so "no row" after the last order is a true zero only if the ETL kept running.
-    # Only a 'success' heartbeat counts (partial = a receipt it could not read; failed = down).
-    # One day is held back because a receipt can trail its delivery by ~11 h (the card charge
-    # sometimes posts the next morning).
+    # Only a 'success' heartbeat counts (failed = down; partial = this run hit a receipt it
+    # could not read). A receipt can trail its delivery by ~11 h (the card charge sometimes
+    # posts the next morning), so behavioral day D counts as covered only once a success
+    # heartbeat lands at or after 18:00 ET on D+1: the 6 h behavioral-day offset + a 12 h
+    # receipt allowance (largest next-morning lag seen: 10.6 h).
     data["delivery_covered_through"] = None
+    # V2: a success heartbeat does not prove every receipt was READ. An unreadable receipt
+    # (Uber changes the layout) is logged 'unmatched' / 'error' in pds.delivery_email_log; its
+    # delivery day must never be zero-filled. A receipt can arrive the behavioral day after its
+    # delivery, so both its own day and the day before are treated as unknown.
+    data["delivery_unread_days"] = []
     try:
         hb = fetch_all("sync_log", select="sync_end",
                        filters=[("source", "eq", "delivery"), ("data_type", "eq", "email"),
@@ -867,10 +874,21 @@ def load_all_data() -> dict[str, pd.DataFrame]:
             last_ok = pd.to_datetime(hb["sync_end"], utc=True, errors="coerce").max()
             if pd.notna(last_ok):
                 data["delivery_covered_through"] = (
-                    last_ok.tz_convert("America/New_York") - pd.Timedelta(hours=6) - pd.Timedelta(days=1)
+                    last_ok.tz_convert("America/New_York") - pd.Timedelta(hours=18) - pd.Timedelta(days=1)
                 ).strftime("%Y-%m-%d")
+        unread = fetch_all("delivery_email_log", select="received_at",
+                           filters=[("status", "neq", "parsed")])
+        if not unread.empty:
+            r = pd.to_datetime(unread["received_at"], utc=True, errors="coerce").dropna()
+            b = (r.dt.tz_convert("America/New_York") - pd.Timedelta(hours=6)).dt.tz_localize(None).dt.normalize()
+            data["delivery_unread_days"] = sorted({*b, *(b - pd.Timedelta(days=1))})
+            log.info(f"  {len(unread)} unread delivery receipt(s): "
+                     f"{len(data['delivery_unread_days'])} day(s) will not be zero-filled")
     except Exception as e:  # noqa: BLE001
-        log.warning(f"  delivery heartbeat load failed ({e!r}); delivery coverage ends at the last order day")
+        # Without the heartbeat AND the unread list, fall back to the conservative rule.
+        data["delivery_covered_through"] = None
+        data["delivery_unread_days"] = []
+        log.warning(f"  delivery coverage load failed ({e!r}); delivery coverage ends at the last order day")
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
     # topic_count) joined into the matrix per the audit's Finding #8. The textual
@@ -1287,7 +1305,8 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
 
 
 def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
-                            covered_through: str | None = None) -> pd.DataFrame:
+                            covered_through: str | None = None,
+                            unread_days: list | None = None) -> pd.DataFrame:
     """Uber Eats delivery features from pds.delivery_daily (one row per behavioral day with an order).
 
       delivery_meal_count             restaurant orders delivered that day
@@ -1318,7 +1337,8 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
     are parsed automatically; no logging can lapse). Coverage runs from the first delivery
     day to the later of the last delivery day and `covered_through` (the last behavioral
     day the email ETL verifiably covered — see load_all_data). Outside coverage everything
-    stays NaN, so a broken ETL cannot manufacture zero days.
+    stays NaN, so a broken ETL cannot manufacture zero days. `unread_days` (days that may hold
+    a receipt the ETL could not read) are never zero-filled either.
 
     UNKNOWN TIMES — a day with a meal whose receipt carries no clock time keeps its count,
     but its late flag is NaN unless another meal that day is known to be late.
@@ -1356,6 +1376,8 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
             d[["calendar_date"] + cols], on="calendar_date", how="left")
         row_day = pd.to_datetime(out["calendar_date"], errors="coerce") + pd.Timedelta(days=1)
         in_cov = (row_day >= cov_start) & (row_day <= cov_end)
+        if unread_days:
+            in_cov &= ~row_day.isin(pd.to_datetime(list(unread_days)))
         no_order = in_cov & out["delivery_meal_count"].isna()
         out.loc[no_order, "delivery_meal_count"] = 0.0
         # no meal delivered (no order at all, or only store / package-store runs) → no late meal
@@ -1926,7 +1948,8 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         df["caffeine_total_mg_7d_mean"] = (
             df["caffeine_total_mg"].rolling(7, min_periods=4).mean()
         )
-    df = merge_delivery_features(df, data.get("delivery"), data.get("delivery_covered_through"))
+    df = merge_delivery_features(df, data.get("delivery"), data.get("delivery_covered_through"),
+                                 data.get("delivery_unread_days"))
 
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships
@@ -4935,6 +4958,9 @@ def main() -> None:
         full_ranked = stat_results["correlations"]["feature"].tolist()
     else:
         full_ranked = []
+    # delivery_* are not forecast features (see prepare_ml_data); the Spearman fallback
+    # ranking still lists them, so keep them out of the SARIMAX / Prophet candidates too.
+    full_ranked = [f for f in full_ranked if not f.startswith("delivery_")]
 
     top10_global = (list(xgb_importance_top.keys())[:10]
                     if xgb_importance_top else full_ranked[:10])

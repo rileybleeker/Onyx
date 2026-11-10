@@ -11,7 +11,9 @@
 //                                           { estimate }    → kcal / macros per dish (looped)
 //                                           { done, stats } → ubereats|items heartbeat
 //
-// One-time:   node harvest.mjs --login      (opens a visible window; sign in to Uber, it exits)
+// Sign-in:    do it in a PLAIN Chrome window on this profile (README, "Signing in again"): that
+//             is the route that worked on 2026-11-10. `--login` opens the automated window and
+//             waits instead; whether Uber accepts a sign-in there has not been confirmed.
 // Scheduled:  node harvest.mjs              (no visible window; stops paging at the first page it has seen)
 // Backfill:   node harvest.mjs --full       (pages through the whole order history)
 // Check:      node harvest.mjs --dry-run    (fetch + print, post nothing, write no heartbeat)
@@ -43,7 +45,7 @@ const FULL = process.argv.includes("--full");
 const HEADLESS = process.argv.includes("--headless");
 const VISIBLE = LOGIN_MODE || process.argv.includes("--headed");
 const MAX_PAGES = 400; // safety cap only; reaching it counts as an incomplete run
-const SIGN_IN_HINT = "Uber session missing or expired; run tools/ubereats_harvest/harvest.mjs --login on the PC";
+const SIGN_IN_HINT = "Uber session missing or expired; sign in again on the PC (see tools/ubereats_harvest/README.md, 'Signing in again')";
 
 const TOKEN = (process.env.ONYX_CI_TOKEN || (existsSync(TOKEN_FILE) ? readFileSync(TOKEN_FILE, "utf8") : "")).trim();
 
