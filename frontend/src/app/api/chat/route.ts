@@ -3,6 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist } from "@/lib/spotify-server";
 import { logStackIntake } from "@/lib/supplement-stacks";
+import { behavioralToday, currentTimeZone, logSupplementIntake } from "@/lib/supplement-intake";
 import { addHighlight, getOverview, logSession, recordQuiz, summarizeForChat, type HighlightSource, type Medium } from "@/lib/reading";
 import { mirrorHighlight, mirrorProgress, mirrorSession } from "@/lib/reading-notion";
 
@@ -21,6 +22,8 @@ You have access to the user's data via function calls. When the user asks about 
 When the user mentions completing a habit (e.g., "I meditated today", "I took my vitamins"), use mark_habit_complete to log it. The habit name should match what's defined in their habits list. Use query_journal to see both self-reported behaviors and habit completions together.
 
 The user keeps reusable supplement "stacks" — named lists of supplements + doses (like a bill of materials). When they say they took a named stack or routine (e.g. "log my morning stack", "I took my evening stack"), use log_supplement_stack with the stack name. It records every supplement in that stack at once. If the name doesn't match, the tool returns the list of available stacks so you can confirm which one they mean.
+
+For a single item — any supplement OR medication on their /supplements product list (e.g. "log 15 mg of Adderall at 8:30am and noon", "I took 2 magnesium capsules", "took my creatine") — use log_supplement_intake. Pass the name as they said it (brand names resolve, e.g. Adderall → the amphetamine salts product), the amount + unit they stated, and every clock time they mention in ONE call. The tool converts the amount into servings and stores the times, so never refuse because of a custom dose or time, and never fall back to a habit for this. Confirm in one short line what was logged (amount, times, day).
 
 The user also keeps a free-form *personal* journal in Notion (prose entries about life, mood, relationships, training, mental health). Use query_journal_entries when they ask about what they wrote, how they were feeling, or to find context behind biometric trends — combine it with biometric tools to answer questions like "what was my HRV on days I logged a 'low' mood?". When a question is thematic rather than date-specific, set semantic_query to do similarity search.
 
@@ -197,6 +200,21 @@ const tools: Anthropic.Tool[] = [
         date: { type: "string", description: "Date in YYYY-MM-DD format (defaults to the current behavioral day)" },
       },
       required: ["stack"],
+    },
+  },
+  {
+    name: "log_supplement_intake",
+    description: "Record ONE supplement or medication from the user's /supplements product list as taken, with an optional custom amount and optional clock times. Use for 'log 15 mg of Adderall at 8:30am and noon', 'I took 2 magnesium capsules', 'took melatonin at 11pm'. Writes one intake per time. The product is matched by name, brand, or ingredient (so 'Adderall' finds the amphetamine salts product); on no match or several matches the response lists candidates — relay them and ask. A weight amount (mg/mcg/g/IU) is converted to servings from the product's label; a count (capsules, tablets, scoops) is divided by the serving size. Re-sending the same timed entry is skipped, not duplicated.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        product: { type: "string", description: "The product as the user named it (e.g. 'Adderall', 'magnesium', 'Creatine Monohydrate')" },
+        amount: { type: "number", description: "Amount PER intake, as the user stated it (e.g. 15 for '15 mg', 2 for '2 capsules'). Omit for one standard serving." },
+        unit: { type: "string", description: "Unit of amount: 'mg', 'mcg', 'g', 'IU', a count unit like 'capsule' / 'tablet' / 'scoop', or 'serving'" },
+        times: { type: "array", items: { type: "string" }, description: "Local clock time of each intake in 24-hour HH:MM (e.g. ['08:30','12:00']). One intake is written per time. Omit when no time was given (today → stamped now; a past day → no time stored)." },
+        date: { type: "string", description: "Day the intake belongs to, YYYY-MM-DD (defaults to the current behavioral day — a dose taken after midnight but before sleep still belongs to the day that is ending)" },
+      },
+      required: ["product"],
     },
   },
   {
@@ -856,6 +874,18 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     return JSON.stringify({ success: true, passed: result.passed, score: `${result.quiz.score}/${result.quiz.total}`, checkpoint: result.quiz.checkpoint });
   }
 
+  if (name === "log_supplement_intake") {
+    const result = await logSupplementIntake(supabase, {
+      product: String(input.product ?? ""),
+      amount: input.amount != null ? Number(input.amount) : null,
+      unit: (input.unit as string) || null,
+      times: Array.isArray(input.times) ? (input.times as string[]) : null,
+      date: (input.date as string) || null,
+    });
+    const { ok, ...rest } = result;
+    return JSON.stringify(ok ? { success: true, ...rest } : rest);
+  }
+
   if (name === "log_supplement_stack") {
     const wanted = (input.stack as string)?.trim();
     if (!wanted) return JSON.stringify({ error: "stack name is required" });
@@ -927,11 +957,20 @@ export async function POST(req: NextRequest) {
       return Response.json({ error: "messages required" }, { status: 400 });
     }
 
+    // The model has no clock of its own: tell it the local time and the
+    // behavioral day so "today", "yesterday" and "this morning" resolve.
+    const now = new Date();
+    const [tz, bday] = await Promise.all([currentTimeZone(supabase, now), behavioralToday(supabase)]);
+    const localNow = now.toLocaleString("en-US", {
+      timeZone: tz, weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit",
+    });
+    const systemPrompt = `${SYSTEM_PROMPT}\n\nCurrent local time: ${localNow} (${tz}). Current behavioral day ("today" for logging; it runs until the user sleeps, so it can lag the calendar date after midnight): ${bday}.`;
+
     // Initial Claude call with tools
     let response = await anthropic.messages.create({
       model: "claude-sonnet-5-5",
       max_tokens: 1024,
-      system: SYSTEM_PROMPT,
+      system: systemPrompt,
       tools,
       messages,
     });
@@ -960,7 +999,7 @@ export async function POST(req: NextRequest) {
       response = await anthropic.messages.create({
         model: "claude-sonnet-5-5",
         max_tokens: 1024,
-        system: SYSTEM_PROMPT,
+        system: systemPrompt,
         tools,
         messages: allMessages,
       });
