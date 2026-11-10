@@ -12,10 +12,10 @@
 //                                           { done, stats } → ubereats|items heartbeat
 //
 // One-time:   node harvest.mjs --login      (opens a visible window; sign in to Uber, it exits)
-// Scheduled:  node harvest.mjs              (headless; stops paging at the first page it has seen)
+// Scheduled:  node harvest.mjs              (no visible window; stops paging at the first page it has seen)
 // Backfill:   node harvest.mjs --full       (pages through the whole order history)
 // Check:      node harvest.mjs --dry-run    (fetch + print, post nothing, write no heartbeat)
-//             add --headed to watch a normal run in a visible window
+//             add --headed to watch a run in an on-screen window
 //
 // Auth to Onyx: ONYX_CI_TOKEN env var or ~/.onyx_ci_token (same secret as the Kindle harvester).
 // The script never sees Uber credentials — the session lives in the Chrome profile.
@@ -35,7 +35,13 @@ const LOG_FILE = join(HERE, "harvest.log");
 const LOGIN_MODE = process.argv.includes("--login");
 const DRY = process.argv.includes("--dry-run");
 const FULL = process.argv.includes("--full");
-const HEADED = LOGIN_MODE || process.argv.includes("--headed");
+// Uber's bot protection answers HEADLESS Chrome with a 403 "Just a moment…" challenge, and this
+// script does not try to defeat it (no stealth flags, no fingerprint changes). So a scheduled run
+// uses a normal Chrome window parked far off-screen — nothing appears on the desktop, and
+// run-hidden.js keeps the console hidden too. --headed puts the window on screen; --headless is
+// kept only to re-test whether Uber still blocks it.
+const HEADLESS = process.argv.includes("--headless");
+const VISIBLE = LOGIN_MODE || process.argv.includes("--headed");
 const MAX_PAGES = FULL ? 400 : 30;
 const SIGN_IN_HINT = "Uber session missing or expired; run tools/ubereats_harvest/harvest.mjs --login on the PC";
 
@@ -123,9 +129,9 @@ function signedOut(page, res) {
 mkdirSync(PROFILE, { recursive: true });
 const ctx = await chromium.launchPersistentContext(PROFILE, {
   channel: "chrome",
-  headless: !HEADED,
+  headless: HEADLESS,
   viewport: { width: 1280, height: 900 },
-  args: ["--window-size=1280,900"],
+  args: VISIBLE || HEADLESS ? ["--window-size=1280,900"] : ["--window-position=-32000,-32000", "--window-size=1280,900"],
 });
 let exitCode = 0;
 try {
@@ -134,9 +140,9 @@ try {
   await page.waitForTimeout(2500);
 
   if (LOGIN_MODE) {
-    log("LOGIN: sign in to Uber Eats in the window that just opened (waiting up to 10 minutes)…");
+    log("LOGIN: sign in to Uber Eats in the window that just opened (waiting up to 30 minutes)…");
     let ok = false;
-    for (let i = 0; i < 120 && !ok; i++) {
+    for (let i = 0; i < 360 && !ok; i++) {
       await page.waitForTimeout(5000);
       if (/ubereats\.com/i.test(page.url()) && !/\/login/i.test(page.url())) {
         const res = await fetchPage(page, "");
