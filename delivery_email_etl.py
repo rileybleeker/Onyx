@@ -106,6 +106,50 @@ STORE_WORDS = ("quick save", "mini market", "mini mart", "minimart", "supermarke
                "shoppers drug mart", "sobeys")
 
 
+# Merchant address → IANA zone (new-template receipts only). The receipt prints
+# the MERCHANT's local clock, so its address is the authoritative zone — the
+# WHOOP-cycle / user_tz_log ladder lags on the day Riley flies home (an Atlanta
+# order placed after landing from Madrid was resolved with +02:00). States that
+# straddle two zones get their dominant one.
+_EASTERN = "CT DE DC FL GA IN KY ME MD MA MI NH NJ NY NC OH PA RI SC VT VA WV"
+_CENTRAL = "AL AR IL IA KS LA MN MS MO NE ND OK SD TN TX WI"
+_MOUNTAIN = "CO ID MT NM UT WY"
+_PACIFIC = "CA NV OR WA"
+US_STATE_TZ = {
+    **{s: "America/New_York" for s in _EASTERN.split()},
+    **{s: "America/Chicago" for s in _CENTRAL.split()},
+    **{s: "America/Denver" for s in _MOUNTAIN.split()},
+    **{s: "America/Los_Angeles" for s in _PACIFIC.split()},
+    "AZ": "America/Phoenix", "AK": "America/Anchorage", "HI": "Pacific/Honolulu",
+}
+CA_PROVINCE_TZ = {
+    "ON": "America/Toronto", "QC": "America/Toronto", "BC": "America/Vancouver", "AB": "America/Edmonton",
+    "MB": "America/Winnipeg", "SK": "America/Regina", "NS": "America/Halifax", "NB": "America/Halifax",
+    "PE": "America/Halifax", "NL": "America/St_Johns",
+}
+COUNTRY_TZ = {
+    "ES": "Europe/Madrid", "SPAIN": "Europe/Madrid", "GB": "Europe/London", "UK": "Europe/London",
+    "UNITED KINGDOM": "Europe/London", "FR": "Europe/Paris", "FRANCE": "Europe/Paris", "IT": "Europe/Rome",
+    "ITALY": "Europe/Rome", "PT": "Europe/Lisbon", "PORTUGAL": "Europe/Lisbon", "DE": "Europe/Berlin",
+    "GERMANY": "Europe/Berlin", "NL": "Europe/Amsterdam", "NETHERLANDS": "Europe/Amsterdam",
+    "IE": "Europe/Dublin", "IRELAND": "Europe/Dublin", "JP": "Asia/Tokyo", "JAPAN": "Asia/Tokyo",
+}
+_REGION_RE = re.compile(r",\s*([A-Z]{2})\s+[A-Z0-9][A-Z0-9 -]*,\s*([A-Za-z ]+?)\s*$")
+
+
+def merchant_tz(address: str | None) -> Optional[str]:
+    """IANA zone of the merchant from its printed address, or None when unknown."""
+    if not address:
+        return None
+    country = address.rsplit(",", 1)[-1].strip().upper()
+    m = _REGION_RE.search(address)
+    if m and country in ("US", "USA", "UNITED STATES"):
+        return US_STATE_TZ.get(m.group(1))
+    if m and country in ("CA", "CANADA"):
+        return CA_PROVINCE_TZ.get(m.group(1))
+    return COUNTRY_TZ.get(country)
+
+
 def merchant_kind(name: str) -> str:
     n = name.lower()
     if any(w in n for w in ALCOHOL_WORDS):
@@ -218,6 +262,7 @@ def build_row(parsed: dict, meta: dict) -> dict:
         "merchant_name": parsed["merchant"],
         "merchant_kind": merchant_kind(parsed["merchant"]),
         "merchant_address": parsed["merchant_address"],
+        "merchant_tz": merchant_tz(parsed["merchant_address"]),
         "profile": prof.group(1) if prof else None,
         "order_date_local": parsed["order_date"].isoformat(),
         "daypart": daypart,

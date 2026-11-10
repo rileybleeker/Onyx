@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS pds.delivery_orders (
     merchant_name         TEXT NOT NULL,           -- 'STK Steakhouse (Atlanta)' as printed
     merchant_kind         TEXT NOT NULL DEFAULT 'restaurant',  -- restaurant | alcohol | store (name-keyword guess; hand-correctable)
     merchant_address      TEXT,                    -- pickup address (the business, not the customer); new template only
+    merchant_tz           TEXT,                    -- IANA zone derived from merchant_address by the ETL (NULL when unknown / old template)
     profile               TEXT,                    -- 'Personal' / 'Business' tag from the subject
 
     order_date_local      DATE NOT NULL,           -- printed order date (local)
@@ -95,9 +96,15 @@ CREATE INDEX IF NOT EXISTS idx_delivery_orders_order_date ON pds.delivery_orders
 
 -- -----------------------------------------------------------
 -- Trigger — resolve the printed local times to instants, then the quad.
--- The offset lookup needs an instant, so the local time is first read as ET
--- (never more than a few hours off) to pick the WHOOP-cycle offset or the
--- user_tz_log zone in force, and the local time is then re-read in that zone.
+-- 1. merchant_tz known (new-template receipts): the receipt prints the
+--    MERCHANT's clock, so that zone is authoritative and is passed to
+--    derive_onyx_dates as a source-field offset. This is what keeps the day
+--    Riley flies home right — the WHOOP cycle still carries the trip's offset
+--    then (an Atlanta order after landing from Madrid was stored 6 h early).
+-- 2. otherwise the ADR-0001 ladder. The offset lookup needs an instant, so the
+--    local time is first read as ET (never more than a few hours off) to pick
+--    the WHOOP-cycle offset or the user_tz_log zone in force, and the local
+--    time is then re-read in that zone.
 -- -----------------------------------------------------------
 CREATE OR REPLACE FUNCTION pds.set_onyx_dates_delivery_orders()
 RETURNS TRIGGER AS $$
@@ -121,6 +128,22 @@ BEGIN
         NEW.onyx_local_date      := NEW.order_date_local;
         NEW.onyx_behavioral_date := CASE WHEN NEW.daypart IN ('afternoon', 'evening') THEN NEW.order_date_local END;
         NEW.onyx_tz_source       := 'date_only';
+        RETURN NEW;
+    END IF;
+
+    IF NEW.merchant_tz IS NOT NULL AND NEW.merchant_tz <> '' THEN
+        NEW.ordered_at   := NEW.ordered_local   AT TIME ZONE NEW.merchant_tz;
+        NEW.delivered_at := NEW.delivered_local AT TIME ZONE NEW.merchant_tz;
+        ev       := COALESCE(NEW.delivered_at, NEW.ordered_at);
+        off_iv   := COALESCE(NEW.delivered_local, NEW.ordered_local) - (ev AT TIME ZONE 'UTC');
+        off_text := CASE WHEN off_iv < INTERVAL '0' THEN '-' ELSE '+' END
+                    || to_char(abs(EXTRACT(epoch FROM off_iv))::int * INTERVAL '1 second', 'HH24:MI');
+        NEW.local_utc_offset := off_text;
+        SELECT * INTO d FROM pds.derive_onyx_dates(ev, off_text, 'source_field');
+        NEW.onyx_et_date         := d.onyx_et_date;
+        NEW.onyx_behavioral_date := d.onyx_behavioral_date;
+        NEW.onyx_local_date      := d.onyx_local_date;
+        NEW.onyx_tz_source       := d.onyx_tz_source;
         RETURN NEW;
     END IF;
 
