@@ -20,7 +20,8 @@ function isCiRoute(pathname: string): boolean {
   return (
     pathname.startsWith("/api/habits") ||
     pathname === "/api/reading/highlights/import" ||
-    pathname === "/api/screen-time/event"
+    pathname === "/api/screen-time/event" ||
+    pathname === "/api/delivery/items/import"
   );
 }
 

@@ -1,0 +1,13 @@
+{
+  "name": "onyx-ubereats-harvester",
+  "private": true,
+  "type": "module",
+  "description": "Runs on Riley's PC on a schedule: reads Uber Eats order history (cart items, delivery times) from a signed-in Chrome profile, headless, and posts it to Onyx /api/delivery/items/import.",
+  "scripts": {
+    "harvest": "node harvest.mjs",
+    "login": "node harvest.mjs --login",
+    "dry-run": "node harvest.mjs --dry-run",
+    "backfill": "node harvest.mjs --full"
+  },
+  "dependencies": { "playwright": "^1.50.0" }
+}

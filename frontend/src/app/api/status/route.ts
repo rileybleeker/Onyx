@@ -49,6 +49,7 @@ const CADENCE: Record<string, string> = {
   tanita: "Daily 10am + 1:30pm ET",
   flights: "Every 3h :25 (both Gmail accounts)",
   delivery: "Every 3h :40",
+  ubereats: "Every 6h (Riley's PC, while logged on)",
   nyc_scout: "Daily 6:10am ET",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
   // the frontend matrix reads hit since 2026-06-11). The heartbeat also
@@ -88,6 +89,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   tanita:         { method: "automated",      label: "API ETL" },
   flights:        { method: "automated",      label: "IMAP email parser" },
   delivery:       { method: "automated",      label: "IMAP email parser" },
+  ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
   perf_mats:      { method: "automated",      label: "Matview refresh" },
@@ -709,6 +711,37 @@ export async function GET() {
           cadence: CADENCE.delivery,
           integrationMethod: METHOD.delivery.method,
           methodLabel: METHOD.delivery.label,
+        };
+      })(),
+      // Uber Eats item harvester (tools/ubereats_harvest/harvest.mjs on Riley's PC):
+      // reads the signed-in web app's order history (cart items, exact delivery
+      // times) and posts it to /api/delivery/items/import, which also estimates
+      // kcal / macros per dish. Same shape as the Kindle card: heartbeat-driven,
+      // loose thresholds because the PC may be off (>18h degraded, >48h or an
+      // error row = red). 'failed' usually means the Uber session expired — run
+      // `node harvest.mjs --login` on the PC. 'partial' = dishes still unestimated.
+      ubereats: (() => {
+        const entry = latestBySrcType["ubereats|items"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 48
+            ? "failed"
+            : entry.status === "partial" || ageH > 18
+              ? "partial"
+              : "success";
+        return {
+          label: "Uber Eats Items",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string) ?? null,
+          cadence: CADENCE.ubereats,
+          integrationMethod: METHOD.ubereats.method,
+          methodLabel: METHOD.ubereats.label,
         };
       })(),
       // Body weight via Tanita Health Planet (tanita_etl.py): scale → phone
