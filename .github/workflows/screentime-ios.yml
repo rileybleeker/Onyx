@@ -1,0 +1,68 @@
+name: Screen Time iOS app
+
+# Builds tools/screentime_ios (the Onyx Screen Time iPhone app). Riley has no
+# Mac, so this runner is the only compiler the app ever sees.
+#
+# Today: an UNSIGNED compile check on every change to the app — proves the code
+# builds against the real iOS SDK. The signed build + over-the-air install job
+# is added once the Apple Developer account and App Store Connect key exist.
+#
+# macOS runners bill at 10x minutes on a private repo, so this only runs when
+# the app's own files change (or by hand).
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "tools/screentime_ios/**"
+      - ".github/workflows/screentime-ios.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: screentime-ios
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: Compile (unsigned)
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          NEWEST=$(ls -d /Applications/Xcode*.app | grep -vi beta | sort -V | tail -1)
+          sudo xcode-select -s "$NEWEST"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+
+      - name: Generate Xcode project
+        working-directory: tools/screentime_ios
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build
+        working-directory: tools/screentime_ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project OnyxScreenTime.xcodeproj \
+            -scheme OnyxScreenTime \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log | grep -E "error:|warning: unre|BUILD|\*\*" || true
+          grep -q "BUILD SUCCEEDED" build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screentime-ios-build-log
+          path: tools/screentime_ios/build.log
+          retention-days: 7

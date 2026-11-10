@@ -1,0 +1,48 @@
+# XcodeGen spec — the .xcodeproj is generated in CI (Riley has no Mac).
+#   brew install xcodegen && xcodegen generate
+name: OnyxScreenTime
+options:
+  bundleIdPrefix: com.rileybleeker
+  deploymentTarget:
+    iOS: "26.4"            # DeviceActivityData.activityData(filteredBy:using:) is 26.4+
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  OnyxScreenTime:
+    type: application
+    platform: iOS
+    sources:
+      - path: OnyxScreenTime
+    info:
+      path: OnyxScreenTime/Info.plist
+      properties:
+        CFBundleDisplayName: Onyx Screen Time
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        ITSAppUsesNonExemptEncryption: false
+    entitlements:
+      path: OnyxScreenTime/OnyxScreenTime.entitlements
+      properties:
+        com.apple.developer.family-controls: true
+        com.apple.developer.family-controls.app-and-website-usage: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rileybleeker.onyxscreentime
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: NO
+schemes:
+  OnyxScreenTime:
+    build:
+      targets:
+        OnyxScreenTime: all
+    run:
+      config: Debug
+    archive:
+      config: Release

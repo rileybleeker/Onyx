@@ -21,6 +21,8 @@ function isCiRoute(pathname: string): boolean {
     pathname.startsWith("/api/habits") ||
     pathname === "/api/reading/highlights/import" ||
     pathname === "/api/screen-time/event" ||
+    // Onyx Screen Time iPhone app (tools/screentime_ios, 2026-11-09)
+    pathname === "/api/screen-time/usage" ||
     pathname === "/api/delivery/items/import"
   );
 }
