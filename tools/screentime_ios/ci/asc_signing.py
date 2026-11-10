@@ -311,16 +311,19 @@ def ensure_certificate(c, key_pem_path):
     now = datetime.datetime.now(datetime.timezone.utc)
     certs = c.get_all("/v1/certificates",
                       {"filter[certificateType]": "DEVELOPMENT,IOS_DEVELOPMENT", "limit": 200})
-    unmatched = []
+    unmatched, expiring = [], []
     for cert in certs:
         a = cert["attributes"]
         content = a.get("certificateContent")
         if content:
             der = base64.b64decode(content)
-            if spki_sha256_of_cert(der) == want and parse_time(a["expirationDate"]) > now + datetime.timedelta(days=30):
-                log(f"reusing certificate {cert['id']} ({a.get('name')}, serial {a.get('serialNumber')}, "
-                    f"expires {a['expirationDate']})")
-                return cert, der
+            if spki_sha256_of_cert(der) == want:
+                if parse_time(a["expirationDate"]) > now + datetime.timedelta(days=30):
+                    log(f"reusing certificate {cert['id']} ({a.get('name')}, serial {a.get('serialNumber')}, "
+                        f"expires {a['expirationDate']})")
+                    return cert, der
+                expiring.append((cert, der))    # ours, inside its last 30 days: not "unmatched", never revoked
+                continue
         unmatched.append(cert)
 
     def create():
@@ -339,8 +342,17 @@ def ensure_certificate(c, key_pem_path):
         listing = "; ".join(f"{x['id']} {x['attributes'].get('name')} serial {x['attributes'].get('serialNumber')} "
                             f"expires {x['attributes'].get('expirationDate')}" for x in unmatched) or "(none listed)"
         if os.environ.get("ASC_REVOKE_UNMATCHED_DEV_CERTS") != "1":
-            die(f"Apple refused a new development certificate ({err}). None of the existing ones match our "
-                f"private key: {listing}. Revoke one in the developer portal, then re-run.")
+            usable = [x for x in expiring
+                      if parse_time(x[0]["attributes"]["expirationDate"]) > now + datetime.timedelta(days=2)]
+            if usable:      # still valid: build with it instead of failing, as before the 30-day rule
+                cert, der = max(usable, key=lambda x: parse_time(x[0]["attributes"]["expirationDate"]))
+                log(f"::warning::Apple refused a new development certificate ({err}); reusing {cert['id']}, which "
+                    f"expires {cert['attributes']['expirationDate']}. Revoke an unused development certificate in "
+                    "the developer portal and re-run before that date.")
+                return cert, der
+            ours = "; ".join(f"{c['id']} expires {c['attributes'].get('expirationDate')}" for c, _ in expiring) or "(none)"
+            die(f"Apple refused a new development certificate ({err}). Certificates that do not match our private "
+                f"key: {listing}. Our own, about to expire: {ours}. Revoke one in the developer portal, then re-run.")
         for x in unmatched:
             log(f"revoking certificate {x['id']} ({x['attributes'].get('name')})")
             c.request("DELETE", f"/v1/certificates/{x['id']}")
@@ -428,8 +440,11 @@ def main():
     entitlements = plist.get("Entitlements", {})
     for key in [k.strip() for k in env.get("REQUIRED_ENTITLEMENTS", "").split(",") if k.strip()]:
         if key not in entitlements:
-            problems.append(f"profile does not allow entitlement {key} - tick the capability on the App ID "
-                            "in the developer portal, then re-run")
+            problems.append(f"profile does not allow entitlement {key} - tick Family Controls (Development) "
+                            "and, if listed, Family Controls App And Website Usage on the App ID in the "
+                            "developer portal, then re-run. If they are already ticked, or the second one "
+                            "is not listed, re-running will not help: check the current Apple instructions "
+                            "for this entitlement")
     if norm_udid(udid) not in [norm_udid(d) for d in plist.get("ProvisionedDevices", [])]:
         problems.append(f"profile does not include device {udid} (device status: "
                         f"{device['attributes'].get('status')})")

@@ -177,7 +177,9 @@ sleep_use AS (
                                                                         AS minutes_during_sleep_est
     FROM sleep sl
     JOIN pds.phone_usage_segments s
-      ON s.segment_end   > sl.sleep_start - INTERVAL '60 minutes'
+      -- prune by day so the behavioral-date index is used; the two time tests below decide
+      ON s.onyx_behavioral_date BETWEEN sl.behavioral_date - 2 AND sl.behavioral_date + 2
+     AND s.segment_end   > sl.sleep_start - INTERVAL '60 minutes'
      AND s.segment_start < sl.sleep_end
     GROUP BY sl.behavioral_date
 ),

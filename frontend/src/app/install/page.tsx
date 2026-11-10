@@ -153,7 +153,10 @@ export default function InstallPage() {
                 <li>Tap the app icon. iOS says Developer Mode is required.</li>
                 <li>Settings → Privacy &amp; Security → Developer Mode → turn on, then Restart.</li>
                 <li>After the restart, unlock, tap Enable and enter your passcode.</li>
-                <li>Open the app while online, tap Grant access, then paste the Onyx token and Sync.</li>
+                <li>
+                  Open the app while online and approve the Screen Time prompt (tap Grant access if it does not
+                  appear), then paste the Onyx token and Sync.
+                </li>
               </ol>
             </div>
 

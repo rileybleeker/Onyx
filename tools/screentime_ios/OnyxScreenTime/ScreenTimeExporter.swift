@@ -102,6 +102,7 @@ enum ScreenTimeExporter {
     ) async throws -> ExportResult {
         // Not a hard stop: the in-process status is a cache that can lag, and
         // the export call itself throws when access is really missing.
+        let began = Date()
         let access = await restoreDataAccess()
 
         let now = Date()
@@ -126,7 +127,9 @@ enum ScreenTimeExporter {
             }
         }
 
-        let deadline = now.addingTimeInterval(timeout)
+        // Time spent restoring access (up to 5 s of it) comes out of the stream budget, so a
+        // background run (Apple allows an intent about 30 s) still finishes within `timeout`.
+        let deadline = now.addingTimeInterval(timeout - min(5, now.timeIntervalSince(began)))
         while Date() < deadline {
             if await store.finished { break }
             let count = await store.count

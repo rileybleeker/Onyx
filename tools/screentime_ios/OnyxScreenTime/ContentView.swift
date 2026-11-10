@@ -60,7 +60,8 @@ final class AppModel: ObservableObject {
     /// Reads Screen Time and shows what came back, without sending anything.
     func preview() async {
         busy = true
-        defer { busy = false }
+        // fetch() re-requests access itself, so the status can change during the call
+        defer { busy = false; refreshStatus() }
         refreshStatus()
         do {
             let result = try await ScreenTimeExporter.fetch(days: days, policy: policy)
@@ -89,7 +90,8 @@ final class AppModel: ObservableObject {
 
     func sync() async {
         busy = true
-        defer { busy = false }
+        // fetch() re-requests access itself, so the status can change during the call
+        defer { busy = false; refreshStatus() }
         refreshStatus()
         do {
             let summary = try await SyncService.sync(days: days, policy: policy)

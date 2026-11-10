@@ -24,8 +24,10 @@ on the Onyx page `/install`, behind the normal login.
     Development certificate (upload the same `onyx_dev.certSigningRequest`)
     and a new profile, update `IOS_DEV_CERT_B64` and `IOS_PROFILE_B64`, then
     run the job and reinstall.
-  - API path: run the job during the last 30 days; it then makes a new
-    certificate and profile.
+  - API path: run the job during the last 30 days (it then makes a new
+    certificate and profile), then reinstall from `/install`. The date on
+    `/install` belongs to the newest published build, not to whatever is on
+    the phone.
 - A new process always starts with Screen Time access "not determined", so
   the app asks again on every launch (silent once approved). If the daily
   sync stops, open the app once.
@@ -72,7 +74,9 @@ profile.
 Database: `sql/phone_usage_schema.sql` (tables `phone_usage_segments`,
 `phone_usage_items`, view `phone_usage_daily`). Service role only: they hold
 every app and web domain used, so unlike most `pds` tables they are not
-anon-readable. The file is safe to re-run. `/status` card: "Screen Time app"
+anon-readable. Re-run the file after any change to it (safe to re-run). It
+must be re-run once after 2026-11-10: the first version, which is what the
+database got, granted anon read. `/status` card: "Screen Time app"
 (heartbeat `screen_time|usage`).
 
 ### Alternative: App Store Connect API (no portal downloads)
@@ -80,8 +84,8 @@ anon-readable. The file is safe to re-run. `/status` card: "Screen Time app"
 If `IOS_DEV_CERT_B64` / `IOS_PROFILE_B64` are absent and `ASC_KEY_ID`,
 `ASC_ISSUER_ID`, `ASC_KEY_P8` (a **Team** key, Admin role) and `IPHONE_UDID` are
 set, `ci/asc_signing.py` registers the App ID and device and creates the
-certificate and a fresh profile itself. The two capabilities must still be
-ticked by hand. Untested against a real account.
+certificate and a fresh profile itself. The capabilities in step 1 must still
+be ticked by hand. Untested against a real account.
 
 ## Build and install
 
@@ -89,7 +93,8 @@ ticked by hand. Untested against a real account.
 2. On the iPhone, open `<Onyx>/install` in Safari and tap **Install**.
 3. Tap the app; when iOS asks, turn on Settings → Privacy & Security →
    Developer Mode, restart, confirm.
-4. Open the app online, **Grant access**, paste the Onyx CI token, **Sync**.
+4. Open the app online and approve the Screen Time prompt (tap **Grant access**
+   if it does not appear), paste the Onyx CI token, **Sync**.
 5. Shortcuts → Automation → Time of Day (daily) → **Sync Screen Time to Onyx**.
 
 If neither install link works, download the `.ipa` from `/install` on the PC and
