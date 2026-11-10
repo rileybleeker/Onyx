@@ -57,8 +57,11 @@ CREATE TABLE IF NOT EXISTS pds.delivery_orders (
     order_date_local      DATE NOT NULL,           -- printed order date (local)
     daypart               TEXT,                    -- morning | afternoon | evening, from the subject line
     ordered_local         TIMESTAMP,               -- naive local wall clock, as printed (new template only)
-    delivered_local       TIMESTAMP,               -- naive local wall clock: printed (receipt) or charge − 70 min (payment_estimate); NULL when canceled / date_only
-    time_source           TEXT NOT NULL DEFAULT 'receipt',     -- receipt | payment_estimate | date_only
+    delivered_local       TIMESTAMP,               -- naive local wall clock: printed (receipt) or estimated (payment_estimate); NULL when canceled / date_only
+    time_source           TEXT NOT NULL DEFAULT 'receipt',     -- receipt | payment_estimate | date_only. 'payment_estimate' = any ESTIMATED time:
+                                                   --   old template: card charge − 70 min; new template without a courier timeline:
+                                                   --   order + 30 min (its "Order completed" stamp is a 90-minute auto-close, not a drop-off).
+                                                   --   raw_json.estimate_basis says which.
     local_utc_offset      TEXT,                    -- trigger: offset used to resolve the two instants, e.g. '-05:00'
     ordered_at            TIMESTAMPTZ,             -- trigger-resolved instant
     delivered_at          TIMESTAMPTZ,             -- trigger-resolved instant

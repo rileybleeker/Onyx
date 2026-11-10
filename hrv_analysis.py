@@ -274,7 +274,6 @@ CONTROLLABLE_FEATURE_PREFIXES = (
     "meal_",  # Meal timing: last_hour, first_hour, eating_window, last_meal_to_bedtime_min
     "caffeine_",  # Caffeine timing: first_hour, last_hour, window_hours, intake_count, to_bedtime_min
     "act_",  # Activity taxonomy: run/sauna (auto) + leg/pull/push split + act_mg_* muscle groups (manual)
-    "delivery_",  # Uber Eats deliveries: meal count, late-meal flag, last delivery → sleep minutes
 ) + tuple(MICRONUTRIENT_COLS)  # Cronometer vitamins/minerals (exact column names)
 
 # Re-audit 2026-06-07 (stats/gpt-5/F-009): same-night sleep / recovery / HRV-
@@ -848,12 +847,30 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     try:
         data["delivery"] = fetch_all(
             "delivery_daily",
-            select="behavioral_date,meal_order_count,late_meal_delivery,"
+            select="behavioral_date,meal_order_count,untimed_meal_order_count,late_meal_delivery,"
                    "last_meal_delivery_to_sleep_minutes",
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  delivery_daily load failed ({e!r}); continuing without delivery features")
         data["delivery"] = pd.DataFrame()
+    # How far the receipt ETL has verifiably looked: the view has a row only on days WITH an
+    # order, so "no row" after the last order is a true zero only if the ETL kept running.
+    # Only a 'success' heartbeat counts (partial = a receipt it could not read; failed = down).
+    # One day is held back because a receipt can trail its delivery by ~11 h (the card charge
+    # sometimes posts the next morning).
+    data["delivery_covered_through"] = None
+    try:
+        hb = fetch_all("sync_log", select="sync_end",
+                       filters=[("source", "eq", "delivery"), ("data_type", "eq", "email"),
+                                ("status", "eq", "success")])
+        if not hb.empty:
+            last_ok = pd.to_datetime(hb["sync_end"], utc=True, errors="coerce").max()
+            if pd.notna(last_ok):
+                data["delivery_covered_through"] = (
+                    last_ok.tz_convert("America/New_York") - pd.Timedelta(hours=6) - pd.Timedelta(days=1)
+                ).strftime("%Y-%m-%d")
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  delivery heartbeat load failed ({e!r}); delivery coverage ends at the last order day")
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
     # topic_count) joined into the matrix per the audit's Finding #8. The textual
@@ -1269,8 +1286,9 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
     return wide, tracking_start
 
 
-def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None) -> pd.DataFrame:
-    """Uber Eats delivery features, keyed on the behavioral day (pds.delivery_daily).
+def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
+                            covered_through: str | None = None) -> pd.DataFrame:
+    """Uber Eats delivery features from pds.delivery_daily (one row per behavioral day with an order).
 
       delivery_meal_count             restaurant orders delivered that day
       delivery_any_meal               1 = at least one meal delivered; 0 = none
@@ -1279,12 +1297,31 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None) -> 
       delivery_last_meal_to_sleep_min WHOOP sleep onset − last meal delivery (NaN on
                                       days without a timed delivery or a scored sleep)
 
-    The view has a row only for days WITH an order, so "no row" must be told apart
-    from "not tracked". Inside coverage (first → last delivery day the ETL has
-    seen) a missing day is a true zero — the receipts are parsed automatically, no
-    logging can lapse. Outside coverage everything stays NaN, so a broken ETL
-    cannot manufacture fake zero days. A day whose only meals have no clock time
-    (date-only receipts) keeps its count but an unknown (NaN) late flag.
+    ROW PLACEMENT — a delivery on behavioral day D is written to matrix row D − 1.
+    The matrix puts the HRV of the sleep that CLOSES day D on row D (the WHOOP cycle is
+    dated by its bedtime − 6h; checked against live rows 2026-11-10), and every consumer
+    in this file compares a row's features with the NEXT row's HRV (hrv_next,
+    hrv_target_t1 and the causal outcome all shift(-1)). Left on row D, a meal would be
+    scored against the night AFTER the one it precedes. On row D − 1 its shift(-1) target
+    is exactly the sleep the meal was eaten before — the same re-keying
+    workout_to_sleep_gap applies. The other behavior families (journal_, habit_,
+    supplement_, nutrition_, caffeine_, meal_) are NOT re-keyed and carry that one-night
+    offset; fixing it pipeline-wide is an open decision. If it is fixed (target = same-row
+    HRV), remove this shift and the one in workout_to_sleep_gap in the same change.
+
+    Because row D − 1 holds the NEXT day's delivery, the newest row can never have a value
+    at prediction time. The delivery_ columns are therefore kept out of the forecasting
+    models (see prepare_ml_data) and feed only the descriptive and causal analyses.
+
+    ZERO FILL — the view has a row only for days WITH an order, so "no row" must be told
+    apart from "not tracked". Inside coverage a missing day is a true zero (the receipts
+    are parsed automatically; no logging can lapse). Coverage runs from the first delivery
+    day to the later of the last delivery day and `covered_through` (the last behavioral
+    day the email ETL verifiably covered — see load_all_data). Outside coverage everything
+    stays NaN, so a broken ETL cannot manufacture zero days.
+
+    UNKNOWN TIMES — a day with a meal whose receipt carries no clock time keeps its count,
+    but its late flag is NaN unless another meal that day is known to be late.
     Pre-Nov-2025 delivery times are estimates (card charge − 70 min); see
     sql/delivery_orders_schema.sql.
 
@@ -1294,23 +1331,34 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None) -> 
         return df
     try:
         d = delivery.copy()
-        d["calendar_date"] = d["behavioral_date"].astype(str)
+        d["delivery_day"] = pd.to_datetime(d["behavioral_date"], errors="coerce")
+        d = d.dropna(subset=["delivery_day"]).drop_duplicates("delivery_day")
         d["delivery_meal_count"] = pd.to_numeric(d["meal_order_count"], errors="coerce")
         d["delivery_late_meal"] = d["late_meal_delivery"].map(
             lambda v: np.nan if v is None or (isinstance(v, float) and np.isnan(v)) else float(bool(v))
         )
+        if "untimed_meal_order_count" in d.columns:
+            untimed = pd.to_numeric(d["untimed_meal_order_count"], errors="coerce").fillna(0) > 0
+            d.loc[untimed & (d["delivery_late_meal"] != 1), "delivery_late_meal"] = np.nan
         d["delivery_last_meal_to_sleep_min"] = pd.to_numeric(
             d["last_meal_delivery_to_sleep_minutes"], errors="coerce"
         )
         cols = ["delivery_meal_count", "delivery_late_meal", "delivery_last_meal_to_sleep_min"]
-        d = d[["calendar_date"] + cols].drop_duplicates("calendar_date")
-        cov_start, cov_end = d["calendar_date"].min(), d["calendar_date"].max()
+
+        cov_start, cov_end = d["delivery_day"].min(), d["delivery_day"].max()
+        ct = pd.to_datetime(covered_through, errors="coerce") if covered_through else pd.NaT
+        if pd.notna(ct) and ct > cov_end:
+            cov_end = ct
+
+        # row D − 1 carries day D's delivery (see ROW PLACEMENT above)
+        d["calendar_date"] = (d["delivery_day"] - pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
         out = df.drop(columns=cols + ["delivery_any_meal"], errors="ignore").merge(
-            d, on="calendar_date", how="left")
-        in_cov = (out["calendar_date"] >= cov_start) & (out["calendar_date"] <= cov_end)
+            d[["calendar_date"] + cols], on="calendar_date", how="left")
+        row_day = pd.to_datetime(out["calendar_date"], errors="coerce") + pd.Timedelta(days=1)
+        in_cov = (row_day >= cov_start) & (row_day <= cov_end)
         no_order = in_cov & out["delivery_meal_count"].isna()
         out.loc[no_order, "delivery_meal_count"] = 0.0
-        # no meal delivered (no order at all, or only store / alcohol runs) → no late meal
+        # no meal delivered (no order at all, or only store / package-store runs) → no late meal
         out.loc[in_cov & (out["delivery_meal_count"] == 0), "delivery_late_meal"] = 0.0
         out["delivery_any_meal"] = (out["delivery_meal_count"] > 0).astype(float).where(
             out["delivery_meal_count"].notna()
@@ -1318,8 +1366,8 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None) -> 
         assert len(out) == len(df), "delivery merge changed the row count"
         assert set(out["delivery_late_meal"].dropna().unique()) <= {0.0, 1.0}
         log.info(
-            f"  Delivery features: coverage {cov_start} → {cov_end}, "
-            f"{int((out['delivery_meal_count'] > 0).sum())} delivery days, "
+            f"  Delivery features: delivery days {cov_start:%Y-%m-%d} → {cov_end:%Y-%m-%d} "
+            f"(written one row earlier), {int((out['delivery_meal_count'] > 0).sum())} delivery days, "
             f"{int((out['delivery_late_meal'] == 1).sum())} late-meal days, "
             f"{int(out['delivery_last_meal_to_sleep_min'].notna().sum())} with a gap to sleep"
         )
@@ -1878,7 +1926,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         df["caffeine_total_mg_7d_mean"] = (
             df["caffeine_total_mg"].rolling(7, min_periods=4).mean()
         )
-    df = merge_delivery_features(df, data.get("delivery"))
+    df = merge_delivery_features(df, data.get("delivery"), data.get("delivery_covered_through"))
 
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships
@@ -2866,7 +2914,6 @@ def run_statistical_analysis(
         "caffeine_total_mg": ("Total Caffeine", "mg"),
         "caffeine_mg_at_bedtime": ("Caffeine at Bedtime", "mg"),
         # Uber Eats deliveries (pds.delivery_daily) — timing + counts, no calories.
-        "delivery_meal_count": ("Delivered Meals", "orders"),
         "delivery_last_meal_to_sleep_min": ("Last Delivered Meal → Sleep", "min"),
         **MICRONUTRIENT_COLS,
     }
@@ -3050,6 +3097,10 @@ def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, l
                }
     # Drop every hrv_target_t* column (any horizon's target — they all leak the future)
     exclude |= {c for c in model_df.columns if c.startswith("hrv_target_t")}
+    # delivery_* sit one row early (merge_delivery_features: row D − 1 holds day D's delivery), so
+    # the newest row is always NaN at prediction time while training rows are filled. They feed
+    # the descriptive and causal analyses only, never the forecasting models.
+    exclude |= {c for c in model_df.columns if c.startswith("delivery_")}
     feat_cols = [c for c in model_df.columns
                  if c not in exclude and pd.api.types.is_numeric_dtype(model_df[c])]
 

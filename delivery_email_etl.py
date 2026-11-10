@@ -104,6 +104,16 @@ STORE_WORDS = ("quick save", "mini market", "mini mart", "minimart", "supermarke
                "costco", "walmart", "safeway", "sprouts", "trader joe", "petco", "petsmart", "dollar general",
                "family dollar", "gopuff", "circle k", "quiktrip", "racetrac", "food lion", "aldi",
                "shoppers drug mart", "sobeys")
+# Exact merchant name → kind, checked before the keyword lists. A correction belongs HERE (and in
+# frontend/src/lib/delivery.ts), not in an UPDATE on the table: every later email for the order and
+# every --reprocess rewrites merchant_kind from this file.
+MERCHANT_KIND_OVERRIDES: dict[str, str] = {}
+# Exact merchant name → IANA zone, for merchants whose receipts never print an address (their own
+# couriers, so no pickup line). Without it the time falls back to the WHOOP-cycle ladder, which
+# lags on travel days.
+MERCHANT_TZ_OVERRIDES: dict[str, str] = {
+    "Umai Sushi & Noodles (Grant Park)": "America/New_York",
+}
 
 
 # Merchant address → IANA zone (new-template receipts only). The receipt prints
@@ -151,6 +161,8 @@ def merchant_tz(address: str | None) -> Optional[str]:
 
 
 def merchant_kind(name: str) -> str:
+    if name in MERCHANT_KIND_OVERRIDES:
+        return MERCHANT_KIND_OVERRIDES[name]
     n = name.lower()
     if any(w in n for w in ALCOHOL_WORDS):
         return "alcohol"
@@ -238,10 +250,20 @@ def build_row(parsed: dict, meta: dict) -> dict:
     daypart = when.group(2).lower() if when else None
     ordered, delivered, charge = parsed["ordered_local"], parsed["delivered_local"], parsed["charge_local"]
 
+    estimate_basis = None
     if ordered:
         time_source = "receipt"
         daypart = daypart or daypart_of(ordered.hour)
         key = f"{parsed['merchant']}|{ordered:%Y-%m-%dT%H:%M}"
+        # A receipt with no courier timeline (the restaurant delivers itself) still prints
+        # "Order completed", but 90 minutes after the order: Uber closing the order on a
+        # timer, not a drop-off (12 of 19 such receipts sit at exactly 89-91 min; 1 of 239
+        # with a timeline does). The real delivery time is not in the email, so store an
+        # estimate and flag it instead of trusting the stamp.
+        if (delivered and parsed["pickup_local"] is None
+                and timedelta(minutes=89) <= delivered - ordered <= timedelta(minutes=91)):
+            delivered, time_source = ordered + TYPICAL_ORDER_TO_DELIVERY, "payment_estimate"
+            estimate_basis = "order + 30 min (90-minute auto-close stamp ignored)"
     else:
         # Old template: estimate delivery from the charge time, but only trust it
         # when the implied order time lands on the subject's weekday + daypart.
@@ -249,8 +271,17 @@ def build_row(parsed: dict, meta: dict) -> dict:
         if charge and when and not parsed["canceled"]:
             est_delivered = charge - CHARGE_AFTER_DELIVERY
             est_ordered = est_delivered - TYPICAL_ORDER_TO_DELIVERY
+            # A post-midnight order charged before dawn: charge − 100 min falls back across
+            # midnight, but the receipt prints the order DATE, so the order was placed after
+            # 00:00 that day. Clamp to midnight instead of failing the weekday check and
+            # losing the order's time (and with it its behavioral day) altogether.
+            day_start = datetime.combine(parsed["order_date"], datetime.min.time())
+            if charge.date() == parsed["order_date"] and est_ordered < day_start:
+                est_ordered = day_start
+                est_delivered = max(est_delivered, day_start)
             if WEEKDAYS[est_ordered.weekday()] == when.group(1).lower() and daypart_of(est_ordered.hour) == daypart:
                 delivered, time_source = est_delivered, "payment_estimate"
+                estimate_basis = "card charge − 70 min"
         key = (f"{parsed['merchant']}|pay:{charge:%Y-%m-%dT%H:%M}" if charge
                else f"{parsed['merchant']}|date:{parsed['order_date']}|{parsed['total']}")
 
@@ -283,6 +314,7 @@ def build_row(parsed: dict, meta: dict) -> dict:
             "printed_total": parsed["total"],
             "tip_only": parsed["tip_only"],
             "refund": parsed["refund"],
+            "estimate_basis": estimate_basis,
         },
     }
 
@@ -292,7 +324,9 @@ class Store:
         self.supa = supa
         self.dry_run = dry_run
         self.written = 0
+        self.twins_removed = 0
         self._dry: dict[str, dict] = {}   # dry-run stand-in for the table, so the dedupe rules still run
+        self._tz_cache: dict[str, Optional[str]] = {}
 
     def pds(self, table: str):
         return self.supa.schema("pds").from_(table)
@@ -303,7 +337,11 @@ class Store:
         ids: set[str] = set()
         offset = 0
         while True:
-            res = self.pds("delivery_email_log").select("message_id").eq("account", account).range(offset, offset + 999).execute()
+            # Rows logged as 'error' are NOT done: a one-off database or IMAP hiccup must be
+            # retried on the next run, not skipped forever behind a green heartbeat.
+            res = (self.pds("delivery_email_log").select("message_id")
+                   .eq("account", account).neq("status", "error")
+                   .range(offset, offset + 999).execute())
             rows = res.data or []
             ids.update(r["message_id"] for r in rows)
             if len(rows) < 1000:
@@ -318,8 +356,56 @@ class Store:
                .eq("provider", row["provider"]).eq("order_key", row["order_key"]).execute())
         return (res.data or [None])[0]
 
+    def known_merchant_tz(self, name: str) -> Optional[str]:
+        """Zone this merchant's other receipts resolved to, when they all agree on one
+        (a location-less chain name must not inherit another city's zone)."""
+        if self.supa is None:
+            return None
+        if name not in self._tz_cache:
+            res = (self.pds("delivery_orders").select("merchant_tz")
+                   .eq("merchant_name", name).not_.is_("merchant_tz", "null").execute())
+            zones = {r["merchant_tz"] for r in (res.data or [])}
+            self._tz_cache[name] = zones.pop() if len(zones) == 1 else None
+        return self._tz_cache[name]
+
+    def _twin(self, row: dict) -> Optional[dict]:
+        """An old-template order already stored under a DIFFERENT key. The old key is merchant +
+        first charge time, and Uber re-sends the receipt when the card is charged again days
+        later, so the same order arrives twice. Same merchant + printed order date + daypart +
+        total = the same order."""
+        if row["ordered_local"] is not None or row["status"] != "delivered" or row["total"] is None:
+            return None
+        if self.dry_run:
+            candidates = [r for r in self._dry.values()
+                          if r["merchant_name"] == row["merchant_name"]
+                          and r["order_date_local"] == row["order_date_local"]
+                          and r["status"] == "delivered" and r["ordered_local"] is None
+                          and r["order_key"] != row["order_key"]]
+        else:
+            res = (self.pds("delivery_orders").select("order_id,order_key,time_source,total,daypart")
+                   .eq("provider", row["provider"]).eq("merchant_name", row["merchant_name"])
+                   .eq("order_date_local", row["order_date_local"]).eq("status", "delivered")
+                   .neq("order_key", row["order_key"]).is_("ordered_local", "null").execute())
+            candidates = res.data or []
+        for r in candidates:
+            if (r["daypart"] == row["daypart"] and r["total"] is not None
+                    and abs(float(r["total"]) - float(row["total"])) < 0.005):
+                return r
+        return None
+
     def apply(self, row: dict, tip_only: bool) -> str:
         """Upsert one order. Returns 'written' or the reason it was left alone."""
+        twin = self._twin(row)
+        if twin:
+            if twin["time_source"] == "payment_estimate" or row["time_source"] == "date_only":
+                return "re-sent receipt for an order already stored"
+            # The stored copy has no usable time and this one does: keep this one only.
+            log.info(f"    removing duplicate of {row['order_key']!r}: {twin['order_key']!r}")
+            if self.dry_run:
+                self._dry.pop(twin["order_key"], None)
+            else:
+                self.pds("delivery_orders").delete().eq("order_id", twin["order_id"]).execute()
+            self.twins_removed += 1
         old = self._existing(row)
         if old:
             if tip_only:
@@ -419,6 +505,11 @@ def process_account(account: str, password: str, store: Store, since: date, repr
                                     f"order_date={'ok' if parsed['order_date'] else 'missing'}")
                     continue
                 row = build_row(parsed, meta)
+                if not row["merchant_tz"] and row["ordered_local"]:
+                    # No address on this receipt: use a known zone for the merchant (IANA names
+                    # only — the trigger passes it to AT TIME ZONE).
+                    row["merchant_tz"] = (MERCHANT_TZ_OVERRIDES.get(row["merchant_name"])
+                                          or store.known_merchant_tz(row["merchant_name"]))
                 outcome = store.apply(row, parsed["tip_only"])
                 stats["kinds"][f"{kind}/{row['time_source']}"] += 1
                 if outcome == "written":

@@ -17,9 +17,15 @@ const STORE_WORDS = [
 
 export type MerchantKind = "restaurant" | "alcohol" | "store";
 
+// Exact merchant name -> kind, checked before the keyword lists. MIRRORS MERCHANT_KIND_OVERRIDES
+// in delivery_email_etl.py: a correction goes in both files, never in an UPDATE on the table
+// (the next import rewrites merchant_kind from this rule).
+const MERCHANT_KIND_OVERRIDES: Record<string, MerchantKind> = {};
+
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 export function merchantKind(name: string): MerchantKind {
+  if (Object.prototype.hasOwnProperty.call(MERCHANT_KIND_OVERRIDES, name)) return MERCHANT_KIND_OVERRIDES[name];
   const n = name.toLowerCase();
   if (ALCOHOL_WORDS.some((w) => n.includes(w))) return "alcohol";
   if (STORE_WORDS.some((w) => new RegExp(`(?<![a-z])${escapeRe(w)}(?![a-z])`).test(n))) return "store";
