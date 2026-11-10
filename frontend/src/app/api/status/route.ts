@@ -48,6 +48,7 @@ const CADENCE: Record<string, string> = {
   notion_journal: "Hourly :35",
   tanita: "Daily 10am + 1:30pm ET",
   flights: "Every 3h :25 (both Gmail accounts)",
+  delivery: "Every 3h :40",
   nyc_scout: "Daily 6:10am ET",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
   // the frontend matrix reads hit since 2026-06-11). The heartbeat also
@@ -86,6 +87,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   notion_journal: { method: "automated",      label: "Notion sync" },
   tanita:         { method: "automated",      label: "API ETL" },
   flights:        { method: "automated",      label: "IMAP email parser" },
+  delivery:       { method: "automated",      label: "IMAP email parser" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
   perf_mats:      { method: "automated",      label: "Matview refresh" },
@@ -222,7 +224,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -312,6 +314,8 @@ export async function GET() {
       // Shortcuts automation. No sync_log heartbeat — events arrive in real
       // time, so the newest event IS the freshness signal.
       supabase.from("phone_app_events").select("event_time,onyx_behavioral_date").order("event_time", { ascending: false }).limit(1),
+      // Delivery orders: newest order date parsed from Uber Eats receipt emails.
+      supabase.from("delivery_orders").select("order_date_local").order("order_date_local", { ascending: false }).limit(1),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -675,6 +679,36 @@ export async function GET() {
           cadence: CADENCE.flights,
           integrationMethod: METHOD.flights.method,
           methodLabel: METHOD.flights.label,
+        };
+      })(),
+      // Delivery orders (delivery_email_etl.py): Uber Eats receipt emails parsed over
+      // IMAP → pds.delivery_orders (merchant, order/delivery time, total — the emails
+      // carry no line items). Same shape as Flights: freshness = heartbeat age, since
+      // a day without a delivery is healthy. Cron every 3h → >4h partial, >12h or a
+      // failed row = red. A 'partial' heartbeat = a receipt the parser could not read
+      // (pds.delivery_email_log status 'unmatched'/'error' — Uber changed the template).
+      delivery: (() => {
+        const entry = latestBySrcType["delivery|email"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 12
+            ? "failed"
+            : entry.status === "partial" || ageH > 4
+              ? "partial"
+              : "success";
+        return {
+          label: "Delivery",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: (deliveryRes.data?.[0]?.order_date_local as string | undefined) ?? null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string) ?? deliveryRes.error?.message ?? null,
+          cadence: CADENCE.delivery,
+          integrationMethod: METHOD.delivery.method,
+          methodLabel: METHOD.delivery.label,
         };
       })(),
       // Body weight via Tanita Health Planet (tanita_etl.py): scale → phone

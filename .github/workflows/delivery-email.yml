@@ -1,0 +1,59 @@
+name: Delivery Email ETL
+
+on:
+  schedule:
+    # Every 3 hours at :40 — Uber Eats receipts land ~70 min after delivery and
+    # nothing downstream is time-critical; the /status card tolerates a 12h gap
+    # before going red. :40 keeps clear of the hourly ETL (:00), retrain check
+    # (:20), flights (:25), journal (:35), habits (:45) and Spotify (:50).
+    - cron: '40 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Look-back window in days (default 30; use 1500 for the full history backfill)'
+        required: false
+        type: string
+      reprocess:
+        description: 'Re-parse emails already in pds.delivery_email_log'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: delivery-email
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  delivery-email:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install supabase python-dotenv
+
+      - name: Parse Uber Eats receipt emails
+        run: >
+          python delivery_email_etl.py
+          ${{ inputs.days && format('--days {0}', inputs.days) || '' }}
+          ${{ inputs.reprocess && '--reprocess' || '' }}
+        env:
+          IMAP_HOST: ${{ secrets.IMAP_HOST }}
+          # Same mailbox slots as flights-email.yml (slot 3 = rileybleeklm, where
+          # the Uber receipts arrive). An unset pair is skipped.
+          IMAP_EMAIL: ${{ secrets.IMAP_EMAIL }}
+          IMAP_APP_PASSWORD: ${{ secrets.IMAP_APP_PASSWORD }}
+          IMAP_EMAIL_2: ${{ secrets.IMAP_EMAIL_2 }}
+          IMAP_APP_PASSWORD_2: ${{ secrets.IMAP_APP_PASSWORD_2 }}
+          IMAP_EMAIL_3: ${{ secrets.IMAP_EMAIL_3 }}
+          IMAP_APP_PASSWORD_3: ${{ secrets.IMAP_APP_PASSWORD_3 }}
+          IMAP_EMAIL_4: ${{ secrets.IMAP_EMAIL_4 }}
+          IMAP_APP_PASSWORD_4: ${{ secrets.IMAP_APP_PASSWORD_4 }}
+          IMAP_EMAIL_5: ${{ secrets.IMAP_EMAIL_5 }}
+          IMAP_APP_PASSWORD_5: ${{ secrets.IMAP_APP_PASSWORD_5 }}
