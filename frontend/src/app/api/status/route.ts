@@ -226,7 +226,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, ubereatsSyncRes, kindleSyncRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -318,6 +318,13 @@ export async function GET() {
       supabase.from("phone_app_events").select("event_time,onyx_behavioral_date").order("event_time", { ascending: false }).limit(1),
       // Delivery orders: newest order date parsed from Uber Eats receipt emails.
       supabase.from("delivery_orders").select("order_date_local").order("order_date_local", { ascending: false }).limit(1),
+      // The two PC harvesters heartbeat hours apart (and not at all while the PC is off), so their
+      // newest row regularly falls out of the 100-row window above (~13 h of history). Without a
+      // dedicated fetch a stalled harvester reads "Unknown" instead of going amber, then red.
+      supabase.from("sync_log").select("*").eq("source", "ubereats").eq("data_type", "items")
+        .order("sync_start", { ascending: false }).limit(1),
+      supabase.from("sync_log").select("*").eq("source", "kindle").eq("data_type", "highlights")
+        .order("sync_start", { ascending: false }).limit(1),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -598,7 +605,9 @@ export async function GET() {
       // so the thresholds are loose: >12h degraded, >48h or an error row = red. An
       // expired Amazon session arrives as a failed heartbeat with the fix in the text.
       kindle: (() => {
-        const entry = latestBySrcType["kindle|highlights"] ?? null;
+        const entry = latestBySrcType["kindle|highlights"]
+          ?? (kindleSyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? null;
         const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
         const status: SourceStatus["status"] = !entry
           ? "unknown"
@@ -721,7 +730,9 @@ export async function GET() {
       // error row = red). 'failed' usually means the Uber session expired — run
       // `node harvest.mjs --login` on the PC. 'partial' = dishes still unestimated.
       ubereats: (() => {
-        const entry = latestBySrcType["ubereats|items"] ?? null;
+        const entry = latestBySrcType["ubereats|items"]
+          ?? (ubereatsSyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? null;
         const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
         const status: SourceStatus["status"] = !entry
           ? "unknown"

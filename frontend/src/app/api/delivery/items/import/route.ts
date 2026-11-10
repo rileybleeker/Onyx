@@ -45,9 +45,12 @@ interface HarvestOrder {
 interface Body {
   orders?: HarvestOrder[];
   estimate?: boolean;
+  /** estimate only: dishes per call (1..BATCH) and how many queue rows to step past. */
+  limit?: number;
+  offset?: number;
   done?: boolean;
   error?: string;
-  stats?: { orders?: number; items?: number; pages?: number; estimated?: number; unestimated?: number };
+  stats?: { orders?: number; items?: number; pages?: number; estimated?: number; estimateError?: string | null };
 }
 
 const SYSTEM = `You estimate nutrition for items ordered from restaurants and stores through a food-delivery app, for one person's private health log.
@@ -118,18 +121,29 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    if (body.orders) return NextResponse.json(await importOrders(body.orders));
-    if (body.estimate) return NextResponse.json(await estimateBatch());
+    if (body.orders) {
+      if (!Array.isArray(body.orders)) return NextResponse.json({ error: "orders must be an array" }, { status: 400 });
+      return NextResponse.json(await importOrders(body.orders));
+    }
+    if (body.estimate) return NextResponse.json(await estimateBatch(body.limit, body.offset));
     if (body.done) {
+      // Count the queue here instead of trusting a number from the harvester: a run whose
+      // estimate calls all failed used to report 0 left and was recorded as a success.
       const s = body.stats ?? {};
-      const left = s.unestimated ?? 0;
+      const { count, error } = await supabase
+        .from("delivery_items_unestimated")
+        .select("est_key", { count: "exact", head: true });
+      if (error) throw new Error(`delivery_items_unestimated count: ${error.message}`);
+      const left = count ?? 0;
+      const why = s.estimateError ? `; last estimator error: ${String(s.estimateError).slice(0, 300)}` : "";
+      const status = left > 0 ? "partial" : "success";
       await heartbeat(
         startedAt,
-        left > 0 ? "partial" : "success",
-        s.items ?? 0,
-        left > 0 ? `${left} dish(es) still without a nutrition estimate` : null,
+        status,
+        Number.isFinite(Number(s.items)) ? Number(s.items) : 0,
+        left > 0 ? `${left} dish(es) still without a nutrition estimate${why}` : null,
       );
-      return NextResponse.json({ heartbeat: left > 0 ? "partial" : "success" });
+      return NextResponse.json({ heartbeat: status, unestimated: left });
     }
     return NextResponse.json({ error: "nothing to do: send orders, estimate, done or error" }, { status: 400 });
   } catch (e) {
@@ -140,28 +154,37 @@ export async function POST(req: NextRequest) {
 }
 
 async function importOrders(orders: HarvestOrder[]) {
+  // Values come from Uber's JSON by way of the harvester: coerce them so one odd order
+  // (a string price, a bad date) cannot make the whole upsert throw or store garbage.
+  const cents = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v) / 100 : null);
+  const isoOrNull = (v: unknown) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? v : null);
   const rows = [];
   for (const o of orders) {
-    if (!o.uuid || !o.store) continue;
-    const kind = merchantKind(o.store);
-    for (const [idx, it] of (o.items ?? []).entries()) {
-      if (!it.title) continue;
+    if (!o || typeof o.uuid !== "string" || typeof o.store !== "string" || !o.uuid || !o.store.trim()) continue;
+    const store = o.store.trim().slice(0, 200);
+    const kind = merchantKind(store);
+    const items = Array.isArray(o.items) ? o.items : [];
+    for (const [idx, it] of items.entries()) {
+      if (!it || typeof it.title !== "string" || !it.title.trim()) continue;
+      const title = it.title.trim().slice(0, 300);
+      const customizations = Array.isArray(it.customizations) ? it.customizations : [];
+      const qty = typeof it.quantity === "number" && Number.isFinite(it.quantity) && it.quantity > 0 ? it.quantity : 1;
       rows.push({
         provider: "uber_eats",
         order_uuid: o.uuid,
-        item_key: it.key || `idx:${idx}`,
-        store_name: o.store,
+        item_key: typeof it.key === "string" && it.key ? it.key : `idx:${idx}`,
+        store_name: store,
         merchant_kind: kind,
-        completed_at: o.completedAt ?? null,
+        completed_at: isoOrNull(o.completedAt),
         is_cancelled: !!o.isCancelled,
-        order_total: o.total != null ? o.total / 100 : null,
-        currency: o.currency ?? null,
+        order_total: cents(o.total),
+        currency: typeof o.currency === "string" ? o.currency.slice(0, 8) : null,
         multi_consumer: !!o.multiConsumer,
-        title: it.title,
-        quantity: it.quantity ?? 1,
-        price: it.price != null ? it.price / 100 : null,
-        customizations: it.customizations ?? [],
-        est_key: estKey(o.store, it.title, it.customizations),
+        title,
+        quantity: qty,
+        price: cents(it.price),
+        customizations,
+        est_key: estKey(store, title, customizations),
       });
     }
   }
@@ -174,15 +197,20 @@ async function importOrders(orders: HarvestOrder[]) {
   return { orders: orders.length, items: rows.length };
 }
 
-async function estimateBatch() {
+async function estimateBatch(limit?: number, offset?: number) {
+  // `offset` lets the harvester step past a dish that cannot be estimated (it retries a failed
+  // batch one dish at a time), so one bad dish cannot block the queue forever.
+  const n = Math.min(BATCH, Math.max(1, Math.floor(Number(limit)) || BATCH));
+  const from = Math.min(500, Math.max(0, Math.floor(Number(offset)) || 0));
   const { data, error, count } = await supabase
     .from("delivery_items_unestimated")
     .select("est_key,store_name,merchant_kind,title,customizations,price,currency", { count: "exact" })
     .order("est_key")
-    .limit(BATCH);
+    .limit(from + n);
   if (error) throw new Error(`delivery_items_unestimated: ${error.message}`);
-  const todo = data ?? [];
-  if (todo.length === 0) return { estimated: 0, remaining: 0 };
+  const todo = (data ?? []).slice(from);
+  // Nothing at this offset: the dishes stepped past are still in the queue, so report them.
+  if (todo.length === 0) return { estimated: 0, remaining: count ?? 0 };
 
   const input = todo.map((r, id) => ({
     id,
@@ -207,9 +235,11 @@ async function estimateBatch() {
   const parsed = JSON.parse(text) as { items: Estimate[] };
 
   const rows = [];
-  for (const e of parsed.items) {
+  const used = new Set<number>();
+  for (const e of Array.isArray(parsed.items) ? parsed.items : []) {
     const src = todo[e.id];
-    if (!src) continue;
+    if (!src || used.has(e.id)) continue; // id out of range, or returned twice
+    used.add(e.id);
     const zero = e.kind === "non_food";
     rows.push({
       est_key: src.est_key,
