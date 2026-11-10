@@ -103,7 +103,10 @@ function mapOrder(o) {
       price: typeof i.price === "number" ? i.price : null,
       customizations: (i.customizations || []).map((c) => ({
         title: c.title || null,
-        options: (c.childOptions || []).map((x) => `${x.quantity > 1 ? `${x.quantity}x ` : ""}${x.title || ""}`.trim()).filter(Boolean),
+        // childOptions is { options: [...] } (seen 2026-11); tolerate a bare array too
+        options: (Array.isArray(c.childOptions) ? c.childOptions : (c.childOptions && c.childOptions.options) || [])
+          .map((x) => `${x.quantity > 1 ? `${x.quantity}x ` : ""}${x.title || ""}`.trim())
+          .filter(Boolean),
       })),
     })),
   };
