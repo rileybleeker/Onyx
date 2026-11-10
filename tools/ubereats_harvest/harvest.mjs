@@ -227,9 +227,14 @@ try {
   }
 } catch (e) {
   log(`FAILED: ${e.message}`);
-  try { log(`heartbeat -> ${JSON.stringify(await post({ error: `harvest failed: ${e.message}`.slice(0, 500) }))}`); } catch { /* nothing more to do */ }
+  // A sign-in attempt is not a harvest run: closing the login window must not write a failed heartbeat.
+  if (!LOGIN_MODE) {
+    try { log(`heartbeat -> ${JSON.stringify(await post({ error: `harvest failed: ${e.message}`.slice(0, 500) }))}`); } catch { /* nothing more to do */ }
+  }
   exitCode = 1;
 } finally {
-  await ctx.close();
+  try { await ctx.close(); } catch { /* window already closed by hand */ }
 }
-process.exit(exitCode);
+// Let Playwright's handles drain before exiting (a hard exit here trips a libuv assertion on Windows).
+process.exitCode = exitCode;
+setTimeout(() => process.exit(exitCode), 3000).unref();
