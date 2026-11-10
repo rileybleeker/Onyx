@@ -6,6 +6,9 @@ out/
 
 .vercel
 
+# TypeScript incremental build cache (rewritten by every local build)
+*.tsbuildinfo
+
 # Playwright
 /test-results/
 /playwright-report/

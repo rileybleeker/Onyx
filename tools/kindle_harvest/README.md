@@ -33,12 +33,21 @@ node harvest.mjs --login                      # sign in to Amazon in the window;
 node harvest.mjs --dry-run                    # prints what it would post (chapters mapped, position, highlights)
 ```
 
-Register the schedule (already done 2026-11-07; re-run after a reinstall):
+Register the schedule (done; re-run after a reinstall or to reset the settings — no admin needed):
 
 ```powershell
-schtasks /Create /F /TN "Onyx Kindle Harvest" /SC HOURLY /MO 3 /ST 08:10 `
-  /TR "\"C:\Program Files\nodejs\node.exe\" \"C:\Users\riley\Onyx\tools\kindle_harvest\harvest.mjs\""
+pwsh -File C:\Users\riley\Onyx\tools\kindle_harvest\register-task.ps1
 ```
+
+The task runs every 3 hours from 08:10 with **no visible window**: Task Scheduler starts
+`wscript.exe run-hidden.js`, which launches node with a hidden console and passes node's exit code
+back as the task's Last Run Result (0 ok, 1 harvest error, 2 Amazon signed out, 3 no Onyx token).
+Chrome itself stays headful but parked off-screen, because Amazon challenges headless Chrome.
+It also runs on battery, catches up a run missed while the PC was asleep or off as soon as it is
+back (`StartWhenAvailable`), and is killed after 20 minutes so a hung Chrome cannot block later runs.
+It never wakes the PC. (Before 2026-11-09 the task was a bare `schtasks … node.exe harvest.mjs`:
+it popped a console window, refused to start on battery — result `0x800710E0` — and skipped every
+run missed during sleep, which left the heartbeat 32 h stale.)
 
 ## Adding a book
 
