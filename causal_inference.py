@@ -4,7 +4,8 @@ Causal Inference Module for Onyx HRV Analysis
 ==============================================
 Companion to hrv_analysis.py. Computes treatment-effect estimates for each
 behavioral variable (journal items, habits, supplements, nutrition, exercise)
-on next-night HRV.
+on the HRV of the sleep that follows it — the night that closes the same
+behavioral day (hrv_alignment.py; same matrix row).
 
 Why this exists
 ---------------
@@ -52,7 +53,11 @@ DAG / confounder strategy
 -------------------------
 The default confounder set is *pre-treatment* (lag-1) features only — no
 same-day or downstream variables, which would block the causal path we are
-trying to measure (mediator-adjustment bias).
+trying to measure (mediator-adjustment bias). With the same-row outcome,
+hrv_lag1 = last night's HRV, whoop_sleep_duration_milli_lag1 = last night's
+sleep and whoop_day_strain_lag1 = YESTERDAY's strain (WHOOP cycle totals are
+re-keyed to their own day in hrv_alignment.realign_matrix) — all strictly
+before the treatment day.
 
   COMMON confounders (every treatment family):
     hrv_lag1, hrv_7d_mean, day_of_week, is_weekend,
@@ -70,8 +75,8 @@ those are mediators (the pathway by which most behaviors affect HRV) and
 adjusting for them would erase the effect being measured.
 
 We report TOTAL effects (not direct effects), which is the actionable answer:
-"if I take magnesium tonight, what happens to my HRV tomorrow?" includes the
-sleep-quality channel by design.
+"if I take magnesium tonight, what happens to the HRV I wake up to tomorrow?"
+includes the sleep-quality channel by design.
 """
 from __future__ import annotations
 
@@ -81,6 +86,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+
+import hrv_alignment as al
 
 try:
     from sklearn.linear_model import LogisticRegression, Ridge
@@ -104,7 +111,7 @@ warnings.filterwarnings("ignore")
 # Configuration
 # ---------------------------------------------------------------------------
 
-OUTCOME_COL = "hrv_target_t1"  # next-night HRV; created by prepare_ml_data
+OUTCOME_COL = al.outcome_col(1)  # HRV of the sleep that closes the treatment day (same row)
 ALIGN_KEY = "calendar_date"
 
 COMMON_CONFOUNDERS = (
@@ -422,6 +429,17 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     # Uber Eats deliveries (pds.delivery_daily, 2026-11-09). Timing + counts from
     # receipt emails; pre-Nov-2025 times are estimates (card charge − 70 min).
     ("delivery_last_meal_to_sleep_min", "nutrition", "Last delivered meal → sleep minutes above median", "min"),
+    # iPhone Screen Time (pds.phone_usage_daily, 2026-11-11). Apple's own numbers via the
+    # Onyx Screen Time app; history starts ~2026-10-11, so these sit in dropped_low_n
+    # until MIN_CONTINUOUS_N days accrue, then enter the FDR family on their own.
+    # screen_during_sleep_min is deliberately absent: use after sleep onset is as much a
+    # symptom of a broken night as a cause (hrv_alignment.SAME_SLEEP_EXACT).
+    ("screen_total_min",                  "behavior", "Phone screen time above median",          "min"),
+    ("screen_late_night_min",             "behavior", "Phone use after 10 PM above median",      "min"),
+    ("screen_after_midnight_min",         "behavior", "Phone use after midnight above median",   "min"),
+    ("screen_last_hour_before_sleep_min", "behavior", "Phone use in the last hour before sleep above median", "min"),
+    ("screen_social_min",                 "behavior", "Social-app minutes above median",         "min"),
+    ("screen_pickups",                    "behavior", "Phone pickups above median",              None),
     ("meal_eating_window_hours",      "nutrition", "Eating window above median",               "h"),
     ("meal_last_hour",                "nutrition", "Last meal clock hour above median",        "ET hr"),
     ("meal_first_hour",               "nutrition", "First meal clock hour above median",       "ET hr"),
@@ -963,16 +981,13 @@ def compute_e_value(ate: float, ci_low: float, ci_high: float,
 # ===========================================================================
 
 def _build_outcome_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """Create a copy of df with the next-night outcome column attached."""
-    out = df.copy()
-    if OUTCOME_COL not in out.columns:
-        # Same convention as prepare_ml_data: outcome is the next day's HRV
-        target_col = "whoop_hrv_rmssd"
-        if target_col not in out.columns:
-            raise RuntimeError(f"Outcome target {target_col} missing from feature matrix")
-        out = out.sort_values(ALIGN_KEY).reset_index(drop=True)
-        out[OUTCOME_COL] = out[target_col].shift(-1)
-    return out
+    """Copy of df with the outcome attached: the HRV of the sleep that closes each row's
+    behavioral day. Always rebuilt through hrv_alignment (never trusted from the input) so
+    the causal layer cannot drift from the descriptive layer and the forecast."""
+    if al.TARGET not in df.columns:
+        raise RuntimeError(f"Outcome target {al.TARGET} missing from feature matrix")
+    out = df.sort_values(ALIGN_KEY).reset_index(drop=True)
+    return al.add_outcome(out, 1)
 
 
 _CONFOUNDER_MISSING_WARNED: set[str] = set()
@@ -1432,7 +1447,8 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
         "common_confounders": list(COMMON_CONFOUNDERS),
         "supplement_extra_confounders": list(SUPPLEMENT_EXTRA_CONFOUNDERS),
         "outcome": OUTCOME_COL,
-        "outcome_description": "Next-night WHOOP HRV (RMSSD, ms)",
+        "outcome_description": "WHOOP HRV (RMSSD, ms) of the sleep that closes the treatment day — the HRV you wake up to the next morning",
+        "alignment": al.ALIGNMENT_VERSION,
         "treatment_families": ["journal", "habit", "supplement", "nutrition", "behavior"],
         "mediator_exclusions": [
             "Any same-night sleep, recovery, or HRV-derived variable. These "
@@ -1474,6 +1490,7 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
 
     meta_payload = {
         "outcome": OUTCOME_COL,
+        "alignment": al.ALIGNMENT_VERSION,
         "n_binary_treatments_analyzed": len(binary_results),
         "n_continuous_treatments_analyzed": len(continuous_results),
         "n_treatments_dropped_low_n": len(dropped_low_n),

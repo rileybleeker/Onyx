@@ -126,7 +126,35 @@ def set_output(key: str, value: str) -> None:
     log.info(f"output: {key}={value}")
 
 
+def last_retrain_tripped_a_guard() -> str | None:
+    """Error text if the newest hrv_analysis|retrain heartbeat is a failed GUARD row.
+
+    A tripped alignment guard writes no results, so last_analysis never advances and a
+    pending backfill would re-trigger (and re-fail) the retrain every hour. The daily
+    12:00 UTC run stays the one re-check until someone fixes the cause."""
+    try:
+        resp = (
+            supa.schema("pds").from_("sync_log")
+            .select("status,error_message")
+            .eq("source", "hrv_analysis").eq("data_type", "retrain")
+            .order("sync_start", desc=True).limit(1).execute()
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  guard check failed ({e}) — ignoring")
+        return None
+    row = (resp.data or [None])[0]
+    if row and row.get("status") == "failed" and str(row.get("error_message") or "").startswith("GUARD"):
+        return row["error_message"]
+    return None
+
+
 def main() -> int:
+    guard = last_retrain_tripped_a_guard()
+    if guard:
+        log.warning(f"Last retrain stopped on a guard — no hourly retry (daily run re-checks): {guard[:200]}")
+        set_output("backfill_detected", "false")
+        return 0
+
     last_analysis = get_last_analysis_time()
     if last_analysis is None:
         log.info("No prior hrv_analysis_results found — signaling initial run.")

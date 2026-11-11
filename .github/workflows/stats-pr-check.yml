@@ -10,6 +10,8 @@ on:
     paths:
       - "hrv_analysis.py"
       - "hrv_predict.py"
+      - "hrv_alignment.py"
+      - "causal_inference.py"
       - "garmin_etl.py"
       - "whoop_etl.py"
       - "eight_sleep_etl.py"
@@ -53,12 +55,22 @@ jobs:
       - name: Parse-check Python modules
         run: |
           python -c "import ast; [ast.parse(open(p).read()) for p in (
-            'hrv_analysis.py','hrv_predict.py',
+            'hrv_analysis.py','hrv_predict.py','hrv_alignment.py','causal_inference.py',
             'garmin_etl.py','whoop_etl.py','eight_sleep_etl.py',
           )]; print('all .py modules parse cleanly')"
 
       - name: BH-FDR synthetic-data unit test
         run: python tests/test_fdr_correction.py
+
+      - name: HRV alignment against the live matrix
+        env:
+          ONYX_REQUIRE_LIVE: '1'
+        run: python tests/test_hrv_alignment_live.py
+
+      - name: Delivery features + error-mode join key
+        run: |
+          python tests/test_delivery_features.py
+          python tests/test_error_mode_feature_date.py
 
       - name: Habit-rename cascade integration test
         # Uses synthetic test fixtures (uuid-tagged) and cleans up after itself,

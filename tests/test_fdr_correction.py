@@ -28,19 +28,14 @@ import hrv_analysis as ha  # noqa: E402
 
 def make_synthetic(n: int = 400, n_signal: int = 10, n_noise: int = 90,
                    seed: int = 42) -> pd.DataFrame:
-    """Build a frame where signal_* correlates with NEXT-day target.
+    """Build a frame where signal_* correlates with the SAME row's target.
 
-    `run_statistical_analysis` shifts TARGET by -1 internally (`hrv_next[i] =
-    TARGET[i+1]`), so a feature at row i must be correlated with TARGET[i+1] —
-    i.e., it must lead the target by one day — to be detectable.
-
-    Construction: draw a (n+1)-long target spine. Row i in the dataframe holds
-    TARGET = spine[i] and signal[i] = beta * spine[i+1] + noise.
+    `run_statistical_analysis` scores row i's features against row i's HRV (the sleep
+    that closes day i; hrv_alignment.py), so signal[i] = beta * TARGET[i] + noise.
     """
     rng = np.random.default_rng(seed)
-    spine = rng.normal(120, 30, n + 1).astype(float)
-    target = spine[:-1].copy()
-    next_target = spine[1:]
+    target = rng.normal(120, 30, n).astype(float)
+    next_target = target  # same-row outcome
     cols = {ha.TARGET: target,
             "calendar_date": pd.date_range("2024-01-01", periods=n).astype(str)}
     for i in range(n_signal):

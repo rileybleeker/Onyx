@@ -2,9 +2,13 @@
 """
 Onyx HRV Daily Prediction Script
 ==================================
-Loads the trained XGBoost model, generates tomorrow's HRV prediction,
-backfills actuals for past predictions, recomputes rolling metrics,
-and checks for model drift.
+Loads the trained XGBoost model, predicts the HRV of tonight's sleep (the one
+Riley wakes up from tomorrow), backfills actuals for past predictions,
+recomputes rolling metrics, and checks for model drift.
+
+Alignment (hrv_alignment.py): the forecast predicts from behavioral today's
+matrix row, and prediction_date = that row's date = the behavioral date of the
+sleep. actual_hrv for prediction_date P is matrix row P's HRV.
 
 Run after ETL:
     python hrv_predict.py --predict
@@ -42,7 +46,7 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 supa = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ET is the canonical timezone for Onyx (see CLAUDE.md). Using UTC date.today()
+# ET is the canonical timezone for Onyx (see AGENTS.md). Using UTC date.today()
 # on the GitHub runner would mis-tag any prediction fired between 00:00 UTC and
 # ET midnight (~04:00-05:00 UTC) — the run would predict the day-after-next
 # instead of tomorrow, silently skipping the ET day the user actually cares about.
@@ -158,8 +162,16 @@ def get_latest_features(feat_cols: list) -> pd.DataFrame | None:
 
 
 def predict_tomorrow(model_bundle: dict) -> dict | None:
-    """Generate tomorrow's prediction using the loaded model."""
-    from hrv_analysis import FEATURE_LABELS, compute_input_data_hash, TARGET
+    """Predict tonight's sleep (wake-up tomorrow) using the loaded model."""
+    from hrv_analysis import FEATURE_LABELS, compute_input_data_hash, TARGET, serve_features
+    import hrv_alignment as al
+
+    # A model trained under another alignment rule predicts a different night; never
+    # serve it (the next retrain writes a compatible pickle).
+    if model_bundle.get("alignment") != al.ALIGNMENT_VERSION:
+        log.error(f"Model pickle alignment={model_bundle.get('alignment')!r}, expected "
+                  f"{al.ALIGNMENT_VERSION!r} — retrain (hrv-retrain-on-backfill.yml) before predicting.")
+        return None
 
     model = model_bundle["model"]
     feat_cols = model_bundle["feat_cols"]
@@ -179,8 +191,11 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
         log.warning(f"  input_data_hash compute failed: {e}")
         input_data_hash = None
 
-    # Predict on latest row
-    latest_X = X.iloc[[-1]]
+    # Predict from behavioral today's row: tonight's sleep.
+    latest_X, serve_date = serve_features(df, feat_cols)
+    if latest_X is None:
+        log.error("No matrix row for behavioral today — cannot predict tonight's sleep.")
+        return None
     pred_val = float(model.predict(latest_X)[0])
     lower = pred_val - CI_Z * pred_std
     upper = pred_val + CI_Z * pred_std
@@ -214,7 +229,8 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
     train_end = str(df["calendar_date"].iloc[-1])
 
     return {
-        "prediction_date": str(et_today() + timedelta(days=1)),
+        # Behavioral date of the predicted sleep; the page shows the wake-up date (+1).
+        "prediction_date": serve_date,
         "model": "xgboost",
         "predicted_hrv": round(pred_val, 2),
         "prediction_lower": round(lower, 2),
@@ -312,9 +328,17 @@ def recompute_rolling_metrics() -> None:
     preds = fetch_all(
         "hrv_predictions",
         select="prediction_date,model,horizon_days,predicted_hrv,actual_hrv,"
-               "prediction_lower,prediction_upper",
+               "prediction_lower,prediction_upper,model_version",
         filters=[("prediction_date", "gte", window_start)],
     )
+    if preds.empty:
+        return
+    # Live forecasts written before the alignment fix predicted a different night (the
+    # sleep after tonight). Keep them out of the rolling accuracy; backtest rows are
+    # rewritten by every retrain, so they are always on the current rule.
+    import hrv_alignment as al
+    ver = preds["model_version"].fillna("").astype(str)
+    preds = preds[ver.str.startswith("backtest") | (ver.str[:10] >= al.ALIGNMENT_CUTOVER_DATE)]
     if preds.empty:
         return
 
@@ -405,7 +429,7 @@ def check_drift(current_mae: float | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Onyx HRV Daily Prediction")
-    parser.add_argument("--predict", action="store_true", help="Generate tomorrow's prediction")
+    parser.add_argument("--predict", action="store_true", help="Predict tonight's sleep (wake-up tomorrow)")
     parser.add_argument("--backfill-only", action="store_true", help="Only backfill actuals")
     args = parser.parse_args()
 
@@ -453,12 +477,12 @@ def main() -> None:
                     ).execute()
 
                     log.info(
-                        f"Tomorrow ({prediction['prediction_date']}): "
+                        f"Tonight's sleep (night of {prediction['prediction_date']}): "
                         f"predicted HRV = {prediction['predicted_hrv']} ms  "
                         f"({int(CI_NOMINAL * 100)}% CI: {prediction['prediction_lower']} - {prediction['prediction_upper']})"
                     )
                     if today_hrv:
-                        log.info(f"Today's actual HRV: {today_hrv:.1f} ms")
+                        log.info(f"Last night's HRV: {today_hrv:.1f} ms")
 
                     try:
                         metrics = supa.schema("pds").from_("hrv_model_metrics").select("mae").eq(

@@ -1,20 +1,15 @@
 """Regression test for the error-mode residual-to-behavior join key.
 
-Audit re-2026-05-26 (gpt-5 stats F-002, P1): the error-mode breakdown in
-hrv_analysis.run_evaluation previously merged XGBoost residuals to
-journal_/habit_ flags on prediction_date. The model's features for HRV[N]
-come from day N-1 behaviors (build_feature_matrix applies shift(-1) to make
-behaviors[N-1] -> HRV[N]). The merge therefore blamed the morning-after's
-behaviors for the prior night's prediction error — off by one day.
+hrv_analysis.run_evaluation joins each XGBoost residual to the journal_/habit_
+flags of the behavioral day whose features produced it. prediction_date is the
+behavioral date of the predicted sleep, and at horizon h that sleep closes day
+feature_date + h - 1 (hrv_alignment.py, 2026-11-10). So
+feature_date = prediction_date - (h - 1): the same day at h = 1.
 
-Fix: feature_date = prediction_date - horizon_days.
-
-This test reproduces the merge in isolation against a synthetic residual frame
-with a known signal: residuals are LARGE on days following alcohol = Yes,
-SMALL otherwise. Under the fix, the alcohol = Yes group's mean abs residual
-must be materially larger than the alcohol = No group. Under the bug
-(pre-fix), the signal would be diluted toward zero because alcohol = Yes on
-day N would join to the residual predicting HRV on day N (not day N+1).
+This test runs hrv_alignment.feature_date (the function production uses) against
+a synthetic residual frame with a known signal: residuals are LARGE on
+predictions whose feature day had alcohol = Yes. The correct key must reveal it;
+a key shifted by one day must not.
 
 Run: python tests/test_error_mode_feature_date.py
 """
@@ -32,14 +27,16 @@ os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "stub")
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
+import hrv_alignment as al  # noqa: E402
+
 
 N_DAYS = 60
 SEED = 7
 
 
 def _build_synthetic_residual_frame() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (bt_df_xgb_h1, journal_df) where the residual on day N+1 is
-    correlated with alcohol[N], not alcohol[N+1]."""
+    """Return (bt_df_xgb_h1, journal_df) where the h=1 residual for the sleep of
+    night N is correlated with alcohol[N] (same behavioral day)."""
     rng = np.random.default_rng(SEED)
     dates = pd.date_range("2026-01-01", periods=N_DAYS, freq="D")
     # Alcohol pattern: ~30% of days, random
@@ -47,15 +44,8 @@ def _build_synthetic_residual_frame() -> tuple[pd.DataFrame, pd.DataFrame]:
     journal_df = pd.DataFrame(
         {"calendar_date": dates.strftime("%Y-%m-%d"), "journal_alcohol": alcohol}
     )
-    # Residual on day N is correlated with alcohol[N-1] (behaviors-of-the-
-    # previous-day-explain-todays-prediction-error). Build a residual series:
-    #   resid[0] = small noise (no day -1 to look at)
-    #   resid[i for i>=1] = N(8, 2) when alcohol[i-1]==1, N(0, 2) otherwise
-    residuals = np.zeros(N_DAYS)
-    residuals[0] = rng.normal(0, 2)
-    for i in range(1, N_DAYS):
-        mean = 8.0 if alcohol[i - 1] == 1 else 0.0
-        residuals[i] = rng.normal(mean, 2)
+    # resid[i] = N(8, 2) when alcohol[i]==1, N(0, 2) otherwise
+    residuals = np.array([rng.normal(8.0 if a == 1 else 0.0, 2) for a in alcohol])
     bt_df = pd.DataFrame(
         {
             "model": ["xgboost"] * N_DAYS,
@@ -68,12 +58,11 @@ def _build_synthetic_residual_frame() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _error_mode_under_fix(bt_df: pd.DataFrame, jdf: pd.DataFrame) -> float:
-    """Run the production join logic (feature_date = pred_date - h)."""
+    """Production join key (hrv_alignment.feature_date)."""
     xgb_bt = bt_df.copy()
-    xgb_bt["feature_date"] = (
-        pd.to_datetime(xgb_bt["prediction_date"])
-        - pd.to_timedelta(xgb_bt["horizon_days"].astype(int), unit="D")
-    ).dt.strftime("%Y-%m-%d")
+    xgb_bt["feature_date"] = pd.Series(al.feature_date(
+        xgb_bt["prediction_date"].to_numpy(), xgb_bt["horizon_days"].to_numpy()
+    )).dt.strftime("%Y-%m-%d")
     joined = xgb_bt.merge(
         jdf, left_on="feature_date", right_on="calendar_date", how="left"
     )
@@ -83,9 +72,10 @@ def _error_mode_under_fix(bt_df: pd.DataFrame, jdf: pd.DataFrame) -> float:
 
 
 def _error_mode_under_bug(bt_df: pd.DataFrame, jdf: pd.DataFrame) -> float:
-    """Reproduce the pre-fix join logic (uses prediction_date directly)."""
+    """A key one day off (the pre-2026-11-10 prediction_date - h)."""
     xgb_bt = bt_df.copy()
-    xgb_bt["pred_date"] = pd.to_datetime(xgb_bt["prediction_date"]).dt.strftime("%Y-%m-%d")
+    xgb_bt["pred_date"] = (pd.to_datetime(xgb_bt["prediction_date"])
+                           - pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
     joined = xgb_bt.merge(
         jdf, left_on="pred_date", right_on="calendar_date", how="left"
     )

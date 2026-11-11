@@ -228,7 +228,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -330,6 +330,10 @@ export async function GET() {
       // Onyx Screen Time iPhone app: one heartbeat a day, so it also needs its own fetch.
       supabase.from("sync_log").select("*").eq("source", "screen_time").eq("data_type", "usage")
         .order("sync_start", { ascending: false }).limit(1),
+      // HRV retrain: daily safety net + conditional hourly runs, so its newest heartbeat (incl. a
+      // failed "GUARD …" row from the alignment check) can fall out of the 100-row window.
+      supabase.from("sync_log").select("*").eq("source", "hrv_analysis").eq("data_type", "retrain")
+        .order("sync_start", { ascending: false }).limit(1),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -385,7 +389,8 @@ export async function GET() {
     // Latest hrv_analysis retrain heartbeat (added 2026-05-26 — older runs
     // didn't emit one, so fall back to MAX(hrv_analysis_results.computed_at)
     // below for historical signal).
-    const hrvRetrainEntry = latestBySrcType["hrv_analysis|retrain"] ?? null;
+    const hrvRetrainEntry = (hrvRetrainSyncRes.data?.[0] as Record<string, unknown> | undefined)
+      ?? latestBySrcType["hrv_analysis|retrain"] ?? null;
     const hrvRetrainComputedAt = (hrvRetrainRes.data?.[0]?.computed_at as string | undefined) ?? null;
     const tanitaEntry = latestBySrcType["tanita|weight"]
       ?? (tanitaSyncRes.data?.[0] as Record<string, unknown> | undefined)
