@@ -96,11 +96,11 @@ export default function TodayClient() {
         {inbox.state === "ready" && <>
           {inbox.stale && <p className="mt-3 text-sm text-amber-300">Couldn&apos;t refresh requests. Showing the last check from {checkedAt}; these requests may have changed.</p>}
           {requests.length === 0 ? <p className="mt-4 text-sm text-text-secondary">The last check returned no open requests. Messages and updates are in your inbox.</p> : <>
-            <p className="mt-2 text-xs text-text-tertiary">Showing {Math.min(requests.length, 3)} of {requests.length} requests returned, in inbox order.</p>
+            <p className="mt-2 text-xs text-text-secondary">Showing {Math.min(requests.length, 3)} of {requests.length} requests returned, in inbox order.</p>
             <ul className="mt-4 divide-y divide-border-subtle">
               {requests.slice(0, 3).map((item) => <li key={`${item.thread}:${item.messageId}:${item.card.code}`}>
                 <Link href={requestHref(item)} className="group flex items-center justify-between gap-3 rounded-lg py-4 focus-visible:outline-2 focus-visible:outline-accent">
-                  <span className="min-w-0"><span className="block text-xs text-text-tertiary">{item.card.agent || "Agent"}</span>
+                  <span className="min-w-0"><span className="block text-xs text-text-secondary">{item.card.agent || "Agent"}</span>
                     <span className="mt-1 block break-words text-sm font-medium text-text-primary">{item.card.name}</span>
                     <span className="mt-1 block text-xs text-accent">Review request</span></span>
                   <ArrowUpRight aria-hidden="true" className="h-4 w-4 shrink-0 text-text-secondary" />
@@ -109,7 +109,7 @@ export default function TodayClient() {
             </ul>
             {requests.length > 3 && <Link href="/agents?view=unread" className={linkStyle}>See the rest in your inbox</Link>}
           </>}
-          <p className="mt-4 text-xs text-text-tertiary">Inbox checked at {checkedAt}. Opening Today does not mark anything read.</p>
+          <p className="mt-4 text-xs text-text-secondary">Inbox checked at {checkedAt}. Opening Today does not mark anything read.</p>
         </>}
       </section>
       <section className={panelStyle} aria-labelledby="reading-heading" aria-busy={reading.state === "loading"}>
@@ -121,7 +121,7 @@ export default function TodayClient() {
         {reading.state === "ready" && (book ? <>
           <p className="mt-3 text-base font-medium text-text-primary">{book.book.title}</p>
           <p className="mt-1 text-sm text-text-secondary">{Number.isFinite(book.chaptersDone) && Number.isFinite(book.totalChapters) && book.totalChapters > 0 && book.chaptersDone >= 0 && book.chaptersDone <= book.totalChapters ? `${book.chaptersDone} of ${book.totalChapters} chapters recorded.` : "Chapter progress is not available."}</p>
-          <p className="mt-1 text-xs text-text-tertiary">Recorded progress may lag your latest reading.</p>
+          <p className="mt-1 text-xs text-text-secondary">Recorded progress may lag your latest reading.</p>
         </> : <p className="mt-3 text-sm text-text-secondary">No book is currently in progress.</p>)}
         <Link href="/reading" className={`${linkStyle} mt-4 inline-block`}>{book ? "Continue reading" : "Open reading"}</Link>
       </section>
