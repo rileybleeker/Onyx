@@ -76,3 +76,9 @@ run missed during sleep, which left the heartbeat 32 h stale.)
   the reading position is attributed to the harvest day (approximate, used only when there are no
   highlights that day). Manual `/reading` and chat sessions are never touched by the sync and are
   what audiobook listening still needs (unless Whispersync for Voice moves the Kindle position).
+
+## Offline reliability tests
+
+Run: node --test tools/kindle_harvest/harvest.test.mjs. These tests use synthetic responses and browser stubs, without credentials, Amazon, or production writes. CI runs them on harvester changes.
+
+Imports time out after 60 seconds and HTTP errors, malformed responses, and partial imports fail the run. Browser startup/navigation failures attempt a generic failed heartbeat; login and dry-run modes never post failure heartbeats. If Onyx itself cannot be reached, the local log and nonzero task exit remain the fallback.
