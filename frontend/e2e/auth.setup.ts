@@ -27,12 +27,12 @@ setup("authenticate against the app", async ({ page }) => {
   // The submit button reads exactly "Sign in" in password mode (login/page.tsx).
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
 
-  // A successful password login does router.replace("/status").
-  await page.waitForURL("**/status", { timeout: 30_000 });
-  await expect(page).toHaveURL(/\/status/);
+  // A successful password login lands on Today.
+  await page.waitForURL("**/today", { timeout: 30_000 });
+  await expect(page).toHaveURL(/\/today$/);
   // Confirm we're really authenticated (page rendered, not bounced back).
   await expect(
-    page.getByRole("heading", { name: "System Status" })
+    page.getByRole("heading", { name: "Today", exact: true })
   ).toBeVisible({ timeout: 15_000 });
 
   await page.context().storageState({ path: authFile });
