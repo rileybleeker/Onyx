@@ -82,7 +82,8 @@
 --   fixed in the second migration).
 --
 -- pg_cron (enabled by this migration; was available, not installed):
---   refresh_daily_health_matrix_behavioral_mat  '10,25,40,55 * * * *'
+--   refresh_daily_health_matrix_behavioral_mat  '10,40 * * * *' (was '10,25,40,55'
+--     until 2026-11-11; see sql/matview_refresh_30min.sql)
 --     (Garmin/WHOOP hourly ETL at :00 lands ~:02-:06 -> :10 catches it;
 --      journal :35 / habits :45 / spotify :50 do not feed the matrix)
 --   purge_cron_job_run_details                  '0 8 * * *' (keep 7 days)
