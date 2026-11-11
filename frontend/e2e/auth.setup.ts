@@ -28,8 +28,8 @@ setup("authenticate against the app", async ({ page }) => {
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
 
   // A successful password login does router.replace("/status").
-  await page.waitForURL("**/status", { timeout: 30_000 });
-  await expect(page).toHaveURL(/\/status/);
+  await page.waitForURL("**/today", { timeout: 30_000 });
+  await expect(page).toHaveURL(/\/today$/);
   // Confirm we're really authenticated (page rendered, not bounced back).
   await expect(
     page.getByRole("heading", { name: "System Status" })
