@@ -1,7 +1,8 @@
 'use client';
 import { useRef, useState } from 'react';
 import { defaultMapping, MAX_BYTES, parseCsv, preview, summarize, type Mapping, type Transaction } from '@/lib/financials';
-const money = (cents: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(cents / 100);
+const currencyFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+const money = (cents: number) => currencyFormatter.format(cents / 100);
 const box = 'rounded-lg border border-border-subtle bg-surface-card p-4';
 const input = 'rounded border border-border-subtle bg-surface-card p-2 text-text-primary';
 export default function FinancialsClient() {
