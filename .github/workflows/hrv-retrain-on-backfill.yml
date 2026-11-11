@@ -70,6 +70,18 @@ jobs:
         if: steps.decide.outputs.retrain == 'true'
         run: pip install -r requirements-analysis.txt
 
+      - name: Check HRV alignment against the live matrix
+        # tests/test_hrv_alignment_live.py: fails (and writes a failed
+        # "GUARD alignment_test:" heartbeat) if a matrix row's HRV stops matching
+        # the WHOOP cycle dated to it, if any layer stops scoring day D against
+        # row D, or if the alcohol canary reverses. Runs BEFORE the analysis so
+        # misaligned results are never written.
+        if: steps.decide.outputs.retrain == 'true'
+        env:
+          ONYX_REQUIRE_LIVE: '1'
+          ONYX_ALIGNMENT_HEARTBEAT: '1'
+        run: python tests/test_hrv_alignment_live.py
+
       - name: Run full HRV analysis (refresh correlations + retrain model)
         if: steps.decide.outputs.retrain == 'true'
         run: python hrv_analysis.py

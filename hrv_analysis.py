@@ -102,6 +102,8 @@ except ImportError:
 
 import hashlib
 
+import hrv_alignment as al
+
 warnings.filterwarnings("ignore")
 
 # ---------------------------------------------------------------------------
@@ -163,7 +165,7 @@ def et_today() -> date:
 
 
 MODEL_VERSION = f"{et_today().isoformat()}_behavioral_v1"
-TARGET = "whoop_hrv_rmssd"
+TARGET = al.TARGET  # whoop_hrv_rmssd; outcome alignment lives in hrv_alignment.py
 
 # Stage-1 BH-FDR threshold for promoting features to Stage 2 partial correlations.
 FDR_Q_THRESHOLD = 0.05
@@ -278,10 +280,9 @@ CONTROLLABLE_FEATURE_PREFIXES = (
 
 # Re-audit 2026-06-07 (stats/gpt-5/F-009): same-night sleep / recovery / HRV-
 # derived composites must NOT enter the SARIMAX/Prophet exogenous-regressor
-# candidate list. The exog is shifted by 1 to model HRV(N+1) from day-N signals,
-# but a same-night sleep score / recovery composite is contemporaneous with the
-# very HRV being forecast (it is measured FROM that night's sleep), so admitting
-# it risks over-attribution in the interpretive forecasts even after the shift.
+# candidate list. The exog models HRV of the sleep closing day N from day-N signals
+# (same row, hrv_alignment.py), and a same-night sleep score / recovery composite is
+# measured FROM that very sleep, so it is unknown at forecast time and a mediator.
 # We keep ONLY truly pre-treatment day-N behavioral features. This mirrors the
 # mediator-exclusion list the causal layer already enforces (causal_inference.py
 # docstring). Matched by prefix OR exact name.
@@ -696,8 +697,11 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         filters=[("is_excluded", "eq", False)],
     )
     if not data["garmin_acts"].empty:
-        data["garmin_acts"]["calendar_date"] = to_date_str(
-            data["garmin_acts"]["start_time_local"]
+        # Behavioral day (bedtime-to-bedtime), so a 1 AM session sits with the day it
+        # belongs to; clock date only as a fallback for rows the trigger never dated.
+        data["garmin_acts"]["calendar_date"] = (
+            data["garmin_acts"]["onyx_behavioral_date"].astype("string")
+            .fillna(to_date_str(data["garmin_acts"]["start_time_local"]))
         )
 
     log.info("  Loading garmin_activity_laps…")
@@ -709,7 +713,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     log.info("  Loading whoop_cycles…")
     data["whoop_cycles"] = fetch_all(
         "whoop_cycles",
-        select="cycle_id,start_time,strain,kilojoule,average_heart_rate,max_heart_rate,timezone_offset,onyx_behavioral_date",
+        select="cycle_id,start_time,end_time,strain,kilojoule,average_heart_rate,max_heart_rate,timezone_offset,onyx_behavioral_date",
     )
     if not data["whoop_cycles"].empty:
         # Per ADR-0001 (post-Phase 1): the matrix spine is now
@@ -720,6 +724,10 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         # behavioral_date on transition cycles by 1 day — silently dropped
         # timezone_offset from those rows in earlier Phase A iteration).
         data["whoop_cycles"]["calendar_date"] = data["whoop_cycles"]["onyx_behavioral_date"].astype(str)
+
+    # Recovery per cycle, for the alignment guard (hrv_alignment.check_matrix_hrv).
+    log.info("  Loading whoop_recovery (alignment guard)…")
+    data["whoop_recovery"] = fetch_all("whoop_recovery", select="cycle_id,hrv_rmssd_milli,score_state")
 
     log.info("  Loading whoop_sleep…")
     # start_time / end_time added for the workout-to-sleep gap feature.
@@ -741,8 +749,12 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         filters=[("score_state", "eq", "SCORED"), ("is_excluded", "eq", False)],
     )
     if not data["whoop_wk"].empty:
-        # Derive ET calendar_date from true-UTC start_time, matching view logic
-        data["whoop_wk"]["calendar_date"] = to_et_date_str(data["whoop_wk"]["start_time"])
+        # Behavioral day, matching the view's whoop_workout_* aggregates (ET clock date
+        # of the start only as a fallback).
+        data["whoop_wk"]["calendar_date"] = (
+            data["whoop_wk"]["onyx_behavioral_date"].astype("string")
+            .fillna(to_et_date_str(data["whoop_wk"]["start_time"]))
+        )
 
     log.info("  Loading whoop_workouts manual sauna overrides…")
     # The whoop_wk load above filters score_state='SCORED' + is_excluded=False
@@ -1070,8 +1082,8 @@ def aggregate_activity_categories(whoop_wk: pd.DataFrame, garmin_acts: pd.DataFr
     legacy single split_label is honored as a fallback when split_labels is absent.
 
     Keyed on onyx_behavioral_date (= the matrix spine's calendar_date) so a
-    session's category co-locates with its behavioral day and the shift(-1) target
-    alignment holds even for a session that starts after midnight — rather than the
+    session's category co-locates with its behavioral day and its outcome (the sleep
+    closing that day, hrv_alignment.py) even for a session that starts after midnight — rather than the
     ET-of-start key the other workout aggregates inherited (ADR-0001 #1 trap).
     Falls back to the loader's ET-of-start calendar_date only when the behavioral
     column is absent/NULL. The caller fills a day with no session to 0 (not NaN).
@@ -1179,10 +1191,9 @@ def pivot_journal(journal: pd.DataFrame) -> pd.DataFrame:
     Date alignment: keys on `behaviors_date` (the calendar day the answer
     describes), which the DB layer computes from each cycle's bedtime − 6h in
     local TZ. For pre-midnight bedtimes this equals cycle_date; for
-    post-midnight bedtimes it's cycle_date − 1. The pipeline's downstream
-    `hrv_next = whoop_hrv_rmssd.shift(-1)` then puts journal_* on row N
-    (behaviors of day N) opposite hrv_next on row N (HRV from sleep N → N+1),
-    which is the intended 1-day causal lag.
+    post-midnight bedtimes it's cycle_date − 1. journal_* on row N (behaviors of
+    day N) is then scored against row N's own HRV — the sleep that closes day N
+    (hrv_alignment.py).
 
     Falls back to cycle_date if behaviors_date is missing (older rows pre-
     backfill or rows with no matching whoop_cycle).
@@ -1217,8 +1228,8 @@ def pivot_habits(journal: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
     Date semantics: habit completions are recorded under the date Riley marks
     them complete (ET), with no WHOOP-style next-morning-asking offset, so no
     cycle_date shift is applied here — `habit_*` on calendar_date=N already
-    means "Riley did this habit on day N", which lines up with the rest of the
-    pipeline's behaviors-on-N → HRV(N+1) assumption.
+    means "Riley did this habit on day N", scored against the sleep that closes
+    day N (row N's HRV, hrv_alignment.py).
 
     Returns (wide_df, label_map) where label_map carries the original habit
     name from Notion (preserving casing and special characters) keyed by the
@@ -1316,21 +1327,15 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
       delivery_last_meal_to_sleep_min WHOOP sleep onset − last meal delivery (NaN on
                                       days without a timed delivery or a scored sleep)
 
-    ROW PLACEMENT — a delivery on behavioral day D is written to matrix row D − 1.
-    The matrix puts the HRV of the sleep that CLOSES day D on row D (the WHOOP cycle is
-    dated by its bedtime − 6h; checked against live rows 2026-11-10), and every consumer
-    in this file compares a row's features with the NEXT row's HRV (hrv_next,
-    hrv_target_t1 and the causal outcome all shift(-1)). Left on row D, a meal would be
-    scored against the night AFTER the one it precedes. On row D − 1 its shift(-1) target
-    is exactly the sleep the meal was eaten before — the same re-keying
-    workout_to_sleep_gap applies. The other behavior families (journal_, habit_,
-    supplement_, nutrition_, caffeine_, meal_) are NOT re-keyed and carry that one-night
-    offset; fixing it pipeline-wide is an open decision. If it is fixed (target = same-row
-    HRV), remove this shift and the one in workout_to_sleep_gap in the same change.
+    ROW PLACEMENT — a delivery on behavioral day D sits on matrix row D, the row whose HRV is
+    the sleep that closes day D (hrv_alignment.py). Until 2026-11-10 it was written to row
+    D − 1 to compensate for the pipeline's old next-row outcome; that compensation is gone
+    with the outcome fix.
 
-    Because row D − 1 holds the NEXT day's delivery, the newest row can never have a value
-    at prediction time. The delivery_ columns are therefore kept out of the forecasting
-    models (see prepare_ml_data) and feed only the descriptive and causal analyses.
+    The delivery_ columns stay out of the forecasting models (prepare_ml_data): on the
+    evening a forecast is made, today's receipts may not be parsed yet and today is never
+    inside the zero-fill coverage window, so the newest row reads NaN where training rows
+    read 0. They feed the descriptive and causal analyses only.
 
     ZERO FILL — the view has a row only for days WITH an order, so "no row" must be told
     apart from "not tracked". Inside coverage a missing day is a true zero (the receipts
@@ -1370,11 +1375,11 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
         if pd.notna(ct) and ct > cov_end:
             cov_end = ct
 
-        # row D − 1 carries day D's delivery (see ROW PLACEMENT above)
-        d["calendar_date"] = (d["delivery_day"] - pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
+        # row D carries day D's delivery (see ROW PLACEMENT above)
+        d["calendar_date"] = d["delivery_day"].dt.strftime("%Y-%m-%d")
         out = df.drop(columns=cols + ["delivery_any_meal"], errors="ignore").merge(
             d[["calendar_date"] + cols], on="calendar_date", how="left")
-        row_day = pd.to_datetime(out["calendar_date"], errors="coerce") + pd.Timedelta(days=1)
+        row_day = pd.to_datetime(out["calendar_date"], errors="coerce")
         in_cov = (row_day >= cov_start) & (row_day <= cov_end)
         if unread_days:
             in_cov &= ~row_day.isin(pd.to_datetime(list(unread_days)))
@@ -1389,7 +1394,7 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
         assert set(out["delivery_late_meal"].dropna().unique()) <= {0.0, 1.0}
         log.info(
             f"  Delivery features: delivery days {cov_start:%Y-%m-%d} → {cov_end:%Y-%m-%d} "
-            f"(written one row earlier), {int((out['delivery_meal_count'] > 0).sum())} delivery days, "
+            f"(same row), {int((out['delivery_meal_count'] > 0).sum())} delivery days, "
             f"{int((out['delivery_late_meal'] == 1).sum())} late-meal days, "
             f"{int(out['delivery_last_meal_to_sleep_min'].notna().sum())} with a gap to sleep"
         )
@@ -1405,11 +1410,20 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
 
     df = data["matrix"].copy()
     df["calendar_date"] = df["calendar_date"].astype(str)
+    # The live forecast predicts from behavioral today's row; make sure it exists even
+    # before any source has written one (its lags are derived below).
+    df = al.ensure_row(df, al.behavioral_today())
+    df = df.sort_values("calendar_date").reset_index(drop=True)
 
     # Numeric conversion of all matrix columns
     for c in df.columns:
         if c != "calendar_date":
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # THE alignment rule (hrv_alignment.py): row D = day D, and every sleep column = the
+    # sleep that closes day D. Moves WHOOP cycle totals one day later and Eight Sleep /
+    # Garmin HRV one day earlier, by date, before anything is derived from them.
+    df = al.realign_matrix(df)
 
     # --- Join garmin_daily extra columns ---
     if not data["garmin_daily"].empty:
@@ -1433,6 +1447,8 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
 
         gs_drop = ["is_nap", "sleep_start", "sleep_end", "hrv_status"]
         gs = gs.drop(columns=[c for c in gs_drop if c in gs.columns])
+        # garmin_sleep.calendar_date is the wake-up day -> re-key to the day it closes.
+        gs = al.wake_date_to_closing_day(gs)
         df = df.merge(gs, on="calendar_date", how="left", suffixes=("", "_gs"))
 
     # --- Join garmin_heart_rate ---
@@ -1460,6 +1476,8 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         HRV_STATUS_ORDINAL = {"LOW": 0, "UNBALANCED": 1, "BALANCED": 2}
         ghrv["garmin_hrv_status_ord"] = ghrv["hrv_status"].map(HRV_STATUS_ORDINAL)
         ghrv = ghrv.drop(columns=["hrv_status"], errors="ignore")
+        # garmin_hrv.calendar_date is the wake-up day -> re-key to the day it closes.
+        ghrv = al.wake_date_to_closing_day(ghrv)
         df = df.merge(ghrv, on="calendar_date", how="left", suffixes=("", "_garminhrv"))
 
     # --- Join garmin_stress ---
@@ -1546,7 +1564,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     # Note this is STRICTER than is_run_day, which stays NaN on non-activity days:
     # any pre-device-coverage spine rows become structural 0s. That's harmless —
     # every downstream consumer (Spearman/Welch, XGBoost prepare_ml_data, causal
-    # AIPW) first drops rows lacking the next-night HRV outcome + HRV-derived
+    # AIPW) first drops rows lacking the same-night HRV outcome + HRV-derived
     # confounders, which is exactly the pre-coverage era.
     # Union the unconditional is_sauna=true override rows into the WHOOP frame used
     # for the activity taxonomy ONLY (so a hand-flagged sauna that came back
@@ -1604,6 +1622,8 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
                 pd.to_numeric(df["eight_sleep_bed_temp"], errors="coerce") -
                 pd.to_numeric(df["eight_sleep_room_temp"], errors="coerce")
             )
+        # eight_sleep_trends.calendar_date is the wake-up day -> re-key to the day it closes.
+        es = al.wake_date_to_closing_day(es)
         df = df.merge(es, on="calendar_date", how="left", suffixes=("", "_es"))
 
 
@@ -2172,12 +2192,12 @@ def _days_since(flag: pd.Series) -> pd.Series:
 def workout_to_sleep_gap(data: dict) -> pd.DataFrame:
     """Compute time between last workout end and sleep onset, per calendar_date.
 
-    For row N (calendar_date = N), the gap measures: (sleep onset of the cycle
-    that ends on the morning of N+1, i.e. the night sleep covering N→N+1)
-    minus (end_time of the latest workout that finished within 18 hours
-    before that sleep onset). The HRV pipeline uses N to predict HRV at the
-    end of that sleep, so this feature describes "how late was your last
-    workout relative to bedtime on day N".
+    For row N (calendar_date = behavioral day N), the gap measures: (onset of
+    the sleep that closes day N — the WHOOP cycle dated N) minus (end_time of
+    the latest workout that finished within 18 hours before that sleep onset).
+    Row N's outcome is that same sleep's HRV (hrv_alignment.py), so this
+    feature describes "how late was your last workout relative to bedtime on
+    day N".
 
     Returns a DataFrame keyed on calendar_date (str) with:
       last_workout_end_to_sleep_min : float, NULL if no workout in prior 18h
@@ -2199,12 +2219,11 @@ def workout_to_sleep_gap(data: dict) -> pd.DataFrame:
     if sleep.empty or "start_time" not in sleep.columns or cycles.empty:
         return pd.DataFrame(columns=EMPTY_COLS)
 
-    # Sleep onset per cycle. cycles.calendar_date is the canonical ET "wake
-    # day" already (computed via to_cycle_et_date_str at load time = midday
-    # ET of the day the cycle represents). The sleep that BEGINS that cycle
-    # is the night of cycle_date-1 → cycle_date, so behaviors causing it are
-    # on cycle_date-1. Shift back by 1 to put sleep_onset on the row for the
-    # day whose behaviors caused it.
+    # Sleep onset per cycle. cycles.calendar_date is the cycle's
+    # onyx_behavioral_date (sleep onset − 6 h), i.e. the behavioral day this
+    # sleep CLOSES — exactly the row whose behaviours precede it. No shift.
+    # (Until 2026-11-10 this subtracted a day to offset the old next-row
+    # outcome; both went away together.)
     sleep_with_date = sleep.merge(
         cycles[["cycle_id", "calendar_date"]], on="cycle_id", how="inner"
     )
@@ -2212,9 +2231,7 @@ def workout_to_sleep_gap(data: dict) -> pd.DataFrame:
         sleep_with_date["start_time"], utc=True, errors="coerce", format="ISO8601"
     )
     sleep_with_date = sleep_with_date.dropna(subset=["sleep_onset", "calendar_date"])
-    sleep_with_date["pred_date"] = (
-        pd.to_datetime(sleep_with_date["calendar_date"]) - pd.Timedelta(days=1)
-    ).dt.strftime("%Y-%m-%d")
+    sleep_with_date["pred_date"] = sleep_with_date["calendar_date"].astype(str)
     # Earliest sleep onset per pred_date (in case of multiple sleeps in a cycle)
     sleep_per_date = (
         sleep_with_date.sort_values("sleep_onset")
@@ -2353,28 +2370,22 @@ def run_statistical_analysis(
     """
     results: dict = {}
 
-    # Use next-night HRV as the analysis target.
-    # WHOOP cycles start ~1 AM (after midnight), so calendar_date N = sleep on morning of N.
-    # The behaviors that drove that HRV happened on day N-1. By shifting the target forward
-    # by one day we correctly ask: "do today's behaviors predict tonight's HRV?"
-    df = df.copy()
-    df["hrv_next"] = df[TARGET].shift(-1)
-    STAT_TARGET = "hrv_next"
+    # Outcome = HRV of the sleep that closes the row's behavioral day (same row; the one
+    # alignment rule lives in hrv_alignment.py). "Do today's behaviors go with tonight's
+    # HRV?" — tonight's sleep being the one Riley wakes up from tomorrow.
+    df = al.add_outcome(df, 1)
+    STAT_TARGET = al.outcome_col(1)
 
     hrv_valid = df.dropna(subset=[STAT_TARGET])
-    # Exclude target + same-target-shifted-back + pure-autocorrelation transforms of HRV.
-    # Including these in the descriptive driver chart crowds out behavioral signals with
-    # trivial "yesterday's HRV correlates with tomorrow's HRV" results.
-    # `whoop_hrv_rmssd` IS the target one row back. `whoop_recovery_score` is the WHOOP
-    # composite of that same prior-night HRV/RHR pair. `hrv_*` lags/rolling/z-scores are
-    # explicit HRV-history transforms and are already used as Stage-3 OLS controls.
-    PHASE2_AUTOCORR_EXCLUDE = {
-        TARGET,
-        "whoop_recovery_score",
+    # Exclude the outcome itself, other measurements of the same night's HRV/RHR
+    # (al.OUTCOME_TWINS: WHOOP recovery/RHR, Garmin + Eight Sleep HRV of that night) and
+    # pure-autocorrelation transforms of HRV. Including these in the descriptive driver chart
+    # crowds out behavioral signals with "HRV correlates with HRV" results. `hrv_*`
+    # lags/rolling stats are explicit HRV-history transforms, already Stage-3 OLS controls.
+    PHASE2_AUTOCORR_EXCLUDE = set(al.OUTCOME_TWINS) | {
         "hrv_lag1", "hrv_lag2", "hrv_lag3",
         "hrv_7d_mean", "hrv_7d_std",
-        "hrv_28d_mean", "hrv_28d_std", "hrv_z_28d",
-        "delta_hrv", "hrv_vs_baseline",
+        "hrv_28d_mean", "hrv_28d_std",
     }
     numeric_cols = [c for c in hrv_valid.columns
                     if c not in ("calendar_date", STAT_TARGET)
@@ -2454,8 +2465,8 @@ def run_statistical_analysis(
         colors = ["#22c55e" if r > 0 else "#ef4444" for r in top25["spearman_r"]]
         ax.barh(top25["label"][::-1], top25["spearman_r"][::-1], color=colors[::-1])
         ax.axvline(0, color="#ffffff", linewidth=0.5, alpha=0.4)
-        ax.set_xlabel("Spearman r with next-night WHOOP HRV")
-        ax.set_title("Top 25 HRV Drivers — Spearman Correlation (behaviors -> next night)")
+        ax.set_xlabel("Spearman r with that night's WHOOP HRV")
+        ax.set_title("Top 25 HRV Drivers — Spearman Correlation (behaviors -> that night's sleep)")
         ax.set_facecolor("#1a1a1d")
         fig.patch.set_facecolor("#0a0a0b")
         ax.tick_params(colors="#a1a1aa")
@@ -2474,7 +2485,9 @@ def run_statistical_analysis(
     if HAS_PINGOUIN:
         try:
             partial_results = []
-            controls = [c for c in ["hrv_lag1", "whoop_sleep_duration_milli"]
+            # Last night's HRV + last night's sleep (lag 1): both precede the day's
+            # behaviours. Tonight's sleep duration would be a mediator.
+            controls = [c for c in ["hrv_lag1", "whoop_sleep_duration_milli_lag1"]
                         if c in hrv_valid.columns]
             survivors_df = corr_df[corr_df["passes_fdr"]] if "passes_fdr" in corr_df.columns else corr_df
             top15_feats = survivors_df.head(15)["feature"].tolist()
@@ -2772,7 +2785,7 @@ def run_statistical_analysis(
             log.warning(f"  Habit analysis failed: {e}")
 
     # --- Supplement Yes/No impact ---
-    # Welch's two-sample t-test on next-night HRV for each compound (Yes vs No
+    # Welch's two-sample t-test on that night's HRV for each compound (Yes vs No
     # nights), with Cohen's d and 95% CI. Yes/No framing is the headline because
     # most compounds are taken at a near-constant dose, so the actionable
     # question is "does taking it help?" rather than a dose-response one.
@@ -2842,7 +2855,7 @@ def run_statistical_analysis(
             log.warning(f"  Supplement Yes/No analysis failed: {e}")
 
     # --- Supplement dose-response ---
-    # Spearman rank correlation between daily total_amount and next-night HRV,
+    # Spearman rank correlation between daily total_amount and that night's HRV,
     # for compounds where the dose actually varies (≥3 distinct non-zero amounts).
     # Captures monotonic dose-response effects that Yes/No collapses on.
     # Rank-based to handle outliers and non-linear monotonic responses.
@@ -2906,7 +2919,7 @@ def run_statistical_analysis(
             log.warning(f"  Supplement dose-response analysis failed: {e}")
 
     # --- Nutrition Spearman correlation ---
-    # Per-nutrient rank correlation with next-night HRV. Spearman (not Pearson)
+    # Per-nutrient rank correlation with that night's HRV. Spearman (not Pearson)
     # because nutrition data is heavy-tailed (occasional restaurant blowouts),
     # non-normal, and relationships are likely monotonic but not necessarily
     # linear across the full range (e.g. HRV vs sodium 1g→8g).
@@ -3092,37 +3105,32 @@ def run_statistical_analysis(
 # ===========================================================================
 
 def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, list[str], pd.Series]:
-    """Build X, feature_cols, y for ML. Target = HRV `horizon` days ahead.
+    """Build X, feature_cols, y for ML. Target = HRV of the sleep that closes day D+h-1.
 
-    horizon=1 (default) trains/scores a next-day model; horizon=h>1 produces
-    the same feature matrix paired with HRV h days into the future, used by
-    the multi-horizon backtest in run_evaluation(). Each horizon-specific
-    target column is named hrv_target_t{h} so a single dataframe can carry
-    multiple horizons side-by-side without colliding, and every hrv_target_t*
-    column is excluded from the feature set to prevent target leakage.
+    horizon=1 (default) is the headline model: row D's own HRV, i.e. the sleep that
+    follows day D's behaviours (hrv_alignment.py). horizon=h>1 pairs the same features
+    with the sleep h-1 nights later, for the multi-horizon backtest in run_evaluation().
+    Each horizon-specific target column is named hrv_target_t{h} so a single dataframe
+    can carry several side-by-side, and every hrv_target_t* column is excluded from the
+    feature set to prevent target leakage.
     """
     df = df.copy()
-    target_col = f"hrv_target_t{horizon}"
-    df[target_col] = df[TARGET].shift(-horizon)
+    target_col = al.outcome_col(horizon)
+    df[target_col] = al.outcome_series(df, horizon)
 
     # Filter to rows with a valid target
     model_df = df.dropna(subset=[target_col, "hrv_lag1"])
 
-    # Feature columns: all numeric except the training target, date, and future-leaking columns.
-    # NOTE: TARGET (whoop_hrv_rmssd) is intentionally kept as a feature — it represents
-    # this morning's HRV score, which is known at prediction time and is the strongest
-    # same-day predictor of tonight's HRV.
-    # whoop_recovery_score is excluded because it is derived from the same sleep's HRV
-    # (circular leak). Other same-night WHOOP/Garmin sleep metrics are kept — they represent
-    # yesterday's sleep quality, valid context for tonight's prediction.
-    exclude = {"calendar_date", "hrv_next",
-               "whoop_recovery_score",  # derived from same sleep's HRV — circular
-               }
-    # Drop every hrv_target_t* column (any horizon's target — they all leak the future)
-    exclude |= {c for c in model_df.columns if c.startswith("hrv_target_t")}
-    # delivery_* sit one row early (merge_delivery_features: row D − 1 holds day D's delivery), so
-    # the newest row is always NaN at prediction time while training rows are filled. They feed
-    # the descriptive and causal analyses only, never the forecasting models.
+    # Feature columns: numeric columns known on the evening BEFORE the sleep being
+    # forecast. al.forecast_can_use drops the target itself and everything measured from
+    # that sleep (WHOOP recovery/RHR/sleep, Garmin + Eight Sleep of that night) or anchored
+    # to its onset (meal/caffeine/workout-to-bed gaps, WHOOP-cycle travel flags). Last
+    # night's HRV and sleep reach the model through hrv_lag* and the *_lag1 columns.
+    exclude = {"calendar_date", "whoop_recovery_score"}
+    exclude |= {c for c in model_df.columns if not al.forecast_can_use(c)}
+    # delivery_*: today's receipts may not be parsed when the forecast runs and today is
+    # never inside the zero-fill coverage window, so the newest row reads NaN where training
+    # rows read 0 (see merge_delivery_features). Descriptive and causal analyses only.
     exclude |= {c for c in model_df.columns if c.startswith("delivery_")}
     feat_cols = [c for c in model_df.columns
                  if c not in exclude and pd.api.types.is_numeric_dtype(model_df[c])]
@@ -3143,6 +3151,23 @@ def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, l
     y = model_df[target_col].copy()
 
     return model_df, feat_cols, X, y
+
+
+def serve_features(df: pd.DataFrame, feat_cols: list[str]) -> tuple[pd.DataFrame, str] | tuple[None, None]:
+    """Feature row for the live forecast: behavioral today's row (the sleep Riley goes to
+    tonight). Same 7-day forward-fill of the sparse Garmin columns as prepare_ml_data.
+    Returns (X_row, behavioral_date) or (None, None) if the row is missing."""
+    d = df.sort_values("calendar_date").reset_index(drop=True)
+    for col in HIGH_VALUE_SPARSE_FEATURES:
+        if col in d.columns:
+            d[col] = d[col].ffill(limit=7)
+    idx = al.serve_index(d)
+    if idx is None:
+        return None, None
+    X = d.loc[[idx]].reindex(columns=feat_cols)
+    for c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+    return X, str(d.loc[idx, "calendar_date"])
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
@@ -3188,7 +3213,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
 
 
 def train_xgboost(df: pd.DataFrame) -> tuple:
-    """Train XGBoost next-day HRV predictor. Returns (model, results_dict)."""
+    """Train XGBoost tonight's-sleep HRV predictor. Returns (model, results_dict)."""
     if not HAS_XGB:
         return None, {}
 
@@ -3304,8 +3329,11 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
             except Exception:
                 pass
 
-            # Top drivers for the latest observation
-            X_latest = X.iloc[[-1]]
+            # Top drivers for the row the live forecast uses (behavioral today);
+            # falls back to the newest training row if today's row is missing.
+            X_latest, _ = serve_features(df, feat_cols)
+            if X_latest is None:
+                X_latest = X.iloc[[-1]]
             latest_shap = explainer(X_latest)
             top_drivers = [
                 {"feature": f, "label": FEATURE_LABELS.get(f, f),
@@ -3412,9 +3440,15 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
 
     # Re-explain the latest observation with the production model so the displayed
     # drivers match the deployed forecast (overrides the held-out-model drivers).
-    if HAS_SHAP:
+    # The live forecast predicts from behavioral today's row: tonight's sleep, which
+    # Riley wakes up from tomorrow. (Until 2026-11-10 this used the newest row WITH a
+    # known outcome, i.e. a night already in the past.)
+    X_serve, serve_date = serve_features(df, feat_cols)
+    if X_serve is None:
+        log.warning("  No row for behavioral today — live forecast skipped")
+    if HAS_SHAP and X_serve is not None:
         try:
-            _prod_latest = shap.TreeExplainer(production_model)(X.iloc[[-1]])
+            _prod_latest = shap.TreeExplainer(production_model)(X_serve)
             _td = [
                 {"feature": f, "label": FEATURE_LABELS.get(f, f),
                  "shap_value": float(_prod_latest.values[0, i])}
@@ -3425,15 +3459,17 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
         except Exception as e:
             log.debug(f"  production-model top_drivers failed, keeping held-out drivers: {e}")
 
-    # Tomorrow's prediction (latest available data) — from the full-data model.
-    tomorrow_pred = float(production_model.predict(X.iloc[[-1]])[0])
+    # Tonight's-sleep prediction — from the full-data model.
+    tomorrow_pred = float(production_model.predict(X_serve)[0]) if X_serve is not None else None
+    # Last night's HRV (the newest scored sleep).
     today_hrv = float(df[TARGET].dropna().iloc[-1]) if df[TARGET].dropna().shape[0] > 0 else None
 
     # Save model
     model_path = OUTPUT_DIR / "xgboost_hrv_model.pkl"
     with open(model_path, "wb") as f:
         pickle.dump({"model": production_model, "feat_cols": feat_cols,
-                     "pred_std": pred_std, "model_version": MODEL_VERSION}, f)
+                     "pred_std": pred_std, "model_version": MODEL_VERSION,
+                     "alignment": al.ALIGNMENT_VERSION}, f)
     log.info(f"  Model saved: {model_path}")
 
     results = {
@@ -3451,6 +3487,9 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
         "controllable_importance": controllable_importance,
         "top_drivers": top_drivers,
         "tomorrow_pred": tomorrow_pred,
+        # Behavioral date of the predicted sleep (stored as prediction_date; the page
+        # shows the wake-up date = this + 1).
+        "serve_date": serve_date,
         "today_hrv": today_hrv,
         "pred_std": pred_std,
         "train_start": model_df["calendar_date"].iloc[0],
@@ -3513,48 +3552,31 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                  f"({hrv_series.index.min().date()} → {hrv_series.index.max().date()}); "
                  f"{n_missing_hrv} HRV gaps handled via Kalman filter")
 
-        # Exogenous: top features with sufficient coverage.
-        # Shift by 1 day so that HRV[N] is modelled using features[N-1].
-        # This corrects the causal alignment: behaviors on day N-1 drive HRV on night N.
-        # Exclude whoop_hrv_rmssd from exog (it's the endogenous variable itself).
-        # Coverage threshold lowered from 0.5 → 0.2 so behavioral features
-        # (journal/mfp/supplement, typically 20-30% coverage) are eligible;
-        # ffill+bfill on the chosen series still produces a continuous exog.
-        # Slot count raised from 5 → 7 so the category-seeded features fit
-        # alongside the global SHAP top.
+        # Exogenous: top features with sufficient coverage, on the SAME row as the HRV they
+        # explain (hrv_alignment.py): HRV of the sleep that closes day N is modelled with
+        # day-N signals, which are all known on the evening before that sleep. (Until
+        # 2026-11-10 the exog was shifted one row, which paired day N-1's behaviours with
+        # it.) Exclude whoop_hrv_rmssd (the endogenous variable itself).
+        # Coverage threshold 0.2 so behavioral features (journal/nutrition/supplement,
+        # typically 20-30% coverage) are eligible; up to 7 slots.
         exog_feats = [f for f in top_features
                       if f in hrv_valid.columns
                       and f != TARGET
                       and hrv_valid[f].notna().mean() >= 0.2][:7]
         log.info(f"  SARIMAX exog features ({len(exog_feats)}): {exog_feats}")
         # Re-audit 2026-06-07 (stats/gpt-5/F-001, P0): build exog with CAUSAL fill only.
-        # The prior `.ffill().bfill()` back-filled early/gap rows with FUTURE feature values
-        # (including the holdout), leaking information into both the SARIMAX fit and the
-        # walk-forward backtest. ffill carries the last *known* value forward (past→present,
-        # causal); remaining leading NaNs (before a feature's first observation, where no past
-        # value exists) get a fixed 0.0 — a constant, never future data.
-        original_exog = (hrv_valid[exog_feats].copy().asfreq("D") if exog_feats else None)
-        if original_exog is not None:
-            original_exog = original_exog.ffill().fillna(0.0)
-        # Shift forward 1 row: exog for row N = original feature values from row N-1.
-        # Audit P1 contract assertion (paired with the full-data forecast fix
-        # below): for k >= 1, exog.iloc[k] must equal original_exog.iloc[k-1].
-        # Everything else in this function — walk-forward future-exog slicing
-        # at line ~2710, full-data future-exog at line ~2740 — relies on this
-        # invariant. If shift semantics ever change, this assertion catches it.
-        # Only row 0 is NaN after the shift (no row -1); fill it with a constant, not bfill.
-        exog = original_exog.shift(1).fillna(0.0) if original_exog is not None else None
-        if original_exog is not None and exog is not None and len(exog) >= 3:
-            chk = min(max(1, len(exog) // 2), len(exog) - 1)
-            if not np.allclose(
-                exog.iloc[chk].to_numpy(dtype=float),
-                original_exog.iloc[chk - 1].to_numpy(dtype=float),
-                equal_nan=True,
-            ):
-                log.warning(
-                    f"  SARIMAX exog shift contract violated at idx={chk} — "
-                    "training/forecast alignment is unreliable"
-                )
+        # ffill carries the last *known* value forward (past→present, causal); remaining
+        # leading NaNs (before a feature's first observation) get a fixed 0.0 — a constant,
+        # never future data. The exog runs past the last observed HRV up to behavioral
+        # today, so the live forecast's first step sees today's behaviours.
+        exog_ext = None
+        exog = None
+        if exog_feats:
+            ext_end = max(valid_hrv_dates.max(), pd.Timestamp(al.behavioral_today()))
+            ext_idx = pd.date_range(valid_hrv_dates.min(), ext_end, freq="D")
+            exog_ext = hrv_indexed.reindex(ext_idx)[exog_feats].apply(
+                pd.to_numeric, errors="coerce").ffill().fillna(0.0)
+            exog = exog_ext.reindex(full_idx)
 
         n = len(hrv_series)
         split = int(n * 0.85)
@@ -3634,16 +3656,13 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                         f_step = m_step.filter(cur_params)
                 else:
                     f_step = m_step.filter(cur_params)
-                # Audit re-2026-05-26 P1 (gemini F-003, gpt-5 F-004): the
-                # walk-forward previously passed ACTUAL future shifted-exog
-                # values (`exog.iloc[split+i : split+i+h]`) into get_forecast,
-                # which leaks future behaviors into the held-out window and
-                # artificially inflates SARIMAX skill. Live forecasting cannot
-                # know tomorrow's journal/strain — substitute the last KNOWN
-                # exog row repeated h times. Under the shift contract
-                # exog.iloc[N] == original_exog.iloc[N-1], so exog.iloc[split+i]
-                # is the shifted-exog row aligned with the first forecast step
-                # (= behaviors of the latest training day).
+                # Audit re-2026-05-26 P1 (gemini F-003, gpt-5 F-004): never pass
+                # actual FUTURE exog into get_forecast. The first forecast step is
+                # row split+i — the sleep that closes day split+i — and that day's
+                # behaviours are known on its evening, so exog.iloc[split+i] is
+                # legitimately available. Later steps reuse that row (the
+                # "last-known-behaviour" proxy): day split+i+1's behaviours are not
+                # known yet.
                 if exog is not None:
                     last_known_idx = min(split + i, len(exog) - 1)
                     last_row = exog.iloc[[last_known_idx]].to_numpy(dtype=float)
@@ -3693,15 +3712,17 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
                              seasonal_order=(1, 0, 1, 7),
                              enforce_stationarity=False, enforce_invertibility=False)
         full_fit = full_model.fit(disp=False, maxiter=200)
-        # Audit P1 fix: training contract is exog[N] = original_exog[N-1] (one
-        # row above), so the forecast at step k from last training row T wants
-        # exog[T+k] = original_exog[T+k-1] — future behaviors we don't know.
-        # As a proxy, pass the last 7 rows of the already-shifted `exog`
-        # matrix; semantically that's "use the past week's lagged behaviors as
-        # a stand-in for tomorrow's." Passing `original_exog.iloc[-7:]` here
-        # (the previous code) fed unshifted values into a shifted-trained
-        # model — off by one at every horizon.
-        fut_exog_all = exog.iloc[-7:] if exog is not None else None
+        # Live forecast: step k = the sleep that closes day (last HRV day + k). Use the
+        # real exog rows for the days after the last observed HRV up to behavioral today
+        # (known), then repeat the newest known row for the days still to come.
+        fut_exog_all = None
+        if exog_ext is not None:
+            fut = exog_ext.loc[exog_ext.index > hrv_series.index[-1]].iloc[:7].to_numpy(dtype=float)
+            last_known = exog_ext.iloc[[-1]].to_numpy(dtype=float)
+            if len(fut) < 7:
+                pad_row = fut[[-1]] if len(fut) else last_known
+                fut = np.vstack([fut, np.tile(pad_row, (7 - len(fut), 1))]) if len(fut) else np.tile(pad_row, (7, 1))
+            fut_exog_all = pd.DataFrame(fut, columns=exog_ext.columns)
         fc_full = full_fit.get_forecast(steps=7, exog=fut_exog_all)
         fc_mean = fc_full.predicted_mean
         fc_ci = fc_full.conf_int(alpha=CI_ALPHA)  # 80% CI — see CI_NOMINAL
@@ -3747,9 +3768,9 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
         return {}
     log.info("Training Prophet model…")
     try:
-        # Use next-night HRV as y (causal alignment: today's behaviors -> tonight's HRV)
-        df_p = df.copy()
-        df_p["hrv_target_t1"] = df_p[TARGET].shift(-1)
+        # y = HRV of the sleep that closes day ds, regressors = day ds's signals (same row,
+        # hrv_alignment.py): today's behaviours -> tonight's HRV.
+        df_p = al.add_outcome(df, 1)
         hrv_df = df_p[["calendar_date", "hrv_target_t1"]].dropna(subset=["hrv_target_t1"]).copy()
         hrv_df = hrv_df.rename(columns={"calendar_date": "ds", "hrv_target_t1": "y"})
         hrv_df["ds"] = pd.to_datetime(hrv_df["ds"])
@@ -3765,7 +3786,7 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
         # top_features is composed with behavioral seeds first, the first 3
         # slots reliably include the category seeds anyway.
         reg_feats = [f for f in top_features if f in df_p.columns
-                     and f != TARGET
+                     and f != TARGET and al.forecast_can_use(f)
                      and df_p.dropna(subset=["hrv_target_t1"])[f].notna().mean() >= 0.25][:3]
         log.info(f"  Prophet regressors ({len(reg_feats)}): {reg_feats}")
 
@@ -3963,22 +3984,18 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
                 if test_start >= n_h - 1:
                     break
                 end = min(test_start + step, n_h - 1)
-                # Re-audit 2026-06-07 (stats/gemini/F-004): per-horizon train-end
-                # trim replaces the blanket 28-day embargo. The training window
-                # ends at `test_start - h + 1` so its latest target (HRV at day
-                # train_end_idx-1+h) is observed no later than the test feature
-                # date (day test_start). For h=1 this equals `start` (no change);
-                # for h>1 it drops the final h-1 rows whose targets would still
-                # be in the future at the test prediction moment.
-                train_end_idx = max(1, test_start - h + 1)
+                # Per-horizon train-end trim (re-audit 2026-06-07, gemini F-004):
+                # a training row j's target is the sleep closing day j+h-1, which
+                # must already have happened on the evening of day test_start
+                # (sleeps up to row test_start-1). See al.train_cutoff.
+                train_end_idx = al.train_cutoff(test_start, h)
                 X_tr, y_tr = X_h.iloc[:train_end_idx], y_h.iloc[:train_end_idx]
                 X_pred_block = X_h.iloc[test_start:end]
                 y_actual_block = y_h.iloc[test_start:end]
-                # Target dates = feature dates + h (y is shifted(-h), so y.iloc[i]
-                # is the HRV h days AFTER model_df_h.calendar_date.iloc[i]).
-                dates_block = (
-                    pd.to_datetime(model_df_h["calendar_date"].iloc[test_start:end])
-                    + pd.Timedelta(days=h)
+                # Target dates = behavioral date of the sleep each target refers to
+                # (feature date + h - 1; h=1 is the same row).
+                dates_block = al.target_date(
+                    model_df_h["calendar_date"].iloc[test_start:end], h
                 ).dt.strftime("%Y-%m-%d").values
                 train_start_d = model_df_h["calendar_date"].iloc[0]
                 train_end_d = model_df_h["calendar_date"].iloc[train_end_idx - 1]
@@ -4032,14 +4049,16 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     hrv_arr = model_df[TARGET].values.astype(float)
     dates_arr = pd.to_datetime(model_df["calendar_date"]).values
     for h in HORIZONS:
-        for i in range(min_train, n - h):
-            actual_idx = i + h
+        # Decision made on the evening of feature row i: the newest known HRV is the sleep
+        # that closed day i-1 (row i's own sleep has not happened). Target = row i+h-1.
+        for i in range(max(min_train, 1), n - h + 1):
+            actual_idx = i + h - 1
             if actual_idx >= len(hrv_arr) or np.isnan(hrv_arr[actual_idx]):
                 continue
             actual = float(hrv_arr[actual_idx])
             feat_date = pd.Timestamp(dates_arr[i])
-            pred_date = (feat_date + pd.Timedelta(days=h)).strftime("%Y-%m-%d")
-            hrv_hist = hrv_arr[:i + 1]
+            pred_date = al.target_date(feat_date, h).strftime("%Y-%m-%d")
+            hrv_hist = hrv_arr[:i]
 
             # Naive persistence: predict = last known HRV (constant across h)
             naive_pred = float(hrv_hist[-1])
@@ -4062,7 +4081,7 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
             # Day-of-week historical mean — DOW of the TARGET date (i+h),
             # not of the feature date, so the prediction is appropriate for
             # the day being forecast.
-            dow = (feat_date + pd.Timedelta(days=h)).dayofweek
+            dow = al.target_date(feat_date, h).dayofweek
             past_dows = pd.DatetimeIndex(dates_arr[:i]).dayofweek
             dow_mask = past_dows == dow
             dow_vals = hrv_arr[:i][dow_mask]
@@ -4201,22 +4220,16 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
         # unambiguous (each prediction_date appears once per model) and the
         # residual distribution reflects the headline next-day model only.
         #
-        # Audit re-2026-05-26 P1 (gpt-5 stats F-002): previously the merge
-        # used prediction_date == calendar_date, which joined journal_*[N]
-        # (behaviors of day N) to residuals predicting HRV on day N. The
-        # model's features for HRV[N] are from day N-1 (the shift-1 contract
-        # in build_feature_matrix); the behavior attribution was therefore
-        # off-by-one, blaming the morning-after for the prior night's drink.
-        # Fix: feature_date = prediction_date - horizon_days. We retain
-        # horizon_days in the arithmetic so the same code generalizes if the
-        # h>1 filter is ever relaxed.
+        # feature_date = prediction_date - (horizon_days - 1): prediction_date is
+        # the behavioral date of the predicted sleep, and at h=1 that sleep closes
+        # the feature day itself (hrv_alignment.py). Kept in horizon form so the
+        # code generalizes if the h>1 filter is ever relaxed.
         xgb_bt = bt_df[(bt_df["model"] == "xgboost") & (bt_df["horizon_days"] == 1)] \
                     .dropna(subset=["residual"]).copy()
         if not xgb_bt.empty:
-            xgb_bt["feature_date"] = (
-                pd.to_datetime(xgb_bt["prediction_date"])
-                - pd.to_timedelta(xgb_bt["horizon_days"].astype(int), unit="D")
-            ).dt.strftime("%Y-%m-%d")
+            xgb_bt["feature_date"] = pd.Series(al.feature_date(
+                xgb_bt["prediction_date"].to_numpy(), xgb_bt["horizon_days"].to_numpy()
+            ), index=xgb_bt.index).dt.strftime("%Y-%m-%d")
             jcols = [c for c in df.columns if c.startswith("journal_")]
             if jcols:
                 # Lookup table: calendar_date -> journal flags. journal_*[N] = behaviors
@@ -4409,11 +4422,11 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
     rows: list[dict] = []
     today_str = str(et_today())
 
-    # XGBoost tomorrow's prediction
-    if xgb_results:
-        tomorrow = str(et_today() + timedelta(days=1))
+    # XGBoost tonight's-sleep prediction. prediction_date = behavioral date of the sleep
+    # (matrix row key, hrv_alignment.py); Riley sees it on the morning after.
+    if xgb_results and xgb_results.get("tomorrow_pred") is not None and xgb_results.get("serve_date"):
         rows.append({
-            "prediction_date": tomorrow,
+            "prediction_date": xgb_results["serve_date"],
             "model": "xgboost",
             "predicted_hrv": xgb_results.get("tomorrow_pred"),
             "prediction_lower": (xgb_results.get("tomorrow_pred", 0) -
@@ -4852,7 +4865,9 @@ def print_summary(df: pd.DataFrame, xgb_results: dict,
                   f"(Yes={h['n_yes']}, No={h['n_no']})")
 
     # Tomorrow's prediction
-    print(f"\nTOMORROW'S PREDICTION ({str(et_today() + timedelta(days=1))})")
+    _sd = (xgb_results or {}).get("serve_date")
+    _wake = (pd.to_datetime(_sd) + pd.Timedelta(days=1)).date() if _sd else "?"
+    print(f"\nTONIGHT'S SLEEP (night of {_sd or '?'}, you wake up {_wake})")
     if xgb_results and xgb_results.get("tomorrow_pred"):
         p = xgb_results["tomorrow_pred"]
         std = xgb_results.get("pred_std", 0)
@@ -4879,7 +4894,41 @@ def print_summary(df: pd.DataFrame, xgb_results: dict,
 # MAIN
 # ===========================================================================
 
-def main() -> None:
+def check_alignment(data: dict, df: pd.DataFrame) -> str | None:
+    """Runtime guard for the one alignment rule (hrv_alignment.py).
+
+    Hard checks (raise al.AlignmentError -> the run fails with a failed heartbeat):
+      * every matrix row's HRV equals the recovery of the WHOOP cycle dated to that row;
+      * the re-keyed columns (strain, Eight Sleep, Garmin HRV) line up best with the SAME
+        row — if a source's dating is fixed upstream, the re-keys would double-shift.
+    Soft check (returns a warning -> the run ends with a PARTIAL heartbeat):
+      * alcohol canary: drinking should lower the same night's HRV more than the
+        following night's.
+    """
+    problems = al.check_matrix_hrv(data["matrix"], data["whoop_cycles"],
+                                   data.get("whoop_recovery", pd.DataFrame()))
+    problems += al.check_rekey_directions(df)
+    if problems:
+        raise al.AlignmentError("GUARD hrv_alignment: " + " | ".join(problems))
+    log.info("  Alignment guard: matrix HRV == cycle recovery on every row; re-keyed "
+             "columns line up with the same row")
+    canary = al.alcohol_canary(df)
+    if canary.get("ok") is False:
+        msg = (f"GUARD alcohol_canary: same-night effect {canary['same']:+.1f} ms is not "
+               f"larger than the following night's {canary['next']:+.1f} ms "
+               f"({canary['n_yes']} drinking vs {canary['n_no']} non-drinking days)")
+        log.warning(f"  {msg}")
+        return msg
+    if canary.get("ok") is None:
+        log.info(f"  Alcohol canary skipped: {canary.get('reason')}")
+    else:
+        log.info(f"  Alcohol canary OK: same night {canary['same']:+.1f} ms vs following night "
+                 f"{canary['next']:+.1f} ms ({canary['n_yes']} drinking days)")
+    return None
+
+
+def main() -> str | None:
+    """Returns a warning for a PARTIAL heartbeat, or None for success."""
     global INPUT_DATA_HASH
 
     parser = argparse.ArgumentParser(description="Onyx HRV Deep Analysis Pipeline")
@@ -4894,6 +4943,7 @@ def main() -> None:
     data = load_all_data()
     df = build_feature_matrix(data)
     print_completeness(df)
+    run_warning = check_alignment(data, df)
 
     # Compute the input-data hash once for the run so every Supabase write
     # (predictions, metrics, analysis results) carries the same fingerprint.
@@ -4935,7 +4985,7 @@ def main() -> None:
     if args.skip_models:
         log.info("Skipping ML models (--skip-models set).")
         print_summary(df, {}, {}, {}, {}, stat_results)
-        return
+        return run_warning
 
     # ---------- Phase 3: Models ----------
     log.info("=== PHASE 3: PREDICTION MODELS ===")
@@ -4958,9 +5008,11 @@ def main() -> None:
         full_ranked = stat_results["correlations"]["feature"].tolist()
     else:
         full_ranked = []
-    # delivery_* are not forecast features (see prepare_ml_data); the Spearman fallback
-    # ranking still lists them, so keep them out of the SARIMAX / Prophet candidates too.
-    full_ranked = [f for f in full_ranked if not f.startswith("delivery_")]
+    # delivery_* and same-sleep columns are not forecast features (see prepare_ml_data);
+    # the Spearman fallback ranking still lists them, so keep them out of the SARIMAX /
+    # Prophet candidates too.
+    full_ranked = [f for f in full_ranked
+                   if not f.startswith("delivery_") and al.forecast_can_use(f)]
 
     top10_global = (list(xgb_importance_top.keys())[:10]
                     if xgb_importance_top else full_ranked[:10])
@@ -4975,13 +5027,14 @@ def main() -> None:
             seeds.append(f)
 
     # Re-audit 2026-06-07 (stats/gpt-5/F-009): drop same-night sleep/recovery/
-    # HRV-derived composites from the exog candidate list — these are mediators
-    # contemporaneous with HRV(N+1), not pre-treatment day-N features. We filter
+    # HRV-derived composites from the exog candidate list — they are measured from
+    # the very sleep being forecast, not pre-sleep day-N features. We filter
     # BEFORE truncating to 12 so a behavioral feature ranked just below a
     # dropped mediator still gets a slot.
     candidate_features = list(dict.fromkeys(seeds + top10_global))
-    excluded_mediators = [f for f in candidate_features if _is_exog_mediator(f)]
-    top_features = [f for f in candidate_features if not _is_exog_mediator(f)][:12]
+    _not_exog = lambda f: _is_exog_mediator(f) or not al.forecast_can_use(f)  # noqa: E731
+    excluded_mediators = [f for f in candidate_features if _not_exog(f)]
+    top_features = [f for f in candidate_features if not _not_exog(f)][:12]
     if excluded_mediators:
         log.info(f"  Excluded {len(excluded_mediators)} same-night mediator(s) "
                  f"from exog candidates: {excluded_mediators}")
@@ -5059,16 +5112,18 @@ def main() -> None:
 
     # ---------- Summary ----------
     print_summary(df, xgb_results, sarimax_results, prophet_results, eval_results, stat_results)
+    return run_warning
 
 
 if __name__ == "__main__":
     import time as _time
     _started_at = _time.time()
     try:
-        main()
+        _warning = main()
         log_sync_entry(
-            status="success",
+            status="partial" if _warning else "success",
             records=0,
+            error=_warning,
             duration=_time.time() - _started_at,
         )
     except SystemExit:
@@ -5080,7 +5135,9 @@ if __name__ == "__main__":
         log_sync_entry(
             status="failed",
             records=0,
-            error=f"{type(_e).__name__}: {_e}",
+            # Guard failures keep their "GUARD <name>:" prefix (CLAUDE.md convention) so
+            # the devops agent reports them instead of re-running.
+            error=str(_e) if isinstance(_e, al.AlignmentError) else f"{type(_e).__name__}: {_e}",
             duration=_time.time() - _started_at,
         )
         raise
