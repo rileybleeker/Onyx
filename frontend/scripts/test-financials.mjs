@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import ts from 'typescript';
+const source = fs.readFileSync('src/lib/financials.ts', 'utf8');
+const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+const module = { exports: {} };
+vm.runInNewContext(code, { exports: module.exports, module, TextEncoder, Date, Number, Error, Set });
+const { parseCsv, parseDate, parseCents, preview, defaultMapping, summarize } = module.exports;
+let count = 0;
+function test(name, fn) { fn(); count++; console.log(`PASS ${name}`); }
+test('RFC quoted commas, multiline, escaped quotes, BOM and CRLF', () => {
+ const rows = parseCsv('\uFEFFdate,name,amount\r\n2026-11-01,"Demo, \"\"Shop\"\"\nBranch",12.30\r\n');
+ assert.equal(rows[1][1], 'Demo, "Shop"\nBranch');
+});
+test('malformed CSV fails closed', () => { for (const csv of ['a,b\n1', 'a,b\n"x,2', 'a,b\n"x"oops,2', 'a,b\nhello"x,2', 'header']) assert.throws(() => parseCsv(csv)); });
+test('file and row limits', () => { assert.throws(() => parseCsv('a'.repeat(2000001))); assert.throws(() => parseCsv('a\n' + '1\n'.repeat(10001))); });
+test('column count bound', () => assert.throws(() => parseCsv(Array(101).fill('h').join(',')+'\n'+Array(101).fill('1').join(','))));
+test('strict calendar formats without timezone shift', () => { assert.equal(parseDate('2/29/2024', 'us'), '2024-02-29'); assert.equal(parseDate('2026-11-01', 'iso'), '2026-11-01'); for (const date of ['2026-02-29','2026-13-01','2026-04-31','01/02/2026']) assert.throws(() => parseDate(date,'iso')); });
+test('exact cents and grouping', () => { assert.equal(parseCents('1,234.56'),123456); assert.equal(parseCents('-0.01'),-1); assert.equal(parseCents('0.10'),10); for (const amount of ['', '1e3', '$12.00','1,23','NaN','1.234', '1.2.3','999999999999999999']) assert.throws(() => parseCents(amount)); });
+const rows = parseCsv('date,name,amount,category,type\n2026-11-01,Synthetic Salary,-1000,Salary,income\n2026-11-02,Synthetic Grocer,50,Food,debit\n2026-11-03,Synthetic Transfer,100,Transfer,transfer\n2026-11-04,Synthetic Card,200,Card Payment,debit');
+const map = defaultMapping(rows[0]);
+test('positive expense imports normalized amounts', () => { const result = preview(rows,map,true,'iso'); assert.equal(result.errors.length,0); assert.equal(result.transactions[0].cents,100000); assert.equal(result.transactions[1].cents,-5000); });
+test('opposite sign convention', () => assert.equal(preview(rows,map,false,'iso').transactions[0].cents,-100000));
+test('invalid rows reported and not silently counted', () => { const bad = parseCsv('date,name,amount\n2026-02-30,Demo,2\n2026-11-01,,4\n2026-11-01,Demo,broken'); const result=preview(bad,defaultMapping(bad[0]),true,'iso'); assert.equal(result.errors.length,3); assert.equal(result.transactions.length,0); });
+test('required mappings distinct and present', () => { assert.throws(() => preview(rows,{...map, amount:map.date},true,'iso')); assert.throws(() => preview(rows,{...map,date:-1},true,'iso')); });
+test('duplicate rows preserved but replacement never appends', () => { const duplicate = parseCsv('date,name,amount\n2026-11-01,Demo,1\n2026-11-01,Demo,1'); assert.equal(preview(duplicate,defaultMapping(duplicate[0]),true,'iso').transactions.length,2); });
+test('transfers and explicit payment category excluded', () => { const summary = summarize(preview(rows,map,true,'iso').transactions,['Card Payment']); assert.equal(summary.income,100000); assert.equal(summary.spending,5000); assert.equal(summary.net,95000); assert.equal(summary.excludedCount,2); });
+test('hostile category names do not mutate object prototype', () => { const summary=summarize([{date:'2026-11-01',description:'Synthetic',cents:-123,category:'__proto__',transfer:false}],[]); assert.equal(summary.categories['__proto__'],123); });
+test('no finance persistence or network paths', () => { const ui=fs.readFileSync('src/app/financials/FinancialsClient.tsx','utf8'); assert.doesNotMatch(source+ui,/\b(fetch|localStorage|sessionStorage|indexedDB|sendBeacon)\b/); assert.match(ui,/setData\(staged.transactions\)/); });
+console.log(`${count} offline finance tests passed; synthetic data only.`);
