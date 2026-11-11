@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { CHAT_SCOPE, MAX_TOOL_ROUNDS, validateChatMessages } from "@/lib/chat-contract";
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist } from "@/lib/spotify-server";
@@ -15,7 +16,9 @@ const supabase = createClient(
   { db: { schema: "pds" } }
 );
 
-const SYSTEM_PROMPT = `You are Onyx, a personal data scientist assistant. You help the user understand their health and fitness data from three devices: Garmin watch, WHOOP band, and Eight Sleep mattress. You also help them track daily habits.
+const SYSTEM_PROMPT = `${CHAT_SCOPE}
+
+For health and fitness questions, the connected devices are Garmin watch, WHOOP band, and Eight Sleep mattress. Preserve the following domain-specific conventions.
 
 You have access to the user's data via function calls. When the user asks about their health metrics, use the appropriate function to fetch real data before answering. You can call multiple tools to cross-reference data across devices. Be concise and insightful — highlight trends, anomalies, and actionable takeaways.
 
@@ -951,10 +954,14 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
 
 export async function POST(req: NextRequest) {
   try {
-    const { messages } = await req.json();
+    let body: unknown;
+    try { body = await req.json(); } catch {
+      return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
+    const messages = body && typeof body === "object" && "messages" in body ? body.messages : undefined;
 
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return Response.json({ error: "messages required" }, { status: 400 });
+    if (!validateChatMessages(messages)) {
+      return Response.json({ error: "Use a nonempty, alternating text conversation of at most 60 messages and 60,000 characters." }, { status: 400 });
     }
 
     // The model has no clock of its own: tell it the local time and the
@@ -969,22 +976,29 @@ export async function POST(req: NextRequest) {
     // Initial Claude call with tools
     let response = await anthropic.messages.create({
       model: "claude-sonnet-5-5",
-      max_tokens: 1024,
+      max_tokens: 2048,
       system: systemPrompt,
       tools,
       messages,
     });
 
     // Agentic tool-use loop
-    const allMessages = [...messages];
+    const allMessages: Anthropic.MessageParam[] = [...messages];
+    let toolRounds = 0;
 
     while (response.stop_reason === "tool_use") {
+      if (toolRounds++ >= MAX_TOOL_ROUNDS) {
+        return Response.json({ error: "This request reached the tool limit. Some actions may already have completed; check the relevant page before retrying any logging request." }, { status: 422 });
+      }
       const assistantContent = response.content;
       allMessages.push({ role: "assistant", content: assistantContent });
 
       const toolResults = [];
       for (const block of assistantContent) {
         if (block.type === "tool_use") {
+          if (req.signal.aborted) {
+            return Response.json({ error: "Request cancelled. Check the relevant page before retrying any action." }, { status: 499 });
+          }
           const result = await executeTool(block.name, block.input as Record<string, unknown>);
           toolResults.push({
             type: "tool_result" as const,
@@ -998,7 +1012,7 @@ export async function POST(req: NextRequest) {
 
       response = await anthropic.messages.create({
         model: "claude-sonnet-5-5",
-        max_tokens: 1024,
+        max_tokens: 2048,
         system: systemPrompt,
         tools,
         messages: allMessages,
@@ -1012,10 +1026,10 @@ export async function POST(req: NextRequest) {
       .join("\n");
 
     return Response.json({ response: text });
-  } catch (err) {
-    console.error("Chat API error:", err);
+  } catch {
+    console.error("Chat API request failed");
     return Response.json(
-      { error: err instanceof Error ? err.message : "Internal error" },
+      { error: "Unable to finish this request. If you asked to log or create something, check the relevant page before retrying." },
       { status: 500 }
     );
   }
