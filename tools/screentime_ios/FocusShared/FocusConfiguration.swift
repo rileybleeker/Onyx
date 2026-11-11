@@ -13,8 +13,12 @@ struct FocusConfiguration: Codable {
 
     var validationError: String? {
         if let error = rule.validationError { return error }
-        if !linkedInConfirmed || allowed.applicationTokens.isEmpty { return "Select LinkedIn in Allowed apps and confirm it stays available." }
-        if !allowed.categoryTokens.isEmpty { return "Choose individual allowed apps and websites, not whole allowed categories." }
+        if let error = FocusExceptions.validationError(
+            appCount: allowed.applicationTokens.count,
+            domainCount: allowed.webDomainTokens.count,
+            categoryCount: allowed.categoryTokens.count,
+            confirmed: linkedInConfirmed
+        ) { return error }
         if blocked.applicationTokens.isEmpty && blocked.categoryTokens.isEmpty && blocked.webDomainTokens.isEmpty { return "Choose social apps or websites to block." }
         if blocked.categoryTokens.count > 50 || allowed.applicationTokens.count > 50 || allowed.webDomainTokens.count > 50 { return "Selection exceeds Apple's 50-category or exception limit." }
         if blocked.applicationTokens.subtracting(allowed.applicationTokens).count > 50 || blocked.webDomainTokens.subtracting(allowed.webDomainTokens).count > 50 { return "Select at most 50 blocked apps and 50 blocked websites after exceptions." }

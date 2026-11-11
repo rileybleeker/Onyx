@@ -13,7 +13,9 @@ checks are needed for policy tests or unsigned compilation.
 - Daily tasks are currently configured and self-reported in the native Onyx app.
   Existing web/Notion tasks are NOT imported, verified, or synced yet.
 - Select social apps/categories/websites with Apple's picker. Separately select
-  LinkedIn and its website as allowed exceptions. Opaque tokens mean Onyx cannot
+  LinkedIn and its website as allowed exceptions. Enabling requires at least one
+  app AND one website exception plus explicit confirmation of both. App-only
+  exceptions are rejected. Opaque tokens mean Onyx cannot
   verify that the chosen token is really LinkedIn. Category exceptions alone do
   not override direct selections, so allowed tokens are subtracted from both.
 - A named store isolates Onyx Focus restrictions. Other Screen Time apps can

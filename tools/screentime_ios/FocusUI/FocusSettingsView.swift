@@ -66,8 +66,8 @@ struct FocusSettingsView: View {
             Section("Apps and websites") {
                 Button("Choose social apps to block") { showBlocked = true }
                 Text("\(config.blocked.applicationTokens.count) apps, \(config.blocked.categoryTokens.count) categories, \(config.blocked.webDomainTokens.count) websites selected")
-                Button("Allowed: choose LinkedIn") { showAllowed = true }
-                Toggle("I selected LinkedIn in Allowed apps", isOn: $config.linkedInConfirmed)
+                Button("Allowed: choose LinkedIn app and website") { showAllowed = true }
+                Toggle("I selected BOTH LinkedIn app and website", isOn: $config.linkedInConfirmed)
                 Text("Select the LinkedIn app and its website in Allowed. Apple hides app identities from Onyx, so you must verify the selection. Exceptions take precedence within Onyx; other blockers can still restrict LinkedIn.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
@@ -105,7 +105,7 @@ struct FocusSettingsView: View {
                 }
             }
         } message: {
-            Text("Onyx will block your selected apps and websites using the rule above, with your selected LinkedIn exception. You can turn Focus off here or revoke access in iOS Settings. This is a voluntary blocker, not tamper-proof.")
+            Text("Onyx will block your selected apps and websites using the rule above, with your selected LinkedIn app and website exceptions. You can turn Focus off here or revoke access in iOS Settings. This is a voluntary blocker, not tamper-proof.")
         }
         .task { reload() }
         .onChange(of: scenePhase) { _, phase in if phase == .active { FocusEnforcement.reconcile(); reload() } }
