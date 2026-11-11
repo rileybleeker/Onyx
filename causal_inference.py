@@ -429,6 +429,17 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     # Uber Eats deliveries (pds.delivery_daily, 2026-11-09). Timing + counts from
     # receipt emails; pre-Nov-2025 times are estimates (card charge − 70 min).
     ("delivery_last_meal_to_sleep_min", "nutrition", "Last delivered meal → sleep minutes above median", "min"),
+    # iPhone Screen Time (pds.phone_usage_daily, 2026-11-11). Apple's own numbers via the
+    # Onyx Screen Time app; history starts ~2026-10-11, so these sit in dropped_low_n
+    # until MIN_CONTINUOUS_N days accrue, then enter the FDR family on their own.
+    # screen_during_sleep_min is deliberately absent: use after sleep onset is as much a
+    # symptom of a broken night as a cause (hrv_alignment.SAME_SLEEP_EXACT).
+    ("screen_total_min",                  "behavior", "Phone screen time above median",          "min"),
+    ("screen_late_night_min",             "behavior", "Phone use after 10 PM above median",      "min"),
+    ("screen_after_midnight_min",         "behavior", "Phone use after midnight above median",   "min"),
+    ("screen_last_hour_before_sleep_min", "behavior", "Phone use in the last hour before sleep above median", "min"),
+    ("screen_social_min",                 "behavior", "Social-app minutes above median",         "min"),
+    ("screen_pickups",                    "behavior", "Phone pickups above median",              None),
     ("meal_eating_window_hours",      "nutrition", "Eating window above median",               "h"),
     ("meal_last_hour",                "nutrition", "Last meal clock hour above median",        "ET hr"),
     ("meal_first_hour",               "nutrition", "First meal clock hour above median",       "ET hr"),

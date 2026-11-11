@@ -464,6 +464,14 @@ FEATURE_LABELS: dict[str, str] = {
     "delivery_any_meal": "Had a Meal Delivered",
     "delivery_late_meal": "Late Delivered Meal (after 10 PM)",
     "delivery_last_meal_to_sleep_min": "Minutes from Last Delivered Meal to Sleep",
+    "screen_total_min": "Phone Screen Time (min)",
+    "screen_late_night_min": "Phone Use After 10 PM (min)",
+    "screen_after_midnight_min": "Phone Use After Midnight (min)",
+    "screen_pickups": "Phone Pickups",
+    "screen_notifications": "Phone Notifications",
+    "screen_social_min": "Social Apps (min)",
+    "screen_last_hour_before_sleep_min": "Phone Use in the Hour Before Sleep (min)",
+    "screen_during_sleep_min": "Phone Use After Sleep Onset (min)",
     "caffeine_first_hour": "First Caffeine (ET hour)",
     "caffeine_last_hour": "Last Caffeine (ET hour)",
     "caffeine_window_hours": "Caffeine Window (h)",
@@ -901,6 +909,21 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["delivery_covered_through"] = None
         data["delivery_unread_days"] = []
         log.warning(f"  delivery coverage load failed ({e!r}); delivery coverage ends at the last order day")
+
+    # iPhone Screen Time (pds.phone_usage_daily, 2026-11-11): Apple's own Screen Time
+    # numbers, sent daily by the Onyx Screen Time app (tools/screentime_ios). Service-role
+    # only view. Loaded fail-open: a new source must never sink the retrain.
+    log.info("  Loading phone_usage_daily (iPhone Screen Time)…")
+    try:
+        data["screen"] = fetch_all(
+            "phone_usage_daily",
+            select="behavioral_date,total_minutes,late_night_minutes,after_midnight_minutes,pickups,"
+                   "notifications,minutes_by_category,minutes_last_hour_before_sleep_est,"
+                   "minutes_during_sleep_est,synced_at",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  phone_usage_daily load failed ({e!r}); continuing without screen-time features")
+        data["screen"] = pd.DataFrame()
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
     # topic_count) joined into the matrix per the audit's Finding #8. The textual
@@ -1401,6 +1424,71 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Delivery feature merge failed ({e!r}); continuing without delivery features")
+        return df
+
+
+# Families whose newest day is not known when the evening forecast runs.
+NOT_FORECAST_PREFIXES = ("delivery_", "screen_")
+
+SCREEN_COLS = {
+    # feature column                     <- pds.phone_usage_daily column
+    "screen_total_min": "total_minutes",
+    "screen_late_night_min": "late_night_minutes",
+    "screen_after_midnight_min": "after_midnight_minutes",
+    "screen_pickups": "pickups",
+    "screen_notifications": "notifications",
+    "screen_last_hour_before_sleep_min": "minutes_last_hour_before_sleep_est",
+    "screen_during_sleep_min": "minutes_during_sleep_est",
+}
+
+
+def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) -> pd.DataFrame:
+    """iPhone Screen Time features from pds.phone_usage_daily (one row per behavioral day).
+
+      screen_total_min / _late_night_min (22:00-05:59) / _after_midnight_min (00:00-05:59)
+      screen_pickups, screen_notifications
+      screen_social_min                  Apple's "Social" category minutes
+      screen_last_hour_before_sleep_min  estimated use in the hour before WHOOP sleep onset
+      screen_during_sleep_min            estimated use after sleep onset (same-sleep: a
+                                         wake-up symptom as much as a cause, descriptive only)
+
+    ROW PLACEMENT: day D's use sits on row D, whose HRV is the sleep that closes day D
+    (hrv_alignment.py), so no re-keying.
+
+    COMPLETENESS: the app syncs around 10 AM for the days before, so the newest day is often
+    partial. A day counts only once a sync happened after it ended (synced_at >= D + 1 day
+    06:00 ET); partial days stay NaN. Days the app never reported (before the first sync's
+    ~30-day backfill, or a gap) are NaN too, never zero: phone use is never truly zero.
+
+    Kept out of the forecasting models (NOT_FORECAST_PREFIXES): the evening the forecast
+    runs, today's use is not synced yet. Descriptive and causal analyses only; they switch
+    themselves on as days accrue (Spearman >= 20 days, causal MIN_CONTINUOUS_N).
+
+    Fail-open: any problem logs a warning and returns df untouched.
+    """
+    if screen is None or screen.empty:
+        return df
+    try:
+        s = screen.copy()
+        s["day"] = pd.to_datetime(s["behavioral_date"], errors="coerce")
+        s = s.dropna(subset=["day"]).drop_duplicates("day")
+        synced = pd.to_datetime(s["synced_at"], errors="coerce", utc=True)
+        day_end = (s["day"] + pd.Timedelta(days=1, hours=6)).dt.tz_localize(ET_TZ)
+        s = s[(synced >= day_end).fillna(False)]
+        feats = {feat: pd.to_numeric(s[src], errors="coerce") for feat, src in SCREEN_COLS.items()}
+        feats["screen_social_min"] = s["minutes_by_category"].map(
+            lambda c: float(c.get("Social", 0.0)) if isinstance(c, dict) else np.nan)
+        f = pd.DataFrame(feats, index=s.index)
+        f["calendar_date"] = s["day"].dt.strftime("%Y-%m-%d")
+        cols = list(SCREEN_COLS) + ["screen_social_min"]
+        out = df.drop(columns=cols, errors="ignore").merge(
+            f[["calendar_date"] + cols], on="calendar_date", how="left")
+        assert len(out) == len(df), "screen-time merge changed the row count"
+        log.info(f"  Screen-time features: {int(out['screen_total_min'].notna().sum())} complete days "
+                 f"({len(screen) - len(s)} partial/undated day(s) left NaN)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Screen-time feature merge failed ({e!r}); continuing without screen-time features")
         return df
 
 
@@ -1970,6 +2058,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         )
     df = merge_delivery_features(df, data.get("delivery"), data.get("delivery_covered_through"),
                                  data.get("delivery_unread_days"))
+    df = merge_screen_time_features(df, data.get("screen"))
 
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships
@@ -3128,10 +3217,10 @@ def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, l
     # night's HRV and sleep reach the model through hrv_lag* and the *_lag1 columns.
     exclude = {"calendar_date", "whoop_recovery_score"}
     exclude |= {c for c in model_df.columns if not al.forecast_can_use(c)}
-    # delivery_*: today's receipts may not be parsed when the forecast runs and today is
-    # never inside the zero-fill coverage window, so the newest row reads NaN where training
-    # rows read 0 (see merge_delivery_features). Descriptive and causal analyses only.
-    exclude |= {c for c in model_df.columns if c.startswith("delivery_")}
+    # delivery_* / screen_*: today's receipts / Screen Time are not in yet when the forecast
+    # runs, so the newest row reads NaN where training rows have values (see
+    # merge_delivery_features / merge_screen_time_features). Descriptive and causal only.
+    exclude |= {c for c in model_df.columns if c.startswith(NOT_FORECAST_PREFIXES)}
     feat_cols = [c for c in model_df.columns
                  if c not in exclude and pd.api.types.is_numeric_dtype(model_df[c])]
 
@@ -5008,11 +5097,11 @@ def main() -> str | None:
         full_ranked = stat_results["correlations"]["feature"].tolist()
     else:
         full_ranked = []
-    # delivery_* and same-sleep columns are not forecast features (see prepare_ml_data);
+    # delivery_* / screen_* and same-sleep columns are not forecast features (see prepare_ml_data);
     # the Spearman fallback ranking still lists them, so keep them out of the SARIMAX /
     # Prophet candidates too.
     full_ranked = [f for f in full_ranked
-                   if not f.startswith("delivery_") and al.forecast_can_use(f)]
+                   if not f.startswith(NOT_FORECAST_PREFIXES) and al.forecast_can_use(f)]
 
     top10_global = (list(xgb_importance_top.keys())[:10]
                     if xgb_importance_top else full_ranked[:10])

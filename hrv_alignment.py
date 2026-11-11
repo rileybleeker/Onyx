@@ -38,7 +38,7 @@ derived; verified on live data 2026-11-10)
 
 Left as they are (all describe something BEFORE row D's sleep):
 * behaviour families journal_ / habit_ / supplement_ / nutrition_ / caffeine_ / meal_ /
-  act_ / delivery_ / nj_ and the workout gap: day D. (Timed events of day D fall between
+  act_ / delivery_ / screen_ / nj_ and the workout gap: day D. (Timed events of day D fall between
   the previous sleep and row D's sleep in 99-100% of cases; supplements 89% -- the rest
   are retro-logs.)
 * Garmin daily summary / stress / HR zones / training status: the clock day. Their activity
@@ -189,6 +189,8 @@ SAME_SLEEP_EXACT = frozenset({
     "hrv_z_28d", "delta_hrv", "delta_rhr", "sleep_debt_ratio", "bed_room_temp_delta",
     "room_temp_x_sleep_eff", "alcohol_x_sleep_duration",
     "whoop_rhr_z28d", "whoop_sleep_duration_milli_z28d", "whoop_recovery_score_z28d",
+    # phone use after WHOOP sleep onset (pds.phone_usage_daily): happens during the sleep
+    "screen_during_sleep_min",
 })
 
 # Anchored to the outcome sleep's onset (or to the WHOOP cycle that starts with it):
@@ -196,6 +198,7 @@ SAME_SLEEP_EXACT = frozenset({
 NEEDS_SLEEP_ONSET = frozenset({
     "meal_last_meal_to_bedtime_min", "caffeine_to_bedtime_min", "caffeine_mg_at_bedtime",
     "delivery_last_meal_to_sleep_min", "last_workout_end_to_sleep_min",
+    "screen_last_hour_before_sleep_min",
     "last_workout_whoop_strain", "last_workout_garmin_load", "had_evening_workout",
     "whoop_strain_per_hour_to_bed",
     # travel flags derived from the WHOOP cycle that begins with row D's sleep
