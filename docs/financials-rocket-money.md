@@ -28,3 +28,5 @@ Procurement should separately track purchase ideas, comparisons, user-approved o
 
 From `frontend`: `node scripts/test-financials.mjs`, `npx tsc --noEmit`, and `npx next build --experimental-build-mode compile`. No production credentials or real financial exports are needed. Full production-data smoke tests are not a substitute for these offline tests and are not run by this change.
 
+
+For isolated interactive checks, run `node frontend/scripts/test-financials-ui.mjs` from the repository root (Chromium must already be installed for Playwright). It copies only the finance component and styles to a temporary app, omits production environment variables, blocks external browser requests, exercises mobile/desktop flows and >100-row navigation, and retains synthetic screenshots in its printed temporary directory. It does not exercise production authentication or database access.

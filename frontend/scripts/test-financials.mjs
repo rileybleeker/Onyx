@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import ts from 'typescript';
-const source = fs.readFileSync('src/lib/financials.ts', 'utf8');
+const source = fs.readFileSync(new URL('../src/lib/financials.ts', import.meta.url), 'utf8');
 const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 const module = { exports: {} };
 vm.runInNewContext(code, { exports: module.exports, module, TextEncoder, Date, Number, Error, Set });
@@ -27,5 +27,5 @@ test('required mappings distinct and present', () => { assert.throws(() => previ
 test('duplicate rows preserved but replacement never appends', () => { const duplicate = parseCsv('date,name,amount\n2026-11-01,Demo,1\n2026-11-01,Demo,1'); assert.equal(preview(duplicate,defaultMapping(duplicate[0]),true,'iso').transactions.length,2); });
 test('transfers and explicit payment category excluded', () => { const summary = summarize(preview(rows,map,true,'iso').transactions,['Card Payment']); assert.equal(summary.income,100000); assert.equal(summary.spending,5000); assert.equal(summary.net,95000); assert.equal(summary.excludedCount,2); });
 test('hostile category names do not mutate object prototype', () => { const summary=summarize([{date:'2026-11-01',description:'Synthetic',cents:-123,category:'__proto__',transfer:false}],[]); assert.equal(summary.categories['__proto__'],123); });
-test('no finance persistence or network paths', () => { const ui=fs.readFileSync('src/app/financials/FinancialsClient.tsx','utf8'); assert.doesNotMatch(source+ui,/\b(fetch|localStorage|sessionStorage|indexedDB|sendBeacon)\b/); assert.match(ui,/setData\(staged.transactions\)/); });
+test('no finance persistence or network paths', () => { const ui=fs.readFileSync(new URL('../src/app/financials/FinancialsClient.tsx', import.meta.url),'utf8'); assert.doesNotMatch(source+ui,/\b(fetch|localStorage|sessionStorage|indexedDB|sendBeacon)\b/); assert.match(ui,/setData\(staged.transactions\)/); });
 console.log(`${count} offline finance tests passed; synthetic data only.`);
