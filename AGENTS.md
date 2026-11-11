@@ -89,7 +89,7 @@ Onyx/
 ├── .env                     # Secrets (NEVER commit)
 └── frontend/                # Next.js 15 app
     └── src/
-        ├── app/             # Pages (13 routes; `/` redirects to /status, `/meals` redirects to /nutrition) + API routes
+        ├── app/             # Pages (13 routes; `/` redirects to /today, `/meals` redirects to /nutrition) + API routes
         │   ├── analytics/hrv/  # HRV Analysis dashboard (predictions, SHAP, models)
         │   ├── reading/        # Reading quest: progress ring + pace, streak, XP/levels, badges, checkpoints, burn-up chart, SM-2 review, session + highlight capture (Kindle export import); mirrors to Notion
         │   └── spotify/        # Spotify listening dashboard (volume, mood signature, sonic profile radar, top artists/tracks)
@@ -466,3 +466,7 @@ Production tripwire for the class of bug `tsc` + `lint` cannot catch: a panel th
 **This is the source of truth for "what's open" and "what's next" on Onyx** — read it filtered to `Source = "Onyx Roadmap"` and `Status ≠ Done`. Do not track open items in this file — AGENTS.md is for *shipped* capability + conventions; the roadmap is for *pending* work. When shipping a feature, mark the matching task `Done` (or create-then-Done one in the same call) and refresh its Notes with the commit / module / route. When noticing a bug or polish opportunity you won't fix in the current session, create a `Not Started` page (tagged `Source = "Onyx Roadmap"`) with enough context that a future session can pick it up cold.
 
 Mechanics: use the Notion MCP — `notion-update-page` (`command: "update_properties"`, `properties: {"Status": "Done", "Notes": "..."}`) for existing pages; `notion-create-pages` (`parent: {"type":"data_source_id", "data_source_id":"6149d32a-66be-4e54-ab1b-28c4a11c6543"}`) for new ones. Always set `Source: "Onyx Roadmap"` plus Component / Phase / Priority / Status (and Notes) — leaving any blank makes the entry hard to triage.
+
+## Today home (2026-11-11)
+
+`/` and the mobile Today tab open `/today`. This read-only landing page shows up to three open agent request links in inbox order (not an urgency ranking), recorded reading progress, and the existing check-in link. Informational messages stay in the Agents inbox; Status stays available. Loading, failure, empty and unknown progress states remain distinct. Fetch on mount, manual refresh and return to the app; stale requests cannot replace newer results. Opening Today never sends a reply, marks anything read or logs a behavior. Reuse the existing authenticated inbox and reading endpoints, and keep personal record data out of review prompts and fixture tests.

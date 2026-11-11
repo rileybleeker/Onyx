@@ -1,5 +1,6 @@
 import type { LucideIcon } from "lucide-react";
 import {
+  House,
   Moon,
   Activity,
   Utensils,
@@ -43,6 +44,7 @@ export interface NavSection {
 }
 
 export const NAV_SECTIONS: NavSection[] = [
+  { title: "Home", items: [{ href: "/today", label: "Today", shortcut: "H", icon: House, keywords: ["home", "requests", "next", "reading", "check-in"] }] },
   {
     title: "Logging",
     items: [
