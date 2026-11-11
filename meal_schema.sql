@@ -13,7 +13,7 @@
 --
 -- Same behavioral-day convention as pds.supplement_intake — a meal
 -- eaten at 12:05 AM ET *before bed* belongs to the previous behavioral
--- day, not the new clock date. See CLAUDE.md "Supplement intake" bullet
+-- day, not the new clock date. See AGENTS.md "Supplement intake" bullet
 -- for the full reasoning; the same logic applies here because the
 -- downstream HRV pipeline uses the same shift(-1) on the matrix.
 -- ============================================

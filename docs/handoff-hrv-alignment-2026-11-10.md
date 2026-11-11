@@ -1,6 +1,6 @@
 # Handoff: fix the one-night misalignment in the HRV analysis
 
-Written 2026-11-10 for a Claude Code session with no memory of the session that found this. Read the "KNOWN ISSUE (confirmed 2026-11-10 ...)" bullet under Conventions in `CLAUDE.md` first; this brief adds what that bullet does not say. The roadmap row is Notion task `414bf5b4-4bf2-81ee-a60a-f7775ae71ec7` (Critical); its Notes hold the raw evidence.
+Written 2026-11-10 for a Claude Code session with no memory of the session that found this. Read the "KNOWN ISSUE (confirmed 2026-11-10 ...)" bullet under Conventions in `AGENTS.md` first; this brief adds what that bullet does not say. The roadmap row is Notion task `414bf5b4-4bf2-81ee-a60a-f7775ae71ec7` (Critical); its Notes hold the raw evidence.
 
 ## The problem
 
@@ -47,7 +47,7 @@ This is not the April bug again, and the fix is not the April fix again. For mos
 4. **Tests.** Replace the synthetic alignment test with one that encodes the real matrix dating, and update `tests/test_delivery_features.py`. The `.venv` has no pytest; run test files directly.
 5. **Snapshot before retraining.** Save the current `pds.hrv_analysis_results` rows (correlation, journal/habit/supplement/nutrition impact, causal) to a file. The retrain overwrites them, so this is the only "before" copy. Baseline retrain: Actions run 42763606230.
 6. **Retrain in GitHub Actions** (`hrv-retrain-on-backfill.yml`; the local machine has no `.env`) and compare before and after: which findings strengthened, vanished or changed sign, and which survive FDR.
-7. **Wording and records.** Update `/analytics/hrv` (`HrvAnalysisClient.tsx` has about 38 "next-night" / "tomorrow" phrases), remove the KNOWN ISSUE bullet from `CLAUDE.md` and correct the other passages there that describe the old alignment, set the Notion task to Done with notes, then commit and push.
+7. **Wording and records.** Update `/analytics/hrv` (`HrvAnalysisClient.tsx` has about 38 "next-night" / "tomorrow" phrases), remove the KNOWN ISSUE bullet from `AGENTS.md` and correct the other passages there that describe the old alignment, set the Notion task to Done with notes, then commit and push.
 8. **Make the alignment a runtime guard, not only a test.** At the start of every retrain, check the assumption the pairing depends on: each matrix row's HRV is the recovery of the WHOOP main cycle whose sleep began at the end of that row's day. If it fails, stop the run and write a `failed` `hrv_analysis|retrain` heartbeat whose `error_message` starts with `GUARD alignment:`. Add a known-answer canary if one has enough data: a behaviour with a known direction should move same-night HRV more than the following night's; on a reversal write a `partial` heartbeat starting `GUARD canary-<name>:`. Alcohol has only 6 drinking days, so check the canary has power before relying on it; if nothing qualifies, ship the structural guard alone and say so. The `GUARD` prefix is a contract: the devops agent matches it (`personal-agents/agents/devops.md`, check 2) and tells Riley instead of re-running.
 
 ## Constraints
@@ -55,7 +55,7 @@ This is not the April bug again, and the fix is not the April fix again. For mos
 - The matrix dating is correct. Fix the analysis, not the view or the source tables. If a view change turns out to be unavoidable, stop and say so: the matview must be recreated with it, and the Supabase MCP rejects migrations that contain `DROP`.
 - Feature names stored in `pds.hrv_analysis_results` and read by the frontend must not change.
 - If the forecast target changes, give new forecasts a new `model_version` suffix and keep old-target rows out of the accuracy metrics and the Prediction-vs-Actual chart, or mark on the page where the definition changed.
-- Settle every disputed point against live data, never against `CLAUDE.md`, a CONTEXT file or an existing test (Conventions, "Audit and review findings ...").
+- Settle every disputed point against live data, never against `AGENTS.md`, a CONTEXT file or an existing test (Conventions, "Audit and review findings ...").
 - Riley is a consultant, not a developer. Report in plain language.
 
 ## Done when

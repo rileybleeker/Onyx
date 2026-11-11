@@ -5224,7 +5224,7 @@ if __name__ == "__main__":
         log_sync_entry(
             status="failed",
             records=0,
-            # Guard failures keep their "GUARD <name>:" prefix (CLAUDE.md convention) so
+            # Guard failures keep their "GUARD <name>:" prefix (AGENTS.md convention) so
             # the devops agent reports them instead of re-running.
             error=str(_e) if isinstance(_e, al.AlignmentError) else f"{type(_e).__name__}: {_e}",
             duration=_time.time() - _started_at,

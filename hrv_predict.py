@@ -46,7 +46,7 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 supa = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ET is the canonical timezone for Onyx (see CLAUDE.md). Using UTC date.today()
+# ET is the canonical timezone for Onyx (see AGENTS.md). Using UTC date.today()
 # on the GitHub runner would mis-tag any prediction fired between 00:00 UTC and
 # ET midnight (~04:00-05:00 UTC) — the run would predict the day-after-next
 # instead of tomorrow, silently skipping the ET day the user actually cares about.

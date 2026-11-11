@@ -9,7 +9,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
  * Writes ordinary pds.supplement_intake rows (one per time), so every rollup
  * and the HRV/causal pipeline pick them up unchanged.
  *
- * Conventions honored (see CLAUDE.md, supplement intake):
+ * Conventions honored (see AGENTS.md, supplement intake):
  *   - intake_date = behavioral day (defaults to pds.behavioral_today_now()).
  *   - A clock time before 06:00 belongs to the NEXT calendar day's small hours
  *     (awake tail), so its instant still resolves back to intake_date under the

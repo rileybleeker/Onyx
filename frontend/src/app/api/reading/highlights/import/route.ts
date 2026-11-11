@@ -75,7 +75,7 @@ const iso = (v: unknown): string | null => {
  * Auth: a browser session, or the `x-onyx-ci-token` header (middleware carve-out shared with
  * /api/habits) — the harvester has no session. When `harvest` is set the route also writes a
  * heartbeat to pds.sync_log (`kindle|highlights`) on success AND failure so /status can show the
- * Kindle card (every pipeline that writes to Supabase heartbeats, per CLAUDE.md).
+ * Kindle card (every pipeline that writes to Supabase heartbeats, per AGENTS.md).
  */
 export async function POST(req: NextRequest) {
   const startedAt = new Date();

@@ -96,7 +96,7 @@ DECLARE
     d RECORD;
 BEGIN
     -- onyx_behavioral_date = the Onyx-owned intake_date (already behavioral
-    -- per CLAUDE.md "Supplement intake — behavioral-day convention").
+    -- per AGENTS.md "Supplement intake — behavioral-day convention").
     NEW.onyx_behavioral_date := NEW.intake_date;
 
     -- If intake_time is captured, derive et/local from it. Otherwise default
