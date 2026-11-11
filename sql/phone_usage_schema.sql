@@ -75,24 +75,30 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS phone_usage_segments_set_onyx_dates ON pds.phone_usage_segments;
-CREATE TRIGGER phone_usage_segments_set_onyx_dates
+CREATE OR REPLACE TRIGGER phone_usage_segments_set_onyx_dates
     BEFORE INSERT OR UPDATE OF segment_start ON pds.phone_usage_segments
     FOR EACH ROW EXECUTE FUNCTION pds.set_onyx_dates_phone_usage_segments();
 
--- SERVICE ROLE ONLY. Unlike most pds tables these are NOT anon-readable: they
--- hold every app and web domain used, hour by hour, and the anon key ships in
--- the site's public JavaScript. Read them through a server route.
--- (The DROPs + REVOKE also undo the anon grants of the first version of this
--- file, and pds default privileges re-grant SELECT on every new relation.)
+-- SERVICE ROLE ONLY (not even the signed-in owner): they hold every app and
+-- web domain used, hour by hour. Read them through a server route.
+-- (The first version of this file gave anon a read policy; the block below
+-- hands it to service_role instead, and the REVOKE undoes the grants that pds
+-- default privileges used to add to every new relation. No statement here
+-- removes objects: the Supabase MCP connector refuses migrations that do.)
 ALTER TABLE pds.phone_usage_segments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.phone_usage_items    ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_read"           ON pds.phone_usage_segments;
-DROP POLICY IF EXISTS "service_full_access" ON pds.phone_usage_segments;
-DROP POLICY IF EXISTS "anon_read"           ON pds.phone_usage_items;
-DROP POLICY IF EXISTS "service_full_access" ON pds.phone_usage_items;
-CREATE POLICY "service_full_access" ON pds.phone_usage_segments FOR ALL    TO service_role USING (true) WITH CHECK (true);
-CREATE POLICY "service_full_access" ON pds.phone_usage_items    FOR ALL    TO service_role USING (true) WITH CHECK (true);
+DO $$
+DECLARE t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['phone_usage_segments', 'phone_usage_items'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'pds' AND tablename = t AND policyname = 'anon_read') THEN
+            EXECUTE format('ALTER POLICY anon_read ON pds.%I TO service_role', t);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'pds' AND tablename = t AND policyname = 'service_full_access') THEN
+            EXECUTE format('CREATE POLICY service_full_access ON pds.%I FOR ALL TO service_role USING (true) WITH CHECK (true)', t);
+        END IF;
+    END LOOP;
+END $$;
 REVOKE ALL ON pds.phone_usage_segments, pds.phone_usage_items FROM anon, authenticated;
 GRANT ALL  ON pds.phone_usage_segments, pds.phone_usage_items TO service_role;
 

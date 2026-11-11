@@ -3,7 +3,12 @@
 -- ============================================
 -- Run this in the Supabase SQL Editor.
 --
--- Two-role model:
+-- SUPERSEDED for reads by sql/pds_owner_only_read.sql (2026-11-10): anon has no
+-- access to pds at all, and the signed-in owner reads through owner_read
+-- policies. Re-running this file re-creates inert anon policies/grants (anon
+-- has no schema USAGE); re-run pds_owner_only_read.sql afterwards.
+--
+-- Historical two-role model:
 --   anon (read-only)       - frontend public reads via NEXT_PUBLIC_SUPABASE_ANON_KEY
 --   service_role (writes)  - ETL + server-side API routes via SUPABASE_SERVICE_ROLE_KEY
 --   authenticated          - Supabase Auth logged-in users; same read scope as anon by
@@ -128,12 +133,13 @@ CREATE POLICY "service_write_metrics"     ON pds.hrv_model_metrics    FOR ALL TO
 CREATE POLICY "service_write_analysis"    ON pds.hrv_analysis_results FOR ALL TO service_role USING (true) WITH CHECK (true);
 
 -- ---- 4) Schema-level grants ----
-GRANT USAGE ON SCHEMA pds TO anon, authenticated, service_role;
-GRANT SELECT ON ALL TABLES IN SCHEMA pds TO anon, authenticated;
+-- anon deliberately gets NO usage on pds (2026-11-10).
+GRANT USAGE ON SCHEMA pds TO authenticated, service_role;
+GRANT SELECT ON ALL TABLES IN SCHEMA pds TO authenticated;
 GRANT ALL    ON ALL TABLES IN SCHEMA pds TO service_role;
 
 -- Auto-grant SELECT on any future tables created in pds schema
-ALTER DEFAULT PRIVILEGES IN SCHEMA pds GRANT SELECT ON TABLES TO anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA pds GRANT SELECT ON TABLES TO authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA pds GRANT ALL    ON TABLES TO service_role;
 
 -- ---- 5) Defense-in-depth — revoke from PUBLIC ----

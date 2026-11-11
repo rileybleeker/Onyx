@@ -10,6 +10,10 @@ function safeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+// The single Onyx account (auth.users). Not a secret; the sms-reminders Worker
+// pins the same id (OWNER_SUPABASE_USER_ID).
+const OWNER_USER_ID = process.env.ONYX_OWNER_USER_ID || "dc041abc-115a-4252-8536-803f2ac75557";
+
 // Routes that accept the x-onyx-ci-token shared secret instead of a session:
 // the hourly habits-sync Action (/api/habits/*) and the local Kindle Notebook
 // harvester (tools/kindle_harvest → /api/reading/highlights/import, 2026-11-07),
@@ -78,10 +82,13 @@ export async function middleware(request: NextRequest) {
   // until exp (≤1h) — acceptable for a single-operator app.
   // try/catch: getClaims rethrows non-AuthError exceptions (malformed JWK,
   // bad alg) — treat any throw as logged-out rather than 500ing.
+  // Only the owner account counts as logged in: the API routes behind this
+  // check use the service-role key, so any other Supabase account (e.g. one
+  // created while sign-ups were open) must not get past it.
   let user: unknown = null;
   try {
     const { data } = await supabase.auth.getClaims();
-    user = data?.claims ?? null;
+    user = data?.claims?.sub === OWNER_USER_ID ? data.claims : null;
   } catch {
     user = null;
   }
