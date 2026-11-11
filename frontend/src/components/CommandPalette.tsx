@@ -28,6 +28,7 @@ export default function CommandPalette() {
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
 
   const results = useMemo(() => NAV_ITEMS.filter((i) => matches(i, query)), [query]);
 
@@ -79,6 +80,14 @@ export default function CommandPalette() {
     setActive((a) => Math.min(a, Math.max(0, results.length - 1)));
   }, [results.length]);
 
+  // Arrow-key selection must remain visible inside the scrollable result list.
+  useEffect(() => {
+    if (open) {
+      listRef.current?.querySelector<HTMLElement>('[aria-selected="true"]')
+        ?.scrollIntoView({ block: "nearest" });
+    }
+  }, [active, open, results]);
+
   if (!open) return null;
 
   function onListKey(e: React.KeyboardEvent) {
@@ -123,7 +132,7 @@ export default function CommandPalette() {
           <kbd className="text-[10px] font-mono text-text-tertiary border border-border-subtle rounded px-1.5 py-0.5">ESC</kbd>
         </div>
 
-        <ul className="max-h-[52vh] overflow-y-auto py-1.5" role="listbox" aria-label="Pages">
+        <ul ref={listRef} className="max-h-[52vh] overflow-y-auto py-1.5" role="listbox" aria-label="Pages">
           {results.length === 0 && (
             <li className="px-3.5 py-6 text-center text-[13px] text-text-tertiary">No matches</li>
           )}
