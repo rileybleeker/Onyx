@@ -22,6 +22,6 @@ matplotlib==3.10.8
 seaborn==0.13.2
 
 # Supabase / IO
-supabase==2.19.0
+supabase==2.34.1  # exact-pins its sub-packages (2.19.0 was yanked: unpinned supabase-auth broke imports 2026-11-11)
 httpx==0.28.1
 python-dotenv  # any
