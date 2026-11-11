@@ -166,9 +166,12 @@ test.describe("Nutrition — Cronometer migration tripwire", () => {
     // New Cronometer panels must render (catches a silently-broken nutrition_* /
     // micronutrient query). Section headings are structural — present even on a
     // thin day — so this won't false-fail when micronutrient coverage is sparse.
+    // Heading renamed "Cronometer · Daily Macros" → "Daily Macros" in #11
+    // (Uber Eats estimates now fill unlogged days). exact: the page subtitle
+    // also contains "Daily macros, …" and would trip strict mode otherwise.
     await expect(
-      page.getByText("Cronometer · Daily Macros"),
-      "Cronometer macros section missing"
+      page.getByText("Daily Macros", { exact: true }),
+      "Daily Macros section missing"
     ).toBeVisible();
     await expect(
       page.getByText("Vitamins & Minerals"),
