@@ -31,7 +31,18 @@ function isCiRoute(pathname: string): boolean {
   );
 }
 
+// Routes reachable with NO session and NO token. Only the iPhone over-the-air
+// install manifest (/api/screen-time/manifest/<32 hex>, 2026-11-11): iOS fetches
+// it without cookies or headers, and it reveals only a signed link to a
+// development-signed .ipa that installs on no device but Riley's. The pattern is
+// exact — do not widen it.
+const PUBLIC_MANIFEST = /^\/api\/screen-time\/manifest\/[0-9a-f]{32}$/;
+
 export async function middleware(request: NextRequest) {
+  if (PUBLIC_MANIFEST.test(request.nextUrl.pathname)) {
+    return NextResponse.next({ request });
+  }
+
   // CI shared-secret carve-out for /api/habits/*. The hourly habits-sync
   // GitHub Action authenticates server-to-server with the x-onyx-ci-token
   // header (it has no Supabase session). This is the ONLY non-session path past

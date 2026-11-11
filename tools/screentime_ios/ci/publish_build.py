@@ -163,6 +163,7 @@ def main():
     public_bucket = env.get("PUBLIC_BUCKET", "ios-builds-public")
     expires_in = int(env.get("EXPIRES_IN", str(30 * 86400)))
     ipa_path = env["IPA_PATH"]
+    onyx_base = env.get("ONYX_BASE_URL", "https://frontend-six-alpha-69.vercel.app").rstrip("/")
 
     info = ipa_info(ipa_path)
     if info.get("CFBundleIdentifier") != env["EXPECT_BUNDLE_ID"]:
@@ -183,15 +184,20 @@ def main():
         ipa_url = storage.sign(private_bucket, f"{prefix}/OnyxScreenTime.ipa", expires_in)
         manifest = build_manifest(info, ipa_url)
 
-        storage.upload(private_bucket, f"{prefix}/manifest.plist", manifest, "text/xml")
-        manifest_a = storage.sign(private_bucket, f"{prefix}/manifest.plist", expires_in)
-
+        # Supabase Storage serves XML as text/plain (anti-XSS), which the iPhone
+        # installer rejects, so link A goes through the Onyx route
+        # /api/screen-time/manifest/<slug>, which reads this private copy and
+        # answers text/xml.
         slug = secrets.token_hex(16)
+        storage.upload(private_bucket, f"screentime/manifests/{slug}.plist", manifest, "text/xml")
+        manifest_a = f"{onyx_base}/api/screen-time/manifest/{slug}"
+
         storage.upload(public_bucket, f"screentime/{slug}/manifest.plist", manifest, "text/xml")
         manifest_b = storage.public_url(public_bucket, f"screentime/{slug}/manifest.plist")
 
-        fetch_like_the_phone("manifest A (signed URL)", manifest_a, "text/xml")
-        fetch_like_the_phone("manifest B (public path)", manifest_b, "text/xml")
+        fetch_like_the_phone("manifest A (Onyx route)", manifest_a, "text/xml")
+        # Storage answers text/plain here; kept as a fallback link in case iOS accepts it.
+        fetch_like_the_phone("manifest B (public path)", manifest_b, "text/xml", fatal=False)
         fetch_like_the_phone("ipa HEAD", ipa_url, "application/octet-stream", method="HEAD", fatal=False)
         fetch_like_the_phone("ipa GET", ipa_url, "application/octet-stream")
 
