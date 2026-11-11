@@ -64,6 +64,56 @@ function InstallLink({ label, hint, href }: { label: string; hint: string; href:
   );
 }
 
+// Copies the Onyx CI token for the app's one-time setup. iOS Safari drops the
+// tap's clipboard permission across an await, so the fetch goes INSIDE a
+// ClipboardItem promise; if that still fails, the token is shown for a
+// long-press copy.
+function CopyTokenButton() {
+  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+  const [shown, setShown] = useState<string | null>(null);
+  const load = () =>
+    fetch("/api/screen-time/token", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((j) => {
+        if (!j.token) throw new Error(j.error ?? "no token");
+        return j.token as string;
+      });
+  return (
+    <div className="space-y-1.5">
+      <button
+        type="button"
+        onClick={async () => {
+          try {
+            await navigator.clipboard.write([
+              new ClipboardItem({ "text/plain": load().then((t) => new Blob([t], { type: "text/plain" })) }),
+            ]);
+            setState("copied");
+          } catch {
+            try {
+              setShown(await load());
+            } catch {
+              /* shown stays null */
+            }
+            setState("failed");
+          }
+        }}
+        className="block w-full text-center border border-border-subtle hover:bg-surface text-text-primary font-medium py-2.5 rounded-[4px] text-sm transition-colors"
+      >
+        {state === "copied" ? "Token copied — paste it in the app" : "Copy Onyx token"}
+      </button>
+      {state === "failed" && shown && (
+        <input
+          readOnly
+          value={shown}
+          onFocus={(e) => e.currentTarget.select()}
+          className="w-full bg-surface border border-border-subtle rounded-[4px] px-2 py-1.5 text-xs text-text-secondary font-mono"
+        />
+      )}
+      {state === "failed" && <p className="text-text-tertiary text-xs">Copy didn&apos;t work — tap the box above, then Copy.</p>}
+    </div>
+  );
+}
+
 export default function InstallPage() {
   const [build, setBuild] = useState<Build | null>(null);
   const [state, setState] = useState<"loading" | "ready" | "none" | "error">("loading");
@@ -158,6 +208,7 @@ export default function InstallPage() {
                   appear), then paste the Onyx token and Sync.
                 </li>
               </ol>
+              <CopyTokenButton />
             </div>
 
             {!expired && (
