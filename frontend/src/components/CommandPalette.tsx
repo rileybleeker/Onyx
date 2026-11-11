@@ -29,10 +29,12 @@ export default function CommandPalette() {
   const [active, setActive] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
+  const pointerSelect = useRef(false);
 
   const results = useMemo(() => NAV_ITEMS.filter((i) => matches(i, query)), [query]);
 
   const close = useCallback(() => {
+    pointerSelect.current = false;
     setOpen(false);
     setQuery("");
     setActive(0);
@@ -69,6 +71,7 @@ export default function CommandPalette() {
   // Focus input + reset selection on open.
   useEffect(() => {
     if (open) {
+      pointerSelect.current = false;
       setActive(0);
       const t = setTimeout(() => inputRef.current?.focus(), 10);
       return () => clearTimeout(t);
@@ -77,15 +80,18 @@ export default function CommandPalette() {
 
   // Keep the active index within the (changing) result set.
   useEffect(() => {
-    setActive((a) => Math.min(a, Math.max(0, results.length - 1)));
+    setActive((a) => Math.max(0, Math.min(a, results.length - 1)));
   }, [results.length]);
 
-  // Arrow-key selection must remain visible inside the scrollable result list.
+  // Reveal keyboard/filter selection without moving rows under the pointer.
   useEffect(() => {
-    if (open) {
-      listRef.current?.querySelector<HTMLElement>('[aria-selected="true"]')
-        ?.scrollIntoView({ block: "nearest" });
+    if (!open) return;
+    if (pointerSelect.current) {
+      pointerSelect.current = false;
+      return;
     }
+    listRef.current?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.scrollIntoView({ block: "nearest" });
   }, [active, open, results]);
 
   if (!open) return null;
@@ -93,9 +99,11 @@ export default function CommandPalette() {
   function onListKey(e: React.KeyboardEvent) {
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActive((a) => Math.min(a + 1, results.length - 1));
+      pointerSelect.current = false;
+      setActive((a) => Math.max(0, Math.min(a + 1, results.length - 1)));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
+      pointerSelect.current = false;
       setActive((a) => Math.max(a - 1, 0));
     } else if (e.key === "Enter") {
       e.preventDefault();
@@ -123,7 +131,10 @@ export default function CommandPalette() {
           <input
             ref={inputRef}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              pointerSelect.current = false;
+              setQuery(e.target.value);
+            }}
             onKeyDown={onListKey}
             placeholder="Jump to…"
             className="flex-1 bg-transparent py-3 text-[14px] text-text-primary placeholder:text-text-tertiary outline-none"
@@ -143,7 +154,12 @@ export default function CommandPalette() {
               <li key={item.href} role="option" aria-selected={isActive}>
                 <button
                   type="button"
-                  onMouseEnter={() => setActive(i)}
+                  onMouseEnter={() => {
+                    if (i !== active) {
+                      pointerSelect.current = true;
+                      setActive(i);
+                    }
+                  }}
                   onClick={() => go(item)}
                   className={`w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px] transition-colors ${
                     isActive ? "bg-white/[0.06] text-text-primary" : "text-text-secondary"
