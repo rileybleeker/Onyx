@@ -118,8 +118,11 @@ def main():
     fresh, errors = inspect(args.pr, review)
     if errors or fresh['headRefOid'] != pr['headRefOid']:
         raise SystemExit('PR changed during validation: ' + '; '.join(errors))
-    run('gh', 'pr', 'merge', str(args.pr), '-R', REPO, '--squash',
-        '--match-head-commit', pr['headRefOid'])
+    try:
+        run('gh', 'pr', 'merge', str(args.pr), '-R', REPO, '--squash',
+            '--match-head-commit', pr['headRefOid'])
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit('merge outcome unconfirmed; inspect before retrying') from exc
     receipt = json.loads(run('gh', 'pr', 'view', str(args.pr), '-R', REPO,
         '--json', 'state,mergeCommit,url'))
     if receipt.get('state') != 'MERGED' or not receipt.get('mergeCommit'):
