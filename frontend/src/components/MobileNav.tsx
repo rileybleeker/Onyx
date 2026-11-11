@@ -94,7 +94,7 @@ export default function MobileNav() {
   }
 
   const tabs = [
-    { key: "today", label: "Today", icon: House, href: "/sleep", isActive: pathname === "/sleep" },
+    { key: "today", label: "Today", icon: House, href: "/today", isActive: pathname === "/today" },
     { key: "trends", label: "Trends", icon: BarChart3, href: "/analytics/hrv", isActive: pathname.startsWith("/analytics") },
     { key: "log", label: "Log", icon: Plus, action: () => setLogOpen(true), isActive: logOpen },
     { key: "chat", label: "Chat", icon: MessageSquare, href: "/agents", isActive: pathname.startsWith("/agents") },

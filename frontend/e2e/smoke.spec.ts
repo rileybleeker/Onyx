@@ -532,3 +532,19 @@ test("/check-in lists today's habit questions", async ({ page }) => {
   expect(await yesButtons.count(), "expected the core check-in questions").toBeGreaterThanOrEqual(10);
   await expectNoClientCrash(page);
 });
+
+// Today is a read-only entry point. A legitimate empty inbox/book is allowed;
+// unavailable data must be visible, never mistaken for an all-clear.
+test.describe("Today home", () => {
+  test("home opens Today and its independent sections settle", async ({ page }) => {
+    await gotoAuthed(page, "/", /\/today$/);
+    await expect(page.getByRole("heading", { name: "Today", exact: true })).toBeVisible();
+    await expect(page.getByText("Checking agent requests...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+    await expect(page.getByText("Loading reading progress...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+    await expect(page.getByText("Couldn't check requests.", { exact: false })).toHaveCount(0);
+    await expect(page.getByText("Reading progress is unavailable right now.")).toHaveCount(0);
+    await expect(page.getByRole("link", { name: "Open check-in", exact: true })).toHaveAttribute("href", "/check-in");
+    await expect(page.getByRole("link", { name: "System status", exact: true })).toHaveAttribute("href", "/status");
+    await expectNoClientCrash(page);
+  });
+});
