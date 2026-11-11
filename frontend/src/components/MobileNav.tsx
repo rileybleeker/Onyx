@@ -41,8 +41,15 @@ export default function MobileNav() {
       'a[href], button:not([disabled]), input:not([disabled]), [tabindex="0"]',
     )).filter((element) => element.getClientRects().length > 0);
     focusable()[0]?.focus();
+    function closeOverlays() {
+      setDrawerOpen(false);
+      setLogOpen(false);
+    }
     function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
+      // Yield focus ownership when the global command palette opens.
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        closeOverlays();
+      } else if (event.key === "Escape") {
         event.preventDefault();
         setDrawerOpen(false);
         setLogOpen(false);
@@ -66,11 +73,13 @@ export default function MobileNav() {
       if (desktop.matches) { setDrawerOpen(false); setLogOpen(false); }
     }
     document.addEventListener("keydown", onKeyDown);
+    window.addEventListener(OPEN_COMMAND_PALETTE, closeOverlays);
     desktop.addEventListener("change", onViewportChange);
     onViewportChange();
     return () => {
       document.body.style.overflow = previousOverflow;
       document.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener(OPEN_COMMAND_PALETTE, closeOverlays);
       desktop.removeEventListener("change", onViewportChange);
       if (opener?.isConnected && (overlay.contains(document.activeElement) || document.activeElement === document.body)) {
         opener.focus();
