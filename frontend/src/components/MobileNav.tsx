@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { House, BarChart3, Plus, MessageSquare, Menu, X, LogOut, Search, Pill, CircleCheck, Scale } from "lucide-react";
@@ -17,6 +17,8 @@ const LOG_ACTIONS = [
 export default function MobileNav() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
+  const drawerRef = useRef<HTMLElement>(null);
+  const logRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
   const router = useRouter();
 
@@ -26,11 +28,54 @@ export default function MobileNav() {
     setLogOpen(false);
   }, [pathname]);
 
-  // Lock body scroll while any overlay is open.
+  // Treat each overlay as a modal: contain keyboard focus and return it to
+  // the opener. Preserve any scroll lock owned by another surface.
   useEffect(() => {
-    const locked = drawerOpen || logOpen;
-    document.body.style.overflow = locked ? "hidden" : "";
-    return () => { document.body.style.overflow = ""; };
+    if (!drawerOpen && !logOpen) return;
+    const overlay = drawerOpen ? drawerRef.current : logRef.current;
+    if (!overlay) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const focusable = () => Array.from(overlay.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), input:not([disabled]), [tabindex="0"]',
+    )).filter((element) => element.getClientRects().length > 0);
+    focusable()[0]?.focus();
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setDrawerOpen(false);
+        setLogOpen(false);
+      } else if (event.key === "Tab") {
+        const elements = focusable();
+        const first = elements[0];
+        const last = elements[elements.length - 1];
+        if (!first) { event.preventDefault(); return; }
+        if (event.shiftKey && (document.activeElement === first || !overlay!.contains(document.activeElement))) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || !overlay!.contains(document.activeElement))) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    }
+    // A hidden mobile overlay must not leave desktop scrolling locked.
+    const desktop = window.matchMedia("(min-width: 768px)");
+    function onViewportChange() {
+      if (desktop.matches) { setDrawerOpen(false); setLogOpen(false); }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    desktop.addEventListener("change", onViewportChange);
+    onViewportChange();
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", onKeyDown);
+      desktop.removeEventListener("change", onViewportChange);
+      if (opener?.isConnected && (overlay.contains(document.activeElement) || document.activeElement === document.body)) {
+        opener.focus();
+      }
+    };
   }, [drawerOpen, logOpen]);
 
   async function handleSignOut() {
@@ -97,7 +142,7 @@ export default function MobileNav() {
 
       {/* Log sheet — quick entry to the three logging surfaces. */}
       {logOpen && (
-        <div className="md:hidden fixed inset-0 z-50 flex flex-col justify-end" role="dialog" aria-modal="true" aria-label="Quick log">
+        <div ref={logRef} className="md:hidden fixed inset-0 z-50 flex flex-col justify-end" role="dialog" aria-modal="true" aria-label="Quick log">
           <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setLogOpen(false)} />
           <div className="relative bg-surface-raised border-t border-border-default rounded-t-[12px] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] animate-fade-in-up">
             <div className="flex items-center justify-between mb-3">
@@ -113,6 +158,7 @@ export default function MobileNav() {
                   <Link
                     key={a.label}
                     href={a.href}
+                    onClick={() => setLogOpen(false)}
                     className="flex items-center gap-2.5 px-3 py-3 rounded-[6px] bg-surface-card border border-border-subtle text-[14px] text-text-primary hover:border-border-hover transition-colors"
                   >
                     <Icon className="w-[18px] h-[18px] text-accent shrink-0" strokeWidth={1.75} />
@@ -133,6 +179,11 @@ export default function MobileNav() {
         />
       )}
       <aside
+        ref={drawerRef}
+        role={drawerOpen ? "dialog" : undefined}
+        aria-modal={drawerOpen ? true : undefined}
+        aria-label="Navigation"
+        inert={!drawerOpen}
         className={`md:hidden fixed inset-y-0 left-0 z-50 w-[240px] bg-surface-card border-r border-border-subtle flex flex-col transition-transform duration-200 ease-in-out ${
           drawerOpen ? "translate-x-0" : "-translate-x-full"
         }`}
@@ -176,6 +227,7 @@ export default function MobileNav() {
                     <Link
                       key={item.href}
                       href={item.href}
+                      onClick={() => setDrawerOpen(false)}
                       aria-current={active ? "page" : undefined}
                       className={`flex items-center gap-2.5 px-3 py-2 rounded-[4px] text-[13px] font-medium transition-colors relative ${
                         active
