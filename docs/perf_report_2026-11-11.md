@@ -2,7 +2,7 @@
 
 ## Shippable improvement
 
-The HRV dashboard previously issued 17 simultaneous requests to the same analysis-results table. It now makes three: one bounded query for the 15 exact `(result_type, result_key)` panels, plus the existing latest-row queries for journal and habit impact. The complete dashboard's nominal initial query count falls from 26 to 12 (excluding existing forecast fallback and historical pagination). This applies to both server prefetch and browser silent revalidation because they share the same loader.
+The HRV dashboard previously issued 17 simultaneous requests to the same analysis-results table. It now makes three: one bounded query for the 15 exact `(result_type, result_key)` panels, plus the existing latest-row queries for journal and habit impact. The complete dashboard's nominal database-request count falls from 30 to 16 (excluding existing forecast fallback and historical pagination). Its 26 top-level logical fetches included a workout/sleep helper that itself issues five requests; this distinction matters when comparing browser traces. This applies to both server prefetch and browser silent revalidation because they share the same loader.
 
 Measured with the real TypeScript query functions and a synthetic PostgREST-compatible test double: 17 to 3 requests, 82.4% fewer analysis requests. Returned panel results are identical on the fixture. With 1001 additional type-only keys, the new path still returns exactly 17 rows in three requests. No health data, credentials, or external network is used by these tests.
 
