@@ -83,12 +83,14 @@ struct FocusSettingsView: View {
         .familyActivityPicker(isPresented: $showBlocked, selection: $config.blocked)
         .sheet(isPresented: $showAllowed) {
             NavigationStack {
-                FamilyActivityPicker(selection: $config.allowed)
+                FamilyActivityPicker(selection: Binding(
+                    get: { config.allowed },
+                    set: { config.allowed = $0; config.linkedInConfirmed = false }
+                ))
                     .navigationTitle("Allow LinkedIn")
                     .toolbar { Button("Done") { showAllowed = false } }
             }
         }
-        .onChange(of: config.allowed) { _, _ in config.linkedInConfirmed = false }
         .alert("Enable iPhone app blocking?", isPresented: $confirmEnable) {
             Button("Cancel", role: .cancel) {}
             Button("Enable") {

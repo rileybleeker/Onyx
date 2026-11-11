@@ -45,6 +45,17 @@ final class FocusRuleTests: XCTestCase {
         XCTAssertFalse(r.shouldShield(at: date("2026-07-01T16:00:00Z"), calendar: calendar))
         XCTAssertTrue(r.shouldShield(at: date("2026-11-01T16:59:00Z"), calendar: calendar))
     }
+    func testEverySelectedTaskMustBeDoneToday() {
+        var r = rule(.tasksOnly)
+        r.tasks[0].completedDay = "2026-11-11"
+        r.tasks.append(FocusTask(title: "Second task", completedDay: "2026-11-10"))
+        let now = date("2026-11-11T18:00:00Z")
+        XCTAssertTrue(r.shouldShield(at: now, calendar: calendar))
+        r.tasks[1].completedDay = "2026-11-11"
+        XCTAssertFalse(r.shouldShield(at: now, calendar: calendar))
+        r.enabled = false
+        XCTAssertFalse(r.shouldShield(at: date("2026-11-12T18:00:00Z"), calendar: calendar))
+    }
     func testInvalidRulesFailOpenAndRoundTrip() throws {
         var r = rule(.both); r.unlockMinute = -1
         XCTAssertNotNil(r.validationError)
