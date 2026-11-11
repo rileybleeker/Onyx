@@ -163,7 +163,8 @@ function deriveStatus(
   lag: number
 ): "success" | "partial" | "failed" | "unknown" {
   if (!syncEntry && lag === 999) return "unknown";
-  if (syncEntry?.status === "failed" || lag > 3) return "failed";
+  // "error" is what cronometer_etl.py / cronometer_import.py write on a failed run.
+  if (syncEntry?.status === "failed" || syncEntry?.status === "error" || lag > 3) return "failed";
   if (syncEntry?.status === "partial" || lag > 1) return "partial";
   return "success";
 }
