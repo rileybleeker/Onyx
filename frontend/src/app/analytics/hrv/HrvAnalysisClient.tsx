@@ -175,6 +175,14 @@ function fmtDate(s: string) {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+// prediction_date is the behavioral date of the predicted sleep (the matrix row,
+// hrv_alignment.py); Riley wakes up from that sleep the next calendar day.
+function wakeUpLabel(predictionDate: string) {
+  const d = new Date(predictionDate + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+}
+
 function rolling7(data: number[], i: number): number {
   const slice = data.slice(Math.max(0, i - 6), i + 1).filter(v => !isNaN(v));
   return slice.length ? slice.reduce((a, b) => a + b, 0) / slice.length : NaN;
@@ -247,8 +255,8 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
   const [envMatrix, setEnvMatrix] = useState<any[]>(initial?.envMatrix ?? []);
   const [xgbDiagnostics, setXgbDiagnostics] = useState<any | null>(initial?.xgbDiagnostics ?? null);
   // Environment Sweet Spot dual-axis selectors. X axis is which temp sensor
-  // to bucket by (Pod room vs bed surface); Y axis is which next-night
-  // outcome to plot. Defaults preserve the original chart (room × HRV).
+  // to bucket by (Pod room vs bed surface); Y axis is which outcome of
+  // that same night to plot. Defaults preserve the original chart (room × HRV).
   const [envXAxis, setEnvXAxis] = useState<"room" | "bed">("room");
   const [envOutcome, setEnvOutcome] = useState<"hrv" | "recovery" | "efficiency" | "deep">("hrv");
   const [expandedEval, setExpandedEval] = useState(false);
@@ -582,20 +590,25 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           <span aria-hidden className="absolute left-0 top-0 bottom-0 w-[3px] rounded-l-[4px]" style={{ backgroundColor: "var(--color-accent)" }} />
           <MetricRing
             testId="hero-tomorrow-hrv"
-            label="Tomorrow"
+            label="Tonight's sleep"
             value={hrvPercentile ?? NaN}
             zone
             centerValue={tomorrowPred ? Number(tomorrowPred.predicted_hrv).toFixed(0) : "—"}
             centerUnit="ms"
             sublabel={hrvPercentile != null ? `${hrvPercentile}th pctile` : undefined}
           />
+          {tomorrowPred?.prediction_date && (
+            <p className="mt-1 text-center text-[11px] font-mono text-text-tertiary">
+              you wake up {wakeUpLabel(tomorrowPred.prediction_date)}
+            </p>
+          )}
           {tomorrowPred && (
             <p className="mt-2 text-center text-[11px] font-mono text-text-tertiary">
               80% CI {Number(tomorrowPred.prediction_lower).toFixed(0)}–{Number(tomorrowPred.prediction_upper).toFixed(0)} ms
               {todayActualHrv != null && (
                 <span style={{ color: directionalColor(Number(tomorrowPred.predicted_hrv) - todayActualHrv, { favorable: "up" }) }}>
                   {" · "}{Number(tomorrowPred.predicted_hrv) > todayActualHrv ? "↑" : "↓"}{" "}
-                  {Math.abs(Number(tomorrowPred.predicted_hrv) - todayActualHrv).toFixed(1)} vs today
+                  {Math.abs(Number(tomorrowPred.predicted_hrv) - todayActualHrv).toFixed(1)} vs last night
                 </span>
               )}
             </p>
@@ -630,7 +643,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         />
       </div>
 
-      <SectionHeader id="forecast" tick="forecast" title="Forecast & Drivers" kicker="What tomorrow looks like, and why" />
+      <SectionHeader id="forecast" tick="forecast" title="Forecast & Drivers" kicker="What tonight's sleep should bring, and why" />
       {/* ── Forward-looking: what's predicted and why (today) ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* 30-Day Prophet Forecast */}
@@ -668,9 +681,9 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           )}
         </ChartCard>
 
-        <ChartCard collapsible title="Prediction Drivers (Today)" subtitle="What's driving tomorrow's forecast right now"
+        <ChartCard collapsible title="Prediction Drivers (Today)" subtitle="What's driving tonight's forecast right now"
           source="XGBOOST · SHAP"
-          info="Shows what's pushing tomorrow's prediction up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes. Journal behaviors appear in a separate section below because they're Yes/No entries — they have smaller numerical impact than continuous metrics like heart rate, but they're still part of the model.">
+          info="Shows what's pushing the forecast for tonight's sleep (the HRV you wake up to) up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes. Journal behaviors appear in a separate section below because they're Yes/No entries — they have smaller numerical impact than continuous metrics like heart rate, but they're still part of the model.">
           {xgbDiagnostics?.shap_unstable && (
             <div className="mb-3 bg-amber-500/10 border border-amber-500/30 rounded-[4px] px-3 py-2 text-[11px] leading-relaxed text-amber-200">
               <strong className="text-amber-100">High feature collinearity detected</strong>
@@ -721,7 +734,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
               <span className="text-[9px] text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px] font-mono">XGBOOST · SHAP</span>
             </div>
             <p className="text-[10px] text-text-tertiary leading-relaxed mb-3">
-              Your logged Yes/No behaviors are part of the model. A <span className="text-up">green</span> bar means that behavior <em>raised</em> tomorrow&apos;s predicted HRV today; a <span className="text-down">red</span> bar means it <em>lowered</em> it. Binary features have smaller ms impact than continuous metrics but still shift the forecast.
+              Your logged Yes/No behaviors are part of the model. A <span className="text-up">green</span> bar means that behavior <em>raised</em> the predicted HRV for tonight&apos;s sleep; a <span className="text-down">red</span> bar means it <em>lowered</em> it. Binary features have smaller ms impact than continuous metrics but still shift the forecast.
             </p>
             {journalDriversToday.length > 0 ? (
               <ResponsiveContainer width="100%" height={Math.max(120, journalDriversToday.length * 22)}>
@@ -1033,14 +1046,14 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       </div>
       </DeferredMount>
 
-      <SectionHeader id="impact" tick="descriptive" title="Behavior Impact" kicker="Mean next-night HRV difference (Welch's t-test)" />
+      <SectionHeader id="impact" tick="descriptive" title="Behavior Impact" kicker="Mean HRV difference on the night after the behavior (Welch's t-test)" />
       {/* ── Behavior t-tests: Journal + Habit Impact ── */}
       <DeferredMount minHeight={480}>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Journal Impact */}
         <ChartCard collapsible title="Journal Behavior Impact" subtitle="Mean HRV difference: Yes vs No"
           source="WELCH'S T-TEST"
-          info="How each logged behavior affects your HRV the following night. A +15ms bar means your HRV was 15ms higher, on average, on nights after you did that thing. Green = helps recovery; red = hurts it. Method: Welch's two-sample t-test (unequal variance) on HRV distributions for Yes vs No nights. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise. Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Yes-nights / No-nights) that fed the comparison.">
+          info="How each logged behavior affects the HRV of that night's sleep — the sleep that ends the day you did it, which you wake up from the next morning. A +15ms bar means your HRV was 15ms higher, on average, after days you did that thing. Green = helps recovery; red = hurts it. Method: Welch's two-sample t-test (unequal variance) on HRV distributions for Yes vs No nights. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise. Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Yes-nights / No-nights) that fed the comparison.">
           {journalImpact.length > 0 ? (() => {
             const filtered = fdrOnly
               ? journalImpact.filter((d: any) => d.passes_fdr === true)
@@ -1109,7 +1122,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
 
         <ChartCard collapsible title="Habit Impact" subtitle="Mean HRV difference: nights you completed the habit vs nights you didn't"
           source="WELCH'S T-TEST"
-          info="Same statistical treatment as Journal Behavior Impact, applied to Notion-managed habits (from /habits). A +Xms bar means HRV averaged X ms higher on the night following days you completed that habit. Method: Welch's two-sample t-test on next-night HRV for Yes vs No nights. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise (and for habits with few completed-nights the whiskers will be wide — that's the chart honestly signaling 'trust this less'). Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Y completed-nights, N skipped-nights). Habits need at least 5 Yes-nights and 5 No-nights before they appear (the t-test isn't meaningful with smaller groups). Add more habits or toggle them more consistently at /habits to populate this view.">
+          info="Same statistical treatment as Journal Behavior Impact, applied to Notion-managed habits (from /habits). A +Xms bar means HRV averaged X ms higher in the sleep that ended the days you completed that habit. Method: Welch's two-sample t-test on that night's HRV for Yes vs No days. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise (and for habits with few completed-nights the whiskers will be wide — that's the chart honestly signaling 'trust this less'). Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Y completed-nights, N skipped-nights). Habits need at least 5 Yes-nights and 5 No-nights before they appear (the t-test isn't meaningful with smaller groups). Add more habits or toggle them more consistently at /habits to populate this view.">
           {habitImpact.length > 0 ? (() => {
             const filtered = fdrOnly
               ? habitImpact.filter((d: any) => d.passes_fdr === true)
@@ -1189,7 +1202,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           title="Supplement Impact (Yes vs No)"
           subtitle="Mean HRV difference: nights compound taken vs not"
           source="WELCH'S T-TEST"
-          info="How each supplement compound (rolled up across products via FDA UNII code, e.g. Vitamin C from a multi + standalone tablet sum into one row) affects HRV the following night. Method: Welch's two-sample t-test (unequal variance) on next-night HRV for Yes vs No nights. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise (compounds with fewer tracked nights will show wide whiskers — that's the chart honestly signaling 'trust this less'). Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Y compound-taken nights, N compound-skipped nights). BH-FDR corrected across compounds. Yes/No framing chosen because most compounds are taken at a near-constant dose, so the actionable question is 'does taking it help?' — a continuous test would collapse on near-zero amount variance. ⚠ marks compounds with fewer than 20 Yes or No nights — estimates are unstable. Associational, not causal."
+          info="How each supplement compound (rolled up across products via FDA UNII code, e.g. Vitamin C from a multi + standalone tablet sum into one row) affects the HRV of that night's sleep (the one that ends the day you took it). Method: Welch's two-sample t-test (unequal variance) on that night's HRV for Yes vs No days. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise (compounds with fewer tracked nights will show wide whiskers — that's the chart honestly signaling 'trust this less'). Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Y compound-taken nights, N compound-skipped nights). BH-FDR corrected across compounds. Yes/No framing chosen because most compounds are taken at a near-constant dose, so the actionable question is 'does taking it help?' — a continuous test would collapse on near-zero amount variance. ⚠ marks compounds with fewer than 20 Yes or No nights — estimates are unstable. Associational, not causal."
         >
           {supplementImpact.length > 0 ? (() => {
             const filtered = fdrOnly
@@ -1263,9 +1276,9 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         {supplementDoseResponse.length > 0 && (
           <ChartCard collapsible
             title="Supplement Dose-Response"
-            subtitle="Spearman ρ between daily amount and next-night HRV (compounds with ≥3 distinct doses)"
+            subtitle="Spearman ρ between daily amount and that night's HRV (compounds with ≥3 distinct doses)"
             source="SPEARMAN ρ"
-            info="What it shows: for compounds where the dose actually varies, whether 'more = better/worse?' Only includes compounds with ≥3 distinct non-zero doses (constant-dose compounds appear in the Yes/No chart above instead). Method: Spearman ρ — a rank-based correlation between daily total amount and next-night HRV; robust to outliers and skewed distributions; handles non-linear monotonic dose-response curves; scores range −1.0 to +1.0. Tooltip: ρ is the correlation; p is the p-value (chance the link is random noise — <0.05 is the conventional significance threshold); n is the number of nights; doses is the count of distinct non-zero dose levels seen. BH-FDR corrected across compounds. ⚠ marks rows with n<20 — estimates are unstable. Associational, not causal."
+            info="What it shows: for compounds where the dose actually varies, whether 'more = better/worse?' Only includes compounds with ≥3 distinct non-zero doses (constant-dose compounds appear in the Yes/No chart above instead). Method: Spearman ρ — a rank-based correlation between daily total amount and that night's HRV; robust to outliers and skewed distributions; handles non-linear monotonic dose-response curves; scores range −1.0 to +1.0. Tooltip: ρ is the correlation; p is the p-value (chance the link is random noise — <0.05 is the conventional significance threshold); n is the number of nights; doses is the count of distinct non-zero dose levels seen. BH-FDR corrected across compounds. ⚠ marks rows with n<20 — estimates are unstable. Associational, not causal."
           >
             {(() => {
               // dose-response rows may or may not carry passes_fdr depending
@@ -1333,7 +1346,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         {/* Nutrition Spearman */}
         <ChartCard collapsible
           title="Nutrition Correlations"
-          subtitle="Spearman ρ between daily nutrient totals and next-night HRV"
+          subtitle="Spearman ρ between daily nutrient totals and that night's HRV"
           source="SPEARMAN ρ"
           info="What it shows: how strongly each daily nutrient total moves with HRV the following morning. A bar near +1.0 means that nutrient almost always rises when your HRV rises; near −1.0 means the opposite; near 0 means no consistent link. Method: Spearman ρ — a rank-based correlation that's robust to outliers and skewed distributions; scores range −1.0 to +1.0. Rank-based so occasional restaurant blowouts don't dominate and non-linear monotonic effects still show up — e.g. sodium at 1g vs 8g. Tooltip: ρ is the correlation; p is the p-value (chance the link is random noise — <0.05 is the conventional significance threshold); n is the number of nights. BH-FDR corrected across nutrients. ⚠ marks rows with n<20 — estimates unstable. Associational, not causal."
         >
@@ -1515,11 +1528,12 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           <div>
             <p className="text-text-primary font-medium mb-1">What&apos;s being estimated</p>
             <p>
-              For each behavior X, the Average Treatment Effect on next-night HRV:{" "}
-              <em>&ldquo;If you did X today (holding the pre-treatment confounders fixed), what would your
-              HRV be tomorrow, vs. if you didn&apos;t?&rdquo;</em> Outcome is{" "}
-              <code className="font-mono text-[11px] text-text-tertiary">whoop_hrv_rmssd</code> shifted
-              −1 day, the same convention as the XGBoost prediction model above.
+              For each behavior X, the Average Treatment Effect on the HRV of that night&apos;s sleep:{" "}
+              <em>&ldquo;If you did X today (holding the pre-treatment confounders fixed), what would the
+              HRV you wake up to tomorrow be, vs. if you didn&apos;t?&rdquo;</em> Outcome is{" "}
+              <code className="font-mono text-[11px] text-text-tertiary">whoop_hrv_rmssd</code> of the
+              sleep that ends day X (the same matrix row), the same convention as the XGBoost
+              prediction model above.
             </p>
           </div>
 
@@ -1687,9 +1701,9 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       {/* Causal Forest Plot: Binary Treatments */}
       <ChartCard collapsible
         title="Causal Effects · Binary Treatments"
-        subtitle={`AIPW ATE on next-night HRV (ms) · 95% CI shown as error bars · top ${Math.min(causalBinary.length, 20)} by |effect|`}
+        subtitle={`AIPW ATE on that night's HRV (ms) · 95% CI shown as error bars · top ${Math.min(causalBinary.length, 20)} by |effect|`}
         source="AIPW (DOUBLY ROBUST)"
-        info="Each bar is the doubly-robust AIPW estimate of the average treatment effect on tomorrow's HRV. Error bars are 95% CIs from the influence-function variance. ⚠ marks treatments with fewer than 20 days in either arm. ⊕ marks treatments where the autocorrelation-aware block-bootstrap CI is meaningfully wider than the IF CI (ratio >1.5×) — the BB CI is the more honest answer for those rows; check the tooltip. A pale-green or pale-red bar means IF said the effect is significant but the BB CI crosses zero (the temporal structure of the residuals doesn't support the IF call). Bars whose IF CI stays positive (saturated green) or negative (saturated red) are robust causal evidence under the stated confounder set. The naive estimate is in the comparison table below."
+        info="Each bar is the doubly-robust AIPW estimate of the average treatment effect on the HRV of that night's sleep (the one you wake up from the next morning). Error bars are 95% CIs from the influence-function variance. ⚠ marks treatments with fewer than 20 days in either arm. ⊕ marks treatments where the autocorrelation-aware block-bootstrap CI is meaningfully wider than the IF CI (ratio >1.5×) — the BB CI is the more honest answer for those rows; check the tooltip. A pale-green or pale-red bar means IF said the effect is significant but the BB CI crosses zero (the temporal structure of the residuals doesn't support the IF call). Bars whose IF CI stays positive (saturated green) or negative (saturated red) are robust causal evidence under the stated confounder set. The naive estimate is in the comparison table below."
       >
         {causalBinary.length > 0 ? (() => {
           const finiteRows = causalBinary.filter((d: any) => Number.isFinite(d.aipw_ate));
@@ -2169,7 +2183,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         (binary direction). This panel answers the different question "what
         SPECIFIC temperature is optimal for me?" by binning every night by the
         selected temperature sensor and showing the mean of the selected
-        next-night outcome per bucket. Peak bucket = personal sweet spot for
+        outcome of that same night per bucket. Peak bucket = personal sweet spot for
         that outcome. Error bars are ±1 SEM. Computed client-side from
         daily_health_matrix; no python pipeline dependency.
 
@@ -2459,7 +2473,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                     <strong className="text-text-secondary">Why it&apos;s used:</strong> Excellent at finding non-obvious patterns across many variables at once — like &ldquo;high strain + poor sleep + high stress = low HRV&rdquo; — which simpler methods miss.
                   </p>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it predicts:</strong> Tomorrow&apos;s HRV, using today&apos;s ~250-feature matrix (training load, sleep quality, behaviors, recent HRV trend, etc.).
+                    <strong className="text-text-secondary">What it predicts:</strong> The HRV of tonight&apos;s sleep (the one you wake up to tomorrow), using what&apos;s known by this evening — last night&apos;s HRV and sleep plus today&apos;s ~250-feature matrix (training load, sleep quality, behaviors, recent HRV trend, etc.).
                   </p>
                 </div>
 
@@ -2485,7 +2499,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">SEASONAL</span>
                   </div>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it is:</strong> A classical statistics model that predicts tomorrow&apos;s HRV using your own past HRV values (today&apos;s HRV predicts tomorrow&apos;s to some degree), while also factoring in external variables like training load.
+                    <strong className="text-text-secondary">What it is:</strong> A classical statistics model that predicts tonight&apos;s HRV using your own past HRV values (last night&apos;s HRV predicts tonight&apos;s to some degree), while also factoring in external variables like training load.
                   </p>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
                     <strong className="text-text-secondary">Why it&apos;s used:</strong> Provides a transparent, interpretable baseline alongside XGBoost. If both models agree, the prediction is more reliable.
@@ -2556,10 +2570,10 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">BENCHMARKS</span>
                   </div>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">The baselines:</strong> three dumb &ldquo;models&rdquo; with no machine learning. <em>Naive</em> predicts tomorrow&apos;s HRV = today&apos;s. <em>7-day avg</em> predicts the last 7-day mean. <em>Day-of-week</em> predicts your average for that weekday. Every real model must beat all three to prove it&apos;s actually learning — if XGBoost can&apos;t outperform &ldquo;just copy yesterday,&rdquo; it isn&apos;t useful.
+                    <strong className="text-text-secondary">The baselines:</strong> three dumb &ldquo;models&rdquo; with no machine learning. <em>Naive</em> predicts tonight&apos;s HRV = last night&apos;s. <em>7-day avg</em> predicts the last 7-day mean. <em>Day-of-week</em> predicts your average for that weekday. Every real model must beat all three to prove it&apos;s actually learning — if XGBoost can&apos;t outperform &ldquo;just copy yesterday,&rdquo; it isn&apos;t useful.
                   </p>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">MAE &amp; forecast horizon:</strong> <em>MAE</em> (mean absolute error) is the average miss in ms — lower is better. The <em>Accuracy by Forecast Horizon</em> chart plots MAE for each model at horizons <code className="font-mono text-[10px]">h=1</code> (tomorrow) through <code className="font-mono text-[10px]">h=7</code> (a week out); error naturally grows as the horizon lengthens.
+                    <strong className="text-text-secondary">MAE &amp; forecast horizon:</strong> <em>MAE</em> (mean absolute error) is the average miss in ms — lower is better. The <em>Accuracy by Forecast Horizon</em> chart plots MAE for each model at horizons <code className="font-mono text-[10px]">h=1</code> (tonight&apos;s sleep) through <code className="font-mono text-[10px]">h=7</code> (a week out); error naturally grows as the horizon lengthens.
                   </p>
                 </div>
               </div>
@@ -2582,7 +2596,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                     <strong className="text-text-secondary">Why it&apos;s used:</strong> correlation conflates a behavior with everything it travels with — alcohol nights are also weekend, restaurant, and late nights, so a raw comparison blames alcohol for the whole pile. AIPW adjusts for that lifestyle clustering. &ldquo;Doubly robust&rdquo; = it combines a model for <em>which nights you do the behavior</em> with a model for <em>your HRV</em>, and stays correct if <em>either</em> one is right.
                   </p>
                   <p className="text-[11px] text-text-tertiary leading-relaxed">
-                    <strong className="text-text-secondary">What it produces:</strong> the <em>ATE</em> (average treatment effect) in ms — the adjusted next-night HRV change — with a 95% CI. It powers the Causal Effects charts; pale bars = the CI crosses zero (inconclusive).
+                    <strong className="text-text-secondary">What it produces:</strong> the <em>ATE</em> (average treatment effect) in ms — the adjusted change in that night&apos;s HRV — with a 95% CI. It powers the Causal Effects charts; pale bars = the CI crosses zero (inconclusive).
                   </p>
                 </div>
 

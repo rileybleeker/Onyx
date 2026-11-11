@@ -26,19 +26,20 @@ import { getWorkoutSleepGap, type WorkoutSleepGap } from "@/lib/queries";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-// ET tomorrow as YYYY-MM-DD. ET is canonical for all calendar_date joins in
-// this pipeline; browser-local would drift for users outside ET.
-function etTomorrowStr(): string {
+// Behavioral today as YYYY-MM-DD: the ET clock minus 6 h (before ~6 AM it is
+// still yesterday's behavioral day). The live forecast is stored under this
+// date: prediction_date = behavioral date of the predicted sleep (tonight's),
+// which Riley wakes up from the next calendar day (hrv_alignment.py, 2026-11-10).
+function etBehavioralTodayStr(): string {
+  const shifted = new Date(Date.now() - 6 * 3600 * 1000);
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",
     year: "numeric", month: "2-digit", day: "2-digit",
-  }).formatToParts(new Date());
+  }).formatToParts(shifted);
   const y = parts.find(p => p.type === "year")!.value;
   const m = parts.find(p => p.type === "month")!.value;
   const d = parts.find(p => p.type === "day")!.value;
-  const t = new Date(`${y}-${m}-${d}T00:00:00Z`);
-  t.setUTCDate(t.getUTCDate() + 1);
-  return t.toISOString().split("T")[0];
+  return `${y}-${m}-${d}`;
 }
 
 // Every fetch below MUST `if (error) throw error` (like lib/queries.ts): the
@@ -48,8 +49,10 @@ function etTomorrowStr(): string {
 // error would bake an empty-but-non-null snapshot into the ISR cache and let
 // a transient failure wipe seeded charts to their empty states.
 
+// Tonight's-sleep forecast (the HRV Riley wakes up to tomorrow). Name kept for
+// the existing callers / ISR payload key.
 export async function getTomorrowPrediction() {
-  const tomorrow = etTomorrowStr();
+  const tomorrow = etBehavioralTodayStr();
   const cols = "prediction_date,model,predicted_hrv,prediction_lower,prediction_upper,actual_hrv,horizon_days,top_drivers,model_version";
   const primary = await supabase
     .from("hrv_predictions_latest")
@@ -61,7 +64,7 @@ export async function getTomorrowPrediction() {
     .limit(1);
   if (primary.error) throw primary.error;
   if (primary.data?.[0]) return primary.data[0];
-  // Fallback: earliest unscored XGBoost h=1 on or after ET tomorrow.
+  // Fallback: earliest unscored XGBoost h=1 on or after behavioral today.
   const fb = await supabase
     .from("hrv_predictions_latest")
     .select(cols)
@@ -155,30 +158,53 @@ export async function getHistoricalHrv(days = 180) {
 }
 
 // All-time pull (no date filter) of nights that have a temperature reading
-// AND any of the next-night outcomes. Powers the Environment Sweet Spot
+// AND any of that night's outcomes. Powers the Environment Sweet Spot
 // dose-response chart, which buckets nights by selected temperature and
 // shows mean of the selected outcome per bucket. Filters at "any temp + HRV"
 // so we don't drop nights where bed_temp is present but room_temp isn't.
 // Per-row null-check happens client-side per selected axis pair.
 export async function getEnvDoseResponseData() {
-  // ADR-0001 Phase 3: order by onyx_behavioral_date so the sweet-spot
-  // buckets pair each temperature reading with the HRV/recovery measured
-  // the morning of the same bedtime-day, not the clock-day calendar slot
-  // that pre-midnight bedtimes would mis-attribute by ±1 day.
+  // Pairs each night's bedroom / bed temperature with the HRV / recovery /
+  // sleep of THAT SAME night. Eight Sleep rows are dated by the wake-up day,
+  // so in the matrix the temperature on row D belongs to the sleep on row D-1
+  // (live check 2026-11-10: Eight Sleep HRV on row D+1 vs WHOOP HRV on row D,
+  // r = 0.84). The pipeline re-keys it in hrv_alignment.realign_matrix; this
+  // chart reads the matview directly, so it does the same move here: the
+  // outcome on row D is paired with the temperatures from row D+1.
   //
   // Reads the 15-min-refreshed matview (created 2026-06-11) instead of the
   // live view — staleness is invisible to this historical chart.
-  const { data, error } = await supabase
-    .from("daily_health_matrix_behavioral_mat")
-    .select(
-      "onyx_behavioral_date,eight_sleep_room_temp,eight_sleep_bed_temp,whoop_hrv_rmssd," +
-      "whoop_recovery_score,whoop_sleep_efficiency,whoop_deep_sleep_milli"
-    )
-    .or("eight_sleep_room_temp.not.is.null,eight_sleep_bed_temp.not.is.null")
-    .not("whoop_hrv_rmssd", "is", null)
-    .order("onyx_behavioral_date", { ascending: true });
-  if (error) throw error;
-  return data ?? [];
+  // Paged: every HRV night is needed (not just temperature nights), which passes
+  // PostgREST's 1000-row cap as history grows.
+  const rows: any[] = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase
+      .from("daily_health_matrix_behavioral_mat")
+      .select(
+        "onyx_behavioral_date,eight_sleep_room_temp,eight_sleep_bed_temp,whoop_hrv_rmssd," +
+        "whoop_recovery_score,whoop_sleep_efficiency,whoop_deep_sleep_milli"
+      )
+      .or("eight_sleep_room_temp.not.is.null,eight_sleep_bed_temp.not.is.null,whoop_hrv_rmssd.not.is.null")
+      .order("onyx_behavioral_date", { ascending: true })
+      .range(from, from + 999);
+    if (error) throw error;
+    rows.push(...(data ?? []));
+    if (!data || data.length < 1000) break;
+  }
+  const temps = new Map<string, { room: any; bed: any }>();
+  for (const r of rows) temps.set(r.onyx_behavioral_date, { room: r.eight_sleep_room_temp, bed: r.eight_sleep_bed_temp });
+  const nextDay = (d: string) => {
+    const t = new Date(d + "T00:00:00Z");
+    t.setUTCDate(t.getUTCDate() + 1);
+    return t.toISOString().split("T")[0];
+  };
+  return rows
+    .filter(r => r.whoop_hrv_rmssd != null)
+    .map(r => {
+      const t = temps.get(nextDay(r.onyx_behavioral_date));
+      return { ...r, eight_sleep_room_temp: t?.room ?? null, eight_sleep_bed_temp: t?.bed ?? null };
+    })
+    .filter(r => r.eight_sleep_room_temp != null || r.eight_sleep_bed_temp != null);
 }
 
 export async function getHrvResiduals() {
