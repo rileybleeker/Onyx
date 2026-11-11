@@ -81,7 +81,7 @@ CREATE INDEX IF NOT EXISTS idx_spotify_tracks_features_source
 -- 3. Daily Audio Signature view (per-ET-date aggregate)
 -- ---------------------------------------------------------------------------
 -- Pushes the heavy aggregation into Postgres so the frontend reads a small
--- pre-shaped result. Mirrors the hrv_predictions_latest pattern (CLAUDE.md L125).
+-- pre-shaped result. Mirrors the hrv_predictions_latest pattern (AGENTS.md L125).
 -- Only counts plays whose track has audio features attached, so the means
 -- aren't biased by the unfeaturized tail.
 DROP VIEW IF EXISTS pds.spotify_daily_signature;

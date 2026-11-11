@@ -567,7 +567,7 @@ def main():
     except Exception as e:
         # Audit fix: previously returned without writing a sync_log row, so
         # /status saw silence on every run with a broken token / WHOOP outage.
-        # Per CLAUDE.md: every ETL run emits a heartbeat, success AND failure.
+        # Per AGENTS.md: every ETL run emits a heartbeat, success AND failure.
         msg = f"WHOOP profile check failed: {e}"
         log.error(msg)
         log_sync(

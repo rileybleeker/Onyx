@@ -179,7 +179,7 @@ are ephemeral, tokens are stored in `pds.ci_tokens` (Supabase). The `ci_token_he
 script downloads tokens before each run and uploads (potentially refreshed) tokens after.
 Upload uses `if: always()` so tokens are saved even if the ETL fails partway through.
 
-**Secrets**: All credentials stored as GitHub Actions secrets (10 total). See CLAUDE.md for the full list.
+**Secrets**: All credentials stored as GitHub Actions secrets (10 total). See AGENTS.md for the full list.
 
 ---
 
@@ -240,7 +240,7 @@ A treatment graduates between tiers automatically on the retrain after the thres
 ## Time Conventions
 
 > Onyx makes a deliberate choice about how to bucket activity into "days".
-> The full rationale lives in `CLAUDE.md` under "Timezone convention" and
+> The full rationale lives in `AGENTS.md` under "Timezone convention" and
 > "Supplement intake — behavioral-day convention"; this is the summary.
 
 **Canonical timezone:** `America/New_York` (ET). All `calendar_date` join keys in `daily_health_matrix` are ET-aligned. Raw timestamps are stored as true UTC instants; date-only columns (MFP, Eight Sleep, WHOOP journal, habits, supplements) are stored ET-aligned at the source.

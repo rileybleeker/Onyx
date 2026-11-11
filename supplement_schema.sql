@@ -3,7 +3,7 @@
 -- ============================================
 -- Two tables + two analytical views. Deliberately kept isolated from
 -- daily_health_matrix (matches the spotify_plays / spotify_tracks
--- isolation pattern documented in CLAUDE.md). Correlation against
+-- isolation pattern documented in AGENTS.md). Correlation against
 -- HRV/sleep/recovery happens at query time via the daily_supplement_matrix
 -- view, not at storage.
 --

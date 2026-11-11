@@ -115,7 +115,7 @@ export function formatDistance(meters: number | null | undefined): string {
 
 // ─── Canonical unit conversions ───
 // Helpers live here (not in component files) so every conversion site reads
-// from one source. format.ts is the canonical formatter per CLAUDE.md.
+// from one source. format.ts is the canonical formatter per AGENTS.md.
 // Conversions are precise; rounding/formatting happens at display time only,
 // so weekly / monthly averages don't accumulate per-cycle rounding error.
 export const METERS_PER_MILE = 1609.344;  // International mile (exact)

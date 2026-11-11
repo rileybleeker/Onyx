@@ -657,7 +657,7 @@ export default function SupplementsPage() {
           >
             {/* Manual date override — defaults to today; lets the user
                 attribute a post-midnight pre-bed intake to the day that
-                just ended (behavioral-day convention; see CLAUDE.md). */}
+                just ended (behavioral-day convention; see AGENTS.md). */}
             <div className="flex flex-wrap items-center gap-2 mb-2">
               <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
                 Intake date
