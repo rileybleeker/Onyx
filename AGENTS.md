@@ -64,9 +64,9 @@ Onyx/
 ├── tools/ubereats_harvest/  # LOCAL-PC Uber Eats item harvester (Playwright + signed-in Chrome in an OFF-SCREEN window — headless is blocked by Uber; Task Scheduler "Onyx Uber Eats Harvest" every 6h): order history → POST /api/delivery/items/import (CI token) → pds.delivery_order_items + per-dish kcal/macro estimates; heartbeats ubereats|items
 ├── .github/workflows/
 │   ├── daily-etl.yml            # Hourly Health ETL: Garmin + WHOOP (`0 * * * *`)
-│   ├── eight-sleep-etl.yml      # Eight Sleep ETL — daily at 3 PM ET (`0 19 * * *`)
-│   ├── mfp-email.yml            # MyFitnessPal email check (`15 * * * *`)
-│   ├── whoop-journal-email.yml  # WHOOP journal email check (`30 * * * *`)
+│   ├── eight-sleep-etl.yml      # Eight Sleep ETL - 19:00 UTC daily (3 PM EDT / 2 PM EST)
+│   ├── mfp-email.yml            # MyFitnessPal email check - manual fallback only (Cronometer cutover)
+│   ├── whoop-journal-email.yml  # WHOOP journal - decommissioned; archive frozen, do not run (see warning below)
 │   ├── journal-sync.yml         # Notion personal Journal sync (`35 * * * *`)
 │   ├── habits-sync.yml          # Habits sync from Notion (`45 * * * *`)
 │   ├── spotify-etl.yml          # Spotify recently-played (`50 * * * *`)
@@ -116,12 +116,12 @@ Onyx/
 # ETL (runs automatically via GitHub Actions every hour on :00)
 python garmin_etl.py                    # Sync last 7 days
 python whoop_etl.py                     # Sync last 30 days
-python whoop_journal_import.py <csv>    # Import WHOOP journal CSV export
-python whoop_journal_email.py --once   # Check email for WHOOP export, import journal
-python whoop_journal_watcher.py        # Watch inbox folder for auto-import
+python whoop_journal_import.py <csv>    # ARCHIVE ONLY: retired WHOOP journal importer
+python whoop_journal_email.py --once   # ARCHIVE ONLY: retired WHOOP journal email importer
+python whoop_journal_watcher.py        # ARCHIVE ONLY: retired watcher; do not start routinely
 python eight_sleep_etl.py               # Sync last 7 days
-python myfitnesspal_import.py <csv>     # Import MFP nutrition CSV export
-python myfitnesspal_email.py --once    # Check email for MFP export, import
+python myfitnesspal_import.py <csv>     # Manual fallback only; Cronometer is primary
+python myfitnesspal_email.py --once    # Manual fallback only; Cronometer is primary
 python <etl>.py --backfill N            # Backfill N days
 python spotify_etl.py --auth            # One-time Spotify OAuth bootstrap (local)
 python spotify_etl.py                   # Sync recently-played (last 50 since high-water mark)
@@ -156,7 +156,7 @@ python ci_token_helper.py download cronometer # Restore Cronometer session from 
 
 # GitHub Actions
 gh workflow run daily-etl.yml           # Manually trigger ETL workflow
-gh workflow run whoop-journal-email.yml # Manually trigger journal email check
+gh workflow run whoop-journal-email.yml # ARCHIVE ONLY: not a routine sync; see warning below
 
 # Frontend
 cd frontend && npm run dev              # Dev server on :3000
@@ -175,6 +175,8 @@ python hrv_predict.py --predict         # Daily prediction (run after ETL)
 python hrv_predict.py --backfill-only   # Just backfill actuals + recompute metrics
 gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in CI
 ```
+
+**Retired WHOOP journal commands:** the journal pipeline was decommissioned on 2026-06-11. Its archive table is frozen and no longer read by the app. Do not run the importer, watcher, or manual workflow as routine maintenance or incident recovery. Any deliberate archive write requires a separate review of the freeze and the intended migration; current habits use the habits sync pipeline.
 
 ## Database
 
