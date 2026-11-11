@@ -6,7 +6,7 @@ const { mkdtempSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const output = mkdtempSync(path.join(tmpdir(), 'onyx-wins-'));
-execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'), 'src/lib/wins.ts', 'src/lib/wins-server.ts', '--outDir', output, '--module', 'commonjs', '--target', 'ES2022', '--skipLibCheck']);
+execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'), 'next-env.d.ts', 'src/lib/wins.ts', 'src/lib/wins-server.ts', '--outDir', output, '--module', 'commonjs', '--target', 'ES2022', '--skipLibCheck']);
 const { makeBoard, highlights } = require(path.join(output, 'wins.js'));
 const state = (row) => makeBoard([ { number: 15, ...row } ], null).wins[0].state;
 test('merge status requires a real merge timestamp, not merely closed', () => {
