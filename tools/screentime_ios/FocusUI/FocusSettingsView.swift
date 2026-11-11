@@ -96,7 +96,11 @@ struct FocusSettingsView: View {
                     try FocusEnforcement.enable(config)
                     config = try FocusStorage.load()
                     message = "Focus enabled. iOS will shield the selected targets while your rule is unmet."
-                } catch { config.rule.enabled = false; message = "Focus was not enabled: \(error.localizedDescription)" }
+                } catch {
+                    let problem = error.localizedDescription
+                    reload()
+                    message = "Could not update Focus: \(problem). Check the saved status before relying on enforcement."
+                }
             }
         } message: {
             Text("Onyx will block your selected apps and websites using the rule above, with your selected LinkedIn exception. You can turn Focus off here or revoke access in iOS Settings. This is a voluntary blocker, not tamper-proof.")
@@ -120,12 +124,9 @@ struct FocusSettingsView: View {
 
     private func complete(_ id: UUID) {
         do {
-            // Apply completion to the persisted rule, never accidentally save edits.
-            var saved = try FocusStorage.load()
-            guard let index = saved.rule.tasks.firstIndex(where: { $0.id == id }) else { return }
-            saved.rule.tasks[index].completedDay = FocusRule.dayKey(Date(), calendar: .autoupdatingCurrent)
-            try FocusStorage.save(saved)
-            FocusEnforcement.reconcile(); reload()
+            // Never save unrelated draft edits while marking a task done.
+            try FocusEnforcement.complete(id)
+            reload()
         } catch { message = "Completion could not be saved: \(error.localizedDescription)" }
     }
 }

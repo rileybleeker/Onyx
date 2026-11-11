@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import FamilyControls
 import ManagedSettings
 import DeviceActivity
@@ -16,6 +17,7 @@ struct FocusConfiguration: Codable {
         if !allowed.categoryTokens.isEmpty { return "Choose individual allowed apps and websites, not whole allowed categories." }
         if blocked.applicationTokens.isEmpty && blocked.categoryTokens.isEmpty && blocked.webDomainTokens.isEmpty { return "Choose social apps or websites to block." }
         if blocked.categoryTokens.count > 50 || allowed.applicationTokens.count > 50 || allowed.webDomainTokens.count > 50 { return "Selection exceeds Apple's 50-category or exception limit." }
+        if blocked.applicationTokens.subtracting(allowed.applicationTokens).count > 50 || blocked.webDomainTokens.subtracting(allowed.webDomainTokens).count > 50 { return "Select at most 50 blocked apps and 50 blocked websites after exceptions." }
         return nil
     }
 }
@@ -24,6 +26,16 @@ enum FocusStorage {
     static let group = "group.com.rileybleeker.onyxscreentime.focus"
     static var file: URL? {
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)?.appendingPathComponent("focus.json")
+    }
+    /// Serializes the app and extension's read/decide/apply cycle, not just JSON writes.
+    static func withLock<T>(_ action: () throws -> T) throws -> T {
+        guard let file else { throw FocusFailure.message("Focus App Group is not provisioned.") }
+        let descriptor = open(file.appendingPathExtension("lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { throw FocusFailure.message("Cannot open Focus state lock.") }
+        defer { close(descriptor) }
+        guard flock(descriptor, LOCK_EX) == 0 else { throw FocusFailure.message("Cannot lock Focus state.") }
+        defer { flock(descriptor, LOCK_UN) }
+        return try action()
     }
     static func load() throws -> FocusConfiguration {
         guard let file else { throw FocusFailure.message("Focus App Group is not provisioned.") }
@@ -49,7 +61,16 @@ enum FocusEnforcement {
     static func clear() { store.clearAllSettings() }
 
     static func reconcile() {
-        guard let config = try? FocusStorage.load(), config.validationError == nil,
+        do {
+            try FocusStorage.withLock {
+                guard let config = try? FocusStorage.load() else { clear(); return }
+                apply(config)
+            }
+        } catch { clear() }
+    }
+
+    private static func apply(_ config: FocusConfiguration) {
+        guard config.validationError == nil,
               config.rule.shouldShield(at: Date(), calendar: .autoupdatingCurrent) else {
             clear(); return
         }
@@ -69,16 +90,14 @@ enum FocusEnforcement {
             throw FocusFailure.message("Grant Screen Time access before enabling Focus.")
         }
         var staged = draft; staged.rule.enabled = false
-        try FocusStorage.save(staged)
-        clear()
+        try FocusStorage.withLock { try FocusStorage.save(staged); clear() }
         let minute = draft.rule.unlockMinute
         do {
             try DeviceActivityCenter().startMonitoring(activity, during: DeviceActivitySchedule(
                 intervalStart: DateComponents(hour: 0, minute: 0),
                 intervalEnd: DateComponents(hour: minute / 60, minute: minute % 60), repeats: true))
             staged.rule.enabled = true
-            try FocusStorage.save(staged)
-            reconcile()
+            try FocusStorage.withLock { try FocusStorage.save(staged); apply(staged) }
         } catch {
             DeviceActivityCenter().stopMonitoring([activity])
             clear()
@@ -86,12 +105,26 @@ enum FocusEnforcement {
         }
     }
 
+    static func complete(_ id: UUID) throws {
+        try FocusStorage.withLock {
+            var saved = try FocusStorage.load()
+            guard let index = saved.rule.tasks.firstIndex(where: { $0.id == id }) else { return }
+            saved.rule.tasks[index].completedDay = FocusRule.dayKey(Date(), calendar: .autoupdatingCurrent)
+            try FocusStorage.save(saved)
+            apply(saved)
+        }
+    }
+
     static func disable() throws {
-        // Persist off before stopping callbacks. If persistence fails, clear now
-        // and surface the error rather than falsely reporting a durable disable.
-        var config = try FocusStorage.load(); config.rule.enabled = false
-        do { try FocusStorage.save(config) }
-        catch { clear(); throw error }
-        DeviceActivityCenter().stopMonitoring([activity]); clear()
+        // Always stop and clear, even if the file is missing or unreadable.
+        // Persist a clean off configuration on recovery so future opens stay off.
+        DeviceActivityCenter().stopMonitoring([activity])
+        defer { clear() }
+        try FocusStorage.withLock {
+            var config = (try? FocusStorage.load()) ?? FocusConfiguration()
+            config.rule.enabled = false
+            try FocusStorage.save(config)
+            clear()
+        }
     }
 }
