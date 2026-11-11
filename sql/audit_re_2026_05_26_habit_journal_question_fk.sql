@@ -6,7 +6,7 @@
 -- Background:
 --   - habit_journal.question is free-text and loosely joined to
 --     habit_name_map. No FK means typos / Notion renames could silently orphan
---     rows. Per CLAUDE.md, the habit-rename flow already auto-updates
+--     rows. Per AGENTS.md, the habit-rename flow already auto-updates
 --     historical habit_journal entries; this just promotes that invariant to
 --     a constraint.
 --   - Verified no orphans exist before applying; habit_name has no duplicates.

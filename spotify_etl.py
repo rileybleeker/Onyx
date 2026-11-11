@@ -200,7 +200,7 @@ def refresh_access_token(tokens: dict) -> dict:
 
     Raises SpotifyAuthError on a 400/401 from /api/token — the documented
     invalid_grant response when the refresh token has expired or been revoked
-    (Spotify rotates these occasionally; see CLAUDE.md).
+    (Spotify rotates these occasionally; see AGENTS.md).
     """
     basic = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
     resp = httpx.post(
@@ -279,7 +279,7 @@ class SpotifyClient:
 
         Spotify's Feb 2026 migration removed the batch GET /v1/artists?ids=...
         endpoint for Development Mode apps (bare 403 Forbidden, no scope hint —
-        matching the playlist-endpoint symptom documented in CLAUDE.md). The
+        matching the playlist-endpoint symptom documented in AGENTS.md). The
         replacement is per-id GET /v1/artists/{id}. Rate limits are generous
         for this endpoint; a tiny sleep keeps us polite without slowing things.
         """

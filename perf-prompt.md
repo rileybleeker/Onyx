@@ -42,7 +42,7 @@ THIS IS AN UNATTENDED OVERNIGHT RUN. Nobody is watching:
    - Don't change any data semantics (TZ/behavioral-day conventions, WHOOP-as-TDEE,
      view choices). Performance-only pass.
    - All reads keep going through the existing views (e.g. hrv_predictions_latest),
-     per CLAUDE.md.
+     per AGENTS.md.
    - Don't touch the ETL Python or the GitHub Actions workflows.
 
 4. VERIFY (all must pass before pushing; if verification fails, fix or revert until

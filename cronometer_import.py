@@ -22,7 +22,7 @@ Idempotency:
     - cronometer_servings        : delete-by-calendar_date + insert (reflects edits/deletes
                                    in the source export; survives re-import of the same range).
 
-Conventions honored (see CLAUDE.md):
+Conventions honored (see AGENTS.md):
     - utf-8-sig read (Cronometer exports carry a BOM; micro sign is UTF-8 'µ').
     - JSONB columns get raw dicts, NEVER json.dumps (supabase-py serializes natively).
     - pds.sync_log heartbeat on EVERY run, success AND failure, one per data_type.

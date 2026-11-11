@@ -9,7 +9,7 @@
 -- Pre-rename the name hid both the source (WHOOP RMSSD vs Garmin's algorithm
 -- vs Eight Sleep's avg_hrv) and the unit (milliseconds). The three HRV
 -- sources are deliberately NEVER combined statistically — each has its own
--- algorithm and unit (see CLAUDE.md HRV semantics note). View consumers
+-- algorithm and unit (see AGENTS.md HRV semantics note). View consumers
 -- must pick a specific source column rather than a unified "HRV" metric.
 -- =============================================================================
 

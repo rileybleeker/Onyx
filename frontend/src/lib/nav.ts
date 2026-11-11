@@ -24,7 +24,7 @@ import {
  *
  * Consumed by both `Sidebar` (desktop) and `MobileNav` (drawer) and the
  * `CommandPalette` — this replaces the two hand-maintained `nav` arrays that
- * the CLAUDE.md convention previously forced to be edited in lockstep. Add or
+ * the AGENTS.md convention previously forced to be edited in lockstep. Add or
  * reorder routes HERE and every surface updates together.
  */
 export interface NavItem {

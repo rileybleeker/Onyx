@@ -64,7 +64,7 @@ export async function getDailySummaries(days: number = 30) {
 
   if (error) throw error;
 
-  // TDEE guard: CLAUDE.md is explicit that WHOOP `kilojoule / 4.184` is the
+  // TDEE guard: AGENTS.md is explicit that WHOOP `kilojoule / 4.184` is the
   // canonical "calories burnt" — Garmin's `total_kilocalories` must not be
   // substituted. Rename on the way out so any chart that destructures
   // `total_kilocalories` as TDEE silently breaks instead of silently
@@ -361,7 +361,7 @@ export async function getWorkoutSleepGap(days: number = 60): Promise<WorkoutSlee
     }
     // pred_date = behavioral date (day the workout/strain "belongs to" for the
     // following sleep). Use whoopSleepDay() — `(cycle_start − 6h)::ET date` —
-    // matching the canonical pipeline attribution (ADR-0001, see CLAUDE.md
+    // matching the canonical pipeline attribution (ADR-0001, see AGENTS.md
     // behavioral-day rule). The previous naive (cycle_start − 24h) math pushed
     // pre-midnight bedtimes back TWO calendar days instead of one, mis-pairing
     // workouts with the wrong day's sleep on every pre-midnight night.
@@ -562,7 +562,7 @@ export async function getDailyNutrientsFull(days: number = 30) {
  * Source of record on Onyx — NOT Garmin. Reads `pds.whoop_cycles.kilojoule`
  * and converts to kcal via /4.184. Each cycle is tagged to its ET cycle date
  * via the +12h rule (a bedtime-start cycle lands on the wake day), matching
- * the canonical timezone convention in CLAUDE.md.
+ * the canonical timezone convention in AGENTS.md.
  */
 export async function getWhoopCaloriesBurnt(days: number = 30) {
   const since = new Date();
@@ -671,7 +671,7 @@ export interface CaffeineHrvPair {
 /**
  * Caffeine (behavioral day N) paired with the recovery of the WHOOP cycle that
  * STARTS at the bedtime closing day N — i.e. the same-row whoop_hrv_rmssd is
- * the NEXT-NIGHT HRV relative to that day's caffeine (see CLAUDE.md matrix
+ * the NEXT-NIGHT HRV relative to that day's caffeine (see AGENTS.md matrix
  * semantics). Same-row pairing IS the correct "caffeine day → following
  * night's HRV" comparison; label it "next-night HRV" in any UI. Only rows
  * where both sides are non-null.
@@ -889,7 +889,7 @@ export async function getJournal(days: number = 30) {
 }
 
 // ---------------------------------------------------------------------------
-// Spotify (separate domain — no joins to health tables; see CLAUDE.md)
+// Spotify (separate domain — no joins to health tables; see AGENTS.md)
 // ---------------------------------------------------------------------------
 
 export interface SpotifyPlayRow {

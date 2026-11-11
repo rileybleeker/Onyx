@@ -1,4 +1,6 @@
-# Onyx — Claude Code Instructions
+# Onyx — Agent Instructions
+
+Read by every coding agent (Claude Code, Codex, Cursor, Copilot, Gemini CLI, …). This is the only project-instructions file; there is no CLAUDE.md.
 
 Personal health data aggregation and analytics platform.
 Syncs biometric data from Garmin, WHOOP, and Eight Sleep into a unified Supabase Postgres database,
@@ -378,28 +380,9 @@ NOTION_API_KEY, NOTION_JOURNAL_DB, VOYAGE_API_KEY
 `frontend/.env.local`: NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
 SUPABASE_SERVICE_ROLE_KEY, ANTHROPIC_API_KEY, NOTION_API_KEY, NOTION_HABITS_DB, VOYAGE_API_KEY
 
-## Claude Code Permissions
+## Agent Permissions
 
-Configured in `.claude/settings.local.json`. Two layers of control:
-
-**Permission Modes** (cycle with Shift+Tab in CLI):
-- `default` — prompts for each tool on first use
-- `acceptEdits` — auto-approves file edits, still prompts for bash
-- `plan` — read-only, no edits or commands
-- `bypassPermissions` — skip all prompts (isolated environments only)
-
-**Pre-approved Bash Commands** (run without prompting in any mode):
-`python`, `python3`, `pip`, `npm`, `npx`, `node`, `git`, `gh`, `ls`, `pwd`,
-`which`, `where`, `find`, `curl`, `export`, `cmd.exe`, `wc`, `diff`, `sort`,
-`mkdir`, `cp`, `mv`, `touch`
-
-**Pre-approved Tools**: WebSearch, WebFetch, all Supabase MCP ops, Notion (fetch/search/update/create pages)
-
-**Guard Hooks** (run before every tool call regardless of mode):
-- `guard_path.sh` — validates file paths before Write/Edit/NotebookEdit
-- `guard_bash.sh` — validates commands before Bash execution
-
-**Not pre-approved** (always prompts): `rm`, `kill`, destructive commands, Supabase project lifecycle ops
+Each agent's permissions live in that agent's own settings, not in this repo (Claude Code: `~/.claude/settings.json` + the untracked `.claude/settings.local.json`). Whatever the agent, ask before `rm`, `kill`, other destructive commands, and Supabase project lifecycle operations (pause, restore, delete, branch merge/reset).
 
 ## GitHub Actions ETL
 
@@ -480,4 +463,4 @@ Production tripwire for the class of bug `tsc` + `lint` cannot catch: a panel th
 
 **This is the source of truth for "what's open" and "what's next" on Onyx** — read it filtered to `Source = "Onyx Roadmap"` and `Status ≠ Done`. Do not track open items in this file — CLAUDE.md is for *shipped* capability + conventions; the roadmap is for *pending* work. When shipping a feature, mark the matching task `Done` (or create-then-Done one in the same call) and refresh its Notes with the commit / module / route. When noticing a bug or polish opportunity you won't fix in the current session, create a `Not Started` page (tagged `Source = "Onyx Roadmap"`) with enough context that a future session can pick it up cold.
 
-Mechanics (Claude Code): use the Notion MCP — `notion-update-page` (`command: "update_properties"`, `properties: {"Status": "Done", "Notes": "..."}`) for existing pages; `notion-create-pages` (`parent: {"type":"data_source_id", "data_source_id":"6149d32a-66be-4e54-ab1b-28c4a11c6543"}`) for new ones. Always set `Source: "Onyx Roadmap"` plus Component / Phase / Priority / Status (and Notes) — leaving any blank makes the entry hard to triage.
+Mechanics: use the Notion MCP — `notion-update-page` (`command: "update_properties"`, `properties: {"Status": "Done", "Notes": "..."}`) for existing pages; `notion-create-pages` (`parent: {"type":"data_source_id", "data_source_id":"6149d32a-66be-4e54-ab1b-28c4a11c6543"}`) for new ones. Always set `Source: "Onyx Roadmap"` plus Component / Phase / Priority / Status (and Notes) — leaving any blank makes the entry hard to triage.

@@ -316,7 +316,7 @@ const PAGES: SmokePage[] = [
     heading: "Spotify",
     signal: "charts",
     // "No featurized plays…" / "No plays in this range." can be legitimately
-    // empty (ReccoBeats coverage gap; range windowing) — see CLAUDE.md Spotify
+    // empty (ReccoBeats coverage gap; range windowing) — see AGENTS.md Spotify
     // coverage notes. The page-level + top-list emptiness are hard fails.
     hardEmpty: [
       "No Spotify plays in the database yet.",
