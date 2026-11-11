@@ -23,5 +23,13 @@ seaborn==0.13.2
 
 # Supabase / IO
 supabase==2.19.0
+# supabase 2.19.0 does not pin its sub-packages, so pip pulled supabase-auth 2.34.1
+# (Nov 2026), which dropped supabase_auth.http_clients and breaks `import supabase`.
+# Pin the sub-packages to the matching release.
+supabase-auth==2.19.0
+supabase-functions==2.19.0
+storage3==2.19.0
+postgrest==2.19.0
+realtime==2.19.0
 httpx==0.28.1
 python-dotenv  # any
