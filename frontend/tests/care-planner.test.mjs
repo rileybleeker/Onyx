@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import { nextDue, validDate, todayLocal, parseItems } from '../src/lib/care-planner.ts';
+assert.equal(nextDue('2024-01-31', 1), '2024-02-29');
+assert.equal(nextDue('2023-01-31', 1), '2023-02-28');
+assert.equal(nextDue('2024-02-29', 12), '2025-02-28');
+assert.equal(nextDue('2026-11-11', 3), '2027-02-11');
+assert.equal(validDate('2026-02-30'), false);
+assert.equal(validDate('2026-2-03'), false);
+assert.throws(() => nextDue('bad', 3));
+assert.throws(() => nextDue('2026-01-01', -1));
+assert.equal(todayLocal(new Date(2026, 10, 11, 23, 59)), '2026-11-11');
+const item = { id: 'fixture', title: 'Routine care', due: '2026-11-11', months: 12, booked: false, archived: false };
+assert.deepEqual(parseItems(JSON.stringify([item])), [item]);
+assert.throws(() => parseItems(JSON.stringify([item, item])));
+assert.throws(() => parseItems(JSON.stringify([{...item, due: '2026-02-30'}])));
+assert.throws(() => parseItems('{}'));
+console.log('Care planner date and storage tests passed');
+assert.throws(() => parseItems(JSON.stringify([{...item, months: 7}])));
