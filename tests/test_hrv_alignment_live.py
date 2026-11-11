@@ -15,7 +15,9 @@ behaviour was scored one night late. This one reads live data and fails if:
   4. the descriptive outcome, the forecast target (prepare_ml_data) or the causal outcome
      stops being row D's own HRV;
   5. anyone re-introduces a negative shift of the HRV target in the pipeline sources;
-  6. the alcohol canary reverses (same night must be hit harder than the next night).
+  6. (warning only) the alcohol canary: drinking should hit the same night harder than the
+     next night. It rests on a handful of drinking days, so a reversal is printed, never a
+     failure; hrv_analysis.check_alignment turns it into a PARTIAL heartbeat.
 
 Needs SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY (GitHub Actions has them; this PC has no
 .env). Without them it SKIPS, unless ONYX_REQUIRE_LIVE=1 (set in CI), which makes a
@@ -188,8 +190,11 @@ def test_alcohol_canary():
     df = m.merge(pj, on="calendar_date", how="left").sort_values("calendar_date")
     res = al.alcohol_canary(df)
     print(f"  alcohol canary: {res}")
-    assert res.get("ok") is not False, f"alcohol canary reversed: {res}"
-    print("PASS: alcohol hits the same night's HRV harder than the next night's")
+    if res.get("ok") is False:
+        # Soft by design: ~6 drinking days with HRV, so one new day can flip it.
+        print("WARN: alcohol canary reversed (not a failure; the retrain writes a partial heartbeat)")
+    else:
+        print("PASS: alcohol hits the same night's HRV harder than the next night's (or too few days to judge)")
 
 
 def _heartbeat(msg: str) -> None:

@@ -1,5 +1,7 @@
 # Handoff: fix the one-night misalignment in the HRV analysis
 
+**Status: executed 2026-11-11 — do not run again.** The rule now lives in `hrv_alignment.py` (see the "HRV alignment rule" bullet under Conventions in `AGENTS.md`; the KNOWN ISSUE bullet referred to below was replaced by it). Pre-fix results: `pds.hrv_analysis_results_pre_alignment_20261110`.
+
 Written 2026-11-10 for a Claude Code session with no memory of the session that found this. Read the "KNOWN ISSUE (confirmed 2026-11-10 ...)" bullet under Conventions in `AGENTS.md` first; this brief adds what that bullet does not say. The roadmap row is Notion task `414bf5b4-4bf2-81ee-a60a-f7775ae71ec7` (Critical); its Notes hold the raw evidence.
 
 ## The problem
@@ -10,7 +12,7 @@ Row D of `pds.daily_health_matrix_behavioral` holds the HRV of the sleep that CL
 
 - 2026-04-04, commit `b0828fa`: introduced `shift(-1)` ("use next-night HRV as target"). Correct then, because the matrix dated the WHOOP cycle by wake day, so a row held the HRV Riley woke up with.
 - 2026-05-25, commits `165b879` and `a04d35e` (ADR-0001): the pipeline switched to the behavioral matrix, which dates the cycle by bedtime minus 6 hours. `shift(-1)` was left in place.
-- 2026-05-26: the re-audit flagged exactly this (gemini F-001, P0). It was marked DISPUTED because it contradicted the docs and `tests/test_phase2_alignment.py`, and it never became a task.
+- 2026-05-27: the re-audit flagged exactly this (gemini F-001, P0). It was marked DISPUTED because it contradicted the docs and `tests/test_phase2_alignment.py`, and it never became a task.
 - That test builds a synthetic, pre-aligned frame in the April layout and never reads the real matrix. It passes and catches nothing.
 
 This is not the April bug again, and the fix is not the April fix again. For most behaviour features it is the reverse.

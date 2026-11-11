@@ -64,6 +64,8 @@ BEHAVIORAL_DAY_OFFSET = timedelta(hours=6)
 # Bumped whenever the rule changes. Stored in the model pickle and the causal payload so a
 # model trained under one rule is never served under another.
 ALIGNMENT_VERSION = "same_night_v1"
+# First day whose live forecasts follow this rule (model_version starts with the run date).
+ALIGNMENT_CUTOVER_DATE = "2026-11-11"
 
 # Matrix columns that describe the waking day AFTER row D's sleep (see module docstring).
 NEXT_DAY_COLS = ("whoop_day_strain", "whoop_kilojoule", "whoop_cycle_avg_hr", "whoop_cycle_max_hr")

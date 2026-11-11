@@ -178,10 +178,31 @@ export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInit
     );
   }
 
+  // Eight Sleep and Garmin HRV rows are dated by the WAKE-UP day, so on matrix row D they
+  // describe the night before WHOOP's (row D = the sleep that closes day D). Pair each WHOOP /
+  // Garmin-sleep night with the Eight Sleep + Garmin HRV values from row D+1 — the same
+  // re-key hrv_alignment.realign_matrix applies in the pipeline (live check 2026-11-10:
+  // Eight Sleep HRV vs WHOOP r = 0.56 same row, 0.84 one row apart; Garmin HRV 0.19 vs 0.82).
+  // Rows are re-derived from the fetched range, so the newest night has no partner yet.
+  const byDate = new Map<string, any>(data.map((d) => [String(d.calendar_date ?? d.onyx_behavioral_date), d]));
+  const nextDay = (s: string) => {
+    const t2 = new Date(s + "T00:00:00Z");
+    t2.setUTCDate(t2.getUTCDate() + 1);
+    return t2.toISOString().split("T")[0];
+  };
+  const paired = data.map((d) => {
+    const n = byDate.get(nextDay(String(d.calendar_date ?? d.onyx_behavioral_date))) ?? {};
+    const moved: Record<string, any> = {};
+    for (const k of Object.keys(d)) {
+      if (k.startsWith("eight_sleep_") || k.startsWith("garmin_hrv_")) moved[k] = n[k] ?? null;
+    }
+    return { ...d, ...moved };
+  });
+
   // Extract arrays per source
-  const garminSleep = data.map((d) => d.garmin_sleep_score);
-  const whoopSleep = data.map((d) => d.whoop_sleep_performance);
-  const eightSleep = data.map((d) => d.eight_sleep_score);
+  const garminSleep = paired.map((d) => d.garmin_sleep_score);
+  const whoopSleep = paired.map((d) => d.whoop_sleep_performance);
+  const eightSleep = paired.map((d) => d.eight_sleep_score);
 
   // Per-night HRV reading from each device's main-sleep session. Garmin
   // exposes weekly_avg / last_night / 5min_high / baselines on the matrix;
@@ -189,42 +210,42 @@ export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInit
   // comparable to WHOOP's per-cycle hrv_rmssd_milli and Eight Sleep's avg_hrv.
   // (The view previously surfaced a `garmin_hrv` alias which was removed in
   // the c0cff10 source-prefixing pass.)
-  const garminHrv = data.map((d) => d.garmin_hrv_last_night ? +d.garmin_hrv_last_night : null);
-  const whoopHrv = data.map((d) => d.whoop_hrv_rmssd ? +d.whoop_hrv_rmssd : null);
-  const eightHrv = data.map((d) => d.eight_sleep_hrv ? +d.eight_sleep_hrv : null);
+  const garminHrv = paired.map((d) => d.garmin_hrv_last_night ? +d.garmin_hrv_last_night : null);
+  const whoopHrv = paired.map((d) => d.whoop_hrv_rmssd ? +d.whoop_hrv_rmssd : null);
+  const eightHrv = paired.map((d) => d.eight_sleep_hrv ? +d.eight_sleep_hrv : null);
 
-  const garminRhr = data.map((d) => d.garmin_rhr);
-  const whoopRhr = data.map((d) => d.whoop_rhr);
-  const eightHr = data.map((d) => d.eight_sleep_hr ? +d.eight_sleep_hr : null);
+  const garminRhr = paired.map((d) => d.garmin_rhr);
+  const whoopRhr = paired.map((d) => d.whoop_rhr);
+  const eightHr = paired.map((d) => d.eight_sleep_hr ? +d.eight_sleep_hr : null);
 
-  const garminResp = data.map((d) => d.garmin_sleep_respiration ? +d.garmin_sleep_respiration : null);
-  const whoopResp = data.map((d) => d.whoop_respiratory_rate ? +d.whoop_respiratory_rate : null);
-  const eightResp = data.map((d) => d.eight_sleep_breath_rate ? +d.eight_sleep_breath_rate : null);
+  const garminResp = paired.map((d) => d.garmin_sleep_respiration ? +d.garmin_sleep_respiration : null);
+  const whoopResp = paired.map((d) => d.whoop_respiratory_rate ? +d.whoop_respiratory_rate : null);
+  const eightResp = paired.map((d) => d.eight_sleep_breath_rate ? +d.eight_sleep_breath_rate : null);
 
   // Duration pairs in MINUTES. Each side is main-session-only so naps don't
   // bias one device upward (see Notion decision record on nap-inclusion
   // convention). Garmin uses is_nap=false in the matrix; WHOOP same; Eight
   // Sleep uses the _main_sec columns added 2026-05-25.
-  const garminDurMin = data.map((d) => d.garmin_sleep_duration_sec ? +d.garmin_sleep_duration_sec / 60 : null);
-  const whoopDurMin = data.map((d) => d.whoop_sleep_duration_milli ? +d.whoop_sleep_duration_milli / 60000 : null);
-  const eightDurMin = data.map((d) => d.eight_sleep_duration_main_sec ? +d.eight_sleep_duration_main_sec / 60 : null);
+  const garminDurMin = paired.map((d) => d.garmin_sleep_duration_sec ? +d.garmin_sleep_duration_sec / 60 : null);
+  const whoopDurMin = paired.map((d) => d.whoop_sleep_duration_milli ? +d.whoop_sleep_duration_milli / 60000 : null);
+  const eightDurMin = paired.map((d) => d.eight_sleep_duration_main_sec ? +d.eight_sleep_duration_main_sec / 60 : null);
 
-  const garminDeepMin = data.map((d) => d.garmin_deep_sleep_sec ? +d.garmin_deep_sleep_sec / 60 : null);
-  const whoopDeepMin = data.map((d) => d.whoop_deep_sleep_milli ? +d.whoop_deep_sleep_milli / 60000 : null);
-  const eightDeepMin = data.map((d) => d.eight_sleep_deep_main_sec ? +d.eight_sleep_deep_main_sec / 60 : null);
+  const garminDeepMin = paired.map((d) => d.garmin_deep_sleep_sec ? +d.garmin_deep_sleep_sec / 60 : null);
+  const whoopDeepMin = paired.map((d) => d.whoop_deep_sleep_milli ? +d.whoop_deep_sleep_milli / 60000 : null);
+  const eightDeepMin = paired.map((d) => d.eight_sleep_deep_main_sec ? +d.eight_sleep_deep_main_sec / 60 : null);
 
-  const garminRemMin = data.map((d) => d.garmin_rem_sleep_sec ? +d.garmin_rem_sleep_sec / 60 : null);
-  const whoopRemMin = data.map((d) => d.whoop_rem_sleep_milli ? +d.whoop_rem_sleep_milli / 60000 : null);
-  const eightRemMin = data.map((d) => d.eight_sleep_rem_main_sec ? +d.eight_sleep_rem_main_sec / 60 : null);
+  const garminRemMin = paired.map((d) => d.garmin_rem_sleep_sec ? +d.garmin_rem_sleep_sec / 60 : null);
+  const whoopRemMin = paired.map((d) => d.whoop_rem_sleep_milli ? +d.whoop_rem_sleep_milli / 60000 : null);
+  const eightRemMin = paired.map((d) => d.eight_sleep_rem_main_sec ? +d.eight_sleep_rem_main_sec / 60 : null);
 
-  const garminLightMin = data.map((d) => d.garmin_light_sleep_sec ? +d.garmin_light_sleep_sec / 60 : null);
-  const whoopLightMin = data.map((d) => d.whoop_light_sleep_milli ? +d.whoop_light_sleep_milli / 60000 : null);
-  const eightLightMin = data.map((d) => d.eight_sleep_light_main_sec ? +d.eight_sleep_light_main_sec / 60 : null);
+  const garminLightMin = paired.map((d) => d.garmin_light_sleep_sec ? +d.garmin_light_sleep_sec / 60 : null);
+  const whoopLightMin = paired.map((d) => d.whoop_light_sleep_milli ? +d.whoop_light_sleep_milli / 60000 : null);
+  const eightLightMin = paired.map((d) => d.eight_sleep_light_main_sec ? +d.eight_sleep_light_main_sec / 60 : null);
 
   // Awake keeps true zeros (a night with no recorded wake time is real data).
-  const garminAwakeMin = data.map((d) => d.garmin_awake_sec != null ? +d.garmin_awake_sec / 60 : null);
-  const whoopAwakeMin = data.map((d) => d.whoop_awake_milli != null ? +d.whoop_awake_milli / 60000 : null);
-  const eightAwakeMin = data.map((d) => d.eight_sleep_awake_main_sec != null ? +d.eight_sleep_awake_main_sec / 60 : null);
+  const garminAwakeMin = paired.map((d) => d.garmin_awake_sec != null ? +d.garmin_awake_sec / 60 : null);
+  const whoopAwakeMin = paired.map((d) => d.whoop_awake_milli != null ? +d.whoop_awake_milli / 60000 : null);
+  const eightAwakeMin = paired.map((d) => d.eight_sleep_awake_main_sec != null ? +d.eight_sleep_awake_main_sec / 60 : null);
 
   // Compute all Bland-Altman comparisons
   const sleepBA = [

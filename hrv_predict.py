@@ -328,9 +328,17 @@ def recompute_rolling_metrics() -> None:
     preds = fetch_all(
         "hrv_predictions",
         select="prediction_date,model,horizon_days,predicted_hrv,actual_hrv,"
-               "prediction_lower,prediction_upper",
+               "prediction_lower,prediction_upper,model_version",
         filters=[("prediction_date", "gte", window_start)],
     )
+    if preds.empty:
+        return
+    # Live forecasts written before the alignment fix predicted a different night (the
+    # sleep after tonight). Keep them out of the rolling accuracy; backtest rows are
+    # rewritten by every retrain, so they are always on the current rule.
+    import hrv_alignment as al
+    ver = preds["model_version"].fillna("").astype(str)
+    preds = preds[ver.str.startswith("backtest") | (ver.str[:10] >= al.ALIGNMENT_CUTOVER_DATE)]
     if preds.empty:
         return
 
