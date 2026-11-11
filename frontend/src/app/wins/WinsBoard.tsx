@@ -21,7 +21,7 @@ export default function WinsBoard({ board }: { board: Board }) {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div role="group" aria-label="Filter progress" className="flex flex-wrap gap-2">{filters.map((name) => <button key={name} type="button" aria-pressed={filter === name} onClick={() => setFilter(name)} className={`rounded-full border px-4 py-2 text-sm focus-visible:outline-2 focus-visible:outline-accent ${filter === name ? "border-accent text-accent" : "border-border-subtle text-text-secondary"}`}>{name}</button>)}</div>
       </div>
-      <p className="text-xs text-text-secondary">Selected highlights, not a complete activity log. Status is a cached snapshot and may be older than five minutes. The source time is shown below.{board.checkedAt ? ` Source checked: ${new Date(board.checkedAt).toISOString().replace("T", " ").slice(0, 16)} UTC.` : " No check time available."}</p>
+      <p className="text-xs text-text-secondary">Selected highlights, not a complete activity log. Status is a cached snapshot and may be older than five minutes.{board.checkedAt ? ` Source checked: ${new Date(board.checkedAt).toISOString().replace("T", " ").slice(0, 16)} UTC.` : " No check time available."}</p>
       {unavailable && <p role="status" className="rounded-xl border border-border-subtle p-4 text-sm text-text-secondary">Some statuses could not be verified. Those cards are not counted as merged. Follow the evidence link for the latest status.</p>}
       <p role="status" aria-live="polite" className="sr-only">Showing {visible.length} of {board.wins.length} highlights.</p>
       <div className="grid gap-4 md:grid-cols-2">{visible.map((win) => <article key={win.pr} className="flex flex-col rounded-2xl border border-border-subtle bg-surface-card p-6">
@@ -31,7 +31,7 @@ export default function WinsBoard({ board }: { board: Board }) {
         {win.mergedAt && <p className="mt-4 text-xs text-text-secondary">Merged {win.mergedAt.slice(0, 10)} (UTC)</p>}
         <a className="mt-5 inline-flex items-center gap-1 self-start text-sm text-accent underline underline-offset-4" href={`https://github.com/rileybleeker/Onyx/pull/${win.pr}`} target="_blank" rel="noopener noreferrer">View evidence - PR #{win.pr}<ArrowUpRight size={14} aria-hidden="true" /><span className="sr-only"> (opens in a new tab)</span></a>
       </article>)}</div>
-      {visible.length === 0 && <p role="status" className="rounded-xl border border-border-subtle p-6 text-text-secondary">No verified highlights in this view yet. Try All to see the full board.</p>}
+      {visible.length === 0 && <p className="rounded-xl border border-border-subtle p-6 text-text-secondary">No verified highlights in this view yet. Try All to see the full board.</p>}
     </section>
     <footer className="flex flex-wrap gap-5 text-sm text-text-secondary"><Link href="/today" className="underline underline-offset-4">Back to Today</Link><Link href="/agents" className="underline underline-offset-4">Open agent conversations</Link></footer>
   </div>;
