@@ -13,6 +13,7 @@ import {
   getNutrition,
   getWhoopCaloriesBurnt,
   getCronometerServings,
+  getDeliveryItemsForDay,
   getDailyVitamins,
   getDailyNutrientsFull,
   rangeDays,
@@ -141,6 +142,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   const [vitaminsData, setVitaminsData] = useState<any[]>(initial?.vitaminsData ?? []);
   const [fullNutrients, setFullNutrients] = useState<any[]>(initial?.fullNutrients ?? []);
   const [todayServings, setTodayServings] = useState<any[]>([]);
+  const [todayDelivery, setTodayDelivery] = useState<any[]>([]);
   const [nutritionLoading, setNutritionLoading] = useState(!initial);
   const [range, setRange] = useState<Range>("30d");
   const firstRunWithInitial = useRef(!!initial);
@@ -204,6 +206,9 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   useEffect(() => {
     getCronometerServings(1, behavioralToday)
       .then(setTodayServings)
+      .catch(console.error);
+    getDeliveryItemsForDay(behavioralToday)
+      .then(setTodayDelivery)
       .catch(console.error);
   }, [behavioralToday]);
 
@@ -351,13 +356,21 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   const avgCarbs = avg(nutritionData, "carbs_g");
   const avgFat = avg(nutritionData, "fat_g");
 
+  // Days without a Cronometer log are filled with Uber Eats estimates
+  // (getNutrition) — label the source honestly.
+  const estDays = nutritionData.filter((d) => d.nutrition_source === "uber_eats").length;
+  const loggedDays = nutritionData.length - estDays;
+  const macroSource =
+    estDays === 0 ? "CRONOMETER" : loggedDays === 0 ? "UBER EATS EST." : "CRONOMETER + UBER EATS EST.";
+  const latestSource = latest?.nutrition_source === "uber_eats" ? "UBER EATS EST." : "CRONOMETER";
+
   return (
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Nutrition</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Daily macros, micronutrients &amp; body weight — food from Cronometer — {rangeLabel(range)}
+            Daily macros, micronutrients &amp; body weight — food from Cronometer + Uber Eats — {rangeLabel(range)}
           </p>
         </div>
         <RangeFilter value={range} onChange={setRange} />
@@ -368,7 +381,13 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
           "Today's Meals" below; meal-timing drivers show on /analytics/hrv. */}
 
       {/* ─── Daily Macros (Cronometer; MFP fills pre-cutover history) ──────── */}
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Cronometer · Daily Macros</p>
+      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Daily Macros</p>
+      {estDays > 0 && (
+        <p className="text-xs text-text-tertiary -mt-2 mb-3">
+          {estDays} of {nutritionData.length} days use Uber Eats estimates (dish names → kcal/macros; no Cronometer log that day).
+          They count the whole order, not what was eaten, and miss anything not delivered.
+        </p>
+      )}
 
       {nutritionLoading ? (
         <div className="space-y-6">
@@ -389,33 +408,33 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
               label="Calories"
               value={latest?.calories ?? null}
               sublabel={avgCalories > 0 ? `avg ${Math.round(avgCalories)} kcal` : undefined}
-              source="CRONOMETER"
+              source={latestSource}
             />
             <StatCard
               label="Protein"
               value={latest?.protein_g ? `${Number(latest.protein_g).toFixed(0)}g` : null}
               sublabel={avgProtein > 0 ? `avg ${avgProtein.toFixed(0)}g` : undefined}
-              source="CRONOMETER"
+              source={latestSource}
             />
             <StatCard
               label="Carbs"
               value={latest?.carbs_g ? `${Number(latest.carbs_g).toFixed(0)}g` : null}
               sublabel={avgCarbs > 0 ? `avg ${avgCarbs.toFixed(0)}g` : undefined}
-              source="CRONOMETER"
+              source={latestSource}
             />
             <StatCard
               label="Fat"
               value={latest?.fat_g ? `${Number(latest.fat_g).toFixed(0)}g` : null}
               sublabel={avgFat > 0 ? `avg ${avgFat.toFixed(0)}g` : undefined}
-              source="CRONOMETER"
+              source={latestSource}
             />
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <ChartCard
               title="Calorie Trend — Consumed vs Burnt"
-              subtitle="Cronometer daily intake against WHOOP cycle energy expenditure (kilojoule → kcal). Net = consumed − burnt."
-              source="CRONOMETER + WHOOP"
+              subtitle="Daily intake (Cronometer; Uber Eats dish estimates on days with no Cronometer log) against WHOOP cycle energy expenditure (kilojoule → kcal). Net = consumed − burnt."
+              source={`${macroSource} + WHOOP`}
               className="lg:col-span-2"
             >
               <ResponsiveContainer width="100%" height={280}>
@@ -437,7 +456,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                     stroke={C.accent}
                     strokeWidth={2}
                     fill="url(#calConsumedGrad)"
-                    name="Consumed (Cronometer)"
+                    name="Consumed"
                     connectNulls={false}
                     isAnimationActive={false}
                   />
@@ -458,7 +477,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
             <ChartCard
               title="Net Energy Balance"
               subtitle="Consumed − burnt per day. Above zero = surplus, below = deficit."
-              source="CRONOMETER + WHOOP"
+              source={`${macroSource} + WHOOP`}
               className="lg:col-span-2"
             >
               <ResponsiveContainer width="100%" height={220}>
@@ -480,7 +499,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
               </ResponsiveContainer>
             </ChartCard>
 
-            <ChartCard title="Macro Breakdown (g)" source="CRONOMETER" className="lg:col-span-2">
+            <ChartCard title="Macro Breakdown (g)" source={macroSource} className="lg:col-span-2">
               <ResponsiveContainer width="100%" height={260}>
                 <BarChart data={macroData}>
                   <CartesianGrid {...gridStyle} />
@@ -574,13 +593,13 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
       {/* ─── Today's meals (Cronometer per-entry log) ──────────────────────── */}
       <div className="flex items-baseline justify-between mb-3">
         <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">Today&apos;s Meals</p>
-        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER · {behavioralToday}</span>
+        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + UBER EATS · {behavioralToday}</span>
       </div>
-      {todayServings.length === 0 ? (
+      {todayServings.length === 0 && todayDelivery.length === 0 ? (
         <p className="text-xs text-text-tertiary mb-2">
-          No Cronometer entries for today yet. Entries appear after you export from Cronometer and the import runs.
+          Nothing logged for today yet. Cronometer entries and Uber Eats orders appear here once they sync.
         </p>
-      ) : (
+      ) : todayServings.length === 0 ? null : (
         <div className="bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle">
           {todayServings.map((s) => (
             <div key={s.serving_id} className="flex items-center gap-3 px-4 py-2.5 text-sm">
@@ -593,6 +612,29 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
               <span className="text-[11px] font-mono text-text-tertiary shrink-0">{s.amount_raw}</span>
               <span className="text-[11px] font-mono text-text-tertiary w-16 text-right shrink-0">
                 {s.calories != null ? `${Math.round(Number(s.calories))} kcal` : ""}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {todayDelivery.length > 0 && (
+        <div className={`bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle ${todayServings.length ? "mt-3" : ""}`}>
+          {todayDelivery.map((d) => (
+            <div key={d.item_id} className="flex items-center gap-3 px-4 py-2.5 text-sm">
+              <span className="text-[11px] font-mono text-text-tertiary w-20 shrink-0">
+                {d.completed_at
+                  ? new Date(d.completed_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })
+                  : "—"}
+              </span>
+              <span className="flex-1 truncate text-text-secondary">
+                {d.title}
+                <span className="text-text-tertiary"> · {d.store_name}</span>
+              </span>
+              <span className="text-[11px] font-mono text-text-tertiary shrink-0">
+                {Number(d.quantity) > 1 ? `×${d.quantity}` : ""} UBER EATS
+              </span>
+              <span className="text-[11px] font-mono text-text-tertiary w-16 text-right shrink-0">
+                {d.est_kcal != null ? `~${Math.round(Number(d.est_kcal))} kcal` : "—"}
               </span>
             </div>
           ))}

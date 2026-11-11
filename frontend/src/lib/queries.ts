@@ -465,7 +465,75 @@ export async function getNutrition(days: number = 30) {
     .order("calendar_date", { ascending: true });
 
   if (error) throw error;
-  return data ?? [];
+
+  // Uber Eats estimates fill days with no Cronometer/MFP log (Cronometer has
+  // been quiet since 2026-06-29, so delivery orders are often the only food
+  // signal). A logged day always wins — a Cronometer diary usually already
+  // contains the delivered meal, so adding both would double-count.
+  // Estimates are per-dish guesses from the Uber Eats cart (restaurant orders
+  // only), so these days are tagged nutrition_source='uber_eats'.
+  const { data: est, error: estErr } = await supabase
+    .from("delivery_nutrition_daily")
+    .select("behavioral_date, est_kcal, est_protein_g, est_carbs_g, est_fat_g")
+    .gte("behavioral_date", since.toISOString().split("T")[0])
+    .not("est_kcal", "is", null)
+    .order("behavioral_date", { ascending: true });
+  if (estErr) throw estErr;
+
+  type NutritionRow = Record<string, unknown> & { calendar_date: string };
+  const rows: NutritionRow[] = [...((data as unknown as NutritionRow[]) ?? [])];
+  const logged = new Set(rows.map((r) => r.calendar_date));
+  for (const e of est ?? []) {
+    if (logged.has(e.behavioral_date)) continue;
+    rows.push({
+      calendar_date: e.behavioral_date,
+      nutrition_source: "uber_eats",
+      calories: e.est_kcal,
+      protein_g: e.est_protein_g,
+      carbs_g: e.est_carbs_g,
+      fat_g: e.est_fat_g,
+      fiber_g: null,
+      sugar_g: null,
+      sodium_mg: null,
+      water_ml: null,
+    });
+  }
+  rows.sort((a, b) => (a.calendar_date < b.calendar_date ? -1 : a.calendar_date > b.calendar_date ? 1 : 0));
+  return rows;
+}
+
+/**
+ * Uber Eats cart lines for one behavioral day with the per-dish estimate
+ * (one unit × quantity). Restaurant orders only, cancelled orders excluded —
+ * same scope as pds.delivery_nutrition_daily. Feeds "Today's Meals".
+ */
+export async function getDeliveryItemsForDay(date: string) {
+  const { data, error } = await supabase
+    .from("delivery_order_items")
+    .select("item_id, store_name, title, quantity, completed_at, est_key, merchant_kind, is_cancelled")
+    .eq("onyx_behavioral_date", date)
+    .eq("is_cancelled", false)
+    .order("completed_at", { ascending: true })
+    .order("item_id", { ascending: true });
+  if (error) throw error;
+  const items = (data ?? []).filter((i) => i.merchant_kind === "restaurant");
+  const keys = Array.from(new Set(items.map((i) => i.est_key).filter(Boolean)));
+  const kcalByKey = new Map<string, number | null>();
+  if (keys.length) {
+    const { data: est, error: estErr } = await supabase
+      .from("delivery_item_nutrition")
+      .select("est_key, kcal")
+      .in("est_key", keys);
+    if (estErr) throw estErr;
+    for (const e of est ?? []) kcalByKey.set(e.est_key, e.kcal == null ? null : Number(e.kcal));
+  }
+  return items.map((i) => {
+    const unit = kcalByKey.get(i.est_key);
+    return {
+      ...i,
+      est_kcal: unit == null ? null : unit * Number(i.quantity ?? 1),
+    };
+  });
 }
 
 /**
