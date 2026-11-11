@@ -7,7 +7,7 @@ interface StatCardProps {
   unit?: string;
   sublabel?: string;
   trend?: { delta: number; favorable: "up" | "down" };
-  source?: "GARMIN" | "WHOOP" | "8SLP" | "MFP" | "CRONOMETER" | "SPOTIFY" | "TANITA";
+  source?: "GARMIN" | "WHOOP" | "8SLP" | "MFP" | "CRONOMETER" | "SPOTIFY" | "TANITA" | "UBER EATS EST.";
   className?: string;
   // ── Stage 2 (Direction A) additions — optional / additive ─────────────────
   sparkline?: { values: number[]; color?: string; favorable?: "up" | "down" };
@@ -21,6 +21,7 @@ const sourceColors: Record<string, string> = {
   CRONOMETER: "text-source-cronometer",
   SPOTIFY: "text-source-spotify",
   TANITA: "text-amber-500",
+  "UBER EATS EST.": "text-amber-300",
 };
 
 export default function StatCard({
