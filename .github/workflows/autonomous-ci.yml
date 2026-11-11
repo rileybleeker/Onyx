@@ -1,0 +1,53 @@
+name: Autonomous CI
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: autonomous-ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  offline-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Parse tracked Python without importing production modules
+        run: |
+          python - <<'PY'
+          import ast, subprocess
+          for path in subprocess.check_output(['git', 'ls-files', '*.py'], text=True).splitlines():
+              with open(path, encoding='utf-8-sig') as stream:
+                  ast.parse(stream.read(), filename=path)
+          PY
+      - name: Autonomous merge guard unit tests (no credentials or network)
+        run: python -m unittest discover -s tests -p test_autonomous_merge.py -v
+  frontend-types:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npx --no-install tsc --noEmit
+      - name: Compile production bundles without prerendering or production credentials
+        run: npx --no-install next build --experimental-build-mode compile
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'

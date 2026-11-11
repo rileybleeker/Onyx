@@ -1,14 +1,14 @@
 import type { Metadata, Viewport } from "next";
 import { GeistSans } from "geist/font/sans";
-import { JetBrains_Mono } from "next/font/google";
+import localFont from "next/font/local";
 import "./globals.css";
 import AppShell from "@/components/AppShell";
 
-// Direction A ("Terminal") display + numeric face. Self-hosted by next/font at
-// build time; exposed as --font-jetbrains-mono and led in the --font-mono stack.
-const jetbrainsMono = JetBrains_Mono({
-  subsets: ["latin"],
-  weight: ["400", "500", "600", "700"],
+// Direction A ("Terminal") display + numeric face. Self-hosted by next/font from
+// a vendored Google Fonts asset at build time; exposed as --font-jetbrains-mono and led in the --font-mono stack.
+const jetbrainsMono = localFont({
+  src: "./fonts/JetBrainsMono-Latin.woff2",
+  weight: "400 700",
   variable: "--font-jetbrains-mono",
   display: "swap",
 });

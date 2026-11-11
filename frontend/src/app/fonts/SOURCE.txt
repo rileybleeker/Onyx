@@ -1,0 +1,9 @@
+JetBrains Mono variable font
+Source: https://github.com/google/fonts/tree/5bb28733cec313b63fbd415b574b5ae35c8aa8b8/ofl/jetbrainsmono
+Upstream file: JetBrainsMono[wght].ttf; subset to Latin and converted to WOFF2 with fontTools 4.68.0, preserving the variable weight axis.
+Upstream TTF SHA-256: 48715a42ec242c21e9f02692891e147d022299a52e48d5e413e1a942193ffeda
+License: SIL Open Font License 1.1, reproduced in OFL.txt.
+Vendored to make CI builds deterministic and independent of Google's CSS endpoint.
+
+Subset ranges: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+2074,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD
+Vendored WOFF2 SHA-256: 1ddace4b01938fc8f4581b4db5201964fedf003b94da9115e11de8f6ae3dda99
