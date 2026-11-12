@@ -1,0 +1,41 @@
+name: Merge train
+# Merges green, routine PRs and keeps exactly one PR at a time up to date with master. Replaces the manual
+# "rebase, wait, merge, repeat" loop. Branch protection (required checks, up-to-date branch, enforced for admins)
+# stays the gate; this job uses only the repo's GITHUB_TOKEN and never checks out or runs PR code.
+# Brakes: `hold` label on a PR, an open `train-halt` issue (opened by a failed release), or disable this workflow.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+  workflow_run:
+    workflows: ["Autonomous CI", "Stats Tests (PR check)"]
+    types: [completed]
+  issues:
+    types: [closed, unlabeled]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+  checks: read
+  statuses: read
+  deployments: read
+# One evaluation at a time; a burst of events collapses into the one that is already queued.
+concurrency:
+  group: merge-train
+  cancel-in-progress: false
+jobs:
+  train:
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Run the train
+        run: python3 tools/merge_train.py train
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
