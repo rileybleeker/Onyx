@@ -13,7 +13,6 @@ import {
   getNutrition,
   getWhoopCaloriesBurnt,
   getCronometerServings,
-  getDeliveryItemsForDay,
   getDailyVitamins,
   getDailyNutrientsFull,
   rangeDays,
@@ -24,6 +23,8 @@ import { formatDate, kgToLb, lbToKg, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
+import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortions";
+import { shiftYmd } from "@/lib/delivery-portion";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -141,11 +142,15 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   const [burntData, setBurntData] = useState<any[]>(initial?.burntData ?? []);
   const [vitaminsData, setVitaminsData] = useState<any[]>(initial?.vitaminsData ?? []);
   const [fullNutrients, setFullNutrients] = useState<any[]>(initial?.fullNutrients ?? []);
-  const [todayServings, setTodayServings] = useState<any[]>([]);
-  const [todayDelivery, setTodayDelivery] = useState<any[]>([]);
+  const [servingsState, setServingsState] = useState<{ date: string | null; rows: any[]; failed?: boolean }>({ date: null, rows: [] });
   const [nutritionLoading, setNutritionLoading] = useState(!initial);
   const [range, setRange] = useState<Range>("30d");
   const firstRunWithInitial = useRef(!!initial);
+  // Guards for the silent post-save refresh (refreshNutritionSilently): the range it ran for, a counter the
+  // range effect bumps (a newer range load wins), and a counter per refresh (the newest refresh wins).
+  const rangeRef = useRef(range);
+  const nutritionGen = useRef(0);
+  const refreshSeq = useRef(0);
 
   // ─── Weight state ───
   const [weightRows, setWeightRows] = useState<WeightRow[]>([]);
@@ -176,6 +181,9 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     // loading state as before. The cancelled flag stops a superseded slow
     // response from overwriting a newer range's data (out-of-order resolve).
     let cancelled = false;
+    rangeRef.current = range;
+    nutritionGen.current += 1;
+    const refreshAtStart = refreshSeq.current;
     const silent = firstRunWithInitial.current;
     firstRunWithInitial.current = false;
     if (!silent) setNutritionLoading(true);
@@ -190,7 +198,8 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
         // sameJson bail-out: the silent revalidation's data is usually
         // byte-identical to the server-seeded state — returning the previous
         // reference lets React skip the commit (and a full chart re-render).
-        setNutritionData((prev) => (sameJson(prev, n) ? prev : n));
+        // A post-save refresh started after this load fetched newer macros: keep those.
+        if (refreshSeq.current === refreshAtStart) setNutritionData((prev) => (sameJson(prev, n) ? prev : n));
         setBurntData((prev) => (sameJson(prev, b) ? prev : b));
         setVitaminsData((prev) => (sameJson(prev, v) ? prev : v));
         setFullNutrients((prev) => (sameJson(prev, f) ? prev : f));
@@ -202,15 +211,46 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     return () => { cancelled = true; };
   }, [range]);
 
-  // ─── Today's Cronometer food log (behavioral day, not clock day) ───
+  // ─── Meals log for one behavioral day (today by default; the two days before are one tap away,
+  // because a leftover is usually noticed the next morning) ───
+  const [mealsDayOffset, setMealsDayOffset] = useState(0);
+  const mealsDay = shiftYmd(behavioralToday, -mealsDayOffset);
   useEffect(() => {
-    getCronometerServings(1, behavioralToday)
-      .then(setTodayServings)
+    let cancelled = false;
+    getCronometerServings(1, mealsDay)
+      .then((rows) => {
+        if (!cancelled) {
+          setServingsState((prev) =>
+            prev.date === mealsDay && !prev.failed && sameJson(prev.rows, rows) ? prev : { date: mealsDay, rows },
+          );
+        }
+      })
+      .catch((e) => {
+        console.error(e);
+        if (!cancelled) setServingsState({ date: mealsDay, rows: [], failed: true });
+      });
+    return () => { cancelled = true; };
+  }, [mealsDay]);
+
+  // A saved portion changes that day's Uber Eats estimate in the macro charts: refetch them silently.
+  // Reads the CURRENT range (not the one at tap time) and drops its result if the range changed, or a
+  // newer refresh started, while it was in flight.
+  const refreshNutritionSilently = useCallback(() => {
+    const r = rangeRef.current;
+    const gen = nutritionGen.current;
+    const seq = ++refreshSeq.current;
+    getNutrition(rangeDays(r))
+      .then((n) => {
+        if (rangeRef.current !== r || nutritionGen.current !== gen || refreshSeq.current !== seq) return;
+        setNutritionData((prev) => (sameJson(prev, n) ? prev : n));
+      })
       .catch(console.error);
-    getDeliveryItemsForDay(behavioralToday)
-      .then(setTodayDelivery)
-      .catch(console.error);
-  }, [behavioralToday]);
+  }, []);
+  const delivery = useDeliveryDishes(mealsDay, { onSaved: refreshNutritionSilently });
+  const servingsLoaded = servingsState.date === mealsDay;
+  const servingsFailed = servingsLoaded && !!servingsState.failed;
+  const todayServings = servingsLoaded ? servingsState.rows : [];
+  const mealsLoading = !servingsLoaded || !delivery.loaded;
 
   // ─── Weight loader + default date init ───
   const loadWeight = useCallback(async () => {
@@ -385,7 +425,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
       {estDays > 0 && (
         <p className="text-xs text-text-tertiary -mt-2 mb-3">
           {estDays} of {nutritionData.length} days use Uber Eats estimates (dish names → kcal/macros; no Cronometer log that day).
-          They count the whole order, not what was eaten, and miss anything not delivered.
+          They count what you marked as eaten under Meals below or in the check-in (All unless you change it), and miss anything not delivered.
         </p>
       )}
 
@@ -592,14 +632,38 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
 
       {/* ─── Today's meals (Cronometer per-entry log) ──────────────────────── */}
       <div className="flex items-baseline justify-between mb-3">
-        <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">Today&apos;s Meals</p>
-        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + UBER EATS · {behavioralToday}</span>
-      </div>
-      {todayServings.length === 0 && todayDelivery.length === 0 ? (
-        <p className="text-xs text-text-tertiary mb-2">
-          Nothing logged for today yet. Cronometer entries and Uber Eats orders appear here once they sync.
+        <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">
+          {mealsDayOffset === 0 ? "Today's Meals" : "Meals"}
         </p>
-      ) : todayServings.length === 0 ? null : (
+        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + UBER EATS · {mealsDay}</span>
+      </div>
+      <div className="flex gap-1.5 mb-3" role="tablist" aria-label="Meals day">
+        {[0, 1, 2].map((off) => (
+          <button
+            key={off}
+            role="tab"
+            aria-selected={mealsDayOffset === off}
+            onClick={() => setMealsDayOffset(off)}
+            className={`px-2.5 py-1 rounded-[5px] border text-[11px] font-mono transition-colors ${
+              mealsDayOffset === off
+                ? "border-accent/60 bg-accent/10 text-text-primary"
+                : "border-border-subtle text-text-tertiary hover:text-text-secondary"
+            }`}
+          >
+            {off === 0 ? "Today" : off === 1 ? "Yesterday" : formatShortDate(shiftYmd(behavioralToday, -2))}
+          </button>
+        ))}
+      </div>
+      {mealsLoading ? (
+        <p className="text-xs text-text-tertiary mb-2">Loading…</p>
+      ) : todayServings.length === 0 && delivery.items.length === 0 && !servingsFailed && !delivery.loadError ? (
+        <p className="text-xs text-text-tertiary mb-2">
+          Nothing logged for {mealsDayOffset === 0 ? "today" : "this day"} yet. Cronometer entries and Uber Eats orders appear here once they sync.
+        </p>
+      ) : null}
+      {servingsFailed && <p className="text-xs text-red-400 mb-2">Couldn&apos;t load Cronometer entries.</p>}
+      {delivery.loadError && <p className="text-xs text-red-400 mb-2">{delivery.loadError}</p>}
+      {todayServings.length === 0 ? null : (
         <div className="bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle">
           {todayServings.map((s) => (
             <div key={s.serving_id} className="flex items-center gap-3 px-4 py-2.5 text-sm">
@@ -617,28 +681,19 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
           ))}
         </div>
       )}
-      {todayDelivery.length > 0 && (
-        <div className={`bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle ${todayServings.length ? "mt-3" : ""}`}>
-          {todayDelivery.map((d) => (
-            <div key={d.item_id} className="flex items-center gap-3 px-4 py-2.5 text-sm">
-              <span className="text-[11px] font-mono text-text-tertiary w-20 shrink-0">
-                {d.completed_at
-                  ? new Date(d.completed_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })
-                  : "—"}
-              </span>
-              <span className="flex-1 truncate text-text-secondary">
-                {d.title}
-                <span className="text-text-tertiary"> · {d.store_name}</span>
-              </span>
-              <span className="text-[11px] font-mono text-text-tertiary shrink-0">
-                {Number(d.quantity) > 1 ? `×${d.quantity}` : ""} UBER EATS
-              </span>
-              <span className="text-[11px] font-mono text-text-tertiary w-16 text-right shrink-0">
-                {d.est_kcal != null ? `~${Math.round(Number(d.est_kcal))} kcal` : "—"}
-              </span>
-            </div>
-          ))}
-        </div>
+      {delivery.items.length > 0 && (
+        <>
+          <div className={`flex items-baseline justify-between ${todayServings.length ? "mt-3" : ""} mb-1.5`}>
+            <span className="text-[10px] font-mono text-text-tertiary">
+              Tap how much you ate; leftovers count only the part eaten.
+            </span>
+            <span className="text-[11px] font-mono text-text-secondary">
+              {delivery.totalKcal != null ? `Uber Eats ~${Math.round(delivery.totalKcal)} kcal` : ""}
+            </span>
+          </div>
+          <DeliveryDishList items={delivery.items} onPick={delivery.setFraction} />
+          {delivery.error && <p className="text-[11px] text-red-400 mt-1.5">{delivery.error}</p>}
+        </>
       )}
 
       <div className="border-t border-border-subtle my-10" />
