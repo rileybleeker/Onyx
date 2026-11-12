@@ -1,7 +1,7 @@
 """
 Air quality (PM2.5) -> Supabase ETL
 
-Pulls hourly PM2.5 (ug/m3) and US AQI for the home location from the keyless
+Pulls hourly PM2.5 (ug/m3) and US AQI for the Atlanta area from the keyless
 Open-Meteo Air Quality API (CAMS model analysis; no account, no secret) and
 upserts one row per ET clock day into pds.air_quality_daily (daily mean + max,
 hour count). The HRV pipeline reads that table as the `aqi_*` features
@@ -15,7 +15,7 @@ Usage:
     python air_quality_etl.py --lat 40.72 --lon -73.99   # another location (after the NYC move)
 
 Design notes:
-  - Location is fixed to home (Atlanta 33.77, -84.36) and overridable with
+  - Location is fixed to central Atlanta (33.75, -84.39) and overridable with
     AIR_QUALITY_LAT / AIR_QUALITY_LON or --lat/--lon. Reading the latest Garmin
     activity GPS was deliberately skipped: a run in Madrid would silently move
     the whole daily series, and the model data is regional (~0.4 degree grid)
@@ -56,8 +56,8 @@ ET_NAME = "America/New_York"
 ET = ZoneInfo(ET_NAME)
 SOURCE = "open-meteo-cams"
 
-DEFAULT_LAT = 33.77   # Old Fourth Ward, Atlanta
-DEFAULT_LON = -84.36
+DEFAULT_LAT = 33.75   # central Atlanta (the API grid is ~11 km, so no finer location is useful)
+DEFAULT_LON = -84.39
 DEFAULT_DAYS = 7
 BOOTSTRAP_START = date(2024, 1, 1)   # an empty table backfills from here (global data exists from 2022-07-29)
 CHUNK_DAYS = 90                      # keep each API call to ~2,200 hourly values

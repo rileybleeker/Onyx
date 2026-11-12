@@ -32,7 +32,7 @@ import causal_inference as ci  # noqa: E402
 import hrv_alignment as al  # noqa: E402
 import hrv_analysis as h  # noqa: E402
 
-LAT, LON = 33.77, -84.36
+LAT, LON = 33.75, -84.39
 NOW = datetime(2026, 11, 11, 14, 30, tzinfo=etl.ET)   # 14:30 ET: hours up to 14:00 exist
 
 
@@ -95,7 +95,7 @@ def test_windows_cover_the_range_without_gaps():
 def test_resolve_location():
     saved = {k: os.environ.pop(k, None) for k in ("AIR_QUALITY_LAT", "AIR_QUALITY_LON")}
     try:
-        assert etl.resolve_location(None, None) == (etl.DEFAULT_LAT, etl.DEFAULT_LON) == (33.77, -84.36)
+        assert etl.resolve_location(None, None) == (etl.DEFAULT_LAT, etl.DEFAULT_LON) == (33.75, -84.39)
         os.environ["AIR_QUALITY_LAT"], os.environ["AIR_QUALITY_LON"] = "40.72", "-73.99"
         assert etl.resolve_location(None, None) == (40.72, -73.99)
         assert etl.resolve_location(1.0, 2.0) == (1.0, 2.0), "a CLI flag beats the environment"
