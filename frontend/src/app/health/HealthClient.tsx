@@ -1,7 +1,9 @@
 "use client";
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
-import { type CareItem, STORAGE_KEY, nextDue, parseItems, todayLocal, validDate } from '@/lib/care-planner';
+import { type CareItem, STORAGE_KEY, nextDue, parseItems, sampleItems, todayLocal, validDate } from '@/lib/care-planner';
+import { CareCalendar, DueSoon } from './CareCalendar';
+import CalendarConnectionCard from './CalendarConnectionCard';
 
 const panel = 'rounded-2xl border border-border-default bg-surface-card p-5';
 const field = 'rounded-lg border border-border-default bg-surface-card px-3 py-2 text-text-primary';
@@ -20,6 +22,9 @@ export default function HealthClient() {
   const [booked, setBooked] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [today, setToday] = useState('');
+  const [demo, setDemo] = useState(false);
+  // Sample items are display-only: never in `items`, never saved, never editable.
+  const shown = useMemo(() => (demo && today ? [...items, ...sampleItems(today)] : items), [demo, items, today]);
   useEffect(() => {
     const updateDay = () => setToday(todayLocal());
     updateDay();
@@ -79,11 +84,14 @@ export default function HealthClient() {
         if (!enabled) { try { writeSaved(null); setSave(false); setError(''); } catch { setError('Could not remove the saved copy. Browser storage may still contain it.'); } }
         else { try { writeSaved(items); setSave(true); setError(''); } catch { setError('Could not save this session. Storage may be unavailable or changed in another tab.'); } }
       }} />Save on this browser (not encrypted, not synced; anyone using this browser profile may access it). Uncheck to remove the saved copy; current entries remain for this session.</label>
-      <div className="mt-4 border-t border-border-default pt-3"><h3 className="text-sm font-semibold">Google Calendar: not connected</h3><p className="mt-1 text-sm text-text-secondary">Personal calendars are not being read or updated. Two-way calendar sync still needs a secure connection and calendar selection. Marking an item booked only records your confirmation here.</p></div>
+      <CalendarConnectionCard />
     </section>
     {error && <p role="alert" className="text-sm text-amber-400">{error}</p>}
     {undo && <button className={button} onClick={() => { persist(undo); setUndo(null); if (editing && !undo.some(item => item.id === editing && !item.archived)) reset(); }}>Undo last change</button>}
     {!ready ? <p role="status">Loading local planner…</p> : <>
+      <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={demo} onChange={event => setDemo(event.target.checked)} />Show sample data in the calendar and due-soon list (invented examples, not saved, not your records)</label>
+      <DueSoon items={shown} today={today} />
+      <CareCalendar items={shown} today={today} />
       <form onSubmit={submit} className={`${panel} space-y-4`}>
         <h2 className="font-semibold">{editing ? 'Edit care item' : 'Add care item'}</h2>
         <div className="grid gap-3 sm:grid-cols-2">
