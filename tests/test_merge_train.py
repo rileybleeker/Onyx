@@ -125,5 +125,51 @@ class Plan(unittest.TestCase):
         self.assertEqual(mt.plan([self.d(1, "skip")])[0], "idle")
 
 
+class MasterCiVerdict(unittest.TestCase):
+    def run_(self, conclusion, status="completed"):
+        return dict(id=1, status=status, conclusion=conclusion)
+
+    def test_green(self):
+        self.assertEqual(mt.master_ci_verdict([self.run_("success")], False)[0], "ok")
+
+    def test_still_running_waits(self):
+        self.assertIsNone(mt.master_ci_verdict([self.run_(None, "in_progress")], True))
+
+    def test_cancelled_by_next_merge_is_superseded_not_failed(self):
+        # 2026-11-12: #32 landed while #24's master CI ran; the cancel halted the train and pushed a false revert
+        self.assertEqual(mt.master_ci_verdict([self.run_("cancelled")], True)[0], "skipped")
+
+    def test_cancelled_while_still_head_fails(self):
+        self.assertEqual(mt.master_ci_verdict([self.run_("cancelled")], False)[0], "fail")
+
+    def test_real_failure_fails_even_after_master_moved(self):
+        self.assertEqual(mt.master_ci_verdict([self.run_("failure")], True)[0], "fail")
+
+    def test_mixed_cancel_and_failure_fails(self):
+        runs = [self.run_("cancelled"), dict(id=2, status="completed", conclusion="failure")]
+        self.assertEqual(mt.master_ci_verdict(runs, True)[0], "fail")
+
+    def test_rerun_success_beats_cancel(self):
+        runs = [self.run_("cancelled"), dict(id=2, status="completed", conclusion="success")]
+        self.assertEqual(mt.master_ci_verdict(runs, False)[0], "ok")
+
+
+class ProductionVerdict(unittest.TestCase):
+    def test_success_wins(self):
+        self.assertEqual(mt.production_verdict(["success"], True)[0], "ok")
+
+    def test_failed_deploy_fails(self):
+        self.assertEqual(mt.production_verdict(["failure"], False)[0], "fail")
+        self.assertEqual(mt.production_verdict(["error", "failure"], True)[0], "fail")
+
+    def test_replaced_deployment_is_skipped_not_failed(self):
+        self.assertEqual(mt.production_verdict(["inactive"], False)[0], "skipped")
+        self.assertEqual(mt.production_verdict(["pending"], True)[0], "skipped")
+
+    def test_still_building_waits(self):
+        self.assertIsNone(mt.production_verdict(["in_progress"], False))
+        self.assertIsNone(mt.production_verdict([], False))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,52 @@
+name: Watchdog
+
+# Cloud half of the stall/recovery watchdog: the dead-man switch that works while
+# RileyPC is asleep. Deterministic (no AI), GITHUB_TOKEN only, never checks out
+# or runs PR code. Findings go to ONE issue labelled `watchdog`. See docs/watchdog.md.
+#
+# Scheduled runs only ever happen on the default branch; the job guard below also
+# refuses a manual dispatch from any other branch, so branch code can never use
+# this token's issue/actions write access.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Print findings and planned actions without writing anything'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  actions: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Run watchdog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python3 tools/watchdog_cloud.py "${args[@]}"
