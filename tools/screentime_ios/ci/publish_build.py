@@ -26,6 +26,11 @@ Environment:
   PROFILE_EXPIRES                 optional: when the build stops opening (the earlier of
                                   profile and certificate expiry), shown on /install
   GITHUB_RUN_NUMBER, GITHUB_SHA   used for the storage path
+  PUBLISH_PREFIX                  storage folder, default screentime (the Screen Time export app,
+                                  read by /install). focus-ios-signed.yml uses screentime-focus so
+                                  the Focus build never replaces the export app's install links.
+                                  The private manifest copy always goes to screentime/manifests/,
+                                  the only folder the Onyx manifest route reads (random slugs).
 """
 import datetime
 import json
@@ -59,9 +64,9 @@ class Storage:
     def call(self, method, route, body=None, headers=None, ok_statuses=(200, 201)):
         """Returns (status, bytes). Raises RuntimeError with Supabase's own message otherwise."""
         req = urllib.request.Request(self.base + route, data=body, method=method)
-        # Public log: never show the unguessable folder of the public manifest (the
-        # upload may have landed even when the answer was lost).
-        shown = re.sub(r"/screentime/[0-9a-f]{32}/", "/screentime/<slug>/", route)
+        # Public log: never show an unguessable manifest slug (the upload may have
+        # landed even when the answer was lost).
+        shown = re.sub(r"[0-9a-f]{32}", "<slug>", route)
         req.add_header("apikey", self.key)
         req.add_header("Authorization", "Bearer " + self.key)
         req.add_header("User-Agent", USER_AGENT)
@@ -164,6 +169,9 @@ def main():
     expires_in = int(env.get("EXPIRES_IN", str(30 * 86400)))
     ipa_path = env["IPA_PATH"]
     onyx_base = env.get("ONYX_BASE_URL", "https://frontend-six-alpha-69.vercel.app").rstrip("/")
+    folder = env.get("PUBLISH_PREFIX") or "screentime"
+    if not re.fullmatch(r"[a-z0-9-]+", folder):
+        die("PUBLISH_PREFIX must be lower-case letters, digits and hyphens")
 
     info = ipa_info(ipa_path)
     if info.get("CFBundleIdentifier") != env["EXPECT_BUNDLE_ID"]:
@@ -173,7 +181,7 @@ def main():
 
     run = env.get("GITHUB_RUN_NUMBER", "0")
     sha = env.get("GITHUB_SHA", "local")[:7]
-    prefix = f"screentime/{run}-{sha}"
+    prefix = f"{folder}/{run}-{sha}"
     now = datetime.datetime.now(datetime.timezone.utc)
 
     try:
@@ -192,8 +200,8 @@ def main():
         storage.upload(private_bucket, f"screentime/manifests/{slug}.plist", manifest, "text/xml")
         manifest_a = f"{onyx_base}/api/screen-time/manifest/{slug}"
 
-        storage.upload(public_bucket, f"screentime/{slug}/manifest.plist", manifest, "text/xml")
-        manifest_b = storage.public_url(public_bucket, f"screentime/{slug}/manifest.plist")
+        storage.upload(public_bucket, f"{folder}/{slug}/manifest.plist", manifest, "text/xml")
+        manifest_b = storage.public_url(public_bucket, f"{folder}/{slug}/manifest.plist")
 
         fetch_like_the_phone("manifest A (Onyx route)", manifest_a, "text/xml")
         # Storage answers text/plain here; kept as a fallback link in case iOS accepts it.
@@ -215,12 +223,14 @@ def main():
             "link_b": install_link(manifest_b),
             "ipa_url": ipa_url,
         }
-        storage.upload(private_bucket, "screentime/latest.json", json.dumps(latest, indent=2).encode(),
+        storage.upload(private_bucket, f"{folder}/latest.json", json.dumps(latest, indent=2).encode(),
                        "application/json")
     except RuntimeError as err:
         die(str(err))
 
-    log(f"published build {run}-{sha} ({len(ipa_bytes)} bytes); install links are on the Onyx /install page")
+    log(f"published build {run}-{sha} ({len(ipa_bytes)} bytes) to {folder}/; "
+        f"install links are in {private_bucket}/{folder}/latest.json"
+        + (" (shown on the Onyx /install page)" if folder == "screentime" else ""))
 
 
 if __name__ == "__main__":

@@ -107,6 +107,8 @@ Developer Mode switch if it never appears.
 - `project.yml` — XcodeGen spec; the `.xcodeproj` is generated in CI.
 - `OnyxScreenTime/` — the app (SwiftUI, App Intent, exporter, Keychain token).
 - `ci/asc_signing.py` — App Store Connect API path for certificate + profile.
+- `ci/focus_signing_check.py` — profile and signed-bundle gates for the Focus
+  build (`FOCUS.md`, Signed build).
 - `ci/publish_build.py` — uploads the build and writes `screentime/latest.json`
   (private bucket `ios-builds`; manifests for the alternative link sit at
   unguessable paths in `ios-builds-public`).
