@@ -19,7 +19,7 @@ Google Calendar is explicitly disconnected. This stage does not satisfy the requ
 
 ## Verification
 
-- `node frontend/tests/care-planner.test.mjs` (date math, storage parsing, status, due-soon window, month grid, projections, sample data, disconnected connection state).
+- `cd frontend; node scripts/test-care-planner.mjs` (auto-run by CI) (date math, storage parsing, status, due-soon window, month grid, projections, sample data, disconnected connection state).
 - `cd frontend; npx --no-install tsc --noEmit` and `npx --no-install next build --experimental-build-mode compile` (the two required CI checks).
 - Browser UI, multi-tab storage behaviour and any connected-calendar flow still need a real-browser check before relying on them.
 

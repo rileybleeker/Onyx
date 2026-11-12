@@ -1,8 +1,16 @@
 import assert from 'node:assert/strict';
-import {
+import fs from 'node:fs';
+import ts from 'typescript';
+// Load the real helper module (no I/O, no imports) the same way the other offline tests do,
+// so it works on any Node version CI uses.
+const source = fs.readFileSync(new URL('../src/lib/care-planner.ts', import.meta.url), 'utf8');
+const planner = { exports: {} };
+// Same realm (not vm.runInNewContext) so deepStrictEqual compares plain objects and arrays.
+new Function('exports', 'module', ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText)(planner.exports, planner);
+const {
   nextDue, validDate, todayLocal, parseItems, addDays, daysBetween, careStatus, dueSoon, monthGrid, monthBounds,
   entriesInRange, sampleItems, isSampleItem, CALENDAR_CONNECTION,
-} from '../src/lib/care-planner.ts';
+} = planner.exports;
 assert.equal(nextDue('2024-01-31', 1), '2024-02-29');
 assert.equal(nextDue('2023-01-31', 1), '2023-02-28');
 assert.equal(nextDue('2024-02-29', 12), '2025-02-28');
