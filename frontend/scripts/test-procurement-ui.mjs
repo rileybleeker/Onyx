@@ -36,14 +36,15 @@ try {
     server.once('exit', code => { clearTimeout(timer); reject(new Error('Local fixture exited '+code+' '+output.slice(-2000))); });
   });
   browser = await chromium.launch({headless: true});
-  const page = await browser.newPage({viewport:{width:390,height:844}});
+  const context = await browser.newContext({viewport:{width:390,height:844}, permissions:['clipboard-read','clipboard-write']});
+  const page = await context.newPage();
   const errors = [], blocked = [];
   page.on('pageerror', e => errors.push(e.message));
   await page.route('**/*', route => {
     if (new URL(route.request().url()).origin === new URL(url).origin) return route.continue();
     blocked.push(route.request().url()); return route.abort();
   });
-  await page.goto(url); await page.getByRole('heading',{name:'Procurement',exact:true}).waitFor();
+  await page.goto(url, {timeout: 180000}); await page.getByRole('heading',{name:'Procurement',exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:'Place order (unavailable)',exact:true}).isDisabled(),true);
   await page.getByRole('button',{name:'Show synthetic examples'}).click();
   await page.getByText('Demo workspace subscription',{exact:true}).waitFor();
@@ -64,13 +65,65 @@ try {
   await page.getByLabel('Item or service').fill('Synthetic'); await page.getByLabel('Merchant',{exact:true}).fill('Demo');
   await page.getByLabel('Estimated total (USD)').fill('-1'); await page.getByRole('button',{name:'Add planning draft'}).click();
   await page.getByRole('alert').filter({hasText:'Enter a positive USD amount'}).waitFor();
+  // --- subscription tracker (synthetic data only) ---
+  const localIso = offset => { const d = new Date(); d.setDate(d.getDate() + offset); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
+  await page.getByText('No subscriptions tracked yet.',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'Load synthetic demo subscriptions'}).click();
+  await page.getByText('Demo streaming service',{exact:true}).waitFor();
+  await page.getByText(/About \$.*\/ month, \$.* \/ year across 4 tracked subscriptions/).waitFor();
+  await page.getByText(/Demo streaming service renews in 5 days/).waitFor();
+  const addSub = async (name, price, cycle, date) => {
+    await page.getByLabel('Subscription name').fill(name);
+    await page.getByLabel('Price per cycle (USD)').fill(price);
+    await page.getByLabel('Billing cycle').selectOption(cycle);
+    await page.getByLabel('Next renewal date').fill(date);
+    await page.getByRole('button',{name:'Add subscription'}).click();
+  };
+  await addSub('Demo streaming service', '9.99', 'monthly', localIso(20));
+  await page.getByText(/tracked 2 times/).waitFor();
+  await addSub('Demo bad price', '0', 'monthly', localIso(20));
+  await page.getByRole('heading',{name:'Track subscriptions',exact:true}).locator('xpath=..').getByRole('alert').filter({hasText:'Enter a positive USD amount'}).waitFor();
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button',{name:'Download renewal reminders (.ics)'}).click(),
+  ]);
+  assert.equal(download.suggestedFilename(), 'onyx-renewal-reminders.ics');
+  const icsPath = path.join(fixture, 'reminders.ics'); await download.saveAs(icsPath);
+  const ics = await readFile(icsPath, 'utf8');
+  assert.match(ics, /^BEGIN:VCALENDAR\r\n/); assert.equal((ics.match(/BEGIN:VEVENT/g) ?? []).length, 5);
+  await page.getByRole('button',{name:/^Remove subscription \d+$/}).first().click();
+  await page.getByText(/across 4 tracked subscriptions/).waitFor();
+
+  // --- order preparation: totals, duplicate-subscription warning, prepared list, copy ---
+  await page.getByLabel('Item or service').fill('Demo streaming service');
+  await page.getByLabel('Merchant',{exact:true}).fill('Demo shop');
+  await page.getByLabel('Estimated total (USD)').fill('15.99');
+  await page.getByLabel('Commitment',{exact:true}).selectOption('monthly');
+  await page.getByRole('button',{name:'Add planning draft'}).click();
+  await page.getByLabel('Item or service').fill('Synthetic cable');
+  await page.getByLabel('Merchant',{exact:true}).fill('Demo shop');
+  await page.getByLabel('Estimated total (USD)').fill('4.90');
+  await page.getByRole('button',{name:'Add planning draft'}).click();
+  await page.getByText('Estimated one-time: $4.90 · Recurring: $15.99 / month',{exact:true}).waitFor();
+  await page.getByText(/which you already track/).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Copy prepared list'}).isDisabled(),true);
+  await page.getByRole('button',{name:'Show prepared list'}).click();
+  const prepared = page.getByLabel('Prepared list');
+  await prepared.waitFor();
+  assert.match(await prepared.innerText(), /Nothing has been ordered, submitted or paid for/);
+  await page.getByRole('button',{name:'Copy prepared list'}).click();
+  await page.getByText('Prepared list copied. No order was placed.',{exact:true}).waitFor();
+  assert.match(await page.evaluate(() => navigator.clipboard.readText()), /Estimated recurring total: \$15\.99 \/ month/);
+  assert.equal(await page.getByRole('button',{name:'Place order (unavailable)',exact:true}).isDisabled(),true);
   for(const width of [390,1280]) {
     await page.setViewportSize({width,height:844});
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),true);
     await page.screenshot({path:path.join(fixture,`procurement-${width}.png`),fullPage:true});
   }
+  await page.getByRole('button',{name:'Clear subscriptions'}).click();
+  await page.getByText('No subscriptions tracked yet.',{exact:true}).waitFor();
   assert.deepEqual(errors,[]); assert.deepEqual(blocked,[]);
-  console.log('PASS offline procurement UI: synthetic toggle, draft add/remove/clear/reload, recurring amount, invalid amount, hard-disabled checkout, mobile/desktop overflow, no runtime errors or external requests.');
+  console.log('PASS offline procurement UI: synthetic toggle, draft add/remove/clear/reload, recurring amount, invalid amount, subscription tracker (synthetic load, duplicate prompt, bad price, .ics download, remove, clear), prepared list and copy, duplicate-subscription warning, hard-disabled checkout, mobile/desktop overflow, no runtime errors or external requests.');
   console.log('Synthetic fixture/screenshots retained at '+fixture);
 } finally {
   if (browser) await browser.close();
