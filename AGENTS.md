@@ -18,9 +18,9 @@ Onyx/
 ├── journal_inbox/           # (legacy) WHOOP journal CSV drop folder — no longer consumed
 ├── journal_archive/         # Processed WHOOP CSVs (historical raw exports — keep)
 ├── eight_sleep_etl.py       # Eight Sleep API → Supabase (1 table)
-├── myfitnesspal_import.py   # MyFitnessPal CSV → Supabase (nutrition table)
-├── myfitnesspal_email.py    # IMAP monitor: auto-imports MFP CSV export emails
-├── mfp_inbox/               # Drop MFP nutrition CSVs here for auto-import
+├── myfitnesspal_import.py   # MyFitnessPal CSV → Supabase (nutrition table); manual fallback only, Cronometer is primary
+├── myfitnesspal_email.py    # IMAP monitor for MFP export emails; manual fallback only (workflow cron removed 2026-05-31)
+├── mfp_inbox/               # MFP CSVs picked up only when `myfitnesspal_email.py` is run by hand (no scheduled job)
 ├── mfp_archive/             # Processed CSVs moved here
 ├── cronometer_etl.py        # Automated Cronometer web-export → Supabase (unofficial endpoints; replaces the manual export click)
 ├── cronometer_import.py     # Cronometer CSV/ZIP parser → Supabase (cronometer_nutrition_daily + cronometer_servings); run_import() reused by the ETL
@@ -64,9 +64,9 @@ Onyx/
 ├── tools/ubereats_harvest/  # LOCAL-PC Uber Eats item harvester (Playwright + signed-in Chrome in an OFF-SCREEN window — headless is blocked by Uber; Task Scheduler "Onyx Uber Eats Harvest" every 6h): order history → POST /api/delivery/items/import (CI token) → pds.delivery_order_items + per-dish kcal/macro estimates; heartbeats ubereats|items
 ├── .github/workflows/
 │   ├── daily-etl.yml            # Hourly Health ETL: Garmin + WHOOP (`0 * * * *`)
-│   ├── eight-sleep-etl.yml      # Eight Sleep ETL — daily at 3 PM ET (`0 19 * * *`)
-│   ├── mfp-email.yml            # MyFitnessPal email check (`15 * * * *`)
-│   ├── whoop-journal-email.yml  # WHOOP journal email check (`30 * * * *`)
+│   ├── eight-sleep-etl.yml      # Eight Sleep ETL - 19:00 UTC daily (3 PM EDT / 2 PM EST)
+│   ├── mfp-email.yml            # MyFitnessPal email check - manual fallback only (Cronometer cutover)
+│   ├── whoop-journal-email.yml  # WHOOP journal - decommissioned; archive frozen, do not run (see warning below)
 │   ├── journal-sync.yml         # Notion personal Journal sync (`35 * * * *`)
 │   ├── habits-sync.yml          # Habits sync from Notion (`45 * * * *`)
 │   ├── spotify-etl.yml          # Spotify recently-played (`50 * * * *`)
@@ -89,7 +89,7 @@ Onyx/
 ├── .env                     # Secrets (NEVER commit)
 └── frontend/                # Next.js 15 app
     └── src/
-        ├── app/             # Pages (13 routes; `/` redirects to /status, `/meals` redirects to /nutrition) + API routes
+        ├── app/             # Pages (13 routes; `/` redirects to /today, `/meals` redirects to /nutrition) + API routes
         │   ├── analytics/hrv/  # HRV Analysis dashboard (predictions, SHAP, models)
         │   ├── reading/        # Reading quest: progress ring + pace, streak, XP/levels, badges, checkpoints, burn-up chart, SM-2 review, session + highlight capture (Kindle export import); mirrors to Notion
         │   └── spotify/        # Spotify listening dashboard (volume, mood signature, sonic profile radar, top artists/tracks)
@@ -116,12 +116,12 @@ Onyx/
 # ETL (runs automatically via GitHub Actions every hour on :00)
 python garmin_etl.py                    # Sync last 7 days
 python whoop_etl.py                     # Sync last 30 days
-python whoop_journal_import.py <csv>    # Import WHOOP journal CSV export
-python whoop_journal_email.py --once   # Check email for WHOOP export, import journal
-python whoop_journal_watcher.py        # Watch inbox folder for auto-import
+python whoop_journal_import.py <csv>    # ARCHIVE ONLY: retired WHOOP journal importer
+python whoop_journal_email.py --once   # ARCHIVE ONLY: retired WHOOP journal email importer
+python whoop_journal_watcher.py        # ARCHIVE ONLY: retired watcher; do not start routinely
 python eight_sleep_etl.py               # Sync last 7 days
-python myfitnesspal_import.py <csv>     # Import MFP nutrition CSV export
-python myfitnesspal_email.py --once    # Check email for MFP export, import
+python myfitnesspal_import.py <csv>     # Manual fallback only; Cronometer is primary
+python myfitnesspal_email.py --once    # Manual fallback only; Cronometer is primary
 python <etl>.py --backfill N            # Backfill N days
 python spotify_etl.py --auth            # One-time Spotify OAuth bootstrap (local)
 python spotify_etl.py                   # Sync recently-played (last 50 since high-water mark)
@@ -156,7 +156,7 @@ python ci_token_helper.py download cronometer # Restore Cronometer session from 
 
 # GitHub Actions
 gh workflow run daily-etl.yml           # Manually trigger ETL workflow
-gh workflow run whoop-journal-email.yml # Manually trigger journal email check
+gh workflow run whoop-journal-email.yml # ARCHIVE ONLY: not a routine sync; see warning below
 
 # Frontend
 cd frontend && npm run dev              # Dev server on :3000
@@ -175,6 +175,8 @@ python hrv_predict.py --predict         # Daily prediction (run after ETL)
 python hrv_predict.py --backfill-only   # Just backfill actuals + recompute metrics
 gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in CI
 ```
+
+**Retired WHOOP journal commands:** the journal pipeline was decommissioned on 2026-06-11. Its archive table is frozen and no longer read by the app. Do not run the importer, watcher, or manual workflow as routine maintenance or incident recovery. Any deliberate archive write requires a separate review of the freeze and the intended migration; current habits use the habits sync pipeline.
 
 ## Database
 
@@ -195,7 +197,7 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
 - `habit_name_map` tracks Notion page ID → name (+ `channel`); renaming a **native** habit in Notion auto-updates all historical `habit_journal` entries via the FK's ON UPDATE CASCADE (the sync renames the map row and lets the cascade do the work); the 29 retired WHOOP questions have synthetic `whoop-archived:<md5>` map rows for FK coverage
 - **Backdated habit completions trigger HRV retraining.** A Postgres trigger (`habit_journal_backfill_trigger`, defined in `sql/habit_journal_backfill_trigger.sql`) fires on every INSERT/UPDATE/DELETE on `pds.habit_journal` and emits a `pds.sync_log` row (`source='habit_journal', data_type='backfill_signal'`) whenever the affected `cycle_date` is in the past (ET). **No-op UPDATEs are suppressed (2026-06-11)** — the hourly sync's idempotent Last-Completed upserts previously fired 3 signals/hour, scheduling a full retrain EVERY hour (31 in 48h); the sync route also now skips the upsert when the completion row already exists. `hrv_backfill_check.py` reads this signal alongside its row-scan checks; either path setting `backfill_detected=true` triggers a full `hrv_analysis.py` retrain on the next hourly tick. The trigger covers paths the original row-scan missed: the UPDATE branch of upsert (which doesn't bump `synced_at` because the API call doesn't include it in the patch object) and DELETE (which leaves no row for `WHERE synced_at > last_analysis` to find — relevant when Riley undoes a backdated completion). Today's writes are deliberately suppressed by the trigger; same-day mutations are picked up by the daily safety-net retrain at 12:00 UTC instead, since an hourly retrain on every habit tap would be wasteful.
 - **Habits are analyzed as a first-class category in `hrv_analysis.py`** (alongside but separate from journal). The pipeline loads `source` from the unified `pds.journal` view and routes WHOOP entries through `pivot_journal` (`journal_*` columns) and habit completions through `pivot_habits` (`habit_*` columns, label preserved from Notion). After merging, unlogged days stay NaN (policy 2026-07-19; the per-habit first-completion-forward 0-fill was removed) — explicit Yes → 1.0, explicit No → 0.0, no row → NaN = "not logged = unknown". Four habit-specific `hrv_analysis_results` rows are written every run: `correlation/spearman_habit`, `habit_impact/all` (Welch's t-test mirroring `journal_impact`), `feature_importance/shap_habit`, and `model_comparison/error_modes_by_habit`. `habit_` is also in `CONTROLLABLE_FEATURE_PREFIXES` (actionable-only SHAP ranking) and in the SARIMAX/Prophet exog seed prefix list. The `/analytics/hrv` dashboard surfaces all four via dedicated Habit sub-sections in Prediction Drivers, HRV Correlates, and a sibling "Habit Impact" card next to Journal Impact. With sparse history (each habit needs ≥5 Yes-nights + ≥5 No-nights for the t-test, and ≥20 non-null days for Spearman) the chart populates incrementally as completions accumulate.
-- `myfitnesspal_nutrition` stores daily nutrition totals (calories, macros, fiber, sugar, sodium) + `meals_json` JSONB for per-meal breakdown. Import via CSV export (Settings → Export Data in MFP app). Email automation in `myfitnesspal_email.py` checks inbox every 4h via `mfp-email.yml`. Uses same IMAP credentials as WHOOP journal. Manual: drop CSV in `mfp_inbox/` or run `myfitnesspal_import.py <csv>`. **MFP is the pre-2026-05-31 historical archive only — see the Cronometer migration below.**
+- `myfitnesspal_nutrition` stores daily nutrition totals (calories, macros, fiber, sugar, sodium) + `meals_json` JSONB for per-meal breakdown. Import via CSV export (Settings → Export Data in MFP app). `myfitnesspal_email.py` (IMAP, shares the WHOOP-journal mailbox credentials) is no longer scheduled: the `mfp-email.yml` cron was removed at the 2026-05-31 Cronometer cutover and the workflow is `workflow_dispatch` only. Manual fallback: run `myfitnesspal_import.py <csv>` (or `myfitnesspal_email.py --once`). **MFP is the pre-2026-05-31 historical archive only — see the Cronometer migration below.**
 - **Cronometer is the sole new-day nutrition source (cutover 2026-05-31; replaced MyFitnessPal).**
   - **Why:** Cronometer's NCCDB/USDA backbone tracks ~62 micronutrients per food (vitamins, minerals, omega fractions, amino acids) that MFP never exported — the migration was for micronutrient + per-meal-timing coverage.
   - **Tables (`cronometer_schema.sql`):** `pds.cronometer_nutrition_daily` (one row/behavioral-day, PK `calendar_date`, from `dailysummary.csv` `Group='Total'` rows) and `pds.cronometer_servings` (one row/logged food entry, from `servings.csv`; idempotent re-import via delete-by-`calendar_date`+insert). Both carry the ADR-0001 quad (`onyx_et_date`/`onyx_behavioral_date`/`onyx_local_date`/`onyx_tz_source`) + the full ~68-column nutrient set + future-proof nullable columns (beta_carotene, biotin, choline, iodine, chromium, molybdenum — not in the default export). RLS mirrors `myfitnesspal_nutrition` (anon read / service_role full).
@@ -279,7 +281,7 @@ gh workflow run hrv-prediction.yml      # Manually trigger daily prediction in C
   **Matrix views** (ADR-0001):
   - **`pds.daily_health_matrix_behavioral`** — every source join keyed on `onyx_behavioral_date`. **This is the canonical view for HRV / causal / behavior-affects-recovery analytics.** WHOOP cycle deduplicated via `LATERAL ... LIMIT 1` (longest cycle per behavioral day) so transition-day "arrival nap + main cycle" doesn't double-count. `onyx_is_transition_day` aggregated via `bool_or` across all cycles on the day. Consumers: `hrv_analysis.py`, `causal_inference.py`, `/analytics/hrv`, `lib/queries.ts:getHealthMatrix`. DDL: `sql/adr_0001_08_daily_health_matrix_behavioral.sql`.
   - **`pds.daily_health_matrix`** (legacy clock-date view) — **DROPPED 2026-11-08** (`sql/drop_legacy_daily_health_matrix.sql`): no code readers, no DB dependents, and its WHOOP join mis-attributed travel days. Restore from `sql/deprecated/daily_health_matrix_live_2026-11-07.sql` if ever needed. Do not reintroduce clock-date matrix reads — use the behavioral view.
-  - **`pds.daily_health_matrix_behavioral_mat`** — materialized copy of the behavioral view for **frontend page-load reads only** (perf, 2026-06-11; the live view's ~30-relation join cost 150-650 ms mean with 1.5-2.7 s tails via PostgREST). Refreshed every 15 min by pg_cron (`10,25,40,55 * * * *`) through `pds.refresh_daily_health_matrix_behavioral_mat()`, which writes a `pds.sync_log` heartbeat (`matrix_mat`|`refresh`) on success AND failure and includes a pg_attribute **schema-drift tripwire** — surfaced as the "Matrix Matview" card on `/status`. **⚠ RULE: every migration that changes `pds.daily_health_matrix_behavioral` MUST drop + recreate the matview (+ unique index on `onyx_behavioral_date`, `calendar_date` index, anon/authenticated grants) in the same migration — the matview's `SELECT *` is frozen at creation. NEVER `DROP VIEW ... CASCADE` on the canonical view.** Frontend consumers: `getHealthMatrix`/`getNutrition`/`getCaffeineHrvPairs` (queries.ts), `getHistoricalHrv`/`getEnvDoseResponseData` (queries-hrv.ts), travel's `getHRVData`. The Python pipeline and the chat tools deliberately stay on the LIVE view. Full doc + recreate recipe: `sql/perf_matrix_matview.sql`.
+  - **`pds.daily_health_matrix_behavioral_mat`** — materialized copy of the behavioral view for **frontend page-load reads only** (perf, 2026-06-11; the live view's ~30-relation join cost 150-650 ms mean with 1.5-2.7 s tails via PostgREST). Refreshed every 30 min by pg_cron (`10,40 * * * *`; was every 15 min until 2026-11-11, cut to halve Disk IO — see `sql/matview_refresh_30min.sql`) through `pds.refresh_daily_health_matrix_behavioral_mat()`, which writes a `pds.sync_log` heartbeat (`matrix_mat`|`refresh`) on success AND failure and includes a pg_attribute **schema-drift tripwire** — surfaced as the "Matrix Matview" card on `/status`. **⚠ RULE: every migration that changes `pds.daily_health_matrix_behavioral` MUST drop + recreate the matview (+ unique index on `onyx_behavioral_date`, `calendar_date` index, anon/authenticated grants) in the same migration — the matview's `SELECT *` is frozen at creation. NEVER `DROP VIEW ... CASCADE` on the canonical view.** Frontend consumers: `getHealthMatrix`/`getNutrition`/`getCaffeineHrvPairs` (queries.ts), `getHistoricalHrv`/`getEnvDoseResponseData` (queries-hrv.ts), travel's `getHRVData`. The Python pipeline and the chat tools deliberately stay on the LIVE view. Full doc + recreate recipe: `sql/perf_matrix_matview.sql`.
 
   **`pds.user_tz_log`** — hand-maintained table of TZ transitions. Schema: `(effective_from TIMESTAMPTZ PK, tz TEXT IANA, notes TEXT)`. Insert one row per flight landing into a non-ET zone (and back). NY trips don't need entries (default). Read by `pds.tz_for_instant(ts)` which is used by every non-WHOOP / non-Garmin-activity trigger to derive local TZ.
 
@@ -392,8 +394,8 @@ All data sources run **hourly** on a staggered schedule to spread load and avoid
 | Workflow | File | Cron | What it does |
 |---|---|---|---|
 | Hourly Health ETL | `daily-etl.yml` | `0 * * * *` | Garmin + WHOOP (2 parallel jobs) |
-| Eight Sleep ETL | `eight-sleep-etl.yml` | `0 19 * * *` | Eight Sleep — daily at 3 PM ET (data only updates post-sleep) |
-| MyFitnessPal email | `mfp-email.yml` | `15 * * * *` | IMAP check → import MFP nutrition CSV |
+| Eight Sleep ETL | `eight-sleep-etl.yml` | `0 19 * * *` | Eight Sleep — daily at a fixed 19:00 UTC (3 PM EDT / 2 PM EST; data only updates post-sleep) |
+| MyFitnessPal email | `mfp-email.yml` | **disabled 2026-05-31** (`workflow_dispatch` only) | Manual fallback for a late MFP export; Cronometer is the nutrition source |
 | WHOOP journal email | `whoop-journal-email.yml` | **decommissioned 2026-06-11** (`workflow_dispatch` only) | WHOOP journal merged into habits — see `sql/whoop_journal_merge.sql` |
 | Notion Journal Sync | `journal-sync.yml` | `35 * * * *` | Notion DB query → upsert + Voyage embed → `pds.journal_entries` |
 | Habits sync | `habits-sync.yml` | `45 * * * *` | Curls `POST /api/habits/sync` on Vercel |
@@ -466,3 +468,11 @@ Production tripwire for the class of bug `tsc` + `lint` cannot catch: a panel th
 **This is the source of truth for "what's open" and "what's next" on Onyx** — read it filtered to `Source = "Onyx Roadmap"` and `Status ≠ Done`. Do not track open items in this file — AGENTS.md is for *shipped* capability + conventions; the roadmap is for *pending* work. When shipping a feature, mark the matching task `Done` (or create-then-Done one in the same call) and refresh its Notes with the commit / module / route. When noticing a bug or polish opportunity you won't fix in the current session, create a `Not Started` page (tagged `Source = "Onyx Roadmap"`) with enough context that a future session can pick it up cold.
 
 Mechanics: use the Notion MCP — `notion-update-page` (`command: "update_properties"`, `properties: {"Status": "Done", "Notes": "..."}`) for existing pages; `notion-create-pages` (`parent: {"type":"data_source_id", "data_source_id":"6149d32a-66be-4e54-ab1b-28c4a11c6543"}`) for new ones. Always set `Source: "Onyx Roadmap"` plus Component / Phase / Priority / Status (and Notes) — leaving any blank makes the entry hard to triage.
+
+## Today home (2026-11-11)
+
+`/` and the mobile Today tab open `/today`. This read-only landing page shows up to three open agent request links in inbox order (not an urgency ranking), recorded reading progress, and the existing check-in link. Informational messages stay in the Agents inbox; Status stays available. Loading, failure, empty and unknown progress states remain distinct. Fetch on mount, manual refresh and return to the app; stale requests cannot replace newer results. Opening Today never sends a reply, marks anything read or logs a behavior. Reuse the existing authenticated inbox and reading endpoints, and keep personal record data out of review prompts and fixture tests.
+
+## Financials (2026-11-11)
+
+`/financials` accepts Rocket Money transaction CSV exports as an explicitly reviewed browser-memory snapshot. No finance data is persisted, uploaded, sent to AI, or synchronized automatically. It uses integer cents, explicit amount/date mapping, all-or-nothing validation, period/search filters, and explicit transfer-category exclusions. Do not claim a live Rocket Money connection or infer balances/subscription status from this export. Provider findings and the future read-only integration boundary are in `docs/financials-rocket-money.md`. Offline synthetic tests: `cd frontend && node scripts/test-financials.mjs`.

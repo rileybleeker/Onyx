@@ -1,0 +1,49 @@
+# Opt-in development build. The existing export-only project.yml is unchanged.
+include: project.yml
+packages:
+  FocusCore:
+    path: FocusCore
+targets:
+  OnyxScreenTime:
+    sources:
+      - path: FocusShared
+      - path: FocusUI
+    dependencies:
+      - package: FocusCore
+      - target: OnyxFocusMonitor
+        embed: true
+    entitlements:
+      properties:
+        com.apple.security.application-groups:
+          - group.com.rileybleeker.onyxscreentime.focus
+    settings:
+      base:
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) ONYX_FOCUS
+  OnyxFocusMonitor:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: FocusMonitor
+      - path: FocusShared
+    dependencies:
+      - package: FocusCore
+    info:
+      path: FocusMonitor/Info.plist
+      properties:
+        CFBundleDisplayName: Onyx Focus Monitor
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.deviceactivity.monitor-extension
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FocusMonitor
+    entitlements:
+      path: FocusMonitor/FocusMonitor.entitlements
+      properties:
+        com.apple.developer.family-controls: true
+        com.apple.security.application-groups:
+          - group.com.rileybleeker.onyxscreentime.focus
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rileybleeker.onyxscreentime.focusmonitor
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES

@@ -21,10 +21,26 @@ on:
       - "requirements-analysis.lock"
       - ".github/workflows/stats-pr-check.yml"
   workflow_dispatch:
+    inputs:
+      run_live_write_tests:
+        description: 'Explicitly run habit-rename fixtures against the configured live database'
+        type: boolean
+        default: false
+        required: false
 
 env:
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
   SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+# These tests read (and, until PR #21 lands, write) the live production
+# database. On 2026-11-11 a burst of parallel PR runs (781 requests in
+# 06:40-06:45Z) preceded a Postgres stall. One global group means only one
+# Stats Tests run touches the database at a time; the rest wait. GitHub keeps
+# at most one waiting run per group, so in a burst the older waiting runs are
+# cancelled and the newest one runs; re-run a cancelled PR check if needed.
+concurrency:
+  group: stats-pr-check
+  cancel-in-progress: false
 
 jobs:
   stats-tests:
@@ -72,9 +88,11 @@ jobs:
           python tests/test_delivery_features.py
           python tests/test_error_mode_feature_date.py
 
-      - name: Habit-rename cascade integration test
-        # Uses synthetic test fixtures (uuid-tagged) and cleans up after itself,
-        # so it's safe to run against the live DB.
+      - name: Habit-rename cascade integration test (explicit live-write opt-in)
+        if: github.event_name == 'workflow_dispatch' && inputs.run_live_write_tests == true
+        # This test MUTATES the configured database. Never run it implicitly for
+        # PRs. The operator must explicitly opt in to the live write; retain the
+        # test for deliberate integration validation until isolated staging exists.
         run: python tests/test_habit_rename.py
 
       - name: TDEE source guard (WHOOP kJ is canonical, never Garmin kcal)
