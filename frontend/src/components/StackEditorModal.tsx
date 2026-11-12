@@ -24,6 +24,8 @@ export interface EditableStack {
   stack_id: number | null;
   name: string;
   description: string | null;
+  /** Local 'HH:MM' for the push reminder; null / empty = reminders off. */
+  remind_time?: string | null;
   items: StackItemDraft[];
 }
 
@@ -38,6 +40,7 @@ interface Props {
 export default function StackEditorModal({ open, stack, products, onClose, onSaved }: Props) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [remindTime, setRemindTime] = useState("");
   const [items, setItems] = useState<StackItemDraft[]>([]);
   const [addProductId, setAddProductId] = useState("");
   const [saving, setSaving] = useState(false);
@@ -47,6 +50,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
     if (!stack) return;
     setName(stack.name);
     setDescription(stack.description ?? "");
+    setRemindTime(stack.remind_time ?? "");
     setItems(stack.items.map((i) => ({ ...i })));
     setAddProductId("");
     setError(null);
@@ -111,6 +115,8 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
           ...(isNew ? {} : { stack_id: stack!.stack_id }),
           name: trimmed,
           description: description.trim() || null,
+          // Empty = reminders off (the API stores NULL).
+          remind_time: remindTime || null,
           items: cleanItems,
         }),
       });
@@ -188,6 +194,35 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
           placeholder="e.g. taken right after waking"
           className="w-full mb-4 px-3 py-2 text-[13px] bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none disabled:opacity-50"
         />
+
+        <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
+          Reminder time (optional)
+        </label>
+        <div className="flex items-center gap-2 mb-1">
+          <input
+            type="time"
+            value={remindTime}
+            onChange={(e) => setRemindTime(e.target.value)}
+            disabled={saving}
+            aria-label="Reminder time"
+            className="px-3 py-2 text-[13px] tabular-nums bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none disabled:opacity-50"
+          />
+          {remindTime && (
+            <button
+              type="button"
+              onClick={() => setRemindTime("")}
+              disabled={saving}
+              className="px-2 py-1 text-[11px] font-mono text-text-tertiary hover:text-text-primary disabled:opacity-40 transition-colors"
+            >
+              clear
+            </button>
+          )}
+        </div>
+        <p className="text-[10px] text-text-tertiary font-mono mb-4">
+          {remindTime
+            ? "Onyx pushes a Log it / Skip card to your Agents chat at this time (your local clock) if the stack isn't logged yet."
+            : "Empty = no reminder."}
+        </p>
 
         <div className="flex items-center justify-between mb-1">
           <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary">

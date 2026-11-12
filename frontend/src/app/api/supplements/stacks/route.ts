@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { parseRemindTime } from "@/lib/supplement-reminders";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -46,7 +47,7 @@ export async function GET(req: NextRequest) {
 
   let sq = supabase
     .from("supplement_stack")
-    .select("stack_id,name,description,is_active,sort_order,created_at,updated_at");
+    .select("stack_id,name,description,remind_time,is_active,sort_order,created_at,updated_at");
   if (!includeArchived) sq = sq.eq("is_active", true);
   const { data: stacks, error: stacksErr } = await sq
     .order("sort_order", { ascending: true })
@@ -120,21 +121,29 @@ export async function GET(req: NextRequest) {
 
 /**
  * POST /api/supplements/stacks
- * Body: { name, description?, items: [{ product_id, doses }] }
+ * Body: { name, description?, remind_time?, items: [{ product_id, doses }] }
  *
  * Creates a new stack (header + items). Items with a blank product_id are
  * skipped; duplicates within the payload are de-duped (the table also enforces
- * a unique (stack_id, product_id)).
+ * a unique (stack_id, product_id)). remind_time is a local 'HH:MM' for the push
+ * reminder; empty / null = reminders off.
  */
 export async function POST(req: NextRequest) {
-  const body = (await req.json()) as { name?: string; description?: string; items?: IncomingItem[] };
+  const body = (await req.json()) as {
+    name?: string;
+    description?: string;
+    remind_time?: string | null;
+    items?: IncomingItem[];
+  };
   const name = body.name?.trim();
   if (!name) return NextResponse.json({ error: "name is required" }, { status: 400 });
+  const remind = parseRemindTime(body.remind_time ?? null);
+  if (!remind.ok) return NextResponse.json({ error: remind.error }, { status: 400 });
 
   const { data: stack, error: stackErr } = await supabase
     .from("supplement_stack")
-    .insert({ name, description: body.description?.trim() || null })
-    .select("stack_id,name,description,is_active,sort_order,created_at,updated_at")
+    .insert({ name, description: body.description?.trim() || null, remind_time: remind.value })
+    .select("stack_id,name,description,remind_time,is_active,sort_order,created_at,updated_at")
     .single();
   if (stackErr) return NextResponse.json({ error: stackErr.message }, { status: 500 });
 
@@ -152,16 +161,19 @@ export async function POST(req: NextRequest) {
 
 /**
  * PATCH /api/supplements/stacks
- * Body: { stack_id, name?, description?, is_active?, items? }
+ * Body: { stack_id, name?, description?, remind_time?, is_active?, items? }
  *
- * Updates header fields that are present. If `items` is provided, ALL items are
- * replaced (delete-by-stack_id + insert) so the editor is a simple full-save.
+ * Updates header fields that are present (remind_time: 'HH:MM' sets it, empty
+ * or null turns the reminder off, omitted leaves it alone). If `items` is
+ * provided, ALL items are replaced (delete-by-stack_id + insert) so the editor
+ * is a simple full-save.
  */
 export async function PATCH(req: NextRequest) {
   const body = (await req.json()) as {
     stack_id?: number;
     name?: string;
     description?: string | null;
+    remind_time?: string | null;
     is_active?: boolean;
     items?: IncomingItem[];
   };
@@ -176,6 +188,11 @@ export async function PATCH(req: NextRequest) {
     patch.name = n;
   }
   if (body.description !== undefined) patch.description = body.description?.trim() || null;
+  if (body.remind_time !== undefined) {
+    const remind = parseRemindTime(body.remind_time);
+    if (!remind.ok) return NextResponse.json({ error: remind.error }, { status: 400 });
+    patch.remind_time = remind.value;
+  }
   if (body.is_active !== undefined) patch.is_active = body.is_active;
 
   const { error: upErr } = await supabase

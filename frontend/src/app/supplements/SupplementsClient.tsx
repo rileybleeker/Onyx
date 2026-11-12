@@ -72,6 +72,7 @@ interface Stack {
   stack_id: number;
   name: string;
   description: string | null;
+  remind_time: string | null;
   items: StackItem[];
   item_count: number;
   total_doses: number;
@@ -574,7 +575,7 @@ export default function SupplementsPage() {
             <div className="flex items-center justify-end mb-2">
               <button
                 onClick={() =>
-                  setEditingStack({ stack_id: null, name: "", description: null, items: [] })
+                  setEditingStack({ stack_id: null, name: "", description: null, remind_time: null, items: [] })
                 }
                 className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-text-primary bg-accent/15 hover:bg-accent/25 border border-accent/30 rounded-[4px] transition-colors"
               >
@@ -618,6 +619,7 @@ export default function SupplementsPage() {
                           {s.item_count} product{s.item_count === 1 ? "" : "s"} · {s.total_doses} dose
                           {s.total_doses === 1 ? "" : "s"}
                           {s.description ? ` · ${s.description}` : ""}
+                          {s.remind_time ? ` · remind ${s.remind_time}` : ""}
                         </p>
                       </div>
                       <span className="text-[11px] text-accent/90 font-mono shrink-0">
@@ -630,6 +632,7 @@ export default function SupplementsPage() {
                           stack_id: s.stack_id,
                           name: s.name,
                           description: s.description,
+                          remind_time: s.remind_time,
                           items: s.items.map((i) => ({
                             product_id: i.product_id,
                             doses: Number(i.doses),
