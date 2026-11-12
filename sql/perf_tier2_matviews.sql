@@ -17,9 +17,10 @@
 --
 -- WHAT
 -- ----
--- Five matviews, refreshed every 15 min by pg_cron ('12,27,42,57 * * * *' —
--- +2 min after matrix_mat's tick so the two never compete; :12/:57 land just
--- after the hourly :00 health ETL and :50 Spotify ETL):
+-- Five matviews, refreshed every 30 min by pg_cron ('12,42 * * * *' since 2026-11-11,
+-- was '12,27,42,57' — see sql/matview_refresh_30min.sql;
+-- +2 min after matrix_mat's tick so the two never compete; :12 lands just
+-- after the hourly :00 health ETL):
 --   pds.tz_log_gaps_mat              1:1 SELECT * copy   (unique: cycle_id)
 --   pds.hrv_prediction_gaps_mat      1:1 SELECT * copy   (unique: expected_date)
 --   pds.spotify_daily_signature_mat  1:1 SELECT * copy   (unique: calendar_date)

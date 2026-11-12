@@ -60,8 +60,15 @@ async function post(body) {
     method: "POST",
     headers: { "x-onyx-ci-token": TOKEN, "content-type": "application/json" },
     body: JSON.stringify({ harvest: true, source: "kindle", ...body }),
+    signal: AbortSignal.timeout(60_000),
   });
-  return `${r.status} ${(await r.text()).slice(0, 400)}`;
+  const text = await r.text();
+  if (!r.ok) throw new Error(`Onyx import HTTP ${r.status}`);
+  const result = JSON.parse(text);
+  if (!body.error && (result.error || result.errors?.length)) {
+    throw new Error("Onyx import reported incomplete results");
+  }
+  return `${r.status} ${text.slice(0, 400)}`;
 }
 
 /** True when Amazon bounced us to a sign-in / MFA / captcha page. */
@@ -248,16 +255,17 @@ async function readBookWithRetry(page, asin) {
 /* Main                                                                 */
 /* ------------------------------------------------------------------ */
 
-mkdirSync(PROFILE, { recursive: true });
-const ctx = await chromium.launchPersistentContext(PROFILE, {
-  channel: "chrome",
-  headless: false, // Amazon challenges headless Chrome; the window is parked off-screen on scheduled runs
-  viewport: { width: 1280, height: 900 },
-  args: LOGIN_MODE ? ["--window-size=1280,900"] : ["--window-position=-32000,-32000", "--window-size=1280,900"],
-});
-
+let ctx;
 let exitCode = 0;
 try {
+  mkdirSync(PROFILE, { recursive: true });
+  ctx = await chromium.launchPersistentContext(PROFILE, {
+    channel: "chrome",
+    headless: false, // Amazon challenges headless Chrome; the window is parked off-screen on scheduled runs
+    viewport: { width: 1280, height: 900 },
+    args: LOGIN_MODE ? ["--window-size=1280,900"] : ["--window-position=-32000,-32000", "--window-size=1280,900"],
+  });
+
   const page = ctx.pages()[0] || (await ctx.newPage());
   await page.goto(NOTEBOOK, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(2000);
@@ -340,7 +348,14 @@ try {
 } catch (e) {
   log(`FATAL ${e.message}`);
   exitCode = 1;
+  if (!LOGIN_MODE && !DRY) {
+    try {
+      await post({ error: "Kindle harvest did not confirm completion; check the local harvester log" });
+    } catch {
+      log("Failed to report the harvest error to Onyx");
+    }
+  }
 } finally {
-  await ctx.close().catch(() => {});
+  await ctx?.close().catch(() => {});
 }
 process.exit(exitCode);
