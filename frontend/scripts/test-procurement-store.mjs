@@ -165,15 +165,26 @@ const fetches = [...client.matchAll(/fetch\(([^,)]+)/g)].map(m => m[1].trim());
 assert.ok(fetches.length > 0 && fetches.every(f => f === 'SUBSCRIPTIONS_API' || f.startsWith('`${SUBSCRIPTIONS_API}/')), 'the page only talks to its own subscriptions API: ' + fetches.join(' | '));
 const routeFiles = [];
 (function walk(dir) { for (const e of fs.readdirSync(new URL(dir, root), { withFileTypes: true })) { const rel = dir + e.name + (e.isDirectory() ? '/' : ''); if (e.isDirectory()) walk(rel); else routeFiles.push(rel); } })('src/app/api/procurement/');
-assert.deepEqual(routeFiles.sort(), ['src/app/api/procurement/subscriptions/[id]/route.ts', 'src/app/api/procurement/subscriptions/route.ts'], 'only the tracker routes exist under /api/procurement');
+// The tracker routes plus the PunchOut routes (2026-11-11, tests/punchout.test.cjs). Nothing else.
+const PUNCHOUT_ROUTES = [
+  'src/app/api/procurement/punchout/public/return/[token]/route.ts',
+  'src/app/api/procurement/punchout/public/test-supplier/setup/route.ts',
+  'src/app/api/procurement/punchout/start/route.ts',
+  'src/app/api/procurement/punchout/test-supplier/checkout/route.ts',
+];
+assert.deepEqual(routeFiles.sort(), [...PUNCHOUT_ROUTES, 'src/app/api/procurement/subscriptions/[id]/route.ts', 'src/app/api/procurement/subscriptions/route.ts'].sort(), 'only the tracker and PunchOut routes exist under /api/procurement');
 for (const file of routeFiles) {
   const src = read(file);
   const methods = [...src.matchAll(/export async function (\w+)/g)].map(m => m[1]);
   assert.ok(methods.length > 0 && methods.every(m => ['GET', 'POST', 'PATCH', 'DELETE'].includes(m)), file + ': ' + methods);
-  assert.doesNotMatch(src, /\b(fetch|axios|https?:\/\/)/, file + ' must not call any merchant or provider');
+  assert.doesNotMatch(src, /\b(axios|https?:\/\/)/, file + ' must not hard-code any merchant or provider');
+  // Only /start talks to a supplier (the cXML setup call, through lib/punchout.ts startPunchout).
+  if (!file.endsWith('punchout/start/route.ts')) assert.doesNotMatch(src, /\bfetch\b/, file + ' must not call any merchant or provider');
 }
-// Session-protected: the procurement API is not on the middleware's no-session carve-outs.
-assert.doesNotMatch(read('src/middleware.ts'), /api\/procurement/);
+// Session-protected: the only procurement paths past the middleware without a session are the two exact
+// PunchOut paths in PUNCHOUT_PUBLIC_RE (lib/punchout-paths.ts; tests/punchout.test.cjs proves the
+// subscription API and /start do not match). No procurement path literal sits in middleware code.
+assert.doesNotMatch(read('src/middleware.ts').replace(/\/\/.*$/gm, ''), /api\/procurement/);
 
 // --- the SQL: idempotent, service-role only, nothing removed, no anon access ---
 const sql = fs.readFileSync(new URL('../sql/procurement_schema.sql', root), 'utf8');

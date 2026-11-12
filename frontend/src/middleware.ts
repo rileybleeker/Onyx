@@ -1,5 +1,6 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
+import { PUNCHOUT_PUBLIC_RE } from "@/lib/punchout-paths";
 
 // Constant-time string comparison (Edge-runtime safe — no node:crypto). Keeps
 // the CI shared-secret check from leaking the token via compare timing.
@@ -44,6 +45,16 @@ const PUBLIC_MANIFEST = /^\/api\/screen-time\/manifest\/[0-9a-f]{32}$/;
 
 export async function middleware(request: NextRequest) {
   if (PUBLIC_MANIFEST.test(request.nextUrl.pathname)) {
+    return NextResponse.next({ request });
+  }
+
+  // PunchOut (2026-11-11): exactly two path shapes, matched in full by PUNCHOUT_PUBLIC_RE
+  // (lib/punchout-paths.ts). The BrowserFormPost return /api/procurement/punchout/public/return/<32 hex>.<43
+  // base64url> is a cross-site form POST from the supplier's page, so the SameSite=Lax session cookie never
+  // arrives; the route itself authenticates the single-use, expiring secret in the path. The synthetic test
+  // supplier's setup endpoint /api/procurement/punchout/public/test-supplier/setup is called server-to-server
+  // and checks the cXML SharedSecret. Do not widen this to /api/procurement/*.
+  if (PUNCHOUT_PUBLIC_RE.test(request.nextUrl.pathname)) {
     return NextResponse.next({ request });
   }
 
