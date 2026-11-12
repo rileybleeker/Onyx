@@ -1,0 +1,26 @@
+name: Rocket Money Harvester Tests
+on:
+  pull_request:
+    paths: ['tools/rocketmoney_harvest/**', '.github/workflows/rocketmoney-harvester-test.yml']
+  push:
+    branches: [master]
+    paths: ['tools/rocketmoney_harvest/**', '.github/workflows/rocketmoney-harvester-test.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+      - name: Syntax check (no dependencies installed, nothing imported)
+        run: |
+          for f in tools/rocketmoney_harvest/*.mjs tools/rocketmoney_harvest/lib/*.mjs; do node --check "$f"; done
+      - name: Offline tests (synthetic data only; no credentials, network, or browser)
+        run: node --test tools/rocketmoney_harvest/test/*.test.mjs
