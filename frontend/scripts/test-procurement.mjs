@@ -146,8 +146,10 @@ assert.ok(synthetic.every(s => lib.nextRenewal(s, today) >= today));
 
 // --- source hygiene: no network, storage, secrets or imports in the planning module and its UI ---
 for (const file of ['../src/lib/procurement.ts','../src/app/procurement/ProcurementClient.tsx']) {
- const content=fs.readFileSync(new URL(file, import.meta.url),'utf8');
+ let content=fs.readFileSync(new URL(file, import.meta.url),'utf8');
+ // The page may call exactly one thing: its own saved-subscriptions API (see test-procurement-store.mjs). Anything else still fails below.
+ if (file.endsWith('ProcurementClient.tsx')) content=content.replace(/fetch\(SUBSCRIPTIONS_API/g,'').replace(/fetch\(`\$\{SUBSCRIPTIONS_API\}\//g,'');
  assert.doesNotMatch(content, /fetch\(|localStorage|sessionStorage|indexedDB|supabase|process\.env|XMLHttpRequest|WebSocket|sendBeacon|window\.open|location\.(href|assign)/);
 }
 assert.doesNotMatch(source, /^import /m, 'procurement.ts must stay import-free so this VM harness can load it');
-console.log('PASS procurement: drafts, dates, subscription maths and renewal rolling, review prompts, prepared list, calendar file, execution hard-disable, no network/storage integrations');
+console.log('PASS procurement: drafts, dates, subscription maths and renewal rolling, review prompts, prepared list, calendar file, execution hard-disable, no network/storage integrations (the page may only call its own subscriptions API)');

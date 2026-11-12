@@ -1,5 +1,5 @@
 "use client";
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   CAPABILITIES, MAX_DRAFTS, MAX_SUBSCRIPTIONS, REMINDER_LEAD_DAYS,
   createDraft, createSubscription, draftTotals, duplicateWarnings, executionReadiness, formatDate, isoFromLocalDate,
@@ -9,6 +9,13 @@ import {
 const card = 'rounded-xl border border-border-subtle bg-surface-card p-5 space-y-4';
 const field = 'block w-full rounded border border-border-subtle bg-transparent p-2 mt-1';
 const button = 'rounded border border-border-subtle px-3 py-2 text-sm hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed';
+const SUBSCRIPTIONS_API = '/api/procurement/subscriptions';
+const persistenceNote = {
+  checking: 'Checking for saved subscriptions...',
+  saved: 'Saved to your Onyx account: subscriptions you add here are kept between visits. Synthetic demo rows are never saved.',
+  pending: 'Not saved yet - setup pending. The subscription table has not been created in Supabase, so this tracker works for this visit only and clears on reload.',
+  unavailable: 'Saved subscriptions could not be loaded right now. This tracker works for this visit only and clears on reload.',
+} as const;
 const cycleLabel = { monthly: 'month', quarterly: 'quarter', annual: 'year' } as const;
 function relative(daysAway: number) { return daysAway === 0 ? 'today' : daysAway === 1 ? 'tomorrow' : `in ${daysAway} days`; }
 export default function ProcurementClient() {
@@ -22,6 +29,25 @@ export default function ProcurementClient() {
   const [subError, setSubError] = useState('');
   const [subNotice, setSubNotice] = useState('');
   const [leadDays, setLeadDays] = useState(3);
+  // 'checking' until the first load answers; 'saved' = table exists and rows persist; 'pending' = SQL not applied yet; 'unavailable' = the save API could not be reached.
+  const [store, setStore] = useState<'checking' | 'saved' | 'pending' | 'unavailable'>('checking');
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(SUBSCRIPTIONS_API, { cache: 'no-store' });
+        const body = await res.json().catch(() => null);
+        if (cancelled) return;
+        if (res.ok && body && body.persisted === true && Array.isArray(body.subscriptions)) {
+          setStore('saved');
+          // Keep anything typed before the load finished (it has no id); replace only the previously loaded rows.
+          setSubs(previous => [...(body.subscriptions as Subscription[]), ...previous.filter(sub => sub.id === undefined)]);
+        } else setStore(body && body.setupPending === true ? 'pending' : 'unavailable');
+      } catch { if (!cancelled) setStore('unavailable'); }
+    })();
+    return () => { cancelled = true; };
+  }, []);
   // Only read the clock once there is something to show, so the server-rendered page (no subscriptions) never depends on the date.
   const today = subs.length ? isoFromLocalDate(new Date()) : '';
   const summary = subs.length ? summarizeSubscriptions(subs, today) : null;
@@ -37,18 +63,56 @@ export default function ProcurementClient() {
       setDrafts(previous => [...previous, draft]); setError(''); setNotice('Draft added for this visit only. No order was placed.'); form.reset(); setCommitment('one-time');
     } catch (e) { setError(e instanceof Error ? e.message : 'Unable to add draft.'); setNotice(''); }
   }
-  function addSubscription(event: React.FormEvent<HTMLFormElement>) {
+  async function addSubscription(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
     try {
       if (subs.length >= MAX_SUBSCRIPTIONS) throw new Error('This preview tracks up to 30 subscriptions. Clear the list to start again.');
       const sub = createSubscription(String(data.get('subName') ?? ''), String(data.get('subAmount') ?? ''), String(data.get('subCycle') ?? ''), String(data.get('subRenews') ?? ''));
-      setSubs(previous => [...previous, sub]); setSubError(''); setSubNotice('Subscription added for this visit only. Nothing was contacted.'); form.reset();
+      setSubError('');
+      if (store === 'saved') {
+        setBusy(true);
+        let failure = 'it could not be saved';
+        try {
+          const res = await fetch(SUBSCRIPTIONS_API, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: sub.name, amount: (sub.cents / 100).toFixed(2), cycle: sub.cycle, renewsOn: sub.renewsOn }) });
+          const body = await res.json().catch(() => null);
+          if (res.ok && body && body.subscription) {
+            setSubs(previous => [...previous, body.subscription as Subscription]); setSubNotice('Subscription saved. Nothing was contacted.'); form.reset(); setBusy(false); return;
+          }
+          if (body && body.setupPending === true) { setStore('pending'); failure = 'setup is pending'; }
+          else if (body && typeof body.error === 'string') failure = body.error;
+        } catch { /* network failure: fall through to the in-memory add */ }
+        setBusy(false);
+        setSubs(previous => [...previous, sub]); setSubNotice(`Subscription added for this visit only (${failure}). Nothing was contacted.`); form.reset(); return;
+      }
+      setSubs(previous => [...previous, sub]); setSubNotice('Subscription added for this visit only. Nothing was contacted.'); form.reset();
     } catch (e) { setSubError(e instanceof Error ? e.message : 'Unable to add subscription.'); setSubNotice(''); }
+  }
+  async function removeSubscription(sub: Subscription) {
+    if (sub.id !== undefined && store === 'saved') {
+      setBusy(true);
+      try {
+        const res = await fetch(`${SUBSCRIPTIONS_API}/${sub.id}`, { method: 'DELETE' });
+        if (!res.ok && res.status !== 404) throw new Error('archive failed');
+      } catch { setBusy(false); setSubError('Could not remove that subscription from your saved list. It is still saved.'); setSubNotice(''); return; }
+      setBusy(false);
+    }
+    setSubs(previous => previous.filter(item => item !== sub)); setSubError(''); setSubNotice('Subscription removed from this list. Nothing was cancelled.');
+  }
+  async function clearSubscriptions() {
+    if (store === 'saved' && subs.some(sub => sub.id !== undefined)) {
+      setBusy(true);
+      try {
+        const res = await fetch(SUBSCRIPTIONS_API, { method: 'DELETE' });
+        if (!res.ok) throw new Error('archive failed');
+      } catch { setBusy(false); setSubError('Could not clear your saved list. Nothing was changed.'); setSubNotice(''); return; }
+      setBusy(false);
+    }
+    setSubs([]); setSubNotice('All tracked subscriptions cleared.'); setSubError('');
   }
   function loadSynthetic() {
     const room = MAX_SUBSCRIPTIONS - subs.length;
     if (room < 4) { setSubError('Not enough room for the four synthetic examples. Clear the list first.'); return; }
-    setSubs(previous => [...previous, ...syntheticSubscriptions(isoFromLocalDate(new Date()))]); setSubError(''); setSubNotice('Added four synthetic demo subscriptions. They are not yours.');
+    setSubs(previous => [...previous, ...syntheticSubscriptions(isoFromLocalDate(new Date()))]); setSubError(''); setSubNotice('Added four synthetic demo subscriptions. They are not yours and are never saved.');
   }
   function downloadReminders() {
     const url = URL.createObjectURL(new Blob([renewalReminderIcs(subs, today, leadDays)], { type: 'text/calendar;charset=utf-8' }));
@@ -62,18 +126,18 @@ export default function ProcurementClient() {
   }
   return <main className="max-w-5xl mx-auto p-4 md:p-8 space-y-6">
     <header><p className="text-xs uppercase tracking-widest text-text-tertiary">Planning workspace</p><h1 className="text-3xl font-semibold mt-2">Procurement</h1><p className="text-text-secondary mt-2">Review subscriptions, plan orders, and evaluate purchases.</p></header>
-    <section className={card} aria-label="Connection status"><h2 className="text-lg font-semibold">Disconnected preview</h2><p>No accounts are connected. Onyx never buys, checks out or submits anything on a merchant site: it prepares lists and reminders for you to act on yourself. Everything below stays in memory for this visit and disappears on reload. Do not enter payment details, credentials, addresses, or sensitive information.</p><ul className="text-sm text-text-secondary"><li>Subscription providers: {CAPABILITIES.providers}</li><li>Orders: {CAPABILITIES.orders}</li><li>Recommendations: {CAPABILITIES.recommendations}</li><li>Tracking: {CAPABILITIES.tracking}</li><li>Reminders: {CAPABILITIES.reminders}</li></ul></section>
+    <section className={card} aria-label="Connection status"><h2 className="text-lg font-semibold">Disconnected preview</h2><p>No accounts are connected. Onyx never buys, checks out or submits anything on a merchant site: it prepares lists and reminders for you to act on yourself. Order drafts stay in memory for this visit and disappear on reload; tracked subscriptions are saved to your Onyx account once the one-time Supabase setup has been applied (the note under Track subscriptions says which). Do not enter payment details, credentials, addresses, or sensitive information.</p><ul className="text-sm text-text-secondary"><li>Subscription providers: {CAPABILITIES.providers}</li><li>Orders: {CAPABILITIES.orders}</li><li>Recommendations: {CAPABILITIES.recommendations}</li><li>Tracking: {CAPABILITIES.tracking}</li><li>Reminders: {CAPABILITIES.reminders}</li></ul></section>
     <div className="grid md:grid-cols-2 gap-6">
       <section className={card}><h2 className="text-xl font-semibold">Subscriptions</h2><p className="text-text-secondary">No provider is connected, so nothing is synced and Financials is not read. Track subscriptions by hand in the next section.</p><button className={button} onClick={() => setExamples(value => !value)}>{examples ? 'Hide synthetic examples' : 'Show synthetic examples'}</button>{examples && <div className="space-y-3"><p className="text-xs uppercase">Synthetic examples, not your subscriptions</p>{EXAMPLES.map(example => <article className="border-t border-border-subtle pt-3" key={example.name}><h3>{example.name}</h3><p>{money(example.monthlyCents)} / month, illustrative</p><p className="text-sm text-text-secondary">{example.note}</p></article>)}</div>}<button className={button} disabled>Manage with provider (unavailable)</button></section>
       <section className={card}><h2 className="text-xl font-semibold">Purchase recommendations</h2><p>No personalized recommendations yet. Product search, current prices, availability, and account history are not connected.</p><ul className="list-disc pl-5 text-sm text-text-secondary space-y-2"><li>Start with the need and total budget.</li><li>Compare the full delivered price, recurring costs, and return terms.</li><li>Check existing subscriptions before adding a duplicate.</li></ul><p className="text-xs text-text-tertiary">These are planning tips, not researched product offers. The review prompts under Track subscriptions come only from what you type in.</p></section>
     </div>
-    <section className={card}><h2 className="text-xl font-semibold">Track subscriptions</h2><p className="text-sm text-text-secondary">Type in what you pay for, see the monthly and yearly cost, and get a calendar reminder file before each renewal. This does not cancel, change or pay for anything.</p>
-      <form onSubmit={addSubscription} className="grid md:grid-cols-2 gap-4"><label>Subscription name<input className={field} name="subName" required maxLength={80}/></label><label>Price per cycle (USD)<input className={field} name="subAmount" inputMode="decimal" required placeholder="0.00"/></label><label>Billing cycle<select className={field} name="subCycle" defaultValue="monthly"><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annual">Annual</option></select></label><label>Next renewal date<input className={field} name="subRenews" type="date" required/></label><button className={button} type="submit">Add subscription</button></form>
+    <section className={card}><h2 className="text-xl font-semibold">Track subscriptions</h2><p className="text-sm text-text-secondary">Type in what you pay for, see the monthly and yearly cost, and get a calendar reminder file before each renewal. This does not cancel, change or pay for anything.</p><p className="text-sm text-text-secondary" data-testid="procurement-persistence" data-state={store}>{persistenceNote[store]}</p>
+      <form onSubmit={addSubscription} className="grid md:grid-cols-2 gap-4"><label>Subscription name<input className={field} name="subName" required maxLength={80}/></label><label>Price per cycle (USD)<input className={field} name="subAmount" inputMode="decimal" required placeholder="0.00"/></label><label>Billing cycle<select className={field} name="subCycle" defaultValue="monthly"><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annual">Annual</option></select></label><label>Next renewal date<input className={field} name="subRenews" type="date" required/></label><button className={button} type="submit" disabled={busy}>Add subscription</button></form>
       {subError && <p role="alert" className="text-red-400">{subError}</p>}<p role="status">{subNotice}</p>
-      <div className="flex flex-wrap gap-3"><button className={button} onClick={loadSynthetic}>Load synthetic demo subscriptions</button><button className={button} disabled={!subs.length} onClick={() => { setSubs([]); setSubNotice('All tracked subscriptions cleared.'); setSubError(''); }}>Clear subscriptions</button></div>
+      <div className="flex flex-wrap gap-3"><button className={button} onClick={loadSynthetic}>Load synthetic demo subscriptions</button><button className={button} disabled={!subs.length || busy} onClick={clearSubscriptions}>Clear subscriptions</button></div>
       {summary ? <div className="space-y-4">
         <p>About {money(summary.monthlyCents)} / month, {money(summary.annualCents)} / year across {summary.count} tracked subscription{summary.count === 1 ? '' : 's'}. Entered by you; not synced from any provider.</p>
-        <ul className="space-y-3">{summary.renewals.map((r, position) => <li className="border-t border-border-subtle pt-3 flex flex-wrap gap-3 justify-between" key={r.index}><div><h3>{r.sub.name}</h3><p className="text-sm">{money(r.sub.cents)} / {cycleLabel[r.sub.cycle]} · renews {formatDate(r.nextOn)} ({relative(r.daysAway)})</p></div><button className={button} onClick={() => { setSubs(previous => previous.filter((_, i) => i !== r.index)); setSubNotice('Subscription removed from this list. Nothing was cancelled.'); }}>Remove subscription {position + 1}</button></li>)}</ul>
+        <ul className="space-y-3">{summary.renewals.map((r, position) => <li className="border-t border-border-subtle pt-3 flex flex-wrap gap-3 justify-between" key={r.index}><div><h3>{r.sub.name}</h3><p className="text-sm">{money(r.sub.cents)} / {cycleLabel[r.sub.cycle]} · renews {formatDate(r.nextOn)} ({relative(r.daysAway)})</p></div><button className={button} disabled={busy} onClick={() => removeSubscription(r.sub)}>Remove subscription {position + 1}</button></li>)}</ul>
         {prompts.length > 0 && <div><h3 className="font-semibold">Worth a look</h3><ul className="list-disc pl-5 text-sm text-text-secondary space-y-1">{prompts.map((p, i) => <li key={i}>{p}</li>)}</ul></div>}
         <div className="flex flex-wrap items-end gap-3"><label className="text-sm">Remind me<select className={field} value={leadDays} onChange={e => setLeadDays(Number(e.target.value))}>{REMINDER_LEAD_DAYS.map(d => <option key={d} value={d}>{d} day{d === 1 ? '' : 's'} before</option>)}</select></label><button className={button} onClick={downloadReminders}>Download renewal reminders (.ics)</button></div>
       </div> : <p>No subscriptions tracked yet.</p>}
