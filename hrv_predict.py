@@ -72,6 +72,99 @@ CI_Z = 1.282
 # desensitizing the metric over time. 30 days matches the function name.
 ROLLING_WINDOW_DAYS = 30
 
+# Live rolling metrics are stored under their own model label (e.g. 'xgboost_live_rolling').
+# pds.hrv_model_metrics' primary key is (eval_date, model, horizon_days), so writing them under
+# the plain model name replaced the retrain's walk-forward backtest h=1 row for the same
+# eval_date (and left a hybrid row: live MAE / n next to the backtest's R2 / MAPE / CI).
+# A separate label keeps both rows without changing the key. Readers: the /analytics/hrv
+# page (frontend/src/lib/queries-hrv.ts LIVE_METRICS_SUFFIX) and check_drift() below.
+LIVE_METRICS_SUFFIX = "_live_rolling"
+# The first live forecast made by the same-night code (hrv_alignment.py, PR #5) was
+# created 2026-11-11 01:06 ET; the last one made by the old code at 00:05 ET that day
+# (prediction_date 2026-11-12, model_version '2026-11-11_v1', so the version date alone
+# does not separate them). Rows created before this instant predicted another night.
+ALIGNMENT_CUTOVER_AT = pd.Timestamp("2026-11-11T01:00:00", tz=ET_TZ)
+
+
+def live_metrics_model(model: str) -> str:
+    return f"{model}{LIVE_METRICS_SUFFIX}"
+
+
+def select_live_forecasts(preds: pd.DataFrame) -> pd.DataFrame:
+    """One scored live h=1 forecast per (model, prediction_date), on the current alignment.
+
+    Leaves out backtest rows (the retrain scores those itself), other horizons, forecasts
+    created before the alignment cutover, and rows without an actual. Where a date has several live
+    versions it keeps the row pds.hrv_predictions_latest serves: the hrv_predict path
+    ('*_v1') before the retrain path ('*_behavioral_v1'), then the newest created_at.
+    """
+    if preds.empty:
+        return preds
+    p = preds.copy()
+    ver = p["model_version"].fillna("").astype(str)
+    created = pd.to_datetime(p["created_at"], utc=True, errors="coerce")
+    p["actual_hrv"] = pd.to_numeric(p["actual_hrv"], errors="coerce")
+    p["predicted_hrv"] = pd.to_numeric(p["predicted_hrv"], errors="coerce")
+    keep = (
+        ~ver.str.startswith("backtest")
+        & (pd.to_numeric(p["horizon_days"], errors="coerce") == 1)
+        & (created >= ALIGNMENT_CUTOVER_AT)
+        & p["actual_hrv"].notna()
+        & p["predicted_hrv"].notna()
+    )
+    p = p[keep].copy()
+    if p.empty:
+        return p
+    p["_rank"] = ver[keep].str.contains("behavioral").astype(int)
+    p["_created"] = created[keep]
+    p = p.sort_values(["model", "prediction_date", "_rank", "_created"],
+                      ascending=[True, True, True, False])
+    p = p.drop_duplicates(["model", "prediction_date"], keep="first")
+    return p.drop(columns=["_rank", "_created"]).sort_values(["model", "prediction_date"])
+
+
+def live_metrics_row(sub: pd.DataFrame, model: str, eval_date: str) -> dict:
+    """Accuracy of one model's scored live forecasts (one row per date, date order)."""
+    actuals = sub["actual_hrv"].to_numpy(dtype=float)
+    preds_arr = sub["predicted_hrv"].to_numpy(dtype=float)
+    err = actuals - preds_arr
+    row = {
+        "eval_date": eval_date,
+        "model": live_metrics_model(model),
+        "horizon_days": 1,
+        "mae": float(np.mean(np.abs(err))),
+        "rmse": float(np.sqrt(np.mean(err ** 2))),
+        "mape": float(np.mean(np.abs(err / np.where(actuals != 0, actuals, 1))) * 100),
+        "r_squared": None,
+        "n_predictions": int(len(sub)),
+        "directional_accuracy": None,
+        "directional_accuracy_legacy": None,
+        "ci_coverage": None,
+        "ci_avg_width": None,
+        "model_version": MODEL_VERSION,
+    }
+    ss_tot = float(np.sum((actuals - actuals.mean()) ** 2))
+    if ss_tot > 0:
+        row["r_squared"] = 1 - float(np.sum(err ** 2)) / ss_tot
+    # Standard directional accuracy: did the forecast for day t, relative to *yesterday's
+    # actual*, point in the same direction as the actual change from yesterday to today?
+    # The legacy variant compares diff(predictions) vs diff(actuals).
+    if len(actuals) > 1:
+        actual_change = np.diff(actuals)
+        row["directional_accuracy"] = float(
+            np.mean(np.sign(actual_change) == np.sign(preds_arr[1:] - actuals[:-1])) * 100)
+        row["directional_accuracy_legacy"] = float(
+            np.mean(np.sign(actual_change) == np.sign(np.diff(preds_arr))) * 100)
+    if {"prediction_lower", "prediction_upper"} <= set(sub.columns):
+        lo = pd.to_numeric(sub["prediction_lower"], errors="coerce")
+        hi = pd.to_numeric(sub["prediction_upper"], errors="coerce")
+        has_pi = (lo.notna() & hi.notna()).to_numpy()
+        if has_pi.any():
+            a, l_, h_ = actuals[has_pi], lo.to_numpy()[has_pi], hi.to_numpy()[has_pi]
+            row["ci_coverage"] = float(np.mean((a >= l_) & (a <= h_)) * 100)
+            row["ci_avg_width"] = float(np.mean(h_ - l_))
+    return row
+
 
 def _clean_for_json(obj):
     """Recursively replace NaN / NaT / numpy scalars with JSON-safe Python types.
@@ -313,93 +406,68 @@ def backfill_actuals() -> int:
     return len(updates)
 
 
-def recompute_rolling_metrics() -> None:
-    """Recompute rolling N-day metrics and upsert into hrv_model_metrics.
+def recompute_rolling_metrics() -> list[dict]:
+    """Recompute the live rolling N-day accuracy and upsert it into hrv_model_metrics.
 
-    The function name promises a rolling window; the previous implementation read
-    every historical row, which desensitized the metric as the dataset grew. We
-    now restrict to predictions whose prediction_date is within the last
-    ROLLING_WINDOW_DAYS days, so a recent regression actually moves the number.
+    Scores real forecasts only: one live h=1 forecast per (model, prediction_date) made
+    since the alignment cutover (select_live_forecasts), over the last ROLLING_WINDOW_DAYS
+    days. Until 2026-11-11 this also counted backtest rows of every horizon (so the "live"
+    MAE was mostly backtest) and several forecasts per date, and it wrote under the plain
+    model name, which overwrote the retrain's backtest h=1 row. Rows are written as
+    '<model>_live_rolling' (LIVE_METRICS_SUFFIX). Returns the rows written.
     """
-    log.info(f"Recomputing rolling {ROLLING_WINDOW_DAYS}-day metrics…")
+    log.info(f"Recomputing rolling {ROLLING_WINDOW_DAYS}-day live metrics…")
     today_str = str(et_today())
     window_start = (et_today() - timedelta(days=ROLLING_WINDOW_DAYS)).isoformat()
 
     preds = fetch_all(
         "hrv_predictions",
         select="prediction_date,model,horizon_days,predicted_hrv,actual_hrv,"
-               "prediction_lower,prediction_upper,model_version",
-        filters=[("prediction_date", "gte", window_start)],
+               "prediction_lower,prediction_upper,model_version,created_at",
+        filters=[("prediction_date", "gte", window_start), ("horizon_days", "eq", 1)],
     )
-    if preds.empty:
-        return
-    # Live forecasts written before the alignment fix predicted a different night (the
-    # sleep after tonight). Keep them out of the rolling accuracy; backtest rows are
-    # rewritten by every retrain, so they are always on the current rule.
-    import hrv_alignment as al
-    ver = preds["model_version"].fillna("").astype(str)
-    preds = preds[ver.str.startswith("backtest") | (ver.str[:10] >= al.ALIGNMENT_CUTOVER_DATE)]
-    if preds.empty:
-        return
-
-    preds = preds.dropna(subset=["actual_hrv", "predicted_hrv"])
-    preds["actual_hrv"] = pd.to_numeric(preds["actual_hrv"], errors="coerce")
-    preds["predicted_hrv"] = pd.to_numeric(preds["predicted_hrv"], errors="coerce")
-    preds = preds.dropna(subset=["actual_hrv", "predicted_hrv"])
-    if preds.empty:
-        return
+    live = select_live_forecasts(preds)
+    if live.empty:
+        log.info("  No scored live forecasts since the alignment cutover yet.")
+        return []
 
     rows = []
-    for model_name in preds["model"].unique():
-        sub = preds[preds["model"] == model_name].copy()
-        sub = sub.sort_values("prediction_date")
-        sub["abs_err"] = (sub["actual_hrv"] - sub["predicted_hrv"]).abs()
-
+    for model_name, sub in live.groupby("model", sort=True):
         if len(sub) >= 5:
-            mae = float(sub["abs_err"].mean())
-            rmse = float(np.sqrt((sub["actual_hrv"] - sub["predicted_hrv"]).pow(2).mean()))
-            # Standard directional accuracy: did the forecast for day t, relative
-            # to *yesterday's actual*, point in the same direction as the actual
-            # change from yesterday to today? Compares pred(t) - actual(t-1)
-            # against actual(t) - actual(t-1). The previous version compared
-            # diff(predictions) vs diff(actuals), which understates accuracy when
-            # successive predictions are both close to the mean.
-            actuals = sub["actual_hrv"].values
-            preds_arr = sub["predicted_hrv"].values
-            if len(actuals) > 1:
-                actual_change = np.diff(actuals)
-                pred_change_from_prev_actual = preds_arr[1:] - actuals[:-1]
-                dir_acc = float(np.mean(np.sign(actual_change) == np.sign(pred_change_from_prev_actual)) * 100)
-                dir_acc_legacy = float(np.mean(np.sign(actual_change) == np.sign(np.diff(preds_arr))) * 100)
-            else:
-                dir_acc = None
-                dir_acc_legacy = None
-            rows.append({
-                "eval_date": today_str,
-                "model": model_name,
-                "horizon_days": 1,
-                "mae": mae,
-                "rmse": rmse,
-                "n_predictions": len(sub),
-                "directional_accuracy": dir_acc,
-                "directional_accuracy_legacy": dir_acc_legacy,
-                "model_version": MODEL_VERSION,
-            })
+            rows.append(live_metrics_row(sub, str(model_name), today_str))
+        else:
+            log.info(f"  {model_name}: {len(sub)} scored live forecast(s), need 5 — skipped")
 
     if rows:
         supa.schema("pds").from_("hrv_model_metrics").upsert(
             _clean_for_json(rows), on_conflict="eval_date,model,horizon_days"
         ).execute()
-        log.info(f"  Updated metrics for {len(rows)} models (last {ROLLING_WINDOW_DAYS} days).")
+        log.info(f"  Updated live metrics for {len(rows)} models (last {ROLLING_WINDOW_DAYS} days).")
+    return rows
+
+
+def latest_live_mae(model: str = "xgboost") -> float | None:
+    """MAE of the newest live rolling-metrics row for `model` (h=1), or None."""
+    resp = (
+        supa.schema("pds")
+        .from_("hrv_model_metrics")
+        .select("mae,eval_date")
+        .eq("model", live_metrics_model(model))
+        .eq("horizon_days", 1)
+        .order("eval_date", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return float(resp.data[0]["mae"]) if resp.data else None
 
 
 def check_drift(current_mae: float | None) -> None:
-    """Compare current 30-day MAE against backtest MAE; log warning if drifting."""
+    """Compare the live 30-day MAE against the backtest MAE; log warning if drifting."""
     if current_mae is None:
         return
-    # Fetch backtest baseline MAE. Order by eval_date ASC + horizon_days ASC so we
-    # always anchor against the *first* recorded backtest at horizon=1, rather
-    # than whichever row happens to come back first from the unordered query.
+    # Anchor on the NEWEST walk-forward backtest at h=1: the retrain that produced the
+    # deployed model, on the current alignment rule. (The first-ever backtest row predates
+    # the 2026-11-10 alignment fix and scored another night.)
     baseline_rows = (
         supa.schema("pds")
         .from_("hrv_model_metrics")
@@ -407,7 +475,7 @@ def check_drift(current_mae: float | None) -> None:
         .eq("model", "xgboost")
         .eq("model_version", "backtest_initial")
         .eq("horizon_days", 1)
-        .order("eval_date", desc=False)
+        .order("eval_date", desc=True)
         .limit(1)
         .execute()
     )
@@ -485,11 +553,7 @@ def main() -> None:
                         log.info(f"Last night's HRV: {today_hrv:.1f} ms")
 
                     try:
-                        metrics = supa.schema("pds").from_("hrv_model_metrics").select("mae").eq(
-                            "model", "xgboost"
-                        ).order("eval_date", desc=True).limit(1).execute()
-                        current_mae = float(metrics.data[0]["mae"]) if metrics.data else None
-                        check_drift(current_mae)
+                        check_drift(latest_live_mae("xgboost"))
                     except Exception as e:
                         stage_errors.append("check_drift")
                         log.exception(f"check_drift failed: {e}")
