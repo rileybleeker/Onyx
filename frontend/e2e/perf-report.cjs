@@ -18,17 +18,22 @@ const stats = require("./perf-stats.cjs");
 const ORDER = ["today", "analytics-hrv", "sleep", "nutrition", "supplements", "agents", "status", "caffeine", "caffeine-720"];
 
 function loadRun(dir) {
+  // First page start .. last page finish (older result files only have a finish time, mislabelled startedAt).
   const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "summary.json");
   const pages = [];
+  const window_ = { first: null, last: null };
   let meta = null;
   for (const f of files) {
     const raw = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
     if (!raw.meta || !Array.isArray(raw.samples)) continue;
     meta = meta || raw.meta;
+    const t0 = raw.meta.startedAt, t1 = raw.meta.finishedAt || raw.meta.startedAt;
+    window_.first = !window_.first || t0 < window_.first ? t0 : window_.first;
+    window_.last = !window_.last || t1 > window_.last ? t1 : window_.last;
     pages.push({ slug: raw.meta.slug, label: raw.meta.label, note: raw.meta.note, summary: stats.summarizePage(raw.samples) });
   }
   pages.sort((a, b) => ORDER.indexOf(a.slug) - ORDER.indexOf(b.slug));
-  return { dir, meta, pages };
+  return { dir, meta, pages, window: window_ };
 }
 
 function render(runs) {
@@ -40,7 +45,7 @@ function render(runs) {
     const r = m.runner || {};
     out.push(`## Run ${idx + 1}${g.runId ? ` (GitHub run ${g.runId})` : ""}\n`);
     out.push(
-      `Started ${m.startedAt || "?"}, ${m.navigations || "?"} navigations per page (first = cold browser cache, the rest = warm), runner ${r.platform || "?"} ${r.cpus || "?"} vCPU / ${r.memGB || "?"} GB, Chromium ${r.chromium || "?"}, commit ${(g.sha || "?").slice(0, 7)}.\n`
+      `Measured ${run.window.first || "?"} to ${run.window.last || "?"} (UTC), ${m.navigations || "?"} navigations per page (first = cold browser cache, the rest = warm), runner ${r.platform || "?"} ${r.cpus || "?"} vCPU / ${r.memGB || "?"} GB, Chromium ${r.chromium || "?"}, commit ${(g.sha || "?").slice(0, 7)}.\n`
     );
     out.push("### Timing, milliseconds (warm navigations: p50 / p95)\n");
     out.push(stats.timingTable(run.pages) + "\n");

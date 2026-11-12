@@ -307,6 +307,7 @@ for (const spec of PAGES) {
     const origin = new URL(test.info().project.use.baseURL as string).origin;
 
     const samples: Sample[] = [];
+    const startedAt = new Date().toISOString();
     try {
       for (let i = 0; i < NAVIGATIONS; i++) {
         const s = await measureOnce(page, spec, origin, i);
@@ -326,7 +327,8 @@ for (const spec of PAGES) {
           route: spec.route,
           note: spec.note ?? null,
           navigations: NAVIGATIONS,
-          startedAt: new Date().toISOString(),
+          startedAt,
+          finishedAt: new Date().toISOString(),
           quietMs: QUIET_MS,
           windowCapMs: WINDOW_CAP_MS,
           github: {
