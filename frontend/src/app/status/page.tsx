@@ -35,7 +35,6 @@ const SOURCE_BADGE: Record<string, string> = {
   urgent_email: "GMAIL",
   ubereats: "UBER EATS",
   nyc_scout: "AGENT",
-  rocket_money: "ROCKET MONEY",
   matrix_mat: "DB",
   perf_mats: "DB",
 };
@@ -66,7 +65,6 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   urgent_email: "text-rose-400",
   ubereats: "text-emerald-400/70",
   nyc_scout: "text-sky-400",
-  rocket_money: "text-lime-400",
   matrix_mat: "text-cyan-400/70",
   perf_mats: "text-cyan-400/70",
 };
@@ -128,7 +126,6 @@ const SOURCE_ORDER = [
   "urgent_email",
   "ubereats",
   "nyc_scout",
-  "rocket_money",
   "matrix_mat",
   "perf_mats",
 ];
@@ -255,7 +252,6 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   supplement_reminders: "Supplement Reminders",
   urgent_email: "Urgent Email",
   ubereats: "Uber Eats Items",
-  rocketmoney: "Rocket Money",
   matrix_mat: "Matrix Matview",
   perf_mats: "Perf Matviews",
 };
@@ -280,8 +276,6 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   labels: "Labels",
   refresh: "Refresh",
   prompt: "Reminder Poll",
-  transactions: "Transactions",
-  balances: "Balances",
 };
 
 // "refreshed Xm ago" label, isolated from the page render cycle (perf round

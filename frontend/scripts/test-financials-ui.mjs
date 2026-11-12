@@ -13,8 +13,7 @@ await symlink(path.join(frontend, 'node_modules'), path.join(fixture, 'node_modu
 await copyFile(path.join(frontend, 'src/lib/financials.ts'), path.join(fixture, 'lib/financials.ts'));
 const client = await readFile(path.join(frontend, 'src/app/financials/FinancialsClient.tsx'), 'utf8');
 await writeFile(path.join(fixture, 'app/FinancialsClient.tsx'), client.replace('@/lib/financials', '../lib/financials'));
-// The real page reads the saved ledger on the server; this fixture only exercises the CSV preview tool.
-await writeFile(path.join(fixture, 'app/page.tsx'), ["import FinancialsClient from './FinancialsClient';", 'export default function Page() { return <FinancialsClient />; }'].join('\n') + '\n');
+await copyFile(path.join(frontend, 'src/app/financials/page.tsx'), path.join(fixture, 'app/page.tsx'));
 await copyFile(path.join(frontend, 'src/app/globals.css'), path.join(fixture, 'app/globals.css'));
 await copyFile(path.join(frontend, 'postcss.config.mjs'), path.join(fixture, 'postcss.config.mjs'));
 await writeFile(path.join(fixture, 'app/layout.tsx'), 'import "./globals.css"; export default function Layout({children}: {children: React.ReactNode}) {return <html lang="en" className="dark"><body className="bg-surface text-text-primary antialiased font-sans">{children}</body></html>}');
