@@ -166,6 +166,7 @@ def train_cutoff(test_start: int, horizon: int) -> int:
 SAME_SLEEP_PREFIXES = (
     "whoop_sleep_", "garmin_sleep_", "eight_sleep_", "garmin_hrv_",
     "whoop_deep", "whoop_rem", "whoop_light", "garmin_deep", "garmin_rem",
+    "garmin_light", "garmin_awake",
 )
 SAME_SLEEP_EXACT = frozenset({
     TARGET, "whoop_recovery_score", "whoop_rhr", "whoop_spo2", "whoop_skin_temp",
@@ -217,6 +218,9 @@ OUTCOME_TWINS = frozenset({
     "last_night_avg_ms", "last_night_5min_high_ms", "weekly_avg_ms", "avg_hrv",
     "hrv_vs_baseline", "hrv_z_28d", "delta_hrv", "delta_rhr",
     "whoop_rhr_z28d", "whoop_recovery_score_z28d", "avg_sleep_heart_rate",
+    # Garmin training status' HRV factor: realign_matrix moves it with the other garmin_hrv_*
+    # columns (prefix match), so after re-keying it describes the outcome night.
+    "garmin_hrv_factor",
 })
 
 
