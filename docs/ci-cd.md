@@ -17,7 +17,7 @@ Drafts, forks, PRs from anyone but the owner login, PRs with the `hold` label, c
 
 ## Conventions
 
-- **Tests are discovered, not listed.** Add `frontend/tests/<name>.test.cjs` (run with `node --test`) or `frontend/scripts/test-<name>.mjs`. Do not edit `autonomous-ci.yml` to add a test line: it is a protected path, and every PR appending to the same lines conflicts.
+- **Tests are discovered, not listed.** Add `frontend/tests/<name>.test.cjs` (run with `node --test`) or `frontend/scripts/test-<name>.mjs` (files ending `-ui.mjs` need a browser and are not auto-run). Do not edit `autonomous-ci.yml` to add a test line: it is a protected path, and every PR appending to the same lines conflicts.
 - **Stop a PR:** `hold` label or draft. **Stop everything:** open an issue labeled `train-halt`, or disable the "Merge train" workflow.
 - **Audit:** every action is in the run summary of Merge train / Post-merge verify and as a comment on the PR; halts and reverts are issues/PRs; git history is the release log.
 - **Rollback drill** (exercise the path without breaking prod): Actions > Post-merge verify > Run workflow, `sha` = current master head, `drill` = true.
