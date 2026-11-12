@@ -289,6 +289,7 @@ CONTROLLABLE_FEATURE_PREFIXES = (
 EXOG_MEDIATOR_PREFIXES = (
     "whoop_sleep_", "garmin_sleep_", "eight_sleep_",
     "whoop_deep", "garmin_deep", "whoop_rem", "garmin_rem", "whoop_light", "garmin_light",
+    "garmin_awake",
     "sleep_debt", "sleep_performance", "sleep_efficiency", "sleep_consistency",
     "hrv_lag", "hrv_z", "hrv_28d", "hrv_7d", "hrv_3d", "hrv_vs_baseline",
     "delta_hrv", "delta_rhr",
