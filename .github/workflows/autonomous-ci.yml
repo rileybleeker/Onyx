@@ -32,6 +32,8 @@ jobs:
         run: python tests/test_hrv_clock_boundaries.py
       - name: Autonomous merge guard unit tests (no credentials or network)
         run: python -m unittest discover -s tests -p test_autonomous_merge.py -v
+      - name: Merge train decision tests (no credentials or network)
+        run: python -m unittest discover -s tests -p test_merge_train.py -v
   frontend-types:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -48,10 +50,13 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci --ignore-scripts
+      - name: Offline Node tests (auto-discovered - add a test file, not a workflow line; *-ui.mjs needs a browser and is excluded)
+        run: |
+          shopt -s nullglob
+          for f in tests/*.test.cjs; do node --test "$f"; done
+          for f in scripts/test-*.mjs; do case "$f" in *-ui.mjs) continue;; esac; node "$f"; done
       - name: Status freshness regression tests (synthetic, no credentials)
         run: node test-status-freshness.cjs
-      - name: Offline finance import regressions (synthetic data only)
-        run: node scripts/test-financials.mjs
       - run: npx --no-install tsc --noEmit
       - name: Compile production bundles without prerendering or production credentials
         run: npx --no-install next build --experimental-build-mode compile
