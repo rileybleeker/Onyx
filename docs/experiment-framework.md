@@ -1,6 +1,6 @@
 # Experiment framework (N-of-1 trials): design
 
-Status: design only (2026-11-11). No code, no schema and no Notion database exist yet, and nothing here has been applied. Every number below comes from read-only queries on the live Supabase project on 2026-11-11 (the SQL is in Appendix A) or from simulations run locally on those aggregate numbers (Appendix B). No per-day personal rows are stored in this repo.
+Status: design only (2026-11-11), with Riley's decisions recorded in Section 13. No code and no schema exist yet; the empty "Onyx Experiments" Notion database was created on 2026-11-11 (Section 10.1). Nothing else here has been applied. Every number below comes from read-only queries on the live Supabase project on 2026-11-11 (the SQL is in Appendix A) or from simulations run locally on those aggregate numbers (Appendix B). No per-day personal rows are stored in this repo.
 
 Roadmap row: "Build experiment framework" (Tasks DB, `Source = "Onyx Roadmap"`).
 
@@ -59,7 +59,7 @@ The whole schedule is generated before the start (the randomization test needs i
 ### 4.4 How Riley learns today's arm
 
 - A session-only endpoint (proposed `GET /api/experiments/today`) returns today's arm and the plain-language instruction ("Arm B: no caffeine after 12:00").
-- A morning card in the `/agents` inbox (posted by the sms-reminders Worker, which already posts the 21:30 check-in card) and, later, an additive card on `/today`. Which surface fires the card is decided in Phase 2; the endpoint is the single source either way.
+- A card on `/today` only (Riley's decision, Section 13). `/today` is the page Riley opens daily and one surface is less to maintain, so there is no `/agents` morning card from the sms-reminders Worker. The endpoint stays the single source for the card.
 - Reveal time: 06:00 local, the start of the behavioral day. If Riley sees it after already doing something that breaks the arm, that day is recorded as non-adherent, never re-assigned.
 
 ### 4.5 Adherence capture
@@ -286,7 +286,7 @@ Best first candidates with objective adherence today: phone use in the last hour
 
 ### 10.1 Target
 
-A new Notion database **"Onyx Experiments"** under the Project Onyx page (the parent of the Habits DB `29cc936fd5e14ae8b10a4fe5c5f7a6cd`), one page per experiment. Created in Phase 2 with Riley's approval and shared with the Onyx integration.
+A new Notion database **"Onyx Experiments"** under the Project Onyx page (the parent of the Habits DB `29cc936fd5e14ae8b10a4fe5c5f7a6cd`), one page per experiment. Created empty on 2026-11-11 with Riley's approval (database `2d460253-f94b-437d-ab74-0920c213d3b7`, data source `d99f3df8-6759-4de0-b9be-3761759ecd26`, parent Project Onyx `32bbf5b4-4bf2-805f-8d33-e6c72915a970`) with exactly the properties above, Status as a Notion status property and Decision as a select. It inherits the parent page's sharing, so the Onyx integration can write to it as long as Project Onyx stays shared with it; confirm that with the first report write in Phase 2.
 
 Properties: Experiment (title, "EXP-001 Phone off before bed"), Status (Draft / Registered / Running / Paused / Stopped early / Complete), Hypothesis, Arms, Primary outcome, MID (ms), Design, Start, Planned end, Days elapsed, Nights with outcome, Adherence %, Missing %, Estimate (ms), CI low, CI high, p (randomization), Carryover b1, Decision (Adopt A / No meaningful effect / Inconclusive), Protocol SHA-256, Alignment version, Last report (date).
 
@@ -346,13 +346,15 @@ Per the AGENTS.md three-place rule, in the same commit as the report job:
 | 3 | First real trial, pre-registered and locked | yes | final report written; Status stays open on the roadmap until it is verified in production |
 | 4 | Calibration with `causal_inference.py`: trial vs AIPW estimate per finished trial, AIPW-based candidate list | yes (`hrv_analysis_results` rows) | first comparison published |
 
-## 13. Decisions for Riley
+## 13. Decisions (Riley, 2026-11-11)
 
-1. Accept that a trial is about 8 months for an 8 ms effect at today's noise, or only run trials for effects larger than that.
-2. Commit to wearing the WHOOP every night during a trial (the cheapest way to shorten it).
-3. Pick the first treatment (suggested: phone off in the last hour before bed, which Onyx can verify from Screen Time).
-4. Approve creating the "Onyx Experiments" Notion database under Project Onyx (Phase 2).
-5. Choose where the daily arm card appears: `/agents` morning card, `/today`, or both.
+1. **Effect size and length.** Only trial treatments with a plausible effect of 8 ms or more, and accept that one trial takes about 8 months (232 days at today's noise and missing-night rate, Section 7). Analyze only at the pre-registered end; interim looks follow the stopping boundary in the protocol, never an ad hoc peek.
+2. **Wear the WHOOP every night during a trial.** Missed nights add about 50 days (about 184 days at 5% missing instead of 232 at 18.9%, Section 1).
+3. **First treatment: phone off in the last hour before bed.** Adherence is verified from Screen Time (`pds.phone_usage_daily.minutes_last_hour_before_sleep_est`, Section 9). Planning input from the observational layer, retrain run 43142943594 (2026-11-12 02:51 UTC), AIPW treatment `journal_viewed_a_screen_device_in_bed` (screen in bed, yes vs no): **AIPW +13.2 ms** (influence-function 95% CI -14.7 to +41.1, block-bootstrap CI -27.0 to +56.5, raw p 0.50, not FDR-significant, 185 treated vs 69 control days), against naive +3.0 ms and PSM +5.9 ms. Positive means higher HRV on nights with a screen in bed, so the sign is the opposite of the trial hypothesis and the interval is wider than the effect. It is a reason to test the treatment, not an estimate of it. The same run flagged 23 of 121 causal rows implausible; this one was not flagged.
+4. **Notion database: created now.** "Onyx Experiments" exists under Project Onyx with the fields in Section 10.1 and no rows (URL and ids in Section 10.1). Rows appear when the first protocol is registered.
+5. **Daily arm card: `/today` only.** No `/agents` morning card (Section 4.4).
+
+Still open: the Phase 2 schema, the check-in adherence question and the protocol file for EXP-001 (Section 12). None of these decisions changes the design in Sections 4 to 11.
 
 ## 14. What this doc does not prove
 
