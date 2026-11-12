@@ -1,0 +1,84 @@
+name: Live DB Checks
+
+# Tests that need the production Supabase project. They run ONLY after code is on master,
+# on a daily schedule, or when someone starts them by hand - never on a pull request, so
+# unreviewed PR code never holds the service-role key and PR bursts never load the database.
+# The credential-free PR tests are in stats-pr-check.yml. See docs/ci-checks.md.
+#
+# Both live tests are listed in tests/run_offline_tests.py (LIVE_TESTS); that script checks
+# that every test it excludes from the PR job is run here.
+#
+# The secrets are scoped to the individual steps that need them, not to the workflow or job.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "hrv_analysis.py"
+      - "hrv_predict.py"
+      - "hrv_alignment.py"
+      - "causal_inference.py"
+      - "garmin_etl.py"
+      - "whoop_etl.py"
+      - "eight_sleep_etl.py"
+      - "tests/**"
+      - "requirements-analysis*"
+      - ".github/workflows/live-checks.yml"
+  schedule:
+    # 08:25 UTC daily: a quiet slot between the hourly ETL crons (the 3-hourly :25 flights job
+    # does not run at hour 8) and well before the 12:00 UTC retrain, which runs the alignment
+    # test itself.
+    - cron: "25 8 * * *"
+  workflow_dispatch:
+    inputs:
+      run_live_write_tests:
+        description: "ALSO run tests/test_habit_rename.py, which WRITES temporary fixtures to the production database"
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: read
+
+# One run at a time against the database; never cancel a run that is mid-query.
+concurrency:
+  group: live-checks
+  cancel-in-progress: false
+
+jobs:
+  live-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-analysis.lock
+
+      - name: Install (pinned analysis lock)
+        run: pip install -r requirements-analysis.lock
+
+      - name: HRV alignment against the live matrix (read-only)
+        # Fails if a matrix row's HRV stops matching the WHOOP cycle dated to it, if any layer
+        # stops scoring day D against row D, or if a negative target shift re-enters the pipeline.
+        # Read-only: ONYX_ALIGNMENT_HEARTBEAT is deliberately NOT set, so no sync_log row is written.
+        # (hrv-retrain-on-backfill.yml runs the same test, with the heartbeat, before each retrain.)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ONYX_REQUIRE_LIVE: "1"
+        run: python tests/test_hrv_alignment_live.py
+
+      - name: Habit-rename cascade (WRITES fixtures to production; manual opt-in only)
+        # Same gate PR #21 put on this test: only a person starting the workflow by hand and
+        # ticking run_live_write_tests. Never on push, schedule or pull request.
+        if: github.event_name == 'workflow_dispatch' && inputs.run_live_write_tests == true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python tests/test_habit_rename.py
