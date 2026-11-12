@@ -242,7 +242,7 @@ test.describe("Supplements — renamed-view-column regression tripwire", () => {
 // intentionally NOT asserted to avoid false failures — noted inline.
 // ---------------------------------------------------------------------------
 
-type Signal = "charts" | "status-cards" | "journal-list";
+type Signal = "charts" | "status-cards" | "journal-list" | "page-loads";
 
 interface SmokePage {
   route: string;
@@ -339,6 +339,17 @@ const PAGES: SmokePage[] = [
   },
   { route: "/status", heading: "System Status", signal: "status-cards", hardEmpty: [] },
   {
+    // Finance ledger (2026-11-12): a private server-rendered page over pds.finance_*. CI may run
+    // against an empty ledger, so this is a page-loads check only: it must render behind the
+    // login and must not show the query-failure state, but the honest empty state is allowed and
+    // SKIPS (like /caffeine) rather than fails. It never asserts on any amount or name.
+    route: "/financials",
+    heading: "Financials",
+    signal: "page-loads",
+    hardEmpty: ["Couldn't load the ledger."],
+    legitimateEmpty: "No ledger data yet - the harvester has not run.",
+  },
+  {
     route: "/journal",
     heading: "Journal",
     signal: "journal-list",
@@ -347,6 +358,7 @@ const PAGES: SmokePage[] = [
 ];
 
 async function assertDataPresent(page: Page, signal: Signal) {
+  if (signal === "page-loads") return;
   if (signal === "charts") {
     await expect(
       page.locator(RECHARTS_SVG).first(),
@@ -589,15 +601,17 @@ test("/health renders the care planner with sample data off and calendar disconn
   await expectNoClientCrash(page);
 });
 
-// /financials (2026-11-11, PR #28): Rocket Money CSV import. Files are parsed in browser
-// memory only and nothing is stored, so a fresh load must show the empty "starts with your
-// export" state with the file picker available. Read-only: never chooses a file.
-test("/financials renders the CSV import page with nothing imported", async ({ page }) => {
+// /financials keeps PR #28's browser-only CSV preview as a secondary tool behind a "Preview a CSV"
+// disclosure (the page itself now reads the saved ledger; see the /financials entry in PAGES).
+// Read-only: opens the disclosure, never chooses a file.
+test("/financials keeps the CSV preview tool behind its disclosure", async ({ page }) => {
   await gotoAuthed(page, "/financials");
   await expect(page.getByRole("heading", { name: "Financials", exact: true })).toBeVisible({ timeout: LOAD_TIMEOUT });
-  await expect(page.getByRole("heading", { name: "Rocket Money · Manual CSV import", exact: true })).toBeVisible();
+  const summary = page.getByText("Preview a CSV", { exact: true });
+  await expect(summary).toBeVisible();
+  await summary.click();
   await expect(page.getByLabel(/Choose transaction CSV/)).toBeAttached();
   await expect(page.getByRole("heading", { name: "Your overview starts with your export", exact: true })).toBeVisible();
-  await expect(page.locator("main").getByRole("alert"), "unexpected import error on a fresh load").toHaveCount(0);
+  await expect(page.locator("details").getByRole("alert"), "unexpected import error on a fresh load").toHaveCount(0);
   await expectNoClientCrash(page);
 });

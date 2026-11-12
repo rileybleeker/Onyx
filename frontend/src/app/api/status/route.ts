@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { getNycScoutFreshness } from "@/lib/nyc";
 import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
+import { financeLedgerCard } from "@/lib/finance-status";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -58,6 +59,7 @@ const CADENCE: Record<string, string> = {
   urgent_email: "Hourly :15 (both Gmail accounts)",
   ubereats: "Every 6h (Riley's PC, while logged on)",
   nyc_scout: "Daily 6:10am ET",
+  rocket_money: "Daily (harvester)",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
   // the frontend matrix reads hit since 2026-06-11). The heartbeat also
   // carries the schema-drift tripwire — a 'failed' here can mean the view
@@ -103,6 +105,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   urgent_email:   { method: "automated",      label: "IMAP label reader" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
+  rocket_money:   { method: "automated",      label: "Harvester import" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
   perf_mats:      { method: "automated",      label: "Matview refresh" },
 };
@@ -370,6 +373,10 @@ export async function GET() {
       Promise.all([
         ["garmin", "full_sync"], ["whoop", "full_sync"],
         ["eight_sleep", "trends"], ["cronometer", "daily"],
+        // Finance ledger: the harvester + importers heartbeat once a day (transactions and
+        // balances separately), so the pair needs its own limit-1 reads. Heartbeats only:
+        // this endpoint is CDN-cacheable, so no ledger rows or amounts are read here.
+        ["rocketmoney", "transactions"], ["rocketmoney", "balances"],
       ].map(async ([source, dataType]) => {
         const { data, error } = await supabase.from("sync_log").select("*")
           .eq("source", source).eq("data_type", dataType)
@@ -1027,6 +1034,30 @@ export async function GET() {
           cadence: CADENCE.perf_mats,
           integrationMethod: METHOD.perf_mats.method,
           methodLabel: METHOD.perf_mats.label,
+        };
+      })(),
+      // Rocket Money ledger (pds.finance_*, read by /financials): the daily harvester and the
+      // transactions + balances importers each write a rocketmoney heartbeat on every run.
+      // Status is the worse of the two (>36h degraded, >72h or a failed/error row = red, a
+      // "login required" failure shows the importer's own text). Heartbeat-only by design:
+      // no amounts or row contents ever reach this cacheable endpoint.
+      rocket_money: (() => {
+        const card = financeLedgerCard(
+          latestBySrcType["rocketmoney|transactions"],
+          latestBySrcType["rocketmoney|balances"],
+        );
+        return {
+          label: "Rocket Money",
+          lastSync: card.lastSync,
+          status: card.status,
+          latestDataDate: card.latestDataDate,
+          daysLag: card.lastSync ? Math.floor((Date.now() - new Date(card.lastSync).getTime()) / 86_400_000) : 999,
+          recordsSynced: card.recordsSynced,
+          durationSeconds: card.durationSeconds,
+          errorMessage: card.errorMessage,
+          cadence: CADENCE.rocket_money,
+          integrationMethod: METHOD.rocket_money.method,
+          methodLabel: METHOD.rocket_money.label,
         };
       })(),
       // Urgent email for Today: inbox-triage's Agent/Action + Agent/Deadline labels read
