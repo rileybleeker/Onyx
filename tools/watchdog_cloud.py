@@ -102,6 +102,9 @@ SCHEDULED: dict[str, Sched] = {
     'hrv-prediction.yml': Sched('HRV Prediction', _h(26), True, 'daily crons plus a run after every hourly ETL'),
     'flights-email.yml': Sched('Flights Email ETL', _h(4), True, 'every 3h; routinely 3h19 in practice'),
     'delivery-email.yml': Sched('Delivery Email ETL', _h(4), True, 'every 3h; worst seen 3h08'),
+    'urgent-email.yml': Sched(
+        'Urgent Email Labels', _m(150), False, 'hourly :15; new 2026-11-11, no run history yet',
+        'every run fails until sql/inbox_emails_schema.sql is applied, so a re-run cannot help; Riley decides'),
     'cronometer-etl.yml': Sched(
         'Cronometer ETL', _h(15), True, '02:30 and 16:00 UTC (13h30 gap); 14h would fire on normal delay'),
     'tanita-etl.yml': Sched('Tanita ETL', _h(26), True, '14:00 and 17:30 UTC (20h30 gap); worst seen 21h19'),
