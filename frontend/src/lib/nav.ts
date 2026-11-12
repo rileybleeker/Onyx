@@ -1,6 +1,8 @@
 import type { LucideIcon } from "lucide-react";
 import {
   House,
+  ShoppingCart,
+  Wallet,
   Moon,
   Activity,
   Utensils,
@@ -71,7 +73,9 @@ export const NAV_SECTIONS: NavSection[] = [
   {
     title: "Tools",
     items: [
+      { href: "/procurement", label: "Procurement", shortcut: "", icon: ShoppingCart, keywords: ["buy", "orders", "subscriptions", "shopping"] },
       { href: "/agents", label: "Agents", shortcut: "G", icon: Bot, keywords: ["chat", "messages", "briefing", "approvals", "leads", "reminders", "inbox", "notifications"] },
+      { href: "/financials", label: "Financials", shortcut: "W", icon: Wallet, keywords: ["money", "finance", "rocket money", "spending", "transactions", "budget"] },
       { href: "/nyc", label: "NYC Search", shortcut: "Y", icon: Building2, keywords: ["apartment", "move", "new york", "listings", "leads", "rent", "scout", "manhattan"] },
       { href: "/chat", label: "Health Q&A", shortcut: "C", icon: MessageSquare, keywords: ["ask", "claude", "assistant", "query", "chat"] },
       { href: "/status", label: "Status", shortcut: "U", icon: ShieldCheck, keywords: ["system", "sync", "etl", "health", "freshness"] },

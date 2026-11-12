@@ -472,3 +472,7 @@ Mechanics: use the Notion MCP — `notion-update-page` (`command: "update_proper
 ## Today home (2026-11-11)
 
 `/` and the mobile Today tab open `/today`. This read-only landing page shows up to three open agent request links in inbox order (not an urgency ranking), recorded reading progress, and the existing check-in link. Informational messages stay in the Agents inbox; Status stays available. Loading, failure, empty and unknown progress states remain distinct. Fetch on mount, manual refresh and return to the app; stale requests cannot replace newer results. Opening Today never sends a reply, marks anything read or logs a behavior. Reuse the existing authenticated inbox and reading endpoints, and keep personal record data out of review prompts and fixture tests.
+
+## Financials (2026-11-11)
+
+`/financials` accepts Rocket Money transaction CSV exports as an explicitly reviewed browser-memory snapshot. No finance data is persisted, uploaded, sent to AI, or synchronized automatically. It uses integer cents, explicit amount/date mapping, all-or-nothing validation, period/search filters, and explicit transfer-category exclusions. Do not claim a live Rocket Money connection or infer balances/subscription status from this export. Provider findings and the future read-only integration boundary are in `docs/financials-rocket-money.md`. Offline synthetic tests: `cd frontend && node scripts/test-financials.mjs`.
