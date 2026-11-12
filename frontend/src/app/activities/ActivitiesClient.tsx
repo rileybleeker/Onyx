@@ -8,6 +8,10 @@ import RangeFilter from "@/components/RangeFilter";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel, chartColors as C } from "@/lib/chart-theme";
+import {
+  SPLIT_LABELS, MUSCLE_GROUPS, SUGGEST_MAX_ITEMS, SUGGEST_WINDOW_DAYS, deriveActivityCategory,
+  type ActivityCategory, type MuscleGroup, type SplitLabel, type SuggestionConfidence,
+} from "@/lib/activity-tags";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -35,35 +39,25 @@ type ActivityRow = {
   planned_workout_id?: string | null;
 };
 
-type ActivityCategory = "run" | "sauna" | "strength" | "other";
-
-// Multi-select tag vocabularies — single source of truth in this file. The union
-// types are DERIVED from these const arrays (via `as const` + indexed access) so the
-// runtime list and the type cannot silently drift — adding a tag to one without the
-// other is a compile error. Must still stay in sync with the DB CHECK constraints
-// (sql/activity_muscle_groups.sql) and the API allow-sets (/api/activities/categorize).
-const SPLIT_LABELS = ["leg", "pull", "push"] as const;
-const MUSCLE_GROUPS = [
-  "chest", "back", "shoulders", "biceps", "triceps", "forearms",
-  "quads", "hamstrings", "glutes", "calves", "core",
-] as const;
-type SplitLabel = (typeof SPLIT_LABELS)[number];
-type MuscleGroup = (typeof MUSCLE_GROUPS)[number];
+// Multi-select tag vocabularies (SPLIT_LABELS / MUSCLE_GROUPS) and the category rule live in
+// @/lib/activity-tags, shared with the tag-suggestion route so the two cannot drift. They must
+// still match the DB CHECK constraints (sql/activity_muscle_groups.sql) and the API allow-sets
+// (/api/activities/categorize); tests/activity-tag-suggest.test.cjs fails if any of them drifts.
 
 const DEDUP_WINDOW_MS = 5 * 60 * 1000;
+
+type TagSuggestion = {
+  split_labels: SplitLabel[];
+  muscle_groups: MuscleGroup[];
+  confidence: SuggestionConfidence | null;
+};
 
 // Onyx auto-categorizes each activity from its device sport label / name. The
 // leg/pull/push split is the ONLY dimension devices can't distinguish (WHOOP logs
 // all lifting as one generic 'weightlifting_msk'; Garmin records no strength), so
 // it's the one thing reported manually via the toggle on strength rows.
 function deriveCategory(act: ActivityRow): ActivityCategory {
-  const hay = `${act.type} ${act.name}`.toLowerCase();
-  // act.is_sauna is the manual override (set on a WHOOP session the device didn't
-  // label 'sauna'); honoring it keeps the category badge consistent with the toggle.
-  if (act.is_sauna || hay.includes("sauna")) return "sauna";
-  if (hay.includes("run")) return "run";
-  if (/weightlift|strength|lifting|resistance/.test(hay)) return "strength";
-  return "other";
+  return deriveActivityCategory(act.type, act.name, act.is_sauna);
 }
 
 const CATEGORY_BADGE: Record<ActivityCategory, string> = {
@@ -416,6 +410,11 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
   const [loading, setLoading] = useState(!initial);
   const [range, setRange] = useState<Range>("30d");
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  // LLM-proposed tags for untagged strength rows, keyed by row id ("whoop:<id>"). Never part of the
+  // ISR prefetch: they load after the list has painted (effect below) and degrade to nothing on
+  // any failure. The entry doubles as the draft - toggling a ghost chip edits it in place.
+  const [suggestions, setSuggestions] = useState<Record<string, TagSuggestion>>({});
+  const suggestStarted = useRef(false);
   const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
@@ -526,7 +525,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
   async function saveTags(
     act: ActivityRow,
     next: { split_labels?: SplitLabel[]; muscle_groups?: MuscleGroup[]; is_sauna?: boolean },
-  ) {
+  ): Promise<boolean> {
     const sourceId = act.id.slice(act.id.indexOf(":") + 1); // colon-safe: WHOOP ids are opaque TEXT
     // Capture only THIS row's prior values for the dimension(s) we're about to change.
     // Rollback reverts just those keys on just this row (a functional update), NOT a
@@ -545,11 +544,100 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
         body: JSON.stringify({ source: act.source, id: sourceId, ...next }),
       });
       if (!res.ok) throw new Error(await res.text());
+      return true;
     } catch (e) {
       setRows((prev) => prev.map((r) => (r.id === act.id ? { ...r, ...prevValues } : r)));
       console.error("Categorize activity:", e);
       alert(`Failed to save tags: ${e instanceof Error ? e.message : String(e)}`);
+      return false;
     }
+  }
+
+  // ---- LLM tag suggestions (ghosted chips + Accept / Dismiss) ---------------------------------
+  // Loads AFTER the list is on screen: the effect only fires once `loading` is false, asks the
+  // server about untagged strength rows from the last SUGGEST_WINDOW_DAYS (the server re-checks
+  // every row and caps the batch at SUGGEST_MAX_ITEMS), and stays silent on any failure - a missing
+  // suggestion is just the manual pills as before. No tag is ever written without Accept.
+  useEffect(() => {
+    if (loading || suggestStarted.current) return;
+    const cutoff = Date.now() - SUGGEST_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+    const wanted = rows.filter(
+      (r) =>
+        deriveCategory(r) === "strength" &&
+        r.split_labels.length === 0 &&
+        r.muscle_groups.length === 0 &&
+        r.utc_ms >= cutoff, // NaN (no start time) compares false
+    );
+    if (wanted.length === 0) return; // nothing eligible: no request, no cost
+    suggestStarted.current = true;
+    (async () => {
+      // Newest first, in server-sized chunks; two chunks at most per page load.
+      for (let i = 0; i < Math.min(wanted.length, SUGGEST_MAX_ITEMS * 2); i += SUGGEST_MAX_ITEMS) {
+        const items = wanted.slice(i, i + SUGGEST_MAX_ITEMS).map((r) => ({ source: r.source, id: r.id.slice(r.id.indexOf(":") + 1) }));
+        try {
+          const res = await fetch("/api/activities/suggest-tags", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ items }),
+          });
+          if (!res.ok) return;
+          const body = (await res.json()) as { suggestions?: Array<TagSuggestion & { source: string; id: string }>; failed?: boolean };
+          const got: Record<string, TagSuggestion> = {};
+          for (const sg of body.suggestions ?? []) {
+            got[`${sg.source}:${sg.id}`] = { split_labels: sg.split_labels, muscle_groups: sg.muscle_groups, confidence: sg.confidence };
+          }
+          // Keep any chip edits already made to a suggestion that arrived earlier.
+          setSuggestions((prev) => ({ ...got, ...prev }));
+          if (body.failed) return;
+        } catch (e) {
+          console.warn("Tag suggestions unavailable:", e);
+          return;
+        }
+      }
+    })();
+  }, [loading, rows]);
+
+  // Best-effort: tell the server this activity's suggestion is done (dismissed or accepted).
+  function resolveSuggestion(act: ActivityRow) {
+    fetch("/api/activities/suggest-tags/dismiss", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: act.source, id: act.id.slice(act.id.indexOf(":") + 1) }),
+    }).catch((e) => console.warn("Could not record suggestion dismissal:", e));
+  }
+
+  function removeSuggestion(id: string) {
+    setSuggestions((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }
+
+  function toggleSuggestedChip(id: string, dim: "split_labels" | "muscle_groups", value: string) {
+    setSuggestions((prev) => {
+      const cur = prev[id];
+      if (!cur) return prev;
+      const list = cur[dim] as string[];
+      const next = list.includes(value) ? list.filter((v) => v !== value) : [...list, value];
+      return { ...prev, [id]: { ...cur, [dim]: next } as TagSuggestion };
+    });
+  }
+
+  async function acceptSuggestion(act: ActivityRow) {
+    const sg = suggestions[act.id];
+    if (!sg || (sg.split_labels.length === 0 && sg.muscle_groups.length === 0)) return;
+    // Writes through the same /api/activities/categorize every manual tap uses (it validates the
+    // arrays). On failure saveTags rolls the row back and the suggestion stays for another try.
+    const ok = await saveTags(act, { split_labels: sg.split_labels, muscle_groups: sg.muscle_groups });
+    if (!ok) return;
+    removeSuggestion(act.id);
+    resolveSuggestion(act);
+  }
+
+  function dismissSuggestion(act: ActivityRow) {
+    removeSuggestion(act.id);
+    resolveSuggestion(act);
   }
 
   // Toggle one coarse split (leg/pull/push) on a session — multi-select.
@@ -853,24 +941,34 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
 
               {/* Strength tagging: coarse split + granular muscle groups, both
                   multi-select. Devices can't distinguish either dimension, so the
-                  user holds them. ETL-preserving via /api/activities/categorize. */}
-              {category === "strength" && (
+                  user holds them. ETL-preserving via /api/activities/categorize.
+                  While an LLM suggestion is pending for an untagged row, the SAME pill
+                  rows preview it as ghosted (dashed) chips: tapping a chip edits the
+                  draft instead of saving, and nothing is written until Accept. */}
+              {category === "strength" && (() => {
+                const sug = act.split_labels.length === 0 && act.muscle_groups.length === 0 ? suggestions[act.id] : undefined;
+                const splitsOn: readonly string[] = sug ? sug.split_labels : act.split_labels ?? [];
+                const musclesOn: readonly string[] = sug ? sug.muscle_groups : act.muscle_groups ?? [];
+                const canAccept = !!sug && (sug.split_labels.length > 0 || sug.muscle_groups.length > 0);
+                return (
                 <div className="border-t border-border-subtle px-4 py-3 space-y-2.5">
                   <div className="flex items-center gap-2">
                     <span className="text-text-tertiary text-[11px] uppercase tracking-wider w-14 shrink-0">Split</span>
                     <div className="flex flex-wrap gap-1.5">
                       {SPLIT_LABELS.map((s) => {
-                        const on = (act.split_labels ?? []).includes(s);
+                        const on = splitsOn.includes(s);
                         return (
                           <button
                             key={s}
-                            onClick={() => toggleSplit(act, s)}
+                            onClick={() => (sug ? toggleSuggestedChip(act.id, "split_labels", s) : toggleSplit(act, s))}
                             className={`text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px] border transition-colors ${
-                              on
+                              on && sug
+                                ? "bg-violet-500/10 border-dashed border-violet-400/60 text-violet-200/70"
+                                : on
                                 ? "bg-violet-500/20 border-violet-400/50 text-violet-200"
                                 : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"
                             }`}
-                            title={`Tag this session as ${s}`}
+                            title={sug ? `${on ? "Remove" : "Add"} ${s} (suggestion, not saved yet)` : `Tag this session as ${s}`}
                           >
                             {s}
                           </button>
@@ -882,17 +980,19 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
                     <span className="text-text-tertiary text-[11px] uppercase tracking-wider w-14 shrink-0 mt-1">Muscles</span>
                     <div className="flex flex-wrap gap-1.5">
                       {MUSCLE_GROUPS.map((m) => {
-                        const on = (act.muscle_groups ?? []).includes(m);
+                        const on = musclesOn.includes(m);
                         return (
                           <button
                             key={m}
-                            onClick={() => toggleMuscle(act, m)}
+                            onClick={() => (sug ? toggleSuggestedChip(act.id, "muscle_groups", m) : toggleMuscle(act, m))}
                             className={`text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px] border transition-colors ${
-                              on
+                              on && sug
+                                ? "bg-sky-500/10 border-dashed border-sky-400/60 text-sky-200/70"
+                                : on
                                 ? "bg-sky-500/20 border-sky-400/50 text-sky-200"
                                 : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"
                             }`}
-                            title={`Tag ${m}`}
+                            title={sug ? `${on ? "Remove" : "Add"} ${m} (suggestion, not saved yet)` : `Tag ${m}`}
                           >
                             {m}
                           </button>
@@ -900,8 +1000,31 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
                       })}
                     </div>
                   </div>
+                  {sug && (
+                    <div className="flex flex-wrap items-center gap-2 pt-0.5" data-testid="tag-suggestion">
+                      <span className="text-text-tertiary text-[11px]">
+                        Suggested{sug.confidence ? ` (${sug.confidence} confidence)` : ""}. Tap chips to adjust, then accept.
+                      </span>
+                      <button
+                        onClick={() => acceptSuggestion(act)}
+                        disabled={!canAccept}
+                        className="text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px] border border-emerald-400/50 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                        title="Save these tags to the session"
+                      >
+                        Accept
+                      </button>
+                      <button
+                        onClick={() => dismissSuggestion(act)}
+                        className="text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-[2px] border border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover transition-colors"
+                        title="Hide this suggestion"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  )}
                 </div>
-              )}
+                );
+              })()}
 
               {/* Manual sauna flag. WHOOP auto-detects saunas as sport_name='sauna',
                   but some sauna sessions get logged under a generic sport (or none).
