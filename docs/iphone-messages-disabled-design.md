@@ -1,6 +1,13 @@
 # iPhone Messages integration: disabled design
 
-Status: design only. No connector, message collection, background job, permission request, provider account, or send path is enabled or created by this document.
+Status: disabled scaffold plus design. The only code is a switch-off gate (`frontend/src/lib/phone-messages.ts`) and a read-only status route. There is no connector, message collection, background job, permission request, provider account, or working send path, and no way to read an iPhone inbox exists in this repo. Nothing here has been run against a real phone.
+
+## What is built (all disabled)
+
+- `frontend/src/lib/phone-messages.ts`: the gate every future operation must pass. Off unless `ONYX_PHONE_MESSAGES_ENABLED` is exactly `true`. When off, no adapter is created or opened and nothing is fetched. Reading and sending are separate switches (`ONYX_PHONE_MESSAGES_SEND_ENABLED` for send); a send also needs the adapter's send capability and an approval equal to the exact recipient, thread and text. An unsupported capability returns a refusal code, never an empty inbox. Adapter errors collapse to `adapter_error` so message text never escapes. The flag is read on every call, so switching it off stops the next call.
+- `GET /api/phone-messages/status` (browser session only): reports `enabled`, `sendEnabled`, `adapterRegistered`, all-false `capabilities` and a reason. Even with the flag on it answers `no_supported_adapter`, because no adapter exists. It has no read or send endpoint and never creates an adapter.
+- `frontend/scripts/test-phone-messages.mjs`: synthetic tests (`node scripts/test-phone-messages.mjs`, Node 22.18+). They prove disabled calls touch no adapter and no network, flag values other than `true` stay off, send is separate and approval-bound, revocation works, errors leak nothing, and the module has no imports, fetch, fs or process access. They say nothing about whether any real source works.
+- Production default: the variable is unset, so the integration is off. Do not set it until an adapter is chosen and approved.
 
 ## Product boundary
 
@@ -14,6 +21,15 @@ Do not add a working-looking inbox or enable switch until a supported source and
 - Apple's TelephonyMessagingKit supports SMS/MMS/RCS for an entitled default carrier messaging app, with EU account and location eligibility. It does not establish iMessage or unrestricted historical-inbox access: https://developer.apple.com/documentation/TelephonyMessagingKit
 - Windows Phone Link for iPhone shows messages sent/received during its paired, connected session, not full historical conversations. Its documented history disappears when Bluetooth disconnects: https://support.microsoft.com/en-us/windows/apps/phonelink/send-and-receive-text-messages-from-your-pc and https://support.microsoft.com/en-us/windows/apps/phonelink/troubleshooting-for-messages-in-the-phone-link
 - Apple supports syncing Messages across a Mac and iPhone using the same Apple Account. This is a potential future source, not an existing Onyx adapter or authorization to read its database: https://support.apple.com/en-au/guide/icloud/mm0de0d4528d/icloud
+
+## What iOS allows, and what is not yet verified
+
+- Supported and Apple-documented: a Shortcuts personal automation with a Message trigger (filter by sender or by a phrase the message contains; all filters must match). It fires on newly received messages only, runs on the phone, and needs the user to build it and, for no prompt, turn off Ask Before Running. Apple's page does not say whether the Message trigger can run without confirmation. Source: https://support.apple.com/en-au/guide/shortcuts/apdd711f9dff/ios
+- Apple's release notes name Messages actions "Find Message" and "Find Conversation" (iOS 26) and say Find Message can filter by sender (iOS 27 notes), plus Send Message to group chats: https://support.apple.com/en-us/125148 and https://support.apple.com/en-us/149045. The notes do not say how far back Find Message reads or whether it runs unattended inside an automation. Unverified on Riley's phone.
+- So a Shortcuts route is the only phone-side path that needs no entitlement: Riley's own shortcut would push selected texts to an Onyx endpoint, like the existing Screen Time shortcut. That endpoint does not exist and is not built here. It would cover new or selected messages, not the whole inbox, and every message pushed leaves the phone, so scope (which senders or phrases) must be approved first.
+- Needs an Apple entitlement and replaces Messages as default: TelephonyMessagingKit (SMS/MMS/RCS only, limited regions). Not iMessage, not suitable.
+- Not available: a third-party app reading the existing SMS/iMessage inbox (see next section).
+- To verify the Shortcuts route later, on the phone: Shortcuts, Automation, new Message trigger with one test sender, an action that shows the text, Don't Ask enabled, then text yourself and see whether it runs while the phone is locked. Record the result before any Onyx endpoint is designed.
 
 ## Can this read all existing texts?
 
@@ -40,4 +56,4 @@ A local iPhone backup on a PC is another possible point-in-time research source,
 - Verify no message bodies, contacts, credentials, or attachment contents enter diagnostics or public telemetry.
 - Obtain explicit approval for the chosen access and data flow. Only then validate a narrowly selected conversation, report gaps, and consider broader history import.
 
-No user-facing surface is added yet: an unavailable fake inbox would add clutter without providing a supported integration. The next implementation decision is the source adapter, not a different messaging provider.
+No user-facing page is added: an unavailable fake inbox would add clutter without providing a supported integration. The only route is the read-only status check above. The next implementation decision is the source adapter (Shortcuts push, approved Mac helper, or backup import), not a different messaging provider.
