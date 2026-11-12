@@ -78,12 +78,26 @@ export async function getTomorrowPrediction() {
   return fb.data?.[0] ?? null;
 }
 
+// First prediction_date served by the same-night alignment (hrv_alignment.py, PR #5): the
+// live forecast for behavioral night 2026-11-10 was the first one made by the new code
+// (created 2026-11-11 01:06 ET; checked in pds.hrv_predictions_latest). Live forecasts on
+// earlier dates were made under the old, one-night-late pairing.
+export const SAME_NIGHT_FIRST_PREDICTION_DATE = "2026-11-10";
+
+// pds.hrv_model_metrics model label suffix for hrv_predict.py's live 30-day accuracy
+// (hrv_predict.LIVE_METRICS_SUFFIX). Plain model names are the retrain's walk-forward
+// backtest. Until 2026-11-11 both were written under the plain name and the hourly live
+// row replaced the backtest h=1 row.
+export const LIVE_METRICS_SUFFIX = "_live_rolling";
+
 export async function getHrvPredictionAccuracy(days: number = 60) {
   const since = new Date();
   since.setDate(since.getDate() - days);
+  // model_version tells the chart which points are live forecasts and which are the
+  // walk-forward backtest standing in for a night with no live forecast.
   const { data, error } = await supabase
     .from("hrv_predictions_latest")
-    .select("prediction_date,model,predicted_hrv,actual_hrv,residual,prediction_lower,prediction_upper")
+    .select("prediction_date,model,predicted_hrv,actual_hrv,residual,prediction_lower,prediction_upper,model_version")
     .eq("model", "xgboost")
     .eq("horizon_days", 1)
     .not("actual_hrv", "is", null)
@@ -94,8 +108,9 @@ export async function getHrvPredictionAccuracy(days: number = 60) {
 }
 
 export async function getHrvModelMetrics() {
-  // Latest eval_date now writes ~36 rows (xgboost + 3 baselines + sarimax all at
-  // h=1..7 = 35, plus prophet h=1 = 36). Limit must cover the full latest sweep
+  // Latest eval_date writes ~38 rows: the retrain's walk-forward backtest (xgboost +
+  // 3 baselines + sarimax at h=1..7 = 35) plus hrv_predict's live 30-day rows
+  // ('<model>_live_rolling', h=1, up to 3). Limit must cover the full latest sweep
   // so the Accuracy-by-Forecast-Horizon chart sees every (model × horizon) cell.
   //
   // Secondary .order()s (perf round 3, 2026-06-11): eval_date alone is a

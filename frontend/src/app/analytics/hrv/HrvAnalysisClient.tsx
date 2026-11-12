@@ -18,7 +18,10 @@ import {
   chartColors as C, directionalColor,
 } from "@/lib/chart-theme";
 import { rangeDays, rangeLabel, type Range, type WorkoutSleepGap } from "@/lib/queries";
-import { loadHrvDashboard, loadHrvRangeDependent, parseJsonb } from "@/lib/queries-hrv";
+import {
+  loadHrvDashboard, loadHrvRangeDependent, parseJsonb,
+  LIVE_METRICS_SUFFIX, SAME_NIGHT_FIRST_PREDICTION_DATE,
+} from "@/lib/queries-hrv";
 import type { HrvInitial } from "./HrvLoader";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -414,9 +417,22 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
   // Derived state
   // ---------------------------------------------------------------------------
   const todayActualHrv = historicalHrv.length ? Number(historicalHrv[historicalHrv.length - 1]?.whoop_hrv_rmssd) : null;
-  const xgbMetrics = metrics.filter(m => m.model === "xgboost").sort((a, b) =>
-    new Date(b.eval_date).getTime() - new Date(a.eval_date).getTime())[0];
-  const naiveMetrics = metrics.find(m => m.model === "baseline_naive");
+  // Newest hrv_model_metrics row for (model, horizon). Plain model names are the
+  // retrain's walk-forward backtest; '<model>_live_rolling' rows are the last 30 days of
+  // real forecasts (hrv_predict.py). Until 2026-11-11 the live job overwrote the backtest
+  // h=1 row, so older eval_dates hold hybrid rows: backtest reads prefer
+  // model_version 'backtest%' and fall back to the newest row only if none is loaded.
+  const latestMetric = (model: string, horizon = 1): any | undefined => {
+    const rows = metrics
+      .filter(m => m.model === model && Number(m.horizon_days) === horizon)
+      .sort((a, b) => String(b.eval_date).localeCompare(String(a.eval_date)));
+    if (model.endsWith(LIVE_METRICS_SUFFIX)) return rows[0];
+    return rows.find(m => String(m.model_version ?? "").startsWith("backtest")) ?? rows[0];
+  };
+  const xgbMetrics = latestMetric("xgboost");
+  const naiveMetrics = latestMetric("baseline_naive");
+  const xgbLive = latestMetric(`xgboost${LIVE_METRICS_SUFFIX}`);
+  const accuracyTile = xgbLive ?? xgbMetrics;
 
   const rawDrivers: any = tomorrowPred?.top_drivers
     ? (() => { try { return parseJsonb(tomorrowPred.top_drivers); } catch { return null; } })()
@@ -455,14 +471,27 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
     return wd === 0 || wd === 6;
   });
 
-  // Prediction vs actual overlay (last 60 days)
-  const predActualData = accuracy.map(d => ({
-    date: fmtDate(d.prediction_date),
-    actual: Number(d.actual_hrv),
-    predicted: Number(d.predicted_hrv),
-    lower: d.prediction_lower ? Number(d.prediction_lower) : null,
-    upper: d.prediction_upper ? Number(d.prediction_upper) : null,
-  }));
+  // Prediction vs actual overlay. Keyed by the ISO prediction_date (unique even on the
+  // all-time range, where "Nov 10" repeats) and labelled with fmtDate. `source` says what
+  // each point is: a live forecast made before the 2026-11-11 alignment fix (old
+  // pairing), one made after it, or the walk-forward backtest standing in for a night
+  // with no live forecast (pds.hrv_predictions_latest falls back to it).
+  const predActualData = accuracy.map(d => {
+    const backtest = String(d.model_version ?? "").startsWith("backtest");
+    const sameNight = d.prediction_date >= SAME_NIGHT_FIRST_PREDICTION_DATE;
+    return {
+      day: d.prediction_date as string,
+      actual: Number(d.actual_hrv),
+      predicted: Number(d.predicted_hrv),
+      lower: d.prediction_lower ? Number(d.prediction_lower) : null,
+      upper: d.prediction_upper ? Number(d.prediction_upper) : null,
+      source: backtest ? "walk-forward backtest"
+        : sameNight ? "live forecast" : "live forecast, old pairing (before the fix)",
+    };
+  });
+  // Mark the cutover only when the window holds points on both sides of it.
+  const cutoverIdx = predActualData.findIndex(d => d.day >= SAME_NIGHT_FIRST_PREDICTION_DATE);
+  const cutoverDay = cutoverIdx > 0 ? predActualData[cutoverIdx].day : null;
 
   // Prophet 30-day forecast + SARIMAX 7-day short-term overlay
   const sarimaxByDate = new Map(
@@ -486,12 +515,19 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
     })),
   ];
 
-  // Model comparison table
-  const modelComparison = ["xgboost", "sarimax", "prophet", "baseline_naive", "baseline_7d_avg"].map(m => {
-    const row = metrics.filter(r => r.model === m).sort((a, b) =>
-      new Date(b.eval_date).getTime() - new Date(a.eval_date).getTime())[0];
-    return { model: m, ...row };
-  }).filter(r => r.mae);
+  // Model comparison table: walk-forward backtest rows (h=1), then the live 30-day rows.
+  // Prophet only has a live row (the retrain does not backtest it).
+  const COMPARISON_ROWS = [
+    { key: "xgboost", label: "xgboost" },
+    { key: "sarimax", label: "sarimax" },
+    { key: "baseline_naive", label: "baseline_naive" },
+    { key: "baseline_7d_avg", label: "baseline_7d_avg" },
+    { key: `xgboost${LIVE_METRICS_SUFFIX}`, label: "xgboost · live 30d" },
+    { key: `sarimax${LIVE_METRICS_SUFFIX}`, label: "sarimax · live 30d" },
+    { key: `prophet${LIVE_METRICS_SUFFIX}`, label: "prophet · live 30d" },
+  ];
+  const modelComparison = COMPARISON_ROWS.map(({ key, label }) =>
+    ({ ...latestMetric(key), model: key, label })).filter(r => r.mae);
 
   // MAE by horizon — all 5 multi-horizon models. Prophet writes h=1 only
   // (it's a 30-day forecaster, not a per-horizon evaluator) so it's
@@ -509,9 +545,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
   const horizonData = [1, 2, 3, 4, 5, 6, 7].map(h => {
     const row: Record<string, number | string | null> = { horizon: `t+${h}` };
     for (const { key } of HORIZON_MODELS) {
-      const rows = metrics.filter(m => m.model === key && m.horizon_days === h);
-      const latest = rows.sort((a, b) =>
-        new Date(b.eval_date).getTime() - new Date(a.eval_date).getTime())[0];
+      const latest = latestMetric(key, h);
       row[key] = latest?.mae != null ? Number(latest.mae) : null;
     }
     return row;
@@ -615,18 +649,23 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           )}
           <p className="mt-1 font-mono text-[10px] uppercase tracking-[0.06em] text-text-tertiary/70">XGBOOST</p>
         </div>
+        {/* Live 30-day accuracy once 5 nights since the 2026-11-11 alignment fix are
+            scored; until then the walk-forward backtest (the only apples-to-apples
+            comparison with the naive baseline). */}
         <KpiTile
           className="min-w-[78%] snap-start sm:min-w-0"
-          label="Model Accuracy (30d)"
-          value={xgbMetrics ? Number(xgbMetrics.mae).toFixed(1) : "—"}
-          unit={xgbMetrics ? "ms MAE" : undefined}
-          sub={xgbMetrics?.directional_accuracy
-            ? `${Number(xgbMetrics.directional_accuracy).toFixed(0)}% directional`
-            : undefined}
-          delta={xgbMetrics && naiveMetrics
+          label={xgbLive ? "Model Accuracy (live 30d)" : "Model Accuracy (backtest)"}
+          value={accuracyTile ? Number(accuracyTile.mae).toFixed(1) : "—"}
+          unit={accuracyTile ? "ms MAE" : undefined}
+          sub={xgbLive
+            ? `${xgbLive.n_predictions} scored nights${xgbMetrics ? ` · backtest ${Number(xgbMetrics.mae).toFixed(1)} ms` : ""}`
+            : xgbMetrics?.directional_accuracy
+              ? `${Number(xgbMetrics.directional_accuracy).toFixed(0)}% directional`
+              : undefined}
+          delta={!xgbLive && xgbMetrics && naiveMetrics
             ? { value: Number(naiveMetrics.mae) - Number(xgbMetrics.mae), favorable: "up", suffix: "vs naive" }
             : undefined}
-          meta={[{ text: "XGBOOST" }]}
+          meta={[{ text: xgbLive ? "XGBOOST · LIVE" : "XGBOOST · WALK-FORWARD" }]}
         />
         <KpiTile
           className="min-w-[78%] snap-start sm:min-w-0"
@@ -834,15 +873,26 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Prediction vs Actual */}
         <ChartCard collapsible storageKey="prediction-vs-actual" title={`Prediction vs Actual (${rangeLabel(range)})`}
-                   subtitle="Red dots = miss > 15ms"
-                   info="What the model predicted each night (blue dashed) vs what your HRV actually was (green). Red dots are nights where it missed by more than 15ms. Fewer red dots = more accurate model.">
+                   subtitle={cutoverDay
+                     ? "Red dots = miss > 15ms · yellow line = 2026-11-11 alignment fix"
+                     : "Red dots = miss > 15ms"}
+                   info="What the model predicted each night (blue dashed) vs what your HRV actually was (green). Red dots are nights where it missed by more than 15ms. Fewer red dots = more accurate model. The yellow dashed line marks the 2026-11-11 alignment fix: from that night on, each forecast is scored against the sleep it was made for. Live forecasts left of the line were made under the old pairing (one night late) and are not comparable. Nights without a live forecast show the walk-forward backtest instead; the tooltip says which one a point is.">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={predActualData}>
               <CartesianGrid {...gridStyle} />
-              <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+              <XAxis dataKey="day" tick={axisTick} interval="preserveStartEnd"
+                     tickFormatter={(v: any) => fmtDate(String(v))} />
               <YAxis tick={axisTick} width={55} domain={["auto", "auto"]} label={axisLabel("HRV (ms)", "y")} />
-              <Tooltip {...chartTooltip} />
+              <Tooltip {...chartTooltip}
+                       labelFormatter={(v: any, payload: any) => {
+                         const src = payload?.[0]?.payload?.source;
+                         return src ? `${fmtDate(String(v))} · ${src}` : fmtDate(String(v));
+                       }} />
               <Legend wrapperStyle={legendStyle} />
+              {cutoverDay && (
+                <ReferenceLine x={cutoverDay} stroke={C.mid} strokeDasharray="3 3"
+                               label={{ value: "same-night fix", position: "insideTopRight", fill: C.mid, fontSize: 10 }} />
+              )}
               <Line type="monotone" dataKey="actual" stroke={C.up} strokeWidth={2}
                     dot={false} name="Actual HRV" isAnimationActive={false} />
               <Line type="monotone" dataKey="predicted" stroke={C.source.garmin} strokeWidth={2}
@@ -2729,7 +2779,9 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                 <strong className="text-text-secondary">R²</strong> — how well the model tracks your personal HRV patterns (1.0 = perfect, 0 = no better than a flat guess).{" "}
                 <strong className="text-text-secondary">Dir %</strong> — how often it correctly called up vs down.{" "}
                 <strong className="text-text-secondary">CI Cov</strong> — how often your actual HRV fell inside the predicted range.{" "}
-                Naive and 7d Avg are simple guesses — beating them means the model is learning real patterns, not just copying recent numbers.
+                Naive and 7d Avg are simple guesses — beating them means the model is learning real patterns, not just copying recent numbers.{" "}
+                Untagged rows are the walk-forward backtest (every night of history, model retrained weekly);{" "}
+                <strong className="text-text-secondary">live 30d</strong> rows score the real forecasts of the last 30 days made since the 2026-11-11 alignment fix, and appear once 5 nights are scored.
               </p>
               <div className="overflow-x-auto">
                 <table className="w-full text-xs">
@@ -2745,9 +2797,9 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   <tbody>
                     {modelComparison.length > 0 ? modelComparison.map(row => (
                       <tr key={row.model} className="border-b border-white/5 hover:bg-white/[0.02]">
-                        <td className="py-2 pr-4 font-mono text-text-secondary">{row.model}</td>
+                        <td className="py-2 pr-4 font-mono text-text-secondary">{row.label}</td>
                         <td className="py-2 pr-4 tabular-nums"
-                            style={{ color: row.model === "xgboost" ? C.up : C.neutral }}>
+                            style={{ color: row.model.startsWith("xgboost") ? C.up : C.neutral }}>
                           {row.mae ? Number(row.mae).toFixed(1) : "—"}
                         </td>
                         <td className="py-2 pr-4 tabular-nums text-text-tertiary">
