@@ -32,7 +32,7 @@ jobs:
         run: python -m unittest discover -s tests -p test_autonomous_merge.py -v
   frontend-types:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: frontend
@@ -47,8 +47,15 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci --ignore-scripts
       - run: node --test tests/wins.test.cjs
+      - name: Offline finance import regressions (synthetic data only)
+        run: node scripts/test-financials.mjs
       - run: npx --no-install tsc --noEmit
       - name: Compile production bundles without prerendering or production credentials
         run: npx --no-install next build --experimental-build-mode compile
         env:
           NEXT_TELEMETRY_DISABLED: '1'
+      - name: Install isolated regression browser
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Run synthetic Today component regressions (no credentials or backend)
+        working-directory: .
+        run: node tests/today-regression.cjs
