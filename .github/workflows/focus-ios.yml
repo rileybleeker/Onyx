@@ -1,0 +1,33 @@
+name: Focus iOS checks
+on:
+  pull_request:
+    paths: ["tools/screentime_ios/**", ".github/workflows/focus-ios.yml"]
+  push:
+    branches: ["codex/focus-rules-20261111"]
+    paths: ["tools/screentime_ios/**", ".github/workflows/focus-ios.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select newest Xcode
+        run: |
+          NEWEST=$(ls -d /Applications/Xcode*.app | grep -vi beta | sort -V | tail -1)
+          sudo xcode-select -s "$NEWEST"
+      - name: Test policy (offline)
+        working-directory: tools/screentime_ios/FocusCore
+        run: swift test
+      - name: Generate opt-in focus project
+        working-directory: tools/screentime_ios
+        run: |
+          brew install xcodegen
+          xcodegen generate --spec project-focus.yml
+      - name: Compile app and monitor without signing or backend
+        working-directory: tools/screentime_ios
+        run: |
+          set -o pipefail
+          xcodebuild -project OnyxScreenTime.xcodeproj -scheme OnyxScreenTime -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
