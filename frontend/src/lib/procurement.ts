@@ -5,12 +5,13 @@
  */
 export type Draft = { item: string; merchant: string; totalCents: number; currency: 'USD'; commitment: 'one-time' | 'monthly'; status: 'draft' };
 export type Cycle = 'monthly' | 'quarterly' | 'annual';
-export type Subscription = { name: string; cents: number; currency: 'USD'; cycle: Cycle; renewsOn: string };
+// id/vendor/notes exist only on rows that came from (or were saved to) the database; hand-typed in-memory rows leave them off.
+export type Subscription = { name: string; cents: number; currency: 'USD'; cycle: Cycle; renewsOn: string; id?: number; vendor?: string; notes?: string };
 export const CAPABILITIES = Object.freeze({
   providers: 'disconnected',
   orders: 'disabled',
   recommendations: 'examples-only',
-  tracking: 'typed-by-hand-this-visit-only',
+  tracking: 'typed-by-hand-saved-once-setup-applied',
   reminders: 'calendar-file-you-import-yourself',
 } as const);
 
@@ -221,4 +222,54 @@ export function syntheticSubscriptions(today: string): Subscription[] {
     createSubscription('Demo cloud backup', '59.88', 'annual', addDays(today, 45)),
     createSubscription('Demo gym pass', '90.00', 'quarterly', addDays(today, 30)),
   ];
+}
+
+/* ---------- saving (pure helpers; the database calls live in procurement-store.ts) ---------- */
+export const PROCUREMENT_TABLE = 'procurement_subscriptions';
+export const MAX_VENDOR_LENGTH = 80;
+export const MAX_NOTES_LENGTH = 500;
+const NOTE_CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+export type SubscriptionDetails = Subscription & { vendor: string; notes: string };
+export type SubscriptionRow = {
+  subscription_id: number; name: string; vendor: string | null; amount_cents: number; currency: string;
+  cadence: string; next_renewal: string; notes: string | null; is_active: boolean;
+};
+/** Validate a request body from the browser with the same rules as the form, plus optional vendor and notes. */
+export function parseSubscriptionInput(body: unknown): SubscriptionDetails {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Send the subscription as a JSON object.');
+  const b = body as Record<string, unknown>;
+  for (const key of ['name', 'amount', 'cycle', 'renewsOn']) if (typeof b[key] !== 'string') throw new Error(`Missing ${key}.`);
+  for (const key of ['vendor', 'notes']) if (b[key] !== undefined && b[key] !== null && typeof b[key] !== 'string') throw new Error(`${key} must be text.`);
+  const sub = createSubscription(b.name as string, b.amount as string, b.cycle as string, b.renewsOn as string);
+  const vendor = ((b.vendor as string | null | undefined) ?? '').trim(), notes = ((b.notes as string | null | undefined) ?? '').trim();
+  if (vendor.length > MAX_VENDOR_LENGTH || CONTROL_CHARS.test(vendor)) throw new Error(`Vendor can be up to ${MAX_VENDOR_LENGTH} characters.`);
+  if (notes.length > MAX_NOTES_LENGTH || NOTE_CONTROL_CHARS.test(notes)) throw new Error(`Notes can be up to ${MAX_NOTES_LENGTH} characters.`);
+  return { ...sub, vendor, notes };
+}
+export function subscriptionToRow(sub: SubscriptionDetails) {
+  return { name: sub.name, vendor: sub.vendor || null, amount_cents: sub.cents, currency: 'USD', cadence: sub.cycle, next_renewal: sub.renewsOn, notes: sub.notes || null };
+}
+/** Database row back to the shape the page uses. Returns null for a row that fails the same checks (never throws, never shown half-valid). */
+export function subscriptionFromRow(row: Partial<SubscriptionRow> | null | undefined): Subscription | null {
+  if (!row || typeof row.subscription_id !== 'number' || typeof row.name !== 'string' || !row.name.trim()) return null;
+  if (typeof row.amount_cents !== 'number' || !Number.isInteger(row.amount_cents) || row.amount_cents <= 0) return null;
+  if (typeof row.cadence !== 'string' || !Object.prototype.hasOwnProperty.call(CYCLE_MONTHS, row.cadence)) return null;
+  if (typeof row.next_renewal !== 'string' || !parseIsoDate(row.next_renewal)) return null;
+  const sub: Subscription = { id: row.subscription_id, name: row.name, cents: row.amount_cents, currency: 'USD', cycle: row.cadence as Cycle, renewsOn: row.next_renewal };
+  if (row.vendor) sub.vendor = row.vendor;
+  if (row.notes) sub.notes = row.notes;
+  return sub;
+}
+/** A row id from a URL segment: digits only, a safe positive integer, or null. */
+export function parseRowId(value: string): number | null {
+  if (!/^\d{1,15}$/.test(value)) return null;
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+/** True when the table has not been created yet (PostgREST PGRST205 or Postgres 42P01). Any other error is a real failure. */
+export function isMissingTableError(error: { code?: string | null; message?: string | null } | null | undefined): boolean {
+  if (!error) return false;
+  const code = error.code ?? '', message = error.message ?? '';
+  if (code === 'PGRST205' || code === '42P01') return true;
+  return message.includes(PROCUREMENT_TABLE) && /schema cache|does not exist|could not find the table/i.test(message);
 }

@@ -8,10 +8,13 @@ Route: `/procurement`. This is a planning preview, not a functioning purchasing 
 - **Subscription tracker (typed by hand).** Name, USD price, monthly/quarterly/annual billing, next renewal date. Shows approximate monthly and yearly cost, renewals sorted by date (a past date is rolled forward by whole billing cycles, month-end safe, leap-day safe), and plain-words "worth a look" prompts: renewing within 14 days, the same name tracked twice, one item over half the spend. "Load synthetic demo subscriptions" fills it with four obviously fake rows.
 - **Renewal reminders.** "Download renewal reminders (.ics)" builds an all-day calendar file (reminder 1, 3, 7 or 14 days before each renewal, never in the past) in the browser. Riley imports it into his own calendar; Onyx sends nothing and calls no calendar API. The file is deterministic, escapes names and folds long lines per RFC 5545.
 - **Order preparation.** In-memory USD order drafts with exact-cent validation, one-time/monthly commitment, removal and clear. Totals (one-time and recurring), a warning when a recurring draft matches a tracked subscription, and a "Prepared list" grouped by merchant that Riley can copy. The list says in its first lines that nothing was ordered and that he buys it himself.
-- No localStorage, database, merchant calls, account discovery, credential entry, or external product recommendations. Everything disappears on reload. Provider management and ordering remain disabled. `executionReadiness()` takes no arguments and always fails closed.
+- **Saved tracker (2026-11-11).** The subscription tracker persists to `pds.procurement_subscriptions` (name, vendor, amount in cents, currency, cadence, next renewal, notes, `is_active` soft delete, timestamps) through owner-session API routes `/api/procurement/subscriptions` (GET list, POST create, DELETE archive all) and `/api/procurement/subscriptions/[id]` (PATCH update, DELETE archive one). The table is service-role only (`sql/procurement_schema.sql`, mirrors `phone_usage_schema.sql`); the browser never reads it directly and the routes are not on any middleware carve-out. The form has no vendor/notes inputs yet; the API accepts them. Synthetic demo rows and order drafts are never saved.
+- **Graceful fallback.** If the table is missing (SQL not applied yet) or the API is unreachable, the page keeps working in memory and shows a visible note ("Not saved yet - setup pending ..." or "Saved subscriptions could not be loaded right now ..."). Reads degrade to an empty list with `persisted:false`; writes answer 503 `setupPending:true` and the page keeps the row in memory. A real database error is never reported as "setup pending".
+- No localStorage, merchant calls, account discovery, credential entry, or external product recommendations. Order drafts still disappear on reload. Provider management and ordering remain disabled. `executionReadiness()` takes no arguments and always fails closed. There is no purchase, checkout, order-submission or cancel route or function; "archive" only hides a row in Onyx.
+- `/status` has a small manual "Procurement" card: grey (unknown) with "saving not set up" until the SQL is applied, green once the table answers, red only on a real database error. Data age is not a signal for a hand-typed list.
 
-## Not built yet (needs a decision or SQL from Riley)
-Saving the tracker across visits. It would need a table behind an authenticated API route and the SQL applied in Supabase, so it is deliberately left out of this slice. Until then the tracker is a scratchpad plus a reminder-file generator.
+## One-time setup (Riley)
+Open the Supabase SQL editor for the Onyx project and run `sql/procurement_schema.sql` (idempotent, no DROP). Reload `/procurement`: the note under "Track subscriptions" changes to "Saved to your Onyx account".
 
 ## Future execution boundary (not implemented)
 An authenticated server must own every quote and authorization, never trust a client approval boolean. The immutable quote needs merchant identity, item/quantity, delivered total including all fees, currency, recurrence/renewal price, fulfillment destination/method, cancellation/refund restrictions, and opaque payment-method reference. Never store card numbers or secrets here.
@@ -25,6 +28,7 @@ Financials has a separate unmerged branch; this module neither reads its data no
 ## Verification
 Run from repository root:
 - `node frontend/scripts/test-procurement.mjs` (pure logic: money, dates, renewal rolling, prompts, prepared list, .ics)
+- `node frontend/scripts/test-procurement-store.mjs` (save validation, missing-table fallback, fake-database store, no purchase action, SQL guards)
 - `node frontend/node_modules/typescript/bin/tsc --project frontend/tsconfig.json --noEmit --incremental false`
 - `node frontend/scripts/test-procurement-ui.mjs`
 

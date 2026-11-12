@@ -45,6 +45,7 @@ const CADENCE: Record<string, string> = {
   musicbrainz: "With Spotify ETL",
   supplements: "Manual",
   reading: "Manual",
+  procurement: "Manual",
   kindle: "Every 3h (Riley's PC, while logged on)",
   screen_time: "Real-time (iPhone app open/close)",
   screen_usage: "Daily (iPhone Shortcuts automation)",
@@ -88,6 +89,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   musicbrainz:    { method: "automated",      label: "API ETL" },
   supplements:    { method: "manual",         label: "Manual entry" },
   reading:        { method: "manual",         label: "Manual entry" },
+  procurement:    { method: "manual",         label: "Manual entry" },
   kindle:         { method: "automated",      label: "Local Chrome harvest" },
   screen_time:    { method: "automated",      label: "iOS Shortcuts events" },
   screen_usage:   { method: "automated",      label: "iPhone app export" },
@@ -449,6 +451,10 @@ export async function GET() {
     const nyc = await nycPromise;
     const nycDate = nyc.ok ? nyc.lastVerified : null;
     const nycLag = daysLag(nycDate, spineMaxDate);
+    // Procurement subscription tracker (/procurement): hand-typed, so data age says nothing. The card reports whether saving is set up (table answers) and how many are tracked.
+    const procurementRes = await supabase.from("procurement_subscriptions").select("updated_at", { count: "exact" }).eq("is_active", true).order("updated_at", { ascending: false }).limit(1);
+    const procurementPending = procurementRes.error?.code === "PGRST205" || procurementRes.error?.code === "42P01";
+    const procurementLast = (procurementRes.data?.[0]?.updated_at as string | undefined) ?? null;
     // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
     const urgentEmailCard = await getUrgentEmailStatusCard(supabase);
 
@@ -650,6 +656,21 @@ export async function GET() {
         cadence: CADENCE.reading,
         integrationMethod: METHOD.reading.method,
         methodLabel: METHOD.reading.label,
+      },
+      // Procurement subscription tracker (/procurement, 2026-11-11): typed by hand, never connected to a provider.
+      // "unknown" (not red) until sql/procurement_schema.sql is applied; green once the table answers.
+      procurement: {
+        label: procurementPending ? "Procurement (saving not set up)" : "Procurement",
+        lastSync: procurementLast,
+        status: procurementPending ? "unknown" : procurementRes.error ? "failed" : "success",
+        latestDataDate: procurementLast ? procurementLast.slice(0, 10) : null,
+        daysLag: 0,
+        recordsSynced: procurementRes.count ?? 0,
+        durationSeconds: null,
+        errorMessage: procurementRes.error && !procurementPending ? procurementRes.error.message : null,
+        cadence: CADENCE.procurement,
+        integrationMethod: METHOD.procurement.method,
+        methodLabel: METHOD.procurement.label,
       },
       // Kindle Notebook harvester (tools/kindle_harvest): a Task Scheduler job on
       // Riley's PC scrapes read.amazon.com/notebook in a signed-in Chrome and posts
