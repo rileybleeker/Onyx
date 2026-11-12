@@ -36,9 +36,36 @@ export function memoryStore({ failOn = null } = {}) {
       maybeFail("upsertTransactions");
       for (const r of rows) {
         writes.transactions++;
+        // the real table has a partial unique index on source_txn_id
+        if (r.source_txn_id != null && [...txns.values()].some((t) => t.txn_key !== r.txn_key && t.source_txn_id === r.source_txn_id)) {
+          throw new Error("duplicate key value violates unique constraint finance_transactions_source_txn_id_uidx");
+        }
         const prev = txns.get(r.txn_key);
-        txns.set(r.txn_key, { first_seen_at: r.last_seen_at, ...(prev ?? {}), ...r });
+        txns.set(r.txn_key, { first_seen_at: r.last_seen_at, source_txn_id: null, ...(prev ?? {}), ...r });
       }
+    },
+    async getTransactionsBySourceIds(ids) {
+      const wanted = new Set(ids.map(String));
+      return [...txns.values()].filter((t) => t.source_txn_id != null && wanted.has(String(t.source_txn_id))).map((t) => ({ ...t }));
+    },
+    async getUnreconciledSince(date) {
+      return [...txns.values()].filter((t) => t.source_txn_id == null && t.txn_date >= date).map((t) => ({ ...t }));
+    },
+    async getTransactionsForReconcile() {
+      return [...txns.values()].map((t) => ({ ...t, source_txn_id: t.source_txn_id ?? null }));
+    },
+    async attachSourceIds(pairs) {
+      maybeFail("attachSourceIds");
+      let n = 0;
+      for (const p of pairs) {
+        const t = txns.get(p.txn_key);
+        if (t && t.source_txn_id == null) {
+          t.source_txn_id = p.source_txn_id;
+          writes.transactions++;
+          n++;
+        }
+      }
+      return n;
     },
     async insertSnapshots(rows) {
       maybeFail("insertSnapshots");

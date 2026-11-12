@@ -35,7 +35,7 @@ test("success: exit 0, ONE json line of counts, success heartbeat, no row conten
     assert.equal(code, 0);
     assert.equal(h.lines.length, 1);
     const out = JSON.parse(h.lines[0]);
-    assert.deepEqual(out, { ok: true, dry_run: false, rows: 5, accounts: 3, inserted: 5, updated: 0, skipped: 0, errors: 0, heartbeat: "ok" });
+    assert.deepEqual(out, { ok: true, dry_run: false, rows: 5, accounts: 3, inserted: 5, updated: 0, skipped: 0, matched_existing: 0, errors: 0, heartbeat: "ok" });
     for (const secret of ["ACME", "WIDGETS", "PAYROLL", "Test Card", "2500", "1111"]) assert.equal(h.lines[0].includes(secret), false, secret);
     assert.equal(store.heartbeats.length, 1);
     const hb = store.heartbeats[0];
