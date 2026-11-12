@@ -4,17 +4,20 @@
 // responses the web app itself loads for the Net Worth and Settings > Accounts pages (account list, last
 // four digits, type, balance, asset or debt). It turns them into pds.finance_balance_snapshots rows by
 // running import-balances.mjs. It never types, never clicks, never submits anything: it navigates to two
-// pages and listens. As a belt-and-braces guard it aborts any GraphQL request that is a mutation, so even
+// pages and listens (plus the read-only Transactions queries described below). As a belt-and-braces guard it aborts any GraphQL request that is a mutation, so even
 // something the app fires on its own while loading cannot change the account.
 //
-// What it does NOT do: transactions. Rocket Money only reveals the export file name in an email, and this
-// harvester must never read email. See README.md, "Transactions".
+// Transactions: from the same signed-in page it also reads the Transactions list the way the app's own list
+// does (the app's operation, one extra read-only GraphQL query per page of 200, last 60 days by default) and
+// upserts it by Rocket Money's own transaction id (lib/web-transactions.mjs). Pending rows are skipped. The
+// export CSV is not used: its file name is only ever sent by email, and this harvester never reads email.
 //
 // Sign-in is yours, once:   node harvest.mjs --login     (opens a window; you sign in; it only watches)
 // Scheduled run:            node harvest.mjs             (window parked far off-screen, no console)
 // Check without writing:    node harvest.mjs --dry-run   (reads the app + the database, writes nothing)
 // Watch a run:              node harvest.mjs --headed
 // Run again within 20 h:    node harvest.mjs --force
+// Wider transaction window: node harvest.mjs --force --days 400     (default 60)
 //
 // The Supabase key is read from ~/.onyx_supabase_secret by the importer (never printed). The harvester never
 // sees Rocket Money credentials: the session lives in the Chrome profile.
@@ -27,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { classifyResponse, isGraphqlUrl, isLoginUrl, isMutationRequest, parseSummaryLine } from "./lib/harvest-core.mjs";
 import { runHarvest } from "./lib/harvest-run.mjs";
 import { createSupabaseStore } from "./lib/store.mjs";
+import { DEFAULT_DAYS, GRAPHQL_ENDPOINT, MAX_PAGES, PAGE_SIZE, pageFetchTransactions, TRANSACTIONS_OPERATION, TRANSACTIONS_QUERY } from "./lib/web-transactions.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const LOCAL = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
@@ -42,6 +46,11 @@ const LOGIN_MODE = process.argv.includes("--login");
 const DRY = process.argv.includes("--dry-run");
 const FORCE = process.argv.includes("--force");
 const VISIBLE = LOGIN_MODE || process.argv.includes("--headed");
+const DAYS = (() => {
+  const i = process.argv.indexOf("--days");
+  const n = i >= 0 ? Number(process.argv[i + 1]) : DEFAULT_DAYS;
+  return Number.isInteger(n) && n >= 1 && n <= 4000 ? n : DEFAULT_DAYS;
+})();
 
 // Counts and statuses only: never balances, account names, numbers or merchants.
 function log(msg) {
@@ -61,7 +70,7 @@ function launchOptions() {
 
 /** Attaches the read-only guard and the response listener; returns the live capture object. */
 async function attach(page) {
-  const captured = { networth: null, accounts: null, blockedMutations: 0 };
+  const captured = { networth: null, accounts: null, blockedMutations: 0, version: null };
   // READ-ONLY GUARD: a GraphQL mutation never leaves the browser.
   await page.route((url) => isGraphqlUrl(url.href), async (route) => {
     const req = route.request();
@@ -70,6 +79,10 @@ async function attach(page) {
       return route.abort("blockedbyclient");
     }
     return route.continue();
+  });
+  // The app sends its web-client version with every request; the transaction reads repeat it like the app does.
+  page.on("request", (req) => {
+    if (!captured.version && isGraphqlUrl(req.url())) captured.version = req.headers()["x-truebill-web-client-version"] ?? null;
   });
   page.on("response", async (res) => {
     if (!isGraphqlUrl(res.url()) || res.request().method() !== "POST") return;
@@ -109,7 +122,7 @@ async function withContext(fn) {
   }
 }
 
-async function capture() {
+async function capture({ gteDate }) {
   return withContext(async (page) => {
     const captured = await attach(page);
     await goto(page, START_URL);
@@ -122,8 +135,19 @@ async function capture() {
     if (!(await waitFor(page, () => captured.accounts, 30000))) {
       return isLoginUrl(page.url()) ? { status: "login_required" } : { status: "failed", error: "the account list did not load within 30 s" };
     }
+    // Transactions: read from inside the signed-in page, with its own session. Nothing is clicked or scrolled.
+    const transactions = await page.evaluate(pageFetchTransactions, {
+      endpoint: GRAPHQL_ENDPOINT,
+      query: TRANSACTIONS_QUERY,
+      operationName: TRANSACTIONS_OPERATION,
+      gteDate,
+      pageSize: PAGE_SIZE,
+      maxPages: MAX_PAGES,
+      version: captured.version,
+    });
+    if (isLoginUrl(page.url())) transactions.login = true;
     if (captured.blockedMutations) log(`blocked ${captured.blockedMutations} mutation request(s) made by the page (read-only guard)`);
-    return { status: "ok", networth: captured.networth, accounts: captured.accounts };
+    return { status: "ok", networth: captured.networth, accounts: captured.accounts, transactions };
   });
 }
 
@@ -181,6 +205,7 @@ try {
     exitCode = await runHarvest({
       force: FORCE,
       dryRun: DRY,
+      days: DAYS,
       statePath: STATE_PATH,
       lockPath: LOCK_PATH,
       tmpRoot: TMP_ROOT,
