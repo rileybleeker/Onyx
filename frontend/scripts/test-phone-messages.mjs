@@ -1,16 +1,29 @@
 // Synthetic tests for the disabled iPhone Messages gate (src/lib/phone-messages.ts).
 // No network, no files outside the repo source, no credentials, no real messages.
-// Run: node scripts/test-phone-messages.mjs   (Node 22.18+/24 strips TypeScript types natively)
+// Run: node scripts/test-phone-messages.mjs   (CI auto-discovers scripts/test-*.mjs)
+// The TypeScript module is compiled in-process with the repo's own `typescript`
+// package, so this does not depend on the Node version's type-stripping support.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import {
+import ts from "typescript";
+
+const lib = await loadTs("../src/lib/phone-messages.ts");
+const {
   createPhoneMessagesService,
   isFlagOn,
   NO_CAPABILITIES,
   PHONE_MESSAGES_FLAG,
   PHONE_MESSAGES_SEND_FLAG,
-} from "../src/lib/phone-messages.ts";
+} = lib;
+
+async function loadTs(relativePath) {
+  const source = readFileSync(new URL(relativePath, import.meta.url), "utf8");
+  const { outputText } = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  });
+  return import("data:text/javascript;base64," + Buffer.from(outputText).toString("base64"));
+}
 
 const SYNTH_BODY = "SYNTHETIC-BODY-do-not-leak";
 
