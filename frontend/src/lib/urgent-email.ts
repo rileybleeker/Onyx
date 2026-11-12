@@ -302,6 +302,26 @@ export function gmailMessageHref(account: string | null | undefined, messageId: 
   return `https://mail.google.com/mail/?authuser=${authuser}${query}`;
 }
 
+/**
+ * Link to a Gmail thread by its decimal thread id (IMAP X-GM-THRID), the same
+ * `#all/thread-f:<n>` form Gmail's own links and inbox-triage's Agent Inbox rows use.
+ */
+export function gmailThreadHref(account: string | null | undefined, threadId: string | null | undefined): string | null {
+  const id = (threadId ?? "").trim();
+  if (!/^\d{1,20}$/.test(id)) return null;
+  const acct = (account ?? "").trim();
+  const authuser = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(acct) ? encodeURIComponent(acct) : "0";
+  return `https://mail.google.com/mail/?authuser=${authuser}#all/thread-f:${id}`;
+}
+
+/** "Thu, Nov 12": the Eastern calendar day `days` after the Eastern day of `now`. */
+export function etDayLabel(now: Date, days: number): string {
+  const today = etDay(now);
+  return new Date(Date.UTC(today.year, today.month, today.day + days, 12)).toLocaleDateString("en-US", {
+    timeZone: "UTC", weekday: "short", month: "short", day: "numeric",
+  });
+}
+
 export function isGmailHref(href: string): boolean {
   return href.startsWith("https://mail.google.com/mail/");
 }
