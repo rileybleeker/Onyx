@@ -265,8 +265,10 @@ def test_good_play_older_than_gap_is_kept() -> None:
 
 
 if __name__ == "__main__":
-    test_tracks_upsert_before_plays_and_fk_invariant()
-    print("PASS: test_tracks_upsert_before_plays_and_fk_invariant")
-    test_play_with_unfetchable_track_is_skipped()
-    print("PASS: test_play_with_unfetchable_track_is_skipped")
+    # Run every test_* function. (The hand-written list that used to be here named a test
+    # that had been renamed and skipped test_good_play_older_than_gap_is_kept.)
+    for _name, _fn in list(globals().items()):
+        if _name.startswith("test_") and callable(_fn):
+            _fn()
+            print(f"PASS: {_name}")
     print("All tests passed.")

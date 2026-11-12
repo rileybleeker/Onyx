@@ -1,0 +1,8 @@
+# Python dependencies for the credential-free PR test job (.github/workflows/stats-pr-check.yml).
+# The analysis pins (pandas, statsmodels, supabase, ...) come from the lock file so PR checks run
+# on the same versions the pipeline was verified with; extras below are imported at module level
+# by ETL modules that the offline tests load but the HRV pipeline does not.
+-r requirements-analysis.lock
+
+# garmin_etl.py does `from garminconnect import Garmin` at import time (tests/test_garmin_*.py).
+garminconnect==0.3.6
