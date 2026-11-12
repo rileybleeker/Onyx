@@ -126,3 +126,21 @@ test("balances: dry run writes nothing", async () => {
   assert.equal(out.inserted, 1);
   assert.equal(store.snaps.size + store.accounts.size, 0);
 });
+
+test("balances: the export's 'NAME ...1234' naming is matched exactly, and matching is one-to-one", async () => {
+  const store = memoryStore();
+  await importTransactions(rows(), { store, now: T0 }); // contains "Test Card ...1111" (Credit Card) and "Test Checking ...2222" (Cash)
+  const before = store.accounts.size;
+  const out = await importBalances(
+    [
+      { institution: "Test Bank", account_name: "Test Card", account_type: "Credit Card", mask: "1111", balance_cents: 100, captured_at: "2026-11-12T15:00:00Z" },
+      // same institution and mask again: the first entry already claimed that account, so this one is a new account
+      { institution: "Test Bank", account_name: "Other Card", account_type: "Credit Card", mask: "1111", balance_cents: 200, captured_at: "2026-11-12T15:00:00Z" },
+    ],
+    { store, now: T1 },
+  );
+  assert.equal(out.accounts_matched, 1);
+  assert.equal(out.accounts_created, 1);
+  assert.equal(store.accounts.size, before + 1);
+  assert.equal(store.snaps.size, 2);
+});

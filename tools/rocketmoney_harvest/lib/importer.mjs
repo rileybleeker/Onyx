@@ -1,7 +1,7 @@
 // Import logic shared by import-csv / import-rows / import-balances. Talks only to a `store`
 // (lib/store.mjs), so tests run it against an in-memory fake. Summaries are COUNTS ONLY.
 import { TXN_COMPARE_COLUMNS } from "./store.mjs";
-import { normalizeBalances, normalizeRows } from "./normalize.mjs";
+import { accountKey, normalizeBalances, normalizeRows } from "./normalize.mjs";
 
 const same = (a, b) => (a ?? null) === (b ?? null) || (a != null && b != null && String(a) === String(b));
 const minDate = (a, b) => (a == null ? b : b == null ? a : a < b ? a : b);
@@ -65,17 +65,25 @@ export async function importBalances(entries, { store, dryRun = false, now = new
   const byKey = new Map(existing.map((a) => [a.account_key, a]));
 
   const remap = new Map(); // key derived from the balance entry -> key of the account it belongs to
+  const claimed = new Set(); // existing accounts already taken by one entry (matching is one-to-one)
   const toCreate = [];
   let matchedExisting = 0;
   for (const a of norm.accounts) {
-    if (byKey.has(a.account_key)) {
+    // The export names an account "NAME ...1234" for some institutions and plain "NAME" for others, so
+    // the balances page's plain name may need the suffix to hit the export's key.
+    const suffixed = a.mask ? accountKey({ ...a, account_name: `${a.account_name} ...${a.mask}` }) : null;
+    const exact = [a.account_key, suffixed].find((k) => k && byKey.has(k) && !claimed.has(k));
+    if (exact) {
+      claimed.add(exact);
+      if (exact !== a.account_key) remap.set(a.account_key, exact);
       matchedExisting++;
       continue;
     }
     const candidates = a.mask
-      ? existing.filter((x) => x.mask === a.mask && String(x.institution).trim().toLowerCase() === a.institution.toLowerCase())
+      ? existing.filter((x) => x.mask === a.mask && !claimed.has(x.account_key) && String(x.institution).trim().toLowerCase() === a.institution.toLowerCase())
       : [];
     if (candidates.length === 1) {
+      claimed.add(candidates[0].account_key);
       remap.set(a.account_key, candidates[0].account_key);
       matchedExisting++;
     } else {
