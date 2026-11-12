@@ -11,6 +11,10 @@ We patch StandardScaler to record which row counts it sees during .fit(),
 then assert that fit() is called once per fold with the training-set length
 (not once with the full n).
 
+2026-11-11: cross-fitting moved from TimeSeriesSplit to blocked folds with a
+gap (ci._blocked_folds), so the expected sizes are now "n minus the test block
+minus the gap rows", not an expanding window.
+
 Run: python tests/test_aipw_fold_local_scaler.py
 """
 from __future__ import annotations
@@ -43,7 +47,7 @@ def _synthetic_data(n: int = 200, p: int = 5, seed: int = 11) -> tuple[np.ndarra
 
 def test_scaler_fit_is_per_fold() -> None:
     """Capture every call to StandardScaler.fit and assert sample counts
-    correspond to the training rows of each TimeSeriesSplit fold (NOT the
+    correspond to the training rows of each cross-fitting fold (NOT the
     full n) — the structural signature of fold-local scaling.
     """
     seen_n: list[int] = []
@@ -64,7 +68,7 @@ def test_scaler_fit_is_per_fold() -> None:
 
     # We expect one fit() per fold (cross-fitting), each on a subset of n.
     assert len(seen_n) == ci.N_FOLDS_AIPW, (
-        f"Expected {ci.N_FOLDS_AIPW} scaler fits (one per TimeSeriesSplit fold), "
+        f"Expected {ci.N_FOLDS_AIPW} scaler fits (one per cross-fitting fold), "
         f"saw {len(seen_n)}"
     )
     # None of the fits should see the full dataset — that's what the bug did.
@@ -72,10 +76,12 @@ def test_scaler_fit_is_per_fold() -> None:
         f"All fold scalers should fit on TRAINING subsets (size < {n}), "
         f"saw fit sample sizes {seen_n}"
     )
-    # TimeSeriesSplit gives strictly growing training-set sizes.
-    assert seen_n == sorted(seen_n), (
-        f"Expanding-window TimeSeriesSplit should produce growing training "
-        f"set sizes; saw {seen_n}"
+    # Each fit sees exactly that blocked fold's training rows (test block and the
+    # gap on either side excluded).
+    expected = [len(tr) for tr, _ in ci._blocked_folds(n, ci.N_FOLDS_AIPW)]
+    assert seen_n == expected, (
+        f"Scaler fit sizes should equal the blocked-fold training sizes "
+        f"{expected}; saw {seen_n}"
     )
     print(f"  per-fold scaler fits = {seen_n} (n={n})")
 

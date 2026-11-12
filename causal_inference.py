@@ -35,8 +35,18 @@ Methods (three estimators, reported side-by-side)
      influence function gives the per-unit pseudo-outcome psi_i; ATE is its
      sample mean; SE is sd(psi)/sqrt(n).  *Doubly robust* means the estimate
      is unbiased if EITHER the propensity model OR the outcome model is
-     correctly specified.  Implemented with 5-fold cross-fitting so the
-     models aren't evaluated on their training data.
+     correctly specified.  Implemented with blocked 5-fold cross-fitting
+     (contiguous calendar blocks, a 7-row gap either side of the test block)
+     so the models aren't evaluated on their training data, and with overlap
+     trimming: days whose cross-fitted propensity falls outside [0.05, 0.95]
+     are left out of the average instead of being weighted by up to 20.
+
+Plausibility guard
+------------------
+Every row carries ``implausible`` + ``implausible_reasons``: an AIPW effect
+larger than one SD of nightly HRV, or one far from both the naive and the PSM
+estimates, is flagged; the UI hides flagged rows from the charts and the row
+cannot pass FDR. See ``plausibility_flags``.
 
 Sensitivity analysis
 --------------------
@@ -203,6 +213,31 @@ PROPENSITY_TRIM_HIGH = 0.95
 
 # AIPW cross-fitting
 N_FOLDS_AIPW = 5
+# 2026-11-11: blocked folds replace forward-only TimeSeriesSplit. Measured on the live
+# matrix (rebuilt read-only; it reproduced the stored -129.9 ms for "viewed a screen in
+# bed" exactly): treatment prevalence drifts over the history, so TimeSeriesSplit's
+# small early training folds were nearly one-armed (75 treated / 11 control). The
+# propensity model then predicted ~0.99 for the next block, the old clip to 0.95 still
+# gave each control day a weight of 20, and a control outcome model fit on 11 days left
+# ~50 ms residuals: one fold averaged -728 ms and dragged the ATE to -130 ms (naive +3,
+# PSM +6). The first sixth of the rows was never scored either, yet its psi stayed 0 and
+# was averaged in, shrinking every ATE by ~1/6. Blocked folds train on ~80% of the days
+# (both HRV eras, both arms); the gap keeps every 7-day feature of a training row clear
+# of the test block's outcomes, the leakage the 2026-05-26 audit (F-001) found with
+# shuffled KFold.
+AIPW_FOLD_GAP = 7       # rows dropped from training on each side of the test block
+MIN_FOLD_ARM = 10       # a training fold needs this many treated AND control days
+# More than this share of days outside [PROPENSITY_TRIM_LOW, PROPENSITY_TRIM_HIGH]
+# means the estimate describes a minority of days: flagged unreliable + implausible.
+MAX_TRIMMED_FRACTION = 0.5
+
+# Plausibility guard. Nightly HRV SD is ~30-35 ms here; no single daily behaviour should
+# move the next night's HRV by more than that on average (synthetic known-effect frames
+# with the fixed estimator never exceed ~0.4 SD of error), and when the doubly robust
+# estimate sits far from BOTH simpler estimators the nuisance models, not the data,
+# are driving it.
+PLAUSIBLE_MAX_ATE_SD = 1.0      # |AIPW ATE| must stay within this many outcome SDs
+PLAUSIBLE_DISAGREE_SD = 0.5     # ...and within this many SDs of naive OR of PSM
 
 # Block-bootstrap parameters for AIPW CI. Per audit finding F-001's follow-up
 # recommendation: resample contiguous time blocks of the influence values to
@@ -802,56 +837,80 @@ def _block_bootstrap_stats(psi: np.ndarray, block_len: int = AIPW_BOOTSTRAP_BLOC
     return (ci_low, ci_high, p_val)
 
 
+def _blocked_folds(n: int, n_folds: int = N_FOLDS_AIPW, gap: int = AIPW_FOLD_GAP):
+    """Blocked cross-fitting over calendar-ordered rows.
+
+    Yields (train_idx, test_idx): the test set is one contiguous block; the training
+    set is every other row except the `gap` rows on each side of the block. Every row
+    is scored exactly once. Rows are calendar-ordered and at least one day apart, so a
+    gap of 7 rows is at least 7 days: no training row's hrv_lag1 / hrv_7d_mean /
+    rolling-7d confounder contains a test-block outcome.
+    """
+    edges = np.linspace(0, n, n_folds + 1).astype(int)
+    idx = np.arange(n)
+    for a, b in zip(edges[:-1], edges[1:]):
+        test_idx = idx[a:b]
+        train_idx = idx[(idx < a - gap) | (idx >= b + gap)]
+        yield train_idx, test_idx
+
+
 def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
                   n_folds: int = N_FOLDS_AIPW) -> dict:
-    """Doubly robust AIPW with k-fold cross-fitting. Returns ATE + IF-based CI."""
+    """Doubly robust AIPW with blocked cross-fitting and overlap trimming.
+    Returns ATE + IF-based CI + block-bootstrap CI and fold/overlap diagnostics."""
     n = len(T)
     if n < n_folds * 4:
         return {"ate": float("nan"), "ci_low": float("nan"),
                 "ci_high": float("nan"), "se": float("nan")}
 
-    # TimeSeriesSplit (not shuffled KFold) — HRV is autocorrelated (ρ₁ ≈ 0.4-0.5);
-    # shuffled folds let the outcome model see near-future values via hrv_lag1,
-    # narrowing the IF variance and overstating CI coverage. Audit finding F-001.
+    # Blocked folds with a gap (see AIPW_FOLD_GAP). Never shuffled KFold: HRV is
+    # autocorrelated (ρ₁ ≈ 0.4-0.5) and a shuffled split lets the outcome model see a
+    # test day's HRV through the next day's hrv_lag1 (audit F-001). Never the old
+    # forward-only TimeSeriesSplit either: its tiny, nearly one-armed early folds are
+    # what produced the ±100 ms estimates (constants block above).
     #
     # Audit re-2026-05-26 P1 (gemini F-004, gpt-5 F-001) follow-up: the
-    # StandardScaler is now fit FRESH on the training rows of each fold and
-    # applied to that fold's validation rows. The previous full-data scaler
-    # leaked the validation fold's mean/variance back into training — small
-    # numerical effect on point estimates, but a strict violation of time-
-    # respecting cross-fitting. Verified empirically with the existing
-    # AIPW shift harness (audit/aipw_shift_findings.md).
-    kf = TimeSeriesSplit(n_splits=n_folds)
-    psi = np.zeros(n)
+    # StandardScaler is fit FRESH on the training rows of each fold and applied to
+    # that fold's validation rows (no validation mean/variance in training).
+    #
+    # psi starts as NaN, not 0: a row that is skipped or trimmed must not enter the
+    # mean as a zero effect.
+    psi = np.full(n, np.nan)
     # Audit re-2026-05-26 P2 (gpt-5 stats F-007): track per-fold class-balance
-    # skips. Previously NaN'd silently; with sparse treatments many folds can
-    # drop without alerting the user. Log once at the end and flag the result
-    # as `unreliable` when > 2 of n_folds are skipped.
+    # skips. Flag the result as `unreliable` when > 2 of n_folds are skipped.
     fold_failures = 0
+    n_trimmed = 0
+    n_scored = 0
 
-    for fold_idx, (train_idx, test_idx) in enumerate(kf.split(X)):
+    for fold_idx, (train_idx, test_idx) in enumerate(_blocked_folds(n, n_folds)):
         # Per-fold scaler fit on training rows only (no leakage from val).
         scaler = StandardScaler().fit(X[train_idx])
         Xt = scaler.transform(X[train_idx])
         Xv = scaler.transform(X[test_idx])
         Tt, Yt = T[train_idx], Y[train_idx]
 
-        # Need at least one treated and one control in the training fold to fit
+        # Each arm's outcome model needs real data: Ridge on 9 confounders fit to a
+        # handful of days is noise, and the propensity model it pairs with saturates.
         n_treated_tr = int(Tt.sum())
         n_control_tr = int((Tt == 0).sum())
-        if n_treated_tr < 2 or n_control_tr < 2:
+        if n_treated_tr < MIN_FOLD_ARM or n_control_tr < MIN_FOLD_ARM:
             log.warning(
-                f"  AIPW fold {fold_idx}: class imbalance "
-                f"(T={n_treated_tr}, C={n_control_tr}); skipping"
+                f"  AIPW fold {fold_idx}: training arm too small "
+                f"(T={n_treated_tr}, C={n_control_tr} < {MIN_FOLD_ARM}); skipping"
             )
             fold_failures += 1
-            psi[test_idx] = np.nan
             continue
 
         try:
             ps_model = LogisticRegression(penalty="l2", C=1.0, solver="lbfgs", max_iter=200)
             ps_model.fit(Xt, Tt)
-            e = _trim_propensity(ps_model.predict_proba(Xv)[:, 1])
+            e = ps_model.predict_proba(Xv)[:, 1]
+            # Overlap trimming (Crump et al. 2009): a day the model calls near-certain
+            # to be treated (or untreated) has no comparable days in the other arm.
+            # Drop it from the average rather than clip it to 0.05 / 0.95, which still
+            # weighted it by up to 20.
+            in_support = (e >= PROPENSITY_TRIM_LOW) & (e <= PROPENSITY_TRIM_HIGH)
+            n_trimmed += int((~in_support).sum())
 
             # Two outcome models, one per arm
             X1, Y1 = Xt[Tt == 1], Yt[Tt == 1]
@@ -862,21 +921,25 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
             mu0 = mu0_model.predict(Xv)
 
             Tv, Yv = T[test_idx], Y[test_idx]
-            psi[test_idx] = (
+            e = np.clip(e, PROPENSITY_TRIM_LOW, PROPENSITY_TRIM_HIGH)  # trimmed rows are discarded below
+            fold_psi = (
                 mu1 - mu0
                 + Tv * (Yv - mu1) / e
                 - (1 - Tv) * (Yv - mu0) / (1 - e)
             )
+            psi[test_idx[in_support]] = fold_psi[in_support]
+            n_scored += int(len(test_idx))
         except Exception as ex:
             log.warning(f"  AIPW fold {fold_idx} failed: {ex}")
             fold_failures += 1
-            psi[test_idx] = np.nan
 
+    fraction_trimmed = float(n_trimmed / n_scored) if n_scored else float("nan")
     psi_valid = psi[~np.isnan(psi)]
     if len(psi_valid) < 10:
         return {"ate": float("nan"), "ci_low": float("nan"),
                 "ci_high": float("nan"), "se": float("nan"),
                 "fold_failures": int(fold_failures), "n_folds": int(n_folds),
+                "n_trimmed": int(n_trimmed), "fraction_trimmed": fraction_trimmed,
                 "unreliable": True}
 
     ate = float(psi_valid.mean())
@@ -905,9 +968,10 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
     bb_width_ratio = float(width_bb / width_if) if width_if > 0 and not np.isnan(width_bb) else float("nan")
 
     # AIPW unreliable when > 2 of n_folds were skipped (class imbalance or
-    # estimator failure). Frontend renders these with a ⚠ marker similar to
-    # the existing low_n badge.
-    unreliable = fold_failures > 2
+    # estimator failure) or when most days fell outside propensity overlap.
+    unreliable = fold_failures > 2 or (
+        not np.isnan(fraction_trimmed) and fraction_trimmed > MAX_TRIMMED_FRACTION
+    )
 
     return {
         "ate": ate,
@@ -915,6 +979,8 @@ def estimate_aipw(X: np.ndarray, T: np.ndarray, Y: np.ndarray,
         "ci_high": ci_high_if,
         "se": se,
         "n_used": int(len(psi_valid)),
+        "n_trimmed": int(n_trimmed),
+        "fraction_trimmed": fraction_trimmed,
         "ci_low_bb": ci_low_bb,
         "ci_high_bb": ci_high_bb,
         "bb_width_ratio": bb_width_ratio,  # bb_width / if_width; >1 means BB is wider (IF too narrow)
@@ -1242,6 +1308,54 @@ def _significance_flags(aipw: dict) -> dict:
     return {"significant": bool(significant), "direction": direction}
 
 
+def _finite(x) -> bool:
+    try:
+        return x is not None and bool(np.isfinite(float(x)))
+    except (TypeError, ValueError):
+        return False
+
+
+def plausibility_flags(row: dict) -> dict:
+    """Decide whether an AIPW row can be read as an effect at all.
+
+    Returns {"implausible": bool, "implausible_reasons": [plain-language str]}.
+    Mirrored for rows stored before this guard existed by
+    frontend/src/lib/causal-plausibility.ts (rules 1 and 2 only use stored fields).
+
+      1. |AIPW ATE| > PLAUSIBLE_MAX_ATE_SD x the SD of nightly HRV.
+      2. AIPW is more than PLAUSIBLE_DISAGREE_SD x SD from the naive estimate AND
+         from the PSM estimate (rule needs a finite PSM).
+      3. More than MAX_TRIMMED_FRACTION of the days fell outside propensity overlap.
+      4. More than 2 of the cross-fitting folds were skipped.
+    """
+    reasons: list[str] = []
+    ate, sd = row.get("aipw_ate"), row.get("pooled_outcome_sd")
+    naive, psm = row.get("naive_ate"), row.get("psm_ate")
+    if _finite(ate) and _finite(sd) and float(sd) > 0:
+        ate, sd = float(ate), float(sd)
+        if abs(ate) > PLAUSIBLE_MAX_ATE_SD * sd:
+            reasons.append(
+                f"AIPW {ate:+.0f} ms is larger than one SD of nightly HRV ({sd:.0f} ms)"
+            )
+        tol = PLAUSIBLE_DISAGREE_SD * sd
+        if _finite(naive) and _finite(psm) and abs(ate - float(naive)) > tol \
+                and abs(ate - float(psm)) > tol:
+            reasons.append(
+                f"AIPW {ate:+.0f} ms is more than {tol:.0f} ms from both naive "
+                f"({float(naive):+.0f}) and PSM ({float(psm):+.0f})"
+            )
+    frac = row.get("aipw_fraction_trimmed")
+    if _finite(frac) and float(frac) > MAX_TRIMMED_FRACTION:
+        reasons.append(
+            f"{float(frac):.0%} of days had no comparable days in the other arm "
+            f"(propensity outside [{PROPENSITY_TRIM_LOW}, {PROPENSITY_TRIM_HIGH}])"
+        )
+    ff, nf = row.get("aipw_fold_failures") or 0, row.get("aipw_n_folds") or N_FOLDS_AIPW
+    if int(ff) > 2:
+        reasons.append(f"{int(ff)} of {int(nf)} cross-fitting folds skipped (an arm too small)")
+    return {"implausible": bool(reasons), "implausible_reasons": reasons}
+
+
 def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None) -> dict:
     """Top-level entry. Returns the full causal-results payload."""
     if not HAS_SKLEARN:
@@ -1327,6 +1441,11 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             "aipw_fold_failures": est["aipw"].get("fold_failures", 0),
             "aipw_n_folds": est["aipw"].get("n_folds", N_FOLDS_AIPW),
             "aipw_unreliable": bool(est["aipw"].get("unreliable", False)),
+            # Overlap trimming bookkeeping (2026-11-11): days left out because the
+            # cross-fitted propensity fell outside [0.05, 0.95].
+            "aipw_n_used": est["aipw"].get("n_used"),
+            "aipw_n_trimmed": est["aipw"].get("n_trimmed"),
+            "aipw_fraction_trimmed": est["aipw"].get("fraction_trimmed"),
             # PSM caliper bookkeeping (gpt-5 F-006).
             "psm_caliper_value": est["psm"].get("caliper_value"),
             "psm_caliper_drops": est["psm"].get("caliper_drops", 0),
@@ -1342,6 +1461,10 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             "attenuation_pct": _attenuation(est["naive"]["ate"], est["aipw"]["ate"]),
             "pooled_outcome_sd": est["pooled_outcome_sd"],
         }
+        result_row.update(plausibility_flags(result_row))
+        if result_row["implausible"]:
+            log.warning(f"  Causal {spec.name!r} implausible: "
+                        f"{'; '.join(result_row['implausible_reasons'])}")
         if spec.kind == "binary":
             binary_results.append(result_row)
         else:
@@ -1422,13 +1545,21 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             if ok and suppress:
                 ok = False
                 n_suppressed += 1
+            # An implausible estimate is never reported as a discovery. It stays in
+            # the BH family (conservative: it still counts as a test).
+            implausible_block = bool(ok and r.get("implausible"))
+            if implausible_block:
+                ok = False
+                n_suppressed += 1
             r["passes_fdr"] = ok
             r["fdr_suppressed_by_bb_width"] = bool(suppress)
+            r["fdr_suppressed_by_plausibility"] = implausible_block
             if ok:
                 n_pass += 1
         log.info(f"  Causal BH-FDR (q<={FDR_Q_THRESHOLD}, p=block-bootstrap): "
                  f"{n_pass}/{len(all_results)} treatments survive "
-                 f"({n_suppressed} suppressed by bb_width_ratio>={BB_WIDTH_RATIO_SUPPRESS})")
+                 f"({n_suppressed} suppressed by bb_width_ratio>={BB_WIDTH_RATIO_SUPPRESS} "
+                 f"or the plausibility guard)")
     else:
         # No statsmodels/scipy available — mark every row as un-evaluated so
         # downstream consumers can detect the gap explicitly.
@@ -1479,7 +1610,7 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
         "estimand": "ATE (population average) for AIPW; ATT (effect on the treated) for PSM",
         "identifying_assumptions": [
             "Conditional ignorability: treatment is independent of potential outcomes given the listed confounders.",
-            "Positivity (common support): every confounder profile has non-trivial probability of both treatment values (enforced via propensity trimming to [0.05, 0.95]).",
+            "Positivity (common support): every confounder profile has non-trivial probability of both treatment values (enforced by trimming: AIPW leaves out days whose cross-fitted propensity is outside [0.05, 0.95]; PSM drops treated days above 0.95 and controls below 0.05).",
             "SUTVA: no interference between days; one day's behavior doesn't affect another day's outcome (mild violation for chronic adherence patterns — interpret with care).",
         ],
         "sensitivity": {
@@ -1502,7 +1633,16 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
         # on each resample (not an i.i.d. resample of the final matched_diffs).
         "psm_bootstrap": "block(7d)_refit_propensity_and_match",
         "aipw_n_folds": N_FOLDS_AIPW,
+        "aipw_cross_fit": f"blocked_{N_FOLDS_AIPW}fold_gap{AIPW_FOLD_GAP}_min_arm{MIN_FOLD_ARM}",
+        "aipw_overlap": "trim (drop days outside propensity_trim), not clip",
         "propensity_trim": [PROPENSITY_TRIM_LOW, PROPENSITY_TRIM_HIGH],
+        "plausibility_guard": {
+            "max_abs_ate_sd": PLAUSIBLE_MAX_ATE_SD,
+            "disagree_with_naive_and_psm_sd": PLAUSIBLE_DISAGREE_SD,
+            "max_fraction_trimmed": MAX_TRIMMED_FRACTION,
+            "max_fold_failures": 2,
+            "effect": "row flagged implausible; never passes FDR; hidden from the /analytics/hrv charts",
+        },
         "min_per_arm_full": MIN_BINARY_PER_ARM_FULL,
         "min_per_arm_reported": MIN_BINARY_PER_ARM_REPORT,
         # Multiple-testing correction applied across the binary+continuous union
