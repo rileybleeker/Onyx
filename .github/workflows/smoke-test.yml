@@ -10,10 +10,11 @@ on:
   schedule:
     - cron: "0 */6 * * *" # every 6 hours
   workflow_dispatch: {}
+  workflow_call: {} # post-merge.yml runs this after every merge
 
 # A new run supersedes an in-flight one rather than piling up.
 concurrency:
-  group: smoke-test
+  group: smoke-test-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
