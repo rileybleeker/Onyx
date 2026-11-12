@@ -344,11 +344,11 @@ def post_merge(sha: str, drill: bool) -> int:
         if out:
             with open(out, "a", encoding="utf-8") as fh:
                 fh.write(f"result={result}\nsha={sha}\ndetail={detail}\n")
+    if drill:  # any commit on master, so a drill can target a harmless one while other merges keep landing
+        emit("fail", "DRILL: failure injected to exercise rollback; nothing is actually broken")
+        return 0
     if head != sha:
         emit("skipped", f"master moved on to {head[:7]}; that merge's own verification covers this one")
-        return 0
-    if drill:
-        emit("fail", "DRILL: failure injected to exercise rollback; nothing is actually broken")
         return 0
     result, why = wait_production(sha)
     if result == "ok":
