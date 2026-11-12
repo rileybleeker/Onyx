@@ -1,0 +1,81 @@
+name: Production Performance Timing
+
+# MANUAL ONLY. Measures authenticated page loads against PRODUCTION from a GitHub-hosted
+# runner: per key page, N full navigations (first = cold browser cache), recording TTFB, FCP,
+# LCP, time to the page's data, and every Supabase /rest/v1 + /api + Worker request (path,
+# duration, bytes - no query strings, no bodies, no cookies). Results go to the job summary
+# and to a JSON artifact. See docs/perf-evidence-2026-11-12.md for method and caveats.
+#
+# Start it with:  gh workflow run perf-timing.yml --ref <branch>
+# It has no schedule and no pull_request trigger on purpose: it signs in to production and
+# loads every key page 15 times, which is a load nobody should get by opening a PR.
+
+on:
+  workflow_dispatch:
+    inputs:
+      navigations:
+        description: "Navigations per page (the first one is recorded as cold)"
+        type: string
+        default: "15"
+        required: false
+
+permissions:
+  contents: read
+
+# Never two timing runs at once (they would measure each other), never cancel one mid-run.
+concurrency:
+  group: perf-timing
+  cancel-in-progress: false
+
+jobs:
+  perf:
+    name: Playwright timing
+    # Same pin as smoke-test.yml (Playwright cannot install chromium deps on ubuntu-26.04 yet).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install Playwright (chromium)
+        run: npx --no-install playwright install --with-deps chromium
+
+      - name: Measure production (sign in once, then time each page)
+        env:
+          SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
+          SMOKE_TEST_EMAIL: ${{ secrets.SMOKE_TEST_EMAIL }}
+          SMOKE_TEST_PASSWORD: ${{ secrets.SMOKE_TEST_PASSWORD }}
+          PERF_NAVIGATIONS: ${{ inputs.navigations }}
+        run: npx --no-install playwright test -c e2e/perf.config.ts
+
+      - name: Summarize (job summary)
+        if: always()
+        run: |
+          if ls perf-results/*.json >/dev/null 2>&1; then
+            node e2e/perf-report.cjs perf-results --md perf-results/summary.md --json perf-results/summary.json
+            cat perf-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No timing results were written (the sign-in or the first page failed)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-timing-results
+          path: frontend/perf-results/
+          if-no-files-found: ignore
+          retention-days: 30

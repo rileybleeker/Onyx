@@ -14,3 +14,4 @@ out/
 /playwright-report/
 /playwright/.cache/
 e2e/.auth/
+/perf-results/
