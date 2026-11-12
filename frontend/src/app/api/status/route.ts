@@ -1,3 +1,4 @@
+import { ingestionHeartbeatStatus } from "@/lib/status-freshness";
 import { NextResponse } from "next/server";
 import { getNycScoutFreshness } from "@/lib/nyc";
 import { createClient } from "@supabase/supabase-js";
@@ -163,7 +164,8 @@ function deriveStatus(
   lag: number
 ): "success" | "partial" | "failed" | "unknown" {
   if (!syncEntry && lag === 999) return "unknown";
-  if (syncEntry?.status === "failed" || lag > 3) return "failed";
+  // "error" is what cronometer_etl.py / cronometer_import.py write on a failed run.
+  if (syncEntry?.status === "failed" || syncEntry?.status === "error" || lag > 3) return "failed";
   if (syncEntry?.status === "partial" || lag > 1) return "partial";
   return "success";
 }
@@ -228,7 +230,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, ingestionHeartbeats] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -334,6 +336,19 @@ export async function GET() {
       // failed "GUARD …" row from the alignment check) can fall out of the 100-row window.
       supabase.from("sync_log").select("*").eq("source", "hrv_analysis").eq("data_type", "retrain")
         .order("sync_start", { ascending: false }).limit(1),
+      // Scheduled ingestion must retain its latest heartbeat even when the shared
+      // history window is full of newer jobs. In particular, daily Eight Sleep and
+      // twice-daily Cronometer regularly fall outside that window overnight.
+      Promise.all([
+        ["garmin", "full_sync"], ["whoop", "full_sync"],
+        ["eight_sleep", "trends"], ["cronometer", "daily"],
+      ].map(async ([source, dataType]) => {
+        const { data, error } = await supabase.from("sync_log").select("*")
+          .eq("source", source).eq("data_type", dataType)
+          .order("sync_start", { ascending: false }).limit(1);
+        if (error) throw error;
+        return { key: `${source}|${dataType}`, entry: data?.[0] ?? null };
+      })),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -343,6 +358,10 @@ export async function GET() {
       if (!latestBySrcType[key]) {
         latestBySrcType[key] = row as Record<string, unknown>;
       }
+    }
+
+    for (const { key, entry } of ingestionHeartbeats) {
+      if (entry) latestBySrcType[key] = entry as Record<string, unknown>;
     }
 
     const garminDate = garminRes.data?.[0]?.calendar_date ?? null;
@@ -415,7 +434,7 @@ export async function GET() {
       garmin: {
         label: "Garmin",
         lastSync: (garminEntry?.sync_start as string) ?? null,
-        status: deriveStatus(garminEntry, garminLag),
+        status: ingestionHeartbeatStatus(deriveStatus(garminEntry, garminLag), garminEntry, 3, 6),
         latestDataDate: garminDate,
         daysLag: garminLag,
         recordsSynced: (garminEntry?.records_synced as number) ?? 0,
@@ -428,7 +447,7 @@ export async function GET() {
       whoop: {
         label: "WHOOP",
         lastSync: (whoopEntry?.sync_start as string) ?? null,
-        status: deriveStatus(whoopEntry, whoopLag),
+        status: ingestionHeartbeatStatus(deriveStatus(whoopEntry, whoopLag), whoopEntry, 3, 6),
         latestDataDate: whoopDate,
         daysLag: whoopLag,
         recordsSynced: (whoopEntry?.records_synced as number) ?? 0,
@@ -441,7 +460,7 @@ export async function GET() {
       eight_sleep: {
         label: "Eight Sleep",
         lastSync: (eightSleepEntry?.sync_start as string) ?? null,
-        status: deriveStatus(eightSleepEntry, eightSleepLag),
+        status: ingestionHeartbeatStatus(deriveStatus(eightSleepEntry, eightSleepLag), eightSleepEntry, 26, 30),
         latestDataDate: eightSleepDate,
         daysLag: eightSleepLag,
         recordsSynced: (eightSleepEntry?.records_synced as number) ?? 0,
@@ -486,7 +505,7 @@ export async function GET() {
       cronometer: {
         label: "Cronometer",
         lastSync: (cronEntry?.sync_start as string) ?? null,
-        status: deriveStatus(cronEntry, cronLag),
+        status: ingestionHeartbeatStatus(deriveStatus(cronEntry, cronLag), cronEntry, 16, 28),
         latestDataDate: cronDate,
         daysLag: cronLag,
         recordsSynced: (cronEntry?.records_synced as number) ?? 0,
