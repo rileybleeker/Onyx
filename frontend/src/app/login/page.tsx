@@ -35,7 +35,7 @@ export default function LoginPage() {
       // Return to the page that sent us here (middleware adds ?next=), e.g. the Agents chat; same-origin paths only.
       const next = new URLSearchParams(window.location.search).get("next") || "";
       const safe = next.startsWith("/") && !next.startsWith("//") && !next.startsWith("/\\") && !next.startsWith("/login");
-      router.replace(safe ? next : "/status");
+      router.replace(safe ? next : "/today");
       router.refresh();
       return;
     }

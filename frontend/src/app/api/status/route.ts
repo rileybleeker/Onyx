@@ -56,13 +56,13 @@ const CADENCE: Record<string, string> = {
   // the frontend matrix reads hit since 2026-06-11). The heartbeat also
   // carries the schema-drift tripwire — a 'failed' here can mean the view
   // gained columns the matview is missing.
-  matrix_mat: "Every 15 min (:10/:25/:40/:55)",
+  matrix_mat: "Every 30 min (:10/:40)",
   // pg_cron refresh of ALL FIVE tier-2 perf matviews (tz_log_gaps_mat +
   // hrv_prediction_gaps_mat read by this endpoint, plus
   // spotify_daily_signature_mat, recovery_vs_pace_mat and hrv_residuals_mat
   // read by /spotify, /activities and /analytics/hrv). A failed heartbeat
   // therefore flags staleness beyond this endpoint's own reads.
-  perf_mats: "Every 15 min (:12/:27/:42/:57)",
+  perf_mats: "Every 30 min (:12/:42)",
 };
 
 // Integration method per source.
@@ -207,7 +207,7 @@ function enrichmentSource({
 export async function GET() {
   try {
     // Fetch last 100 sync_log rows (enough to cover all sources with history).
-    // matrix_mat and perf_mats each refresh 4x/hour (~96 heartbeat rows/day
+    // matrix_mat and perf_mats each refresh 2x/hour (~48 heartbeat rows/day
     // apiece) and would flood this window, drowning every other source's
     // history — each gets a dedicated limit-1 fetch below instead.
     const { data: syncRows, error: syncErr } = await supabase
@@ -837,14 +837,14 @@ export async function GET() {
         integrationMethod: METHOD.nyc_scout.method,
         methodLabel: METHOD.nyc_scout.label,
       },
-      // Materialized matrix view refresh (pg_cron, every 15 min). Frontend
+      // Materialized matrix view refresh (pg_cron, every 30 min). Frontend
       // matrix reads (/analytics/hrv, /caffeine, /nutrition, /bland-altman,
       // /analytics/travel) hit the matview since 2026-06-11; a stuck refresh
       // means those pages silently serve aging data while the live view (and
       // the Python pipeline) move on — exactly the silent-staleness failure
       // mode the heartbeat convention exists to catch. Freshness is heartbeat
-      // age in MINUTES (like the enrichment cards but tighter): >20 min = one
-      // missed refresh (partial), >45 min = three missed (failed). A 'failed'
+      // age in MINUTES (like the enrichment cards but tighter): >40 min = one
+      // missed refresh (partial), >75 min = two missed (failed). A 'failed'
       // heartbeat can also be the schema-drift tripwire — the error message
       // names the columns the matview is missing.
       matrix_mat: (() => {
@@ -853,8 +853,8 @@ export async function GET() {
         const ageMin = lastSync ? Math.round((Date.now() - new Date(lastSync).getTime()) / 60000) : null;
         let status: SourceStatus["status"];
         if (!entry) status = "unknown";
-        else if (entry.status === "failed" || ageMin === null || ageMin > 45) status = "failed";
-        else if (ageMin > 20) status = "partial";
+        else if (entry.status === "failed" || ageMin === null || ageMin > 75) status = "failed";
+        else if (ageMin > 40) status = "partial";
         else status = "success";
         return {
           label: "Matrix Matview",
@@ -870,20 +870,20 @@ export async function GET() {
           methodLabel: METHOD.matrix_mat.label,
         };
       })(),
-      // Perf matviews (pg_cron, every 15 min): tz_log_gaps_mat +
+      // Perf matviews (pg_cron, every 30 min): tz_log_gaps_mat +
       // hrv_prediction_gaps_mat — the matviews THIS endpoint reads for the
       // travel banner and the HRV-gap check (perf round 3, 2026-06-11; the
       // live views were the two slowest Promise.all members). Same heartbeat
-      // semantics + thresholds as matrix_mat: >20 min = one missed refresh
-      // (partial), >45 min = three missed (failed).
+      // semantics + thresholds as matrix_mat: >40 min = one missed refresh
+      // (partial), >75 min = two missed (failed).
       perf_mats: (() => {
         const entry = (perfMatsRes.data?.[0] as Record<string, unknown> | undefined) ?? null;
         const lastSync = (entry?.sync_start as string) ?? null;
         const ageMin = lastSync ? Math.round((Date.now() - new Date(lastSync).getTime()) / 60000) : null;
         let status: SourceStatus["status"];
         if (!entry) status = "unknown";
-        else if (entry.status === "failed" || ageMin === null || ageMin > 45) status = "failed";
-        else if (ageMin > 20) status = "partial";
+        else if (entry.status === "failed" || ageMin === null || ageMin > 75) status = "failed";
+        else if (ageMin > 40) status = "partial";
         else status = "success";
         return {
           label: "Perf Matviews",
