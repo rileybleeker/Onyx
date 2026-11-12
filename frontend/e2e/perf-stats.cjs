@@ -103,6 +103,20 @@ function foldRequests(records) {
   return { req, total: { n, bytes }, endpoints };
 }
 
+/**
+ * x-vercel-id looks like "iad1::<request-id>" when the CDN answered and
+ * "iad1::iad1::<request-id>" when a function ran. The request id differs on every
+ * response, so keep only the region part(s): "iad1 (cdn)" or "iad1>iad1 (function)".
+ * Also repairs the first run's samples, which kept the request id as a second part.
+ */
+function normRegion(raw) {
+  if (!raw) return null;
+  const parts = String(raw).split(/>|::/);
+  const looksLikeId = (x) => /-\d{9,}-/.test(x) || x.length > 12;
+  if (parts.length >= 2 && !looksLikeId(parts[1])) return `${parts[0]}>${parts[1]} (function)`;
+  return `${parts[0]} (cdn)`;
+}
+
 const TIMING_KEYS = ["ttfb", "fcp", "lcp", "ready", "firstChart"];
 
 /** Aggregate the samples of one page (cold = first navigation, warm = the rest). */
@@ -173,7 +187,14 @@ function summarizePage(samples) {
     total_: total,
     endpoints,
     cache: tally("cache"),
-    region: tally("region"),
+    region: (() => {
+      const t = {};
+      for (const x of samples) {
+        const r = normRegion(x.region);
+        if (r) t[r] = (t[r] || 0) + 1;
+      }
+      return t;
+    })(),
   };
 }
 
@@ -216,12 +237,12 @@ function timingTable(pages) {
 
 function requestsTable(pages) {
   const out = [];
-  out.push("| Page | Requests (all) | /rest/v1 n | /rest/v1 summed ms | /rest/v1 last finish (ms) | /api n | /api summed ms | worker n | RSC n | KB transferred (all) | KB /rest/v1 |");
-  out.push("|---|---|---|---|---|---|---|---|---|---|---|");
+  out.push("| Page | Requests (all) | /rest/v1 n | /rest/v1 summed ms | /rest/v1 last finish (ms) | /api n | /api summed ms | worker n | RSC prefetch n / summed ms | static chunk n | KB transferred (all) | KB /rest/v1 |");
+  out.push("|---|---|---|---|---|---|---|---|---|---|---|---|");
   for (const p of pages) {
     const r = p.summary.requests;
     out.push(
-      `| ${p.label} | ${num(p.summary.total_.n)} | ${num(r.rest.n)} | ${ms(r.rest.ms)} | ${ms(r.rest.endMs)} | ${num(r.api.n)} | ${ms(r.api.ms)} | ${num(r.worker.n)} | ${num(r.rsc.n)} | ${kb(p.summary.total_.bytes)} | ${kb(r.rest.bytes)} |`
+      `| ${p.label} | ${num(p.summary.total_.n)} | ${num(r.rest.n)} | ${ms(r.rest.ms)} | ${ms(r.rest.endMs)} | ${num(r.api.n)} | ${ms(r.api.ms)} | ${num(r.worker.n)} | ${num(r.rsc.n)} / ${ms(r.rsc.ms)} | ${num(r.static.n)} | ${kb(p.summary.total_.bytes)} | ${kb(r.rest.bytes)} |`
     );
   }
   return out.join("\n");
@@ -293,4 +314,5 @@ module.exports = {
   endpointTable,
   runNotes,
   stabilityTable,
+  normRegion,
 };

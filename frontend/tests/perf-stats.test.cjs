@@ -111,3 +111,10 @@ test('report renders tables and a stability section from result files', () => {
   assert.ok(!/NaN|undefined/.test(md), 'no NaN/undefined leaks into the output');
   for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
 });
+
+test('normRegion drops per-request ids and tells CDN answers from function runs', () => {
+  assert.equal(stats.normRegion('iad1'), 'iad1 (cdn)');
+  assert.equal(stats.normRegion('iad1>iad1'), 'iad1>iad1 (function)');
+  assert.equal(stats.normRegion('iad1>zqs8v-1794452282628-11b03cce4640'), 'iad1 (cdn)', 'run-1 samples kept the request id');
+  assert.equal(stats.normRegion(null), null);
+});

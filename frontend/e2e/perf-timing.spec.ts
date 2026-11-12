@@ -208,7 +208,8 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     const headers = resp ? resp.headers() : {};
     sample.cache = headers["x-vercel-cache"] ?? null;
     const vid = headers["x-vercel-id"];
-    sample.region = vid ? vid.split("::").slice(0, 2).join(">") : null;
+    // "iad1::<request-id>" (CDN) or "iad1::iad1::<request-id>" (function ran): keep the regions only.
+    sample.region = vid ? vid.split("::").slice(0, -1).join(">") : null;
 
     const finalPath = new URL(page.url()).pathname;
     if (/^\/login/.test(finalPath)) throw new Error("bounced-to-login: saved session is not valid");
