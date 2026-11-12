@@ -53,6 +53,7 @@ const CADENCE: Record<string, string> = {
   tanita: "Daily 10am + 1:30pm ET",
   flights: "Every 3h :25 (both Gmail accounts)",
   delivery: "Every 3h :40",
+  air_quality: "Every 3h :12",
   supplement_reminders: "Worker poll (heartbeat ~hourly); cards at each stack's reminder time",
   urgent_email: "Hourly :15 (both Gmail accounts)",
   ubereats: "Every 6h (Riley's PC, while logged on)",
@@ -97,6 +98,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   tanita:         { method: "automated",      label: "API ETL" },
   flights:        { method: "automated",      label: "IMAP email parser" },
   delivery:       { method: "automated",      label: "IMAP email parser" },
+  air_quality:    { method: "automated",      label: "API ETL" },
   supplement_reminders: { method: "automated", label: "Worker push cards" },
   urgent_email:   { method: "automated",      label: "IMAP label reader" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
@@ -245,7 +247,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, airQualityRes, airQualitySyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -337,6 +339,12 @@ export async function GET() {
       supabase.from("phone_app_events").select("event_time,onyx_behavioral_date").order("event_time", { ascending: false }).limit(1),
       // Delivery orders: newest order date parsed from Uber Eats receipt emails.
       supabase.from("delivery_orders").select("order_date_local").order("order_date_local", { ascending: false }).limit(1),
+      // Air quality: newest ET day in pds.air_quality_daily, plus a dedicated limit-1 heartbeat fetch
+      // (the 3-hourly run can fall out of the 100-row window above when hourly sources are busy).
+      // A missing table (SQL not applied yet) shows its error text on the card instead of breaking /status.
+      supabase.from("air_quality_daily").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
+      supabase.from("sync_log").select("*").eq("source", "air_quality").eq("data_type", "daily")
+        .order("sync_start", { ascending: false }).limit(1),
       // The two PC harvesters heartbeat hours apart (and not at all while the PC is off), so their
       // newest row regularly falls out of the 100-row window above (~13 h of history). Without a
       // dedicated fetch a stalled harvester reads "Unknown" instead of going amber, then red.
@@ -829,6 +837,38 @@ export async function GET() {
           cadence: CADENCE.delivery,
           integrationMethod: METHOD.delivery.method,
           methodLabel: METHOD.delivery.label,
+        };
+      })(),
+      // Air quality (air_quality_etl.py): hourly PM2.5 / US AQI from the keyless Open-Meteo
+      // Air Quality API, averaged per ET day into pds.air_quality_daily for the HRV pipeline
+      // (aqi_* features, aqi_pm25 causal exposure). Freshness = heartbeat age, same thresholds
+      // as Flights / Delivery: cron every 3h -> >4h partial, >12h or a failed row = red. A
+      // 'partial' heartbeat means the API returned no PM2.5 values for the whole window.
+      air_quality: (() => {
+        const entry = latestBySrcType["air_quality|daily"]
+          ?? (airQualitySyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || entry.status === "error" || ageH > 12
+            ? "failed"
+            : entry.status === "partial" || ageH > 4
+              ? "partial"
+              : "success";
+        return {
+          label: "Air Quality",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: (airQualityRes.data?.[0]?.calendar_date as string | undefined) ?? null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (entry ? null : airQualityRes.error?.message ?? airQualitySyncRes.error?.message ?? null),
+          cadence: CADENCE.air_quality,
+          integrationMethod: METHOD.air_quality.method,
+          methodLabel: METHOD.air_quality.label,
         };
       })(),
       // Supplement stack reminders (sms-reminders Worker -> /api/supplements/reminders/*):

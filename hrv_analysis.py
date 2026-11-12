@@ -276,6 +276,8 @@ CONTROLLABLE_FEATURE_PREFIXES = (
     "meal_",  # Meal timing: last_hour, first_hour, eating_window, last_meal_to_bedtime_min
     "caffeine_",  # Caffeine timing: first_hour, last_hour, window_hours, intake_count, to_bedtime_min
     "act_",  # Activity taxonomy: run/sauna (auto) + leg/pull/push split + act_mg_* muscle groups (manual)
+    "aqi_",  # Outdoor PM2.5 / AQI: not changeable, but exposure is (indoor workout, mask, closed windows).
+             # aqi_ is in NOT_FORECAST_PREFIXES, so it only reaches this ranking if that ever changes.
 ) + tuple(MICRONUTRIENT_COLS)  # Cronometer vitamins/minerals (exact column names)
 
 # Re-audit 2026-06-07 (stats/gpt-5/F-009): same-night sleep / recovery / HRV-
@@ -473,6 +475,9 @@ FEATURE_LABELS: dict[str, str] = {
     "screen_social_min": "Social Apps (min)",
     "screen_last_hour_before_sleep_min": "Phone Use in the Hour Before Sleep (min)",
     "screen_during_sleep_min": "Phone Use After Sleep Onset (min)",
+    "aqi_pm25": "Outdoor PM2.5 (µg/m³)",
+    "aqi_pm25_max": "Peak Hourly PM2.5 (µg/m³)",
+    "aqi_us_max": "Peak US AQI",
     "caffeine_first_hour": "First Caffeine (ET hour)",
     "caffeine_last_hour": "Last Caffeine (ET hour)",
     "caffeine_window_hours": "Caffeine Window (h)",
@@ -536,12 +541,19 @@ HABIT_LABELS: dict[str, str] = {}
 # ===========================================================================
 
 def fetch_all(table: str, select: str = "*", filters: list | None = None,
-              chunk: int = 1000) -> pd.DataFrame:
-    """Paginate through a Supabase pds-schema table and return a DataFrame."""
+              chunk: int = 1000, order: str | None = None) -> pd.DataFrame:
+    """Paginate through a Supabase pds-schema table and return a DataFrame.
+
+    `order` sorts by that column before paging; pass it for any table that is re-upserted
+    and can pass 1000 rows, because unordered pages can skip or repeat rows when the
+    physical order shifts between page requests.
+    """
     rows: list[dict] = []
     offset = 0
     while True:
         q = supa.schema("pds").from_(table).select(select)
+        if order:
+            q = q.order(order)
         if filters:
             for f in filters:
                 col, op, val = f
@@ -925,6 +937,20 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     except Exception as e:  # noqa: BLE001
         log.warning(f"  phone_usage_daily load failed ({e!r}); continuing without screen-time features")
         data["screen"] = pd.DataFrame()
+
+    # Air quality (pds.air_quality_daily, 2026-11-11): daily PM2.5 / US AQI per ET clock day from
+    # the keyless Open-Meteo Air Quality API (air_quality_etl.py). Loaded fail-open: a brand-new
+    # source (the table may not exist yet) must never sink the retrain.
+    log.info("  Loading air_quality_daily (Open-Meteo PM2.5)…")
+    try:
+        data["air_quality"] = fetch_all(
+            "air_quality_daily",
+            select="calendar_date,pm25_mean,pm25_max,us_aqi_max,n_hours",
+            order="calendar_date",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  air_quality_daily load failed ({e!r}); continuing without air-quality features")
+        data["air_quality"] = pd.DataFrame()
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
     # topic_count) joined into the matrix per the audit's Finding #8. The textual
@@ -1429,7 +1455,7 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
 
 
 # Families whose newest day is not known when the evening forecast runs.
-NOT_FORECAST_PREFIXES = ("delivery_", "screen_")
+NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_")
 
 SCREEN_COLS = {
     # feature column                     <- pds.phone_usage_daily column
@@ -1490,6 +1516,59 @@ def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) ->
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Screen-time feature merge failed ({e!r}); continuing without screen-time features")
+        return df
+
+
+AQI_COLS = {
+    # feature column  <- pds.air_quality_daily column
+    "aqi_pm25": "pm25_mean",       # ug/m3, mean of the ET day's hourly values (the causal exposure)
+    "aqi_pm25_max": "pm25_max",    # ug/m3, highest hourly value
+    "aqi_us_max": "us_aqi_max",    # US AQI (all pollutants), highest hour
+}
+AQI_MIN_HOURS = 20   # a day counts only with >= 20 hourly values; today's row is partial until the day ends
+
+
+def merge_air_quality_features(df: pd.DataFrame, air: pd.DataFrame | None) -> pd.DataFrame:
+    """Outdoor air quality from pds.air_quality_daily (one row per ET clock day, air_quality_etl.py).
+
+      aqi_pm25      mean PM2.5 (ug/m3) of the day's hourly values
+      aqi_pm25_max  highest hourly PM2.5
+      aqi_us_max    highest hourly US AQI (all pollutants, so it also reflects ozone)
+
+    ROW PLACEMENT: the air breathed on ET clock day D sits on matrix row D, the row whose HRV
+    is the sleep that closes behavioral day D (hrv_alignment.py), so there is no re-keying
+    (unlike the wake-date-keyed sleep frames). Every hour of clock day D except possibly the
+    last one before midnight comes before that sleep starts. The first six hours belong to the
+    previous behavioral day's awake tail or sleep and are still pre-treatment for row D; the
+    cost is that a bedtime before midnight puts up to an hour of sleep-time air into the mean.
+
+    COMPLETENESS: days with fewer than AQI_MIN_HOURS hourly values (today, or an API gap) stay
+    NaN. Days the table does not cover are NaN too, never zero: air is never "zero" and nothing
+    is filled, so before the first backfilled day the features are simply absent.
+
+    Kept out of the forecasting models (NOT_FORECAST_PREFIXES): the evening the forecast runs,
+    today's row is partial, so the newest row would read NaN where training rows have values.
+    Descriptive (Spearman) and causal analyses only.
+
+    Fail-open: any problem logs a warning and returns df untouched.
+    """
+    if air is None or air.empty:
+        return df
+    try:
+        a = air.copy()
+        a["calendar_date"] = pd.to_datetime(a["calendar_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        a = a.dropna(subset=["calendar_date"]).drop_duplicates("calendar_date", keep="last")
+        enough = pd.to_numeric(a["n_hours"], errors="coerce") >= AQI_MIN_HOURS
+        a = a[enough.fillna(False)]
+        f = pd.DataFrame({feat: pd.to_numeric(a[src], errors="coerce") for feat, src in AQI_COLS.items()})
+        f["calendar_date"] = a["calendar_date"]
+        out = df.drop(columns=list(AQI_COLS), errors="ignore").merge(f, on="calendar_date", how="left")
+        assert len(out) == len(df), "air-quality merge changed the row count"
+        log.info(f"  Air-quality features: {int(out['aqi_pm25'].notna().sum())} complete days "
+                 f"({len(air) - len(a)} partial/undated day(s) left NaN)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Air-quality feature merge failed ({e!r}); continuing without air-quality features")
         return df
 
 
@@ -2060,6 +2139,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     df = merge_delivery_features(df, data.get("delivery"), data.get("delivery_covered_through"),
                                  data.get("delivery_unread_days"))
     df = merge_screen_time_features(df, data.get("screen"))
+    df = merge_air_quality_features(df, data.get("air_quality"))
 
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships
@@ -3218,9 +3298,10 @@ def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, l
     # night's HRV and sleep reach the model through hrv_lag* and the *_lag1 columns.
     exclude = {"calendar_date", "whoop_recovery_score"}
     exclude |= {c for c in model_df.columns if not al.forecast_can_use(c)}
-    # delivery_* / screen_*: today's receipts / Screen Time are not in yet when the forecast
-    # runs, so the newest row reads NaN where training rows have values (see
-    # merge_delivery_features / merge_screen_time_features). Descriptive and causal only.
+    # delivery_* / screen_* / aqi_*: today's receipts / Screen Time / air-quality hours are not
+    # all in yet when the forecast runs, so the newest row reads NaN where training rows have
+    # values (see merge_delivery_features / merge_screen_time_features / merge_air_quality_features).
+    # Descriptive and causal only.
     exclude |= {c for c in model_df.columns if c.startswith(NOT_FORECAST_PREFIXES)}
     feat_cols = [c for c in model_df.columns
                  if c not in exclude and pd.api.types.is_numeric_dtype(model_df[c])]
@@ -5104,7 +5185,7 @@ def main() -> str | None:
         full_ranked = stat_results["correlations"]["feature"].tolist()
     else:
         full_ranked = []
-    # delivery_* / screen_* and same-sleep columns are not forecast features (see prepare_ml_data);
+    # delivery_* / screen_* / aqi_* and same-sleep columns are not forecast features (see prepare_ml_data);
     # the Spearman fallback ranking still lists them, so keep them out of the SARIMAX /
     # Prophet candidates too.
     full_ranked = [f for f in full_ranked

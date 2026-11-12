@@ -475,6 +475,13 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     ("screen_last_hour_before_sleep_min", "behavior", "Phone use in the last hour before sleep above median", "min"),
     ("screen_social_min",                 "behavior", "Social-app minutes above median",         "min"),
     ("screen_pickups",                    "behavior", "Phone pickups above median",              None),
+    # Outdoor air quality (pds.air_quality_daily via air_quality_etl.py, 2026-11-11): mean PM2.5
+    # of the ET clock day that precedes the sleep (same row, hrv_alignment.py). Exogenous (weather,
+    # season, smoke), so the common lag-1 confounder set applies; family 'behavior' like
+    # eight_sleep_room_temp. Model-grid regional air, not a sensor at the apartment, so expect
+    # a small, noisy effect. History from the 2024-01-01 backfill, so it clears MIN_CONTINUOUS_N
+    # as soon as the first run lands.
+    ("aqi_pm25",                          "behavior", "Outdoor PM2.5 above median",              "µg/m³"),
     ("meal_eating_window_hours",      "nutrition", "Eating window above median",               "h"),
     ("meal_last_hour",                "nutrition", "Last meal clock hour above median",        "ET hr"),
     ("meal_first_hour",               "nutrition", "First meal clock hour above median",       "ET hr"),
