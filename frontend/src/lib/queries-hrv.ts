@@ -126,6 +126,43 @@ export async function getHrvAnalysisResults(resultType: string, resultKey?: stri
   return data?.[0] ?? null;
 }
 
+// Three requests for the dashboard's analysis panels rather than 17 concurrent
+// requests competing for browser connections and database capacity. Keep the
+// type-only selectors bounded: they deliberately choose the newest key of that type.
+export const HRV_ANALYSIS_PANELS: readonly (readonly [string, string?])[] = [
+  ["correlation", "spearman_top50"], ["journal_impact"],
+  ["feature_importance", "shap_mean_abs"], ["correlation", "spearman_journal"],
+  ["feature_importance", "shap_journal"], ["supplement_impact", "yes_no"],
+  ["supplement_impact", "dose_response"], ["nutrition_impact", "spearman"],
+  ["habit_impact"], ["correlation", "spearman_habit"],
+  ["feature_importance", "shap_habit"], ["causal", "binary_treatments"],
+  ["causal", "continuous_treatments"], ["causal", "dag"],
+  ["causal", "meta"], ["causal", "dropped_low_n"], ["model_diagnostics", "xgboost"],
+];
+
+export async function getHrvAnalysisBatch() {
+  // These are fixed internal identifiers, never user-supplied filter strings.
+  const exactPanels = HRV_ANALYSIS_PANELS.filter(([, key]) => key);
+  const filter = exactPanels.map(([type, key]) =>
+    `and(result_type.eq.${type},result_key.eq.${key})`).join(",");
+  // The existing unique (result_type, result_key) constraint bounds this to
+  // 15 rows. Type-only selectors retain their LIMIT 1 queries, so future keys
+  // cannot turn one rendered panel into an unbounded download of JSON blobs.
+  const [exact, journal, habits] = await Promise.all([
+    supabase.from("hrv_analysis_results")
+      .select("result_type,result_key,result_json,computed_at")
+      .or(filter)
+      .order("computed_at", { ascending: false })
+      .order("result_type").order("result_key"),
+    getHrvAnalysisResults("journal_impact"),
+    getHrvAnalysisResults("habit_impact"),
+  ]);
+  if (exact.error) throw exact.error;
+  const rows = [...(exact.data ?? []), ...[journal, habits].filter(Boolean)];
+  return (type: string, key?: string) => rows.find(row =>
+    row.result_type === type && (!key || row.result_key === key)) ?? null;
+}
+
 // hrv_analysis_results.result_json is a jsonb column, so supabase-js returns it
 // already-parsed — calling JSON.parse() on the object throws (silently, via the
 // bare catch blocks below) and the chart renders empty. Pre-2026-05-26 rows were
@@ -345,6 +382,8 @@ export async function loadHrvRangeDependent(days: number): Promise<HrvRangeDepen
  * passed nothing).
  */
 async function loadHrvStatic(): Promise<Omit<HrvDashboardData, keyof HrvRangeDependent>> {
+  const analysis = getHrvAnalysisBatch();
+  const panel = (type: string, key?: string) => analysis.then(select => select(type, key));
   const [
     tomorrow, m, corr, ji, fi, res, prophet, jCorr, jShap, sarimax,
     suppImp, suppDose, nutImp, hi, hCorr, hShap,
@@ -352,27 +391,27 @@ async function loadHrvStatic(): Promise<Omit<HrvDashboardData, keyof HrvRangeDep
   ] = await Promise.all([
     getTomorrowPrediction(),
     getHrvModelMetrics(),
-    getHrvAnalysisResults("correlation", "spearman_top50"),
-    getHrvAnalysisResults("journal_impact"),
-    getHrvAnalysisResults("feature_importance", "shap_mean_abs"),
+    panel("correlation", "spearman_top50"),
+    panel("journal_impact"),
+    panel("feature_importance", "shap_mean_abs"),
     getHrvResiduals(),
     getProphetForecast(),
-    getHrvAnalysisResults("correlation", "spearman_journal"),
-    getHrvAnalysisResults("feature_importance", "shap_journal"),
+    panel("correlation", "spearman_journal"),
+    panel("feature_importance", "shap_journal"),
     getSarimaxForecast(),
-    getHrvAnalysisResults("supplement_impact", "yes_no"),
-    getHrvAnalysisResults("supplement_impact", "dose_response"),
-    getHrvAnalysisResults("nutrition_impact", "spearman"),
-    getHrvAnalysisResults("habit_impact"),
-    getHrvAnalysisResults("correlation", "spearman_habit"),
-    getHrvAnalysisResults("feature_importance", "shap_habit"),
-    getHrvAnalysisResults("causal", "binary_treatments"),
-    getHrvAnalysisResults("causal", "continuous_treatments"),
-    getHrvAnalysisResults("causal", "dag"),
-    getHrvAnalysisResults("causal", "meta"),
-    getHrvAnalysisResults("causal", "dropped_low_n"),
+    panel("supplement_impact", "yes_no"),
+    panel("supplement_impact", "dose_response"),
+    panel("nutrition_impact", "spearman"),
+    panel("habit_impact"),
+    panel("correlation", "spearman_habit"),
+    panel("feature_importance", "shap_habit"),
+    panel("causal", "binary_treatments"),
+    panel("causal", "continuous_treatments"),
+    panel("causal", "dag"),
+    panel("causal", "meta"),
+    panel("causal", "dropped_low_n"),
     getEnvDoseResponseData(),
-    getHrvAnalysisResults("model_diagnostics", "xgboost"),
+    panel("model_diagnostics", "xgboost"),
   ]);
   return {
     tomorrowPred: tomorrow,
