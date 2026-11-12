@@ -123,6 +123,11 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             Form {
+#if ONYX_FOCUS
+                Section("Focus") {
+                    NavigationLink("Configure social media rules") { FocusSettingsView() }
+                }
+#endif
                 Section("Screen Time access") {
                     LabeledContent("Status", value: model.status)
                     if model.hasDataAccess {
