@@ -13,6 +13,7 @@ import KpiTile from "@/components/KpiTile";
 import MetricRing from "@/components/MetricRing";
 import SectionHeader from "@/components/SectionHeader";
 import { sameJson } from "@/lib/format";
+import { causalPlausibility, splitPlausible } from "@/lib/causal-plausibility";
 import {
   chartTooltip, axisTick, gridStyle, axisLabel, legendStyle,
   chartColors as C, directionalColor,
@@ -223,6 +224,27 @@ const SECTIONS = [
 // (loadHrvDashboard(rangeDays("30d"))), which produced `initial` for exactly
 // this window. A mismatch would silently render wrong-window data.
 const DEFAULT_RANGE: Range = "30d";
+
+// Causal rows that failed the plausibility check (lib/causal-plausibility.ts): not drawn,
+// listed under the chart with the reason so a missing treatment is never a mystery.
+function HiddenCausalNote({ hidden }: { hidden: { row: any; reasons: string[] }[] }) {
+  if (hidden.length === 0) return null;
+  return (
+    <div className="mt-3 border-t border-border-subtle/60 pt-2 text-[10px] leading-relaxed text-text-tertiary">
+      <p className="mb-1">
+        ⊘ {hidden.length} estimate{hidden.length === 1 ? "" : "s"} hidden: they failed the plausibility
+        check (estimator instability, not an effect).
+      </p>
+      <ul className="space-y-0.5">
+        {hidden.map(({ row, reasons }) => (
+          <li key={row.treatment}>
+            <span className="text-text-secondary">{row.label ?? row.treatment}</span>: {reasons.join("; ")}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | null }) {
   // Server-prefetched initial data (ISR, default 30d range) seeds the charts
@@ -1602,7 +1624,9 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
               <li>
                 <strong>AIPW (doubly-robust)</strong>: combines a logistic propensity model with two Ridge
                 outcome models (one per arm). Unbiased if <em>either</em> model is correct. 5-fold
-                cross-fit so the models aren&apos;t evaluated on their training data. CI from the
+                blocked cross-fit (contiguous stretches of days, a 7-day gap around each) so the
+                models aren&apos;t evaluated on their training data; days with no comparable days in
+                the other arm (propensity outside 0.05–0.95) are left out. CI from the
                 influence-function variance.
               </li>
             </ol>
@@ -1635,6 +1659,11 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                 (or grew) the naive estimate. Big shrinkage = naive view was dominated by confounding.
               </li>
               <li>⚠ flags any treatment with fewer than 20 days in either arm — small-sample CIs are unreliable.</li>
+              <li>
+                ⊘ marks an estimate that failed the plausibility check: larger than one SD of your
+                nightly HRV, or far from both the naive and the PSM estimate. These are estimator
+                instability, not effects; they are left out of the charts and listed with the reason.
+              </li>
             </ul>
           </div>
 
@@ -1753,10 +1782,12 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         title="Causal Effects · Binary Treatments"
         subtitle={`AIPW ATE on that night's HRV (ms) · 95% CI shown as error bars · top ${Math.min(causalBinary.length, 20)} by |effect|`}
         source="AIPW (DOUBLY ROBUST)"
-        info="Each bar is the doubly-robust AIPW estimate of the average treatment effect on the HRV of that night's sleep (the one you wake up from the next morning). Error bars are 95% CIs from the influence-function variance. ⚠ marks treatments with fewer than 20 days in either arm. ⊕ marks treatments where the autocorrelation-aware block-bootstrap CI is meaningfully wider than the IF CI (ratio >1.5×) — the BB CI is the more honest answer for those rows; check the tooltip. A pale-green or pale-red bar means IF said the effect is significant but the BB CI crosses zero (the temporal structure of the residuals doesn't support the IF call). Bars whose IF CI stays positive (saturated green) or negative (saturated red) are robust causal evidence under the stated confounder set. The naive estimate is in the comparison table below."
+        info="Each bar is the doubly-robust AIPW estimate of the average treatment effect on the HRV of that night's sleep (the one you wake up from the next morning). Error bars are 95% CIs from the influence-function variance. ⚠ marks treatments with fewer than 20 days in either arm. ⊕ marks treatments where the autocorrelation-aware block-bootstrap CI is meaningfully wider than the IF CI (ratio >1.5×) — the BB CI is the more honest answer for those rows; check the tooltip. A pale-green or pale-red bar means IF said the effect is significant but the BB CI crosses zero (the temporal structure of the residuals doesn't support the IF call). Bars whose IF CI stays positive (saturated green) or negative (saturated red) are robust causal evidence under the stated confounder set. Estimates that fail the plausibility check (larger than one SD of nightly HRV, or far from both the naive and the PSM estimate) are not drawn; they are listed under the chart with the reason. The naive estimate is in the comparison table below."
       >
         {causalBinary.length > 0 ? (() => {
-          const finiteRows = causalBinary.filter((d: any) => Number.isFinite(d.aipw_ate));
+          const { shown: finiteRows, hidden: hiddenRows } = splitPlausible(
+            causalBinary.filter((d: any) => Number.isFinite(d.aipw_ate)),
+          );
           const fdrFiltered = fdrOnly
             ? finiteRows.filter((d: any) => d.passes_fdr === true)
             : finiteRows;
@@ -1789,18 +1820,22 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
             });
           if (top.length === 0) {
             return (
-              <div className="h-[260px] flex items-center justify-center px-6">
-                <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
-                  No causal binary treatments survive BH-FDR at q&lt;0.05.{" "}
-                  <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
-                    Show all
-                  </button>{" "}
-                  to see the unfiltered ranking (non-FDR rows at 0.5 opacity).
-                </p>
-              </div>
+              <>
+                <div className="h-[260px] flex items-center justify-center px-6">
+                  <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+                    No causal binary treatments survive BH-FDR at q&lt;0.05.{" "}
+                    <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
+                      Show all
+                    </button>{" "}
+                    to see the unfiltered ranking (non-FDR rows at 0.5 opacity).
+                  </p>
+                </div>
+                <HiddenCausalNote hidden={hiddenRows} />
+              </>
             );
           }
           return (
+            <>
             <ResponsiveContainer width="100%" height={chartHeight(top.map((d: any) => d.displayLabel), chars.xlong, 420)}>
               <BarChart data={top} layout="vertical"
                         margin={{ left: 8, right: 32, top: 4, bottom: 24 }}>
@@ -1835,6 +1870,8 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
+            <HiddenCausalNote hidden={hiddenRows} />
+            </>
           );
         })() : (
           <div className="h-[260px] flex items-center justify-center px-6">
@@ -1876,11 +1913,65 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                 </tr>
               </thead>
               <tbody>
-                {[...causalBinary]
-                  .filter((d: any) => Number.isFinite(d.aipw_ate) && Number.isFinite(d.naive_ate))
-                  .sort((a: any, b: any) => Math.abs(b.attenuation_pct ?? 0) - Math.abs(a.attenuation_pct ?? 0))
-                  .slice(0, 15)
+                {(() => {
+                  // Implausible rows would top an attenuation ranking (a -130 ms AIPW vs a
+                  // +3 ms naive is "4400% attenuation"), so rank only plausible rows and
+                  // list the failed ones after them, greyed, with the reason.
+                  const finite = causalBinary.filter(
+                    (d: any) => Number.isFinite(d.aipw_ate) && Number.isFinite(d.naive_ate));
+                  const { shown, hidden } = splitPlausible(finite);
+                  const ranked = [...shown]
+                    .sort((a: any, b: any) => Math.abs(b.attenuation_pct ?? 0) - Math.abs(a.attenuation_pct ?? 0))
+                    .slice(0, 15);
+                  const failed = [...hidden]
+                    .map(h => h.row)
+                    .sort((a: any, b: any) => Math.abs(b.aipw_ate) - Math.abs(a.aipw_ate));
+                  return [
+                    ...ranked,
+                    ...(failed.length > 0 ? [{ __separator: true, count: failed.length }] : []),
+                    ...failed,
+                  ];
+                })()
                   .map((d: any) => {
+                    if (d.__separator) {
+                      return (
+                        <tr key="__implausible_separator" className="border-b border-border-subtle/40">
+                          <td colSpan={9} className="pt-4 pb-2 pl-3 text-[10px] uppercase tracking-wide text-text-tertiary">
+                            ⊘ {d.count} estimate{d.count === 1 ? "" : "s"} failed the plausibility check — not interpretable, hidden from the charts
+                          </td>
+                        </tr>
+                      );
+                    }
+                    const plaus = causalPlausibility(d);
+                    if (plaus.implausible) {
+                      return (
+                        <tr key={d.treatment} className="border-b border-border-subtle/40 opacity-50"
+                            title={plaus.reasons.join("; ")}>
+                          <td className="py-2 pl-3 pr-2 text-text-tertiary">
+                            <span className="mr-1">⊘</span>{d.label}
+                            <div className="text-[10px] leading-snug mt-0.5 font-sans">{plaus.reasons.join("; ")}</div>
+                          </td>
+                          <td className="py-2 px-2 text-text-tertiary">{d.family}</td>
+                          <td className="py-2 px-2 text-right tabular-nums text-text-tertiary">
+                            {d.naive_ate >= 0 ? "+" : ""}{Number(d.naive_ate).toFixed(1)}
+                          </td>
+                          <td className="py-2 px-2 text-right tabular-nums text-text-tertiary">
+                            {Number.isFinite(d.psm_ate)
+                              ? `${d.psm_ate >= 0 ? "+" : ""}${Number(d.psm_ate).toFixed(1)}`
+                              : "—"}
+                          </td>
+                          <td className="py-2 px-2 text-right tabular-nums text-text-tertiary line-through">
+                            {d.aipw_ate >= 0 ? "+" : ""}{Number(d.aipw_ate).toFixed(1)}
+                          </td>
+                          <td className="py-2 px-2 text-right tabular-nums text-text-tertiary">—</td>
+                          <td className="py-2 px-2 text-right tabular-nums text-text-tertiary">—</td>
+                          <td className="py-2 px-2 text-right tabular-nums text-text-tertiary">—</td>
+                          <td className="py-2 pl-2 pr-3 text-right tabular-nums text-text-tertiary">
+                            {d.n_treated} / {d.n_control}
+                          </td>
+                        </tr>
+                      );
+                    }
                     const sigColor = d.significant
                       ? (d.aipw_ate > 0 ? "text-emerald-400" : "text-red-400")
                       : "text-text-tertiary";
@@ -1958,7 +2049,9 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           info="Continuous treatments (calories, strain, training load, steps) are binarized at their personal median, giving an 'above your usual' contrast that's directly comparable to the binary treatments. Same AIPW machinery, same pre-treatment confounders. ⚠ marks small-arm treatments. ⊕ marks treatments where the autocorrelation-aware block-bootstrap CI is meaningfully wider than the IF CI (ratio >1.5×) — trust the BB CI for those; check the tooltip. Pale bars = IF said significant but BB CI crosses zero (treat as inconclusive). Note that median-split loses dose information — for full dose-response curves see the Supplement Dose-Response chart above."
         >
           {causalContinuous.length > 0 ? (() => {
-            const finiteRows = causalContinuous.filter((d: any) => Number.isFinite(d.aipw_ate));
+            const { shown: finiteRows, hidden: hiddenRows } = splitPlausible(
+              causalContinuous.filter((d: any) => Number.isFinite(d.aipw_ate)),
+            );
             const fdrFiltered = fdrOnly
               ? finiteRows.filter((d: any) => d.passes_fdr === true)
               : finiteRows;
@@ -1989,18 +2082,22 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
               });
             if (top.length === 0) {
               return (
-                <div className="h-[260px] flex items-center justify-center px-6">
-                  <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
-                    No continuous treatments survive BH-FDR at q&lt;0.05.{" "}
-                    <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
-                      Show all
-                    </button>{" "}
-                    to see the unfiltered ranking.
-                  </p>
-                </div>
+                <>
+                  <div className="h-[260px] flex items-center justify-center px-6">
+                    <p className="text-[11px] text-text-tertiary text-center leading-relaxed">
+                      No continuous treatments survive BH-FDR at q&lt;0.05.{" "}
+                      <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
+                        Show all
+                      </button>{" "}
+                      to see the unfiltered ranking.
+                    </p>
+                  </div>
+                  <HiddenCausalNote hidden={hiddenRows} />
+                </>
               );
             }
             return (
+              <>
               <ResponsiveContainer width="100%" height={chartHeight(top.map((d: any) => d.displayLabel), chars.long, 280)}>
                 <BarChart data={top} layout="vertical"
                           margin={{ left: 8, right: 28, top: 4, bottom: 24 }}>
@@ -2035,6 +2132,8 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
+              <HiddenCausalNote hidden={hiddenRows} />
+              </>
             );
           })() : (
             <div className="h-[260px] flex items-center justify-center px-6">
