@@ -548,3 +548,16 @@ test.describe("Today home", () => {
     await expectNoClientCrash(page);
   });
 });
+
+// /procurement (2026-11-11): planning workspace only. It holds no data of its own
+// and talks to no merchant, so the tripwire is: the page renders behind the login,
+// says it is disconnected, and the order button is still disabled. Read-only:
+// never types into a form, never adds a draft.
+test("/procurement renders as a disconnected planning page with ordering disabled", async ({ page }) => {
+  await gotoAuthed(page, "/procurement");
+  await expect(page.getByRole("heading", { name: "Procurement", exact: true })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(page.getByRole("heading", { name: "Disconnected preview", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Track subscriptions", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Place order (unavailable)", exact: true })).toBeDisabled();
+  await expectNoClientCrash(page);
+});
