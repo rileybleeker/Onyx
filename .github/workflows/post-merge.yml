@@ -1,0 +1,73 @@
+name: Post-merge verify
+# After every merge to master: wait for the Production deploy and master CI, run the production smoke test
+# (one retry for flakiness), and if any of it fails halt the merge train and open a revert PR.
+# `drill: true` injects a failure so the rollback path can be exercised on a harmless commit.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Merge commit to verify (default master head)
+        required: false
+      drill:
+        description: Inject a failure to exercise halt + revert
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  actions: write
+  checks: read
+  statuses: read
+  deployments: read
+concurrency:
+  group: post-merge-${{ github.event.inputs.sha || github.sha }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    outputs:
+      result: ${{ steps.v.outputs.result }}
+      sha: ${{ steps.v.outputs.sha }}
+      detail: ${{ steps.v.outputs.detail }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - id: v
+        run: python3 tools/merge_train.py post-merge --sha "$SHA" $DRILL
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.inputs.sha || github.sha }}
+          DRILL: ${{ github.event.inputs.drill == 'true' && '--drill' || '' }}
+  smoke:
+    needs: verify
+    if: needs.verify.outputs.result == 'ok'
+    uses: ./.github/workflows/smoke-test.yml
+    secrets: inherit
+  smoke-retry:
+    needs: [verify, smoke]
+    if: needs.smoke.result == 'failure'
+    uses: ./.github/workflows/smoke-test.yml
+    secrets: inherit
+  rollback:
+    needs: [verify, smoke, smoke-retry]
+    if: always() && (needs.verify.outputs.result == 'fail' || needs.smoke-retry.result == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Halt the train and open the revert
+        run: python3 tools/merge_train.py rollback --sha "$SHA" --reason "$REASON"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.inputs.sha || github.sha }}
+          REASON: ${{ needs.verify.outputs.result == 'fail' && needs.verify.outputs.detail || 'production smoke test failed twice' }}
