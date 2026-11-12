@@ -144,3 +144,92 @@ test("balances: the export's 'NAME ...1234' naming is matched exactly, and match
   assert.equal(store.accounts.size, before + 1);
   assert.equal(store.snaps.size, 2);
 });
+
+// --- re-importing an export after the web ingest has written rows under Rocket Money's own ids -----------------
+import { ingestWebTransactions, webAccountRefs } from "../lib/web-transactions.mjs";
+
+const gid = (type, n) => Buffer.from(`${type}:${n}`).toString("base64");
+const webNode = (id, over = {}) => ({
+  id: gid("Transaction", id),
+  shortName: "Web Name",
+  longName: "WEB NAME LONG",
+  amount: 300,
+  date: "2026-02-01",
+  note: null,
+  taxDeductible: false,
+  pending: false,
+  ignoredFrom: null,
+  category: { label: "Misc" },
+  account: { id: gid("Account", 1) },
+  ...over,
+});
+const webAccounts = {
+  data: { viewer: { masterAccounts: { edges: [{ node: { institution: { name: "Test Bank" }, accounts: { edges: [{ node: { id: gid("Account", 1), name: "Test Card", number: "1111", customType: "credit" } }] } } }] } } },
+};
+const ingest = (store, nodes) => ingestWebTransactions({ nodes, accountRefs: webAccountRefs(webAccounts), store, now: T0, gteDate: "2026-01-01" });
+const NEW_LINE = "2026-02-01,2026-02-01,Credit Card,Test Card ...1111,1111,Test Bank,NEW PLACE,,3.00,x,Misc,,,,";
+const csvWith = (...lines) => rowsFromCsv(syntheticCsv(lines)).rows;
+async function seeded() {
+  const store = memoryStore();
+  await importTransactions(rows(), { store, now: T0 }); // the history, from the export
+  return store;
+}
+
+test("CSV re-import after web ingestion: a row the ledger already holds under a web key is matched by count, not inserted again", async () => {
+  const store = await seeded();
+  await ingest(store, [webNode(1)]); // the web wrote the new purchase under its own key
+  const size = store.txns.size;
+  const out = await importTransactions(csvWith(NEW_LINE), { store, now: T1 });
+  assert.equal(out.inserted, 0);
+  assert.equal(out.matched_existing, 1);
+  assert.equal(out.skipped, 5);
+  assert.equal(store.txns.size, size, "no duplicate row");
+});
+
+test("CSV re-import inserts only the surplus of CSV rows over what the ledger holds for the same account, date and amount", async () => {
+  const store = await seeded();
+  await ingest(store, [webNode(1)]); // the ledger holds ONE of the two identical purchases
+  const size = store.txns.size;
+  const out = await importTransactions(csvWith(NEW_LINE, NEW_LINE), { store, now: T1 });
+  assert.equal(out.inserted, 1);
+  assert.equal(out.matched_existing, 1);
+  assert.equal(store.txns.size, size + 1);
+  // the surplus insert is stable: importing the same file again adds nothing
+  const again = await importTransactions(csvWith(NEW_LINE, NEW_LINE), { store, now: T1 });
+  assert.equal(again.inserted, 0);
+  assert.equal(again.matched_existing, 1); // the other row is the one the web already holds
+  assert.equal(store.txns.size, size + 1);
+});
+
+test("CSV re-import: with the web covering both rows of a group, even a third export row is the only insert", async () => {
+  const store = await seeded();
+  await ingest(store, [webNode(1), webNode(2)]);
+  const out = await importTransactions(csvWith(NEW_LINE, NEW_LINE, NEW_LINE), { store, now: T1 });
+  assert.equal(out.inserted, 1, "3 export rows vs 2 held: one surplus");
+  assert.equal(out.matched_existing, 2);
+});
+
+test("CSV re-import after the web tied ids onto export rows: same keys, nothing inserted, source_txn_id survives", async () => {
+  const store = await seeded();
+  await ingest(store, [
+    webNode(11, { amount: 450, date: "2026-01-05", shortName: "ACME COFFEE", category: { label: "Coffee" } }),
+    webNode(12, { amount: 450, date: "2026-01-05", shortName: "ACME COFFEE", category: { label: "Coffee" } }),
+  ]); // (b): both identical coffee rows of the export get an id
+  assert.deepEqual([...store.txns.values()].filter((t) => t.source_txn_id).map((t) => t.source_txn_id).sort(), ["11", "12"]);
+  const size = store.txns.size;
+  const out = await importTransactions(rows(), { store, now: T1 });
+  assert.equal(out.inserted, 0);
+  assert.equal(out.matched_existing, 0);
+  assert.equal(store.txns.size, size);
+  assert.deepEqual([...store.txns.values()].filter((t) => t.source_txn_id).map((t) => t.source_txn_id).sort(), ["11", "12"]);
+});
+
+test("CSV dry run reports the surplus count and writes nothing", async () => {
+  const store = await seeded();
+  await ingest(store, [webNode(1)]);
+  const writes = { ...store.writes };
+  const out = await importTransactions(csvWith(NEW_LINE, NEW_LINE), { store, dryRun: true, now: T1 });
+  assert.equal(out.inserted, 1);
+  assert.equal(out.matched_existing, 1);
+  assert.deepEqual(store.writes, writes);
+});

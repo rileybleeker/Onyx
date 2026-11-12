@@ -21,17 +21,18 @@ import {
 import { runHarvest } from "../lib/harvest-run.mjs";
 import { importBalances } from "../lib/importer.mjs";
 
-// --- fixtures shaped like the app's two responses (fake names and numbers) ---------------------------------
+// --- fixtures shaped like the app's responses (fake names and numbers) ----------------------------------------
+const gid = (type, n) => Buffer.from(`${type}:${n}`).toString("base64");
 const NETWORTH = {
   data: {
     viewer: {
       netWorth: {
-        cash: [{ id: "n1", name: "Test Checking", valueCents: 123456, type: "checking", accountNodeId: "a1", institution: { name: "Test Bank" } }],
-        savings: [{ id: "n2", name: "Test Savings", valueCents: 50000, accountNodeId: "a2", institution: { name: "Test Bank" } }],
-        investments: [{ id: "n3", name: "Test Brokerage", valueCents: 9000000, accountNodeId: "a3", institution: { name: "Test Invest" } }],
+        cash: [{ id: "n1", name: "Test Checking", valueCents: 123456, type: "checking", accountNodeId: gid("Account", 1), institution: { name: "Test Bank" } }],
+        savings: [{ id: "n2", name: "Test Savings", valueCents: 50000, accountNodeId: gid("Account", 2), institution: { name: "Test Bank" } }],
+        investments: [{ id: "n3", name: "Test Brokerage", valueCents: 9000000, accountNodeId: gid("Account", 3), institution: { name: "Test Invest" } }],
         other: [{ id: "n4", name: "Test Car", valueCents: 1500000, assetNodeId: "x1", accountNodeId: null, institution: null }],
         assetsWithLoan: [],
-        creditCardDebts: [{ id: "n5", name: "Test Card", balanceCents: 4200, accountNodeId: "a4", institution: { name: "Test Bank" } }],
+        creditCardDebts: [{ id: "n5", name: "Test Card", balanceCents: 4200, accountNodeId: gid("Account", 4), institution: { name: "Test Bank" } }],
         longTermDebts: [],
         assetBackedLoans: [],
         otherDebts: [],
@@ -49,12 +50,28 @@ function accountsResponse(list) {
   return { data: { viewer: { masterAccounts: { edges: [...byInst].map(([name, accounts]) => ({ node: { institution: { name }, accounts: { edges: accounts } } })) } } } };
 }
 const ACCOUNTS = accountsResponse([
-  acct("a1", "Test Checking", "1111", "checking", 123456, "Test Bank"),
-  acct("a2", "Test Savings", "2222", "saving", 50000, "Test Bank"),
-  acct("a3", "Test Brokerage", "3333", "investment", 9000000, "Test Invest"),
-  acct("a4", "Test Card", "", "credit", 4200, "Test Bank"),
+  acct(gid("Account", 1), "Test Checking", "1111", "checking", 123456, "Test Bank"),
+  acct(gid("Account", 2), "Test Savings", "2222", "saving", 50000, "Test Bank"),
+  acct(gid("Account", 3), "Test Brokerage", "3333", "investment", 9000000, "Test Invest"),
+  acct(gid("Account", 4), "Test Card", "", "credit", 4200, "Test Bank"),
 ]);
 const CAPTURED_AT = "2026-11-12T12:00:00.000Z";
+const txNode = (id, over = {}) => ({
+  id: gid("Transaction", id),
+  shortName: "Test Shop",
+  longName: "TEST SHOP #1",
+  amount: 1250,
+  date: "2026-11-10",
+  note: null,
+  taxDeductible: false,
+  pending: false,
+  ignoredFrom: null,
+  category: { label: "Shopping" },
+  account: { id: gid("Account", 4) },
+  ...over,
+});
+const TRANSACTIONS = { ok: true, rows: [txNode(1), txNode(2, { amount: 300, account: { id: gid("Account", 1) } }), txNode(3, { pending: true })] };
+const okCapture = (over = {}) => async () => ({ status: "ok", networth: NETWORTH, accounts: ACCOUNTS, transactions: TRANSACTIONS, ...over });
 
 test("classifyResponse recognizes the two responses and nothing else", () => {
   assert.equal(classifyResponse(NETWORTH), "networth");
@@ -82,8 +99,8 @@ test("buildBalanceEntries: type labels, kinds, masks and manual assets", () => {
 
 test("buildBalanceEntries: skips disabled accounts and falls back to net-worth cents when the list has none", () => {
   const accounts = accountsResponse([
-    acct("a1", "Test Checking", "1111", "checking", null, "Test Bank"),
-    acct("a2", "Test Savings", "2222", "saving", 50000, "Test Bank", { enabled: false }),
+    acct(gid("Account", 1), "Test Checking", "1111", "checking", null, "Test Bank"),
+    acct(gid("Account", 2), "Test Savings", "2222", "saving", 50000, "Test Bank", { enabled: false }),
   ]);
   const entries = buildBalanceEntries({ networth: NETWORTH, accounts, capturedAt: CAPTURED_AT });
   const checking = entries.find((e) => e.account_name === "Test Checking");
@@ -177,9 +194,9 @@ test("selectToPrune keeps the three newest, tmpFolderName is a legal Windows nam
 });
 
 // --- orchestration with mocks ---------------------------------------------------------------------------
-function rig({ capture, importer, state, failStore = false } = {}) {
+function rig({ capture, importer, state, failStore = false, failOn = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "rm-run-"));
-  const store = memoryStore({ failOn: failStore ? "logHeartbeat" : null });
+  const store = memoryStore({ failOn: failStore ? "logHeartbeat" : failOn });
   const logs = [];
   const recycled = [];
   const paths = { statePath: join(dir, "state.json"), lockPath: join(dir, "harvest.lock"), tmpRoot: join(dir, "tmp") };
@@ -188,7 +205,7 @@ function rig({ capture, importer, state, failStore = false } = {}) {
     runHarvest({
       ...paths,
       now: new Date("2026-11-12T12:00:00.000Z"),
-      capture: capture ?? (async () => ({ status: "ok", networth: NETWORTH, accounts: ACCOUNTS })),
+      capture: capture ?? okCapture(),
       runImporter: importer ?? (async () => ({ ok: true, rows: 5, accounts: 5, inserted: 5, skipped: 0, errors: 0, heartbeat: "ok" })),
       getStore: async () => store,
       recycle: async (p) => { recycled.push(p); return true; },
@@ -198,7 +215,7 @@ function rig({ capture, importer, state, failStore = false } = {}) {
   return { dir, store, logs, recycled, paths, run, done: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-test("run: success writes balances.json to a fresh scratch folder, recycles it, records the attempt, writes no extra heartbeat", async () => {
+test("run: success writes balances.json to a fresh scratch folder, recycles it, records the attempt; the only heartbeat written here is the transactions one", async () => {
   let seenFile = null;
   const r = rig({
     importer: async (file) => {
@@ -215,7 +232,12 @@ test("run: success writes balances.json to a fresh scratch folder, recycles it, 
     const state = JSON.parse(readFileSync(r.paths.statePath, "utf8"));
     assert.equal(state.lastAttemptAt, "2026-11-12T12:00:00.000Z");
     assert.ok(state.lastSuccessAt);
-    assert.equal(r.store.heartbeats.length, 0); // the importer wrote the success heartbeat itself
+    // the balances importer wrote its own heartbeat; the in-process transactions step wrote exactly one
+    assert.equal(r.store.heartbeats.length, 1);
+    assert.equal(r.store.heartbeats[0].data_type, "transactions");
+    assert.equal(r.store.heartbeats[0].status, "success");
+    assert.equal(r.store.heartbeats[0].records_synced, 2); // the pending row is skipped
+    assert.equal(r.logs.join("\n").includes("Test Shop"), false);
     assert.equal(existsSync(r.paths.lockPath), false);
     assert.equal(r.logs.join("\n").includes("Test Checking"), false);
   } finally {
@@ -227,7 +249,7 @@ test("run: refuses a second run within 20 hours unless forced", async () => {
   const r = rig({ state: { lastAttemptAt: "2026-11-12T03:00:00.000Z" } });
   try {
     let called = 0;
-    const capture = async () => { called++; return { status: "ok", networth: NETWORTH, accounts: ACCOUNTS }; };
+    const capture = async () => { called++; return { status: "ok", networth: NETWORTH, accounts: ACCOUNTS, transactions: TRANSACTIONS }; };
     assert.equal(await r.run({ capture }), 0);
     assert.equal(called, 0);
     assert.equal(r.store.heartbeats.length, 0);
@@ -242,12 +264,12 @@ test("run: not signed in -> failed 'login required' heartbeat, exit 2, and the n
   const r = rig({ capture: async () => ({ status: "login_required" }), state: { lastAttemptAt: "2026-11-10T00:00:00.000Z" } });
   try {
     assert.equal(await r.run(), 2);
-    assert.equal(r.store.heartbeats.length, 1);
-    const hb = r.store.heartbeats[0];
-    assert.equal(hb.source, "rocketmoney");
-    assert.equal(hb.data_type, "balances");
-    assert.equal(hb.status, "failed");
-    assert.match(hb.error_message, /^login required/);
+    assert.deepEqual(r.store.heartbeats.map((h) => h.data_type).sort(), ["balances", "transactions"]);
+    for (const hb of r.store.heartbeats) {
+      assert.equal(hb.source, "rocketmoney");
+      assert.equal(hb.status, "failed");
+      assert.match(hb.error_message, /^login required/);
+    }
     assert.equal(JSON.parse(readFileSync(r.paths.statePath, "utf8")).lastAttemptAt, "2026-11-10T00:00:00.000Z");
   } finally {
     r.done();
@@ -258,15 +280,14 @@ test("run: capture errors and empty/odd responses write a failed heartbeat with 
   for (const [capture, expected] of [
     [async () => { throw new Error('launch failed near "C:\\Users\\someone\\profile" 123456789'); }, /could not read the app/],
     [async () => ({ status: "failed", error: "the Net Worth data did not load within 30 s" }), /did not load/],
-    [async () => ({ status: "ok", networth: { data: { viewer: { netWorth: {} } } }, accounts: accountsResponse([]) }), /no accounts/],
+    [async () => ({ status: "ok", networth: { data: { viewer: { netWorth: {} } } }, accounts: accountsResponse([]), transactions: TRANSACTIONS }), /no accounts/],
   ]) {
     const r = rig({ capture });
     try {
       assert.equal(await r.run(), 1);
-      assert.equal(r.store.heartbeats.length, 1);
-      assert.equal(r.store.heartbeats[0].status, "failed");
-      assert.match(r.store.heartbeats[0].error_message, expected);
-      assert.equal(/someone|123456789/.test(r.store.heartbeats[0].error_message), false);
+      const failed = r.store.heartbeats.filter((h) => h.status === "failed" && expected.test(h.error_message));
+      assert.ok(failed.length >= 1);
+      for (const hb of r.store.heartbeats) assert.equal(/someone|123456789/.test(hb.error_message ?? ""), false);
     } finally {
       r.done();
     }
@@ -279,7 +300,7 @@ test("run: a failed import keeps the scratch folder (max 3 kept) and does not do
     mkdirSync(r.paths.tmpRoot, { recursive: true });
     for (const n of ["2026-11-01T00-00-00-000Z", "2026-11-02T00-00-00-000Z", "2026-11-03T00-00-00-000Z"]) mkdirSync(join(r.paths.tmpRoot, n));
     assert.equal(await r.run(), 1);
-    assert.equal(r.store.heartbeats.length, 0); // the importer already wrote its failed heartbeat
+    assert.deepEqual(r.store.heartbeats.map((h) => h.data_type), ["transactions"]); // the importer already wrote its failed balances heartbeat
     const left = readdirSync(r.paths.tmpRoot);
     assert.ok(left.includes("2026-11-12T12-00-00-000Z"));
     assert.equal(r.recycled.length, 1); // the oldest of four was pruned (mock recycle does not delete)
@@ -293,8 +314,9 @@ test("run: when the importer left no heartbeat the harvester writes the failed o
   const r = rig({ importer: async () => null });
   try {
     assert.equal(await r.run(), 1);
-    assert.equal(r.store.heartbeats.length, 1);
-    assert.equal(r.store.heartbeats[0].status, "failed");
+    const balances = r.store.heartbeats.filter((h) => h.data_type === "balances");
+    assert.equal(balances.length, 1);
+    assert.equal(balances[0].status, "failed");
   } finally {
     r.done();
   }
@@ -304,7 +326,7 @@ test("run: a failing heartbeat write cannot crash the run", async () => {
   const r = rig({ capture: async () => ({ status: "login_required" }), failStore: true });
   try {
     assert.equal(await r.run(), 2);
-    assert.ok(r.logs.some((l) => /could not write the failed heartbeat/.test(l)));
+    assert.ok(r.logs.some((l) => /could not write the (balances|transactions) heartbeat/.test(l)));
   } finally {
     r.done();
   }
@@ -319,6 +341,10 @@ test("run: dry run writes no heartbeat and no state, and still cleans up", async
     assert.equal(existsSync(r.paths.statePath), false);
     assert.equal(r.store.heartbeats.length, 0);
     assert.equal(r.recycled.length, 1);
+    // dry run reads the database for the transactions step but writes nothing
+    assert.deepEqual(r.store.writes, { accounts: 0, transactions: 0, snapshots: 0, heartbeats: 0 });
+    assert.equal(r.store.txns.size, 0);
+    assert.ok(r.logs.some((l) => /transactions \(dry run\) .*"inserted":2/.test(l)));
   } finally {
     r.done();
   }
@@ -327,10 +353,133 @@ test("run: dry run writes no heartbeat and no state, and still cleans up", async
 test("run: another live run holding the lock makes this one exit quietly", async () => {
   const r = rig();
   try {
-    const release = acquireLock(r.paths.lockPath, { now: new Date("2026-11-12T12:00:00.000Z").getTime() });
-    assert.equal(await r.run(), 0);
+    // the lock's age is judged against the file's real modification time, so use the real clock for both sides
+    const now = new Date();
+    const release = acquireLock(r.paths.lockPath, { now: now.getTime() });
+    let captured = 0;
+    assert.equal(await r.run({ now, capture: async () => { captured++; return { status: "login_required" }; } }), 0);
+    assert.equal(captured, 0, "a run that does not hold the lock must not touch the app");
     assert.equal(r.store.heartbeats.length, 0);
     release();
+  } finally {
+    r.done();
+  }
+});
+
+// --- the transactions step -------------------------------------------------------------------------------------
+test("run: the transactions window starts 60 days back (New York calendar) unless --days says otherwise", async () => {
+  const seen = [];
+  const capture = async (opts) => { seen.push(opts.gteDate); return { status: "ok", networth: NETWORTH, accounts: ACCOUNTS, transactions: TRANSACTIONS }; };
+  const r = rig({ capture });
+  try {
+    assert.equal(await r.run(), 0);
+    assert.equal(await r.run({ force: true, days: 400 }), 0);
+    assert.deepEqual(seen, ["2026-09-13", "2025-10-08"]);
+  } finally {
+    r.done();
+  }
+});
+
+test("run: running twice writes the transactions once (second run: all unchanged, no new rows)", async () => {
+  const r = rig();
+  try {
+    assert.equal(await r.run(), 0);
+    const keys = [...r.store.txns.keys()].sort();
+    assert.equal(keys.length, 2);
+    assert.equal(await r.run({ force: true, now: new Date("2026-11-13T12:00:00.000Z") }), 0);
+    assert.deepEqual([...r.store.txns.keys()].sort(), keys);
+    assert.deepEqual(r.store.heartbeats.map((h) => [h.data_type, h.status, h.records_synced]), [["transactions", "success", 2], ["transactions", "success", 0]]);
+  } finally {
+    r.done();
+  }
+});
+
+test("run: a failed transactions read fails only the transactions heartbeat; balances still import", async () => {
+  let imported = 0;
+  const r = rig({
+    capture: okCapture({ transactions: { ok: false, error: "the transactions request returned HTTP 500" } }),
+    importer: async () => { imported++; return { ok: true, rows: 5, accounts: 5, inserted: 5, skipped: 0, errors: 0, heartbeat: "ok" }; },
+  });
+  try {
+    assert.equal(await r.run(), 1);
+    assert.equal(imported, 1);
+    assert.deepEqual(r.store.heartbeats.map((h) => [h.data_type, h.status]), [["transactions", "failed"]]);
+    assert.match(r.store.heartbeats[0].error_message, /HTTP 500/);
+    assert.equal(r.store.txns.size, 0);
+  } finally {
+    r.done();
+  }
+});
+
+test("run: the session expiring during the transactions read is 'login required' (exit 2) and the next run is not held back", async () => {
+  const r = rig({ capture: okCapture({ transactions: { ok: false, error: "the transactions request was refused", login: true } }), state: { lastAttemptAt: "2026-11-10T00:00:00.000Z" } });
+  try {
+    assert.equal(await r.run(), 2);
+    assert.match(r.store.heartbeats[0].error_message, /^login required/);
+    assert.equal(JSON.parse(readFileSync(r.paths.statePath, "utf8")).lastAttemptAt, "2026-11-10T00:00:00.000Z");
+  } finally {
+    r.done();
+  }
+});
+
+test("run: a balances failure does not stop the transactions step", async () => {
+  const r = rig({ importer: async () => ({ ok: false, error: "write finance_balance_snapshots failed", heartbeat: "ok" }) });
+  try {
+    assert.equal(await r.run(), 1);
+    assert.equal(r.store.txns.size, 2);
+    assert.deepEqual(r.store.heartbeats.map((h) => [h.data_type, h.status]), [["transactions", "success"]]);
+  } finally {
+    r.done();
+  }
+});
+
+test("run: a database failure while writing transactions is a failed heartbeat with a masked reason", async () => {
+  const r = rig({ failOn: "upsertTransactions" });
+  try {
+    assert.equal(await r.run(), 1);
+    const hb = r.store.heartbeats.find((h) => h.data_type === "transactions");
+    assert.equal(hb.status, "failed");
+    assert.match(hb.error_message, /transaction import failed/);
+    assert.equal(hb.error_message.includes("SENSITIVE-VALUE"), false);
+  } finally {
+    r.done();
+  }
+});
+
+test("run: unreadable or ambiguous transactions make the heartbeat 'partial' with counts, not a failure", async () => {
+  const rows = [txNode(1), txNode(2, { date: "someday" }), txNode(3, { account: { id: gid("Account", 99) } })];
+  const r = rig({ capture: okCapture({ transactions: { ok: true, rows } }) });
+  try {
+    assert.equal(await r.run(), 0);
+    const hb = r.store.heartbeats[0];
+    assert.equal(hb.status, "partial");
+    assert.match(hb.error_message, /2 row\(s\) rejected/);
+    assert.equal(hb.records_synced, 1);
+    assert.equal(r.store.txns.size, 1);
+  } finally {
+    r.done();
+  }
+});
+
+test("run: a window with no readable transactions at all is a failure (the format may have changed)", async () => {
+  for (const rows of [[], [txNode(1, { date: "someday" })]]) {
+    const r = rig({ capture: okCapture({ transactions: { ok: true, rows } }) });
+    try {
+      assert.equal(await r.run(), 1);
+      const hb = r.store.heartbeats.find((h) => h.data_type === "transactions");
+      assert.equal(hb.status, "failed");
+      assert.match(hb.error_message, /no readable transactions/);
+    } finally {
+      r.done();
+    }
+  }
+});
+
+test("run: a capture that returns no transactions result at all is a failure, not a silent skip", async () => {
+  const r = rig({ capture: async () => ({ status: "ok", networth: NETWORTH, accounts: ACCOUNTS }) });
+  try {
+    assert.equal(await r.run(), 1);
+    assert.match(r.store.heartbeats.find((h) => h.data_type === "transactions").error_message, /were not read/);
   } finally {
     r.done();
   }
