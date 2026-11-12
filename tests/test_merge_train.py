@@ -125,5 +125,24 @@ class Plan(unittest.TestCase):
         self.assertEqual(mt.plan([self.d(1, "skip")])[0], "idle")
 
 
+class CiOutcome(unittest.TestCase):
+    def r(self, status, conclusion=None):
+        return dict(id=1, status=status, conclusion=conclusion)
+
+    def test_cancelled_by_newer_push_is_not_a_failure(self):
+        self.assertEqual(mt.ci_outcome([self.r("completed", "cancelled")]), "inconclusive")
+
+    def test_success_wins_over_earlier_cancel(self):
+        self.assertEqual(mt.ci_outcome([self.r("completed", "cancelled"), self.r("completed", "success")]), "ok")
+
+    def test_real_failure(self):
+        self.assertEqual(mt.ci_outcome([self.r("completed", "failure")]), "fail")
+        self.assertEqual(mt.ci_outcome([self.r("completed", "timed_out")]), "fail")
+
+    def test_running_or_absent_is_pending(self):
+        self.assertEqual(mt.ci_outcome([]), "pending")
+        self.assertEqual(mt.ci_outcome([self.r("in_progress")]), "pending")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -263,39 +263,67 @@ def run_train(dry: bool) -> int:
 
 
 # ---------- post-merge verification ----------
-def wait_production(sha: str, timeout: int = 900) -> tuple[bool, str]:
+REAL_FAILURES = {"failure", "timed_out", "startup_failure", "action_required"}
+
+
+def ci_outcome(runs: list[dict]) -> str:
+    """ok | fail | pending | inconclusive. A cancelled run was superseded by a newer push (the workflow cancels
+    in-progress runs per ref); that is not a failure of the release."""
+    if any(r["status"] == "completed" and r["conclusion"] == "success" for r in runs):
+        return "ok"
+    if not runs or any(r["status"] != "completed" for r in runs):
+        return "pending"
+    if any(r["conclusion"] in REAL_FAILURES for r in runs):
+        return "fail"
+    return "inconclusive"
+
+
+def wait_production(sha: str, timeout: int = 900) -> tuple[str, str]:
+    """-> (ok | fail | superseded, detail). Vercel retires older Production deployments when master moves on."""
     end = time.time() + timeout
     while time.time() < end:
+        if master_sha() != sha:
+            return "superseded", "master moved on"
         deps = api_items(f"repos/{REPO}/deployments?sha={sha}&environment=Production&per_page=5", ".[]|{id}")
         states = []
         for d in deps:
             st = api_items(f"repos/{REPO}/deployments/{d['id']}/statuses?per_page=1", ".[]|{state}")
             states.append(st[0]["state"] if st else "pending")
         if "success" in states:
-            return True, "Production deployment succeeded"
+            return "ok", "Production deployment succeeded"
         if states and all(s in ("failure", "error") for s in states):
-            return False, "Production deployment " + states[0]
+            return "fail", "Production deployment " + states[0]
         time.sleep(20)
-    return False, f"no successful Production deployment within {timeout // 60} min"
+    return "fail", f"no successful Production deployment within {timeout // 60} min"
 
 
-def wait_master_ci(sha: str, timeout: int = 600) -> tuple[bool, str]:
-    """Autonomous CI on the merge commit. A token-made merge may start no push run, so dispatch one if none exists."""
+def wait_master_ci(sha: str, timeout: int = 600) -> tuple[str, str]:
+    """-> (ok | fail | superseded, detail). A token-made merge may start no push run, so dispatch one if none
+    exists; a cancelled run on an unmoved master gets one fresh run before it counts against the release."""
     def runs():
         return api_items(f"repos/{REPO}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={sha}&per_page=10",
                          ".workflow_runs[]|{id,status,conclusion}")
     time.sleep(45)
+    redispatched = False
     if not runs():
         gh("workflow", "run", CI_WORKFLOW, "-R", REPO, "--ref", BASE)
+        redispatched = True
     end = time.time() + timeout
     while time.time() < end:
-        done = [r for r in runs() if r["status"] == "completed"]
-        if done and any(r["conclusion"] == "success" for r in done):
-            return True, "master CI green"
-        if done and all(r["conclusion"] in BAD for r in done) and len(done) == len(runs()):
-            return False, "master CI " + done[0]["conclusion"]
+        if master_sha() != sha:
+            return "superseded", "master moved on"
+        outcome = ci_outcome(runs())
+        if outcome == "ok":
+            return "ok", "master CI green"
+        if outcome == "fail":
+            return "fail", "master CI failed"
+        if outcome == "inconclusive":
+            if redispatched:
+                return "fail", "master CI cancelled twice with master unchanged"
+            gh("workflow", "run", CI_WORKFLOW, "-R", REPO, "--ref", BASE)
+            redispatched = True
         time.sleep(20)
-    return False, "master CI did not finish in %d min" % (timeout // 60)
+    return "fail", "master CI did not finish in %d min" % (timeout // 60)
 
 
 def post_merge(sha: str, drill: bool) -> int:
@@ -313,11 +341,14 @@ def post_merge(sha: str, drill: bool) -> int:
     if drill:
         emit("fail", "DRILL: failure injected to exercise rollback; nothing is actually broken")
         return 0
-    ok, why = wait_production(sha)
-    if ok:
-        ok, why2 = wait_master_ci(sha)
+    state, why = wait_production(sha)
+    if state == "ok":
+        state, why2 = wait_master_ci(sha)
         why = why + "; " + why2
-    emit("ok" if ok else "fail", why)
+    if state == "superseded":
+        emit("skipped", "master moved on while waiting; the newer merge's verification covers this one")
+    else:
+        emit("ok" if state == "ok" else "fail", why)
     return 0
 
 
