@@ -1,0 +1,69 @@
+name: Autonomous CI
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: autonomous-ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  offline-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Parse tracked Python without importing production modules
+        run: |
+          python - <<'PY'
+          import ast, subprocess
+          for path in subprocess.check_output(['git', 'ls-files', '*.py'], text=True).splitlines():
+              with open(path, encoding='utf-8-sig') as stream:
+                  ast.parse(stream.read(), filename=path)
+          PY
+      - name: HRV behavioral clock boundary tests
+        run: python tests/test_hrv_clock_boundaries.py
+      - name: Autonomous merge guard unit tests (no credentials or network)
+        run: python -m unittest discover -s tests -p test_autonomous_merge.py -v
+      - name: Merge train decision tests (no credentials or network)
+        run: python -m unittest discover -s tests -p test_merge_train.py -v
+  frontend-types:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Offline Node tests (auto-discovered - add a test file, not a workflow line; *-ui.mjs needs a browser and is excluded)
+        run: |
+          shopt -s nullglob
+          for f in tests/*.test.cjs; do node --test "$f"; done
+          for f in scripts/test-*.mjs; do case "$f" in *-ui.mjs) continue;; esac; node "$f"; done
+      - name: Status freshness regression tests (synthetic, no credentials)
+        run: node test-status-freshness.cjs
+      - run: npx --no-install tsc --noEmit
+      - name: Compile production bundles without prerendering or production credentials
+        run: npx --no-install next build --experimental-build-mode compile
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+      - name: Install isolated regression browser
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Run synthetic Today component regressions (no credentials or backend)
+        working-directory: .
+        run: node tests/today-regression.cjs
