@@ -14,7 +14,8 @@ This is a request-count improvement, NOT a measured percentage improvement in re
 - Frontend TypeScript check passed.
 - Next.js production compile mode passed. Compile-only mode does not prerender, test authenticated behavior, or report useful per-route transfer sizes. Shared first-load JS is 103 kB, middleware 82.5 kB; no bundle-size improvement claimed.
 - Targeted ESLint check passed without warnings or errors.
-- Independent Claude review identified an overfetch/pagination risk in the first implementation. That design was replaced with the bounded three-query design before publication.
+- Independent Claude review identified an overfetch/pagination risk in the first implementation. That design was replaced with the bounded three-query design before publication. A second review of the bounded design reported no correctness or boundedness bug; its one note (TypeScript narrowing of `[journal, habits].filter(Boolean)`) is covered by a clean `tsc --noEmit`, re-run after merging master on 2026-11-11.
+- Production database load goes down, not up: 17 concurrent reads of `hrv_analysis_results` become 3, each bounded (15 unique-key rows, plus two `LIMIT 1` reads). No new tables, indexes, polling, or migrations. All verification here ran offline against a synthetic test double; nothing touched production.
 - Full authenticated production smoke and measured cold/warm page loads remain required follow-up work. Existing smoke runs had failures before this patch; this change must not be represented as fixing all slow pages.
 
 ## Preserved behavior
