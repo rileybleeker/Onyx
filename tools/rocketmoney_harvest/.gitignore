@@ -1,0 +1,12 @@
+node_modules/
+package-lock.json
+state.json
+harvest.log
+harvest.lock
+probe.png
+# Downloaded exports and import scratch files hold real transactions: never commit them.
+*.csv
+rocketmoney-harvest-tmp/
+tmp/
+balances.json
+rows.json

@@ -1,0 +1,16 @@
+{
+  "name": "onyx-rocketmoney-harvester",
+  "private": true,
+  "type": "module",
+  "description": "Finance ledger importer and PC harvester: loads the Rocket Money transaction export and account balances into pds.finance_* (service-role only).",
+  "scripts": {
+    "harvest": "node harvest.mjs",
+    "login": "node harvest.mjs --login",
+    "dry-run": "node harvest.mjs --dry-run",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "playwright": "^1.50.0"
+  }
+}
