@@ -41,6 +41,10 @@ Left as they are (all describe something BEFORE row D's sleep):
   act_ / delivery_ / screen_ / nj_ and the workout gap: day D. (Timed events of day D fall between
   the previous sleep and row D's sleep in 99-100% of cases; supplements 89% -- the rest
   are retro-logs.)
+* aqi_ (outdoor PM2.5 / AQI, pds.air_quality_daily): the ET clock day's hourly mean on row D.
+  It is not re-keyed and not a mediator: every hour but possibly the last one before
+  midnight precedes the sleep that closes day D. It is kept out of the forecast only because
+  today's row is partial when the evening forecast runs (hrv_analysis.NOT_FORECAST_PREFIXES).
 * Garmin daily summary / stress / HR zones / training status: the clock day. Their activity
   fields are day D; their overnight fields (RHR, body-battery charge, sleeping seconds,
   readiness) describe the night that closes day D-1 -- earlier than row D's sleep.

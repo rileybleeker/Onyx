@@ -1,0 +1,49 @@
+name: Air Quality ETL
+
+on:
+  schedule:
+    # Every 3 hours at :12. The source is a daily mean of a regional model analysis,
+    # so hourly runs would add nothing but sync_log rows (they would also crowd the
+    # other sources out of /status's 100-row heartbeat window) and Actions minutes.
+    # Each run re-upserts the last 7 days, which heals hours the model revised.
+    # /status: >4h since the last heartbeat = degraded, >12h = error.
+    - cron: '12 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Re-sync the last N days (backfill). Leave empty for the routine 7-day window (an empty table backfills itself from 2024-01-01).'
+        required: false
+        type: string
+
+concurrency:
+  group: air-quality-etl
+  cancel-in-progress: false
+
+# The only credentials are the two SUPABASE_* secrets. Open-Meteo needs no key.
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  air-quality-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install httpx supabase python-dotenv
+
+      - name: Run Air Quality ETL
+        env:
+          # workflow_dispatch input, passed through the environment so it is never
+          # interpolated into the shell command (and validated as digits).
+          BACKFILL_DAYS: ${{ inputs.days }}
+        run: |
+          if [ -n "$BACKFILL_DAYS" ]; then
+            case "$BACKFILL_DAYS" in *[!0-9]*) echo "days must be a whole number" >&2; exit 2;; esac
+            python air_quality_etl.py --backfill "$BACKFILL_DAYS"
+          else
+            python air_quality_etl.py
+          fi
