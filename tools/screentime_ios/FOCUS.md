@@ -1,5 +1,7 @@
 # Native Focus development build
 
+Device test steps, what is proven and what is not built yet: `docs/focus-device-test.md`.
+
 Status: opt-in implementation, not an installed or verified blocker. The standard
 `project.yml` export app does not include Focus. Generate `project-focus.yml` to
 compile the app with its Device Activity monitor. Focus starts disabled and
