@@ -561,3 +561,43 @@ test("/procurement renders as a disconnected planning page with ordering disable
   await expect(page.getByRole("button", { name: "Place order (unavailable)", exact: true })).toBeDisabled();
   await expectNoClientCrash(page);
 });
+
+// /wins (2026-11-11, PR #19): the Wins board reads public GitHub PR data. It holds no
+// production data of its own and renders (with an "unverified" note) even when GitHub is
+// unreachable, so the tripwire is: behind the login, heading + board landmarks render and
+// the error boundary is absent. Never asserts on card counts or any PR title.
+test("/wins renders the Wins board", async ({ page }) => {
+  await gotoAuthed(page, "/wins");
+  await expect(page.getByRole("heading", { name: "Worth celebrating", exact: true })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(page.getByRole("region", { name: "Progress board", exact: true })).toBeVisible();
+  await expect(page.getByRole("group", { name: "Filter progress", exact: true })).toBeVisible();
+  await expectNoClientCrash(page);
+});
+
+// /health (2026-11-11, PR #30): local-only care/appointments planner. Items live in the
+// browser, sample data is opt-in, and the Google Calendar card is a read-only "not connected"
+// stub. Tripwire: the planner finishes loading, sample data is NOT on by default, and the
+// calendar connect button is still disabled. Read-only: never types, adds or toggles anything.
+test("/health renders the care planner with sample data off and calendar disconnected", async ({ page }) => {
+  await gotoAuthed(page, "/health");
+  await expect(page.getByRole("heading", { name: "Health & appointments", exact: true })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(page.getByRole("heading", { name: "Private planning, on this browser", exact: true })).toBeVisible();
+  await expect(page.getByText(/Loading local planner/)).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+  await expect(page.getByRole("heading", { name: "Add care item", exact: true })).toBeVisible();
+  await expect(page.getByLabel(/Show sample data/), "sample data must be opt-in").not.toBeChecked();
+  await expect(page.getByRole("button", { name: /^Connect Google Calendar$/ })).toBeDisabled();
+  await expectNoClientCrash(page);
+});
+
+// /financials (2026-11-11, PR #28): Rocket Money CSV import. Files are parsed in browser
+// memory only and nothing is stored, so a fresh load must show the empty "starts with your
+// export" state with the file picker available. Read-only: never chooses a file.
+test("/financials renders the CSV import page with nothing imported", async ({ page }) => {
+  await gotoAuthed(page, "/financials");
+  await expect(page.getByRole("heading", { name: "Financials", exact: true })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(page.getByRole("heading", { name: "Rocket Money · Manual CSV import", exact: true })).toBeVisible();
+  await expect(page.getByLabel(/Choose transaction CSV/)).toBeAttached();
+  await expect(page.getByRole("heading", { name: "Your overview starts with your export", exact: true })).toBeVisible();
+  await expect(page.locator("main").getByRole("alert"), "unexpected import error on a fresh load").toHaveCount(0);
+  await expectNoClientCrash(page);
+});
