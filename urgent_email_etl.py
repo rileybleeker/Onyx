@@ -50,6 +50,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any, Iterable, Optional
+from zoneinfo import ZoneInfo
 
 # Shared IMAP / HTML plumbing (one implementation for every email ETL).
 from flights_email_etl import (
@@ -81,6 +82,11 @@ _LABEL_TOKEN = re.compile(rb'"((?:[^"\\]|\\.)*)"|([^\s"]+)')
 # Preheader padding in marketing mail: combining grapheme joiner, zero-width
 # characters, soft hyphen, BOM.
 _INVISIBLE = re.compile("[͏​‌‍⁠­﻿]")
+
+
+def et_today() -> date:
+    """Riley's calendar day. A UTC date.today() on the runner is already tomorrow in the ET evening."""
+    return datetime.now(ZoneInfo("America/New_York")).date()
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +276,7 @@ def store_account(supa: Any, account: str, rows: list[dict], seen_at: str) -> No
 def run(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run: bool = False) -> tuple[str, int, Optional[str]]:
     """Returns (heartbeat status, records, error note)."""
     seen_at = datetime.now(timezone.utc).isoformat()
-    since = date.today() - timedelta(days=days)
+    since = et_today() - timedelta(days=days)
     failures: list[str] = []
     notes: list[str] = []
     total = 0
@@ -319,7 +325,7 @@ def main() -> int:
     status, total, error = run(supa, accounts, args.days)
     log.info(f"Done: {status}, {total} labeled message(s)")
     log_sync(supa, SOURCE, DATA_TYPE, status, records=total, started_at=started, error=error,
-             date_range_start=date.today() - timedelta(days=args.days), date_range_end=date.today())
+             date_range_start=et_today() - timedelta(days=args.days), date_range_end=et_today())
     return 0 if status != "failed" else 1
 
 

@@ -16,10 +16,11 @@ register(
 );
 
 const rules = await import("../src/lib/urgent-email.ts");
-const { getUrgentEmail, SCAN_LIMIT } = await import("../src/lib/urgent-email-query.ts");
+const { getUrgentEmail, getUrgentEmailStatusCard, SCAN_LIMIT, WINDOW_DAYS: WINDOW_DAYS_Q } = await import("../src/lib/urgent-email-query.ts");
 const {
   assessEmail, selectUrgent, daysUntilDeadline, domainMatches, gmailMessageHref, isGmailHref,
   MAX_URGENT_SHOWN, WINDOW_DAYS, URGENT_THRESHOLD, PRIORITY_SENDER_DOMAINS,
+  parseGmailLink, isEmailCard, mergeUrgent, ageLabel, parseWorkerTime,
 } = rules;
 
 // Wednesday 2026-11-11, 10:00 Eastern.
@@ -257,80 +258,245 @@ await test("gmailMessageHref refuses unusable ids and cannot be steered off Gmai
   assert.equal(isGmailHref("javascript:alert(1)"), false);
 });
 
-// ---- Query (fake client, no database) ------------------------------------------------
-function fakeClient(result) {
-  const calls = {};
-  const chain = {
-    from(t) { calls.table = t; return chain; },
-    select(c) { calls.columns = c; return chain; },
-    gte(col, v) { calls.gte = [col, v]; return chain; },
-    order(col, o) { calls.order = [col, o]; return chain; },
-    limit(n) { calls.limit = n; return Promise.resolve(result); },
+// ---- Query: inbox-triage labels from pds.inbox_emails (fake client, no database) ------
+// The fake records every filter so the tests can check what is read, and answers the
+// inbox_emails and sync_log reads separately.
+function fakeClient({ rows = [], error = null, beat = null, beatError = null } = {}) {
+  const calls = [];
+  const from = (table) => {
+    const call = { table, filters: [], orders: [] };
+    calls.push(call);
+    const chain = {
+      select(c) { call.columns = c; return chain; },
+      eq(col, v) { call.filters.push(["eq", col, v]); return chain; },
+      gte(col, v) { call.filters.push(["gte", col, v]); return chain; },
+      order(col, o) { call.orders.push([col, o]); return chain; },
+      limit(n) {
+        call.limit = n;
+        return Promise.resolve(table === "sync_log"
+          ? { data: beat ? [beat] : [], error: beatError }
+          : { data: error ? null : rows, error });
+      },
+    };
+    return chain;
   };
-  return { client: chain, calls };
+  return { client: { from }, calls };
 }
+const ACCT = "owner@example.com";
 const row = (over = {}) => ({
-  email_id: 1, account: "me@example.com", message_id: "m1@mail.example.com", received_at: hoursAgo(3),
-  from_name: "Example Billing", from_address: "billing@example.com", subject: "Payment failed",
-  snippet: null, is_unread: true, ...over,
+  account: ACCT, message_id: `m${++seq}@mail.example.com`, received_at: hoursAgo(3),
+  from_name: "Example Sender", from_address: "sender@example.com", subject: "Please reply",
+  snippet: null, is_unread: true, gmail_thread_id: `10000000000000${String(seq).padStart(5, "0")}`,
+  agent_labels: ["Agent/Action"], in_inbox: true, last_seen_at: hoursAgo(1), ...over,
 });
+const BEAT = { sync_start: hoursAgo(0.5), status: "success", error_message: null };
 
-await test("a missing table means 'not connected', for either error code", async () => {
-  for (const code of ["PGRST205", "42P01"]) {
-    const { client } = fakeClient({ data: null, error: { code, message: "relation does not exist" } });
+await test("a missing table or column means 'not connected', not an error", async () => {
+  for (const code of ["PGRST205", "42P01", "42703"]) {
+    const { client } = fakeClient({ error: { code, message: "relation does not exist" } });
     assert.deepEqual(await getUrgentEmail(client, NOW), { status: "not_connected" });
   }
 });
 
-await test("any other database error is an error, not an empty inbox", async () => {
-  const { client } = fakeClient({ data: null, error: { code: "XX000", message: "boom with details" } });
+await test("any other database error is an error, without the detail", async () => {
+  const { client } = fakeClient({ error: { code: "XX000", message: "boom with details" } });
   await assert.rejects(() => getUrgentEmail(client, NOW), (e) => e.message.includes("XX000") && !e.message.includes("details"));
 });
 
-await test("the query is windowed, newest first, and hard-limited", async () => {
-  const { client, calls } = fakeClient({ data: [], error: null });
+await test("reads only labelled rows in the window, bounded, deterministic order, no body columns", async () => {
+  const { client, calls } = fakeClient({ beat: BEAT });
   await getUrgentEmail(client, NOW);
-  assert.equal(calls.table, "inbox_emails");
-  assert.equal(calls.limit, SCAN_LIMIT);
-  assert.deepEqual(calls.order, ["received_at", { ascending: false }]);
-  assert.deepEqual(calls.gte, ["received_at", new Date(NOW.getTime() - WINDOW_DAYS * 86_400_000).toISOString()]);
-  assert.ok(!/body|html|attachment/.test(calls.columns), "no body columns are ever selected");
+  const q = calls.find((c) => c.table === "inbox_emails");
+  assert.deepEqual(q.filters.find((f) => f[0] === "eq"), ["eq", "labeled", true]);
+  assert.deepEqual(q.filters.find((f) => f[0] === "gte"), ["gte", "received_at", new Date(NOW.getTime() - WINDOW_DAYS_Q * 86_400_000).toISOString()]);
+  assert.equal(q.limit, SCAN_LIMIT);
+  assert.deepEqual(q.orders.map((o) => o[0]), ["received_at", "message_id"], "a secondary sort keeps ties stable");
+  assert.ok(!/body|html|attachment/.test(q.columns));
+  const s = calls.find((c) => c.table === "sync_log");
+  assert.deepEqual(s.filters, [["eq", "source", "urgent_email"], ["eq", "data_type", "labels"]]);
 });
 
-await test("an empty table answers ready with nothing to show", async () => {
-  const { client } = fakeClient({ data: [], error: null });
-  assert.deepEqual(await getUrgentEmail(client, NOW), {
-    status: "ready", windowDays: WINDOW_DAYS, scanned: 0, total: 0, newestReceivedAt: null, items: [],
-  });
-});
-
-await test("urgent rows come back bounded, linked and without the snippet", async () => {
-  const rows = [
-    row({ email_id: 1, subject: "Payment failed", snippet: "private body text" }),
-    row({ email_id: 2, subject: "Lunch?", from_address: "friend@example.com", from_name: null, received_at: hoursAgo(1) }),
-    row({ email_id: 3, subject: "Weekly digest sale", from_address: "newsletter@example.com" }),
-    row({ email_id: 4, subject: "Final notice: " + "x".repeat(400), message_id: null }),
-  ];
-  const { client } = fakeClient({ data: rows, error: null });
+await test("an empty table answers ready with nothing to show and the last sync", async () => {
+  const { client } = fakeClient({ beat: BEAT });
   const out = await getUrgentEmail(client, NOW);
   assert.equal(out.status, "ready");
-  assert.equal(out.scanned, 4);
-  assert.equal(out.total, 2);
-  assert.equal(out.newestReceivedAt, rows[0].received_at);
-  const first = out.items.find((i) => i.id === "1");
-  assert.equal(first.from, "Example Billing");
-  assert.ok(first.href.startsWith("https://mail.google.com/mail/?authuser=me%40example.com#search/rfc822msgid%3A"));
-  assert.ok(!JSON.stringify(out).includes("private body text"), "snippet must not leave the server");
-  const noLink = out.items.find((i) => i.id === "4");
-  assert.equal(noLink.href, null);
-  assert.ok(noLink.subject.length <= 140);
+  assert.deepEqual([out.scanned, out.total, out.hidden, out.items.length], [0, 0, 0, 0]);
+  assert.deepEqual(out.lastSync, { at: BEAT.sync_start, status: "success", error: null });
+  const never = await getUrgentEmail(fakeClient().client, NOW);
+  assert.equal(never.lastSync, null, "before the first run there is no sync line");
+});
+
+await test("one item per thread even when both labels sit on different messages of it", async () => {
+  const thread = "1000000000000000777";
+  const rows = [
+    row({ gmail_thread_id: thread, agent_labels: ["Agent/Action"], received_at: hoursAgo(30), subject: "Lease question" }),
+    row({ gmail_thread_id: thread, agent_labels: ["Agent/Deadline"], received_at: hoursAgo(2), subject: "Re: Lease question, reply by Nov 12" }),
+  ];
+  const out = await getUrgentEmail(fakeClient({ rows, beat: BEAT }).client, NOW);
+  assert.equal(out.scanned, 1);
+  assert.equal(out.items.length, 1);
+  assert.deepEqual(out.items[0].labels, ["Agent/Action", "Agent/Deadline"]);
+  assert.equal(out.items[0].subject, "Re: Lease question, reply by Nov 12", "newest message names the thread");
+  assert.equal(out.items[0].deadline.daysLeft, 1);
+  assert.equal(out.items[0].href, `https://mail.google.com/mail/?authuser=owner%40example.com#all/thread-f:${thread}`);
+});
+
+await test("stale items stay off Today: passed deadlines, archived threads, old Action, old undated Deadline", async () => {
+  const rows = [
+    row({ agent_labels: ["Agent/Deadline"], subject: "Ballot closes Nov 9", received_at: hoursAgo(24 * 5) }),     // passed
+    row({ agent_labels: ["Agent/Action"], in_inbox: false }),                                                      // archived
+    row({ agent_labels: ["Agent/Action"], received_at: hoursAgo(24 * 20) }),                                       // too old
+    row({ agent_labels: ["Agent/Deadline"], subject: "Appointment details", received_at: hoursAgo(24 * 6) }),     // undated, old
+    row({ agent_labels: ["Agent/Deadline"], subject: "Renewal due Nov 30", received_at: hoursAgo(5) }),            // > 7 days out
+    row({ agent_labels: ["Agent/Deadline"], subject: "Form", snippet: "The window closes in 48 hours.", received_at: hoursAgo(4) }),
+  ];
+  const out = await getUrgentEmail(fakeClient({ rows, beat: BEAT }).client, NOW);
+  assert.equal(out.scanned, 6);
+  assert.equal(out.total, 1);
+  assert.equal(out.hidden, 5);
+  assert.equal(out.items[0].subject, "Form");
+  assert.equal(out.items[0].deadline.daysLeft, 2);
+  assert.ok(out.items[0].reasons[0].startsWith("Deadline in 2 days"));
+  assert.ok(!JSON.stringify(out).includes("closes in 48 hours"), "the snippet never leaves the server");
+});
+
+await test("deadlines first (soonest first), then Action, each with a next step", async () => {
+  const rows = [
+    row({ agent_labels: ["Agent/Action"], subject: "Question from a friend", received_at: hoursAgo(1) }),
+    row({ agent_labels: ["Agent/Deadline"], subject: "Bill due Nov 14", received_at: hoursAgo(10) }),
+    row({ agent_labels: ["Agent/Deadline"], subject: "RSVP by tomorrow", received_at: hoursAgo(8) }),
+  ];
+  const out = await getUrgentEmail(fakeClient({ rows, beat: BEAT }).client, NOW);
+  assert.deepEqual(out.items.map((i) => i.subject), ["RSVP by tomorrow", "Bill due Nov 14", "Question from a friend"]);
+  assert.ok(out.items[0].nextStep.includes("Thu, Nov 12"));
+  assert.ok(out.items[2].nextStep.startsWith("Reply or decide"));
+  assert.ok(out.items.every((i) => i.reasons.length > 0));
 });
 
 await test("malformed rows are skipped, not fatal", async () => {
-  const { client } = fakeClient({ data: [null, { email_id: 9 }, row({ email_id: 10, received_at: undefined }), row({ email_id: 11 })], error: null });
-  const out = await getUrgentEmail(client, NOW);
+  const rows = [null, { message_id: "x" }, row({ received_at: "not a date" }), row({ from_address: null }), row({ subject: "Kept" })];
+  const out = await getUrgentEmail(fakeClient({ rows, beat: BEAT }).client, NOW);
   assert.equal(out.scanned, 1);
-  assert.equal(out.items[0].id, "11");
+  assert.equal(out.items[0].subject, "Kept");
+});
+
+await test("a failed heartbeat read only drops the sync line", async () => {
+  const out = await getUrgentEmail(fakeClient({ rows: [row()], beatError: { code: "XX000" } }).client, NOW);
+  assert.equal(out.lastSync, null);
+  assert.equal(out.items.length, 1);
+});
+
+// ---- /status card ---------------------------------------------------------------------
+await test("status card: unknown before the first run, then heartbeat age and run status", async () => {
+  const card = async (beat, beatError = null) => (await getUrgentEmailStatusCard(fakeClient({ beat, beatError }).client, NOW)).status;
+  assert.equal(await card(null), "unknown");
+  assert.equal(await card({ sync_start: hoursAgo(1), status: "success" }), "success");
+  assert.equal(await card({ sync_start: hoursAgo(3.5), status: "success" }), "partial");
+  assert.equal(await card({ sync_start: hoursAgo(9), status: "success" }), "failed");
+  assert.equal(await card({ sync_start: hoursAgo(1), status: "partial" }), "partial");
+  assert.equal(await card({ sync_start: hoursAgo(1), status: "failed" }), "failed");
+  assert.equal(await card(null, { code: "XX000", message: "down" }), "failed");
+  const full = await getUrgentEmailStatusCard(fakeClient({ beat: { sync_start: hoursAgo(1), status: "partial", records_synced: 4, error_message: "label Agent/Action missing" } }).client, NOW);
+  assert.deepEqual([full.label, full.recordsSynced, full.errorMessage], ["Urgent Email", 4, "label Agent/Action missing"]);
+});
+
+// ---- Today merge: labels + Agent Inbox, each thing once ------------------------------
+const emailItem = (over = {}) => ({
+  key: `thread:${ACCT}:${++seq}`, threadId: `20000000000000${String(seq).padStart(5, "0")}`, messageId: `e${seq}@mail.example.com`,
+  account: ACCT, from: "Sender", subject: `Email ${seq}`, receivedAt: hoursAgo(5), labels: ["Agent/Action"],
+  deadline: null, reasons: ["inbox-triage marked it Agent/Action (needs a reply or decision)"],
+  nextStep: "Reply or decide in Gmail", href: `https://mail.google.com/mail/?authuser=owner%40example.com#all/thread-f:20000000000000${String(seq).padStart(5, "0")}`, ...over,
+});
+const card = (over = {}, cardOver = {}) => ({
+  kind: "card", thread: "inbox-triage", messageId: ++seq, created_at: "2026-11-11 13:00:00",
+  card: { code: `C${seq}`, agent: "inbox-triage", type: "question", name: "Urgent: check a sign-in", details: "", link: "", expires: null, updated: false, ...cardOver },
+  ...over,
+});
+
+await test("parseGmailLink reads account + thread from both Gmail link forms and rejects others", () => {
+  assert.deepEqual(parseGmailLink("https://mail.google.com/mail/?authuser=Owner@Example.com#all/thread-f:1234567890123456789"),
+    { account: "owner@example.com", threadId: "1234567890123456789" });
+  assert.deepEqual(parseGmailLink("https://mail.google.com/mail/?authuser=owner@example.com#all/thread-f:42|msg-f:43"),
+    { account: "owner@example.com", threadId: "42" });
+  // hex API/web id = the same 64-bit number as thread-f (synthetic 0x18c2a4b1d3e5f607)
+  assert.equal(parseGmailLink("https://mail.google.com/mail/u/0/#inbox/18c2a4b1d3e5f607").threadId, "1784169486063367687");
+  assert.deepEqual(parseGmailLink("https://mail.google.com/mail/?authuser=owner@example.com#search/password+reset"),
+    { account: "owner@example.com", threadId: null });
+  assert.equal(parseGmailLink("https://evil.example/mail/#all/thread-f:1"), null);
+  assert.equal(parseGmailLink("https://mail.google.com.evil.example/mail/#all/thread-f:1"), null);
+  assert.equal(parseGmailLink(""), null);
+  assert.equal(parseGmailLink(null), null);
+});
+
+await test("isEmailCard: inbox-triage 'Urgent:' questions or a Gmail link; other cards stay in Needs your input", () => {
+  assert.equal(isEmailCard(card().card), true);
+  assert.equal(isEmailCard(card({}, { name: "Unsubscribe list", link: "https://app.notion.example/p/1" }).card), false);
+  assert.equal(isEmailCard(card({}, { agent: "coordinator", name: "Urgent: Onyx down" }).card), false);
+  assert.equal(isEmailCard(card({}, { agent: "coordinator", name: "Pay the bill", link: "https://mail.google.com/mail/?authuser=owner@example.com#all/thread-f:9" }).card), true);
+  assert.equal(isEmailCard({ code: "x", agent: "Planning assistant", name: "Review a plan" }), false, "fixture cards without a link");
+});
+
+await test("a card linking a labelled thread merges into that email: one item, both sources, both links", () => {
+  const e = emailItem({ deadline: { daysLeft: 1, label: "Thu, Nov 12" }, labels: ["Agent/Deadline"], nextStep: "Handle it in Gmail by Thu, Nov 12" });
+  const c = card({}, { name: "Urgent: ballot closes tomorrow", link: `https://mail.google.com/mail/?authuser=${ACCT}#all/thread-f:${e.threadId}` });
+  const out = mergeUrgent([e], [c]);
+  assert.equal(out.total, 1);
+  const [item] = out.items;
+  assert.deepEqual(item.sources, ["Gmail", "Agent Inbox"]);
+  assert.ok(item.reasons[0].includes("ballot closes tomorrow"));
+  assert.ok(item.nextStep.startsWith("Answer the request, then handle it"));
+  assert.equal(item.gmailHref, e.href);
+  assert.equal(item.requestHref, `/agents?t=inbox-triage#m${c.messageId}`);
+  assert.equal(item.atVerb, "Received");
+});
+
+await test("same thread id in another mailbox does not merge; same Message-ID in both mailboxes does", () => {
+  const e = emailItem();
+  const other = card({}, { link: `https://mail.google.com/mail/?authuser=second@example.com#all/thread-f:${e.threadId}` });
+  assert.equal(mergeUrgent([e], [other]).total, 2);
+  const twin = emailItem({ account: "second@example.com", messageId: e.messageId.toUpperCase() });
+  const out = mergeUrgent([e, twin], []);
+  assert.equal(out.total, 1);
+  assert.ok(out.items[0].reasons.includes("Also in second@"));
+});
+
+await test("unmatched email cards stand alone with source, freshness, reason and next step; duplicates by code once", () => {
+  const c = card({ created_at: "2026-11-11 13:00:00" }, { name: "Urgent: password was reset (second@)", link: "https://mail.google.com/mail/?authuser=second@example.com#search/password+reset" });
+  const out = mergeUrgent([], [c, { ...c, messageId: c.messageId + 1 }, card({}, { name: "Not email", agent: "nyc-scout" })]);
+  assert.equal(out.total, 1);
+  const [item] = out.items;
+  assert.equal(item.title, "password was reset (second@)");
+  assert.equal(item.sourceDetail, "Agent Inbox: inbox-triage, second@");
+  assert.equal(item.at, "2026-11-11T13:00:00.000Z", "worker UTC time parsed as UTC");
+  assert.equal(item.atVerb, "Posted");
+  assert.ok(item.reasons[0].includes("flagged it as urgent"));
+  assert.ok(item.nextStep.startsWith("Answer the request"));
+  assert.ok(item.gmailHref.startsWith("https://mail.google.com/mail/"));
+});
+
+await test("order: deadline today/tomorrow, then agent questions, then later deadlines, then Action; bounded", () => {
+  const action = emailItem({ receivedAt: hoursAgo(1) });
+  const later = emailItem({ labels: ["Agent/Deadline"], deadline: { daysLeft: 4, label: "Sun, Nov 15" } });
+  const soon = emailItem({ labels: ["Agent/Deadline"], deadline: { daysLeft: 0, label: "Wed, Nov 11" }, receivedAt: hoursAgo(40) });
+  const c = card();
+  const out = mergeUrgent([action, later, soon], [c], 3);
+  assert.equal(out.total, 4);
+  assert.deepEqual(out.items.map((i) => i.key), [`email:${soon.key}`, `card:${c.card.code.toUpperCase()}`, `email:${later.key}`]);
+  assert.equal(mergeUrgent([action], [], 0).items.length, 0);
+});
+
+await test("an off-Gmail href from the API is never passed through as a link", () => {
+  const out = mergeUrgent([emailItem({ href: "javascript:alert(1)" })], []);
+  assert.equal(out.items[0].gmailHref, null);
+});
+
+await test("ageLabel is relative and honest about bad input", () => {
+  assert.equal(ageLabel(hoursAgo(0.01), NOW), "just now");
+  assert.equal(ageLabel(hoursAgo(0.5), NOW), "30 min ago");
+  assert.equal(ageLabel(hoursAgo(5), NOW), "5 h ago");
+  assert.equal(ageLabel(hoursAgo(72), NOW), "3 d ago");
+  assert.equal(ageLabel("nope", NOW), "at an unknown time");
+  assert.equal(parseWorkerTime("2026-11-11 13:00:00"), "2026-11-11T13:00:00.000Z");
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

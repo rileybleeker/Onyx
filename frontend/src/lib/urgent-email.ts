@@ -1,10 +1,15 @@
 // Urgent-email rules for the Today page.
 //
-// Deterministic and offline: keyword, sender and deadline rules over email METADATA
-// (sender, subject, a short plain-text snippet, received time, unread flag). No model
-// calls, no network, no imports, so it runs unchanged in the browser, in the API route
-// and in frontend/scripts/test-urgent-email.mjs (Node strips the type annotations).
-// Keep this file to erasable TypeScript (no enums, no parameter properties) for that reason.
+// What is urgent is decided by inbox-triage (personal-agents): its Gmail labels
+// Agent/Action and Agent/Deadline, and its "Urgent: ..." Agent Inbox questions. This file
+// adds what Today needs on top: the deadline a subject/snippet names (daysUntilDeadline),
+// a few plain-words reasons (assessEmail's keyword rules), Gmail links, and the merge of
+// the two sources into one deduplicated list (mergeUrgent).
+//
+// Deterministic and offline: no model calls, no network, no imports, so it runs unchanged
+// in the browser, in the API route, in frontend/scripts/test-urgent-email.mjs (Node strips
+// the type annotations) and in tests/today-regression.cjs. Keep this file to erasable
+// TypeScript (no enums, no parameter properties) and import-free for that reason.
 //
 // Scope: email only. Text-message ingestion stays disabled; nothing here reads or models it.
 
@@ -324,4 +329,216 @@ export function etDayLabel(now: Date, days: number): string {
 
 export function isGmailHref(href: string): boolean {
   return href.startsWith("https://mail.google.com/mail/");
+}
+
+// ---- Today: one list from the email labels and the Agent Inbox ---------------------
+// inbox-triage reports urgent mail two ways: it labels the thread (Agent/Action,
+// Agent/Deadline; read by urgent_email_etl.py into GET /api/urgent-email) and, for the
+// rare same-day items, it posts an Agent Inbox question named "Urgent: <what>" whose
+// Link is the Gmail thread (/onyx/inbox card, already fetched by Today). The same
+// thread can arrive both ways, so Today merges them here and shows it once.
+
+/** The part of an /onyx/inbox card (lib/agents-api.ts) this file reads. */
+export interface InboxCardLike {
+  thread: string;
+  messageId: number;
+  created_at: string;
+  card: { code: string; agent: string; name: string; link?: string | null };
+}
+
+/** The part of a GET /api/urgent-email item (lib/urgent-email-query.ts) this file reads. */
+export interface EmailItemLike {
+  key: string;
+  threadId: string | null;
+  messageId: string;
+  account: string;
+  from: string;
+  subject: string;
+  receivedAt: string;
+  labels: readonly string[];
+  deadline: { daysLeft: number; label: string } | null;
+  reasons: string[];
+  nextStep: string;
+  href: string | null;
+}
+
+export interface TodayUrgentItem {
+  key: string;
+  /** Where Today learned about it: "Gmail", "Agent Inbox", or both. */
+  sources: ("Gmail" | "Agent Inbox")[];
+  /** e.g. "Gmail, rileybleeklm@: Agent/Deadline" or "Agent Inbox: inbox-triage". */
+  sourceDetail: string;
+  title: string;
+  from: string | null;
+  reasons: string[];
+  nextStep: string;
+  /** Item age anchor: when the email arrived, or when the agent posted the request. */
+  at: string;
+  atVerb: "Received" | "Posted";
+  gmailHref: string | null;
+  requestHref: string | null;
+}
+
+const URGENT_PREFIX = /^\s*urgent\s*:\s*/i;
+
+/** Decimal Gmail thread id from a hex id (the Gmail API / old web-link form). */
+function hexToDecimal(hex: string): string {
+  let digits = [0];
+  for (const ch of hex.toLowerCase()) {
+    let carry = parseInt(ch, 16);
+    for (let i = 0; i < digits.length; i++) {
+      const v = digits[i] * 16 + carry;
+      digits[i] = v % 10;
+      carry = Math.floor(v / 10);
+    }
+    while (carry > 0) { digits.push(carry % 10); carry = Math.floor(carry / 10); }
+  }
+  digits = digits.reverse();
+  return digits.join("");
+}
+
+/**
+ * Account and decimal thread id named by a Gmail web link, e.g.
+ * `https://mail.google.com/mail/?authuser=me@example.com#all/thread-f:1234` or `#inbox/18c2...`.
+ * A `#search/...` link names no thread (threadId null). Anything not on mail.google.com → null.
+ */
+export function parseGmailLink(link: string | null | undefined): { account: string | null; threadId: string | null } | null {
+  if (!link || !isGmailHref(link)) return null;
+  let url: URL;
+  try { url = new URL(link); } catch { return null; }
+  if (url.origin !== "https://mail.google.com") return null;
+  const user = (url.searchParams.get("authuser") ?? "").trim().toLowerCase();
+  const account = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(user) ? user : null;
+  let hash = url.hash;
+  try { hash = decodeURIComponent(hash); } catch { /* keep raw */ }
+  const decimal = hash.match(/thread-f:(\d{1,20})\b/);
+  if (decimal) return { account, threadId: decimal[1] };
+  const hex = hash.match(/^#(?:all|inbox|starred|imp|sent|label\/[^/]+)\/([0-9a-f]{16})$/i);
+  return { account, threadId: hex ? hexToDecimal(hex[1]) : null };
+}
+
+/** An Agent Inbox card that is about email: inbox-triage's "Urgent: ..." questions, or any card linking Gmail. */
+export function isEmailCard(card: InboxCardLike["card"]): boolean {
+  return (card.agent === "inbox-triage" && URGENT_PREFIX.test(card.name)) || parseGmailLink(card.link) !== null;
+}
+
+/** The worker stores "YYYY-MM-DD HH:MM:SS" in UTC with no zone marker. */
+export function parseWorkerTime(s: string): string {
+  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(s) ? `${s.replace(" ", "T")}Z` : s;
+  const t = new Date(iso);
+  return Number.isNaN(t.getTime()) ? s : t.toISOString();
+}
+
+/** "just now", "25 min ago", "3 h ago", "2 d ago". */
+export function ageLabel(iso: string | null | undefined, now: Date): string {
+  const t = iso ? new Date(iso).getTime() : NaN;
+  if (!Number.isFinite(t)) return "at an unknown time";
+  const min = Math.max(0, Math.floor((now.getTime() - t) / 60_000));
+  if (min < 2) return "just now";
+  if (min < 60) return `${min} min ago`;
+  if (min < 48 * 60) return `${Math.floor(min / 60)} h ago`;
+  return `${Math.floor(min / 1440)} d ago`;
+}
+
+function shortAccount(account: string): string {
+  const at = account.indexOf("@");
+  return at > 0 ? `${account.slice(0, at)}@` : account;
+}
+
+/** Lower sorts first: a deadline today/tomorrow, then anything inbox-triage asked about, then nearer deadlines, then Action, then undated. */
+function emailRank(item: EmailItemLike): number {
+  if (item.deadline && item.deadline.daysLeft <= 1) return item.deadline.daysLeft / 10;
+  if (item.deadline) return 2 + item.deadline.daysLeft / 10;
+  return item.labels.includes("Agent/Action") ? 3 : 4;
+}
+
+/**
+ * Merge the label-sourced emails and the email cards of the Agent Inbox into one list,
+ * each thing once: same Gmail thread (card link ↔ email thread id, same account when the
+ * link names one) or same Message-ID in two mailboxes. Best first, bounded to `limit`.
+ */
+export function mergeUrgent(
+  emails: readonly EmailItemLike[],
+  cards: readonly InboxCardLike[],
+  limit: number = MAX_URGENT_SHOWN,
+): { items: TodayUrgentItem[]; total: number } {
+  type Entry = { item: TodayUrgentItem; rank: number; threadId: string | null; account: string | null };
+  const entries: Entry[] = [];
+  const byMessageId = new Map<string, Entry>();
+  for (const e of emails) {
+    const mid = e.messageId.trim().toLowerCase();
+    const twin = mid ? byMessageId.get(mid) : undefined;
+    if (twin) {   // the same message delivered to both mailboxes
+      if (!twin.item.reasons.some((r) => r.startsWith("Also in "))) twin.item.reasons.push(`Also in ${shortAccount(e.account)}`);
+      continue;
+    }
+    const href = e.href && isGmailHref(e.href) ? e.href : null;
+    const entry: Entry = {
+      rank: emailRank(e),
+      threadId: e.threadId,
+      account: e.account.trim().toLowerCase() || null,
+      item: {
+        key: `email:${e.key}`,
+        sources: ["Gmail"],
+        sourceDetail: `Gmail, ${shortAccount(e.account)}: ${e.labels.join(" + ") || "labelled"}`,
+        title: e.subject,
+        from: e.from || null,
+        reasons: [...e.reasons],
+        nextStep: e.nextStep,
+        at: e.receivedAt,
+        atVerb: "Received",
+        gmailHref: href,
+        requestHref: null,
+      },
+    };
+    entries.push(entry);
+    if (mid) byMessageId.set(mid, entry);
+  }
+
+  const seenCodes = new Set<string>();
+  for (const c of cards) {
+    if (!isEmailCard(c.card)) continue;
+    const code = c.card.code.toUpperCase();
+    if (seenCodes.has(code)) continue;
+    seenCodes.add(code);
+    const ref = parseGmailLink(c.card.link);
+    const ask = c.card.name.replace(URGENT_PREFIX, "").trim() || c.card.name;
+    const requestHref = `/agents?${new URLSearchParams({ t: c.thread })}#m${c.messageId}`;
+    const match = ref?.threadId
+      ? entries.find((x) => x.threadId === ref.threadId && (!ref.account || !x.account || x.account === ref.account))
+      : undefined;
+    if (match) {
+      if (!match.item.sources.includes("Agent Inbox")) {
+        match.item.sources.push("Agent Inbox");
+        match.item.sourceDetail += ` + Agent Inbox (${c.card.agent})`;
+        match.item.reasons.unshift(`${c.card.agent} asked you about it: ${ask}`);
+        match.item.nextStep = `Answer the request, then ${match.item.nextStep.charAt(0).toLowerCase()}${match.item.nextStep.slice(1)}`;
+        match.item.requestHref = requestHref;
+        match.rank = Math.min(match.rank, 1);
+      }
+      continue;
+    }
+    entries.push({
+      rank: 1,
+      threadId: ref?.threadId ?? null,
+      account: ref?.account ?? null,
+      item: {
+        key: `card:${code}`,
+        sources: ["Agent Inbox"],
+        sourceDetail: `Agent Inbox: ${c.card.agent}${ref?.account ? `, ${shortAccount(ref.account)}` : ""}`,
+        title: ask,
+        from: null,
+        reasons: [`${c.card.agent} flagged it as urgent`],
+        nextStep: "Answer the request in your inbox",
+        at: parseWorkerTime(c.created_at),
+        atVerb: "Posted",
+        gmailHref: c.card.link && ref ? c.card.link : null,
+        requestHref,
+      },
+    });
+  }
+
+  const time = (iso: string) => { const t = new Date(iso).getTime(); return Number.isFinite(t) ? t : 0; };
+  entries.sort((a, b) => a.rank - b.rank || time(b.item.at) - time(a.item.at) || (a.item.key < b.item.key ? -1 : a.item.key > b.item.key ? 1 : 0));
+  return { items: entries.slice(0, Math.max(0, limit)).map((e) => e.item), total: entries.length };
 }

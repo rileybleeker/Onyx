@@ -2,6 +2,7 @@ import { ingestionHeartbeatStatus } from "@/lib/status-freshness";
 import { NextResponse } from "next/server";
 import { getNycScoutFreshness } from "@/lib/nyc";
 import { createClient } from "@supabase/supabase-js";
+import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -51,6 +52,7 @@ const CADENCE: Record<string, string> = {
   tanita: "Daily 10am + 1:30pm ET",
   flights: "Every 3h :25 (both Gmail accounts)",
   delivery: "Every 3h :40",
+  urgent_email: "Hourly :15 (both Gmail accounts)",
   ubereats: "Every 6h (Riley's PC, while logged on)",
   nyc_scout: "Daily 6:10am ET",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
@@ -92,6 +94,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   tanita:         { method: "automated",      label: "API ETL" },
   flights:        { method: "automated",      label: "IMAP email parser" },
   delivery:       { method: "automated",      label: "IMAP email parser" },
+  urgent_email:   { method: "automated",      label: "IMAP label reader" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
@@ -429,6 +432,8 @@ export async function GET() {
     const nyc = await nycPromise;
     const nycDate = nyc.ok ? nyc.lastVerified : null;
     const nycLag = daysLag(nycDate, spineMaxDate);
+    // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
+    const urgentEmailCard = await getUrgentEmailStatusCard(supabase);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -917,6 +922,14 @@ export async function GET() {
           methodLabel: METHOD.perf_mats.label,
         };
       })(),
+      // Urgent email for Today: inbox-triage's Agent/Action + Agent/Deadline labels read
+      // over IMAP (read-only) into pds.inbox_emails. Thresholds in getUrgentEmailStatusCard.
+      urgent_email: {
+        ...urgentEmailCard,
+        cadence: CADENCE.urgent_email,
+        integrationMethod: METHOD.urgent_email.method,
+        methodLabel: METHOD.urgent_email.label,
+      },
     };
 
     const recentHistory = (syncRows ?? []).slice(0, 20).map((r) => ({

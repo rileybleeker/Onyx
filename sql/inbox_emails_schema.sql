@@ -11,7 +11,7 @@
 -- snippet, when it arrived, whether it is still unread / still in the inbox, its
 -- Agent/* labels, the Gmail thread + message ids and the RFC 5322 Message-ID.
 -- What is NOT stored: full bodies, HTML, attachments, recipients, or any credentials.
--- Rows are never deleted: a message that loses its label (or leaves the 30-day search
+-- Rows are never removed: a message that loses its label (or leaves the 30-day search
 -- window) is set labeled = false by the next run. Re-running this file is safe.
 --
 -- Privacy: unlike most of pds this table is SERVICE-ROLE ONLY. No anon or authenticated

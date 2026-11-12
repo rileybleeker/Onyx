@@ -1,6 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import {
-  MAX_URGENT_SHOWN,
   assessEmail,
   daysUntilDeadline,
   etDayLabel,
@@ -31,7 +30,7 @@ type Supa = SupabaseClient<any, any, any>;
 export type AgentLabel = "Agent/Action" | "Agent/Deadline";
 
 export interface UrgentEmailItem {
-  /** "thread:<gmail thread id>" or "msg:<Message-ID>": the dedup key Today merges on. */
+  /** "thread:<account>:<gmail thread id>" or "msg:<account>:<Message-ID>": one item per thread. */
   key: string;
   threadId: string | null;
   messageId: string;
@@ -75,6 +74,8 @@ export type UrgentEmailResponse =
 
 /** Most rows read per request: a hard bound on work and payload. */
 export const SCAN_LIMIT = 300;
+/** Items returned (Today merges them with the Agent Inbox, then shows the top 5). */
+export const ITEMS_RETURNED = 20;
 export const WINDOW_DAYS = 30;
 export const ACTION_DAYS = 14;
 export const DEADLINE_AHEAD_DAYS = 7;
@@ -187,6 +188,48 @@ export function describeThread(thread: Thread, now: Date): UrgentEmailItem | nul
   };
 }
 
+/**
+ * /status "Urgent Email" card (the source key is urgent_email): freshness = age of the newest
+ * urgent_email|labels heartbeat, read with its own limit-1 query so the shared 100-row
+ * sync_log window cannot hide it. The job runs hourly: >3 h degraded, >8 h or a failed run
+ * red. A 'partial' run (an account failed or is not configured, a label is missing) is
+ * degraded. "unknown" until the first run, which needs sql/inbox_emails_schema.sql applied.
+ */
+export async function getUrgentEmailStatusCard(client: Supa, now: Date = new Date()) {
+  const { data, error } = await client
+    .from("sync_log")
+    .select("sync_start,status,records_synced,duration_seconds,error_message")
+    .eq("source", "urgent_email")
+    .eq("data_type", "labels")
+    .order("sync_start", { ascending: false })
+    .limit(1);
+  const entry = (error ? null : data?.[0]) as
+    | { sync_start: string; status: string; records_synced: number | null; duration_seconds: number | null; error_message: string | null }
+    | undefined;
+  const ageH = entry?.sync_start ? (now.getTime() - new Date(entry.sync_start).getTime()) / 3_600_000 : Infinity;
+  const status: "success" | "partial" | "failed" | "unknown" = error
+    ? "failed"
+    : !entry
+      ? "unknown"
+      : entry.status === "failed" || entry.status === "error" || ageH > 8
+        ? "failed"
+        : entry.status === "partial" || ageH > 3
+          ? "partial"
+          : "success";
+  return {
+    label: "Urgent Email",
+    lastSync: entry?.sync_start ?? null,
+    status,
+    latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+    daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+    recordsSynced: entry?.records_synced ?? 0,
+    durationSeconds: entry?.duration_seconds ?? null,
+    errorMessage: error?.message
+      ?? entry?.error_message
+      ?? (entry && ageH > 8 ? `No label sync for ${Math.floor(ageH)}h - check the Urgent Email Labels workflow.` : null),
+  };
+}
+
 function rank(item: UrgentEmailItem): number {
   if (item.deadline) return item.deadline.daysLeft;          // 0..7
   return item.labels.includes("Agent/Action") ? 8 : 9;
@@ -224,8 +267,10 @@ export async function getUrgentEmail(client: Supa, now: Date = new Date()): Prom
   for (const row of (emails.data ?? []) as Row[]) {
     if (!row || typeof row.received_at !== "string" || Number.isNaN(time(row.received_at)) || typeof row.from_address !== "string") continue;
     const account = (row.account ?? "").trim().toLowerCase();
+    // Thread ids are per mailbox, so the key carries the account too. The same message in
+    // both mailboxes is two threads here; Today folds them by Message-ID (mergeUrgent).
     const key = row.gmail_thread_id && /^\d+$/.test(row.gmail_thread_id)
-      ? `thread:${row.gmail_thread_id}`
+      ? `thread:${account}:${row.gmail_thread_id}`
       : `msg:${account}:${(row.message_id ?? "").trim()}`;
     const t = threads.get(key);
     if (!t) threads.set(key, { key, newest: row, rows: [row] });
@@ -248,6 +293,6 @@ export async function getUrgentEmail(client: Supa, now: Date = new Date()): Prom
     total: shown.length,
     hidden: threads.size - shown.length,
     lastSync,
-    items: shown.slice(0, MAX_URGENT_SHOWN),
+    items: shown.slice(0, ITEMS_RETURNED),
   };
 }

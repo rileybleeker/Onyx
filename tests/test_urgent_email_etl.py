@@ -30,15 +30,15 @@ def raw_email(subject, sender, date, mid, body):
 
 
 MESSAGES = {
-    b"101": dict(thr="1881486786616357571", gm="1881486786616357571",
+    b"101": dict(thr="1000000000000000101", gm="1000000000000000101",
                  labels=b'("\\\\Inbox" "Agent/Deadline" "Agent/Triaged")', flags=b"()",
-                 raw=raw_email("Ballot closes soon", "Race Org <info@race.example>", "Tue, 10 Nov 2026 15:47:02 +0000",
+                 raw=raw_email("Ballot closes soon", "Race Org <info@race.example>", "Tue, 10 Nov 2026 14:00:00 +0000",
                                "<ballot-1@race.example>", "The ballot closes in 48 hours.͏ ͏ Enter now.")),
-    b"102": dict(thr="1881125265404240948", gm="1881125265404240948",
+    b"102": dict(thr="1000000000000000102", gm="1000000000000000102",
                  labels=b"(\\Important Agent/Action)", flags=b"(\\Seen)",
                  raw=raw_email("Review requested", "Code Host <noreply@code.example>", "Fri, 06 Nov 2026 16:00:51 +0000",
                                "<review-2@code.example>", "Someone asked for your review. https://code.example/x")),
-    b"103": dict(thr="1881000000000000001", gm="1881000000000000001",
+    b"103": dict(thr="1000000000000000103", gm="1000000000000000103",
                  labels=b'("\\\\Inbox" "Agent/Triaged")', flags=b"()",
                  raw=raw_email("No agent label", "x@example.com", "Fri, 06 Nov 2026 16:00:51 +0000", "<n-3@example.com>", "hi")),
 }
@@ -179,10 +179,10 @@ class RunTests(unittest.TestCase):
         ballot, review = rows["ballot-1@race.example"], rows["review-2@code.example"]
         self.assertEqual(ballot["agent_labels"], ["Agent/Deadline"])
         self.assertTrue(ballot["in_inbox"] and ballot["is_unread"])
-        self.assertEqual(ballot["gmail_thread_id"], "1881486786616357571")
+        self.assertEqual(ballot["gmail_thread_id"], "1000000000000000101")
         self.assertEqual(ballot["snippet"], "The ballot closes in 48 hours. Enter now.")
         self.assertEqual((ballot["from_name"], ballot["from_address"]), ("Race Org", "info@race.example"))
-        self.assertEqual(ballot["received_at"], "2026-11-10T15:47:02+00:00")
+        self.assertEqual(ballot["received_at"], "2026-11-10T14:00:00+00:00")
         self.assertEqual(review["agent_labels"], ["Agent/Action"])
         self.assertFalse(review["in_inbox"] or review["is_unread"])
         self.assertNotIn("http", review["snippet"])
