@@ -2,9 +2,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, BookOpen, ClipboardCheck, RefreshCw } from "lucide-react";
+import { ArrowUpRight, BookOpen, ClipboardCheck, Mail, RefreshCw } from "lucide-react";
 import { agentsApi, type InboxResponse, type InboxItem } from "@/lib/agents-api";
 import type { ReadingOverview } from "@/lib/reading";
+import type { UrgentEmailResponse } from "@/lib/urgent-email-query";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -20,6 +21,14 @@ async function bounded<T>(promise: Promise<T>): Promise<T> {
     })]);
   } finally { clearTimeout(timer!); }
 }
+function receivedLabel(iso: string): string {
+  const at = new Date(iso);
+  return Number.isNaN(at.getTime()) ? "" : at.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+// Only ever link out to the Gmail message the API built; anything else renders as plain text.
+function gmailLink(href: string | null): string | null {
+  return href && href.startsWith("https://mail.google.com/mail/") ? href : null;
+}
 function requestHref(item: RequestCard): string {
   return `/agents?${new URLSearchParams({ t: item.thread })}#m${item.messageId}`;
 }
@@ -27,6 +36,7 @@ function requestHref(item: RequestCard): string {
 export default function TodayClient() {
   const [inbox, setInbox] = useState<Load<InboxResponse>>({ state: "loading" });
   const [reading, setReading] = useState<Load<ReadingOverview | null>>({ state: "loading" });
+  const [urgent, setUrgent] = useState<Load<UrgentEmailResponse>>({ state: "loading" });
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
   const sequence = useRef(0);
   const inFlight = useRef(false);
@@ -40,6 +50,7 @@ export default function TodayClient() {
     const current = ++sequence.current;
     setInbox((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setReading((previous) => previous.state === "ready" ? previous : { state: "loading" });
+    setUrgent((previous) => previous.state === "ready" ? previous : { state: "loading" });
     const inboxRequest = bounded(Promise.resolve().then(() => agentsApi.inbox())).then((value) => {
       if (!Array.isArray(value.items) || !Array.isArray(value.threads)) throw new Error("Invalid inbox");
       if (sequence.current !== current) return;
@@ -54,7 +65,15 @@ export default function TodayClient() {
     })).then((value) => {
       if (sequence.current === current) setReading({ state: "ready", value });
     }).catch(() => { if (sequence.current === current) setReading((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
-    void Promise.allSettled([inboxRequest, readingRequest]).then(() => {
+    const urgentRequest = bounded(fetch("/api/urgent-email", { cache: "no-store" }).then(async (res) => {
+      if (!res.ok) throw new Error("Urgent email unavailable");
+      const data = await res.json() as UrgentEmailResponse;
+      if (data.status !== "not_connected" && !(data.status === "ready" && Array.isArray(data.items))) throw new Error("Invalid urgent email");
+      return data;
+    })).then((value) => {
+      if (sequence.current === current) setUrgent({ state: "ready", value });
+    }).catch(() => { if (sequence.current === current) setUrgent((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
+    void Promise.allSettled([inboxRequest, readingRequest, urgentRequest]).then(() => {
       if (sequence.current === current) { inFlight.current = false; setRefreshing(false); }
     });
   }, []);
@@ -72,8 +91,9 @@ export default function TodayClient() {
   }, [load]);
 
   const requests = inbox.state === "ready" ? inbox.value.items.filter((item): item is RequestCard => item.kind === "card") : [];
-  const pending = refreshing || inbox.state === "loading" || reading.state === "loading";
-  const unavailable = inbox.state === "error" || reading.state === "error" || (inbox.state === "ready" && inbox.stale) || (reading.state === "ready" && reading.stale);
+  const pending = refreshing || inbox.state === "loading" || reading.state === "loading" || urgent.state === "loading";
+  const unavailable = inbox.state === "error" || reading.state === "error" || urgent.state === "error" || (inbox.state === "ready" && inbox.stale) || (reading.state === "ready" && reading.stale) || (urgent.state === "ready" && urgent.stale);
+  const email = urgent.state === "ready" && urgent.value.status === "ready" ? urgent.value : null;
   const book = reading.state === "ready" ? reading.value : null;
   return (
     <div className="mx-auto max-w-2xl space-y-5">
@@ -111,6 +131,39 @@ export default function TodayClient() {
           </>}
           <p className="mt-4 text-xs text-text-secondary">Inbox checked at {checkedAt}. Opening Today does not mark anything read.</p>
         </>}
+      </section>
+      <section className={panelStyle} aria-labelledby="urgent-email-heading" aria-busy={urgent.state === "loading"}>
+        <div className="flex items-center gap-2"><Mail aria-hidden="true" className="h-5 w-5 text-accent" />
+          <h2 id="urgent-email-heading" className="text-lg font-medium text-text-primary">Urgent email</h2></div>
+        {urgent.state === "loading" && <p className="mt-3 text-sm text-text-secondary">Checking email...</p>}
+        {urgent.state === "error" && <p className="mt-3 text-sm text-text-secondary">Couldn&apos;t check urgent email. Try refreshing.</p>}
+        {urgent.state === "ready" && urgent.stale && <p className="mt-3 text-sm text-amber-300">Couldn&apos;t refresh email. Showing the last check; it may have changed.</p>}
+        {urgent.state === "ready" && urgent.value.status === "not_connected" && <>
+          <p className="mt-3 text-sm text-text-primary">No urgent email source connected yet.</p>
+          <p className="mt-1 text-xs text-text-secondary">Onyx is not reading any email, so nothing is checked here.</p>
+        </>}
+        {email && (email.items.length === 0 ? <>
+          <p className="mt-3 text-sm text-text-secondary">{email.scanned === 0 ? `No unread email from the last ${email.windowDays} days to check.` : `Checked ${email.scanned} unread email${email.scanned === 1 ? "" : "s"} from the last ${email.windowDays} days; none look urgent.`}</p>
+          {email.newestReceivedAt && <p className="mt-1 text-xs text-text-secondary">Newest synced message: {receivedLabel(email.newestReceivedAt)}.</p>}
+        </> : <>
+          <p className="mt-2 text-xs text-text-secondary">Showing {email.items.length} of {email.total} urgent email{email.total === 1 ? "" : "s"}, strongest first.</p>
+          <ul className="mt-3 divide-y divide-border-subtle">
+            {email.items.map((item) => {
+              const href = gmailLink(item.href);
+              const body = <>
+                <span className="min-w-0"><span className="block break-words text-xs text-text-secondary">{item.from}{receivedLabel(item.receivedAt) ? ` - ${receivedLabel(item.receivedAt)}` : ""}</span>
+                  <span className="mt-1 block break-words text-sm font-medium text-text-primary">{item.subject}</span>
+                  {item.reasons.length > 0 && <span className="mt-1 block text-xs text-text-secondary">Why: {item.reasons.join(", ")}</span>}
+                  <span className={`mt-1 block text-xs ${href ? "text-accent" : "text-text-secondary"}`}>{href ? "Open in Gmail" : "No link available"}</span></span>
+                {href && <ArrowUpRight aria-hidden="true" className="h-4 w-4 shrink-0 text-text-secondary" />}
+              </>;
+              return <li key={item.id}>{href
+                ? <a href={href} target="_blank" rel="noopener noreferrer" className="group flex items-center justify-between gap-3 rounded-lg py-4 focus-visible:outline-2 focus-visible:outline-accent">{body}</a>
+                : <div className="flex items-center justify-between gap-3 py-4">{body}</div>}</li>;
+            })}
+          </ul>
+        </>)}
+        {urgent.state === "ready" && urgent.value.status === "ready" && <p className="mt-3 text-xs text-text-secondary">Picked by simple rules on sender, subject and dates, so it can miss things. Opening Today does not mark email read.</p>}
       </section>
       <section className={panelStyle} aria-labelledby="reading-heading" aria-busy={reading.state === "loading"}>
         <div className="flex items-center gap-2"><BookOpen aria-hidden="true" className="h-5 w-5 text-accent" />
