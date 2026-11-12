@@ -1,0 +1,63 @@
+name: Urgent Email Labels
+
+# Copies the metadata of threads that the personal-agents inbox-triage routine
+# labelled Agent/Action or Agent/Deadline (both Gmail accounts) into
+# pds.inbox_emails for the Today page. Read-only on Gmail (EXAMINE + BODY.PEEK);
+# writes one urgent_email|labels heartbeat per run for the /status card.
+# Needs sql/inbox_emails_schema.sql applied first; until then every run writes a
+# 'failed' heartbeat that names the missing table.
+
+on:
+  schedule:
+    # Hourly at :15. inbox-triage runs at :05 five times a day and labels within
+    # ~10 minutes, so new labels reach Today within the hour. :15 keeps clear of
+    # the hourly ETL (:00), retrain check (:20), flights (:25), journal (:35),
+    # delivery (:40), habits (:45) and Spotify (:50).
+    - cron: '15 * * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Look-back window in days (default 30)'
+        required: false
+        type: string
+
+concurrency:
+  group: urgent-email
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  urgent-email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install supabase python-dotenv
+
+      - name: Read Agent/Action + Agent/Deadline labels (read-only IMAP)
+        run: >
+          python urgent_email_etl.py
+          ${{ inputs.days && format('--days {0}', inputs.days) || '' }}
+        env:
+          IMAP_HOST: ${{ secrets.IMAP_HOST }}
+          # Same mailbox slots as flights-email.yml / delivery-email.yml. An unset pair is skipped.
+          IMAP_EMAIL: ${{ secrets.IMAP_EMAIL }}
+          IMAP_APP_PASSWORD: ${{ secrets.IMAP_APP_PASSWORD }}
+          IMAP_EMAIL_2: ${{ secrets.IMAP_EMAIL_2 }}
+          IMAP_APP_PASSWORD_2: ${{ secrets.IMAP_APP_PASSWORD_2 }}
+          IMAP_EMAIL_3: ${{ secrets.IMAP_EMAIL_3 }}
+          IMAP_APP_PASSWORD_3: ${{ secrets.IMAP_APP_PASSWORD_3 }}
+          IMAP_EMAIL_4: ${{ secrets.IMAP_EMAIL_4 }}
+          IMAP_APP_PASSWORD_4: ${{ secrets.IMAP_APP_PASSWORD_4 }}
+          IMAP_EMAIL_5: ${{ secrets.IMAP_EMAIL_5 }}
+          IMAP_APP_PASSWORD_5: ${{ secrets.IMAP_APP_PASSWORD_5 }}

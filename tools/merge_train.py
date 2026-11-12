@@ -204,9 +204,27 @@ def evaluate() -> list[tuple[dict, str, str]]:
             out.append((pr, "skip", "draft or other base"))
             continue
         files = pr_files(pr["number"])
+        if is_rollback(pr):
+            approve_held_runs(pr["headRefOid"])
         runs, statuses, active = head_checks(pr["headRefOid"])
         out.append((pr, *judge(pr, files, runs, statuses, active, stop)))
     return out
+
+
+def approve_held_runs(sha: str) -> None:
+    """GitHub holds pull_request runs on PRs the Actions bot opened. Only called for rollback-shaped PRs (a revert
+    of a master commit opened by post-merge verify), so this never releases CI for anyone else's code."""
+    for r in api_items(f"repos/{REPO}/actions/runs?head_sha={sha}&status=action_required&per_page=20", ".workflow_runs[]|{id}"):
+        gh("api", "-X", "POST", f"repos/{REPO}/actions/runs/{r['id']}/approve", check=False)
+        note(f"approved held CI run {r['id']} on rollback head {sha[:7]}")
+
+
+def close_halt(pr: dict) -> None:
+    """A token-made merge does not fire 'Closes #N', so the train closes the halt issue the rollback PR names."""
+    body = gh("api", f"repos/{REPO}/pulls/{pr['number']}", "--jq", ".body // \"\"", check=False)
+    for n in re.findall(r"Closes #(\d+)", body):
+        gh("issue", "close", n, "-R", REPO, "--comment", f"Rollback #{pr['number']} merged; train resumes.", check=False)
+        note(f"closed halt issue #{n}")
 
 
 def merge(pr: dict, why: str) -> str | None:
@@ -224,6 +242,8 @@ def merge(pr: dict, why: str) -> str | None:
            f"Merge train: squash-merged at `{sha[:7]}` (head `{pr['headRefOid'][:7]}`, required checks green). "
            f"Deploy and smoke verification follow; a failure opens an automatic revert.", check=False)
         gh("api", "-X", "DELETE", f"repos/{REPO}/git/refs/heads/{pr['headRefName']}", check=False)
+        if is_rollback(pr):
+            close_halt(pr)
         return sha
     note(f"not merged #{pr['number']}: {body.get('message') or out.strip()[:200]}")
     return None

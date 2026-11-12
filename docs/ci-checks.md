@@ -48,6 +48,10 @@ A failure is a red run (and GitHub's failure email). Concurrency group `live-che
 2. Needs production: it is not an offline test. Add it to `LIVE_TESTS` in `tests/run_offline_tests.py` and give it a step in `live-checks.yml` with the secrets in that step's `env`. The runner fails if a name in `LIVE_TESTS` does not appear in `live-checks.yml`, so a live test cannot be excluded from the PR job and then forgotten. Keep it read-only; anything that writes goes behind a manual input like `run_live_write_tests`.
 3. A test that fails for a reason unrelated to your change: do not delete or skip it silently. Add it to `KNOWN_BROKEN` in `tests/run_offline_tests.py` with the reason. It still runs and is reported as a warning; once it passes the job fails until you remove the entry. The list is empty today.
 
+## Parallel feature builds
+
+When several branches are in flight at once (one git worktree each), CI checks each PR on its own and cannot tell you whether two PRs collide with each other. Use `tools/integration_plan.py` for that: it is read-only and reports which branches conflict with master, which pairs conflict with each other, and the order to merge them in. Run `python tools/integration_plan.py --claims --touching <paths>` before claiming work and `python tools/integration_plan.py` before opening a PR. Full usage and the ordering rules are in `docs/integration-plan.md`.
+
 ## Not covered by this change
 
 - `autonomous-ci.yml` (including its `offline-checks` and `frontend-types` jobs, the required checks) is unchanged.

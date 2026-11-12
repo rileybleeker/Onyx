@@ -2,6 +2,7 @@ import { GARMIN_WEARABLE_FILTER, garminNoWearMessage, ingestionHeartbeatStatus }
 import { NextResponse } from "next/server";
 import { getNycScoutFreshness } from "@/lib/nyc";
 import { createClient } from "@supabase/supabase-js";
+import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -52,6 +53,8 @@ const CADENCE: Record<string, string> = {
   tanita: "Daily 10am + 1:30pm ET",
   flights: "Every 3h :25 (both Gmail accounts)",
   delivery: "Every 3h :40",
+  supplement_reminders: "Worker poll (heartbeat ~hourly); cards at each stack's reminder time",
+  urgent_email: "Hourly :15 (both Gmail accounts)",
   ubereats: "Every 6h (Riley's PC, while logged on)",
   nyc_scout: "Daily 6:10am ET",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
@@ -94,6 +97,8 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   tanita:         { method: "automated",      label: "API ETL" },
   flights:        { method: "automated",      label: "IMAP email parser" },
   delivery:       { method: "automated",      label: "IMAP email parser" },
+  supplement_reminders: { method: "automated", label: "Worker push cards" },
+  urgent_email:   { method: "automated",      label: "IMAP label reader" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
@@ -240,7 +245,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, ingestionHeartbeats] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -346,6 +351,11 @@ export async function GET() {
       // failed "GUARD …" row from the alignment check) can fall out of the 100-row window.
       supabase.from("sync_log").select("*").eq("source", "hrv_analysis").eq("data_type", "retrain")
         .order("sync_start", { ascending: false }).limit(1),
+      // Supplement stack reminders: the sms-reminders Worker polls /api/supplements/reminders/claim
+      // and each poll (throttled to ~1/h when nothing is due) writes a heartbeat. Dedicated fetch so
+      // a Worker that stops polling reads red instead of "unknown" once the row leaves the window.
+      supabase.from("sync_log").select("*").eq("source", "supplement_reminders").eq("data_type", "prompt")
+        .order("sync_start", { ascending: false }).limit(1),
       // Scheduled ingestion must retain its latest heartbeat even when the shared
       // history window is full of newer jobs. In particular, daily Eight Sleep and
       // twice-daily Cronometer regularly fall outside that window overnight.
@@ -445,6 +455,8 @@ export async function GET() {
     const procurementRes = await supabase.from("procurement_subscriptions").select("updated_at", { count: "exact" }).eq("is_active", true).order("updated_at", { ascending: false }).limit(1);
     const procurementPending = procurementRes.error?.code === "PGRST205" || procurementRes.error?.code === "42P01";
     const procurementLast = (procurementRes.data?.[0]?.updated_at as string | undefined) ?? null;
+    // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
+    const urgentEmailCard = await getUrgentEmailStatusCard(supabase);
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -819,6 +831,31 @@ export async function GET() {
           methodLabel: METHOD.delivery.label,
         };
       })(),
+      // Supplement stack reminders (sms-reminders Worker -> /api/supplements/reminders/*):
+      // the Worker claims due stacks on a schedule and posts Log it / Skip cards to /agents.
+      // Freshness = heartbeat age, because a day with nothing due (stacks logged early, reminders
+      // off) is healthy. >3h with no poll = degraded, >8h or a failed heartbeat = red; "unknown"
+      // until the Worker's first call. records_synced = stacks claimed by that call.
+      supplement_reminders: (() => {
+        const entry = latestBySrcType["supplement_reminders|prompt"]
+          ?? (supplementRemindersSyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        return {
+          label: "Supplement Reminders",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status: ingestionHeartbeatStatus("success", entry, 3, 8),
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (entry && ageH > 8 ? `No claim call for ${Math.floor(ageH)}h - check the sms-reminders Worker's supplement reminder poll.` : null),
+          cadence: CADENCE.supplement_reminders,
+          integrationMethod: METHOD.supplement_reminders.method,
+          methodLabel: METHOD.supplement_reminders.label,
+        };
+      })(),
       // Uber Eats item harvester (tools/ubereats_harvest/harvest.mjs on Riley's PC):
       // reads the signed-in web app's order history (cart items, exact delivery
       // times) and posts it to /api/delivery/items/import, which also estimates
@@ -952,6 +989,14 @@ export async function GET() {
           methodLabel: METHOD.perf_mats.label,
         };
       })(),
+      // Urgent email for Today: inbox-triage's Agent/Action + Agent/Deadline labels read
+      // over IMAP (read-only) into pds.inbox_emails. Thresholds in getUrgentEmailStatusCard.
+      urgent_email: {
+        ...urgentEmailCard,
+        cadence: CADENCE.urgent_email,
+        integrationMethod: METHOD.urgent_email.method,
+        methodLabel: METHOD.urgent_email.label,
+      },
     };
 
     const recentHistory = (syncRows ?? []).slice(0, 20).map((r) => ({
