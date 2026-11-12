@@ -32,10 +32,10 @@ The user also keeps a free-form *personal* journal in Notion (prose entries abou
 
 You also have the user's nutrition data. FOOD comes from Cronometer (cutover 2026-05-31; MyFitnessPal for older history). Use query_nutrition for daily macros and query_meals_log for the per-meal food log. For vitamins/minerals use query_vitamins — it already COMBINES dietary intake (food, from Cronometer) with supplemental intake (pills, from Onyx's /supplements tracker) and returns the dietary, supplement, and total amounts per nutrient, so never add supplements on top of those totals. The rule is: Cronometer = food, Onyx /supplements = pills. Use query_micronutrient_trend for single-nutrient trends.
 
-You can also create Spotify playlists. The user has private-playlist write access enabled. When asked to make a playlist:
+You can also create Spotify playlists, but only when the user explicitly asks you to create, make or save one. A request for suggestions, ideas or recommendations (e.g. "suggest music for a focused afternoon") is NOT a request to create a playlist: answer with the suggested tracks in your reply and offer to turn them into a playlist, but do not call create_spotify_playlist. The user has private-playlist write access enabled. When explicitly asked to make a playlist:
 - Use query_spotify_tracks_by_features to pick tracks from their listening history (filter by audio-feature ranges like valence, energy, tempo).
 - Use search_spotify_catalog when they want tracks they haven't listened to before, or when filling out a playlist beyond what their history covers.
-- Once you have track IDs (mix sources freely), call create_spotify_playlist directly — playlists are private and easily deleted, so don't ask for confirmation.
+- Once you have track IDs (mix sources freely), call create_spotify_playlist directly — they already asked for it and playlists are private and easily deleted, so no extra confirmation is needed.
 - Default to ~25–40 tracks unless the user specifies otherwise. Give the playlist a descriptive name that reflects the user's request.
 
 The user is also reading a book as a tracked "reading quest" (currently The Goal by Goldratt, 40 chapters, target Nov 30 2026). Use get_reading_status for progress, pace and coaching. When they report reading ("finished chapters 3 and 4 on my run, here's what I remember: …"), call log_reading_session and pass their recall text VERBATIM — never summarize it. Kindle reading logs ITSELF: a local harvester turns Kindle highlights, notes and the reading position into source='kindle' sessions (recall = their Kindle notes), so never ask them to log Kindle sessions or re-enter Kindle highlights; manual logging is for audiobook/paper reading only. When they quote a passage with a comment, call add_book_highlight. When they ask to be quizzed ("quiz me on The Goal through chapter 12"), first call get_reading_status, then ask 5 short questions ONE AT A TIME drawn from the chapters they have read, their highlights and recall notes; grade each answer honestly; then call record_reading_quiz with checkpoint 'ch<N>' and the score. Keep coaching brief and specific (chapters behind pace, streak at risk, reviews due).
@@ -340,7 +340,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "create_spotify_playlist",
-    description: "Create a private Spotify playlist with the given tracks. Playlists are added to the user's Spotify account and a link is returned. Always private — do not ask for confirmation, just create it (easy to delete in Spotify if not wanted).",
+    description: "Create a private Spotify playlist with the given tracks. Playlists are added to the user's Spotify account and a link is returned. Call this ONLY when the user explicitly asked to create, make or save a playlist; never for a request for suggestions or recommendations (list the tracks in the reply instead and offer to create it). Always private; once explicitly asked, create it without further confirmation (easy to delete in Spotify).",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -989,22 +989,29 @@ export async function POST(req: NextRequest) {
     let toolRounds = 0;
     let toolCalls = 0;
 
+    // A tool batch is never cut in half: the client disconnecting is checked
+    // only BETWEEN rounds (before a batch starts and after it finishes), so a
+    // retry cannot double-log the first write of a half-run batch. The batch
+    // size is also checked up front for the same reason.
+    const cancelled = () =>
+      Response.json({ error: "Request cancelled. Check the relevant page before retrying any action." }, { status: 499 });
+
     while (response.stop_reason === "tool_use") {
       if (toolRounds++ >= MAX_TOOL_ROUNDS) {
         return Response.json({ error: "This request reached the tool limit. Some actions may already have completed; check the relevant page before retrying any logging request." }, { status: 422 });
       }
+      if (req.signal.aborted) return cancelled();
       const assistantContent = response.content;
+      const batchSize = assistantContent.filter((b) => b.type === "tool_use").length;
+      if (toolCalls + batchSize > MAX_TOOL_CALLS) {
+        return Response.json({ error: "This request reached the tool-call limit. Some actions may already have completed; check the relevant page before repeating an action." }, { status: 422 });
+      }
+      toolCalls += batchSize;
       allMessages.push({ role: "assistant", content: assistantContent });
 
       const toolResults = [];
       for (const block of assistantContent) {
         if (block.type === "tool_use") {
-          if (req.signal.aborted) {
-            return Response.json({ error: "Request cancelled. Check the relevant page before retrying any action." }, { status: 499 });
-          }
-          if (toolCalls++ >= MAX_TOOL_CALLS) {
-            return Response.json({ error: "This request reached the tool-call limit. Some actions may already have completed; check the relevant page before repeating an action." }, { status: 422 });
-          }
           const result = await executeTool(block.name, block.input as Record<string, unknown>);
           toolResults.push({
             type: "tool_result" as const,
@@ -1015,6 +1022,8 @@ export async function POST(req: NextRequest) {
       }
 
       allMessages.push({ role: "user", content: toolResults });
+
+      if (req.signal.aborted) return cancelled();
 
       response = await anthropic.messages.create({
         model: "claude-sonnet-5-5",
@@ -1036,8 +1045,19 @@ export async function POST(req: NextRequest) {
       : "No answer was produced. Please try rephrasing your question.");
     const suffix = response.stop_reason === "max_tokens" ? "\n\nThis response reached its length limit. Ask me to continue if needed; do not repeat an action without checking its result." : "";
     return Response.json({ response: summary + suffix });
-  } catch {
-    console.error("Chat API request failed");
+  } catch (err) {
+    // The client is gone (the SDK throws when the abort signal fires).
+    if (req.signal.aborted) {
+      return Response.json({ error: "Request cancelled. Check the relevant page before retrying any action." }, { status: 499 });
+    }
+    // Server-side diagnostics only: error class and HTTP status, never the
+    // message (it can echo user text or upstream detail). The client gets the
+    // generic text below.
+    const { name, status } = (err ?? {}) as { name?: unknown; status?: unknown };
+    console.error("Chat API request failed", {
+      name: typeof name === "string" ? name : typeof err,
+      status: typeof status === "number" ? status : undefined,
+    });
     return Response.json(
       { error: "Unable to finish this request. If you asked to log or create something, check the relevant page before retrying." },
       { status: 500 }
