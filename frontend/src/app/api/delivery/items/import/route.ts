@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import Anthropic from "@anthropic-ai/sdk";
-import { customizationsText, estKey, merchantKind, type ItemCustomization } from "@/lib/delivery";
+import { buildOrderItemRows, customizationsText, type HarvestOrder, type ItemCustomization } from "@/lib/delivery";
 
 // Uber Eats item harvester endpoint (tools/ubereats_harvest/harvest.mjs on Riley's PC).
 // Auth: the middleware CI carve-out (x-onyx-ci-token) or a Supabase session.
@@ -25,23 +25,6 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const MODEL = "claude-opus-5-5";
 const BATCH = 25;
 
-interface HarvestItem {
-  key?: string;
-  title?: string;
-  quantity?: number | null;
-  price?: number | null; // cents
-  customizations?: ItemCustomization[] | null;
-}
-interface HarvestOrder {
-  uuid?: string;
-  store?: string;
-  completedAt?: string | null;
-  isCancelled?: boolean;
-  currency?: string | null;
-  total?: number | null; // cents
-  multiConsumer?: boolean;
-  items?: HarvestItem[];
-}
 interface Body {
   orders?: HarvestOrder[];
   estimate?: boolean;
@@ -154,40 +137,9 @@ export async function POST(req: NextRequest) {
 }
 
 async function importOrders(orders: HarvestOrder[]) {
-  // Values come from Uber's JSON by way of the harvester: coerce them so one odd order
-  // (a string price, a bad date) cannot make the whole upsert throw or store garbage.
-  const cents = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v) / 100 : null);
-  const isoOrNull = (v: unknown) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? v : null);
-  const rows = [];
-  for (const o of orders) {
-    if (!o || typeof o.uuid !== "string" || typeof o.store !== "string" || !o.uuid || !o.store.trim()) continue;
-    const store = o.store.trim().slice(0, 200);
-    const kind = merchantKind(store);
-    const items = Array.isArray(o.items) ? o.items : [];
-    for (const [idx, it] of items.entries()) {
-      if (!it || typeof it.title !== "string" || !it.title.trim()) continue;
-      const title = it.title.trim().slice(0, 300);
-      const customizations = Array.isArray(it.customizations) ? it.customizations : [];
-      const qty = typeof it.quantity === "number" && Number.isFinite(it.quantity) && it.quantity > 0 ? it.quantity : 1;
-      rows.push({
-        provider: "uber_eats",
-        order_uuid: o.uuid,
-        item_key: typeof it.key === "string" && it.key ? it.key : `idx:${idx}`,
-        store_name: store,
-        merchant_kind: kind,
-        completed_at: isoOrNull(o.completedAt),
-        is_cancelled: !!o.isCancelled,
-        order_total: cents(o.total),
-        currency: typeof o.currency === "string" ? o.currency.slice(0, 8) : null,
-        multi_consumer: !!o.multiConsumer,
-        title,
-        quantity: qty,
-        price: cents(it.price),
-        customizations,
-        est_key: estKey(store, title, customizations),
-      });
-    }
-  }
+  // eaten_fraction is deliberately absent from these rows (see buildOrderItemRows), so the upsert
+  // never resets a portion Riley set on /nutrition or /check-in.
+  const rows = buildOrderItemRows(orders);
   for (let i = 0; i < rows.length; i += 500) {
     const { error } = await supabase
       .from("delivery_order_items")

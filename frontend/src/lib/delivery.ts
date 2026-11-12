@@ -57,3 +57,67 @@ export function estKey(store: string, title: string, c: ItemCustomization[] | nu
     .digest("hex")
     .slice(0, 32);
 }
+
+// ─── Uber Eats harvester payload → pds.delivery_order_items rows ─────────────
+// (tools/ubereats_harvest/harvest.mjs posts these to /api/delivery/items/import)
+
+export interface HarvestItem {
+  key?: string;
+  title?: string;
+  quantity?: number | null;
+  price?: number | null; // cents
+  customizations?: ItemCustomization[] | null;
+}
+export interface HarvestOrder {
+  uuid?: string;
+  store?: string;
+  completedAt?: string | null;
+  isCancelled?: boolean;
+  currency?: string | null;
+  total?: number | null; // cents
+  multiConsumer?: boolean;
+  items?: HarvestItem[];
+}
+
+/**
+ * Upsert rows for pds.delivery_order_items. FACTS ONLY: the row never carries eaten_fraction (how much
+ * Riley ate, set by hand on /nutrition and /check-in), so the importer's ON CONFLICT DO UPDATE leaves a
+ * set portion alone on every re-harvest. tests/delivery-portion.test.cjs asserts the key set.
+ */
+export function buildOrderItemRows(orders: HarvestOrder[]) {
+  // Values come from Uber's JSON by way of the harvester: coerce them so one odd order
+  // (a string price, a bad date) cannot make the whole upsert throw or store garbage.
+  const cents = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v) / 100 : null);
+  const isoOrNull = (v: unknown) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? v : null);
+  const rows = [];
+  for (const o of orders) {
+    if (!o || typeof o.uuid !== "string" || typeof o.store !== "string" || !o.uuid || !o.store.trim()) continue;
+    const store = o.store.trim().slice(0, 200);
+    const kind = merchantKind(store);
+    const items = Array.isArray(o.items) ? o.items : [];
+    for (const [idx, it] of items.entries()) {
+      if (!it || typeof it.title !== "string" || !it.title.trim()) continue;
+      const title = it.title.trim().slice(0, 300);
+      const customizations = Array.isArray(it.customizations) ? it.customizations : [];
+      const qty = typeof it.quantity === "number" && Number.isFinite(it.quantity) && it.quantity > 0 ? it.quantity : 1;
+      rows.push({
+        provider: "uber_eats",
+        order_uuid: o.uuid,
+        item_key: typeof it.key === "string" && it.key ? it.key : `idx:${idx}`,
+        store_name: store,
+        merchant_kind: kind,
+        completed_at: isoOrNull(o.completedAt),
+        is_cancelled: !!o.isCancelled,
+        order_total: cents(o.total),
+        currency: typeof o.currency === "string" ? o.currency.slice(0, 8) : null,
+        multi_consumer: !!o.multiConsumer,
+        title,
+        quantity: qty,
+        price: cents(it.price),
+        customizations,
+        est_key: estKey(store, title, customizations),
+      });
+    }
+  }
+  return rows;
+}

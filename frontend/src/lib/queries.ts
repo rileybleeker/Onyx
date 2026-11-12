@@ -1,5 +1,6 @@
 import { supabase } from "./supabase";
 import { whoopSleepDay, kjToKcal } from "./format";
+import { dishKcal } from "./delivery-portion";
 
 // Re-audit 2026-06-07 (units/deepseek/F-003): promoted the workout→sleep gap
 // window from a function-local literal to a named module-level const. The pairing
@@ -502,39 +503,73 @@ export async function getNutrition(days: number = 30) {
   return rows;
 }
 
+export interface DeliveryDish {
+  item_id: number;
+  order_uuid: string;
+  store_name: string;
+  title: string;
+  quantity: number;
+  completed_at: string | null;
+  est_key: string;
+  multi_consumer: boolean;
+  /** NULL = all of it (the default); 0.25 = a quarter eaten. Set on /nutrition or /check-in. */
+  eaten_fraction: number | null;
+  /** Estimate for ONE unit (pds.delivery_item_nutrition.kcal); null until estimated. */
+  unit_kcal: number | null;
+  /** food | drink | alcohol | non_food; the day total counts food + drink, like delivery_nutrition_daily. */
+  est_kind: string | null;
+  /** unit_kcal x quantity x eaten_fraction (NULL fraction = 1). */
+  est_kcal: number | null;
+}
+
 /**
  * Uber Eats cart lines for one behavioral day with the per-dish estimate
  * (one unit × quantity × eaten_fraction). Restaurant orders only, cancelled orders excluded —
- * same scope as pds.delivery_nutrition_daily. Feeds "Today's Meals".
+ * same scope as pds.delivery_nutrition_daily. Feeds "Today's Meals" on /nutrition and the
+ * Uber Eats portion section on /check-in.
  */
-export async function getDeliveryItemsForDay(date: string) {
+export async function getDeliveryItemsForDay(date: string): Promise<DeliveryDish[]> {
   const { data, error } = await supabase
     .from("delivery_order_items")
-    // "*" rather than a column list so this keeps working whether or not
-    // sql/delivery_item_eaten_fraction.sql (eaten_fraction) has been applied yet.
-    .select("*")
+    // Explicit columns (no customizations jsonb): eaten_fraction is applied in production
+    // (sql/delivery_item_eaten_fraction.sql).
+    .select("item_id, order_uuid, store_name, merchant_kind, title, quantity, completed_at, est_key, multi_consumer, eaten_fraction")
     .eq("onyx_behavioral_date", date)
     .eq("is_cancelled", false)
+    .eq("merchant_kind", "restaurant")
     .order("completed_at", { ascending: true })
     .order("item_id", { ascending: true });
   if (error) throw error;
-  const items = (data ?? []).filter((i) => i.merchant_kind === "restaurant");
+  const items = data ?? [];
   const keys = Array.from(new Set(items.map((i) => i.est_key).filter(Boolean)));
-  const kcalByKey = new Map<string, number | null>();
+  const estByKey = new Map<string, { kcal: number | null; kind: string | null }>();
   if (keys.length) {
     const { data: est, error: estErr } = await supabase
       .from("delivery_item_nutrition")
-      .select("est_key, kcal")
+      .select("est_key, kcal, kind")
       .in("est_key", keys);
     if (estErr) throw estErr;
-    for (const e of est ?? []) kcalByKey.set(e.est_key, e.kcal == null ? null : Number(e.kcal));
+    for (const e of est ?? []) {
+      estByKey.set(e.est_key, { kcal: e.kcal == null ? null : Number(e.kcal), kind: e.kind ?? null });
+    }
   }
   return items.map((i) => {
-    const unit = kcalByKey.get(i.est_key);
+    const est = estByKey.get(i.est_key);
+    const fraction = i.eaten_fraction == null ? null : Number(i.eaten_fraction);
+    const unit = est?.kcal ?? null;
     return {
-      ...i,
-      // eaten_fraction: NULL = all of it; 0.25 = a quarter eaten (leftovers).
-      est_kcal: unit == null ? null : unit * Number(i.quantity ?? 1) * Number(i.eaten_fraction ?? 1),
+      item_id: Number(i.item_id),
+      order_uuid: i.order_uuid,
+      store_name: i.store_name,
+      title: i.title,
+      quantity: Number(i.quantity ?? 1),
+      completed_at: i.completed_at ?? null,
+      est_key: i.est_key,
+      multi_consumer: !!i.multi_consumer,
+      eaten_fraction: fraction,
+      unit_kcal: unit,
+      est_kind: est?.kind ?? null,
+      est_kcal: dishKcal(unit, i.quantity, fraction),
     };
   });
 }

@@ -5,12 +5,16 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
 import type { CheckinAnswer, CheckinItem, CheckinPayload } from "@/lib/checkin";
+import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortions";
 
 // Daily habit check-in (2026-11-07). One screen per behavior day: Yes / No per question, one Save.
 // - Saved answers load as-is; questions another source can answer (alcohol, rest day) start pre-filled and
 //   labeled with that source; everything else starts blank. Blank on save = not logged (never a "No").
 // - Taps are kept as a local draft per day, so leaving the page (or the app being killed) loses nothing.
 // - Save writes the whole day in one request, then tells the Agents chat the day is done so the card settles.
+// - Days with delivered Uber Eats restaurant dishes get one extra section, "how much did you eat?". It loads
+//   on its own after the questions (never delays them), shows nothing on days without orders, and each tap
+//   saves immediately through PATCH /api/delivery/items/[itemId] (not part of the Save bar).
 
 type Origin = "saved" | "suggested" | "tapped";
 type Cell = { answer: CheckinAnswer; origin: Origin; source?: string };
@@ -42,6 +46,7 @@ export default function CheckInClient() {
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [showExtras, setShowExtras] = useState(false);
+  const delivery = useDeliveryDishes(data?.date ?? null);
 
   const load = useCallback(async (date: string | null) => {
     setError(null);
@@ -269,6 +274,18 @@ export default function CheckInClient() {
               </div>
             </>
           )}
+        </section>
+      )}
+
+      {delivery.items.length > 0 && (
+        <section className="mb-6">
+          <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">Uber Eats: how much did you eat?</h3>
+          <p className="text-[12px] text-text-tertiary mb-2">
+            Saved as you tap. Left as All unless you change it
+            {delivery.totalKcal != null ? ` · ~${Math.round(delivery.totalKcal)} kcal counted` : ""}.
+          </p>
+          <DeliveryDishList items={delivery.items} onPick={delivery.setFraction} />
+          {delivery.error && <p className="text-[12px] text-red-400 mt-1.5">{delivery.error}</p>}
         </section>
       )}
 

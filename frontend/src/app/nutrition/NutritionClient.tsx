@@ -13,7 +13,6 @@ import {
   getNutrition,
   getWhoopCaloriesBurnt,
   getCronometerServings,
-  getDeliveryItemsForDay,
   getDailyVitamins,
   getDailyNutrientsFull,
   rangeDays,
@@ -24,6 +23,7 @@ import { formatDate, kgToLb, lbToKg, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
+import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortions";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -108,6 +108,13 @@ function formatShortDate(ymd: string): string {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+/** YYYY-MM-DD shifted by whole days (calendar arithmetic in UTC, so no DST edge). */
+function shiftYmd(ymd: string, days: number): string {
+  const d = new Date(`${ymd}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
 // ─── Nutrition helpers ───────────────────────────────────────────────────────
 
 function avg(arr: any[], key: string): number {
@@ -141,8 +148,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   const [burntData, setBurntData] = useState<any[]>(initial?.burntData ?? []);
   const [vitaminsData, setVitaminsData] = useState<any[]>(initial?.vitaminsData ?? []);
   const [fullNutrients, setFullNutrients] = useState<any[]>(initial?.fullNutrients ?? []);
-  const [todayServings, setTodayServings] = useState<any[]>([]);
-  const [todayDelivery, setTodayDelivery] = useState<any[]>([]);
+  const [servingsState, setServingsState] = useState<{ date: string | null; rows: any[] }>({ date: null, rows: [] });
   const [nutritionLoading, setNutritionLoading] = useState(!initial);
   const [range, setRange] = useState<Range>("30d");
   const firstRunWithInitial = useRef(!!initial);
@@ -202,15 +208,30 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     return () => { cancelled = true; };
   }, [range]);
 
-  // ─── Today's Cronometer food log (behavioral day, not clock day) ───
+  // ─── Meals log for one behavioral day (today by default; the two days before are one tap away,
+  // because a leftover is usually noticed the next morning) ───
+  const [mealsDayOffset, setMealsDayOffset] = useState(0);
+  const mealsDay = shiftYmd(behavioralToday, -mealsDayOffset);
   useEffect(() => {
-    getCronometerServings(1, behavioralToday)
-      .then(setTodayServings)
+    let cancelled = false;
+    getCronometerServings(1, mealsDay)
+      .then((rows) => {
+        if (!cancelled) {
+          setServingsState((prev) => (prev.date === mealsDay && sameJson(prev.rows, rows) ? prev : { date: mealsDay, rows }));
+        }
+      })
       .catch(console.error);
-    getDeliveryItemsForDay(behavioralToday)
-      .then(setTodayDelivery)
+    return () => { cancelled = true; };
+  }, [mealsDay]);
+
+  // A saved portion changes that day's Uber Eats estimate in the macro charts: refetch them silently.
+  const refreshNutritionSilently = useCallback(() => {
+    getNutrition(rangeDays(range))
+      .then((n) => setNutritionData((prev) => (sameJson(prev, n) ? prev : n)))
       .catch(console.error);
-  }, [behavioralToday]);
+  }, [range]);
+  const delivery = useDeliveryDishes(mealsDay, refreshNutritionSilently);
+  const todayServings = servingsState.date === mealsDay ? servingsState.rows : [];
 
   // ─── Weight loader + default date init ───
   const loadWeight = useCallback(async () => {
@@ -592,12 +613,31 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
 
       {/* ─── Today's meals (Cronometer per-entry log) ──────────────────────── */}
       <div className="flex items-baseline justify-between mb-3">
-        <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">Today&apos;s Meals</p>
-        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + UBER EATS · {behavioralToday}</span>
+        <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">
+          {mealsDayOffset === 0 ? "Today's Meals" : "Meals"}
+        </p>
+        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + UBER EATS · {mealsDay}</span>
       </div>
-      {todayServings.length === 0 && todayDelivery.length === 0 ? (
+      <div className="flex gap-1.5 mb-3" role="tablist" aria-label="Meals day">
+        {[0, 1, 2].map((off) => (
+          <button
+            key={off}
+            role="tab"
+            aria-selected={mealsDayOffset === off}
+            onClick={() => setMealsDayOffset(off)}
+            className={`px-2.5 py-1 rounded-[5px] border text-[11px] font-mono transition-colors ${
+              mealsDayOffset === off
+                ? "border-accent/60 bg-accent/10 text-text-primary"
+                : "border-border-subtle text-text-tertiary hover:text-text-secondary"
+            }`}
+          >
+            {off === 0 ? "Today" : off === 1 ? "Yesterday" : formatShortDate(shiftYmd(behavioralToday, -2))}
+          </button>
+        ))}
+      </div>
+      {todayServings.length === 0 && delivery.items.length === 0 ? (
         <p className="text-xs text-text-tertiary mb-2">
-          Nothing logged for today yet. Cronometer entries and Uber Eats orders appear here once they sync.
+          Nothing logged for {mealsDayOffset === 0 ? "today" : "this day"} yet. Cronometer entries and Uber Eats orders appear here once they sync.
         </p>
       ) : todayServings.length === 0 ? null : (
         <div className="bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle">
@@ -617,28 +657,19 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
           ))}
         </div>
       )}
-      {todayDelivery.length > 0 && (
-        <div className={`bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle ${todayServings.length ? "mt-3" : ""}`}>
-          {todayDelivery.map((d) => (
-            <div key={d.item_id} className="flex items-center gap-3 px-4 py-2.5 text-sm">
-              <span className="text-[11px] font-mono text-text-tertiary w-20 shrink-0">
-                {d.completed_at
-                  ? new Date(d.completed_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })
-                  : "—"}
-              </span>
-              <span className="flex-1 truncate text-text-secondary">
-                {d.title}
-                <span className="text-text-tertiary"> · {d.store_name}</span>
-              </span>
-              <span className="text-[11px] font-mono text-text-tertiary shrink-0">
-                {Number(d.quantity) > 1 ? `×${d.quantity}` : ""} UBER EATS
-              </span>
-              <span className="text-[11px] font-mono text-text-tertiary w-16 text-right shrink-0">
-                {d.est_kcal != null ? `~${Math.round(Number(d.est_kcal))} kcal` : "—"}
-              </span>
-            </div>
-          ))}
-        </div>
+      {delivery.items.length > 0 && (
+        <>
+          <div className={`flex items-baseline justify-between ${todayServings.length ? "mt-3" : ""} mb-1.5`}>
+            <span className="text-[10px] font-mono text-text-tertiary">
+              Tap how much you ate; leftovers count only the part eaten.
+            </span>
+            <span className="text-[11px] font-mono text-text-secondary">
+              {delivery.totalKcal != null ? `Uber Eats ~${Math.round(delivery.totalKcal)} kcal` : ""}
+            </span>
+          </div>
+          <DeliveryDishList items={delivery.items} onPick={delivery.setFraction} />
+          {delivery.error && <p className="text-[11px] text-red-400 mt-1.5">{delivery.error}</p>}
+        </>
       )}
 
       <div className="border-t border-border-subtle my-10" />
