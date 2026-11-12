@@ -8,6 +8,7 @@ Usage:
     python eight_sleep_etl.py --backfill 730     # Backfill ~2 years of history
     python eight_sleep_etl.py --backfill 30      # Backfill last 30 days
     python eight_sleep_etl.py --date 2025-06-15  # Sync a specific date
+    python eight_sleep_etl.py --selfheal-max 0   # Skip the temp self-heal step
 
 Requirements:
     pip install httpx supabase python-dotenv
@@ -26,6 +27,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 from retry_helper import retry_http
+from sync_log_helper import log_sync
 
 # ---------------------------------------------------------------------------
 # Config
@@ -156,6 +158,26 @@ class EightSleepClient:
         )
         return resp.json().get("intervals", [])
 
+    def get_interval(self, user_id: str, session_id: str) -> dict | None:
+        """Fetch ONE interval (with timeseries) by session ID; None on 404.
+
+        Unlike the /intervals collection (capped at the 10 most recent
+        sessions), this per-ID endpoint serves sessions of any age.
+        """
+        try:
+            resp = retry_http(
+                lambda: self.http.get(
+                    f"{CLIENT_API_URL}/users/{user_id}/intervals/{session_id}",
+                    headers=self._headers(),
+                ),
+                max_attempts=3, log=log,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
+        return resp.json()
+
     def close(self):
         self.http.close()
 
@@ -209,36 +231,17 @@ def sum_timeseries(timeseries: list | None) -> int | None:
     return int(sum(entry[1] for entry in timeseries))
 
 
-def log_sync(sb: Client, source: str, data_type: str, status: str,
-             records: int = 0, date_start: date = None, date_end: date = None,
-             error: str = None, duration: float = None):
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(seconds=duration) if duration is not None else end
-    try:
-        sb.schema("pds").table("sync_log").insert({
-            "source": source,
-            "data_type": data_type,
-            "status": status,
-            "records_synced": records,
-            "date_range_start": date_start.isoformat() if date_start else None,
-            "date_range_end": date_end.isoformat() if date_end else None,
-            "error_message": error,
-            "duration_seconds": duration,
-            "sync_start": start.isoformat(),
-            "sync_end": end.isoformat(),
-        }).execute()
-    except Exception as e:
-        log.warning(f"Failed to write sync log: {e}")
-
-
 def upsert_to_supabase(sb: Client, table: str, rows: list[dict],
                         conflict_columns: str):
     if not rows:
         return 0
+    # return=representation is spelled out (not left to the client default) so
+    # the row count below, which feeds sync_log.records_synced, can never
+    # silently become 0 if a client version flips its default to minimal.
     result = (
         sb.schema("pds")
         .table(table)
-        .upsert(rows, on_conflict=conflict_columns)
+        .upsert(rows, on_conflict=conflict_columns, returning="representation")
         .execute()
     )
     return len(result.data) if result.data else 0
@@ -579,6 +582,129 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
 
 
 # ---------------------------------------------------------------------------
+# Temp self-heal
+# ---------------------------------------------------------------------------
+# The /intervals collection only returns the 10 most recent sessions, so a
+# pause of 10+ days (or a wide --days catch-up, which upserts NULL temps for
+# dates the collection no longer covers) leaves median_bed_temp /
+# median_room_temp NULL. The per-ID endpoint serves any session, and the
+# trends rows already store mainSessionId, so each gap can be recovered.
+# eight_sleep_temp_backfill.py is the one-off, unbounded version of this step.
+
+SELFHEAL_MAX_ROWS = 20        # per-ID API calls per run, both sides combined
+SELFHEAL_LOOKBACK_DAYS = 60   # only rows newer than this are scanned
+SELFHEAL_SCAN_LIMIT = 500     # rows read from Postgres per run
+SELFHEAL_DELAY_S = 0.3        # politeness delay between per-ID calls
+TEMP_COLUMNS = ("median_bed_temp", "median_room_temp")
+
+
+def _session_id_from_raw(raw) -> str | None:
+    """mainSessionId (else the first sessionId) from a stored trends payload.
+
+    raw_json is a dict on current rows and a JSON string on older ones.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    main_id = raw.get("mainSessionId")
+    if main_id:
+        return str(main_id)
+    session_ids = raw.get("sessionIds") or []
+    return str(session_ids[0]) if session_ids else None
+
+
+def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
+                    max_rows: int = SELFHEAL_MAX_ROWS,
+                    lookback_days: int = SELFHEAL_LOOKBACK_DAYS,
+                    delay_s: float = SELFHEAL_DELAY_S) -> dict:
+    """Fill NULL median_bed_temp / median_room_temp from /intervals/{id}.
+
+    Bounded: at most `max_rows` per-ID calls per run (rows with no usable
+    session id or bed side cost nothing and do not count). Idempotent and
+    non-destructive: only columns that are NULL are written, and the UPDATE
+    itself re-checks `IS NULL` so a concurrent writer is never overwritten.
+    Today is excluded (the session may still be processing). One failing row
+    never stops the others; it stays NULL and is retried next run.
+    Returns counters; `scan_error` is set if the candidate query failed.
+    """
+    stats = {"candidates": 0, "attempted": 0, "healed": 0, "no_temp": 0,
+             "not_found": 0, "failed": 0, "skipped": 0, "scan_error": None}
+    if max_rows <= 0:
+        return stats
+    try:
+        rows = (
+            sb.schema("pds").from_("eight_sleep_trends")
+            .select("calendar_date,bed_side,raw_json,"
+                    "median_bed_temp,median_room_temp")
+            .gte("calendar_date",
+                 (today - timedelta(days=lookback_days)).isoformat())
+            .lt("calendar_date", today.isoformat())
+            .or_("median_bed_temp.is.null,median_room_temp.is.null")
+            .order("calendar_date", desc=True)
+            .limit(SELFHEAL_SCAN_LIMIT)
+            .execute()
+        ).data or []
+    except Exception as e:  # noqa: BLE001 — heal must never fail the ETL
+        stats["scan_error"] = f"candidate query failed: {e}"
+        log.warning(f"Self-heal: {stats['scan_error']}")
+        return stats
+
+    stats["candidates"] = len(rows)
+    for row in rows:
+        if stats["attempted"] >= max_rows:
+            break
+        cal, side = row.get("calendar_date"), row.get("bed_side")
+        user_id = users.get(side)
+        session_id = _session_id_from_raw(row.get("raw_json"))
+        if not user_id or not session_id:
+            stats["skipped"] += 1
+            continue
+
+        stats["attempted"] += 1
+        try:
+            interval = client.get_interval(user_id, session_id)
+            if interval is None:
+                stats["not_found"] += 1
+                log.info(f"  Self-heal [{cal}/{side}]: session {session_id} not found")
+                continue
+            ts = interval.get("timeseries") or {}
+            found = {
+                "median_bed_temp": median_timeseries(ts.get("tempBedC")),
+                "median_room_temp": median_timeseries(ts.get("tempRoomC")),
+            }
+            # Never overwrite: only columns NULL on the row AND present in the interval.
+            payload = {c: found[c] for c in TEMP_COLUMNS
+                       if found[c] is not None and row.get(c) is None}
+            if not payload:
+                stats["no_temp"] += 1
+                continue
+            q = (sb.schema("pds").from_("eight_sleep_trends").update(payload)
+                 .eq("calendar_date", cal).eq("bed_side", side))
+            for col in payload:
+                q = q.is_(col, "null")
+            q.execute()
+            stats["healed"] += 1
+            log.info(f"  Self-heal [{cal}/{side}]: {payload}")
+        except Exception as e:  # noqa: BLE001 — row stays NULL, retried next run
+            stats["failed"] += 1
+            log.warning(f"  Self-heal [{cal}/{side}] session {session_id} failed: {e}")
+        time.sleep(delay_s)
+    return stats
+
+
+def _selfheal_summary(stats: dict, max_rows: int) -> str:
+    return (f"healed {stats['healed']} of {stats['attempted']} attempted "
+            f"(cap {max_rows}, {stats['candidates']} candidate rows); "
+            f"failed={stats['failed']} no_temp={stats['no_temp']} "
+            f"not_found={stats['not_found']} skipped={stats['skipped']}"
+            + (f"; {stats['scan_error']}" if stats["scan_error"] else ""))
+
+
+# ---------------------------------------------------------------------------
 # Discover bed sides
 # ---------------------------------------------------------------------------
 
@@ -630,6 +756,10 @@ def main():
     parser.add_argument("--side", type=str, default=None,
                         choices=["left", "right"],
                         help="Sync only one bed side (default: both)")
+    parser.add_argument("--selfheal-max", type=int, default=SELFHEAL_MAX_ROWS,
+                        help="Max per-ID interval lookups the post-sync temp "
+                             f"self-heal may make (default: {SELFHEAL_MAX_ROWS}; "
+                             "0 disables)")
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -683,6 +813,28 @@ def main():
             errors += 1
             log.error(f"[{side}] Sync failed: {e}", exc_info=True)
 
+    # Self-heal NULL temps the normal sync could not fill (before the matview
+    # refresh so healed values reach daily_health_matrix this run).
+    heal_t0 = time.time()
+    try:
+        heal = self_heal_temps(client, sb, users, today,
+                               max_rows=args.selfheal_max)
+    except Exception as e:  # noqa: BLE001 — never fail the ETL on the heal step
+        log.warning(f"Temp self-heal crashed: {e}")
+        heal = {"candidates": 0, "attempted": 0, "healed": 0, "no_temp": 0,
+                "not_found": 0, "failed": 0, "skipped": 0,
+                "scan_error": f"self-heal crashed: {e}"}
+    if heal["candidates"] or heal["scan_error"]:
+        summary = _selfheal_summary(heal, args.selfheal_max)
+        log.info(f"Temp self-heal: {summary}")
+        clean = not (heal["failed"] or heal["scan_error"])
+        log_sync(sb, "eight_sleep", "temp_selfheal",
+                 "success" if clean else "partial",
+                 records=heal["healed"], started_at=heal_t0,
+                 date_range_start=today - timedelta(days=SELFHEAL_LOOKBACK_DAYS),
+                 date_range_end=today,
+                 error=None if clean else summary)
+
     # Refresh materialized views
     log.info("Refreshing materialized views...")
     try:
@@ -694,12 +846,13 @@ def main():
     duration = time.time() - t0
 
     log_sync(sb, "eight_sleep", "trends", "success" if errors == 0 else "partial",
-             records=total_records, date_start=start, date_end=end,
-             duration=duration,
+             records=total_records, started_at=t0,
+             date_range_start=start, date_range_end=end,
              error=f"{errors} error(s)" if errors else None)
 
     log.info("=" * 60)
-    log.info(f"Done! {total_records} total records | {errors} errors | {duration:.1f}s")
+    log.info(f"Done! {total_records} total records | {heal['healed']} temps healed "
+             f"| {errors} errors | {duration:.1f}s")
     log.info("=" * 60)
 
     client.close()
@@ -717,7 +870,7 @@ if __name__ == "__main__":
             _sb_for_log = get_supabase_client()
             log_sync(_sb_for_log, "eight_sleep", "trends", "failed",
                      records=0, error=f"Uncaught exception: {exc}",
-                     duration=_time.time() - _t_main_start)
+                     started_at=_t_main_start)
         except Exception as log_exc:  # noqa: BLE001
             log.error(f"Could not write failure sync_log row: {log_exc}")
         raise
