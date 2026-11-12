@@ -154,6 +154,14 @@ class MasterCiVerdict(unittest.TestCase):
         self.assertEqual(mt.master_ci_verdict(runs, False)[0], "ok")
 
 
+class MasterCiTimeout(unittest.TestCase):
+    def test_slow_ci_is_not_a_failure(self):
+        # 2026-11-12: three merges in three minutes queued master CI past 10 min and #83 was reverted for nothing
+        result, why = mt.ci_timeout_verdict(600)
+        self.assertEqual(result, "ok")
+        self.assertIn("smoke", why)
+
+
 class ProductionVerdict(unittest.TestCase):
     def test_success_wins(self):
         self.assertEqual(mt.production_verdict(["success"], True)[0], "ok")
