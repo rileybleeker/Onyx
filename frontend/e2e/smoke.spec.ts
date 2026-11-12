@@ -167,7 +167,7 @@ test.describe("Nutrition — Cronometer migration tripwire", () => {
     // micronutrient query). Section headings are structural — present even on a
     // thin day — so this won't false-fail when micronutrient coverage is sparse.
     await expect(
-      page.getByText("Cronometer · Daily Macros"),
+      page.getByText("Daily Macros", { exact: true }),
       "Cronometer macros section missing"
     ).toBeVisible();
     await expect(
