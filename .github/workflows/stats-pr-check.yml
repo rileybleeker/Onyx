@@ -1,99 +1,61 @@
 name: Stats Tests (PR check)
 
-# Audit Tier 4 #37: run the in-repo stats unit tests on every PR that
-# touches hrv_analysis.py, hrv_predict.py, or any tests/ file. Catches
-# regressions in BH-FDR, the workout-to-sleep gap feature, or the habit
-# rename cascade before they merge.
+# Offline, credential-free unit tests for the HRV pipeline and the ETL helpers.
+#
+# This job holds NO secrets and sets NO SUPABASE_* variables. A pull request can edit tests/
+# or this very file, so anything it can reach would be exposed to unreviewed code; nothing
+# here can reach production. Tests that need the live database (tests/test_hrv_alignment_live.py,
+# tests/test_habit_rename.py) run in live-checks.yml on master / on a schedule instead.
+#
+# What runs: every tests/test_*.py except the live ones, discovered and run in parallel by
+# tests/run_offline_tests.py (the single place that lists exclusions). See docs/ci-checks.md.
 
 on:
   pull_request:
     paths:
-      - "hrv_analysis.py"
-      - "hrv_predict.py"
-      - "hrv_alignment.py"
-      - "causal_inference.py"
-      - "garmin_etl.py"
-      - "whoop_etl.py"
-      - "eight_sleep_etl.py"
+      - "**/*.py"
       - "tests/**"
-      - "frontend/src/**"
-      - "requirements-analysis*.txt"
-      - "requirements-analysis.lock"
+      - "frontend/src/**"        # tests/test_tdee_source_guard.py scans the TypeScript sources
+      - "requirements*"
       - ".github/workflows/stats-pr-check.yml"
   workflow_dispatch:
-    inputs:
-      run_live_write_tests:
-        description: 'Explicitly run habit-rename fixtures against the configured live database'
-        type: boolean
-        default: false
-        required: false
 
-env:
-  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+permissions:
+  contents: read
 
-# These tests read (and, until PR #21 lands, write) the live production
-# database. On 2026-11-11 a burst of parallel PR runs (781 requests in
-# 06:40-06:45Z) preceded a Postgres stall. One global group means only one
-# Stats Tests run touches the database at a time; the rest wait. GitHub keeps
-# at most one waiting run per group, so in a burst the older waiting runs are
-# cancelled and the newest one runs; re-run a cancelled PR check if needed.
+# Nothing here touches shared state, so a newer push simply replaces the older run.
 concurrency:
-  group: stats-pr-check
-  cancel-in-progress: false
+  group: stats-pr-check-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # Job name is referenced by merge tooling; keep it stable.
   stats-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          python-version: "3.12"
+          persist-credentials: false
 
-      - name: Cache pip
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-stats-${{ hashFiles('requirements-analysis.lock', 'requirements-analysis.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-stats-
-
-      - name: Install (lock first, fall back to txt)
+      - name: Parse-check Python modules (fails fast, before the install)
         run: |
-          if [ -f requirements-analysis.lock ]; then
-            pip install -r requirements-analysis.lock
-          else
-            pip install -r requirements-analysis.txt
-          fi
-          pip install supabase python-dotenv
-
-      - name: Parse-check Python modules
-        run: |
-          python -c "import ast; [ast.parse(open(p).read()) for p in (
+          python3 -c "import ast; [ast.parse(open(p).read()) for p in (
             'hrv_analysis.py','hrv_predict.py','hrv_alignment.py','causal_inference.py',
-            'garmin_etl.py','whoop_etl.py','eight_sleep_etl.py',
+            'garmin_etl.py','whoop_etl.py','eight_sleep_etl.py','spotify_etl.py',
+            'whoop_tz_backfill.py',
           )]; print('all .py modules parse cleanly')"
 
-      - name: BH-FDR synthetic-data unit test
-        run: python tests/test_fdr_correction.py
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-ci.txt
+            requirements-analysis.lock
 
-      - name: HRV alignment against the live matrix
-        env:
-          ONYX_REQUIRE_LIVE: '1'
-        run: python tests/test_hrv_alignment_live.py
+      - name: Install (pinned analysis lock + the few extras the ETL modules import)
+        run: pip install -r requirements-ci.txt
 
-      - name: Delivery features + error-mode join key
-        run: |
-          python tests/test_delivery_features.py
-          python tests/test_error_mode_feature_date.py
-
-      - name: Habit-rename cascade integration test (explicit live-write opt-in)
-        if: github.event_name == 'workflow_dispatch' && inputs.run_live_write_tests == true
-        # This test MUTATES the configured database. Never run it implicitly for
-        # PRs. The operator must explicitly opt in to the live write; retain the
-        # test for deliberate integration validation until isolated staging exists.
-        run: python tests/test_habit_rename.py
-
-      - name: TDEE source guard (WHOOP kJ is canonical, never Garmin kcal)
-        run: python tests/test_tdee_source_guard.py
+      - name: Offline tests (all of tests/test_*.py except the live ones, in parallel)
+        run: python tests/run_offline_tests.py
