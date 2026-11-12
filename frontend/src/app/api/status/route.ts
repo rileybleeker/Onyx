@@ -1,4 +1,4 @@
-import { ingestionHeartbeatStatus } from "@/lib/status-freshness";
+import { GARMIN_WEARABLE_FILTER, garminNoWearMessage, ingestionHeartbeatStatus } from "@/lib/status-freshness";
 import { NextResponse } from "next/server";
 import { getNycScoutFreshness } from "@/lib/nyc";
 import { createClient } from "@supabase/supabase-js";
@@ -222,6 +222,14 @@ export async function GET() {
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+    // Garmin freshness = the newest day the watch was worn. Garmin writes an
+    // (empty) summary row for every day, so the newest row alone stayed green
+    // through 40 unworn days (2026-10-03 -> 2026-11-11). The query builder is
+    // lazy; .then() sends it now so it overlaps the reads below.
+    const garminWornPromise = supabase.from("garmin_daily_summary").select("calendar_date")
+      .or(GARMIN_WEARABLE_FILTER).order("calendar_date", { ascending: false }).limit(1)
+      .then((res) => res);
+
     // NYC scout freshness lives in Notion (the "NYC Leads" database the
     // nyc-scout agent upserts every run), not in sync_log. Started here so the
     // one Notion call overlaps the Supabase reads; a Notion failure turns the
@@ -364,7 +372,9 @@ export async function GET() {
       if (entry) latestBySrcType[key] = entry as Record<string, unknown>;
     }
 
-    const garminDate = garminRes.data?.[0]?.calendar_date ?? null;
+    const garminRowDate = garminRes.data?.[0]?.calendar_date ?? null;
+    const garminWorn = await garminWornPromise;
+    const garminDate = (garminWorn.data?.[0]?.calendar_date as string | undefined) ?? null;
     const whoopDate = whoopRes.data?.[0]?.start_time?.split("T")[0] ?? null;
     const eightSleepDate = eightSleepRes.data?.[0]?.calendar_date ?? null;
     const habitsDate = habitsRes.data?.[0]?.cycle_date ?? null;
@@ -439,7 +449,9 @@ export async function GET() {
         daysLag: garminLag,
         recordsSynced: (garminEntry?.records_synced as number) ?? 0,
         durationSeconds: (garminEntry?.duration_seconds as number) ?? null,
-        errorMessage: (garminEntry?.error_message as string) ?? null,
+        errorMessage: (garminEntry?.error_message as string)
+          ?? garminWorn.error?.message
+          ?? garminNoWearMessage(garminDate, garminRowDate, garminLag),
         cadence: CADENCE.garmin,
         integrationMethod: METHOD.garmin.method,
         methodLabel: METHOD.garmin.label,
@@ -694,8 +706,10 @@ export async function GET() {
       // a daily Shortcuts automation runs the app's "Sync Screen Time to Onyx"
       // intent, and every POST writes a screen_time|usage heartbeat. Kept separate
       // from the card above (the older open/close events path) while both exist.
-      // A failure on the phone never reaches the route, so this card has to age
-      // out: >26h degraded, >36h or a failed row = red. "unknown" until first sync.
+      // The app reports its own failures (Screen Time unreadable, network, HTTP)
+      // as a failed row (2026-11-11), but a missing or refused token cannot be
+      // reported, so the card still ages out: >26h degraded, >36h or a failed
+      // row = red. "unknown" until first sync.
       screen_usage: (() => {
         const entry = latestBySrcType["screen_time|usage"]
           ?? (screenUsageSyncRes.data?.[0] as Record<string, unknown> | undefined)
