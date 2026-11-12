@@ -43,7 +43,7 @@ BEGIN
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'pds'
           AND c.relkind IN ('r', 'p', 'v', 'm')
-          AND c.relname NOT IN ('ci_tokens', 'phone_usage_segments', 'phone_usage_items', 'phone_usage_daily')
+          AND c.relname NOT IN ('ci_tokens', 'phone_usage_segments', 'phone_usage_items', 'phone_usage_daily', 'inbox_emails')
           AND (has_table_privilege('anon', c.oid, 'SELECT')
                OR has_table_privilege('authenticated', c.oid, 'SELECT'))
     LOOP

@@ -25,6 +25,15 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * Re-sending an hour overwrites it (the current hour keeps growing until it
  * ends), so the app can safely re-send the last few days on every run.
  *
+ * Failure report (2026-11-11): the app POSTs `{ app_version?, failure: { stage,
+ * message } }` (no segments) when a sync breaks before or while sending, with
+ * stage one of FAILURE_STAGES. It becomes a failed screen_time|usage heartbeat,
+ * so /status turns red at once instead of after the 36 h age-out. A rejected
+ * upload (400) and a database error (500) log a failed heartbeat here too and
+ * answer `logged: true`, which tells the app not to report the same failure
+ * again. A missing or refused token never reaches this route (middleware 401),
+ * so those failures still surface only through the age-out.
+ *
  * Auth: a browser session, or the `x-onyx-ci-token` header (middleware
  * carve-out — the app stores the token in the iPhone Keychain).
  *
@@ -79,6 +88,17 @@ function text(v: unknown, max: number): string | null {
   return s ? s.slice(0, max) : null;
 }
 
+// Where a sync can break on the phone (tools/screentime_ios SyncService.swift SyncStage).
+const FAILURE_STAGES = ["access", "read", "encode", "network", "http"] as const;
+
+/** The heartbeat text for an app failure report. Never echoes usage data. */
+function failureMessage(failure: unknown, appVersion: unknown): string {
+  const f = failure && typeof failure === "object" ? (failure as { stage?: unknown; message?: unknown }) : {};
+  const stage = (FAILURE_STAGES as readonly unknown[]).includes(f.stage) ? (f.stage as string) : "unknown";
+  const version = text(appVersion, 40);
+  return `iPhone app sync failed (${stage}): ${text(f.message, 300) ?? "no detail"}${version ? ` [app ${version}]` : ""}`;
+}
+
 async function heartbeat(startedAt: Date, status: "success" | "failed", records: number, error: string | null) {
   const end = new Date();
   const { error: e } = await supabase.from("sync_log").insert({
@@ -96,16 +116,41 @@ async function heartbeat(startedAt: Date, status: "success" | "failed", records:
 
 export async function POST(req: NextRequest) {
   const startedAt = new Date();
-  let body: { device?: unknown; device_name?: unknown; device_model?: unknown; segments?: unknown };
+  // A rejected upload is a failed sync: log it, so /status goes red now. The
+  // heartbeat gets a generic reason (sync_log is owner-readable, the usage
+  // tables are service-role only); the detailed error goes back to the app.
+  const reject = async (error: string, reason: string) => {
+    await heartbeat(startedAt, "failed", 0, `Rejected upload: ${reason}`);
+    return NextResponse.json({ error, logged: true }, { status: 400 });
+  };
+
+  let body: {
+    device?: unknown; device_name?: unknown; device_model?: unknown; segments?: unknown;
+    app_version?: unknown; failure?: unknown;
+  };
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "Body must be JSON" }, { status: 400 });
+    return reject("Body must be JSON", "body was not JSON");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return reject("Body must be a JSON object", "body was not a JSON object");
+  }
+
+  if (body.failure !== undefined && body.failure !== null) {
+    if (Array.isArray(body.segments) && body.segments.length > 0) {
+      return reject("Send a failure report without segments", "failure report carried segments");
+    }
+    await heartbeat(startedAt, "failed", 0, failureMessage(body.failure, body.app_version));
+    return NextResponse.json({ ok: true, recorded: "failed" });
   }
 
   const inputs = Array.isArray(body.segments) ? (body.segments as SegmentInput[]) : null;
   if (!inputs || inputs.length > MAX_SEGMENTS) {
-    return NextResponse.json({ error: `Send segments[] with 0-${MAX_SEGMENTS} entries` }, { status: 400 });
+    return reject(
+      `Send segments[] with 0-${MAX_SEGMENTS} entries`,
+      inputs ? `${inputs.length} segments (limit ${MAX_SEGMENTS})` : "no segments[] array",
+    );
   }
 
   const device = text(body.device, 60) ?? "iphone";
@@ -123,11 +168,11 @@ export async function POST(req: NextRequest) {
     const end = iso(raw.end);
     const total = num(raw.total_seconds);
     if (!start || !end || total === null || total < 0) {
-      return NextResponse.json({ error: `Bad segment ${JSON.stringify(raw).slice(0, 200)}` }, { status: 400 });
+      return reject(`Bad segment ${JSON.stringify(raw).slice(0, 200)}`, "a segment lacks a valid start, end or total_seconds");
     }
     const startMs = new Date(start).getTime();
     if (new Date(end).getTime() <= startMs || startMs > now + MAX_FUTURE_MS || startMs < now - MAX_AGE_MS) {
-      return NextResponse.json({ error: `Segment out of range: ${start} → ${end}` }, { status: 400 });
+      return reject(`Segment out of range: ${start} → ${end}`, "a segment is outside the accepted time range");
     }
     segments.set(start, {
       device,
@@ -165,7 +210,7 @@ export async function POST(req: NextRequest) {
   }
 
   if (items.size > MAX_ITEMS) {
-    return NextResponse.json({ error: `Too many items (${items.size}); send fewer days per request` }, { status: 400 });
+    return reject(`Too many items (${items.size}); send fewer days per request`, `${items.size} items (limit ${MAX_ITEMS})`);
   }
 
   try {
@@ -189,7 +234,7 @@ export async function POST(req: NextRequest) {
     const message = e instanceof Error ? e.message : String(e);
     console.error("screen-time usage write failed:", message);
     await heartbeat(startedAt, "failed", 0, message);
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: message, logged: true }, { status: 500 });
   }
 }
 

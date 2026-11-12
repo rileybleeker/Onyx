@@ -160,11 +160,11 @@ def build_row(account: str, attrs: dict, header: email.message.Message, snippet:
         mid = f"gmail:{attrs.get('gmail_message_id') or attrs['uid'].decode()}"
     subject = decode_hdr(header.get("Subject"))
     return {
-        "account": account.strip().lower(),
+        "account": account.strip().lower()[:320],
         "message_id": mid[:500],
         "received_at": received.astimezone(timezone.utc).isoformat(),
-        "from_name": (name.strip() or None),
-        "from_address": address,
+        "from_name": (name.strip()[:200] or None),   # length caps match sql/inbox_emails_schema.sql
+        "from_address": address[:320],
         "subject": subject[:SUBJECT_MAX],
         "snippet": snippet,
         "is_unread": bool(attrs.get("unread")),

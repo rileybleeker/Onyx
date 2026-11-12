@@ -47,6 +47,14 @@ def ignored(name: str) -> bool:
     return "vercel" in name.lower() and "preview" in name.lower()
 
 
+# The train's own job shows up as a check on the PR head; waiting on it would wait on itself.
+OWN_CHECKS = {"train"}
+OWN_WORKFLOWS = {"Merge train", "Post-merge verify"}
+# Vercel's preview build status: it queues behind other builds on Vercel and repeats what frontend-types already
+# compiles, so a pending preview does not hold a merge. A failed preview still blocks.
+PREVIEW_STATUS = "Vercel"
+
+
 def note(msg: str) -> None:
     print(msg, flush=True)
     path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -95,7 +103,7 @@ def judge(pr: dict, files: list[str] | None, runs: list[dict], statuses: list[di
         return "skip", f"protected path {hit} (owner merges these)"
     if pr["mergeable"] == "CONFLICTING" or pr["mergeStateStatus"] == "DIRTY":
         return "skip", "merge conflict"
-    latest = latest_runs([r for r in runs if not ignored(r["name"])])
+    latest = latest_runs([r for r in runs if not ignored(r["name"]) and r["name"] not in OWN_CHECKS])
     for name, r in latest.items():
         if r["status"] == "completed" and r["conclusion"] in BAD:
             return "skip", f"check {name} {r['conclusion']}"
@@ -105,7 +113,7 @@ def judge(pr: dict, files: list[str] | None, runs: list[dict], statuses: list[di
     if pr["mergeStateStatus"] == "BEHIND":
         return "update", "behind " + BASE
     pending = active_runs > 0 or any(r["status"] != "completed" for r in latest.values()) or \
-        any(s["state"] == "pending" and not ignored(s["context"]) for s in statuses)
+        any(s["state"] == "pending" and not ignored(s["context"]) and s["context"] != PREVIEW_STATUS for s in statuses)
     if pending:
         return "wait", "checks running"
     missing = [n for n in REQUIRED if n not in latest or latest[n]["conclusion"] != "success"]
@@ -176,8 +184,8 @@ def head_checks(sha: str) -> tuple[list[dict], list[dict], int]:
     statuses = api_items(f"repos/{REPO}/commits/{sha}/status?per_page=100",
                          ".statuses[]|{context,state}")
     wf = api_items(f"repos/{REPO}/actions/runs?head_sha={sha}&per_page=100",
-                   ".workflow_runs[]|{status}")
-    return runs, statuses, sum(1 for w in wf if w["status"] != "completed")
+                   ".workflow_runs[]|{status,name}")
+    return runs, statuses, sum(1 for w in wf if w["status"] != "completed" and w["name"] not in OWN_WORKFLOWS)
 
 
 def halted() -> bool:
@@ -263,7 +271,22 @@ def run_train(dry: bool) -> int:
 
 
 # ---------- post-merge verification ----------
-def wait_production(sha: str, timeout: int = 900) -> tuple[bool, str]:
+def production_verdict(states: list[str], master_moved: bool) -> tuple[str, str] | None:
+    """Pure: verdict on the commit's Production deployment statuses, or None while still waiting.
+
+    Vercel marks a deployment inactive once a newer Production deployment replaces it, so with merges landing
+    back to back the older one never reads success again. That is superseded, not failed: the newer merge's own
+    verification covers it."""
+    if "success" in states:
+        return "ok", "Production deployment succeeded"
+    if states and all(s in ("failure", "error") for s in states):
+        return "fail", "Production deployment " + states[0]
+    if "inactive" in states or master_moved:
+        return "skipped", "Production deployment replaced by a newer merge; that merge's own verification covers this one"
+    return None
+
+
+def wait_production(sha: str, timeout: int = 900) -> tuple[str, str]:
     end = time.time() + timeout
     while time.time() < end:
         deps = api_items(f"repos/{REPO}/deployments?sha={sha}&environment=Production&per_page=5", ".[]|{id}")
@@ -271,15 +294,30 @@ def wait_production(sha: str, timeout: int = 900) -> tuple[bool, str]:
         for d in deps:
             st = api_items(f"repos/{REPO}/deployments/{d['id']}/statuses?per_page=1", ".[]|{state}")
             states.append(st[0]["state"] if st else "pending")
-        if "success" in states:
-            return True, "Production deployment succeeded"
-        if states and all(s in ("failure", "error") for s in states):
-            return False, "Production deployment " + states[0]
+        verdict = production_verdict(states, master_sha() != sha)
+        if verdict:
+            return verdict
         time.sleep(20)
-    return False, f"no successful Production deployment within {timeout // 60} min"
+    return "fail", f"no successful Production deployment within {timeout // 60} min"
 
 
-def wait_master_ci(sha: str, timeout: int = 600) -> tuple[bool, str]:
+def master_ci_verdict(runs: list[dict], master_moved: bool) -> tuple[str, str] | None:
+    """Pure: verdict on the merge commit's Autonomous CI runs, or None while still waiting.
+
+    Autonomous CI cancels an in-progress master run when the next merge lands (concurrency per ref). A run that was
+    only cancelled because master moved on is superseded, not failed: the newer merge's own verification covers it.
+    """
+    done = [r for r in runs if r["status"] == "completed"]
+    if done and any(r["conclusion"] == "success" for r in done):
+        return "ok", "master CI green"
+    if done and all(r["conclusion"] in BAD for r in done) and len(done) == len(runs):
+        if master_moved and all(r["conclusion"] == "cancelled" for r in done):
+            return "skipped", "master CI cancelled because master moved on; that merge's own verification covers this one"
+        return "fail", "master CI " + done[0]["conclusion"]
+    return None
+
+
+def wait_master_ci(sha: str, timeout: int = 600) -> tuple[str, str]:
     """Autonomous CI on the merge commit. A token-made merge may start no push run, so dispatch one if none exists."""
     def runs():
         return api_items(f"repos/{REPO}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={sha}&per_page=10",
@@ -289,13 +327,12 @@ def wait_master_ci(sha: str, timeout: int = 600) -> tuple[bool, str]:
         gh("workflow", "run", CI_WORKFLOW, "-R", REPO, "--ref", BASE)
     end = time.time() + timeout
     while time.time() < end:
-        done = [r for r in runs() if r["status"] == "completed"]
-        if done and any(r["conclusion"] == "success" for r in done):
-            return True, "master CI green"
-        if done and all(r["conclusion"] in BAD for r in done) and len(done) == len(runs()):
-            return False, "master CI " + done[0]["conclusion"]
+        current = runs()
+        verdict = master_ci_verdict(current, master_sha() != sha)
+        if verdict:
+            return verdict
         time.sleep(20)
-    return False, "master CI did not finish in %d min" % (timeout // 60)
+    return "fail", "master CI did not finish in %d min" % (timeout // 60)
 
 
 def post_merge(sha: str, drill: bool) -> int:
@@ -313,11 +350,11 @@ def post_merge(sha: str, drill: bool) -> int:
     if drill:
         emit("fail", "DRILL: failure injected to exercise rollback; nothing is actually broken")
         return 0
-    ok, why = wait_production(sha)
-    if ok:
-        ok, why2 = wait_master_ci(sha)
+    result, why = wait_production(sha)
+    if result == "ok":
+        result, why2 = wait_master_ci(sha)
         why = why + "; " + why2
-    emit("ok" if ok else "fail", why)
+    emit(result, why)
     return 0
 
 

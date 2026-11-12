@@ -57,6 +57,8 @@ export const MAX_REASONS = 3;
 /** Keyword points are capped so a stuffed subject cannot outrank a real deadline. */
 const CONTENT_POINTS_CAP = 6;
 const DAY_MS = 86_400_000;
+/** Mail dated further ahead than this is treated as junk, not as "just arrived". */
+export const FUTURE_SKEW_MS = DAY_MS;
 
 /**
  * Domains whose mail always counts for a little more (+2). Empty on purpose: add the
@@ -69,6 +71,8 @@ interface PhraseRule {
   reason: string;
   points: number;
   pattern: RegExp;
+  /** A hit here is never overridden by the promotional veto (real alerts that happen to name a shop or deal). */
+  keepsPastPromoVeto?: boolean;
 }
 
 // Strong (3): the sender is saying something is wrong or must happen now.
@@ -78,11 +82,13 @@ const PHRASE_RULES: readonly PhraseRule[] = [
     pattern: /\b(urgent|urgently|immediate action|action (?:is )?(?:required|needed)|response (?:is )?(?:required|needed))\b/i },
   { reason: "overdue or final notice", points: 3,
     pattern: /\b(?:final|last|second|third) (?:notice|reminder|warning)\b|\bpast due\b|\boverdue\b|\bdelinquent\b/i },
-  { reason: "payment problem", points: 3,
-    pattern: /\bpayment (?:has )?(?:failed|was declined|declined|unsuccessful|could not be processed)\b|\bcard (?:was )?declined\b|\bunable to (?:process|charge) your (?:payment|card)\b/i },
-  { reason: "security or fraud alert", points: 3,
+  { reason: "payment problem", points: 3, keepsPastPromoVeto: true,
+    pattern: /\b(?:payment|charge)(?: to [^,.:;!?\n]{1,60}?)?\s+(?:(?:has|have|had|was|is) (?:been )?)?(?:failed|declined|unsuccessful|rejected|returned|could not be processed|couldn't be processed|did not go through|didn't go through)\b|\b(?:failed|declined|returned) payment\b|\bpayment failure\b|\bcard (?:was )?declined\b|\bunable to (?:process|charge) your (?:payment|card)\b/i },
+  { reason: "rent or loan payment due", points: 3,
+    pattern: /\b(?:rent|mortgage|tuition|property tax(?:es)?|loan payment|car payment|insurance premium)(?: payment)?\s+(?:is\s+|are\s+)?(?:now\s+|almost\s+)?(?:due|late|overdue)\b|\b(?:late|overdue)\s+(?:rent|mortgage|tuition|loan payment)\b/i },
+  { reason: "security or fraud alert", points: 3, keepsPastPromoVeto: true,
     pattern: /\b(?:unauthorized|suspicious|unusual) (?:activity|sign-?in|log-?in|charge|transaction|access)\b|\bfraud(?:ulent)?\b|\bsecurity alert\b|\baccount (?:has been |was )?(?:compromised|hacked)\b/i },
-  { reason: "account at risk", points: 3,
+  { reason: "account at risk", points: 3, keepsPastPromoVeto: true,
     pattern: /\baccount (?:has been |was |is |will be )?(?:suspended|locked|disabled|deactivated|terminated)\b/i },
   { reason: "service about to end", points: 3,
     pattern: /\b(?:will be|about to be|at risk of being) (?:cancell?ed|terminated|shut off|disconnected|suspended)\b|\bwill lapse\b/i },
@@ -100,7 +106,9 @@ const PHRASE_RULES: readonly PhraseRule[] = [
     pattern: /\b(?:important|reminder|required)\b/i },
 ];
 
-// Promotional mail is never urgent: a match is a hard veto, whatever else the message says.
+// Promotional mail is never urgent: a match is a hard veto, whatever else the message says,
+// EXCEPT when a payment-problem, security/fraud or account-at-risk phrase also matched
+// (keepsPastPromoVeto): "Suspicious charge at Big Sale Outlet" must still surface.
 // Checked against the subject and sender only, so a marketing footer in a body snippet
 // cannot bury a real alert. Deliberately narrow words ("deals", not "deal"; named sales,
 // not "sale") so ordinary business mail ("bill of sale due tomorrow") is not swallowed.
@@ -231,8 +239,13 @@ export function assessEmail(email: EmailForUrgency, now: Date): UrgencyAssessmen
   const hits: { reason: string; points: number }[] = [];
 
   let content = 0;
+  let keepsPastPromoVeto = false;
   for (const rule of PHRASE_RULES) {
-    if (rule.pattern.test(text)) { content += rule.points; hits.push({ reason: rule.reason, points: rule.points }); }
+    if (rule.pattern.test(text)) {
+      content += rule.points;
+      hits.push({ reason: rule.reason, points: rule.points });
+      if (rule.keepsPastPromoVeto) keepsPastPromoVeto = true;
+    }
   }
   let score = Math.min(content, CONTENT_POINTS_CAP);
 
@@ -257,7 +270,7 @@ export function assessEmail(email: EmailForUrgency, now: Date): UrgencyAssessmen
     hits.push({ reason: "from a billing or security address", points: 1 });
   }
 
-  if (PROMO_SUBJECT.test(email.subject) || PROMO_SENDER.test(senderLocalPart(email.fromAddress))) {
+  if (!keepsPastPromoVeto && (PROMO_SUBJECT.test(email.subject) || PROMO_SENDER.test(senderLocalPart(email.fromAddress)))) {
     score = Math.min(score, URGENT_THRESHOLD - 1);
   }
 
@@ -276,7 +289,7 @@ export function selectUrgent(
   limit: number = MAX_URGENT_SHOWN,
 ): UrgentSelection {
   const earliest = now.getTime() - WINDOW_DAYS * DAY_MS;
-  const latest = now.getTime() + DAY_MS; // tolerate small clock skew, drop obviously future rows
+  const latest = now.getTime() + FUTURE_SKEW_MS; // tolerate small clock skew, drop obviously future rows
   const ranked: RankedEmail[] = [];
   let scanned = 0;
   for (const email of emails) {

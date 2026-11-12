@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import {
+  FUTURE_SKEW_MS,
   assessEmail,
   daysUntilDeadline,
   etDayLabel,
@@ -237,12 +238,15 @@ function rank(item: UrgentEmailItem): number {
 
 export async function getUrgentEmail(client: Supa, now: Date = new Date()): Promise<UrgentEmailResponse> {
   const since = new Date(now.getTime() - WINDOW_DAYS * DAY_MS).toISOString();
+  // A junk Date header far in the future must not sort to the top and use up the row cap.
+  const until = new Date(now.getTime() + FUTURE_SKEW_MS).toISOString();
   const [emails, sync] = await Promise.all([
     client
       .from("inbox_emails")
       .select("account,message_id,received_at,from_name,from_address,subject,snippet,is_unread,gmail_thread_id,agent_labels,in_inbox,last_seen_at")
       .eq("labeled", true)
       .gte("received_at", since)
+      .lte("received_at", until)
       .order("received_at", { ascending: false })
       .order("message_id", { ascending: true })
       .limit(SCAN_LIMIT),

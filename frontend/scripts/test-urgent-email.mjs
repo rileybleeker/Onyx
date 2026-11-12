@@ -91,8 +91,51 @@ await test("snippet text counts, not only the subject", () => {
 
 await test("keyword points are capped so stuffing cannot run away", () => {
   const r = assessEmail(mail({ subject: "URGENT final notice: payment failed, fraud alert, account suspended, deadline" }), NOW);
-  assert.ok(r.score <= 6 + 3, `score ${r.score} should be content cap 6 plus at most one deadline bonus`);
+  assert.equal(r.score, 6, "five strong phrases and a medium one are worth exactly the content cap of 6");
   assert.equal(r.reasons.length, 3);
+  // The cap covers phrases only; a real, dated deadline still adds its own 3 on top.
+  const dated = assessEmail(mail({ subject: "URGENT final notice: payment failed, fraud alert, account suspended, due tomorrow" }), NOW);
+  assert.equal(dated.score, 9);
+});
+
+await test("'Your payment to X failed' phrasings are a payment problem", () => {
+  for (const subject of [
+    "Your payment to Example Utilities failed",
+    "Payment to Example Landlord was declined",
+    "Your payment to Example Insurance has been returned",
+    "Failed payment on your account",
+    "Payment failure notice",
+    "We couldn't charge your card: card declined",
+  ]) {
+    const r = assessEmail(mail({ subject }), NOW);
+    assert.equal(r.urgent, true, subject);
+    assert.ok(r.reasons.includes("payment problem"), subject);
+  }
+});
+
+await test("successful or unrelated payment mail is not a payment problem", () => {
+  for (const subject of [
+    "Your payment to Example Utilities was successful",
+    "Payment to Example Landlord processed",
+    "Receipt for your payment",
+    "Payment received, thank you",
+    "Failed to load? Our app update fixes it",
+  ]) {
+    const r = assessEmail(mail({ subject }), NOW);
+    assert.equal(r.urgent, false, subject);
+    assert.ok(!r.reasons.includes("payment problem"), subject);
+  }
+});
+
+await test("rent, mortgage and tuition due or late are urgent", () => {
+  for (const subject of ["Rent due", "Your rent is due", "Rent payment is now due", "Mortgage payment due", "Tuition overdue", "Late rent notice", "Property taxes are due"]) {
+    const r = assessEmail(mail({ subject }), NOW);
+    assert.equal(r.urgent, true, subject);
+  }
+  assert.ok(assessEmail(mail({ subject: "Rent due" }), NOW).reasons.includes("rent or loan payment due"));
+  for (const subject of ["Rent receipt for October", "Renters insurance quote", "Parent night: dues and donations", "Your rent was paid"]) {
+    assert.equal(assessEmail(mail({ subject }), NOW).urgent, false, subject);
+  }
 });
 
 // ---- Promotional damping -----------------------------------------------------------
@@ -100,6 +143,23 @@ await test("promotional mail with urgent words is not urgent", () => {
   assert.equal(assessEmail(mail({ subject: "URGENT: 50% off sale ends today" }), NOW).urgent, false);
   assert.equal(assessEmail(mail({ subject: "Last chance: final notice for our newsletter giveaway" }), NOW).urgent, false);
   assert.equal(assessEmail(mail({ fromAddress: "newsletter@example.com", subject: "Action required: read this week's digest" }), NOW).urgent, false);
+});
+
+await test("the promotional veto never hides a fraud, payment or account-security alert", () => {
+  for (const subject of [
+    "Suspicious charge at Big Sale Outlet",
+    "Unauthorized transaction: Example Deals Inc",
+    "Fraud alert: 50% off is not why we are writing",
+    "Your payment to Weekly Digest Co failed",
+    "Account suspended: confirm to get free shipping",
+  ]) {
+    assert.equal(assessEmail(mail({ subject }), NOW).urgent, true, subject);
+  }
+  // Even from a marketing-looking sender.
+  assert.equal(assessEmail(mail({ fromAddress: "offers@example.com", subject: "Suspicious sign-in to your account" }), NOW).urgent, true);
+  // The exception is narrow: overdue/deadline/urgent wording does not lift the veto.
+  assert.equal(assessEmail(mail({ subject: "Final notice: sale ends today, due tomorrow" }), NOW).urgent, false);
+  assert.equal(assessEmail(mail({ fromAddress: "offers@example.com", subject: "Action required: rent due" }), NOW).urgent, false);
 });
 
 await test("a marketing footer in the snippet does not hide a real alert", () => {
@@ -270,6 +330,7 @@ function fakeClient({ rows = [], error = null, beat = null, beatError = null } =
       select(c) { call.columns = c; return chain; },
       eq(col, v) { call.filters.push(["eq", col, v]); return chain; },
       gte(col, v) { call.filters.push(["gte", col, v]); return chain; },
+      lte(col, v) { call.filters.push(["lte", col, v]); return chain; },
       order(col, o) { call.orders.push([col, o]); return chain; },
       limit(n) {
         call.limit = n;
@@ -309,6 +370,8 @@ await test("reads only labelled rows in the window, bounded, deterministic order
   const q = calls.find((c) => c.table === "inbox_emails");
   assert.deepEqual(q.filters.find((f) => f[0] === "eq"), ["eq", "labeled", true]);
   assert.deepEqual(q.filters.find((f) => f[0] === "gte"), ["gte", "received_at", new Date(NOW.getTime() - WINDOW_DAYS_Q * 86_400_000).toISOString()]);
+  assert.deepEqual(q.filters.find((f) => f[0] === "lte"), ["lte", "received_at", new Date(NOW.getTime() + rules.FUTURE_SKEW_MS).toISOString()],
+    "future-dated junk cannot use up the row cap");
   assert.equal(q.limit, SCAN_LIMIT);
   assert.deepEqual(q.orders.map((o) => o[0]), ["received_at", "message_id"], "a secondary sort keeps ties stable");
   assert.ok(!/body|html|attachment/.test(q.columns));

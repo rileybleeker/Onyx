@@ -39,10 +39,11 @@ unsigned xcodebuild command in `.github/workflows/focus-ios.yml`. That workflow
 uses no signing secrets, no data and no production service. Windows cannot
 compile the iOS target; passing policy tests is not a signed-install/device test.
 
-## Signing gates (not performed by this change)
+## Signing gates
 
-The existing signed export workflow supports ONE profile. Do not run it expecting
-a working Focus build. A Focus signed workflow must instead use this spec and:
+The signed export workflow (`screentime-ios.yml`) supports ONE profile. Do not
+run it expecting a working Focus build. The Focus signed workflow (see Signed
+build below) uses this spec and:
 
 1. Register App Group `group.com.rileybleeker.onyxscreentime.focus` and associate
    it with the existing app and extension IDs, subject to account authorization.
@@ -60,6 +61,37 @@ a working Focus build. A Focus signed workflow must instead use this spec and:
    app and web, blocked app/web, before/at/after cutoff with app terminated,
    completion/next-day reset, restart, offline use, time-zone change, permission
    revocation and Turn off. Do not claim active enforcement until these pass.
+
+## Signed build
+
+`.github/workflows/focus-ios-signed.yml` (manual only) implements gates 4 and 5.
+Secrets (portal downloads; no App Store Connect API path):
+
+- `IOS_DEV_KEY_B64`, `IOS_DEV_CERT_B64`: the same key and Apple Development
+  certificate as the export app (README.md).
+- `IOS_PROFILE_B64`: the main app profile for `com.rileybleeker.onyxscreentime`,
+  regenerated after step 3 (App Group plus both Family Controls entitlements).
+  The export workflow keeps working with it.
+- `IOS_FOCUS_MONITOR_PROFILE_B64` (new): the iOS App Development profile for
+  `com.rileybleeker.onyxscreentime.focusmonitor` (step 2), with a different
+  name from the main profile.
+- `IPHONE_UDID` (required here), `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`.
+
+```powershell
+$d = "$HOME\.onyx-ios-signing"   # wherever the downloads were saved
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("$d\profile.mobileprovision")) | gh secret set IOS_PROFILE_B64
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("$d\focusmonitor.mobileprovision")) | gh secret set IOS_FOCUS_MONITOR_PROFILE_B64
+gh workflow run focus-ios-signed.yml
+```
+
+Before building it checks both profiles, and before publishing the signed .app
+and embedded .appex (`ci/focus_signing_check.py`). Each failure names the
+missing portal step. It publishes to `ios-builds/screentime-focus/` (links in
+`screentime-focus/latest.json`), never over the export app's
+`screentime/latest.json`. `/install` shows it as a second card, "Onyx with Focus
+(development build)" (`/api/screen-time/build?variant=focus`). Both builds use
+the same bundle ID, so installing one replaces the other on the phone (upgrade
+in place).
 
 App Store/TestFlight distribution additionally needs Apple's Family Controls
 approval for the app and each Screen Time extension. Personal development signing

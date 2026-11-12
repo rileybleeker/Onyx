@@ -15,6 +15,14 @@ enum ExportError: LocalizedError {
             return "Apple returned no Screen Time data for that range."
         }
     }
+
+    /// True when the app lacks Screen Time data access (vs. a read that failed).
+    var isAccessDenied: Bool {
+        switch self {
+        case .noDataAccess(_): return true
+        case .noData: return false
+        }
+    }
 }
 
 /// Collects segments as the system streams them. A later copy of the same
