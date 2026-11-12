@@ -47,6 +47,14 @@ def ignored(name: str) -> bool:
     return "vercel" in name.lower() and "preview" in name.lower()
 
 
+# The train's own job shows up as a check on the PR head; waiting on it would wait on itself.
+OWN_CHECKS = {"train"}
+OWN_WORKFLOWS = {"Merge train", "Post-merge verify"}
+# Vercel's preview build status: it queues behind other builds on Vercel and repeats what frontend-types already
+# compiles, so a pending preview does not hold a merge. A failed preview still blocks.
+PREVIEW_STATUS = "Vercel"
+
+
 def note(msg: str) -> None:
     print(msg, flush=True)
     path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -95,7 +103,7 @@ def judge(pr: dict, files: list[str] | None, runs: list[dict], statuses: list[di
         return "skip", f"protected path {hit} (owner merges these)"
     if pr["mergeable"] == "CONFLICTING" or pr["mergeStateStatus"] == "DIRTY":
         return "skip", "merge conflict"
-    latest = latest_runs([r for r in runs if not ignored(r["name"])])
+    latest = latest_runs([r for r in runs if not ignored(r["name"]) and r["name"] not in OWN_CHECKS])
     for name, r in latest.items():
         if r["status"] == "completed" and r["conclusion"] in BAD:
             return "skip", f"check {name} {r['conclusion']}"
@@ -105,7 +113,7 @@ def judge(pr: dict, files: list[str] | None, runs: list[dict], statuses: list[di
     if pr["mergeStateStatus"] == "BEHIND":
         return "update", "behind " + BASE
     pending = active_runs > 0 or any(r["status"] != "completed" for r in latest.values()) or \
-        any(s["state"] == "pending" and not ignored(s["context"]) for s in statuses)
+        any(s["state"] == "pending" and not ignored(s["context"]) and s["context"] != PREVIEW_STATUS for s in statuses)
     if pending:
         return "wait", "checks running"
     missing = [n for n in REQUIRED if n not in latest or latest[n]["conclusion"] != "success"]
@@ -176,8 +184,8 @@ def head_checks(sha: str) -> tuple[list[dict], list[dict], int]:
     statuses = api_items(f"repos/{REPO}/commits/{sha}/status?per_page=100",
                          ".statuses[]|{context,state}")
     wf = api_items(f"repos/{REPO}/actions/runs?head_sha={sha}&per_page=100",
-                   ".workflow_runs[]|{status}")
-    return runs, statuses, sum(1 for w in wf if w["status"] != "completed")
+                   ".workflow_runs[]|{status,name}")
+    return runs, statuses, sum(1 for w in wf if w["status"] != "completed" and w["name"] not in OWN_WORKFLOWS)
 
 
 def halted() -> bool:

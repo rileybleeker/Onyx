@@ -171,5 +171,18 @@ class ProductionVerdict(unittest.TestCase):
         self.assertIsNone(mt.production_verdict([], False))
 
 
+class SelfAndPreview(unittest.TestCase):
+    def test_own_running_job_does_not_block(self):
+        runs = GREEN + [dict(id=7, name="train", status="in_progress", conclusion=None)]
+        self.assertEqual(judge(runs=runs)[0], "merge")
+
+    def test_pending_vercel_preview_does_not_block_but_failure_does(self):
+        self.assertEqual(judge(pr(mergeStateStatus="UNSTABLE"), statuses=[dict(context="Vercel", state="pending")])[0], "merge")
+        self.assertEqual(judge(statuses=[dict(context="Vercel", state="failure")])[0], "skip")
+
+    def test_other_pending_status_still_waits(self):
+        self.assertEqual(judge(statuses=[dict(context="ci/other", state="pending")])[0], "wait")
+
+
 if __name__ == "__main__":
     unittest.main()
