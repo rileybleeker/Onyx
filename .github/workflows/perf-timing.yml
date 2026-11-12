@@ -11,6 +11,13 @@ name: Production Performance Timing
 # loads every key page 15 times, which is a load nobody should get by opening a PR.
 
 on:
+  # TEMPORARY-BOOTSTRAP-TRIGGER (removed before the PR is ready): GitHub only lets you dispatch a
+  # workflow that already exists on the default branch, so a brand-new workflow cannot be
+  # dispatched from its own branch. This push trigger, limited to the evidence branch and to this
+  # file, starts the measurement runs until the file is merged.
+  push:
+    branches: [perf/production-timing-evidence]
+    paths: [".github/workflows/perf-timing.yml"]
   workflow_dispatch:
     inputs:
       navigations:
@@ -79,3 +86,5 @@ jobs:
           path: frontend/perf-results/
           if-no-files-found: ignore
           retention-days: 30
+
+# bootstrap run 1
