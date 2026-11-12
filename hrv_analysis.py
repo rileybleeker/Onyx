@@ -4217,53 +4217,10 @@ def run_evaluation(df: pd.DataFrame, xgb_model, xgb_results: dict) -> dict:
     # every horizon to claim signal — that's what the chart will show.
     # -----------------------------------------------------------------------
     log.info("  Computing naive baselines (multi-horizon)…")
-    hrv_arr = model_df[TARGET].values.astype(float)
-    dates_arr = pd.to_datetime(model_df["calendar_date"]).values
-    for h in HORIZONS:
-        # Decision made on the evening of feature row i: the newest known HRV is the sleep
-        # that closed day i-1 (row i's own sleep has not happened). Target = row i+h-1.
-        for i in range(max(min_train, 1), n - h + 1):
-            actual_idx = i + h - 1
-            if actual_idx >= len(hrv_arr) or np.isnan(hrv_arr[actual_idx]):
-                continue
-            actual = float(hrv_arr[actual_idx])
-            feat_date = pd.Timestamp(dates_arr[i])
-            pred_date = al.target_date(feat_date, h).strftime("%Y-%m-%d")
-            hrv_hist = hrv_arr[:i]
-
-            # Naive persistence: predict = last known HRV (constant across h)
-            naive_pred = float(hrv_hist[-1])
-            all_preds.append({
-                "prediction_date": pred_date, "model": "baseline_naive",
-                "predicted_hrv": naive_pred, "actual_hrv": actual,
-                "residual": actual - naive_pred, "horizon_days": h,
-                "model_version": "backtest_initial",
-            })
-
-            # 7-day rolling mean (constant across h)
-            roll7 = float(np.nanmean(hrv_hist[-7:])) if len(hrv_hist) >= 7 else naive_pred
-            all_preds.append({
-                "prediction_date": pred_date, "model": "baseline_7d_avg",
-                "predicted_hrv": roll7, "actual_hrv": actual,
-                "residual": actual - roll7, "horizon_days": h,
-                "model_version": "backtest_initial",
-            })
-
-            # Day-of-week historical mean — DOW of the TARGET date (i+h),
-            # not of the feature date, so the prediction is appropriate for
-            # the day being forecast.
-            dow = al.target_date(feat_date, h).dayofweek
-            past_dows = pd.DatetimeIndex(dates_arr[:i]).dayofweek
-            dow_mask = past_dows == dow
-            dow_vals = hrv_arr[:i][dow_mask]
-            dow_vals = dow_vals[~np.isnan(dow_vals)]
-            dow_pred = float(np.mean(dow_vals)) if len(dow_vals) >= 5 else naive_pred
-            all_preds.append({
-                "prediction_date": pred_date, "model": "baseline_dow",
-                "predicted_hrv": dow_pred, "actual_hrv": actual,
-                "residual": actual - dow_pred, "horizon_days": h,
-                "model_version": "backtest_initial",
-            })
+    # Date-keyed: each baseline is scored against the night target_date(feature row, h),
+    # looked up by date in df like the XGBoost target (dot's review 2026-11-11, finding 3;
+    # it used to be row i+h-1, a different night across missing days).
+    all_preds.extend(al.naive_baseline_rows(model_df, HORIZONS, min_train, outcome_df=df))
 
     # -----------------------------------------------------------------------
     # Aggregate metrics per model
