@@ -379,7 +379,7 @@ export interface TodayUrgentItem {
   key: string;
   /** Where Today learned about it: "Gmail", "Agent Inbox", or both. */
   sources: ("Gmail" | "Agent Inbox")[];
-  /** e.g. "Gmail, rileybleeklm@: Agent/Deadline" or "Agent Inbox: inbox-triage". */
+  /** e.g. "Gmail, owner@: Agent/Deadline" or "Agent Inbox: inbox-triage". */
   sourceDetail: string;
   title: string;
   from: string | null;
