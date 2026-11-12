@@ -33,6 +33,18 @@ struct UsagePayload: Codable {
     let segments: [UsageSegment]
 }
 
+/// A failed sync, reported to the same route so /status turns red at once.
+/// The route reads `failure` and writes a failed screen_time|usage heartbeat.
+struct FailureReport: Codable {
+    struct Failure: Codable {
+        let stage: String       // SyncStage raw value: access | read | encode | network | http
+        let message: String
+    }
+    let device: String
+    let app_version: String
+    let failure: Failure
+}
+
 struct ExportResult {
     let segments: [UsageSegment]
     let deviceName: String?

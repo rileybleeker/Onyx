@@ -30,6 +30,8 @@ jobs:
           PY
       - name: HRV behavioral clock boundary tests
         run: python tests/test_hrv_clock_boundaries.py
+      - name: Garmin empty-day heartbeat tests (fakes only, no credentials)
+        run: python tests/test_garmin_empty_days.py
       - name: Autonomous merge guard unit tests (no credentials or network)
         run: python -m unittest discover -s tests -p test_autonomous_merge.py -v
       - name: Merge train decision tests (no credentials or network)

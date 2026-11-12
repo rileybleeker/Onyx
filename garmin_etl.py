@@ -186,8 +186,59 @@ def _is_future_et(target_date: date, dataset: str) -> bool:
     return False
 
 
-def sync_daily_summary(garmin: Garmin, sb: Client, target_date: date) -> int:
-    """Sync one day of daily summary stats."""
+# Daily-summary fields that only the worn watch can produce. Garmin still
+# returns a summary for a day the watch was off: goals, BMR kcal (computed from
+# the profile), sedentary_seconds = 86400 and stress -1/-2 ("not enough data").
+# Steps are NULL on such days (never 0 in 965 live rows checked 2026-11-11), and
+# none of these fields is set. Keep in step with GARMIN_WEARABLE_FILTER in
+# frontend/src/lib/status-freshness.ts, which keys the /status card on it.
+WEARABLE_SUMMARY_FIELDS = (
+    "restingHeartRate", "minHeartRate", "maxHeartRate",
+    "bodyBatteryHighestValue", "averageSpo2", "avgWakingRespirationValue",
+)
+
+
+def daily_summary_has_wearable_values(stats: dict | None) -> bool:
+    """True when a Garmin daily summary carries data from the worn watch."""
+    if not stats:
+        return False
+    steps = stats.get("totalSteps")
+    if isinstance(steps, (int, float)) and steps > 0:
+        return True
+    return any(stats.get(field) is not None for field in WEARABLE_SUMMARY_FIELDS)
+
+
+def classify_run(errors: int, days: list[date], wearable_days: set[str],
+                 sleep_records: int, hrv_records: int,
+                 activity_records: int) -> tuple[str, str | None]:
+    """Return (status, error_message) for the full_sync heartbeat.
+
+    'failed' on any sync error. 'partial' when the run succeeded but every
+    fetched day came back empty (no daily summary with wearable values, no
+    sleep, HRV or activity rows): the watch was not worn, or Garmin is
+    returning empty payloads. The two look the same from here, so the message
+    names both. Before 2026-11-11 such runs logged 'success' and /status stayed
+    green for 40 empty days.
+    """
+    if errors:
+        return "failed", f"{errors} sync error(s) across {len(days)} day(s)"
+    if not wearable_days and not (sleep_records or hrv_records or activity_records):
+        span = f"{days[0]} to {days[-1]}" if days else "no dates"
+        return "partial", (
+            f"No wearable data in the {len(days)} fetched day(s) ({span}): no steps, "
+            "heart rate or body battery, no sleep, HRV or activities. Watch not worn, "
+            "or Garmin returned empty payloads."
+        )
+    return "success", None
+
+
+def sync_daily_summary(garmin: Garmin, sb: Client, target_date: date,
+                       wearable_days: set[str] | None = None) -> int:
+    """Sync one day of daily summary stats.
+
+    Adds the date to `wearable_days` (when given) if the summary carries data
+    from the worn watch; the row is upserted either way.
+    """
     ds = target_date.isoformat()
     # Skip future dates: Garmin's API returns a stub row for today+1 onwards with
     # all metric columns NULL. Storing those breaks "latest data date" queries
@@ -203,6 +254,9 @@ def sync_daily_summary(garmin: Garmin, sb: Client, target_date: date) -> int:
 
     if not stats:
         return 0
+
+    if wearable_days is not None and daily_summary_has_wearable_values(stats):
+        wearable_days.add(ds)
 
     row = {
         "ts": date_to_ts(target_date),
@@ -771,8 +825,12 @@ def backfill_laps(garmin: Garmin, sb: Client) -> int:
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
-def sync_date(garmin: Garmin, sb: Client, target_date: date) -> tuple[dict, int]:
+def sync_date(garmin: Garmin, sb: Client, target_date: date,
+              wearable_days: set[str] | None = None) -> tuple[dict, int]:
     """Sync all data types for a single date.
+
+    `wearable_days` (optional) collects the dates whose daily summary carried
+    data from the worn watch (see classify_run).
 
     Returns:
         counts: per-type record count
@@ -797,7 +855,10 @@ def sync_date(garmin: Garmin, sb: Client, target_date: date) -> tuple[dict, int]
     errors = 0
     for name, func in syncs.items():
         try:
-            counts[name] = func(garmin, sb, target_date)
+            if name == "daily_summary" and wearable_days is not None:
+                counts[name] = func(garmin, sb, target_date, wearable_days=wearable_days)
+            else:
+                counts[name] = func(garmin, sb, target_date)
         except Exception as e:
             log.warning(f"  {name} {target_date}: {e}", exc_info=True)
             counts[name] = 0
@@ -899,13 +960,20 @@ def main():
     t0 = time.time()
     total_records = 0
     errors = 0
+    # Evidence that the watch was worn in this window (see classify_run).
+    wearable_days: set[str] = set()
+    sleep_records = 0
+    hrv_records = 0
+    act_count = 0
 
     for i, d in enumerate(dates):
         try:
-            counts, day_errors = sync_date(garmin, sb, d)
+            counts, day_errors = sync_date(garmin, sb, d, wearable_days=wearable_days)
             day_total = sum(counts.values())
             total_records += day_total
             errors += day_errors
+            sleep_records += counts.get("sleep", 0)
+            hrv_records += counts.get("hrv", 0)
             if day_errors > 0:
                 log.warning(f"  [{i+1}/{len(dates)}] {d}: {day_total} records, "
                             f"{day_errors} per-type errors")
@@ -963,12 +1031,15 @@ def main():
     # signal came from whole-day exceptions that escaped sync_date — but
     # sync_date used to swallow per-type failures and return zeroes, so a
     # day with all six sync_* functions raising looked indistinguishable
-    # from a day with no Garmin data.
-    status = "success" if errors == 0 else "failed"
+    # from a day with no Garmin data. A run whose fetched days are all empty
+    # (watch not worn) is 'partial' with the reason in error_message.
+    status, status_message = classify_run(errors, dates, wearable_days,
+                                          sleep_records, hrv_records, act_count)
+    if status == "partial":
+        log.warning(f"  {status_message}")
     log_sync(sb, "garmin", "full_sync", status,
              records=total_records, date_start=dates[0], date_end=dates[-1],
-             duration=duration,
-             error=f"{errors} sync error(s) across {len(dates)} day(s)" if errors else None)
+             duration=duration, error=status_message)
 
     # Persist any refreshed tokens to disk (needed for CI token upload)
     # garth attribute removed in newer garminconnect versions; login(TOKEN_DIR) handles persistence

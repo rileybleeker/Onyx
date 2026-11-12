@@ -97,6 +97,14 @@ be ticked by hand. Untested against a real account.
    if it does not appear), paste the Onyx CI token, **Sync**.
 5. Shortcuts → Automation → Time of Day (daily) → **Sync Screen Time to Onyx**.
 
+Failed syncs (from the build after 2026-11-11): when Screen Time cannot be read,
+or Onyx cannot be reached or answers with an error, the app POSTs
+`{ failure: { stage, message } }` to `/api/screen-time/usage` before showing
+the error, and the "Screen Time app" card on `/status` turns red on that run.
+Stages: `access`, `read`, `encode`, `network`, `http`. A missing token or one
+Onyx refuses (401) cannot be reported; the card catches those when the last
+heartbeat is more than 36 h old. Builds before this one report nothing.
+
 If neither install link works, download the `.ipa` from `/install` on the PC and
 install over USB with `pymobiledevice3 apps install <file>` (it also prints the
 phone's real error). `pymobiledevice3 amfi reveal-developer-mode` shows the
