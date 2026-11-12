@@ -152,30 +152,3 @@ export function formatPace(speedMps: number | null | undefined): string {
   if (secs === 60) return `${mins + 1}:00 /mi`;
   return `${mins}:${secs.toString().padStart(2, "0")} /mi`;
 }
-
-// ─── Money (finance ledger, /financials) ───
-// Amounts are carried as integer minor units (cents) end to end and only turned
-// into a string here. `signed` adds an explicit "+" so a cashflow column reads
-// as in/out at a glance. A currency code Intl does not know falls back to
-// "12.30 XYZ" instead of throwing during render.
-const moneyFormatters = new Map<string, Intl.NumberFormat>();
-export function formatCents(
-  cents: number | null | undefined,
-  opts: { currency?: string; signed?: boolean } = {},
-): string {
-  if (cents == null || !Number.isFinite(cents)) return "—";
-  const currency = (opts.currency ?? "USD").toUpperCase();
-  let fmt = moneyFormatters.get(currency);
-  if (!fmt) {
-    try {
-      fmt = new Intl.NumberFormat("en-US", { style: "currency", currency });
-    } catch {
-      fmt = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    }
-    moneyFormatters.set(currency, fmt);
-  }
-  const text = fmt.format(cents / 100);
-  const known = fmt.resolvedOptions().style === "currency";
-  const body = known ? text : `${text} ${currency}`;
-  return opts.signed && cents > 0 ? `+${body}` : body;
-}

@@ -5,8 +5,7 @@ const currencyFormatter = new Intl.NumberFormat('en-US', { style: 'currency', cu
 const money = (cents: number) => currencyFormatter.format(cents / 100);
 const box = 'rounded-lg border border-border-subtle bg-surface-card p-4';
 const input = 'rounded border border-border-subtle bg-surface-card p-2 text-text-primary';
-/** `embedded`: shown inside the ledger page's "Preview a CSV" disclosure, so no page header or <main> of its own. */
-export default function FinancialsClient({ embedded = false }: { embedded?: boolean } = {}) {
+export default function FinancialsClient() {
   const [csv, setCsv] = useState<string[][] | null>(null), [mapping, setMapping] = useState<Mapping | null>(null);
   const [data, setData] = useState<Transaction[] | null>(null), [expensePositive, setExpensePositive] = useState(true);
   const [format, setFormat] = useState<'iso' | 'us'>('iso'), [error, setError] = useState(''), [busy, setBusy] = useState(false);
@@ -26,12 +25,11 @@ export default function FinancialsClient({ embedded = false }: { embedded?: bool
     catch (e) { if (seq === fileSequence.current) setError((e as Error).message); }
     finally { if (seq === fileSequence.current) { setBusy(false); if (fileInput.current) fileInput.current.value = ''; } }
   }
-  const Root = embedded ? 'div' : 'main';
-  return <Root className={embedded ? 'space-y-5' : 'mx-auto max-w-6xl space-y-5 p-4 md:p-8'}>
-    {!embedded && <header><p className="text-xs uppercase tracking-widest text-text-tertiary">Money, in view</p><h1 className="text-2xl font-semibold">Financials</h1><p className="mt-2 text-text-secondary">Bring a Rocket Money export into a private spending overview.</p></header>}
-    <section className={box}><h2 className="font-semibold">Rocket Money · Manual CSV import</h2><p className="mt-2 text-sm text-text-secondary">{embedded ? 'Preview only: nothing here touches the saved ledger. ' : 'No account connected. '}Files are processed only in this page’s memory, never uploaded, sent to AI, or saved. Use Clear session or reload to clear imported data. Keep your original export.</p>
+  return <main className="mx-auto max-w-6xl space-y-5 p-4 md:p-8">
+    <header><p className="text-xs uppercase tracking-widest text-text-tertiary">Money, in view</p><h1 className="text-2xl font-semibold">Financials</h1><p className="mt-2 text-text-secondary">Bring a Rocket Money export into a private spending overview.</p></header>
+    <section className={box}><h2 className="font-semibold">Rocket Money · Manual CSV import</h2><p className="mt-2 text-sm text-text-secondary">No account connected. Files are processed only in this page’s memory, never uploaded, sent to AI, or saved. Use Clear session or reload to clear imported data. Keep your original export.</p>
       <p className="mt-2 text-sm">In Rocket Money, open Transactions → Export, choose filters, then download the emailed file on a desktop. <a className="underline" href="https://help.rocketmoney.com/en/articles/10296106-exporting-transactions" target="_blank" rel="noreferrer">Official export guide</a></p>
-      <p className="mt-2 text-sm text-text-secondary">{embedded ? 'The saved ledger above is filled by a separate automated import, not by this tool. ' : 'Automatic sync is not connected. '}No supported public Rocket Money API has been verified.{embedded ? '' : ' You can keep using Rocket Money with CSV; a future live connection would need a supported provider and separate consent.'}</p>
+      <p className="mt-2 text-sm text-text-secondary">Automatic sync is not connected. No supported public Rocket Money API has been verified. You can keep using Rocket Money with CSV; a future live connection would need a supported provider and separate consent.</p>
       <label className="mt-4 block text-sm font-medium">Choose transaction CSV (USD only, up to 2 MB / 10,000 rows)<input ref={fileInput} className="mt-2 block w-full" type="file" accept=".csv,text/csv" onChange={e => void choose(e.target.files?.[0])} /></label>
       {busy && <p role="status">Reading locally…</p>}{error && <p role="alert" className="mt-2 text-red-400">{error}</p>}
     </section>
@@ -52,5 +50,5 @@ export default function FinancialsClient({ embedded = false }: { embedded?: bool
       <section className={box}><h2 className="font-semibold">Money out by category</h2>{Object.entries(summary.categories).length ? <ul className="mt-3 space-y-2">{Object.entries(summary.categories).sort((a, b) => b[1] - a[1]).map(([c, amount]) => <li key={c} className="flex justify-between gap-4"><span>{c}</span><span className="font-mono">{money(amount)}</span></li>)}</ul> : <p className="mt-2 text-text-secondary">No money-out transactions in this selection.</p>}</section>
       <section className={box}><h2 className="font-semibold">Transactions</h2><label className="mt-3 block text-sm">Search description, category, date or amount<input className={`${input} mt-1 block w-full`} value={search} onChange={e => { setSearch(e.target.value); setVisibleLimit(100); }} /></label><p className="my-2 text-sm">{visible.length} matches. Showing {Math.min(visibleLimit, visible.length)}; period totals are not changed by search.</p><div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr><th className="p-2">Date</th><th className="p-2">Description</th><th className="p-2">Category</th><th className="p-2">Cashflow</th></tr></thead><tbody>{visible.slice(0, visibleLimit).map((r, i) => <tr key={i} className="border-t border-border-subtle"><td className="p-2 whitespace-nowrap">{r.date}</td><td className="p-2">{r.description}</td><td className="p-2">{r.category}{r.transfer || excluded.includes(r.category) ? ' (excluded)' : ''}</td><td className="p-2 whitespace-nowrap">{money(r.cents)}</td></tr>)}</tbody></table></div>{visible.length > visibleLimit && <button className={`${input} mt-3`} onClick={() => setVisibleLimit(n => n + 100)}>Show next {Math.min(100, visible.length - visibleLimit)} transactions</button>}{!visible.length && <p>No matching transactions.</p>}</section>
     </>}
-  </Root>;
+  </main>;
 }
