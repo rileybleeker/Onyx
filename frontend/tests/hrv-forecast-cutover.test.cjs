@@ -66,7 +66,21 @@ test('splitComparable keeps order and partitions every row exactly once', () => 
   assert.equal(used.length + excluded.length, rows.length);
 });
 
-test('getHrvResiduals reads the latest-forecast view with model_version, xgboost h=1 only', async () => {
+test('eval-view rows: a date with a rewritten backtest row stays, only backtest-less old live dates are left out', () => {
+  // hrv_predictions_eval keeps the newest row per date. A backtest row is created after the
+  // live forecast for its date, so dates that have both arrive as the backtest row.
+  const evalRows = [
+    { prediction_date: '2026-10-16', model_version: 'backtest_initial', residual: 1 }, // had an old live forecast too
+    { prediction_date: '2026-10-17', model_version: '2026-10-16_v1', residual: 2 },    // old live only
+    { prediction_date: '2026-11-09', model_version: 'backtest_initial', residual: 3 }, // had an old live forecast too
+    { prediction_date: '2026-11-10', model_version: '2026-11-11_v1', residual: 4 },    // same-night live
+  ];
+  const { used, excluded } = plain(cutover.splitComparable(evalRows));
+  assert.deepEqual(used.map(r => r.residual), [1, 3, 4]);
+  assert.deepEqual(excluded.map(r => r.residual), [2]);
+});
+
+test('getHrvResiduals reads the eval view (newest row per date) with model_version, xgboost h=1 only', async () => {
   const calls = [];
   const rows = [{ prediction_date: '2026-11-10', model: 'xgboost', model_version: '2026-11-11_v1', residual: 3 }];
   const client = {
@@ -91,7 +105,7 @@ test('getHrvResiduals reads the latest-forecast view with model_version, xgboost
   const out = await queries.getHrvResiduals();
   assert.equal(out.length, 1);
   const q = calls[0];
-  assert.equal(q.table, 'hrv_predictions_latest');
+  assert.equal(q.table, 'hrv_predictions_eval');
   assert.ok(q.select.split(',').includes('model_version'));
   assert.ok(q.select.split(',').includes('residual'));
   assert.deepEqual(plain(q.eq), [['model', 'xgboost'], ['horizon_days', 1]]);

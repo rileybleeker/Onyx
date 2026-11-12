@@ -577,8 +577,9 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
   });
 
   // Residual histogram
-  // Old-pairing live forecasts (before the 2026-11-11 same-night fix) are left out: their
-  // residuals compare a forecast with the wrong night. Walk-forward backtest rows stay.
+  // Nights whose only row is an old-pairing live forecast (before the 2026-11-11 same-night
+  // fix) are left out: that residual compares a forecast with the wrong night. getHrvResiduals
+  // serves the rewritten backtest row where one exists, and those rows stay.
   const residualData: any[] = [];
   const { used: residualsUsed, excluded: residualsLeftOut } =
     splitComparable(residuals.filter(r => r.model === "xgboost"));
@@ -2826,7 +2827,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                 </p>
                 {residualsLeftOut.length > 0 && (
                   <p className="text-[11px] text-text-tertiary leading-relaxed mb-3">
-                    {residualsUsed.length} nights counted. {residualsLeftOut.length} live forecasts from before the 2026-11-11 same-night fix (one night off) are left out.
+                    {residualsUsed.length} nights counted. {residualsLeftOut.length} {residualsLeftOut.length === 1 ? "night" : "nights"} with only a live forecast from before the 2026-11-11 same-night fix (one night off) {residualsLeftOut.length === 1 ? "is" : "are"} left out.
                   </p>
                 )}
                 {residualData.length > 0 && residualData.some(d => d.count > 0) ? (

@@ -1,12 +1,15 @@
-// Which rows of pds.hrv_predictions_latest are comparable under the same-night pairing.
+// Which forecast rows (pds.hrv_predictions_latest / pds.hrv_predictions_eval) are comparable
+// under the same-night pairing.
 //
 // Since the alignment fix (hrv_alignment.py, shipped 2026-11-11) a forecast's
 // prediction_date is the behavioral date of the sleep it predicts: the night that begins at
 // the end of that date, scored against the same matrix row. Live forecasts written before
 // the fix used the old, one-night-late pairing, so their "misses" compare a forecast with
 // the wrong night and say nothing about the model. The walk-forward backtest rows are
-// re-run by every retrain (and pds.hrv_predictions_latest keeps only the newest run), so
-// they follow the current rule whatever date they carry.
+// rewritten by every retrain (upsert on date/model/horizon/model_version), so the ones the
+// retrain still produces follow the current rule whatever date they carry. A few backtest
+// rows for dates the retrain no longer produces keep their pre-fix values (14 on
+// 2026-11-11, an older input_data_hash); nothing in the row says so, so they stay counted.
 //
 // Pure module (no Supabase, no React) so node:test can cover it directly.
 

@@ -257,14 +257,25 @@ export async function getEnvDoseResponseData() {
 }
 
 export async function getHrvResiduals() {
-  // Reads pds.hrv_predictions_latest (the same rows as the Prediction-vs-Actual chart) so
-  // every row carries model_version: the residual histogram leaves out live forecasts made
-  // before the 2026-11-11 same-night alignment fix (lib/hrv-forecast-cutover.ts), and the
-  // old hrv_residuals_mat has no model_version to tell them apart. ~520 rows, 4 narrow
-  // columns, one index-backed read (4 ms measured). The view's PK (prediction_date, model,
-  // horizon_days) makes the ascending order total, which the client's sameJson bailout needs.
+  // Reads pds.hrv_predictions_eval (newest created_at per prediction_date, backtest rows
+  // included) with model_version, so the residual histogram can leave out live forecasts
+  // made before the 2026-11-11 same-night alignment fix (lib/hrv-forecast-cutover.ts).
+  //
+  // Why this view and not hrv_predictions_latest: _latest prefers a live row over a backtest
+  // row for the same date, so on the ~170 dates with an old-pairing live forecast it would
+  // serve that row (dropped as non-comparable) and hide the same-night backtest residual the
+  // retrain rewrote for that date. _eval keeps the newest row, and a backtest row is always
+  // created after the live forecast for its date, so those dates serve the backtest row; only
+  // dates with no backtest row at all fall back to the old live row and are left out (6 on
+  // 2026-11-11). The matview this replaced (hrv_residuals_mat, same rows) has no
+  // model_version column, and adding one needs a drop-and-recreate migration.
+  //
+  // ~520 rows x 4 narrow columns, one index-backed read (4 ms warm, quals push down into the
+  // DISTINCT ON). One row per (prediction_date, model, horizon_days) makes the ascending
+  // order total, which the client's sameJson bailout needs. Stays under PostgREST's 1000-row
+  // cap until about mid-2027.
   const { data, error } = await supabase
-    .from("hrv_predictions_latest")
+    .from("hrv_predictions_eval")
     .select("prediction_date,model,model_version,residual")
     .eq("model", "xgboost")
     .eq("horizon_days", 1)
