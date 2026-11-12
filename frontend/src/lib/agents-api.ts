@@ -28,7 +28,7 @@ export interface AgentMessage {
 }
 
 /** Where a card stands on the server: open = still needs Riley. */
-export type CardState = "open" | "approve" | "decline" | "answer" | "complete" | "closed" | "expired";
+export type CardState = "open" | "approve" | "decline" | "answer" | "complete" | "closed" | "expired" | "logged" | "skipped";
 
 export interface MessagesResponse {
   messages: AgentMessage[];

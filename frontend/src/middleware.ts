@@ -17,8 +17,8 @@ const OWNER_USER_ID = process.env.ONYX_OWNER_USER_ID || "dc041abc-115a-4252-8536
 // Routes that accept the x-onyx-ci-token shared secret instead of a session:
 // the hourly habits-sync Action (/api/habits/*) and the local Kindle Notebook
 // harvester (tools/kindle_harvest → /api/reading/highlights/import, 2026-11-07),
-// and the iPhone Shortcuts screen-time automation (/api/screen-time/event,
-// 2026-11-08). Keep this list tiny — every entry is a service-role write
+// the iPhone Shortcuts screen-time automation (/api/screen-time/event,
+// 2026-11-08) and the supplement-reminder Worker. Keep this list tiny — every entry is a service-role write
 // reachable without a login, gated only by the constant-time token check below.
 function isCiRoute(pathname: string): boolean {
   return (
@@ -27,7 +27,11 @@ function isCiRoute(pathname: string): boolean {
     pathname === "/api/screen-time/event" ||
     // Onyx Screen Time iPhone app (tools/screentime_ios, 2026-11-09)
     pathname === "/api/screen-time/usage" ||
-    pathname === "/api/delivery/items/import"
+    pathname === "/api/delivery/items/import" ||
+    // Supplement stack reminders: the sms-reminders Worker claims due stacks and
+    // relays Log it / Skip taps (2026-11-11). Exact paths - never /api/supplements/*.
+    pathname === "/api/supplements/reminders/claim" ||
+    pathname === "/api/supplements/reminders/respond"
   );
 }
 

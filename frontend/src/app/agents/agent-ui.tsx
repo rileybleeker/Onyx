@@ -99,14 +99,20 @@ export function cardActions(card: AgentCard): CardAction[] {
   const t = card.type.toLowerCase();
   if (t === "checkin") return [{ label: "Open check-in", href: card.link, primary: true }];
   if (t === "approval") return [{ label: "Approve", text: `${card.code} yes`, primary: true }, { label: "Decline", text: `${card.code} no` }, { label: "Reply", reply: true }];
+  if (t === "supplement") return [{ label: "Log it", text: `${card.code} log`, primary: true }, { label: "Skip", text: `${card.code} skip` }];
   if (t === "lead") return [{ label: "Interested", text: `${card.code} interested`, primary: true }, { label: "Pass", text: `${card.code} no` }, { label: "Reply", reply: true }];
   if (t === "question") return [{ label: "Reply", reply: true, primary: true }, { label: "Done", text: `${card.code} done` }];
   return [{ label: "Reply", reply: true, primary: true }];
 }
 
 /** What Riley sees on a card that no longer needs them: from their own reply when known, else the server state. */
-export function settledLabel(reply: string | undefined, state: CardState | undefined): string | null {
+export function settledLabel(reply: string | undefined, state: CardState | undefined, cardType?: string): string | null {
   if (reply !== undefined) {
+    // Supplement reminder cards: "log" / "skip" are their own words ("skip" reads as Declined on an approval).
+    if (cardType?.toLowerCase() === "supplement") {
+      if (/^log/i.test(reply)) return "Logged";
+      if (/^skip/i.test(reply)) return "Skipped";
+    }
     if (/^(yes|y|ok|okay|approve)/i.test(reply)) return "Approved";
     if (/^(no|n|nope|decline|skip|pass)/i.test(reply)) return "Declined";
     if (/^done/i.test(reply)) return "Marked done";
@@ -126,6 +132,10 @@ export function settledLabel(reply: string | undefined, state: CardState | undef
       return "Closed by the agent";
     case "expired":
       return "Expired";
+    case "logged":
+      return "Logged";
+    case "skipped":
+      return "Skipped";
     default:
       return null;
   }

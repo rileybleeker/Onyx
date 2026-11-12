@@ -81,7 +81,7 @@ function UnreadCard({ item, sent, onSend }: { item: Extract<InboxItem, { kind: "
       </div>
       <CardButtons
         card={card}
-        settled={settledLabel(sent, undefined)}
+        settled={settledLabel(sent, undefined, card.type)}
         onSend={onSend}
         onReply={(code) => router.push(threadHref(item.thread, { messageId: item.messageId, reply: code }))}
       />

@@ -29,6 +29,7 @@ const SOURCE_BADGE: Record<string, string> = {
   tanita: "TANITA",
   flights: "DELTA",
   delivery: "UBER EATS",
+  supplement_reminders: "AGENTS",
   ubereats: "UBER EATS",
   nyc_scout: "AGENT",
   matrix_mat: "DB",
@@ -55,6 +56,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   tanita: "text-amber-500",
   flights: "text-indigo-400",
   delivery: "text-emerald-400",
+  supplement_reminders: "text-amber-400/70",
   ubereats: "text-emerald-400/70",
   nyc_scout: "text-sky-400",
   matrix_mat: "text-cyan-400/70",
@@ -112,6 +114,7 @@ const SOURCE_ORDER = [
   "tanita",
   "flights",
   "delivery",
+  "supplement_reminders",
   "ubereats",
   "nyc_scout",
   "matrix_mat",
@@ -236,6 +239,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   screen_time: "Screen Time app",
   flights: "Flights",
   delivery: "Delivery",
+  supplement_reminders: "Supplement Reminders",
   ubereats: "Uber Eats Items",
   matrix_mat: "Matrix Matview",
   perf_mats: "Perf Matviews",
@@ -259,6 +263,7 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   items: "Order Items",
   email: "Email Parse",
   refresh: "Refresh",
+  prompt: "Reminder Poll",
 };
 
 // "refreshed Xm ago" label, isolated from the page render cycle (perf round
