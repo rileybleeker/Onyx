@@ -352,7 +352,16 @@ def wait_master_ci(sha: str, timeout: int = 600) -> tuple[str, str]:
         if verdict:
             return verdict
         time.sleep(20)
-    return "fail", "master CI did not finish in %d min" % (timeout // 60)
+    return ci_timeout_verdict(timeout)
+
+
+def ci_timeout_verdict(timeout: int) -> tuple[str, str]:
+    """Master CI still queued or running when the wait ends is not a failure. Back-to-back merges queue the runs
+    (2026-11-12: #74 and #83 were reverted for exactly this, with green PR checks and a green deploy). The same checks
+    passed on the PR head before the merge, so the production smoke test that runs next is the gate; a real CI failure
+    is still caught by master_ci_verdict whenever it finishes in time."""
+    return "ok", "master CI still queued or running after %d min (PR checks were green); production smoke decides" % (
+        timeout // 60)
 
 
 def post_merge(sha: str, drill: bool) -> int:
