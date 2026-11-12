@@ -20,9 +20,11 @@ import {
 } from "@/lib/chart-theme";
 import { rangeDays, rangeLabel, type Range, type WorkoutSleepGap } from "@/lib/queries";
 import {
-  loadHrvDashboard, loadHrvRangeDependent, parseJsonb,
-  LIVE_METRICS_SUFFIX, SAME_NIGHT_FIRST_PREDICTION_DATE,
+  loadHrvDashboard, loadHrvRangeDependent, parseJsonb, LIVE_METRICS_SUFFIX,
 } from "@/lib/queries-hrv";
+import {
+  SAME_NIGHT_FIRST_PREDICTION_DATE, forecastSource, isSameNightComparable, splitComparable,
+} from "@/lib/hrv-forecast-cutover";
 import type { HrvInitial } from "./HrvLoader";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -192,10 +194,13 @@ function rolling7(data: number[], i: number): number {
   return slice.length ? slice.reduce((a, b) => a + b, 0) / slice.length : NaN;
 }
 
-// Custom dot for prediction vs actual line
+// Custom dot for prediction vs actual line. Old-pairing live forecasts (made before the
+// 2026-11-11 same-night fix) get no dot: they were scored against the wrong night, so a
+// ">15 ms miss" there is not a model miss.
 const HrvDot = (props: any) => {
   const { cx, cy, payload } = props;
   if (!payload?.actual || !payload?.predicted) return null;
+  if (payload.comparable === false) return null;
   const diff = Math.abs(payload.actual - payload.predicted);
   const color = diff > 15 ? C.down : "transparent";
   return <circle cx={cx} cy={cy} r={4} fill={color} stroke={C.down} strokeWidth={1} />;
@@ -498,19 +503,17 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
   // each point is: a live forecast made before the 2026-11-11 alignment fix (old
   // pairing), one made after it, or the walk-forward backtest standing in for a night
   // with no live forecast (pds.hrv_predictions_latest falls back to it).
-  const predActualData = accuracy.map(d => {
-    const backtest = String(d.model_version ?? "").startsWith("backtest");
-    const sameNight = d.prediction_date >= SAME_NIGHT_FIRST_PREDICTION_DATE;
-    return {
-      day: d.prediction_date as string,
-      actual: Number(d.actual_hrv),
-      predicted: Number(d.predicted_hrv),
-      lower: d.prediction_lower ? Number(d.prediction_lower) : null,
-      upper: d.prediction_upper ? Number(d.prediction_upper) : null,
-      source: backtest ? "walk-forward backtest"
-        : sameNight ? "live forecast" : "live forecast, old pairing (before the fix)",
-    };
-  });
+  const predActualData = accuracy.map(d => ({
+    day: d.prediction_date as string,
+    actual: Number(d.actual_hrv),
+    predicted: Number(d.predicted_hrv),
+    lower: d.prediction_lower ? Number(d.prediction_lower) : null,
+    upper: d.prediction_upper ? Number(d.prediction_upper) : null,
+    source: forecastSource(d),
+    // false = old pairing: shown for reference, never counted as a miss.
+    comparable: isSameNightComparable(d),
+  }));
+  const hasOldPairing = predActualData.some(d => !d.comparable);
   // Mark the cutover only when the window holds points on both sides of it.
   const cutoverIdx = predActualData.findIndex(d => d.day >= SAME_NIGHT_FIRST_PREDICTION_DATE);
   const cutoverDay = cutoverIdx > 0 ? predActualData[cutoverIdx].day : null;
@@ -574,9 +577,14 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
   });
 
   // Residual histogram
+  // Nights whose only row is an old-pairing live forecast (before the 2026-11-11 same-night
+  // fix) are left out: that residual compares a forecast with the wrong night. getHrvResiduals
+  // serves the rewritten backtest row where one exists, and those rows stay.
   const residualData: any[] = [];
+  const { used: residualsUsed, excluded: residualsLeftOut } =
+    splitComparable(residuals.filter(r => r.model === "xgboost"));
   if (residuals.length) {
-    const xgbRes = residuals.filter(r => r.model === "xgboost").map(r => Number(r.residual));
+    const xgbRes = residualsUsed.map(r => Number(r.residual));
     const bins = Array.from({ length: 20 }, (_, i) => -50 + i * 5);
     bins.forEach((bin, i) => {
       const count = xgbRes.filter(v => v >= bin && v < bin + 5).length;
@@ -896,9 +904,9 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         {/* Prediction vs Actual */}
         <ChartCard collapsible storageKey="prediction-vs-actual" title={`Prediction vs Actual (${rangeLabel(range)})`}
                    subtitle={cutoverDay
-                     ? "Red dots = miss > 15ms · yellow line = 2026-11-11 alignment fix"
+                     ? "Red dots = miss > 15ms · yellow line = first forecast after the 2026-11-11 same-night fix"
                      : "Red dots = miss > 15ms"}
-                   info="What the model predicted each night (blue dashed) vs what your HRV actually was (green). Red dots are nights where it missed by more than 15ms. Fewer red dots = more accurate model. The yellow dashed line marks the 2026-11-11 alignment fix: from that night on, each forecast is scored against the sleep it was made for. Live forecasts left of the line were made under the old pairing (one night late) and are not comparable. Nights without a live forecast show the walk-forward backtest instead; the tooltip says which one a point is.">
+                   info="What the model predicted each night (blue dashed) vs what your HRV actually was (green). Red dots are nights where it missed by more than 15ms. Fewer red dots = more accurate model. The yellow dashed line marks the first forecast made after the 2026-11-11 alignment fix (the night of Nov 10): from there on, each forecast is scored against the sleep it was made for. Live forecasts left of the line were made under the old pairing (one night late), so they get no red dots and are left out of the residual histogram. Nights without a live forecast show the walk-forward backtest instead; the tooltip says which one a point is.">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={predActualData}>
               <CartesianGrid {...gridStyle} />
@@ -923,6 +931,13 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           </ResponsiveContainer>
           {predActualData.length === 0 && (
             <p className="text-[11px] text-text-tertiary text-center mt-2">No backtest data yet</p>
+          )}
+          {hasOldPairing && (
+            <p className="text-[11px] text-text-tertiary mt-2 leading-relaxed">
+              {cutoverDay
+                ? "Left of the dashed line: live forecasts made before the 2026-11-11 same-night fix, one night off. Shown for reference; not counted as misses."
+                : "Live forecasts here were made before the 2026-11-11 same-night fix, one night off. Shown for reference; not counted as misses."}
+            </p>
           )}
         </ChartCard>
 
@@ -2810,6 +2825,11 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                 <p className="text-[11px] text-text-tertiary leading-relaxed mb-3">
                   Each bar counts how many nights the model missed by that amount (in ms). The tall bars should pile up near 0 (the red line) — random small misses. Bars skewed to one side mean the model is consistently predicting too high or too low.
                 </p>
+                {residualsLeftOut.length > 0 && (
+                  <p className="text-[11px] text-text-tertiary leading-relaxed mb-3">
+                    {residualsUsed.length} nights counted. {residualsLeftOut.length} {residualsLeftOut.length === 1 ? "night" : "nights"} with only a live forecast from before the 2026-11-11 same-night fix (one night off) {residualsLeftOut.length === 1 ? "is" : "are"} left out.
+                  </p>
+                )}
                 {residualData.length > 0 && residualData.some(d => d.count > 0) ? (
                   <ResponsiveContainer width="100%" height={200}>
                     <BarChart data={residualData} margin={{ top: 4, right: 8, left: 0, bottom: 20 }}>

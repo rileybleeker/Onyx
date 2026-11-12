@@ -78,11 +78,8 @@ export async function getTomorrowPrediction() {
   return fb.data?.[0] ?? null;
 }
 
-// First prediction_date served by the same-night alignment (hrv_alignment.py, PR #5): the
-// live forecast for behavioral night 2026-11-10 was the first one made by the new code
-// (created 2026-11-11 01:06 ET; checked in pds.hrv_predictions_latest). Live forecasts on
-// earlier dates were made under the old, one-night-late pairing.
-export const SAME_NIGHT_FIRST_PREDICTION_DATE = "2026-11-10";
+// SAME_NIGHT_FIRST_PREDICTION_DATE and the live / old-pairing / backtest split live in
+// lib/hrv-forecast-cutover.ts (pure, so node:test covers them).
 
 // pds.hrv_model_metrics model label suffix for hrv_predict.py's live 30-day accuracy
 // (hrv_predict.LIVE_METRICS_SUFFIX). Plain model names are the retrain's walk-forward
@@ -260,23 +257,28 @@ export async function getEnvDoseResponseData() {
 }
 
 export async function getHrvResiduals() {
-  // Reads pds.hrv_residuals_mat (perf round 3, 2026-06-11) — a 5-col narrow
-  // matview (prediction_date, model, predicted_hrv, actual_hrv, residual)
-  // over the h=1 *_eval rows, refreshed every 15 min. The matview has NO
-  // horizon_days column (h=1 is baked in), so do not re-add that filter —
-  // it would 400.
+  // Reads pds.hrv_predictions_eval (newest created_at per prediction_date, backtest rows
+  // included) with model_version, so the residual histogram can leave out live forecasts
+  // made before the 2026-11-11 same-night alignment fix (lib/hrv-forecast-cutover.ts).
   //
-  // Narrowed to xgboost only: the single consumer (HrvAnalysisClient's
-  // 20-bin residual histogram) filters to model === "xgboost" client-side
-  // anyway, so fetching the baselines was pure dead weight. With the column
-  // list trimmed too, the payload drops from ~168kB to ~12kB. Bonus
-  // correctness fix: the old wide query was silently capped at PostgREST's
-  // 1000-row default (1,153 rows existed); the narrowed ~387-row result is
-  // complete.
+  // Why this view and not hrv_predictions_latest: _latest prefers a live row over a backtest
+  // row for the same date, so on the ~170 dates with an old-pairing live forecast it would
+  // serve that row (dropped as non-comparable) and hide the same-night backtest residual the
+  // retrain rewrote for that date. _eval keeps the newest row, and a backtest row is always
+  // created after the live forecast for its date, so those dates serve the backtest row; only
+  // dates with no backtest row at all fall back to the old live row and are left out (6 on
+  // 2026-11-11). The matview this replaced (hrv_residuals_mat, same rows) has no
+  // model_version column, and adding one needs a drop-and-recreate migration.
+  //
+  // ~520 rows x 4 narrow columns, one index-backed read (4 ms warm, quals push down into the
+  // DISTINCT ON). One row per (prediction_date, model, horizon_days) makes the ascending
+  // order total, which the client's sameJson bailout needs. Stays under PostgREST's 1000-row
+  // cap until about mid-2027.
   const { data, error } = await supabase
-    .from("hrv_residuals_mat")
-    .select("prediction_date,model,residual")
+    .from("hrv_predictions_eval")
+    .select("prediction_date,model,model_version,residual")
     .eq("model", "xgboost")
+    .eq("horizon_days", 1)
     .not("residual", "is", null)
     .order("prediction_date", { ascending: true });
   if (error) throw error;
