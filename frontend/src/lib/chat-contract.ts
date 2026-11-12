@@ -26,6 +26,7 @@ export interface ChatMessage {
 export const MAX_CHAT_MESSAGES = 60;
 export const MAX_CHAT_CHARACTERS = 60000;
 export const MAX_TOOL_ROUNDS = 8;
+export const MAX_TOOL_CALLS = 32;
 
 /** Accept only plain conversation text, never client-supplied tool results. */
 export function validateChatMessages(value: unknown): value is ChatMessage[] {

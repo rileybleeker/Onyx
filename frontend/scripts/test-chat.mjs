@@ -62,3 +62,27 @@ test("an aborted request does not execute its requested write",async()=>{
   const response=await r.raw({json:async()=>({messages:[user("Log an item")]}),signal:controller.signal});
   assert.equal(response.status,499); assert.equal(r.writes(),0);
 });
+
+test("empty final summaries do not falsely claim a completed action or encourage blind retries",async()=>{
+  const r=route([{stop_reason:"tool_use",content:[{type:"tool_use",id:"x",name:"not_a_tool",input:{}}]},{stop_reason:"end_turn",content:[]}]);
+  const response=await r.post({messages:[user("Do something")]});
+  assert.equal(response.status,200);
+  assert.match((await response.json()).response,/does not confirm every action succeeded/);
+});
+test("truncated responses disclose the length limit",async()=>{
+  const r=route([{stop_reason:"max_tokens",content:[{type:"text",text:"Partial answer"}]}]);
+  assert.match((await (await r.post({messages:[user("Explain")]})).json()).response,/length limit/);
+});
+
+test("a single oversized parallel tool batch is bounded",async()=>{
+  const r=route([{stop_reason:"tool_use",content:Array.from({length:contract.MAX_TOOL_CALLS+1},(_,i)=>({type:"tool_use",id:String(i),name:"not_a_tool",input:{}}))}]);
+  const response=await r.post({messages:[user("Do something")]});
+  assert.equal(response.status,422);
+  assert.match((await response.json()).error,/tool-call limit/);
+  assert.equal(r.calls(),1);
+});
+test("pre-cancelled requests never invoke the model",async()=>{
+  const r=route(); const controller=new AbortController();controller.abort();
+  assert.equal((await r.raw({json:async()=>({messages:[user("Explain")]}),signal:controller.signal})).status,499);
+  assert.equal(r.calls(),0);
+});

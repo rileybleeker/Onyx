@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { CHAT_SCOPE, MAX_TOOL_ROUNDS, validateChatMessages } from "@/lib/chat-contract";
+import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, validateChatMessages } from "@/lib/chat-contract";
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist } from "@/lib/spotify-server";
@@ -964,6 +964,8 @@ export async function POST(req: NextRequest) {
       return Response.json({ error: "Use a nonempty, alternating text conversation of at most 60 messages and 60,000 characters." }, { status: 400 });
     }
 
+    if (req.signal.aborted) return Response.json({ error: "Request cancelled" }, { status: 499 });
+
     // The model has no clock of its own: tell it the local time and the
     // behavioral day so "today", "yesterday" and "this morning" resolve.
     const now = new Date();
@@ -980,11 +982,12 @@ export async function POST(req: NextRequest) {
       system: systemPrompt,
       tools,
       messages,
-    });
+    }, { signal: req.signal });
 
     // Agentic tool-use loop
     const allMessages: Anthropic.MessageParam[] = [...messages];
     let toolRounds = 0;
+    let toolCalls = 0;
 
     while (response.stop_reason === "tool_use") {
       if (toolRounds++ >= MAX_TOOL_ROUNDS) {
@@ -998,6 +1001,9 @@ export async function POST(req: NextRequest) {
         if (block.type === "tool_use") {
           if (req.signal.aborted) {
             return Response.json({ error: "Request cancelled. Check the relevant page before retrying any action." }, { status: 499 });
+          }
+          if (toolCalls++ >= MAX_TOOL_CALLS) {
+            return Response.json({ error: "This request reached the tool-call limit. Some actions may already have completed; check the relevant page before repeating an action." }, { status: 422 });
           }
           const result = await executeTool(block.name, block.input as Record<string, unknown>);
           toolResults.push({
@@ -1016,7 +1022,7 @@ export async function POST(req: NextRequest) {
         system: systemPrompt,
         tools,
         messages: allMessages,
-      });
+      }, { signal: req.signal });
     }
 
     // Extract final text
@@ -1025,7 +1031,11 @@ export async function POST(req: NextRequest) {
       .map((b) => b.text)
       .join("\n");
 
-    return Response.json({ response: text });
+    const summary = text.trim() || (toolRounds > 0
+      ? "No final summary was produced. Tool requests were processed, but that does not confirm every action succeeded. Check the relevant page before repeating an action."
+      : "No answer was produced. Please try rephrasing your question.");
+    const suffix = response.stop_reason === "max_tokens" ? "\n\nThis response reached its length limit. Ask me to continue if needed; do not repeat an action without checking its result." : "";
+    return Response.json({ response: summary + suffix });
   } catch {
     console.error("Chat API request failed");
     return Response.json(

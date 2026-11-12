@@ -18,6 +18,12 @@ export default function ChatPage() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, pending, error]);
 
+  useEffect(() => {
+    if (!loading && messages.length > 0 && window.matchMedia("(pointer: fine)").matches) {
+      inputRef.current?.focus();
+    }
+  }, [loading, messages.length]);
+
   async function send() {
     const text = input.trim();
     if (!text || sending.current) return;
@@ -36,9 +42,10 @@ export default function ChatPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messages: updated }),
       });
-      const data = await res.json();
-      if (!res.ok || typeof data.response !== "string" || !data.response.trim()) {
-        throw new Error(typeof data.error === "string" ? data.error : "Onyx could not finish this response.");
+      const data = await res.json().catch(() => null);
+      if (res.redirected || res.status === 401) throw new Error("Your session may have expired. Sign in again.");
+      if (!res.ok || typeof data?.response !== "string" || !data?.response.trim()) {
+        throw new Error(typeof data?.error === "string" ? data.error : "Onyx could not finish this response.");
       }
       setMessages([...updated, { role: "assistant", content: data.response }]);
     } catch (err) {
@@ -91,20 +98,22 @@ export default function ChatPage() {
             </div>
           </div>
         ))}
-        {loading && <p role="status" className="text-sm text-text-tertiary animate-pulse">Thinking...</p>}
-        {error && <p role="alert" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3">{error}</p>}
+
+
         <div ref={bottomRef} />
       </div>
 
+      {loading && <p role="status" className="text-sm text-text-tertiary mb-3 animate-pulse">Thinking...</p>}
+      {error && <p role="alert" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 mb-3">{error}</p>}
       <form onSubmit={(event) => { event.preventDefault(); void send(); }} className="flex gap-2 shrink-0">
         <label htmlFor="onyx-message" className="sr-only">Message Onyx</label>
         <textarea id="onyx-message" ref={inputRef} rows={2} value={input} onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && window.matchMedia("(pointer: fine)").matches) { e.preventDefault(); void send(); } }}
           placeholder="Ask Onyx anything..." disabled={loading} maxLength={MAX_CHAT_CHARACTERS}
           className="flex-1 min-w-0 resize-none bg-surface-card border border-border-subtle rounded px-4 py-3 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent" />
         <button type="submit" disabled={loading || !input.trim()} className="bg-accent hover:bg-accent/90 disabled:opacity-40 text-white px-4 py-3 rounded text-sm font-medium">Send</button>
       </form>
-      <p className="text-xs text-text-tertiary mt-2 shrink-0">Enter to send. Shift+Enter for a new line.</p>
+      <p className="text-xs text-text-tertiary mt-2 shrink-0">Use Send to submit. On a keyboard: Enter sends, Shift+Enter adds a line.</p>
     </div>
   );
 }
