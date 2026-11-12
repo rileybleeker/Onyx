@@ -108,3 +108,172 @@ export function dayKcal(items: ReadonlyArray<{ est_kcal: number | null; est_kind
 export function selectedPortion(fraction: number | null | undefined): number {
   return fraction == null ? 1 : Number(fraction);
 }
+
+/** YYYY-MM-DD shifted by whole days (calendar arithmetic in UTC, so no DST edge). */
+export function shiftYmd(ymd: string, days: number): string {
+  const d = new Date(`${ymd}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+// ─── Uber Eats estimates filling days with no food log (getNutrition) ───────
+
+export interface DeliveryEstimateDay {
+  behavioral_date: string;
+  est_kcal: number | string | null;
+  est_protein_g: number | string | null;
+  est_carbs_g: number | string | null;
+  est_fat_g: number | string | null;
+}
+
+/**
+ * Adds pds.delivery_nutrition_daily estimates for days with no Cronometer/MFP log. A logged day always
+ * wins (the diary usually already holds the delivered meal). A day whose estimate is 0 kcal or less (every
+ * dish marked "None": an order for a guest, or one thrown away) is left out: nothing delivered was eaten,
+ * so there is no food signal for that day, which is not the same as a day Riley ate nothing.
+ */
+export function mergeDeliveryEstimates<T extends { calendar_date: string }>(
+  logged: ReadonlyArray<T>,
+  estimates: ReadonlyArray<DeliveryEstimateDay>,
+): Array<T | (Record<string, unknown> & { calendar_date: string })> {
+  const rows: Array<T | (Record<string, unknown> & { calendar_date: string })> = [...logged];
+  const seen = new Set(logged.map((r) => r.calendar_date));
+  for (const e of estimates) {
+    if (seen.has(e.behavioral_date)) continue;
+    const kcal = e.est_kcal == null ? NaN : Number(e.est_kcal);
+    if (!Number.isFinite(kcal) || kcal <= 0) continue;
+    seen.add(e.behavioral_date);
+    rows.push({
+      calendar_date: e.behavioral_date,
+      nutrition_source: "uber_eats",
+      calories: e.est_kcal,
+      protein_g: e.est_protein_g,
+      carbs_g: e.est_carbs_g,
+      fat_g: e.est_fat_g,
+      fiber_g: null,
+      sugar_g: null,
+      sodium_mg: null,
+      water_ml: null,
+    });
+  }
+  rows.sort((a, b) => (a.calendar_date < b.calendar_date ? -1 : a.calendar_date > b.calendar_date ? 1 : 0));
+  return rows;
+}
+
+// ─── Which dishes the check-in asks about ────────────────────────────────────
+
+/**
+ * The check-in for day D shows every dish of D, plus dishes of the days before D (the caller fetches
+ * D-1 and D-2) whose portion was never set. The harvester runs every 6 h, so a dinner delivered after the
+ * evening check-in usually lands in the database after it; it is then asked at the next check-in. Grouped
+ * by day: D first, then the earlier days, newest first.
+ */
+export function checkinDishGroups<T extends { behavioral_date: string; eaten_fraction: number | null }>(
+  rows: ReadonlyArray<T>,
+  date: string,
+): Array<{ date: string; items: T[] }> {
+  return groupDishesByDay(
+    rows.filter((r) => r.behavioral_date === date || (r.behavioral_date < date && r.eaten_fraction == null)),
+    date,
+  );
+}
+
+/** Group by behavioral day: `date` first, then the other days newest first; order within a day kept. */
+export function groupDishesByDay<T extends { behavioral_date: string }>(
+  rows: ReadonlyArray<T>,
+  date: string,
+): Array<{ date: string; items: T[] }> {
+  const byDay = new Map<string, T[]>();
+  for (const r of rows) byDay.set(r.behavioral_date, [...(byDay.get(r.behavioral_date) ?? []), r]);
+  return [...byDay.entries()]
+    .sort((a, b) => (a[0] === b[0] ? 0 : a[0] === date ? -1 : b[0] === date ? 1 : a[0] < b[0] ? 1 : -1))
+    .map(([d, items]) => ({ date: d, items }));
+}
+
+// ─── Saving taps ─────────────────────────────────────────────────────────────
+
+export type PortionSendResult = { ok: true } | { ok: false; error: string };
+
+export interface PortionSaverOptions {
+  /** Write one dish's fraction (PATCH /api/delivery/items/[itemId]). A throw counts as a network error. */
+  send(itemId: number, fraction: number | null): Promise<PortionSendResult>;
+  /** Show a value for the dish (the optimistic tap, or the stored value after a failed save). */
+  apply(itemId: number, fraction: number | null): void;
+  onError(itemId: number, message: string): void;
+  onSaved(itemId: number, fraction: number | null): void;
+}
+
+/**
+ * Optimistic one-tap saving with writes SERIALIZED per dish: while a write is in flight, further taps on
+ * that dish only update the screen and the newest one is sent when the write returns. So the server sees
+ * the taps in order, and a failed save goes back to the last value the server CONFIRMED (the loaded one,
+ * or the last successful write), never to an earlier optimistic tap that was not saved.
+ */
+export function createPortionSaver(o: PortionSaverOptions) {
+  type Dish = { confirmed: number | null; shown: number | null; inflight: boolean; pending: { v: number | null } | null };
+  const dishes = new Map<number, Dish>();
+
+  async function run(id: number, d: Dish, f: number | null): Promise<void> {
+    d.inflight = true;
+    let r: PortionSendResult;
+    try {
+      r = await o.send(id, f);
+    } catch {
+      r = { ok: false, error: "Network error: the portion was not saved." };
+    }
+    d.inflight = false;
+    if (r.ok) d.confirmed = f;
+    const next = d.pending;
+    d.pending = null;
+    if (next && next.v !== d.confirmed) return run(id, d, next.v);
+    if (r.ok) {
+      o.onSaved(id, d.confirmed);
+      return;
+    }
+    // This write failed, but the newest tap went back to the stored value: the screen is already right.
+    if (next) return;
+    d.shown = d.confirmed;
+    o.apply(id, d.confirmed);
+    o.onError(id, r.error);
+  }
+
+  return {
+    /**
+     * Record the stored value of a freshly loaded dish. Returns the value to display: the stored one,
+     * or (while a save for that dish is still in flight) the value on screen.
+     */
+    seed(itemId: number, stored: number | null): number | null {
+      const d = dishes.get(itemId);
+      if (!d) {
+        dishes.set(itemId, { confirmed: stored, shown: stored, inflight: false, pending: null });
+        return stored;
+      }
+      if (d.inflight || d.pending) return d.shown;
+      d.confirmed = stored;
+      d.shown = stored;
+      return stored;
+    },
+    /** A tap. Resolves when this tap's write (or the queued write that supersedes it) has settled. */
+    set(itemId: number, fraction: number | null): Promise<void> {
+      let d = dishes.get(itemId);
+      if (!d) {
+        d = { confirmed: null, shown: null, inflight: false, pending: null };
+        dishes.set(itemId, d);
+      }
+      if (d.shown === fraction) return Promise.resolve();
+      d.shown = fraction;
+      o.apply(itemId, fraction);
+      if (d.inflight) {
+        d.pending = { v: fraction };
+        return Promise.resolve();
+      }
+      return run(itemId, d, fraction);
+    },
+    shown(itemId: number): number | null | undefined {
+      return dishes.get(itemId)?.shown;
+    },
+    confirmed(itemId: number): number | null | undefined {
+      return dishes.get(itemId)?.confirmed;
+    },
+  };
+}

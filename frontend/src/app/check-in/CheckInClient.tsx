@@ -12,9 +12,12 @@ import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortio
 //   labeled with that source; everything else starts blank. Blank on save = not logged (never a "No").
 // - Taps are kept as a local draft per day, so leaving the page (or the app being killed) loses nothing.
 // - Save writes the whole day in one request, then tells the Agents chat the day is done so the card settles.
-// - Days with delivered Uber Eats restaurant dishes get one extra section, "how much did you eat?". It loads
-//   on its own after the questions (never delays them), shows nothing on days without orders, and each tap
-//   saves immediately through PATCH /api/delivery/items/[itemId] (not part of the Save bar).
+// - Delivered Uber Eats restaurant dishes get one extra section, "how much did you eat?": every dish of the
+//   day being checked in, plus dishes of the 2 days before whose portion was never set (the harvester runs
+//   every 6 h, so a dinner delivered after the 21:30 card usually lands after that evening's check-in and is
+//   asked the next evening). It loads on its own after the questions (never delays them), shows nothing when
+//   there is nothing to ask, and each tap saves immediately through PATCH /api/delivery/items/[itemId]
+//   (not part of the Save bar).
 
 type Origin = "saved" | "suggested" | "tapped";
 type Cell = { answer: CheckinAnswer; origin: Origin; source?: string };
@@ -46,7 +49,7 @@ export default function CheckInClient() {
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [showExtras, setShowExtras] = useState(false);
-  const delivery = useDeliveryDishes(data?.date ?? null);
+  const delivery = useDeliveryDishes(data?.date ?? null, { earlierDays: 2 });
 
   const load = useCallback(async (date: string | null) => {
     setError(null);
@@ -277,14 +280,26 @@ export default function CheckInClient() {
         </section>
       )}
 
-      {delivery.items.length > 0 && (
+      {(delivery.groups.length > 0 || delivery.loadError) && (
         <section className="mb-6">
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">Uber Eats: how much did you eat?</h3>
-          <p className="text-[12px] text-text-tertiary mb-2">
-            Saved as you tap. Left as All unless you change it
-            {delivery.totalKcal != null ? ` · ~${Math.round(delivery.totalKcal)} kcal counted` : ""}.
-          </p>
-          <DeliveryDishList items={delivery.items} onPick={delivery.setFraction} />
+          {delivery.groups.length > 0 && (
+            <p className="text-[12px] text-text-tertiary mb-2">Saved as you tap. Left as All unless you change it; tap All to confirm.</p>
+          )}
+          {delivery.groups.map((g) => (
+            <div key={g.date} className="mb-3">
+              <div className="flex items-baseline justify-between mb-1">
+                <span className="text-[11px] font-mono text-text-secondary">
+                  {g.date === data.date ? dayLabel(g.date, data.today) : `${dayLabel(g.date, data.today)} · not answered yet`}
+                </span>
+                {g.totalKcal != null && (
+                  <span className="text-[11px] font-mono text-text-tertiary">~{Math.round(g.totalKcal)} kcal counted</span>
+                )}
+              </div>
+              <DeliveryDishList items={g.items} onPick={delivery.setFraction} />
+            </div>
+          ))}
+          {delivery.loadError && <p className="text-[12px] text-red-400 mt-1.5">{delivery.loadError}</p>}
           {delivery.error && <p className="text-[12px] text-red-400 mt-1.5">{delivery.error}</p>}
         </section>
       )}

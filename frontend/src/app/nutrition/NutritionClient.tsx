@@ -24,6 +24,7 @@ import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
 import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortions";
+import { shiftYmd } from "@/lib/delivery-portion";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -108,13 +109,6 @@ function formatShortDate(ymd: string): string {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
-/** YYYY-MM-DD shifted by whole days (calendar arithmetic in UTC, so no DST edge). */
-function shiftYmd(ymd: string, days: number): string {
-  const d = new Date(`${ymd}T12:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().slice(0, 10);
-}
-
 // ─── Nutrition helpers ───────────────────────────────────────────────────────
 
 function avg(arr: any[], key: string): number {
@@ -148,10 +142,15 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   const [burntData, setBurntData] = useState<any[]>(initial?.burntData ?? []);
   const [vitaminsData, setVitaminsData] = useState<any[]>(initial?.vitaminsData ?? []);
   const [fullNutrients, setFullNutrients] = useState<any[]>(initial?.fullNutrients ?? []);
-  const [servingsState, setServingsState] = useState<{ date: string | null; rows: any[] }>({ date: null, rows: [] });
+  const [servingsState, setServingsState] = useState<{ date: string | null; rows: any[]; failed?: boolean }>({ date: null, rows: [] });
   const [nutritionLoading, setNutritionLoading] = useState(!initial);
   const [range, setRange] = useState<Range>("30d");
   const firstRunWithInitial = useRef(!!initial);
+  // Guards for the silent post-save refresh (refreshNutritionSilently): the range it ran for, a counter the
+  // range effect bumps (a newer range load wins), and a counter per refresh (the newest refresh wins).
+  const rangeRef = useRef(range);
+  const nutritionGen = useRef(0);
+  const refreshSeq = useRef(0);
 
   // ─── Weight state ───
   const [weightRows, setWeightRows] = useState<WeightRow[]>([]);
@@ -182,6 +181,9 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     // loading state as before. The cancelled flag stops a superseded slow
     // response from overwriting a newer range's data (out-of-order resolve).
     let cancelled = false;
+    rangeRef.current = range;
+    nutritionGen.current += 1;
+    const refreshAtStart = refreshSeq.current;
     const silent = firstRunWithInitial.current;
     firstRunWithInitial.current = false;
     if (!silent) setNutritionLoading(true);
@@ -196,7 +198,8 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
         // sameJson bail-out: the silent revalidation's data is usually
         // byte-identical to the server-seeded state — returning the previous
         // reference lets React skip the commit (and a full chart re-render).
-        setNutritionData((prev) => (sameJson(prev, n) ? prev : n));
+        // A post-save refresh started after this load fetched newer macros: keep those.
+        if (refreshSeq.current === refreshAtStart) setNutritionData((prev) => (sameJson(prev, n) ? prev : n));
         setBurntData((prev) => (sameJson(prev, b) ? prev : b));
         setVitaminsData((prev) => (sameJson(prev, v) ? prev : v));
         setFullNutrients((prev) => (sameJson(prev, f) ? prev : f));
@@ -217,21 +220,37 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     getCronometerServings(1, mealsDay)
       .then((rows) => {
         if (!cancelled) {
-          setServingsState((prev) => (prev.date === mealsDay && sameJson(prev.rows, rows) ? prev : { date: mealsDay, rows }));
+          setServingsState((prev) =>
+            prev.date === mealsDay && !prev.failed && sameJson(prev.rows, rows) ? prev : { date: mealsDay, rows },
+          );
         }
       })
-      .catch(console.error);
+      .catch((e) => {
+        console.error(e);
+        if (!cancelled) setServingsState({ date: mealsDay, rows: [], failed: true });
+      });
     return () => { cancelled = true; };
   }, [mealsDay]);
 
   // A saved portion changes that day's Uber Eats estimate in the macro charts: refetch them silently.
+  // Reads the CURRENT range (not the one at tap time) and drops its result if the range changed, or a
+  // newer refresh started, while it was in flight.
   const refreshNutritionSilently = useCallback(() => {
-    getNutrition(rangeDays(range))
-      .then((n) => setNutritionData((prev) => (sameJson(prev, n) ? prev : n)))
+    const r = rangeRef.current;
+    const gen = nutritionGen.current;
+    const seq = ++refreshSeq.current;
+    getNutrition(rangeDays(r))
+      .then((n) => {
+        if (rangeRef.current !== r || nutritionGen.current !== gen || refreshSeq.current !== seq) return;
+        setNutritionData((prev) => (sameJson(prev, n) ? prev : n));
+      })
       .catch(console.error);
-  }, [range]);
-  const delivery = useDeliveryDishes(mealsDay, refreshNutritionSilently);
-  const todayServings = servingsState.date === mealsDay ? servingsState.rows : [];
+  }, []);
+  const delivery = useDeliveryDishes(mealsDay, { onSaved: refreshNutritionSilently });
+  const servingsLoaded = servingsState.date === mealsDay;
+  const servingsFailed = servingsLoaded && !!servingsState.failed;
+  const todayServings = servingsLoaded ? servingsState.rows : [];
+  const mealsLoading = !servingsLoaded || !delivery.loaded;
 
   // ─── Weight loader + default date init ───
   const loadWeight = useCallback(async () => {
@@ -406,7 +425,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
       {estDays > 0 && (
         <p className="text-xs text-text-tertiary -mt-2 mb-3">
           {estDays} of {nutritionData.length} days use Uber Eats estimates (dish names → kcal/macros; no Cronometer log that day).
-          They count the whole order, not what was eaten, and miss anything not delivered.
+          They count what you marked as eaten under Meals below or in the check-in (All unless you change it), and miss anything not delivered.
         </p>
       )}
 
@@ -635,11 +654,16 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
           </button>
         ))}
       </div>
-      {todayServings.length === 0 && delivery.items.length === 0 ? (
+      {mealsLoading ? (
+        <p className="text-xs text-text-tertiary mb-2">Loading…</p>
+      ) : todayServings.length === 0 && delivery.items.length === 0 && !servingsFailed && !delivery.loadError ? (
         <p className="text-xs text-text-tertiary mb-2">
           Nothing logged for {mealsDayOffset === 0 ? "today" : "this day"} yet. Cronometer entries and Uber Eats orders appear here once they sync.
         </p>
-      ) : todayServings.length === 0 ? null : (
+      ) : null}
+      {servingsFailed && <p className="text-xs text-red-400 mb-2">Couldn&apos;t load Cronometer entries.</p>}
+      {delivery.loadError && <p className="text-xs text-red-400 mb-2">{delivery.loadError}</p>}
+      {todayServings.length === 0 ? null : (
         <div className="bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle">
           {todayServings.map((s) => (
             <div key={s.serving_id} className="flex items-center gap-3 px-4 py-2.5 text-sm">

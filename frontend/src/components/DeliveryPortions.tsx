@@ -1,37 +1,63 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { getDeliveryItemsForDay, type DeliveryDish } from "@/lib/queries";
-import { PORTION_OPTIONS, dayKcal, dishKcal, selectedPortion } from "@/lib/delivery-portion";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getDeliveryItemsForDays, type DeliveryDish } from "@/lib/queries";
+import {
+  PORTION_OPTIONS,
+  checkinDishGroups,
+  createPortionSaver,
+  dayKcal,
+  dishKcal,
+  groupDishesByDay,
+  selectedPortion,
+  shiftYmd,
+} from "@/lib/delivery-portion";
 import { sameJson } from "@/lib/format";
 
-// Uber Eats dishes for one behavioral day + the one-tap "Ate: All / 3/4 / 1/2 / 1/4 / None" control.
-// Shared by /nutrition (Today's Meals) and /check-in. Each tap saves on its own through
-// PATCH /api/delivery/items/[itemId]: the kcal shown change at once (optimistic) and go back, with a
-// message, if the save fails. Per-dish sequence numbers stop a slow earlier response from undoing a
-// later tap (same guard as setAnswer on /habits).
+// Uber Eats dishes + the one-tap "Ate: All / 3/4 / 1/2 / 1/4 / None" control.
+// Shared by /nutrition (Today's Meals, one day) and /check-in (the checked-in day plus earlier days'
+// dishes whose portion was never set: the harvester runs every 6 h, so a late dinner usually lands after
+// that evening's check-in). Each tap saves on its own through PATCH /api/delivery/items/[itemId]: the
+// kcal shown change at once (optimistic). Writes are serialized per dish (createPortionSaver), and a
+// failed save goes back to the last value the server confirmed, with a message.
 
-export function useDeliveryDishes(date: string | null, onSaved?: () => void) {
-  const [state, setState] = useState<{ date: string | null; items: DeliveryDish[] }>({ date: null, items: [] });
+export type DishGroup = { date: string; items: DeliveryDish[]; totalKcal: number | null };
+
+type Opts = {
+  /** Also fetch this many days before `date` and keep their dishes whose portion is still unset. */
+  earlierDays?: number;
+  /** Called after each successful save (e.g. to refresh charts). The latest callback is used. */
+  onSaved?: () => void;
+};
+
+async function sendPortion(itemId: number, fraction: number | null) {
+  const res = await fetch(`/api/delivery/items/${itemId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ eaten_fraction: fraction }),
+  });
+  if (res.ok) return { ok: true as const };
+  const j = await res.json().catch(() => ({}));
+  return { ok: false as const, error: j?.error ? `Not saved: ${j.error}` : `Not saved (${res.status}).` };
+}
+
+export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
+  const earlierDays = opts.earlierDays ?? 0;
+  const key = date ? `${date}|${earlierDays}` : null;
+  const [state, setState] = useState<{ key: string | null; items: DeliveryDish[]; loadError: string | null }>({
+    key: null,
+    items: [],
+    loadError: null,
+  });
   const [error, setError] = useState<string | null>(null);
-  const seq = useRef(new Map<number, number>());
 
+  const onSavedRef = useRef(opts.onSaved);
   useEffect(() => {
-    if (!date) return;
-    let cancelled = false;
-    getDeliveryItemsForDay(date)
-      .then((rows) => {
-        if (cancelled) return;
-        setState((prev) => (prev.date === date && sameJson(prev.items, rows) ? prev : { date, items: rows }));
-      })
-      .catch((e) => {
-        console.error("Uber Eats dishes:", e);
-        if (!cancelled) setState((prev) => (prev.date === date ? prev : { date, items: [] }));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [date]);
+    onSavedRef.current = opts.onSaved;
+  }, [opts.onSaved]);
+  // Days currently on screen, and each loaded dish's day: a save error for a dish no longer shown is dropped.
+  const shownDays = useRef<Set<string>>(new Set());
+  const dishDay = useRef(new Map<number, string>());
 
   const apply = useCallback(
     (itemId: number, fraction: number | null) =>
@@ -44,39 +70,77 @@ export function useDeliveryDishes(date: string | null, onSaved?: () => void) {
     [],
   );
 
-  const setFraction = useCallback(
-    async (dish: DeliveryDish, fraction: number | null) => {
-      if (dish.eaten_fraction === fraction) return;
-      const previous = dish.eaten_fraction;
-      const n = (seq.current.get(dish.item_id) ?? 0) + 1;
-      seq.current.set(dish.item_id, n);
-      setError(null);
-      apply(dish.item_id, fraction);
-      try {
-        const res = await fetch(`/api/delivery/items/${dish.item_id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ eaten_fraction: fraction }),
-        });
-        if (seq.current.get(dish.item_id) !== n) return;
-        if (!res.ok) {
-          const j = await res.json().catch(() => ({}));
-          apply(dish.item_id, previous);
-          setError(j.error ? `Not saved: ${j.error}` : `Not saved (${res.status}).`);
-          return;
-        }
-        onSaved?.();
-      } catch {
-        if (seq.current.get(dish.item_id) !== n) return;
-        apply(dish.item_id, previous);
-        setError("Network error: the portion was not saved.");
-      }
-    },
-    [apply, onSaved],
+  const [saver] = useState(() =>
+    createPortionSaver({
+      send: sendPortion,
+      apply,
+      onError: (itemId, message) => {
+        const day = dishDay.current.get(itemId);
+        if (day && shownDays.current.has(day)) setError(message);
+      },
+      onSaved: () => onSavedRef.current?.(),
+    }),
   );
 
-  const items = state.date === date ? state.items : [];
-  return { items, loaded: state.date === date, error, setFraction, totalKcal: dayKcal(items) };
+  useEffect(() => {
+    setError(null);
+    if (!date || !key) {
+      shownDays.current = new Set();
+      return;
+    }
+    const days = Array.from({ length: earlierDays + 1 }, (_, i) => shiftYmd(date, -i));
+    shownDays.current = new Set(days);
+    let cancelled = false;
+    getDeliveryItemsForDays(days)
+      .then((rows) => {
+        if (cancelled) return;
+        // Which dishes are shown is decided here, once per load: the day's dishes plus earlier days' dishes
+        // still unset, so an earlier dish stays on screen after Riley taps it.
+        const kept = checkinDishGroups(rows, date).flatMap((g) => g.items);
+        // Dishes with a save still in flight keep the value on screen, not the (older) loaded one.
+        const seeded = kept.map((r) => {
+          dishDay.current.set(r.item_id, r.behavioral_date);
+          const shown = saver.seed(r.item_id, r.eaten_fraction);
+          return shown === r.eaten_fraction ? r : { ...r, eaten_fraction: shown, est_kcal: dishKcal(r.unit_kcal, r.quantity, shown) };
+        });
+        setState((prev) =>
+          prev.key === key && !prev.loadError && sameJson(prev.items, seeded) ? prev : { key, items: seeded, loadError: null },
+        );
+      })
+      .catch((e) => {
+        console.error("Uber Eats dishes:", e);
+        if (!cancelled) setState({ key, items: [], loadError: "Couldn't load Uber Eats dishes." });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [date, key, earlierDays, saver]);
+
+  const setFraction = useCallback(
+    (dish: DeliveryDish, fraction: number | null) => {
+      setError(null);
+      void saver.set(dish.item_id, fraction);
+    },
+    [saver],
+  );
+
+  const loaded = state.key === key && key != null;
+  const all = useMemo(() => (loaded ? state.items : []), [loaded, state.items]);
+  const groups: DishGroup[] = useMemo(
+    () => (date ? groupDishesByDay(all, date).map((g) => ({ ...g, totalKcal: dayKcal(g.items) })) : []),
+    [date, all],
+  );
+  const items = useMemo(() => groups.flatMap((g) => g.items), [groups]);
+
+  return {
+    items,
+    groups,
+    loaded,
+    loadError: loaded ? state.loadError : null,
+    error,
+    setFraction,
+    totalKcal: dayKcal(items),
+  };
 }
 
 function timeOf(iso: string | null): string {
@@ -128,14 +192,17 @@ export function DeliveryDishList({
     <div className={`bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle ${className}`}>
       {items.map((d) => (
         <div key={d.item_id} className="px-4 py-2.5 text-sm">
-          <div className="flex items-center gap-3">
-            <span className="text-[11px] font-mono text-text-tertiary w-20 shrink-0">{timeOf(d.completed_at)}</span>
-            <span className="flex-1 min-w-0 truncate text-text-secondary">
-              {d.title}
-              <span className="text-text-tertiary"> · {d.store_name}</span>
-            </span>
-            <span className="text-[11px] font-mono text-text-tertiary shrink-0">{d.quantity > 1 ? `×${d.quantity} ` : ""}UBER EATS</span>
-            <span className="text-[11px] font-mono text-text-tertiary w-16 text-right shrink-0">
+          <div className="flex items-start gap-2">
+            <span className="text-[11px] font-mono text-text-tertiary w-14 shrink-0 pt-0.5">{timeOf(d.completed_at)}</span>
+            <div className="flex-1 min-w-0">
+              {/* Full dish name (up to two lines): similar dishes in one order must be told apart. */}
+              <div className="text-text-secondary line-clamp-2 break-words">
+                {d.title}
+                {d.quantity > 1 && <span className="text-[11px] font-mono text-text-tertiary"> ×{d.quantity}</span>}
+              </div>
+              <div className="text-[11px] text-text-tertiary truncate">{d.store_name}</div>
+            </div>
+            <span className="text-[11px] font-mono text-text-tertiary w-16 text-right shrink-0 pt-0.5">
               {d.est_kcal != null ? `~${Math.round(d.est_kcal)} kcal` : "—"}
             </span>
           </div>

@@ -1,6 +1,6 @@
 import { supabase } from "./supabase";
 import { whoopSleepDay, kjToKcal } from "./format";
-import { dishKcal } from "./delivery-portion";
+import { dishKcal, mergeDeliveryEstimates } from "./delivery-portion";
 
 // Re-audit 2026-06-07 (units/deepseek/F-003): promoted the workout→sleep gap
 // window from a function-local literal to a named module-level const. The pairing
@@ -472,40 +472,26 @@ export async function getNutrition(days: number = 30) {
   // signal). A logged day always wins — a Cronometer diary usually already
   // contains the delivered meal, so adding both would double-count.
   // Estimates are per-dish guesses from the Uber Eats cart (restaurant orders
-  // only), so these days are tagged nutrition_source='uber_eats'.
+  // only, each dish times the eaten portion), tagged nutrition_source='uber_eats'.
+  // est_kcal > 0: a day where every dish was marked "None" has no food signal;
+  // it must not show as a 0 kcal day (mergeDeliveryEstimates skips it too).
   const { data: est, error: estErr } = await supabase
     .from("delivery_nutrition_daily")
     .select("behavioral_date, est_kcal, est_protein_g, est_carbs_g, est_fat_g")
     .gte("behavioral_date", since.toISOString().split("T")[0])
-    .not("est_kcal", "is", null)
+    .gt("est_kcal", 0)
     .order("behavioral_date", { ascending: true });
   if (estErr) throw estErr;
 
   type NutritionRow = Record<string, unknown> & { calendar_date: string };
-  const rows: NutritionRow[] = [...((data as unknown as NutritionRow[]) ?? [])];
-  const logged = new Set(rows.map((r) => r.calendar_date));
-  for (const e of est ?? []) {
-    if (logged.has(e.behavioral_date)) continue;
-    rows.push({
-      calendar_date: e.behavioral_date,
-      nutrition_source: "uber_eats",
-      calories: e.est_kcal,
-      protein_g: e.est_protein_g,
-      carbs_g: e.est_carbs_g,
-      fat_g: e.est_fat_g,
-      fiber_g: null,
-      sugar_g: null,
-      sodium_mg: null,
-      water_ml: null,
-    });
-  }
-  rows.sort((a, b) => (a.calendar_date < b.calendar_date ? -1 : a.calendar_date > b.calendar_date ? 1 : 0));
-  return rows;
+  return mergeDeliveryEstimates((data as unknown as NutritionRow[]) ?? [], est ?? []) as NutritionRow[];
 }
 
 export interface DeliveryDish {
   item_id: number;
   order_uuid: string;
+  /** Behavioral day of the order (onyx_behavioral_date). */
+  behavioral_date: string;
   store_name: string;
   title: string;
   quantity: number;
@@ -523,20 +509,24 @@ export interface DeliveryDish {
 }
 
 /**
- * Uber Eats cart lines for one behavioral day with the per-dish estimate
+ * Uber Eats cart lines for the given behavioral days with the per-dish estimate
  * (one unit × quantity × eaten_fraction). Restaurant orders only, cancelled orders excluded —
  * same scope as pds.delivery_nutrition_daily. Feeds "Today's Meals" on /nutrition and the
- * Uber Eats portion section on /check-in.
+ * Uber Eats portion section on /check-in (which also asks about earlier days' unset dishes).
  */
-export async function getDeliveryItemsForDay(date: string): Promise<DeliveryDish[]> {
+export async function getDeliveryItemsForDays(dates: string[]): Promise<DeliveryDish[]> {
+  if (dates.length === 0) return [];
   const { data, error } = await supabase
     .from("delivery_order_items")
     // Explicit columns (no customizations jsonb): eaten_fraction is applied in production
     // (sql/delivery_item_eaten_fraction.sql).
-    .select("item_id, order_uuid, store_name, merchant_kind, title, quantity, completed_at, est_key, multi_consumer, eaten_fraction")
-    .eq("onyx_behavioral_date", date)
+    .select(
+      "item_id, order_uuid, onyx_behavioral_date, store_name, merchant_kind, title, quantity, completed_at, est_key, multi_consumer, eaten_fraction",
+    )
+    .in("onyx_behavioral_date", dates)
     .eq("is_cancelled", false)
     .eq("merchant_kind", "restaurant")
+    .order("onyx_behavioral_date", { ascending: true })
     .order("completed_at", { ascending: true })
     .order("item_id", { ascending: true });
   if (error) throw error;
@@ -560,6 +550,7 @@ export async function getDeliveryItemsForDay(date: string): Promise<DeliveryDish
     return {
       item_id: Number(i.item_id),
       order_uuid: i.order_uuid,
+      behavioral_date: i.onyx_behavioral_date,
       store_name: i.store_name,
       title: i.title,
       quantity: Number(i.quantity ?? 1),
