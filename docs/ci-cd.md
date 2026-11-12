@@ -8,7 +8,7 @@ Riley authorized routine PR merges without per-PR approval (2026-11-11). This is
 2. **Merge train** (`.github/workflows/merge-train.yml`, `tools/merge_train.py`) runs on PR events, on CI completion, and every 15 min. Per pass it:
    - merges the oldest PR whose required checks are green on its exact head (squash, pinned to that head SHA; GitHub still enforces branch protection, there is no admin bypass);
    - brings **one** behind PR up to date and kicks its CI (the only genuinely serial step: strict branch protection means a merge makes every other PR behind). Parallel CI otherwise.
-3. **Production**: Vercel deploys master on merge. `post-merge.yml` waits for the `Production` deployment of that commit, for master CI, then runs the production smoke test (one retry).
+3. **Production**: Vercel deploys master on merge. `post-merge.yml` waits for the `Production` deployment of that commit, for master CI, then runs the production smoke test (one retry). If master CI of that commit was cancelled only because the next merge landed (Autonomous CI cancels in-progress master runs), the result is `skipped`, not a failure: the newer merge's own verification covers it.
 4. **Failure**: the train halts (open `train-halt` issue), a `rollback/<sha>` revert PR is opened and labeled `rollback`; the train merges it (checks still apply), its `Closes #N` closes the halt issue and the train resumes. The revert is itself verified like any release. Never reverts a revert.
 
 ## What the train will not merge (the owner does)

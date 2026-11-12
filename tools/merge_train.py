@@ -279,7 +279,23 @@ def wait_production(sha: str, timeout: int = 900) -> tuple[bool, str]:
     return False, f"no successful Production deployment within {timeout // 60} min"
 
 
-def wait_master_ci(sha: str, timeout: int = 600) -> tuple[bool, str]:
+def master_ci_verdict(runs: list[dict], master_moved: bool) -> tuple[str, str] | None:
+    """Pure: verdict on the merge commit's Autonomous CI runs, or None while still waiting.
+
+    Autonomous CI cancels an in-progress master run when the next merge lands (concurrency per ref). A run that was
+    only cancelled because master moved on is superseded, not failed: the newer merge's own verification covers it.
+    """
+    done = [r for r in runs if r["status"] == "completed"]
+    if done and any(r["conclusion"] == "success" for r in done):
+        return "ok", "master CI green"
+    if done and all(r["conclusion"] in BAD for r in done) and len(done) == len(runs):
+        if master_moved and all(r["conclusion"] == "cancelled" for r in done):
+            return "skipped", "master CI cancelled because master moved on; that merge's own verification covers this one"
+        return "fail", "master CI " + done[0]["conclusion"]
+    return None
+
+
+def wait_master_ci(sha: str, timeout: int = 600) -> tuple[str, str]:
     """Autonomous CI on the merge commit. A token-made merge may start no push run, so dispatch one if none exists."""
     def runs():
         return api_items(f"repos/{REPO}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={sha}&per_page=10",
@@ -289,13 +305,12 @@ def wait_master_ci(sha: str, timeout: int = 600) -> tuple[bool, str]:
         gh("workflow", "run", CI_WORKFLOW, "-R", REPO, "--ref", BASE)
     end = time.time() + timeout
     while time.time() < end:
-        done = [r for r in runs() if r["status"] == "completed"]
-        if done and any(r["conclusion"] == "success" for r in done):
-            return True, "master CI green"
-        if done and all(r["conclusion"] in BAD for r in done) and len(done) == len(runs()):
-            return False, "master CI " + done[0]["conclusion"]
+        current = runs()
+        verdict = master_ci_verdict(current, master_sha() != sha)
+        if verdict:
+            return verdict
         time.sleep(20)
-    return False, "master CI did not finish in %d min" % (timeout // 60)
+    return "fail", "master CI did not finish in %d min" % (timeout // 60)
 
 
 def post_merge(sha: str, drill: bool) -> int:
@@ -314,10 +329,11 @@ def post_merge(sha: str, drill: bool) -> int:
         emit("fail", "DRILL: failure injected to exercise rollback; nothing is actually broken")
         return 0
     ok, why = wait_production(sha)
+    result = "ok" if ok else "fail"
     if ok:
-        ok, why2 = wait_master_ci(sha)
+        result, why2 = wait_master_ci(sha)
         why = why + "; " + why2
-    emit("ok" if ok else "fail", why)
+    emit(result, why)
     return 0
 
 
