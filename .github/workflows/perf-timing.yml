@@ -6,18 +6,12 @@ name: Production Performance Timing
 # duration, bytes - no query strings, no bodies, no cookies). Results go to the job summary
 # and to a JSON artifact. See docs/perf-evidence-2026-11-12.md for method and caveats.
 #
-# Start it with:  gh workflow run perf-timing.yml --ref <branch>
+# Start it with:  gh workflow run perf-timing.yml   (GitHub only dispatches a workflow file that is
+# already on the default branch; --ref <branch> then runs that branch's copy of it.)
 # It has no schedule and no pull_request trigger on purpose: it signs in to production and
 # loads every key page 15 times, which is a load nobody should get by opening a PR.
 
 on:
-  # TEMPORARY-BOOTSTRAP-TRIGGER (removed before the PR is ready): GitHub only lets you dispatch a
-  # workflow that already exists on the default branch, so a brand-new workflow cannot be
-  # dispatched from its own branch. This push trigger, limited to the evidence branch and to this
-  # file, starts the measurement runs until the file is merged.
-  push:
-    branches: [perf/production-timing-evidence]
-    paths: [".github/workflows/perf-timing.yml"]
   workflow_dispatch:
     inputs:
       navigations:
@@ -86,5 +80,3 @@ jobs:
           path: frontend/perf-results/
           if-no-files-found: ignore
           retention-days: 30
-
-# bootstrap run 3
