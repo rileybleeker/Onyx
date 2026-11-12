@@ -56,6 +56,20 @@ def die(msg):
     sys.exit(1)
 
 
+def auth_headers(key):
+    """Headers that carry the Supabase key.
+
+    The legacy service-role key is a JWT and Storage reads the role from the Bearer token, so it is
+    sent both ways. The newer sb_secret_ keys are NOT JWTs: sent as a Bearer token they are rejected,
+    and the gateway needs only the apikey header. Sending Bearer only for a JWT keeps this working
+    before and after the legacy keys are disabled.
+    """
+    headers = {"apikey": key}
+    if key.startswith("eyJ"):
+        headers["Authorization"] = "Bearer " + key
+    return headers
+
+
 class Storage:
     def __init__(self, supabase_url, key):
         self.base = supabase_url.rstrip("/") + "/storage/v1"
@@ -67,8 +81,8 @@ class Storage:
         # Public log: never show an unguessable manifest slug (the upload may have
         # landed even when the answer was lost).
         shown = re.sub(r"[0-9a-f]{32}", "<slug>", route)
-        req.add_header("apikey", self.key)
-        req.add_header("Authorization", "Bearer " + self.key)
+        for name, value in auth_headers(self.key).items():
+            req.add_header(name, value)
         req.add_header("User-Agent", USER_AGENT)
         for name, value in (headers or {}).items():
             req.add_header(name, value)
