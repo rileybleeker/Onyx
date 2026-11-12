@@ -37,6 +37,7 @@ Onyx/
 ├── tanita_etl.py            # Tanita Health Planet → Supabase (tanita_measurements raw + weight_log daily rollup)
 ├── flights_email_etl.py     # Delta confirmation/trip-details/check-in emails (IMAP, BOTH Gmail accounts) → pds.flights (+ user_tz_log flight-auto)
 ├── delivery_email_etl.py    # Uber Eats receipt emails (IMAP, shares flights_email_etl.py plumbing) → pds.delivery_orders (merchant, order/delivery time, total — NO items)
+├── urgent_email_etl.py      # inbox-triage's Gmail labels Agent/Action + Agent/Deadline (IMAP, read-only, both accounts) → pds.inbox_emails metadata for Today's Urgent email
 ├── tanita_schema.sql        # tanita_measurements DDL (ADR-0001 quad trigger, RLS) + weight_log.source column
 ├── spotify_schema.sql       # Spotify table DDL + spotify_daily_signature view
 ├── spotify_playlists_schema.sql  # Spotify playlists audit table DDL
@@ -73,6 +74,7 @@ Onyx/
 │   ├── tanita-etl.yml           # Tanita weight ETL — daily 10am + 1:30pm ET
 │   ├── flights-email.yml        # Flights Email ETL — every 3h at :25 (`25 */3 * * *`) catch-up
 │   ├── delivery-email.yml       # Delivery Email ETL — every 3h at :40 (`40 */3 * * *`)
+│   ├── urgent-email.yml         # Urgent Email Labels — hourly at :15 (`15 * * * *`)
 │   ├── hrv-prediction.yml       # HRV prediction — auto-runs after each ETL via workflow_run, plus guaranteed 23:50 ET finalization (DST-safe)
 │   └── hrv-retrain-on-backfill.yml  # HRV Analysis Retrain — hourly backfill check + daily 12:00 UTC safety-net
 ├── whoop_schema.sql         # WHOOP table DDL
@@ -82,6 +84,7 @@ Onyx/
 │   ├── ci_tokens.sql        # CI token storage table
 │   ├── flights_schema.sql   # pds.flights (one row per flight segment) + pds.flight_email_log (parse ledger)
 │   ├── delivery_orders_schema.sql # pds.delivery_orders (one row per Uber Eats order) + pds.delivery_email_log + pds.delivery_daily view
+│   ├── inbox_emails_schema.sql   # pds.inbox_emails (service-role only): metadata of Agent/Action + Agent/Deadline labelled mail for Today
 │   ├── delivery_order_items_schema.sql # pds.delivery_order_items (cart lines) + pds.delivery_item_nutrition (per-dish estimate) + delivery_items_unestimated / delivery_nutrition_daily views
 │   ├── phone_screen_time_schema.sql # pds.phone_app_events (iOS Shortcuts app open/close) + phone_app_sessions + phone_screen_daily views
 │   └── reading_schema.sql   # Reading module: books, reading_sessions, book_highlights (SM-2 review), reading_reviews, reading_quizzes
@@ -407,6 +410,7 @@ All data sources run **hourly** on a staggered schedule to spread load and avoid
 | Tanita ETL | `tanita-etl.yml` | `0 14 * * *` + `30 17 * * *` | Health Planet weigh-ins → tanita_measurements + weight_log rollup. Mid-morning ET (post weigh-in + phone-app sync) + early-afternoon catch-up; daily cadence — the scale yields ~1 measurement/day. |
 | Flights Email ETL | `flights-email.yml` | `25 */3 * * *` | Parses Delta operational emails from BOTH Gmail accounts over IMAP (read-only, All Mail) → `pds.flights`; proposes `user_tz_log` rows for landed segments; `flights\|email` heartbeat. `workflow_dispatch` inputs `days` (backfill window) + `reprocess`. |
 | Delivery Email ETL | `delivery-email.yml` | `40 */3 * * *` | Parses Uber Eats receipt emails over IMAP (read-only, All Mail) → `pds.delivery_orders`; `delivery\|email` heartbeat. `workflow_dispatch` inputs `days` (backfill window, e.g. 1500) + `reprocess`. |
+| Urgent Email Labels | `urgent-email.yml` | `15 * * * *` | Reads inbox-triage's `Agent/Action` + `Agent/Deadline` labels in BOTH Gmail accounts over IMAP (read-only: EXAMINE + BODY.PEEK, no flag or label change) → `pds.inbox_emails` metadata; `urgent_email\|labels` heartbeat. Needs `sql/inbox_emails_schema.sql` applied first. |
 | HRV prediction | `hrv-prediction.yml` | `workflow_run` after hourly ETL + `50 3 * * *` + `50 4 * * *` | Backfills actuals + predicts tonight's sleep (behavioral today's row; `prediction_date` = that behavioral date, the page shows the wake-up date). Hourly workflow_run runs give intra-day monitoring; the two scheduled crons land on 23:50 ET year-round (one per DST state — the `dst-gate` job skips the wrong-season run by checking `TZ=America/New_York date +%H == 23`). The 23:50 ET run captures the final day's imports (Habits at :45, journal at :30, MFP at :15) before ET midnight closes the day. **`hrv_predict.py` uses `et_today()` (`zoneinfo.ZoneInfo("America/New_York")`) for all date arithmetic** — a UTC `date.today()` on the runner would mis-tag the late-ET-evening run as the day-after-next. |
 | HRV Analysis Retrain | `hrv-retrain-on-backfill.yml` | `20 * * * *` + `0 12 * * *` | Two triggers: (1) hourly backfill check via `hrv_backfill_check.py` — runs full `hrv_analysis.py` only if any row with `calendar_date < today-2` was updated since last `hrv_analysis_results.computed_at`. (2) Daily unconditional retrain at 12:00 UTC (~8am ET) — safety net so correlations stay fresh even if no backfill ever fires. The decision is made by the "Decide whether to retrain" step that branches on `github.event.schedule` / `github.event_name`. |
 
@@ -475,6 +479,8 @@ Mechanics: use the Notion MCP — `notion-update-page` (`command: "update_proper
 ## Today home (2026-11-11)
 
 `/` and the mobile Today tab open `/today`. This read-only landing page shows up to three open agent request links in inbox order (not an urgency ranking), recorded reading progress, and the existing check-in link. Informational messages stay in the Agents inbox; Status stays available. Loading, failure, empty and unknown progress states remain distinct. Fetch on mount, manual refresh and return to the app; stale requests cannot replace newer results. Opening Today never sends a reply, marks anything read or logs a behavior. Reuse the existing authenticated inbox and reading endpoints, and keep personal record data out of review prompts and fixture tests.
+
+**Urgent email (2026-11-11).** Email only; text messages stay disabled. inbox-triage (personal-agents) decides what is urgent; Today only shows it. Two sources, merged into one list by `mergeUrgent` in `lib/urgent-email.ts`: (1) threads it labelled `Agent/Action` or `Agent/Deadline`, copied hourly by `urgent_email_etl.py` into `pds.inbox_emails` (service-role only; subject, sender, times, labels, flags and a ≤240-char snippet that never leaves the server) and served by `GET /api/urgent-email` (`lib/urgent-email-query.ts`: one item per thread; archived threads, Action older than 14 days, deadlines already passed or more than 7 days out, and undated Deadline mail older than 3 days are left out); (2) its `Urgent: …` Agent Inbox questions from `/onyx/inbox` (any card whose link is a Gmail URL counts too). A card whose link names a labelled thread (`#all/thread-f:<X-GM-THRID>`, same account) merges into that item, and the same Message-ID in both mailboxes shows once; email cards are listed under Urgent email, not under Needs your input. Each item shows its source, age and the label sync's age, why it is shown, and the next step, with an `Open in Gmail` link (mail.google.com only) and/or `Open request`. Until `sql/inbox_emails_schema.sql` is applied the API answers `not_connected` and Today says the label sync is not connected. `/status` card **Urgent Email** (badge GMAIL) = `urgent_email|labels` heartbeat age: >3 h degraded, >8 h or a failed run red. Tests: `frontend/scripts/test-urgent-email.mjs`, `tests/test_urgent_email_etl.py`, `tests/today-regression.cjs` (synthetic fixtures only).
 
 ## Financials (2026-11-11)
 
