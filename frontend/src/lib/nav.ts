@@ -73,7 +73,7 @@ export const NAV_SECTIONS: NavSection[] = [
   {
     title: "Tools",
     items: [
-      { href: "/wins", label: "Wins", shortcut: "O", icon: Sparkles, keywords: ["accomplishments", "celebrate", "progress", "board", "claude", "dot"] },
+      { href: "/wins", label: "Wins", shortcut: "E", icon: Sparkles, keywords: ["accomplishments", "celebrate", "progress", "board", "claude", "dot"] },
       { href: "/agents", label: "Agents", shortcut: "G", icon: Bot, keywords: ["chat", "messages", "briefing", "approvals", "leads", "reminders", "inbox", "notifications"] },
       { href: "/financials", label: "Financials", shortcut: "W", icon: Wallet, keywords: ["money", "finance", "rocket money", "spending", "transactions", "budget"] },
       { href: "/nyc", label: "NYC Search", shortcut: "Y", icon: Building2, keywords: ["apartment", "move", "new york", "listings", "leads", "rent", "scout", "manhattan"] },
