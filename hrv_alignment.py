@@ -161,6 +161,65 @@ def train_cutoff(test_start: int, horizon: int) -> int:
     return max(1, test_start - (horizon - 1))
 
 
+def naive_baseline_rows(model_df: pd.DataFrame, horizons, min_train: int,
+                        outcome_df: pd.DataFrame | None = None) -> list[dict]:
+    """Backtest rows for the naive baselines (persistence, 7-day mean, day-of-week) at
+    every horizon, for run_evaluation's Accuracy-by-Horizon comparison.
+
+    A prediction made on the evening of feature row i (behavioral day D) at horizon h is
+    scored against the sleep that closes day D + h - 1 (target_date), looked up BY DATE
+    in `outcome_df` (default: model_df), the same way outcome_series builds the XGBoost
+    target. It used to be row i + h - 1 of model_df, which is a different night wherever
+    the history has missing days (model_df drops rows without HRV): dot's review
+    2026-11-11, finding 3. A target night with no HRV is skipped, as XGBoost skips it.
+
+    The history a baseline may use is the model_df rows before row i (sleeps up to day
+    D - 1), unchanged.
+    """
+    src = model_df if outcome_df is None else outcome_df
+    by_date = pd.Series(pd.to_numeric(src[TARGET], errors="coerce").to_numpy(dtype=float),
+                        index=pd.to_datetime(src[DATE_COL]))
+    by_date = by_date[~by_date.index.duplicated(keep="last")]
+
+    hrv_arr = pd.to_numeric(model_df[TARGET], errors="coerce").to_numpy(dtype=float)
+    dates = pd.DatetimeIndex(pd.to_datetime(model_df[DATE_COL]))
+    n = len(hrv_arr)
+    rows: list[dict] = []
+    for h in horizons:
+        for i in range(max(min_train, 1), n):
+            tdate = target_date(dates[i], h)
+            actual = by_date.get(tdate, np.nan)
+            if actual is None or np.isnan(actual):
+                continue
+            actual = float(actual)
+            pred_date = tdate.strftime("%Y-%m-%d")
+            hrv_hist = hrv_arr[:i]
+
+            def row(model: str, pred: float) -> dict:
+                return {
+                    "prediction_date": pred_date, "model": model,
+                    "predicted_hrv": pred, "actual_hrv": actual,
+                    "residual": actual - pred, "horizon_days": h,
+                    "model_version": "backtest_initial",
+                }
+
+            # Naive persistence: the last known HRV (constant across h).
+            naive_pred = float(hrv_hist[-1])
+            rows.append(row("baseline_naive", naive_pred))
+
+            # 7-day rolling mean of the last 7 known values (constant across h).
+            roll7 = float(np.nanmean(hrv_hist[-7:])) if len(hrv_hist) >= 7 else naive_pred
+            rows.append(row("baseline_7d_avg", roll7))
+
+            # Day-of-week mean for the weekday of the TARGET night's behavioral day.
+            dow_mask = dates[:i].day_of_week == tdate.day_of_week
+            dow_vals = hrv_hist[dow_mask]
+            dow_vals = dow_vals[~np.isnan(dow_vals)]
+            dow_pred = float(np.mean(dow_vals)) if len(dow_vals) >= 5 else naive_pred
+            rows.append(row("baseline_dow", dow_pred))
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Which columns can feed what
 # ---------------------------------------------------------------------------
