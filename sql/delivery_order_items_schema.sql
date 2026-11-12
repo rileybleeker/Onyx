@@ -117,6 +117,8 @@ SELECT DISTINCT ON (i.est_key)
  ORDER BY i.est_key, i.completed_at DESC NULLS LAST;
 
 -- Per behavioral day: estimated intake from delivered RESTAURANT orders.
+-- SUPERSEDED 2026-11-11 by sql/delivery_item_eaten_fraction.sql, which adds
+-- delivery_order_items.eaten_fraction and multiplies it in (same columns).
 CREATE OR REPLACE VIEW pds.delivery_nutrition_daily AS
 SELECT i.onyx_behavioral_date                                              AS behavioral_date,
        count(DISTINCT i.order_uuid)                                        AS order_count,
