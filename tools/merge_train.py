@@ -263,7 +263,22 @@ def run_train(dry: bool) -> int:
 
 
 # ---------- post-merge verification ----------
-def wait_production(sha: str, timeout: int = 900) -> tuple[bool, str]:
+def production_verdict(states: list[str], master_moved: bool) -> tuple[str, str] | None:
+    """Pure: verdict on the commit's Production deployment statuses, or None while still waiting.
+
+    Vercel marks a deployment inactive once a newer Production deployment replaces it, so with merges landing
+    back to back the older one never reads success again. That is superseded, not failed: the newer merge's own
+    verification covers it."""
+    if "success" in states:
+        return "ok", "Production deployment succeeded"
+    if states and all(s in ("failure", "error") for s in states):
+        return "fail", "Production deployment " + states[0]
+    if "inactive" in states or master_moved:
+        return "skipped", "Production deployment replaced by a newer merge; that merge's own verification covers this one"
+    return None
+
+
+def wait_production(sha: str, timeout: int = 900) -> tuple[str, str]:
     end = time.time() + timeout
     while time.time() < end:
         deps = api_items(f"repos/{REPO}/deployments?sha={sha}&environment=Production&per_page=5", ".[]|{id}")
@@ -271,12 +286,11 @@ def wait_production(sha: str, timeout: int = 900) -> tuple[bool, str]:
         for d in deps:
             st = api_items(f"repos/{REPO}/deployments/{d['id']}/statuses?per_page=1", ".[]|{state}")
             states.append(st[0]["state"] if st else "pending")
-        if "success" in states:
-            return True, "Production deployment succeeded"
-        if states and all(s in ("failure", "error") for s in states):
-            return False, "Production deployment " + states[0]
+        verdict = production_verdict(states, master_sha() != sha)
+        if verdict:
+            return verdict
         time.sleep(20)
-    return False, f"no successful Production deployment within {timeout // 60} min"
+    return "fail", f"no successful Production deployment within {timeout // 60} min"
 
 
 def master_ci_verdict(runs: list[dict], master_moved: bool) -> tuple[str, str] | None:
@@ -328,9 +342,8 @@ def post_merge(sha: str, drill: bool) -> int:
     if drill:
         emit("fail", "DRILL: failure injected to exercise rollback; nothing is actually broken")
         return 0
-    ok, why = wait_production(sha)
-    result = "ok" if ok else "fail"
-    if ok:
+    result, why = wait_production(sha)
+    if result == "ok":
         result, why2 = wait_master_ci(sha)
         why = why + "; " + why2
     emit(result, why)
