@@ -4598,7 +4598,13 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
 
 
 def store_metrics(eval_results: dict) -> None:
-    """Upsert model metrics into pds.hrv_model_metrics."""
+    """Upsert model metrics into pds.hrv_model_metrics.
+
+    These are the walk-forward backtest rows under the plain model names. The key is
+    (eval_date, model, horizon_days), so hrv_predict.py writes its live 30-day accuracy
+    under '<model>_live_rolling' instead; never write live metrics under a plain name
+    (until 2026-11-11 they replaced this function's h=1 rows every hour).
+    """
     rows = eval_results.get("model_metrics_rows", [])
     if rows:
         for r in rows:
