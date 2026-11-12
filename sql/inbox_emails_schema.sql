@@ -14,8 +14,8 @@
 -- Privacy: unlike most of pds this table is SERVICE-ROLE ONLY. No anon or authenticated
 -- grant and no owner_read policy, so the Data API and the browser cannot read it; only
 -- the Next.js API route (service-role key, behind the owner-login middleware) does.
--- Re-running sql/pds_owner_only_read.sql does not expose it: that script only touches
--- relations that already carry an anon/authenticated SELECT grant.
+-- sql/pds_owner_only_read.sql lists inbox_emails in its skip list, so re-running it (or
+-- rls_policies.sql followed by it) never grants SELECT or an owner_read policy here.
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS pds.inbox_emails (
@@ -34,7 +34,13 @@ CREATE TABLE IF NOT EXISTS pds.inbox_emails (
     synced_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT inbox_emails_account_message_key UNIQUE (account, message_id),
-    CONSTRAINT inbox_emails_snippet_len CHECK (snippet IS NULL OR char_length(snippet) <= 500)
+    -- Length caps: the ingestion job truncates to these; the database refuses anything longer.
+    CONSTRAINT inbox_emails_account_len      CHECK (char_length(account) <= 320),
+    CONSTRAINT inbox_emails_message_id_len   CHECK (char_length(message_id) BETWEEN 1 AND 500),  -- 500 = the Gmail-link limit in the app
+    CONSTRAINT inbox_emails_from_name_len    CHECK (from_name IS NULL OR char_length(from_name) <= 200),
+    CONSTRAINT inbox_emails_from_address_len CHECK (char_length(from_address) <= 320),
+    CONSTRAINT inbox_emails_subject_len      CHECK (char_length(subject) <= 500),
+    CONSTRAINT inbox_emails_snippet_len      CHECK (snippet IS NULL OR char_length(snippet) <= 500)
 );
 
 CREATE INDEX IF NOT EXISTS inbox_emails_received_idx ON pds.inbox_emails (received_at DESC);

@@ -90,8 +90,51 @@ await test("snippet text counts, not only the subject", () => {
 
 await test("keyword points are capped so stuffing cannot run away", () => {
   const r = assessEmail(mail({ subject: "URGENT final notice: payment failed, fraud alert, account suspended, deadline" }), NOW);
-  assert.ok(r.score <= 6 + 3, `score ${r.score} should be content cap 6 plus at most one deadline bonus`);
+  assert.equal(r.score, 6, "five strong phrases and a medium one are worth exactly the content cap of 6");
   assert.equal(r.reasons.length, 3);
+  // The cap covers phrases only; a real, dated deadline still adds its own 3 on top.
+  const dated = assessEmail(mail({ subject: "URGENT final notice: payment failed, fraud alert, account suspended, due tomorrow" }), NOW);
+  assert.equal(dated.score, 9);
+});
+
+await test("'Your payment to X failed' phrasings are a payment problem", () => {
+  for (const subject of [
+    "Your payment to Example Utilities failed",
+    "Payment to Example Landlord was declined",
+    "Your payment to Example Insurance has been returned",
+    "Failed payment on your account",
+    "Payment failure notice",
+    "We couldn't charge your card: card declined",
+  ]) {
+    const r = assessEmail(mail({ subject }), NOW);
+    assert.equal(r.urgent, true, subject);
+    assert.ok(r.reasons.includes("payment problem"), subject);
+  }
+});
+
+await test("successful or unrelated payment mail is not a payment problem", () => {
+  for (const subject of [
+    "Your payment to Example Utilities was successful",
+    "Payment to Example Landlord processed",
+    "Receipt for your payment",
+    "Payment received, thank you",
+    "Failed to load? Our app update fixes it",
+  ]) {
+    const r = assessEmail(mail({ subject }), NOW);
+    assert.equal(r.urgent, false, subject);
+    assert.ok(!r.reasons.includes("payment problem"), subject);
+  }
+});
+
+await test("rent, mortgage and tuition due or late are urgent", () => {
+  for (const subject of ["Rent due", "Your rent is due", "Rent payment is now due", "Mortgage payment due", "Tuition overdue", "Late rent notice", "Property taxes are due"]) {
+    const r = assessEmail(mail({ subject }), NOW);
+    assert.equal(r.urgent, true, subject);
+  }
+  assert.ok(assessEmail(mail({ subject: "Rent due" }), NOW).reasons.includes("rent or loan payment due"));
+  for (const subject of ["Rent receipt for October", "Renters insurance quote", "Parent night: dues and donations", "Your rent was paid"]) {
+    assert.equal(assessEmail(mail({ subject }), NOW).urgent, false, subject);
+  }
 });
 
 // ---- Promotional damping -----------------------------------------------------------
@@ -99,6 +142,23 @@ await test("promotional mail with urgent words is not urgent", () => {
   assert.equal(assessEmail(mail({ subject: "URGENT: 50% off sale ends today" }), NOW).urgent, false);
   assert.equal(assessEmail(mail({ subject: "Last chance: final notice for our newsletter giveaway" }), NOW).urgent, false);
   assert.equal(assessEmail(mail({ fromAddress: "newsletter@example.com", subject: "Action required: read this week's digest" }), NOW).urgent, false);
+});
+
+await test("the promotional veto never hides a fraud, payment or account-security alert", () => {
+  for (const subject of [
+    "Suspicious charge at Big Sale Outlet",
+    "Unauthorized transaction: Example Deals Inc",
+    "Fraud alert: 50% off is not why we are writing",
+    "Your payment to Weekly Digest Co failed",
+    "Account suspended: confirm to get free shipping",
+  ]) {
+    assert.equal(assessEmail(mail({ subject }), NOW).urgent, true, subject);
+  }
+  // Even from a marketing-looking sender.
+  assert.equal(assessEmail(mail({ fromAddress: "offers@example.com", subject: "Suspicious sign-in to your account" }), NOW).urgent, true);
+  // The exception is narrow: overdue/deadline/urgent wording does not lift the veto.
+  assert.equal(assessEmail(mail({ subject: "Final notice: sale ends today, due tomorrow" }), NOW).urgent, false);
+  assert.equal(assessEmail(mail({ fromAddress: "offers@example.com", subject: "Action required: rent due" }), NOW).urgent, false);
 });
 
 await test("a marketing footer in the snippet does not hide a real alert", () => {
@@ -258,22 +318,45 @@ await test("gmailMessageHref refuses unusable ids and cannot be steered off Gmai
 });
 
 // ---- Query (fake client, no database) ------------------------------------------------
-function fakeClient(result) {
-  const calls = {};
+// fakeClient: every query resolves to one canned result (errors, malformed rows).
+// fakeDb: a tiny in-memory table that really applies eq / gte / lte / order / limit, so the
+// tests below fail if the query leans on a filter it did not send to the database.
+function builder(onRun, calls) {
+  const q = { table: null, columns: null, eq: [], gte: [], lte: [], order: null, limit: null };
+  calls.push(q);
   const chain = {
-    from(t) { calls.table = t; return chain; },
-    select(c) { calls.columns = c; return chain; },
-    gte(col, v) { calls.gte = [col, v]; return chain; },
-    order(col, o) { calls.order = [col, o]; return chain; },
-    limit(n) { calls.limit = n; return Promise.resolve(result); },
+    from(t) { q.table = t; return chain; },
+    select(c) { q.columns = c; return chain; },
+    eq(col, v) { q.eq.push([col, v]); return chain; },
+    gte(col, v) { q.gte.push([col, v]); return chain; },
+    lte(col, v) { q.lte.push([col, v]); return chain; },
+    order(col, o) { q.order = [col, o]; return chain; },
+    limit(n) { q.limit = n; return Promise.resolve(onRun(q)); },
   };
-  return { client: chain, calls };
+  return chain;
+}
+function fakeClient(result) {
+  const calls = [];
+  return { client: { from: (t) => builder(() => result, calls).from(t) }, calls };
+}
+function fakeDb(rows) {
+  const calls = [];
+  const run = (q) => {
+    let out = rows.filter((r) => q.eq.every(([c, v]) => r[c] === v)
+      && q.gte.every(([c, v]) => r[c] >= v) && q.lte.every(([c, v]) => r[c] <= v));
+    const [col, o] = q.order;
+    out = [...out].sort((a, b) => (a[col] < b[col] ? 1 : a[col] > b[col] ? -1 : 0) * (o.ascending ? -1 : 1));
+    return { data: out.slice(0, q.limit), error: null };
+  };
+  return { client: { from: (t) => builder(run, calls).from(t) }, calls };
 }
 const row = (over = {}) => ({
   email_id: 1, account: "me@example.com", message_id: "m1@mail.example.com", received_at: hoursAgo(3),
   from_name: "Example Billing", from_address: "billing@example.com", subject: "Payment failed",
   snippet: null, is_unread: true, ...over,
 });
+const manyRows = (n, make) => Array.from({ length: n }, (_, i) => row({ email_id: 1000 + i, message_id: `bulk${i}@mail.example.com`, ...make(i) }));
+const DAY = 86_400_000;
 
 await test("a missing table means 'not connected', for either error code", async () => {
   for (const code of ["PGRST205", "42P01"]) {
@@ -287,20 +370,27 @@ await test("any other database error is an error, not an empty inbox", async () 
   await assert.rejects(() => getUrgentEmail(client, NOW), (e) => e.message.includes("XX000") && !e.message.includes("details"));
 });
 
-await test("the query is windowed, newest first, and hard-limited", async () => {
+await test("the scan query asks the database for unread mail inside the window, newest first, hard-limited", async () => {
   const { client, calls } = fakeClient({ data: [], error: null });
   await getUrgentEmail(client, NOW);
-  assert.equal(calls.table, "inbox_emails");
-  assert.equal(calls.limit, SCAN_LIMIT);
-  assert.deepEqual(calls.order, ["received_at", { ascending: false }]);
-  assert.deepEqual(calls.gte, ["received_at", new Date(NOW.getTime() - WINDOW_DAYS * 86_400_000).toISOString()]);
-  assert.ok(!/body|html|attachment/.test(calls.columns), "no body columns are ever selected");
+  const scan = calls.find((q) => q.limit === SCAN_LIMIT);
+  assert.ok(scan, "one query is capped at SCAN_LIMIT");
+  assert.equal(scan.table, "inbox_emails");
+  assert.deepEqual(scan.eq, [["is_unread", true]], "read mail is filtered out in the database");
+  assert.deepEqual(scan.gte, [["received_at", new Date(NOW.getTime() - WINDOW_DAYS * DAY).toISOString()]]);
+  assert.deepEqual(scan.lte, [["received_at", new Date(NOW.getTime() + DAY).toISOString()]], "future-dated rows are cut off in the database");
+  assert.deepEqual(scan.order, ["received_at", { ascending: false }]);
+  assert.ok(!/body|html|attachment/.test(scan.columns), "no body columns are ever selected");
+  assert.equal(calls.length, 2, "plus one tiny freshness query");
+  const fresh = calls.find((q) => q.limit === 1);
+  assert.deepEqual(fresh.lte, scan.lte);
+  assert.equal(fresh.columns, "received_at");
 });
 
 await test("an empty table answers ready with nothing to show", async () => {
   const { client } = fakeClient({ data: [], error: null });
   assert.deepEqual(await getUrgentEmail(client, NOW), {
-    status: "ready", windowDays: WINDOW_DAYS, scanned: 0, total: 0, newestReceivedAt: null, items: [],
+    status: "ready", windowDays: WINDOW_DAYS, scanned: 0, total: 0, newestReceivedAt: null, truncated: false, items: [],
   });
 });
 
@@ -316,6 +406,7 @@ await test("urgent rows come back bounded, linked and without the snippet", asyn
   assert.equal(out.status, "ready");
   assert.equal(out.scanned, 4);
   assert.equal(out.total, 2);
+  assert.equal(out.truncated, false);
   assert.equal(out.newestReceivedAt, rows[0].received_at);
   const first = out.items.find((i) => i.id === "1");
   assert.equal(first.from, "Example Billing");
@@ -331,6 +422,50 @@ await test("malformed rows are skipped, not fatal", async () => {
   const out = await getUrgentEmail(client, NOW);
   assert.equal(out.scanned, 1);
   assert.equal(out.items[0].id, "11");
+});
+
+await test("a busy week of READ mail cannot push an older unread 'Final notice' out of the scan", async () => {
+  const read = manyRows(SCAN_LIMIT + 50, (i) => ({ received_at: hoursAgo(1 + i * 0.1), is_unread: false, subject: "Thanks!" }));
+  const notice = row({ email_id: 7, subject: "Final notice: payment failed", received_at: hoursAgo(24 * 6), is_unread: true });
+  const { client } = fakeDb([...read, notice]);
+  const out = await getUrgentEmail(client, NOW);
+  assert.equal(out.status, "ready");
+  assert.deepEqual(out.items.map((i) => i.id), ["7"]);
+  assert.equal(out.scanned, 1);
+  assert.equal(out.truncated, false);
+});
+
+await test("junk with a far-future Date header cannot fill the slots or the scan", async () => {
+  const future = manyRows(SCAN_LIMIT + 20, (i) => ({
+    received_at: new Date(NOW.getTime() + 400 * DAY + i * 1000).toISOString(), subject: "Final notice: payment failed", is_unread: true,
+  }));
+  const real = row({ email_id: 8, subject: "Your payment to Example Utilities failed", received_at: hoursAgo(5) });
+  const { client } = fakeDb([...future, real]);
+  const out = await getUrgentEmail(client, NOW);
+  assert.deepEqual(out.items.map((i) => i.id), ["8"]);
+  assert.equal(out.total, 1);
+  assert.equal(out.scanned, 1);
+  assert.equal(out.truncated, false);
+  assert.ok(new Date(out.newestReceivedAt).getTime() <= NOW.getTime() + DAY, "freshness ignores future-dated junk too");
+  assert.equal(out.newestReceivedAt, real.received_at);
+});
+
+await test("hitting the row cap is reported as truncated; staying under it is not", async () => {
+  const unread = (n) => manyRows(n, (i) => ({ received_at: hoursAgo(1 + i * 0.01), subject: "Lunch on Friday?", from_address: "friend@example.com" }));
+  for (const [n, truncated] of [[SCAN_LIMIT + 50, true], [SCAN_LIMIT, true], [SCAN_LIMIT - 1, false], [0, false]]) {
+    const out = await getUrgentEmail(fakeDb(unread(n)).client, NOW);
+    assert.equal(out.truncated, truncated, `${n} unread rows`);
+    assert.equal(out.scanned, Math.min(n, SCAN_LIMIT));
+    assert.equal(out.items.length, 0);
+  }
+});
+
+await test("freshness reports the newest message even when everything is read", async () => {
+  const rows = [row({ email_id: 1, is_unread: false, received_at: hoursAgo(30) }), row({ email_id: 2, is_unread: false, received_at: hoursAgo(9) })];
+  const out = await getUrgentEmail(fakeDb(rows).client, NOW);
+  assert.equal(out.scanned, 0);
+  assert.equal(out.truncated, false);
+  assert.equal(out.newestReceivedAt, rows[1].received_at);
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

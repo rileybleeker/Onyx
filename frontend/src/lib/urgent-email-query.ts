@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import {
+  FUTURE_SKEW_MS,
   MAX_URGENT_SHOWN,
   WINDOW_DAYS,
   gmailMessageHref,
@@ -39,12 +40,14 @@ export type UrgentEmailResponse =
       scanned: number;
       /** Urgent messages found (items is the bounded top of these). */
       total: number;
-      /** Receive time of the newest stored message, to show when the source has gone quiet. */
+      /** Receive time of the newest stored message (read or not), to show when the source has gone quiet. */
       newestReceivedAt: string | null;
+      /** True when the scan hit its row cap, so older unread mail in the window was not checked. */
+      truncated: boolean;
       items: UrgentEmailItem[];
     };
 
-/** Most rows read per request: a hard bound on work and payload. */
+/** Most unread rows read per request: a hard bound on work and payload. */
 export const SCAN_LIMIT = 200;
 const SUBJECT_MAX = 140;
 const FROM_MAX = 80;
@@ -64,21 +67,46 @@ interface Row {
   is_unread: boolean | null;
 }
 
+function newestReceived(data: unknown): string | null {
+  const first = Array.isArray(data) ? (data[0] as { received_at?: unknown } | null | undefined) : null;
+  return first && typeof first.received_at === "string" ? first.received_at : null;
+}
+
 const clip = (s: string, max: number) => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
+
+const COLUMNS = "email_id,account,message_id,received_at,from_name,from_address,subject,snippet,is_unread";
 
 export async function getUrgentEmail(client: Supa, now: Date = new Date()): Promise<UrgentEmailResponse> {
   const since = new Date(now.getTime() - WINDOW_DAYS * 86_400_000).toISOString();
-  const { data, error } = await client
-    .from("inbox_emails")
-    .select("email_id,account,message_id,received_at,from_name,from_address,subject,snippet,is_unread")
-    .gte("received_at", since)
-    .order("received_at", { ascending: false })
-    .limit(SCAN_LIMIT);
+  // Same upper bound selectUrgent applies. It is in the query too so a junk Date header
+  // far in the future cannot sort to the top and use up the row cap.
+  const until = new Date(now.getTime() + FUTURE_SKEW_MS).toISOString();
+  // Read mail is excluded in the database, not afterwards, so a busy week of read mail
+  // cannot push an unread "Final notice" past the row cap.
+  const [main, newest] = await Promise.all([
+    client
+      .from("inbox_emails")
+      .select(COLUMNS)
+      .eq("is_unread", true)
+      .gte("received_at", since)
+      .lte("received_at", until)
+      .order("received_at", { ascending: false })
+      .limit(SCAN_LIMIT),
+    // Freshness of the source regardless of read state: one tiny row.
+    client
+      .from("inbox_emails")
+      .select("received_at")
+      .lte("received_at", until)
+      .order("received_at", { ascending: false })
+      .limit(1),
+  ]);
 
-  if (error) {
+  for (const { error } of [main, newest]) {
+    if (!error) continue;
     if (MISSING_TABLE_CODES.has(error.code)) return { status: "not_connected" };
     throw new Error(`inbox_emails query failed (${error.code || "unknown"})`);
   }
+  const data = main.data;
 
   const rows = (data ?? []) as Row[];
   const byId = new Map<string, Row>();
@@ -116,7 +144,8 @@ export async function getUrgentEmail(client: Supa, now: Date = new Date()): Prom
     windowDays: WINDOW_DAYS,
     scanned: picked.scanned,
     total: picked.total,
-    newestReceivedAt: emails.length > 0 ? emails[0].receivedAt : null,
+    newestReceivedAt: newestReceived(newest.data),
+    truncated: rows.length >= SCAN_LIMIT,
     items,
   };
 }

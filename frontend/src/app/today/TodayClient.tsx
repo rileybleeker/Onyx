@@ -144,9 +144,11 @@ export default function TodayClient() {
         </>}
         {email && (email.items.length === 0 ? <>
           <p className="mt-3 text-sm text-text-secondary">{email.scanned === 0 ? `No unread email from the last ${email.windowDays} days to check.` : `Checked ${email.scanned} unread email${email.scanned === 1 ? "" : "s"} from the last ${email.windowDays} days; none look urgent.`}</p>
+          {email.truncated && <p className="mt-1 text-xs text-amber-300">Only the newest unread emails were checked, so older ones in this window may be missing.</p>}
           {email.newestReceivedAt && <p className="mt-1 text-xs text-text-secondary">Newest synced message: {receivedLabel(email.newestReceivedAt)}.</p>}
         </> : <>
           <p className="mt-2 text-xs text-text-secondary">Showing {email.items.length} of {email.total} urgent email{email.total === 1 ? "" : "s"}, strongest first.</p>
+          {email.truncated && <p className="mt-1 text-xs text-amber-300">Only the newest unread emails were checked, so older ones in this window may be missing.</p>}
           <ul className="mt-3 divide-y divide-border-subtle">
             {email.items.map((item) => {
               const href = gmailLink(item.href);

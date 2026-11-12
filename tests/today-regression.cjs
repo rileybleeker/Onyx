@@ -17,8 +17,9 @@ const book = { book: { title: 'A book for steady progress' }, chaptersDone: 3, t
 const urgentItem = (i, over = {}) => ({ id: String(i), from: 'Example Billing ' + i, subject: 'Payment failed for invoice ' + i, receivedAt: '2026-11-10T15:00:00Z', reasons: ['payment problem', 'deadline tomorrow'], href: 'https://mail.google.com/mail/?authuser=me%40example.com#search/rfc822msgid%3Aabc' + i, ...over });
 const urgentFixtures = {
     not_connected: { status: 'not_connected' },
-    none: { status: 'ready', windowDays: 7, scanned: 12, total: 0, newestReceivedAt: '2026-11-11T12:00:00Z', items: [] },
-    items: { status: 'ready', windowDays: 7, scanned: 40, total: 8, newestReceivedAt: '2026-11-11T12:00:00Z', items: [urgentItem(1), urgentItem(2, { href: null }), urgentItem(3, { href: 'https://evil.example/x' })] },
+    none: { status: 'ready', windowDays: 7, scanned: 12, total: 0, newestReceivedAt: '2026-11-11T12:00:00Z', truncated: false, items: [] },
+    truncated_none: { status: 'ready', windowDays: 7, scanned: 200, total: 0, newestReceivedAt: '2026-11-11T12:00:00Z', truncated: true, items: [] },
+    items: { status: 'ready', windowDays: 7, scanned: 40, total: 8, newestReceivedAt: '2026-11-11T12:00:00Z', truncated: true, items: [urgentItem(1), urgentItem(2, { href: null }), urgentItem(3, { href: 'https://evil.example/x' })] },
 };
 // Missing CSS must fail: a script-only pass cannot validate responsive layout.
 const css = fs.readdirSync('frontend/.next/static/css').filter(x => x.endsWith('.css')).map(x => fs.readFileSync('frontend/.next/static/css/' + x, 'utf8')).join('\n');
@@ -139,12 +140,19 @@ assert(css.trim(), 'Compile the frontend before running layout regressions');
         await page.getByRole('button', { name: 'Refresh Today' }).click();
         await settled(page);
         assert(await page.getByText(/Checked 12 unread emails from the last 7 days; none look urgent/).isVisible());
+        assert.equal(await page.getByText(/Only the newest unread emails were checked/).count(), 0);
+        await page.evaluate(() => window.urgentMode = 'truncated_none');
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert(await page.getByText(/Checked 200 unread emails from the last 7 days; none look urgent/).isVisible());
+        assert(await page.getByText(/Only the newest unread emails were checked, so older ones in this window may be missing/).isVisible());
         await page.evaluate(() => window.urgentMode = 'items');
         await page.getByRole('button', { name: 'Refresh Today' }).click();
         await settled(page);
         const urgentPanel = page.locator('section[aria-labelledby="urgent-email-heading"]');
         assert(await urgentPanel.getByText('Showing 3 of 8 urgent emails, strongest first.').isVisible());
         assert.equal(await urgentPanel.locator('li').count(), 3);
+        assert(await urgentPanel.getByText(/Only the newest unread emails were checked/).isVisible(), 'a capped scan is disclosed next to the list too');
         assert.equal(await urgentPanel.locator('a').count(), 1, 'only a mail.google.com link may be linked; no-link and off-Gmail rows are plain text');
         assert.equal(await urgentPanel.getByRole('link', { name: /Payment failed for invoice 1/ }).getAttribute('href'), 'https://mail.google.com/mail/?authuser=me%40example.com#search/rfc822msgid%3Aabc1');
         assert.equal(await urgentPanel.getByRole('link', { name: /Payment failed for invoice 1/ }).getAttribute('rel'), 'noopener noreferrer');
