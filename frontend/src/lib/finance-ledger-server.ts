@@ -86,13 +86,13 @@ interface PgErr {
   code?: string;
   message?: string;
 }
-class LedgerQueryError extends Error {
+export class LedgerQueryError extends Error {
   constructor(readonly code: string | null) {
     super(code ?? "query failed");
   }
 }
 
-function serviceClient() {
+export function serviceClient() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) throw new LedgerQueryError("not-configured");
@@ -111,7 +111,7 @@ function check<T extends { error: PgErr | null }>(res: T): T {
  * instead of silently stopping after a short first page. `truncated` is true when the page cap cut
  * the read off before the count was reached.
  */
-async function fetchPaged(
+export async function fetchPaged(
   build: (from: number, to: number) => PromiseLike<{ data: unknown[] | null; error: PgErr | null; count: number | null }>,
   maxPages: number,
 ): Promise<{ rows: unknown[]; truncated: boolean }> {

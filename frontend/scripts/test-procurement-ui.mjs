@@ -12,8 +12,18 @@ await mkdir(path.join(fixture, 'app')); await mkdir(path.join(fixture, 'lib'));
 await symlink(path.join(frontend, 'node_modules'), path.join(fixture, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
 await copyFile(path.join(frontend, 'src/lib/procurement.ts'), path.join(fixture, 'lib/procurement.ts'));
 const client = await readFile(path.join(frontend, 'src/app/procurement/ProcurementClient.tsx'), 'utf8');
-await writeFile(path.join(fixture, 'app/ProcurementClient.tsx'), client.replace('@/lib/procurement', '../lib/procurement'));
-await copyFile(path.join(frontend, 'src/app/procurement/page.tsx'), path.join(fixture, 'app/page.tsx'));
+// The type-only import of the detector is erased at compile time; point it at a relative path anyway.
+await writeFile(path.join(fixture, 'app/ProcurementClient.tsx'), client.replace("'@/lib/procurement-recurring'", "'../lib/procurement-recurring'").replace("'@/lib/procurement'", "'../lib/procurement'"));
+await copyFile(path.join(frontend, 'src/lib/procurement-recurring.ts'), path.join(fixture, 'lib/procurement-recurring.ts'));
+await copyFile(path.join(frontend, 'src/lib/finance-ledger.ts'), path.join(fixture, 'lib/finance-ledger.ts'));
+// The real page.tsx reads the ledger on the server; the fixture has no database, so it renders the client with synthetic detected rows.
+await writeFile(path.join(fixture, 'app/page.tsx'), `import ProcurementClient from './ProcurementClient';
+const detected = { state: 'ok', today: '2030-03-15', total: 1500, subs: [
+  { merchant: 'Demo streaming plan', cadence: 'monthly', typicalCents: 1500, lastCharge: '2030-03-10', nextExpected: '2030-04-09', chargeCount: 6, monthlyCents: 1500, status: 'active' },
+  { merchant: 'Demo old gym', cadence: 'monthly', typicalCents: 3000, lastCharge: '2029-11-01', nextExpected: '2029-12-01', chargeCount: 5, monthlyCents: 3000, status: 'lapsed' },
+] } as const;
+export default function Page() { return <ProcurementClient detected={detected as never} />; }
+`);
 await copyFile(path.join(frontend, 'src/app/globals.css'), path.join(fixture, 'app/globals.css'));
 await copyFile(path.join(frontend, 'postcss.config.mjs'), path.join(fixture, 'postcss.config.mjs'));
 await writeFile(path.join(fixture, 'app/layout.tsx'), 'import "./globals.css"; export default function Layout({children}: {children: React.ReactNode}) {return <html lang="en" className="dark"><body className="bg-surface text-text-primary antialiased font-sans">{children}</body></html>}');
@@ -46,6 +56,11 @@ try {
   });
   await page.goto(url, {timeout: 180000}); await page.getByRole('heading',{name:'Procurement',exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:'Place order (unavailable)',exact:true}).isDisabled(),true);
+  await page.getByRole('heading',{name:'Detected subscriptions',exact:true}).waitFor();
+  await page.getByText('Demo streaming plan',{exact:true}).waitFor();
+  await page.getByText(/About \$15\.00 \/ month across 1 active subscription\./).waitFor();
+  await page.getByText(/1 lapsed/).waitFor();
+  assert.equal(await page.getByText(/Financials is not read/).count(),0);
   await page.getByRole('button',{name:'Show synthetic examples'}).click();
   await page.getByText('Demo workspace subscription',{exact:true}).waitFor();
   await page.getByRole('button',{name:'Hide synthetic examples'}).click();
