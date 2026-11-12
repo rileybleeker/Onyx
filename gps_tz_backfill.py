@@ -72,15 +72,33 @@ def fetch_gps_activities(since: str | None = None) -> list[dict]:
     return rows
 
 
+DEFAULT_TZ = "America/New_York"
+
+
+def _normalize_rpc_scalar(data) -> str | None:
+    """Reduce a PostgREST scalar-RPC payload to a plain non-empty string, or None.
+
+    Re-audit 2026-06-07 (tz/gpt-5/F-008): depending on the function definition
+    and client version, a scalar-returning RPC comes back as a bare string, a
+    one-element list (``["America/Chicago"]``), a list of one-key row dicts
+    (``[{"tz_for_instant": "America/Chicago"}]``) or a single dict. Returning
+    ``res.data`` as-is let a list leak into ``current_tz`` and break the
+    string comparison and ``ZoneInfo(...)`` lookups downstream.
+    """
+    if isinstance(data, (list, tuple)):
+        data = data[0] if data else None
+    if isinstance(data, dict):
+        data = next(iter(data.values()), None) if len(data) == 1 else data.get("tz_for_instant")
+    if isinstance(data, str) and data.strip():
+        return data.strip()
+    return None
+
+
 def tz_for_instant_via_pg(ts_iso: str) -> str:
     """Query pds.tz_for_instant for the IANA TZ in effect at ts."""
-    # Use RPC-style call; the function takes a TIMESTAMPTZ and returns TEXT.
-    # supabase-py doesn't have a direct way to call a SQL function, so we
-    # bounce it through a one-row query.
+    # The function takes a TIMESTAMPTZ and returns TEXT; call it through PostgREST RPC.
     res = (supa.schema("pds").rpc("tz_for_instant", {"ts": ts_iso}).execute())
-    if res.data:
-        return res.data
-    return "America/New_York"
+    return _normalize_rpc_scalar(res.data) or DEFAULT_TZ
 
 
 def infer_proposed_inserts(activities: list[dict]) -> list[dict]:

@@ -413,7 +413,7 @@ export default function AgentsChat({ thread, reply }: { thread: string; reply?: 
                       const mine = replies.get(code);
                       const replied = mine && mine.id > r.m.id ? mine.text : undefined;
                       const state = cardStates[code];
-                      const settled = settledLabel(replied, state && state !== "open" ? state : undefined);
+                      const settled = settledLabel(replied, state && state !== "open" ? state : undefined, c.type);
                       return <CardBubble key={c.code} card={c} settled={settled} onSend={(t) => send(t)} onReply={replyTo} />;
                     })}
                   </>

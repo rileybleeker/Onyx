@@ -54,6 +54,12 @@ from sync_log_helper import log_sync, now_epoch
 # instead of being left in the inbox to be retried (and re-fail) on every poll.
 ERROR_DIR = os.path.join(SCRIPT_DIR, "cronometer_error")
 
+# The watcher polls every 10s, but /status only needs proof of life. Emitting the
+# empty-inbox heartbeat on every poll would add ~8,600 sync_log rows a day, so it is
+# throttled to one per interval (the first empty poll after start still writes one).
+HEARTBEAT_INTERVAL_S = 3600
+_last_heartbeat_at: float | None = None
+
 
 def get_supabase():
     """Create a Supabase client for sync_log heartbeats, or None if unconfigured."""
@@ -111,6 +117,19 @@ def error_file(path: str):
     log.info(f"Moved to error/ -> {os.path.basename(dest)}")
 
 
+def _maybe_heartbeat():
+    """Write the no-op heartbeat at most once per HEARTBEAT_INTERVAL_S."""
+    global _last_heartbeat_at
+    now = time.monotonic()
+    if _last_heartbeat_at is not None and now - _last_heartbeat_at < HEARTBEAT_INTERVAL_S:
+        return
+    sb = get_supabase()
+    if sb is None:
+        return
+    log_sync(sb, "cronometer", "watcher", "success", records=0, started_at=now_epoch())
+    _last_heartbeat_at = now
+
+
 def process_inbox() -> int:
     """Import ALL inbox files in a single run (servings + daily together). Returns files processed."""
     files = get_inbox_files()
@@ -118,9 +137,7 @@ def process_inbox() -> int:
         # Re-audit 2026-06-07 (etl/gpt-5/F-007): emit a heartbeat on an empty-inbox
         # poll so /status sees the local watcher is alive on quiet days (most polls
         # have no new export and that's healthy — mirrors the email-cron heartbeats).
-        sb = get_supabase()
-        if sb is not None:
-            log_sync(sb, "cronometer", "watcher", "success", records=0, started_at=now_epoch())
+        _maybe_heartbeat()
         return 0
 
     for f in files:
