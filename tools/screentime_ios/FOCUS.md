@@ -88,9 +88,10 @@ Before building it checks both profiles, and before publishing the signed .app
 and embedded .appex (`ci/focus_signing_check.py`). Each failure names the
 missing portal step. It publishes to `ios-builds/screentime-focus/` (links in
 `screentime-focus/latest.json`), never over the export app's
-`screentime/latest.json`. `/install` currently shows only the export app.
-Both builds use the same bundle ID, so installing one replaces the other on the
-phone.
+`screentime/latest.json`. `/install` shows it as a second card, "Onyx with Focus
+(development build)" (`/api/screen-time/build?variant=focus`). Both builds use
+the same bundle ID, so installing one replaces the other on the phone (upgrade
+in place).
 
 App Store/TestFlight distribution additionally needs Apple's Family Controls
 approval for the app and each Screen Time extension. Personal development signing

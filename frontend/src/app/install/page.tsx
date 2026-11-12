@@ -1,13 +1,16 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { BUILD_VARIANTS, buildApiUrl, type BuildVariant } from "@/lib/install-builds";
 
 /**
  * /install — over-the-air install page for the Onyx Screen Time iPhone app
  * (tools/screentime_ios). Reads the newest signed build from
- * /api/screen-time/build and shows its two install links. Open this page in
- * Safari on the iPhone itself: the itms-services links only work there.
- * Deliberately not in the nav — it is a setup utility, used a few times a year.
+ * /api/screen-time/build and shows its two install links, plus a second card
+ * for the Focus development build (/api/screen-time/build?variant=focus).
+ * Open this page in Safari on the iPhone itself: the itms-services links only
+ * work there. Deliberately not in the nav — it is a setup utility, used a few
+ * times a year.
  */
 
 interface Build {
@@ -114,14 +117,16 @@ function CopyTokenButton() {
   );
 }
 
-export default function InstallPage() {
+type LoadState = "loading" | "ready" | "none" | "error";
+
+function useBuild(variant: BuildVariant) {
   const [build, setBuild] = useState<Build | null>(null);
-  const [state, setState] = useState<"loading" | "ready" | "none" | "error">("loading");
+  const [state, setState] = useState<LoadState>("loading");
   const [reason, setReason] = useState("");
   const [expired, setExpired] = useState(false);
 
   useEffect(() => {
-    fetch("/api/screen-time/build", { cache: "no-store" })
+    fetch(buildApiUrl(variant), { cache: "no-store" })
       .then(async (res) => {
         const json = await res.json();
         if (json.build) {
@@ -138,7 +143,65 @@ export default function InstallPage() {
         setReason(String(e));
         setState("error");
       });
-  }, []);
+  }, [variant]);
+
+  return { build, state, reason, expired };
+}
+
+// The Focus development build (.github/workflows/focus-ios-signed.yml). Same
+// bundle ID as the Screen Time app, so installing it upgrades that app in place.
+function FocusBuildCard() {
+  const { build, state, reason, expired } = useBuild("focus");
+  const meta = BUILD_VARIANTS.focus;
+  return (
+    <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 space-y-4">
+      <div>
+        <h2 className="text-base font-medium text-text-primary">{meta.title}</h2>
+        <p className="text-text-tertiary text-xs mt-1">
+          Installs over the Screen Time app (same bundle ID): it upgrades it in place and keeps the Screen Time
+          export. Installing the plain Screen Time build later replaces it again.
+        </p>
+      </div>
+      {state === "loading" && <p className="text-text-tertiary text-sm">Loading…</p>}
+      {state === "none" && <p className="text-text-secondary text-sm">No Focus build has been published yet.</p>}
+      {state === "error" && (
+        <>
+          <p className="text-down text-sm">Couldn&apos;t load the Focus build.</p>
+          {reason && <p className="text-text-tertiary text-xs">{reason}</p>}
+        </>
+      )}
+      {state === "ready" && build && (
+        <>
+          <p className="text-text-tertiary text-xs">
+            Version {build.version} ({build.build}) · build #{build.run_number} · built {fmt(build.built_at)} from{" "}
+            {build.sha} · {(build.ipa_bytes / 1_048_576).toFixed(1)} MB
+          </p>
+          {expired ? (
+            <p className="text-down text-sm">
+              These links expired {fmt(build.links_expire_at)}. Run the “{meta.workflow}” workflow again.
+            </p>
+          ) : (
+            <>
+              <InstallLink label="Install with Focus" hint="Try this first." href={build.link_a} />
+              <InstallLink
+                label="Install with Focus (alternative link)"
+                hint="Use this if the first button does nothing."
+                href={build.link_b}
+              />
+              <p className="text-text-tertiary text-xs">Links expire {fmt(build.links_expire_at)}.</p>
+            </>
+          )}
+          <p className="text-text-tertiary text-xs">
+            Keeps opening until its signing certificate and profiles expire: {fmt(build.profile_expires)}.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+export default function InstallPage() {
+  const { build, state, reason, expired } = useBuild("default");
 
   return (
     <div className="min-h-screen bg-surface px-4 py-12">
@@ -224,6 +287,8 @@ export default function InstallPage() {
             )}
           </>
         )}
+
+        <FocusBuildCard />
       </div>
     </div>
   );
