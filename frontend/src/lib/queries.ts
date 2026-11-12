@@ -504,13 +504,15 @@ export async function getNutrition(days: number = 30) {
 
 /**
  * Uber Eats cart lines for one behavioral day with the per-dish estimate
- * (one unit × quantity). Restaurant orders only, cancelled orders excluded —
+ * (one unit × quantity × eaten_fraction). Restaurant orders only, cancelled orders excluded —
  * same scope as pds.delivery_nutrition_daily. Feeds "Today's Meals".
  */
 export async function getDeliveryItemsForDay(date: string) {
   const { data, error } = await supabase
     .from("delivery_order_items")
-    .select("item_id, store_name, title, quantity, completed_at, est_key, merchant_kind, is_cancelled")
+    // "*" rather than a column list so this keeps working whether or not
+    // sql/delivery_item_eaten_fraction.sql (eaten_fraction) has been applied yet.
+    .select("*")
     .eq("onyx_behavioral_date", date)
     .eq("is_cancelled", false)
     .order("completed_at", { ascending: true })
@@ -531,7 +533,8 @@ export async function getDeliveryItemsForDay(date: string) {
     const unit = kcalByKey.get(i.est_key);
     return {
       ...i,
-      est_kcal: unit == null ? null : unit * Number(i.quantity ?? 1),
+      // eaten_fraction: NULL = all of it; 0.25 = a quarter eaten (leftovers).
+      est_kcal: unit == null ? null : unit * Number(i.quantity ?? 1) * Number(i.eaten_fraction ?? 1),
     };
   });
 }
