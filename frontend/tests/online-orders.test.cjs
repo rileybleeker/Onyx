@@ -251,3 +251,8 @@ test("amazon import: events are keyed so the first-seen time sticks and a new da
   assert.equal(del[1].received_at, "2026-11-11T21:00:00+00:00");
   for (const e of [...e1, ...late, ...del]) assert.ok(!("total" in e) && e.subject === null);
 });
+
+test("amazon import: an undated delivery (same-day) is dated to the order day, not the harvest", () => {
+  const e = A.eventsFor(amz({ status: "delivered", status_on: null, expected_on: null, ordered_on: "2026-10-23" }), "2026-11-13T03:50:00.000Z");
+  assert.equal(e[1].received_at, "2026-10-23T21:00:00+00:00");
+});

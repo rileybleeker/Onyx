@@ -137,7 +137,9 @@ export function eventsFor(o: AmazonOrder, nowIso: string): EventRow[] {
   // A status seen at harvest time is stamped "now"; never earlier than the order itself.
   const seen = nowIso < noonEt(o.ordered_on) ? noonEt(o.ordered_on) : nowIso;
   if (o.status === "delivered") {
-    rows.push({ ...base, message_id: id(`delivered:${o.status_on ?? ""}`), received_at: o.status_on ? `${o.status_on}T21:00:00+00:00` : seen, status: "delivered", expected_date: null });
+    // No date on the card = same-day delivery ("Amazon Now Delivery"): the order day, not the harvest time.
+    const on = o.status_on ?? o.ordered_on;
+    rows.push({ ...base, message_id: id(`delivered:${o.status_on ?? ""}`), received_at: `${on}T21:00:00+00:00`, status: "delivered", expected_date: null });
   } else if (o.status === "shipped" || o.status === "out_for_delivery") {
     rows.push({ ...base, message_id: id(`${o.status}:${o.expected_on ?? ""}`), received_at: seen, status: o.status, expected_date: o.expected_on });
     if (o.delayed) rows.push({ ...base, message_id: id(`delayed:${o.expected_on ?? ""}`), received_at: seen, status: "delayed", expected_date: o.expected_on });
