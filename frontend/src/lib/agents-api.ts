@@ -100,6 +100,12 @@ export const agentsApi = {
   /** Mark one conversation read up to `id`; `all` marks every conversation. Returns the new unread count. */
   read: (id: number, opts: { thread?: string; all?: boolean } = {}) =>
     call<{ ok: boolean; badge: number }>("/onyx/read", { method: "POST", body: JSON.stringify({ id, ...opts }) }),
+  /**
+   * Clear cards from Unread without answering them (app-only: the agent's row, the card and its buttons in the
+   * conversation stay). `all` also marks every message read. `undo` brings the given cards back.
+   */
+  dismiss: (opts: { codes: string[]; undo?: boolean } | { all: true }) =>
+    call<{ ok: boolean; codes: string[]; badge: number }>("/onyx/dismiss", { method: "POST", body: JSON.stringify(opts) }),
   /** The /check-in screen saved a day: settle that day's check-in card and skip its evening send / morning nudge. */
   checkinDone: (date: string) => call<{ ok: boolean; badge: number }>("/onyx/checkin/done", { method: "POST", body: JSON.stringify({ date }) }),
   subscribe: (sub: PushSubscriptionJSON) => call<{ ok: boolean; pushed: number }>("/onyx/subscribe", { method: "POST", body: JSON.stringify(sub) }),
@@ -161,6 +167,21 @@ export async function refreshPushSubscription(): Promise<void> {
   const reg = await registerServiceWorker();
   const sub = await reg?.pushManager.getSubscription();
   if (sub) await agentsApi.subscribe(sub.toJSON()).catch(() => {});
+}
+
+/**
+ * Remove Onyx's notifications from the phone's notification list (they are all in the Unread list once the app
+ * is open). Best effort: browsers without getNotifications() just keep them.
+ */
+export async function clearDeviceNotifications(): Promise<void> {
+  try {
+    if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+    const reg = await navigator.serviceWorker.getRegistration();
+    const shown = await reg?.getNotifications?.();
+    shown?.forEach((n) => n.close());
+  } catch {
+    /* not supported here */
+  }
 }
 
 /** Home-screen icon badge = what the Unread list shows. */
