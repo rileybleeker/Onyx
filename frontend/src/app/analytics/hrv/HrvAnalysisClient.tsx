@@ -614,7 +614,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       {/* Header */}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h2 className="text-[28px] font-medium text-text-primary">HRV Deep Analysis</h2>
+          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">HRV Deep Analysis</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
             Predictive modeling · Statistical drivers · {rangeLabel(range)} · {historicalHrv.length} days of data
           </p>

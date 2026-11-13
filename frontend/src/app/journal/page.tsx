@@ -152,7 +152,7 @@ export default function JournalPage() {
     <div className="px-4 md:px-6 pb-4 md:pb-6 max-w-4xl mx-auto">
       <header className="mb-6 flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-xl md:text-2xl font-semibold text-text-primary tracking-tight">
+          <h1 data-testid="page-heading" className="text-xl md:text-2xl font-semibold text-text-primary tracking-tight">
             Journal
           </h1>
           <p className="text-xs md:text-sm text-text-tertiary mt-1">

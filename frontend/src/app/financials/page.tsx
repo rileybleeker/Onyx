@@ -26,7 +26,7 @@ export default async function FinancialsPage({
     <main className="mx-auto max-w-6xl space-y-6 p-4 md:p-8">
       <header>
         <p className="text-xs uppercase tracking-widest text-text-tertiary">Money, in view</p>
-        <h1 className="text-2xl font-semibold">Financials</h1>
+        <h1 data-testid="page-heading" className="text-2xl font-semibold">Financials</h1>
         <p className="mt-2 text-text-secondary">
           Your Rocket Money accounts, balances and transactions, imported automatically and shown only to you.
         </p>

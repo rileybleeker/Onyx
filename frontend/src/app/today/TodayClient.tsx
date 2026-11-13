@@ -116,7 +116,7 @@ export default function TodayClient() {
   return (
     <div className="mx-auto max-w-2xl space-y-5">
       <header className="flex items-start justify-between gap-4">
-        <div><h1 className="text-[30px] font-medium text-text-primary">Today</h1>
+        <div><h1 data-testid="page-heading" className="text-[30px] font-medium text-text-primary">Today</h1>
           <p className="mt-1 text-sm text-text-secondary">A few useful places to pick up.</p></div>
         <button type="button" onClick={() => { if (!pending) load(); }} aria-disabled={pending} aria-label="Refresh Today"
           className="rounded-xl border border-border-default p-3 text-text-secondary aria-disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-accent">

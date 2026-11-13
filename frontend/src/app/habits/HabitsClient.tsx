@@ -487,7 +487,7 @@ export default function HabitsPage() {
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 className="text-[28px] font-medium text-text-primary">Habits</h2>
+          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Habits</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
             Track daily behaviors and build streaks — {rangeLabel(range)}
             {syncing && <span className="ml-2 text-accent animate-pulse">syncing from Notion...</span>}

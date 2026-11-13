@@ -408,7 +408,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 className="text-[28px] font-medium text-text-primary">Nutrition</h2>
+          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Nutrition</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
             Daily macros, micronutrients &amp; body weight — food from Cronometer + Uber Eats — {rangeLabel(range)}
           </p>
