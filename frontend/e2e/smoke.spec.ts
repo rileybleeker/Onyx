@@ -601,6 +601,19 @@ test("/health renders the care planner with sample data off and calendar disconn
   await expectNoClientCrash(page);
 });
 
+// /orders (2026-11-12, PR #95): online orders tracked from shipping/delivery emails. Tripwire:
+// behind the login, heading renders, and neither the load-error nor the never-synced state shows.
+// "Nothing on the way right now." and an empty Needs attention section are legitimate, so they are
+// not asserted. Asserts on page text only, never on store names or items.
+test("/orders renders without the load-error or never-synced state", async ({ page }) => {
+  await gotoAuthed(page, "/orders");
+  await settle(page);
+  await expect(page.getByRole("heading", { name: "Orders", exact: true })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(page.getByText("Couldn't load orders. Try again in a minute."), "orders failed to load").toHaveCount(0);
+  await expect(page.getByText("The order email sync hasn't run yet."), "order email sync has never run").toHaveCount(0);
+  await expectNoClientCrash(page);
+});
+
 // /financials keeps PR #28's browser-only CSV preview as a secondary tool behind a "Preview a CSV"
 // disclosure (the page itself now reads the saved ledger; see the /financials entry in PAGES).
 // Read-only: opens the disclosure, never chooses a file.
