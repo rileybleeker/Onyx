@@ -28,6 +28,8 @@ function isCiRoute(pathname: string): boolean {
     // Onyx Screen Time iPhone app (tools/screentime_ios, 2026-11-09)
     pathname === "/api/screen-time/usage" ||
     pathname === "/api/delivery/items/import" ||
+    // Personal Amazon order list, read by the Kindle harvester on Riley's PC (2026-11-12). Exact path.
+    pathname === "/api/orders/amazon/import" ||
     // Supplement stack reminders: the sms-reminders Worker claims due stacks and
     // relays Log it / Skip taps (2026-11-11). Exact paths - never /api/supplements/*.
     pathname === "/api/supplements/reminders/claim" ||

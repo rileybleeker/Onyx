@@ -178,7 +178,10 @@ test("PATCH checks: order key shape, exact body, same origin + JSON", () => {
 
 test("the orders routes are not in middleware's CI carve-out and the reader is server-only", () => {
   const mw = fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8");
-  assert.doesNotMatch(mw, /api\/orders/);
+  // Only the Amazon import path is token-reachable; the page, summary and PATCH stay session-only.
+  const orderPaths = [...new Set(mw.match(/\/api\/orders[^"']*/g) || [])];
+  assert.deepEqual(orderPaths, ["/api/orders/amazon/import"]);
+  assert.doesNotMatch(mw, /startsWith\("\/api\/orders/);
   const server = fs.readFileSync(path.join(SRC, "lib/online-orders-server.ts"), "utf8");
   assert.match(server, /^import "server-only";/);
   const page = fs.readFileSync(path.join(SRC, "app/orders/page.tsx"), "utf8");
@@ -218,4 +221,33 @@ test("review 9: the PATCH route finds an order by any alias and stores under its
   const route = fs.readFileSync(path.join(SRC, "app/api/orders/[key]/route.ts"), "utf8");
   assert.match(route, /\.contains\("aliases", \[key\]\)/);
   assert.match(route, /alias_key: current/);
+});
+
+// ─── personal Amazon orders (lib/amazon-orders.ts) ───────────────────────────
+
+const A = loadTs("lib/amazon-orders.ts");
+const amz = (over = {}) => ({ order_number: "111-1111111-1111111", ordered_on: "2026-11-10", status: "shipped", status_on: null,
+  expected_on: "2026-11-21", delayed: false, items: ["Example Trash Bags"], ...over });
+
+test("amazon import: validates orders and rejects amounts, bad numbers and dates", () => {
+  const ok = A.parseAmazonImport({ orders: [amz({ items: ["Example Bags", "Thing $12.99", "x"] })], scanned: 3, unparsed: 1 });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.orders[0].items, ["Example Bags"]);
+  assert.equal(ok.unparsed, 1);
+  for (const bad of [{}, { orders: "x" }, { orders: [amz({ order_number: "12345" })] }, { orders: [amz({ status: "lost" })] },
+    { orders: [amz({ ordered_on: "2026-02-30" })] }, { orders: Array(61).fill(amz()) }]) assert.equal(A.parseAmazonImport(bad).ok, false);
+  const err = A.parseAmazonImport({ error: "Amazon session expired" });
+  assert.equal(err.kind, "error");
+});
+
+test("amazon import: events are keyed so the first-seen time sticks and a new date is a new event", () => {
+  const e1 = A.eventsFor(amz(), "2026-11-12T03:00:00.000Z");
+  assert.deepEqual(e1.map((e) => e.message_id), ["amazon-web:111-1111111-1111111:ordered", "amazon-web:111-1111111-1111111:shipped:2026-11-21"]);
+  assert.equal(e1[0].merchant_key, "amazon.com");
+  assert.equal(e1[1].expected_date, "2026-11-21");
+  const late = A.eventsFor(amz({ delayed: true, expected_on: "2026-11-25" }), "2026-11-20T03:00:00.000Z");
+  assert.ok(late.some((e) => e.status === "delayed" && e.message_id.endsWith(":delayed:2026-11-25")));
+  const del = A.eventsFor(amz({ status: "delivered", status_on: "2026-11-11", expected_on: null }), "2026-11-12T03:00:00.000Z");
+  assert.equal(del[1].received_at, "2026-11-11T21:00:00+00:00");
+  for (const e of [...e1, ...late, ...del]) assert.ok(!("total" in e) && e.subject === null);
 });
