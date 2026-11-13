@@ -54,6 +54,7 @@ const CADENCE: Record<string, string> = {
   tanita: "Daily 10am + 1:30pm ET",
   flights: "Every 3h :25 (both Gmail accounts)",
   delivery: "Every 3h :40",
+  online_orders: "Every 3h :05 (both Gmail accounts)",
   air_quality: "Every 3h :12",
   supplement_reminders: "Worker poll (heartbeat ~hourly); cards at each stack's reminder time",
   urgent_email: "Hourly :15 (both Gmail accounts)",
@@ -100,6 +101,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   tanita:         { method: "automated",      label: "API ETL" },
   flights:        { method: "automated",      label: "IMAP email parser" },
   delivery:       { method: "automated",      label: "IMAP email parser" },
+  online_orders:  { method: "automated",      label: "IMAP email parser" },
   air_quality:    { method: "automated",      label: "API ETL" },
   supplement_reminders: { method: "automated", label: "Worker push cards" },
   urgent_email:   { method: "automated",      label: "IMAP label reader" },
@@ -377,6 +379,8 @@ export async function GET() {
         // balances separately), so the pair needs its own limit-1 reads. Heartbeats only:
         // this endpoint is CDN-cacheable, so no ledger rows or amounts are read here.
         ["rocketmoney", "transactions"], ["rocketmoney", "balances"],
+        // Online orders (every 3h): its own read so the shared 100-row window cannot push it out.
+        ["online_orders", "email"],
       ].map(async ([source, dataType]) => {
         const { data, error } = await supabase.from("sync_log").select("*")
           .eq("source", source).eq("data_type", dataType)
@@ -814,6 +818,35 @@ export async function GET() {
           cadence: CADENCE.flights,
           integrationMethod: METHOD.flights.method,
           methodLabel: METHOD.flights.label,
+        };
+      })(),
+      // Online orders (orders_email_etl.py): shipping / delivery emails from stores, Amazon and
+      // the carriers, both Gmail accounts, joined into pds.online_orders for /orders. Freshness =
+      // heartbeat age (a week without an order is healthy): cron every 3h -> >4h partial, >12h or
+      // a failed run red. 'partial' = an account is missing or an email failed to parse.
+      online_orders: (() => {
+        const entry = latestBySrcType["online_orders|email"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 12
+            ? "failed"
+            : entry.status === "partial" || ageH > 4
+              ? "partial"
+              : "success";
+        return {
+          label: "Online Orders",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No run yet - the Online Orders Email workflow has not reported." : ageH > 12 ? `No run for ${Math.floor(ageH)}h - check the Online Orders Email workflow.` : null),
+          cadence: CADENCE.online_orders,
+          integrationMethod: METHOD.online_orders.method,
+          methodLabel: METHOD.online_orders.label,
         };
       })(),
       // Delivery orders (delivery_email_etl.py): Uber Eats receipt emails parsed over

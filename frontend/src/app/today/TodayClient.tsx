@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, BookOpen, ClipboardCheck, Mail, RefreshCw } from "lucide-react";
+import { ArrowUpRight, BookOpen, ClipboardCheck, Mail, Package, RefreshCw } from "lucide-react";
 import { agentsApi, type InboxResponse, type InboxItem } from "@/lib/agents-api";
 import type { ReadingOverview } from "@/lib/reading";
 import type { UrgentEmailResponse } from "@/lib/urgent-email-query";
@@ -10,6 +10,9 @@ import { ageLabel, isEmailCard, isGmailHref, mergeUrgent } from "@/lib/urgent-em
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
+// GET /api/orders/summary (online orders read from shipping emails; see /orders).
+type OrdersSummary = { status: "not_connected" } | { status: "ready"; attention: number; arrivingToday: number; onTheWay: number;
+  top: { merchant: string; label: string; reason: string }[] };
 const linkStyle = "text-sm text-accent underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-accent";
 const panelStyle = "rounded-2xl border border-border-default bg-surface-card p-5 sm:p-6";
 
@@ -33,6 +36,9 @@ export default function TodayClient() {
   const [inbox, setInbox] = useState<Load<InboxResponse>>({ state: "loading" });
   const [reading, setReading] = useState<Load<ReadingOverview | null>>({ state: "loading" });
   const [urgent, setUrgent] = useState<Load<UrgentEmailResponse>>({ state: "loading" });
+  // Packages are shown only when something needs attention or arrives today, and a failed check
+  // just hides the panel: /orders is where package status lives.
+  const [orders, setOrders] = useState<OrdersSummary | null>(null);
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
   const sequence = useRef(0);
   const inFlight = useRef(false);
@@ -69,7 +75,15 @@ export default function TodayClient() {
     })).then((value) => {
       if (sequence.current === current) setUrgent({ state: "ready", value });
     }).catch(() => { if (sequence.current === current) setUrgent((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
-    void Promise.allSettled([inboxRequest, readingRequest, urgentRequest]).then(() => {
+    const ordersRequest = bounded(fetch("/api/orders/summary", { cache: "no-store" }).then(async (res) => {
+      if (!res.ok) throw new Error("Orders unavailable");
+      const data = await res.json() as OrdersSummary;
+      if (data.status !== "not_connected" && !(data.status === "ready" && Array.isArray(data.top))) throw new Error("Invalid orders");
+      return data;
+    })).then((value) => {
+      if (sequence.current === current) setOrders(value);
+    }).catch(() => { /* keep the last summary; /orders has the details */ });
+    void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest]).then(() => {
       if (sequence.current === current) { inFlight.current = false; setRefreshing(false); }
     });
   }, []);
@@ -98,6 +112,7 @@ export default function TodayClient() {
   const lastSync = email?.lastSync ?? null;
   const syncStale = !!lastSync && (now.getTime() - new Date(lastSync.at).getTime() > LABEL_SYNC_STALE_MS || lastSync.status !== "success");
   const book = reading.state === "ready" ? reading.value : null;
+  const packages = orders?.status === "ready" && (orders.attention > 0 || orders.arrivingToday > 0) ? orders : null;
   return (
     <div className="mx-auto max-w-2xl space-y-5">
       <header className="flex items-start justify-between gap-4">
@@ -169,6 +184,18 @@ export default function TodayClient() {
           : "The email label sync has not run yet."}</p>}
         {urgent.state !== "loading" && <p className="mt-1 text-xs text-text-secondary">Opening Today does not mark email read or change any label.</p>}
       </section>
+      {packages && <section className={panelStyle} aria-labelledby="packages-heading">
+        <div className="flex items-center gap-2"><Package aria-hidden="true" className="h-5 w-5 text-accent" />
+          <h2 id="packages-heading" className="text-lg font-medium text-text-primary">Packages</h2></div>
+        <p className="mt-3 text-sm text-text-primary">{[
+          packages.attention > 0 ? `${packages.attention} need${packages.attention === 1 ? "s" : ""} attention` : null,
+          packages.arrivingToday > 0 ? `${packages.arrivingToday} arriving today` : null,
+        ].filter(Boolean).join(" · ")}</p>
+        {packages.top.length > 0 && <ul className="mt-2 space-y-2" aria-label="Packages that need attention">
+          {packages.top.map((t, i) => <li key={i} className="text-xs text-text-secondary"><span className="text-text-primary">{t.merchant}: {t.label}.</span> {t.reason}</li>)}
+        </ul>}
+        <Link href="/orders" className={`${linkStyle} mt-4 inline-block`}>Open orders</Link>
+      </section>}
       <section className={panelStyle} aria-labelledby="reading-heading" aria-busy={reading.state === "loading"}>
         <div className="flex items-center gap-2"><BookOpen aria-hidden="true" className="h-5 w-5 text-accent" />
           <h2 id="reading-heading" className="text-lg font-medium text-text-primary">Keep reading</h2></div>

@@ -4,6 +4,7 @@ import {
   Sparkles,
   CalendarDays,
   ShoppingCart,
+  Package,
   Wallet,
   Moon,
   Activity,
@@ -77,6 +78,7 @@ export const NAV_SECTIONS: NavSection[] = [
     items: [
       { href: "/wins", label: "Wins", shortcut: "E", icon: Sparkles, keywords: ["accomplishments", "celebrate", "progress", "board", "claude", "dot"] },
       { href: "/health", label: "Health & appointments", shortcut: "", icon: CalendarDays, keywords: ["care", "recurring", "doctor", "dentist", "calendar", "due"] },
+      { href: "/orders", label: "Orders", shortcut: "D", icon: Package, keywords: ["packages", "deliveries", "shipping", "tracking", "amazon", "ups", "fedex", "usps", "arriving", "delivered", "overdue", "missing"] },
       { href: "/procurement", label: "Procurement", shortcut: "O", icon: ShoppingCart, keywords: ["buy", "orders", "subscriptions", "shopping"] },
       { href: "/agents", label: "Agents", shortcut: "G", icon: Bot, keywords: ["chat", "messages", "briefing", "approvals", "leads", "reminders", "inbox", "notifications"] },
       { href: "/financials", label: "Financials", shortcut: "W", icon: Wallet, keywords: ["money", "finance", "rocket money", "spending", "transactions", "budget", "net worth", "balances", "accounts", "ledger", "cashflow"] },
