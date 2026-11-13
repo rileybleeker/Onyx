@@ -75,7 +75,7 @@ export default function HealthClient() {
     persist(items.map(old => old.id !== item.id ? old : item.months ? { ...old, due: nextDue(todayLocal(), item.months), booked: false } : { ...old, archived: true }));
   }
   return <div className="mx-auto max-w-4xl space-y-6 p-4 sm:p-8">
-    <header><h1 className="text-2xl font-semibold">Health & appointments</h1><p className="mt-2 text-text-secondary">Plan routine care and keep track of what needs booking.</p></header>
+    <header><h1 data-testid="page-heading" className="text-2xl font-semibold">Health & appointments</h1><p className="mt-2 text-text-secondary">Plan routine care and keep track of what needs booking.</p></header>
     <section className={panel} aria-label="Privacy and calendar connection">
       <h2 className="font-semibold">Private planning, on this browser</h2>
       <p className="mt-2 text-sm text-text-secondary">Start with a short label and date. No medical records, provider contact, bookings or reminders are sent. Dates and repeat intervals are yours to choose, not medical recommendations.</p>

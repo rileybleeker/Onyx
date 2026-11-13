@@ -27,7 +27,7 @@ export default function WinsBoard({ board }: { board: Board }) {
   return <div className="mx-auto max-w-5xl space-y-7">
     <header className="rounded-2xl border border-border-subtle bg-surface-card p-6 sm:p-8">
       <div className="mb-3 flex items-center gap-2 text-accent"><Sparkles size={18} aria-hidden="true" /><span className="text-xs uppercase tracking-widest">Small wins. Better Onyx.</span></div>
-      <h1 className="text-3xl font-semibold text-text-primary">Worth celebrating</h1>
+      <h1 data-testid="page-heading" className="text-3xl font-semibold text-text-primary">Worth celebrating</h1>
       <p className="mt-3 max-w-2xl text-text-secondary">A place to see the care going into Onyx. Real improvements, work still taking shape, and the evidence behind each one.</p>
       <p className="mt-5 text-sm text-text-secondary">{live + merged > 0 ? `${live} live on the site, ${merged} merged, ${proposed} proposed or in draft.` : "Every improvement starts somewhere."} Each stage is kept apart: proposals and drafts are not merged, and merged is not the same as live on the site.</p>
     </header>

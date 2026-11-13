@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "@playwright/test";
 
 /**
  * Production smoke-test tripwire.
@@ -62,6 +62,18 @@ async function expectNoClientCrash(page: Page) {
 }
 
 /**
+ * Page-title gate keyed on a stable hook, not on the title copy (2026-11-13):
+ * every page marks its title element with data-testid="page-heading", so a
+ * heading rename no longer breaks the smoke run (PR #11 needed #16, #15 needed
+ * #18). `copyFallback` is the old copy-keyed locator; it keeps the gate passing
+ * in the minutes between a merge and its Vercel deploy, while production still
+ * serves pages without the hook. Either one visible passes.
+ */
+function pageHeading(page: Page, copyFallback: Locator): Locator {
+  return page.getByTestId("page-heading").or(copyFallback).first();
+}
+
+/**
  * Navigate and assert we landed on a real, authenticated page: not a 4xx/5xx,
  * and not bounced to /login by middleware (which is how an invalid/expired
  * session manifests). `expectFinalUrl` is for routes that redirect server-side
@@ -95,7 +107,7 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
     // The page returns ONLY a skeleton while loading; the heading appears once
     // the fetch resolves, so waiting for it gates "load complete".
     await expect(
-      page.getByRole("heading", { name: "HRV Deep Analysis" })
+      pageHeading(page, page.getByRole("heading", { name: "HRV Deep Analysis" }))
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
     // Stage 4 (Direction A): the Tomorrow's-HRV hero KpiTile must render.
@@ -147,7 +159,7 @@ test.describe("Nutrition — Cronometer migration tripwire", () => {
     await settle(page);
 
     await expect(
-      page.getByRole("heading", { name: "Nutrition" })
+      pageHeading(page, page.getByRole("heading", { name: "Nutrition" }))
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
     // The macros block is now Cronometer-sourced (MFP fills pre-cutover history).
@@ -202,7 +214,7 @@ test.describe("Supplements — renamed-view-column regression tripwire", () => {
     await gotoAuthed(page, "/supplements");
     await settle(page);
     await expect(
-      page.getByRole("heading", { name: "Supplements", exact: true })
+      pageHeading(page, page.getByRole("heading", { name: "Supplements", exact: true }))
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
     const totalsCard = page
@@ -246,7 +258,7 @@ type Signal = "charts" | "status-cards" | "journal-list" | "page-loads";
 
 interface SmokePage {
   route: string;
-  heading: string; // stable text rendered on the page (load/shell gate)
+  heading: string; // title copy: fallback for the data-testid="page-heading" gate, and the failure message
   signal: Signal; // how we prove real data rendered
   hardEmpty: string[];
   // The page's own "nothing in the window" empty-state. If it is visible the
@@ -396,7 +408,7 @@ for (const p of PAGES) {
     await gotoAuthed(page, p.route, p.finalUrl);
     await settle(page);
     await expect(
-      page.getByText(p.heading, { exact: true }).first(),
+      pageHeading(page, page.getByText(p.heading, { exact: true })),
       `${p.route} did not render its "${p.heading}" heading`
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
@@ -550,7 +562,7 @@ test("/check-in lists today's habit questions", async ({ page }) => {
 test.describe("Today home", () => {
   test("home opens Today and its independent sections settle", async ({ page }) => {
     await gotoAuthed(page, "/", /\/today$/);
-    await expect(page.getByRole("heading", { name: "Today", exact: true })).toBeVisible();
+    await expect(pageHeading(page, page.getByRole("heading", { name: "Today", exact: true }))).toBeVisible();
     await expect(page.getByText("Checking agent requests...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
     await expect(page.getByText("Loading reading progress...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
     await expect(page.getByText("Couldn't check requests.", { exact: false })).toHaveCount(0);
@@ -567,7 +579,7 @@ test.describe("Today home", () => {
 // never types into a form, never adds a draft.
 test("/procurement renders as a disconnected planning page with ordering disabled", async ({ page }) => {
   await gotoAuthed(page, "/procurement");
-  await expect(page.getByRole("heading", { name: "Procurement", exact: true })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(pageHeading(page, page.getByRole("heading", { name: "Procurement", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
   await expect(page.getByRole("heading", { name: "Disconnected preview", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Track subscriptions", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Place order (unavailable)", exact: true })).toBeDisabled();
@@ -580,7 +592,7 @@ test("/procurement renders as a disconnected planning page with ordering disable
 // the error boundary is absent. Never asserts on card counts or any PR title.
 test("/wins renders the Wins board", async ({ page }) => {
   await gotoAuthed(page, "/wins");
-  await expect(page.getByRole("heading", { name: "Worth celebrating", exact: true })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(pageHeading(page, page.getByRole("heading", { name: "Worth celebrating", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
   await expect(page.getByRole("region", { name: "Progress board", exact: true })).toBeVisible();
   await expect(page.getByRole("group", { name: "Filter progress", exact: true })).toBeVisible();
   await expectNoClientCrash(page);
@@ -592,7 +604,7 @@ test("/wins renders the Wins board", async ({ page }) => {
 // calendar connect button is still disabled. Read-only: never types, adds or toggles anything.
 test("/health renders the care planner with sample data off and calendar disconnected", async ({ page }) => {
   await gotoAuthed(page, "/health");
-  await expect(page.getByRole("heading", { name: "Health & appointments", exact: true })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(pageHeading(page, page.getByRole("heading", { name: "Health & appointments", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
   await expect(page.getByRole("heading", { name: "Private planning, on this browser", exact: true })).toBeVisible();
   await expect(page.getByText(/Loading local planner/)).toHaveCount(0, { timeout: LOAD_TIMEOUT });
   await expect(page.getByRole("heading", { name: "Add care item", exact: true })).toBeVisible();
@@ -608,7 +620,7 @@ test("/health renders the care planner with sample data off and calendar disconn
 test("/orders renders without the load-error or never-synced state", async ({ page }) => {
   await gotoAuthed(page, "/orders");
   await settle(page);
-  await expect(page.getByRole("heading", { name: "Orders", exact: true })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(pageHeading(page, page.getByRole("heading", { name: "Orders", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
   await expect(page.getByText("Couldn't load orders. Try again in a minute."), "orders failed to load").toHaveCount(0);
   await expect(page.getByText("The order email sync hasn't run yet."), "order email sync has never run").toHaveCount(0);
   await expectNoClientCrash(page);
@@ -619,7 +631,7 @@ test("/orders renders without the load-error or never-synced state", async ({ pa
 // Read-only: opens the disclosure, never chooses a file.
 test("/financials keeps the CSV preview tool behind its disclosure", async ({ page }) => {
   await gotoAuthed(page, "/financials");
-  await expect(page.getByRole("heading", { name: "Financials", exact: true })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(pageHeading(page, page.getByRole("heading", { name: "Financials", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
   const summary = page.getByText("Preview a CSV", { exact: true });
   await expect(summary).toBeVisible();
   await summary.click();

@@ -100,7 +100,7 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 className="text-[28px] font-medium text-text-primary">Heart & HRV</h2>
+          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Heart & HRV</h2>
           <p className="text-sm text-text-tertiary mt-0.5">Heart rate and variability trends — {rangeLabel(range)}</p>
         </div>
         <RangeFilter value={range} onChange={setRange} />

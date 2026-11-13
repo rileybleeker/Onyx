@@ -444,7 +444,7 @@ export default function StatusPage() {
       {/* Page header */}
       <div className="flex items-baseline justify-between mb-8">
         <div>
-          <h2 className="text-[28px] font-medium text-text-primary">System Status</h2>
+          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">System Status</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
             ETL pipeline health and data freshness
             <RefreshedLabel refreshedAtRef={refreshedAtRef} />

@@ -246,7 +246,7 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 className="text-[28px] font-medium text-text-primary">Caffeine</h2>
+          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Caffeine</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
             Intake, timing windows &amp; next-night HRV — supplements + Cronometer dietary — last {windowDays} days
           </p>
