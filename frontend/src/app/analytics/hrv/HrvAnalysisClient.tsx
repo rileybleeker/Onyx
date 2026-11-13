@@ -6,6 +6,7 @@ import {
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
   CartesianGrid, ReferenceLine, Cell, ErrorBar,
 } from "recharts";
+import AirQualityPanel from "@/components/AirQualityPanel";
 import ChartCard from "@/components/ChartCard";
 import DeferredMount from "@/components/DeferredMount";
 import RangeFilter from "@/components/RangeFilter";
@@ -2574,6 +2575,11 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       </div>
       );
       })()}
+      </DeferredMount>
+
+      {/* PM2.5 panel: fetches /api/air-quality itself (service-role table, not in the ISR prefetch). */}
+      <DeferredMount minHeight={420}>
+        <AirQualityPanel />
       </DeferredMount>
 
       <SectionHeader id="methods" tick="calibration" title="Methods & Evaluation" />
