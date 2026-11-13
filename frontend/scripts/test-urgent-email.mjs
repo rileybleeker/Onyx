@@ -523,6 +523,46 @@ await test("same thread id in another mailbox does not merge; same Message-ID in
   assert.ok(out.items[0].reasons.includes("Also in second@"));
 });
 
+const SEARCH = (words, acct = ACCT) => `https://mail.google.com/mail/?authuser=${acct}#search/${words}`;
+
+await test("gmailSearchWords: lowercases, drops operators, null for thread and non-Gmail links", () => {
+  const { gmailSearchWords } = rules;
+  assert.deepEqual(gmailSearchWords(SEARCH("Invoice+Overdue+from%3Abilling%40example.com+newer_than%3A2d+label:Agent")), ["invoice", "overdue"]);
+  assert.deepEqual(gmailSearchWords(SEARCH("Renew%20Plan++now")), ["renew", "plan", "now"]);
+  assert.equal(gmailSearchWords(`https://mail.google.com/mail/?authuser=${ACCT}#all/thread-f:42`), null);
+  assert.equal(gmailSearchWords("https://evil.example/mail/#search/a+b"), null);
+  assert.equal(gmailSearchWords(null), null);
+});
+
+await test("a #search card merges into the one labelled email holding every word (same account, within 7 days)", () => {
+  const e = emailItem({ subject: "Invoice 42 is overdue, please pay", receivedAt: "2026-11-11T10:00:00.000Z" });
+  const noise = emailItem({ subject: "Weekly digest", receivedAt: "2026-11-11T09:00:00.000Z" });
+  const c = card({}, { name: "Urgent: invoice overdue", link: SEARCH("Invoice+overdue") });
+  const out = mergeUrgent([e, noise], [c]);
+  assert.equal(out.total, 2);
+  const item = out.items.find((i) => i.key === `email:${e.key}`);
+  assert.deepEqual(item.sources, ["Gmail", "Agent Inbox"]);
+  assert.ok(item.reasons[0].includes("invoice overdue"));
+  assert.ok(item.nextStep.startsWith("Answer the request, then reply"));
+  assert.equal(item.requestHref, `/agents?t=inbox-triage#m${c.messageId}`);
+  // 6 days 23 h before the card still counts
+  const old = emailItem({ subject: "Invoice overdue", receivedAt: "2026-11-04T14:00:00.000Z" });
+  assert.equal(mergeUrgent([old], [c]).total, 1);
+});
+
+await test("a #search card stays separate: missing word, ambiguous, other account, wrong time window", () => {
+  const link = SEARCH("Invoice+overdue");
+  const c = card({}, { link });
+  const base = { subject: "Invoice overdue", receivedAt: "2026-11-11T10:00:00.000Z" };
+  assert.equal(mergeUrgent([emailItem({ ...base, subject: "Invoice due soon" })], [c]).total, 2, "word missing");
+  assert.equal(mergeUrgent([emailItem({ subject: "Invoicer overdue" })], [c]).total, 2, "whole words only");
+  assert.equal(mergeUrgent([emailItem(base), emailItem({ ...base, subject: "Re: Invoice overdue" })], [c]).total, 3, "ambiguous");
+  assert.equal(mergeUrgent([emailItem({ ...base, account: "second@example.com" })], [card({}, { link })]).total, 2, "other account");
+  assert.equal(mergeUrgent([emailItem({ ...base, receivedAt: "2026-11-11T14:00:00.000Z" })], [c]).total, 2, "received after the card");
+  assert.equal(mergeUrgent([emailItem({ ...base, receivedAt: "2026-11-04T12:00:00.000Z" })], [c]).total, 2, "more than 7 days before");
+  assert.equal(mergeUrgent([emailItem(base)], [card({}, { link: SEARCH("from%3Abilling%40example.com") })]).total, 2, "operators only");
+});
+
 await test("unmatched email cards stand alone with source, freshness, reason and next step; duplicates by code once", () => {
   const c = card({ created_at: "2026-11-11 13:00:00" }, { name: "Urgent: password was reset (second@)", link: "https://mail.google.com/mail/?authuser=second@example.com#search/password+reset" });
   const out = mergeUrgent([], [c, { ...c, messageId: c.messageId + 1 }, card({}, { name: "Not email", agent: "nyc-scout" })]);
