@@ -430,6 +430,32 @@ export function parseGmailLink(link: string | null | undefined): { account: stri
   return { account, threadId: hex ? hexToDecimal(hex[1]) : null };
 }
 
+/**
+ * Lowercase search words of a Gmail `#search/...` link (split on + and spaces; Gmail
+ * operators such as `from:` or `newer_than:2d` are dropped). Any other link → null.
+ */
+export function gmailSearchWords(link: string | null | undefined): string[] | null {
+  if (!link || !isGmailHref(link)) return null;
+  let url: URL;
+  try { url = new URL(link); } catch { return null; }
+  if (url.origin !== "https://mail.google.com") return null;
+  let hash = url.hash;
+  try { hash = decodeURIComponent(hash); } catch { /* keep raw */ }
+  const m = hash.match(/^#search\/(.*)$/i);
+  if (!m) return null;
+  return m[1]
+    .toLowerCase()
+    .split(/[+\s]+/)
+    .filter((w) => w !== "" && !/^-?[a-z_]+:/.test(w));
+}
+
+/** Lowercase whole words of a subject, punctuation stripped. */
+function subjectWords(s: string): Set<string> {
+  return new Set(s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean));
+}
+
+const SEARCH_MATCH_WINDOW_MS = 7 * 24 * 3_600_000;
+
 /** An Agent Inbox card that is about email: inbox-triage's "Urgent: ..." questions, or any card linking Gmail. */
 export function isEmailCard(card: InboxCardLike["card"]): boolean {
   return (card.agent === "inbox-triage" && URGENT_PREFIX.test(card.name)) || parseGmailLink(card.link) !== null;
@@ -517,9 +543,26 @@ export function mergeUrgent(
     const ref = parseGmailLink(c.card.link);
     const ask = c.card.name.replace(URGENT_PREFIX, "").trim() || c.card.name;
     const requestHref = `/agents?${new URLSearchParams({ t: c.thread })}#m${c.messageId}`;
-    const match = ref?.threadId
-      ? entries.find((x) => x.threadId === ref.threadId && (!ref.account || !x.account || x.account === ref.account))
-      : undefined;
+    let match: Entry | undefined;
+    if (ref?.threadId) {
+      match = entries.find((x) => x.threadId === ref.threadId && (!ref.account || !x.account || x.account === ref.account));
+    } else if (ref) {
+      // A Gmail search link names no thread: merge only into the ONE labelled email whose
+      // subject holds every search word, from the same account, received up to 7 days before the card.
+      const words = (gmailSearchWords(c.card.link) ?? []).flatMap((w) => [...subjectWords(w)]);
+      const cardAt = new Date(parseWorkerTime(c.created_at)).getTime();
+      if (words.length > 0 && Number.isFinite(cardAt)) {
+        const hits = entries.filter((x) => {
+          if (!x.item.sources.includes("Gmail")) return false;
+          if (ref.account && x.account !== ref.account) return false;
+          const at = new Date(x.item.at).getTime();
+          if (!Number.isFinite(at) || at > cardAt || cardAt - at > SEARCH_MATCH_WINDOW_MS) return false;
+          const sw = subjectWords(x.item.title);
+          return words.every((w) => sw.has(w));
+        });
+        if (hits.length === 1) match = hits[0];
+      }
+    }
     if (match) {
       if (!match.item.sources.includes("Agent Inbox")) {
         match.item.sources.push("Agent Inbox");
