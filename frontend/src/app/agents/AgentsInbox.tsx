@@ -3,10 +3,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Bell, BellOff, CheckCheck, ChevronLeft, ChevronRight, Share, SquarePen } from "lucide-react";
+import { Bell, BellOff, CheckCheck, ChevronLeft, ChevronRight, Share, SquarePen, X } from "lucide-react";
 import {
   agentsApi,
   AuthError,
+  clearDeviceNotifications,
   enablePush,
   pushState,
   refreshPushSubscription,
@@ -61,21 +62,32 @@ function threadHref(thread: string, opts: { messageId?: number; reply?: string }
   return `/agents?${p}${opts.messageId ? `#m${opts.messageId}` : ""}`;
 }
 
-function UnreadCard({ item, sent, onSend }: { item: Extract<InboxItem, { kind: "card" }>; sent: string | undefined; onSend: (text: string) => void }) {
+function UnreadCard({ item, sent, onSend, onClear }: { item: Extract<InboxItem, { kind: "card" }>; sent: string | undefined; onSend: (text: string) => void; onClear: () => void }) {
   const router = useRouter();
   const [expanded, setExpanded] = useState(false);
   const { card } = item;
   return (
     <div className="mx-3 rounded-[16px] bg-surface-card border border-border-default overflow-hidden">
-      <button type="button" onClick={() => router.push(threadHref(item.thread, { messageId: item.messageId }))} className="w-full flex items-center gap-2.5 px-4 pt-3 text-left">
-        <Avatar thread={item.thread} size={26} />
-        <span className="text-[13px] font-semibold text-text-primary">{agentInfo(item.thread).name}</span>
-        <span className="text-[12px] text-text-tertiary">
-          {card.type}
-          {card.updated ? " · updated" : ""}
-        </span>
-        <span className="ml-auto text-[12px] text-text-tertiary">{listTime(parseUtc(item.created_at))}</span>
-      </button>
+      <div className="flex items-center">
+        <button type="button" onClick={() => router.push(threadHref(item.thread, { messageId: item.messageId }))} className="min-w-0 flex-1 flex items-center gap-2.5 pl-4 pt-3 text-left">
+          <Avatar thread={item.thread} size={26} />
+          <span className="text-[13px] font-semibold text-text-primary">{agentInfo(item.thread).name}</span>
+          <span className="text-[12px] text-text-tertiary">
+            {card.type}
+            {card.updated ? " · updated" : ""}
+          </span>
+          <span className="ml-auto text-[12px] text-text-tertiary">{listTime(parseUtc(item.created_at))}</span>
+        </button>
+        <button
+          type="button"
+          onClick={onClear}
+          aria-label={`Clear ${card.code} from Unread`}
+          title="Clear from Unread (you can still answer it in the conversation)"
+          className="shrink-0 w-10 h-10 mt-1 mr-1 flex items-center justify-center text-text-tertiary hover:text-text-primary"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
       <div className="px-4 pt-2 pb-3" onClick={() => setExpanded((e) => !e)}>
         <CardBody card={card} clamp={!expanded} />
       </div>
@@ -134,6 +146,10 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
   const [pushBusy, setPushBusy] = useState(false);
   const activeUntilRef = useRef(0);
   const viewChosenRef = useRef(initialView !== null);
+  // Cards cleared on this screen stay hidden while the server catches up (a poll can land before the clear).
+  const hiddenRef = useRef(new Set<string>());
+  const [hiddenTick, setHiddenTick] = useState(0);
+  const [cleared, setCleared] = useState<{ codes: string[]; text: string } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -141,6 +157,8 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
       setData(res);
       setBadge(res.badge);
       setError(null);
+      // Everything the phone notified about is listed here, so the phone's notification list need not keep it.
+      if (document.visibilityState === "visible") clearDeviceNotifications();
       // First open with nothing waiting: show the conversations instead of an empty list.
       if (!viewChosenRef.current) {
         viewChosenRef.current = true;
@@ -207,17 +225,56 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
     }
   }
 
-  async function markAllRead() {
-    const top = Math.max(0, ...(data?.threads.map((t) => t.last.id) ?? []));
-    if (!top) return;
+  function hide(codes: string[], on: boolean) {
+    for (const c of codes) {
+      if (on) hiddenRef.current.add(c.toUpperCase());
+      else hiddenRef.current.delete(c.toUpperCase());
+    }
+    setHiddenTick((t) => t + 1);
+  }
+
+  /** Clear one card, or everything in Unread (cards cleared, messages marked read). Undo brings the cards back. */
+  async function clear(codes: string[] | "all") {
+    const cardCodes = codes === "all" ? items.flatMap((i) => (i.kind === "card" ? [i.card.code] : [])) : codes;
+    const count = codes === "all" ? items.length : codes.length;
+    hide(cardCodes, true);
+    if (codes === "all") {
+      setData((d) => (d ? { ...d, items: [], threads: d.threads.map((t) => ({ ...t, unread: 0, open: 0 })) } : d));
+      setBadge(0);
+    }
+    clearDeviceNotifications();
     try {
-      const { badge } = await agentsApi.read(top, { all: true });
-      setBadge(badge);
+      const res = await agentsApi.dismiss(codes === "all" ? { all: true } : { codes });
+      setBadge(res.badge);
+      setCleared({ codes: res.codes, text: count === 1 ? "Cleared 1" : `Cleared ${count}` });
+      load();
+    } catch (e) {
+      hide(cardCodes, false);
+      load();
+      if (e instanceof AuthError) setAuthExpired(true);
+      else setError("Couldn't clear that. Try again.");
+    }
+  }
+
+  async function undoClear() {
+    const last = cleared;
+    setCleared(null);
+    if (!last?.codes.length) return;
+    try {
+      await agentsApi.dismiss({ codes: last.codes, undo: true });
+      hide(last.codes, false);
       load();
     } catch (e) {
       if (e instanceof AuthError) setAuthExpired(true);
+      else setError("Couldn't undo that. Try again.");
     }
   }
+
+  useEffect(() => {
+    if (!cleared) return;
+    const t = setTimeout(() => setCleared(null), 8000);
+    return () => clearTimeout(t);
+  }, [cleared]);
 
   async function turnOnPush() {
     setPushBusy(true);
@@ -230,7 +287,12 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
     }
   }
 
-  const items = useMemo(() => data?.items ?? [], [data]);
+  const items = useMemo(
+    () => (data?.items ?? []).filter((i) => i.kind !== "card" || !hiddenRef.current.has(i.card.code.toUpperCase())),
+    // hiddenTick re-runs this when the hidden set changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [data, hiddenTick]
+  );
   const counts = useMemo(() => {
     const m = new Map<string, number>();
     for (const i of items) m.set(i.thread, (m.get(i.thread) || 0) + 1);
@@ -238,7 +300,6 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
   }, [items]);
   const activeFilter = filter && counts.some(([t]) => t === filter) ? filter : null;
   const shown = activeFilter ? items.filter((i) => i.thread === activeFilter) : items;
-  const unreadMessages = items.filter((i) => i.kind === "message").length;
 
   const threads = useMemo(() => {
     const list = data?.threads ?? [];
@@ -255,9 +316,9 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
             <ChevronLeft className="w-6 h-6" />
           </Link>
           <div className="ml-auto flex items-center">
-            {view === "unread" && unreadMessages > 0 && (
-              <button type="button" onClick={markAllRead} className="h-10 px-2 text-[15px] text-accent">
-                Mark all read
+            {view === "unread" && items.length > 0 && (
+              <button type="button" onClick={() => clear("all")} className="h-10 px-2 text-[15px] text-accent">
+                Clear all
               </button>
             )}
             {push === "default" && (
@@ -330,7 +391,7 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
             <div className="flex flex-col gap-2.5 pt-3">
               {shown.map((i) =>
                 i.kind === "card" ? (
-                  <UnreadCard key={`c${i.card.code}`} item={i} sent={sent[i.card.code.toUpperCase()]} onSend={(text) => sendFromCard(text, i.thread)} />
+                  <UnreadCard key={`c${i.card.code}`} item={i} sent={sent[i.card.code.toUpperCase()]} onSend={(text) => sendFromCard(text, i.thread)} onClear={() => clear([i.card.code])} />
                 ) : (
                   <UnreadMessage key={`m${i.messageId}`} item={i} typing={data.typing === i.thread} />
                 )
@@ -344,6 +405,12 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
                 <ConversationRow key={t.id} t={t} typing={data.typing === t.id} />
               ))}
             </div>
+          )}
+
+          {view === "unread" && items.some((i) => i.kind === "card") && (
+            <p className="text-center text-[12px] text-text-tertiary mt-4 px-6">
+              Clearing a card only tidies this list and your notifications. The agent still waits for an answer; you can reply in its conversation.
+            </p>
           )}
 
           {(error || authExpired) && (
@@ -362,6 +429,20 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
           )}
         </div>
       </div>
+
+      {cleared && (
+        <div
+          role="status"
+          className="fixed left-1/2 -translate-x-1/2 bottom-[max(20px,env(safe-area-inset-bottom))] z-40 flex items-center gap-4 rounded-full bg-surface-raised border border-border-default px-4 py-2 shadow-elevated text-[14px] text-text-primary"
+        >
+          <span>{cleared.text}</span>
+          {cleared.codes.length > 0 && (
+            <button type="button" onClick={undoClear} className="text-accent font-medium">
+              Undo
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
