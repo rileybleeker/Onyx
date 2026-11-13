@@ -17,6 +17,11 @@
 // Scheduled:  node harvest.mjs              (window parked off-screen; see README.md)
 // Preview:    node harvest.mjs --dry-run    (read only, print what would be posted)
 // Debug:      node harvest.mjs --probe      (20 s look at the Notebook page + probe.png)
+// Orders:     node harvest.mjs --orders-only (skip the books; only the Amazon order list)
+//
+// Every scheduled pass also reads the personal Amazon "Your Orders" list for Onyx /orders
+// (amazon-orders.mjs -> POST /api/orders/amazon/import, its own amazon|orders heartbeat). A failure
+// there is reported to Onyx and never fails the Kindle pass.
 //
 // Auth to Onyx: ONYX_CI_TOKEN env var or ~/.onyx_ci_token (same secret as the habits-sync
 // GitHub Action / Vercel env). Never written to this folder.
@@ -24,6 +29,7 @@ import { chromium } from "playwright";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readAmazonOrders } from "./amazon-orders.mjs";
 
 const HERE = new URL(".", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
 const cfg = JSON.parse(readFileSync(join(HERE, "books.json"), "utf8"));
@@ -37,6 +43,7 @@ const STATE = join(HERE, "state.json");
 const PROBE = process.argv.includes("--probe");
 const LOGIN_MODE = process.argv.includes("--login") || PROBE;
 const DRY = process.argv.includes("--dry-run");
+const ORDERS_ONLY = process.argv.includes("--orders-only");
 
 let state = { lastRun: null, books: {} };
 try { state = { ...state, ...JSON.parse(readFileSync(STATE, "utf8")) }; } catch {}
@@ -69,6 +76,19 @@ async function post(body) {
     throw new Error("Onyx import reported incomplete results");
   }
   return `${r.status} ${text.slice(0, 400)}`;
+}
+
+async function postOrders(body) {
+  if (DRY) return "dry-run";
+  const r = await fetch(`${ONYX}/api/orders/amazon/import`, {
+    method: "POST",
+    headers: { "x-onyx-ci-token": TOKEN, "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`Onyx orders import HTTP ${r.status}`);
+  return `${r.status} ${text.slice(0, 200)}`;
 }
 
 /** True when Amazon bounced us to a sign-in / MFA / captcha page. */
@@ -294,6 +314,7 @@ try {
   } else if (await signedOut(page)) {
     log("SIGNED OUT: Amazon wants a fresh sign-in. Run: node harvest.mjs --login");
     log(`heartbeat -> ${await post({ error: "Amazon session expired; run tools/kindle_harvest/harvest.mjs --login on the PC" })}`);
+    await postOrders({ error: "Amazon session expired; run tools/kindle_harvest/harvest.mjs --login on the PC" }).catch(() => {});
     exitCode = 2;
   } else {
     // The Notebook library lists every book with at least one annotation: ASIN (element id) + title.
@@ -303,7 +324,7 @@ try {
       Array.from(document.querySelectorAll(".kp-notebook-library-each-book")).map((e) => ({ asin: e.id, title: (e.querySelector("h2")?.innerText || "").trim() })),
     );
 
-    for (const book of cfg.books) {
+    for (const book of ORDERS_ONLY ? [] : cfg.books) {
       try {
         const re = new RegExp(book.titleMatch, "i");
         const hit = library.find((b) => re.test(b.title));
@@ -340,6 +361,19 @@ try {
         }
         log(`${book.slug}: heartbeat -> ${await post({ book: book.slug, error: `harvest failed: ${e.message}`.slice(0, 500) })}`);
         exitCode = 1;
+      }
+    }
+    // Personal Amazon orders for /orders: separate heartbeat, never fails the Kindle pass.
+    if (exitCode !== 2) {
+      try {
+        const today = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date());
+        const { orders, scanned, unparsed } = await readAmazonOrders(page, today, { log });
+        if (DRY) for (const o of orders) log(`  amazon ${o.order_number.slice(0, 7)}… ${o.status} ${o.expected_on ?? o.status_on ?? ""} (${o.items.length} item(s))`);
+        log(`amazon orders: push -> ${await postOrders({ orders, scanned, unparsed })}`);
+        state.amazonOrders = { at: new Date().toISOString(), orders: orders.length, unparsed };
+      } catch (e) {
+        log(`amazon orders: ERROR ${e.message}`);
+        await postOrders({ error: `Amazon order list failed: ${e.message}`.slice(0, 200) }).catch(() => log("amazon orders: could not report the error to Onyx"));
       }
     }
     state.lastRun = new Date().toISOString();

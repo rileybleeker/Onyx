@@ -48,6 +48,7 @@ const CADENCE: Record<string, string> = {
   reading: "Manual",
   procurement: "Manual",
   kindle: "Every 3h (Riley's PC, while logged on)",
+  amazon_orders: "Every 3h with the Kindle harvest (Riley's PC)",
   screen_time: "Real-time (iPhone app open/close)",
   screen_usage: "Daily (iPhone Shortcuts automation)",
   notion_journal: "Hourly :35",
@@ -95,6 +96,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   reading:        { method: "manual",         label: "Manual entry" },
   procurement:    { method: "manual",         label: "Manual entry" },
   kindle:         { method: "automated",      label: "Local Chrome harvest" },
+  amazon_orders:  { method: "automated",      label: "Local Chrome harvest" },
   screen_time:    { method: "automated",      label: "iOS Shortcuts events" },
   screen_usage:   { method: "automated",      label: "iPhone app export" },
   notion_journal: { method: "automated",      label: "Notion sync" },
@@ -381,6 +383,8 @@ export async function GET() {
         ["rocketmoney", "transactions"], ["rocketmoney", "balances"],
         // Online orders (every 3h): its own read so the shared 100-row window cannot push it out.
         ["online_orders", "email"],
+        // Personal Amazon order list (Kindle harvester pass on Riley's PC, every 3h).
+        ["amazon", "orders"],
       ].map(async ([source, dataType]) => {
         const { data, error } = await supabase.from("sync_log").select("*")
           .eq("source", source).eq("data_type", dataType)
@@ -721,6 +725,35 @@ export async function GET() {
           cadence: CADENCE.kindle,
           integrationMethod: METHOD.kindle.method,
           methodLabel: METHOD.kindle.label,
+        };
+      })(),
+      // Personal Amazon orders (tools/kindle_harvest/amazon-orders.mjs): the Kindle harvester's
+      // 3-hourly pass on Riley's PC reads the "Your Orders" list and posts to
+      // /api/orders/amazon/import, which writes an amazon|orders heartbeat on every call. PC-bound,
+      // so Kindle's loose thresholds: >12h degraded, >48h or a failed row red.
+      amazon_orders: (() => {
+        const entry = latestBySrcType["amazon|orders"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 48
+            ? "failed"
+            : entry.status === "partial" || ageH > 12
+              ? "partial"
+              : "success";
+        return {
+          label: "Amazon Orders",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No run yet - the Kindle harvester's Amazon pass has not reported." : null),
+          cadence: CADENCE.amazon_orders,
+          integrationMethod: METHOD.amazon_orders.method,
+          methodLabel: METHOD.amazon_orders.label,
         };
       })(),
       // Phone screen time (/api/screen-time/event): an iOS Shortcuts automation

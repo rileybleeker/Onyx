@@ -21,3 +21,5 @@ jobs:
           node-version: 22
       - run: node --check tools/kindle_harvest/harvest.mjs
       - run: node --test tools/kindle_harvest/harvest.test.mjs
+      - run: node --check tools/kindle_harvest/amazon-orders.mjs
+      - run: node --test tools/kindle_harvest/amazon-orders.test.mjs

@@ -136,7 +136,7 @@ export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIs
       <header>
         <h1 className="text-[30px] font-medium text-text-primary">Orders</h1>
         <p className="mt-1 text-sm text-text-secondary">
-          Online orders read from shipping and delivery emails in both Gmail accounts, checked every 3 hours.
+          Online orders from shipping and delivery emails (both Gmail accounts) and your Amazon order history, checked every 3 hours.
         </p>
         {sync && (
           <p className={`mt-2 text-xs ${syncStale ? "text-amber-300" : "text-text-secondary"}`}>
