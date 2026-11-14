@@ -21,6 +21,7 @@ import {
   type CheckinPayload,
   type CheckinSuggestion,
 } from "@/lib/checkin";
+import { CHECKIN_SCREEN_COLUMNS, settledLastHourMinutes } from "@/lib/checkin-screen";
 
 /**
  * Daily habit check-in (2026-11-07). One screen, one write for a whole behavior day.
@@ -114,13 +115,14 @@ async function suggestionsFor(date: string, today: string, names: Set<string>): 
       (async () => {
         const { data } = await supabase
           .from("phone_usage_daily")
-          .select("minutes_last_hour_before_sleep_est, minutes_by_app")
+          .select(CHECKIN_SCREEN_COLUMNS)
           .eq("behavioral_date", date)
           .maybeSingle();
         if (!data) return;
-        const row = data as { minutes_last_hour_before_sleep_est: number | string | null; minutes_by_app: Record<string, unknown> | null };
+        const row = data as { minutes_by_app: Record<string, unknown> | null };
         if (names.has(Q_SCREEN_IN_BED)) {
-          const s = screenInBedSuggestion(row.minutes_last_hour_before_sleep_est);
+          // Only once that day's sync is complete (lib/checkin-screen.ts): before it, the estimate reads 0 and would suggest No.
+          const s = screenInBedSuggestion(settledLastHourMinutes(data, date));
           if (s) out[Q_SCREEN_IN_BED] = s;
         }
         Object.assign(out, appHabitSuggestions(row.minutes_by_app, names));
