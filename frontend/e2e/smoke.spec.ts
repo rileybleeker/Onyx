@@ -578,6 +578,9 @@ test.describe("Today home", () => {
     await expect(page.getByText("Loading reading progress...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
     await expect(page.getByText("Couldn't check requests.", { exact: false })).toHaveCount(0);
     await expect(page.getByText("Reading progress is unavailable right now.")).toHaveCount(0);
+    // Calendar panel (2026-11-13): "isn't connected yet" and an empty day are legitimate; a failed read is not.
+    await expect(page.getByText("Checking your calendar...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+    await expect(page.getByText("Couldn't check the calendar.", { exact: false })).toHaveCount(0);
     await expect(page.getByRole("link", { name: "Open check-in", exact: true })).toHaveAttribute("href", "/check-in");
     await expect(page.getByRole("link", { name: "System status", exact: true })).toHaveAttribute("href", "/status");
     await expectNoClientCrash(page);
@@ -621,6 +624,12 @@ test("/wins renders the Wins board", async ({ page }) => {
 // rendered; an empty list is legitimate), sample data is NOT on by default, and the calendar card
 // shows one of its two real states. Read-only: never types, adds, toggles, copies, connects or
 // syncs anything, and never asserts on an item's label or date.
+// Calendar events (2026-11-13): the page also shows read-only copies of the events on Riley's
+// calendars (google_calendar_etl.py, hourly) with a "Your calendar events" card. That card being
+// "not synced yet", late or failing (the /status card's job) and a month with no events are all
+// legitimate, so the only tripwire is that Onyx could read its own copy: the card settles and is
+// not in the "couldn't be checked" state (= /api/calendar/events is broken). Both lines hold
+// before the first sync run and after it. Never asserts on an event.
 test("/health renders the care planner with sample data off and a calendar state", async ({ page }) => {
   await gotoAuthed(page, "/health");
   await expect(pageHeading(page, page.getByRole("heading", { name: "Health & appointments", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
@@ -630,6 +639,8 @@ test("/health renders the care planner with sample data off and a calendar state
   await expect(page.getByRole("heading", { name: "Add care item", exact: true })).toBeVisible();
   await expect(page.getByLabel(/Show sample data/), "sample data must be opt-in").not.toBeChecked();
   await expect(page.getByRole("heading", { name: /^Google Calendar: (not connected|connected)$/ })).toBeVisible();
+  await expect(page.getByText("Checking the calendar events sync.")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+  await expect(page.getByRole("heading", { name: /^Your calendar events: couldn't be checked$/i }), "Onyx could not read its copy of the calendar events").toHaveCount(0);
   await expectNoClientCrash(page);
 });
 
