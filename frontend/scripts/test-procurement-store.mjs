@@ -166,7 +166,7 @@ assert.ok(fetches.length > 0 && fetches.every(f => f === 'SUBSCRIPTIONS_API' || 
 // The other files of the page: the detected-subscriptions card may call ONE thing, the PATCH that
 // remembers a dismissed flag; nothing else makes a request, and none has an order button.
 const pageFiles = fs.readdirSync(new URL('src/app/procurement/', root)).filter(f => /\.tsx?$/.test(f)).sort();
-assert.deepEqual(pageFiles, ['DetectedSubscriptions.tsx', 'ProcurementClient.tsx', 'page.tsx']);
+assert.deepEqual(pageFiles, ['DetectedSubscriptions.tsx', 'ProcurementClient.tsx', 'ReorderSuggestions.tsx', 'page.tsx']);
 for (const file of pageFiles.filter(f => f !== 'ProcurementClient.tsx')) {
   const src = read('src/app/procurement/' + file);
   const calls = [...src.matchAll(/\bfetch\(([^,)]+)/g)].map(m => m[1].trim());
