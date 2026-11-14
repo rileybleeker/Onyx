@@ -1,0 +1,51 @@
+name: Weather ETL
+
+on:
+  schedule:
+    # Every 3 hours at :32, on hours 1, 4, 7 ... 22 UTC (the air-quality run uses :12 on
+    # hours 0, 3, 6 ...). :32 is clear of the hourly jobs (:00 :15 :20 :35 :45 :50), the
+    # other 3-hourly ETLs (:05 :12 :25 :40), the merge train (*/15) and the watchdog (*/30).
+    # The source is daily weather for one grid cell, so hourly runs would add nothing but
+    # sync_log rows and Actions minutes. Each run re-upserts the last 10 days, which heals
+    # values the archive revises when reanalysis replaces the first model run.
+    # /status: >4h since the last heartbeat = degraded, >12h = error.
+    - cron: '32 1-23/3 * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Re-sync the last N days (backfill). Leave empty for the routine 10-day window (an empty table backfills itself from 2024-01-01).'
+        required: false
+        type: string
+
+concurrency:
+  group: weather-etl
+  cancel-in-progress: false
+
+# The only credentials are the two SUPABASE_* secrets. Open-Meteo needs no key.
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  weather-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install httpx supabase python-dotenv
+
+      - name: Run Weather ETL
+        env:
+          # workflow_dispatch input, passed through the environment so it is never
+          # interpolated into the shell command (and validated as digits).
+          BACKFILL_DAYS: ${{ inputs.days }}
+        run: |
+          if [ -n "$BACKFILL_DAYS" ]; then
+            case "$BACKFILL_DAYS" in *[!0-9]*) echo "days must be a whole number" >&2; exit 2;; esac
+            python weather_etl.py --backfill "$BACKFILL_DAYS"
+          else
+            python weather_etl.py
+          fi
