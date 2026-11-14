@@ -355,7 +355,7 @@ def test_rrule_until_count_and_rdate():
         + vevent("UID:rdate@example.com", "DTSTART:20261102T180000Z", "DTEND:20261102T190000Z",
                  "RDATE:20261105T180000Z,20261109T180000Z", "SUMMARY:Extra dates"))
     assert [r["start_date"] for r in by_title(rows, "Until instant")] == ["2026-11-02", "2026-11-03", "2026-11-04"], "UNTIL is inclusive"
-    assert [r["start_date"] for r in by_title(rows, "Until date")] == ["2026-11-02", "2026-11-03"],         "a bare-date UNTIL on a timed series ends at the start of that date"
+    assert [r["start_date"] for r in by_title(rows, "Until date")] == ["2026-11-02", "2026-11-03"], "a bare-date UNTIL ends at the start of that date"
     assert [r["start_date"] for r in by_title(rows, "Counted")] == ["2026-11-02", "2026-11-09"]
     extra = by_title(rows, "Extra dates")
     assert [r["start_date"] for r in extra] == ["2026-11-02", "2026-11-05", "2026-11-09"] and all(r["recurring"] for r in extra)
