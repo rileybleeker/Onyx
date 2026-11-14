@@ -9,13 +9,15 @@ function bundle(file) { if (ids.has(file))
     return ids.get(file); const id = ids.size; ids.set(file, id); let code = fs.readFileSync(file, 'utf8'); code = code.replace(/require\(['"]([^'"]+)['"]\)/g, (_, dep) => `require(${bundle(require.resolve(dep, { paths: [path.dirname(file)] }))})`); modules[id] = code; return id; }
 const react = bundle(require.resolve(base + '/react')), dom = bundle(require.resolve(base + '/react-dom/client'));
 let component = ts.transpileModule(fs.readFileSync('frontend/src/app/today/TodayClient.tsx', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.React, esModuleInterop: true } }).outputText;
-component = 'const React=require(' + react + ');\n' + component.replace(/require\("react"\)/g, `require(${react})`).replace(/require\("next\/link"\)/g, `({__esModule:true,default:({children,href,...props})=>React.createElement('a',{...props,href,onClick:e=>{e.preventDefault();window.navigated=href;}},children)})`).replace(/require\("lucide-react"\)/g, `new Proxy({},{get:()=>props=>React.createElement('svg',{...props,viewBox:'0 0 24 24'},React.createElement('circle',{cx:12,cy:12,r:8,fill:'none',stroke:'currentColor',strokeWidth:1.5}))})`).replace(/require\("@\/lib\/agents-api"\)/g, '({agentsApi:new Proxy({inbox:()=>window.mockInbox()},{get:(target,key)=>key==="inbox"?target.inbox:()=>{window.unexpectedRequests.push("agentsApi."+String(key));throw Error("Unexpected agentsApi method");}})})');
+component = 'const React=require(' + react + ');\n' + component.replace(/require\("react"\)/g, `require(${react})`).replace(/require\("next\/link"\)/g, `({__esModule:true,default:({children,href,...props})=>React.createElement('a',{...props,href,onClick:e=>{e.preventDefault();window.navigated=href;}},children)})`).replace(/require\("lucide-react"\)/g, `new Proxy({},{get:()=>props=>React.createElement('svg',{...props,viewBox:'0 0 24 24'},React.createElement('circle',{cx:12,cy:12,r:8,fill:'none',stroke:'currentColor',strokeWidth:1.5}))})`).replace(/require\("@\/lib\/agents-api"\)/g, '({agentsApi:new Proxy({inbox:()=>window.mockInbox(),dismiss:o=>window.mockDismiss(o)},{get:(target,key)=>key in target?target[key]:()=>{window.unexpectedRequests.push("agentsApi."+String(key));throw Error("Unexpected agentsApi method");}}),clearDeviceNotifications:()=>{window.deviceCleared=(window.deviceCleared||0)+1;return Promise.resolve();},setBadge:n=>{window.badge=n;}})');
 const urgentLib = ids.size; ids.set('frontend/src/lib/urgent-email.ts', urgentLib); modules[urgentLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/urgent-email.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/urgent-email"\)/g, `require(${urgentLib})`);
 const experimentsLib = ids.size; ids.set('frontend/src/lib/experiments.ts', experimentsLib); modules[experimentsLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/experiments.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/experiments"\)/g, `require(${experimentsLib})`);
 const calendarLib = ids.size; ids.set('frontend/src/lib/calendar-events.ts', calendarLib); modules[calendarLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/calendar-events.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/calendar-events"\)/g, `require(${calendarLib})`);
+const clearLib = ids.size; ids.set('frontend/src/lib/today-clear.ts', clearLib); modules[clearLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/today-clear.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/today-clear"\)/g, `require(${clearLib})`);
 // GET /api/experiments/today answers (synthetic). "none" is the usual case: no trial registered.
 const experimentFixtures = {
     none: { status: 'none' },
@@ -73,10 +75,10 @@ assert(css.trim(), 'Compile the frontend before running layout regressions');
                 events: { status: 'ready', events: list, truncated: false, lastSync: okSync },
                 stale_sync: { status: 'ready', events: list, truncated: false, lastSync: { at: new Date(Date.now() - 6.2 * 3600000).toISOString(), status: 'partial', error: 'synthetic' } },
             };
-        })(); window.experimentMode = experiment; window.experimentFixtures = experimentFixtures; window.experimentCalls = 0; window.urgentMode = urgent; window.urgentFixtures = urgentFixtures; window.fixtureWithEmail = fixtureWithEmail; window.urgentCalls = []; window.strict = strict; window.reactEnv = strict ? 'development' : 'production'; window.fixture = fixture; window.book = book; window.mode = mode; window.calls = []; window.unexpectedRequests = []; window.pending = []; window.mockInbox = () => { window.calls.push({ url: '/onyx/inbox', method: 'GET' }); if (window.mode === 'sync-error')
+        })(); window.experimentMode = experiment; window.experimentFixtures = experimentFixtures; window.experimentCalls = 0; window.urgentMode = urgent; window.urgentFixtures = urgentFixtures; window.fixtureWithEmail = fixtureWithEmail; window.urgentCalls = []; window.strict = strict; window.reactEnv = strict ? 'development' : 'production'; window.fixture = fixture; window.book = book; window.mode = mode; window.calls = []; window.unexpectedRequests = []; window.pending = []; window.dismissCalls = []; window.clearCalls = []; window.mockDismiss = o => { window.dismissCalls.push(o); return window.dismissMode === 'error' ? Promise.reject(Error('synthetic')) : Promise.resolve({ ok: true, codes: (o.codes || []).map(c => c.toUpperCase()), badge: 2 }); }; window.mockInbox = () => { window.calls.push({ url: '/onyx/inbox', method: 'GET' }); if (window.mode === 'sync-error')
             throw Error('synthetic'); if (['error', 'inbox-error', 'refresh-error'].includes(window.mode))
             return Promise.reject(Error('synthetic')); if (window.mode === 'defer')
-            return new Promise((resolve, reject) => window.pending.push({ kind: 'inbox', resolve, reject })); return Promise.resolve(window.mode === 'empty' ? { ...window.fixture, items: [] } : window.mode === 'email-cards' ? window.fixtureWithEmail : window.fixture); }; window.fetch = (url, init) => { if (url === '/api/urgent-email' && !(init?.method && init.method !== 'GET')) { window.urgentCalls.push(url); return Promise.resolve(window.urgentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.urgentFixtures[window.urgentMode] }); } if (String(url).startsWith('/api/calendar/events?') && !(init?.method && init.method !== 'GET')) { window.calendarCalls.push(String(url)); return Promise.resolve(window.calendarMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.calendarFixtures[window.calendarMode] }); } if (url === '/api/orders/summary' && !(init?.method && init.method !== 'GET')) { window.ordersCalls = (window.ordersCalls || 0) + 1; return Promise.resolve({ ok: true, status: 200, json: async () => ({ status: 'ready', attention: 0, arrivingToday: 0, onTheWay: 0, top: [] }) }); } if (url === '/api/procurement/renewals/summary' && !(init?.method && init.method !== 'GET')) { window.renewalsCalls = (window.renewalsCalls || 0) + 1; return Promise.resolve(window.renewalsFixture === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => (window.renewalsFixture || { status: 'ready', count: 0, soon: [], withinDays: 3 }) }); } if (url === '/api/experiments/today' && !(init?.method && init.method !== 'GET')) { window.experimentCalls++; return Promise.resolve(window.experimentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.experimentFixtures[window.experimentMode] }); } if (url !== '/api/reading' || (init?.method && init.method !== 'GET')) { window.unexpectedRequests.push(String(url)); return Promise.reject(Error('Unexpected request')); } window.calls.push({ url, method: init?.method || 'GET' }); if (['error', 'reading-error', 'refresh-error'].includes(window.mode))
+            return new Promise((resolve, reject) => window.pending.push({ kind: 'inbox', resolve, reject })); return Promise.resolve(window.mode === 'empty' ? { ...window.fixture, items: [] } : window.mode === 'email-cards' ? window.fixtureWithEmail : window.fixture); }; window.fetch = (url, init) => { if (url === '/api/urgent-email/clear' && init?.method === 'POST') { window.clearCalls.push(JSON.parse(init.body)); return Promise.resolve(window.clearMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => ({ ok: true }) }); } if (url === '/api/urgent-email' && !(init?.method && init.method !== 'GET')) { window.urgentCalls.push(url); return Promise.resolve(window.urgentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.urgentFixtures[window.urgentMode] }); } if (String(url).startsWith('/api/calendar/events?') && !(init?.method && init.method !== 'GET')) { window.calendarCalls.push(String(url)); return Promise.resolve(window.calendarMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.calendarFixtures[window.calendarMode] }); } if (url === '/api/orders/summary' && !(init?.method && init.method !== 'GET')) { window.ordersCalls = (window.ordersCalls || 0) + 1; return Promise.resolve({ ok: true, status: 200, json: async () => ({ status: 'ready', attention: 0, arrivingToday: 0, onTheWay: 0, top: [] }) }); } if (url === '/api/procurement/renewals/summary' && !(init?.method && init.method !== 'GET')) { window.renewalsCalls = (window.renewalsCalls || 0) + 1; return Promise.resolve(window.renewalsFixture === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => (window.renewalsFixture || { status: 'ready', count: 0, soon: [], withinDays: 3 }) }); } if (url === '/api/experiments/today' && !(init?.method && init.method !== 'GET')) { window.experimentCalls++; return Promise.resolve(window.experimentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.experimentFixtures[window.experimentMode] }); } if (url !== '/api/reading' || (init?.method && init.method !== 'GET')) { window.unexpectedRequests.push(String(url)); return Promise.reject(Error('Unexpected request')); } window.calls.push({ url, method: init?.method || 'GET' }); if (['error', 'reading-error', 'refresh-error'].includes(window.mode))
             return Promise.resolve({ ok: false }); if (window.mode === 'defer')
             return new Promise(resolve => window.pending.push({ kind: 'reading', resolve })); return Promise.resolve({ ok: true, json: async () => ({ overview: window.mode === 'empty' ? null : window.book }) }); }; }, { fixture, book, mode, strict, urgent, urgentFixtures, fixtureWithEmail, experiment, experimentFixtures, calendar }); await page.addScriptTag({ content: script }); await page.getByRole('heading', { name: 'Today', exact: true }).waitFor(); assert.equal(await page.locator('[role=status]').evaluate(el => getComputedStyle(el).position), 'absolute', 'compiled CSS must be applied'); return page; }
         async function close(page) { assert.deepEqual(await page.evaluate(() => window.unexpectedRequests), [], 'Only expected GET endpoints may be requested'); await page.close(); }
@@ -240,6 +242,68 @@ assert(css.trim(), 'Compile the frontend before running layout regressions');
         urgentPanel = page.locator('section[aria-labelledby="urgent-email-heading"]');
         assert(await urgentPanel.getByText('Email labels last synced 6 h ago (that run: partial); newer labels may be missing.').isVisible());
         await close(page);
+        // Clearing from Today: x per row, Clear all per panel, Undo. Cards go to the Worker's dismiss,
+        // labelled threads to POST /api/urgent-email/clear; opening Today clears nothing.
+        page = await setup('email-cards', 390, false, 'items');
+        await settled(page);
+        assert.deepEqual(await page.evaluate(() => [window.dismissCalls.length, window.clearCalls.length]), [0, 0], 'opening Today clears nothing');
+        const requestsPanel = page.locator('section[aria-labelledby="requests-heading"]');
+        urgentPanel = page.locator('section[aria-labelledby="urgent-email-heading"]');
+        const clearResult = page.getByRole('status', { name: 'Clear result' });
+        await requestsPanel.getByRole('button', { name: 'Clear: Review a proposed plan' }).click();
+        await clearResult.getByText('Cleared 1').waitFor();
+        assert.deepEqual(await page.evaluate(() => window.dismissCalls), [{ codes: ['REQUEST-0'] }]);
+        assert.equal(await requestsPanel.getByText('Review a proposed plan').count(), 0);
+        assert(await requestsPanel.getByText('Showing 3 of 4 requests returned, in inbox order.').isVisible());
+        assert.equal(await page.evaluate(() => window.badge), 2, 'the home-screen badge follows the Worker');
+        assert(await page.evaluate(() => window.deviceCleared >= 1), "the phone's notifications are closed too");
+        assert.equal(await page.evaluate(() => window.clearCalls.length), 0, 'a request is not an email thread');
+        await clearResult.getByRole('button', { name: 'Undo' }).click();
+        await requestsPanel.getByText('Review a proposed plan').waitFor();
+        assert.deepEqual(await page.evaluate(() => window.dismissCalls[1]), { codes: ['REQUEST-0'], undo: true });
+        await requestsPanel.getByRole('button', { name: 'Clear: Confirm your next step' }).click();
+        await clearResult.getByText('Cleared 1').waitFor();
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert.equal(await requestsPanel.getByText('Confirm your next step').count(), 0, 'a refresh that lands before the Worker catches up keeps it hidden');
+        await requestsPanel.getByRole('button', { name: 'Clear all requests' }).click();
+        await requestsPanel.getByText(/last check returned no open requests/).waitFor();
+        assert.deepEqual(await page.evaluate(() => window.dismissCalls[3]), { codes: ['REQUEST-0', 'REQUEST-1', 'REQUEST-3', 'REQUEST-4'] }, 'Clear all takes every request, not only the 3 on screen');
+        assert(await clearResult.getByText('Cleared 4').isVisible());
+        assert.equal(await requestsPanel.getByRole('button', { name: 'Clear all requests' }).count(), 0);
+        assert.equal(await urgentPanel.locator('li').count(), 4, 'clearing requests leaves urgent email alone');
+        await urgentPanel.getByRole('button', { name: 'Clear: Synthetic labelled email 1' }).click();
+        await clearResult.getByText('Cleared 1').waitFor();
+        assert.deepEqual(await page.evaluate(() => window.dismissCalls[4]), { codes: ['E1'] }, 'the merged Agent Inbox question is cleared with its email');
+        assert.deepEqual(await page.evaluate(() => window.clearCalls[0]), { items: [{ key: urgentItems[0].key, receivedAt: urgentItems[0].receivedAt }] });
+        assert.equal(await urgentPanel.locator('li').count(), 3);
+        assert.equal(await urgentPanel.getByText('Synthetic labelled email 1').count(), 0);
+        await urgentPanel.getByRole('button', { name: 'Clear all urgent email' }).click();
+        await urgentPanel.getByText('Nothing urgent right now.').waitFor();
+        assert.deepEqual(await page.evaluate(() => window.dismissCalls[5]), { codes: ['E2'] });
+        assert.deepEqual(await page.evaluate(() => window.clearCalls[1]), { items: urgentItems.slice(1).map(i => ({ key: i.key, receivedAt: i.receivedAt })) });
+        assert(await clearResult.getByText('Cleared 3').isVisible());
+        await clearResult.getByRole('button', { name: 'Undo' }).click();
+        await page.waitForFunction(() => document.querySelectorAll('section[aria-labelledby="urgent-email-heading"] li').length === 3);
+        assert.deepEqual(await page.evaluate(() => [window.dismissCalls[6], window.clearCalls[2]]), [{ codes: ['E2'], undo: true }, { items: urgentItems.slice(1).map(i => ({ key: i.key })), undo: true }]);
+        assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+        assert((await page.evaluate(() => window.calls)).every(c => c.method === 'GET'));
+        await close(page);
+        page = await setup('email-cards', 390, false, 'items');
+        await settled(page);
+        await page.evaluate(() => { window.dismissMode = 'error'; window.clearMode = 'error'; });
+        await page.locator('section[aria-labelledby="requests-heading"]').getByRole('button', { name: 'Clear: Review a proposed plan' }).click();
+        await page.getByText("Couldn't clear that. Try again.").waitFor();
+        assert(await page.getByText('Review a proposed plan').isVisible(), 'a failed clear puts the row back');
+        assert.equal(await page.getByRole('button', { name: 'Undo' }).count(), 0, 'nothing to undo');
+        await page.evaluate(() => { window.dismissMode = 'ok'; });
+        urgentPanel = page.locator('section[aria-labelledby="urgent-email-heading"]');
+        await urgentPanel.getByRole('button', { name: 'Clear: Synthetic labelled email 1' }).click();
+        await page.getByText(/Some of that couldn't be cleared/).waitFor();
+        assert(await urgentPanel.getByText('Synthetic labelled email 1').isVisible(), 'the email whose clear failed stays listed');
+        assert.equal(await urgentPanel.getByText(/Agent Inbox \(inbox-triage\)/).count(), 0, 'its cleared question is gone from it');
+        await close(page);
+        console.log('PASS clearing: opening clears nothing; x and Clear all per panel; cards via the Worker, threads via /api/urgent-email/clear; Undo; a refresh keeps it hidden; failures put rows back');
         console.log('PASS urgent email: not connected vs nothing urgent vs list, labels + Agent Inbox merged once, source/freshness/reason/next step, Gmail-only links, failed refresh keeps list, error is not empty, stale sync flagged');
         // Renewals panel: hidden unless something renews within 3 days; a failed check keeps the last answer.
         page = await setup();

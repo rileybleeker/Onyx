@@ -7,6 +7,7 @@ import {
   gmailMessageHref,
   gmailThreadHref,
 } from "@/lib/urgent-email";
+import { clearKeyHash, stillCleared } from "@/lib/today-clear";
 
 // The client passed in MUST be scoped to schema "pds" (service role), like lib/reading.ts.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -24,6 +25,8 @@ type Supa = SupabaseClient<any, any, any>;
  *   - Agent/Action older than ACTION_DAYS;
  *   - Agent/Deadline whose date has passed, is more than DEADLINE_AHEAD_DAYS out,
  *     or (no readable date) that arrived more than UNDATED_DEADLINE_DAYS ago.
+ *   - threads Riley cleared on Today (pds.today_cleared_emails, lib/today-clear.ts) until a
+ *     newer message arrives in them.
  * One item per Gmail thread. The snippet never leaves the server.
  * Until the table exists this reports `not_connected`, a normal answer, not an error.
  */
@@ -68,6 +71,8 @@ export type UrgentEmailResponse =
       total: number;
       /** Labelled threads left out (archived, old, or deadline passed). */
       hidden: number;
+      /** Threads that would be shown but Riley cleared them on Today. */
+      cleared: number;
       /** Newest urgent_email|labels heartbeat; null before the first run. */
       lastSync: UrgentEmailSync | null;
       items: UrgentEmailItem[];
@@ -75,6 +80,8 @@ export type UrgentEmailResponse =
 
 /** Most rows read per request: a hard bound on work and payload. */
 export const SCAN_LIMIT = 300;
+/** Most clear marks read per request (one per cleared thread inside the window). */
+export const CLEARED_LIMIT = 1000;
 /** Items returned (Today merges them with the Agent Inbox, then shows the top 5). */
 export const ITEMS_RETURNED = 20;
 export const WINDOW_DAYS = 30;
@@ -240,7 +247,7 @@ export async function getUrgentEmail(client: Supa, now: Date = new Date()): Prom
   const since = new Date(now.getTime() - WINDOW_DAYS * DAY_MS).toISOString();
   // A junk Date header far in the future must not sort to the top and use up the row cap.
   const until = new Date(now.getTime() + FUTURE_SKEW_MS).toISOString();
-  const [emails, sync] = await Promise.all([
+  const [emails, sync, clearedRead] = await Promise.all([
     client
       .from("inbox_emails")
       .select("account,message_id,received_at,from_name,from_address,subject,snippet,is_unread,gmail_thread_id,agent_labels,in_inbox,last_seen_at")
@@ -257,6 +264,14 @@ export async function getUrgentEmail(client: Supa, now: Date = new Date()): Prom
       .eq("data_type", "labels")
       .order("sync_start", { ascending: false })
       .limit(1),
+    // Only marks that can still hide something: a cleared time before the window hides nothing.
+    client
+      .from("today_cleared_emails")
+      .select("key_hash,cleared_through")
+      .gte("cleared_through", since)
+      .order("cleared_through", { ascending: false })
+      .order("key_hash", { ascending: true })
+      .limit(CLEARED_LIMIT),
   ]);
 
   if (emails.error) {
@@ -284,10 +299,22 @@ export async function getUrgentEmail(client: Supa, now: Date = new Date()): Prom
     }
   }
 
+  // A failed read of the clear marks (or the table not applied yet) shows everything: never hide on a guess.
+  const clearedThrough = new Map<string, string>();
+  if (!clearedRead.error) {
+    for (const m of (clearedRead.data ?? []) as { key_hash?: unknown; cleared_through?: unknown }[]) {
+      if (typeof m?.key_hash === "string" && typeof m.cleared_through === "string") clearedThrough.set(m.key_hash, m.cleared_through);
+    }
+  }
+
   const shown: UrgentEmailItem[] = [];
+  let cleared = 0;
   for (const t of threads.values()) {
     const item = describeThread(t, now);
-    if (item) shown.push(item);
+    if (!item) continue;
+    const through = clearedThrough.size > 0 ? clearedThrough.get(await clearKeyHash(item.key)) : undefined;
+    if (through && stillCleared(item.receivedAt, through)) cleared++;
+    else shown.push(item);
   }
   shown.sort((a, b) => rank(a) - rank(b) || time(b.receivedAt) - time(a.receivedAt) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
   return {
@@ -295,7 +322,8 @@ export async function getUrgentEmail(client: Supa, now: Date = new Date()): Prom
     windowDays: WINDOW_DAYS,
     scanned: threads.size,
     total: shown.length,
-    hidden: threads.size - shown.length,
+    hidden: threads.size - shown.length - cleared,
+    cleared,
     lastSync,
     items: shown.slice(0, ITEMS_RETURNED),
   };
