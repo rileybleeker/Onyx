@@ -430,11 +430,34 @@ export function parseGmailLink(link: string | null | undefined): { account: stri
   return { account, threadId: hex ? hexToDecimal(hex[1]) : null };
 }
 
+/** One term of a Gmail search, reduced to what Today can check: the subject and the sender. */
+export interface GmailSearchTerm {
+  /** `subject:` → the subject; `from:` → the sender; a plain word or phrase → either. */
+  field: "any" | "subject" | "from";
+  /** Lowercase whole words. More than one = a quoted phrase: they must sit next to each other, in this order. */
+  words: string[];
+  /** A leading "-": an email holding these words there is NOT a match. */
+  negated: boolean;
+}
+
+// -?  then  op:"phrase" | op:(words) | op:word | "phrase" | word
+const SEARCH_TERM = /(-)?(?:([A-Za-z][A-Za-z0-9_]*):(?:"([^"]*)"?|\(([^)]*)\)?|([^\s"]*))|"([^"]*)"?|([^\s"]+))/g;
+
+/** Lowercase whole words in order, punctuation stripped. */
+function wordList(s: string): string[] {
+  return s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+}
+
 /**
- * Lowercase search words of a Gmail `#search/...` link (split on + and spaces; Gmail
- * operators such as `from:` or `newer_than:2d` are dropped). Any other link → null.
+ * The terms of a Gmail `#search/...` link (+ and %20 both separate words). Any other link → null.
+ * Handled: plain words, "quoted phrases", `subject:` and `from:` (with a word, a "phrase" or a
+ * (group of words)), and a leading "-" on any of those. Ignored, value included: every other
+ * operator (`newer_than:`, `label:`, `in:`, `is:`, `has:`, `to:`, `rfc822msgid:` ...), since it
+ * says nothing about the subject or sender. Not understood: `OR` / `AND` / `{ }` / `( )` grouping —
+ * the operator words are dropped and every remaining word stays required, which is stricter than
+ * Gmail and so can only miss a merge, never invent one.
  */
-export function gmailSearchWords(link: string | null | undefined): string[] | null {
+export function gmailSearchTerms(link: string | null | undefined): GmailSearchTerm[] | null {
   if (!link || !isGmailHref(link)) return null;
   let url: URL;
   try { url = new URL(link); } catch { return null; }
@@ -443,15 +466,65 @@ export function gmailSearchWords(link: string | null | undefined): string[] | nu
   try { hash = decodeURIComponent(hash); } catch { /* keep raw */ }
   const m = hash.match(/^#search\/(.*)$/i);
   if (!m) return null;
-  return m[1]
-    .toLowerCase()
-    .split(/[+\s]+/)
-    .filter((w) => w !== "" && !/^-?[a-z_]+:/.test(w));
+  const terms: GmailSearchTerm[] = [];
+  for (const t of m[1].replace(/\+/g, " ").matchAll(SEARCH_TERM)) {
+    const op = t[2]?.toLowerCase();
+    const field = op === undefined ? "any" : op === "subject" || op === "from" ? op : null;
+    if (field === null) continue;
+    const negated = t[1] === "-";
+    const phrase = t[3] ?? t[6];
+    if (phrase !== undefined) {
+      const words = wordList(phrase);
+      if (words.length > 0) terms.push({ field, words, negated });
+      continue;
+    }
+    const loose = t[4] ?? t[5] ?? t[7] ?? "";
+    if (op === undefined && (loose === "OR" || loose === "AND")) continue;
+    for (const w of wordList(loose)) terms.push({ field, words: [w], negated });
+  }
+  return terms;
 }
 
-/** Lowercase whole words of a subject, punctuation stripped. */
-function subjectWords(s: string): Set<string> {
-  return new Set(s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean));
+/** Lowercase plain search words of a Gmail `#search/...` link (operators and "-" exclusions dropped). Any other link → null. */
+export function gmailSearchWords(link: string | null | undefined): string[] | null {
+  const terms = gmailSearchTerms(link);
+  return terms && terms.filter((t) => t.field === "any" && !t.negated).flatMap((t) => t.words);
+}
+
+/** " word word word ": whole words (and phrases) can be looked up with includes(" x "). */
+function wordText(words: string[]): string {
+  return ` ${words.join(" ")} `;
+}
+
+/**
+ * The sender as search words. With a display name: the name only. The address is not sent to the
+ * browser then, so a `from:` term naming an address cannot match (a missed merge, never a wrong one).
+ * With no display name `from` is the bare address: a plain word may match its domain labels, but not
+ * the local part (billing, noreply, alerts ... are too generic to identify a sender) or the last
+ * label (com, org); a `from:` term names the sender on purpose, so it sees the whole address.
+ */
+function senderText(from: string | null, forFromTerm: boolean): string {
+  const s = (from ?? "").trim();
+  if (forFromTerm || !/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(s)) return wordText(wordList(s));
+  return wordText(s.slice(s.lastIndexOf("@") + 1).split(".").slice(0, -1).flatMap(wordList));
+}
+
+/**
+ * Would this Gmail search find this email, judged on its subject and sender alone?
+ * Every term must hold (a plain word in the subject OR the sender), no excluded term may,
+ * and there must be at least one positive term.
+ */
+export function searchMatchesEmail(terms: readonly GmailSearchTerm[], subject: string, from: string | null): boolean {
+  const subjectText = wordText(wordList(subject));
+  const sender = senderText(from, false);
+  const senderForFrom = senderText(from, true);
+  const holds = (t: GmailSearchTerm): boolean => {
+    const needle = wordText(t.words);
+    if (t.field === "subject") return subjectText.includes(needle);
+    if (t.field === "from") return senderForFrom.includes(needle);
+    return subjectText.includes(needle) || sender.includes(needle);
+  };
+  return terms.some((t) => !t.negated) && terms.every((t) => holds(t) !== t.negated);
 }
 
 const SEARCH_MATCH_WINDOW_MS = 7 * 24 * 3_600_000;
@@ -547,18 +620,18 @@ export function mergeUrgent(
     if (ref?.threadId) {
       match = entries.find((x) => x.threadId === ref.threadId && (!ref.account || !x.account || x.account === ref.account));
     } else if (ref) {
-      // A Gmail search link names no thread: merge only into the ONE labelled email whose
-      // subject holds every search word, from the same account, received up to 7 days before the card.
-      const words = (gmailSearchWords(c.card.link) ?? []).flatMap((w) => [...subjectWords(w)]);
+      // A Gmail search link names no thread: merge only into the ONE labelled email the search
+      // would find (every word in its subject or sender name; searchMatchesEmail), from the
+      // same account, received up to 7 days before the card. Two candidates = no merge.
+      const terms = gmailSearchTerms(c.card.link) ?? [];
       const cardAt = new Date(parseWorkerTime(c.created_at)).getTime();
-      if (words.length > 0 && Number.isFinite(cardAt)) {
+      if (terms.length > 0 && Number.isFinite(cardAt)) {
         const hits = entries.filter((x) => {
           if (!x.item.sources.includes("Gmail")) return false;
           if (ref.account && x.account !== ref.account) return false;
           const at = new Date(x.item.at).getTime();
           if (!Number.isFinite(at) || at > cardAt || cardAt - at > SEARCH_MATCH_WINDOW_MS) return false;
-          const sw = subjectWords(x.item.title);
-          return words.every((w) => sw.has(w));
+          return searchMatchesEmail(terms, x.item.title, x.item.from);
         });
         if (hits.length === 1) match = hits[0];
       }
