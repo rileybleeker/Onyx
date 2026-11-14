@@ -106,6 +106,8 @@ export interface ForecastInput {
   adjustments?: readonly StreamAdjustment[];
   cardTerms?: readonly CardTerms[];
   growth?: readonly GrowthDriver[];
+  /** What-ifs: extra payments to a card on a date (lower its balance and interest in the net worth side). */
+  extraCardPayments?: readonly { account_key: string; date: string; cents: number }[];
   settings?: ForecastSettings;
 }
 
@@ -1221,12 +1223,14 @@ function projectCards(
     let bal = owed;
     let interestNext12 = 0;
     const months: CardProjection["months"] = [];
+    const extras = (input.extraCardPayments ?? []).filter((x) => x.account_key === acct.account_key && x.cents > 0);
     for (let k = 1; k <= 12; k++) {
       const key = monthFromIndex(thisMonth + k);
       const monthStart = `${key}-01`;
       const rate = promoEnds && monthStart <= promoEnds ? promoApr : promoEnds ? Math.max(apr, standardApr) : apr;
       const interest = Math.round((bal * rate) / 100 / 12);
-      bal = Math.max(0, bal + interest + monthlySpend - monthlyPayment);
+      const extra = extras.filter((x) => monthKeyOf(x.date) === key || (k === 1 && monthKeyOf(x.date) <= key)).reduce((sum, x) => sum + x.cents, 0);
+      bal = Math.max(0, bal + interest + monthlySpend - monthlyPayment - extra);
       interestNext12 += interest;
       months.push({ month: key, owed: bal, interest });
     }

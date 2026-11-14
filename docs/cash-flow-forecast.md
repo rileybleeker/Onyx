@@ -1,6 +1,6 @@
 # Cash flow forecast, tax planning and what-if scenarios: design
 
-Status (2026-11-14): Phase 1 (the engine, `frontend/src/lib/cash-forecast.ts`) is built and backtested (Section 9.1); nothing on a page yet. Cash pool = checking + savings (D1); no buffer line yet (D2 deferred, default $0). Roadmap row: "Cash flow forecast + tax planning" (Tasks DB,
+Status (2026-11-14): Phases 1 to 4 are live at `/financials/forecast`: the engine (`lib/cash-forecast.ts`, backtested, Section 9.1), the page with planned items and card terms, the tax calculator (`lib/tax-plan.ts`, `lib/tax-tables.ts`; tax profile = driver `tax`; its payments, refunds and after-tax bonuses are planned cash lines with ids `tax:*` / `pay:*`) and what-if levers (`lib/cash-forecast-scenario.ts`; URL params recomputed on the server, saved as drivers `scenario:<slug>`). Not built: the weekly snapshot job and its /status card, alerts, the sensitivity chart. Cash pool = checking + savings (D1); no buffer line yet (D2 deferred, default $0). Roadmap row: "Cash flow forecast + tax planning" (Tasks DB,
 `Source = "Onyx Roadmap"`). This file holds no personal figures (the repo is public); every real amount lives in the
 service-role tables proposed below and is entered through the page.
 

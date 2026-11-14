@@ -3,6 +3,8 @@
  * PURE: no I/O. Used by /api/finance/forecast/* and the server loader. Design: docs/cash-flow-forecast.md.
  */
 import type { CardTerms, Certainty, ForecastSettings, GrowthDriver, PlannedItem } from "./cash-forecast";
+import { parseScenarioParams } from "./cash-forecast-scenario";
+import { parseTaxProfile } from "./tax-plan";
 
 export const MAX_FORECAST_BODY_BYTES = 2048;
 const CERTAINTIES: readonly Certainty[] = ["confirmed", "likely", "possible"];
@@ -97,8 +99,23 @@ export function parseDriverBody(
   const b = body as Record<string, unknown>;
   for (const k of Object.keys(b)) if (k !== "key" && k !== "value") return { ok: false, error: `unknown field ${k}` };
   const key = typeof b.key === "string" ? b.key : "";
+  if (key === "tax") {
+    if (b.value === null) return { ok: true, key, value: null };
+    const profile = parseTaxProfile(b.value);
+    return profile ? { ok: true, key, value: profile as unknown as Record<string, unknown> } : { ok: false, error: "tax profile needs salaryAnnualCents and employmentStart" };
+  }
+  const sm = /^scenario:([a-z0-9-]{1,40})$/.exec(key);
+  if (sm) {
+    if (b.value === null) return { ok: true, key, value: null };
+    const v = b.value as Record<string, unknown> | undefined;
+    const name = typeof v?.name === "string" ? v.name.trim().slice(0, 60) : "";
+    if (!name || !v?.params || typeof v.params !== "object") return { ok: false, error: "scenario needs a name and params" };
+    const raw = v.params as Record<string, unknown>;
+    const params = parseScenarioParams((k) => (raw[k] === undefined || raw[k] === null ? null : String(raw[k])));
+    return { ok: true, key, value: { name, params } };
+  }
   const m = /^(settings|card|growth)(?::(.+))?$/.exec(key);
-  if (!m || (m[1] === "settings") !== !m[2]) return { ok: false, error: "key must be settings, card:<account> or growth:<account>" };
+  if (!m || (m[1] === "settings") !== !m[2]) return { ok: false, error: "key must be settings, tax, scenario:<name>, card:<account> or growth:<account>" };
   if (m[2] && !knownAccounts.has(m[2])) return { ok: false, error: "unknown account" };
   if (b.value === null) return { ok: true, key, value: null };
   if (!b.value || typeof b.value !== "object" || Array.isArray(b.value)) return { ok: false, error: "value must be an object or null" };

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { loadForecast } from "@/lib/cash-forecast-server";
+import { parseScenarioParams } from "@/lib/cash-forecast-scenario";
 import ForecastView from "./ForecastView";
 
 // Private financial data: rendered per request on the server, never ISR, never cached by the CDN; the
@@ -11,8 +12,10 @@ export const metadata: Metadata = {
   robots: { index: false, follow: false },
 };
 
-export default async function ForecastPage() {
-  const load = await loadForecast(new Date());
+export default async function ForecastPage({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
+  const sp = await searchParams;
+  const levers = parseScenarioParams((k) => (typeof sp[k] === "string" ? (sp[k] as string) : null));
+  const load = await loadForecast(new Date(), levers);
   return (
     <main className="mx-auto max-w-6xl space-y-6 p-4 md:p-8">
       <header>
@@ -36,7 +39,19 @@ export default async function ForecastPage() {
           <p className="mt-1 text-[13px] text-text-secondary">The forecast appears after the first SimpleFIN import.</p>
         </section>
       )}
-      {load.kind === "ok" && <ForecastView result={load.result} items={load.items} drivers={load.drivers} accounts={load.accounts} setupPending={load.setupPending} />}
+      {load.kind === "ok" && (
+        <ForecastView
+          result={load.result}
+          items={load.items}
+          drivers={load.drivers}
+          accounts={load.accounts}
+          setupPending={load.setupPending}
+          profile={load.profile}
+          tax={load.tax}
+          scenario={load.scenario}
+          saved={load.saved}
+        />
+      )}
     </main>
   );
 }
