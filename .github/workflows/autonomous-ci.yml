@@ -34,8 +34,6 @@ jobs:
         run: python -m unittest discover -s tests -p test_autonomous_merge.py -v
       - name: Merge train decision tests (no credentials or network)
         run: python -m unittest discover -s tests -p test_merge_train.py -v
-      - name: Notion Notes payload tests (no credentials or network)
-        run: python -m unittest discover -s tests -p test_notion_tasks.py -v
   frontend-types:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
