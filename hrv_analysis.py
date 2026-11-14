@@ -910,7 +910,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["delivery"] = fetch_all(
             "delivery_daily",
             select="behavioral_date,meal_order_count,untimed_meal_order_count,late_meal_delivery,"
-                   "last_meal_delivery_to_sleep_minutes",
+                   "last_meal_delivery_to_sleep_minutes,leftover_meal_count,untimed_leftover_meal_count",
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  delivery_daily load failed ({e!r}); continuing without delivery features")
@@ -1439,8 +1439,12 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
 
     UNEATEN ORDERS — since 2026-11-14 the view does not count a restaurant order whose every
     food dish was marked None on the delivery day (sql/delivery_item_leftovers.sql): it was not
-    a meal that night. A day left with no meal reads 0 like a store-only day. Leftovers eaten on
-    a later day carry no clock time and never enter these features.
+    a meal that night. A day left with no meal reads 0 like a store-only day.
+
+    LEFTOVERS — a leftover meal (part of a delivered dish eaten on a later day,
+    sql/delivery_leftover_time.sql) counts as a meal of the day it was eaten
+    (leftover_meal_count is added to the receipt count). With a time it also feeds the late
+    flag and the gap to sleep (the view folds it in); without one it is an untimed meal.
 
     UNKNOWN TIMES — a day with a meal whose receipt carries no clock time keeps its count,
     but its late flag is NaN unless another meal that day is known to be late.
@@ -1456,11 +1460,18 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
         d["delivery_day"] = pd.to_datetime(d["behavioral_date"], errors="coerce")
         d = d.dropna(subset=["delivery_day"]).drop_duplicates("delivery_day")
         d["delivery_meal_count"] = pd.to_numeric(d["meal_order_count"], errors="coerce")
+        # Leftover meals (pds.delivery_item_leftovers, 2026-11-14) count as meals of the day they were
+        # eaten; the view already folds TIMED ones into the late flag and the gap to sleep.
+        if "leftover_meal_count" in d.columns:
+            d["delivery_meal_count"] = d["delivery_meal_count"].fillna(0) + pd.to_numeric(
+                d["leftover_meal_count"], errors="coerce").fillna(0)
         d["delivery_late_meal"] = d["late_meal_delivery"].map(
             lambda v: np.nan if v is None or (isinstance(v, float) and np.isnan(v)) else float(bool(v))
         )
         if "untimed_meal_order_count" in d.columns:
             untimed = pd.to_numeric(d["untimed_meal_order_count"], errors="coerce").fillna(0) > 0
+            if "untimed_leftover_meal_count" in d.columns:
+                untimed |= pd.to_numeric(d["untimed_leftover_meal_count"], errors="coerce").fillna(0) > 0
             d.loc[untimed & (d["delivery_late_meal"] != 1), "delivery_late_meal"] = np.nan
         d["delivery_last_meal_to_sleep_min"] = pd.to_numeric(
             d["last_meal_delivery_to_sleep_minutes"], errors="coerce"

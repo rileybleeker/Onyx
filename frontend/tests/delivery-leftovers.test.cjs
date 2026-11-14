@@ -19,7 +19,7 @@ const L = loadTs("lib/delivery-leftovers.ts");
 const P = loadTs("lib/delivery-portion.ts");
 
 const dish = (item_id, behavioral_date, eaten_fraction, extra = {}) => ({ item_id, behavioral_date, eaten_fraction, ...extra });
-const row = (item_id, eaten_date, fraction, threw_out = false) => ({ item_id, eaten_date, fraction, threw_out });
+const row = (item_id, eaten_date, fraction, threw_out = false, eaten_time = null) => ({ item_id, eaten_date, fraction, threw_out, eaten_time });
 
 // ─── which dishes are asked about ────────────────────────────────────────────
 
@@ -105,7 +105,7 @@ test("bodyForToken: clear, thrown out, not today, a share", () => {
   assert.deepEqual(L.bodyForToken("2030-01-10", null), { date: "2030-01-10", fraction: null });
   assert.deepEqual(L.bodyForToken("2030-01-10", "out"), { date: "2030-01-10", fraction: 0, threw_out: true });
   assert.deepEqual(L.bodyForToken("2030-01-10", "0"), { date: "2030-01-10", fraction: 0, threw_out: false });
-  assert.deepEqual(L.bodyForToken("2030-01-10", "0.1875"), { date: "2030-01-10", fraction: 0.1875, threw_out: false });
+  assert.deepEqual(L.bodyForToken("2030-01-10", "0.1875"), { date: "2030-01-10", fraction: 0.1875, threw_out: false, time: null });
   // every body a tap can produce passes the route's parser
   for (const k of L.LEFTOVER_OPTIONS.map((o) => o.key)) {
     for (const left of [1, 0.75, 0.5, 0.25, 0.375, 0.1875]) {
@@ -113,6 +113,38 @@ test("bodyForToken: clear, thrown out, not today, a share", () => {
       assert.equal(L.parseLeftoverBody(b).ok, true, `${k} of ${left}`);
     }
   }
+});
+
+test("tokens carry the time it was eaten; changing the amount keeps it, Not today / Threw out drop it", () => {
+  assert.equal(L.tokenOfRow(row(1, "2030-01-10", 0.375, false, "19:30:00")), "0.375@19:30");
+  assert.equal(L.tokenOfRow(row(1, "2030-01-10", 0, false, null)), "0");
+  assert.deepEqual(L.splitToken("0.375@19:30"), { fraction: 0.375, time: "19:30" });
+  assert.deepEqual(L.splitToken("0.375"), { fraction: 0.375, time: null });
+  assert.deepEqual(L.splitToken("out"), { fraction: 0, time: null });
+  assert.equal(L.tokenForOption("0.5", 0.75, "19:30"), "0.375@19:30");
+  assert.equal(L.tokenForOption("not_today", 0.75, "19:30"), "0");
+  assert.equal(L.tokenForOption("threw_out", 0.75, "19:30"), "out");
+  assert.equal(L.optionOfToken("0.375@19:30", 0.75), "0.5");
+  assert.equal(L.fractionOfToken("0.375@19:30"), 0.375);
+  assert.equal(L.withTime("0.375", "01:15"), "0.375@01:15");
+  assert.equal(L.withTime("0.375@19:30", null), "0.375");
+  assert.equal(L.withTime("0", "19:30"), "0"); // no amount, no time
+  assert.equal(L.withTime("out", "19:30"), "out");
+  assert.equal(L.withTime(null, "19:30"), null);
+  assert.equal(L.withTime("0.375", "7:30"), "0.375"); // not HH:MM
+  assert.deepEqual(L.bodyForToken("2030-01-10", "0.375@19:30"), { date: "2030-01-10", fraction: 0.375, threw_out: false, time: "19:30" });
+  assert.deepEqual(L.bodyForToken("2030-01-10", "0.375"), { date: "2030-01-10", fraction: 0.375, threw_out: false, time: null });
+  assert.equal(L.parseLeftoverBody(L.bodyForToken("2030-01-10", "0.375@01:15")).ok, true);
+});
+
+test("clockNow / formatClock / isClock", () => {
+  assert.equal(L.clockNow(new Date(2030, 0, 10, 7, 5)), "07:05");
+  assert.equal(L.clockNow(new Date(2030, 0, 10, 23, 59)), "23:59");
+  assert.equal(L.formatClock("19:30"), "7:30 PM");
+  assert.equal(L.formatClock("00:15"), "12:15 AM");
+  assert.equal(L.formatClock("12:00"), "12:00 PM");
+  for (const ok of ["00:00", "09:30", "23:59"]) assert.equal(L.isClock(ok), true, ok);
+  for (const bad of ["24:00", "7:30", "12:60", "", null, 730, "07:30:00"]) assert.equal(L.isClock(bad), false, String(bad));
 });
 
 test("formatShare", () => {
@@ -129,13 +161,16 @@ test("formatShare", () => {
 test("parseLeftoverBody: exact keys, real dates, 0..1 with at most 4 decimals", () => {
   assert.deepEqual(L.parseLeftoverBody({ date: "2030-01-10", fraction: 0.375 }), {
     ok: true,
-    value: { date: "2030-01-10", fraction: 0.375, threw_out: false },
+    value: { date: "2030-01-10", fraction: 0.375, threw_out: false, time: null },
   });
   assert.deepEqual(L.parseLeftoverBody({ date: "2030-01-10", fraction: 0, threw_out: true }).value, {
     date: "2030-01-10",
     fraction: 0,
     threw_out: true,
+    time: null,
   });
+  assert.equal(L.parseLeftoverBody({ date: "2030-01-10", fraction: 0.25, time: "19:30" }).value.time, "19:30");
+  assert.equal(L.parseLeftoverBody({ date: "2030-01-10", fraction: 0.25, time: null }).value.time, null);
   assert.equal(L.parseLeftoverBody({ date: "2030-01-10", fraction: null }).ok, true);
   for (const b of [
     null,
@@ -153,6 +188,11 @@ test("parseLeftoverBody: exact keys, real dates, 0..1 with at most 4 decimals", 
     { date: "2030-01-10", fraction: "0.5" },
     { date: "2030-01-10", fraction: 0.5, threw_out: "yes" },
     { date: "2030-01-10", fraction: null, threw_out: true },
+    { date: "2030-01-10", fraction: 0.25, time: "7:30" },
+    { date: "2030-01-10", fraction: 0.25, time: "24:00" },
+    { date: "2030-01-10", fraction: 0.25, time: 1930 },
+    { date: "2030-01-10", fraction: 0, time: "19:30" }, // a time needs an amount
+    { date: "2030-01-10", fraction: null, time: "19:30" },
   ]) {
     assert.equal(L.parseLeftoverBody(b).ok, false, JSON.stringify(b));
   }
@@ -178,7 +218,7 @@ test("checkLeftoverWrite mirrors the database guard", () => {
 });
 
 test("leftoverConflictMessage maps the guard codes, nothing else", () => {
-  for (const c of ["OXL01", "OXL02", "OXL03", "OXL04"]) assert.ok(L.leftoverConflictMessage(c, "leftover"), c);
+  for (const c of ["OXL01", "OXL02", "OXL03", "OXL04", "OXL05"]) assert.ok(L.leftoverConflictMessage(c, "leftover"), c);
   assert.match(L.leftoverConflictMessage("OXL01", "portion"), /later day/);
   assert.equal(L.leftoverConflictMessage("23505", "leftover"), null);
   assert.equal(L.leftoverConflictMessage(undefined, "portion"), null);
@@ -279,15 +319,33 @@ test("PUT saves a leftover row for that dish and day and returns the dish's rows
   const revalidated = [];
   const res = await loadPut(db, revalidated).PUT(req({ date: "2030-01-11", fraction: 0.375, threw_out: false }), params("7"));
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { item_id: 7, leftovers: [{ item_id: 7, eaten_date: "2030-01-11", fraction: 0.375, threw_out: false }] });
+  assert.deepEqual(res.body, {
+    item_id: 7,
+    leftovers: [{ item_id: 7, eaten_date: "2030-01-11", fraction: 0.375, threw_out: false, eaten_time: null }],
+  });
   const w = writes(db);
   assert.equal(w.length, 1);
   assert.equal(w[0].table, "delivery_item_leftovers");
-  assert.deepEqual(w[0].payload, { item_id: 7, eaten_date: "2030-01-11", fraction: 0.375, threw_out: false });
+  assert.deepEqual(w[0].payload, { item_id: 7, eaten_date: "2030-01-11", fraction: 0.375, threw_out: false, eaten_time: null });
   assert.equal(w[0].opts.onConflict, "item_id,eaten_date");
   // the dish row itself is never written
   assert.ok(!db.calls.some((c) => c.table === "delivery_order_items" && c.op !== "select"));
   assert.deepEqual(revalidated, ["/nutrition"]);
+});
+
+test("PUT with a time stores eaten_time (the database computes the instant); a future time is 409", async () => {
+  const db = makeDb();
+  const res = await loadPut(db).PUT(req({ date: "2030-01-11", fraction: 0.25, threw_out: false, time: "01:30" }), params("7"));
+  assert.equal(res.status, 200);
+  assert.equal(writes(db)[0].payload.eaten_time, "01:30");
+  assert.ok(!("eaten_at" in writes(db)[0].payload), "the client never sends the instant");
+  assert.equal(res.body.leftovers[0].eaten_time, "01:30");
+  const future = await loadPut(makeDb({ failWrite: { code: "OXL05", message: "secret detail" } })).PUT(
+    req({ date: "2030-01-12", fraction: 0.25, time: "23:59" }),
+    params("7"),
+  );
+  assert.equal(future.status, 409);
+  assert.match(future.body.error, /not happened yet/);
 });
 
 test("PUT with fraction null deletes only that day's answer", async () => {
@@ -402,6 +460,20 @@ test("middleware: the leftovers route is session-only", () => {
   for (const p of ["/api/delivery/items/7/leftovers", "/api/delivery/items/123/leftovers/"]) assert.equal(isCiRoute(p), false, p);
 });
 
+test("SQL (time): no DROP, the trigger computes eaten_at, delivery_daily appends the leftover counts", () => {
+  const sql = fs.readFileSync(path.join(SRC, "..", "..", "sql", "delivery_leftover_time.sql"), "utf8");
+  const code = sql
+    .split("\n")
+    .filter((l) => !l.trim().startsWith("--"))
+    .join("\n");
+  assert.ok(!/\bDROP\b/i.test(code), "no DROP outside comments");
+  assert.ok(code.includes("'OXL05'"));
+  assert.match(code, /NEW\.eaten_at := /);
+  const daily = /CREATE OR REPLACE VIEW pds\.delivery_daily AS([\s\S]*?);\s*\n/.exec(code)[1];
+  const tail = daily.slice(daily.lastIndexOf("SELECT behavioral_date"));
+  assert.match(tail, /merchants,\s*uneaten_meal_order_count,\s*leftover_meal_count,\s*untimed_leftover_meal_count\s*FROM agg/);
+});
+
 test("SQL: no DROP statement, guards present, nutrition view keeps its column order", () => {
   const sql = fs.readFileSync(path.join(SRC, "..", "..", "sql", "delivery_item_leftovers.sql"), "utf8");
   const code = sql
@@ -441,6 +513,7 @@ test("LeftoverList renders the share left, the six answers and the lit one", () 
     token: "0.375",
     option: "0.5",
     kcal: 750,
+    time: null,
   };
   const html = renderToStaticMarkup(React.createElement(C.LeftoverList, { questions: [q], onPick: () => {} }));
   assert.match(html, /From Tue/);
@@ -450,4 +523,26 @@ test("LeftoverList renders the share left, the six answers and the lit one", () 
   assert.equal((html.match(/aria-pressed="true"/g) || []).length, 1);
   assert.match(html, /aria-pressed="true"[^>]*>1\/2</);
   assert.equal(renderToStaticMarkup(React.createElement(C.LeftoverList, { questions: [], onPick: () => {} })), "");
+});
+
+test("LeftoverList: the When? row appears once an amount is picked, with Now and Same as", () => {
+  const C = loadTs("components/DeliveryPortions.tsx", { "@/lib/queries": {} });
+  const base = { left: 0.75, kcal: 750 };
+  const dish = (item_id, title) => ({ item_id, behavioral_date: "2030-01-08", store_name: "Example Pizza Co", title, quantity: 1, unit_kcal: 2000, est_kind: "food", eaten_fraction: 0.25 });
+  const timed = { ...base, dish: dish(7, "Large Test Pie"), token: "0.375@19:30", option: "0.5", time: "19:30" };
+  const untimed = { ...base, dish: dish(8, "Test Garlic Knots"), token: "0.75", option: "1", time: null };
+  const notToday = { ...base, dish: dish(9, "Test Salad"), token: "0", option: "not_today", kcal: null, time: null };
+  const html = renderToStaticMarkup(
+    React.createElement(C.LeftoverList, { questions: [timed, untimed, notToday], onPick: () => {}, onTime: () => {}, showNow: true }),
+  );
+  assert.equal((html.match(/type="time"/g) || []).length, 2, "time row only for answers with an amount");
+  assert.match(html, /value="19:30"/);
+  assert.equal((html.match(/>Now</g) || []).length, 2);
+  assert.equal((html.match(/Same as 7:30 PM/g) || []).length, 1, "offered only where the time is missing");
+  assert.match(html, /When\? \(for meal timing\)/);
+  // without onTime (or on another day without Now) the extras are not drawn
+  const plain = renderToStaticMarkup(React.createElement(C.LeftoverList, { questions: [timed], onPick: () => {} }));
+  assert.ok(!plain.includes('type="time"'));
+  const past = renderToStaticMarkup(React.createElement(C.LeftoverList, { questions: [timed], onPick: () => {}, onTime: () => {} }));
+  assert.ok(!past.includes(">Now<"));
 });

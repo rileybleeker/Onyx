@@ -16,12 +16,16 @@ import {
   LEFTOVER_OPTIONS,
   LEFTOVER_WINDOW_DAYS,
   bodyForToken,
+  clockNow,
+  formatClock,
   formatShare,
   fractionOfToken,
   leftoverQuestions,
   optionOfToken,
+  splitToken,
   tokenForOption,
   tokenOfRow,
+  withTime,
   type LeftoverRow,
   type LeftoverToken,
 } from "@/lib/delivery-leftovers";
@@ -51,6 +55,8 @@ export type LeftoverQuestion = {
   option: string | null;
   /** kcal eaten from this leftover on this day (null = not answered / nothing eaten / no estimate). */
   kcal: number | null;
+  /** "HH:MM" it was eaten, when given. */
+  time: string | null;
 };
 
 type Opts = {
@@ -94,7 +100,8 @@ async function sendLeftover(k: string, token: LeftoverToken) {
 function withToken(rows: ReadonlyArray<LeftoverRow>, itemId: number, date: string, token: LeftoverToken): LeftoverRow[] {
   const rest = rows.filter((r) => !(r.item_id === itemId && r.eaten_date === date));
   if (token == null) return rest;
-  return [...rest, { item_id: itemId, eaten_date: date, fraction: fractionOfToken(token), threw_out: token === "out" }];
+  const { fraction, time } = splitToken(token);
+  return [...rest, { item_id: itemId, eaten_date: date, fraction, threw_out: token === "out", eaten_time: time }];
 }
 
 type State = {
@@ -237,7 +244,14 @@ export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
     return leftoverQuestions(state.all, state.leftovers, date).map(({ dish, left, row }) => {
       const token = tokenOfRow(row);
       const f = fractionOfToken(token);
-      return { dish, left, token, option: optionOfToken(token, left), kcal: f > 0 ? dishKcal(dish.unit_kcal, dish.quantity, f) : null };
+      return {
+        dish,
+        left,
+        token,
+        option: optionOfToken(token, left),
+        kcal: f > 0 ? dishKcal(dish.unit_kcal, dish.quantity, f) : null,
+        time: splitToken(token).time,
+      };
     });
   }, [loaded, date, state.all, state.leftovers]);
 
@@ -245,8 +259,18 @@ export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
     (q: LeftoverQuestion, optionKey: string) => {
       if (!date) return;
       setError(null);
-      const token = q.option === optionKey ? null : tokenForOption(optionKey, q.left);
+      const token = q.option === optionKey ? null : tokenForOption(optionKey, q.left, q.time);
       void leftoverSaver.set(slot(q.dish.item_id, date), token);
+    },
+    [date, leftoverSaver],
+  );
+
+  /** When it was eaten ("HH:MM"), or null to clear. Only for an answer with an amount. */
+  const setLeftoverTime = useCallback(
+    (q: LeftoverQuestion, time: string | null) => {
+      if (!date || q.token == null) return;
+      setError(null);
+      void leftoverSaver.set(slot(q.dish.item_id, date), withTime(q.token, time));
     },
     [date, leftoverSaver],
   );
@@ -264,6 +288,7 @@ export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
     error,
     setFraction,
     setLeftover,
+    setLeftoverTime,
     leftoverKcal,
     /** Uber Eats kcal eaten on `date`: its own dishes plus leftovers eaten that day. */
     totalKcal,
@@ -349,18 +374,27 @@ function weekday(ymd: string): string {
 /**
  * Leftovers of earlier deliveries, asked on one day: "From Tue · 3/4 left · Ate: All / 3/4 / 1/2 / 1/4 ·
  * Not today · Threw out". Shares are of what is left; tapping the lit answer clears it. Unanswered =
- * thrown out (nothing counted).
+ * thrown out (nothing counted). Once an amount is picked, "When?" takes the clock time it was eaten
+ * (a time picker, plus "Now" on the current day and "Same as 7:30 PM" when another leftover of the day
+ * already has one); with a time the leftover also counts for meal timing.
  */
 export function LeftoverList({
   questions,
   onPick,
+  onTime,
+  showNow = false,
   className = "",
 }: {
   questions: LeftoverQuestion[];
   onPick: (q: LeftoverQuestion, optionKey: string) => void;
+  /** Set ("HH:MM") or clear (null) when it was eaten. Without it no time row is shown. */
+  onTime?: (q: LeftoverQuestion, time: string | null) => void;
+  /** The list is for the current behavioral day: offer "Now". */
+  showNow?: boolean;
   className?: string;
 }) {
   if (questions.length === 0) return null;
+  const shared = questions.find((x) => x.time && fractionOfToken(x.token) > 0)?.time ?? null;
   return (
     <div className={`bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle ${className}`}>
       {questions.map((q) => (
@@ -403,6 +437,40 @@ export function LeftoverList({
               );
             })}
           </div>
+          {onTime && fractionOfToken(q.token) > 0 && (
+            <div className="mt-1.5 flex flex-wrap items-center justify-end gap-1">
+              <span className="text-[10px] font-mono text-text-tertiary mr-0.5">{q.time ? "At" : "When? (for meal timing)"}</span>
+              <input
+                type="time"
+                value={q.time ?? ""}
+                aria-label={`When you ate the leftover ${q.dish.title}`}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "") onTime(q, null);
+                  else if (/^\d{2}:\d{2}$/.test(v)) onTime(q, v);
+                }}
+                className="h-7 px-1.5 rounded-[5px] border border-border-subtle bg-transparent text-[11px] font-mono text-text-secondary"
+              />
+              {showNow && (
+                <button
+                  type="button"
+                  onClick={() => onTime(q, clockNow())}
+                  className="h-7 px-1.5 rounded-[5px] border border-border-subtle text-[11px] font-mono text-text-tertiary hover:text-text-secondary"
+                >
+                  Now
+                </button>
+              )}
+              {!q.time && shared && (
+                <button
+                  type="button"
+                  onClick={() => onTime(q, shared)}
+                  className="h-7 px-1.5 rounded-[5px] border border-border-subtle text-[11px] font-mono text-text-tertiary hover:text-text-secondary"
+                >
+                  Same as {formatClock(shared)}
+                </button>
+              )}
+            </div>
+          )}
         </div>
       ))}
     </div>
