@@ -30,7 +30,7 @@ function harness(rows, failAt = -1) {
   }};
   const exports = {};
   vm.runInNewContext(ts.transpileModule(source, {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,
-    {exports, require(id) { if(id === '@/lib/supabase') return {supabase:client}; if(id === '@/lib/queries') return {}; throw new Error(id); }, Date, Intl, Map});
+    {exports, require(id) { if(id === '@/lib/supabase') return {supabase:client}; if(id === '@/lib/queries' || id === '@/lib/sweet-spot') return {}; throw new Error(id); }, Date, Intl, Map});
   return {api:exports,count:()=>requests,returned:()=>returnedRows};
 }
 function fixture() {

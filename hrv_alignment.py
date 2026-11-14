@@ -220,6 +220,43 @@ def naive_baseline_rows(model_df: pd.DataFrame, horizons, min_train: int,
     return rows
 
 
+def _as_days(values) -> pd.Series:
+    """Dates as midnight datetime64[ns], so two frames built by different libraries join."""
+    return pd.to_datetime(pd.Series(np.asarray(values))).dt.normalize().astype("datetime64[ns]")
+
+
+def holdout_forecast_periods(train_dates, holdout_dates, minimum: int = 30) -> int:
+    """Daily steps a forecast must run past the last training date to reach the last
+    held-out night. The held-out rows are the last N nights WITH an HRV value, so when a
+    day is missing they span more than N calendar days. Equals `minimum` when there is no
+    gap (N = minimum)."""
+    span = (_as_days(holdout_dates).max() - _as_days(train_dates).max()).days
+    return max(int(minimum), int(span))
+
+
+def pair_holdout_by_date(holdout_df: pd.DataFrame, forecast_df: pd.DataFrame,
+                         date_col: str = "ds", actual_col: str = "y",
+                         forecast_cols=("yhat", "yhat_lower", "yhat_upper")) -> pd.DataFrame:
+    """Held-out actuals next to the forecast made for the SAME date, in date order.
+
+    The Prophet holdout used to compare the k-th forecast day with the k-th held-out row
+    (dot's review 2026-11-11, finding 4). The forecast is a daily calendar; the held-out
+    rows skip days without HRV, so after the first gap every pair was two different
+    nights. A held-out night the forecast does not reach is left out, never matched to
+    another date. Identical to the positional pairing when the history has no gap.
+    """
+    cols = [c for c in forecast_cols if c in forecast_df.columns]
+    actual = pd.DataFrame({
+        date_col: _as_days(holdout_df[date_col]),
+        actual_col: pd.to_numeric(holdout_df[actual_col], errors="coerce").to_numpy(dtype=float),
+    })
+    forecast = forecast_df[cols].reset_index(drop=True)
+    forecast.insert(0, date_col, _as_days(forecast_df[date_col]))
+    forecast = forecast.drop_duplicates(subset=date_col, keep="last")
+    return (actual.merge(forecast, on=date_col, how="inner")
+            .sort_values(date_col, kind="stable").reset_index(drop=True))
+
+
 # ---------------------------------------------------------------------------
 # Which columns can feed what
 # ---------------------------------------------------------------------------

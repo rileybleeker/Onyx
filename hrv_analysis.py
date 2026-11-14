@@ -4002,22 +4002,26 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
         # ffill then carries the latest training-time value across all 30
         # holdout days (the same "last-known-behavior" naive proxy applied
         # to the SARIMAX backtest path).
-        future_holdout = m.make_future_dataframe(periods=30)
+        # The held-out rows are the last 30 nights WITH an HRV value, so with a missing
+        # day they span more than 30 calendar days. Forecast far enough to reach the last
+        # one (30 when there is no gap) and score each night against the forecast for its
+        # own date. Pairing by position compared different nights after the first gap
+        # (dot's review 2026-11-11, finding 4; tests/test_prophet_holdout_dates.py).
+        holdout_periods = al.holdout_forecast_periods(train_df["ds"], holdout_df["ds"])
+        future_holdout = m.make_future_dataframe(periods=holdout_periods)
         if reg_feats:
             train_reg = train_df[["ds"] + reg_feats].copy()
             future_holdout = future_holdout.merge(train_reg, on="ds", how="left")
             for rf in reg_feats:
                 future_holdout[rf] = future_holdout[rf].ffill()
         fc_holdout = m.predict(future_holdout)
-        fc_30 = fc_holdout.tail(30)
-        holdout_preds = fc_30["yhat"].values[: len(holdout_df)]
-        holdout_lower = fc_30["yhat_lower"].values[: len(holdout_df)]
-        holdout_upper = fc_30["yhat_upper"].values[: len(holdout_df)]
-        holdout_actuals = holdout_df["y"].values
+        paired = al.pair_holdout_by_date(holdout_df, fc_holdout)
 
-        val_metrics = compute_metrics(holdout_actuals, holdout_preds, holdout_lower, holdout_upper)
+        val_metrics = compute_metrics(paired["y"].values, paired["yhat"].values,
+                                      paired["yhat_lower"].values, paired["yhat_upper"].values)
         log.info(f"  Prophet 30-day holdout MAE: {val_metrics.get('mae', '?'):.2f} ms  "
-                 f"CI coverage: {val_metrics.get('ci_coverage', '?'):.1f}%")
+                 f"CI coverage: {val_metrics.get('ci_coverage', '?'):.1f}%  "
+                 f"({len(paired)} nights paired by date over {holdout_periods} days)")
 
         # Full model (all data) + next-30-day forecast
         m_full = Prophet(
