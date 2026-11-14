@@ -15,6 +15,7 @@ Requirements:
 import os
 import sys
 import json
+import math
 import time
 import argparse
 import logging
@@ -369,7 +370,7 @@ def parse_step_count(value):
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if number != number or number < 0 or number != int(number):
+    if not math.isfinite(number) or number < 0 or number != int(number):
         return None
     return int(number)
 

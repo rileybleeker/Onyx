@@ -28,6 +28,12 @@ derived; verified on live data 2026-11-10)
   through the NEXT waking day, so row D shows day D+1's strain (strain on row D vs WHOOP
   workouts on row D+1: r = 0.83; same row: r = -0.01). Moved one day later, so row D
   holds day D's strain. Without this, a same-row outcome would make strain reverse-causal.
+  whoop_steps (pds.whoop_cycles.step_count, merged in pandas by
+  hrv_analysis.merge_whoop_steps_features, not a matrix column) is the same kind of total
+  and is put on the waking day by cycle_date_to_waking_day(). Live check 2026-11-13, main
+  cycle per behavioral day: the count of the cycle dated D vs Garmin steps of clock day
+  D+1: r = 0.94 (451 days); D-2, D-1, D, D+2, D+3: r between -0.11 and 0.22. Against WHOOP
+  running distance of behavioral day D+1: r = 0.75 (80 days); every other offset |r| < 0.14.
 * Eight Sleep and Garmin HRV (matrix columns eight_sleep_* and garmin_hrv_*): both are
   dated by the wake-up day, so row D shows the night that closes day D-1 (Eight Sleep HRV
   on row D+1 vs WHOOP HRV on row D: r = 0.84; Garmin HRV on row D vs WHOOP row D-1:
@@ -80,6 +86,10 @@ ALIGNMENT_CUTOVER_DATE = "2026-11-11"
 
 # Matrix columns that describe the waking day AFTER row D's sleep (see module docstring).
 NEXT_DAY_COLS = ("whoop_day_strain", "whoop_kilojoule", "whoop_cycle_avg_hr", "whoop_cycle_max_hr")
+# Cycle totals hrv_analysis builds from pds.whoop_cycles itself: same dating as
+# NEXT_DAY_COLS, re-keyed with cycle_date_to_waking_day() before the merge, so they are
+# already on the rule when they reach the frame (never passed through realign_matrix).
+CYCLE_TOTAL_FEATURES = ("whoop_steps",)
 # Matrix columns keyed by the wake-up day (they show the night BEFORE row D's sleep).
 PREVIOUS_NIGHT_PREFIXES = ("eight_sleep_", "garmin_hrv_")
 
@@ -123,6 +133,17 @@ def wake_date_to_closing_day(frame: pd.DataFrame) -> pd.DataFrame:
         return frame
     f = frame.copy()
     f[DATE_COL] = (pd.to_datetime(f[DATE_COL]) - pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
+    return f
+
+
+def cycle_date_to_waking_day(frame: pd.DataFrame) -> pd.DataFrame:
+    """Re-key a per-cycle frame from the cycle's behavioral date (the day its opening sleep
+    closes) to the waking day the cycle's totals describe (cycle date + 1). The pandas
+    twin of what realign_matrix does to NEXT_DAY_COLS."""
+    if frame is None or frame.empty or DATE_COL not in frame.columns:
+        return frame
+    f = frame.copy()
+    f[DATE_COL] = (pd.to_datetime(f[DATE_COL]) + pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
     return f
 
 
@@ -443,6 +464,9 @@ def check_rekey_directions(realigned: pd.DataFrame) -> list[str]:
         ("whoop_day_strain", "whoop_workout_strain"),
         ("eight_sleep_hrv", TARGET),
         ("garmin_hrv_last_night", TARGET),
+        # WHOOP steps (cycle total, re-keyed in pandas) vs Garmin steps (clock day): two
+        # devices counting the same day. Skipped when either column is absent.
+        ("whoop_steps", "total_steps"),
     ]
     for col, ref in checks:
         if col not in df.columns or ref not in df.columns:
