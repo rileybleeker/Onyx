@@ -6,6 +6,7 @@ import {
   APP_HABITS,
   appHabitSuggestions,
   CHECKIN_MAX_DAYS_BACK,
+  fallbackBehavioralToday,
   groupFor,
   journaledSuggestion,
   Q_JOURNALED,
@@ -15,9 +16,12 @@ import {
   screenInBedSuggestion,
   SLEEP_KIT,
   SLEEP_QUESTIONS,
+  sleepDateError,
+  sleepNights,
   usualKit,
   type CheckinAnswer,
   type CheckinItem,
+  type CheckinNight,
   type CheckinPayload,
   type CheckinSuggestion,
 } from "@/lib/checkin";
@@ -27,7 +31,10 @@ import { CHECKIN_SCREEN_COLUMNS, settledLastHourMinutes } from "@/lib/checkin-sc
  * Daily habit check-in (2026-11-07). One screen, one write for a whole behavior day.
  *
  * GET  /api/habits/checkin?date=YYYY-MM-DD → CheckinPayload (questions, saved answers, data-backed pre-fills,
- *      the usual sleep kit, progress for today and the two days before). date defaults to behavioral today.
+ *      progress for today and the two days before, and `nights`). date defaults to behavioral today.
+ *      Sleep questions (2026-11-13) are NOT part of a day tab: `nights` lists the finished nights (last night
+ *      and the one before), each with its saved answers, pre-fills and usual kit. A night's answers are stored
+ *      on the behavior day that night closes, so the screen POSTs them with that date. Tonight is never asked.
  *      Pre-fills (2026-11-13) are never written by this route: the screen shows them with their source and
  *      they are stored only when Riley saves. Rules and thresholds live in lib/checkin.ts.
  * POST /api/habits/checkin { date, answers: { [question]: 'Yes' | 'No' | null } } → upserts Yes/No rows and
@@ -64,7 +71,7 @@ async function behavioralToday(): Promise<string> {
   } catch {
     /* fall through */
   }
-  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  return fallbackBehavioralToday(new Date());
 }
 
 function dateError(date: string, today: string): string | null {
@@ -109,40 +116,14 @@ async function suggestionsFor(date: string, today: string, names: Set<string>): 
     );
   }
 
-  // Screen Time (the Onyx iPhone app): phone use in the hour before sleep, and minutes in habit apps.
-  if (names.has(Q_SCREEN_IN_BED) || Object.keys(APP_HABITS).some((h) => names.has(h))) {
+  // Screen Time (the Onyx iPhone app): minutes in habit apps that day.
+  if (Object.keys(APP_HABITS).some((h) => names.has(h))) {
     tasks.push(
       (async () => {
-        const { data } = await supabase
-          .from("phone_usage_daily")
-          .select(CHECKIN_SCREEN_COLUMNS)
-          .eq("behavioral_date", date)
-          .maybeSingle();
+        const { data } = await supabase.from("phone_usage_daily").select("minutes_by_app").eq("behavioral_date", date).maybeSingle();
         if (!data) return;
         const row = data as { minutes_by_app: Record<string, unknown> | null };
-        if (names.has(Q_SCREEN_IN_BED)) {
-          // Only once that day's sync is complete (lib/checkin-screen.ts): before it, the estimate reads 0 and would suggest No.
-          const s = screenInBedSuggestion(settledLastHourMinutes(data, date));
-          if (s) out[Q_SCREEN_IN_BED] = s;
-        }
         Object.assign(out, appHabitSuggestions(row.minutes_by_app, names));
-      })()
-    );
-  }
-
-  // Eight Sleep: was the night that closes this day spent in the usual bed? (a night is keyed by its wake-up date = date + 1)
-  if (names.has(Q_SAME_BED)) {
-    tasks.push(
-      (async () => {
-        const [night, newest] = await Promise.all([
-          supabase.from("eight_sleep_trends").select("time_slept_seconds").eq("calendar_date", addDays(date, 1)).neq("bed_side", "away"),
-          supabase.from("eight_sleep_trends").select("calendar_date").neq("bed_side", "away").order("calendar_date", { ascending: false }).limit(1),
-        ]);
-        if (night.error || newest.error) return;
-        const rows = (night.data ?? []) as { time_slept_seconds: number | null }[];
-        const slept = rows.length ? Math.max(...rows.map((r) => Number(r.time_slept_seconds || 0))) : null;
-        const s = sameBedSuggestion(date, slept, (newest.data?.[0] as { calendar_date: string } | undefined)?.calendar_date ?? null);
-        if (s) out[Q_SAME_BED] = s;
       })()
     );
   }
@@ -183,6 +164,48 @@ async function suggestionsFor(date: string, today: string, names: Set<string>): 
   return out;
 }
 
+/**
+ * Pre-fills for one finished night. `night` = the behavior day that night closes (its answers are stored on that
+ * day). Same contract as suggestionsFor: only when the data is clear, never written here.
+ */
+async function sleepSuggestionsFor(night: string, names: Set<string>): Promise<Record<string, CheckinSuggestion>> {
+  const out: Record<string, CheckinSuggestion> = {};
+  const tasks: Promise<void>[] = [];
+
+  // Screen Time: phone use in the hour before that night's sleep onset.
+  if (names.has(Q_SCREEN_IN_BED)) {
+    tasks.push(
+      (async () => {
+        const { data } = await supabase.from("phone_usage_daily").select(CHECKIN_SCREEN_COLUMNS).eq("behavioral_date", night).maybeSingle();
+        if (!data) return;
+        // Only once that night's sync is complete (lib/checkin-screen.ts): before it, the estimate reads 0 and would suggest No.
+        const s = screenInBedSuggestion(settledLastHourMinutes(data, night));
+        if (s) out[Q_SCREEN_IN_BED] = s;
+      })()
+    );
+  }
+
+  // Eight Sleep: was that night spent in the usual bed? (Eight Sleep keys a night by its wake-up date = night + 1)
+  if (names.has(Q_SAME_BED)) {
+    tasks.push(
+      (async () => {
+        const [rowsRes, newest] = await Promise.all([
+          supabase.from("eight_sleep_trends").select("time_slept_seconds").eq("calendar_date", addDays(night, 1)).neq("bed_side", "away"),
+          supabase.from("eight_sleep_trends").select("calendar_date").neq("bed_side", "away").order("calendar_date", { ascending: false }).limit(1),
+        ]);
+        if (rowsRes.error || newest.error) return;
+        const rows = (rowsRes.data ?? []) as { time_slept_seconds: number | null }[];
+        const slept = rows.length ? Math.max(...rows.map((r) => Number(r.time_slept_seconds || 0))) : null;
+        const s = sameBedSuggestion(night, slept, (newest.data?.[0] as { calendar_date: string } | undefined)?.calendar_date ?? null);
+        if (s) out[Q_SAME_BED] = s;
+      })()
+    );
+  }
+
+  await Promise.all(tasks.map((t) => t.catch((e) => console.error("[checkin] sleep suggestion failed", e))));
+  return out;
+}
+
 export async function GET(req: NextRequest) {
   try {
     const today = await behavioralToday();
@@ -196,29 +219,48 @@ export async function GET(req: NextRequest) {
     const core = new Set(items.filter((i) => i.group === "core").map((i) => i.name));
     const from = addDays(today, -CHECKIN_MAX_DAYS_BACK);
 
-    const kitNames = SLEEP_KIT.filter((q) => core.has(q));
-    const [{ data: rows, error }, suggestions, kitRows] = await Promise.all([
+    // Sleep questions are asked per finished NIGHT (sleepNights), never per day tab: the day's own lists leave them out.
+    const sleepNames = new Set(items.filter((i) => i.sleep).map((i) => i.name));
+    const dayCore = new Set([...core].filter((n) => !sleepNames.has(n)));
+    const dayNames = new Set(names.filter((n) => !sleepNames.has(n)));
+    const nightDates = sleepNames.size ? sleepNights(today, WHOOP_JOURNAL_FROZEN_THROUGH) : [];
+    const kitNames = SLEEP_KIT.filter((q) => sleepNames.has(q));
+
+    const [{ data: rows, error }, suggestions, kitRows, nightSuggestions] = await Promise.all([
       supabase.from("habit_journal").select("cycle_date, question, answer").gte("cycle_date", from).lte("cycle_date", today).in("question", names),
-      suggestionsFor(date, today, new Set(names)),
-      // Newest answers to the sleep-kit questions before this day (200 rows = 40 fully answered days).
-      kitNames.length
-        ? supabase.from("habit_journal").select("cycle_date, question, answer").in("question", kitNames).lt("cycle_date", date).order("cycle_date", { ascending: false }).limit(200)
+      suggestionsFor(date, today, dayNames),
+      // Newest answers to the sleep-kit questions before the newest night asked (200 rows = 40 fully answered days).
+      kitNames.length && nightDates.length
+        ? supabase.from("habit_journal").select("cycle_date, question, answer").in("question", kitNames).lt("cycle_date", nightDates[0]).order("cycle_date", { ascending: false }).limit(200)
         : Promise.resolve({ data: [], error: null }),
+      Promise.all(nightDates.map((n) => sleepSuggestionsFor(n, sleepNames))),
     ]);
     if (error) return NextResponse.json({ error: error.message }, { status: 500 });
-    const kit = kitRows.error ? {} : usualKit((kitRows.data ?? []) as { cycle_date: string; question: string; answer: string }[], date, kitNames);
+    const kitHistory = kitRows.error ? [] : ((kitRows.data ?? []) as { cycle_date: string; question: string; answer: string }[]);
 
     const answers: Record<string, CheckinAnswer> = {};
+    const nightAnswers = new Map<string, Record<string, CheckinAnswer>>(nightDates.map((n) => [n, {}]));
     const answeredByDay = new Map<string, number>();
     for (const r of (rows ?? []) as { cycle_date: string; question: string; answer: CheckinAnswer }[]) {
+      if (sleepNames.has(r.question)) {
+        const night = nightAnswers.get(r.cycle_date);
+        if (night) night[r.question] = r.answer;
+        continue;
+      }
       if (r.cycle_date === date) answers[r.question] = r.answer;
-      if (core.has(r.question)) answeredByDay.set(r.cycle_date, (answeredByDay.get(r.cycle_date) || 0) + 1);
+      if (dayCore.has(r.question)) answeredByDay.set(r.cycle_date, (answeredByDay.get(r.cycle_date) || 0) + 1);
     }
     const days = Array.from({ length: CHECKIN_MAX_DAYS_BACK + 1 }, (_, i) => addDays(today, -i))
       .filter((d) => d > WHOOP_JOURNAL_FROZEN_THROUGH)
-      .map((d) => ({ date: d, answered: answeredByDay.get(d) || 0, total: core.size }));
+      .map((d) => ({ date: d, answered: answeredByDay.get(d) || 0, total: dayCore.size }));
+    const nights: CheckinNight[] = nightDates.map((n, i) => ({
+      date: n,
+      answers: nightAnswers.get(n) ?? {},
+      suggestions: nightSuggestions[i] ?? {},
+      usualKit: usualKit(kitHistory, n, kitNames),
+    }));
 
-    const payload: CheckinPayload = { date, today, items, answers, suggestions, usualKit: kit, days };
+    const payload: CheckinPayload = { date, today, items, answers, suggestions, nights, days };
     return NextResponse.json(payload, { headers: { "Cache-Control": "no-store" } });
   } catch (e) {
     if (e instanceof NotionHabitsError) return NextResponse.json({ error: e.message }, { status: 502 });
@@ -227,8 +269,13 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const body = (await req.json().catch(() => ({}))) as { date?: unknown; answers?: unknown };
+  const body = (await req.json().catch(() => ({}))) as { date?: unknown; answers?: unknown; today?: unknown };
   const today = await behavioralToday();
+  // The screen sends the `today` it was drawn with. If the day has rolled over since (a page left open
+  // overnight), its "Last night" is now the night before: refuse, and the screen reloads. Optional field.
+  if (isDate(body.today) && body.today !== today) {
+    return NextResponse.json({ error: "A new day started since this page loaded. Check the nights and days, then save again.", today, stale: true }, { status: 409 });
+  }
   if (!isDate(body.date)) return NextResponse.json({ error: "date must be YYYY-MM-DD" }, { status: 400 });
   const date = body.date;
   const bad = dateError(date, today);
@@ -250,6 +297,9 @@ export async function POST(req: NextRequest) {
   for (const [name, raw] of Object.entries(body.answers as Record<string, unknown>)) {
     const item = byName.get(name);
     if (!item) return NextResponse.json({ error: `"${name}" is not an active habit` }, { status: 400 });
+    // A sleep answer on today (an old copy of the screen still does this) would describe tonight: refuse it.
+    const tonight = sleepDateError(name, date, today, raw);
+    if (tonight) return NextResponse.json({ error: `${tonight} Reload this page.` }, { status: 400 });
     if (raw === null) clears.push(name);
     else if (raw === "Yes" || raw === "No") upserts.push({ cycle_date: date, question: name, category: item.category || null, answer: raw });
     else return NextResponse.json({ error: `answer for "${name}" must be 'Yes', 'No' or null` }, { status: 400 });

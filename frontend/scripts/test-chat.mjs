@@ -5,11 +5,13 @@ import vm from "node:vm";
 import test from "node:test";
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
+// lib/checkin.ts is pure date / question rules with no imports: the chat route gets the real module.
+let checkinLib;
 function compile(path, imports = {}, sandboxConsole = { error() {} }) {
   const source = readFileSync(new URL(path, import.meta.url), "utf8");
   const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true } }).outputText;
   const exports = {};
-  vm.runInNewContext(js, { exports, require: name => { if (name in imports) return imports[name]; throw new Error(`Unexpected import: ${name}`); }, Response, console: sandboxConsole, process: { env: {} } });
+  vm.runInNewContext(js, { exports, require: name => { if (name in imports) return imports[name]; if (name === "@/lib/checkin") return (checkinLib ??= compile("../src/lib/checkin.ts")); throw new Error(`Unexpected import: ${name}`); }, Response, console: sandboxConsole, process: { env: {} } });
   return exports;
 }
 const contract = compile("../src/lib/chat-contract.ts");

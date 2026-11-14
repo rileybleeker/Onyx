@@ -69,7 +69,8 @@ test("the question text is the frozen habit name and the gate does not touch the
 
 test("the route reads the gate's columns and passes the minutes through the gate", () => {
   const route = fs.readFileSync(path.join(SRC, "app/api/habits/checkin/route.ts"), "utf8");
-  assert.match(route, /screenInBedSuggestion\(settledLastHourMinutes\(data, date\)\)/);
+  // Since the sleep questions moved to the per-night blocks, the gate is asked about that night's behavior day.
+  assert.match(route, /screenInBedSuggestion\(settledLastHourMinutes\(data, night\)\)/);
   assert.match(route, /\.from\("phone_usage_daily"\)\s*\.select\(CHECKIN_SCREEN_COLUMNS\)/);
   assert.ok(!/screenInBedSuggestion\(row\./.test(route));
   for (const col of ["behavioral_date", "sleep_start", "synced_at", "minutes_last_hour_before_sleep_est", "minutes_by_app"]) {
