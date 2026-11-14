@@ -30,6 +30,8 @@ export default function CommandPalette() {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
   const pointerSelect = useRef(false);
+  // Ignore hover refreshes caused by rows scrolling under a stationary mouse.
+  const lastPointer = useRef<string | null>(null);
 
   const results = useMemo(() => NAV_ITEMS.filter((i) => matches(i, query)), [query]);
 
@@ -72,6 +74,7 @@ export default function CommandPalette() {
   useEffect(() => {
     if (open) {
       pointerSelect.current = false;
+      lastPointer.current = null;
       setActive(0);
       const t = setTimeout(() => inputRef.current?.focus(), 10);
       return () => clearTimeout(t);
@@ -154,11 +157,14 @@ export default function CommandPalette() {
               <li key={item.href} role="option" aria-selected={isActive}>
                 <button
                   type="button"
-                  onMouseEnter={() => {
-                    if (i !== active) {
-                      pointerSelect.current = true;
-                      setActive(i);
-                    }
+                  onMouseMove={(e) => {
+                    const pos = `${e.clientX},${e.clientY}`;
+                    const prev = lastPointer.current;
+                    lastPointer.current = pos;
+                    // First sample establishes position; only movement selects.
+                    if (prev === null || prev === pos || i === active) return;
+                    pointerSelect.current = true;
+                    setActive(i);
                   }}
                   onClick={() => go(item)}
                   className={`w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px] transition-colors ${
