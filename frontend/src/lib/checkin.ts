@@ -99,7 +99,20 @@ export function sleepAnswerDate(today: string): string {
  * (The plain Eastern date would be a day ahead between midnight and 06:00 and turn "last night" into tonight.)
  */
 export function fallbackBehavioralToday(now: Date): string {
-  return new Date(now.getTime() - 6 * 3600_000).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  // Same rule as SQL ((ts AT TIME ZONE tz) - 6h)::date: take the Eastern WALL clock, then subtract 6 hours.
+  // (Subtracting from the instant first is an hour off on the two daylight-saving days.)
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" }).formatToParts(now);
+  const part = (type: string) => Number(parts.find((p) => p.type === type)?.value);
+  return new Date(Date.UTC(part("year"), part("month") - 1, part("day"), part("hour") - 6)).toISOString().slice(0, 10);
+}
+
+/**
+ * Every write path refuses a Yes/No to a sleep question dated behavioral today or later: that night has not
+ * happened. Returns the message to show, or null when the write is fine (clearing is always allowed).
+ */
+export function sleepDateError(question: string, date: string, today: string, answer: unknown): string | null {
+  if (answer === null || !SLEEP_QUESTIONS.has(question) || date < today) return null;
+  return `"${question}" is about a night that already happened. Answer it for last night (${sleepAnswerDate(today)}) on the check-in; tonight is asked tomorrow.`;
 }
 
 /** How many finished nights the check-in asks about (same reach as the day tabs). */

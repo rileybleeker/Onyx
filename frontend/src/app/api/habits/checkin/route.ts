@@ -16,6 +16,7 @@ import {
   screenInBedSuggestion,
   SLEEP_KIT,
   SLEEP_QUESTIONS,
+  sleepDateError,
   sleepNights,
   syncedAfter,
   usualKit,
@@ -299,6 +300,9 @@ export async function POST(req: NextRequest) {
   for (const [name, raw] of Object.entries(body.answers as Record<string, unknown>)) {
     const item = byName.get(name);
     if (!item) return NextResponse.json({ error: `"${name}" is not an active habit` }, { status: 400 });
+    // A sleep answer on today (an old copy of the screen still does this) would describe tonight: refuse it.
+    const tonight = sleepDateError(name, date, today, raw);
+    if (tonight) return NextResponse.json({ error: `${tonight} Reload this page.` }, { status: 400 });
     if (raw === null) clears.push(name);
     else if (raw === "Yes" || raw === "No") upserts.push({ cycle_date: date, question: name, category: item.category || null, answer: raw });
     else return NextResponse.json({ error: `answer for "${name}" must be 'Yes', 'No' or null` }, { status: 400 });

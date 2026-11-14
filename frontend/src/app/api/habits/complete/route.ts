@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { after } from "next/server";
 import { NextRequest, NextResponse } from "next/server";
+import { fallbackBehavioralToday, SLEEP_QUESTIONS, sleepDateError } from "@/lib/checkin";
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_HABITS_DB = process.env.NOTION_HABITS_DB || "29cc936fd5e14ae8b10a4fe5c5f7a6cd";
@@ -62,6 +63,20 @@ export async function POST(req: NextRequest) {
 
   if (!habit) {
     return NextResponse.json({ error: "habit is required" }, { status: 400 });
+  }
+
+  // Sleep questions describe a finished night: a Yes/No dated behavioral today (or later) would be about
+  // tonight. They are answered on /check-in for last night. Clearing is always allowed.
+  if (answer !== null && SLEEP_QUESTIONS.has(habit)) {
+    let today: string;
+    try {
+      const { data: bday } = await supabase.rpc("behavioral_today_now");
+      today = (bday as string) || fallbackBehavioralToday(new Date());
+    } catch {
+      today = fallbackBehavioralToday(new Date());
+    }
+    const tonight = sleepDateError(habit, completionDate, today, answer);
+    if (tonight) return NextResponse.json({ error: tonight }, { status: 400 });
   }
 
   // 2026-06-11 merge guard: rows with cycle_date <= 2026-06-08 for

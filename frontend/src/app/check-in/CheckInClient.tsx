@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, Moon, Sun, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
-import { kitSummary, nightLabel, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload, type CheckinSuggestion } from "@/lib/checkin";
+import { kitSummary, nightLabel, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
+import { buildCells, draftSettled, draftWith, parseDraft, savePlan, visibleNights, type Cell, type Cells, type Draft, type Patch } from "@/lib/checkin-cells";
 import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortions";
 
 // Daily habit check-in (2026-11-07). Yes / No per question, one Save.
@@ -29,81 +30,34 @@ import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortio
 //   there is nothing to ask, and each tap saves immediately through PATCH /api/delivery/items/[itemId]
 //   (not part of the Save bar).
 
-type Origin = "saved" | "suggested" | "tapped";
-type Cell = { answer: CheckinAnswer; origin: Origin; source?: string };
-type Cells = Record<string, Cell>;
-/** Unsaved taps: an answer, or null for "cleared". Also the shape POSTed to /api/habits/checkin. */
-type Patch = Record<string, CheckinAnswer | null>;
-
 const CATEGORY_ORDER = ["health", "fitness", "nutrition", "mindfulness", "productivity", "social", "learning", "general"];
 const dayDraftKey = (date: string) => `onyx:checkin:${date}`;
 const nightDraftKey = (night: string) => `onyx:checkin:night:${night}`;
 
-function readDraft(key: string): Patch {
+// Drafts live in localStorage; the rules (baseline, settle, build) are pure functions in lib/checkin-cells.ts.
+function readDraft(key: string): Draft {
   try {
-    const v = JSON.parse(localStorage.getItem(key) || "{}");
-    return v && typeof v === "object" && !Array.isArray(v) ? (v as Patch) : {};
+    return parseDraft(JSON.parse(localStorage.getItem(key) || "{}"));
   } catch {
     return {};
   }
 }
 
-function writeDraft(key: string, patch: Patch) {
+function storeDraft(key: string, draft: Draft) {
   try {
-    localStorage.setItem(key, JSON.stringify({ ...readDraft(key), ...patch }));
+    if (Object.keys(draft).length) localStorage.setItem(key, JSON.stringify(draft));
+    else localStorage.removeItem(key);
   } catch {
     /* storage unavailable: the in-memory state still works */
   }
 }
 
-/** After a save: drop from the draft only what was sent and is still unchanged, so a tap made mid-save survives. */
-function settleDraft(key: string, posted: Patch) {
-  try {
-    const draft = readDraft(key);
-    for (const [name, a] of Object.entries(posted)) if (draft[name] === a) delete draft[name];
-    if (Object.keys(draft).length) localStorage.setItem(key, JSON.stringify(draft));
-    else localStorage.removeItem(key);
-  } catch {
-    /* ignore */
-  }
-}
+const writeDraft = (key: string, patch: Patch, saved: Record<string, CheckinAnswer>) => storeDraft(key, draftWith(readDraft(key), patch, saved));
+/** After a save: drop what was sent and is still unchanged, so a tap made mid-save survives. */
+const settleDraft = (key: string, posted: Patch) => storeDraft(key, draftSettled(readDraft(key), posted));
 
 /** The server refused because the day rolled over since the page loaded: reload, don't keep the stale labels. */
 class StaleDayError extends Error {}
-
-/** Saved answers, then pre-fills for what is still blank, then the local draft on top. Only `items` are kept. */
-function buildCells(
-  items: CheckinItem[],
-  saved: Record<string, CheckinAnswer>,
-  suggestions: Record<string, CheckinSuggestion>,
-  draft: Patch
-): Cells {
-  const next: Cells = {};
-  for (const item of items) {
-    const s = saved[item.name];
-    const sug = suggestions[item.name];
-    if (s) next[item.name] = { answer: s, origin: "saved" };
-    else if (sug) next[item.name] = { answer: sug.answer, origin: "suggested", source: sug.source };
-  }
-  for (const [name, a] of Object.entries(draft)) {
-    if (!items.some((i) => i.name === name)) continue;
-    if (a === null) delete next[name];
-    else if (a === "Yes" || a === "No") next[name] = { answer: a, origin: "tapped" };
-  }
-  return next;
-}
-
-/** What Save would change: every set answer that differs from what's stored, plus clears of stored answers. */
-function changesOf(items: CheckinItem[], saved: Record<string, CheckinAnswer>, cells: Cells): Patch {
-  const out: Patch = {};
-  for (const item of items) {
-    const stored = saved[item.name];
-    const cur = cells[item.name]?.answer;
-    if (cur && cur !== stored) out[item.name] = cur;
-    if (!cur && stored) out[item.name] = null;
-  }
-  return out;
-}
 
 /** Sleep questions live in the night blocks; core ones are asked, occasional ones are an optional row there. */
 const isNightItem = (i: CheckinItem) => i.sleep;
@@ -140,13 +94,17 @@ export default function CheckInClient() {
   const lastLoad = useRef(0);
   const savingRef = useRef(false);
 
+  const loadSeq = useRef(0);
+
   const load = useCallback(async (date: string | null) => {
     lastLoad.current = Date.now();
+    const seq = ++loadSeq.current; // a newer load (tab switch, resume) makes this one's result irrelevant
     setError(null);
     setSavedAt(null);
     try {
       const res = await fetch(`/api/habits/checkin${date ? `?date=${date}` : ""}`, { cache: "no-store" });
       const json = await res.json();
+      if (seq !== loadSeq.current) return;
       if (!res.ok) {
         setError(json.error || `Couldn't load the check-in (${res.status}).`);
         setData(null);
@@ -168,7 +126,7 @@ export default function CheckInClient() {
       // Open "Also did" when it holds a saved or pre-filled answer, so nothing is saved out of sight.
       setShowExtras(payload.items.some((i) => i.group === "extra" && day[i.name]));
     } catch {
-      setError("Couldn't reach Onyx. Check your connection and try again.");
+      if (seq === loadSeq.current) setError("Couldn't reach Onyx. Check your connection and try again.");
     }
   }, []);
 
@@ -201,10 +159,10 @@ export default function CheckInClient() {
     };
     if (scope === null) {
       setCells(update);
-      writeDraft(dayDraftKey(data.date), patch);
+      writeDraft(dayDraftKey(data.date), patch, data.answers);
     } else {
       setNightCells((prev) => ({ ...prev, [scope]: update(prev[scope] ?? {}) }));
-      writeDraft(nightDraftKey(scope), patch);
+      writeDraft(nightDraftKey(scope), patch, data.nights?.find((n) => n.date === scope)?.answers ?? {});
     }
   };
 
@@ -233,34 +191,18 @@ export default function CheckInClient() {
     return { dayItems, sleepItems, core, extras, coreByCategory };
   }, [data]);
 
-  // Last night always; an earlier night only while its SAVED required answers are incomplete (so it doesn't vanish mid-tap).
-  const nights = useMemo(
-    () => (sleepItems.length ? (data?.nights ?? []).filter((n, i) => i === 0 || sleepItems.some((it) => it.group === "core" && !n.answers[it.name])) : []),
-    [data, sleepItems]
-  );
+  // Last night always; an earlier night while it is incomplete or holds an unsaved tap (lib/checkin-cells.ts).
+  const nights = useMemo(() => visibleNights(data?.nights ?? [], sleepItems, nightCells), [data, sleepItems, nightCells]);
 
   const coreDone = core.filter((i) => cells[i.name]).length;
   const coreLeft = core.length - coreDone;
   const dayBlanks = core.filter((i) => !cells[i.name]);
 
-  const dayChanges = useMemo(() => (data ? changesOf(dayItems, data.answers, cells) : {}), [data, dayItems, cells]);
-  const nightChanges = useMemo(
-    () =>
-      nights
-        .map((n) => ({ date: n.date, changes: changesOf(sleepItems, n.answers, nightCells[n.date] ?? {}) }))
-        .filter((n) => Object.keys(n.changes).length > 0),
-    [nights, sleepItems, nightCells]
+  // What Save sends: only the parts Riley touched (see savePlan).
+  const { dayPatch, nightPatches, changeCount } = useMemo(
+    () => savePlan({ dayItems, dayAnswers: data?.answers ?? {}, cells, sleepItems, nights, nightCells }),
+    [data, dayItems, cells, sleepItems, nights, nightCells]
   );
-  // A day Riley has not touched is not saved along with a sleep save: its pre-fills can still change (a workout
-  // later today), and saving them would mark the day's check-in done. With nothing else to save, Save means the day.
-  const dayTouched = Object.entries(dayChanges).some(([name, a]) => a === null || cells[name]?.origin === "tapped");
-  const dayPatch = dayTouched || nightChanges.length === 0 ? dayChanges : {};
-  const nightCount = nightChanges.reduce((s, n) => s + Object.keys(n.changes).length, 0);
-  const changeCount = Object.keys(dayPatch).length + nightCount;
-  // Unsaved answers Riley tapped himself (as opposed to pre-fills waiting to be accepted).
-  const tappedCount =
-    Object.keys(dayChanges).filter((name) => dayChanges[name] === null || cells[name]?.origin === "tapped").length +
-    nightChanges.reduce((s, n) => s + Object.keys(n.changes).filter((name) => n.changes[name] === null || nightCells[n.date]?.[name]?.origin === "tapped").length, 0);
 
   const save = async () => {
     if (!data || saving || changeCount === 0) return;
@@ -288,7 +230,7 @@ export default function CheckInClient() {
         // Settle the Agents card; best-effort (the card also expires on its own). Only when the day was saved.
         agentsApi.checkinDone(data.date).catch(() => {});
       }
-      for (const n of nightChanges) {
+      for (const n of nightPatches) {
         await post(n.date, n.changes);
         settleDraft(nightDraftKey(n.date), n.changes);
       }
@@ -297,9 +239,12 @@ export default function CheckInClient() {
       setSavedAt(date);
     } catch (e) {
       if (e instanceof StaleDayError) {
-        // Redraw with the new day (taps come back from the drafts under their own dates), then say why.
+        // These taps were made on a page whose "last night" and "today" were a day old, so they may be meant for
+        // other nights: drop them all (not only the refused request), redraw with the new day, and say why.
+        settleDraft(dayDraftKey(data.date), dayPatch);
+        for (const n of nightPatches) settleDraft(nightDraftKey(n.date), n.changes);
         await load(requested);
-        setError(e.message);
+        setError("A new day started since this page loaded, so the unsaved answers were cleared. Please answer again.");
       } else {
         setError(e instanceof TypeError ? "Couldn't reach Onyx. Your answers are still here." : e instanceof Error ? e.message : "Save failed. Your answers are still here.");
       }
@@ -318,7 +263,13 @@ export default function CheckInClient() {
       <div className="max-w-xl">
         <h2 className="text-[28px] font-medium text-text-primary">Check-in</h2>
         <p className="mt-4 text-sm text-text-secondary">{error}</p>
-        <button onClick={() => goTo(new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" }))} className="mt-4 px-3 py-1.5 text-[13px] bg-white/5 border border-border-subtle rounded-[6px]">
+        <button
+          onClick={() => {
+            // No date: the server decides which day it is (before 06:00 the clock date is a day ahead).
+            router.replace("/check-in", { scroll: false });
+            load(null);
+          }}
+          className="mt-4 px-3 py-1.5 text-[13px] bg-white/5 border border-border-subtle rounded-[6px]">
           Go to today
         </button>
       </div>
@@ -392,6 +343,7 @@ export default function CheckInClient() {
               key={d.date}
               role="tab"
               aria-selected={active}
+              disabled={saving}
               onClick={() => goTo(d.date)}
               className={`flex-1 px-3 py-2 rounded-[6px] border text-left transition-colors ${
                 active ? "border-accent/60 bg-accent/10" : "border-border-subtle bg-white/[0.02] hover:bg-white/[0.05]"
@@ -488,10 +440,9 @@ export default function CheckInClient() {
           <div className="flex-1 min-w-0 text-[13px]">
             {error ? (
               <span className="text-red-400">{error}</span>
-            ) : savedAt === data.date && tappedCount === 0 ? (
-              <span className="text-text-secondary inline-flex items-center gap-1.5 flex-wrap">
+            ) : savedAt === data.date && changeCount === 0 ? (
+              <span className="text-text-secondary inline-flex items-center gap-1.5">
                 <Check className="w-4 h-4 text-accent" /> Saved
-                {changeCount > 0 && <span className="text-text-tertiary">· {changeCount} pre-filled answer{changeCount === 1 ? "" : "s"} not saved yet</span>}
                 {catchUp && (
                   <button onClick={() => goTo(catchUp.date)} className="ml-2 text-accent underline underline-offset-2">
                     Catch up {dayLabel(catchUp.date, data.today).toLowerCase()}

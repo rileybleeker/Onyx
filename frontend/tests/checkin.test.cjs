@@ -9,6 +9,7 @@ const path = require("node:path");
 const { loadTs, SRC } = require("./helpers/load-ts.cjs");
 
 const C = loadTs("lib/checkin.ts");
+const K = loadTs("lib/checkin-cells.ts");
 
 // ─── which questions are asked every day ─────────────────────────────────────
 
@@ -167,6 +168,22 @@ test("fallbackBehavioralToday: Eastern time minus 6 hours", () => {
   assert.equal(C.fallbackBehavioralToday(new Date("2031-03-05T11:00:00Z")), "2031-03-05");
   // 21:30 EDT in July (UTC-4)
   assert.equal(C.fallbackBehavioralToday(new Date("2031-07-10T01:30:00Z")), "2031-07-09");
+  // Fall-back day (2026-11-01, clocks go 02:00 EDT -> 01:00 EST): 05:30 EST is still the day before
+  assert.equal(C.fallbackBehavioralToday(new Date("2026-11-01T10:30:00Z")), "2026-10-31");
+  assert.equal(C.fallbackBehavioralToday(new Date("2026-11-01T11:00:00Z")), "2026-11-01"); // 06:00 EST
+  // Spring-forward day (2027-03-14): 05:30 EDT is still the day before, 06:30 EDT is the new day
+  assert.equal(C.fallbackBehavioralToday(new Date("2027-03-14T09:30:00Z")), "2027-03-13");
+  assert.equal(C.fallbackBehavioralToday(new Date("2027-03-14T10:30:00Z")), "2027-03-14");
+});
+
+test("sleepDateError: a Yes/No to a sleep question is refused for today or later, never for a past night", () => {
+  const q = C.SLEEP_KIT[0];
+  assert.match(C.sleepDateError(q, "2031-03-05", "2031-03-05", "Yes"), /already happened/);
+  assert.match(C.sleepDateError(q, "2031-03-06", "2031-03-05", "No"), /2031-03-04/); // names last night's date
+  assert.equal(C.sleepDateError(q, "2031-03-04", "2031-03-05", "Yes"), null);
+  assert.equal(C.sleepDateError(q, "2031-03-05", "2031-03-05", null), null); // clearing a stray row is allowed
+  assert.equal(C.sleepDateError("Experienced stress?", "2031-03-05", "2031-03-05", "Yes"), null);
+  assert.match(C.sleepDateError(C.Q_READ_IN_BED, "2031-03-05", "2031-03-05", "Yes"), /already happened/);
 });
 
 test("screen in bed is never pre-filled No before the phone has synced past sleep onset", () => {
@@ -192,19 +209,111 @@ test("a stale page cannot write: the POST refuses a `today` that is no longer to
   assert.match(client, /visibilitychange/);
 });
 
-test("a sleep-only save leaves an untouched day alone and does not mark it done", () => {
+// ─── the screen's save rules (lib/checkin-cells.ts), exercised for real ──────
+
+const item = (name, group = "core", sleep = false) => ({ name, notionPageId: "x", category: "health", frequency: "daily", channel: "whoop", group, sleep });
+const REST = "Took a rest day?";
+const STRESS = "Experienced stress?";
+const DAY_ITEMS = [item(REST), item(STRESS)];
+const SLEEP_ITEMS = [item(TAPE, "core", true), item(C.Q_SAME_BED, "core", true), item(C.Q_READ_IN_BED, "extra", true)];
+const night = (date, answers = {}, suggestions = {}) => ({ date, answers, suggestions, usualKit: {} });
+const plan = (o) => K.savePlan({ dayItems: DAY_ITEMS, dayAnswers: {}, cells: {}, sleepItems: SLEEP_ITEMS, nights: [], nightCells: {}, ...o });
+
+test("a sleep-only save sends the night and leaves an untouched day's pre-fill alone, on every press", () => {
+  const cells = K.buildCells(DAY_ITEMS, {}, { [REST]: { answer: "Yes", source: "No workouts recorded" } }, {});
+  assert.equal(cells[REST].origin, "suggested");
+  const n = night("2031-03-04");
+  const nightCells = { [n.date]: K.buildCells(SLEEP_ITEMS, {}, {}, K.draftWith({}, { [TAPE]: "Yes" }, {})) };
+  const first = plan({ cells, nights: [n], nightCells });
+  assert.deepEqual(first.dayPatch, {}); // the day is not sent, so its card is not settled
+  assert.deepEqual(first.nightPatches, [{ date: "2031-03-04", changes: { [TAPE]: "Yes" } }]);
+  assert.equal(first.changeCount, 1);
+  // after that save: the night is stored, the day's pre-fill is still only a suggestion -> nothing to save
+  const saved = night("2031-03-04", { [TAPE]: "Yes" });
+  const second = plan({ cells, nights: [saved], nightCells: { [saved.date]: K.buildCells(SLEEP_ITEMS, saved.answers, {}, {}) } });
+  assert.deepEqual(second, { dayPatch: {}, nightPatches: [], changeCount: 0 });
+});
+
+test("a touched day is sent with its pre-fills; an untouched night's pre-fill is not", () => {
+  const cells = K.buildCells(DAY_ITEMS, {}, { [REST]: { answer: "Yes", source: "x" } }, K.draftWith({}, { [STRESS]: "No" }, {}));
+  const n = night("2031-03-04", {}, { [C.Q_SAME_BED]: { answer: "Yes", source: "Eight Sleep: 7.0 h in your bed" } });
+  const nightCells = { [n.date]: K.buildCells(SLEEP_ITEMS, n.answers, n.suggestions, {}) };
+  const p = plan({ cells, nights: [n], nightCells });
+  assert.deepEqual(p.dayPatch, { [REST]: "Yes", [STRESS]: "No" });
+  assert.deepEqual(p.nightPatches, []);
+  // one kit tap makes the night touched: its pre-fill goes with it
+  const tapped = { [n.date]: K.buildCells(SLEEP_ITEMS, n.answers, n.suggestions, K.draftWith({}, { [TAPE]: "Yes" }, {})) };
+  assert.deepEqual(plan({ nights: [n], nightCells: tapped }).nightPatches, [{ date: n.date, changes: { [TAPE]: "Yes", [C.Q_SAME_BED]: "Yes" } }]);
+});
+
+test("pre-fills alone are never sent; clearing a saved answer is", () => {
+  const cells = K.buildCells(DAY_ITEMS, {}, { [REST]: { answer: "Yes", source: "x" } }, {});
+  assert.equal(plan({ cells }).changeCount, 0);
+  const cleared = K.buildCells(DAY_ITEMS, { [STRESS]: "Yes" }, {}, K.draftWith({}, { [STRESS]: null }, { [STRESS]: "Yes" }));
+  assert.deepEqual(plan({ dayAnswers: { [STRESS]: "Yes" }, cells: cleared }).dayPatch, { [STRESS]: null });
+});
+
+test("drafts: a tap made mid-save survives, a sent one is dropped, a no-op or outdated one is ignored", () => {
+  let draft = K.draftWith({}, { [REST]: "Yes" }, {});
+  draft = K.draftWith(draft, { [STRESS]: "Yes" }, {}); // tapped while the save was in flight
+  assert.deepEqual(K.draftSettled(draft, { [REST]: "Yes" }), { [STRESS]: { a: "Yes", base: null } });
+  // re-tapped to a different answer mid-save: stays
+  assert.deepEqual(Object.keys(K.draftSettled(K.draftWith({}, { [REST]: "No" }, {}), { [REST]: "Yes" })), [REST]);
+  // the stored answer changed elsewhere since the tap (base differs): server wins
+  const outdated = K.draftWith({}, { [REST]: null }, {}); // blanked a pre-fill when nothing was stored
+  assert.equal(K.buildCells(DAY_ITEMS, { [REST]: "No" }, {}, outdated)[REST].origin, "saved");
+  // a null that blanks a still-present pre-fill is kept; one with nothing to blank is a no-op
+  assert.equal(K.buildCells(DAY_ITEMS, {}, { [REST]: { answer: "Yes", source: "x" } }, outdated)[REST], undefined);
+  assert.deepEqual(plan({ cells: K.buildCells(DAY_ITEMS, {}, {}, outdated) }).dayPatch, {});
+  // a draft equal to what is stored is not pending
+  assert.equal(K.buildCells(DAY_ITEMS, { [REST]: "Yes" }, {}, K.parseDraft({ [REST]: "Yes" }))[REST].origin, "saved");
+});
+
+test("parseDraft reads old bare answers and the new shape, and drops junk", () => {
+  assert.deepEqual(K.parseDraft({ a: "Yes", b: null, c: { a: "No", base: "Yes" }, d: { a: null, base: null }, e: 5, f: { a: "maybe" }, g: { a: "Yes" } }), {
+    a: { a: "Yes" },
+    b: { a: null },
+    c: { a: "No", base: "Yes" },
+    d: { a: null, base: null },
+    g: { a: "Yes", base: undefined },
+  });
+  for (const junk of [null, "x", 3, [1, 2]]) assert.deepEqual(K.parseDraft(junk), {});
+});
+
+test("visibleNights: last night always; an earlier night while incomplete or holding an unsaved tap", () => {
+  const last = night("2031-03-04", { [TAPE]: "Yes", [C.Q_SAME_BED]: "Yes" });
+  const earlierDone = night("2031-03-03", { [TAPE]: "Yes", [C.Q_SAME_BED]: "Yes" });
+  const earlierOpen = night("2031-03-03", { [TAPE]: "Yes" });
+  const dates = (ns, nc = {}) => K.visibleNights(ns, SLEEP_ITEMS, nc).map((n) => n.date);
+  assert.deepEqual(dates([last, earlierDone]), ["2031-03-04"]); // the optional read-in-bed row does not keep it open
+  assert.deepEqual(dates([last, earlierOpen]), ["2031-03-04", "2031-03-03"]);
+  // complete, but with an unsaved tap on the optional row: stays so the tap can be saved
+  const tapped = { "2031-03-03": K.buildCells(SLEEP_ITEMS, earlierDone.answers, {}, K.draftWith({}, { [C.Q_READ_IN_BED]: "Yes" }, earlierDone.answers)) };
+  assert.deepEqual(dates([last, earlierDone], tapped), ["2031-03-04", "2031-03-03"]);
+  assert.deepEqual(K.visibleNights([last], [], {}), []);
+});
+
+test("the screen wires the save plan: day under its date with the card settle, nights under theirs", () => {
   const client = fs.readFileSync(path.join(SRC, "app/check-in/CheckInClient.tsx"), "utf8");
-  assert.match(client, /const dayPatch = dayTouched \|\| nightChanges\.length === 0 \? dayChanges : \{\}/);
+  assert.match(client, /savePlan\(\{ dayItems, dayAnswers: data\?\.answers \?\? \{\}, cells, sleepItems, nights, nightCells \}\)/);
   const save = client.slice(client.indexOf("const save = async"), client.indexOf("const goTo"));
-  // checkinDone sits inside the branch that posted the day
-  const dayBranch = save.slice(save.indexOf("if (Object.keys(dayPatch).length)"), save.indexOf("for (const n of nightChanges)"));
-  assert.match(dayBranch, /agentsApi\.checkinDone\(data\.date\)/);
+  const dayBranch = save.slice(save.indexOf("if (Object.keys(dayPatch).length)"), save.indexOf("for (const n of nightPatches)"));
+  assert.match(dayBranch, /agentsApi\.checkinDone\(data\.date\)/); // only when the day was sent
   assert.equal((save.match(/checkinDone/g) || []).length, 1);
+  // a refused stale page drops its unsaved taps before redrawing
+  const stale = save.slice(save.indexOf("e instanceof StaleDayError"));
+  assert.ok(stale.indexOf("settleDraft(dayDraftKey(data.date), dayPatch)") < stale.indexOf("await load(requested)"));
 });
 
 test("other write paths keep sleep answers off today", () => {
   const chat = fs.readFileSync(path.join(SRC, "app/api/chat/route.ts"), "utf8");
-  assert.match(chat, /if \(SLEEP_QUESTIONS\.has\(habit\)\) date = sleepAnswerDate\(date\)/);
+  assert.match(chat, /if \(!date\) date = sleepAnswerDate\(today\)/);
+  assert.match(chat, /const tonight = sleepDateError\(habit, date, today, answer\)/);
+  assert.equal(/toLocaleDateString\("en-CA", \{ timeZone: "America\/New_York" \}\)/.test(chat.slice(chat.indexOf('name === "mark_habit_complete"'), chat.indexOf("WHOOP-era rows"))), false);
+  const complete = fs.readFileSync(path.join(SRC, "app/api/habits/complete/route.ts"), "utf8");
+  assert.match(complete, /sleepDateError\(habit, completionDate, today, answer\)/);
+  const checkin = fs.readFileSync(path.join(SRC, "app/api/habits/checkin/route.ts"), "utf8");
+  assert.match(checkin, /sleepDateError\(name, date, today, raw\)/);
   const habits = fs.readFileSync(path.join(SRC, "app/habits/HabitsClient.tsx"), "utf8");
   assert.match(habits, /habits\.filter\(\(h\) => !SLEEP_QUESTIONS\.has\(h\.name\)\)\.map/);
 });
