@@ -32,6 +32,7 @@ import {
 } from "@/lib/finance-ledger";
 import { FINANCE_SOURCE, SIMPLEFIN_THRESHOLDS, financeLedgerCard, type FinanceCard } from "@/lib/finance-status";
 import { NO_FIXES, applyFixes, fixedCategory, type CategoryFixes } from "@/lib/finance-categories";
+import { merchantKey } from "@/lib/procurement-recurring";
 
 /**
  * Server-side reads of the finance ledger. SERVICE ROLE ONLY: pds.finance_* has RLS on, no
@@ -62,6 +63,8 @@ export interface ListRow {
   currency: string;
   category: string | null;
   excluded: Exclude<TxnClass, "counted"> | null;
+  /** Normalized merchant label, the key a category rule uses. */
+  merchant_key: string;
 }
 export interface LedgerData {
   query: LedgerQuery & { month: string };
@@ -314,6 +317,7 @@ async function readList(
       currency: t.currency,
       category: t.category,
       excluded: cls === "counted" ? null : cls,
+      merchant_key: merchantKey({ name, custom_name: custom || null }),
     });
   }
   const total = typeof count === "number" ? count : rows.length;

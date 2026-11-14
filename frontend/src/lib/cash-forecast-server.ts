@@ -3,6 +3,7 @@ import { etDate } from "@/lib/format";
 import { accountLabel, parseAccount, parseBalance, toCents } from "@/lib/finance-ledger";
 import { fetchPaged, loadCategoryFixes, serviceClient } from "@/lib/finance-ledger-server";
 import { fixedCategory } from "@/lib/finance-categories";
+import { computeGoals, type GoalRow, type GoalView } from "@/lib/finance-goals";
 import { forecastCash, poolBalanceAt, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
 import { driversToInputs, itemRowToPlanned, type DriverRow, type ItemInput, type ItemRow } from "@/lib/cash-forecast-store";
 import { applyToProfile, hasLevers, scenarioCardPayments, scenarioItems, type ScenarioParams } from "@/lib/cash-forecast-scenario";
@@ -54,6 +55,7 @@ export type ForecastLoad =
       scenario: { params: ScenarioParams; result: ForecastResult; tax: TaxYearResult[] } | null;
       saved: { slug: string; name: string; params: ScenarioParams }[];
       accuracy: AccuracyRow[];
+      goals: GoalView[];
     }
   | { kind: "empty" }
   | { kind: "error"; code: string };
@@ -168,6 +170,22 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
         });
       }
     }
+    // Savings goals: progress from the latest balances, and the forecast for goals on the cash pool.
+    let goals: GoalView[] = [];
+    const goalRes = await db.from("finance_goals").select("id,name,target_cents,target_date,account_key").is("removed_at", null).order("target_date", { ascending: true });
+    if (!goalRes.error && goalRes.data) {
+      const latestBal = new Map<string, number>();
+      const latestAt = new Map<string, string>();
+      for (const b of balances) {
+        if (!latestAt.has(b.account_key) || b.captured_at > latestAt.get(b.account_key)!) {
+          latestAt.set(b.account_key, b.captured_at);
+          latestBal.set(b.account_key, b.kind === "liability" ? -Math.abs(b.balance_cents) : b.balance_cents);
+        }
+      }
+      const labels = new Map(accounts.map((a) => [a.account_key, a.label]));
+      const rows = (goalRes.data as GoalRow[]).map((g) => ({ ...g, target_cents: Number(g.target_cents) }));
+      goals = computeGoals(rows, latestBal, labels, result.opening.cents, result.days, today);
+    }
     const saved = drivers
       .filter((d) => d.key.startsWith("scenario:"))
       .map((d) => ({ slug: d.key.slice(9), name: String((d.value as { name?: unknown }).name ?? d.key.slice(9)), params: ((d.value as { params?: ScenarioParams }).params ?? {}) as ScenarioParams }));
@@ -193,6 +211,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
       scenario,
       saved,
       accuracy,
+      goals,
     };
   } catch (e) {
     const code = e && typeof e === "object" && "code" in e ? String((e as { code: unknown }).code) : "unknown";

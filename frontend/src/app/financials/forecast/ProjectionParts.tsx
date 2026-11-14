@@ -2,7 +2,10 @@
 
 import { CartesianGrid, ComposedChart, Legend, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { accentColor, axisTick, chartColors, chartTooltip, gridStyle, legendStyle } from "@/lib/chart-theme";
+import { useState } from "react";
 import type { ForecastResult } from "@/lib/cash-forecast";
+import type { ForecastAccountView } from "@/lib/cash-forecast-server";
+import type { GoalView } from "@/lib/finance-goals";
 
 const usd = (cents: number | null | undefined): string => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -145,6 +148,88 @@ export function NetWorthChart({ result, scenario }: { result: ForecastResult; sc
           Investments in {result.netWorth.length} months: {accounts.map(([k, v]) => `${k} ${usd(v)}`).join(" · ")}. 5% a year unless set otherwise: an assumption, not a promise.
         </p>
       )}
+    </section>
+  );
+}
+
+async function send(url: string, method: string, body?: unknown): Promise<string | null> {
+  try {
+    const res = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+    if (res.ok) return null;
+    return ((await res.json().catch(() => ({}))) as { error?: string }).error ?? `failed (${res.status})`;
+  } catch {
+    return "network error";
+  }
+}
+
+export function GoalsSection({ goals, accounts, busy, run }: { goals: GoalView[]; accounts: ForecastAccountView[]; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
+  const [name, setName] = useState("");
+  const [target, setTarget] = useState("");
+  const [date, setDate] = useState("");
+  const [account, setAccount] = useState("");
+  const inputCls = "rounded-control border border-border-subtle bg-transparent px-2 py-1 text-[13px]";
+  const btn = "rounded-control border border-border-subtle px-3 py-1 text-[13px] hover:bg-white/5 disabled:opacity-50";
+  const options = accounts.filter((a) => a.type === "cash" || a.type === "investment");
+  return (
+    <section className={card} aria-labelledby="fc-goals">
+      <h2 id="fc-goals" className="font-semibold">Savings goals</h2>
+      <p className="text-[12px] text-text-tertiary">Tracked against your real balances; goals on checking + savings are also checked against the forecast. Onyx never moves money toward a goal.</p>
+      {goals.length > 0 && (
+        <ul className="mt-3 space-y-3 text-[13px]">
+          {goals.map((g) => (
+            <li key={g.id}>
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <span>
+                  <b>{g.name}</b> <span className="text-text-tertiary">· {g.accountLabel} · by {g.targetDate}</span>
+                </span>
+                <span className="text-text-secondary">
+                  {usd(g.currentCents)} of {usd(g.targetCents)} ({g.pct}%)
+                </span>
+              </div>
+              <div className="mt-1 h-2 w-full rounded-control bg-white/5">
+                <div className={`h-2 rounded-control ${g.onTrack === false ? "bg-mid" : "bg-accent"}`} style={{ width: `${g.pct}%` }} />
+              </div>
+              <p className="mt-1 text-[12px] text-text-secondary">
+                {g.perMonthNeededCents > 0 ? `Needs about ${usd(g.perMonthNeededCents)} a month for ${g.monthsLeft} months. ` : "Reached. "}
+                {g.projectedCents !== null && (g.onTrack ? `On track: the forecast has ${usd(g.projectedCents)} on that date.` : `Not on track: the forecast has ${usd(g.projectedCents)} on that date.`)}
+                <button className="ml-2 text-text-tertiary hover:text-down" disabled={busy} onClick={() => run(() => send(`/api/finance/goals/${g.id}`, "DELETE"))}>
+                  remove
+                </button>
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <input className={inputCls} placeholder="Goal (e.g. NYC move fund)" value={name} onChange={(e) => setName(e.target.value)} maxLength={80} />
+        <input className={`${inputCls} w-28`} placeholder="$ target" inputMode="decimal" value={target} onChange={(e) => setTarget(e.target.value)} />
+        <input className={inputCls} type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+        <select className={inputCls} value={account} onChange={(e) => setAccount(e.target.value)}>
+          <option value="">Checking + savings</option>
+          {options.map((a) => (
+            <option key={a.account_key} value={a.account_key}>
+              {a.label}
+            </option>
+          ))}
+        </select>
+        <button
+          className={btn}
+          disabled={busy || !name.trim() || !date || !(Number(target.replace(/[$,\s]/g, "")) > 0)}
+          onClick={() =>
+            run(() =>
+              send("/api/finance/goals", "POST", { name: name.trim(), targetCents: Math.round(Number(target.replace(/[$,\s]/g, "")) * 100), targetDate: date, ...(account ? { accountKey: account } : {}) }).then((e) => {
+                if (!e) {
+                  setName("");
+                  setTarget("");
+                }
+                return e;
+              }),
+            )
+          }
+        >
+          Add goal
+        </button>
+      </div>
     </section>
   );
 }

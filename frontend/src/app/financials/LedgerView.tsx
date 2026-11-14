@@ -15,6 +15,7 @@ import type { LedgerData } from "@/lib/finance-ledger-server";
 import type { FinanceCard } from "@/lib/finance-status";
 import FilterBar from "./FilterBar";
 import SpendingTrendChart from "./SpendingTrendChart";
+import CategoryEditor from "./CategoryEditor";
 
 /** Server-rendered ledger: every number below is computed per request and sent as HTML. */
 
@@ -319,7 +320,7 @@ export default function LedgerView({ data, now }: { data: LedgerData; now: Date 
                     <td className="p-2">{r.title}</td>
                     <td className="p-2 text-text-secondary">{data.accountLabels[r.account_key] ?? "Unknown account"}</td>
                     <td className="p-2 text-text-secondary">
-                      {r.category?.trim() || "Uncategorized"}
+                      <CategoryEditor txnKey={r.txn_key} merchantKey={r.merchant_key} category={r.category} />
                       {r.excluded && (
                         <span className="ml-2 rounded-[3px] border border-border-subtle px-1 py-px text-[10px] uppercase tracking-wide text-text-tertiary">
                           {r.excluded === "transfer" ? "not spending" : "ignored"}
