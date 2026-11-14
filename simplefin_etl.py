@@ -38,7 +38,7 @@ error text is built from fixed wording. Supabase: SUPABASE_URL + SUPABASE_SERVIC
 Usage:
   python simplefin_etl.py --claim [--set-github-secret]   # one time: setup token file -> Access URL
   python simplefin_etl.py --dry-run [--days 90]            # read everything, write nothing, show the matching
-  python simplefin_etl.py [--days N]                       # routine run (default 60 days, max 90)
+  python simplefin_etl.py [--days N]                       # routine run (default 45 days, max 90)
 """
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ SUPABASE_SECRET_FILE = HOME / ".onyx_supabase_secret"
 DEFAULT_SUPABASE_URL = "https://fewweioupmsnbccqtxdl.supabase.co"
 GITHUB_REPO = "rileybleeker/Onyx"
 
-DEFAULT_DAYS = 60
+DEFAULT_DAYS = 45      # SimpleFIN: "Requested date range exceeds recommended range of 45 days" beyond this
 MAX_DAYS = 90          # SimpleFIN: "limited to 90 days at a time"
 OVERLAP_DAYS = 3       # cutover: how far a SimpleFIN date may sit from the Rocket Money date of the same row
 PAIR_DAYS = 5          # a card payment / transfer posts on both accounts within this many days
@@ -435,6 +435,11 @@ def match_accounts(sf_accounts: list[SfAccount], ledger: list[dict]) -> dict[str
             if cname and (compact_name(r.get("account_name")) == cname
                           or (len(cname) >= 5 and (cname in compact_name(r.get("account_name")) or compact_name(r.get("account_name")) in cname)))
         ]
+        if not hits:
+            # Some connections name the account after its owner ("Riley") and carry the product in the
+            # connection name ("Apple Card (Updated Monthly)"): match a ledger name found inside it.
+            conn = compact_name(a.institution)
+            hits = [r for r in same_inst if len(compact_name(r.get("account_name"))) >= 5 and compact_name(r.get("account_name")) in conn]
         if len(hits) == 1:
             result[a.id] = Match(hits[0]["account_key"], "matched", "institution + name")
             taken.add(hits[0]["account_key"])
@@ -782,7 +787,7 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
 def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[datetime] = None, out=print) -> int:
     started = time.time()
     today = et_today(now)
-    start = today - timedelta(days=days)
+    start = today - timedelta(days=days - 1)  # `days` calendar days including today
     try:
         body = fetch_accounts(access_url, start, today + timedelta(days=1), http)
         plan = build_plan(body, store, today, days)
@@ -863,15 +868,19 @@ def main() -> int:
     ap.add_argument("--claim", action="store_true", help="exchange the setup token in ~/.simplefin_setup_token")
     ap.add_argument("--set-github-secret", action="store_true", help="with --claim: also set the GitHub secret")
     ap.add_argument("--dry-run", action="store_true", help="read SimpleFIN and the ledger, write nothing")
-    ap.add_argument("--days", type=int, default=DEFAULT_DAYS, help=f"window in days (1..{MAX_DAYS})")
+    ap.add_argument("--days", type=int, default=DEFAULT_DAYS, help=f"window in calendar days including today (1..{MAX_DAYS})")
     args = ap.parse_args()
+    try:  # account names carry characters a Windows console cannot print; never crash on them
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
     import httpx
 
     with httpx.Client() as http:
         if args.claim:
             return claim_command(args.set_github_secret, http)
-        days = min(max(args.days, 1), MAX_DAYS - 1)  # the window also includes today
+        days = min(max(args.days, 1), MAX_DAYS)
         try:
             store = Store(supabase_client())
         except SimpleFinError as e:

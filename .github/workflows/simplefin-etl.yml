@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       days:
-        description: 'Window in days (1-89). Leave empty for the routine 60 days.'
+        description: 'Window in days (1-90). Leave empty for the routine 45 days (SimpleFIN warns above 45).'
         required: false
         type: string
 
