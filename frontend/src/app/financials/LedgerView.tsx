@@ -48,14 +48,14 @@ export function FreshnessLine({ freshness, now }: { freshness: FinanceCard | nul
   if (!freshness) {
     return (
       <p className="text-[12px] text-text-tertiary">
-        Rocket Money sync: no heartbeat recorded yet. <Link className="underline" href="/status" prefetch={false}>Status</Link>
+        Bank sync (SimpleFIN): no heartbeat recorded yet. <Link className="underline" href="/status" prefetch={false}>Status</Link>
       </p>
     );
   }
   return (
     <div className="text-[12px] text-text-secondary">
       <p>
-        Rocket Money sync:{" "}
+        Bank sync (SimpleFIN):{" "}
         <span className={STATUS_TEXT[freshness.status]}>{STATUS_WORD[freshness.status]}</span>
         {freshness.lastSync && <> · last report {ageLabel(freshness.lastSync, now)}</>} ·{" "}
         <Link className="underline" href="/status" prefetch={false}>

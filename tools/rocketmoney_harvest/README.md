@@ -1,5 +1,10 @@
 # Rocket Money finance ledger: importers and PC harvester
 
+> **RETIRED 2026-11-14.** New transactions and balances come from SimpleFIN Bridge (`simplefin_etl.py`,
+> `docs/financials-simplefin.md`): the Rocket Money web sign-in expired within hours every day. The Task Scheduler
+> entry "Onyx Rocket Money Harvest" is disabled (not deleted). This folder stays as the record of how the history was
+> built and for a manual backfill (`import-csv.mjs`). Do not turn the harvester back on as a feed.
+
 Loads Rocket Money data into the finance tables (`sql/finance_schema.sql`: `pds.finance_accounts`,
 `pds.finance_transactions`, `pds.finance_balance_snapshots`; `sql/finance_source_txn_id.sql` adds Rocket Money's own
 transaction id). Rocket Money is the only source that sees all accounts, including the Fidelity balances; it has no API.

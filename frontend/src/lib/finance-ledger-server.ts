@@ -30,7 +30,7 @@ import {
   type TrendPoint,
   type TxnClass,
 } from "@/lib/finance-ledger";
-import { financeLedgerCard, type FinanceCard } from "@/lib/finance-status";
+import { FINANCE_SOURCE, SIMPLEFIN_THRESHOLDS, financeLedgerCard, type FinanceCard } from "@/lib/finance-status";
 
 /**
  * Server-side reads of the finance ledger. SERVICE ROLE ONLY: pds.finance_* has RLS on, no
@@ -139,7 +139,7 @@ async function heartbeat(db: Db, dataType: string): Promise<Record<string, unkno
   const { data, error } = await db
     .from("sync_log")
     .select(HEARTBEAT_COLS)
-    .eq("source", "rocketmoney")
+    .eq("source", FINANCE_SOURCE)
     .eq("data_type", dataType)
     .order("sync_start", { ascending: false })
     .limit(1);
@@ -155,19 +155,18 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
     return fail(e);
   }
   try {
-    const [accountsRes, minDate, maxDate, txHeartbeat, balHeartbeat, keepaliveHeartbeat] = await Promise.all([
+    const [accountsRes, minDate, maxDate, txHeartbeat, balHeartbeat] = await Promise.all([
       db.from("finance_accounts").select(ACCOUNT_COLS).order("institution").order("account_name").order("account_key"),
       dateEdge(db, true),
       dateEdge(db, false),
       heartbeat(db, "transactions"),
       heartbeat(db, "balances"),
-      heartbeat(db, "keepalive"),
     ]);
     const accounts = (check(accountsRes).data ?? [])
       .map(parseAccount)
       .filter((a): a is LedgerAccount => a !== null);
     const freshness =
-      txHeartbeat || balHeartbeat ? financeLedgerCard(txHeartbeat, balHeartbeat, now.getTime(), keepaliveHeartbeat) : null;
+      txHeartbeat || balHeartbeat ? financeLedgerCard(txHeartbeat, balHeartbeat, now.getTime(), null, SIMPLEFIN_THRESHOLDS) : null;
 
     if (accounts.length === 0 && maxDate === null) return { kind: "empty", freshness };
 

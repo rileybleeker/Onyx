@@ -1,5 +1,8 @@
 # Financials: Rocket Money first
 
+> **Superseded 2026-11-14:** the ledger is now fed by SimpleFIN Bridge, see `docs/financials-simplefin.md`. The Rocket
+> Money harvester is retired; the rows it and the CSV export stored before the cutover stay as history.
+
 ## Current state (2026-11-12)
 
 `/financials` shows a persisted ledger. Accounts, balances and transactions from Rocket Money are stored in `pds.finance_accounts`, `pds.finance_transactions` and `pds.finance_balance_snapshots` and are filled by a Rocket Money importer and a daily harvester (separate from the frontend). The page is rendered on the server for every request (`force-dynamic`: no ISR, no CDN caching, `noindex`), only for the signed-in owner. It shows net worth and the latest balance per account (with its capture time and a stale badge after 48 hours), a month picker with money in / money out / net cashflow, a category outflow ranking, a 12-month spending trend, and a searchable, server-paged transaction list with a per-account filter.

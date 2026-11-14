@@ -1,0 +1,48 @@
+name: SimpleFIN ETL
+
+on:
+  schedule:
+    # Every 6 hours at :30. SimpleFIN Bridge refreshes bank data about once a day and asks clients for
+    # at most 24 requests a day; one run is one GET /accounts. 4 a day keeps /financials within hours of
+    # the bank without coming near the limit (going over it gets the Access URL disabled).
+    # /status: the SimpleFIN card is degraded after 14 h without a heartbeat, red after 30 h.
+    - cron: '30 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Window in days (1-89). Leave empty for the routine 60 days.'
+        required: false
+        type: string
+
+concurrency:
+  group: simplefin-etl
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  simplefin-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install httpx supabase
+
+      - name: Run SimpleFIN ETL
+        env:
+          # The read-only Access URL (contains its own credentials). GitHub masks it in the log; the ETL never
+          # prints it and its output is counts only (this repo's logs are public).
+          SIMPLEFIN_ACCESS_URL: ${{ secrets.SIMPLEFIN_ACCESS_URL }}
+          WINDOW_DAYS: ${{ inputs.days }}
+        run: |
+          if [ -n "$WINDOW_DAYS" ]; then
+            case "$WINDOW_DAYS" in *[!0-9]*) echo "days must be a whole number" >&2; exit 2;; esac
+            python simplefin_etl.py --days "$WINDOW_DAYS"
+          else
+            python simplefin_etl.py
+          fi

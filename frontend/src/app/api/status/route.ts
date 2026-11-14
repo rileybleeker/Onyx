@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { getNycScoutFreshness } from "@/lib/nyc";
 import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
-import { financeLedgerCard } from "@/lib/finance-status";
+import { SIMPLEFIN_THRESHOLDS, financeLedgerCard } from "@/lib/finance-status";
 import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
 
 const supabase = createClient(
@@ -66,7 +66,7 @@ const CADENCE: Record<string, string> = {
   google_calendar: "Hourly :55",
   ubereats: "Every 6h (Riley's PC, while logged on)",
   nyc_scout: "Daily 6:10am ET",
-  rocket_money: "Daily import; sign-in kept alive every 2h (Riley's PC)",
+  simplefin: "Every 6h :30 (GitHub Actions); banks refresh about daily, Apple Card monthly",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
   // the frontend matrix reads hit since 2026-06-11). The heartbeat also
   // carries the schema-drift tripwire — a 'failed' here can mean the view
@@ -116,7 +116,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   google_calendar: { method: "automated",     label: "iCal feed ETL" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
-  rocket_money:   { method: "automated",      label: "Harvester import" },
+  simplefin:      { method: "automated",      label: "Bank feed API" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
   perf_mats:      { method: "automated",      label: "Matview refresh" },
 };
@@ -385,12 +385,10 @@ export async function GET() {
       Promise.all([
         ["garmin", "full_sync"], ["whoop", "full_sync"],
         ["eight_sleep", "trends"], ["cronometer", "daily"],
-        // Finance ledger: the harvester + importers heartbeat once a day (transactions and
-        // balances separately), so the pair needs its own limit-1 reads. Heartbeats only:
-        // this endpoint is CDN-cacheable, so no ledger rows or amounts are read here.
-        ["rocketmoney", "transactions"], ["rocketmoney", "balances"],
-        // The harvester's keep-alive visits between imports (every 2h): a failing one drags the card down.
-        ["rocketmoney", "keepalive"],
+        // Finance ledger: simplefin_etl.py heartbeats every 6h (transactions and balances
+        // separately), so the pair needs its own limit-1 reads. Heartbeats only: this
+        // endpoint is CDN-cacheable, so no ledger rows or amounts are read here.
+        ["simplefin", "transactions"], ["simplefin", "balances"],
         // Online orders (every 3h): its own read so the shared 100-row window cannot push it out.
         ["online_orders", "email"],
         // Personal Amazon order list (Kindle harvester pass on Riley's PC, every 3h).
@@ -1156,21 +1154,22 @@ export async function GET() {
           methodLabel: METHOD.perf_mats.label,
         };
       })(),
-      // Rocket Money ledger (pds.finance_*, read by /financials): the harvester's daily import and the
-      // transactions + balances importers each write a rocketmoney heartbeat on every import run; the
-      // keep-alive visits in between write rocketmoney|keepalive (a failing one drags the card down).
-      // Status is the worse of the two (>36h degraded, >72h or a failed/error row = red, a
-      // "login required" failure shows the importer's own text). Heartbeat-only by design:
-      // no amounts or row contents ever reach this cacheable endpoint.
-      rocket_money: (() => {
+      // Finance ledger (pds.finance_*, read by /financials), fed by SimpleFIN Bridge since 2026-11-14
+      // (simplefin_etl.py; the Rocket Money harvester it replaced is retired). Each run writes a
+      // simplefin|transactions and a simplefin|balances heartbeat. Status is the worse of the two
+      // (>14h degraded, >30h or a failed row red; 'partial' = SimpleFIN reported a connection problem
+      // or an account could not be matched, with that text). Heartbeat-only by design: no amounts or
+      // row contents ever reach this cacheable endpoint.
+      simplefin: (() => {
         const card = financeLedgerCard(
-          latestBySrcType["rocketmoney|transactions"],
-          latestBySrcType["rocketmoney|balances"],
+          latestBySrcType["simplefin|transactions"],
+          latestBySrcType["simplefin|balances"],
           Date.now(),
-          latestBySrcType["rocketmoney|keepalive"],
+          null,
+          SIMPLEFIN_THRESHOLDS,
         );
         return {
-          label: "Rocket Money",
+          label: "SimpleFIN",
           lastSync: card.lastSync,
           status: card.status,
           latestDataDate: card.latestDataDate,
@@ -1178,9 +1177,9 @@ export async function GET() {
           recordsSynced: card.recordsSynced,
           durationSeconds: card.durationSeconds,
           errorMessage: card.errorMessage,
-          cadence: CADENCE.rocket_money,
-          integrationMethod: METHOD.rocket_money.method,
-          methodLabel: METHOD.rocket_money.label,
+          cadence: CADENCE.simplefin,
+          integrationMethod: METHOD.simplefin.method,
+          methodLabel: METHOD.simplefin.label,
         };
       })(),
       // Google Calendar (google_calendar_etl.py): the calendars' iCal feeds copied hourly into

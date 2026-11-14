@@ -94,7 +94,7 @@ test("net worth: liabilities subtract, unclassified is surfaced not counted, sta
   assert.match(out, /1 account has no asset or liability label/);
   assert.match(out, /Not counted in net worth until the source labels them/);
   assert.match(out, /••0000/);
-  assert.match(out, /Rocket Money sync:/);
+  assert.match(out, /Bank sync \(SimpleFIN\):/);
   assert.match(out, /Login required/, "a failed heartbeat shows its own text");
 });
 

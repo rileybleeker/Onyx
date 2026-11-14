@@ -121,7 +121,7 @@ function expectedFlows(month, account) {
 test("an empty ledger is its own state, with the heartbeat if one exists", async () => {
   const none = await load(makeDb({})).loadLedger(q(), NOW);
   assert.deepEqual(none, { kind: "empty", freshness: null });
-  const ran = await load(makeDb({ beats: [{ source: "rocketmoney", data_type: "transactions", status: "failed", sync_start: hoursAgo(1), records_synced: 0, duration_seconds: 1, error_message: "Login required" }] })).loadLedger(q(), NOW);
+  const ran = await load(makeDb({ beats: [{ source: "simplefin", data_type: "transactions", status: "failed", sync_start: hoursAgo(1), records_synced: 0, duration_seconds: 1, error_message: "Login required" }] })).loadLedger(q(), NOW);
   assert.equal(ran.kind, "empty");
   assert.equal(ran.freshness.status, "failed");
   assert.equal(ran.freshness.errorMessage, "Login required");

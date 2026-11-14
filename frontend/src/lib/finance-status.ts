@@ -1,8 +1,10 @@
 import { ingestionHeartbeatStatus, type HealthStatus } from "@/lib/status-freshness";
 
 /**
- * Rocket Money ledger health, from the two sync_log heartbeats the importers write on every import
- * run: source 'rocketmoney', data_type 'transactions' and 'balances'. Used by the /status card and
+ * Finance ledger health, from the two sync_log heartbeats the feed writes on every run (data_type
+ * 'transactions' and 'balances'). Since 2026-11-14 the feed is SimpleFIN Bridge (simplefin_etl.py,
+ * source 'simplefin', every 6 h, thresholds SIMPLEFIN_*_HOURS); before that it was the Rocket Money
+ * harvester (source 'rocketmoney', daily, the FINANCE_*_HOURS defaults). Used by the /status card and
  * by the freshness line at the top of /financials, so both always agree.
  *
  * Thresholds: a heartbeat older than 36 h is degraded, older than 72 h is failed; a failed or
@@ -17,6 +19,11 @@ import { ingestionHeartbeatStatus, type HealthStatus } from "@/lib/status-freshn
  */
 export const FINANCE_WARN_HOURS = 36;
 export const FINANCE_FAIL_HOURS = 72;
+/** SimpleFIN runs every 6 h: two missed runs is degraded, a day and more without one is red. */
+export const SIMPLEFIN_WARN_HOURS = 14;
+export const SIMPLEFIN_FAIL_HOURS = 30;
+export const FINANCE_SOURCE = "simplefin";
+export const SIMPLEFIN_THRESHOLDS = { warnHours: SIMPLEFIN_WARN_HOURS, failHours: SIMPLEFIN_FAIL_HOURS } as const;
 
 type Entry = Record<string, unknown> | null | undefined;
 export interface FinanceCard {
@@ -48,13 +55,20 @@ function keepaliveStatus(keepalive: Entry, imports: Entry[]): HealthStatus | nul
   return null;
 }
 
-export function financeLedgerCard(transactions: Entry, balances: Entry, now = Date.now(), keepalive: Entry = null): FinanceCard {
+export function financeLedgerCard(
+  transactions: Entry,
+  balances: Entry,
+  now = Date.now(),
+  keepalive: Entry = null,
+  thresholds: { warnHours: number; failHours: number } = { warnHours: FINANCE_WARN_HOURS, failHours: FINANCE_FAIL_HOURS },
+): FinanceCard {
+  const { warnHours, failHours } = thresholds;
   const parts = [
     { name: "transactions", entry: transactions ?? null },
     { name: "balances", entry: balances ?? null },
   ].map((p) => ({
     ...p,
-    status: p.entry ? ingestionHeartbeatStatus("success", p.entry, FINANCE_WARN_HOURS, FINANCE_FAIL_HOURS, now) : ("unknown" as HealthStatus),
+    status: p.entry ? ingestionHeartbeatStatus("success", p.entry, warnHours, failHours, now) : ("unknown" as HealthStatus),
   }));
   const present = parts.filter((p) => p.entry);
   const keep = present.length ? keepaliveStatus(keepalive, present.map((p) => p.entry)) : null;
@@ -86,7 +100,7 @@ export function financeLedgerCard(transactions: Entry, balances: Entry, now = Da
       else {
         const h = ageHours(p.entry, now);
         errorMessage = Number.isFinite(h)
-          ? `Last ${p.name} import was ${Math.floor(h)}h ago (degraded after ${FINANCE_WARN_HOURS}h, failed after ${FINANCE_FAIL_HOURS}h).`
+          ? `Last ${p.name} import was ${Math.floor(h)}h ago (degraded after ${warnHours}h, failed after ${failHours}h).`
           : `The ${p.name} heartbeat could not be read.`;
       }
       break;

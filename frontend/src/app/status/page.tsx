@@ -41,7 +41,7 @@ const SOURCE_BADGE: Record<string, string> = {
   google_calendar: "GOOGLE",
   ubereats: "UBER EATS",
   nyc_scout: "AGENT",
-  rocket_money: "ROCKET MONEY",
+  simplefin: "SIMPLEFIN",
   matrix_mat: "DB",
   perf_mats: "DB",
 };
@@ -76,7 +76,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   google_calendar: "text-blue-300",
   ubereats: "text-emerald-400/70",
   nyc_scout: "text-sky-400",
-  rocket_money: "text-lime-400",
+  simplefin: "text-lime-400",
   matrix_mat: "text-cyan-400/70",
   perf_mats: "text-cyan-400/70",
 };
@@ -142,7 +142,7 @@ const SOURCE_ORDER = [
   "google_calendar",
   "ubereats",
   "nyc_scout",
-  "rocket_money",
+  "simplefin",
   "matrix_mat",
   "perf_mats",
 ];
@@ -281,6 +281,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   google_calendar: "Google Calendar",
   ubereats: "Uber Eats Items",
   rocketmoney: "Rocket Money",
+  simplefin: "SimpleFIN",
   matrix_mat: "Matrix Matview",
   perf_mats: "Perf Matviews",
 };
