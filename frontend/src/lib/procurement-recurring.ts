@@ -28,6 +28,9 @@ export interface DetectedSubscription {
   cadence: RecurringCadence;
   typicalCents: number;
   lastCharge: string;
+  /** Amount of the last charge, and the usual amount of the (up to three) charges before it. */
+  lastCents: number;
+  previousTypicalCents: number | null;
   /** Estimated date of the next charge (see nextMethod / confidence). */
   nextExpected: string;
   /** How nextExpected was estimated, in plain words. */
@@ -68,6 +71,8 @@ const BANDS: Record<RecurringCadence, { min: number; max: number; minCharges: nu
 const CADENCES = Object.keys(BANDS) as RecurringCadence[];
 const MIN_IN_BAND = 0.7;
 const AMOUNT_TOLERANCE = 0.25;
+/** A single step up between recent charges is still one subscription when the new price is at most this multiple. */
+const MAX_STEP_UP = 2;
 const DAY_MS = 86_400_000;
 /** Calendar months per cycle, for the cadences that bill on a calendar date. */
 const CYCLE_MONTHS: Partial<Record<RecurringCadence, number>> = { monthly: 1, quarterly: 3, annual: 12 };
@@ -238,6 +243,30 @@ function estimateNext(dates: string[], cadence: RecurringCadence, medGap: number
   return { next, method, confidence, checkedGaps: miss.length, maxMissDays: maxMiss };
 }
 
+/**
+ * The usual amount of the last (up to three) charges, or null when they do not agree.
+ * They agree when all are within 25% of their median, or when they show ONE step up of at most
+ * double (a price increase or a plan change): then the new, higher amount is the usual one.
+ */
+function usualAmount(recent: number[]): number | null {
+  const agree = (values: number[], t: number) => values.every((c) => Math.abs(c - t) <= AMOUNT_TOLERANCE * t);
+  const typical = Math.round(median(recent));
+  if (typical <= 0) return null;
+  if (agree(recent, typical)) return typical;
+  // Every place the step could be; the split whose two sides are tightest wins.
+  let best: { amount: number; spread: number } | null = null;
+  for (let split = 1; split < recent.length; split++) {
+    const lower = recent.slice(0, split);
+    const upper = recent.slice(split);
+    const a = Math.round(median(lower));
+    const b = Math.round(median(upper));
+    if (!(a > 0 && b > a && b <= MAX_STEP_UP * a && agree(lower, a) && agree(upper, b))) continue;
+    const spread = lower.reduce((sum, c) => sum + Math.abs(c - a), 0) + upper.reduce((sum, c) => sum + Math.abs(c - b), 0);
+    if (!best || spread < best.spread) best = { amount: b, spread };
+  }
+  return best ? best.amount : null;
+}
+
 function classify(key: string, charges: Charge[], today: string): DetectedSubscription | null {
   const list = oncePerDay(charges);
   if (list.length < 2) return null;
@@ -252,12 +281,11 @@ function classify(key: string, charges: Charge[], today: string): DetectedSubscr
   const inBand = gaps.filter((g) => g >= band.min && g <= band.max).length;
   if (inBand / gaps.length < MIN_IN_BAND) return null;
 
-  const recent = list.slice(-3).map((c) => c.cents);
-  const typical = Math.round(median(recent));
-  if (typical <= 0) return null;
-  if (recent.some((c) => Math.abs(c - typical) > AMOUNT_TOLERANCE * typical)) return null;
+  const typical = usualAmount(list.slice(-3).map((c) => c.cents));
+  if (typical === null) return null;
 
   const last = list[list.length - 1];
+  const before = list.slice(-4, -1).map((c) => c.cents);
   const typicalGap = Math.round(medGap);
   const estimate = estimateNext(list.map((c) => c.date), cadence, medGap);
   const nextExpected = estimate.next;
@@ -271,6 +299,8 @@ function classify(key: string, charges: Charge[], today: string): DetectedSubscr
     cadence,
     typicalCents: typical,
     lastCharge: last.date,
+    lastCents: last.cents,
+    previousTypicalCents: before.length > 0 ? Math.round(median(before)) : null,
     nextExpected,
     nextMethod: estimate.method,
     confidence: estimate.confidence,
