@@ -98,6 +98,8 @@ export type CardAction = { label: string; text?: string; reply?: boolean; primar
 export function cardActions(card: AgentCard): CardAction[] {
   const t = card.type.toLowerCase();
   if (t === "checkin") return [{ label: "Open check-in", href: card.link, primary: true }];
+  // Renewal cards ("<merchant> renews in 2 days") are informational: one fixed link, nothing to answer.
+  if (t === "renewal") return [{ label: "Open procurement", href: "/procurement", primary: true }];
   if (t === "approval") return [{ label: "Approve", text: `${card.code} yes`, primary: true }, { label: "Decline", text: `${card.code} no` }, { label: "Reply", reply: true }];
   if (t === "supplement") return [{ label: "Log it", text: `${card.code} log`, primary: true }, { label: "Skip", text: `${card.code} skip` }];
   if (t === "lead") return [{ label: "Interested", text: `${card.code} interested`, primary: true }, { label: "Pass", text: `${card.code} no` }, { label: "Reply", reply: true }];
@@ -153,7 +155,7 @@ export function CardBody({ card, clamp = false }: { card: AgentCard; clamp?: boo
       )}
       {(card.link || (exp && !Number.isNaN(exp.getTime()))) && (
         <div className="mt-2 flex items-center gap-3 text-[12px] text-text-tertiary">
-          {card.link && card.type !== "checkin" && (
+          {card.link && card.type !== "checkin" && card.type !== "renewal" && (
             <a href={card.link} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-accent" onClick={(e) => e.stopPropagation()}>
               Open <ExternalLink className="w-3 h-3" />
             </a>

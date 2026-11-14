@@ -181,7 +181,9 @@ const routeFiles = [];
 (function walk(dir) { for (const e of fs.readdirSync(new URL(dir, root), { withFileTypes: true })) { const rel = dir + e.name + (e.isDirectory() ? '/' : ''); if (e.isDirectory()) walk(rel); else routeFiles.push(rel); } })('src/app/api/procurement/');
 // The tracker routes, the read-only renewals summary Today reads (GET only; tests/procurement-renewals.test.cjs)
 // and the flag-dismissal route (PATCH only; tests/procurement-flags.test.cjs).
-assert.deepEqual(routeFiles.sort(), ['src/app/api/procurement/flags/route.ts', 'src/app/api/procurement/renewals/summary/route.ts', 'src/app/api/procurement/subscriptions/[id]/route.ts', 'src/app/api/procurement/subscriptions/route.ts'], 'only the tracker routes, the renewals summary and the flag dismissal exist under /api/procurement');
+// The renewal claim (POST only; tests/procurement-renewal-claim.test.cjs) is the Worker's poll for /agents cards.
+assert.deepEqual(routeFiles.sort(), ['src/app/api/procurement/flags/route.ts', 'src/app/api/procurement/renewals/claim/route.ts', 'src/app/api/procurement/renewals/summary/route.ts', 'src/app/api/procurement/subscriptions/[id]/route.ts', 'src/app/api/procurement/subscriptions/route.ts'], 'only the tracker routes, the renewals summary, the renewal claim and the flag dismissal exist under /api/procurement');
+assert.deepEqual([...read('src/app/api/procurement/renewals/claim/route.ts').matchAll(/export async function (\w+)/g)].map(m => m[1]), ['POST'], 'the renewal claim is one POST');
 assert.deepEqual([...read('src/app/api/procurement/renewals/summary/route.ts').matchAll(/export async function (\w+)/g)].map(m => m[1]), ['GET'], 'the renewals summary is read-only');
 assert.deepEqual([...read('src/app/api/procurement/flags/route.ts').matchAll(/export async function (\w+)/g)].map(m => m[1]), ['PATCH'], 'the flags route only records a dismissal');
 for (const file of routeFiles) {
@@ -190,8 +192,21 @@ for (const file of routeFiles) {
   assert.ok(methods.length > 0 && methods.every(m => ['GET', 'POST', 'PATCH', 'DELETE'].includes(m)), file + ': ' + methods);
   assert.doesNotMatch(src, /\b(fetch|axios|https?:\/\/)/, file + ' must not call any merchant or provider');
 }
-// Session-protected: the procurement API is not on the middleware's no-session carve-outs.
-assert.doesNotMatch(read('src/middleware.ts'), /api\/procurement/);
+// Session-protected, with ONE deliberate exception. Riley decided on 2026-11-13 that the
+// sms-reminders Worker may raise a card in /agents before a renewal, so exactly one exact path,
+// /api/procurement/renewals/claim, accepts the CI token. What it may return is fixed: an opaque id,
+// the merchant display name, the estimated renewal date and the days until it - never an amount,
+// an account, a category or a transaction (tests/procurement-renewal-claim.test.cjs enforces the
+// fields). Every other procurement route, and any other route over the finance ledger, stays
+// session-only: adding a second procurement path, or a prefix match, fails here.
+{
+  const middleware = read('src/middleware.ts');
+  const named = [...middleware.matchAll(/["'`](\/api\/procurement[^"'`]*)["'`]/g)].map(m => m[1]);
+  assert.deepEqual(named, ['/api/procurement/renewals/claim'], 'the renewal claim is the only procurement path in the middleware');
+  assert.match(middleware, /pathname === "\/api\/procurement\/renewals\/claim"/, 'exact path, never a prefix');
+  assert.doesNotMatch(middleware, /startsWith\(\s*["'`]\/api\/(procurement|financ)/, 'no prefix carve-out over procurement or finance routes');
+  assert.doesNotMatch(middleware, /["'`]\/api\/financ/, 'no finance route accepts the CI token');
+}
 
 // --- the SQL: idempotent, service-role only, nothing removed, no anon access ---
 const sql = fs.readFileSync(new URL('../sql/procurement_schema.sql', root), 'utf8');

@@ -57,6 +57,7 @@ const CADENCE: Record<string, string> = {
   online_orders: "Every 3h :05 (both Gmail accounts)",
   air_quality: "Every 3h :12",
   supplement_reminders: "Worker poll (heartbeat ~hourly); cards at each stack's reminder time",
+  renewal_reminders: "Worker poll, hourly; a card up to 3 days before a renewal",
   urgent_email: "Hourly :15 (both Gmail accounts)",
   ubereats: "Every 6h (Riley's PC, while logged on)",
   nyc_scout: "Daily 6:10am ET",
@@ -104,6 +105,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   online_orders:  { method: "automated",      label: "IMAP email parser" },
   air_quality:    { method: "automated",      label: "API ETL" },
   supplement_reminders: { method: "automated", label: "Worker push cards" },
+  renewal_reminders: { method: "automated", label: "Worker push cards" },
   urgent_email:   { method: "automated",      label: "IMAP label reader" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
@@ -472,6 +474,10 @@ export async function GET() {
     const procurementRes = await supabase.from("procurement_subscriptions").select("updated_at", { count: "exact" }).eq("is_active", true).order("updated_at", { ascending: false }).limit(1);
     const procurementPending = procurementRes.error?.code === "PGRST205" || procurementRes.error?.code === "42P01";
     const procurementLast = (procurementRes.data?.[0]?.updated_at as string | undefined) ?? null;
+    // Renewal cards (sms-reminders Worker -> /api/procurement/renewals/claim): heartbeat age, own limit-1
+    // query so a Worker that stops polling reads red instead of dropping out of the shared window.
+    const renewalRemindersRes = await supabase.from("sync_log").select("status,sync_start,records_synced,duration_seconds,error_message")
+      .eq("source", "procurement_renewals").eq("data_type", "prompt").order("sync_start", { ascending: false }).limit(1);
     // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
     const urgentEmailCard = await getUrgentEmailStatusCard(supabase);
 
@@ -674,6 +680,31 @@ export async function GET() {
         integrationMethod: METHOD.reading.method,
         methodLabel: METHOD.reading.label,
       },
+      // Renewal cards (2026-11-13): the Worker claims subscriptions renewing within 3 days and posts a
+      // card to /agents. Freshness = heartbeat age, because a week with nothing renewing is healthy.
+      // Hourly poll, quiet 23:30-07:00: >3h with no poll = degraded, >9h or a failed heartbeat = red;
+      // "unknown" until the Worker's first call. records_synced = renewals claimed by that call. The
+      // heartbeat text is an error code at most - never a merchant or an amount.
+      renewal_reminders: (() => {
+        const entry = latestBySrcType["procurement_renewals|prompt"]
+          ?? (renewalRemindersRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        return {
+          label: "Renewal Reminders",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status: ingestionHeartbeatStatus("success", entry, 3, 9),
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (entry && ageH > 9 ? `No claim call for ${Math.floor(ageH)}h - check the sms-reminders Worker's renewal poll.` : null),
+          cadence: CADENCE.renewal_reminders,
+          integrationMethod: METHOD.renewal_reminders.method,
+          methodLabel: METHOD.renewal_reminders.label,
+        };
+      })(),
       // Procurement subscription tracker (/procurement, 2026-11-11): typed by hand, never connected to a provider.
       // "unknown" (not red) until sql/procurement_schema.sql is applied; green once the table answers.
       procurement: {

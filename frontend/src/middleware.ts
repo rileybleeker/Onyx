@@ -36,7 +36,12 @@ function isCiRoute(pathname: string): boolean {
     pathname === "/api/supplements/reminders/respond" ||
     // Onyx Focus iPhone app: read-only "are today's chosen habits done?" (2026-11-13).
     // Exact path - never /api/focus/* (the settings route /api/focus/config stays session-only).
-    pathname === "/api/focus/unlock-status"
+    pathname === "/api/focus/unlock-status" ||
+    // Renewal cards for /agents: the sms-reminders Worker claims subscriptions that renew within
+    // 3 days (Riley's decision, 2026-11-13). The response carries only an opaque id, the merchant
+    // name, the estimated date and the days until it - never an amount. Exact path: every other
+    // procurement route, and everything else over the finance ledger, stays session-only.
+    pathname === "/api/procurement/renewals/claim"
   );
 }
 
