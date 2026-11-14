@@ -37,7 +37,7 @@ Privacy boundary:
 - Calendar: a month grid and an agenda list of the same month. Each active item appears on its real date; repeating items also show italic "projected" dates. For an item already past due the projection counts from today, because repeats count from completion.
 - Add / edit form: label, kind, date, optional time (plus the time zone of the appointment when a time is set), repeat, booked, note.
 - Sample data: an unchecked-by-default checkbox adds five invented, clearly labelled "Sample:" items to the calendar and due-soon list. They are display-only: never saved, never sent, and the API refuses them.
-- Calendar connection card: Google Calendar is shown as not connected and the connect button is disabled.
+- Calendar connection card: Google Calendar is "not connected" until it is set up and connected (see [health-google-calendar.md](health-google-calendar.md)); until then the connect button is disabled and Google is never contacted.
 
 Saving is optimistic: a change shows at once and is sent to Onyx; if Onyx does not confirm it, that one item goes back to what it was and a message says so. "Undo last change" sends the opposite change. While an item is being saved its buttons are disabled.
 
@@ -59,7 +59,7 @@ The first version of the page saved items in the browser only (opt-in, `localSto
 
 ## Not done
 
-- Google Calendar is not connected. Nothing on the page reads from or writes to a calendar.
+- Google Calendar sync is built but not connected: it needs two values in Vercel and one consent click from Riley ([health-google-calendar.md](health-google-calendar.md)). Until then nothing on the page reads from or writes to a calendar.
 - Today does not show care items.
 - No reminders are sent.
 
@@ -67,5 +67,6 @@ The first version of the page saved items in the browser only (opt-in, `localSto
 
 - `cd frontend; node scripts/test-care-planner.mjs` (date math, DST changes, month-end repeats, items across midnight, the browser-copy offer, calendar layout, sample data).
 - `cd frontend; node --test tests/care-items.test.cjs` (body checks, the three routes against an in-memory table, same-origin and size checks, optimistic helpers, the owner-session boundary, the additive service-role-only schema).
-- Both run in CI with synthetic data only. The smoke test loads `/health` in production and fails if the list did not load.
+- `cd frontend; node --test tests/care-google.test.cjs` (Google Calendar sync against a fake Google).
+- All three run in CI with synthetic data only. The smoke test loads `/health` in production and fails if the list did not load.
 - Not covered by an automated test: clicking through the page in a real browser against the live table.
