@@ -1,14 +1,14 @@
 "use client";
 
 /**
- * Desktop app glue (2026-11-14): the "Install desktop app" button and the launch handler for the
- * installed window. Nothing here reads or writes data. See lib/desktop-app.ts.
+ * Desktop app glue (2026-11-14): the "Install desktop app" button, the Reload button of the
+ * installed window and its launch handler. Nothing here reads or writes data. See lib/desktop-app.ts.
  */
 
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
-import { MonitorDown } from "lucide-react";
-import { launchTarget, paletteShortcutLabel } from "@/lib/desktop-app";
+import { MonitorDown, RotateCw } from "lucide-react";
+import { INSTALLED_DISPLAY_MODES, isInstalledWindow, launchTarget, paletteShortcutLabel, reloadShortcutLabel } from "@/lib/desktop-app";
 
 type InstallPromptEvent = Event & {
   prompt: () => Promise<void>;
@@ -62,6 +62,46 @@ export function InstallAppButton() {
     >
       <MonitorDown className="w-[17px] h-[17px] shrink-0" strokeWidth={1.75} />
       Install desktop app
+    </button>
+  );
+}
+
+function subscribeDisplayMode(listener: () => void) {
+  const queries = INSTALLED_DISPLAY_MODES.map((mode) => window.matchMedia(`(display-mode: ${mode})`));
+  queries.forEach((q) => q.addEventListener("change", listener));
+  return () => queries.forEach((q) => q.removeEventListener("change", listener));
+}
+
+/**
+ * The installed window has no browser toolbar, so it gets its own Reload (same as Ctrl R / F5).
+ * Hidden in a normal browser tab, which has the browser's reload button.
+ */
+export function ReloadAppButton() {
+  const installed = useSyncExternalStore(
+    subscribeDisplayMode,
+    () => isInstalledWindow((q) => window.matchMedia(q).matches),
+    () => false,
+  );
+  const [reloading, setReloading] = useState(false);
+  const [hint, setHint] = useState("Ctrl R");
+  useEffect(() => {
+    setHint(reloadShortcutLabel(navigator.platform, navigator.userAgent));
+  }, []);
+  if (!installed) return null;
+
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        setReloading(true);
+        window.location.reload();
+      }}
+      disabled={reloading}
+      className="flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full focus:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-60"
+    >
+      <RotateCw className={`w-[17px] h-[17px] shrink-0 ${reloading ? "animate-spin" : ""}`} strokeWidth={1.75} />
+      <span className="flex-1 text-left">{reloading ? "Reloading…" : "Reload"}</span>
+      <kbd className="text-[10px] font-mono text-text-tertiary hidden lg:inline">{hint}</kbd>
     </button>
   );
 }
