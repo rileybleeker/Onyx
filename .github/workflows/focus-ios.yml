@@ -3,7 +3,7 @@ on:
   pull_request:
     paths: ["tools/screentime_ios/**", ".github/workflows/focus-ios.yml"]
   push:
-    branches: ["codex/focus-rules-20261111"]
+    branches: ["master"]
     paths: ["tools/screentime_ios/**", ".github/workflows/focus-ios.yml"]
   workflow_dispatch:
 permissions:
