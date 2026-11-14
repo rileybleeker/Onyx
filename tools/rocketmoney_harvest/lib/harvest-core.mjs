@@ -8,7 +8,11 @@ export const GRAPHQL_HOST = "client-api.rocketmoney.com";
 export const MIN_HOURS_BETWEEN_RUNS = 20;
 export const MAX_KEPT_TMP = 3;
 
-/** Signed-out detection: Rocket Money bounces to auth.rocketaccount.com; anything off the app host is not signed in. */
+/**
+ * True when an address is not the app itself. NOT a verdict on the sign-in: the silent renewal passes through
+ * the API and the sign-in service for a moment and comes back, so a visit is judged over time by
+ * createLandingJudge in lib/session.mjs. Kept for the one place that only asks "is the page still on the app".
+ */
 export function isLoginUrl(url) {
   try {
     const u = new URL(url);
@@ -18,9 +22,9 @@ export function isLoginUrl(url) {
   }
 }
 
-export const isGraphqlUrl = (url) => {
+export const isGraphqlUrl = (url, host = GRAPHQL_HOST) => {
   try {
-    return new URL(url).hostname === GRAPHQL_HOST && new URL(url).pathname.startsWith("/graphql");
+    return new URL(url).hostname === host && new URL(url).pathname.startsWith("/graphql");
   } catch {
     return false;
   }

@@ -301,6 +301,7 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   prompt: "Reminder Poll",
   transactions: "Transactions",
   balances: "Balances",
+  keepalive: "Keep-alive",
 };
 
 // "refreshed Xm ago" label, isolated from the page render cycle (perf round

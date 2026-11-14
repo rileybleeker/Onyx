@@ -155,18 +155,19 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
     return fail(e);
   }
   try {
-    const [accountsRes, minDate, maxDate, txHeartbeat, balHeartbeat] = await Promise.all([
+    const [accountsRes, minDate, maxDate, txHeartbeat, balHeartbeat, keepaliveHeartbeat] = await Promise.all([
       db.from("finance_accounts").select(ACCOUNT_COLS).order("institution").order("account_name").order("account_key"),
       dateEdge(db, true),
       dateEdge(db, false),
       heartbeat(db, "transactions"),
       heartbeat(db, "balances"),
+      heartbeat(db, "keepalive"),
     ]);
     const accounts = (check(accountsRes).data ?? [])
       .map(parseAccount)
       .filter((a): a is LedgerAccount => a !== null);
     const freshness =
-      txHeartbeat || balHeartbeat ? financeLedgerCard(txHeartbeat, balHeartbeat, now.getTime()) : null;
+      txHeartbeat || balHeartbeat ? financeLedgerCard(txHeartbeat, balHeartbeat, now.getTime(), keepaliveHeartbeat) : null;
 
     if (accounts.length === 0 && maxDate === null) return { kind: "empty", freshness };
 
