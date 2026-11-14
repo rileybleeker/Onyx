@@ -45,6 +45,13 @@ Left as they are (all describe something BEFORE row D's sleep):
   It is not re-keyed and not a mediator: every hour but possibly the last one before
   midnight precedes the sleep that closes day D. It is kept out of the forecast only because
   today's row is partial when the evening forecast runs (hrv_analysis.NOT_FORECAST_PREFIXES).
+* wx_ (outdoor weather, pds.weather_daily): the daytime aggregates of ET clock day D on row D,
+  for the same reason as aqi_. The two wx_night_* columns are the exception and ARE re-keyed, in
+  hrv_analysis.merge_weather_features: the table stores the 01:00-08:00 ET temperatures on their
+  own clock day, and for the sleep that closes day D that is clock day D + 1, so they are moved
+  one day earlier. They are concurrent with the outcome sleep but exogenous and not measured
+  from it, so they are not mediators. The clock day's minimum temperature is not used at all:
+  it usually falls near dawn, inside the previous row's sleep. Out of the forecast like aqi_.
 * Garmin daily summary / stress / HR zones / training status: the clock day. Their activity
   fields are day D; their overnight fields (RHR, body-battery charge, sleeping seconds,
   readiness) describe the night that closes day D-1 -- earlier than row D's sleep.
