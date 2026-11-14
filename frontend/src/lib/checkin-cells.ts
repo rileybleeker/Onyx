@@ -40,9 +40,14 @@ export function draftWith(draft: Draft, patch: Patch, saved: Record<string, Chec
 }
 
 /** The draft after a save: what was sent and is still unchanged goes; a tap made mid-save stays. */
-export function draftSettled(draft: Draft, posted: Patch): Draft {
+export function draftSettled(draft: Draft, posted: Patch, sent: Draft = draft): Draft {
   const next = { ...draft };
-  for (const [name, a] of Object.entries(posted)) if (next[name] && next[name].a === a) delete next[name];
+  for (const [name, a] of Object.entries(posted)) {
+    if (!next[name]) continue;
+    if (next[name] === sent[name] && next[name].a === a) delete next[name];
+    // A newer tap was made against the old server value. Keep it against the value just saved.
+    else next[name] = { ...next[name], base: a };
+  }
   return next;
 }
 

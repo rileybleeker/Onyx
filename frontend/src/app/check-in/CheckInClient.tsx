@@ -5,14 +5,15 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, Moon, Sun, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
 import { VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
-import { kitSummary, nightLabel, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
-import { buildCells, draftSettled, draftWith, parseDraft, savePlan, visibleNights, type Cell, type Cells, type Draft, type Patch } from "@/lib/checkin-cells";
+import { addDays, kitSummary, nightLabel, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
+import { buildCells, savePlan, visibleNights, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
+import { CheckinDraftStore, dayDraftKey, nightDraftKey, recoveryTarget, type DatedDraft } from "@/lib/checkin-drafts";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
 
 // Daily habit check-in (2026-11-07). Yes / No per question, one Save.
 // - Saved answers load as-is; questions another source can answer start pre-filled and labeled with that
 //   source; everything else starts blank. Blank on save = not logged (never a "No").
-// - Taps are kept as a local draft, so leaving the page (or the app being killed) loses nothing.
+// - Taps are kept as dated local drafts. Reopened drafts require review; storage failures are surfaced.
 // - Two parts (2026-11-13, rules in lib/checkin.ts):
 //     SLEEP   one block per night that already happened ("Last night", and the night before while it is
 //             unanswered). It does not follow the day tabs and never asks about tonight. A night's answers
@@ -32,30 +33,14 @@ import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/
 //   (not part of the Save bar).
 
 const CATEGORY_ORDER = ["health", "fitness", "nutrition", "mindfulness", "productivity", "social", "learning", "general"];
-const dayDraftKey = (date: string) => `onyx:checkin:${date}`;
-const nightDraftKey = (night: string) => `onyx:checkin:night:${night}`;
-
-// Drafts live in localStorage; the rules (baseline, settle, build) are pure functions in lib/checkin-cells.ts.
-function readDraft(key: string): Draft {
-  try {
-    return parseDraft(JSON.parse(localStorage.getItem(key) || "{}"));
-  } catch {
-    return {};
+const withAnswers = (saved: Record<string, CheckinAnswer>, patch: Patch) => {
+  const next = { ...saved };
+  for (const [name, answer] of Object.entries(patch)) {
+    if (answer === null) delete next[name];
+    else next[name] = answer;
   }
-}
-
-function storeDraft(key: string, draft: Draft) {
-  try {
-    if (Object.keys(draft).length) localStorage.setItem(key, JSON.stringify(draft));
-    else localStorage.removeItem(key);
-  } catch {
-    /* storage unavailable: the in-memory state still works */
-  }
-}
-
-const writeDraft = (key: string, patch: Patch, saved: Record<string, CheckinAnswer>) => storeDraft(key, draftWith(readDraft(key), patch, saved));
-/** After a save: drop what was sent and is still unchanged, so a tap made mid-save survives. */
-const settleDraft = (key: string, posted: Patch) => storeDraft(key, draftSettled(readDraft(key), posted));
+  return next;
+};
 
 /** The server refused because the day rolled over since the page loaded: reload, don't keep the stale labels. */
 class StaleDayError extends Error {}
@@ -90,6 +75,13 @@ export default function CheckInClient() {
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [showExtras, setShowExtras] = useState(false);
+  const [drafts] = useState(() => new CheckinDraftStore(() => localStorage));
+  const [recovery, setRecovery] = useState<DatedDraft[]>([]);
+  const [storageFailed, setStorageFailed] = useState(false);
+  const refreshDrafts = useCallback(() => {
+    setRecovery(drafts.recovery());
+    setStorageFailed(drafts.storageFailed);
+  }, [drafts]);
   const delivery = useDeliveryDishes(data?.date ?? null, { earlierDays: 2 });
   const [voiceText, setVoiceText] = useState("");
   const [voiceBusy, setVoiceBusy] = useState(false);
@@ -100,10 +92,16 @@ export default function CheckInClient() {
 
   const lastLoad = useRef(0);
   const savingRef = useRef(false);
+  const deferredLoad = useRef<{ date: string | null } | null>(null);
 
   const loadSeq = useRef(0);
 
-  const load = useCallback(async (date: string | null) => {
+  const load = useCallback(async (date: string | null, afterSave = false) => {
+    // Back/forward can change the URL even while the tabs are disabled. Finish the dated save first.
+    if (savingRef.current && !afterSave) {
+      deferredLoad.current = { date };
+      return;
+    }
     lastLoad.current = Date.now();
     const seq = ++loadSeq.current; // a newer load (tab switch, resume) makes this one's result irrelevant
     setError(null);
@@ -113,29 +111,50 @@ export default function CheckInClient() {
       const json = await res.json();
       if (seq !== loadSeq.current) return;
       if (!res.ok) {
+        drafts.holdAll();
         setError(json.error || `Couldn't load the check-in (${res.status}).`);
         setData(null);
         return;
       }
       const payload = json as CheckinPayload;
+      drafts.prepare(payload);
       const day = buildCells(
         payload.items.filter((i) => !isNightItem(i)),
         payload.answers,
         payload.suggestions,
-        readDraft(dayDraftKey(payload.date))
+        drafts.active(dayDraftKey(payload.date))
       );
       const sleepItems = payload.items.filter(isNightItem);
       const nights: Record<string, Cells> = {};
-      for (const n of payload.nights ?? []) nights[n.date] = buildCells(sleepItems, n.answers, n.suggestions, readDraft(nightDraftKey(n.date)));
+      for (const n of payload.nights ?? []) nights[n.date] = buildCells(sleepItems, n.answers, n.suggestions, drafts.active(nightDraftKey(n.date)));
       setData(payload);
       setCells(day);
       setNightCells(nights);
       // Open "Also did" when it holds a saved or pre-filled answer, so nothing is saved out of sight.
       setShowExtras(payload.items.some((i) => i.group === "extra" && day[i.name]));
     } catch {
-      if (seq === loadSeq.current) setError("Couldn't reach Onyx. Check your connection and try again.");
+      if (seq === loadSeq.current) {
+        drafts.holdAll();
+        setData(null);
+        setError("Couldn't reach Onyx. Check your connection and try again.");
+      }
     }
-  }, []);
+    finally { if (seq === loadSeq.current) refreshDrafts(); }
+  }, [drafts, refreshDrafts]);
+
+  useEffect(() => {
+    // Discover recovery records even if the requested date has expired or the GET cannot load.
+    drafts.scan();
+    refreshDrafts();
+    const leaving = (event: BeforeUnloadEvent) => {
+      if (drafts.storageFailed && drafts.hasPending()) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
+    };
+    window.addEventListener("beforeunload", leaving);
+    return () => window.removeEventListener("beforeunload", leaving);
+  }, [drafts, refreshDrafts]);
 
   useEffect(() => {
     load(requested);
@@ -155,6 +174,13 @@ export default function CheckInClient() {
   // One or several answers at once. scope = null for the day tab, or the night's date for a sleep block.
   const apply = (scope: string | null, patch: Patch) => {
     if (!data || !Object.keys(patch).length) return;
+    const key = scope === null ? dayDraftKey(data.date) : nightDraftKey(scope);
+    const saved = scope === null ? data.answers : data.nights?.find((n) => n.date === scope)?.answers ?? {};
+    if (!drafts.write(key, patch, saved)) {
+      setError("Review or discard the preserved draft for this date before changing its answers.");
+      return;
+    }
+    refreshDrafts();
     setSavedAt(null);
     const update = (prev: Cells): Cells => {
       const next = { ...prev };
@@ -166,10 +192,8 @@ export default function CheckInClient() {
     };
     if (scope === null) {
       setCells(update);
-      writeDraft(dayDraftKey(data.date), patch, data.answers);
     } else {
       setNightCells((prev) => ({ ...prev, [scope]: update(prev[scope] ?? {}) }));
-      writeDraft(nightDraftKey(scope), patch, data.nights?.find((n) => n.date === scope)?.answers ?? {});
     }
   };
 
@@ -212,10 +236,30 @@ export default function CheckInClient() {
   );
 
   const save = async () => {
-    if (!data || saving || changeCount === 0) return;
+    if (!data || savingRef.current || changeCount === 0) return;
     setSaving(true);
     savingRef.current = true;
+    ++loadSeq.current; // an older in-flight GET must not replace a just-saved baseline
     setError(null);
+    const sentDrafts = new Map([
+      [dayDraftKey(data.date), drafts.read(dayDraftKey(data.date))],
+      ...nightPatches.map((n) => [nightDraftKey(n.date), drafts.read(nightDraftKey(n.date))] as const),
+    ]);
+    const settled = (date: string, patch: Patch, night: boolean) => {
+      const key = night ? nightDraftKey(date) : dayDraftKey(date);
+      drafts.settle(key, patch, sentDrafts.get(key) ?? {});
+      // Settle each successful part immediately, even if the next request or the final reload fails.
+      setData((prev) => !prev ? prev : night
+        ? { ...prev, nights: prev.nights.map((n) => n.date === date ? { ...n, answers: withAnswers(n.answers, patch) } : n) }
+        : prev.date === date ? { ...prev, answers: withAnswers(prev.answers, patch) } : prev);
+      if (night) {
+        const n = data.nights.find((n) => n.date === date)!;
+        setNightCells((prev) => ({ ...prev, [date]: buildCells(sleepItems, withAnswers(n.answers, patch), n.suggestions, drafts.active(key)) }));
+      } else {
+        setCells(buildCells(dayItems, withAnswers(data.answers, patch), data.suggestions, drafts.active(key)));
+      }
+      refreshDrafts();
+    };
     const post = async (date: string, answers: Patch) => {
       const res = await fetch("/api/habits/checkin", {
         method: "POST",
@@ -229,35 +273,40 @@ export default function CheckInClient() {
       }
     };
     try {
-      // The day, then each night under ITS date. A part that saved is not lost if a later part fails: its
-      // answers stay on screen and saving again just writes the same rows.
+      // The day, then each night under ITS date. Only successful requests settle their draft snapshots.
       if (Object.keys(dayPatch).length) {
         await post(data.date, dayPatch);
-        settleDraft(dayDraftKey(data.date), dayPatch);
+        settled(data.date, dayPatch, false);
         // Settle the Agents card; best-effort (the card also expires on its own). Only when the day was saved.
         agentsApi.checkinDone(data.date).catch(() => {});
       }
       for (const n of nightPatches) {
         await post(n.date, n.changes);
-        settleDraft(nightDraftKey(n.date), n.changes);
+        settled(n.date, n.changes, true);
       }
       const date = data.date;
-      await load(date);
+      await load(date, true);
       setSavedAt(date);
     } catch (e) {
       if (e instanceof StaleDayError) {
-        // These taps were made on a page whose "last night" and "today" were a day old, so they may be meant for
-        // other nights: drop them all (not only the refused request), redraw with the new day, and say why.
-        settleDraft(dayDraftKey(data.date), dayPatch);
-        for (const n of nightPatches) settleDraft(nightDraftKey(n.date), n.changes);
-        await load(requested);
-        setError("A new day started since this page loaded, so the unsaved answers were cleared. Please answer again.");
+        // Keep every unfinished tap under its original date, outside Save until explicitly reviewed.
+        drafts.holdAll();
+        refreshDrafts();
+        setData(null);
+        router.replace("/check-in", { scroll: false });
+        await load(null, true);
+        setError("A new day started. Unsaved answers are preserved under their original dates. Review them below before using them.");
       } else {
         setError(e instanceof TypeError ? "Couldn't reach Onyx. Your answers are still here." : e instanceof Error ? e.message : "Save failed. Your answers are still here.");
       }
     } finally {
       savingRef.current = false;
       setSaving(false);
+      if (deferredLoad.current) {
+        const { date } = deferredLoad.current;
+        deferredLoad.current = null;
+        void load(date);
+      }
     }
   };
 
@@ -308,11 +357,38 @@ export default function CheckInClient() {
     router.replace(`/check-in?date=${date}`, { scroll: false });
   };
 
+  const reviewDraft = (entry: DatedDraft) => {
+    if (!data || savingRef.current || !drafts.recover(entry.key, data)) return;
+    setError(null);
+    setSavedAt(null);
+    if (entry.night) {
+      const n = data.nights.find((n) => n.date === entry.date)!;
+      setNightCells((prev) => ({ ...prev, [n.date]: buildCells(sleepItems, n.answers, n.suggestions, drafts.active(entry.key)) }));
+    } else {
+      const next = buildCells(dayItems, data.answers, data.suggestions, drafts.active(entry.key));
+      setCells(next);
+      setShowExtras(dayItems.some((i) => i.group === "extra" && next[i.name]));
+    }
+    refreshDrafts();
+  };
+
+  const draftRecovery = (
+    <>
+      {storageFailed && <p role="alert" className="my-4 text-sm text-mid">Browser storage is unavailable. Pending answers are kept in this open page, but may be lost if you close or refresh it. Keep it open until saved, or copy the answers.</p>}
+      <DraftRecovery entries={recovery} page={data} saving={saving} onReview={reviewDraft} onGo={goTo} onDiscard={(key) => {
+        if (savingRef.current) return;
+        drafts.discard(key);
+        refreshDrafts();
+      }} />
+    </>
+  );
+
   if (error && !data) {
     return (
       <div className="max-w-xl">
         <h2 className="text-[28px] font-medium text-text-primary">Check-in</h2>
         <p className="mt-4 text-sm text-text-secondary">{error}</p>
+        {draftRecovery}
         <button
           onClick={() => {
             // No date: the server decides which day it is (before 06:00 the clock date is a day ahead).
@@ -329,6 +405,7 @@ export default function CheckInClient() {
   if (!data) {
     return (
       <div className="max-w-xl space-y-3">
+        {draftRecovery}
         <div className="h-8 w-40 bg-white/5 animate-pulse rounded" />
         {[...Array(8)].map((_, i) => (
           <div key={i} className="h-12 bg-white/[0.03] animate-pulse rounded-control" />
@@ -350,6 +427,8 @@ export default function CheckInClient() {
             : `Daytime: ${longDate(data.date)}. Skip anything you're unsure of.`}
         </p>
       </div>
+
+      {draftRecovery}
 
       {/* SLEEP: nights that already happened. Not tied to the day tabs below. */}
       {nights.length > 0 && (
@@ -566,6 +645,52 @@ export default function CheckInClient() {
         </div>
       </div>
     </div>
+  );
+}
+
+/** Review is local only. Restoring fills the original dated form; a separate Save is still required. */
+function DraftRecovery({ entries, page, saving, onReview, onDiscard, onGo }: {
+  entries: DatedDraft[];
+  page: CheckinPayload | null;
+  saving: boolean;
+  onReview: (entry: DatedDraft) => void;
+  onDiscard: (key: string) => void;
+  onGo: (date: string) => void;
+}) {
+  const [discardKey, setDiscardKey] = useState<string | null>(null);
+  if (!entries.length) return null;
+  return (
+    <section aria-label="Preserved check-in drafts" className="my-4 rounded-card border border-border-subtle bg-surface-card p-3">
+      <h3 className="text-sm font-medium text-text-primary">Review preserved answers</h3>
+      <p className="mt-1 text-xs text-text-secondary">These answers are excluded from Save until you review their original dates. Using them fills that dated form; then press Save. You can also select and copy the text.</p>
+      {entries.map((entry) => {
+        const label = entry.night ? `Night ${entry.date} → ${addDays(entry.date, 1)} morning` : `Daytime ${entry.date}`;
+        const target = recoveryTarget(entry, page);
+        const selectableDay = !entry.night && page?.days.some((d) => d.date === entry.date);
+        return (
+          <details key={entry.key} className="mt-3 text-sm">
+            <summary className="cursor-pointer text-text-primary">{label} · {Object.keys(entry.draft).length} answers</summary>
+            <ul className="mt-2 space-y-1 text-text-secondary">
+              {Object.entries(entry.draft).map(([name, e]) => <li key={name}>{name}: <strong>{e.a ?? "Clear answer"}</strong>{e.base !== undefined && <span className="text-text-tertiary"> (saved when tapped: {e.base ?? "not logged"})</span>}</li>)}
+            </ul>
+            {target ? (
+              <button disabled={saving} onClick={() => onReview(entry)} className="mt-2 rounded-control border border-border-subtle px-3 py-2 text-accent disabled:opacity-50">Use answers for {label}</button>
+            ) : selectableDay && page?.date !== entry.date ? (
+              <button disabled={saving} onClick={() => onGo(entry.date)} className="mt-2 rounded-control border border-border-subtle px-3 py-2 text-accent disabled:opacity-50">Open {entry.date} to review</button>
+            ) : (
+              <p className="mt-2 text-xs text-text-tertiary">This date or a question is no longer offered in check-in. The draft stays here for review and copying; it will not be moved to another date.</p>
+            )}
+            <div className="mt-2">
+              {discardKey === entry.key ? <>
+                <span className="text-xs text-text-secondary">Discard these unsaved answers for {label}?</span>
+                <button disabled={saving} onClick={() => { onDiscard(entry.key); setDiscardKey(null); }} className="ml-2 rounded-control border border-border-subtle px-3 py-2 text-down">Discard these answers</button>
+                <button onClick={() => setDiscardKey(null)} className="ml-2 rounded-control px-3 py-2 text-text-secondary">Keep draft</button>
+              </> : <button disabled={saving} onClick={() => setDiscardKey(entry.key)} className="rounded-control border border-border-subtle px-3 py-2 text-text-secondary">Discard draft…</button>}
+            </div>
+          </details>
+        );
+      })}
+    </section>
   );
 }
 
