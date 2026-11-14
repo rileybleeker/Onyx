@@ -516,8 +516,15 @@ export default function CheckInClient() {
                   <span className="text-[11px] font-mono text-text-tertiary">~{Math.round(delivery.leftoverKcal)} kcal counted</span>
                 )}
               </div>
-              <p className="text-[12px] text-text-tertiary mb-2">Share of what was left. Unanswered counts as thrown out.</p>
-              <LeftoverList questions={delivery.leftovers} onPick={delivery.setLeftover} />
+              <p className="text-[12px] text-text-tertiary mb-2">
+                Share of what was left. Add the time so it counts for meal timing. Unanswered counts as thrown out.
+              </p>
+              <LeftoverList
+                questions={delivery.leftovers}
+                onPick={delivery.setLeftover}
+                onTime={delivery.setLeftoverTime}
+                showNow={data.date === data.today}
+              />
             </div>
           )}
           {delivery.loadError && <p className="text-[12px] text-red-400 mt-1.5">{delivery.loadError}</p>}

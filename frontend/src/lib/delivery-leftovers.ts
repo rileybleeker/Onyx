@@ -19,6 +19,8 @@ export interface LeftoverRow {
   fraction: number;
   /** The rest was thrown away after this day: stop asking. */
   threw_out: boolean;
+  /** Local clock time it was eaten ("19:30"; before 06:00 = the small hours closing that day), or null. */
+  eaten_time: string | null;
 }
 
 /** The dish fields the leftover rules need. */
@@ -60,31 +62,61 @@ export function leftFor(dish: LeftoverDish, rows: ReadonlyArray<LeftoverRow>, da
 
 /**
  * Stored token for one (dish, day): null = not answered, "out" = threw it out, else the share of the
- * whole dish eaten that day as a decimal string ("0" = not today). A string so the serialized saver
- * can compare taps with ===.
+ * whole dish eaten that day as a decimal string ("0" = not today), with "@HH:MM" when the time it was
+ * eaten is known ("0.375@19:30"). A string so the serialized saver can compare taps with ===.
  */
 export type LeftoverToken = string | null;
+
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+/** "HH:MM", 24-hour, 00:00..23:59. */
+export function isClock(v: unknown): v is string {
+  return typeof v === "string" && HHMM.test(v);
+}
+
+/** The amount and time parts of a token. */
+export function splitToken(token: LeftoverToken): { fraction: number; time: string | null } {
+  if (token == null || token === "out") return { fraction: 0, time: null };
+  const [f, t] = token.split("@");
+  const n = Number(f);
+  return { fraction: Number.isFinite(n) ? n : 0, time: t && isClock(t) ? t : null };
+}
+
+function joinToken(fraction: number, time: string | null): LeftoverToken {
+  const f = String(round4(fraction));
+  return fraction > EPS && time ? `${f}@${time}` : f;
+}
 
 export function tokenOfRow(row: LeftoverRow | undefined): LeftoverToken {
   if (!row) return null;
   if (row.threw_out) return "out";
-  return String(round4(Number(row.fraction)));
+  return joinToken(Number(row.fraction), row.eaten_time ? row.eaten_time.slice(0, 5) : null);
 }
 
-/** The token a tap on `optionKey` stores, given what is left for that day. */
-export function tokenForOption(optionKey: string, left: number): LeftoverToken {
+/**
+ * The token a tap on `optionKey` stores, given what is left for that day. Changing the amount keeps
+ * the time already entered; Not today / Threw out drop it (a time needs an amount).
+ */
+export function tokenForOption(optionKey: string, left: number, time: string | null = null): LeftoverToken {
   if (optionKey === "threw_out") return "out";
   if (optionKey === "not_today") return "0";
   const o = LEFTOVER_OPTIONS.find((x) => x.key === optionKey);
   if (!o || o.share == null) return null;
-  return String(round4(left * o.share));
+  return joinToken(left * o.share, time);
+}
+
+/** The same answer with the time set (or cleared with null). A token without an amount is returned as is. */
+export function withTime(token: LeftoverToken, time: string | null): LeftoverToken {
+  const { fraction } = splitToken(token);
+  if (token == null || token === "out" || fraction <= EPS) return token;
+  return joinToken(fraction, time && isClock(time) ? time : null);
 }
 
 /** Which button is lit for a stored token (null = none). */
 export function optionOfToken(token: LeftoverToken, left: number): string | null {
   if (token == null) return null;
   if (token === "out") return "threw_out";
-  const f = Number(token);
+  const f = splitToken(token).fraction;
   if (f <= EPS) return "not_today";
   if (left <= EPS) return "1";
   let best: string | null = null;
@@ -102,16 +134,29 @@ export function optionOfToken(token: LeftoverToken, left: number): string | null
 
 /** Share of the whole dish eaten that day for a token (null / "out" = 0). */
 export function fractionOfToken(token: LeftoverToken): number {
-  if (token == null || token === "out") return 0;
-  const f = Number(token);
-  return Number.isFinite(f) ? f : 0;
+  return splitToken(token).fraction;
 }
 
 /** PUT body for a token. */
-export function bodyForToken(date: string, token: LeftoverToken): { date: string; fraction: number | null; threw_out?: boolean } {
+export function bodyForToken(
+  date: string,
+  token: LeftoverToken,
+): { date: string; fraction: number | null; threw_out?: boolean; time?: string | null } {
   if (token == null) return { date, fraction: null };
   if (token === "out") return { date, fraction: 0, threw_out: true };
-  return { date, fraction: Number(token), threw_out: false };
+  const { fraction, time } = splitToken(token);
+  return fraction > EPS ? { date, fraction, threw_out: false, time } : { date, fraction: 0, threw_out: false };
+}
+
+/** The browser's clock as "HH:MM" (for the "Now" button). */
+export function clockNow(d: Date = new Date()): string {
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** "19:30" -> "7:30 PM". */
+export function formatClock(hhmm: string): string {
+  const [h, m] = hhmm.split(":").map(Number);
+  return `${h % 12 === 0 ? 12 : h % 12}:${String(m).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`;
 }
 
 /**
@@ -141,7 +186,7 @@ export function leftoverQuestions<T extends LeftoverDish>(
 
 // ─── PUT /api/delivery/items/[itemId]/leftovers ──────────────────────────────
 
-export type LeftoverBody = { date: string; fraction: number | null; threw_out: boolean };
+export type LeftoverBody = { date: string; fraction: number | null; threw_out: boolean; time: string | null };
 
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -151,27 +196,34 @@ function isRealYmd(s: string): boolean {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 
-/** Exactly {date, fraction, threw_out?}: fraction null (= clear) or 0..1 with at most 4 decimals. */
+/**
+ * Exactly {date, fraction, threw_out?, time?}: fraction null (= clear) or 0..1 with at most 4 decimals;
+ * time null or "HH:MM", only with an amount eaten (fraction > 0).
+ */
 export function parseLeftoverBody(body: unknown): { ok: true; value: LeftoverBody } | { ok: false; error: string } {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, error: "body must be a JSON object" };
   const b = body as Record<string, unknown>;
   const keys = Object.keys(b);
-  if (!keys.includes("date") || !keys.includes("fraction") || keys.some((k) => !["date", "fraction", "threw_out"].includes(k))) {
-    return { ok: false, error: "body must be exactly {date, fraction, threw_out?}" };
+  if (!keys.includes("date") || !keys.includes("fraction") || keys.some((k) => !["date", "fraction", "threw_out", "time"].includes(k))) {
+    return { ok: false, error: "body must be exactly {date, fraction, threw_out?, time?}" };
   }
+  if (b.time !== undefined && b.time !== null && !isClock(b.time)) return { ok: false, error: "time must be HH:MM (24-hour)" };
+  const time = isClock(b.time) ? b.time : null;
   if (typeof b.date !== "string" || !isRealYmd(b.date)) return { ok: false, error: "date must be YYYY-MM-DD" };
   if (b.threw_out !== undefined && typeof b.threw_out !== "boolean") return { ok: false, error: "threw_out must be true or false" };
   const threw = b.threw_out === true;
   if (b.fraction === null) {
     if (threw) return { ok: false, error: "threw_out needs a fraction (0 when nothing was eaten)" };
-    return { ok: true, value: { date: b.date, fraction: null, threw_out: false } };
+    if (time) return { ok: false, error: "a time needs an amount eaten" };
+    return { ok: true, value: { date: b.date, fraction: null, threw_out: false, time: null } };
   }
   const f = b.fraction;
   if (typeof f !== "number" || !Number.isFinite(f) || f < 0 || f > 1) {
     return { ok: false, error: "fraction must be null or a number from 0 to 1" };
   }
   if (Math.abs(f * 10000 - Math.round(f * 10000)) > 1e-6) return { ok: false, error: "fraction may have at most 4 decimals" };
-  return { ok: true, value: { date: b.date, fraction: round4(f), threw_out: threw } };
+  if (time && f <= 0) return { ok: false, error: "a time needs an amount eaten" };
+  return { ok: true, value: { date: b.date, fraction: round4(f), threw_out: threw, time } };
 }
 
 /**
@@ -220,6 +272,8 @@ export function leftoverConflictMessage(code: string | undefined | null, context
       return "nothing left: this dish is marked All on its delivery day";
     case "OXL04":
       return "this dish was marked thrown out on an earlier day";
+    case "OXL05":
+      return "that time has not happened yet";
     default:
       return null;
   }

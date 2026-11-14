@@ -574,7 +574,7 @@ export async function getDeliveryLeftovers(itemIds: number[]): Promise<LeftoverR
   if (itemIds.length === 0) return [];
   const { data, error } = await supabase
     .from("delivery_item_leftovers")
-    .select("item_id, eaten_date, fraction, threw_out")
+    .select("item_id, eaten_date, fraction, threw_out, eaten_time")
     .in("item_id", itemIds)
     .order("item_id", { ascending: true })
     .order("eaten_date", { ascending: true });
@@ -584,6 +584,7 @@ export async function getDeliveryLeftovers(itemIds: number[]): Promise<LeftoverR
     eaten_date: String(r.eaten_date),
     fraction: Number(r.fraction),
     threw_out: !!r.threw_out,
+    eaten_time: r.eaten_time == null ? null : String(r.eaten_time).slice(0, 5),
   }));
 }
 

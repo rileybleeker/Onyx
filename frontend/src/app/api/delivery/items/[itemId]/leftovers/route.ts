@@ -4,10 +4,12 @@ import { createClient } from "@supabase/supabase-js";
 import { MAX_PORTION_BODY_BYTES, checkPortionRequest, parseItemId } from "@/lib/delivery-portion";
 import { checkLeftoverWrite, leftoverConflictMessage, parseLeftoverBody, type LeftoverRow } from "@/lib/delivery-leftovers";
 
-// PUT /api/delivery/items/[itemId]/leftovers   body {date, fraction, threw_out?}
+// PUT /api/delivery/items/[itemId]/leftovers   body {date, fraction, threw_out?, time?}
 // Leftovers of one delivered Uber Eats cart line eaten on a LATER behavioral day (D+1..D+3):
 // fraction = share of the WHOLE line eaten that day (0 + threw_out false = "not today"),
-// threw_out = the rest was thrown away (stop asking), fraction null = clear that day's answer.
+// threw_out = the rest was thrown away (stop asking), fraction null = clear that day's answer,
+// time = local "HH:MM" it was eaten (before 06:00 = the small hours closing that day; the trigger turns
+// it into the instant eaten_at and refuses a time in the future).
 // Owner session only: NOT in middleware's isCiRoute carve-out. Writes only pds.delivery_item_leftovers
 // (one row per dish and day). The database trigger enforces the same rules (checkLeftoverWrite only
 // names the problem first); a trigger refusal is answered 409.
@@ -23,6 +25,7 @@ function toRows(data: unknown): LeftoverRow[] {
     eaten_date: String(r.eaten_date),
     fraction: Number(r.fraction),
     threw_out: !!r.threw_out,
+    eaten_time: r.eaten_time == null ? null : String(r.eaten_time).slice(0, 5),
   }));
 }
 
@@ -63,7 +66,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ item
       .from("delivery_order_items")
       .select("item_id, onyx_behavioral_date, eaten_fraction, merchant_kind, is_cancelled")
       .eq("item_id", id),
-    supabase.from("delivery_item_leftovers").select("item_id, eaten_date, fraction, threw_out").eq("item_id", id),
+    supabase.from("delivery_item_leftovers").select("item_id, eaten_date, fraction, threw_out, eaten_time").eq("item_id", id),
     behavioralToday(),
   ]);
   if (dishRes.error || rowsRes.error) {
@@ -88,7 +91,10 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ item
       ? await supabase.from("delivery_item_leftovers").delete().eq("item_id", id).eq("eaten_date", w.date)
       : await supabase
           .from("delivery_item_leftovers")
-          .upsert({ item_id: id, eaten_date: w.date, fraction: w.fraction, threw_out: w.threw_out }, { onConflict: "item_id,eaten_date" });
+          .upsert(
+            { item_id: id, eaten_date: w.date, fraction: w.fraction, threw_out: w.threw_out, eaten_time: w.time },
+            { onConflict: "item_id,eaten_date" },
+          );
   if (write.error) {
     const msg = leftoverConflictMessage(write.error.code, "leftover");
     if (msg) return NextResponse.json({ error: msg }, { status: 409 });
@@ -98,7 +104,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ item
 
   const after = await supabase
     .from("delivery_item_leftovers")
-    .select("item_id, eaten_date, fraction, threw_out")
+    .select("item_id, eaten_date, fraction, threw_out, eaten_time")
     .eq("item_id", id)
     .order("eaten_date", { ascending: true });
   // The /nutrition ISR snapshot carries pds.delivery_nutrition_daily totals, which now include leftovers.

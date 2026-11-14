@@ -697,7 +697,12 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
               <div className={`text-[10px] font-mono text-text-tertiary ${delivery.items.length ? "mt-3" : ""} mb-1.5`}>
                 Leftovers: how much did you eat this day? Unanswered counts as thrown out.
               </div>
-              <LeftoverList questions={delivery.leftovers} onPick={delivery.setLeftover} />
+              <LeftoverList
+                questions={delivery.leftovers}
+                onPick={delivery.setLeftover}
+                onTime={delivery.setLeftoverTime}
+                showNow={mealsDayOffset === 0}
+              />
             </>
           )}
           {delivery.error && <p className="text-[11px] text-red-400 mt-1.5">{delivery.error}</p>}
