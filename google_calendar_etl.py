@@ -214,6 +214,44 @@ def _text(value, limit: int = MAX_TEXT) -> str:
     return " ".join(str(value).split())[:limit] if value is not None else ""
 
 
+# Meeting invitations often put the join link, meeting id and passcode in LOCATION (or the title).
+# Those are credentials for the meeting, so they are never stored: links are cut out, and a field
+# that was only a meeting link is stored as "Online meeting".
+_LINK = re.compile(r"(?:https?://|www\.)\S+", re.I)
+_MEETING_BITS = re.compile(
+    r"\b(?:meeting|conference|webinar)\s*(?:id|number|no\.?)\s*[:#]?\s*[\d\s-]{6,}"
+    r"|\b(?:passcode|password|pwd|pin|access code)\b\s*[:=#]?\s*\S+", re.I)
+_MEETING_HOSTS = re.compile(r"\S*\b(?:zoom\.us|teams\.microsoft|meet\.google|webex\.com|gotomeeting|chime\.aws)\S*", re.I)
+
+
+def _scrub(text: str) -> tuple[str, bool]:
+    """Remove links and meeting credentials. Returns (clean text, whether anything was removed)."""
+    clean = _MEETING_HOSTS.sub(" ", _MEETING_BITS.sub(" ", _LINK.sub(" ", text)))
+    clean = " ".join(clean.split()).strip(" ,;|-–—:/")
+    return clean, clean != text
+
+
+def _place(value) -> str | None:
+    text = _text(value)
+    if not text:
+        return None
+    clean, changed = _scrub(text)
+    if not clean or (changed and not re.search(r"[A-Za-z]{3}", clean)):
+        return "Online meeting"
+    return clean
+
+
+def _title(value) -> str:
+    text = _text(value)
+    clean, _ = _scrub(text)
+    return clean or ("(no title)" if text else "")
+
+
+def et_today() -> date:
+    """Today in ET. Tests replace this so fixed-date fixtures never age out."""
+    return datetime.now(ET).date()
+
+
 def _is_all_day(value) -> bool:
     return isinstance(value, date) and not isinstance(value, datetime)
 
@@ -280,9 +318,9 @@ def build_row(occ, account: str, calendar: str, cal_tz: str | None, series_uids:
         "event_key": event_key(account, calendar, uid, slot),
         "account": account,
         "calendar": calendar,
-        "title": _text(occ.get("SUMMARY")),
+        "title": _title(occ.get("SUMMARY")),
         **row_times,
-        "location": _text(occ.get("LOCATION")) or None,
+        "location": _place(occ.get("LOCATION")),
         "status": STATUSES.get(str(occ.get("STATUS") or "").strip().upper(), "confirmed"),
         "recurring": recurring,
     }
@@ -520,7 +558,7 @@ def purge_unconfigured(sb, feeds: list[Feed]) -> None:
 def run(sb, feeds: list[Feed], days: int = DEFAULT_WINDOW_DAYS, dry_run: bool = False,
         allow_large_removal: bool = False, today: date | None = None) -> tuple[str, int, str | None]:
     """Sync every feed. Returns (heartbeat status, events written, note). Database errors propagate."""
-    today = today or datetime.now(ET).date()
+    today = today or et_today()
     win_start, win_end = window_bounds(today, days)
     stamp = datetime.now(UTC).isoformat()
     failures: list[str] = []
@@ -561,7 +599,7 @@ def run(sb, feeds: list[Feed], days: int = DEFAULT_WINDOW_DAYS, dry_run: bool = 
 
 def check_file(path: str, days: int) -> int:
     """Parser check on a saved .ics file. Prints counts only."""
-    win_start, win_end = window_bounds(datetime.now(ET).date(), days)
+    win_start, win_end = window_bounds(et_today(), days)
     try:
         text = Path(path).read_bytes().decode("utf-8-sig", errors="replace")
         rows, stats = expand_events(text, "file", "file", win_start, win_end)
@@ -605,7 +643,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if status != "failed" else 1
 
     sb = get_supabase()
-    window = window_bounds(datetime.now(ET).date(), args.days)
+    window = window_bounds(et_today(), args.days)
     try:
         status, total, note = run(sb, feeds, args.days, allow_large_removal=args.allow_large_removal)
     except Exception as exc:  # noqa: BLE001 - a database error: heartbeat without row content, then fail the job

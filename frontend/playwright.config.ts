@@ -47,15 +47,17 @@ export default defineConfig({
   // a real bug, caused the heaviest page (/bland-altman) to flake. retries: 1
   // absorbs the occasional genuine transient blip on top of that.
   workers: 2,
-  reporter: process.env.CI
-    ? [["html", { open: "never" }], ["list"]]
-    : [["list"]],
+  // The repo is public, so CI keeps no trace, screenshot or HTML report: each one holds
+  // the signed-in pages and API answers (health data, calendar titles, finances) and an
+  // uploaded artifact can be downloaded by anyone. The list output names the failing check.
+  // Locally (not CI) the debugging aids stay on.
+  reporter: [["list"]],
   use: {
     baseURL,
     actionTimeout: 15_000,
     navigationTimeout: 30_000,
-    trace: "on-first-retry",
-    screenshot: "only-on-failure",
+    trace: process.env.CI ? "off" : "on-first-retry",
+    screenshot: process.env.CI ? "off" : "only-on-failure",
   },
   projects: [
     // 1. Authenticate once, persist the session to e2e/.auth/state.json.
