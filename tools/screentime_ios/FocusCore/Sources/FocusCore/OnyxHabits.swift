@@ -71,16 +71,21 @@ public enum OnyxHabitGate: Equatable, Sendable {
     /// Onyx has never answered, or no habits are chosen there: the phone's
     /// own rule applies unchanged.
     case notConfigured
-    /// Habits are chosen but today's answer is missing: time-only rule.
+    /// Habits are chosen and the phone has not asked Onyx about today yet.
+    /// Counts as "not done": under OR that is the time rule; under AND the
+    /// block stays after the unlock time until the app is opened and checks.
+    case notCheckedToday(rule: OnyxUnlockRule)
+    /// Habits are chosen, the phone asked today, and got no usable answer:
+    /// time-only rule.
     case unknown(OnyxUnknownReason)
     case known(rule: OnyxUnlockRule, done: Bool)
 }
 
 public enum OnyxUnknownReason: Equatable, Sendable {
-    /// The stored answer is for another day (not checked yet today, or Onyx
-    /// still counts yesterday because it is before 6 AM there).
+    /// Onyx answered today, but for a different day than the phone's (its
+    /// clock and the phone's disagree, for example on a trip).
     case otherDay
-    /// The latest check failed and the last answer for today said "not done".
+    /// Today's latest check failed and no answer says "done".
     case checkFailed
 }
 
@@ -106,19 +111,33 @@ public struct OnyxHabitState: Codable, Equatable, Sendable {
         lastAttempt = date; lastError = String(message.prefix(200))
     }
 
-    /// `today` is the phone's calendar day (FocusRule.dayKey). An answer only
-    /// counts when Onyx's behavioral day is that same day, so yesterday's
-    /// ticks never unlock today.
+    /// Onyx's behavioral day starts at 06:00 local: before that hour Onyx
+    /// still reports the previous day, so an answer fetched then says nothing
+    /// about the phone's new calendar day.
+    public static let onyxDayStartHour = 6
+
+    /// An answer only counts when Onyx's behavioral day is the phone's
+    /// calendar day, so yesterday's ticks never unlock today.
     ///
-    /// A failed check turns "not done" into unknown (time-only), so a network
-    /// failure can never keep apps blocked past the unlock time. It does not
-    /// undo a "done" that Onyx already confirmed today.
-    public func gate(today: String) -> OnyxHabitGate {
+    /// A failed check turns "not done" into unknown (time-only), so a check
+    /// that fails can never keep apps blocked past the unlock time. It does
+    /// not undo a "done" that Onyx already confirmed today.
+    public func gate(at date: Date, calendar: Calendar) -> OnyxHabitGate {
         guard let status, !status.habits.isEmpty else { return .notConfigured }
-        guard status.day == today else { return .unknown(.otherDay) }
-        if status.allDone { return .known(rule: status.rule, done: true) }
-        if lastError != nil { return .unknown(.checkFailed) }
-        return .known(rule: status.rule, done: false)
+        let today = FocusRule.dayKey(date, calendar: calendar)
+        if status.day == today {
+            if status.allDone { return .known(rule: status.rule, done: true) }
+            if lastError != nil { return .unknown(.checkFailed) }
+            return .known(rule: status.rule, done: false)
+        }
+        // No answer for today. Did the phone ask today?
+        if lastError != nil, let lastAttempt, FocusRule.dayKey(lastAttempt, calendar: calendar) == today {
+            return .unknown(.checkFailed)
+        }
+        let fetchedToday = FocusRule.dayKey(status.fetchedAt, calendar: calendar) == today
+        let fetchedHour = calendar.component(.hour, from: status.fetchedAt)
+        if fetchedToday && fetchedHour >= Self.onyxDayStartHour { return .unknown(.otherDay) }
+        return .notCheckedToday(rule: status.rule)
     }
 }
 
@@ -144,16 +163,19 @@ extension FocusRule {
     /// answer ever) this is exactly `shouldShield(at:calendar:)`. Once habits
     /// are chosen, they replace this phone's own "Unlock when" choice and task
     /// list; the "Not before" time is still the time half of the rule.
+    /// Uses the stored answer only: no network.
     public func shouldShield(at date: Date, calendar: Calendar, onyx: OnyxHabitState?) -> Bool {
         guard enabled, validationError == nil else { return false }
-        let today = Self.dayKey(date, calendar: calendar)
-        switch onyx?.gate(today: today) ?? .notConfigured {
+        let ready = timeReady(at: date, calendar: calendar)
+        switch onyx?.gate(at: date, calendar: calendar) ?? .notConfigured {
         case .notConfigured:
             return shouldShield(at: date, calendar: calendar)
         case .unknown:
-            return !OnyxUnlock.shouldUnlock(rule: .or, habitsDone: nil, timeReady: timeReady(at: date, calendar: calendar), configPresent: true)
+            return !OnyxUnlock.shouldUnlock(rule: .or, habitsDone: nil, timeReady: ready, configPresent: true)
+        case .notCheckedToday(let rule):
+            return !OnyxUnlock.shouldUnlock(rule: rule, habitsDone: false, timeReady: ready, configPresent: true)
         case .known(let rule, let done):
-            return !OnyxUnlock.shouldUnlock(rule: rule, habitsDone: done, timeReady: timeReady(at: date, calendar: calendar), configPresent: true)
+            return !OnyxUnlock.shouldUnlock(rule: rule, habitsDone: done, timeReady: ready, configPresent: true)
         }
     }
 }

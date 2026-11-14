@@ -9,7 +9,7 @@ final class OnyxHabitTests: XCTestCase {
     // 2026-11-11 in New York: 15:00Z = 10:00 (before noon), 18:00Z = 13:00 (after noon).
     var morning: Date { date("2026-11-11T15:00:00Z") }
     var afternoon: Date { date("2026-11-11T18:00:00Z") }
-    let today = "2026-11-11"
+    func gate(_ s: OnyxHabitState, at now: Date? = nil) -> OnyxHabitGate { s.gate(at: now ?? morning, calendar: calendar) }
 
     func rule(_ mode: UnlockMode = .timeOnly) -> FocusRule {
         var r = FocusRule(); r.enabled = true; r.mode = mode
@@ -17,11 +17,13 @@ final class OnyxHabitTests: XCTestCase {
         return r
     }
 
-    func state(_ onyxRule: OnyxUnlockRule, done: [Bool], day: String = "2026-11-11", error: String? = nil) -> OnyxHabitState {
+    /// An answer fetched at 09:00 New York time on 2026-11-11 unless `fetched` says otherwise;
+    /// `error` adds a failed check half an hour later.
+    func state(_ onyxRule: OnyxUnlockRule, done: [Bool], day: String = "2026-11-11", fetched: String = "2026-11-11T14:00:00Z", error: String? = nil) -> OnyxHabitState {
         let habits = done.enumerated().map { OnyxHabit(name: "Example habit \($0.offset + 1)", done: $0.element) }
         var s = OnyxHabitState()
-        s.recordSuccess(OnyxHabitStatus(day: day, rule: onyxRule, habits: habits, fetchedAt: date("2026-11-11T14:00:00Z")))
-        if let error { s.recordFailure(error, at: date("2026-11-11T14:30:00Z")) }
+        s.recordSuccess(OnyxHabitStatus(day: day, rule: onyxRule, habits: habits, fetchedAt: date(fetched)))
+        if let error { s.recordFailure(error, at: date(fetched).addingTimeInterval(1800)) }
         return s
     }
 
@@ -56,11 +58,11 @@ final class OnyxHabitTests: XCTestCase {
                 XCTAssertEqual(r.shouldShield(at: now, calendar: calendar, onyx: noHabits), old)
             }
         }
-        XCTAssertEqual(OnyxHabitState().gate(today: today), .notConfigured)
-        XCTAssertEqual(noHabits.gate(today: today), .notConfigured)
+        XCTAssertEqual(gate(OnyxHabitState()), .notConfigured)
+        XCTAssertEqual(gate(noHabits), .notConfigured)
         // A failed first check with no earlier answer is still "not configured".
         var failedFirst = OnyxHabitState(); failedFirst.recordFailure("offline", at: morning)
-        XCTAssertEqual(failedFirst.gate(today: today), .notConfigured)
+        XCTAssertEqual(gate(failedFirst), .notConfigured)
     }
 
     func testOrRuleUnlocksEarlyWhenHabitsDone() {
@@ -80,7 +82,7 @@ final class OnyxHabitTests: XCTestCase {
     func testFailedCheckNeverBlocksPastTheUnlockTime() {
         let r = rule()
         let failed = state(.and, done: [false], error: "offline")
-        XCTAssertEqual(failed.gate(today: today), .unknown(.checkFailed))
+        XCTAssertEqual(gate(failed), .unknown(.checkFailed))
         // Time-only: blocked before the time, open after it, even under AND.
         XCTAssertTrue(r.shouldShield(at: morning, calendar: calendar, onyx: failed))
         XCTAssertFalse(r.shouldShield(at: afternoon, calendar: calendar, onyx: failed))
@@ -91,26 +93,55 @@ final class OnyxHabitTests: XCTestCase {
     func testFailedCheckKeepsADoneConfirmedToday() {
         let r = rule()
         let s = state(.or, done: [true], error: "offline")
-        XCTAssertEqual(s.gate(today: today), .known(rule: .or, done: true))
+        XCTAssertEqual(gate(s), .known(rule: .or, done: true))
         XCTAssertFalse(r.shouldShield(at: morning, calendar: calendar, onyx: s))
         // The last good answer survives the failure and the error is kept for the screen.
         XCTAssertEqual(s.status?.habits.count, 1)
         XCTAssertEqual(s.lastError, "offline")
     }
 
-    func testAnswerForAnotherDayIsTimeOnly() {
+    func testNextDayResetAndNotCheckedToday() {
         let r = rule()
-        // Yesterday's "all done" does not unlock this morning (next-day reset)...
-        let yesterdayDone = state(.or, done: [true], day: "2026-11-10")
-        XCTAssertEqual(yesterdayDone.gate(today: today), .unknown(.otherDay))
+        // Yesterday's "all done" (fetched yesterday) does not unlock this morning.
+        let yesterdayDone = state(.or, done: [true], day: "2026-11-10", fetched: "2026-11-10T14:00:00Z")
+        XCTAssertEqual(gate(yesterdayDone), .notCheckedToday(rule: .or))
         XCTAssertTrue(r.shouldShield(at: morning, calendar: calendar, onyx: yesterdayDone))
-        // ...and yesterday's "not done" does not block this afternoon under AND.
-        let yesterdayNotDone = state(.and, done: [false], day: "2026-11-10")
-        XCTAssertFalse(r.shouldShield(at: afternoon, calendar: calendar, onyx: yesterdayNotDone))
+        // OR, not checked today: the unlock time still unlocks.
+        XCTAssertFalse(r.shouldShield(at: afternoon, calendar: calendar, onyx: yesterdayDone))
+        // AND, not checked today: stays blocked after the time until the phone checks.
+        let andStale = state(.and, done: [true], day: "2026-11-10", fetched: "2026-11-10T14:00:00Z")
+        XCTAssertEqual(gate(andStale, at: afternoon), .notCheckedToday(rule: .and))
+        XCTAssertTrue(r.shouldShield(at: afternoon, calendar: calendar, onyx: andStale))
+        // ...then a check that fails today lifts it (time-only)...
+        var failedToday = andStale; failedToday.recordFailure("offline", at: afternoon)
+        XCTAssertEqual(gate(failedToday, at: afternoon), .unknown(.checkFailed))
+        XCTAssertFalse(r.shouldShield(at: afternoon, calendar: calendar, onyx: failedToday))
+        // ...but a failure from yesterday does not count as today's check.
+        let failedYesterday = state(.and, done: [false], day: "2026-11-10", fetched: "2026-11-10T14:00:00Z", error: "offline")
+        XCTAssertEqual(gate(failedYesterday, at: afternoon), .notCheckedToday(rule: .and))
         // Midnight: the same stored answer stops counting when the phone's day changes.
         let done = state(.or, done: [true])
         XCTAssertFalse(r.shouldShield(at: date("2026-11-12T04:59:00Z"), calendar: calendar, onyx: done))
         XCTAssertTrue(r.shouldShield(at: date("2026-11-12T05:00:00Z"), calendar: calendar, onyx: done))
+    }
+
+    func testAnswerFetchedBeforeSixIsNotTodaysCheck() {
+        let r = rule()
+        // 00:30 New York on 2026-11-11: Onyx still reports 2026-11-10.
+        let awakeTail = state(.and, done: [true], day: "2026-11-10", fetched: "2026-11-11T05:30:00Z")
+        XCTAssertEqual(gate(awakeTail, at: afternoon), .notCheckedToday(rule: .and))
+        XCTAssertTrue(r.shouldShield(at: afternoon, calendar: calendar, onyx: awakeTail))
+    }
+
+    func testAnswerForAnotherDayFetchedTodayIsTimeOnly() {
+        let r = rule()
+        // Fetched at 09:00 today, yet Onyx answered for another day: the clocks disagree.
+        for day in ["2026-11-10", "2026-11-12"] {
+            let mismatch = state(.and, done: [false], day: day)
+            XCTAssertEqual(gate(mismatch), .unknown(.otherDay))
+            XCTAssertTrue(r.shouldShield(at: morning, calendar: calendar, onyx: mismatch))
+            XCTAssertFalse(r.shouldShield(at: afternoon, calendar: calendar, onyx: mismatch))
+        }
     }
 
     func testOnyxHabitsReplaceThePhoneTaskList() {

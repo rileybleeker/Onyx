@@ -40,12 +40,15 @@ struct FocusSettingsView: View {
                          ? "Rule from Onyx: habits AND time. Stays blocked after the unlock time until these are done."
                          : "Rule from Onyx: habits OR time. Finishing these unlocks early; the unlock time unlocks regardless.")
                         .font(.footnote).foregroundStyle(.secondary)
+                    // Done flags only mean something when the answer is for the phone's today.
+                    let current = status.day == FocusRule.dayKey(Date(), calendar: .autoupdatingCurrent)
                     ForEach(Array(status.habits.enumerated()), id: \.offset) { _, habit in
+                        let label: String = !current ? "Not checked" : (habit.done ? "Done" : "To do")
                         HStack {
                             Text(habit.name)
                             Spacer()
-                            Text(habit.done ? "Done" : "To do")
-                                .foregroundStyle(habit.done ? Color.secondary : Color.orange)
+                            Text(label)
+                                .foregroundStyle(current && !habit.done ? Color.orange : Color.secondary)
                         }
                     }
                     Text("Answer for Onyx day \(status.day), received \(status.fetchedAt.formatted(date: .abbreviated, time: .shortened)).")
@@ -54,7 +57,7 @@ struct FocusSettingsView: View {
                 LabeledContent("Last checked", value: habits.state.lastAttempt.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "Never")
                 Button(habits.checking ? "Checking…" : "Check now") { Task { await habits.refresh() } }
                     .disabled(habits.checking)
-                Text("Choose the habits and the rule in Onyx on the web (the install page). A habit counts once it is answered Yes for the day. This phone only checks when Onyx is opened, when you tap Check now, or when the \"Check Onyx Focus habits\" shortcut runs: iOS does not let it check in the background, so open Onyx after finishing your habits. If Onyx cannot be reached, the unlock time alone decides, so a failed check never keeps apps blocked past that time.")
+                Text("Choose the habits and the rule in Onyx on the web (the install page). A habit counts once it is answered Yes for the day. This phone only checks when this app is opened, when you tap Check now, or when the \"Check Onyx Focus habits\" shortcut runs: iOS does not let it check in the background, so open this app after finishing your habits. If a check fails (offline, token refused, server error), the unlock time alone decides, so a failed check never keeps apps blocked past that time.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("Unlock rules") {

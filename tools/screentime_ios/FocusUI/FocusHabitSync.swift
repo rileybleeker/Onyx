@@ -57,7 +57,7 @@ enum FocusHabitSync {
 
     /// Fetches, stores the outcome and re-applies the shield. Never throws: a
     /// failure is stored too, and the rule then falls back to the unlock time
-    /// alone (OnyxHabitState.gate), so it can never block past that time.
+    /// alone (OnyxHabitState.gate), so a failed check never blocks past it.
     @discardableResult
     static func check() async -> OnyxHabitState {
         let now = Date()
@@ -84,17 +84,19 @@ enum FocusHabitSync {
 
     /// One line for the Focus screen and the shortcut result.
     static func summary(_ state: OnyxHabitState, now: Date = Date()) -> String {
-        let today = FocusRule.dayKey(now, calendar: .autoupdatingCurrent)
-        switch state.gate(today: today) {
+        switch state.gate(at: now, calendar: .autoupdatingCurrent) {
         case .notConfigured:
             if state.status == nil, let error = state.lastError { return "Onyx could not be checked: \(error) This phone's own rule applies." }
             return state.status == nil ? "Onyx habits have not been checked yet." : "No habits are chosen in Onyx. This phone's own rule applies."
         case .unknown(.checkFailed):
             return "Last check failed: \(state.lastError ?? "unknown error") Using the unlock time only until a check succeeds."
         case .unknown(.otherDay):
-            let day = state.status?.day ?? "another day"
-            if let error = state.lastError { return "Last check failed: \(error) No answer for today yet (last answer is for \(day)). Using the unlock time only." }
-            return "Onyx's answer is for \(day), not today. Using the unlock time only. (Before 6 AM Onyx still counts the previous day.)"
+            return "Onyx answered for \(state.status?.day ?? "another day"), not for this phone's today. Using the unlock time only."
+        case .notCheckedToday(let rule):
+            let head = "No answer for today yet (before 6 AM Onyx still counts the previous day). "
+            return head + (rule == .and
+                ? "Stays blocked after the unlock time until Onyx is opened and the habits are done."
+                : "Unlocks at the unlock time; to unlock earlier, finish the habits and open Onyx.")
         case .known(let rule, let done):
             let left = state.status?.outstanding.count ?? 0
             let failed = state.lastError.map { " Last check failed (\($0)); keeping the answer Onyx confirmed earlier today." } ?? ""

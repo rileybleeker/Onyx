@@ -10,7 +10,7 @@ READY for the device test. Nothing in the build chain blocks it: the signed Focu
 
 1. The block lifting at the "Not before" time with Onyx closed (background Device Activity monitor).
 2. The block coming back at midnight with Onyx closed (same monitor), i.e. the real "blocked before noon" morning.
-3. Everything beyond one time rule: task unlock from real Onyx tasks, configuring from the Onyx web app, a status card. These are not built (see "Not built yet").
+3. Unlocking from real Onyx habits (built 2026-11-13, tests H1 to H6 below; not yet run on the phone). A status card is not built (see "Not built yet").
 
 The roadmap row's log records that on the evening of 2026-11-11 Riley saw a blocked social app show the iOS restriction screen while the LinkedIn app and linkedin.com in Safari opened. That was written by another agent; I could not check the phone, so treat it as reported, not as verified here.
 
@@ -41,7 +41,7 @@ The roadmap row's log records that on the evening of 2026-11-11 Riley saw a bloc
 - Blocked apps/sites/categories come from Apple's picker. "Allowed" (LinkedIn) must contain at least one app AND one website, and you must tick the confirmation. The exception is subtracted from direct picks and passed as `except:` for categories.
 - Enabling applies the shield immediately from the app, so the first block does not depend on the monitor. The monitor only handles the scheduled changes (unlock at the time, re-block at midnight).
 - Tasks are typed and ticked on the phone. They are not Onyx tasks or habits.
-- Opening the Onyx app does NOT re-check the rule. `reconcile()` runs from the app only when the app comes back to the foreground while the Focus screen is already showing (`onChange(of: scenePhase)` in `FocusSettingsView`). After a force-quit the app starts on its main list, and opening the Focus screen only re-reads the saved file and message; it does not touch the shield. To force a re-check by hand: open the Focus screen, swipe to the Home screen, reopen Onyx. "Save and enable Focus" also re-applies. Keep this in mind when reading a result.
+- Until the 2026-11-13 build, opening the Onyx app did NOT re-check the rule (only returning to the foreground with the Focus screen already showing did). From that build on, launching the app or bringing it to the foreground on any screen re-applies the rule and asks Onyx about the chosen habits (see "Habit unlock tests"). "Save and enable Focus" also re-applies. Keep the build in mind when reading a result.
 
 ### The hold on PR #50
 
@@ -142,14 +142,94 @@ There is no heartbeat. Focus sends nothing to Onyx, so `/status` has no Focus ca
 
 If T4/T5 fail and you want logs: with the phone plugged in, `pymobiledevice3 syslog live` and look for lines from `deviceactivityd` around the unlock time (the forum threads use that filter on a Mac; not tried here). An empty log at the scheduled time is the "extension never launched" signature.
 
+## Habit unlock tests (added 2026-11-13)
+
+What changed: the habits Riley picks in Onyx (web, `/install`, card "Focus: unlock with habits") can unlock the block. Rule and limits: `tools/screentime_ios/FOCUS.md`, "Onyx habit unlock". Built and compiled in CI; nothing below has been run on the phone. The row "Unlock iPhone Focus when today's Onyx habits are done" is NOT done until H2 and H3 are seen on the phone.
+
+Two things to keep in mind while testing:
+
+- The phone only asks Onyx when the Onyx Screen Time app is opened (any screen), when "Check now" is tapped, or when the "Check Onyx Focus habits" shortcut runs. Ticking a habit in Onyx changes nothing on the phone until then.
+- Habits count from 06:00. Before 06:00 Onyx still reports the previous day, so run these tests between 06:00 and midnight.
+
+Use one or two habits you can tick and untick freely. Tick and untick them on `/habits` (the Yes circle; tap it again to clear). Clear them again when you are done so the day's record stays true.
+
+### H0. Install the new build and pick habits (3 min)
+
+1. iPhone, Safari, `/install`, second card "Onyx with Focus (development build)", Install with Focus. The build must be newer than 2026-11-13 (the card shows the build time).
+2. Open Onyx Screen Time, Focus, "Configure social media rules". A new section "Onyx habits" is at the top. With nothing chosen yet it says "No habits are chosen in Onyx. This phone's own rule applies." If it says "No Onyx token is saved in this app", go back one screen, paste the token (Copy Onyx token on `/install`) and Save.
+3. On `/install` (phone or PC), card "Focus: unlock with habits": tick one or two habits, leave the rule on "Habits OR time", Save. The "Today, as the phone sees it" block lists them with To do.
+4. Phone: Focus screen, "Check now". Expect the habits listed with "To do", "Rule from Onyx: habits OR time", and "Last checked" = now.
+5. If Focus is not enabled yet, do T1 (time-only rule, apps, LinkedIn exception, Enable). For H1 and H2 the "Not before" time must be at least 20 minutes away.
+
+### H1. Nothing chosen behaves as before (1 min, optional)
+
+On `/install` untick everything, Save. Phone: Check now. Expect "No habits are chosen in Onyx" and the block exactly as in T2/T4 (blocked until the time, open after). Then tick the habits again, Save, Check now.
+
+### H2. OR rule: finishing the habits unlocks early (3 min)
+
+Before the "Not before" time, with the habits not ticked:
+
+| Do | Expect |
+|---|---|
+| Open a blocked app | Apple's restriction screen |
+| Tick every chosen habit Yes in Onyx (`/habits`), then open a blocked app WITHOUT opening Onyx Screen Time | Still blocked. This is the known limit, not a bug |
+| Open Onyx Screen Time (any screen), wait about 5 seconds, open the blocked app | Opens. The Focus screen shows the habits "Done" and "All chosen habits are done: unlocked early." |
+| Clear one habit in Onyx, open Onyx Screen Time, wait, open the blocked app | Blocked again (the time has not come) |
+| Wait for the "Not before" time with that habit still clear, Onyx Screen Time closed | The app opens at the time (OR: the time unlocks regardless). Same background path as T4 |
+
+### H3. AND rule: stays blocked after the time until the habits are done (5 min plus a short wait)
+
+1. `/install`: rule "Habits AND time", Save. Clear the chosen habits in Onyx.
+2. Phone: Onyx Screen Time, Focus, set "Not before" to now + 16 minutes (Turn off and unblock first, then Save and enable), then Check now. Expect "... to do. Stays blocked after the unlock time until done." Close Onyx Screen Time.
+
+| Do | Expect |
+|---|---|
+| Before the time: tick every habit, open Onyx Screen Time, wait, open a blocked app | Still blocked (AND: habits alone do not unlock early). Clear the habits again and reopen Onyx Screen Time |
+| After the time, habits not ticked, Onyx Screen Time closed: open a blocked app | Still blocked. If it opens, either the last check had failed (time-only) or the unlock-time callback misbehaved: note the text of the "Onyx habits" section |
+| Tick every habit in Onyx, open the blocked app without opening Onyx Screen Time | Still blocked (known limit) |
+| Open Onyx Screen Time, wait about 5 seconds, open the blocked app | Opens |
+
+### H4. Offline fallback (3 min)
+
+Run under the AND rule, after the "Not before" time, with a chosen habit NOT ticked and the apps blocked (end of H3 before ticking, or clear a habit and reopen Onyx Screen Time).
+
+| Do | Expect |
+|---|---|
+| Airplane mode on (Wi-Fi off too). Open Onyx Screen Time, Focus | "Last check failed: No answer from Onyx (...). Using the unlock time only until a check succeeds." |
+| Open a blocked app | Opens: a failed check never blocks past the unlock time. This is the documented trade-off |
+| Airplane mode off, Onyx Screen Time, Check now | Habits listed "To do" again, and the app is blocked again |
+
+Before the time (either rule), airplane mode on, open Onyx Screen Time: the block must stay (a failed check cannot unlock early), and the screen must say the check failed.
+
+Token refused: only if you want to see it. In the app's main list paste a wrong token and Save, then Focus, Check now: "Onyx refused the token (HTTP 401)" and time-only behaviour. Paste the right token again afterwards (Copy Onyx token on `/install`), or the Screen Time export stops syncing.
+
+### H5. Next-day reset (overnight)
+
+Leave the habits ticked and the phone unlocked-early (OR) or unlocked (AND) in the evening. Do not open Onyx Screen Time again.
+
+| Next morning | Expect |
+|---|---|
+| Before the time, Onyx Screen Time not opened: open a blocked app | Blocked: yesterday's ticks do not count (also needs the 00:00 monitor callback, as in T5) |
+| Open Onyx Screen Time, Focus | Habits listed as "To do" (after 06:00), or "No answer for today yet" (before 06:00) |
+| OR rule: tick today's habits, open Onyx Screen Time | Unlocks early |
+| AND rule: do not open Onyx Screen Time; after the time open a blocked app | Still blocked until Onyx Screen Time is opened with the habits done |
+
+### H6. Optional: the shortcut (2 min)
+
+Shortcuts app, new shortcut, add action "Check Onyx Focus habits" (under Onyx Screen Time). With the habits ticked and the apps still blocked (OR rule, before the time), run it. Expect a result line such as "All chosen habits are done: unlocked early." and the blocked app opens. If the result is right but the app stays blocked until Onyx Screen Time is opened, iOS did not apply the change from the background run: write that down, the automation idea in `FOCUS.md` then does not work.
+
+### What to write down
+
+For each of H2 to H5: pass or fail, the iPhone's iOS version, and on a fail the full text of the "Onyx habits" section (summary line and "Last checked").
+
 ## Not built yet
 
 | Wish | State |
 |---|---|
 | No social media before noon | Built. Needs T4/T5 to be believed |
 | LinkedIn allowed | Built as a picker exception (app AND website, you confirm). Onyx cannot check the choice is really LinkedIn: Apple's tokens are opaque |
-| Task completion unlocks | Only phone-local, self-reported tasks. NOT connected to Onyx tasks, habits, check-in or Notion |
-| Configurable in Onyx | Only on the phone. No web page, table or route. The app/site picks can never be set from the web (tokens exist only on the device), so only time, mode and task list could ever move to the web |
+| Habit completion unlocks | Built 2026-11-13: chosen Onyx habits, rule OR / AND set on `/install`. Needs H2/H3 to be believed. The phone only learns about a finished habit when the app is opened (no background check, no push) |
+| Configurable in Onyx | The habits and the OR / AND rule are set on `/install`. The unlock time, the blocked apps and the LinkedIn exception are still set on the phone only (the app/site picks can never move to the web: tokens exist only on the device) |
 | Visible in Onyx | No `/status` card, no heartbeat, no last-run time even on the phone |
 | Reliable timing | Unknown until T4/T5. Nothing re-arms the schedule if iOS drops it |
 

@@ -269,8 +269,9 @@ export default function FocusUnlockSettings() {
         )}
         <p className="text-text-tertiary text-xs">
           The phone only checks when the Onyx Screen Time app is opened (or its “Check Onyx Focus habits” shortcut
-          runs), so open the app after finishing the habits. If the phone cannot reach Onyx it uses the unlock time
-          alone. Before 6 AM Onyx still counts the previous day, so habits start counting at 6 AM.
+          runs), so open the app after finishing the habits; under AND the block stays after the unlock time until
+          you do. If that check fails (offline, for example) the phone uses the unlock time alone. Before 6 AM Onyx
+          still counts the previous day, so habits start counting at 6 AM.
         </p>
       </div>
     </div>

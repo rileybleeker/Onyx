@@ -41,11 +41,13 @@ export const DEFAULT_FOCUS_CONFIG: FocusUnlockConfig = { rule: "or", habitPageId
  * The decision the phone makes. `true` = the blocked apps open.
  *
  *   configPresent     false when no habits are chosen in Onyx: the time alone decides.
- *   habitsDone        true / false from a status the phone trusts for today; null when it is unknown
- *                     (never fetched, fetched for another day, or the last fetch failed).
+ *   habitsDone        true / false as far as the phone knows for today; null when a check today got no
+ *                     usable answer (the fetch failed, or Onyx answered for a different day).
+ *                     "Not asked yet today" is false, not null: under AND the block then stays after
+ *                     the unlock time until the app is opened and checks.
  *   nowPastUnlockTime the phone's own "Not before" time has passed today.
  *
- * Unknown always means time-only, under BOTH rules: a network failure can delay an early unlock, but it
+ * Unknown always means time-only, under BOTH rules: a failed check can delay an early unlock, but it
  * can never keep apps blocked past the unlock time.
  */
 export function shouldUnlock(
