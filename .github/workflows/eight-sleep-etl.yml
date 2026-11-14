@@ -10,6 +10,10 @@ on:
         description: 'Lookback window in days (raise for catch-up after an outage)'
         type: number
         default: 7
+      selfheal_days:
+        description: 'How far back (days) the temp self-heal looks for missing bed/room temps'
+        type: number
+        default: 60
 
 concurrency:
   group: eight-sleep-etl
@@ -30,7 +34,7 @@ jobs:
       - name: Install dependencies
         run: pip install httpx supabase python-dotenv
       - name: Run Eight Sleep ETL
-        run: python eight_sleep_etl.py --days ${{ inputs.days || 7 }}
+        run: python eight_sleep_etl.py --days ${{ inputs.days || 7 }} --selfheal-days ${{ inputs.selfheal_days || 60 }}
         env:
           EIGHTSLEEP_EMAIL: ${{ secrets.EIGHTSLEEP_EMAIL }}
           EIGHTSLEEP_PASSWORD: ${{ secrets.EIGHTSLEEP_PASSWORD }}
