@@ -12,6 +12,15 @@ spec.loader.exec_module(scope)
 
 
 class StatsScopeTests(unittest.TestCase):
+    def setUp(self):
+        snapshot = patch.object(scope, "dependency_snapshot_matches", return_value=True)
+        self.snapshot = snapshot.start()
+        self.addCleanup(snapshot.stop)
+
+    def test_unknown_dependency_snapshot_stays_full(self):
+        self.snapshot.return_value = False
+        self.assertEqual(scope.select_scope("pull_request", "a"*40, "b"*40), "full")
+
     def test_frontend_only(self):
         self.assertTrue(scope.frontend_only(["frontend/src/app/page.tsx", "frontend/src/app/globals.css"]))
 

@@ -17,6 +17,7 @@ on:
       - "tests/**"
       - "frontend/src/**"        # tests/test_tdee_source_guard.py scans the TypeScript sources
       - "requirements*"
+      - "tools/stats_ci_dependencies.sha256"
       - ".github/workflows/stats-pr-check.yml"
   workflow_dispatch:
 
