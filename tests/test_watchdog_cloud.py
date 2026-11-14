@@ -401,11 +401,11 @@ class PrCheckTests(unittest.TestCase):
 
     def test_pending_more_than_45_minutes(self):
         self.fake.prs = [pr(1, 'BLOCKED')]
-        self.checks_for([check_run('offline-checks', completed=50, run_id=1),
-                         check_run('frontend-types', status='in_progress', started=ts(minutes_ago=50), run_id=2)])
+        self.checks_for([check_run('offline-checks', status='in_progress', started=ts(minutes_ago=50), run_id=1),
+                         check_run('frontend-types', completed=50, run_id=2)])  # no longer required (2026-11-14)
         found, _ = self.run_check()
         self.assertEqual(keys(found), ['pr-pending:pr-1'])
-        self.assertIn('frontend-types (pending)', found[0].detail)
+        self.assertIn('offline-checks (pending)', found[0].detail)
 
     def test_pending_under_45_minutes_is_quiet(self):
         self.fake.prs = [pr(1, 'BLOCKED')]

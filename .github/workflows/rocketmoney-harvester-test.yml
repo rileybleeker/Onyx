@@ -1,7 +1,5 @@
 name: Rocket Money Harvester Tests
 on:
-  pull_request:
-    paths: ['tools/rocketmoney_harvest/**', '.github/workflows/rocketmoney-harvester-test.yml']
   push:
     branches: [master]
     paths: ['tools/rocketmoney_harvest/**', '.github/workflows/rocketmoney-harvester-test.yml']

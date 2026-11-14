@@ -3,7 +3,7 @@ name: Live DB Checks
 # Tests that need the production Supabase project. They run ONLY after code is on master,
 # on a daily schedule, or when someone starts them by hand - never on a pull request, so
 # unreviewed PR code never holds the service-role key and PR bursts never load the database.
-# The credential-free PR tests are in stats-pr-check.yml. See docs/ci-checks.md.
+# The credential-free tests run in scheduled-tests.yml (stats-tests job). See docs/ci-checks.md.
 #
 # Both live tests are listed in tests/run_offline_tests.py (LIVE_TESTS); that script checks
 # that every test it excludes from the PR job is run here.

@@ -16,8 +16,8 @@ def pr(**kw):
     return base
 
 
-GREEN = [dict(id=1, name="offline-checks", status="completed", conclusion="success"),
-         dict(id=2, name="frontend-types", status="completed", conclusion="success")]
+GREEN = [dict(id=1, name="offline-checks", status="completed", conclusion="success")]
+OTHER = dict(id=2, name="kindle-harvester", status="completed", conclusion="success")  # a non-required check
 OK_FILES = ["frontend/src/components/Foo.tsx"]
 
 
@@ -39,11 +39,11 @@ class Judge(unittest.TestCase):
 
     def test_newer_success_replaces_older_failure(self):
         runs = [dict(id=1, name="offline-checks", status="completed", conclusion="failure"),
-                dict(id=9, name="offline-checks", status="completed", conclusion="success"), GREEN[1]]
+                dict(id=9, name="offline-checks", status="completed", conclusion="success"), OTHER]
         self.assertEqual(judge(runs=runs)[0], "merge")
 
     def test_cancelled_latest_blocks(self):
-        runs = [dict(id=9, name="offline-checks", status="completed", conclusion="cancelled"), GREEN[1]]
+        runs = [dict(id=9, name="offline-checks", status="completed", conclusion="cancelled"), OTHER]
         self.assertEqual(judge(runs=runs)[0], "skip")
 
     def test_failed_commit_status_blocks_but_vercel_preview_does_not(self):
@@ -51,19 +51,25 @@ class Judge(unittest.TestCase):
         self.assertEqual(judge(statuses=[dict(context="Vercel Preview Comments", state="failure")])[0], "merge")
 
     def test_running_check_waits(self):
-        runs = [dict(id=1, name="offline-checks", status="in_progress", conclusion=None), GREEN[1]]
+        runs = [dict(id=1, name="offline-checks", status="in_progress", conclusion=None), OTHER]
         self.assertEqual(judge(runs=runs)[0], "wait")
         self.assertEqual(judge(active=1)[0], "wait")
 
     def test_missing_required_check_dispatches_ci(self):
-        self.assertEqual(judge(runs=[GREEN[0]])[0], "dispatch")
+        self.assertEqual(judge(runs=[OTHER])[0], "dispatch")
         self.assertEqual(judge(runs=[])[0], "dispatch")
 
-    def test_behind_updates(self):
-        self.assertEqual(judge(pr(mergeStateStatus="BEHIND"), runs=[])[0], "update")
+    def test_only_offline_checks_is_required(self):
+        # 2026-11-14: frontend-types and stats-tests moved to scheduled-tests.yml; offline-checks alone merges
+        self.assertEqual(mt.REQUIRED, ("offline-checks",))
+        self.assertEqual(judge(runs=GREEN)[0], "merge")
+
+    def test_behind_merges_without_a_rebase_round(self):
+        self.assertEqual(judge(pr(mergeStateStatus="BEHIND"))[0], "merge")
+        self.assertEqual(judge(pr(mergeStateStatus="BEHIND"), runs=[])[0], "dispatch")
 
     def test_behind_with_failed_check_is_left_alone(self):
-        runs = [dict(id=1, name="offline-checks", status="completed", conclusion="failure"), GREEN[1]]
+        runs = [dict(id=1, name="offline-checks", status="completed", conclusion="failure"), OTHER]
         self.assertEqual(judge(pr(mergeStateStatus="BEHIND"), runs=runs)[0], "skip")
 
     def test_conflict_skips(self):
@@ -126,102 +132,30 @@ class Plan(unittest.TestCase):
         self.assertEqual(mt.plan([self.d(1, "skip")])[0], "idle")
 
 
-class MasterCiVerdict(unittest.TestCase):
-    def run_(self, conclusion, status="completed"):
-        return dict(id=1, status=status, conclusion=conclusion)
+class Culprit(unittest.TestCase):
+    """A failed build is reverted at the commit that broke it, not at the merge that happened to be verified."""
+    A, B, C = "a" * 40, "b" * 40, "c" * 40
 
-    def test_green(self):
-        self.assertEqual(mt.master_ci_verdict([self.run_("success")], False)[0], "ok")
+    def test_head_broke_it(self):
+        self.assertEqual(mt.culprit_of([(self.C, ["failure"]), (self.B, ["success"])]), self.C)
 
-    def test_still_running_waits(self):
-        self.assertIsNone(mt.master_ci_verdict([self.run_(None, "in_progress")], True))
+    def test_parent_already_broken(self):
+        chain = [(self.C, ["failure"]), (self.B, ["error"]), (self.A, ["inactive"])]
+        self.assertEqual(mt.culprit_of(chain), self.B)
 
-    def test_cancelled_by_next_merge_is_superseded_not_failed(self):
-        # 2026-11-12: #32 landed while #24's master CI ran; the cancel halted the train and pushed a false revert
-        self.assertEqual(mt.master_ci_verdict([self.run_("cancelled")], True)[0], "skipped")
-
-    def test_cancelled_while_still_head_fails(self):
-        self.assertEqual(mt.master_ci_verdict([self.run_("cancelled")], False)[0], "fail")
-
-    def test_real_failure_fails_even_after_master_moved(self):
-        self.assertEqual(mt.master_ci_verdict([self.run_("failure")], True)[0], "fail")
-
-    def test_mixed_cancel_and_failure_fails(self):
-        runs = [self.run_("cancelled"), dict(id=2, status="completed", conclusion="failure")]
-        self.assertEqual(mt.master_ci_verdict(runs, True)[0], "fail")
-
-    def test_rerun_success_beats_cancel(self):
-        runs = [self.run_("cancelled"), dict(id=2, status="completed", conclusion="success")]
-        self.assertEqual(mt.master_ci_verdict(runs, False)[0], "ok")
+    def test_parent_without_a_deployment_stops_the_walk(self):
+        self.assertEqual(mt.culprit_of([(self.C, ["failure"]), (self.B, [])]), self.C)
 
 
-class ImmutableCi(unittest.TestCase):
-    SHA = "a" * 40
-    NEXT = "b" * 40
-
-    def run_(self, tested, head, **kwargs):
-        return dict(id=1, display_title="Autonomous CI " + tested, head_sha=head,
-                    status=kwargs.get("status", "completed"), conclusion=kwargs.get("conclusion", "success"))
-
-    def test_pinned_run_counts_for_checkout_not_dispatch_ref(self):
-        row = self.run_(self.SHA, self.NEXT)
-        self.assertEqual(mt.ci_runs_for_sha([row], self.SHA), [row])
-        self.assertEqual(mt.ci_runs_for_sha([row], self.NEXT), [])
-
-    def test_unrelated_green_run_cannot_satisfy_old_commit(self):
-        self.assertEqual(mt.ci_runs_for_sha([self.run_(self.NEXT, self.NEXT)], self.SHA), [])
-
-    def test_legacy_native_run_matches_its_actual_head(self):
-        row = dict(head_sha=self.SHA, display_title="old push run")
-        self.assertEqual(mt.ci_runs_for_sha([row], self.SHA), [row])
-        self.assertEqual(mt.ci_runs_for_sha([row], self.NEXT), [])
-
-    def test_dispatch_passes_immutable_commit_and_observes_matching_run(self):
-        row = self.run_(self.SHA, self.NEXT)
-        with patch.object(mt, "api_json", side_effect=[{"workflow_runs": []}, {"workflow_runs": [row]}]), \
-             patch.object(mt, "master_sha", side_effect=[self.SHA, self.NEXT]), \
-             patch.object(mt, "gh") as gh:
-            self.assertEqual(mt.wait_master_ci(self.SHA)[0], "ok")
-        gh.assert_called_once_with("workflow", "run", mt.CI_WORKFLOW, "-R", mt.REPO,
-                                   "--ref", mt.BASE, "-f", "sha=" + self.SHA)
-
-    def test_superseded_without_run_skips_without_dispatch_or_sleep(self):
-        with patch.object(mt, "api_json", return_value={"workflow_runs": []}), \
-             patch.object(mt, "master_sha", return_value=self.NEXT), \
-             patch.object(mt, "gh") as gh, patch.object(mt.time, "sleep") as sleep:
-            self.assertEqual(mt.wait_master_ci(self.SHA)[0], "skipped")
-        gh.assert_not_called()
-        sleep.assert_not_called()
-
-    def test_existing_failure_is_not_hidden_by_new_master(self):
-        row = self.run_(self.SHA, self.SHA, conclusion="failure")
-        with patch.object(mt, "api_json", return_value={"workflow_runs": [row]}), \
-             patch.object(mt, "master_sha", return_value=self.NEXT), patch.object(mt, "gh") as gh:
-            self.assertEqual(mt.wait_master_ci(self.SHA)[0], "fail")
-        gh.assert_not_called()
-
-    def test_invalid_or_mutable_ref_refused_before_io(self):
-        with patch.object(mt, "api_json") as api:
-            for value in ("master", "abc1234", "a" * 40 + "\n"):
-                with self.assertRaises(ValueError):
-                    mt.wait_master_ci(value)
-        api.assert_not_called()
-
+class PinnedCiWorkflow(unittest.TestCase):
+    """Manual pinned runs of Autonomous CI (workflow_dispatch with sha) never satisfy the required check."""
     def test_workflow_checks_out_and_keys_concurrency_by_input(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/autonomous-ci.yml").read_text()
-        self.assertEqual(workflow.count("ref: ${{ inputs.sha || github.sha }}"), 2)
+        self.assertEqual(workflow.count("ref: ${{ inputs.sha || github.sha }}"), len(mt.REQUIRED))  # one job per check
         self.assertIn("run-name: Autonomous CI ${{ inputs.sha || github.sha }}", workflow)
         self.assertIn("group: autonomous-ci-${{ inputs.sha || github.ref }}", workflow)
         for check in mt.REQUIRED:
             self.assertIn("name: ${{ inputs.sha && '" + check + "-pinned' || '" + check + "' }}", workflow)
-
-
-class MasterCiTimeout(unittest.TestCase):
-    def test_slow_ci_is_not_a_failure(self):
-        # 2026-11-12: three merges in three minutes queued master CI past 10 min and #83 was reverted for nothing
-        result, why = mt.ci_timeout_verdict(600)
-        self.assertEqual(result, "ok")
-        self.assertIn("smoke", why)
 
 
 class ProductionVerdict(unittest.TestCase):

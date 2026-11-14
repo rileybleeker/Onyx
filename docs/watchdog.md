@@ -57,7 +57,7 @@ protected paths); the watchdog does not care which of them is late.
 
 | Key | Condition | Since |
 |---|---|---|
-| `merge-stall:pr-N` | `offline-checks` and `frontend-types` (GitHub Actions app) green on the head, merge state CLEAN or UNSTABLE, for more than 20 min | later of the two completion times |
+| `merge-stall:pr-N` | `offline-checks` (GitHub Actions app; the only required check since 2026-11-14) green on the head, merge state CLEAN or UNSTABLE, for more than 20 min | later of the two completion times |
 | `pr-red:pr-N` | a required check failed on the current head more than 6 h ago (a new commit gives a new head, so "no new commit" is implied) | failure completion |
 | `pr-pending:pr-N` | a required check queued, running or absent for more than 45 min | check start, or head commit time if absent |
 | `pr-conflict:pr-N` | merge state DIRTY for more than 2 h; names open PRs and PRs merged in the last 48 h that touch the same files | first seen by the watchdog |
