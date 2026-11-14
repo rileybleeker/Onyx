@@ -23,6 +23,7 @@
 
 import { supabase } from "@/lib/supabase";
 import { getWorkoutSleepGap, type WorkoutSleepGap } from "@/lib/queries";
+import { SWEET_SPOT_COLUMNS, shapeSweetSpotRows, type SweetSpotRow } from "@/lib/sweet-spot";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -206,54 +207,39 @@ export async function getHistoricalHrv(days = 180) {
   return data ?? [];
 }
 
-// All-time pull (no date filter) of nights that have a temperature reading
-// AND any of that night's outcomes. Powers the Environment Sweet Spot
-// dose-response chart, which buckets nights by selected temperature and
-// shows mean of the selected outcome per bucket. Filters at "any temp + HRV"
-// so we don't drop nights where bed_temp is present but room_temp isn't.
-// Per-row null-check happens client-side per selected axis pair.
-export async function getEnvDoseResponseData() {
-  // Pairs each night's bedroom / bed temperature with the HRV / recovery /
-  // sleep of THAT SAME night. Eight Sleep rows are dated by the wake-up day,
-  // so in the matrix the temperature on row D belongs to the sleep on row D-1
-  // (live check 2026-11-10: Eight Sleep HRV on row D+1 vs WHOOP HRV on row D,
-  // r = 0.84). The pipeline re-keys it in hrv_alignment.realign_matrix; this
-  // chart reads the matview directly, so it does the same move here: the
-  // outcome on row D is paired with the temperatures from row D+1.
+// All-time pull (no date filter) for the Environment Sweet Spot panel: every night that has
+// WHOOP HRV and at least one of the panel's inputs (bedroom / bed temperature, last meal to
+// bedtime, calories, caffeine). The panel buckets nights by the selected input and shows the
+// mean of the selected outcome; which rows count for an axis pair is decided client-side, so
+// this takes NO arguments and the server prefetch and the client revalidation cannot diverge.
+export async function getEnvDoseResponseData(): Promise<SweetSpotRow[]> {
+  // Row D of the matrix holds the HRV / recovery / sleep of the sleep that CLOSES behavioral
+  // day D, and day-D inputs (meals, calories, caffeine) are on the same row, so those pair
+  // as-is. Eight Sleep rows are dated by the wake-up day, so the temperature on row D belongs
+  // to the sleep on row D-1 (live check 2026-11-10: Eight Sleep HRV on row D+1 vs WHOOP HRV on
+  // row D, r = 0.84). The pipeline re-keys it in hrv_alignment.realign_matrix; this chart reads
+  // the matview directly, so shapeSweetSpotRows does the same move: the outcome on row D is
+  // paired with the temperatures from row D+1.
   //
-  // Reads the 15-min-refreshed matview (created 2026-06-11) instead of the
-  // live view — staleness is invisible to this historical chart.
-  // Paged: every HRV night is needed (not just temperature nights), which passes
-  // PostgREST's 1000-row cap as history grows.
-  const rows: any[] = [];
+  // Reads the 30-min-refreshed matview instead of the live view (staleness is invisible to
+  // this historical chart) through an explicit all-scalar column list (SWEET_SPOT_COLUMNS).
+  // Paged: every HRV night is needed (not just temperature nights), which passes PostgREST's
+  // 1000-row cap as history grows. onyx_behavioral_date is unique in the matview, so the order
+  // is total (the client's sameJson bailout needs that).
+  const rows: Record<string, unknown>[] = [];
   for (let from = 0; ; from += 1000) {
     const { data, error } = await supabase
       .from("daily_health_matrix_behavioral_mat")
-      .select(
-        "onyx_behavioral_date,eight_sleep_room_temp,eight_sleep_bed_temp,whoop_hrv_rmssd," +
-        "whoop_recovery_score,whoop_sleep_efficiency,whoop_deep_sleep_milli"
-      )
+      .select(SWEET_SPOT_COLUMNS)
       .or("eight_sleep_room_temp.not.is.null,eight_sleep_bed_temp.not.is.null,whoop_hrv_rmssd.not.is.null")
       .order("onyx_behavioral_date", { ascending: true })
       .range(from, from + 999);
     if (error) throw error;
-    rows.push(...(data ?? []));
+    rows.push(...((data ?? []) as unknown as Record<string, unknown>[]));
     if (!data || data.length < 1000) break;
   }
-  const temps = new Map<string, { room: any; bed: any }>();
-  for (const r of rows) temps.set(r.onyx_behavioral_date, { room: r.eight_sleep_room_temp, bed: r.eight_sleep_bed_temp });
-  const nextDay = (d: string) => {
-    const t = new Date(d + "T00:00:00Z");
-    t.setUTCDate(t.getUTCDate() + 1);
-    return t.toISOString().split("T")[0];
-  };
-  return rows
-    .filter(r => r.whoop_hrv_rmssd != null)
-    .map(r => {
-      const t = temps.get(nextDay(r.onyx_behavioral_date));
-      return { ...r, eight_sleep_room_temp: t?.room ?? null, eight_sleep_bed_temp: t?.bed ?? null };
-    })
-    .filter(r => r.eight_sleep_room_temp != null || r.eight_sleep_bed_temp != null);
+  // Compact rows (short keys, nulls dropped): about 420 nights ride in the ISR payload.
+  return shapeSweetSpotRows(rows);
 }
 
 export async function getHrvResiduals() {
@@ -373,7 +359,7 @@ export interface HrvDashboardData extends HrvRangeDependent {
   causalDag: any | null;
   causalMeta: any | null;
   causalDropped: any[];
-  envMatrix: any[];
+  envMatrix: SweetSpotRow[];
   xgbDiagnostics: any | null;
 }
 
