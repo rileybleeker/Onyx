@@ -30,6 +30,8 @@ test("a settled day passes its minutes through, so the existing Yes / No rule ap
   assert.equal(suggest(row()).answer, "Yes");
   assert.equal(suggest(row({ minutes_last_hour_before_sleep_est: 0 })).answer, "No");
   assert.equal(suggest(row({ minutes_last_hour_before_sleep_est: 5 })), null);
+  assert.equal(suggest(row({ minutes_last_hour_before_sleep_est: 19.9 })), null);
+  assert.equal(suggest(row({ minutes_last_hour_before_sleep_est: 20 })).answer, "Yes");
 });
 
 test("sleep scored but the phone has not synced since: blank, not a No from missing data", () => {

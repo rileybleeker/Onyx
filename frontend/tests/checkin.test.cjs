@@ -77,13 +77,18 @@ test("kitSummary lists what is worn, then what is not", () => {
 
 // ─── pre-fills ───────────────────────────────────────────────────────────────
 
-test("screenInBedSuggestion: Yes from 10 min, No up to 1 min, nothing in between or without data", () => {
+test("screenInBedSuggestion: Yes from 20 min, No up to 1 min, nothing in between or without data", () => {
+  assert.equal(C.SCREEN_IN_BED_YES_MIN, 20);
   assert.equal(C.screenInBedSuggestion(28.3).answer, "Yes");
   assert.match(C.screenInBedSuggestion("28.3").source, /28 min/);
-  assert.equal(C.screenInBedSuggestion(10).answer, "Yes");
+  assert.equal(C.screenInBedSuggestion(20).answer, "Yes");
+  // The Yes label states the threshold it was suggested at.
+  assert.equal(C.screenInBedSuggestion(20).source, "Screen Time: 20 min on the phone in the hour before sleep (20+ min suggests Yes)");
   assert.equal(C.screenInBedSuggestion(0).answer, "No");
   assert.equal(C.screenInBedSuggestion(1).answer, "No");
-  for (const v of [5, 9.9, 1.1, null, undefined, "", "abc", NaN]) assert.equal(C.screenInBedSuggestion(v), null, String(v));
+  assert.equal(C.screenInBedSuggestion(0).source, "Screen Time: no phone use in the hour before sleep");
+  // 10 to 19.9 min suggested Yes before 2026-11-13; up to 15 of those minutes can come from use 60 to 90 min before sleep.
+  for (const v of [5, 10, 15, 19.9, 1.1, null, undefined, "", "abc", NaN]) assert.equal(C.screenInBedSuggestion(v), null, String(v));
 });
 
 test("sameBedSuggestion: a recorded night is Yes; a missing night is No only after a later night synced", () => {

@@ -137,15 +137,21 @@ export function kitSummary(kit: Record<string, CheckinAnswer>): string {
   return [yes.join(", "), no.join(", ")].filter(Boolean).join(" · ");
 }
 
-/** Phone minutes in the hour before WHOOP sleep onset (hourly Screen Time buckets, so an estimate). */
-export const SCREEN_IN_BED_YES_MIN = 10;
+/**
+ * Phone minutes in the hour before WHOOP sleep onset (hourly Screen Time buckets, so an estimate).
+ * Yes from 20 (Riley, 2026-11-13; was 10): an hour that straddles the start of that last hour is
+ * split by overlap, so phone use that ended 60 to 90 minutes before sleep can add up to 15 minutes
+ * to the estimate (s minutes of it weigh (60 - s) / 60, and s * (60 - s) / 60 peaks at 15). At 20+
+ * the phone was in use inside the last hour itself. The threshold is shown in the Yes label.
+ */
+export const SCREEN_IN_BED_YES_MIN = 20;
 export const SCREEN_IN_BED_NO_MAX = 1;
 
 export function screenInBedSuggestion(minutesLastHour: number | string | null | undefined): CheckinSuggestion | null {
   if (minutesLastHour == null || minutesLastHour === "") return null;
   const m = Number(minutesLastHour);
   if (!Number.isFinite(m)) return null;
-  if (m >= SCREEN_IN_BED_YES_MIN) return { answer: "Yes", source: `Screen Time: ${Math.round(m)} min on the phone in the hour before sleep` };
+  if (m >= SCREEN_IN_BED_YES_MIN) return { answer: "Yes", source: `Screen Time: ${Math.round(m)} min on the phone in the hour before sleep (${SCREEN_IN_BED_YES_MIN}+ min suggests Yes)` };
   if (m <= SCREEN_IN_BED_NO_MAX) return { answer: "No", source: "Screen Time: no phone use in the hour before sleep" };
   return null;
 }
