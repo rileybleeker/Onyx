@@ -4,6 +4,7 @@ import { usePathname } from "next/navigation";
 import Sidebar from "./Sidebar";
 import MobileNav from "./MobileNav";
 import CommandPalette from "./CommandPalette";
+import { DesktopLaunchHandler } from "./DesktopApp";
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -21,6 +22,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <Sidebar />
         {children}
         <CommandPalette />
+        <DesktopLaunchHandler />
       </>
     );
   }
@@ -38,6 +40,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       </main>
       <MobileNav />
       <CommandPalette />
+      <DesktopLaunchHandler />
     </>
   );
 }
