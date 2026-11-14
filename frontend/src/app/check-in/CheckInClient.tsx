@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, Moon, Sun, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
+import { VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
 import { kitSummary, nightLabel, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
 import { buildCells, draftSettled, draftWith, parseDraft, savePlan, visibleNights, type Cell, type Cells, type Draft, type Patch } from "@/lib/checkin-cells";
 import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortions";
@@ -90,6 +91,12 @@ export default function CheckInClient() {
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [showExtras, setShowExtras] = useState(false);
   const delivery = useDeliveryDishes(data?.date ?? null, { earlierDays: 2 });
+  const [voiceText, setVoiceText] = useState("");
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
+  const [voiceMarks, setVoiceMarks] = useState<{ date: string; marks: Record<string, CheckinAnswer> }>({ date: "", marks: {} });
+  const dataDateRef = useRef<string | null>(null);
+  dataDateRef.current = data?.date ?? null;
 
   const lastLoad = useRef(0);
   const savingRef = useRef(false);
@@ -254,6 +261,49 @@ export default function CheckInClient() {
     }
   };
 
+  // "Say it once": the server maps the text to Yes/No answers (it writes nothing); they become ordinary draft taps.
+  // Rows already saved or tapped are never overwritten; a data pre-fill is.
+  const fillFromVoice = async () => {
+    if (!data || voiceBusy || !voiceText.trim()) return;
+    const date = data.date;
+    setVoiceBusy(true);
+    setVoiceMsg(null);
+    try {
+      const res = await fetch("/api/habits/checkin/voice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date, text: voiceText.trim() }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (date !== dataDateRef.current) return; // switched day meanwhile: drop it
+      if (!res.ok || json.failed || !json.answers || typeof json.answers !== "object") {
+        setVoiceMsg("Couldn't read that, try again.");
+        return;
+      }
+      const patch: Patch = {};
+      for (const item of dayItems) {
+        const a = (json.answers as Record<string, unknown>)[item.name];
+        const cur = cells[item.name];
+        if ((a === "Yes" || a === "No") && cur?.origin !== "saved" && cur?.origin !== "tapped") patch[item.name] = a;
+      }
+      const n = Object.keys(patch).length;
+      if (n === 0) {
+        setVoiceMsg("Nothing in the text matched a question.");
+        return;
+      }
+      apply(null, patch);
+      setVoiceMarks((prev) => ({ date, marks: { ...(prev.date === date ? prev.marks : {}), ...(patch as Record<string, CheckinAnswer>) } }));
+      setVoiceMsg(`Filled ${n} answer${n === 1 ? "" : "s"}. Check them, then Save.`);
+    } catch {
+      setVoiceMsg("Couldn't read that, try again.");
+    } finally {
+      setVoiceBusy(false);
+    }
+  };
+
+  // The marker stays while the row still holds the answer the text gave; any change by Riley removes it.
+  const isFromVoice = (name: string) => !!data && voiceMarks.date === data.date && !!cells[name] && voiceMarks.marks[name] === cells[name].answer;
+
   const goTo = (date: string) => {
     router.replace(`/check-in?date=${date}`, { scroll: false });
   };
@@ -356,6 +406,33 @@ export default function CheckInClient() {
         })}
       </div>
 
+      {/* Say it once: dictated text -> draft Yes/No taps (nothing is saved until Save) */}
+      <details className="mb-4 rounded-[6px] border border-border-subtle bg-white/[0.02] px-3 py-2">
+        <summary className="cursor-pointer text-[13px] text-text-secondary">Say it once</summary>
+        <textarea
+          value={voiceText}
+          onChange={(e) => setVoiceText(e.target.value.slice(0, VOICE_MAX_TEXT_CHARS))}
+          maxLength={VOICE_MAX_TEXT_CHARS}
+          rows={4}
+          aria-label="Say it once"
+          className="mt-2 w-full rounded-[6px] border border-border-subtle bg-transparent p-2 text-[14px] text-text-primary"
+        />
+        <p className="text-[11px] text-text-tertiary mt-1">Type or use the keyboard microphone. Nothing is saved until you press Save.</p>
+        <div className="mt-2 flex items-center gap-3">
+          <button
+            onClick={fillFromVoice}
+            disabled={voiceBusy || saving || !voiceText.trim()}
+            className="px-3 py-1.5 rounded-[6px] border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary disabled:opacity-50"
+          >
+            {voiceBusy ? "Filling…" : "Fill answers"}
+          </button>
+          <span className="text-[11px] font-mono text-text-tertiary">
+            {voiceText.length}/{VOICE_MAX_TEXT_CHARS}
+          </span>
+        </div>
+        {voiceMsg && <p className="text-[12px] text-text-secondary mt-2">{voiceMsg}</p>}
+      </details>
+
       {/* Progress */}
       <div className="mb-6">
         <div className="flex justify-between text-[12px] font-mono text-text-tertiary mb-1.5">
@@ -385,7 +462,7 @@ export default function CheckInClient() {
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">{category}</h3>
           <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
             {items.map((item) => (
-              <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} />
+              <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} fromVoice={isFromVoice(item.name)} />
             ))}
           </div>
         </section>
@@ -402,7 +479,7 @@ export default function CheckInClient() {
               <p className="text-[12px] text-text-tertiary mb-2">Weekly and rarely-Yes questions. Leave blank unless you did (or deliberately skipped) one {dayName === "Today" ? "today" : "that day"}.</p>
               <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
                 {extras.map((item) => (
-                  <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} />
+                  <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} fromVoice={isFromVoice(item.name)} />
                 ))}
               </div>
             </>
@@ -545,13 +622,14 @@ function NightBlock({
   );
 }
 
-function Row({ item, cell, onTap }: { item: CheckinItem; cell: Cell | undefined; onTap: (name: string, a: CheckinAnswer) => void }) {
+function Row({ item, cell, onTap, fromVoice }: { item: CheckinItem; cell: Cell | undefined; onTap: (name: string, a: CheckinAnswer) => void; fromVoice?: boolean }) {
   const yes = cell?.answer === "Yes";
   const no = cell?.answer === "No";
   return (
     <div className="flex items-center gap-3 px-3 py-2.5">
       <div className="flex-1 min-w-0">
         <p className="text-[14px] text-text-primary leading-snug">{item.name}</p>
+        {fromVoice && <p className="text-[11px] font-mono text-accent/80 mt-0.5">from what you said</p>}
         {cell?.origin === "suggested" && cell.source && <p className="text-[11px] font-mono text-accent/80 mt-0.5">from {cell.source} · tap to change</p>}
       </div>
       <div className="flex gap-1.5 shrink-0">

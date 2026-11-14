@@ -128,7 +128,10 @@ test("the route never writes a pre-fill: habit_journal is only written in POST",
   assert.equal(/\.(upsert|insert|update|delete)\(/.test(get), false);
   const suggestions = route.slice(route.indexOf("async function suggestionsFor"), route.indexOf("export async function GET"));
   assert.equal(/\.(upsert|insert|update|delete)\(/.test(suggestions), false);
-  assert.match(route, /groupFor\(h\.name, ch, h\.frequency\)/);
+  // loadItems moved to lib/checkin-server.ts (shared with the voice route)
+  const server = fs.readFileSync(path.join(SRC, "lib/checkin-server.ts"), "utf8");
+  assert.match(server, /groupFor\(h\.name, ch, h\.frequency\)/);
+  assert.match(route, /loadItems\(\)/);
 });
 
 // ─── sleep is asked for finished nights only ─────────────────────────────────

@@ -1,13 +1,12 @@
 import { createClient } from "@supabase/supabase-js";
 import { after, NextRequest, NextResponse } from "next/server";
-import { fetchActiveHabits, NotionHabitsError, type NotionHabit } from "@/lib/habits-notion";
+import { NotionHabitsError, type NotionHabit } from "@/lib/habits-notion";
+import { behavioralToday, dateError, isDate, loadItems, WHOOP_JOURNAL_FROZEN_THROUGH } from "@/lib/checkin-server";
 import {
   addDays,
   APP_HABITS,
   appHabitSuggestions,
   CHECKIN_MAX_DAYS_BACK,
-  fallbackBehavioralToday,
-  groupFor,
   journaledSuggestion,
   Q_JOURNALED,
   Q_SAME_BED,
@@ -15,7 +14,6 @@ import {
   sameBedSuggestion,
   screenInBedSuggestion,
   SLEEP_KIT,
-  SLEEP_QUESTIONS,
   sleepDateError,
   sleepNights,
   usualKit,
@@ -49,7 +47,6 @@ import { CHECKIN_SCREEN_COLUMNS, settledLastHourMinutes } from "@/lib/checkin-sc
  */
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
-const WHOOP_JOURNAL_FROZEN_THROUGH = "2026-06-08";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -62,44 +59,7 @@ const Q_REST = "Took a rest day?";
 // WHOOP sports that don't make a day "not a rest day" on their own (yoga, auto-detected activity, sauna, ...).
 const LIGHT_SPORTS = new Set(["yoga", "activity", "other", "walking", "sauna", "meditation", "stretching", "breathwork"]);
 
-const isDate = (s: unknown): s is string => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
-
-async function behavioralToday(): Promise<string> {
-  try {
-    const { data } = await supabase.rpc("behavioral_today_now");
-    if (data) return data as string;
-  } catch {
-    /* fall through */
-  }
-  return fallbackBehavioralToday(new Date());
-}
-
-function dateError(date: string, today: string): string | null {
-  if (date > today) return "That day hasn't happened yet.";
-  if (date < addDays(today, -CHECKIN_MAX_DAYS_BACK)) return `The check-in only covers today and the ${CHECKIN_MAX_DAYS_BACK} days before.`;
-  if (date <= WHOOP_JOURNAL_FROZEN_THROUGH) return "That day is in the frozen WHOOP era.";
-  return null;
-}
-
-async function loadItems(): Promise<{ items: CheckinItem[]; habits: NotionHabit[] }> {
-  const [habits, { data: map }] = await Promise.all([fetchActiveHabits(), supabase.from("habit_name_map").select("habit_name, channel")]);
-  const channel = new Map((map ?? []).map((r: { habit_name: string; channel: string }) => [r.habit_name, r.channel]));
-  const items = habits
-    .filter((h) => h.name)
-    .map((h): CheckinItem => {
-      const ch = channel.get(h.name) === "whoop" ? "whoop" : "habit";
-      return {
-        name: h.name,
-        notionPageId: h.id,
-        category: h.category,
-        frequency: h.frequency,
-        channel: ch,
-        group: groupFor(h.name, ch, h.frequency),
-        sleep: SLEEP_QUESTIONS.has(h.name),
-      };
-    });
-  return { items, habits };
-}
+// behavioralToday, dateError, isDate and loadItems are shared with the voice route (lib/checkin-server.ts).
 
 /** Pre-fills from other sources. Each one is only offered when the data is clear; otherwise the question stays blank. */
 async function suggestionsFor(date: string, today: string, names: Set<string>): Promise<Record<string, CheckinSuggestion>> {
