@@ -1,0 +1,33 @@
+name: Cash Forecast Snapshot
+
+# Weekly: saves the cash forecast's next 13 weekly balances so /financials/forecast can show forecast vs actual
+# (docs/cash-flow-forecast.md, Section 9). Heartbeat finance_forecast|snapshot -> /status "Cash Forecast" card.
+# The log is public: the script prints counts and error codes only.
+on:
+  schedule:
+    - cron: "30 12 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Snapshot (prints counts only)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/cash-forecast-snapshot.cjs

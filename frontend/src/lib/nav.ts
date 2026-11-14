@@ -86,6 +86,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { href: "/procurement", label: "Procurement", shortcut: "O", icon: ShoppingCart, keywords: ["buy", "orders", "subscriptions", "shopping"] },
       { href: "/agents", label: "Agents", shortcut: "G", icon: Bot, keywords: ["chat", "messages", "briefing", "approvals", "leads", "reminders", "inbox", "notifications"] },
       { href: "/financials", label: "Financials", shortcut: "W", icon: Wallet, keywords: ["money", "finance", "rocket money", "spending", "transactions", "budget", "net worth", "balances", "accounts", "ledger", "cashflow"] },
+      { href: "/financials/budgets", label: "Budgets", shortcut: "", icon: Wallet, keywords: ["budget", "spending", "categories", "categorize", "merchants", "overspending", "left to spend", "rules"] },
       { href: "/financials/forecast", label: "Cash forecast", shortcut: "", icon: Wallet, keywords: ["forecast", "cash flow", "projection", "bonus", "taxes", "0%", "promo", "balance transfer", "what if", "safe to move"] },
       { href: "/nyc", label: "NYC Search", shortcut: "Y", icon: Building2, keywords: ["apartment", "move", "new york", "listings", "leads", "rent", "scout", "manhattan"] },
       { href: "/chat", label: "Onyx Chat", shortcut: "C", icon: MessageSquare, keywords: ["ask", "claude", "assistant", "query", "chat", "health", "writing", "planning"] },

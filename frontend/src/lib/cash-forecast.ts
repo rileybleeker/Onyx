@@ -82,6 +82,9 @@ export interface GrowthDriver {
   returnPct?: number;
   monthlyContributionCents?: number;
   contributionStarts?: string; // YYYY-MM-DD
+  /** For an account with no ledger row yet (key "virtual-..."): its name and starting balance. */
+  label?: string;
+  startCents?: number;
 }
 export interface ForecastSettings {
   poolAccountKeys?: readonly string[];
@@ -198,6 +201,8 @@ export interface NetWorthMonth {
   investments: number;
   cardsOwed: number;
   netWorth: number;
+  /** Investment balance by account label (ledger accounts and planned ones such as a future SEP IRA). */
+  byAccount?: Record<string, number>;
 }
 export interface ForecastResult {
   state: "ok" | "no-pool" | "no-balance";
@@ -717,6 +722,89 @@ function detectCardStreams(
   return plans;
 }
 
+/** Monthly-total card streams for unpaired card payments, one per payee (e.g. "APPLECARD GSBANK PAYMENT"). */
+function detectPayeeCardStreams(rows: Row[], today: string, horizonEnd: string, notes: string[]): StreamPlan[] {
+  const byPayee = new Map<string, Row[]>();
+  for (const r of rows) {
+    if (r.t.txn_date < addDays(today, -FORECAST.detectWindowDays)) continue;
+    const key = merchantKey(r.t);
+    if (!key) continue;
+    const list = byPayee.get(key);
+    if (list) list.push(r);
+    else byPayee.set(key, [r]);
+  }
+  const plans: StreamPlan[] = [];
+  const thisMonth = monthIndex(monthKeyOf(today));
+  for (const [key, list] of byPayee) {
+    const occ = oncePerDay(list);
+    if (occ.length < 2) continue;
+    const lastDate = occ[occ.length - 1].date;
+    const label = `${displayMerchant(rowLabel(list[list.length - 1].t))} (card payment)`;
+    if (daysBetween(lastDate, today) > 70) {
+      notes.push(`${label}: none since ${lastDate}, so none is projected.`);
+      continue;
+    }
+    const firstMonth = monthIndex(monthKeyOf(occ[0].date));
+    const totals: number[] = [];
+    for (let k = 1; k <= FORECAST.cardSamplePayments; k++) {
+      const mi = thisMonth - k;
+      if (mi < firstMonth) break;
+      const mk = monthFromIndex(mi);
+      totals.push(occ.filter((o) => monthKeyOf(o.date) === mk).reduce((sum, o) => sum + o.cents, 0));
+    }
+    if (!totals.length) totals.push(occ.reduce((sum, o) => sum + o.cents, 0));
+    const typical = Math.round(mean(totals.slice(0, FORECAST.cardMeanPayments)));
+    if (typical <= 0) continue;
+    const recent = occ.filter((o) => monthIndex(monthKeyOf(o.date)) >= thisMonth - 6);
+    const byDay = [...(recent.length ? recent : occ)].sort((a, b) => dayOfMonth(a.date) - dayOfMonth(b.date));
+    const half = byDay.reduce((sum, o) => sum + o.cents, 0) / 2;
+    let acc = 0;
+    let day = dayOfMonth(byDay[byDay.length - 1].date);
+    for (const o of byDay) {
+      acc += o.cents;
+      if (acc >= half) {
+        day = dayOfMonth(o.date);
+        break;
+      }
+    }
+    const paidThisMonth = occ.filter((o) => monthKeyOf(o.date) === monthKeyOf(today)).reduce((sum, o) => sum + o.cents, 0);
+    const dates: string[] = [];
+    const amounts: number[] = [];
+    if (typical - paidThisMonth > 0) {
+      let d = nextBusinessDay(clampedDay(monthKeyOf(today), day));
+      if (d <= today) d = addDays(today, 1);
+      dates.push(d);
+      amounts.push(-(typical - paidThisMonth));
+    }
+    for (let k = 1; k <= 25; k++) {
+      const d = nextBusinessDay(clampedDay(monthFromIndex(thisMonth + k), day));
+      if (d > horizonEnd) break;
+      if (dates.includes(d)) continue;
+      dates.push(d);
+      amounts.push(-typical);
+    }
+    plans.push({
+      stream: {
+        id: stableId(`cardpayee|${key}`),
+        kind: "card",
+        label,
+        direction: "out",
+        cadence: "monthly",
+        typicalCents: -typical,
+        next: dates[0] ?? null,
+        certainty: totals.slice(0, 3).filter((t) => t > 0).length >= 3 ? "confirmed" : "likely",
+        occurrences: occ.length,
+        method: `monthly total = mean paid in the last ${Math.min(FORECAST.cardMeanPayments, totals.length)} months, around the ${ordinal(day)} (no matching rows on the card's own account)`,
+      },
+      dates,
+      amounts,
+      claimed: list.map((r) => r.i),
+      sampleCents: totals.map((t) => -t),
+    });
+  }
+  return plans;
+}
+
 // ─── Planned items ────────────────────────────────────────────────────────────────────────────
 
 interface PlannedOcc {
@@ -832,7 +920,16 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   const external = poolRows.filter((r) => !internal.has(r.i) && !cardPay.has(r.i));
 
   // Streams and card payments.
-  const streamPlans = [...detectStreams(external, today, horizonEnd, notes), ...detectCardStreams(poolRows, cardPay, input.accounts, today, horizonEnd, notes)];
+  // Pool payments filed as card payments that could not be paired with a card account's rows (a card whose
+  // feed is monthly, or one not connected): modeled per payee as monthly totals, like paired card payments.
+  const unpairedCardRows = external.filter((r) => r.delta < 0 && /credit card payment/i.test(r.t.category ?? ""));
+  const unpairedCards = detectPayeeCardStreams(unpairedCardRows, today, horizonEnd, notes);
+  const unpairedClaimed = new Set(unpairedCards.flatMap((p) => p.claimed));
+  const streamPlans = [
+    ...detectStreams(external.filter((r) => !unpairedClaimed.has(r.i)), today, horizonEnd, notes),
+    ...detectCardStreams(poolRows, cardPay, input.accounts, today, horizonEnd, notes),
+    ...unpairedCards,
+  ];
   const claimed = new Set<number>();
   for (const p of streamPlans) for (const i of p.claimed) claimed.add(i);
 
@@ -1224,14 +1321,14 @@ function projectCards(
     let interestNext12 = 0;
     const months: CardProjection["months"] = [];
     const extras = (input.extraCardPayments ?? []).filter((x) => x.account_key === acct.account_key && x.cents > 0);
-    for (let k = 1; k <= 12; k++) {
+    for (let k = 1; k <= 24; k++) {
       const key = monthFromIndex(thisMonth + k);
       const monthStart = `${key}-01`;
       const rate = promoEnds && monthStart <= promoEnds ? promoApr : promoEnds ? Math.max(apr, standardApr) : apr;
       const interest = Math.round((bal * rate) / 100 / 12);
       const extra = extras.filter((x) => monthKeyOf(x.date) === key || (k === 1 && monthKeyOf(x.date) <= key)).reduce((sum, x) => sum + x.cents, 0);
       bal = Math.max(0, bal + interest + monthlySpend - monthlyPayment - extra);
-      interestNext12 += interest;
+      if (k <= 12) interestNext12 += interest;
       months.push({ month: key, owed: bal, interest });
     }
     if (promoEnds && promoEnds < today) {
@@ -1273,15 +1370,19 @@ function projectNetWorth(
   today: string,
 ): NetWorthMonth[] {
   const growth = new Map((input.growth ?? []).map((g) => [g.account_key, g]));
-  const investments = input.accounts.filter((a) => isInvestmentType(a.account_type));
+  const ledgerInv = input.accounts.filter((a) => isInvestmentType(a.account_type));
+  const virtual = (input.growth ?? []).filter((g) => g.account_key.startsWith("virtual-") && !ledgerInv.some((a) => a.account_key === g.account_key));
+  const investments = [...ledgerInv.map((a) => ({ account_key: a.account_key, label: a.label })), ...virtual.map((g) => ({ account_key: g.account_key, label: g.label ?? "Planned account" }))];
   const thisMonth = monthIndex(monthKeyOf(today));
   const out: NetWorthMonth[] = [];
-  const invBal = new Map(investments.map((a) => [a.account_key, latest.get(a.account_key)?.balance_cents ?? 0]));
-  for (let k = 1; k <= 12; k++) {
+  const invBal = new Map(investments.map((a) => [a.account_key, latest.get(a.account_key)?.balance_cents ?? growth.get(a.account_key)?.startCents ?? 0]));
+  const monthsOut = Math.min(24, Math.max(12, Math.floor(days.length / 30.4)));
+  for (let k = 1; k <= monthsOut; k++) {
     const key = monthFromIndex(thisMonth + k);
     const lastDay = addDays(`${monthFromIndex(thisMonth + k + 1)}-01`, -1);
     const cashDay = days.filter((d) => d.date <= lastDay).pop();
     let inv = 0;
+    const byAccount: Record<string, number> = {};
     for (const a of investments) {
       const g = growth.get(a.account_key);
       const r = (g?.returnPct ?? FORECAST.defaultReturnPct) / 100;
@@ -1289,10 +1390,11 @@ function projectNetWorth(
       if (g?.monthlyContributionCents && (!g.contributionStarts || `${key}-01` >= g.contributionStarts.slice(0, 7) + "-01")) b += g.monthlyContributionCents;
       invBal.set(a.account_key, b);
       inv += b;
+      byAccount[a.label] = Math.round(b);
     }
     const owed = cards.reduce((s, c) => s + (c.months[k - 1]?.owed ?? 0), 0);
     const cash = cashDay?.likely ?? 0;
-    out.push({ month: key, cash, investments: Math.round(inv), cardsOwed: owed, netWorth: Math.round(cash + inv - owed) });
+    out.push({ month: key, cash, investments: Math.round(inv), cardsOwed: owed, netWorth: Math.round(cash + inv - owed), byAccount });
   }
   return out;
 }

@@ -62,6 +62,7 @@ const CADENCE: Record<string, string> = {
   weather: "Every 3h :32",
   supplement_reminders: "Worker poll (heartbeat ~hourly); cards at each stack's reminder time",
   renewal_reminders: "Worker poll, hourly; a card up to 3 days before a renewal",
+  cash_forecast: "Weekly, Monday 12:30 UTC (forecast snapshot)",
   urgent_email: "Hourly :15 (both Gmail accounts)",
   google_calendar: "Hourly :55",
   ubereats: "Every 6h (Riley's PC, while logged on)",
@@ -112,6 +113,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   weather:        { method: "automated",      label: "API ETL" },
   supplement_reminders: { method: "automated", label: "Worker push cards" },
   renewal_reminders: { method: "automated", label: "Worker push cards" },
+  cash_forecast:  { method: "automated",      label: "Snapshot job" },
   urgent_email:   { method: "automated",      label: "IMAP label reader" },
   google_calendar: { method: "automated",     label: "iCal feed ETL" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
@@ -500,6 +502,9 @@ export async function GET() {
     // query so a Worker that stops polling reads red instead of dropping out of the shared window.
     const renewalRemindersRes = await supabase.from("sync_log").select("status,sync_start,records_synced,duration_seconds,error_message")
       .eq("source", "procurement_renewals").eq("data_type", "prompt").order("sync_start", { ascending: false }).limit(1);
+    // Cash forecast snapshot (cash-forecast-snapshot.yml, weekly): heartbeat age, own limit-1 query.
+    const cashForecastRes = await supabase.from("sync_log").select("status,sync_start,records_synced,duration_seconds,error_message")
+      .eq("source", "finance_forecast").eq("data_type", "snapshot").order("sync_start", { ascending: false }).limit(1);
     // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
     const urgentEmailCard = await getUrgentEmailStatusCard(supabase);
 
@@ -728,6 +733,26 @@ export async function GET() {
           cadence: CADENCE.renewal_reminders,
           integrationMethod: METHOD.renewal_reminders.method,
           methodLabel: METHOD.renewal_reminders.label,
+        };
+      })(),
+      // Cash forecast snapshot (2026-11-14): a weekly job saves the forecast so /financials/forecast can show
+      // forecast vs actual. Weekly: >8 days without a run = degraded, >15 days or a failed run = red. The
+      // heartbeat text is an error code at most - never an amount.
+      cash_forecast: (() => {
+        const entry = latestBySrcType["finance_forecast|snapshot"] ?? (cashForecastRes.data?.[0] as Record<string, unknown> | undefined) ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        return {
+          label: "Cash Forecast",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status: ingestionHeartbeatStatus("success", entry, 8 * 24, 15 * 24),
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string) ?? (entry && ageH > 15 * 24 ? `No forecast snapshot for ${Math.floor(ageH / 24)} days - check cash-forecast-snapshot.yml.` : null),
+          cadence: CADENCE.cash_forecast,
+          integrationMethod: METHOD.cash_forecast.method,
+          methodLabel: METHOD.cash_forecast.label,
         };
       })(),
       // Procurement subscription tracker (/procurement, 2026-11-11): typed by hand, never connected to a provider.

@@ -1,8 +1,9 @@
 import "server-only";
 import { etDate } from "@/lib/format";
 import { accountLabel, parseAccount, parseBalance, toCents } from "@/lib/finance-ledger";
-import { fetchPaged, serviceClient } from "@/lib/finance-ledger-server";
-import { forecastCash, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
+import { fetchPaged, loadCategoryFixes, serviceClient } from "@/lib/finance-ledger-server";
+import { fixedCategory } from "@/lib/finance-categories";
+import { forecastCash, poolBalanceAt, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
 import { driversToInputs, itemRowToPlanned, type DriverRow, type ItemInput, type ItemRow } from "@/lib/cash-forecast-store";
 import { applyToProfile, hasLevers, scenarioCardPayments, scenarioItems, type ScenarioParams } from "@/lib/cash-forecast-scenario";
 import { computeTaxYear, federalMarginalRate, parseTaxProfile, taxCashItems, type TaxProfile, type TaxYearResult } from "@/lib/tax-plan";
@@ -13,7 +14,7 @@ import { computeTaxYear, federalMarginalRate, parseTaxProfile, taxCashItems, typ
  * the caller sits behind the owner-only middleware. Explicit columns, no row contents in logs (codes only).
  */
 
-const TXN_COLS = "account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
+const TXN_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
 const HISTORY_DAYS = 450;
 const MAX_PAGES = 40;
 
@@ -31,6 +32,15 @@ export interface ForecastAccountView {
   label: string;
   type: "cash" | "card" | "investment" | "other";
 }
+/** A past week: what a snapshot made about 4 weeks earlier said, and the balance that happened. */
+export interface AccuracyRow {
+  weekEnd: string;
+  asOf: string;
+  likely: number;
+  low: number;
+  high: number;
+  actual: number;
+}
 export type ForecastLoad =
   | {
       kind: "ok";
@@ -43,6 +53,7 @@ export type ForecastLoad =
       tax: TaxYearResult[];
       scenario: { params: ScenarioParams; result: ForecastResult; tax: TaxYearResult[] } | null;
       saved: { slug: string; name: string; params: ScenarioParams }[];
+      accuracy: AccuracyRow[];
     }
   | { kind: "empty" }
   | { kind: "error"; code: string };
@@ -73,6 +84,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     if (!parsedAccounts.length) return { kind: "empty" };
     const accounts: ForecastAccount[] = parsedAccounts.map((a) => ({ account_key: a.account_key, account_type: a.account_type, label: accountLabel(a) }));
     const balances: ForecastBalance[] = bal.rows.map(parseBalance).filter((b): b is NonNullable<typeof b> => !!b);
+    const fixes = await loadCategoryFixes(db);
     const txns: ForecastTxn[] = [];
     for (const raw of txn.rows) {
       const r = raw as Record<string, unknown>;
@@ -85,7 +97,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
         custom_name: typeof r.custom_name === "string" ? r.custom_name : null,
         amount_cents: cents,
         currency: typeof r.currency === "string" ? r.currency : "USD",
-        category: typeof r.category === "string" ? r.category : null,
+        category: fixedCategory(r, fixes),
         ignored_from: typeof r.ignored_from === "string" ? r.ignored_from : null,
       });
     }
@@ -107,7 +119,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const taxFor = (p: TaxProfile | null) => (p ? [computeTaxYear(p, year, today), computeTaxYear(p, year + 1, today)] : []);
     const tax = taxFor(profile);
     const manual = itemRows.map(itemRowToPlanned);
-    const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings };
+    const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings: { ...settings, horizonDays: 730 } };
     const result = forecastCash({ ...baseInput, planned: [...manual, ...(profile ? taxCashItems(profile, tax, today) : [])] });
 
     // What-if: the same history with the levers applied (computed here, so the browser never gets the ledger).
@@ -130,6 +142,31 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
         extraCardPayments: scenarioCardPayments(levers, today),
       });
       scenario = { params: levers, result: sResult, tax: sTax };
+    }
+    // Forecast vs actual: snapshots of past weeks against the balance rebuilt from the ledger.
+    const accuracy: AccuracyRow[] = [];
+    const snaps = await db.from("finance_forecast_snapshots").select("as_of,week_end,likely_cents,low_cents,high_cents").lt("week_end", today).order("week_end", { ascending: false }).limit(200);
+    if (!snaps.error && snaps.data?.length && result.state === "ok") {
+      const poolSet = new Set(result.pool.map((p) => p.account_key));
+      const poolTxns = txns.filter((t) => poolSet.has(t.account_key));
+      const byWeek = new Map<string, { as_of: string; likely_cents: unknown; low_cents: unknown; high_cents: unknown }[]>();
+      for (const r of snaps.data as { as_of: string; week_end: string; likely_cents: unknown; low_cents: unknown; high_cents: unknown }[]) {
+        const list = byWeek.get(r.week_end) ?? [];
+        list.push(r);
+        byWeek.set(r.week_end, list);
+      }
+      for (const [weekEnd, list] of [...byWeek.entries()].sort((a, b) => (a[0] < b[0] ? 1 : -1)).slice(0, 8)) {
+        const target = Date.parse(`${weekEnd}T00:00:00Z`) - 28 * 86_400_000;
+        const pick = list.reduce((best, r) => (Math.abs(Date.parse(`${r.as_of}T00:00:00Z`) - target) < Math.abs(Date.parse(`${best.as_of}T00:00:00Z`) - target) ? r : best));
+        accuracy.push({
+          weekEnd,
+          asOf: pick.as_of,
+          likely: Number(pick.likely_cents),
+          low: Number(pick.low_cents),
+          high: Number(pick.high_cents),
+          actual: poolBalanceAt(poolTxns, result.opening.cents, today, weekEnd),
+        });
+      }
     }
     const saved = drivers
       .filter((d) => d.key.startsWith("scenario:"))
@@ -155,6 +192,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
       tax,
       scenario,
       saved,
+      accuracy,
     };
   } catch (e) {
     const code = e && typeof e === "object" && "code" in e ? String((e as { code: unknown }).code) : "unknown";

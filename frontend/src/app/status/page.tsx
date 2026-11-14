@@ -37,6 +37,7 @@ const SOURCE_BADGE: Record<string, string> = {
   weather: "OPEN-METEO",
   supplement_reminders: "AGENTS",
   renewal_reminders: "AGENTS",
+  cash_forecast: "FORECAST",
   urgent_email: "GMAIL",
   google_calendar: "GOOGLE",
   ubereats: "UBER EATS",
@@ -72,6 +73,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   weather: "text-sky-400",
   supplement_reminders: "text-amber-400/70",
   renewal_reminders: "text-amber-300/70",
+  cash_forecast: "text-amber-300/70",
   urgent_email: "text-rose-400",
   google_calendar: "text-blue-300",
   ubereats: "text-emerald-400/70",
@@ -138,6 +140,7 @@ const SOURCE_ORDER = [
   "weather",
   "supplement_reminders",
   "renewal_reminders",
+  "cash_forecast",
   "urgent_email",
   "google_calendar",
   "ubereats",
@@ -277,6 +280,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   weather: "Weather",
   supplement_reminders: "Supplement Reminders",
   procurement_renewals: "Renewal Reminders",
+  finance_forecast: "Cash Forecast",
   urgent_email: "Urgent Email",
   google_calendar: "Google Calendar",
   ubereats: "Uber Eats Items",
@@ -312,6 +316,7 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   transactions: "Transactions",
   balances: "Balances",
   keepalive: "Keep-alive",
+  snapshot: "Snapshot",
 };
 
 // "refreshed Xm ago" label, isolated from the page render cycle (perf round

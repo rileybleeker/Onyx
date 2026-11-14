@@ -6,10 +6,11 @@ import { Area, CartesianGrid, ComposedChart, Line, ReferenceLine, ResponsiveCont
 import { accentColor, axisTick, chartColors, chartTooltip, gridStyle } from "@/lib/chart-theme";
 import type { ForecastResult } from "@/lib/cash-forecast";
 import type { DriverRow } from "@/lib/cash-forecast-store";
-import type { ForecastAccountView, PlanItemView } from "@/lib/cash-forecast-server";
+import type { AccuracyRow, ForecastAccountView, PlanItemView } from "@/lib/cash-forecast-server";
 import type { ScenarioParams } from "@/lib/cash-forecast-scenario";
 import type { TaxProfile, TaxYearResult } from "@/lib/tax-plan";
 import { CompareTable, TaxSection, WhatIfPanel } from "./TaxAndWhatIf";
+import { NetWorthChart, ProjectionBreakdown } from "./ProjectionParts";
 
 const usd = (cents: number | null | undefined): string => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -44,6 +45,7 @@ export default function ForecastView({
   tax,
   scenario,
   saved,
+  accuracy,
 }: {
   result: ForecastResult;
   items: PlanItemView[];
@@ -54,6 +56,7 @@ export default function ForecastView({
   tax: TaxYearResult[];
   scenario: { params: ScenarioParams; result: ForecastResult; tax: TaxYearResult[] } | null;
   saved: { slug: string; name: string; params: ScenarioParams }[];
+  accuracy: AccuracyRow[];
 }) {
   const router = useRouter();
   const [range, setRange] = useState<"13w" | "12m">("13w");
@@ -186,6 +189,9 @@ export default function ForecastView({
         </p>
       </section>
 
+      <ProjectionBreakdown result={result} scenario={scenario?.result ?? null} />
+      <NetWorthChart result={result} scenario={scenario?.result ?? null} />
+
       {/* Promo call-outs */}
       <section className={card} aria-labelledby="fc-promos">
         <h2 id="fc-promos" className="font-semibold">0% promos</h2>
@@ -254,32 +260,38 @@ export default function ForecastView({
         )}
       </section>
 
-      {/* Net worth */}
-      <section className={card} aria-labelledby="fc-nw">
-        <h2 id="fc-nw" className="font-semibold">Net worth, next 12 months (likely)</h2>
-        <table className="mt-2 w-full text-[13px]">
-          <thead className="text-[12px] text-text-tertiary">
-            <tr>
-              <th className="text-left font-normal">Month</th>
-              <th className="text-right font-normal">Cash</th>
-              <th className="text-right font-normal">Investments</th>
-              <th className="text-right font-normal">Cards owed</th>
-              <th className="text-right font-normal">Net worth</th>
-            </tr>
-          </thead>
-          <tbody>
-            {result.netWorth.map((m) => (
-              <tr key={m.month} className="border-t border-border-subtle">
-                <td className="py-1">{dateLabel(`${m.month}-15`, { month: "short", year: "numeric" })}</td>
-                <td className="py-1 text-right">{usd(m.cash)}</td>
-                <td className="py-1 text-right">{usd(m.investments)}</td>
-                <td className="py-1 text-right">{usd(m.cardsOwed)}</td>
-                <td className="py-1 text-right font-semibold">{usd(m.netWorth)}</td>
+      <section className={card} aria-labelledby="fc-acc">
+        <h2 id="fc-acc" className="font-semibold">How accurate has the forecast been?</h2>
+        {accuracy.length === 0 ? (
+          <p className="mt-1 text-[13px] text-text-secondary">A snapshot is saved every Monday; this fills in as weeks pass. The backtest on 18 months of history: typically off by about 13% of a month&apos;s spending at 4 weeks, with about 80% of outcomes inside the range.</p>
+        ) : (
+          <table className="mt-2 w-full text-[13px]">
+            <thead className="text-[12px] text-text-tertiary">
+              <tr>
+                <th className="text-left font-normal">Week ending</th>
+                <th className="text-left font-normal">Forecast made</th>
+                <th className="text-right font-normal">Said</th>
+                <th className="text-right font-normal">Range</th>
+                <th className="text-right font-normal">Actual</th>
+                <th className="text-right font-normal">Off by</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-        <p className="mt-2 text-[12px] text-text-tertiary">Investments grow at an assumed 5% a year unless you set otherwise; an assumption, not a promise.</p>
+            </thead>
+            <tbody>
+              {accuracy.map((a) => (
+                <tr key={a.weekEnd} className="border-t border-border-subtle">
+                  <td className="py-1">{dateLabel(a.weekEnd)}</td>
+                  <td className="py-1 text-text-secondary">{dateLabel(a.asOf)}</td>
+                  <td className="py-1 text-right">{usd(a.likely)}</td>
+                  <td className="py-1 text-right text-text-tertiary">
+                    {usd(a.low)} to {usd(a.high)}
+                  </td>
+                  <td className="py-1 text-right font-semibold">{usd(a.actual)}</td>
+                  <td className={`py-1 text-right ${a.actual < a.low || a.actual > a.high ? "text-mid" : "text-text-secondary"}`}>{signed(a.likely - a.actual)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </section>
 
       <Settings buffer={buffer} busy={busy} run={run} />
