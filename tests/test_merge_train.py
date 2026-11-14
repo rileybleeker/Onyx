@@ -179,6 +179,18 @@ class ProductionVerdict(unittest.TestCase):
         self.assertIsNone(mt.production_verdict([], False))
 
 
+class MovedOnVerdict(unittest.TestCase):
+    def test_ok_becomes_skipped_when_master_moved_during_the_wait(self):
+        # 2026-11-14: #113 waited 14 min, #120/#124 landed, its old smoke spec failed against their new pages
+        self.assertEqual(mt.moved_on_verdict("ok", "green", "a" * 40, "b" * 40)[0], "skipped")
+
+    def test_ok_stays_ok_while_still_head(self):
+        self.assertEqual(mt.moved_on_verdict("ok", "green", "a" * 40, "a" * 40), ("ok", "green"))
+
+    def test_fail_stays_fail_even_after_master_moved(self):
+        self.assertEqual(mt.moved_on_verdict("fail", "deploy failure", "a" * 40, "b" * 40)[0], "fail")
+
+
 class SelfAndPreview(unittest.TestCase):
     def test_own_running_job_does_not_block(self):
         runs = GREEN + [dict(id=7, name="train", status="in_progress", conclusion=None)]

@@ -364,6 +364,18 @@ def ci_timeout_verdict(timeout: int) -> tuple[str, str]:
         timeout // 60)
 
 
+def moved_on_verdict(result: str, why: str, sha: str, head: str) -> tuple[str, str]:
+    """Pure: an `ok` verdict turns `skipped` when master moved on while we waited for the deploy and CI.
+
+    The smoke test that runs next checks out THIS commit's tests but loads PRODUCTION, which by then serves the newer
+    merge. Old tests against newer pages fail on copy the newer merge changed (2026-11-14: #113's run failed on
+    /procurement and /health headings that #120 and #124, merged during its 14-minute wait, had rewritten together
+    with the tests). The newer merge's own verification smoke-tests what production actually serves."""
+    if result == "ok" and head != sha:
+        return "skipped", f"master moved on to {head[:7]} while this merge was verified; that merge's own verification covers this one"
+    return result, why
+
+
 def post_merge(sha: str, drill: bool) -> int:
     head = master_sha()
     out = os.environ.get("GITHUB_OUTPUT")
@@ -383,6 +395,7 @@ def post_merge(sha: str, drill: bool) -> int:
     if result == "ok":
         result, why2 = wait_master_ci(sha)
         why = why + "; " + why2
+    result, why = moved_on_verdict(result, why, sha, master_sha())
     emit(result, why)
     return 0
 
