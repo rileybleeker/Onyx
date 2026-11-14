@@ -324,6 +324,18 @@ test("newer-wins: a later authorization wins, then the later refresh (same rule 
   assert.ok(py.includes("def spotify_upload_decision(") && py.includes('local.get("authorized_at")'), "the Python twin exists");
 });
 
+test("shouldWriteBack never puts an old refresh token over one rotated elsewhere", () => {
+  const w = lib.shouldWriteBack;
+  const cand = { authorized_at: 100, obtained_at: 500, refresh_token: "refresh-A" };
+  assert.equal(w(cand, "refresh-A", { authorized_at: 100, obtained_at: 300, refresh_token: "refresh-B" }), false, "rotated elsewhere, no new token from Spotify");
+  assert.equal(w({ ...cand, refresh_token: "refresh-C" }, "refresh-A", { authorized_at: 100, obtained_at: 300, refresh_token: "refresh-B" }), true, "Spotify issued a new token");
+  assert.equal(w(cand, "refresh-A", { authorized_at: 200, obtained_at: 100, refresh_token: "refresh-B" }), false, "later authorization in the store");
+  assert.equal(w(cand, "refresh-A", { authorized_at: 100, obtained_at: 300, refresh_token: "refresh-A" }), true, "same token, older obtained_at");
+  assert.equal(w(cand, "refresh-A", { authorized_at: 100, obtained_at: 600, refresh_token: "refresh-A" }), false, "stored is newer");
+  assert.equal(w(cand, "refresh-A", null), true, "unreadable stored row");
+  assert.equal(w(cand, "refresh-A", undefined), true, "missing stored row");
+});
+
 // ----------------------------------------------------------------------------- pure: /status
 
 test("needsSpotifyReconnect matches the ETL's sign-in-again messages and nothing else", () => {
