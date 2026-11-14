@@ -4,6 +4,7 @@ import { getNycScoutFreshness } from "@/lib/nyc";
 import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
 import { financeLedgerCard } from "@/lib/finance-status";
+import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -25,6 +26,8 @@ export interface SourceStatus {
   cadence: string;
   integrationMethod: IntegrationMethod;
   methodLabel: string;
+  /** Spotify card only, from day 165 after the authorization: the date (YYYY-MM-DD, ET) to reconnect by. */
+  reconnectBy?: string | null;
 }
 
 // Human-readable sync cadence per source. "Manual" means user-triggered;
@@ -41,7 +44,7 @@ const CADENCE: Record<string, string> = {
   // unconditional safety-net. Tracked separately because the predict path
   // can stay green while the retrain crashes silently (the model is cached).
   hrv_retrain: "Hourly (cond.) + 12:00 UTC safety-net",
-  spotify: "Every 2h :50",
+  spotify: "Hourly :50",
   reccobeats: "With Spotify ETL",
   musicbrainz: "With Spotify ETL",
   supplements: "Manual",
@@ -258,7 +261,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -402,6 +405,11 @@ export async function GET() {
         if (error) throw error;
         return { key: `${source}|${dataType}`, entry: data?.[0] ?? null };
       })),
+      // Spotify authorization age. Spotify expires a refresh token 180 days after the authorization,
+      // so the card warns from day 165. The token text is read here and ONLY the derived
+      // reconnect-by date leaves this function (this response is CDN-cacheable): never the blob,
+      // a token or authorized_at itself. A failed read just means no warning.
+      supabase.from("ci_tokens").select("token_data").eq("service", "spotify").limit(1),
     ]);
 
     // Find the latest sync entry per (source, data_type) key
@@ -412,6 +420,8 @@ export async function GET() {
         latestBySrcType[key] = row as Record<string, unknown>;
       }
     }
+
+    const spotifyReconnectDate = spotifyReconnectBy(spotifyTokenRes?.data?.[0]?.token_data, Date.now());
 
     for (const { key, entry } of ingestionHeartbeats) {
       if (entry) latestBySrcType[key] = entry as Record<string, unknown>;
@@ -639,7 +649,9 @@ export async function GET() {
       spotify: {
         label: "Spotify",
         lastSync: (spotifyEntry?.sync_start as string) ?? null,
-        status: deriveStatus(spotifyEntry, spotifyLag),
+        // From day 165 of the 180-day authorization a healthy card reads Degraded, so the
+        // reconnect is done before the sync stops rather than after.
+        status: ((s) => (spotifyReconnectDate && s === "success" ? "partial" : s))(deriveStatus(spotifyEntry, spotifyLag)),
         latestDataDate: spotifyDate,
         daysLag: spotifyLag,
         recordsSynced: (spotifyEntry?.records_synced as number) ?? 0,
@@ -648,6 +660,7 @@ export async function GET() {
         cadence: CADENCE.spotify,
         integrationMethod: METHOD.spotify.method,
         methodLabel: METHOD.spotify.label,
+        reconnectBy: spotifyReconnectDate,
       },
       reccobeats: {
         ...enrichmentSource({ label: "ReccoBeats", entry: reccobeatsEntry }),

@@ -3,26 +3,25 @@
  *
  * Token storage mirrors the Python ETL (spotify_etl.py): refresh tokens live
  * in pds.ci_tokens (service='spotify'). On every call we fetch the stored
- * token blob, exchange the refresh_token for a fresh access_token, and if
- * Spotify rotates the refresh_token we write the new blob back to ci_tokens
- * so the Python ETL also picks it up.
+ * token blob, exchange the refresh_token for a fresh access_token and write
+ * the blob back to ci_tokens so the Python ETL also picks it up.
+ *
+ * Spotify expires a refresh token 180 days after the authorization (enforced
+ * since 2026-07-20). The recovery is the Reconnect control on the /status
+ * Spotify card: exchangeAuthorizationCode + probeRecentlyPlayed +
+ * storeSpotifyTokens below, driven by POST /api/spotify/exchange.
  *
  * Server-only — uses SUPABASE_SERVICE_ROLE_KEY. Never import into client code.
  */
 
 import { createClient } from "@supabase/supabase-js";
+import { SPOTIFY_REDIRECT_URI, isNewerBlob, serializeTokenBlob, type SpotifyTokenBlob } from "@/lib/spotify-reconnect";
 
 const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
 const SPOTIFY_API = "https://api.spotify.com/v1";
 
-interface SpotifyTokenBlob {
-  access_token: string;
-  refresh_token: string;
-  expires_in: number;
-  obtained_at: number;
-  token_type?: string;
-  scope?: string;
-}
+/** Shown wherever a Spotify call fails because the stored refresh token is dead. */
+export const SPOTIFY_RECONNECT_HINT = "Spotify needs to be reconnected: open /status and use Reconnect on the Spotify card.";
 
 function supabaseAdmin() {
   return createClient(
@@ -32,9 +31,11 @@ function supabaseAdmin() {
   );
 }
 
-function basicAuthHeader(): string {
-  const id = process.env.SPOTIFY_CLIENT_ID!;
-  const secret = process.env.SPOTIFY_CLIENT_SECRET!;
+/** Basic auth for the token endpoint, or null when either Spotify env var is unset. */
+function basicAuthHeader(): string | null {
+  const id = process.env.SPOTIFY_CLIENT_ID;
+  const secret = process.env.SPOTIFY_CLIENT_SECRET;
+  if (!id || !secret) return null;
   return "Basic " + Buffer.from(`${id}:${secret}`).toString("base64");
 }
 
@@ -46,36 +47,144 @@ async function loadTokens(): Promise<SpotifyTokenBlob> {
     .eq("service", "spotify")
     .single();
   if (error || !data) {
-    throw new Error("Spotify tokens not found in pds.ci_tokens — run `python spotify_etl.py --auth` then upload");
+    throw new Error(`Spotify tokens not found in pds.ci_tokens. ${SPOTIFY_RECONNECT_HINT}`);
   }
   return JSON.parse(data.token_data as string) as SpotifyTokenBlob;
 }
 
+/**
+ * Refresh path write-back. Newer-wins: the row is re-read first, and a blob that is not newer than
+ * the stored one (an earlier authorization, or the same authorization with an older refresh) is
+ * dropped. Without this, a call that loaded the old blob just before a reconnect would write the
+ * old refresh token back over the new one.
+ */
 async function saveTokens(tokens: SpotifyTokenBlob): Promise<void> {
   const sb = supabaseAdmin();
+  const { data: rows, error: readErr } = await sb.from("ci_tokens").select("token_data").eq("service", "spotify").limit(1);
+  if (readErr) {
+    console.error("Spotify token write-back skipped: could not read the stored row:", readErr.code);
+    return;
+  }
+  const storedText = rows?.[0]?.token_data;
+  if (typeof storedText === "string") {
+    try {
+      const stored = JSON.parse(storedText) as Partial<SpotifyTokenBlob> | null;
+      if (stored && typeof stored === "object" && !isNewerBlob(tokens, stored)) return;
+    } catch {
+      // unreadable stored row: fall through and replace it
+    }
+  }
   const { error } = await sb
     .from("ci_tokens")
     .upsert({
       service: "spotify",
-      token_data: JSON.stringify(tokens, null, 2),
+      token_data: serializeTokenBlob(tokens),
       updated_at: new Date().toISOString(),
     });
   if (error) {
-    console.error("Failed to save rotated Spotify refresh token:", error);
-    // Non-fatal — Spotify rotations are rare and the next refresh will use the old token until it stops working.
+    console.error("Failed to save refreshed Spotify tokens:", error.code);
+    // Non-fatal: the refresh token is unchanged in the common case, so the next call refreshes again.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect (POST /api/spotify/exchange)
+// ---------------------------------------------------------------------------
+
+export type ExchangeResult =
+  | { ok: true; token: unknown }
+  | { ok: false; reason: "not_configured" | "code_rejected" | "spotify_unavailable" };
+
+/**
+ * Exchanges an authorization code for tokens. redirect_uri is the same constant the authorize link
+ * used. Returns a reason only: Spotify's response body is never passed on or logged.
+ */
+export async function exchangeAuthorizationCode(code: string): Promise<ExchangeResult> {
+  const auth = basicAuthHeader();
+  if (!auth) return { ok: false, reason: "not_configured" };
+  let resp: Response;
+  try {
+    resp = await fetch(SPOTIFY_TOKEN_URL, {
+      method: "POST",
+      headers: { Authorization: auth, "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: SPOTIFY_REDIRECT_URI }),
+      cache: "no-store",
+    });
+  } catch {
+    return { ok: false, reason: "spotify_unavailable" };
+  }
+  if (resp.status === 400 || resp.status === 401) {
+    // 400 invalid_grant = the code expired, was used already or was issued for another redirect;
+    // 400/401 invalid_client = the client id / secret pair is wrong.
+    let kind = "";
+    try {
+      kind = String(((await resp.json()) as { error?: unknown }).error ?? "");
+    } catch {
+      kind = "";
+    }
+    console.error("Spotify code exchange refused:", resp.status, /^[a-z_]{1,40}$/.test(kind) ? kind : "unknown");
+    return { ok: false, reason: kind === "invalid_client" ? "not_configured" : "code_rejected" };
+  }
+  if (!resp.ok) {
+    console.error("Spotify code exchange failed:", resp.status);
+    return { ok: false, reason: "spotify_unavailable" };
+  }
+  try {
+    return { ok: true, token: await resp.json() };
+  } catch {
+    return { ok: false, reason: "spotify_unavailable" };
   }
 }
 
 /**
- * Returns a valid access token, refreshing if necessary. Persists any rotated
- * refresh token back to ci_tokens so the Python ETL stays in sync.
+ * One recently-played call with a new access token: proves the token works for the read the ETL
+ * makes every hour before anything is stored. "forbidden" = the account is not allowed on the app
+ * (Development Mode allowlist) or the scope is missing.
+ */
+export async function probeRecentlyPlayed(accessToken: string): Promise<"ok" | "forbidden" | "unavailable"> {
+  let resp: Response;
+  try {
+    resp = await fetch(`${SPOTIFY_API}/me/player/recently-played?limit=1`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      cache: "no-store",
+    });
+  } catch {
+    return "unavailable";
+  }
+  if (resp.ok) return "ok";
+  console.error("Spotify reconnect probe failed:", resp.status);
+  return resp.status === 401 || resp.status === 403 ? "forbidden" : "unavailable";
+}
+
+/** Strict store for the reconnect: returns false when the row was not written (the caller answers 500). */
+export async function storeSpotifyTokens(tokens: SpotifyTokenBlob): Promise<boolean> {
+  const { error } = await supabaseAdmin()
+    .from("ci_tokens")
+    .upsert({
+      service: "spotify",
+      token_data: serializeTokenBlob(tokens),
+      updated_at: new Date().toISOString(),
+    });
+  if (error) {
+    console.error("Spotify reconnect: token store failed:", error.code);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Returns a valid access token, refreshing on every call. Writes the refreshed blob back to
+ * ci_tokens (newer-wins) so the Python ETL stays in sync. Every key of the stored blob is kept,
+ * including authorized_at.
  */
 export async function getSpotifyAccessToken(): Promise<string> {
+  const auth = basicAuthHeader();
+  if (!auth) throw new Error("Spotify is not configured on the server (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET)");
   const tokens = await loadTokens();
   const resp = await fetch(SPOTIFY_TOKEN_URL, {
     method: "POST",
     headers: {
-      Authorization: basicAuthHeader(),
+      Authorization: auth,
       "Content-Type": "application/x-www-form-urlencoded",
     },
     body: new URLSearchParams({
@@ -85,6 +194,10 @@ export async function getSpotifyAccessToken(): Promise<string> {
   });
   if (!resp.ok) {
     const body = await resp.text();
+    if (resp.status === 400 && body.includes("invalid_grant")) {
+      // The refresh token expired (180 days after authorization) or was revoked.
+      throw new Error(`Spotify refresh token rejected. ${SPOTIFY_RECONNECT_HINT}`);
+    }
     throw new Error(`Spotify token refresh failed (${resp.status}): ${body}`);
   }
   const fresh = await resp.json();
