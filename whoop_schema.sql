@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS pds.whoop_cycles (
     average_heart_rate  INTEGER,
     max_heart_rate      INTEGER,
 
+    -- Top-level on the cycle (GET /v2/cycle, since 2026-09-23); NULL = no step data.
+    -- Added to the live table by sql/whoop_cycles_step_count.sql.
+    step_count          INTEGER,
+
     raw_json    JSONB,
     synced_at   TIMESTAMPTZ DEFAULT NOW(),
 
