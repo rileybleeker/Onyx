@@ -117,7 +117,7 @@ test("card payments follow what was paid, on the usual day", () => {
   const out = run();
   const card = out.streams.find((s) => s.kind === "card");
   assert.ok(card);
-  assert.equal(card.typicalCents, -170_000); // mean of the last 3 payments: 160k, 170k, 180k
+  assert.equal(card.typicalCents, -165_000); // mean of the monthly totals available (up to 6): 150k, 160k, 170k, 180k
   assert.equal(card.next, F.nextBusinessDay("2030-06-20"));
   // The everyday baseline does not also count the card payments.
   assert.equal(out.baseline.weeklyMeanCents, -10_000);
