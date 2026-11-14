@@ -4,6 +4,8 @@ import { accountLabel, parseAccount, parseBalance, toCents } from "@/lib/finance
 import { fetchPaged, serviceClient } from "@/lib/finance-ledger-server";
 import { forecastCash, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
 import { driversToInputs, itemRowToPlanned, type DriverRow, type ItemInput, type ItemRow } from "@/lib/cash-forecast-store";
+import { applyToProfile, hasLevers, scenarioCardPayments, scenarioItems, type ScenarioParams } from "@/lib/cash-forecast-scenario";
+import { computeTaxYear, federalMarginalRate, parseTaxProfile, taxCashItems, type TaxProfile, type TaxYearResult } from "@/lib/tax-plan";
 
 /**
  * Server-side reads and writes for the cash forecast (/financials/forecast). SERVICE ROLE ONLY: the finance
@@ -30,7 +32,18 @@ export interface ForecastAccountView {
   type: "cash" | "card" | "investment" | "other";
 }
 export type ForecastLoad =
-  | { kind: "ok"; result: ForecastResult; items: PlanItemView[]; drivers: DriverRow[]; accounts: ForecastAccountView[]; setupPending: boolean }
+  | {
+      kind: "ok";
+      result: ForecastResult;
+      items: PlanItemView[];
+      drivers: DriverRow[];
+      accounts: ForecastAccountView[];
+      setupPending: boolean;
+      profile: TaxProfile | null;
+      tax: TaxYearResult[];
+      scenario: { params: ScenarioParams; result: ForecastResult; tax: TaxYearResult[] } | null;
+      saved: { slug: string; name: string; params: ScenarioParams }[];
+    }
   | { kind: "empty" }
   | { kind: "error"; code: string };
 
@@ -39,7 +52,7 @@ const typeOf = (t: string): ForecastAccountView["type"] => {
   return l === "cash" ? "cash" : l.includes("credit") ? "card" : l === "investment" ? "investment" : "other";
 };
 
-export async function loadForecast(now: Date = new Date()): Promise<ForecastLoad> {
+export async function loadForecast(now: Date = new Date(), levers: ScenarioParams = {}): Promise<ForecastLoad> {
   let db;
   try {
     db = serviceClient();
@@ -88,7 +101,39 @@ export async function loadForecast(now: Date = new Date()): Promise<ForecastLoad
     const drivers = ((driversRes.data ?? []) as DriverRow[]).filter((d) => d && typeof d.key === "string" && d.value && typeof d.value === "object");
     const { settings, cardTerms, growth } = driversToInputs(drivers);
 
-    const result = forecastCash({ today, now, accounts, txns, balances, planned: itemRows.map(itemRowToPlanned), cardTerms, growth, settings });
+    // Tax plan for this year and next; its payments, refunds and after-tax bonus become planned cash lines.
+    const profile = parseTaxProfile(drivers.find((d) => d.key === "tax")?.value);
+    const year = Number(today.slice(0, 4));
+    const taxFor = (p: TaxProfile | null) => (p ? [computeTaxYear(p, year, today), computeTaxYear(p, year + 1, today)] : []);
+    const tax = taxFor(profile);
+    const manual = itemRows.map(itemRowToPlanned);
+    const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings };
+    const result = forecastCash({ ...baseInput, planned: [...manual, ...(profile ? taxCashItems(profile, tax, today) : [])] });
+
+    // What-if: the same history with the levers applied (computed here, so the browser never gets the ledger).
+    let scenario: { params: ScenarioParams; result: ForecastResult; tax: TaxYearResult[] } | null = null;
+    if (hasLevers(levers)) {
+      const sp = profile ? applyToProfile(profile, levers) : null;
+      const sTax = taxFor(sp);
+      const adjustments: { streamId: string; from: string; amountCents: number }[] = [];
+      const pay = result.streams.filter((x) => x.kind === "income").sort((a, b) => b.typicalCents - a.typicalCents)[0];
+      if (pay && profile && levers.preTax !== undefined) {
+        const delta = Math.round(levers.preTax * 100) - profile.preTaxAnnualCents;
+        const keep = 1 - (federalMarginalRate(profile, year) + 5) / 100;
+        adjustments.push({ streamId: pay.id, from: today, amountCents: pay.typicalCents - Math.round((delta / 12) * keep) });
+      }
+      const extra = scenarioItems(levers, sp ?? ({ moveDate: null } as TaxProfile), today);
+      const sResult = forecastCash({
+        ...baseInput,
+        planned: [...manual, ...(sp ? taxCashItems(sp, sTax, today) : []), ...extra],
+        adjustments,
+        extraCardPayments: scenarioCardPayments(levers, today),
+      });
+      scenario = { params: levers, result: sResult, tax: sTax };
+    }
+    const saved = drivers
+      .filter((d) => d.key.startsWith("scenario:"))
+      .map((d) => ({ slug: d.key.slice(9), name: String((d.value as { name?: unknown }).name ?? d.key.slice(9)), params: ((d.value as { params?: ScenarioParams }).params ?? {}) as ScenarioParams }));
     if (bal.truncated || txn.truncated) result.warnings.push("Part of the history was not read (page limit), so the forecast may be off.");
     const items: PlanItemView[] = itemRows.map((r) => ({
       id: r.id,
@@ -106,6 +151,10 @@ export async function loadForecast(now: Date = new Date()): Promise<ForecastLoad
       drivers,
       accounts: parsedAccounts.map((a) => ({ account_key: a.account_key, label: accountLabel(a), type: typeOf(a.account_type) })),
       setupPending,
+      profile,
+      tax,
+      scenario,
+      saved,
     };
   } catch (e) {
     const code = e && typeof e === "object" && "code" in e ? String((e as { code: unknown }).code) : "unknown";

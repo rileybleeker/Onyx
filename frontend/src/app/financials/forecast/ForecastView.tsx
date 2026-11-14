@@ -7,6 +7,9 @@ import { accentColor, axisTick, chartColors, chartTooltip, gridStyle } from "@/l
 import type { ForecastResult } from "@/lib/cash-forecast";
 import type { DriverRow } from "@/lib/cash-forecast-store";
 import type { ForecastAccountView, PlanItemView } from "@/lib/cash-forecast-server";
+import type { ScenarioParams } from "@/lib/cash-forecast-scenario";
+import type { TaxProfile, TaxYearResult } from "@/lib/tax-plan";
+import { CompareTable, TaxSection, WhatIfPanel } from "./TaxAndWhatIf";
 
 const usd = (cents: number | null | undefined): string => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -37,12 +40,20 @@ export default function ForecastView({
   drivers,
   accounts,
   setupPending,
+  profile,
+  tax,
+  scenario,
+  saved,
 }: {
   result: ForecastResult;
   items: PlanItemView[];
   drivers: DriverRow[];
   accounts: ForecastAccountView[];
   setupPending: boolean;
+  profile: TaxProfile | null;
+  tax: TaxYearResult[];
+  scenario: { params: ScenarioParams; result: ForecastResult; tax: TaxYearResult[] } | null;
+  saved: { slug: string; name: string; params: ScenarioParams }[];
 }) {
   const router = useRouter();
   const [range, setRange] = useState<"13w" | "12m">("13w");
@@ -62,8 +73,14 @@ export default function ForecastView({
 
   const shown = range === "13w" ? 91 : 365;
   const chartData = useMemo(
-    () => result.days.slice(0, shown).map((d) => ({ date: d.date, likely: d.likely / 100, band: [d.low / 100, d.high / 100] })),
-    [result.days, shown],
+    () =>
+      result.days.slice(0, shown).map((d, i) => ({
+        date: d.date,
+        likely: d.likely / 100,
+        band: [d.low / 100, d.high / 100],
+        whatif: scenario ? (scenario.result.days[i]?.likely ?? 0) / 100 : undefined,
+      })),
+    [result.days, shown, scenario],
   );
   const lastShown = result.days[Math.min(shown, result.days.length) - 1]?.date ?? result.today;
   const milestonesShown = result.milestones.filter((m) => !m.ended && m.date <= lastShown);
@@ -123,6 +140,9 @@ export default function ForecastView({
         </ul>
       )}
 
+      <WhatIfPanel params={scenario?.params ?? null} accounts={accounts} saved={saved} busy={busy} run={run} />
+      {scenario && <CompareTable base={result} baseTax={tax} scen={scenario.result} scenTax={scenario.tax} />}
+
       {/* Chart */}
       <section className={card} aria-labelledby="fc-chart">
         <div className="mb-2 flex items-center justify-between">
@@ -149,7 +169,8 @@ export default function ForecastView({
                 {...chartTooltip}
               />
               <Area dataKey="band" stroke="none" fill={accentColor} fillOpacity={0.15} isAnimationActive={false} name="range" />
-              <Line dataKey="likely" stroke={accentColor} dot={false} strokeWidth={2} isAnimationActive={false} name="likely" />
+              <Line dataKey="likely" stroke={accentColor} dot={false} strokeWidth={2} isAnimationActive={false} name={scenario ? "base plan" : "likely"} />
+              {scenario && <Line dataKey="whatif" stroke={chartColors.strain} dot={false} strokeWidth={2} strokeDasharray="6 3" isAnimationActive={false} name="what-if" />}
               <ReferenceLine y={0} stroke={chartColors.zeroLine} />
               {buffer > 0 && <ReferenceLine y={buffer / 100} stroke={chartColors.down} strokeDasharray="4 4" label={{ value: "buffer", fill: chartColors.down, fontSize: 11 }} />}
               {milestonesShown.map((m) => (
@@ -160,6 +181,7 @@ export default function ForecastView({
         </div>
         <p className="mt-2 text-[12px] text-text-tertiary">
           Line = likely; shaded = 10th to 90th percentile of 500 resampled paths. Amber lines mark where a 0% promo ends.
+          {scenario && " Dashed blue = the what-if."}
           {range === "12m" && " Past 13 weeks the forecast is less certain."}
         </p>
       </section>
@@ -209,6 +231,7 @@ export default function ForecastView({
         </table>
       </section>
 
+      <TaxSection tax={tax} profile={profile} busy={busy} run={run} />
       <PlannedItems items={items} statuses={result.planned} busy={busy} run={run} />
       <Cards result={result} drivers={drivers} accounts={accounts} busy={busy} run={run} />
 
