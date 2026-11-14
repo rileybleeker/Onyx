@@ -199,7 +199,7 @@ export default function HealthClient({ initial, calendar }: { initial: CareLoad;
     <header><h1 data-testid="page-heading" className="text-2xl font-semibold">Health & appointments</h1><p className="mt-2 text-text-secondary">Plan routine care and keep track of what needs booking.</p></header>
     <section className={panel} aria-label="Privacy and calendar connection">
       <h2 className="font-semibold">Private planning, saved in Onyx</h2>
-      <p className="mt-2 text-sm text-text-secondary">Items are saved to your Onyx account and show on any device where you are signed in. Keep labels short: no medical records. Nothing is sent to a provider or a reminder service, and nothing goes to a calendar unless you connect one below. Dates and repeat intervals are yours to choose, not medical recommendations.</p>
+      <p className="mt-2 text-sm text-text-secondary">Items are saved to your Onyx account and show on any device where you are signed in. Keep labels short; lab results and documents go in <Link href="/health/records" className="text-accent hover:underline">Medical records</Link>. Nothing is sent to a provider or a reminder service, and nothing goes to a calendar unless you connect one below. Dates and repeat intervals are yours to choose, not medical recommendations.</p>
       {local.state === 'offer' && <div className="mt-3 rounded-xl border border-border-default p-3 text-sm">
         <p>This browser holds {local.items.length} item{local.items.length === 1 ? '' : 's'} saved by the earlier version of this page.</p>
         <button className={`${button} mt-2`} disabled={copying || load !== 'ready'} onClick={copyLocal}>{copying ? 'Copying…' : `Copy ${local.items.length === 1 ? 'it' : `all ${local.items.length}`} into Onyx`}</button>
