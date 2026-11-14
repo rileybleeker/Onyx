@@ -154,13 +154,21 @@ SUPPLEMENT_EXTRA_CONFOUNDERS = (
 # hrv_7d_mean is likewise a window-overlapping aggregate of the same days, so it
 # is dropped too. We keep day_of_week / is_weekend / sleep_debt_7d (the latter
 # is a slow-moving deficit that is reasonable to treat as a baseline covariate).
+#
+# Only treatments whose value aggregates SEVERAL PAST DAYS belong here.
+# total_training_load is NOT one of them (removed 2026-11-13, dot review #5):
+# it is the sum of the Garmin activities of day D alone
+# (hrv_analysis.aggregate_activities), so hrv_lag1 (HRV of the sleep that closed
+# day D-1), hrv_7d_mean and whoop_day_strain_lag1 (yesterday's strain) are all
+# fixed before the treatment happens — ordinary pre-treatment confounders, the
+# same as for every other daily treatment. While it was listed here its estimate
+# ("Daily training load above median") was less adjusted than any other daily row.
 ROLLING_AGGREGATE_TREATMENTS = frozenset({
     "rolling_3d_training_load",
     "rolling_7d_training_load",
     "acute_training_load",
     "chronic_training_load",
     "atl_ctl_ratio",
-    "total_training_load",
 })
 # Confounders that become mediators (or window-overlapping aggregates) once the
 # treatment spans multiple past days. Dropped from the adjustment set for any
@@ -1160,6 +1168,27 @@ def _enumerate_continuous_treatments(df: pd.DataFrame) -> list[TreatmentSpec]:
     return specs
 
 
+def adjustment_set(treatment: str, declared: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """The confounders a treatment is ACTUALLY adjusted for, given its declared
+    (family-level) set. The one place that decides it; `_prepare_treatment` builds
+    X from this and every result row reports it as `confounders_used`.
+
+      1. The treatment column itself is never a confounder — happens e.g. when
+         rolling_7d_training_load is the treatment AND in the common set, which
+         would perfectly separate the propensity model.
+      2. Re-audit 2026-06-07 (stats/gemini/F-003): for multi-day rolling/aggregate
+         treatments (ROLLING_AGGREGATE_TREATMENTS) the lagged-HRV / lagged-strain /
+         weekly-HRV-mean confounders are MEDIATORS (training load on day N-2 →
+         HRV on night N-1 → outcome), or window-overlapping aggregates of the
+         treatment's own days. Adjusting for a mediator blocks part of the effect
+         being estimated, so they are dropped for these treatments only.
+    """
+    kept = tuple(c for c in declared if c != treatment)
+    if treatment in ROLLING_AGGREGATE_TREATMENTS:
+        kept = tuple(c for c in kept if c not in ROLLING_TREATMENT_MEDIATOR_CONFOUNDERS)
+    return kept
+
+
 def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict] | None:
     """Build (X, T, Y) arrays for one treatment + a metadata dict.
     Returns None if there isn't enough data.
@@ -1171,21 +1200,7 @@ def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarra
       automatically — we don't slice here, which would incorrectly drop
       in-window days when the compound wasn't taken (those are valid controls).
     """
-    # Drop the treatment column from confounders if it appears there — happens
-    # e.g. when rolling_7d_training_load is the treatment AND in the common
-    # confounder set, which would perfectly separate the propensity model.
-    confounders = tuple(c for c in spec.confounders if c != spec.name)
-
-    # Re-audit 2026-06-07 (stats/gemini/F-003): for multi-day rolling/aggregate
-    # treatments, the lagged-HRV / lagged-strain / weekly-HRV-mean confounders
-    # are MEDIATORS (training load on day N-2 → HRV on night N-1 → outcome), or
-    # are window-overlapping aggregates of the treatment's own days. Adjusting
-    # for a mediator blocks part of the effect being estimated. Drop those
-    # intermediate variables from the confounder set for these treatments only.
-    if spec.name in ROLLING_AGGREGATE_TREATMENTS:
-        confounders = tuple(
-            c for c in confounders if c not in ROLLING_TREATMENT_MEDIATOR_CONFOUNDERS
-        )
+    confounders = adjustment_set(spec.name, spec.confounders)
 
     cols_needed = [spec.name, OUTCOME_COL] + list(confounders)
     sub = df[cols_needed].copy()
@@ -1252,6 +1267,9 @@ def _prepare_treatment(df: pd.DataFrame, spec: TreatmentSpec) -> tuple[np.ndarra
         "n_treated": n_treated,
         "n_control": n_control,
         "treatment_prevalence": float(T.mean()) if len(T) else 0.0,
+        # The effective adjustment set (see adjustment_set) — differs from the
+        # declared family set for rolling treatments.
+        "confounders_used": list(confounders),
         # Audit re-2026-05-26 P1 (deepseek F-005): expose confounder-loss
         # diagnostics so dropped_low_n can flag treatments where confounders
         # rather than per-arm cell-size drove the exclusion.
@@ -1424,6 +1442,9 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             "kind": spec.kind,
             "unit": spec.unit,
             "confounders": list(spec.confounders),
+            # What was actually adjusted for. `confounders` above is the declared
+            # family set; for rolling treatments the two differ (adjustment_set).
+            "confounders_used": meta["confounders_used"],
             "naive_ate": est["naive"]["ate"],
             "naive_ci_low": est["naive"]["ci_low"],
             "naive_ci_high": est["naive"]["ci_high"],
@@ -1595,12 +1616,15 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             "adjustment bias).",
             # Re-audit 2026-06-07 (stats/gemini/F-003)
             "For multi-day rolling/aggregate treatments (rolling_3d/7d load, "
-            "acute/chronic load, ATL/CTL ratio, total training load), hrv_lag1, "
+            "acute/chronic load, ATL/CTL ratio), hrv_lag1, "
             "hrv_7d_mean and whoop_day_strain_lag1 are dropped from the "
             "confounder set: they are mediators for the earlier days inside the "
             "treatment window (load on day N-2 → HRV on night N-1 → outcome) or "
-            "window-overlapping aggregates of the treatment's own days.",
+            "window-overlapping aggregates of the treatment's own days. Daily "
+            "training load (the day's own activities) is a same-day treatment "
+            "and keeps the full pre-treatment set.",
         ],
+        "rolling_aggregate_treatments": sorted(ROLLING_AGGREGATE_TREATMENTS),
         # Re-audit 2026-06-07 (stats/gpt-5/F-004): day_of_week is expanded into
         # cyclic sin/cos terms before the propensity + outcome models, replacing
         # the previous ordinal 0-6 encoding (which assumed a linear weekday effect).
