@@ -10,7 +10,8 @@ maximum, and the temperature of the early-morning night hours. The HRV pipeline
 reads the table as the `wx_*` features (hrv_analysis.merge_weather_features).
 
 Usage:
-    python weather_etl.py                  # re-sync the last 10 days (an empty table backfills from 2024-01-01 first)
+    python weather_etl.py                  # re-sync the last 10 days (an empty table backfills from 2024-01-01;
+                                           # after a longer outage it resumes from the newest stored day)
     python weather_etl.py --backfill 400   # re-sync the last 400 days (paged in <=90-day API windows)
     python weather_etl.py --dry-run        # fetch + aggregate, print the rows, write nothing (no .env needed)
     python weather_etl.py --lat 40.72 --lon -73.99   # another location (after the NYC move)
@@ -32,8 +33,10 @@ Design notes:
     minimum can read up to ~1 C lower because it uses the model's within-hour
     extremes, which the hourly endpoint does not expose.
   - Hours after "now" are forecasts (the archive returns them for today) and are
-    never stored: today's row is partial (n_hours < 24) until the day ends, and
-    the HRV pipeline ignores days with fewer than 20 hours.
+    never stored: today's row is partial (n_hours < 24) until the day ends. The
+    HRV pipeline and the Weather panel count a day only once it is over (its date
+    is before ET today) and it has at least 23 hourly values, the shortest full
+    ET day; the hour count alone would let today count from the evening on.
   - Night columns: night_temp_mean / night_temp_min cover 01:00-08:00 ET of the
     row's clock day (the hours Riley's main sleep normally covers, checked on the
     live WHOOP sleeps). They describe the sleep that started the evening BEFORE, so the HRV
@@ -45,7 +48,15 @@ Design notes:
     and is best-effort: if that request fails the UV columns are left untouched
     and the run is reported as partial. uv_source records where the value came from.
   - Recent days mix IFS (no delay) and ERA5 (5 days late), so every run re-upserts
-    a rolling 10-day window instead of only appending.
+    a rolling 10-day window instead of only appending. If the newest stored day is
+    older than that window (the schedule was off for a while), the routine run
+    starts at that day instead, so an outage leaves neither a date gap nor a
+    half-written last day. It does not look for holes further back: after a
+    partial or failed --backfill, run the same backfill again.
+  - Logs: the repository's Actions logs are public, so the coordinates are never
+    logged (an override may be more precise than the default city-centre point)
+    and httpx's per-request INFO lines, which carry the full query string, are
+    switched off.
   - Heartbeat: one pds.sync_log row per run (source='weather', data_type='daily'),
     written on success, on an empty API answer or a failed UV request (partial)
     and on any failure, including an uncaught exception.
@@ -66,6 +77,8 @@ from sync_log_helper import log_sync as _shared_log_sync
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("weather_etl")
+# httpx logs every request URL at INFO, and the URL carries latitude / longitude. Actions logs are public.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 API_URL = "https://archive-api.open-meteo.com/v1/archive"
 UV_API_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
@@ -310,6 +323,35 @@ def log_sync(sb, status: str, records: int, started_at: float, error: str | None
     )
 
 
+def _as_date(value) -> date | None:
+    """A calendar_date value from PostgREST ("2026-11-09") as a date, else None."""
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def routine_start(today: date, newest_stored: date | None, table_empty: bool) -> date:
+    """First day a routine run (no --backfill) re-syncs.
+
+    Normally today - DEFAULT_DAYS. An empty table starts at BOOTSTRAP_START. When the
+    newest stored day is older than the routine window (the schedule was off for longer
+    than DEFAULT_DAYS), the run starts at that day: it was written while still in
+    progress, so it is re-read along with every missing day after it.
+    """
+    if table_empty:
+        return BOOTSTRAP_START
+    start = today - timedelta(days=DEFAULT_DAYS)
+    if newest_stored is not None and newest_stored < start:
+        return newest_stored
+    return start
+
+
+def _public(row: dict) -> dict:
+    """A row without its coordinates, for log output."""
+    return {k: v for k, v in row.items() if k not in ("latitude", "longitude")}
+
+
 def _missing_table(exc: Exception) -> bool:
     msg = str(exc)
     return TABLE in msg and any(s in msg for s in ("PGRST205", "does not exist", "schema cache", "42P01"))
@@ -318,8 +360,10 @@ def _missing_table(exc: Exception) -> bool:
 def run_etl(days: int | None, lat: float, lon: float, dry_run: bool = False, sb=None) -> int:
     """Fetch, aggregate and upsert. Returns the number of day rows written.
 
-    days=None is the routine run: the last DEFAULT_DAYS days, or everything since
-    BOOTSTRAP_START when the table is still empty. An explicit N always means exactly N days back.
+    days=None is the routine run: the last DEFAULT_DAYS days, everything since
+    BOOTSTRAP_START when the table is still empty, or everything since the newest stored
+    day when that is older than the routine window (routine_start). An explicit N always
+    means exactly N days back.
     """
     started = time.time()
     now_et = datetime.now(ET)
@@ -333,12 +377,20 @@ def run_etl(days: int | None, lat: float, lon: float, dry_run: bool = False, sb=
             sb = sb or get_supabase()
         start = today - timedelta(days=days if days is not None else DEFAULT_DAYS)
         if not dry_run and days is None:
-            # An empty table (first run, or right after the schema is applied) backfills itself.
-            probe = sb.schema("pds").table(TABLE).select("calendar_date").limit(1).execute()
+            # An empty table (first run, or right after the schema is applied) backfills
+            # itself; after an outage longer than the routine window the run resumes from
+            # the newest stored day.
+            probe = (sb.schema("pds").table(TABLE).select("calendar_date")
+                     .order("calendar_date", desc=True).limit(1).execute())
+            newest = _as_date(probe.data[0].get("calendar_date")) if probe.data else None
+            routine = start
+            start = routine_start(today, newest, table_empty=not probe.data)
             if not probe.data:
-                start = BOOTSTRAP_START
                 log.info(f"  Table is empty: bootstrapping from {start}")
-        log.info(f"Weather {start} -> {today} at ({lat}, {lon})")
+            elif start < routine:
+                log.info(f"  Newest stored day {newest} is older than the {DEFAULT_DAYS}-day window: resuming from it")
+        # No coordinates here: this line lands in a public Actions log.
+        log.info(f"Weather {start} -> {today}")
 
         with httpx.Client(timeout=60.0) as client:
             for w_start, w_end in windows(start, today, CHUNK_DAYS):
@@ -358,7 +410,7 @@ def run_etl(days: int | None, lat: float, lon: float, dry_run: bool = False, sb=
                 rows = with_uv(rows, uv)
                 if dry_run:
                     for r in rows[-3:]:
-                        log.info(f"  [dry-run] {r}")
+                        log.info(f"  [dry-run] {_public(r)}")
                 else:
                     stamp = datetime.now(timezone.utc).isoformat()
                     for i in range(0, len(rows), UPSERT_BATCH):
@@ -380,8 +432,13 @@ def run_etl(days: int | None, lat: float, lon: float, dry_run: bool = False, sb=
                      date_range=rng)
             log.warning("No temperature values returned")
         elif uv_problem:
+            span = (today - start).days
+            # Only the routine window is retried by itself; older days need the same backfill again.
+            redo = (f" Days older than the routine {DEFAULT_DAYS}-day window keep a missing UV value until"
+                    f" this is run again (--backfill {span}, or the workflow's days={span})." if span > DEFAULT_DAYS else "")
             log_sync(sb, "partial", written, started, date_range=rng,
-                     error=f"Weather rows written, but the UV index request failed (UV columns left as they were): {uv_problem}"[:500])
+                     error=(f"Weather rows written, but the UV index request failed"
+                            f" (UV columns left as they were).{redo} {uv_problem}")[:500])
             log.warning(f"Done with a UV gap: {written} day row(s) upserted")
         else:
             log_sync(sb, "success", written, started, date_range=rng)

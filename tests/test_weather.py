@@ -6,8 +6,9 @@ Covers
     day without temperature, the night window, malformed payloads rejected;
   * weather_etl.uv_daily_max / with_uv: best-effort UV, all-or-nothing keys;
   * weather_etl.run_etl with a fake Supabase client: success / empty answer / UV failure /
-    failure each write exactly one sync_log heartbeat, an empty table bootstraps, a missing
-    table says how to fix it;
+    failure each write exactly one sync_log heartbeat, an empty table bootstraps, a table
+    whose newest day is older than the routine window resumes from that day, a missing
+    table says how to fix it, the coordinates never reach the log;
   * hrv_analysis.merge_weather_features: daytime columns of clock day D land on row D, the
     night columns of clock day D + 1 land on row D, the clock-day minimum is not a feature,
     a day counts only once it is over AND has all its hours (today stays NaN however many
@@ -19,6 +20,7 @@ Synthetic data only. No network, no credentials.
 
 Run: python tests/test_weather.py
 """
+import logging
 import os
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -209,11 +211,13 @@ def test_one_home_location_for_both_open_meteo_sources():
 # ---------------------------------------------------------------------------
 
 class FakeSupabase:
-    """Records upserts and sync_log inserts; `existing` is what the empty-table probe sees."""
+    """Records upserts and sync_log inserts. The newest-day probe sees `newest` (default:
+    yesterday, a table that is up to date) or nothing when existing=False."""
 
-    def __init__(self, existing=True, upsert_error=None):
+    def __init__(self, existing=True, upsert_error=None, newest=None):
         self.existing, self.upsert_error = existing, upsert_error
-        self.upserts, self.heartbeats = [], []
+        self.newest = newest or (datetime.now(etl.ET).date() - timedelta(days=1)).isoformat()
+        self.upserts, self.heartbeats, self.orders = [], [], []
         self._table = None
 
     def schema(self, _):
@@ -224,6 +228,10 @@ class FakeSupabase:
         return self
 
     def select(self, *_):
+        return self
+
+    def order(self, column, desc=False):
+        self.orders.append((self._table, column, desc))
         return self
 
     def limit(self, *_):
@@ -244,7 +252,7 @@ class FakeSupabase:
         class R:
             pass
         r = R()
-        r.data = [{"calendar_date": "2026-11-01"}] if self.existing else []
+        r.data = [{"calendar_date": self.newest}] if self.existing else []
         return r
 
 
@@ -349,6 +357,91 @@ def test_routine_run_window_and_empty_table_bootstrap():
         assert prev_end == nxt_start, "each window asks one extra UTC date, the start of the next window"
     _, calls, _ = _run(FakeSupabase(existing=False), empty_payload, days=30)
     assert calls == [(today - timedelta(days=30), api_end)], "an explicit window never bootstraps"
+
+
+def test_routine_start_resumes_from_the_newest_stored_day_after_an_outage():
+    today = date(2026, 11, 13)
+    routine = today - timedelta(days=etl.DEFAULT_DAYS)
+    assert etl.routine_start(today, None, table_empty=True) == etl.BOOTSTRAP_START
+    assert etl.routine_start(today, today - timedelta(days=1), table_empty=False) == routine
+    assert etl.routine_start(today, routine, table_empty=False) == routine
+    # The schedule was off for 40 days: the newest stored day was written while still in
+    # progress and every day after it is missing. Both are inside the next run's window.
+    stale = today - timedelta(days=40)
+    assert etl.routine_start(today, stale, table_empty=False) == stale
+    assert etl.routine_start(today, None, table_empty=False) == routine, "an unreadable newest day changes nothing"
+    assert etl._as_date("2026-10-04") == date(2026, 10, 4) and etl._as_date("2026-10-04T00:00:00") == date(2026, 10, 4)
+    assert etl._as_date(None) is None and etl._as_date("nope") is None
+
+
+def test_run_after_an_outage_covers_the_gap_and_asks_for_the_newest_day():
+    now_et = datetime.now(etl.ET)
+    today = now_et.date()
+    api_end = min(today + timedelta(days=1), now_et.astimezone(timezone.utc).date())
+    empty_payload = _payload(_day("2026-11-10", [None]))
+    stale = today - timedelta(days=40)
+    sb = FakeSupabase(newest=stale.isoformat())
+    _, calls, _ = _run(sb, empty_payload)
+    assert calls[0][0] == stale and calls[-1][1] == api_end
+    assert sb.orders == [("weather_daily", "calendar_date", True)], "the probe must read the NEWEST stored day"
+    # inside the routine window, and with an unreadable value: the routine 10 days
+    for newest in ((today - timedelta(days=3)).isoformat(), "garbage"):
+        _, calls, _ = _run(FakeSupabase(newest=newest), empty_payload)
+        assert calls == [(today - timedelta(days=etl.DEFAULT_DAYS), api_end)], newest
+    # an explicit window is exactly that window, however old the table is
+    _, calls, _ = _run(FakeSupabase(newest=stale.isoformat()), empty_payload, days=5)
+    assert calls == [(today - timedelta(days=5), api_end)]
+
+
+def test_uv_failure_on_a_backfill_says_to_run_it_again():
+    payload, _ = _today_payload()
+    sb = FakeSupabase()
+    _run(sb, payload, uv_error=RuntimeError("Open-Meteo HTTP 503: uv down"), days=60)
+    msg = sb.heartbeats[0]["error_message"]
+    assert sb.heartbeats[0]["status"] == "partial" and "--backfill 60" in msg and "days=60" in msg and "uv down" in msg
+    sb = FakeSupabase()
+    _run(sb, payload, uv_error=RuntimeError("Open-Meteo HTTP 503: uv down"))
+    assert "--backfill" not in sb.heartbeats[0]["error_message"], "the routine window retries itself"
+
+
+class _Capture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+def test_coordinates_never_reach_the_log():
+    # The repository's Actions logs are public. An override may be a precise point, so
+    # neither ETL logs the coordinates, and httpx's request lines (full query string) are off.
+    lat, lon = 12.3456, -65.4321
+    cap = _Capture()
+    root = logging.getLogger()
+    root.addHandler(cap)
+    real = (etl.fetch_hourly, etl.fetch_uv, aq.fetch_hourly)
+    today = datetime.now(etl.ET).date().isoformat()
+    try:
+        etl.fetch_hourly = lambda *_a, **_k: _payload([(_utc(today, 0), {"temperature_2m": 3.0})])
+        etl.fetch_uv = lambda *_a, **_k: {"hourly": {"time": [], "uv_index": []}}
+        sb = FakeSupabase()
+        assert etl.run_etl(None, lat, lon, sb=sb) == 1
+        assert sb.upserts[0][0]["latitude"] == lat and sb.upserts[0][0]["longitude"] == lon, "stored, not logged"
+        assert etl.run_etl(3, lat, lon, dry_run=True) == 1          # the dry run prints rows
+        aq.fetch_hourly = lambda *_a, **_k: {"hourly": {"time": [], "pm2_5": [], "us_aqi": []}}
+        aq_sb = FakeSupabase()
+        aq.run_etl(None, lat, lon, sb=aq_sb)
+        assert len(aq_sb.heartbeats) == 1
+    finally:
+        etl.fetch_hourly, etl.fetch_uv, aq.fetch_hourly = real
+        root.removeHandler(cap)
+    assert any(line.startswith("Weather ") for line in cap.lines) and any(line.startswith("Air quality ") for line in cap.lines)
+    assert any("[dry-run]" in line for line in cap.lines)
+    for line in cap.lines:
+        for needle in ("12.3456", "65.4321", "12.35", "65.43", "latitude", "longitude"):
+            assert needle not in line, f"location in a log line: {line}"
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING, "httpx INFO lines carry the request URL"
 
 
 def test_window_rows_do_not_leak_the_padding_day():
