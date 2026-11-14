@@ -64,9 +64,14 @@ function TopList({ title, entries, empty }: { title: string; entries: TopEntry[]
       ) : (
         <ol className="mt-3 space-y-2">
           {entries.map((e) => (
-            <li key={e.label}>
+            <li key={e.key}>
               <div className="flex items-baseline justify-between gap-3 text-[13px]">
-                <span className="min-w-0 truncate">{e.label}</span>
+                <span className="min-w-0 truncate">
+                  {e.label}
+                  {e.label !== e.key && e.key !== "(none)" && (
+                    <span className="ml-2 font-mono text-[11px] text-text-tertiary">{e.key}</span>
+                  )}
+                </span>
                 <span className="shrink-0 font-mono tabular-nums text-text-secondary">
                   {formatMinutes(e.perDay)}/day
                   <span className="ml-2 text-text-tertiary">{Math.round(e.share * 100)}%</span>
