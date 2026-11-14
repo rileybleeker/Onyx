@@ -181,7 +181,15 @@ struct ContentView: View {
                 if model.busy { ProgressView().controlSize(.large) }
             }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .active { model.refreshStatus() }
+                if phase == .active {
+                    model.refreshStatus()
+#if ONYX_FOCUS
+                    // Re-check the Focus rule and Onyx habits on every return to the app,
+                    // whichever screen is showing (tools/screentime_ios/FOCUS.md).
+                    FocusEnforcement.reconcile()
+                    Task { await FocusHabitModel.shared.refresh() }
+#endif
+                }
             }
             // A new process always starts at "notDetermined"; asking again on
             // launch restores the granted status (and shows the system prompt
@@ -189,6 +197,10 @@ struct ContentView: View {
             .task {
                 _ = await ScreenTimeExporter.restoreDataAccess()
                 model.refreshStatus()
+#if ONYX_FOCUS
+                FocusEnforcement.reconcile()
+                await FocusHabitModel.shared.refresh()
+#endif
             }
         }
     }

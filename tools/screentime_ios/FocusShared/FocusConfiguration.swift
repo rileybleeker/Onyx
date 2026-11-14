@@ -52,6 +52,26 @@ enum FocusStorage {
     }
 }
 
+/// What the phone last learned from Onyx about the chosen habits. A separate
+/// file from focus.json, so saving a settings draft never overwrites a newer
+/// answer. Written only by the app (FocusUI/FocusHabitSync.swift); the monitor
+/// extension reads it. Call these inside FocusStorage.withLock.
+enum FocusHabitStorage {
+    static var file: URL? {
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: FocusStorage.group)?.appendingPathComponent("focus-habits.json")
+    }
+    /// A missing or unreadable file is "nothing known": the phone's own rule applies.
+    static func load() -> OnyxHabitState {
+        guard let file, let data = try? Data(contentsOf: file),
+              let state = try? JSONDecoder().decode(OnyxHabitState.self, from: data) else { return OnyxHabitState() }
+        return state
+    }
+    static func save(_ value: OnyxHabitState) throws {
+        guard let file else { throw FocusFailure.message("Focus App Group is not provisioned.") }
+        try JSONEncoder().encode(value).write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+}
+
 enum FocusFailure: LocalizedError {
     case message(String)
     var errorDescription: String? { if case .message(let value) = self { return value }; return nil }
@@ -74,8 +94,9 @@ enum FocusEnforcement {
     }
 
     private static func apply(_ config: FocusConfiguration) {
+        // Onyx habits come from the stored answer only: nothing here uses the network.
         guard config.validationError == nil,
-              config.rule.shouldShield(at: Date(), calendar: .autoupdatingCurrent) else {
+              config.rule.shouldShield(at: Date(), calendar: .autoupdatingCurrent, onyx: FocusHabitStorage.load()) else {
             clear(); return
         }
         // Exceptions must also be subtracted from individually selected targets.

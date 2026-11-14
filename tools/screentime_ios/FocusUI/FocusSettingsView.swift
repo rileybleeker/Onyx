@@ -10,6 +10,7 @@ struct FocusSettingsView: View {
     @State private var showAllowed = false
     @State private var confirmEnable = false
     @State private var loaded = false
+    @ObservedObject private var habits = FocusHabitModel.shared
     @Environment(\.scenePhase) private var scenePhase
 
     private var timeBinding: Binding<Date> {
@@ -25,12 +26,36 @@ struct FocusSettingsView: View {
         Form {
             Section("Status") {
                 Text(message)
-                Text("Native iPhone enforcement. These settings and tasks stay on this phone; web tasks are not synced yet.")
+                Text("Native iPhone enforcement. The time, apps and tasks below stay on this phone. Habits chosen in Onyx are read from Onyx (see Onyx habits).")
                     .font(.footnote).foregroundStyle(.secondary)
                 Button("Turn off and unblock", role: .destructive) {
                     do { try FocusEnforcement.disable(); config.rule.enabled = false; message = "Focus is off." }
                     catch { message = "Could not save disabled state: \(error.localizedDescription). Revoke Onyx Screen Time access in Settings if needed." }
                 }
+            }
+            Section("Onyx habits") {
+                Text(FocusHabitSync.summary(habits.state))
+                if let status = habits.state.status, !status.habits.isEmpty {
+                    Text(status.rule == .and
+                         ? "Rule from Onyx: habits AND time. Stays blocked after the unlock time until these are done."
+                         : "Rule from Onyx: habits OR time. Finishing these unlocks early; the unlock time unlocks regardless.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    ForEach(Array(status.habits.enumerated()), id: \.offset) { _, habit in
+                        HStack {
+                            Text(habit.name)
+                            Spacer()
+                            Text(habit.done ? "Done" : "To do")
+                                .foregroundStyle(habit.done ? Color.secondary : Color.orange)
+                        }
+                    }
+                    Text("Answer for Onyx day \(status.day), received \(status.fetchedAt.formatted(date: .abbreviated, time: .shortened)).")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                LabeledContent("Last checked", value: habits.state.lastAttempt.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "Never")
+                Button(habits.checking ? "Checking…" : "Check now") { Task { await habits.refresh() } }
+                    .disabled(habits.checking)
+                Text("Choose the habits and the rule in Onyx on the web (the install page). A habit counts once it is answered Yes for the day. This phone only checks when Onyx is opened, when you tap Check now, or when the \"Check Onyx Focus habits\" shortcut runs: iOS does not let it check in the background, so open Onyx after finishing your habits. If Onyx cannot be reached, the unlock time alone decides, so a failed check never keeps apps blocked past that time.")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
             Section("Unlock rules") {
                 Picker("Unlock when", selection: $config.rule.mode) {
@@ -41,7 +66,7 @@ struct FocusSettingsView: View {
                     Text("Time reached OR all tasks done").tag(UnlockMode.either)
                 }
                 DatePicker("Not before", selection: timeBinding, displayedComponents: .hourAndMinute)
-                Text("Default time: noon. Uses the iPhone's local calendar day. Daily tasks reset at midnight. Choose AND if both requirements must hold.")
+                Text("Default time: noon. Uses the iPhone's local calendar day. Daily tasks reset at midnight. Choose AND if both requirements must hold. When habits are chosen in Onyx, they and the Onyx rule replace this choice and the task list below; the time still applies.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("Daily tasks") {
@@ -107,14 +132,20 @@ struct FocusSettingsView: View {
         } message: {
             Text("Onyx will block your selected apps and websites using the rule above, with your selected LinkedIn app and website exceptions. You can turn Focus off here or revoke access in iOS Settings. This is a voluntary blocker, not tamper-proof.")
         }
-        .task { reload() }
-        .onChange(of: scenePhase) { _, phase in if phase == .active { FocusEnforcement.reconcile(); reload() } }
+        .task { reload(); await habits.refresh() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                FocusEnforcement.reconcile(); reload()
+                Task { await habits.refresh() }
+            }
+        }
+        .onChange(of: habits.revision) { _, _ in reload() }
     }
 
     private var preview: String {
         var rule = config.rule; rule.enabled = true
         guard config.validationError == nil else { return "finish configuration first." }
-        return rule.shouldShield(at: Date(), calendar: .autoupdatingCurrent) ? "your rule would block now." : "your rule would allow now."
+        return rule.shouldShield(at: Date(), calendar: .autoupdatingCurrent, onyx: habits.state) ? "your rule would block now." : "your rule would allow now."
     }
 
     private func reload() {

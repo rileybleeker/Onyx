@@ -33,7 +33,10 @@ function isCiRoute(pathname: string): boolean {
     // Supplement stack reminders: the sms-reminders Worker claims due stacks and
     // relays Log it / Skip taps (2026-11-11). Exact paths - never /api/supplements/*.
     pathname === "/api/supplements/reminders/claim" ||
-    pathname === "/api/supplements/reminders/respond"
+    pathname === "/api/supplements/reminders/respond" ||
+    // Onyx Focus iPhone app: read-only "are today's chosen habits done?" (2026-11-13).
+    // Exact path - never /api/focus/* (the settings route /api/focus/config stays session-only).
+    pathname === "/api/focus/unlock-status"
   );
 }
 
