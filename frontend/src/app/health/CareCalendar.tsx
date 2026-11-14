@@ -1,6 +1,6 @@
 "use client";
 import { useMemo, useState } from 'react';
-import { type CalendarEntry, type CareItem, type CareStatus, dueSoon, entriesInRange, monthBounds, monthGrid } from '@/lib/care-planner';
+import { type CalendarEntry, type CareItem, type CareStatus, dueSoon, entriesInRange, formatTime, monthBounds, monthGrid } from '@/lib/care-planner';
 
 const panel = 'rounded-2xl border border-border-default bg-surface-card p-5';
 const button = 'rounded-lg border border-border-default px-3 py-2 text-sm hover:bg-surface-hover disabled:opacity-50';
@@ -38,7 +38,7 @@ export function DueSoon({ items, today }: { items: CareItem[]; today: string }) 
       ? <p className="text-sm text-text-secondary">Nothing due in the next 30 days.</p>
       : <ul className="space-y-2">{entries.map(({ item, status, daysAway }) => <li key={item.id} className="flex flex-wrap items-baseline justify-between gap-x-3 rounded-xl border border-border-default px-4 py-3">
         <span className="font-medium break-words">{item.title}</span>
-        <span className="text-sm text-text-secondary">{item.due} ({relative(daysAway)}) · <span className={STATUS_TONE[status]}>{STATUS_LABEL[status]}</span></span>
+        <span className="text-sm text-text-secondary">{item.due}{item.time ? ` at ${formatTime(item.time)}` : ''} ({relative(daysAway)}) · <span className={STATUS_TONE[status]}>{STATUS_LABEL[status]}</span></span>
       </li>)}</ul>}
   </section>;
 }
@@ -87,7 +87,7 @@ export function CareCalendar({ items, today }: { items: CareItem[]; today: strin
           const entries = view.byDate.get(cell.date) ?? [];
           return <td key={cell.date} className={`h-20 border border-border-subtle p-1 align-top ${cell.inMonth ? '' : 'opacity-40'} ${cell.date === today ? 'bg-accent-muted' : ''}`}>
             <div className={cell.date === today ? 'font-semibold text-accent' : 'text-text-secondary'}>{Number(cell.date.slice(8))}{cell.date === today && <span className="sr-only"> (today)</span>}</div>
-            <ul className="mt-1 space-y-0.5">{entries.slice(0, 2).map(entry => <li key={entry.key} title={`${entry.title}: ${STATUS_LABEL[entry.status]}`} className={`truncate ${STATUS_TONE[entry.status]} ${entry.status === 'projected' ? 'italic' : ''}`}>{entry.title}<span className="sr-only">: {STATUS_LABEL[entry.status]}</span></li>)}
+            <ul className="mt-1 space-y-0.5">{entries.slice(0, 2).map(entry => <li key={entry.key} title={`${entry.title}${entry.time ? `, ${formatTime(entry.time)}` : ''}: ${STATUS_LABEL[entry.status]}`} className={`truncate ${STATUS_TONE[entry.status]} ${entry.status === 'projected' ? 'italic' : ''}`}>{entry.title}<span className="sr-only">: {STATUS_LABEL[entry.status]}</span></li>)}
               {entries.length > 2 && <li className="text-text-tertiary">+{entries.length - 2} more</li>}</ul>
           </td>;
         })}</tr>)}</tbody>
@@ -96,7 +96,7 @@ export function CareCalendar({ items, today }: { items: CareItem[]; today: strin
         ? <p className="text-sm text-text-secondary">Nothing scheduled in {label}.</p>
         : <ul className="space-y-2">{view.entries.map(entry => <li key={entry.key} className="flex flex-wrap items-baseline justify-between gap-x-3 rounded-xl border border-border-default px-4 py-3">
           <span className={`font-medium break-words ${entry.status === 'projected' ? 'italic' : ''}`}>{entry.title}</span>
-          <span className="text-sm text-text-secondary">{entry.date} · <span className={STATUS_TONE[entry.status]}>{STATUS_LABEL[entry.status]}</span>{entry.months > 0 && entry.status !== 'projected' && ` · Every ${entry.months} month${entry.months === 1 ? '' : 's'} after completion`}</span>
+          <span className="text-sm text-text-secondary">{entry.date}{entry.time ? ` at ${formatTime(entry.time)}` : ''} · <span className={STATUS_TONE[entry.status]}>{STATUS_LABEL[entry.status]}</span>{entry.months > 0 && entry.status !== 'projected' && ` · Every ${entry.months} month${entry.months === 1 ? '' : 's'} after completion`}</span>
         </li>)}</ul>}
     <p className="text-xs text-text-secondary">Dates come only from what you entered here. Projected dates (italic) assume a repeating item is completed on schedule; repeats count from the day you complete them, so they can move.</p>
   </section>;

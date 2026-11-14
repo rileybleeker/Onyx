@@ -362,6 +362,17 @@ const PAGES: SmokePage[] = [
     legitimateEmpty: "No ledger data yet - the harvester has not run.",
   },
   {
+    // iPhone Screen Time (pds.phone_usage_daily, service-role only, server-rendered). The app
+    // syncs once a day and the default window is 30 days, so a month without a sync legitimately
+    // shows the empty state: SKIP, like /caffeine. The failed-query state is a hard fail. It never
+    // asserts on an app name or a number of minutes.
+    route: "/screen-time",
+    heading: "Screen Time",
+    signal: "charts",
+    hardEmpty: ["Couldn't load Screen Time."],
+    legitimateEmpty: "No Screen Time days in this window.",
+  },
+  {
     route: "/journal",
     heading: "Journal",
     signal: "journal-list",
@@ -600,15 +611,18 @@ test("/wins renders the Wins board", async ({ page }) => {
   await expectNoClientCrash(page);
 });
 
-// /health (2026-11-11, PR #30): local-only care/appointments planner. Items live in the
-// browser, sample data is opt-in, and the Google Calendar card is a read-only "not connected"
-// stub. Tripwire: the planner finishes loading, sample data is NOT on by default, and the
-// calendar connect button is still disabled. Read-only: never types, adds or toggles anything.
+// /health (PR #30; stored in Onyx since 2026-11-13): care/appointments planner. Items are read
+// server-side from pds.care_items (service-role only), sample data is opt-in, and the Google
+// Calendar card is a read-only "not connected" stub. Tripwire: the list loaded from Onyx (the
+// load-failure panel is absent and the add form rendered; an empty list is legitimate), sample
+// data is NOT on by default, and the calendar connect button is still disabled. Read-only: never
+// types, adds, toggles or copies anything, and never asserts on an item's label or date.
 test("/health renders the care planner with sample data off and calendar disconnected", async ({ page }) => {
   await gotoAuthed(page, "/health");
   await expect(pageHeading(page, page.getByRole("heading", { name: "Health & appointments", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
-  await expect(page.getByRole("heading", { name: "Private planning, on this browser", exact: true })).toBeVisible();
-  await expect(page.getByText(/Loading local planner/)).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+  await expect(page.getByRole("heading", { name: "Private planning, saved in Onyx", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Couldn't load your care items", exact: true }), "care items failed to load from Onyx").toHaveCount(0);
+  await expect(page.getByText(/Loading your care items/)).toHaveCount(0, { timeout: LOAD_TIMEOUT });
   await expect(page.getByRole("heading", { name: "Add care item", exact: true })).toBeVisible();
   await expect(page.getByLabel(/Show sample data/), "sample data must be opt-in").not.toBeChecked();
   await expect(page.getByRole("button", { name: /^Connect Google Calendar$/ })).toBeDisabled();

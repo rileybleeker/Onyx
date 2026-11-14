@@ -563,6 +563,97 @@ await test("a #search card stays separate: missing word, ambiguous, other accoun
   assert.equal(mergeUrgent([emailItem(base)], [card({}, { link: SEARCH("from%3Abilling%40example.com") })]).total, 2, "operators only");
 });
 
+// A search word may also sit in the sender's display name (the brand is often only there).
+const total = (emails, link, cardOver = {}) => mergeUrgent(emails, [card({}, { link, ...cardOver })]).total;
+
+await test("gmailSearchTerms: words, phrases, subject:/from:, exclusions; other operators and OR/AND dropped", () => {
+  const { gmailSearchTerms } = rules;
+  const any = (w, negated = false) => ({ field: "any", words: [w], negated });
+  assert.deepEqual(gmailSearchTerms(SEARCH("Examplia+Card%20paused")), [any("examplia"), any("card"), any("paused")]);
+  assert.deepEqual(gmailSearchTerms(SEARCH('"card+paused"+-refund+-"final+notice"')), [
+    { field: "any", words: ["card", "paused"], negated: false }, any("refund", true),
+    { field: "any", words: ["final", "notice"], negated: true },
+  ]);
+  assert.deepEqual(gmailSearchTerms(SEARCH('from%3AExamplia+From:(card+team)+from:"Examplia+Bank"+subject:paused+-subject:(a+b)')), [
+    { field: "from", words: ["examplia"], negated: false },
+    { field: "from", words: ["card"], negated: false }, { field: "from", words: ["team"], negated: false },
+    { field: "from", words: ["examplia", "bank"], negated: false },
+    { field: "subject", words: ["paused"], negated: false },
+    { field: "subject", words: ["a"], negated: true }, { field: "subject", words: ["b"], negated: true },
+  ]);
+  assert.deepEqual(gmailSearchTerms(SEARCH('paused+newer_than:2d+label:"agent+action"+in:anywhere+is:unread+has:attachment+to:(a+b)+rfc822msgid:x1@mail.example.com+re:+-label:x')),
+    [any("paused")], "operators that say nothing about subject or sender go, value included");
+  assert.deepEqual(gmailSearchTerms(SEARCH("{card+OR+loan}+AND+(paused)+or")), [any("card"), any("loan"), any("paused"), any("or")],
+    "OR/AND are dropped and every word stays required; a lowercase 'or' is a word");
+  assert.deepEqual(gmailSearchTerms(SEARCH("")), []);
+  assert.equal(gmailSearchTerms(`https://mail.google.com/mail/?authuser=${ACCT}#all/thread-f:42`), null);
+  assert.equal(gmailSearchTerms("https://evil.example/mail/#search/a+b"), null);
+});
+
+await test("a #search card merges when its words are only in the sender's display name", () => {
+  const e = emailItem({ from: "Examplia Card Support", subject: "Your statement is ready" });
+  const noise = emailItem({ from: "Another Sender", subject: "Your statement is ready" });
+  const c = card({}, { name: "Urgent: Examplia support wrote", link: SEARCH("Examplia+support") });
+  const out = mergeUrgent([e, noise], [c]);
+  assert.equal(out.total, 2);
+  const item = out.items.find((i) => i.key === `email:${e.key}`);
+  assert.deepEqual(item.sources, ["Gmail", "Agent Inbox"]);
+  assert.equal(item.requestHref, `/agents?t=inbox-triage#m${c.messageId}`);
+  assert.deepEqual(out.items.find((i) => i.key === `email:${noise.key}`).sources, ["Gmail"]);
+});
+
+await test("a #search card merges when its words are split across the subject and the sender name", () => {
+  const e = emailItem({ from: "Examplia Rewards Team", subject: "Your loyalty card was paused - action needed" });
+  assert.equal(total([e], SEARCH("Examplia+loyalty+card")), 1, "brand in the sender, the rest in the subject");
+  assert.equal(total([e], SEARCH("examplia+LOYALTY+card+card")), 1, "case and repeats do not matter");
+  assert.equal(total([e], SEARCH("Examplia+loyalty+card+refund")), 2, "a word in neither stays unmatched");
+  assert.equal(total([emailItem({ from: "Exampliabank Rewards", subject: e.subject })], SEARCH("Examplia+loyalty+card")), 2, "whole words only in the sender too");
+  assert.equal(total([emailItem({ from: null, subject: e.subject })], SEARCH("Examplia+loyalty+card")), 2, "no sender at all");
+});
+
+await test("sender-name matches keep the safeties: two candidates, other account and the time window never merge", () => {
+  const link = SEARCH("Examplia+loyalty+card");
+  const base = { from: "Examplia Rewards Team", subject: "Your loyalty card was paused", receivedAt: "2026-11-11T10:00:00.000Z" };
+  assert.equal(total([emailItem(base)], link), 1);
+  assert.equal(total([emailItem(base), emailItem({ ...base, subject: "A new loyalty card is on its way" })], link), 3, "two from the same sender");
+  assert.equal(total([emailItem(base), emailItem({ from: "Someone Else", subject: "Examplia loyalty card question" })], link), 3,
+    "one matches through its sender, one through its subject alone: still ambiguous");
+  assert.equal(total([emailItem({ ...base, account: "second@example.com" })], link), 2, "other account");
+  assert.equal(total([emailItem({ ...base, account: "second@example.com" }), emailItem(base)], link), 2, "the other account's twin is not a second candidate");
+  assert.equal(total([emailItem({ ...base, receivedAt: "2026-11-11T14:00:00.000Z" })], link), 2, "received after the card");
+  assert.equal(total([emailItem({ ...base, receivedAt: "2026-11-04T12:00:00.000Z" })], link), 2, "more than 7 days before");
+});
+
+await test("sender address: with no display name a plain word may match the domain, never the local part or the last label", () => {
+  const nameless = { from: "billing@mail.examplia.example", subject: "Your loyalty card was paused" };
+  assert.equal(total([emailItem(nameless)], SEARCH("examplia+card")), 1, "domain label");
+  assert.equal(total([emailItem(nameless)], SEARCH("billing+card")), 2, "local part is too generic");
+  assert.equal(total([emailItem(nameless)], SEARCH("example+card")), 2, "last label (TLD)");
+  assert.equal(total([emailItem(nameless)], SEARCH("from:billing@mail.examplia.example+card")), 1, "a from: term names the whole address");
+  // With a display name the address never reaches the browser, so only the name counts.
+  const named = { from: "Jordan Example", subject: "Your loyalty card was paused" };
+  assert.equal(total([emailItem(named)], SEARCH("from:jordan+card")), 1);
+  assert.equal(total([emailItem(named)], SEARCH("from:billing@mail.examplia.example+card")), 2);
+});
+
+await test("subject:, from:, phrases and exclusions narrow the match; operator-only and exclusion-only links never merge", () => {
+  const e = { from: "Examplia Rewards Team", subject: "Your loyalty card was paused" };
+  assert.equal(total([emailItem(e)], SEARCH("subject:loyalty+from:examplia")), 1);
+  assert.equal(total([emailItem(e)], SEARCH("subject:examplia+loyalty")), 2, "subject: does not look at the sender");
+  assert.equal(total([emailItem(e)], SEARCH("from:loyalty+examplia")), 2, "from: does not look at the subject");
+  assert.equal(total([emailItem(e)], SEARCH('"loyalty+card"+examplia')), 1, "phrase in order");
+  assert.equal(total([emailItem(e)], SEARCH('"card+loyalty"+examplia')), 2, "phrase out of order");
+  assert.equal(total([emailItem(e)], SEARCH('"team+your"')), 2, "a phrase never spans sender and subject");
+  assert.equal(total([emailItem(e)], SEARCH("loyalty+card+-paused")), 2, "excluded word in the subject");
+  assert.equal(total([emailItem(e)], SEARCH("loyalty+card+-from:examplia")), 2, "excluded sender");
+  assert.equal(total([emailItem(e)], SEARCH("loyalty+card+-refund+-from:other")), 1, "exclusions that do not apply");
+  assert.equal(total([emailItem(e), emailItem({ ...e, subject: "Your loyalty card refund" })], SEARCH("examplia+loyalty+card+-refund")), 2,
+    "an exclusion can leave one candidate");
+  assert.equal(total([emailItem(e)], SEARCH("-refund")), 2, "exclusions only");
+  assert.equal(total([emailItem(e)], SEARCH("newer_than:7d+label:agent")), 2, "ignored operators only");
+  assert.equal(total([emailItem(e)], SEARCH("loyalty+OR+refund")), 2, "OR is not understood: both words stay required");
+});
+
 await test("unmatched email cards stand alone with source, freshness, reason and next step; duplicates by code once", () => {
   const c = card({ created_at: "2026-11-11 13:00:00" }, { name: "Urgent: password was reset (second@)", link: "https://mail.google.com/mail/?authuser=second@example.com#search/password+reset" });
   const out = mergeUrgent([], [c, { ...c, messageId: c.messageId + 1 }, card({}, { name: "Not email", agent: "nyc-scout" })]);
