@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { whoopStepsDay } from "@/lib/steps";
 import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, validateChatMessages } from "@/lib/chat-contract";
 import { WRITE_GATE, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, type WriteReceipt } from "@/lib/chat-receipts";
 import { createClient } from "@supabase/supabase-js";
@@ -49,7 +50,7 @@ Format numbers clearly. Use relative comparisons (e.g., "your HRV is 15% above y
 const tools: Anthropic.Tool[] = [
   {
     name: "query_daily_summary",
-    description: "Get Garmin daily summary stats (steps, heart rate, stress, body battery, SpO2) for a date range. Use this for general health questions. Garmin's calorie estimate is returned as garmin_total_kcal_NOT_TDEE and must NOT be reported as calories burned — use query_whoop_cycles (tdee_kcal) for daily energy expenditure.",
+    description: "Get Garmin daily summary stats (steps, heart rate, stress, body battery, SpO2) for a date range. Use this for general health questions. The Garmin watch is rarely worn: a day with 0 or missing total_steps means the watch was off, not that no steps were taken, so use query_whoop_cycles (step_count, steps_day) for steps on those days. Garmin's calorie estimate is returned as garmin_total_kcal_NOT_TDEE and must NOT be reported as calories burned — use query_whoop_cycles (tdee_kcal) for daily energy expenditure.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -126,7 +127,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "query_whoop_cycles",
-    description: "Get WHOOP daily cycle data including strain, kilojoules, average and max heart rate. tdee_kcal (kilojoule / 4.184) is THE canonical daily calories-burned / TDEE figure — always use it for 'calories burned' questions.",
+    description: "Get WHOOP daily cycle data including strain, kilojoules, average and max heart rate, and step_count. tdee_kcal (kilojoule / 4.184) is THE canonical daily calories-burned / TDEE figure — always use it for 'calories burned' questions. step_count is the WHOOP strap's steps for the cycle; steps_day is the calendar day those steps belong to (a cycle starts at a sleep onset, so its steps are the following waking day's). A cycle with no end_time is still in progress and its step_count is the count so far. Say the steps come from WHOOP; never add them to Garmin steps.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -420,6 +421,8 @@ function tagCalorieSources(table: string, rows: Record<string, unknown>[]): Reco
     return rows.map((r) => ({
       ...r,
       tdee_kcal: typeof r.kilojoule === "number" ? Math.round(r.kilojoule / 4.184) : null,
+      // The day step_count belongs to (the waking day after the cycle's opening sleep).
+      steps_day: r.step_count == null ? null : whoopStepsDay(r as { onyx_behavioral_date?: string | null }),
     }));
   }
   return rows;

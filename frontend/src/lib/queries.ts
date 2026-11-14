@@ -195,7 +195,7 @@ export async function getTrainingStatus(days: number = 30) {
 // minimal per-consumer list so future chart additions don't silently get
 // undefined; if the ETL adds a new scalar column, append it here too.
 const WHOOP_CYCLE_COLS =
-  "cycle_id, user_id, created_at, updated_at, start_time, end_time, timezone_offset, score_state, strain, kilojoule, average_heart_rate, max_heart_rate, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source, onyx_is_transition_day";
+  "cycle_id, user_id, created_at, updated_at, start_time, end_time, timezone_offset, score_state, strain, kilojoule, average_heart_rate, max_heart_rate, step_count, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source, onyx_is_transition_day";
 const WHOOP_RECOVERY_COLS =
   "cycle_id, sleep_id, user_id, created_at, updated_at, score_state, recovery_score, resting_heart_rate, hrv_rmssd_milli, spo2_percentage, skin_temp_celsius, user_calibrating, synced_at";
 const WHOOP_SLEEP_COLS =
