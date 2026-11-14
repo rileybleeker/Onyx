@@ -19,19 +19,43 @@ export interface RecurringInput {
   ignored_from: string | null;
 }
 
+export type RenewalConfidence = "high" | "medium" | "low";
+
 export interface DetectedSubscription {
+  /** Opaque and stable for one merchant (a hash of its normalized name); safe to put in a URL. */
+  id: string;
   merchant: string;
   cadence: RecurringCadence;
   typicalCents: number;
   lastCharge: string;
+  /** Amount of the last charge, and the usual amount of the (up to three) charges before it. */
+  lastCents: number;
+  previousTypicalCents: number | null;
+  /** Estimated date of the next charge (see nextMethod / confidence). */
   nextExpected: string;
+  /** How nextExpected was estimated, in plain words. */
+  nextMethod: string;
+  confidence: RenewalConfidence;
+  /** Recent gaps the method was checked against, and its largest miss over them, in days. */
+  checkedGaps: number;
+  maxMissDays: number;
   chargeCount: number;
   monthlyCents: number;
   status: "active" | "lapsed";
 }
 
+/** A charge that repeats for about the same amount but on no regular schedule: no date is estimated. */
+export interface IrregularCharge {
+  id: string;
+  merchant: string;
+  typicalCents: number;
+  lastCharge: string;
+  chargeCount: number;
+  medianGapDays: number;
+}
+
 export type DetectedLoad =
-  | { state: "ok"; subs: DetectedSubscription[]; total: number; today: string }
+  | { state: "ok"; subs: DetectedSubscription[]; irregular: IrregularCharge[]; total: number; today: string }
   | { state: "empty" }
   | { state: "error"; code: string };
 
@@ -47,7 +71,23 @@ const BANDS: Record<RecurringCadence, { min: number; max: number; minCharges: nu
 const CADENCES = Object.keys(BANDS) as RecurringCadence[];
 const MIN_IN_BAND = 0.7;
 const AMOUNT_TOLERANCE = 0.25;
+/** A single step up between recent charges is still one subscription when the new price is at most this multiple. */
+const MAX_STEP_UP = 2;
 const DAY_MS = 86_400_000;
+/** Calendar months per cycle, for the cadences that bill on a calendar date. */
+const CYCLE_MONTHS: Partial<Record<RecurringCadence, number>> = { monthly: 1, quarterly: 3, annual: 12 };
+/** The estimate is checked against this many of the most recent gaps. */
+const CHECKED_GAPS = 4;
+/** Confidence: "high" = at least 3 gaps checked, none off by more than 2 days; "medium" = none off by more than 4. */
+const HIGH_MAX_MISS = 2;
+const HIGH_MIN_GAPS = 3;
+const MEDIUM_MAX_MISS = 4;
+/** Irregular repeats: at least 4 charges, 80% of them within 5% of the usual amount, the last one recent. */
+const IRREGULAR_MIN_CHARGES = 4;
+const IRREGULAR_AMOUNT_TOLERANCE = 0.05;
+const IRREGULAR_MIN_SHARE = 0.8;
+const IRREGULAR_MIN_MEDIAN_GAP = 10;
+const IRREGULAR_RECENT_DAYS = 120;
 
 const isDay = (s: unknown): s is string => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 const dayNumber = (iso: string): number => Math.round(Date.parse(`${iso}T00:00:00Z`) / DAY_MS);
@@ -57,6 +97,27 @@ export function addDays(iso: string, days: number): string {
 }
 export function daysBetween(fromIso: string, toIso: string): number {
   return dayNumber(toIso) - dayNumber(fromIso);
+}
+/** Same day of the month `months` later; a day the target month lacks becomes its last day. */
+export function addMonths(iso: string, months: number): string {
+  const [y, m, d] = iso.split("-").map(Number);
+  const first = new Date(Date.UTC(y, m - 1 + months, 1));
+  const lastDay = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 1, 0)).getUTCDate();
+  return new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth(), Math.min(d, lastDay))).toISOString().slice(0, 10);
+}
+
+/** Opaque 16-hex id for a text (two FNV-1a style passes). An identifier, not a security feature. */
+export function stableId(text: string): string {
+  let a = 0x811c9dc5;
+  let b = 0x9e3779b9;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193);
+    b = Math.imul(b ^ (c + i), 0x85ebca6b);
+    b ^= b >>> 13;
+  }
+  const hex = (n: number) => (n >>> 0).toString(16).padStart(8, "0");
+  return hex(a) + hex(b);
 }
 
 function median(values: readonly number[]): number {
@@ -102,14 +163,112 @@ interface Charge {
   label: string;
 }
 
-function classify(charges: Charge[], today: string): DetectedSubscription | null {
-  // Several charges on one day count once (the largest), so a duplicate never makes a zero-day gap.
+/** Several charges on one day count once (the largest), so a duplicate never makes a zero-day gap. Oldest first. */
+function oncePerDay(charges: Charge[]): Charge[] {
   const byDay = new Map<string, Charge>();
   for (const c of charges) {
     const prev = byDay.get(c.date);
     if (!prev || c.cents > prev.cents) byDay.set(c.date, c);
   }
-  const list = [...byDay.values()].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  return [...byDay.values()].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+}
+
+interface NextEstimate {
+  next: string;
+  method: string;
+  confidence: RenewalConfidence;
+  checkedGaps: number;
+  maxMissDays: number;
+}
+
+/**
+ * Estimate the next charge date from the charge dates (oldest first) of an established cadence.
+ *
+ * Two models are tried on the recent gaps and the one that fits them better is used:
+ *  - calendar: the same day of the month, 1 / 3 / 12 months on (how most services bill);
+ *  - interval: a fixed number of days (the median gap), for 4-weekly or 30-day billing and for weekly.
+ * The date is the median of the last (up to three) charges each carried forward by whole cycles, so
+ * one charge that posted a day or two late (a weekend) does not move it. Confidence says how well
+ * the chosen model reproduced the recent charges; it is not a probability.
+ */
+function estimateNext(dates: string[], cadence: RecurringCadence, medGap: number): NextEstimate {
+  const step = Math.round(medGap);
+  const months = CYCLE_MONTHS[cadence];
+  const band = BANDS[cadence];
+  const recent = dates.slice(-(CHECKED_GAPS + 1));
+  const intervalMiss: number[] = [];
+  const calendarMiss: number[] = [];
+  for (let i = 1; i < recent.length; i++) {
+    intervalMiss.push(Math.abs(daysBetween(recent[i - 1], recent[i]) - step));
+    if (months) calendarMiss.push(Math.abs(daysBetween(addMonths(recent[i - 1], months), recent[i])));
+  }
+  const mean = (v: number[]) => v.reduce((a, b) => a + b, 0) / v.length;
+  const calendar = months !== undefined && mean(calendarMiss) <= mean(intervalMiss);
+  const miss = calendar ? calendarMiss : intervalMiss;
+
+  // Carry the last charges forward; stop at a gap outside the band (a skipped cycle would be off by one).
+  const tail: string[] = [];
+  const projected: number[] = [];
+  for (let i = dates.length - 1, k = 1; i >= 0 && k <= 3; i--, k++) {
+    if (k > 1) {
+      const gap = daysBetween(dates[i], dates[i + 1]);
+      if (gap < band.min || gap > band.max) break;
+    }
+    tail.push(dates[i]);
+    projected.push(dayNumber(calendar ? addMonths(dates[i], (months ?? 0) * k) : addDays(dates[i], step * k)));
+  }
+  let next = new Date(Math.round(median(projected)) * DAY_MS).toISOString().slice(0, 10);
+  // Billing on the 29th-31st lands on the last day of a shorter month, which hides the real billing
+  // day. When a recent charge sits on a month end, bill on the latest day of the month seen instead.
+  if (calendar && tail.some((d) => addDays(d, 1).slice(8) === "01")) {
+    const day = Math.max(...tail.map((d) => Number(d.slice(8))));
+    const target = addMonths(`${dates[dates.length - 1].slice(0, 8)}01`, months ?? 0);
+    next = addMonths(`${target.slice(0, 8)}${String(day).padStart(2, "0")}`, 0);
+  }
+
+  const maxMiss = Math.max(...miss);
+  const confidence: RenewalConfidence =
+    miss.length >= HIGH_MIN_GAPS && maxMiss <= HIGH_MAX_MISS
+      ? "high"
+      : maxMiss <= MEDIUM_MAX_MISS && (miss.length >= 2 || cadence === "annual")
+        ? "medium"
+        : "low";
+  const method = calendar
+    ? months === 1
+      ? "same day of the month as the recent charges"
+      : months === 3
+        ? "three months after the recent charges, same day of the month"
+        : "one year after the last charge, same date"
+    : `every ${step} days, counted from the recent charges`;
+  return { next, method, confidence, checkedGaps: miss.length, maxMissDays: maxMiss };
+}
+
+/**
+ * The usual amount of the last (up to three) charges, or null when they do not agree.
+ * They agree when all are within 25% of their median, or when they show ONE step up of at most
+ * double (a price increase or a plan change): then the new, higher amount is the usual one.
+ */
+function usualAmount(recent: number[]): number | null {
+  const agree = (values: number[], t: number) => values.every((c) => Math.abs(c - t) <= AMOUNT_TOLERANCE * t);
+  const typical = Math.round(median(recent));
+  if (typical <= 0) return null;
+  if (agree(recent, typical)) return typical;
+  // Every place the step could be; the split whose two sides are tightest wins.
+  let best: { amount: number; spread: number } | null = null;
+  for (let split = 1; split < recent.length; split++) {
+    const lower = recent.slice(0, split);
+    const upper = recent.slice(split);
+    const a = Math.round(median(lower));
+    const b = Math.round(median(upper));
+    if (!(a > 0 && b > a && b <= MAX_STEP_UP * a && agree(lower, a) && agree(upper, b))) continue;
+    const spread = lower.reduce((sum, c) => sum + Math.abs(c - a), 0) + upper.reduce((sum, c) => sum + Math.abs(c - b), 0);
+    if (!best || spread < best.spread) best = { amount: b, spread };
+  }
+  return best ? best.amount : null;
+}
+
+function classify(key: string, charges: Charge[], today: string): DetectedSubscription | null {
+  const list = oncePerDay(charges);
   if (list.length < 2) return null;
 
   const gaps: number[] = [];
@@ -122,32 +281,39 @@ function classify(charges: Charge[], today: string): DetectedSubscription | null
   const inBand = gaps.filter((g) => g >= band.min && g <= band.max).length;
   if (inBand / gaps.length < MIN_IN_BAND) return null;
 
-  const recent = list.slice(-3).map((c) => c.cents);
-  const typical = Math.round(median(recent));
-  if (typical <= 0) return null;
-  if (recent.some((c) => Math.abs(c - typical) > AMOUNT_TOLERANCE * typical)) return null;
+  const typical = usualAmount(list.slice(-3).map((c) => c.cents));
+  if (typical === null) return null;
 
   const last = list[list.length - 1];
+  const before = list.slice(-4, -1).map((c) => c.cents);
   const typicalGap = Math.round(medGap);
-  const nextExpected = addDays(last.date, typicalGap);
+  const estimate = estimateNext(list.map((c) => c.date), cadence, medGap);
+  const nextExpected = estimate.next;
   const monthlyCents = Math.round(
     cadence === "weekly" ? (typical * 52) / 12 : cadence === "monthly" ? typical : cadence === "quarterly" ? typical / 3 : typical / 12,
   );
   const active = daysBetween(nextExpected, today) <= typicalGap / 2;
   return {
+    id: stableId(key),
     merchant: cleanLabel(last.label) || last.label.trim(),
     cadence,
     typicalCents: typical,
     lastCharge: last.date,
+    lastCents: last.cents,
+    previousTypicalCents: before.length > 0 ? Math.round(median(before)) : null,
     nextExpected,
+    nextMethod: estimate.method,
+    confidence: estimate.confidence,
+    checkedGaps: estimate.checkedGaps,
+    maxMissDays: estimate.maxMissDays,
     chargeCount: list.length,
     monthlyCents,
     status: active ? "active" : "lapsed",
   };
 }
 
-/** Detect recurring charges. Active first, then by monthly-equivalent descending. */
-export function detectRecurring(txns: readonly RecurringInput[], today: string): DetectedSubscription[] {
+/** Counted USD purchases grouped by normalized merchant (refunds, ignored rows, transfers and other currencies left out). */
+function groupCharges(txns: readonly RecurringInput[]): Map<string, Charge[]> {
   const groups = new Map<string, Charge[]>();
   for (const t of txns) {
     if (classifyTxn(t) !== "counted") continue;
@@ -162,9 +328,14 @@ export function detectRecurring(txns: readonly RecurringInput[], today: string):
     if (list) list.push(charge);
     else groups.set(key, [charge]);
   }
+  return groups;
+}
+
+/** Detect recurring charges. Active first, then by monthly-equivalent descending. */
+export function detectRecurring(txns: readonly RecurringInput[], today: string): DetectedSubscription[] {
   const subs: DetectedSubscription[] = [];
-  for (const charges of groups.values()) {
-    const sub = classify(charges, today);
+  for (const [key, charges] of groupCharges(txns)) {
+    const sub = classify(key, charges, today);
     if (sub) subs.push(sub);
   }
   return subs.sort(
@@ -172,6 +343,42 @@ export function detectRecurring(txns: readonly RecurringInput[], today: string):
       (a.status === b.status ? 0 : a.status === "active" ? -1 : 1) ||
       b.monthlyCents - a.monthlyCents ||
       (a.merchant < b.merchant ? -1 : a.merchant > b.merchant ? 1 : 0),
+  );
+}
+
+/**
+ * Charges that repeat for about the same amount but fit no cadence (so detectRecurring skips them):
+ * a fixed top-up, a membership billed whenever it is used. They are listed WITHOUT a next date -
+ * the spacing gives nothing to estimate one from. Most recent first.
+ */
+export function detectIrregular(txns: readonly RecurringInput[], today: string): IrregularCharge[] {
+  const out: IrregularCharge[] = [];
+  for (const [key, charges] of groupCharges(txns)) {
+    if (classify(key, charges, today)) continue;
+    const list = oncePerDay(charges);
+    if (list.length < IRREGULAR_MIN_CHARGES) continue;
+    const last = list[list.length - 1];
+    const sinceLast = daysBetween(last.date, today);
+    if (sinceLast < 0 || sinceLast > IRREGULAR_RECENT_DAYS) continue;
+    const typical = Math.round(median(list.map((c) => c.cents)));
+    if (typical <= 0) continue;
+    const close = list.filter((c) => Math.abs(c.cents - typical) <= IRREGULAR_AMOUNT_TOLERANCE * typical).length;
+    if (close / list.length < IRREGULAR_MIN_SHARE) continue;
+    const gaps: number[] = [];
+    for (let i = 1; i < list.length; i++) gaps.push(daysBetween(list[i - 1].date, list[i].date));
+    const medGap = median(gaps);
+    if (medGap < IRREGULAR_MIN_MEDIAN_GAP) continue;
+    out.push({
+      id: stableId(key),
+      merchant: cleanLabel(last.label) || last.label.trim(),
+      typicalCents: typical,
+      lastCharge: last.date,
+      chargeCount: list.length,
+      medianGapDays: Math.round(medGap),
+    });
+  }
+  return out.sort((a, b) =>
+    a.lastCharge < b.lastCharge ? 1 : a.lastCharge > b.lastCharge ? -1 : a.merchant < b.merchant ? -1 : a.merchant > b.merchant ? 1 : 0,
   );
 }
 

@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, validateChatMessages } from "@/lib/chat-contract";
+import { WRITE_GATE, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, type WriteReceipt } from "@/lib/chat-receipts";
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist } from "@/lib/spotify-server";
@@ -23,11 +24,11 @@ For health and fitness questions, the connected devices are Garmin watch, WHOOP 
 
 You have access to the user's data via function calls. When the user asks about their health metrics, use the appropriate function to fetch real data before answering. You can call multiple tools to cross-reference data across devices. Be concise and insightful — highlight trends, anomalies, and actionable takeaways.
 
-When the user mentions completing a habit (e.g., "I meditated today", "I took my vitamins"), use mark_habit_complete to log it. The habit name should match what's defined in their habits list. Use query_journal to see both self-reported behaviors and habit completions together.
+When the user's latest message reports completing a habit or asks you to mark one (e.g., "I meditated today", "mark vitamins as done"), use mark_habit_complete to log it. A habit that only comes up inside a question about something else is not a report: answer the question and offer to log it. The habit name should match what's defined in their habits list. Use query_journal to see both self-reported behaviors and habit completions together.
 
 The user keeps reusable supplement "stacks" — named lists of supplements + doses (like a bill of materials). When they say they took a named stack or routine (e.g. "log my morning stack", "I took my evening stack"), use log_supplement_stack with the stack name. It records every supplement in that stack at once. If the name doesn't match, the tool returns the list of available stacks so you can confirm which one they mean.
 
-For a single item — any supplement OR medication on their /supplements product list (e.g. "log 15 mg of Adderall at 8:30am and noon", "I took 2 magnesium capsules", "took my creatine") — use log_supplement_intake. Pass the name as they said it (brand names resolve, e.g. Adderall → the amphetamine salts product), the amount + unit they stated, and every clock time they mention in ONE call. The tool converts the amount into servings and stores the times, so never refuse because of a custom dose or time, and never fall back to a habit for this. Confirm in one short line what was logged (amount, times, day).
+For a single item — any supplement OR medication on their /supplements product list (e.g. "log 15 mg of Adderall at 8:30am and noon", "I took 2 magnesium capsules", "took my creatine") — use log_supplement_intake. Pass the name as they said it (brand names resolve, e.g. Adderall → the amphetamine salts product), the amount + unit they stated, and every clock time they mention in ONE call. The tool converts the amount into servings and stores the times, so never refuse because of a custom dose or time, and never fall back to a habit for this. Confirm in one short line what was logged (product, amount, times, day), taken from the tool result.
 
 The user also keeps a free-form *personal* journal in Notion (prose entries about life, mood, relationships, training, mental health). Use query_journal_entries when they ask about what they wrote, how they were feeling, or to find context behind biometric trends — combine it with biometric tools to answer questions like "what was my HRV on days I logged a 'low' mood?". When a question is thematic rather than date-specific, set semantic_query to do similarity search.
 
@@ -39,7 +40,9 @@ You can also create Spotify playlists, but only when the user explicitly asks yo
 - Once you have track IDs (mix sources freely), call create_spotify_playlist directly — they already asked for it and playlists are private and easily deleted, so no extra confirmation is needed.
 - Default to ~25–40 tracks unless the user specifies otherwise. Give the playlist a descriptive name that reflects the user's request.
 
-The user is also reading a book as a tracked "reading quest" (currently The Goal by Goldratt, 40 chapters, target Nov 30 2026). Use get_reading_status for progress, pace and coaching. When they report reading ("finished chapters 3 and 4 on my run, here's what I remember: …"), call log_reading_session and pass their recall text VERBATIM — never summarize it. Kindle reading logs ITSELF: a local harvester turns Kindle highlights, notes and the reading position into source='kindle' sessions (recall = their Kindle notes), so never ask them to log Kindle sessions or re-enter Kindle highlights; manual logging is for audiobook/paper reading only. When they quote a passage with a comment, call add_book_highlight. When they ask to be quizzed ("quiz me on The Goal through chapter 12"), first call get_reading_status, then ask 5 short questions ONE AT A TIME drawn from the chapters they have read, their highlights and recall notes; grade each answer honestly; then call record_reading_quiz with checkpoint 'ch<N>' and the score. Keep coaching brief and specific (chapters behind pace, streak at risk, reviews due).
+The user is also reading a book as a tracked "reading quest" (currently The Goal by Goldratt, 40 chapters, target Nov 30 2026). Use get_reading_status for progress, pace and coaching. When they report reading ("finished chapters 3 and 4 on my run, here's what I remember: …"), call log_reading_session and pass their recall text VERBATIM — never summarize it. Kindle reading logs ITSELF: a local harvester turns Kindle highlights, notes and the reading position into source='kindle' sessions (recall = their Kindle notes), so never ask them to log Kindle sessions or re-enter Kindle highlights; manual logging is for audiobook/paper reading only. When they ask you to save or highlight a passage ("highlight this: …", "save this quote and note that …"), call add_book_highlight; a passage they merely quote while asking a question is not a request to save it. When they ask to be quizzed ("quiz me on The Goal through chapter 12"), first call get_reading_status, then ask 5 short questions ONE AT A TIME drawn from the chapters they have read, their highlights and recall notes; grade each answer honestly; then call record_reading_quiz with checkpoint 'ch<N>' and the score. Keep coaching brief and specific (chapters behind pace, streak at risk, reviews due).
+
+Replies are rendered as Markdown. Use a table when comparing several days or metrics side by side (at most about five columns: it is often read on a phone), short lists for steps or options, bold for the key figure, and plain paragraphs otherwise. Do not use raw HTML.
 
 Format numbers clearly. Use relative comparisons (e.g., "your HRV is 15% above your weekly average"). When comparing across devices, note any discrepancies. When you don't have enough data, say so.`;
 
@@ -182,7 +185,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "mark_habit_complete",
-    description: "Record a habit answer for a given date — 'Yes' (did it, default) or 'No' (explicitly did NOT do it, e.g. 'I skipped meditation today'). The habit name must match one defined in the user's Notion Habits database (e.g., 'Meditated', 'Exercised', 'Read'). Defaults to today. Only record 'No' when the user explicitly says they didn't do the habit — an unmentioned habit should stay unlogged. Sleep questions (mouth tape, nightguard or retainer, nasal strip, ear plugs, sleep mask, same bed as usual, screen in bed, read in bed) describe a night that already happened: leave date empty for last night (it is stored on yesterday, the day that night closed), and never log them for tonight. The result's stored_for_night names the night (e.g. 'Wed night → Thu morning'): repeat it to the user, and if they meant another night call again with that night's date (the date of the evening it started).",
+    description: "Record a habit answer for a given date — 'Yes' (did it, default) or 'No' (explicitly did NOT do it, e.g. 'I skipped meditation today'). The habit name must match one defined in the user's Notion Habits database (e.g., 'Meditated', 'Exercised', 'Read'). Defaults to today. Only record 'No' when the user explicitly says they didn't do the habit — an unmentioned habit should stay unlogged. Sleep questions (mouth tape, nightguard or retainer, nasal strip, ear plugs, sleep mask, same bed as usual, screen in bed, read in bed) describe a night that already happened: leave date empty for last night (it is stored on yesterday, the day that night closed), and never log them for tonight. The result's stored_for_night names the night (e.g. 'Wed night → Thu morning'): repeat it to the user, and if they meant another night call again with that night's date (the date of the evening it started). " + WRITE_GATE,
     input_schema: {
       type: "object" as const,
       properties: {
@@ -196,7 +199,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "log_supplement_stack",
-    description: "Record a whole supplement 'stack' (a saved, named list of supplements + doses) as consumed. Use when the user says they took a named stack or routine, e.g. 'log my morning stack' or 'I took my evening stack'. Writes one intake event per supplement in the stack. If the stack name doesn't match, the response lists available stacks — relay them and ask which one.",
+    description: "Record a whole supplement 'stack' (a saved, named list of supplements + doses) as consumed. Use when the user says they took a named stack or routine, e.g. 'log my morning stack' or 'I took my evening stack'. Writes one intake event per supplement in the stack. If the stack name doesn't match, the response lists available stacks — relay them and ask which one. " + WRITE_GATE,
     input_schema: {
       type: "object" as const,
       properties: {
@@ -208,7 +211,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "log_supplement_intake",
-    description: "Record ONE supplement or medication from the user's /supplements product list as taken, with an optional custom amount and optional clock times. Use for 'log 15 mg of Adderall at 8:30am and noon', 'I took 2 magnesium capsules', 'took melatonin at 11pm'. Writes one intake per time. The product is matched by name, brand, or ingredient (so 'Adderall' finds the amphetamine salts product); on no match or several matches the response lists candidates — relay them and ask. A weight amount (mg/mcg/g/IU) is converted to servings from the product's label; a count (capsules, tablets, scoops) is divided by the serving size. Re-sending the same timed entry is skipped, not duplicated.",
+    description: "Record ONE supplement or medication from the user's /supplements product list as taken, with an optional custom amount and optional clock times. Use for 'log 15 mg of Adderall at 8:30am and noon', 'I took 2 magnesium capsules', 'took melatonin at 11pm'. Writes one intake per time. The product is matched by name, brand, or ingredient (so 'Adderall' finds the amphetamine salts product); on no match or several matches the response lists candidates — relay them and ask. A weight amount (mg/mcg/g/IU) is converted to servings from the product's label; a count (capsules, tablets, scoops) is divided by the serving size. Re-sending the same timed entry is skipped, not duplicated. " + WRITE_GATE,
     input_schema: {
       type: "object" as const,
       properties: {
@@ -234,7 +237,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "log_reading_session",
-    description: "Record a reading session for the active book: the chapter reached, minutes, medium, and the user's from-memory recall note (what happened, what principle, where it shows up in a BC implementation) plus one question. Use when the user says they read/listened to chapters ('I finished chapters 5 and 6 on my run', 'log my reading: through chapter 8, here is what I remember…'). Pass their recall text VERBATIM as `recall`. Also marks the book's habit for that day and mirrors the entry to Notion. Returns XP gained.",
+    description: "Record a reading session for the active book: the chapter reached, minutes, medium, and the user's from-memory recall note (what happened, what principle, where it shows up in a BC implementation) plus one question. Use when the user says they read/listened to chapters ('I finished chapters 5 and 6 on my run', 'log my reading: through chapter 8, here is what I remember…'). Pass their recall text VERBATIM as `recall`. Also marks the book's habit for that day and mirrors the entry to Notion. Returns XP gained. " + WRITE_GATE,
     input_schema: {
       type: "object" as const,
       properties: {
@@ -252,7 +255,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "add_book_highlight",
-    description: "Save a highlighted passage from the book with the user's comment, chapter and concept tag (e.g. 'Bottleneck / capacity-constrained resource'). Use when the user quotes or paraphrases a passage they want to keep ('highlight this: …', 'save this quote and note that …'). Idempotent on passage. Mirrors to Notion and enters the spaced-repetition review queue.",
+    description: "Save a highlighted passage from the book with the user's comment, chapter and concept tag (e.g. 'Bottleneck / capacity-constrained resource'). Use when the user quotes or paraphrases a passage they want to keep ('highlight this: …', 'save this quote and note that …'). Idempotent on passage. Mirrors to Notion and enters the spaced-repetition review queue. " + WRITE_GATE,
     input_schema: {
       type: "object" as const,
       properties: {
@@ -268,7 +271,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "record_reading_quiz",
-    description: "Record the result of a checkpoint quiz you just ran with the user about the book. Call it AFTER asking the questions one at a time and grading the answers. checkpoint is 'ch<N>' for the chapter checkpoints (e.g. 'ch12', 'ch26', 'ch40') or 'review' for a later spaced review. 80%+ passes and earns the Quiz Master badge.",
+    description: "Record the result of a checkpoint quiz you just ran with the user about the book. Call it AFTER asking the questions one at a time and grading the answers. checkpoint is 'ch<N>' for the chapter checkpoints (e.g. 'ch12', 'ch26', 'ch40') or 'review' for a later spaced review. 80%+ passes and earns the Quiz Master badge. " + WRITE_GATE_QUIZ,
     input_schema: {
       type: "object" as const,
       properties: {
@@ -341,7 +344,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "create_spotify_playlist",
-    description: "Create a private Spotify playlist with the given tracks. Playlists are added to the user's Spotify account and a link is returned. Call this ONLY when the user explicitly asked to create, make or save a playlist; never for a request for suggestions or recommendations (list the tracks in the reply instead and offer to create it). Always private; once explicitly asked, create it without further confirmation (easy to delete in Spotify).",
+    description: "Create a private Spotify playlist with the given tracks. Playlists are added to the user's Spotify account and a link is returned. Call this ONLY when the user explicitly asked to create, make or save a playlist; never for a request for suggestions or recommendations (list the tracks in the reply instead and offer to create it). Always private; once explicitly asked, create it without further confirmation (easy to delete in Spotify). " + WRITE_GATE_REQUEST_ONLY,
     input_schema: {
       type: "object" as const,
       properties: {
@@ -420,6 +423,37 @@ function tagCalorieSources(table: string, rows: Record<string, unknown>[]): Reco
     }));
   }
   return rows;
+}
+
+/**
+ * Read back the intake rows a stack log just wrote (product names, servings,
+ * clock time) for the receipt. Best-effort: on any failure the receipt falls
+ * back to the counts logStackIntake returned.
+ */
+async function describeStackIntakes(intakeIds: number[]): Promise<Record<string, unknown>> {
+  if (intakeIds.length === 0) return {};
+  try {
+    const { data: rows, error } = await supabase
+      .from("supplement_intake")
+      .select("intake_id,product_id,doses,intake_time")
+      .in("intake_id", intakeIds)
+      .order("intake_id", { ascending: true });
+    if (error || !rows || rows.length === 0) return {};
+    const { data: products } = await supabase
+      .from("supplement_products")
+      .select("product_id,brand_name,full_name")
+      .in("product_id", rows.map((r) => r.product_id));
+    const names = new Map((products ?? []).map((p) => [p.product_id, [p.brand_name, p.full_name].filter(Boolean).join(" ")]));
+    const stamp = rows[0].intake_time as string | null;
+    const tz = stamp ? await currentTimeZone(supabase, new Date(stamp)) : null;
+    return {
+      items: rows.map((r) => ({ product: names.get(r.product_id) || r.product_id, doses: Number(r.doses) })),
+      time: stamp && tz ? new Date(stamp).toLocaleTimeString("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" }) : null,
+      ...(tz ? { timezone: tz } : {}),
+    };
+  } catch {
+    return {};
+  }
 }
 
 async function executeTool(name: string, input: Record<string, unknown>): Promise<string> {
@@ -589,7 +623,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
         isPublic: false,
         createdVia: "chat",
       });
-      return JSON.stringify(result);
+      return JSON.stringify({ success: true, ...result });
     } catch (e) {
       return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
     }
@@ -847,6 +881,14 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     await mirrorProgress(result.book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
     return JSON.stringify({
       success: true,
+      book: result.book.title,
+      session_date: result.session.session_date,
+      chapter_from: result.session.chapter_from,
+      chapter_through: result.session.chapter_through,
+      minutes: result.session.minutes,
+      medium: result.session.medium,
+      recall_chars: (result.session.recall ?? "").length,
+      habit: result.habitMarked ? result.book.habit_name : null,
       xp_gained: result.xpGained,
       finished: result.finished,
       habit_marked: result.habitMarked,
@@ -877,7 +919,17 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
         mirrored = true;
       }
     }
-    return JSON.stringify({ success: true, created: result.created, highlight_id: result.highlight.highlight_id, next_review: result.highlight.next_review, notion_mirrored: mirrored });
+    return JSON.stringify({
+      success: true,
+      created: result.created,
+      highlight_id: result.highlight.highlight_id,
+      book: result.book.title,
+      chapter: result.highlight.chapter,
+      passage_excerpt: result.highlight.passage.slice(0, 200),
+      has_comment: !!result.highlight.comment,
+      next_review: result.highlight.next_review,
+      notion_mirrored: mirrored,
+    });
   }
 
   if (name === "record_reading_quiz") {
@@ -889,7 +941,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       notes: (input.notes as string) || null,
     });
     if (!result.ok) return JSON.stringify({ error: result.error });
-    return JSON.stringify({ success: true, passed: result.passed, score: `${result.quiz.score}/${result.quiz.total}`, checkpoint: result.quiz.checkpoint });
+    return JSON.stringify({ success: true, passed: result.passed, score: `${result.quiz.score}/${result.quiz.total}`, checkpoint: result.quiz.checkpoint, quiz_date: result.quiz.quiz_date });
   }
 
   if (name === "log_supplement_intake") {
@@ -927,14 +979,20 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       });
     }
 
-    const result = await logStackIntake(supabase, match.stack_id, { intake_date: date });
+    // A stack logged for an earlier day carries no clock time (same rule as
+    // /supplements and log_supplement_intake): stamping "now" on a past day
+    // gives it a next-day timestamp the caffeine timing layer has to quarantine.
+    const backdated = !!date && date !== (await behavioralToday(supabase));
+    const result = await logStackIntake(supabase, match.stack_id, backdated ? { intake_date: date, intake_time: null } : { intake_date: date });
     if (!result.ok) return JSON.stringify({ error: result.error });
+    const written = await describeStackIntakes(result.intake_ids ?? []);
     return JSON.stringify({
       success: true,
       stack: result.stack_name,
       products: result.count,
       total_doses: result.total_doses,
       date: result.intake_date,
+      ...written,
     });
   }
 
@@ -968,16 +1026,23 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
 }
 
 export async function POST(req: NextRequest) {
+  // One receipt per executed write tool, built from the tool's own result (see
+  // lib/chat-receipts.ts). Returned with every response after a write ran,
+  // error responses included, so the page can show exactly what was saved.
+  const receipts: WriteReceipt[] = [];
+  const withReceipts = <T extends object>(body: T) => (receipts.length > 0 ? { ...body, receipts } : body);
   try {
     let body: unknown;
     try { body = await req.json(); } catch {
       return Response.json({ error: "Invalid JSON body" }, { status: 400 });
     }
-    const messages = body && typeof body === "object" && "messages" in body ? body.messages : undefined;
+    const rawMessages = body && typeof body === "object" && "messages" in body ? body.messages : undefined;
 
-    if (!validateChatMessages(messages)) {
+    if (!validateChatMessages(rawMessages)) {
       return Response.json({ error: "Use a nonempty, alternating text conversation of at most 60 messages and 60,000 characters." }, { status: 400 });
     }
+    // Only role + text reach the model; any other field a client attaches is dropped.
+    const messages = rawMessages.map(({ role, content }) => ({ role, content }));
 
     if (req.signal.aborted) return Response.json({ error: "Request cancelled" }, { status: 499 });
 
@@ -1009,17 +1074,17 @@ export async function POST(req: NextRequest) {
     // retry cannot double-log the first write of a half-run batch. The batch
     // size is also checked up front for the same reason.
     const cancelled = () =>
-      Response.json({ error: "Request cancelled. Check the relevant page before retrying any action." }, { status: 499 });
+      Response.json(withReceipts({ error: "Request cancelled. Check the relevant page before retrying any action." }), { status: 499 });
 
     while (response.stop_reason === "tool_use") {
       if (toolRounds++ >= MAX_TOOL_ROUNDS) {
-        return Response.json({ error: "This request reached the tool limit. Some actions may already have completed; check the relevant page before retrying any logging request." }, { status: 422 });
+        return Response.json(withReceipts({ error: "This request reached the tool limit. Some actions may already have completed; check the relevant page before retrying any logging request." }), { status: 422 });
       }
       if (req.signal.aborted) return cancelled();
       const assistantContent = response.content;
       const batchSize = assistantContent.filter((b) => b.type === "tool_use").length;
       if (toolCalls + batchSize > MAX_TOOL_CALLS) {
-        return Response.json({ error: "This request reached the tool-call limit. Some actions may already have completed; check the relevant page before repeating an action." }, { status: 422 });
+        return Response.json(withReceipts({ error: "This request reached the tool-call limit. Some actions may already have completed; check the relevant page before repeating an action." }), { status: 422 });
       }
       toolCalls += batchSize;
       allMessages.push({ role: "assistant", content: assistantContent });
@@ -1027,11 +1092,29 @@ export async function POST(req: NextRequest) {
       const toolResults = [];
       for (const block of assistantContent) {
         if (block.type === "tool_use") {
-          const result = await executeTool(block.name, block.input as Record<string, unknown>);
+          let result: string;
+          let failed = false;
+          try {
+            result = await executeTool(block.name, block.input as Record<string, unknown>);
+          } catch (toolError) {
+            // A tool that throws may have written part of its work. Tell the
+            // model (and the receipt) so, instead of failing the whole request
+            // with nothing on screen. Tool name and error class only: never the
+            // message, which can echo user text.
+            failed = true;
+            const { name: errorName } = (toolError ?? {}) as { name?: unknown };
+            console.error("Chat tool failed", { tool: block.name, name: typeof errorName === "string" ? errorName : typeof toolError });
+            result = JSON.stringify(isWriteTool(block.name)
+              ? { error: "This tool failed unexpectedly and may have completed only part of its work. Do not retry it; tell the user to check the relevant page.", incomplete: true }
+              : { error: "This lookup failed unexpectedly. Say that this data is unavailable right now; do not guess its contents." });
+          }
+          const receipt = buildWriteReceipt(block.name, block.input, result);
+          if (receipt) receipts.push(receipt);
           toolResults.push({
             type: "tool_result" as const,
             tool_use_id: block.id,
             content: result,
+            ...(failed ? { is_error: true } : {}),
           });
         }
       }
@@ -1059,11 +1142,11 @@ export async function POST(req: NextRequest) {
       ? "No final summary was produced. Tool requests were processed, but that does not confirm every action succeeded. Check the relevant page before repeating an action."
       : "No answer was produced. Please try rephrasing your question.");
     const suffix = response.stop_reason === "max_tokens" ? "\n\nThis response reached its length limit. Ask me to continue if needed; do not repeat an action without checking its result." : "";
-    return Response.json({ response: summary + suffix });
+    return Response.json(withReceipts({ response: summary + suffix }));
   } catch (err) {
     // The client is gone (the SDK throws when the abort signal fires).
     if (req.signal.aborted) {
-      return Response.json({ error: "Request cancelled. Check the relevant page before retrying any action." }, { status: 499 });
+      return Response.json(withReceipts({ error: "Request cancelled. Check the relevant page before retrying any action." }), { status: 499 });
     }
     // Server-side diagnostics only: error class and HTTP status, never the
     // message (it can echo user text or upstream detail). The client gets the
@@ -1074,7 +1157,7 @@ export async function POST(req: NextRequest) {
       status: typeof status === "number" ? status : undefined,
     });
     return Response.json(
-      { error: "Unable to finish this request. If you asked to log or create something, check the relevant page before retrying." },
+      withReceipts({ error: "Unable to finish this request. If you asked to log or create something, check the relevant page before retrying." }),
       { status: 500 }
     );
   }

@@ -18,7 +18,6 @@ import {
   SLEEP_QUESTIONS,
   sleepDateError,
   sleepNights,
-  syncedAfter,
   usualKit,
   type CheckinAnswer,
   type CheckinItem,
@@ -26,6 +25,7 @@ import {
   type CheckinPayload,
   type CheckinSuggestion,
 } from "@/lib/checkin";
+import { CHECKIN_SCREEN_COLUMNS, settledLastHourMinutes } from "@/lib/checkin-screen";
 
 /**
  * Daily habit check-in (2026-11-07). One screen, one write for a whole behavior day.
@@ -122,7 +122,8 @@ async function suggestionsFor(date: string, today: string, names: Set<string>): 
       (async () => {
         const { data } = await supabase.from("phone_usage_daily").select("minutes_by_app").eq("behavioral_date", date).maybeSingle();
         if (!data) return;
-        Object.assign(out, appHabitSuggestions((data as { minutes_by_app: Record<string, unknown> | null }).minutes_by_app, names));
+        const row = data as { minutes_by_app: Record<string, unknown> | null };
+        Object.assign(out, appHabitSuggestions(row.minutes_by_app, names));
       })()
     );
   }
@@ -175,14 +176,10 @@ async function sleepSuggestionsFor(night: string, names: Set<string>): Promise<R
   if (names.has(Q_SCREEN_IN_BED)) {
     tasks.push(
       (async () => {
-        const { data } = await supabase
-          .from("phone_usage_daily")
-          .select("minutes_last_hour_before_sleep_est, sleep_start, synced_at")
-          .eq("behavioral_date", night)
-          .maybeSingle();
+        const { data } = await supabase.from("phone_usage_daily").select(CHECKIN_SCREEN_COLUMNS).eq("behavioral_date", night).maybeSingle();
         if (!data) return;
-        const row = data as { minutes_last_hour_before_sleep_est: number | string | null; sleep_start: string | null; synced_at: string | null };
-        const s = screenInBedSuggestion(row.minutes_last_hour_before_sleep_est, syncedAfter(row.synced_at, row.sleep_start));
+        // Only once that night's sync is complete (lib/checkin-screen.ts): before it, the estimate reads 0 and would suggest No.
+        const s = screenInBedSuggestion(settledLastHourMinutes(data, night));
         if (s) out[Q_SCREEN_IN_BED] = s;
       })()
     );

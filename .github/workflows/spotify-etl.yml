@@ -10,7 +10,15 @@ on:
     # also emits a 'partial' sync_log status whenever a run returns exactly 50
     # items so /status can surface cap-hit incidents.
     - cron: '50 * * * *'
-  workflow_dispatch: # Manual trigger for testing
+  workflow_dispatch: # Manual trigger for testing, and for signing in again
+    inputs:
+      auth_code:
+        description: >-
+          Only to sign in again (Spotify refresh tokens expire after 180 days):
+          the code, or the whole 127.0.0.1 callback URL, from the authorize
+          redirect. Leave empty for a normal run. See AGENTS.md, Token recovery (Spotify).
+        required: false
+        default: ''
 
 concurrency:
   group: spotify-etl
@@ -32,15 +40,33 @@ jobs:
         run: pip install httpx supabase python-dotenv
 
       - name: Download Spotify tokens from Supabase
+        if: ${{ github.event.inputs.auth_code == '' }}
         run: python ci_token_helper.py download spotify
 
+      - name: Sign in again from the pasted authorization code
+        # The code is read from the event file by the script (never from the
+        # command line or this step's env block) and exchanged with the client
+        # secret, which exists only here. A refused code fails the run before
+        # anything is stored.
+        if: ${{ github.event.inputs.auth_code != '' }}
+        run: python spotify_etl.py --exchange-code
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+
       - name: Run Spotify ETL
+        # Exits 1 when the sync fails outright (refresh token refused, fetch
+        # failed) AFTER writing its failed sync_log heartbeats, so this run
+        # goes red. Partial and no-new-plays runs exit 0.
         run: python spotify_etl.py
         env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
 
       - name: Upload refreshed tokens to Supabase
-        # Spotify rotates refresh tokens occasionally — persist whatever's on disk
+        # always(): a token the ETL refreshed (or Spotify rotated) must be kept
+        # even if the run failed later. The helper skips a file the ETL never
+        # refreshed and refuses an empty one, so a failed run cannot put a dead
+        # token back over a good one.
         if: always()
         run: python ci_token_helper.py upload spotify

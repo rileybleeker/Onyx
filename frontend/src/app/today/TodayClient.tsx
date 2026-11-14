@@ -2,11 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, BookOpen, ClipboardCheck, Mail, Package, RefreshCw } from "lucide-react";
+import { ArrowUpRight, BookOpen, CalendarClock, ClipboardCheck, FlaskConical, Mail, Package, RefreshCw } from "lucide-react";
 import { agentsApi, type InboxResponse, type InboxItem } from "@/lib/agents-api";
 import type { ReadingOverview } from "@/lib/reading";
 import type { UrgentEmailResponse } from "@/lib/urgent-email-query";
 import { ageLabel, isEmailCard, isGmailHref, mergeUrgent } from "@/lib/urgent-email";
+import { dayLabel, isExperimentToday, type ExperimentToday } from "@/lib/experiments";
+import type { RenewalSummary } from "@/lib/procurement-renewals";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -39,6 +41,11 @@ export default function TodayClient() {
   // Packages are shown only when something needs attention or arrives today, and a failed check
   // just hides the panel: /orders is where package status lives.
   const [orders, setOrders] = useState<OrdersSummary | null>(null);
+  // Today's arm of the running N-of-1 trial (GET /api/experiments/today). Usually "none": no card.
+  const [experiment, setExperiment] = useState<Load<ExperimentToday>>({ state: "loading" });
+  // Subscription renewals (GET /api/procurement/renewals/summary) follow the same rule: shown only
+  // when one is due within 3 days; a failed check hides the panel, /procurement has the details.
+  const [renewals, setRenewals] = useState<RenewalSummary | null>(null);
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
   const sequence = useRef(0);
   const inFlight = useRef(false);
@@ -53,6 +60,7 @@ export default function TodayClient() {
     setInbox((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setReading((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setUrgent((previous) => previous.state === "ready" ? previous : { state: "loading" });
+    setExperiment((previous) => previous.state === "ready" ? previous : { state: "loading" });
     const inboxRequest = bounded(Promise.resolve().then(() => agentsApi.inbox())).then((value) => {
       if (!Array.isArray(value.items) || !Array.isArray(value.threads)) throw new Error("Invalid inbox");
       if (sequence.current !== current) return;
@@ -83,7 +91,23 @@ export default function TodayClient() {
     })).then((value) => {
       if (sequence.current === current) setOrders(value);
     }).catch(() => { /* keep the last summary; /orders has the details */ });
-    void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest]).then(() => {
+    const renewalsRequest = bounded(fetch("/api/procurement/renewals/summary", { cache: "no-store" }).then(async (res) => {
+      if (!res.ok) throw new Error("Renewals unavailable");
+      const data = await res.json() as RenewalSummary;
+      if (data.status !== "empty" && !(data.status === "ready" && Array.isArray(data.soon) && typeof data.count === "number")) throw new Error("Invalid renewals");
+      return data;
+    })).then((value) => {
+      if (sequence.current === current) setRenewals(value);
+    }).catch(() => { /* keep the last summary; /procurement has the details */ });
+    const experimentRequest = bounded(fetch("/api/experiments/today", { cache: "no-store" }).then(async (res) => {
+      if (!res.ok) throw new Error("Experiment arm unavailable");
+      const data: unknown = await res.json();
+      if (!isExperimentToday(data)) throw new Error("Invalid experiment arm");
+      return data;
+    })).then((value) => {
+      if (sequence.current === current) setExperiment({ state: "ready", value });
+    }).catch(() => { if (sequence.current === current) setExperiment((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
+    void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest, renewalsRequest, experimentRequest]).then(() => {
       if (sequence.current === current) { inFlight.current = false; setRefreshing(false); }
     });
   }, []);
@@ -105,7 +129,9 @@ export default function TodayClient() {
   const emailCards = cards.filter((item) => isEmailCard(item.card));
   const requests = cards.filter((item) => !isEmailCard(item.card));
   const pending = refreshing || inbox.state === "loading" || reading.state === "loading" || urgent.state === "loading";
-  const unavailable = inbox.state === "error" || reading.state === "error" || urgent.state === "error" || (inbox.state === "ready" && inbox.stale) || (reading.state === "ready" && reading.stale) || (urgent.state === "ready" && urgent.stale);
+  const unavailable = inbox.state === "error" || reading.state === "error" || urgent.state === "error" || (inbox.state === "ready" && inbox.stale) || (reading.state === "ready" && reading.stale) || (urgent.state === "ready" && urgent.stale) || experiment.state === "error" || (experiment.state === "ready" && experiment.stale);
+  // "none" (no trial registered, the usual case) and "not_connected" render nothing at all.
+  const trial = experiment.state === "ready" && experiment.value.status !== "none" && experiment.value.status !== "not_connected" ? experiment.value : null;
   const email = urgent.state === "ready" && urgent.value.status === "ready" ? urgent.value : null;
   const merged = mergeUrgent(email?.items ?? [], emailCards, URGENT_SHOWN);
   const now = new Date();
@@ -113,6 +139,7 @@ export default function TodayClient() {
   const syncStale = !!lastSync && (now.getTime() - new Date(lastSync.at).getTime() > LABEL_SYNC_STALE_MS || lastSync.status !== "success");
   const book = reading.state === "ready" ? reading.value : null;
   const packages = orders?.status === "ready" && (orders.attention > 0 || orders.arrivingToday > 0) ? orders : null;
+  const renewing = renewals?.status === "ready" && renewals.count > 0 ? renewals : null;
   return (
     <div className="mx-auto max-w-2xl space-y-5">
       <header className="flex items-start justify-between gap-4">
@@ -124,6 +151,22 @@ export default function TodayClient() {
         </button>
       </header>
       <p role="status" aria-live="polite" className="sr-only">{pending ? "Refreshing Today" : unavailable ? "Some information could not be refreshed. Check the section messages." : "Today refresh finished"}</p>
+      {experiment.state === "error" && <div role="region" aria-label="Experiment arm" className={panelStyle}>
+        <p className="text-sm text-text-secondary">Couldn&apos;t check today&apos;s experiment arm. Try refreshing.</p>
+      </div>}
+      {trial && <div role="region" aria-labelledby="experiment-heading" className={panelStyle}>
+        <div className="flex items-center gap-2"><FlaskConical aria-hidden="true" className="h-5 w-5 text-accent" />
+          <h2 id="experiment-heading" className="text-lg font-medium text-text-primary">{trial.status === "active" ? "Today's experiment arm" : "Experiment"}</h2></div>
+        {trial.status === "active" && <>
+          <p className="mt-1 break-words text-xs text-text-secondary">{trial.experimentId}: {trial.title}. Day {trial.dayNumber} of {trial.nDays} ({dayLabel(trial.behavioralDate)}).</p>
+          <p className="mt-3 text-base font-medium text-text-primary">Arm {trial.arm}</p>
+          <p className="mt-1 break-words text-sm text-text-primary">{trial.instruction}</p>
+          <p className="mt-3 text-xs text-text-secondary">It applies until you go to sleep, also after midnight. Tomorrow&apos;s arm is not shown until tomorrow. Opening Today does not record whether you followed it.</p>
+        </>}
+        {trial.status === "upcoming" && <p className="mt-3 break-words text-sm text-text-primary">{trial.experimentId}: {trial.title} starts {dayLabel(trial.startDate)} and runs {trial.nDays} days. No arm today.</p>}
+        {trial.status === "paused" && <p className="mt-3 break-words text-sm text-text-primary">{trial.experimentId}: {trial.title} is paused. No arm today.</p>}
+        {experiment.state === "ready" && experiment.stale && <p className="mt-3 text-sm text-amber-300">Couldn&apos;t refresh the experiment arm. Showing the last check.</p>}
+      </div>}
       <section className={panelStyle} aria-labelledby="requests-heading" aria-busy={inbox.state === "loading"}>
         <div className="flex items-center justify-between gap-4">
           <h2 id="requests-heading" className="text-lg font-medium text-text-primary">Needs your input</h2>
@@ -195,6 +238,17 @@ export default function TodayClient() {
           {packages.top.map((t, i) => <li key={i} className="text-xs text-text-secondary"><span className="text-text-primary">{t.merchant}: {t.label}.</span> {t.reason}</li>)}
         </ul>}
         <Link href="/orders" className={`${linkStyle} mt-4 inline-block`}>Open orders</Link>
+      </section>}
+      {renewing && <section className={panelStyle} aria-labelledby="renewals-heading">
+        <div className="flex items-center gap-2"><CalendarClock aria-hidden="true" className="h-5 w-5 text-accent" />
+          <h2 id="renewals-heading" className="text-lg font-medium text-text-primary">Renewals</h2></div>
+        <p className="mt-3 text-sm text-text-primary">{renewing.count === 1 ? "1 subscription is" : `${renewing.count} subscriptions are`} expected to renew in the next {renewing.withinDays} days.</p>
+        <ul className="mt-2 space-y-1" aria-label="Subscriptions renewing soon">
+          {renewing.soon.map((r, i) => <li key={i} className="break-words text-xs text-text-secondary"><span className="text-text-primary">{r.merchant}</span> {r.label}</li>)}
+        </ul>
+        {renewing.count > renewing.soon.length && <p className="mt-1 text-xs text-text-secondary">And {renewing.count - renewing.soon.length} more.</p>}
+        <p className="mt-2 text-xs text-text-secondary">Estimated from past charges in your ledger. Onyx never pays or cancels anything.</p>
+        <Link href="/procurement" className={`${linkStyle} mt-4 inline-block`}>Open procurement</Link>
       </section>}
       <section className={panelStyle} aria-labelledby="reading-heading" aria-busy={reading.state === "loading"}>
         <div className="flex items-center gap-2"><BookOpen aria-hidden="true" className="h-5 w-5 text-accent" />

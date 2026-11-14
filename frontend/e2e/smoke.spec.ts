@@ -584,14 +584,19 @@ test.describe("Today home", () => {
   });
 });
 
-// /procurement (2026-11-11): planning workspace only. It holds no data of its own
-// and talks to no merchant, so the tripwire is: the page renders behind the login,
-// says it is disconnected, and the order button is still disabled. Read-only:
-// never types into a form, never adds a draft.
-test("/procurement renders as a disconnected planning page with ordering disabled", async ({ page }) => {
+// /procurement (2026-11-11; renewal estimates 2026-11-13): read-only advice. It talks to no
+// merchant, so the tripwire is: the page renders behind the login, the ledger read behind the
+// detected-subscriptions card and the order-history read behind the purchase suggestions did
+// not fail, and the order button is still disabled. Read-only:
+// never types into a form, never adds a draft. Never asserts on a merchant, a date or an amount.
+test("/procurement renders read-only advice with ordering disabled", async ({ page }) => {
   await gotoAuthed(page, "/procurement");
   await expect(pageHeading(page, page.getByRole("heading", { name: "Procurement", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
-  await expect(page.getByRole("heading", { name: "Disconnected preview", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Detected subscriptions", exact: true })).toBeVisible();
+  await expect(page.getByTestId("procurement-detected")).not.toHaveAttribute("data-state", "error");
+  await expect(page.getByRole("heading", { name: "Purchase suggestions", exact: true })).toBeVisible();
+  await expect(page.getByTestId("procurement-reorder")).not.toHaveAttribute("data-state", "error");
+  await expect(page.getByRole("heading", { name: "What this page reads", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Track subscriptions", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Place order (unavailable)", exact: true })).toBeDisabled();
   await expectNoClientCrash(page);
@@ -609,15 +614,18 @@ test("/wins renders the Wins board", async ({ page }) => {
   await expectNoClientCrash(page);
 });
 
-// /health (2026-11-11, PR #30): local-only care/appointments planner. Items live in the
-// browser, sample data is opt-in, and the Google Calendar card is a read-only "not connected"
-// stub. Tripwire: the planner finishes loading, sample data is NOT on by default, and the
-// calendar connect button is still disabled. Read-only: never types, adds or toggles anything.
+// /health (PR #30; stored in Onyx since 2026-11-13): care/appointments planner. Items are read
+// server-side from pds.care_items (service-role only), sample data is opt-in, and the Google
+// Calendar card is a read-only "not connected" stub. Tripwire: the list loaded from Onyx (the
+// load-failure panel is absent and the add form rendered; an empty list is legitimate), sample
+// data is NOT on by default, and the calendar connect button is still disabled. Read-only: never
+// types, adds, toggles or copies anything, and never asserts on an item's label or date.
 test("/health renders the care planner with sample data off and calendar disconnected", async ({ page }) => {
   await gotoAuthed(page, "/health");
   await expect(pageHeading(page, page.getByRole("heading", { name: "Health & appointments", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
-  await expect(page.getByRole("heading", { name: "Private planning, on this browser", exact: true })).toBeVisible();
-  await expect(page.getByText(/Loading local planner/)).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+  await expect(page.getByRole("heading", { name: "Private planning, saved in Onyx", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Couldn't load your care items", exact: true }), "care items failed to load from Onyx").toHaveCount(0);
+  await expect(page.getByText(/Loading your care items/)).toHaveCount(0, { timeout: LOAD_TIMEOUT });
   await expect(page.getByRole("heading", { name: "Add care item", exact: true })).toBeVisible();
   await expect(page.getByLabel(/Show sample data/), "sample data must be opt-in").not.toBeChecked();
   await expect(page.getByRole("button", { name: /^Connect Google Calendar$/ })).toBeDisabled();

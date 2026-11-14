@@ -205,25 +205,13 @@ export function kitSummary(kit: Record<string, CheckinAnswer>): string {
 export const SCREEN_IN_BED_YES_MIN = 10;
 export const SCREEN_IN_BED_NO_MAX = 1;
 
-/**
- * `syncedPastSleepOnset`: the phone uploaded its usage AFTER that night's sleep began, so the hour before sleep
- * is fully reported. Without it a low number may only mean "not uploaded yet", so it is never read as No.
- */
-export function screenInBedSuggestion(minutesLastHour: number | string | null | undefined, syncedPastSleepOnset = true): CheckinSuggestion | null {
+export function screenInBedSuggestion(minutesLastHour: number | string | null | undefined): CheckinSuggestion | null {
   if (minutesLastHour == null || minutesLastHour === "") return null;
   const m = Number(minutesLastHour);
   if (!Number.isFinite(m)) return null;
   if (m >= SCREEN_IN_BED_YES_MIN) return { answer: "Yes", source: `Screen Time: ${Math.round(m)} min on the phone in the hour before sleep` };
-  if (m <= SCREEN_IN_BED_NO_MAX && syncedPastSleepOnset) return { answer: "No", source: "Screen Time: no phone use in the hour before sleep" };
+  if (m <= SCREEN_IN_BED_NO_MAX) return { answer: "No", source: "Screen Time: no phone use in the hour before sleep" };
   return null;
-}
-
-/** True when both instants are known and the upload is later than sleep onset. */
-export function syncedAfter(syncedAt: string | null | undefined, sleepStart: string | null | undefined): boolean {
-  if (!syncedAt || !sleepStart) return false;
-  const a = Date.parse(syncedAt);
-  const b = Date.parse(sleepStart);
-  return Number.isFinite(a) && Number.isFinite(b) && a > b;
 }
 
 /** A night counts as "in the usual bed" when Eight Sleep recorded at least this much sleep. */

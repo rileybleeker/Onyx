@@ -4,5 +4,8 @@
 # by ETL modules that the offline tests load but the HRV pipeline does not.
 -r requirements-analysis.lock
 
+# experiment_design.py reads the YAML front matter of a trial protocol (tests/test_experiment_framework.py).
+PyYAML==6.0.3
+
 # garmin_etl.py does `from garminconnect import Garmin` at import time (tests/test_garmin_*.py).
 garminconnect==0.3.6

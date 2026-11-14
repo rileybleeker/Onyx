@@ -151,7 +151,7 @@ const client = read('src/app/procurement/ProcurementClient.tsx');
 assert.match(client, /Not saved yet - setup pending/);
 assert.match(client, /setStore\(body && body\.setupPending === true \? 'pending' : 'unavailable'\)/);
 assert.match(client, /catch \{ if \(!cancelled\) setStore\('unavailable'\); \}/, 'a failed or non-JSON load must not break the page');
-for (const heading of ['Procurement', 'Disconnected preview', 'Track subscriptions', 'Plan an order', 'Why execution is disabled']) assert.ok(client.includes(`>${heading}</h`), heading);   // headings the smoke test and UI test rely on
+for (const heading of ['Procurement', 'What this page reads', 'Track subscriptions', 'Plan an order', 'Why execution is disabled']) assert.ok(client.includes(`>${heading}</h`), heading);   // headings the smoke test and UI test rely on
 assert.ok(client.includes('<button className={button} disabled>Place order (unavailable)</button>'));
 assert.ok(client.includes('No subscriptions tracked yet.'));
 
@@ -163,9 +163,27 @@ assert.equal(client.match(/Place order/g).length, 1, 'only the disabled placehol
 assert.equal((client.match(/<button[^>]*>Place order[^<]*<\/button>/g) ?? []).every(b => /\bdisabled>/.test(b)), true);
 const fetches = [...client.matchAll(/fetch\(([^,)]+)/g)].map(m => m[1].trim());
 assert.ok(fetches.length > 0 && fetches.every(f => f === 'SUBSCRIPTIONS_API' || f.startsWith('`${SUBSCRIPTIONS_API}/')), 'the page only talks to its own subscriptions API: ' + fetches.join(' | '));
+// The other files of the page: the detected-subscriptions card may call ONE thing, the PATCH that
+// remembers a dismissed flag; nothing else makes a request, and none has an order button.
+const pageFiles = fs.readdirSync(new URL('src/app/procurement/', root)).filter(f => /\.tsx?$/.test(f)).sort();
+assert.deepEqual(pageFiles, ['DetectedSubscriptions.tsx', 'ProcurementClient.tsx', 'ReorderSuggestions.tsx', 'page.tsx']);
+for (const file of pageFiles.filter(f => f !== 'ProcurementClient.tsx')) {
+  const src = read('src/app/procurement/' + file);
+  const calls = [...src.matchAll(/\bfetch\(([^,)]+)/g)].map(m => m[1].trim());
+  assert.deepEqual(calls, file === 'DetectedSubscriptions.tsx' ? ['FLAGS_API'] : [], file + ' may only call the flag-dismissal API: ' + calls.join(' | '));
+  assert.doesNotMatch(src, /https?:\/\//, file + ' must not name an outside address');
+  assert.doesNotMatch(src, /Place order|checkout|add to cart/i, file);
+}
+const detectedCard = read('src/app/procurement/DetectedSubscriptions.tsx');
+assert.match(detectedCard, /const FLAGS_API = '\/api\/procurement\/flags';/);
+assert.equal((detectedCard.match(/method: '(\w+)'/g) ?? []).join(), "method: 'PATCH'", 'the card only ever sends the dismissal PATCH');
 const routeFiles = [];
 (function walk(dir) { for (const e of fs.readdirSync(new URL(dir, root), { withFileTypes: true })) { const rel = dir + e.name + (e.isDirectory() ? '/' : ''); if (e.isDirectory()) walk(rel); else routeFiles.push(rel); } })('src/app/api/procurement/');
-assert.deepEqual(routeFiles.sort(), ['src/app/api/procurement/subscriptions/[id]/route.ts', 'src/app/api/procurement/subscriptions/route.ts'], 'only the tracker routes exist under /api/procurement');
+// The tracker routes, the read-only renewals summary Today reads (GET only; tests/procurement-renewals.test.cjs)
+// and the flag-dismissal route (PATCH only; tests/procurement-flags.test.cjs).
+assert.deepEqual(routeFiles.sort(), ['src/app/api/procurement/flags/route.ts', 'src/app/api/procurement/renewals/summary/route.ts', 'src/app/api/procurement/subscriptions/[id]/route.ts', 'src/app/api/procurement/subscriptions/route.ts'], 'only the tracker routes, the renewals summary and the flag dismissal exist under /api/procurement');
+assert.deepEqual([...read('src/app/api/procurement/renewals/summary/route.ts').matchAll(/export async function (\w+)/g)].map(m => m[1]), ['GET'], 'the renewals summary is read-only');
+assert.deepEqual([...read('src/app/api/procurement/flags/route.ts').matchAll(/export async function (\w+)/g)].map(m => m[1]), ['PATCH'], 'the flags route only records a dismissal');
 for (const file of routeFiles) {
   const src = read(file);
   const methods = [...src.matchAll(/export async function (\w+)/g)].map(m => m[1]);

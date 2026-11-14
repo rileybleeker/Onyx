@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import FocusUnlockSettings from "@/components/FocusUnlockSettings";
 import { BUILD_VARIANTS, buildApiUrl, type BuildVariant } from "@/lib/install-builds";
 
 /**
@@ -289,6 +290,7 @@ export default function InstallPage() {
         )}
 
         <FocusBuildCard />
+        <FocusUnlockSettings />
       </div>
     </div>
   );

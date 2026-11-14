@@ -26,7 +26,9 @@ import {
 import {
   SAME_NIGHT_FIRST_PREDICTION_DATE, forecastSource, isSameNightComparable, splitComparable,
 } from "@/lib/hrv-forecast-cutover";
+import type { SweetSpotRow } from "@/lib/sweet-spot";
 import type { HrvInitial } from "./HrvLoader";
+import SweetSpotPanel from "./SweetSpotPanel";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -283,13 +285,8 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
   const [causalDag, setCausalDag] = useState<any | null>(initial?.causalDag ?? null);
   const [causalMeta, setCausalMeta] = useState<any | null>(initial?.causalMeta ?? null);
   const [causalDropped, setCausalDropped] = useState<any[]>(initial?.causalDropped ?? []);
-  const [envMatrix, setEnvMatrix] = useState<any[]>(initial?.envMatrix ?? []);
+  const [envMatrix, setEnvMatrix] = useState<SweetSpotRow[]>(initial?.envMatrix ?? []);
   const [xgbDiagnostics, setXgbDiagnostics] = useState<any | null>(initial?.xgbDiagnostics ?? null);
-  // Environment Sweet Spot dual-axis selectors. X axis is which temp sensor
-  // to bucket by (Pod room vs bed surface); Y axis is which outcome of
-  // that same night to plot. Defaults preserve the original chart (room × HRV).
-  const [envXAxis, setEnvXAxis] = useState<"room" | "bed">("room");
-  const [envOutcome, setEnvOutcome] = useState<"hrv" | "recovery" | "efficiency" | "deep">("hrv");
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
   const [range, setRange] = useState<Range>(DEFAULT_RANGE);
@@ -2342,239 +2339,19 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       </DeferredMount>
 
       <SectionHeader id="environment" tick="descriptive" title="Environment" />
-      {/* ── Environment Sweet Spot: dose-response for controllable inputs ── */}
+      {/* ── Environment Sweet Spot: descriptive dose-response for day-D inputs ── */}
       {/*
-        The causal layer above answers "does warmer/cooler than usual move HRV?"
-        (binary direction). This panel answers the different question "what
-        SPECIFIC temperature is optimal for me?" by binning every night by the
-        selected temperature sensor and showing the mean of the selected
-        outcome of that same night per bucket. Peak bucket = personal sweet spot for
-        that outcome. Error bars are ±1 SEM. Computed client-side from
-        daily_health_matrix; no python pipeline dependency.
-
-        Both X and Y axes are user-selectable (since 2026-05-25): toggle
-        between Pod room temp / bed surface temp on the X axis, and HRV /
-        Recovery Score / Sleep Efficiency / Deep Sleep duration on the Y.
-        The optimal temperature for HRV may differ from optimal for deep
-        sleep — surfacing that lets you pick a target based on the metric
-        you actually want to optimize.
+        The causal layer above answers "does more / less than usual move HRV?"
+        (binary direction). This panel answers the different, descriptive
+        question "at which level of an input did my best nights sit?": nights
+        are bucketed by the selected input (bedroom / bed temperature, last meal
+        to bedtime, calories, caffeine) and the mean of the selected outcome of
+        that same night is plotted per bucket (±1 SEM), with a least-squares
+        parabola over the nightly points. Logic: lib/sweet-spot.ts; data:
+        getEnvDoseResponseData (matview, no python pipeline dependency).
       */}
-      <DeferredMount minHeight={780}>
-      {(() => {
-        const X_AXIS_META = {
-          room: {
-            label: "Room temp",
-            column: "eight_sleep_room_temp",
-            axisLabel: "median room temp (°F · Pod sensor, uncalibrated)",
-            sensorCaveat: "the Pod's room-temp sensor sits on the unit (in/under the bed) and reads warmer than a wall thermostat by an unknown amount — the relative shape (peak vs trough) is valid for finding your personal optimum, but absolute Fahrenheit values aren't.",
-          },
-          bed: {
-            label: "Bed temp",
-            column: "eight_sleep_bed_temp",
-            axisLabel: "median bed-surface temp (°F · Pod sensor)",
-            sensorCaveat: "bed temp reflects both your Pod heater/cooler setpoint AND your body warming the surface — it's partly an OUTPUT of how hot you slept, not just an input. Treat the peak as 'the bed temp my best nights converged on' rather than a setpoint recommendation.",
-          },
-        } as const;
-        const Y_OUTCOMES = {
-          hrv: { label: "WHOOP HRV", column: "whoop_hrv_rmssd", unit: "ms", axisLabel: "WHOOP HRV (ms)" },
-          recovery: { label: "Recovery Score", column: "whoop_recovery_score", unit: "%", axisLabel: "WHOOP Recovery (%)" },
-          efficiency: { label: "Sleep Efficiency", column: "whoop_sleep_efficiency", unit: "%", axisLabel: "WHOOP Sleep Efficiency (%)" },
-          deep: { label: "Deep Sleep", column: "whoop_deep_sleep_milli", unit: "min", axisLabel: "WHOOP Deep Sleep (min)" },
-        } as const;
-        const xMeta = X_AXIS_META[envXAxis];
-        const yMeta = Y_OUTCOMES[envOutcome];
-        const useableRows = envMatrix.filter(
-          (d: any) => d[xMeta.column] != null && d[yMeta.column] != null
-        );
-      return (
-      <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 shadow-card">
-        <div className="flex items-start justify-between gap-3 mb-4">
-          <div>
-            <h3 className="text-[18px] font-medium text-text-primary">Environment Sweet Spot</h3>
-            <p className="text-[12px] text-text-tertiary mt-1">
-              Mean {yMeta.label} per {xMeta.label.toLowerCase()} bucket · {useableRows.length} nights
-            </p>
-          </div>
-          <span className="text-[9px] font-mono text-text-tertiary px-2 py-0.5 rounded border border-border-subtle">
-            BINNED MEAN ± SEM
-          </span>
-        </div>
-
-        {/* Axis selectors — surfaced above the explanation block so the
-            chart-controls relationship is obvious. */}
-        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 mb-4 text-[11px] font-mono">
-          <div className="flex items-center gap-2">
-            <span className="text-text-tertiary uppercase tracking-wide">Temp sensor</span>
-            {(Object.keys(X_AXIS_META) as Array<keyof typeof X_AXIS_META>).map((k) => (
-              <button
-                key={k}
-                onClick={() => setEnvXAxis(k)}
-                className={`px-2 py-0.5 rounded-[3px] border ${envXAxis === k
-                  ? "bg-accent/15 border-accent/40 text-text-primary"
-                  : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"}`}
-              >
-                {X_AXIS_META[k].label}
-              </button>
-            ))}
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-text-tertiary uppercase tracking-wide">Outcome</span>
-            {(Object.keys(Y_OUTCOMES) as Array<keyof typeof Y_OUTCOMES>).map((k) => (
-              <button
-                key={k}
-                onClick={() => setEnvOutcome(k)}
-                className={`px-2 py-0.5 rounded-[3px] border ${envOutcome === k
-                  ? "bg-up/15 border-up/40 text-text-primary"
-                  : "border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-hover"}`}
-              >
-                {Y_OUTCOMES[k].label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="text-[12px] text-text-secondary leading-relaxed space-y-3 max-w-4xl mb-4">
-          <p>
-            The Causal Inference section above tells you whether <em>warmer-than-usual</em> or
-            <em> cooler-than-usual</em> moves your outcome (binary direction). This panel
-            answers a different question: <strong>which specific temperature is actually
-            optimal for the outcome you care about?</strong>{" "}
-            Every night with both a temperature reading and a {yMeta.label.toLowerCase()}{" "}
-            value is binned into 2°F buckets and plotted as the per-bucket mean. The peak
-            bucket is your personal sweet spot for that outcome. The optimal temperature
-            for HRV may differ from the optimal for deep sleep — that&apos;s the point of
-            the outcome toggle.
-          </p>
-          <p>
-            <strong>Error bars are ±1 SEM</strong> (standard error of the mean). Narrower bars
-            = more nights in that bucket = more trustworthy. Bars at &lt;35% opacity have n&lt;5
-            nights and shouldn&apos;t drive decisions yet.
-          </p>
-          <p>
-            <strong>⚠ Sensor caveat ({xMeta.label}):</strong> {xMeta.sensorCaveat} Filed
-            a follow-up to calibrate empirically by leaving a separate thermometer in the
-            room for a week and deriving the real offset from paired readings.
-          </p>
-          <p className="text-[11px] text-text-tertiary">
-            <strong>Sample size today:</strong> {useableRows.length} nights collected for
-            this {xMeta.label.toLowerCase()} × {yMeta.label.toLowerCase()} pair.{" "}
-            {useableRows.length < 30 && (
-              <span>Directional reads need <strong>~30 nights</strong>; confident reads need <strong>~100</strong>. Eight Sleep&apos;s intervals API began exposing temp data ~2026-05-15, so this fills in one night per daily ETL run going forward.</span>
-            )}
-            {useableRows.length >= 30 && useableRows.length < 100 && (
-              <span>Enough for a <strong>directional read</strong>. More nights will tighten the bars.</span>
-            )}
-            {useableRows.length >= 100 && (
-              <span>Sample size is sufficient for a <strong>confident read</strong> on the optimal bucket.</span>
-            )}
-          </p>
-        </div>
-
-        {(() => {
-          if (useableRows.length === 0) {
-            return (
-              <p className="text-[11px] text-text-tertiary py-8 text-center">
-                No nights with both {xMeta.label.toLowerCase()} and {yMeta.label.toLowerCase()} yet.
-                Will populate as the nightly ETL accumulates new data.
-              </p>
-            );
-          }
-
-          // Convert °C → °F at the bin boundary (DB canonical = °C). Outcome
-          // conversion for milliseconds-stored fields (deep sleep) → minutes
-          // so the Y axis reads in user-native units.
-          const cToF = (c: number) => c * 9 / 5 + 32;
-          const outcomeToDisplay = (raw: number) =>
-            envOutcome === "deep" ? raw / 60000 : raw; // ms → min for deep sleep
-          const BUCKET_SIZE = 2.0; // °F bins
-          const buckets: Record<string, number[]> = {};
-          useableRows.forEach((d: any) => {
-            const tC = Number(d[xMeta.column]);
-            const yRaw = Number(d[yMeta.column]);
-            if (isNaN(tC) || isNaN(yRaw)) return;
-            const tF = cToF(tC);
-            const start = Math.floor(tF / BUCKET_SIZE) * BUCKET_SIZE;
-            const key = start.toFixed(1);
-            if (!buckets[key]) buckets[key] = [];
-            buckets[key].push(outcomeToDisplay(yRaw));
-          });
-
-          const rows = Object.entries(buckets)
-            .map(([k, ys]) => {
-              const n = ys.length;
-              const mean = ys.reduce((a, b) => a + b, 0) / n;
-              const variance = n > 1
-                ? ys.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1)
-                : 0;
-              const sd = Math.sqrt(variance);
-              const sem = n > 1 ? sd / Math.sqrt(n) : 0;
-              const lo = parseFloat(k);
-              return {
-                start: lo,
-                bucket: `${lo.toFixed(0)}–${(lo + BUCKET_SIZE).toFixed(0)}°F`,
-                n,
-                meanY: +mean.toFixed(1),
-                sem: +sem.toFixed(2),
-                sd: +sd.toFixed(2),
-              };
-            })
-            .sort((a, b) => a.start - b.start);
-
-          if (rows.length === 0) {
-            return <p className="text-[11px] text-text-tertiary py-8 text-center">No valid data to bucket.</p>;
-          }
-
-          const reliable = rows.filter(r => r.n >= 5);
-          const peakRow = (reliable.length > 0 ? reliable : rows).reduce(
-            (m, r) => (r.meanY > m.meanY ? r : m)
-          );
-
-          return (
-            <>
-              <ResponsiveContainer width="100%" height={280}>
-                <BarChart data={rows} margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
-                  <CartesianGrid {...gridStyle} />
-                  <XAxis dataKey="bucket" tick={axisTick}
-                    label={axisLabel(xMeta.axisLabel, "x")} />
-                  <YAxis tick={axisTick} width={55}
-                    label={axisLabel(yMeta.axisLabel, "y")} />
-                  <Tooltip {...chartTooltip}
-                    formatter={(v: any, _name: any, p: any) => {
-                      const d = p?.payload ?? {};
-                      return [
-                        `${Number(v).toFixed(1)} ${yMeta.unit} (n=${d.n}, SEM=±${d.sem}, SD=${d.sd})`,
-                        `Mean ${yMeta.label}`,
-                      ];
-                    }} />
-                  <Bar dataKey="meanY" radius={[2, 2, 0, 0]} isAnimationActive={false}>
-                    {rows.map((r, i) => (
-                      <Cell key={i}
-                        fill={r.bucket === peakRow.bucket ? C.up : C.accent}
-                        fillOpacity={r.n < 5 ? 0.35 : 0.85} />
-                    ))}
-                    <ErrorBar dataKey="sem" width={4} strokeWidth={1.5} stroke={C.source.whoop} />
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-              <p className="text-[11px] text-text-tertiary mt-3">
-                {rows.length >= 3 && useableRows.length >= 10 ? (
-                  <>
-                    Peak bucket ({xMeta.label.toLowerCase()}):{" "}
-                    <strong className="text-text-secondary">{peakRow.bucket}</strong>,{" "}
-                    {peakRow.meanY} {yMeta.unit} mean {yMeta.label.toLowerCase()} across{" "}
-                    {peakRow.n} night{peakRow.n !== 1 ? "s" : ""}.
-                    {reliable.length === 0 && " ⚠ No buckets yet have ≥5 nights — treat the peak as preliminary."}
-                  </>
-                ) : (
-                  <>Too few nights / buckets to identify a meaningful peak. Check back as data accumulates.</>
-                )}
-              </p>
-            </>
-          );
-        })()}
-      </div>
-      );
-      })()}
+      <DeferredMount minHeight={900}>
+        <SweetSpotPanel rows={envMatrix} />
       </DeferredMount>
 
       {/* PM2.5 panel: fetches /api/air-quality itself (service-role table, not in the ISR prefetch). */}

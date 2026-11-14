@@ -1,5 +1,13 @@
 # iPhone screen time → Onyx (Shortcuts setup)
 
+> **RETIRED 2026-11-13. Do not follow these steps.** This Shortcuts open/close
+> path was never set up and never recorded an event. Screen time now comes from
+> the Onyx Screen Time iPhone app (`tools/screentime_ios/README.md`), shown on
+> `/screen-time`. The endpoint below (`POST /api/screen-time/event`) has been
+> removed, so the automations described here would get a 404. The empty
+> `pds.phone_app_events` table and its two views still exist; dropping them is a
+> separate, approved step. The text below is kept only as a record.
+
 Apple keeps Screen Time data on the phone (Opal too — no API, no export), so
 Onyx records app use itself: two Shortcuts automations post every app open and
 close to `POST /api/screen-time/event`. Onyx pairs them into sessions

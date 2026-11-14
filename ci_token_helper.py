@@ -18,6 +18,7 @@ Usage:
 import os
 import sys
 import json
+import hashlib
 import logging
 from datetime import datetime, timezone
 
@@ -123,6 +124,10 @@ def download_spotify():
 
     with open(SPOTIFY_TOKEN_FILE, "w") as f:
         f.write(token_data)
+    # Remember what was downloaded, so upload_spotify can tell "the ETL refreshed the
+    # token" from "the ETL never got that far" (see there).
+    with open(_spotify_baseline_file(), "w") as f:
+        f.write(_file_sha256(SPOTIFY_TOKEN_FILE))
 
     log.info(f"Spotify tokens written to {SPOTIFY_TOKEN_FILE}")
 
@@ -219,14 +224,51 @@ def upload_whoop():
     log.info("WHOOP tokens uploaded to Supabase")
 
 
+def _spotify_baseline_file() -> str:
+    return SPOTIFY_TOKEN_FILE + ".downloaded.sha256"
+
+
+def _file_sha256(path: str) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def upload_spotify():
-    """Read Spotify tokens from ~/.spotify_tokens.json and upload to Supabase."""
+    """Read Spotify tokens from ~/.spotify_tokens.json and upload to Supabase.
+
+    The workflow runs this with `if: always()`, so it must be safe after a failed ETL:
+      * a file that is empty, not JSON or has no refresh token is never uploaded (exit 1);
+      * a file identical to what `download spotify` wrote is not uploaded (exit 0). The
+        ETL rewrites the file on every successful refresh, so "identical" means it never
+        refreshed: uploading would only put the same, possibly dead, token back, over
+        whatever was stored in the meantime (a fresh sign-in, or a token the frontend
+        rotated). Until 2026-11-13 a failing run re-uploaded the dead token every hour.
+    A refreshed file is uploaded even when the ETL failed later in the run, so a rotated
+    refresh token is not lost. With no download baseline (local use after --auth) it
+    always uploads.
+    """
     if not os.path.exists(SPOTIFY_TOKEN_FILE):
         log.error(f"Spotify token file not found: {SPOTIFY_TOKEN_FILE}")
         sys.exit(1)
 
     with open(SPOTIFY_TOKEN_FILE, "r") as f:
         token_data = f.read()
+
+    try:
+        parsed = json.loads(token_data)
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, dict) or not parsed.get("refresh_token"):
+        log.error("Spotify token file is empty or has no refresh token; not uploading")
+        sys.exit(1)
+
+    baseline = _spotify_baseline_file()
+    if os.path.exists(baseline):
+        with open(baseline, "r") as f:
+            downloaded_sha = f.read().strip()
+        if downloaded_sha == _file_sha256(SPOTIFY_TOKEN_FILE):
+            log.info("Spotify token file unchanged since download (no successful refresh); not uploading")
+            return
 
     sb = get_supabase()
     sb.schema("pds").table("ci_tokens").upsert({

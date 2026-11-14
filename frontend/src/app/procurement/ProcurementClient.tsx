@@ -6,7 +6,11 @@ import {
   money, preparedListText, renewalReminderIcs, reviewPrompts, summarizeSubscriptions, syntheticSubscriptions,
   EXAMPLES, type Draft, type Subscription,
 } from '@/lib/procurement';
-import type { DetectedLoad, DetectedSubscription } from '@/lib/procurement-recurring';
+import type { DetectedLoad } from '@/lib/procurement-recurring';
+import type { AdviceLoad } from '@/lib/procurement-flags';
+import type { ReorderLoad } from '@/lib/procurement-reorder';
+import ReorderSuggestions from './ReorderSuggestions';
+import DetectedSubscriptions from './DetectedSubscriptions';
 const card = 'rounded-xl border border-border-subtle bg-surface-card p-5 space-y-4';
 const field = 'block w-full rounded border border-border-subtle bg-transparent p-2 mt-1';
 const button = 'rounded border border-border-subtle px-3 py-2 text-sm hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed';
@@ -19,35 +23,7 @@ const persistenceNote = {
 } as const;
 const cycleLabel = { monthly: 'month', quarterly: 'quarter', annual: 'year' } as const;
 function relative(daysAway: number) { return daysAway === 0 ? 'today' : daysAway === 1 ? 'tomorrow' : `in ${daysAway} days`; }
-const detectedCadence = { weekly: 'week', monthly: 'month', quarterly: 'quarter', annual: 'year' } as const;
-function dayNum(iso: string) { return Math.round(Date.parse(`${iso}T00:00:00Z`) / 86400000); }
-function relativeFrom(today: string, iso: string) {
-  const d = dayNum(iso) - dayNum(today);
-  if (d === 0) return 'today'; if (d === 1) return 'tomorrow'; if (d === -1) return 'yesterday';
-  return d > 0 ? `in ${d} days` : `${-d} days ago`;
-}
-function DetectedRow({ sub, today }: { sub: DetectedSubscription; today: string }) {
-  return <li className="border-t border-border-subtle pt-3 flex flex-wrap gap-3 justify-between"><div><h3>{sub.merchant}</h3><p className="text-sm">{money(sub.typicalCents)} / {detectedCadence[sub.cadence]} · last charged {formatDate(sub.lastCharge)} · next expected {formatDate(sub.nextExpected)} ({relativeFrom(today, sub.nextExpected)})</p></div><p className="text-sm text-text-secondary">about {money(sub.monthlyCents)} / month</p></li>;
-}
-function DetectedCard({ detected }: { detected: DetectedLoad }) {
-  const active = detected.state === 'ok' ? detected.subs.filter(s => s.status === 'active') : [];
-  const lapsed = detected.state === 'ok' ? detected.subs.filter(s => s.status === 'lapsed') : [];
-  const today = detected.state === 'ok' ? detected.today : '';
-  return <section className={card} aria-label="Detected subscriptions" data-testid="procurement-detected" data-state={detected.state}>
-    <h2 className="text-xl font-semibold">Detected subscriptions</h2>
-    <p className="text-sm text-text-secondary">Recurring charges found in your Rocket Money ledger over the last 400 days. Read-only: Onyx never cancels or pays anything.</p>
-    {detected.state === 'error' && <p role="alert" className="text-red-400">Couldn&apos;t read the ledger (code {detected.code}), so no subscriptions are shown. This is a failed query, not an empty ledger.</p>}
-    {detected.state === 'empty' && <p>No ledger data yet. Subscriptions appear here after the daily Rocket Money import; nothing is invented in the meantime.</p>}
-    {detected.state === 'ok' && (detected.subs.length === 0
-      ? <p>The ledger was read but no recurring charges were found in it.</p>
-      : <div className="space-y-4">
-        <p>About {money(detected.total)} / month across {active.length} active subscription{active.length === 1 ? '' : 's'}.</p>
-        {active.length > 0 && <ul className="space-y-3">{active.map(s => <DetectedRow key={`${s.merchant}|${s.cadence}`} sub={s} today={today} />)}</ul>}
-        {lapsed.length > 0 && <details><summary className="cursor-pointer text-sm">{lapsed.length} lapsed (no recent charge)</summary><ul className="space-y-3 mt-3">{lapsed.map(s => <DetectedRow key={`${s.merchant}|${s.cadence}`} sub={s} today={today} />)}</ul></details>}
-      </div>)}
-  </section>;
-}
-export default function ProcurementClient({ detected }: { detected: DetectedLoad }) {
+export default function ProcurementClient({ detected, advice, reorder }: { detected: DetectedLoad; advice: AdviceLoad | null; reorder: ReorderLoad }) {
   const [examples, setExamples] = useState(false);
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [error, setError] = useState('');
@@ -154,12 +130,13 @@ export default function ProcurementClient({ detected }: { detected: DetectedLoad
     catch { setNotice('Copy is not available here. Select the list text and copy it by hand.'); }
   }
   return <main className="max-w-5xl mx-auto p-4 md:p-8 space-y-6">
-    <header><p className="text-xs uppercase tracking-widest text-text-tertiary">Planning workspace</p><h1 data-testid="page-heading" className="text-3xl font-semibold mt-2">Procurement</h1><p className="text-text-secondary mt-2">Review subscriptions, plan orders, and evaluate purchases.</p></header>
-    <DetectedCard detected={detected} />
-    <section className={card} aria-label="Connection status"><h2 className="text-lg font-semibold">Disconnected preview</h2><p>No merchant accounts are connected. Onyx never buys, checks out or submits anything on a merchant site: it prepares lists and reminders for you to act on yourself. Order drafts stay in memory for this visit and disappear on reload; tracked subscriptions are saved to your Onyx account once the one-time Supabase setup has been applied (the note under Track subscriptions says which). Do not enter payment details, credentials, addresses, or sensitive information.</p><ul className="text-sm text-text-secondary"><li>Subscription providers: {CAPABILITIES.providers}</li><li>Orders: {CAPABILITIES.orders}</li><li>Recommendations: {CAPABILITIES.recommendations}</li><li>Tracking: {CAPABILITIES.tracking}</li><li>Reminders: {CAPABILITIES.reminders}</li></ul></section>
+    <header><p className="text-xs uppercase tracking-widest text-text-tertiary">Planning workspace</p><h1 data-testid="page-heading" className="text-3xl font-semibold mt-2">Procurement</h1><p className="text-text-secondary mt-2">Read-only advice from your own data: which subscriptions renew soon, what they cost and which ones are worth a second look, and what you usually reorder, with a hand-typed tracker and an order planner below. Onyx never buys, pays or cancels anything.</p></header>
+    <DetectedSubscriptions detected={detected} advice={advice} />
+    <ReorderSuggestions reorder={reorder} />
+    <section className={card} aria-label="What this page reads"><h2 className="text-lg font-semibold">What this page reads</h2><p>Subscriptions, renewal dates and flags are worked out from your Rocket Money ledger (and, for use, your iPhone Screen Time data) by fixed rules, on the server, each time the page loads; purchase suggestions come the same way from the order history behind the Orders page. No merchant account is connected and no model reads your transactions. Onyx never buys, checks out or submits anything on a merchant site: it prepares lists and reminders for you to act on yourself. Order drafts stay in memory for this visit and disappear on reload; tracked subscriptions are saved to your Onyx account once the one-time Supabase setup has been applied (the note under Track subscriptions says which). Do not enter payment details, credentials, addresses, or sensitive information.</p><ul className="text-sm text-text-secondary"><li>Subscription providers: {CAPABILITIES.providers}</li><li>Orders: {CAPABILITIES.orders}</li><li>Recommendations: {CAPABILITIES.recommendations}</li><li>Tracking: {CAPABILITIES.tracking}</li><li>Reminders: {CAPABILITIES.reminders}</li></ul></section>
     <div className="grid md:grid-cols-2 gap-6">
       <section className={card}><h2 className="text-xl font-semibold">Subscriptions</h2><p className="text-text-secondary">No merchant or provider is connected, so nothing is managed from here. Subscriptions are detected from your ledger at the top of the page; you can also track them by hand in the next section.</p><button className={button} onClick={() => setExamples(value => !value)}>{examples ? 'Hide synthetic examples' : 'Show synthetic examples'}</button>{examples && <div className="space-y-3"><p className="text-xs uppercase">Synthetic examples, not your subscriptions</p>{EXAMPLES.map(example => <article className="border-t border-border-subtle pt-3" key={example.name}><h3>{example.name}</h3><p>{money(example.monthlyCents)} / month, illustrative</p><p className="text-sm text-text-secondary">{example.note}</p></article>)}</div>}<button className={button} disabled>Manage with provider (unavailable)</button></section>
-      <section className={card}><h2 className="text-xl font-semibold">Purchase recommendations</h2><p>No personalized recommendations yet. Product search, current prices, availability, and account history are not connected.</p><ul className="list-disc pl-5 text-sm text-text-secondary space-y-2"><li>Start with the need and total budget.</li><li>Compare the full delivered price, recurring costs, and return terms.</li><li>Check existing subscriptions before adding a duplicate.</li></ul><p className="text-xs text-text-tertiary">These are planning tips, not researched product offers. The review prompts under Track subscriptions come only from what you type in.</p></section>
+      <section className={card}><h2 className="text-xl font-semibold">Before you buy</h2><p>Purchase suggestions above come from your own order history. Onyx does not search products, compare current prices or check availability.</p><ul className="list-disc pl-5 text-sm text-text-secondary space-y-2"><li>Start with the need and total budget.</li><li>Compare the full delivered price, recurring costs, and return terms.</li><li>Check existing subscriptions before adding a duplicate.</li></ul><p className="text-xs text-text-tertiary">These are planning tips, not researched product offers. The review prompts under Track subscriptions come only from what you type in.</p></section>
     </div>
     <section className={card}><h2 className="text-xl font-semibold">Track subscriptions</h2><p className="text-sm text-text-secondary">Type in what you pay for, see the monthly and yearly cost, and get a calendar reminder file before each renewal. This does not cancel, change or pay for anything.</p><p className="text-sm text-text-secondary" data-testid="procurement-persistence" data-state={store}>{persistenceNote[store]}</p>
       <form onSubmit={addSubscription} className="grid md:grid-cols-2 gap-4"><label>Subscription name<input className={field} name="subName" required maxLength={80}/></label><label>Price per cycle (USD)<input className={field} name="subAmount" inputMode="decimal" required placeholder="0.00"/></label><label>Billing cycle<select className={field} name="subCycle" defaultValue="monthly"><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annual">Annual</option></select></label><label>Next renewal date<input className={field} name="subRenews" type="date" required/></label><button className={button} type="submit" disabled={busy}>Add subscription</button></form>

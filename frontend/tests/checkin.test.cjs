@@ -186,15 +186,10 @@ test("sleepDateError: a Yes/No to a sleep question is refused for today or later
   assert.match(C.sleepDateError(C.Q_READ_IN_BED, "2031-03-05", "2031-03-05", "Yes"), /already happened/);
 });
 
-test("screen in bed is never pre-filled No before the phone has synced past sleep onset", () => {
-  assert.equal(C.screenInBedSuggestion(0, false), null);
-  assert.equal(C.screenInBedSuggestion(0, true).answer, "No");
-  assert.equal(C.screenInBedSuggestion(25, false).answer, "Yes"); // enough minutes already reported
-  assert.equal(C.syncedAfter("2031-03-05T15:00:00Z", "2031-03-05T07:00:00Z"), true);
-  assert.equal(C.syncedAfter("2031-03-05T06:00:00Z", "2031-03-05T07:00:00Z"), false);
-  assert.equal(C.syncedAfter(null, "2031-03-05T07:00:00Z"), false);
-  assert.equal(C.syncedAfter("2031-03-05T15:00:00Z", null), false);
-  assert.equal(C.syncedAfter("nonsense", "2031-03-05T07:00:00Z"), false);
+test("the night's screen-in-bed pre-fill goes through the Screen Time readiness gate", () => {
+  const route = fs.readFileSync(path.join(SRC, "app/api/habits/checkin/route.ts"), "utf8");
+  assert.match(route, /screenInBedSuggestion\(settledLastHourMinutes\(data, night\)\)/);
+  assert.equal(/minutes_last_hour_before_sleep_est/.test(route), false); // never read raw in the route
 });
 
 test("a stale page cannot write: the POST refuses a `today` that is no longer today, before anything else", () => {

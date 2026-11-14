@@ -3,12 +3,20 @@
 import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
 import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, type ChatMessage } from "@/lib/chat-contract";
+import { parseReceipts, type WriteReceipt } from "@/lib/chat-receipts";
+import ChatMarkdown from "@/components/ChatMarkdown";
+import ChatReceipts from "@/components/ChatReceipts";
+
+/** A message as shown on the page. Receipts are display-only: the API gets role + text. */
+type ShownMessage = ChatMessage & { receipts?: WriteReceipt[] };
 
 export default function ChatPage() {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ShownMessage[]>([]);
   const [input, setInput] = useState("");
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // What a failed request had already written before it stopped.
+  const [errorReceipts, setErrorReceipts] = useState<WriteReceipt[]>([]);
   const sending = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -27,7 +35,7 @@ export default function ChatPage() {
   async function send() {
     const text = input.trim();
     if (!text || sending.current) return;
-    const updated: ChatMessage[] = [...messages, { role: "user", content: text }];
+    const updated: ShownMessage[] = [...messages, { role: "user", content: text }];
     if (updated.length > MAX_CHAT_MESSAGES || updated.reduce((n, m) => n + m.content.length, 0) > MAX_CHAT_CHARACTERS) {
       setError("This conversation is full. Start a new chat to continue.");
       return;
@@ -36,20 +44,24 @@ export default function ChatPage() {
     setPending(text);
     setInput("");
     setError(null);
+    setErrorReceipts([]);
+    let written: WriteReceipt[] = [];
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: updated }),
+        body: JSON.stringify({ messages: updated.map(({ role, content }) => ({ role, content })) }),
       });
       const data = await res.json().catch(() => null);
+      written = parseReceipts(data?.receipts);
       if (res.redirected || res.status === 401) throw new Error("Your session may have expired. Sign in again.");
       if (!res.ok || typeof data?.response !== "string" || !data?.response.trim()) {
         throw new Error(typeof data?.error === "string" ? data.error : "Onyx could not finish this response.");
       }
-      setMessages([...updated, { role: "assistant", content: data.response }]);
+      setMessages([...updated, { role: "assistant", content: data.response, ...(written.length > 0 ? { receipts: written } : {}) }]);
     } catch (err) {
       setInput(text);
+      setErrorReceipts(written);
       setError(`${err instanceof Error ? err.message : "Unable to connect to Onyx."} Your message is back in the composer. If it requested an action, check the relevant page before sending again.`);
     } finally {
       sending.current = false;
@@ -62,10 +74,11 @@ export default function ChatPage() {
     setMessages([]);
     setInput("");
     setError(null);
+    setErrorReceipts([]);
     inputRef.current?.focus();
   }
 
-  const displayed: ChatMessage[] = pending === null ? messages : [...messages, { role: "user", content: pending }];
+  const displayed: ShownMessage[] = pending === null ? messages : [...messages, { role: "user", content: pending }];
 
   return (
     <div className="flex flex-col h-[calc(100dvh-4rem)] max-md:h-[calc(100dvh-8rem)] min-h-0">
@@ -73,7 +86,7 @@ export default function ChatPage() {
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Chat with Onyx</h2>
           <p className="text-sm text-text-tertiary mt-0.5">Think, plan, write, or explore your connected data.</p>
-          <p className="text-xs text-text-tertiary mt-2">Conversation stays on this page only. Reloading or leaving clears it. Tool actions are saved separately.</p>
+          <p className="text-xs text-text-tertiary mt-2">Conversation stays on this page only. Reloading or leaving clears it. Anything Onyx logs or creates is saved right away and listed under the reply.</p>
         </div>
         <button onClick={newChat} disabled={loading || (!messages.length && !error)} className="shrink-0 text-sm text-text-secondary border border-border-subtle rounded px-3 py-2 disabled:opacity-40">New chat</button>
       </div>
@@ -93,9 +106,19 @@ export default function ChatPage() {
         )}
         {displayed.map((msg, i) => (
           <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-            <div className={`max-w-[90%] sm:max-w-[80%] break-words rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap ${msg.role === "user" ? "bg-accent text-white" : "bg-surface-raised text-text-secondary border border-border-subtle"}`}>
-              <span className="sr-only">{msg.role === "user" ? "You: " : "Onyx: "}</span>{msg.content}
-            </div>
+            {msg.role === "user" ? (
+              <div className="max-w-[90%] sm:max-w-[80%] break-words rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap bg-accent text-white">
+                <span className="sr-only">You: </span>{msg.content}
+              </div>
+            ) : (
+              <div className="min-w-0 max-w-[90%] sm:max-w-[80%]">
+                <div className="break-words rounded-2xl px-4 py-3 text-sm leading-relaxed bg-surface-raised text-text-secondary border border-border-subtle">
+                  <span className="sr-only">Onyx: </span>
+                  <ChatMarkdown text={msg.content} />
+                </div>
+                {msg.receipts && <ChatReceipts receipts={msg.receipts} />}
+              </div>
+            )}
           </div>
         ))}
 
@@ -104,7 +127,12 @@ export default function ChatPage() {
       </div>
 
       {loading && <p role="status" className="text-sm text-text-tertiary mb-3 animate-pulse">Thinking...</p>}
-      {error && <p role="alert" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 mb-3">{error}</p>}
+      {error && (
+        <div role="alert" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 mb-3 max-h-[40dvh] overflow-y-auto">
+          <p>{error}</p>
+          <ChatReceipts receipts={errorReceipts} heading="Before it stopped, this request had already done the following" />
+        </div>
+      )}
       <form onSubmit={(event) => { event.preventDefault(); void send(); }} className="flex gap-2 shrink-0">
         <label htmlFor="onyx-message" className="sr-only">Message Onyx</label>
         <textarea id="onyx-message" ref={inputRef} rows={2} value={input} onChange={(e) => setInput(e.target.value)}
