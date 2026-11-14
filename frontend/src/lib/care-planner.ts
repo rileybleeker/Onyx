@@ -273,28 +273,3 @@ export function sampleItems(today: string): CareItem[] {
     mk(5, 'Sample: skin check', 'medical', 6, 12, false),
   ];
 }
-
-// ---- Calendar connection (nothing is connected in this release) -------------
-
-export type CalendarPermission = { id: 'read-calendars' | 'write-events'; label: string; granted: boolean };
-export type CalendarConnection = {
-  provider: string;
-  status: 'disconnected';
-  statusLabel: string;
-  permissions: CalendarPermission[];
-  canConnect: boolean;
-};
-
-// Static on purpose: no sign-in, token or calendar read/write exists. Both
-// permissions are listed as not granted so the page can say exactly what a
-// future connection would ask for, and nothing here claims otherwise.
-export const CALENDAR_CONNECTION: CalendarConnection = {
-  provider: 'Google Calendar',
-  status: 'disconnected',
-  statusLabel: 'Not connected',
-  permissions: [
-    { id: 'read-calendars', label: 'Read your calendars (to avoid double-booking)', granted: false },
-    { id: 'write-events', label: 'Create and update events on one calendar you choose', granted: false },
-  ],
-  canConnect: false,
-};

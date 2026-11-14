@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { CARE_COLUMNS, MAX_CARE_ITEMS, MAX_ITEM_BODY_BYTES, parseCareItem, rowToItem, toColumns } from "@/lib/care-items";
+import { syncAfterWrite } from "@/lib/care-google-server";
 import { careDb, careJson, liveCareCount, loadCareItems, readCareBody } from "@/lib/care-items-server";
 
 export const dynamic = "force-dynamic";
@@ -34,7 +35,9 @@ export async function POST(req: NextRequest) {
     .single();
   if (!error) {
     const item = rowToItem(data);
-    return item ? careJson({ item }, 201) : careJson({ error: "could not save" }, 500);
+    if (!item) return careJson({ error: "could not save" }, 500);
+    syncAfterWrite(); // Google Calendar, only when connected; runs after this response
+    return careJson({ item }, 201);
   }
   if (error.code !== "23505") {
     console.error("care item insert failed:", error.code || "unknown");

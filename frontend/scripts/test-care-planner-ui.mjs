@@ -17,7 +17,7 @@ const frontend = fileURLToPath(new URL('..', import.meta.url));
 const fixture = await mkdtemp(path.join(tmpdir(), 'onyx-care-ui-'));
 for (const dir of ['src/app/health', 'src/lib']) await mkdir(path.join(fixture, dir), { recursive: true });
 await symlink(path.join(frontend, 'node_modules'), path.join(fixture, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
-for (const file of ['src/lib/care-planner.ts', 'src/lib/care-items.ts', 'src/app/health/HealthClient.tsx', 'src/app/health/CareCalendar.tsx', 'src/app/health/CalendarConnectionCard.tsx', 'src/app/globals.css']) {
+for (const file of ['src/lib/care-planner.ts', 'src/lib/care-items.ts', 'src/lib/care-google.ts', 'src/app/health/HealthClient.tsx', 'src/app/health/CareCalendar.tsx', 'src/app/health/CalendarConnectionCard.tsx', 'src/app/globals.css']) {
   await copyFile(path.join(frontend, file), path.join(fixture, file));
 }
 await copyFile(path.join(frontend, 'postcss.config.mjs'), path.join(fixture, 'postcss.config.mjs'));
@@ -33,10 +33,14 @@ await writeFile(path.join(fixture, 'src/app/initial.json'), JSON.stringify(seed)
 await writeFile(path.join(fixture, 'src/app/page.tsx'), `import HealthClient from './health/HealthClient';
 import seed from './initial.json';
 export const dynamic = 'force-dynamic';
-export default async function Page({ searchParams }: { searchParams: Promise<{ state?: string }> }) {
-  const { state } = await searchParams;
+export default async function Page({ searchParams }: { searchParams: Promise<{ state?: string; cal?: string }> }) {
+  const { state, cal } = await searchParams;
   const initial = state === 'error' ? { state: 'error' } : { state: 'ready', items: state === 'empty' ? [] : seed };
-  return <HealthClient initial={initial as never} />;
+  const off = { configured: false, connected: false, calendarName: 'Onyx care', connectedAt: null, lastSync: null };
+  const calendar = cal === 'ready' ? { ...off, configured: true }
+    : cal === 'on' ? { ...off, configured: true, connected: true, connectedAt: '2031-01-01T00:00:00.000Z' }
+    : cal === 'none' ? undefined : off;
+  return <HealthClient initial={initial as never} calendar={calendar as never} />;
 }
 `);
 await writeFile(path.join(fixture, 'src/app/layout.tsx'), 'import "./globals.css"; export default function Layout({children}: {children: React.ReactNode}) {return <html lang="en" className="dark"><body className="bg-surface text-text-primary antialiased font-sans">{children}</body></html>}');
@@ -69,13 +73,24 @@ try {
   // ---- the stand-in for /api/care/*: same contract as the real routes ----
   const store = new Map(seed.map(item => [item.id, item]));
   const removed = new Map(), importKeys = new Set();
-  const calls = [];
-  let failNext = false;
+  // The one outside address the page may leave for. It is answered here; the real Google is never contacted.
+  const CONSENT_STUB = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=fixture';
+  const calls = [], googleCalls = [], left = [];
+  let failNext = false, startUrl = CONSENT_STUB;
   const answer = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
   await page.route('**/*', route => {
     const request = route.request(), target = new URL(request.url());
+    if (request.url() === CONSENT_STUB) { left.push(request.url()); return route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>Consent page stand-in</h1>' }); }
     if (target.origin !== new URL(url).origin) { blocked.push(request.url()); return route.abort(); }
     if (!target.pathname.startsWith('/api/care/')) return route.continue();
+    if (target.pathname.startsWith('/api/care/google/')) {
+      googleCalls.push(`${request.method()} ${target.pathname} origin=${request.headers().origin === url}`);
+      if (failNext) { failNext = false; return answer(route, { error: 'x' }, 500); }
+      if (target.pathname.endsWith('/start')) return answer(route, { url: startUrl });
+      if (target.pathname.endsWith('/sync')) return answer(route, { sync: { at: new Date().toISOString(), ok: true, created: 2, updated: 1, removed: 0, unchanged: 3, failed: 0, error: null } });
+      if (target.pathname.endsWith('/disconnect')) return answer(route, { configured: true, connected: false, calendarName: 'Onyx care', connectedAt: null, lastSync: null });
+      return answer(route, { error: 'unexpected' }, 404);
+    }
     const method = request.method(), body = request.postData() ? request.postDataJSON() : null;
     calls.push({ method, path: target.pathname, body, origin: request.headers().origin ?? null, type: request.headers()['content-type'] ?? null });
     if (failNext) { failNext = false; return answer(route, { error: 'could not save' }, 500); }
@@ -301,8 +316,55 @@ try {
   assert.equal(await page.evaluate(() => localStorage.getItem('onyx-care-planner-v1')), '{not json');
   assert.equal(await page.getByRole('button', { name: /Copy .* into Onyx/ }).count(), 0);
 
+  // ---- Google Calendar card: not connected by default; no request until a button is pressed ----
+  const cardBox = page.getByLabel('Google Calendar connection');
+  const cardAlert = cardBox.locator('p[role="alert"]');
+  for (const variant of ['', '/?cal=none']) {
+    await page.goto(url + variant);
+    await page.getByRole('heading', { name: 'Google Calendar: not connected', exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: 'Connect Google Calendar', exact: true }).isDisabled(), true);
+    await cardBox.getByText(/Not set up yet: Onyx has no Google credentials/).waitFor();
+    await cardBox.getByText('Never requested', { exact: true }).waitFor();
+  }
+  assert.deepEqual(googleCalls, [], 'showing the card contacts nothing');
+  // Set up, not connected: Connect asks the server for the consent URL and leaves only for the real Google consent page.
+  await page.goto(url + '/?cal=ready');
+  startUrl = 'https://evil.example/phish';
+  await page.getByRole('button', { name: 'Connect Google Calendar', exact: true }).click();
+  await cardAlert.filter({ hasText: "Couldn't start the Google sign-in. Nothing was connected." }).waitFor();
+  assert.equal(new URL(page.url()).origin, url, 'a URL that is not the Google consent page is refused');
+  assert.deepEqual(blocked, []);
+  startUrl = CONSENT_STUB;
+  await page.getByRole('button', { name: 'Connect Google Calendar', exact: true }).click();
+  await page.getByRole('heading', { name: 'Consent page stand-in' }).waitFor();
+  assert.equal(page.url(), CONSENT_STUB);
+  assert.deepEqual(left, [CONSENT_STUB], 'the only outside address the page leaves for');
+  assert.deepEqual(googleCalls.splice(0), ['POST /api/care/google/start origin=true', 'POST /api/care/google/start origin=true']);
+  // Back from Google: the result is shown once and removed from the address bar.
+  await page.goto(url + '/?cal=on&calendar=connected');
+  await page.getByRole('heading', { name: 'Google Calendar: connected', exact: true }).waitFor();
+  await cardBox.getByText(/Google Calendar is connected\. The first sync runs in the background/).waitFor();
+  await page.waitForFunction(() => !location.search.includes('calendar='));
+  assert.equal(new URL(page.url()).search, '?cal=on');
+  await cardBox.getByText('No sync has finished yet.', { exact: true }).waitFor();
+  await cardBox.getByText('Granted', { exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Sync now' }).click();
+  await cardBox.getByText(/Last sync just now: 2 added, 1 changed, 0 taken off, 3 already up to date\./).waitFor();
+  failNext = true;
+  await page.getByRole('button', { name: 'Sync now' }).click();
+  await cardAlert.filter({ hasText: "Couldn't run the sync." }).waitFor();
+  await page.getByRole('button', { name: 'Disconnect' }).click();
+  await page.getByRole('heading', { name: 'Google Calendar: not connected', exact: true }).waitFor();
+  await cardBox.getByText(/Disconnected\. The "Onyx care" calendar and its events are still in Google Calendar/).waitFor();
+  assert.deepEqual(googleCalls.splice(0), ['POST /api/care/google/sync origin=true', 'POST /api/care/google/sync origin=true', 'POST /api/care/google/disconnect origin=true']);
+  await page.goto(url + '/?cal=ready&calendar=error&reason=wrong_scope');
+  await cardAlert.filter({ hasText: 'Could not connect Google Calendar (wrong_scope). Nothing was connected.' }).waitFor();
+  await page.goto(url + '/?cal=ready&calendar=denied');
+  await cardBox.getByText('The Google sign-in was cancelled. Nothing was connected.', { exact: true }).waitFor();
+  assert.deepEqual(googleCalls, []);
+
   assert.deepEqual(errors, []); assert.deepEqual(blocked, []);
-  console.log('Care planner UI regression passed (optimistic saves, reverts, undo, load states, one-time copy). Screenshots: ' + fixture);
+  console.log('Care planner UI regression passed (optimistic saves, reverts, undo, load states, one-time copy, calendar card). Screenshots: ' + fixture);
 } finally {
   await browser?.close();
   server.kill();

@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { CARE_COLUMNS, MAX_ITEM_BODY_BYTES, parseCarePatch, parseItemId, rowToItem, toColumns } from "@/lib/care-items";
+import { syncAfterWrite } from "@/lib/care-google-server";
 import { careDb, careJson, readCareBody } from "@/lib/care-items-server";
 
 export const dynamic = "force-dynamic";
@@ -32,7 +33,9 @@ export async function PATCH(req: NextRequest, { params }: Ctx) {
   }
   if (!data?.length) return careJson({ error: "item not found" }, 404);
   const item = rowToItem(data[0]);
-  return item ? careJson({ item }) : careJson({ error: "could not save" }, 500);
+  if (!item) return careJson({ error: "could not save" }, 500);
+  syncAfterWrite(); // Google Calendar, only when connected; runs after this response
+  return careJson({ item });
 }
 
 export async function DELETE(req: NextRequest, { params }: Ctx) {
@@ -52,5 +55,6 @@ export async function DELETE(req: NextRequest, { params }: Ctx) {
     return careJson({ error: "could not save" }, 500);
   }
   if (!data?.length) return careJson({ error: "item not found" }, 404);
+  syncAfterWrite();
   return careJson({ id });
 }

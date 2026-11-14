@@ -8,6 +8,7 @@ import {
 } from '@/lib/care-planner';
 import { MAX_CARE_ITEMS, MAX_NOTES, type CareOp, type CarePatch, applyOp, inverseOp, opId, opRequest, parseCareItem, putItem, revertOp } from '@/lib/care-items';
 import type { CareLoad } from '@/lib/care-items-server';
+import type { CalendarStatus } from '@/lib/care-google';
 import { CareCalendar, DueSoon } from './CareCalendar';
 import CalendarConnectionCard from './CalendarConnectionCard';
 
@@ -45,7 +46,7 @@ function whenText(item: CareItem, viewerTz: string): string {
   return `${base} (${zoneLabel(item.tz)}; ${formatTime(here.time)}${here.date === item.due ? '' : ` on ${here.date}`} your time)`;
 }
 
-export default function HealthClient({ initial }: { initial: CareLoad }) {
+export default function HealthClient({ initial, calendar }: { initial: CareLoad; calendar?: CalendarStatus }) {
   const [items, setItems] = useState<CareItem[]>(initial.state === 'ready' ? initial.items : []);
   const [load, setLoad] = useState<'ready' | 'loading' | 'failed'>(initial.state === 'ready' ? 'ready' : 'failed');
   const [busy, setBusy] = useState<Set<string>>(new Set());
@@ -190,7 +191,7 @@ export default function HealthClient({ initial }: { initial: CareLoad }) {
     <header><h1 data-testid="page-heading" className="text-2xl font-semibold">Health & appointments</h1><p className="mt-2 text-text-secondary">Plan routine care and keep track of what needs booking.</p></header>
     <section className={panel} aria-label="Privacy and calendar connection">
       <h2 className="font-semibold">Private planning, saved in Onyx</h2>
-      <p className="mt-2 text-sm text-text-secondary">Items are saved to your Onyx account and show on any device where you are signed in. Keep labels short: no medical records. Nothing is sent to a provider, a calendar or a reminder service. Dates and repeat intervals are yours to choose, not medical recommendations.</p>
+      <p className="mt-2 text-sm text-text-secondary">Items are saved to your Onyx account and show on any device where you are signed in. Keep labels short: no medical records. Nothing is sent to a provider or a reminder service, and nothing goes to a calendar unless you connect one below. Dates and repeat intervals are yours to choose, not medical recommendations.</p>
       {local.state === 'offer' && <div className="mt-3 rounded-xl border border-border-default p-3 text-sm">
         <p>This browser holds {local.items.length} item{local.items.length === 1 ? '' : 's'} saved by the earlier version of this page.</p>
         <button className={`${button} mt-2`} disabled={copying || load !== 'ready'} onClick={copyLocal}>{copying ? 'Copying…' : `Copy ${local.items.length === 1 ? 'it' : `all ${local.items.length}`} into Onyx`}</button>
@@ -200,7 +201,7 @@ export default function HealthClient({ initial }: { initial: CareLoad }) {
         <button className={`${button} mt-2`} onClick={removeLocal}>Remove the browser copy</button>
       </div>}
       {local.state === 'unreadable' && <p className="mt-3 text-sm text-text-secondary">This browser holds an older saved planner that cannot be read. It has been left untouched and is not used.</p>}
-      <CalendarConnectionCard />
+      <CalendarConnectionCard initial={calendar} />
     </section>
     {notice && <p role={notice.error ? 'alert' : 'status'} className={`text-sm ${notice.error ? 'text-amber-400' : 'text-text-secondary'}`}>{notice.text}</p>}
     {undo && load === 'ready' && <button className={button} disabled={busy.has(opId(undo))} onClick={() => { const op = undo; setUndo(null); if (form.editing === opId(op)) setForm(emptyForm(viewerTz)); void run(op, false); }}>Undo last change</button>}

@@ -9,7 +9,7 @@ const planner = { exports: {} };
 new Function('exports', 'module', ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText)(planner.exports, planner);
 const {
   nextDue, validDate, todayLocal, parseItems, addDays, daysBetween, careStatus, dueSoon, monthGrid, monthBounds,
-  entriesInRange, sampleItems, isSampleItem, CALENDAR_CONNECTION,
+  entriesInRange, sampleItems, isSampleItem,
   validTime, validTimeZone, tzOffsetMinutes, zonedInstant, zonedParts, todayIn, addMinutesWall, itemInZone, formatTime,
   compareSchedule, completionChange, upgradeLocalItem, localCopyState, CARE_KINDS, DEFAULT_TZ,
 } = planner.exports;
@@ -114,12 +114,6 @@ assert.ok(!isSampleItem(item));
 assert.deepEqual(sampleItems(today), sampleItems(today)); // deterministic
 assert.ok(parseItems(JSON.stringify(samples)).length === samples.length); // valid shape, but never written by the UI
 assert.ok(dueSoon(samples, today).length >= 3);
-
-// ---- calendar connection is explicitly disconnected, nothing granted ----
-assert.equal(CALENDAR_CONNECTION.status, 'disconnected');
-assert.equal(CALENDAR_CONNECTION.canConnect, false);
-assert.ok(CALENDAR_CONNECTION.permissions.length > 0);
-assert.ok(CALENDAR_CONNECTION.permissions.every(p => p.granted === false));
 
 // ---- wall-clock times and time zones (synthetic items only) ----
 const NY = 'America/New_York', MADRID = 'Europe/Madrid', LA = 'America/Los_Angeles';
