@@ -1,6 +1,6 @@
 # Experiment framework (N-of-1 trials): design
 
-Status: design only (2026-11-11), with Riley's decisions recorded in Section 13. No code and no schema exist yet; the empty "Onyx Experiments" Notion database was created on 2026-11-11 (Section 10.1). Nothing else here has been applied. Every number below comes from read-only queries on the live Supabase project on 2026-11-11 (the SQL is in Appendix A) or from simulations run locally on those aggregate numbers (Appendix B). No per-day personal rows are stored in this repo.
+Status (2026-11-13): Phase 1 is done and **corrects the trial length** (Section 7.6: 232 days gives 80% power for 8 ms only if HRV stays as calm as the last three months; on 2025-like noise it gives 41 to 53%). The first part of Phase 2 is built (Section 12.1): tables and lock guards, the allocation and analysis libraries, the `/today` arm card and the admin command that registers a trial. **No trial is registered; every experiment table is empty.** Not built yet: the check-in adherence question, the report job with its heartbeat and `/status` card, the Notion writer, interim looks and the period design. Riley's decisions are in Section 13. The design numbers come from read-only queries on the live Supabase project on 2026-11-11 (Appendix A) and simulations on those aggregates (Appendix B); Section 7.6 comes from the built analysis run over real nightly HRV on 2026-11-13. No per-day personal rows are stored in this repo.
 
 Roadmap row: "Build experiment framework" (Tasks DB, `Source = "Onyx Roadmap"`).
 
@@ -151,6 +151,8 @@ decision:
 co_interventions_held_steady: [bedtime target, supplement stack, training plan]
 ```
 
+The file the code reads is `docs/experiments/TEMPLATE.md` (built 2026-11-13). It differs from the sketch above in three places: `adherence.objective` is structured (`source`, `max`, `arm`) so the database view can check it; `analysis` carries `alpha` and `n_redraws` as numbers; and `stopping.interim` must be `none` until interim looks are built (Section 12.1).
+
 ### 6.2 Where it is stored and how it is locked
 
 1. **Repo**: the file is merged to `master` through a PR before `start`. The merge commit is the registration record; git history is the tamper evidence.
@@ -251,6 +253,46 @@ Monte-Carlo error: about ±0.006 to ±0.014 on power for 4,000 to 800 replicatio
 3. Covariates measured before the treatment (last night's HRV, 7-day mean) may shrink the residual. Not quantified yet; Phase 1 measures it on real data.
 4. One trial at a time. Two concurrent trials need a factorial design registered up front.
 
+### 7.6 Phase 1: the planned analysis on real history (2026-11-13)
+
+What was run: nightly WHOOP HRV for 2024-12-18 to 2026-11-12 (695 behavioral days, 668 nights) was read once, read-only, into a scratch folder outside the repo. Placebo schedules from `experiment_design.generate_schedule` (random arms that change nothing) were laid over it and analysed by `experiment_analysis.randomization_analysis`, the code a real trial will use (block effects + arm + yesterday's arm + weekday, randomization test with 499 re-draws). A planted effect was added to the real nights to measure power. Only the aggregates below left the scratch folder.
+
+Three non-overlapping 232-day windows (2,000 placebo trials for the error rate, 1,000 for power):
+
+| Window | Nights | Mean / SD (ms) | False-positive rate, randomization test | Same, HAC z-test | Chance SD of the estimate (ms) | Power at +8 ms | Estimate with +8 planted | With +8 and +4 carryover: b0 / b1 |
+|---|---|---|---|---|---|---|---|---|
+| 2024-12-18 to 2025-08-06 | 231 / 232 | 124.7 / 31.7 | 0.045 | 0.037 | 3.73 | 0.53 | 7.91 | 8.20 / 4.39 |
+| 2025-08-07 to 2026-03-26 | 229 / 232 | 128.3 / 35.1 | 0.057 | 0.045 | 4.70 | 0.41 | 7.94 | 8.27 / 4.07 |
+| 2026-03-26 to 2026-11-12 (includes the level shift) | 209 / 232 | 99.9 / 39.5 | 0.046 | 0.029 | 3.77 | 0.51 | 7.94 | 7.76 / 3.09 |
+
+Trailing windows ending 2026-11-12 (1,500 placebo trials each). "Days needed" = window length x (chance SD x 2.8016 / 8)^2, the length at which an 8 ms effect has 80% power if the noise stays like that window:
+
+| Window | Nights | Mean / SD (ms) | Chance SD of the estimate (ms) | Days needed for 8 ms |
+|---|---|---|---|---|
+| Last 92 days (the "current regime" of Section 7.1) | 74 / 92 | 70.9 / 21.2 | 4.10 at 92 days | **190** |
+| Last 120 days | 101 / 120 | 78.9 / 26.3 | 4.11 at 120 days | 249 |
+| Last 180 days | 160 / 180 | 87.3 / 30.2 | 3.63 at 180 days | 291 |
+| Last 232 days | 209 / 232 | 99.9 / 39.5 | 3.87 at 232 days | 425 |
+| For comparison, the two 2025-era windows above | | | 3.73 and 4.70 at 232 days | 396 and 628 |
+
+On the last 92 days alone the false-positive rate was 0.046 and a 92-day trial had power 0.42 for 8 ms.
+
+What this confirms:
+
+- **The test is valid on real HRV.** False-positive rates of 0.045 to 0.057 against a nominal 0.05 (one standard error is 0.005). The HAC z-test is conservative (0.029 to 0.045), so it stays a cross-check only.
+- **The estimate is unbiased, and the carryover term works on real nights**: a planted 8 ms comes back as 7.9, and with a 4 ms carryover as 7.8 to 8.3 with b1 3.1 to 4.4.
+- **The 232-day figure of Section 7.3 matches the calm regime it was planned on**: the last 92 days say about 190 days, the AR(1) simulation said 232. One 92-day window cannot separate those two.
+
+What this corrects:
+
+- **232 days is enough only if HRV stays as calm as it has been since mid-August 2026 (SD about 21 ms).** Over any 232-day stretch of the last two years the same trial would have had 41 to 53% power for 8 ms, not 80%, because nightly SD was 32 to 40 ms; 80% would have needed about 400 to 630 days. Section 7.3's set C already pointed this way (381 days for pairs in 2025); this run measures it with the real analysis.
+- **In relative terms the design is stable.** On the log scale the chance SD at 232 days is 0.033 / 0.037 / 0.040 in the three windows, so 232 days detects a change of about 10 to 12% of the current HRV level in every regime. 8 ms is 11% of today's 71 ms but 6.5% of 2025's 124 ms. If HRV climbs back toward its 2025 level during a trial, a fixed 8 ms effect gets harder to see; if effects scale with the level, the pre-registered ln(HRV) sensitivity analysis is the one that keeps its power.
+- **Covariates are not worth adding to the primary model.** The mean of the previous 7 nights cut the chance SD by 6.1%, 6.7% and 3.3% in the three windows (about 6 to 13% fewer days). Last night's HRV changed it by -1.9%, +3.7% and +4.0% and costs the nights that follow a missing night (196 instead of 209 usable in the latest window). Both stay pre-registered sensitivity analyses (Section 8).
+
+Consequence for the first protocol (Riley's call at registration, Section 13): either register 232 days knowing the 80% holds only while the calm regime lasts, or plan the length from a longer window. `experiment_admin.py power --window N` repeats this check on the latest N days at any time before a trial is registered (it refuses once one is active, because that would be an unregistered look at the outcome).
+
+Not checked here: placebo runs cannot show whether a real treatment's effect is additive in ms or proportional, and three windows are three samples of history, not a forecast of the next eight months.
+
 ## 8. Analysis plan
 
 - **Estimand**: intention-to-treat difference between arms in the HRV of the sleep that closes the day (b0). Secondary: b1 (next night) and b0 + b1.
@@ -346,6 +388,34 @@ Per the AGENTS.md three-place rule, in the same commit as the report job:
 | 3 | First real trial, pre-registered and locked | yes | final report written; Status stays open on the roadmap until it is verified in production |
 | 4 | Calibration with `causal_inference.py`: trial vs AIPW estimate per finished trial, AIPW-based candidate list | yes (`hrv_analysis_results` rows) | first comparison published |
 
+Where it stands (2026-11-13): Phase 0 merged. Phase 1 done (Section 7.6; the first treatment was picked in Section 13). Phase 2 partly built (12.1). Phases 3 and 4 not started.
+
+### 12.1 What is built (2026-11-13)
+
+| Piece | Where | Notes |
+|---|---|---|
+| Tables `pds.experiments`, `pds.experiment_secrets`, `pds.experiment_schedule`, `pds.experiment_days`, view `pds.experiment_day_status` | `sql/experiment_framework_schema.sql` (applied) | Service role only: RLS on, no policies, nothing granted to anon / authenticated; the service role cannot remove rows. All empty. |
+| Protocol lock | trigger `experiments_guard` | Once registered, only the status (forward only), the stop fields and the Notion page id can change. The seed and the schedule never change. One active trial at a time (unique index). |
+| Registration in one transaction | `pds.experiment_register(id, fields, schedule)` | Protocol fields + every schedule row + the lock; a failure leaves the draft untouched. Refuses a first day that is not in the future, an unbalanced block, a seed that does not match its commitment. |
+| Reveal | `pds.experiment_today()` | Returns the arm of `pds.behavioral_today_now()` and nothing later. Stamps `first_revealed_at` once per day and moves `registered` to `running` on the first reveal. |
+| Allocation | `experiment_design.py` | Section 4.3 with one change: the block orderings are drawn from PCG64's **raw 64-bit stream** with rejection sampling, not `Generator.integers`, because numpy guarantees only the raw stream across versions. A golden schedule in the tests pins it. |
+| End-of-trial analysis | `experiment_analysis.py` | Section 8: model with the carryover term, randomization test, interval by inversion, HAC cross-check, ln(HRV) and per-protocol sensitivity, missingness check, decision rule. `analyze_trial` raises before the pre-registered end. |
+| Protocol file | `docs/experiments/TEMPLATE.md`, `experiment_design.validate_protocol` | Machine-read YAML front matter. Rules: MID of 8 ms or more, first day after the registration day, alignment version equal to `hrv_alignment.ALIGNMENT_VERSION`, seed commitment equal to the stored one, `stopping.interim: none`. |
+| Admin command | `experiment_admin.py`, run through `.github/workflows/experiment-admin.yml` (manual, master only) | `seed`, `register`, `verify`, `stop`, `status`, `power`. Never prints a seed or an arm (the logs are public). Heartbeat `experiments|admin` on every write. |
+| Today card | `GET /api/experiments/today` (owner session only), `frontend/src/lib/experiments*.ts`, `TodayClient.tsx` | Nothing is rendered when no trial is registered. Read-only: no buttons, and opening Today records nothing about what Riley did. |
+| Tests | `tests/test_experiment_framework.py`, `frontend/tests/experiments.test.cjs`, `tests/today-regression.cjs` | Synthetic only. The database guards were also exercised once on the live project inside a single block that always rolls back (nothing was stored). |
+
+How Riley starts a trial (nothing below has been run):
+
+1. Copy `docs/experiments/TEMPLATE.md` to `docs/experiments/EXP-001.md` and fill it in. Optional: `gh workflow run experiment-admin.yml -f action=power -f window=120` to re-check the length (Section 7.6).
+2. `gh workflow run experiment-admin.yml -f action=seed -f protocol=docs/experiments/EXP-001.md`. The run log prints `seed_sha256`; paste it into the protocol's `allocation.seed_sha256`.
+3. Merge the protocol to `master` through a PR, at least one day before its `start` date.
+4. `gh workflow run experiment-admin.yml -f action=register -f protocol=docs/experiments/EXP-001.md -f confirm=EXP-001`. From the first day, `/today` shows that day's arm.
+
+Left for the next PRs, in order: (a) the "Followed today's arm?" question on `/check-in` writing `pds.experiment_days`; (b) the daily report job with `pds.experiment_reports`, the `experiments|report` heartbeat, the `/status` card and the two `GUARD` checks of Section 10.4; (c) the Notion writer for "Onyx Experiments"; (d) exclusions from flight / transition days wired into the report (the view already flags flight days); (e) interim looks and the period design, only if a protocol needs them; (f) the 4-week A/A sham trial that closes Phase 2.
+
+No `/status` card yet, on purpose: there is no scheduled job, and the card of Section 10.5 reports the report job's heartbeat. An admin command fails in front of whoever ran it and leaves an `experiments|admin` heartbeat in the sync history.
+
 ## 13. Decisions (Riley, 2026-11-11)
 
 1. **Effect size and length.** Only trial treatments with a plausible effect of 8 ms or more, and accept that one trial takes about 8 months (232 days at today's noise and missing-night rate, Section 7). Analyze only at the pre-registered end; interim looks follow the stopping boundary in the protocol, never an ad hoc peek.
@@ -354,14 +424,16 @@ Per the AGENTS.md three-place rule, in the same commit as the report job:
 4. **Notion database: created now.** "Onyx Experiments" exists under Project Onyx with the fields in Section 10.1 and no rows (URL and ids in Section 10.1). Rows appear when the first protocol is registered.
 5. **Daily arm card: `/today` only.** No `/agents` morning card (Section 4.4).
 
-Still open: the Phase 2 schema, the check-in adherence question and the protocol file for EXP-001 (Section 12). None of these decisions changes the design in Sections 4 to 11.
+Still open: the check-in adherence question, the report job and the protocol file for EXP-001 (Section 12.1). None of these decisions changes the design in Sections 4 to 11.
+
+**Open question for decision 1 (raised by Phase 1, 2026-11-13).** "About 8 months" was sized on the last three months of HRV. Section 7.6 shows the same 232 days would have had 41 to 53% power in any earlier stretch. Before EXP-001 is registered Riley should choose: 232 days as decided (cheapest, but a null result would be weak evidence if HRV gets noisier again), or a longer trial sized from a longer window (about 250 to 290 days from the last 120 to 180 days; about 400 or more from a full year).
 
 ## 14. What this doc does not prove
 
 - The power numbers assume AR(1) noise with the measured SD and lag-1 correlation and missing nights at random. Real HRV has a slow drift component (lag-14 r 0.28 in the last 90 days) and clustered gaps; Phase 1 checks the plan on real history.
 - The 3 / 5 / 8 ms effect sizes are planning values, not estimates of any real treatment. The alcohol difference quoted is unadjusted and rests on 6 nights.
 - The "physiological, not device" reading of the 2026 HRV decline rests on two other aggregates (Eight Sleep HRV, WHOOP RHR), not on device logs.
-- Nothing about Notion, the Worker card, the check-in question or the proposed tables has been built or tested.
+- Built but not proven in production (2026-11-13): no trial has been registered, so `experiment-admin.yml` has never run, the `/today` card has only been tested against synthetic answers, and `pds.experiment_today()` has returned an arm only inside a rolled-back test block. The Notion writer, the check-in question and the report job do not exist yet.
 
 ## Appendix A: SQL for the live numbers
 
