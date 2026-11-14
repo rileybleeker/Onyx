@@ -585,7 +585,9 @@ function detectStreams(external: Row[], today: string, horizonEnd: string, notes
   const since = addDays(today, -FORECAST.detectWindowDays);
   for (const r of external) {
     if (r.t.txn_date < since || r.delta === 0) continue;
-    const key = streamKey(r.t);
+    // Deposits group by the robust key (paychecks carry per-deposit references); spending keeps the merchant key,
+    // because grouping card payments and everyday debits by three words merged unrelated rows (backtest 2026-11-14).
+    const key = r.delta > 0 ? streamKey(r.t) : merchantKey(r.t);
     if (!key) continue;
     const g = `${r.delta > 0 ? "in" : "out"}|${key}`;
     const list = groups.get(g);
@@ -747,7 +749,7 @@ function detectPayeeCardStreams(rows: Row[], today: string, horizonEnd: string, 
   const byPayee = new Map<string, Row[]>();
   for (const r of rows) {
     if (r.t.txn_date < addDays(today, -FORECAST.detectWindowDays)) continue;
-    const key = streamKey(r.t);
+    const key = merchantKey(r.t);
     if (!key) continue;
     const list = byPayee.get(key);
     if (list) list.push(r);
