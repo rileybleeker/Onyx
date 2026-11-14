@@ -415,7 +415,11 @@ test("route source: PATCH only, session-only, no outbound call", () => {
   const src = fs.readFileSync(path.join(SRC, "app/api/procurement/flags/route.ts"), "utf8");
   assert.deepEqual([...src.matchAll(/export async function (\w+)/g)].map((m) => m[1]), ["PATCH"]);
   assert.doesNotMatch(src, /\bfetch\(|https?:\/\//);
-  assert.doesNotMatch(fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8"), /api\/procurement/);
+  // Session-only: the one procurement path that takes the CI token is the renewal claim (Riley,
+  // 2026-11-13; scripts/test-procurement-store.mjs holds that exception). Never this route.
+  const middleware = fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8");
+  assert.doesNotMatch(middleware, /api\/procurement\/flags/);
+  assert.deepEqual([...middleware.matchAll(/["'`](\/api\/procurement[^"'`]*)["'`]/g)].map((m) => m[1]), ["/api/procurement/renewals/claim"]);
 });
 
 // ─── no model, no purchase action, SQL guards ────────────────────────────────────────────────

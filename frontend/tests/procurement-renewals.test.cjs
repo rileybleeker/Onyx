@@ -125,5 +125,9 @@ test("route source: read-only GET, session-only, no write or outbound call", () 
   const src = fs.readFileSync(path.join(SRC, "app/api/procurement/renewals/summary/route.ts"), "utf8");
   assert.deepEqual([...src.matchAll(/export async function (\w+)/g)].map((m) => m[1]), ["GET"]);
   assert.doesNotMatch(src, /\.(insert|update|upsert|delete|rpc)\(/);
-  assert.doesNotMatch(fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8"), /api\/procurement/);
+  // Session-only: the one procurement path that takes the CI token is the renewal claim (Riley,
+  // 2026-11-13; scripts/test-procurement-store.mjs holds that exception). Never this route.
+  const middleware = fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8");
+  assert.doesNotMatch(middleware, /api\/procurement\/renewals\/summary/);
+  assert.deepEqual([...middleware.matchAll(/["'`](\/api\/procurement[^"'`]*)["'`]/g)].map((m) => m[1]), ["/api/procurement/renewals/claim"]);
 });
