@@ -113,6 +113,8 @@ SCHEDULED: dict[str, Sched] = {
         'every run fails until sql/inbox_emails_schema.sql is applied, so a re-run cannot help; Riley decides'),
     'google-calendar-etl.yml': Sched(
         'Google Calendar ETL', _m(150), True, 'hourly at :55; new 2026-11-13, no run history yet'),
+    'simplefin-etl.yml': Sched(
+        'SimpleFIN ETL', _h(8), True, 'every 6h at :30; new 2026-11-14, no run history yet'),
     'cronometer-etl.yml': Sched(
         'Cronometer ETL', _h(15), True, '02:30 and 16:00 UTC (13h30 gap); 14h would fire on normal delay'),
     'tanita-etl.yml': Sched('Tanita ETL', _h(26), True, '14:00 and 17:30 UTC (20h30 gap); worst seen 21h19'),

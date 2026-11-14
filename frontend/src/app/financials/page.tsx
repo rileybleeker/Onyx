@@ -28,7 +28,7 @@ export default async function FinancialsPage({
         <p className="text-xs uppercase tracking-widest text-text-tertiary">Money, in view</p>
         <h1 data-testid="page-heading" className="text-2xl font-semibold">Financials</h1>
         <p className="mt-2 text-text-secondary">
-          Your Rocket Money accounts, balances and transactions, imported automatically and shown only to you.
+          Your bank accounts, balances and transactions, imported automatically (SimpleFIN Bridge, every 6 hours; Rocket Money history before 2026-11-14) and shown only to you.
         </p>
       </header>
 
@@ -48,7 +48,7 @@ export default async function FinancialsPage({
               : "No ledger data yet - the harvester has not run."}
           </p>
           <p className="mt-2 text-[13px] text-text-secondary">
-            Accounts, balances and transactions appear here after the daily Rocket Money import. No sample or invented numbers are shown.
+            Accounts, balances and transactions appear here after the first SimpleFIN import. No sample or invented numbers are shown.
           </p>
           <div className="mt-3">
             <FreshnessLine freshness={load.freshness} now={now} />

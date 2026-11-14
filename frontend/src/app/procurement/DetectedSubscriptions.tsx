@@ -5,7 +5,7 @@ import type { DetectedLoad, DetectedSubscription, IrregularCharge } from '@/lib/
 import { RENEWAL_LIST_DAYS, estimateNote, renewalPhrase, renewalRows, type RenewalRow } from '@/lib/procurement-renewals';
 import { dismissalKey, usageLine, type AdviceLoad, type SubscriptionAdvice, type WasteFlag } from '@/lib/procurement-flags';
 
-// Subscriptions detected in the Rocket Money ledger, with renewal estimates and waste flags.
+// Subscriptions detected in the finance ledger, with renewal estimates and waste flags.
 // Read-only advice: every number comes from the server-rendered props. The only request this
 // component makes is the PATCH that remembers a dismissed flag; nothing here pays or cancels.
 const FLAGS_API = '/api/procurement/flags';
@@ -88,9 +88,9 @@ export default function DetectedSubscriptions({ detected, advice }: { detected: 
   const dismissedFlags = flagged.filter(x => isDismissed(x.sub.id, x.flag));
   return <section className={card} aria-label="Detected subscriptions" data-testid="procurement-detected" data-state={detected.state}>
     <h2 className="text-xl font-semibold">Detected subscriptions</h2>
-    <p className="text-sm text-text-secondary">Recurring charges found in your Rocket Money ledger over the last 400 days, with an estimate of when each one renews and rule-based flags worth a look. Read-only: Onyx never cancels or pays anything.</p>
+    <p className="text-sm text-text-secondary">Recurring charges found in your finance ledger over the last 400 days, with an estimate of when each one renews and rule-based flags worth a look. Read-only: Onyx never cancels or pays anything.</p>
     {detected.state === 'error' && <p role="alert" className="text-red-400">Couldn&apos;t read the ledger (code {detected.code}), so no subscriptions are shown. This is a failed query, not an empty ledger.</p>}
-    {detected.state === 'empty' && <p>No ledger data yet. Subscriptions appear here after the daily Rocket Money import; nothing is invented in the meantime.</p>}
+    {detected.state === 'empty' && <p>No ledger data yet. Subscriptions appear here after the bank import; nothing is invented in the meantime.</p>}
     {ok && (ok.subs.length === 0 && irregular.length === 0
       ? <p>The ledger was read but no recurring charges were found in it.</p>
       : <div className="space-y-4">

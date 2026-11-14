@@ -8,7 +8,7 @@ export type Cycle = 'monthly' | 'quarterly' | 'annual';
 // id/vendor/notes exist only on rows that came from (or were saved to) the database; hand-typed in-memory rows leave them off.
 export type Subscription = { name: string; cents: number; currency: 'USD'; cycle: Cycle; renewsOn: string; id?: number; vendor?: string; notes?: string };
 export const CAPABILITIES = Object.freeze({
-  providers: 'subscriptions are detected from the Rocket Money ledger (read-only; Onyx never cancels or pays anything)',
+  providers: 'subscriptions are detected from the finance ledger (read-only; Onyx never cancels or pays anything)',
   orders: 'disabled',
   recommendations: 'reorder suggestions from your own order history (read-only; no product search, no cart, no checkout)',
   tracking: 'typed-by-hand-saved-once-setup-applied',
