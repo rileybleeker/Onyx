@@ -19,6 +19,7 @@ await writeFile(path.join(fixture, 'app/ProcurementClient.tsx'), relative(client
 await writeFile(path.join(fixture, 'app/DetectedSubscriptions.tsx'), relative(await readFile(path.join(frontend, 'src/app/procurement/DetectedSubscriptions.tsx'), 'utf8')));
 await copyFile(path.join(frontend, 'src/lib/procurement-recurring.ts'), path.join(fixture, 'lib/procurement-recurring.ts'));
 await copyFile(path.join(frontend, 'src/lib/procurement-renewals.ts'), path.join(fixture, 'lib/procurement-renewals.ts'));
+await copyFile(path.join(frontend, 'src/lib/procurement-flags.ts'), path.join(fixture, 'lib/procurement-flags.ts'));
 await copyFile(path.join(frontend, 'src/lib/finance-ledger.ts'), path.join(fixture, 'lib/finance-ledger.ts'));
 // The real page.tsx reads the ledger on the server; the fixture has no database, so it renders the client with synthetic detected rows.
 await writeFile(path.join(fixture, 'app/page.tsx'), `import ProcurementClient from './ProcurementClient';
@@ -30,7 +31,15 @@ const detected = { state: 'ok', today: '2030-03-15', total: 2400, subs: [
 ], irregular: [
   { id: '00000000000000b1', merchant: 'Demo top-up', typicalCents: 2000, lastCharge: '2030-03-01', chargeCount: 5, medianGapDays: 23 },
 ] } as const;
-export default function Page() { return <ProcurementClient detected={detected as never} />; }
+// Waste flags as the server would send them (synthetic): one open, one already dismissed, one subscription with unknown usage.
+const advice = { usageAvailable: true, canDismiss: true, advice: [
+  { subId: '00000000000000a1', service: 'Demo streaming', category: 'Video streaming', usage: { state: 'known', minutes: 3, matched: ['com.demo.streaming'], basis: 'service list', daysCovered: 30 }, flags: [
+    { key: 'price_increase:00000000000000c1', kind: 'price_increase', title: 'Price went up', reason: 'Synthetic reason: the last charge is 20% above the usual amount.', dismissed: false },
+    { key: 'no_recent_use:00000000000000c2', kind: 'no_recent_use', title: 'No recent use on your iPhone', reason: 'Synthetic reason: 3 min in 30 days.', dismissed: true },
+  ] },
+  { subId: '00000000000000a2', service: null, category: null, usage: { state: 'unknown', why: 'no app or site in Screen Time matches this merchant' }, flags: [] },
+] } as const;
+export default function Page() { return <ProcurementClient detected={detected as never} advice={advice as never} />; }
 `);
 await copyFile(path.join(frontend, 'src/app/globals.css'), path.join(fixture, 'app/globals.css'));
 await copyFile(path.join(frontend, 'postcss.config.mjs'), path.join(fixture, 'postcss.config.mjs'));
@@ -62,6 +71,12 @@ try {
     if (new URL(route.request().url()).origin === new URL(url).origin) return route.continue();
     blocked.push(route.request().url()); return route.abort();
   });
+  // The fixture has no API: answer the flag-dismissal PATCH here and record what the page sent.
+  const patches = []; let failPatch = false;
+  await page.route('**/api/procurement/flags', route => {
+    patches.push({ method: route.request().method(), body: route.request().postDataJSON() });
+    return route.fulfill({ status: failPatch ? 500 : 200, contentType: 'application/json', body: failPatch ? '{"error":"could not save"}' : '{"ok":true}' });
+  });
   await page.goto(url, {timeout: 180000}); await page.getByRole('heading',{name:'Procurement',exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:'Place order (unavailable)',exact:true}).isDisabled(),true);
   await page.getByRole('heading',{name:'Detected subscriptions',exact:true}).waitFor();
@@ -77,6 +92,32 @@ try {
   await page.getByText('Estimate: same day of the month as the recent charges. High confidence: the last 4 gaps fit within 1 day.',{exact:true}).waitFor();
   await page.getByText(/1 repeating charge without a regular schedule \(no date estimated\)/).click();
   await page.getByText('No next date: the spacing is too uneven to estimate one.',{exact:true}).waitFor();
+  // Waste flags: the reason is shown, usage is stated or unknown, and a dismissal is one PATCH that sticks.
+  const flags = page.getByTestId('procurement-flag');
+  await page.getByText(/^1 open flag, shown under the subscription it belongs to\./).waitFor();
+  assert.equal(await flags.count(), 1);
+  assert.match(await flags.first().innerText(), /Price went up\. Synthetic reason: the last charge is 20% above the usual amount\./);
+  await page.getByText('iPhone use, last 30 days: 3 min (com.demo.streaming).',{exact:true}).waitFor();
+  await page.getByText('iPhone use: unknown (no app or site in Screen Time matches this merchant).',{exact:true}).waitFor();
+  await page.getByText('1 dismissed flag',{exact:true}).waitFor();
+  failPatch = true;
+  await page.getByRole('button',{name:'Dismiss "Price went up" for Demo streaming plan',exact:true}).click();
+  await page.getByRole('alert').filter({hasText:'Could not save that dismissal, so the flag is still shown.'}).waitFor();
+  assert.equal(await flags.count(), 1, 'a failed save keeps the flag');
+  failPatch = false;
+  await page.getByRole('button',{name:'Dismiss "Price went up" for Demo streaming plan',exact:true}).click();
+  await page.getByText('2 dismissed flags',{exact:true}).waitFor();
+  assert.equal(await flags.count(), 0);
+  await page.getByText(/^No open flags on your active subscriptions\./).waitFor();
+  await page.getByText('2 dismissed flags',{exact:true}).click();
+  await page.getByRole('button',{name:'Restore "No recent use on your iPhone" for Demo streaming plan',exact:true}).click();
+  await page.getByText('1 dismissed flag',{exact:true}).waitFor();
+  assert.equal(await flags.count(), 1);
+  assert.deepEqual(patches, [
+    { method: 'PATCH', body: { sub: '00000000000000a1', flag: 'price_increase:00000000000000c1', dismissed: true } },
+    { method: 'PATCH', body: { sub: '00000000000000a1', flag: 'price_increase:00000000000000c1', dismissed: true } },
+    { method: 'PATCH', body: { sub: '00000000000000a1', flag: 'no_recent_use:00000000000000c2', dismissed: false } },
+  ]);
   await page.getByRole('heading',{name:'What this page reads',exact:true}).waitFor();
   assert.equal(await page.getByText(/Disconnected preview/).count(),0);
   assert.equal(await page.getByText(/Financials is not read/).count(),0);
