@@ -32,12 +32,12 @@ net worth, credit score, bill negotiation, Smart Savings, cancellation concierge
 
 | Horizon | Median error (share of a month's outflows) | Bias | Actual below low band | Actual above high band |
 |---|---|---|---|---|
-| 1 week | 15.7% | -6.3% | 14.1% | 20.3% |
-| 4 weeks | 17.0% | -4.8% | 12.5% | 9.4% |
-| 13 weeks | 31.4% | -9.9% | 7.8% | 1.6% |
+| 1 week | 13.5% | -6.4% | 12.5% | 18.8% |
+| 4 weeks | 17.0% | -1.2% | 15.6% | 6.3% |
+| 13 weeks | 31.9% | +1.6% | 14.1% | 1.6% |
 
-The bias is deliberately conservative: deposits with no schedule (transfers in, refunds) are not forecast until
-they happen. The history includes a job change (April 2026), which no forecast made before it could know.
+On average the forecast is now unbiased (it was 10-16% pessimistic before paychecks with changing bank references
+were grouped). Deposits with no schedule (transfers in, refunds) are still not forecast until they happen. The history includes a job change (April 2026), which no forecast made before it could know.
 
 ## Inputs Onyx derived itself (2026-11-14)
 
