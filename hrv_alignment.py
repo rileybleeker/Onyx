@@ -28,6 +28,22 @@ derived; verified on live data 2026-11-10)
   through the NEXT waking day, so row D shows day D+1's strain (strain on row D vs WHOOP
   workouts on row D+1: r = 0.83; same row: r = -0.01). Moved one day later, so row D
   holds day D's strain. Without this, a same-row outcome would make strain reverse-causal.
+  whoop_steps (pds.whoop_cycles.step_count, merged in pandas by
+  hrv_analysis.merge_whoop_steps_features, not a matrix column) is the same kind of total,
+  but it is dated from each cycle's OWN start, not from the matrix's cycle pick:
+  cycle_waking_day() = the behavioral day (-6 h rule, in the cycle's local time) of the
+  instant 12 h after the cycle's opening sleep onset, i.e. (local start + 6 h)'s date. For
+  the usual night-time onset that is cycle date + 1, the same move as strain. It differs
+  only for an onset between 06:00 and 18:00 local: the -6 h rule dates that sleep to its own
+  clock day D, and the next onset (after midnight) is dated D as well, so two cycles share
+  behavioral date D, but the first one's waking hours are clock day D. Cycles that land on
+  the same day are summed (they are consecutive, non-overlapping spans). Live check
+  2026-11-14, 739 closed cycles: cycle date + 1 put two cycles on one day 7 times; this rule
+  0 times, and it equals "the behavioral day of the cycle's END" (the sleep the steps
+  precede) on 732 of 739. Steps of the day vs Garmin steps of the same clock day: r = 0.949
+  (507 days; cycle date + 1: 0.945, 505). Earlier check 2026-11-13: the cycle dated D vs
+  Garmin steps of clock day D+1 r = 0.94 (451 days), D-2, D-1, D, D+2, D+3 between -0.11 and
+  0.22; against WHOOP running distance of day D+1 r = 0.75, other offsets |r| < 0.14.
 * Eight Sleep and Garmin HRV (matrix columns eight_sleep_* and garmin_hrv_*): both are
   dated by the wake-up day, so row D shows the night that closes day D-1 (Eight Sleep HRV
   on row D+1 vs WHOOP HRV on row D: r = 0.84; Garmin HRV on row D vs WHOOP row D-1:
@@ -80,6 +96,13 @@ ALIGNMENT_CUTOVER_DATE = "2026-11-11"
 
 # Matrix columns that describe the waking day AFTER row D's sleep (see module docstring).
 NEXT_DAY_COLS = ("whoop_day_strain", "whoop_kilojoule", "whoop_cycle_avg_hr", "whoop_cycle_max_hr")
+# Cycle totals hrv_analysis builds from pds.whoop_cycles itself, dated with
+# cycle_waking_day() before the merge, so they are already on the rule when they reach the
+# frame (never passed through realign_matrix).
+CYCLE_TOTAL_FEATURES = ("whoop_steps",)
+# A cycle's waking hours start about one sleep after its opening onset; 12 h is the point
+# whose behavioral day (-6 h rule) names the waking day (cycle_waking_day).
+WAKING_DAY_FROM_ONSET = timedelta(hours=12)
 # Matrix columns keyed by the wake-up day (they show the night BEFORE row D's sleep).
 PREVIOUS_NIGHT_PREFIXES = ("eight_sleep_", "garmin_hrv_")
 
@@ -124,6 +147,43 @@ def wake_date_to_closing_day(frame: pd.DataFrame) -> pd.DataFrame:
     f = frame.copy()
     f[DATE_COL] = (pd.to_datetime(f[DATE_COL]) - pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
     return f
+
+
+def _offset_minutes(value) -> float:
+    """A WHOOP timezone_offset ('-04:00', '+0530', '-04') in minutes east of UTC, or NaN."""
+    if not isinstance(value, str):
+        return np.nan
+    s = value.strip()
+    if len(s) < 3 or s[0] not in "+-":
+        return np.nan
+    digits = s[1:].replace(":", "")
+    if not digits.isdigit() or len(digits) not in (2, 4):
+        return np.nan
+    minutes = int(digits[:2]) * 60 + (int(digits[2:]) if len(digits) == 4 else 0)
+    if minutes > 14 * 60:
+        return np.nan
+    return float(minutes if s[0] == "+" else -minutes)
+
+
+def cycle_waking_day(cycles: pd.DataFrame) -> pd.Series:
+    """The waking day ('YYYY-MM-DD') whose totals a WHOOP cycle counts, from the cycle's own
+    start: the behavioral day (-6 h rule) of the instant WAKING_DAY_FROM_ONSET after the
+    opening sleep onset, in the cycle's local time (start_time + timezone_offset; a missing
+    or unreadable offset falls back to America/New_York). NaN where start_time is missing.
+    See the module docstring for why this replaces "cycle date + 1"."""
+    if cycles is None or cycles.empty or "start_time" not in cycles.columns:
+        return pd.Series(np.nan, index=getattr(cycles, "index", None), dtype=object)
+    start = pd.to_datetime(cycles["start_time"], utc=True, errors="coerce", format="ISO8601")
+    if "timezone_offset" in cycles.columns:
+        off = cycles["timezone_offset"].map(_offset_minutes).astype(float)
+    else:
+        off = pd.Series(np.nan, index=cycles.index, dtype=float)
+    et_off = start.map(lambda t: t.tz_convert(ET).utcoffset().total_seconds() / 60
+                       if pd.notna(t) else np.nan).astype(float)
+    off = off.fillna(et_off)
+    local = start.dt.tz_localize(None) + pd.to_timedelta(off, unit="m")
+    day = (local + WAKING_DAY_FROM_ONSET - BEHAVIORAL_DAY_OFFSET).dt.strftime("%Y-%m-%d")
+    return day.where(start.notna())
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +503,9 @@ def check_rekey_directions(realigned: pd.DataFrame) -> list[str]:
         ("whoop_day_strain", "whoop_workout_strain"),
         ("eight_sleep_hrv", TARGET),
         ("garmin_hrv_last_night", TARGET),
+        # WHOOP steps (cycle total, re-keyed in pandas) vs Garmin steps (clock day): two
+        # devices counting the same day. Skipped when either column is absent.
+        ("whoop_steps", "total_steps"),
     ]
     for col, ref in checks:
         if col not in df.columns or ref not in df.columns:

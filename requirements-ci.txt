@@ -17,3 +17,6 @@ icalendar==7.3.0
 recurring-ical-events==3.8.2
 x-wr-timezone==2.0.1
 python-dateutil==2.9.0.post0
+
+# whoop_etl.py does `import requests` at import time (tests/test_whoop_steps.py).
+requests>=2.31,<3

@@ -269,7 +269,7 @@ CONTROLLABLE_FEATURE_PREFIXES = (
     "rolling_3d_training_load", "rolling_7d_training_load", "sleep_debt",
     "moderate_intensity_minutes", "vigorous_intensity_minutes",
     "active_seconds", "highly_active_seconds", "sedentary_seconds",
-    "total_steps", "protein_pct", "carb_pct", "fat_pct", "net_calories",
+    "total_steps", "whoop_steps", "protein_pct", "carb_pct", "fat_pct", "net_calories",
     "days_since_alcohol", "days_since_sauna", "days_since_hard_workout",
     "nj_",  # Notion Journal: mood / confidence / word_count / topic_count
     "sp_",  # Spotify daily signature (opt-in via ONYX_INCLUDE_SPOTIFY=1)
@@ -368,7 +368,8 @@ FEATURE_LABELS: dict[str, str] = {
     "garmin_rem_pct": "REM Sleep % (Garmin)",
     "garmin_rhr": "Resting HR (Garmin)",
     "garmin_spo2": "SpO2 (Garmin)",
-    "total_steps": "Daily Steps",
+    "total_steps": "Daily Steps (Garmin)",
+    "whoop_steps": "Daily Steps (WHOOP)",
     "total_kilocalories": "Total Calories",
     "active_kilocalories": "Active Calories",
     "avg_stress_level": "Avg Stress Level",
@@ -759,6 +760,20 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         # behavioral_date on transition cycles by 1 day — silently dropped
         # timezone_offset from those rows in earlier Phase A iteration).
         data["whoop_cycles"]["calendar_date"] = data["whoop_cycles"]["onyx_behavioral_date"].astype(str)
+
+    # WHOOP step count per cycle (pds.whoop_cycles.step_count, 2026-11-13). A separate,
+    # fail-open read: the cycles frame above feeds the alignment guard, and a problem with
+    # one new column must never take that (or the retrain) down.
+    log.info("  Loading whoop_cycles.step_count (WHOOP steps)…")
+    try:
+        data["whoop_steps"] = fetch_all(
+            "whoop_cycles",
+            select="cycle_id,start_time,end_time,timezone_offset,onyx_behavioral_date,step_count",
+            order="start_time",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  whoop_cycles.step_count load failed ({e!r}); continuing without WHOOP steps")
+        data["whoop_steps"] = pd.DataFrame()
 
     # Recovery per cycle, for the alignment guard (hrv_alignment.check_matrix_hrv).
     log.info("  Loading whoop_recovery (alignment guard)…")
@@ -1482,7 +1497,7 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
 
 
 # Families whose newest day is not known when the evening forecast runs.
-NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_", "wx_")
+NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_", "wx_", "whoop_steps")
 
 SCREEN_COLS = {
     # feature column                     <- pds.phone_usage_daily column
@@ -1702,6 +1717,74 @@ def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None,
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Weather feature merge failed ({e!r}); continuing without weather features")
+        return df
+
+
+WHOOP_STEPS_COL = "whoop_steps"
+DATE_COL_STEPS = "_steps_day"
+
+
+def merge_whoop_steps_features(df: pd.DataFrame, cycles: pd.DataFrame | None) -> pd.DataFrame:
+    """Daily steps from the WHOOP strap (pds.whoop_cycles.step_count, whoop_etl.py).
+
+      whoop_steps  steps WHOOP counted over the waking day (sum of the cycles dated to it)
+
+    The Garmin watch (matrix column total_steps) is rarely worn; the strap is worn every
+    day. The two are different devices with different step detection, so this is its own
+    column and is never blended into total_steps (the pipeline's steps signal is WHOOP
+    only; /activities may show the larger of the two, the analysis never does).
+
+    ROW PLACEMENT: a WHOOP cycle starts at a sleep onset and runs to the next one, so its
+    steps are the waking day after that onset. Each cycle is dated from its OWN start by
+    al.cycle_waking_day (the -6 h behavioral-day rule applied 12 h after the onset, in the
+    cycle's local time). For a normal night-time onset that is the cycle's behavioral date
+    + 1, the same move realign_matrix applies to strain. It is not "the matrix's main cycle
+    + 1": when two cycles share a behavioral date (an onset after 06:00 local), the earlier
+    one counts that date itself and the later one the next day; picking the longest and
+    adding a day put the wrong cycle's count on the wrong row (2026-11-14 review, live data).
+    Row D then holds the steps walked before the sleep that closes day D, which is the sleep
+    row D's HRV comes from. The runtime guard (al.check_rekey_directions) fails the retrain
+    if WHOOP steps ever line up with Garmin steps on an adjacent row instead.
+
+    SEVERAL CYCLES ON ONE DAY: summed (consecutive, non-overlapping spans). The day is kept
+    only when every cycle dated to it is closed and has a count; an open cycle (steps so far)
+    or a null count among them leaves the day NaN, so a partial day never reads as a low one.
+
+    MISSING: WHOOP sends null, never 0, when it has no step data (strap not worn). Those
+    days stay NaN; nothing is zero-filled.
+
+    Kept out of the forecasting models (NOT_FORECAST_PREFIXES): on the evening the forecast
+    runs, today's cycle is still open, so the newest row would read NaN where training rows
+    have values. Descriptive (Spearman) and causal analyses only.
+
+    Fail-open: any problem logs a warning and returns df untouched.
+    """
+    if cycles is None or cycles.empty:
+        return df
+    try:
+        c = cycles.copy()
+        if "cycle_id" in c.columns:
+            c = c.drop_duplicates("cycle_id", keep="last")
+        steps = pd.to_numeric(c["step_count"], errors="coerce")
+        c["_steps"] = steps.where(steps >= 0)
+        c["_ok"] = c["end_time"].notna() & c["_steps"].notna()
+        c[DATE_COL_STEPS] = al.cycle_waking_day(c)
+        c = c.dropna(subset=[DATE_COL_STEPS])
+        g = c.groupby(DATE_COL_STEPS).agg(n=("_ok", "size"), n_ok=("_ok", "sum"),
+                                          total=("_steps", "sum"))
+        g = g[g["n"] == g["n_ok"]]
+        if g.empty:
+            return df
+        f = pd.DataFrame({"calendar_date": g.index.astype(str),
+                          WHOOP_STEPS_COL: g["total"].astype(float).to_numpy()})
+        out = df.drop(columns=[WHOOP_STEPS_COL], errors="ignore").merge(f, on="calendar_date", how="left")
+        assert len(out) == len(df), "WHOOP steps merge changed the row count"
+        multi = int((g["n"] > 1).sum())
+        log.info(f"  WHOOP steps: {int(out[WHOOP_STEPS_COL].notna().sum())} days "
+                 f"({multi} day(s) summed from 2+ cycles; days with an open or step-less cycle left NaN)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  WHOOP steps merge failed ({e!r}); continuing without WHOOP steps")
         return df
 
 
@@ -2274,6 +2357,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     df = merge_screen_time_features(df, data.get("screen"))
     df = merge_air_quality_features(df, data.get("air_quality"))
     df = merge_weather_features(df, data.get("weather"))
+    df = merge_whoop_steps_features(df, data.get("whoop_steps"))
 
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships
@@ -3432,6 +3516,7 @@ def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, l
     # night's HRV and sleep reach the model through hrv_lag* and the *_lag1 columns.
     exclude = {"calendar_date", "whoop_recovery_score"}
     exclude |= {c for c in model_df.columns if not al.forecast_can_use(c)}
+    # whoop_steps: today's WHOOP cycle is still open on the evening of the forecast.
     # delivery_* / screen_* / aqi_* / wx_*: today's receipts / Screen Time / air-quality and
     # weather hours are not all in yet when the forecast runs, so the newest row reads NaN where
     # training rows have values (see merge_delivery_features / merge_screen_time_features /

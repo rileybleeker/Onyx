@@ -7,7 +7,8 @@ import { formatDuration, formatShortDuration, formatDistance, formatPace, format
 import RangeFilter from "@/components/RangeFilter";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
-import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel, chartColors as C } from "@/lib/chart-theme";
+import { chartTooltip, axisTick, gridStyle, axisLabel, sourceColors, chartColors as C } from "@/lib/chart-theme";
+import { mergeDailySteps, stepsSourceLabel } from "@/lib/steps";
 import {
   SPLIT_LABELS, MUSCLE_GROUPS, SUGGEST_MAX_ITEMS, SUGGEST_WINDOW_DAYS, deriveActivityCategory,
   type ActivityCategory, type MuscleGroup, type SplitLabel, type SuggestionConfidence,
@@ -660,10 +661,17 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     saveTags(act, { is_sauna: !act.is_sauna });
   }
 
-  const latestSummary = summaries[summaries.length - 1];
-  const stepsData = summaries.map((d) => ({
-    date: formatDate(d.calendar_date),
-    steps: d.total_steps,
+  // Steps: one count per day, the larger of Garmin's and WHOOP's (whoop_cycles.step_count,
+  // dated to the waking day each cycle counts): a watch worn for part of the day is not a
+  // low-step day. One device per day, never summed; each bar and the stat tile name their
+  // device (lib/steps.ts).
+  const dailySteps = mergeDailySteps(summaries, whoopCycles);
+  const latestSteps = dailySteps[dailySteps.length - 1];
+  const stepsSource = stepsSourceLabel(dailySteps);
+  const stepsData = dailySteps.map((d) => ({
+    date: formatDate(d.day),
+    garmin: d.source === "GARMIN" ? d.steps : null,
+    whoop: d.source === "WHOOP" ? d.steps : null,
   }));
 
   // WHOOP day-wide cycle avg HR (one value per cycle = behavioral day).
@@ -722,9 +730,9 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
       <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
         <StatCard
           label="Steps"
-          value={latestSummary?.total_steps?.toLocaleString()}
-          sublabel={latestSummary?.calendar_date}
-          source="GARMIN"
+          value={latestSteps ? latestSteps.steps.toLocaleString() : null}
+          sublabel={latestSteps ? `${latestSteps.day}${latestSteps.partial ? " so far" : ""}` : undefined}
+          source={latestSteps?.source}
         />
         <StatCard
           label="Avg HR"
@@ -739,14 +747,19 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-        <ChartCard title="Daily Steps" subtitle={rangeLabel(range)} source="GARMIN">
+        <ChartCard title="Daily Steps" subtitle={rangeLabel(range)} source={stepsSource}>
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={stepsData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} label={axisLabel("steps", "y")} />
               <Tooltip {...chartTooltip} />
-              <Bar dataKey="steps" fill={accentColor} radius={[2, 2, 0, 0]} fillOpacity={0.85} isAnimationActive={false} />
+              {stepsSource === "GARMIN + WHOOP" && (
+                <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
+              )}
+              {/* One bar per day: a day has either a Garmin or a WHOOP value, so the stack never adds them. */}
+              <Bar dataKey="garmin" stackId="steps" name="Garmin" fill={sourceColors.garmin} radius={[2, 2, 0, 0]} fillOpacity={0.85} isAnimationActive={false} />
+              <Bar dataKey="whoop" stackId="steps" name="WHOOP" fill={sourceColors.whoop} radius={[2, 2, 0, 0]} fillOpacity={0.85} isAnimationActive={false} />
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
