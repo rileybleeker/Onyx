@@ -143,6 +143,97 @@ test("empty input and malformed rows", () => {
   assert.equal(R.parseRecurringInput({ txn_date: "2030-01-01", amount_cents: "1200", name: "Demo" }).amount_cents, 1200);
 });
 
+// ─── next-charge estimate: method, confidence, no date for irregular repeats ─────────────────
+const monthlyOn = (day, months, over = {}) =>
+  charges(months.map((m) => `2030-${String(m).padStart(2, "0")}-${String(day).padStart(2, "0")}`), 1500, over);
+
+test("same day each month: calendar method, high confidence, exact date", () => {
+  const s = R.detectRecurring(monthlyOn(17, [1, 2, 3, 4, 5]), TODAY)[0];
+  assert.equal(s.nextExpected, "2030-06-17");
+  assert.match(s.nextMethod, /same day of the month/);
+  assert.equal(s.confidence, "high");
+  assert.equal(s.maxMissDays, 0);
+  assert.equal(s.checkedGaps, 4);
+  assert.match(s.id, /^[0-9a-f]{16}$/);
+});
+
+test("a fixed 28-day cycle uses the interval method, not the calendar", () => {
+  const s = R.detectRecurring(charges(series(6, 28, 5), 900), TODAY)[0];
+  assert.equal(s.cadence, "monthly");
+  assert.match(s.nextMethod, /every 28 days/);
+  assert.equal(s.nextExpected, R.addDays(TODAY, 23));
+  assert.equal(s.confidence, "high");
+});
+
+test("one charge posted two days late does not move the estimate", () => {
+  const rows = charges(["2030-02-05", "2030-03-05", "2030-04-05", "2030-05-07"], 1000);
+  const s = R.detectRecurring(rows, "2030-05-20")[0];
+  assert.equal(s.nextExpected, "2030-06-05");
+  assert.equal(s.maxMissDays, 2);
+  assert.equal(s.confidence, "high");
+});
+
+test("month-end billing is clamped to the last day of a short month", () => {
+  assert.equal(R.addMonths("2030-01-31", 1), "2030-02-28");
+  assert.equal(R.addMonths("2028-01-31", 1), "2028-02-29");
+  assert.equal(R.addMonths("2030-11-30", 3), "2031-02-28");
+  assert.equal(R.addMonths("2030-12-15", 1), "2031-01-15");
+  const s = R.detectRecurring(charges(["2030-01-31", "2030-02-28", "2030-03-31", "2030-04-30"], 700), "2030-05-10")[0];
+  assert.equal(s.nextExpected, "2030-05-31");
+  const on30th = R.detectRecurring(charges(["2030-01-30", "2030-02-28", "2030-03-30", "2030-04-30"], 700), "2030-05-10")[0];
+  assert.equal(on30th.nextExpected, "2030-05-30");
+  const intoFeb = R.detectRecurring(charges(["2029-10-31", "2029-11-30", "2029-12-31", "2030-01-31"], 700), "2030-02-10")[0];
+  assert.equal(intoFeb.nextExpected, "2030-02-28");
+});
+
+test("wobbly spacing is low confidence; fairly steady is medium", () => {
+  const wobbly = R.detectRecurring(charges(["2030-01-01", "2030-02-05", "2030-03-03", "2030-04-07", "2030-05-02"], 1000), "2030-05-10")[0];
+  assert.equal(wobbly.confidence, "low");
+  const steady = R.detectRecurring(charges(["2030-01-10", "2030-02-13", "2030-03-12", "2030-04-12"], 1000), "2030-04-20")[0];
+  assert.equal(steady.confidence, "medium");
+});
+
+test("an annual charge seen twice is medium confidence at best", () => {
+  const s = R.detectRecurring(charges(["2029-03-01", "2030-03-01"], 12000), TODAY)[0];
+  assert.equal(s.confidence, "medium");
+  assert.equal(s.checkedGaps, 1);
+  assert.match(s.nextMethod, /one year after/);
+});
+
+test("the id is stable per merchant and differs between merchants", () => {
+  const a = R.detectRecurring(charges(series(4, 30, 10), 1000, { name: "Demo Alpha #12" }), TODAY)[0];
+  const again = R.detectRecurring(charges(series(5, 30, 10), 1100, { name: "DEMO ALPHA #77" }), TODAY)[0];
+  const b = R.detectRecurring(charges(series(4, 30, 10), 1000, { name: "Demo Beta" }), TODAY)[0];
+  assert.equal(a.id, again.id);
+  assert.notEqual(a.id, b.id);
+  assert.equal(R.stableId("demo alpha"), a.id);
+});
+
+test("a same-price charge on no schedule is listed as irregular, with no date", () => {
+  const dates = ["2030-01-04", "2030-01-25", "2030-03-20", "2030-04-02", "2030-05-28"];
+  const rows = charges(dates, 2000, { name: "Demo Top-up" });
+  assert.deepEqual(R.detectRecurring(rows, TODAY), []);
+  const out = R.detectIrregular(rows, TODAY);
+  assert.equal(out.length, 1);
+  assert.deepEqual(Object.keys(out[0]).sort(), ["chargeCount", "id", "lastCharge", "medianGapDays", "merchant", "typicalCents"]);
+  assert.equal(out[0].merchant, "Demo Top-up");
+  assert.equal(out[0].typicalCents, 2000);
+  assert.equal(out[0].chargeCount, 5);
+  assert.equal(out[0].lastCharge, "2030-05-28");
+});
+
+test("irregular: varying amounts, too few charges, frequent visits, old or regular ones are left out", () => {
+  const dates = ["2030-01-04", "2030-01-25", "2030-03-20", "2030-04-02", "2030-05-28"];
+  assert.deepEqual(R.detectIrregular(charges(dates, [1000, 1400, 800, 1000, 1250]), TODAY), [], "amounts vary");
+  assert.deepEqual(R.detectIrregular(charges(dates.slice(0, 3), 2000), TODAY), [], "three charges");
+  assert.deepEqual(R.detectIrregular(charges(series(8, 3, 2), 600), TODAY), [], "every few days");
+  assert.deepEqual(R.detectIrregular(charges(dates, 2000), "2031-06-15"), [], "last charge long ago");
+  assert.deepEqual(R.detectIrregular(charges(series(5, 30, 10), 1000), TODAY), [], "already a regular subscription");
+  assert.deepEqual(R.detectIrregular(charges(dates, 2000, { ignored_from: "budget" }), TODAY), [], "ignored rows");
+  assert.deepEqual(R.detectIrregular(charges(dates, 2000, { currency: "EUR" }), TODAY), [], "not USD");
+  assert.deepEqual(R.detectIrregular(charges(dates, -2000), TODAY), [], "refunds");
+});
+
 // ─── server loader: three distinct states ─────────────────────────────────────────────────────
 function loader({ rows, error, configured = true }) {
   class LedgerQueryError extends Error {
@@ -170,6 +261,7 @@ test("loader: data, empty and failed query are three distinct states", async () 
   assert.equal(ok.subs.length, 1);
   assert.equal(ok.total, 1299);
   assert.equal(ok.today, TODAY);
+  assert.deepEqual(ok.irregular, []);
 
   const empty = await loader({ rows: [] }).run();
   assert.deepEqual(empty, { state: "empty" });

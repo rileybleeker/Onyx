@@ -19,8 +19,10 @@ Files are classified by their header row (not filename), so renamed exports work
 
 Idempotency:
     - cronometer_nutrition_daily : upsert on calendar_date (from dailysummary "Total" rows).
-    - cronometer_servings        : delete-by-calendar_date + insert (reflects edits/deletes
-                                   in the source export; survives re-import of the same range).
+    - cronometer_servings        : the re-imported dates are replaced in ONE transaction by
+                                   pds.replace_cronometer_servings (sql/cronometer_replace_servings.sql);
+                                   reflects edits/deletes in the source export and survives
+                                   re-import of the same range. Readers never see a half-replaced day.
 
 Conventions honored (see AGENTS.md):
     - utf-8-sig read (Cronometer exports carry a BOM; micro sign is UTF-8 'µ').
@@ -429,22 +431,62 @@ def build_daily_rows(csv_path: str) -> list[dict]:
 
 
 # ── Writers ─────────────────────────────────────────────────────────────────────
-def import_servings(rows: list[dict], dry_run: bool) -> int:
+REPLACE_SERVINGS_RPC = "replace_cronometer_servings"
+REPLACE_SERVINGS_SQL = "sql/cronometer_replace_servings.sql"
+
+
+def _is_missing_function(exc: Exception) -> bool:
+    """True when PostgREST / Postgres says the replace function does not exist."""
+    code = str(getattr(exc, "code", "") or "")
+    text = f"{getattr(exc, 'message', '') or ''} {exc}"
+    return (code in ("PGRST202", "42883")
+            or "Could not find the function" in text) and REPLACE_SERVINGS_RPC in text
+
+
+def import_servings(rows: list[dict], dry_run: bool, sb=None) -> int:
+    """Replace the servings of every date in `rows`, in one database transaction.
+
+    One RPC call per import: pds.replace_cronometer_servings removes the rows of
+    exactly the dates present in `rows` and inserts `rows`, atomically. A reader
+    sees the old day or the new day, never an empty one, and any failure leaves
+    the stored servings as they were (audit deepseek/F-005; the old code cleared
+    the dates and inserted in separate requests).
+
+    An empty export makes no call, so it can never clear stored days.
+
+    There is deliberately NO fallback to separate delete + insert requests when
+    the function is missing or fails: that is the non-atomic path this replaces,
+    and running it after a failed attempt is how days end up empty. The import
+    stops with an error that names the SQL file, and nothing is changed.
+    """
     if not rows:
         return 0
     if dry_run:
         return len(rows)
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    if sb is None:
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     dates = sorted({r["calendar_date"] for r in rows})
-    # Idempotent: clear the affected dates, then insert fresh (reflects edits/deletes).
-    for i in range(0, len(dates), 100):
-        chunk = dates[i:i + 100]
-        sb.schema("pds").table("cronometer_servings").delete().in_("calendar_date", chunk).execute()
-    inserted = 0
-    for i in range(0, len(rows), BATCH):
-        batch = rows[i:i + BATCH]
-        res = sb.schema("pds").table("cronometer_servings").insert(batch).execute()
-        inserted += len(res.data) if res.data else 0
+    try:
+        res = (
+            sb.schema("pds")
+            .rpc(REPLACE_SERVINGS_RPC, {"p_dates": dates, "p_rows": rows})
+            .execute()
+        )
+    except Exception as e:  # noqa: BLE001
+        if _is_missing_function(e):
+            raise RuntimeError(
+                f"pds.{REPLACE_SERVINGS_RPC} does not exist in the database. Apply "
+                f"{REPLACE_SERVINGS_SQL} once (Supabase SQL editor), then re-run. "
+                "No servings were changed."
+            ) from e
+        raise
+    data = res.data
+    inserted = data.get("inserted") if isinstance(data, dict) else None
+    if inserted != len(rows):
+        raise RuntimeError(
+            f"pds.{REPLACE_SERVINGS_RPC} answered {data!r} for {len(rows)} rows sent; "
+            "the import cannot be confirmed."
+        )
     return inserted
 
 
@@ -480,7 +522,7 @@ def run_import(paths: list[str], dry_run: bool = False) -> tuple[int, int]:
         t0 = now_epoch()
         try:
             srows = build_serving_rows(servings_path, tz_log) if servings_path else []
-            scount = import_servings(srows, dry_run)
+            scount = import_servings(srows, dry_run, sb)
             print(f"  servings: {scount} entries {'(dry-run)' if dry_run else 'imported'}"
                   f"{' from ' + os.path.basename(servings_path) if servings_path else ' (no file)'}")
             # Heartbeat on EVERY run, including a zero-row export (no food logged
