@@ -104,6 +104,8 @@ SCHEDULED: dict[str, Sched] = {
     'delivery-email.yml': Sched('Delivery Email ETL', _h(4), True, 'every 3h; worst seen 3h08'),
     'air-quality-etl.yml': Sched(
         'Air Quality ETL', _h(4), True, 'every 3h at :12; new 2026-11-11, same cadence as the email ETLs'),
+    'weather-etl.yml': Sched(
+        'Weather ETL', _h(4), True, 'every 3h at :32; new 2026-11-13, same cadence as the air-quality ETL'),
     'orders-email.yml': Sched(
         'Online Orders Email', _h(4), True, 'every 3h at :05; new 2026-11-12, same cadence as the email ETLs'),
     'urgent-email.yml': Sched(

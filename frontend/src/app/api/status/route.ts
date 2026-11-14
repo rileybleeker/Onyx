@@ -56,6 +56,7 @@ const CADENCE: Record<string, string> = {
   delivery: "Every 3h :40",
   online_orders: "Every 3h :05 (both Gmail accounts)",
   air_quality: "Every 3h :12",
+  weather: "Every 3h :32",
   supplement_reminders: "Worker poll (heartbeat ~hourly); cards at each stack's reminder time",
   renewal_reminders: "Worker poll, hourly; a card up to 3 days before a renewal",
   urgent_email: "Hourly :15 (both Gmail accounts)",
@@ -105,6 +106,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   delivery:       { method: "automated",      label: "IMAP email parser" },
   online_orders:  { method: "automated",      label: "IMAP email parser" },
   air_quality:    { method: "automated",      label: "API ETL" },
+  weather:        { method: "automated",      label: "API ETL" },
   supplement_reminders: { method: "automated", label: "Worker push cards" },
   renewal_reminders: { method: "automated", label: "Worker push cards" },
   urgent_email:   { method: "automated",      label: "IMAP label reader" },
@@ -256,7 +258,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -349,6 +351,11 @@ export async function GET() {
       // A missing table (SQL not applied yet) shows its error text on the card instead of breaking /status.
       supabase.from("air_quality_daily").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("sync_log").select("*").eq("source", "air_quality").eq("data_type", "daily")
+        .order("sync_start", { ascending: false }).limit(1),
+      // Weather: same shape as air quality (newest ET day in pds.weather_daily + a dedicated
+      // limit-1 heartbeat fetch for the 3-hourly run; a missing table shows its error on the card).
+      supabase.from("weather_daily").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
+      supabase.from("sync_log").select("*").eq("source", "weather").eq("data_type", "daily")
         .order("sync_start", { ascending: false }).limit(1),
       // The two PC harvesters heartbeat hours apart (and not at all while the PC is off), so their
       // newest row regularly falls out of the 100-row window above (~13 h of history). Without a
@@ -941,6 +948,39 @@ export async function GET() {
           cadence: CADENCE.air_quality,
           integrationMethod: METHOD.air_quality.method,
           methodLabel: METHOD.air_quality.label,
+        };
+      })(),
+      // Weather (weather_etl.py): hourly outdoor weather from the keyless Open-Meteo archive
+      // API, aggregated per ET day into pds.weather_daily for the HRV pipeline (wx_* features)
+      // and the Weather panel on /analytics/hrv. Freshness = heartbeat age, same thresholds as
+      // Air Quality: cron every 3h -> >4h partial, >12h or a failed row = red. A 'partial'
+      // heartbeat means the API returned no temperature values, or the optional UV index
+      // request failed (the error text says which).
+      weather: (() => {
+        const entry = latestBySrcType["weather|daily"]
+          ?? (weatherSyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || entry.status === "error" || ageH > 12
+            ? "failed"
+            : entry.status === "partial" || ageH > 4
+              ? "partial"
+              : "success";
+        return {
+          label: "Weather",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: (weatherRes.data?.[0]?.calendar_date as string | undefined) ?? null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (entry ? null : weatherRes.error?.message ?? weatherSyncRes.error?.message ?? null),
+          cadence: CADENCE.weather,
+          integrationMethod: METHOD.weather.method,
+          methodLabel: METHOD.weather.label,
         };
       })(),
       // Supplement stack reminders (sms-reminders Worker -> /api/supplements/reminders/*):

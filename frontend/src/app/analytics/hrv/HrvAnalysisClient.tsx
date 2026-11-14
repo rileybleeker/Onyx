@@ -13,6 +13,7 @@ import RangeFilter from "@/components/RangeFilter";
 import KpiTile from "@/components/KpiTile";
 import MetricRing from "@/components/MetricRing";
 import SectionHeader from "@/components/SectionHeader";
+import WeatherPanel from "@/components/WeatherPanel";
 import { sameJson } from "@/lib/format";
 import { causalPlausibility, splitPlausible } from "@/lib/causal-plausibility";
 import {
@@ -2357,6 +2358,11 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       {/* PM2.5 panel: fetches /api/air-quality itself (service-role table, not in the ISR prefetch). */}
       <DeferredMount minHeight={420}>
         <AirQualityPanel />
+      </DeferredMount>
+
+      {/* Weather panel: same pattern, fetches /api/weather itself (pds.weather_daily, service-role table). */}
+      <DeferredMount minHeight={500}>
+        <WeatherPanel />
       </DeferredMount>
 
       <SectionHeader id="methods" tick="calibration" title="Methods & Evaluation" />

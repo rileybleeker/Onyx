@@ -540,6 +540,22 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     # a small, noisy effect. History from the 2024-01-01 backfill, so it clears MIN_CONTINUOUS_N
     # as soon as the first run lands.
     ("aqi_pm25",                          "behavior", "Outdoor PM2.5 above median",              "µg/m³"),
+    # Outdoor weather (pds.weather_daily via weather_etl.py, 2026-11-13). Only the three
+    # variables with a daily "what if" reading are treatments: heat during the day (stay in,
+    # train indoors), direct sun (time outside in daylight) and the outdoor temperature during
+    # the sleep itself (cool the bedroom, windows). Pressure, humidity, wind, rain and day
+    # length are features only: nothing Riley does on a given day changes his exposure to them.
+    # EXPLORATORY, read with care: there is NO seasonal adjustment anywhere in this layer (no
+    # month or day-of-year term among the lag-1 confounders). Temperature and sunshine are
+    # almost pure season, so the median split is close to "summer half vs winter half", and
+    # HRV has its own slow drift over the same months. An effect here can be season, not
+    # weather. The values are model data for the fixed home grid cell, not where Riley was.
+    # Row placement: daytime columns = ET clock day D on row D; wx_night_temp_mean = the
+    # 01:00-08:00 ET hours of clock day D + 1, the sleep that closes day D
+    # (hrv_analysis.merge_weather_features). History from the 2024-01-01 backfill.
+    ("wx_apparent_temp_max",              "behavior", "Feels-like high above median",            "°C"),
+    ("wx_sunshine_hours",                 "behavior", "Sunshine hours above median",             "h"),
+    ("wx_night_temp_mean",                "behavior", "Outdoor temperature during sleep above median", "°C"),
     ("meal_eating_window_hours",      "nutrition", "Eating window above median",               "h"),
     ("meal_last_hour",                "nutrition", "Last meal clock hour above median",        "ET hr"),
     ("meal_first_hour",               "nutrition", "First meal clock hour above median",       "ET hr"),

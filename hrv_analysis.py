@@ -478,6 +478,20 @@ FEATURE_LABELS: dict[str, str] = {
     "aqi_pm25": "Outdoor PM2.5 (µg/m³)",
     "aqi_pm25_max": "Peak Hourly PM2.5 (µg/m³)",
     "aqi_us_max": "Peak US AQI",
+    "wx_temp_max": "Outdoor High (°C)",
+    "wx_temp_mean": "Outdoor Mean Temperature (°C)",
+    "wx_apparent_temp_max": "Feels-Like High (°C)",
+    "wx_humidity": "Outdoor Relative Humidity (%)",
+    "wx_dew_point": "Dew Point (°C)",
+    "wx_pressure": "Surface Pressure (hPa)",
+    "wx_precip_mm": "Precipitation (mm)",
+    "wx_wind_max": "Peak Wind (km/h)",
+    "wx_cloud_cover": "Cloud Cover (%)",
+    "wx_daylight_hours": "Daylight (h)",
+    "wx_sunshine_hours": "Sunshine (h)",
+    "wx_uv_max": "Peak UV Index",
+    "wx_night_temp_mean": "Outdoor Temperature During Sleep (°C)",
+    "wx_night_temp_min": "Outdoor Low During Sleep (°C)",
     "caffeine_first_hour": "First Caffeine (ET hour)",
     "caffeine_last_hour": "Last Caffeine (ET hour)",
     "caffeine_window_hours": "Caffeine Window (h)",
@@ -951,6 +965,19 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     except Exception as e:  # noqa: BLE001
         log.warning(f"  air_quality_daily load failed ({e!r}); continuing without air-quality features")
         data["air_quality"] = pd.DataFrame()
+
+    # Weather (pds.weather_daily, 2026-11-13): daily outdoor weather per ET clock day from the
+    # keyless Open-Meteo archive API (weather_etl.py). Loaded fail-open, like air quality.
+    log.info("  Loading weather_daily (Open-Meteo weather)…")
+    try:
+        data["weather"] = fetch_all(
+            "weather_daily",
+            select="calendar_date,n_hours,night_hours," + ",".join([*WX_DAY_COLS.values(), *WX_NIGHT_COLS.values()]),
+            order="calendar_date",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  weather_daily load failed ({e!r}); continuing without weather features")
+        data["weather"] = pd.DataFrame()
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
     # topic_count) joined into the matrix per the audit's Finding #8. The textual
@@ -1455,7 +1482,7 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
 
 
 # Families whose newest day is not known when the evening forecast runs.
-NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_")
+NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_", "wx_")
 
 SCREEN_COLS = {
     # feature column                     <- pds.phone_usage_daily column
@@ -1569,6 +1596,112 @@ def merge_air_quality_features(df: pd.DataFrame, air: pd.DataFrame | None) -> pd
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Air-quality feature merge failed ({e!r}); continuing without air-quality features")
+        return df
+
+
+WX_DAY_COLS = {
+    # feature column         <- pds.weather_daily column (ET clock day D -> matrix row D)
+    "wx_temp_max": "temperature_max",              # C, highest hourly value (afternoon)
+    "wx_temp_mean": "temperature_mean",            # C
+    "wx_apparent_temp_max": "apparent_temp_max",   # C, "feels like" high (causal exposure)
+    "wx_humidity": "humidity_mean",                # % relative humidity
+    "wx_dew_point": "dew_point_mean",              # C
+    "wx_pressure": "pressure_mean",                # hPa at the surface
+    "wx_precip_mm": "precipitation_sum",           # mm (a dry day is a real 0)
+    "wx_wind_max": "wind_speed_max",               # km/h
+    "wx_cloud_cover": "cloud_cover_mean",          # %
+    "wx_daylight_hours": "daylight_hours",         # astronomy: the seasonal term
+    "wx_sunshine_hours": "sunshine_hours",         # hours of direct sun (causal exposure)
+    "wx_uv_max": "uv_index_max",                   # best-effort, may be missing
+}
+WX_NIGHT_COLS = {
+    # feature column         <- pds.weather_daily column (ET clock day D + 1 -> matrix row D)
+    "wx_night_temp_mean": "night_temp_mean",       # C, 01:00-08:00 ET (causal exposure)
+    "wx_night_temp_min": "night_temp_min",
+}
+WX_COLS = (*WX_DAY_COLS, *WX_NIGHT_COLS)
+WX_MIN_HOURS = 23        # the shortest full ET clock day (spring-forward); a normal day has 24, fall-back 25
+WX_NIGHT_MIN_HOURS = 7   # 8 hourly values on a normal night, 7 / 9 on the two DST nights
+
+
+def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None,
+                           today: date | None = None) -> pd.DataFrame:
+    """Outdoor weather from pds.weather_daily (one row per ET clock day, weather_etl.py).
+
+    ROW PLACEMENT (hrv_alignment.py: row D = behavioral day D, its HRV = the sleep that
+    closes day D, which for Riley runs ~01:00-09:00 ET on clock day D + 1):
+
+      * Daytime columns (WX_DAY_COLS): the aggregate of ET clock day D sits on row D, like
+        aqi_pm25. Every hour of clock day D comes before the sleep that closes day D,
+        except possibly the last one before midnight on an early night. No re-keying.
+      * Night columns (WX_NIGHT_COLS): the table stores the 01:00-08:00 ET temperatures on
+        the clock day those hours belong to, which is D + 1 for the sleep that closes day
+        D. They are moved one day EARLIER here, by date, so row D carries the outdoor
+        temperature during row D's own sleep. Left on their own clock day they would be
+        scored against the night after.
+      * temperature_min is deliberately not a feature. The lowest hour of a clock day
+        usually falls near dawn, inside the PREVIOUS row's sleep, and sometimes late in
+        the evening (a cold front), so it is neither a clean day-D exposure nor the
+        outcome night's temperature; wx_night_temp_min is the well-defined version.
+
+    Checked on the live WHOOP sleeps (725 main sleeps since 2024-01-01, 2026-11-13): 85%
+    of all sleep time falls in the 01:00-09:00 ET window of clock day D + 1 and 0.1% in
+    the same window of clock day D; 1.5% of sleep time falls inside clock day D at all.
+
+    The night columns are concurrent with the outcome sleep but are not measured from it
+    and nothing Riley does causes them, so they are not mediators (not in
+    hrv_alignment.SAME_SLEEP_*).
+
+    COMPLETENESS: a clock day's daytime columns count only when the day is OVER (its date
+    is before `today`, the ET clock date; default et_today()) AND it has at least
+    WX_MIN_HOURS hourly values. The hour count alone is not enough: today reaches 20+
+    hours in the evening while its rain sum, wind maximum and means are still growing.
+    A past day short of hours (an API gap, or an ETL outage that left it half-written)
+    stays NaN too. A night with fewer than WX_NIGHT_MIN_HOURS values leaves the night
+    columns NaN (the ETL only counts a night once its last hour has passed). Days the
+    table does not cover are NaN. Nothing is filled: a 0 only ever means the source said
+    0 (a dry day's precipitation).
+
+    Kept out of the forecasting models (NOT_FORECAST_PREFIXES): when the evening forecast
+    runs, today's row is partial and tonight's temperatures are still in the future, so
+    the newest row would read NaN where training rows have values. Descriptive (Spearman)
+    and causal analyses only.
+
+    The weather is for the fixed home location, not for where Riley was on a trip.
+
+    Fail-open: any problem logs a warning and returns df untouched.
+    """
+    if weather is None or weather.empty:
+        return df
+    try:
+        w = weather.copy()
+        w["_day"] = pd.to_datetime(w["calendar_date"], errors="coerce")
+        w = w.dropna(subset=["_day"]).drop_duplicates("_day", keep="last")
+
+        today_ts = pd.Timestamp(today or et_today())
+        enough = (pd.to_numeric(w["n_hours"], errors="coerce") >= WX_MIN_HOURS).fillna(False)
+        day = w[enough & (w["_day"] < today_ts)]
+        day_f = pd.DataFrame({feat: pd.to_numeric(day[src], errors="coerce")
+                              for feat, src in WX_DAY_COLS.items()})
+        day_f["calendar_date"] = day["_day"].dt.strftime("%Y-%m-%d")
+
+        whole = (pd.to_numeric(w["night_hours"], errors="coerce") >= WX_NIGHT_MIN_HOURS).fillna(False)
+        night = w[whole]
+        night_f = pd.DataFrame({feat: pd.to_numeric(night[src], errors="coerce")
+                                for feat, src in WX_NIGHT_COLS.items()})
+        # The early-morning hours of clock day D + 1 belong to the sleep that closes day D.
+        night_f["calendar_date"] = (night["_day"] - pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
+
+        out = (df.drop(columns=list(WX_COLS), errors="ignore")
+               .merge(day_f, on="calendar_date", how="left")
+               .merge(night_f, on="calendar_date", how="left"))
+        assert len(out) == len(df), "weather merge changed the row count"
+        log.info(f"  Weather features: {int(out['wx_temp_mean'].notna().sum())} complete days, "
+                 f"{int(out['wx_night_temp_mean'].notna().sum())} nights "
+                 f"({len(w) - len(day)} unfinished or incomplete day(s) left NaN)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Weather feature merge failed ({e!r}); continuing without weather features")
         return df
 
 
@@ -2140,6 +2273,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
                                  data.get("delivery_unread_days"))
     df = merge_screen_time_features(df, data.get("screen"))
     df = merge_air_quality_features(df, data.get("air_quality"))
+    df = merge_weather_features(df, data.get("weather"))
 
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships
@@ -3298,9 +3432,10 @@ def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, l
     # night's HRV and sleep reach the model through hrv_lag* and the *_lag1 columns.
     exclude = {"calendar_date", "whoop_recovery_score"}
     exclude |= {c for c in model_df.columns if not al.forecast_can_use(c)}
-    # delivery_* / screen_* / aqi_*: today's receipts / Screen Time / air-quality hours are not
-    # all in yet when the forecast runs, so the newest row reads NaN where training rows have
-    # values (see merge_delivery_features / merge_screen_time_features / merge_air_quality_features).
+    # delivery_* / screen_* / aqi_* / wx_*: today's receipts / Screen Time / air-quality and
+    # weather hours are not all in yet when the forecast runs, so the newest row reads NaN where
+    # training rows have values (see merge_delivery_features / merge_screen_time_features /
+    # merge_air_quality_features / merge_weather_features).
     # Descriptive and causal only.
     exclude |= {c for c in model_df.columns if c.startswith(NOT_FORECAST_PREFIXES)}
     feat_cols = [c for c in model_df.columns
@@ -5146,7 +5281,7 @@ def main() -> str | None:
         full_ranked = stat_results["correlations"]["feature"].tolist()
     else:
         full_ranked = []
-    # delivery_* / screen_* / aqi_* and same-sleep columns are not forecast features (see prepare_ml_data);
+    # delivery_* / screen_* / aqi_* / wx_* and same-sleep columns are not forecast features (see prepare_ml_data);
     # the Spearman fallback ranking still lists them, so keep them out of the SARIMAX /
     # Prophet candidates too.
     full_ranked = [f for f in full_ranked

@@ -50,6 +50,8 @@ from sync_log_helper import log_sync as _shared_log_sync
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("air_quality_etl")
+# httpx logs every request URL at INFO, and the URL carries latitude / longitude. Actions logs are public.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 API_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 ET_NAME = "America/New_York"
@@ -219,7 +221,8 @@ def run_etl(days: int | None, lat: float, lon: float, dry_run: bool = False, sb=
             if not probe.data:
                 start = BOOTSTRAP_START
                 log.info(f"  Table is empty: bootstrapping from {start}")
-        log.info(f"Air quality {start} -> {today} at ({lat}, {lon})")
+        # No coordinates here: this line lands in a public Actions log.
+        log.info(f"Air quality {start} -> {today}")
 
         with httpx.Client(timeout=60.0) as client:
             for w_start, w_end in windows(start, today):
