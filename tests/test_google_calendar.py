@@ -452,6 +452,27 @@ def test_rows_hold_only_the_listed_fields():
     assert rows[0]["title"] == SECRET_TITLE and rows[0]["location"] == "Room 4"
 
 
+def test_meeting_links_and_passcodes_never_stored():
+    """Invitations put join links, meeting ids and passcodes in LOCATION or the title: none of it is kept."""
+    secrets = ["zoom.us", "meet.example.com", "https://", "998877", "pwd=", "abcDEF", "987 654 321"]
+    cases = [
+        ("https://zoom.us/j/123456789?pwd=abcDEF", "Online meeting"),
+        ("Conference Room B; https://meet.example.com/abc-defg", "Conference Room B"),
+        ("Meeting ID 987 654 321, Passcode: 998877", "Online meeting"),
+        ("zoom.us/j/555", "Online meeting"),
+        ("Room 4, North wing", "Room 4, North wing"),
+        ("Pinewood Studios", "Pinewood Studios"),
+    ]
+    for i, (location, expected) in enumerate(cases):
+        rows = rows_of(vevent(f"UID:loc{i}@example.com", "DTSTART:20261113T150000Z",
+                              "SUMMARY:Standup https://zoom.us/j/1?pwd=abcDEF", f"LOCATION:{location}"))
+        assert rows[0]["location"] == expected, (location, rows[0]["location"])
+        assert rows[0]["title"] == "Standup"
+        assert all(s not in repr(rows[0]) for s in secrets), rows[0]
+    only_link = rows_of(vevent("UID:t@example.com", "DTSTART:20261113T150000Z", "SUMMARY:https://zoom.us/j/1"))
+    assert only_link[0]["title"] == "(no title)"
+
+
 def test_other_components_are_ignored_and_foreign_uids_work():
     rows, stats = expand(
         "BEGIN:VTODO\nUID:todo@example.com\nDTSTART:20261113T150000Z\nSUMMARY:A task\nEND:VTODO\n"
@@ -815,7 +836,8 @@ def _main(sb, bodies, secret, argv=()):
             raise value
         return value
 
-    etl.fetch_feed, etl.get_supabase = fake_fetch, lambda: sb
+    real_today = etl.et_today
+    etl.fetch_feed, etl.get_supabase, etl.et_today = fake_fetch, lambda: sb, (lambda: TODAY)
     previous = os.environ.get(etl.ENV_NAME)
     if secret is None:
         os.environ.pop(etl.ENV_NAME, None)
@@ -824,7 +846,7 @@ def _main(sb, bodies, secret, argv=()):
     try:
         code = etl.main(list(argv))
     finally:
-        etl.fetch_feed, etl.get_supabase = real_fetch, real_sb
+        etl.fetch_feed, etl.get_supabase, etl.et_today = real_fetch, real_sb, real_today
         logging.getLogger().removeHandler(capture)
         if previous is None:
             os.environ.pop(etl.ENV_NAME, None)
