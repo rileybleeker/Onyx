@@ -37,3 +37,11 @@ test("the v2 Screen Time app card is still wired end to end", () => {
   // The sync history still labels the app's heartbeat source (sync_log.source = 'screen_time').
   assert.match(page, /screen_time: "Screen Time app"/);
 });
+
+test("the token carve-out no longer lists the v1 path; the app's upload path is still exact", () => {
+  const mw = read("middleware.ts");
+  const fn = mw.slice(mw.indexOf("function isCiRoute"), mw.indexOf("// Routes reachable with NO session"));
+  assert.ok(!fn.includes("/api/screen-time/event"));
+  assert.match(fn, /pathname === "\/api\/screen-time\/usage"/);
+  assert.ok(!/startsWith\("\/api\/screen-time/.test(fn), "the screen-time carve-out must stay an exact path");
+});
