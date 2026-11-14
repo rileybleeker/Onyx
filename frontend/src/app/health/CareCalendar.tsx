@@ -26,6 +26,9 @@ const STATUS_TONE: Record<CareStatus | 'projected' | 'external', string> = {
 };
 const NO_EVENTS: CalendarEvent[] = [];
 const MONTH_CELL_LIMIT = 3;
+// Month-cell entries are `relative truncate`: the screen-reader text after a long title is
+// positioned absolutely, and without a positioned parent it escapes the clipping and makes the
+// page scroll sideways on a phone.
 // What a month cell's screen-reader text and tooltip say about one entry.
 function describe(entry: CalendarEntry): string {
   if (entry.status !== 'external') return STATUS_LABEL[entry.status];
@@ -107,7 +110,7 @@ export function CareCalendar({ items, today, external = NO_EVENTS, onRangeChange
           const entries = view.byDate.get(cell.date) ?? [];
           return <td key={cell.date} className={`h-20 border border-border-subtle p-1 align-top ${cell.inMonth ? '' : 'opacity-40'} ${cell.date === today ? 'bg-accent-muted' : ''}`}>
             <div className={cell.date === today ? 'font-semibold text-accent' : 'text-text-secondary'}>{Number(cell.date.slice(8))}{cell.date === today && <span className="sr-only"> (today)</span>}</div>
-            <ul className="mt-1 space-y-0.5">{entries.slice(0, MONTH_CELL_LIMIT).map(entry => <li key={entry.key} title={cellTitle(entry)} className={`truncate ${STATUS_TONE[entry.status]} ${entry.status === 'projected' ? 'italic' : ''} ${entry.tentative ? 'opacity-70' : ''}`}>{entry.title}<span className="sr-only">: {describe(entry)}</span></li>)}
+            <ul className="mt-1 space-y-0.5">{entries.slice(0, MONTH_CELL_LIMIT).map(entry => <li key={entry.key} title={cellTitle(entry)} className={`relative truncate ${STATUS_TONE[entry.status]} ${entry.status === 'projected' ? 'italic' : ''} ${entry.tentative ? 'opacity-70' : ''}`}>{entry.title}<span className="sr-only">: {describe(entry)}</span></li>)}
               {entries.length > MONTH_CELL_LIMIT && <li className="text-text-tertiary">+{entries.length - MONTH_CELL_LIMIT} more</li>}</ul>
           </td>;
         })}</tr>)}</tbody>
