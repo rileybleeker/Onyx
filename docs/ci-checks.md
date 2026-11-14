@@ -16,6 +16,10 @@ A pull request can edit `tests/*.py` or the workflow files themselves, so any se
 | HRV alignment before each retrain | `hrv-retrain-on-backfill.yml` | hourly (conditional) and daily 12:00 UTC | job-level | read-only, writes a failure heartbeat |
 | Production smoke | `smoke-test.yml` | every 6 hours | smoke login | read-only |
 
+For a proven frontend-source-only PR, `stats-tests` runs the unchanged TDEE source guard without installing the Python analytics dependencies. The job/check name and workflow triggers stay the same. The full suite still runs for Python (including Python nested in frontend/src), tests, requirements, workflow changes, the Spotify reconnect source consumed by Python token guards, mixed changes, manual dispatch, empty diffs, missing metadata, or unavailable Git history. Rename detection is disabled so moves cannot hide a backend source path. The guard also runs on full-suite jobs and remains in offline test discovery. No required check is path-skipped and no test is deleted. A tracked-Python-source fingerprint additionally fails closed to the full suite whenever any Python dependency is added, removed or edited after the audited snapshot. Refreshing `tools/stats_ci_dependencies.sha256` requires a fresh frontend-dependency audit; never update it just to make CI faster.
+
+This reduces redundant runner work; it does not guarantee a shorter release when the parallel frontend job is already slower. Measure actual Actions durations before claiming a wall-clock improvement.
+
 `stats-tests` has no `SUPABASE_*` variables at all. Its single install step is `pip install -r requirements-ci.txt` (the pinned `requirements-analysis.lock` plus the one extra package the ETL modules import). Pip downloads are cached on the hash of those two files.
 
 ## PR job: `tests/run_offline_tests.py`
@@ -56,3 +60,5 @@ When several branches are in flight at once (one git worktree each), CI checks e
 
 - `autonomous-ci.yml` (including its `offline-checks` and `frontend-types` jobs, the required checks) is unchanged.
 - Dependencies installed by `requirements-ci.txt` come from the lock file, which was last regenerated 2026-04-16 and pins `supabase==2.19.0`. Local development uses newer versions, so a pin bump should be tried through this job first.
+
+The scoped-job dependency inventory and audit limits are in [stats-ci-dependency-inventory.md](stats-ci-dependency-inventory.md).
