@@ -116,7 +116,9 @@ export default function ForecastView({
         <div className={card}>
           <p className="text-[12px] text-text-tertiary">Safe to move to savings / investing</p>
           <p className="text-xl font-semibold">{usd(h.safeToMoveCents)}</p>
-          <p className="text-[12px] text-text-secondary">keeps the cautious path above {buffer > 0 ? usd(buffer) : "$0"} for 13 weeks</p>
+          <p className="text-[12px] text-text-secondary">
+            keeps the cautious path above {buffer > 0 ? usd(buffer) : "$0"} for 13 weeks{h.safeToMoveCents > 0 ? ` · or about ${usd(Math.floor(h.safeToMoveCents / 13))} a week` : ""}
+          </p>
         </div>
         <div className={card}>
           <p className="text-[12px] text-text-tertiary">Cash in 13 weeks</p>

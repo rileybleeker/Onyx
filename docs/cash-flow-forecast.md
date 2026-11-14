@@ -309,6 +309,7 @@ of the pool's outflows; positive = forecast too high.
 |---|---|---|---|---|---|
 | First run | 1 / 4 / 13 weeks | 15% / 18% / 58% | +4% / +15% / +54% | 31% / 38% / 63% | 16% / 2% / 0% |
 | Card payments as monthly totals, large outflows and ignored rows kept | 1 / 4 / 13 weeks | 14% / 13% / 31% | -7% / -8% / -16% | 11% / 9% / 8% | 23% / 11% / 6% |
+| + unpaired card payments per payee, 6-month card window (live 2026-11-14) | 1 / 4 / 13 weeks | 16% / 17% / 31% | -6% / -5% / -10% | 14% / 13% / 8% | 20% / 9% / 2% |
 
 What changed between the two: (1) card payments are the card's monthly total paid (mean of the last 3 months),
 not one payment a month, because cards are often paid several times a month; (2) only unusually large money IN
