@@ -31,7 +31,7 @@ export default async function FinancialsPage({
           Your bank accounts, balances and transactions, imported automatically (SimpleFIN Bridge, every 6 hours; Rocket Money history before 2026-11-14) and shown only to you.
         </p>
         <p className="mt-2 text-[13px]">
-          <a href="/financials/forecast" className="text-cyan-300 hover:underline">Cash forecast →</a>
+          <a href="/financials/forecast" className="text-accent hover:underline">Cash forecast →</a>
         </p>
       </header>
 

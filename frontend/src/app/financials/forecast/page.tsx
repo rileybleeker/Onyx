@@ -25,13 +25,13 @@ export default async function ForecastPage() {
         </p>
       </header>
       {load.kind === "error" && (
-        <section role="alert" className="rounded-[4px] border border-red-500/30 bg-red-500/5 p-4">
-          <h2 className="font-semibold text-red-300">The forecast could not be loaded</h2>
+        <section role="alert" className="rounded-card border border-down/30 bg-down/5 p-4">
+          <h2 className="font-semibold text-down">The forecast could not be loaded</h2>
           <p className="mt-1 text-[13px] text-text-secondary">Error code {load.code}. This is a failed query, not an empty ledger.</p>
         </section>
       )}
       {load.kind === "empty" && (
-        <section className="rounded-[4px] border border-border-subtle bg-surface-card p-4">
+        <section className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
           <p className="font-semibold">No ledger data yet.</p>
           <p className="mt-1 text-[13px] text-text-secondary">The forecast appears after the first SimpleFIN import.</p>
         </section>

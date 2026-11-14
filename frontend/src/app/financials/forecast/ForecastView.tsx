@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Area, CartesianGrid, ComposedChart, Line, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { accentColor, axisTick, chartColors, chartTooltip, gridStyle } from "@/lib/chart-theme";
 import type { ForecastResult } from "@/lib/cash-forecast";
 import type { DriverRow } from "@/lib/cash-forecast-store";
 import type { ForecastAccountView, PlanItemView } from "@/lib/cash-forecast-server";
@@ -15,9 +16,9 @@ const usd = (cents: number | null | undefined): string => {
 const signed = (cents: number) => (cents > 0 ? `+${usd(cents)}` : usd(cents));
 const dateLabel = (iso: string, opts: Intl.DateTimeFormatOptions = { month: "short", day: "numeric" }) =>
   new Date(`${iso}T12:00:00Z`).toLocaleDateString("en-US", { ...opts, timeZone: "UTC" });
-const card = "rounded-[4px] border border-border-subtle bg-surface-card p-4";
-const input = "rounded-[4px] border border-border-subtle bg-transparent px-2 py-1 text-[13px]";
-const button = "rounded-[4px] border border-border-subtle px-3 py-1 text-[13px] hover:bg-white/5 disabled:opacity-50";
+const card = "rounded-card shadow-card border border-border-subtle bg-surface-card p-4";
+const input = "rounded-control border border-border-subtle bg-transparent px-2 py-1 text-[13px]";
+const button = "rounded-control border border-border-subtle px-3 py-1 text-[13px] hover:bg-white/5 disabled:opacity-50";
 
 async function send(url: string, method: string, body?: unknown): Promise<string | null> {
   try {
@@ -79,8 +80,8 @@ export default function ForecastView({
 
   return (
     <div className="space-y-6">
-      {setupPending && <p className="text-[13px] text-amber-300">Planned items could not be read (the forecast tables may not be set up yet); showing the forecast from your history only.</p>}
-      {error && <p role="alert" className="text-[13px] text-red-300">Not saved: {error}</p>}
+      {setupPending && <p className="text-[13px] text-mid">Planned items could not be read (the forecast tables may not be set up yet); showing the forecast from your history only.</p>}
+      {error && <p role="alert" className="text-[13px] text-down">Not saved: {error}</p>}
 
       {/* Headlines */}
       <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -99,7 +100,7 @@ export default function ForecastView({
           <p className="text-xl font-semibold">{usd(h.end13w?.likely)}</p>
           <p className="text-[12px] text-text-secondary">range {usd(h.end13w?.low)} to {usd(h.end13w?.high)} · today {usd(result.opening.cents)}</p>
         </div>
-        <div className={`${card} ${h.nextPromoEnd ? "border-amber-500/40" : ""}`}>
+        <div className={`${card} ${h.nextPromoEnd ? "border-mid/40" : ""}`}>
           <p className="text-[12px] text-text-tertiary">Next 0% promo ends</p>
           {h.nextPromoEnd ? (
             <>
@@ -115,7 +116,7 @@ export default function ForecastView({
       </section>
 
       {result.warnings.length > 0 && (
-        <ul className="space-y-1 text-[13px] text-amber-300">
+        <ul className="space-y-1 text-[13px] text-mid">
           {result.warnings.map((w) => (
             <li key={w}>{w}</li>
           ))}
@@ -137,22 +138,22 @@ export default function ForecastView({
         <div className="h-72">
           <ResponsiveContainer width="100%" height="100%">
             <ComposedChart data={chartData} margin={{ top: 10, right: 10, bottom: 0, left: 10 }}>
-              <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
-              <XAxis dataKey="date" tickFormatter={(d: string) => dateLabel(d)} minTickGap={40} tick={{ fontSize: 11, fill: "#9ca3af" }} />
-              <YAxis tickFormatter={(v: number) => `$${Math.round(v / 1000)}k`} tick={{ fontSize: 11, fill: "#9ca3af" }} width={48} />
+              <CartesianGrid {...gridStyle} vertical={false} />
+              <XAxis dataKey="date" tickFormatter={(d: string) => dateLabel(d)} minTickGap={40} tick={axisTick} />
+              <YAxis tickFormatter={(v: number) => `$${Math.round(v / 1000)}k`} tick={axisTick} width={48} />
               <Tooltip
                 formatter={(v, name) =>
                   Array.isArray(v) ? [`${usd(Number(v[0]) * 100)} to ${usd(Number(v[1]) * 100)}`, "range"] : [usd(Number(v) * 100), String(name)]
                 }
                 labelFormatter={(d) => dateLabel(String(d), { month: "short", day: "numeric", year: "numeric" })}
-                contentStyle={{ background: "#111", border: "1px solid #333", fontSize: 12 }}
+                {...chartTooltip}
               />
-              <Area dataKey="band" stroke="none" fill="#22d3ee" fillOpacity={0.15} isAnimationActive={false} name="range" />
-              <Line dataKey="likely" stroke="#22d3ee" dot={false} strokeWidth={2} isAnimationActive={false} name="likely" />
-              <ReferenceLine y={0} stroke="#6b7280" />
-              {buffer > 0 && <ReferenceLine y={buffer / 100} stroke="#f87171" strokeDasharray="4 4" label={{ value: "buffer", fill: "#f87171", fontSize: 11 }} />}
+              <Area dataKey="band" stroke="none" fill={accentColor} fillOpacity={0.15} isAnimationActive={false} name="range" />
+              <Line dataKey="likely" stroke={accentColor} dot={false} strokeWidth={2} isAnimationActive={false} name="likely" />
+              <ReferenceLine y={0} stroke={chartColors.zeroLine} />
+              {buffer > 0 && <ReferenceLine y={buffer / 100} stroke={chartColors.down} strokeDasharray="4 4" label={{ value: "buffer", fill: chartColors.down, fontSize: 11 }} />}
               {milestonesShown.map((m) => (
-                <ReferenceLine key={m.account_key} x={nearestDay(chartData, m.date)} stroke="#f59e0b" strokeDasharray="3 3" label={{ value: `${shortCard(m.label)} 0% ends`, fill: "#f59e0b", fontSize: 11, position: "insideTopLeft" }} />
+                <ReferenceLine key={m.account_key} x={nearestDay(chartData, m.date)} stroke={chartColors.mid} strokeDasharray="3 3" label={{ value: `${shortCard(m.label)} 0% ends`, fill: chartColors.mid, fontSize: 11, position: "insideTopLeft" }} />
               ))}
             </ComposedChart>
           </ResponsiveContainer>
@@ -192,7 +193,7 @@ export default function ForecastView({
               <tr key={`${l.sourceId}-${l.date}-${i}`} className="border-t border-border-subtle">
                 <td className="py-1 pr-3 text-text-secondary">{dateLabel(l.date)}</td>
                 <td className="py-1 pr-3">{l.label}</td>
-                <td className={`py-1 pr-3 text-right ${l.amountCents > 0 ? "text-emerald-300" : ""}`}>{signed(l.amountCents)}</td>
+                <td className={`py-1 pr-3 text-right ${l.amountCents > 0 ? "text-up" : ""}`}>{signed(l.amountCents)}</td>
                 <td className="py-1 text-[12px] text-text-tertiary">{l.layer === "planned" ? `planned (${l.certainty})` : l.reason}</td>
               </tr>
             ))}
@@ -309,7 +310,7 @@ function PlannedItems({ items, statuses, busy, run }: { items: PlanItemView[]; s
                   {it.repeat && <span className="text-text-tertiary"> · {it.repeat}</span>}
                   {it.note && <div className="text-[12px] text-text-tertiary">{it.note}</div>}
                 </td>
-                <td className={`py-1 pr-3 text-right ${it.amountCents > 0 ? "text-emerald-300" : ""}`}>{signed(it.amountCents)}</td>
+                <td className={`py-1 pr-3 text-right ${it.amountCents > 0 ? "text-up" : ""}`}>{signed(it.amountCents)}</td>
                 <td className="py-1 pr-3 text-[12px] text-text-tertiary">
                   {it.certainty}
                   {realized > 0 && " · happened"}
@@ -388,12 +389,12 @@ function CardRow({ c, driver, busy, run }: { c: ForecastResult["cards"][number];
         {c.promoEnds && (
           <>
             {" "}
-            · <span className="text-amber-300">promo ends {c.promoEnds}</span> <span className="text-text-tertiary">({c.promoSource})</span>
+            · <span className="text-mid">promo ends {c.promoEnds}</span> <span className="text-text-tertiary">({c.promoSource})</span>
           </>
         )}
       </p>
       {c.warnings.map((w) => (
-        <p key={w} className="text-[12px] text-amber-300">
+        <p key={w} className="text-[12px] text-mid">
           {w}
         </p>
       ))}
