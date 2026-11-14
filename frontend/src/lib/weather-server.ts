@@ -48,10 +48,12 @@ export async function loadWeather(now: Date = new Date()): Promise<WeatherLoad> 
     return { state: "error" };
   }
   const data = (res.data ?? []) as unknown[];
+  // Today (ET) is never a complete day, however many hourly values it already has.
+  const today = etDate(now);
   let location: WeatherLocation | null = null;
   for (const raw of data) {
-    const p = parseWeatherRow(raw);
+    const p = parseWeatherRow(raw, today);
     if (p && p.lat !== null && p.lon !== null) location = { lat: p.lat, lon: p.lon };
   }
-  return { state: "ready", rows: shapeWeatherRows(data), location };
+  return { state: "ready", rows: shapeWeatherRows(data, today), location };
 }

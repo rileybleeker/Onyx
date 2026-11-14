@@ -1620,11 +1620,12 @@ WX_NIGHT_COLS = {
     "wx_night_temp_min": "night_temp_min",
 }
 WX_COLS = (*WX_DAY_COLS, *WX_NIGHT_COLS)
-WX_MIN_HOURS = 20        # a clock day counts only with >= 20 hourly values (today is partial)
+WX_MIN_HOURS = 23        # the shortest full ET clock day (spring-forward); a normal day has 24, fall-back 25
 WX_NIGHT_MIN_HOURS = 7   # 8 hourly values on a normal night, 7 / 9 on the two DST nights
 
 
-def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None) -> pd.DataFrame:
+def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None,
+                           today: date | None = None) -> pd.DataFrame:
     """Outdoor weather from pds.weather_daily (one row per ET clock day, weather_etl.py).
 
     ROW PLACEMENT (hrv_alignment.py: row D = behavioral day D, its HRV = the sleep that
@@ -1651,10 +1652,15 @@ def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None) -> pd
     and nothing Riley does causes them, so they are not mediators (not in
     hrv_alignment.SAME_SLEEP_*).
 
-    COMPLETENESS: a clock day with fewer than WX_MIN_HOURS hourly values (today, or an API
-    gap) leaves its daytime columns NaN; a night with fewer than WX_NIGHT_MIN_HOURS values
-    leaves the night columns NaN. Days the table does not cover are NaN. Nothing is
-    filled: a 0 only ever means the source said 0 (a dry day's precipitation).
+    COMPLETENESS: a clock day's daytime columns count only when the day is OVER (its date
+    is before `today`, the ET clock date; default et_today()) AND it has at least
+    WX_MIN_HOURS hourly values. The hour count alone is not enough: today reaches 20+
+    hours in the evening while its rain sum, wind maximum and means are still growing.
+    A past day short of hours (an API gap, or an ETL outage that left it half-written)
+    stays NaN too. A night with fewer than WX_NIGHT_MIN_HOURS values leaves the night
+    columns NaN (the ETL only counts a night once its last hour has passed). Days the
+    table does not cover are NaN. Nothing is filled: a 0 only ever means the source said
+    0 (a dry day's precipitation).
 
     Kept out of the forecasting models (NOT_FORECAST_PREFIXES): when the evening forecast
     runs, today's row is partial and tonight's temperatures are still in the future, so
@@ -1672,8 +1678,9 @@ def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None) -> pd
         w["_day"] = pd.to_datetime(w["calendar_date"], errors="coerce")
         w = w.dropna(subset=["_day"]).drop_duplicates("_day", keep="last")
 
-        full = (pd.to_numeric(w["n_hours"], errors="coerce") >= WX_MIN_HOURS).fillna(False)
-        day = w[full]
+        today_ts = pd.Timestamp(today or et_today())
+        enough = (pd.to_numeric(w["n_hours"], errors="coerce") >= WX_MIN_HOURS).fillna(False)
+        day = w[enough & (w["_day"] < today_ts)]
         day_f = pd.DataFrame({feat: pd.to_numeric(day[src], errors="coerce")
                               for feat, src in WX_DAY_COLS.items()})
         day_f["calendar_date"] = day["_day"].dt.strftime("%Y-%m-%d")
@@ -1691,7 +1698,7 @@ def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None) -> pd
         assert len(out) == len(df), "weather merge changed the row count"
         log.info(f"  Weather features: {int(out['wx_temp_mean'].notna().sum())} complete days, "
                  f"{int(out['wx_night_temp_mean'].notna().sum())} nights "
-                 f"({len(w) - len(day)} partial day(s) left NaN)")
+                 f"({len(w) - len(day)} unfinished or incomplete day(s) left NaN)")
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Weather feature merge failed ({e!r}); continuing without weather features")

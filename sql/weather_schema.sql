@@ -31,8 +31,9 @@
 -- longitude are stored on every row so a move (NYC) stays auditable.
 --
 -- n_hours counts the hours with a temperature value. Hours after "now" are never
--- stored, so today's row is partial until the day ends; the pipeline ignores days
--- with fewer than 20 hours. Only the date is stored (no timestamptz instant), so
+-- stored, so today's row is partial until the day ends; the pipeline and the page
+-- count a day only once it is over (date before ET today) and has at least 23 hours
+-- (the shortest full ET day). Only the date is stored (no timestamptz instant), so
 -- there are no onyx_*_date columns.
 --
 -- Access: service role only. The ETL writes with the service-role key; /api/status

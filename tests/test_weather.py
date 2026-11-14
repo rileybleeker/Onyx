@@ -10,7 +10,8 @@ Covers
     table says how to fix it;
   * hrv_analysis.merge_weather_features: daytime columns of clock day D land on row D, the
     night columns of clock day D + 1 land on row D, the clock-day minimum is not a feature,
-    partial and uncovered days stay NaN (never zero-filled), fail-open, idempotent;
+    a day counts only once it is over AND has all its hours (today stays NaN however many
+    hours it has), uncovered days stay NaN (never zero-filled), fail-open, idempotent;
   * the wiring: forecast exclusion, labels, causal treatments, one home location for both
     Open-Meteo sources.
 
@@ -387,7 +388,7 @@ def _weather():
         row("2026-01-02", 8.0, precip=0.0),
         row("2026-01-03", 12.0, precip=3.0),
         row("2026-01-04", 99.0, hours=9, night=8),     # partial day, but its night is complete
-        row("2026-01-05", 4.0, hours=20, night=6),     # just enough hours; night incomplete
+        row("2026-01-05", 4.0, hours=23, night=6),     # just enough hours (a spring-forward day has 23); night incomplete
         row("2026-01-09", 50.0),                       # outside the matrix: ignored
     ])
 
@@ -406,6 +407,56 @@ def test_daytime_columns_sit_on_the_same_row():
             assert np.isnan(by.loc[day, feat]), "an uncovered day is unknown, never 0"
     # nothing else on the matrix moved
     assert out["whoop_hrv_rmssd"].tolist() == _matrix()["whoop_hrv_rmssd"].tolist()
+
+
+def test_today_is_never_a_complete_day_however_many_hours_it_has():
+    # From ~19:00 ET today's row has 20+ hourly values, and from 22:00 it has 23, while its
+    # rain sum, wind maximum and means are still growing. The hour count alone must not
+    # make it count: a day is complete only once it is over.
+    w = _weather()
+    w.loc[w["calendar_date"] == "2026-01-03", "n_hours"] = 23           # "today" at 22:xx ET
+    by = h.merge_weather_features(_matrix(), w, today=date(2026, 1, 3)).set_index("calendar_date")
+    for feat in h.WX_DAY_COLS:
+        assert np.isnan(by.loc["2026-01-03", feat]), f"{feat}: today's partial aggregate reached the matrix"
+    assert by.loc["2026-01-02", "wx_temp_mean"] == 8.0, "yesterday is over and complete"
+    # today's early-morning night is already final (the ETL waits for its last hour) and
+    # belongs to the sleep that closed yesterday
+    assert by.loc["2026-01-02", "wx_night_temp_mean"] == 12.5
+    # even a full 24 values before midnight does not make today count
+    w.loc[w["calendar_date"] == "2026-01-03", "n_hours"] = 24
+    by = h.merge_weather_features(_matrix(), w, today=date(2026, 1, 3)).set_index("calendar_date")
+    assert np.isnan(by.loc["2026-01-03", "wx_precip_mm"]) and np.isnan(by.loc["2026-01-03", "wx_wind_max"])
+    # the day after, the same row counts
+    by = h.merge_weather_features(_matrix(), w, today=date(2026, 1, 4)).set_index("calendar_date")
+    assert by.loc["2026-01-03", "wx_temp_mean"] == 12.0 and by.loc["2026-01-03", "wx_precip_mm"] == 3.0
+    # a future-dated row (clock skew, a bad write) never counts either
+    by = h.merge_weather_features(_matrix(), w, today=date(2026, 1, 2)).set_index("calendar_date")
+    assert np.isnan(by.loc["2026-01-02", "wx_temp_mean"]) and np.isnan(by.loc["2026-01-03", "wx_temp_mean"])
+
+
+def test_a_past_day_short_of_hours_stays_unknown():
+    # A day the ETL left half-written (an outage that outlasted the re-upsert window) or
+    # an API gap: 20-22 hours is not a full day, on any date. 23 is (spring-forward).
+    assert h.WX_MIN_HOURS == 23
+    for hours, counts in ((20, False), (22, False), (23, True), (24, True), (25, True)):
+        w = _weather()
+        w.loc[w["calendar_date"] == "2026-01-02", "n_hours"] = hours
+        by = h.merge_weather_features(_matrix(), w).set_index("calendar_date")
+        assert bool(np.isfinite(by.loc["2026-01-02", "wx_temp_mean"])) is counts, hours
+        assert bool(np.isfinite(by.loc["2026-01-02", "wx_precip_mm"])) is counts, hours
+
+
+def test_default_today_is_the_et_clock_date():
+    # Without an explicit `today` the merge uses et_today(): a row dated ET today is left out.
+    today = h.et_today()
+    days = [(today - timedelta(days=1)).isoformat(), today.isoformat()]
+    m = pd.DataFrame({"calendar_date": days, "whoop_hrv_rmssd": [50.0, np.nan]})
+    w = pd.DataFrame([{"calendar_date": d, "n_hours": 24, "night_hours": 8,
+                       **{src: 5.0 for src in h.WX_DAY_COLS.values()},
+                       "night_temp_mean": 1.0, "night_temp_min": 0.0} for d in days])
+    by = h.merge_weather_features(m, w).set_index("calendar_date")
+    assert by.loc[days[0], "wx_temp_mean"] == 5.0 and np.isnan(by.loc[days[1], "wx_temp_mean"])
+    assert by.loc[days[0], "wx_night_temp_mean"] == 1.0, "today's finished night sits on yesterday's row"
 
 
 def test_night_columns_sit_on_the_row_whose_sleep_they_overlap():

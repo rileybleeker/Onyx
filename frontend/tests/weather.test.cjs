@@ -8,6 +8,10 @@ const { loadTs, SRC } = require("./helpers/load-ts.cjs");
 
 const W = loadTs("lib/weather.ts");
 
+// The ET clock date "now" for these fixtures: every 2030 row is a past day.
+const TODAY = "2031-01-01";
+const shape = (rows, etToday = TODAY) => W.shapeWeatherRows(rows, etToday);
+
 function row(date, high, { hours = 24, night = 8, rain = 0, nightTemp = high - 10 } = {}) {
   return {
     calendar_date: date, temperature_max: high, temperature_min: high - 12, temperature_mean: high - 5,
@@ -24,7 +28,7 @@ test("metric rows are converted to US display units", () => {
   assert.equal(W.cToF(null), null);
   assert.equal(W.mmToIn(25.4), 1);
   assert.equal(W.kmhToMph(16.09344), 10);
-  const [d] = W.shapeWeatherRows([row("2030-01-01", 20, { rain: 12.7 })]);
+  const [d] = shape([row("2030-01-01", 20, { rain: 12.7 })]);
   assert.deepEqual([d.highF, d.lowF, d.meanF, d.feelsHighF, d.nightF, d.dewPointF], [68, 46.4, 59, 69.8, 50, 41]);
   assert.deepEqual([d.rainIn, d.windMph, d.humidity, d.pressure, d.sunshineH, d.daylightH, d.uvMax], [0.5, 10, 60, 980.5, 6, 10.5, 4.2]);
   assert.ok(!("lat" in d) && !("latitude" in d), "the location is not part of a day");
@@ -32,28 +36,61 @@ test("metric rows are converted to US display units", () => {
 
 test("numeric strings from PostgREST are parsed and nulls stay null", () => {
   const raw = { ...row("2030-01-01", 20), temperature_max: "21.5", uv_index_max: null, precipitation_sum: "" };
-  const [d] = W.shapeWeatherRows([raw]);
+  const [d] = shape([raw]);
   assert.equal(d.highF, 70.7);
   assert.equal(d.uvMax, null);
   assert.equal(d.rainIn, null, "a missing value is not zero rain");
 });
 
-test("a day with fewer than 20 hours is partial; an incomplete night has no night value", () => {
-  assert.equal(W.isPartialDay(19), true);
-  assert.equal(W.isPartialDay(20), false);
-  const days = W.shapeWeatherRows([row("2030-01-02", 20, { hours: 9, night: 8 }), row("2030-01-01", 20, { night: 6 })]);
+test("a past day short of hours is partial; an incomplete night has no night value", () => {
+  assert.equal(W.COMPLETE_DAY_MIN_HOURS, 23, "the shortest full ET day (spring-forward)");
+  assert.equal(W.isPartialDay("2030-01-01", 22, TODAY), true);
+  assert.equal(W.isPartialDay("2030-01-01", 23, TODAY), false);
+  assert.equal(W.isPartialDay("2030-01-01", 25, TODAY), false);
+  const days = shape([row("2030-01-02", 20, { hours: 9, night: 8 }), row("2030-01-01", 20, { night: 6 })]);
   assert.deepEqual(days.map((d) => [d.date, d.partial, d.nightF]), [["2030-01-01", false, null], ["2030-01-02", true, 50]]);
+});
+
+test("today is never a complete day, however many hours it has", () => {
+  // From about 19:00 ET today has 20+ hourly values and from 22:00 it has 23, while its high,
+  // rain total and peak wind can still change.
+  for (const hours of [20, 23, 24]) assert.equal(W.isPartialDay("2030-01-03", hours, "2030-01-03"), true, String(hours));
+  assert.equal(W.isPartialDay("2030-01-04", 24, "2030-01-03"), true, "a future-dated row is not complete either");
+  assert.equal(W.isPartialDay("2030-01-02", 24, "2030-01-03"), false);
+
+  const rows = [row("2030-01-01", 10, { rain: 25.4 }), row("2030-01-02", 20, { rain: 25.4 }), row("2030-01-03", 40, { hours: 23, rain: 254 })];
+  const evening = shape(rows, "2030-01-03");
+  assert.deepEqual(evening.map((d) => d.partial), [false, false, true]);
+  assert.equal(W.newestCompleteDate(evening), "2030-01-02", "today is not the newest complete day");
+  assert.equal(W.summary30(evening).rainIn, 2, "today's rain so far stays out of the 30-day total");
+  assert.equal(W.summary30(evening).highF, 59);
+  const pts = W.chartPoints(evening);
+  assert.deepEqual([pts[2].highF, pts[2].rainIn, pts[2].windMph], [null, null, null], "today is not plotted on the daytime lines");
+  assert.equal(pts[2].nightF, 86, "today's early-morning night is already final");
+
+  // After midnight the same row counts.
+  const nextDay = shape(rows, "2030-01-04");
+  assert.equal(W.newestCompleteDate(nextDay), "2030-01-03");
+  assert.equal(W.summary30(nextDay).rainIn, 12);
+});
+
+test("the server reader passes the ET date into the row parser", () => {
+  const src = fs.readFileSync(path.join(SRC, "lib/weather-server.ts"), "utf8");
+  assert.match(src, /const today = etDate\(now\);/);
+  assert.match(src, /parseWeatherRow\(raw, today\)/);
+  assert.match(src, /shapeWeatherRows\(data, today\)/);
+  assert.match(src, /timeZone: "America\/New_York"/);
 });
 
 test("rows with a bad date or hour count are dropped", () => {
   const rows = [{ calendar_date: "nope", n_hours: 24 }, null, { calendar_date: "2030-01-01" }, row("2030-01-01", 1)];
-  assert.equal(W.shapeWeatherRows(rows).length, 1);
+  assert.equal(shape(rows).length, 1);
 });
 
 test("30-day summary ignores partial days, sums rain, handles empty", () => {
   assert.equal(W.summary30([]), null);
-  assert.equal(W.summary30(W.shapeWeatherRows([row("2030-01-03", 30, { hours: 5 })])), null);
-  const days = W.shapeWeatherRows([
+  assert.equal(W.summary30(shape([row("2030-01-03", 30, { hours: 5 })])), null);
+  const days = shape([
     row("2030-01-01", 10, { rain: 25.4 }), row("2030-01-02", 20, { rain: 25.4 }), row("2030-01-03", 40, { hours: 5, rain: 254 }),
   ]);
   const s = W.summary30(days);
@@ -65,7 +102,7 @@ test("30-day summary ignores partial days, sums rain, handles empty", () => {
 });
 
 test("30-day summary only spans the 30 days ending at the newest complete day", () => {
-  const days = W.shapeWeatherRows([row("2030-01-01", 40), row("2030-03-01", 10), row("2030-03-02", 20)]);
+  const days = shape([row("2030-01-01", 40), row("2030-03-01", 10), row("2030-03-02", 20)]);
   assert.equal(W.summary30(days).days, 2);
   assert.equal(W.summary30(days).highF, 59);
   assert.equal(W.newestCompleteDate(days), "2030-03-02");
@@ -73,7 +110,7 @@ test("30-day summary only spans the 30 days ending at the newest complete day", 
 });
 
 test("chart points leave a partial day out of the daytime series but keep its finished night", () => {
-  const pts = W.chartPoints(W.shapeWeatherRows([row("2030-01-01", 20), row("2030-01-02", 20, { hours: 10 })]));
+  const pts = W.chartPoints(shape([row("2030-01-01", 20), row("2030-01-02", 20, { hours: 10 })]));
   assert.deepEqual([pts[0].highF, pts[0].nightF, pts[0].rainIn], [68, 50, 0]);
   assert.deepEqual([pts[1].highF, pts[1].sunshineH, pts[1].rainIn, pts[1].humidity], [null, null, null, null]);
   assert.equal(pts[1].nightF, 50);
@@ -81,7 +118,7 @@ test("chart points leave a partial day out of the daytime series but keep its fi
 });
 
 test("every metric's series points at a real chart-point field", () => {
-  const [pt] = W.chartPoints(W.shapeWeatherRows([row("2030-01-01", 20)]));
+  const [pt] = W.chartPoints(shape([row("2030-01-01", 20)]));
   assert.deepEqual(W.WEATHER_METRIC_KEYS, ["temperature", "humidity", "sun", "rain", "pressure"]);
   for (const k of W.WEATHER_METRIC_KEYS) {
     const series = W.WEATHER_METRICS[k].series;

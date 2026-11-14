@@ -9,8 +9,11 @@ export const WEATHER_COLUMNS =
   "dew_point_mean,pressure_mean,precipitation_sum,wind_speed_max,cloud_cover_mean,daylight_hours," +
   "sunshine_hours,uv_index_max,night_temp_mean,night_hours,n_hours,latitude,longitude";
 export const WEATHER_WINDOW_DAYS = 90;
-/** A day with fewer hours than this is partial (today's row until the day ends). */
-export const COMPLETE_DAY_MIN_HOURS = 20;
+/**
+ * The shortest full ET clock day (spring-forward; a normal day has 24 hourly values, fall-back 25).
+ * Same rule as WX_MIN_HOURS in hrv_analysis.py.
+ */
+export const COMPLETE_DAY_MIN_HOURS = 23;
 /** The 01:00-08:00 ET night needs this many hourly values (8 normally, 7 / 9 on DST days). */
 export const NIGHT_MIN_HOURS = 7;
 export const MEAN_WINDOW_DAYS = 30;
@@ -64,12 +67,24 @@ export function kmhToMph(kmh: number | null): number | null {
   return kmh === null ? null : round(kmh / 1.609344, 1);
 }
 
-export function isPartialDay(nHours: number): boolean {
-  return nHours < COMPLETE_DAY_MIN_HOURS;
+/**
+ * A day is complete only when it is OVER (its date is before the ET clock date `etToday`) and
+ * has all its hours. The hour count alone is not enough: today passes 20 hours in the evening
+ * while its high, rain total and peak wind can still change. A past day short of hours (an API
+ * gap or a half-written row) is partial too.
+ */
+export function isPartialDay(date: string, nHours: number, etToday: string): boolean {
+  return date >= etToday || nHours < COMPLETE_DAY_MIN_HOURS;
 }
 
-/** Parse one raw row (metric) into display units; null when the date or hour count is unusable. */
-export function parseWeatherRow(raw: unknown): { day: WeatherDay; lat: number | null; lon: number | null } | null {
+/**
+ * Parse one raw row (metric) into display units; null when the date or hour count is unusable.
+ * `etToday` is the ET clock date (YYYY-MM-DD) at read time.
+ */
+export function parseWeatherRow(
+  raw: unknown,
+  etToday: string,
+): { day: WeatherDay; lat: number | null; lon: number | null } | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
   const date = typeof r.calendar_date === "string" ? r.calendar_date.slice(0, 10) : "";
@@ -94,16 +109,16 @@ export function parseWeatherRow(raw: unknown): { day: WeatherDay; lat: number | 
     sunshineH: num(r.sunshine_hours),
     uvMax: num(r.uv_index_max),
     nHours,
-    partial: isPartialDay(nHours),
+    partial: isPartialDay(date, nHours, etToday),
   };
   return { day, lat: num(r.latitude), lon: num(r.longitude) };
 }
 
 /** Parse, drop unusable rows, sort ascending by date. */
-export function shapeWeatherRows(rows: unknown[]): WeatherDay[] {
+export function shapeWeatherRows(rows: unknown[], etToday: string): WeatherDay[] {
   const out: WeatherDay[] = [];
   for (const raw of rows) {
-    const p = parseWeatherRow(raw);
+    const p = parseWeatherRow(raw, etToday);
     if (p) out.push(p.day);
   }
   return out.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
@@ -206,8 +221,9 @@ export const WEATHER_METRICS: Record<WeatherMetric, { label: string; series: Wea
 export const WEATHER_METRIC_KEYS = Object.keys(WEATHER_METRICS) as WeatherMetric[];
 
 /**
- * Chart points. A partial day (today) is left out of the daytime series, because its high,
- * sunshine and rain are still growing; its night value is already final and is kept.
+ * Chart points. A partial day (today until it is over, or a day short of hours) is left out of
+ * the daytime series, because its high, sunshine and rain are still growing; its night value is
+ * already final and is kept.
  */
 export interface WeatherChartPoint {
   date: string;

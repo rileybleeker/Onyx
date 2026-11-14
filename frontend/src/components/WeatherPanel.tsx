@@ -141,7 +141,7 @@ export default function WeatherPanel() {
       {body}
       <p className="text-[11px] text-text-tertiary mt-3">
         Model data (Open-Meteo) for the fixed home location, not a sensor at home and not where you were on a trip.
-        Today is left out of the daytime lines until the day is complete. In the HRV analysis the night temperature
+        Today is left out of the daytime lines and the 30-day figures until the day is over. In the HRV analysis the night temperature
         (1-8 AM) is matched to the sleep it falls in; weather results there are exploratory, with no seasonal adjustment.
       </p>
     </ChartCard>
