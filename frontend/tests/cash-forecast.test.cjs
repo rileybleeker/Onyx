@@ -29,6 +29,8 @@ const tx = (account_key, txn_date, amount_cents, name, over = {}) => ({
 const months = ["2029-11", "2029-12", "2030-01", "2030-02", "2030-03", "2030-04", "2030-05"];
 const monthEnd = (key) => F.lastBusinessDayOfMonth(Number(key.slice(0, 4)), Number(key.slice(5, 7)));
 
+// Distinct shop names (the stream grouping ignores digits, so numbered names would group into one shop).
+const WORDS = ["ALDER", "BIRCH", "CEDAR", "DOGWOOD", "ELM", "FIR", "GINKGO", "HAZEL", "IVY", "JUNIPER", "KAPOK", "LARCH", "MAPLE", "NUTMEG", "OAK", "PINE", "QUINCE", "ROWAN", "SPRUCE", "TEAK", "ULMUS", "VINE", "WILLOW", "XYLO", "YEW", "ZELKOVA", "ASPEN", "BEECH", "CYPRESS", "DATE"];
 /** Paycheck on the last business day of each month; everyday debit spending; card payments on the 20th. */
 function world(extra = []) {
   const txns = [];
@@ -36,7 +38,7 @@ function world(extra = []) {
   // Everyday: two debits a week for 30 weeks, at changing shops (so no shop looks like a schedule), $100 a week.
   for (let w = 0; w < 30; w++) {
     const d = R.addDays(TODAY, -7 * w - 1);
-    txns.push(tx("chk", d, 3_000 + (w % 3) * 1_000, `DEMO SHOP ${w}`), tx("chk", R.addDays(d, -2), 7_000 - (w % 3) * 1_000, `DEMO DINER ${w}`));
+    txns.push(tx("chk", d, 3_000 + (w % 3) * 1_000, `${WORDS[w]} SHOP`), tx("chk", R.addDays(d, -2), 7_000 - (w % 3) * 1_000, `${WORDS[w]} DINER`));
   }
   // Card payments from checking, paired with the card side.
   for (const [i, m] of ["2030-02", "2030-03", "2030-04", "2030-05"].entries()) {
@@ -85,6 +87,13 @@ test("a month-end paycheck is detected, and a bonus paid on payday does not chan
   assert.ok(out.notes.some((n) => /unusual/.test(n)), "bonus noted as unusual");
   const payLines = out.lines.filter((l) => l.sourceId === pay.id);
   assert.ok(payLines.length >= 11 && payLines.every((l) => l.amountCents === 800_000));
+});
+
+test("a paycheck whose description carries a different reference each month is still one stream", () => {
+  const extra = months.map((m, i) => tx("sav", F.lastBusinessDayOfMonth(Number(m.slice(0, 4)), Number(m.slice(5, 7))), -300_000, `DEMO CONSULTING PAYROLL REF${String.fromCharCode(65 + i)}X${i}`, { category: "Income" }));
+  const out = run({ extra });
+  assert.equal(F.streamKey({ name: "DEMO CONSULTING PAYROLL REFAX0", custom_name: null }), "demo consulting payroll");
+  assert.ok(out.streams.some((x) => x.kind === "income" && x.typicalCents === 300_000));
 });
 
 test("a biweekly deposit is projected every 14 days", () => {
