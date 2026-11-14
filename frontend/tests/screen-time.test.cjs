@@ -113,6 +113,20 @@ test("top apps rank by total minutes over complete days, ties by name, limited",
   assert.equal(Math.round(top[0].share * 1000), Math.round((100 / 310) * 1000));
 });
 
+test("bundle ids get a readable name; real names and odd keys pass through", () => {
+  assert.equal(S.appLabel("com.example.SomeGreatApp"), "Some Great App");
+  assert.equal(S.appLabel("com.example.reader"), "Reader");
+  assert.equal(S.appLabel("com.example.ios"), "Example");
+  assert.equal(S.appLabel("com.example-co.thing.iphone"), "Thing");
+  assert.equal(S.appLabel("org.example.my_tool-kit"), "My tool kit");
+  assert.equal(S.appLabel("App One"), "App One");
+  assert.equal(S.appLabel("nodots"), "nodots");
+  assert.equal(S.appLabel("app.ios"), "Ios"); // nothing but generic segments: keep the last one
+  const days = S.shapeScreenRows([row("2030-01-10", { minutes_by_app: { "com.example.SomeGreatApp": 50, "net.example.SomeGreatApp": 20 } })]);
+  const top = S.topEntries(days, "byApp");
+  assert.deepEqual(top.map((e) => [e.key, e.label]), [["com.example.SomeGreatApp", "Some Great App"], ["net.example.SomeGreatApp", "Some Great App"]]);
+});
+
 test("the uncategorised bucket is renamed and bad map values are ignored", () => {
   const days = S.shapeScreenRows([row("2030-01-10", { minutes_by_category: { Alpha: 30, "(none)": 60, Bad: "x", Zero: 0 } })]);
   const top = S.topEntries(days, "byCategory");
@@ -227,6 +241,8 @@ test("failed query, empty window and data are three different screens", async ()
   const ok = await renderPage({ kind: "ok", windowDays: 30, days, skippedRows: 0, sync: { status: "success", at: "2030-01-12T15:00:00Z" } });
   assert.ok(ok.html.includes('data-charts="3"'));
   assert.ok(ok.html.includes("App One"));
+  const ids = await renderPage({ kind: "ok", windowDays: 30, days: S.shapeScreenRows([row("2030-01-10", { minutes_by_app: { "com.example.SomeGreatApp": 50 } })]), skippedRows: 0, sync: null });
+  assert.ok(ids.html.includes("Some Great App") && ids.html.includes("com.example.SomeGreatApp"));
   assert.ok(ok.html.includes("Uncategorised"));
   assert.ok(ok.html.includes("2 complete days"));
   assert.ok(ok.html.includes("1 day is still syncing"));

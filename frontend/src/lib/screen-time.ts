@@ -185,6 +185,8 @@ export function summarize(days: readonly ScreenDay[]): ScreenSummary {
 }
 
 export interface TopEntry {
+  /** The key as stored: a bundle id for apps, Apple's category name for categories. */
+  key: string;
   label: string;
   minutes: number; // total over the complete days in the window
   perDay: number; // minutes / complete days
@@ -200,23 +202,23 @@ export function topEntries(days: readonly ScreenDay[], key: "byApp" | "byCategor
   let all = 0;
   for (const d of done) {
     for (const [name, minutes] of Object.entries(d[key])) {
-      const label = key === "byCategory" && name === "(none)" ? NO_CATEGORY_LABEL : name;
-      const t = totals.get(label) ?? { minutes: 0, daysUsed: 0 };
+      const t = totals.get(name) ?? { minutes: 0, daysUsed: 0 };
       t.minutes += minutes;
       t.daysUsed += 1;
-      totals.set(label, t);
+      totals.set(name, t);
       all += minutes;
     }
   }
   return [...totals.entries()]
-    .map(([label, t]) => ({
-      label,
+    .map(([name, t]) => ({
+      key: name,
+      label: key === "byApp" ? appLabel(name) : name === "(none)" ? NO_CATEGORY_LABEL : name,
       minutes: t.minutes,
       perDay: t.minutes / done.length,
       daysUsed: t.daysUsed,
       share: all > 0 ? t.minutes / all : 0,
     }))
-    .sort((a, b) => b.minutes - a.minutes || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0))
+    .sort((a, b) => b.minutes - a.minutes || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
     .slice(0, limit);
 }
 
@@ -260,6 +262,35 @@ export function chartPoints(days: readonly ScreenDay[]): ScreenPoint[] {
     });
   }
   return out;
+}
+
+const BUNDLE_ID = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$/;
+/** Last segments that name the platform or build, not the app ("com.vendor.ios" is "Vendor"). */
+const GENERIC_SEGMENTS = new Set([
+  "app", "ios", "iphone", "mobile", "client", "main", "release", "prod", "production", "application", "phone", "native",
+]);
+
+/**
+ * A readable name for a top-apps key. The Screen Time export carries bundle ids, not display names
+ * (the view falls back to the identifier), so "com.vendor.SomeApp" reads "Some App". Anything that
+ * is not a bundle id (a real display name) is returned unchanged. The page shows the raw key next
+ * to it, because two bundle ids can share a last segment.
+ */
+export function appLabel(key: string): string {
+  if (!BUNDLE_ID.test(key)) return key;
+  const parts = key.split(".");
+  let seg = parts[parts.length - 1];
+  for (let i = parts.length - 1; i >= 1; i--) {
+    if (!GENERIC_SEGMENTS.has(parts[i].toLowerCase())) {
+      seg = parts[i];
+      break;
+    }
+  }
+  const words = seg
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : key;
 }
 
 /** 135 -> "2h 15m", 42.4 -> "42m", null -> "-". */
