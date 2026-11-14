@@ -418,12 +418,14 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     # ── Daytime strain / activity (WHOOP + Garmin) ───────────────────────────
     ("whoop_day_strain",            "behavior", "WHOOP day strain above median",      None),
     ("whoop_kilojoule",             "behavior", "Daily energy (kJ) above median",      "kJ"),
-    ("total_steps",                 "behavior", "Garmin steps above median",           None),
-    # WHOOP strap steps (hrv_analysis.merge_whoop_steps_features, 2026-11-13). The same
-    # behaviour as total_steps counted by another device (r = 0.94 on the 451 days both
-    # exist); both stay because their eras differ: the watch is rarely worn now, the strap
-    # has a count for every cycle since 2024-10.
-    ("whoop_steps",                 "behavior", "WHOOP steps above median",            None),
+    # Steps: WHOOP strap only (hrv_analysis.merge_whoop_steps_features, 2026-11-13). Garmin's
+    # total_steps was the treatment until then; it measures the same behaviour (r = 0.95 on
+    # the ~500 days both exist), so keeping both would test one signal twice in the FDR
+    # family (the caffeine rule in AGENTS.md). WHOOP is kept because the watch is worn for
+    # part of the day on many days (under half the strap's count on 112 of 505 shared days)
+    # and rarely at all since 2026-10, while the strap has a count for every cycle since
+    # 2024-10. total_steps stays a matrix column (Spearman, forecast, alignment guard).
+    ("whoop_steps",                 "behavior", "Steps (WHOOP) above median",          None),
     ("total_kilocalories",          "behavior", "Total kcal burned above median",      "kcal"),
     ("active_kilocalories",         "behavior", "Active kcal burned above median",     "kcal"),
     ("moderate_intensity_minutes",  "behavior", "Moderate-intensity min above median", "min"),

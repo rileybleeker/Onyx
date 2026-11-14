@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { whoopStepsDay } from "@/lib/steps";
+import { whoopStepsDay, type WhoopStepsRow } from "@/lib/steps";
 import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, validateChatMessages } from "@/lib/chat-contract";
 import { WRITE_GATE, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, type WriteReceipt } from "@/lib/chat-receipts";
 import { createClient } from "@supabase/supabase-js";
@@ -421,8 +421,8 @@ function tagCalorieSources(table: string, rows: Record<string, unknown>[]): Reco
     return rows.map((r) => ({
       ...r,
       tdee_kcal: typeof r.kilojoule === "number" ? Math.round(r.kilojoule / 4.184) : null,
-      // The day step_count belongs to (the waking day after the cycle's opening sleep).
-      steps_day: r.step_count == null ? null : whoopStepsDay(r as { onyx_behavioral_date?: string | null }),
+      // The day step_count belongs to (the waking day after the cycle's opening sleep, from its local start).
+      steps_day: r.step_count == null ? null : whoopStepsDay(r as WhoopStepsRow),
     }));
   }
   return rows;

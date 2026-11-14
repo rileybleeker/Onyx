@@ -9,11 +9,12 @@ Covers
   * whoop_etl.main: a normal run syncs every endpoint, writes whoop|full_sync and runs the
     time-zone pass; --cycles-only syncs cycles alone, writes whoop|cycles_backfill and never
     runs the time-zone pass;
-  * hrv_analysis.merge_whoop_steps_features: the cycle dated D lands on row D + 1 (the waking
-    day it counts), the open cycle and null counts stay NaN (never zero), the longest cycle
-    wins when a day has two, fail-open, idempotent;
-  * hrv_alignment: cycle_date_to_waking_day, and the runtime guard catching a WHOOP-steps
-    column that sits on the wrong day;
+  * hrv_analysis.merge_whoop_steps_features: each cycle is dated from its own local start
+    (a night-time onset dated D lands on row D + 1, the waking day it counts; an onset after
+    06:00 local counts its own clock day), cycles on the same day are summed, a day with an
+    open cycle or a null count stays NaN (never zero), fail-open, idempotent;
+  * hrv_alignment: cycle_waking_day (local offset, ET fallback), and the runtime guard
+    catching a WHOOP-steps column that sits on the wrong day;
   * the wiring: forecast exclusion, labels, causal treatment, no negative shift.
 
 Synthetic data only. No network, no credentials.
@@ -219,8 +220,9 @@ class FakeSb:
         return self
 
 
-def _run_main(argv):
-    whoop, beats, upserts, spawned = FakeWhoop(), [], [], []
+def _run_main(argv, whoop=None, exits=None):
+    """Run whoop_etl.main with fakes. A sys.exit is recorded in `exits` (when given)."""
+    whoop, beats, upserts, spawned = whoop or FakeWhoop(), [], [], []
     saved = (etl.WhoopClient, etl.get_supabase_client, etl.log_sync, etl.upsert_to_supabase,
              etl.time.sleep, subprocess.run, sys.argv)
     etl.WhoopClient = lambda: whoop
@@ -232,6 +234,10 @@ def _run_main(argv):
     sys.argv = ["whoop_etl.py", *argv]
     try:
         etl.main()
+    except SystemExit as e:
+        if exits is None:
+            raise
+        exits.append(e.code)
     finally:
         (etl.WhoopClient, etl.get_supabase_client, etl.log_sync, etl.upsert_to_supabase,
          etl.time.sleep, subprocess.run, sys.argv) = saved
@@ -256,6 +262,27 @@ def test_cycles_only_run_touches_cycles_alone_and_skips_the_tz_pass():
     assert spawned == [], "a deep re-read must never rewrite time-zone history"
 
 
+def test_cycles_only_failures_go_red_under_their_own_heartbeat():
+    class CyclesDown(FakeWhoop):
+        def get_cycles(self, start, end):
+            raise httpx.ConnectError("synthetic outage")
+
+    class TokenRejected(FakeWhoop):
+        def get_profile(self):
+            raise httpx.ConnectError("synthetic rejection")
+
+    for fake in (CyclesDown(), TokenRejected()):
+        exits = []
+        _, beats, upserts, spawned = _run_main(["--days", "800", "--cycles-only"], whoop=fake, exits=exits)
+        assert exits == [1], "a failed backfill must turn the Actions run red"
+        assert [(s, t, st) for s, t, st, _ in beats] == [("whoop", "cycles_backfill", "failed")],             "never a green partial, and never on the hourly whoop|full_sync"
+        assert upserts == [] and spawned == []
+    # a normal run with one failing endpoint is unchanged: a partial full_sync, exit 0
+    exits = []
+    _, beats, _, _ = _run_main(["--days", "7"], whoop=CyclesDown(), exits=exits)
+    assert exits == [] and [(s, t, st) for s, t, st, _ in beats] == [("whoop", "full_sync", "partial")]
+
+
 def test_workflow_offers_the_cycles_only_backfill():
     yml = (ROOT / ".github" / "workflows" / "daily-etl.yml").read_text(encoding="utf-8")
     assert "whoop_cycles_only:" in yml and "--cycles-only" in yml
@@ -273,7 +300,9 @@ def _matrix():
 
 
 def _cycle(day, steps, start_hour=6, hours=24.0, closed=True, cycle_id=None):
-    """A cycle dated `day`: its opening sleep starts in the small hours of day + 1."""
+    """A cycle dated `day`: its opening sleep starts at `start_hour` UTC on day + 1. There is
+    no timezone_offset, so the merge falls back to ET: 06:00 UTC in January = 01:00 EST, the
+    small hours of day + 1."""
     start = pd.Timestamp(day, tz="UTC") + pd.Timedelta(days=1, hours=start_hour)
     return {
         "cycle_id": cycle_id or int(start.timestamp()),
@@ -284,13 +313,27 @@ def _cycle(day, steps, start_hour=6, hours=24.0, closed=True, cycle_id=None):
     }
 
 
+def _local_cycle(local_start, hours, steps, offset="-04:00", closed=True):
+    """A cycle given by its LOCAL start ('YYYY-MM-DD HH:MM') and WHOOP timezone_offset."""
+    start = pd.Timestamp(local_start + offset)
+    return {
+        "cycle_id": int(start.timestamp()),
+        "start_time": start.tz_convert("UTC").isoformat(),
+        "end_time": (start + pd.Timedelta(hours=hours)).tz_convert("UTC").isoformat() if closed else None,
+        "timezone_offset": offset,
+        # the -6 h rule on the local onset, as the DB trigger dates it
+        "onyx_behavioral_date": (pd.Timestamp(local_start) - pd.Timedelta(hours=6)).strftime("%Y-%m-%d"),
+        "step_count": steps,
+    }
+
+
 def _cycles():
     return pd.DataFrame([
         _cycle("2026-01-01", 5000),
         _cycle("2026-01-02", 12000),
         _cycle("2026-01-03", None),                      # strap not worn: WHOOP sends null
-        _cycle("2026-01-04", 300, hours=2.0),            # a short second cycle on the same day...
-        _cycle("2026-01-04", 9000, start_hour=9),        # ...loses to the day's long cycle
+        _cycle("2026-01-04", 300, start_hour=0, hours=4.0),  # 19:00 EST Jan 4: counts Jan 5...
+        _cycle("2026-01-04", 9000, start_hour=4),        # ...and so does the next cycle: summed
         _cycle("2026-01-05", 0),                         # a real zero
         _cycle("2026-01-06", 4321, closed=False),        # the open cycle: steps so far
         _cycle("2026-01-20", 7777),                      # outside the matrix
@@ -304,7 +347,7 @@ def test_cycle_dated_d_lands_on_row_d_plus_one():
     assert by["2026-01-02"] == 5000, "the cycle dated Jan 1 counts the waking day Jan 2"
     assert by["2026-01-03"] == 12000
     assert np.isnan(by["2026-01-01"]), "nothing lands on the cycle's own date"
-    assert by["2026-01-05"] == 9000, "the longest cycle of the day is used, not the short one"
+    assert by["2026-01-05"] == 9300, "two cycles on one waking day are summed, not one kept"
     assert by["2026-01-06"] == 0, "a real zero stays a zero"
     # nothing else on the matrix moved
     assert out["whoop_hrv_rmssd"].tolist() == _matrix()["whoop_hrv_rmssd"].tolist()
@@ -328,6 +371,32 @@ def test_merge_is_idempotent_and_coerces_types():
     assert once.set_index("calendar_date").loc["2026-01-03", "whoop_steps"] == 12000
 
 
+def test_daytime_onset_counts_its_own_day_not_the_next():
+    """The 2026-11-14 review case: two cycles share behavioral date D because the first
+    onset is after 06:00 local. The first one's waking hours are clock day D, the second's
+    D + 1. Longest-wins + 1 day put the first cycle's count on D + 1 and left D empty, even
+    when the first is longer by a minute."""
+    first = _local_cycle("2026-01-03 06:27", 21.65, 5374)    # dated Jan 3 by the -6 h rule
+    second = _local_cycle("2026-01-04 04:06", 21.6, 751)     # also dated Jan 3
+    assert first["onyx_behavioral_date"] == second["onyx_behavioral_date"] == "2026-01-03"
+    for order in ([first, second], [second, first]):
+        by = h.merge_whoop_steps_features(_matrix(), pd.DataFrame(order)).set_index("calendar_date")["whoop_steps"]
+        assert by["2026-01-03"] == 5374, "the daytime-onset cycle counts its own clock day"
+        assert by["2026-01-04"] == 751, "the next cycle counts the following day"
+        assert int(by.notna().sum()) == 2
+
+
+def test_open_or_null_cycle_on_a_summed_day_leaves_it_nan():
+    closed = _local_cycle("2026-01-02 19:30", 8.0, 800)       # counts Jan 3
+    for partner in (_local_cycle("2026-01-03 03:30", 20.0, 4000, closed=False),   # still open
+                    _local_cycle("2026-01-03 03:30", 20.0, None)):               # no count
+        frame = pd.DataFrame([closed, partner, _local_cycle("2026-01-06 01:00", 20.0, 1234)])
+        by = h.merge_whoop_steps_features(_matrix(), frame).set_index("calendar_date")["whoop_steps"]
+        assert np.isnan(by["2026-01-03"]), "part of the day is unknown, so the day is unknown"
+    by = h.merge_whoop_steps_features(_matrix(), pd.DataFrame([closed])).set_index("calendar_date")["whoop_steps"]
+    assert by["2026-01-03"] == 800
+
+
 def test_negative_counts_are_dropped():
     cycles = pd.DataFrame([_cycle("2026-01-01", -40), _cycle("2026-01-02", 800)])
     by = h.merge_whoop_steps_features(_matrix(), cycles).set_index("calendar_date")["whoop_steps"]
@@ -349,15 +418,36 @@ def test_fail_open():
 # Alignment
 # ---------------------------------------------------------------------------
 
-def test_cycle_date_to_waking_day():
-    f = pd.DataFrame({"calendar_date": ["2026-02-28", "2026-12-31"], "x": [1, 2]})
-    assert al.cycle_date_to_waking_day(f)["calendar_date"].tolist() == ["2026-03-01", "2027-01-01"]
-    assert f["calendar_date"].tolist() == ["2026-02-28", "2026-12-31"], "the input is not changed"
-    empty = pd.DataFrame()
-    assert al.cycle_date_to_waking_day(empty) is empty and al.cycle_date_to_waking_day(None) is None
-    # the inverse direction of the wake-date re-key used for per-night frames
-    assert al.wake_date_to_closing_day(al.cycle_date_to_waking_day(f))["calendar_date"].tolist() == \
-        f["calendar_date"].tolist()
+def test_cycle_waking_day_uses_the_local_start():
+    rows = pd.DataFrame([
+        _local_cycle("2026-02-28 23:10", 24, 1),            # evening onset -> next day
+        _local_cycle("2026-03-01 01:40", 24, 1),            # after midnight -> same clock day
+        _local_cycle("2026-03-01 06:00", 24, 1),            # 06:00 is the first daytime minute
+        _local_cycle("2026-03-01 17:59", 24, 1),            # still its own day
+        _local_cycle("2026-03-01 18:00", 24, 1),            # 18:00 -> next day
+        _local_cycle("2026-12-31 22:00", 24, 1, offset="+01:00"),  # year end, east of UTC
+    ])
+    assert al.cycle_waking_day(rows).tolist() == [
+        "2026-03-01", "2026-03-01", "2026-03-01", "2026-03-01", "2026-03-02", "2027-01-01"]
+    # for a night-time onset the rule equals the behavioral date + 1 (the strain move)
+    night = rows.iloc[[0, 1, 4, 5]]
+    plus_one = (pd.to_datetime(night["onyx_behavioral_date"]) + pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
+    assert al.cycle_waking_day(night).tolist() == plus_one.tolist()
+
+
+def test_cycle_waking_day_offset_and_fallback():
+    # 23:30 UTC = 15:30 at -08:00 (own day) but 18:30 EST in the ET fallback (next day)
+    west = {"start_time": "2026-01-10T23:30:00+00:00", "timezone_offset": "-08:00"}
+    assert al.cycle_waking_day(pd.DataFrame([west])).tolist() == ["2026-01-10"]
+    for missing in (None, "", "garbage", "+99:00"):
+        assert al.cycle_waking_day(pd.DataFrame([{**west, "timezone_offset": missing}])).tolist() == ["2026-01-11"]
+    assert al.cycle_waking_day(pd.DataFrame([{"start_time": west["start_time"]}])).tolist() == ["2026-01-11"]
+    # the ET fallback follows daylight time: 22:30 UTC in July = 18:30 EDT -> next day
+    assert al.cycle_waking_day(pd.DataFrame([{"start_time": "2026-07-10T22:30:00Z"}])).tolist() == ["2026-07-11"]
+    assert al._offset_minutes("+0530") == 330 and al._offset_minutes("-04") == -240
+    out = al.cycle_waking_day(pd.DataFrame([{"start_time": None}, {"start_time": "nope"}]))
+    assert out.isna().all()
+    assert al.cycle_waking_day(pd.DataFrame()).empty
 
 
 def _two_device_frame(n=90):
@@ -408,10 +498,10 @@ def test_alignment_and_forecast_rules():
     assert h.FEATURE_LABELS["total_steps"] == "Daily Steps (Garmin)"
 
 
-def test_causal_treatment_registered_next_to_garmin_steps():
+def test_causal_steps_treatment_is_whoop_only():
     registered = {c: (f, label) for c, f, label, _ in ci.CONTINUOUS_TREATMENTS}
-    assert registered["whoop_steps"][0] == registered["total_steps"][0] == "behavior"
-    assert registered["whoop_steps"][1] != registered["total_steps"][1], "the two devices need different labels"
+    assert registered["whoop_steps"][0] == "behavior"
+    assert "total_steps" not in registered, "one steps signal per FDR family (WHOOP)"
     df = pd.DataFrame({"whoop_steps": [1.0, 2.0], "hrv_lag1": [50.0, 51.0]})
     specs = {s.name: s for s in ci._enumerate_continuous_treatments(df)}
     assert specs["whoop_steps"].kind == "continuous_median_split"
@@ -421,7 +511,7 @@ def test_causal_treatment_registered_next_to_garmin_steps():
 def test_no_negative_shift_in_new_code():
     for src in (Path(etl.__file__).read_text(encoding="utf-8"),
                 inspect.getsource(h.merge_whoop_steps_features),
-                inspect.getsource(al.cycle_date_to_waking_day)):
+                inspect.getsource(al.cycle_waking_day)):
         assert ".shift(-" not in src
 
 

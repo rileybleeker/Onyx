@@ -768,7 +768,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     try:
         data["whoop_steps"] = fetch_all(
             "whoop_cycles",
-            select="cycle_id,start_time,end_time,onyx_behavioral_date,step_count",
+            select="cycle_id,start_time,end_time,timezone_offset,onyx_behavioral_date,step_count",
             order="start_time",
         )
     except Exception as e:  # noqa: BLE001
@@ -1721,29 +1721,34 @@ def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None,
 
 
 WHOOP_STEPS_COL = "whoop_steps"
+DATE_COL_STEPS = "_steps_day"
 
 
 def merge_whoop_steps_features(df: pd.DataFrame, cycles: pd.DataFrame | None) -> pd.DataFrame:
     """Daily steps from the WHOOP strap (pds.whoop_cycles.step_count, whoop_etl.py).
 
-      whoop_steps  steps counted over one WHOOP cycle
+      whoop_steps  steps WHOOP counted over the waking day (sum of the cycles dated to it)
 
     The Garmin watch (matrix column total_steps) is rarely worn; the strap is worn every
     day. The two are different devices with different step detection, so this is its own
-    column and is never blended into total_steps.
+    column and is never blended into total_steps (the pipeline's steps signal is WHOOP
+    only; /activities may show the larger of the two, the analysis never does).
 
-    ROW PLACEMENT: a WHOOP cycle starts at a sleep onset and runs to the next one, so the
-    cycle dated D (pds.whoop_cycles.onyx_behavioral_date = D, the day its opening sleep
-    closes) counts the steps of waking day D + 1. The count is therefore put on row D + 1
-    (hrv_alignment.cycle_date_to_waking_day), the same re-keying realign_matrix applies to
-    strain and kilojoule. Row D then holds the steps walked before the sleep that closes
-    day D, which is the sleep row D's HRV comes from. Verified on live data 2026-11-13
-    (numbers in hrv_alignment.py); the runtime guard (al.check_rekey_directions) fails the
-    retrain if WHOOP steps ever line up with Garmin steps on an adjacent row instead.
+    ROW PLACEMENT: a WHOOP cycle starts at a sleep onset and runs to the next one, so its
+    steps are the waking day after that onset. Each cycle is dated from its OWN start by
+    al.cycle_waking_day (the -6 h behavioral-day rule applied 12 h after the onset, in the
+    cycle's local time). For a normal night-time onset that is the cycle's behavioral date
+    + 1, the same move realign_matrix applies to strain. It is not "the matrix's main cycle
+    + 1": when two cycles share a behavioral date (an onset after 06:00 local), the earlier
+    one counts that date itself and the later one the next day; picking the longest and
+    adding a day put the wrong cycle's count on the wrong row (2026-11-14 review, live data).
+    Row D then holds the steps walked before the sleep that closes day D, which is the sleep
+    row D's HRV comes from. The runtime guard (al.check_rekey_directions) fails the retrain
+    if WHOOP steps ever line up with Garmin steps on an adjacent row instead.
 
-    ONE CYCLE PER DAY: the longest closed cycle per behavioral day (al.main_cycle_per_day,
-    the matrix view's pick). The open cycle holds "steps so far" and is left out, so the
-    day in progress stays NaN until its cycle closes.
+    SEVERAL CYCLES ON ONE DAY: summed (consecutive, non-overlapping spans). The day is kept
+    only when every cycle dated to it is closed and has a count; an open cycle (steps so far)
+    or a null count among them leaves the day NaN, so a partial day never reads as a low one.
 
     MISSING: WHOOP sends null, never 0, when it has no step data (strap not worn). Those
     days stay NaN; nothing is zero-filled.
@@ -1758,21 +1763,25 @@ def merge_whoop_steps_features(df: pd.DataFrame, cycles: pd.DataFrame | None) ->
         return df
     try:
         c = cycles.copy()
-        c = c[c["end_time"].notna() & c["onyx_behavioral_date"].notna()]
-        main = al.main_cycle_per_day(c)
-        steps = pd.to_numeric(main["step_count"], errors="coerce")
-        f = pd.DataFrame({
-            "calendar_date": pd.to_datetime(main["onyx_behavioral_date"], errors="coerce").dt.strftime("%Y-%m-%d"),
-            WHOOP_STEPS_COL: steps.where(steps >= 0),
-        }).dropna()
-        f = al.cycle_date_to_waking_day(f)
-        if f is None or f.empty:
+        if "cycle_id" in c.columns:
+            c = c.drop_duplicates("cycle_id", keep="last")
+        steps = pd.to_numeric(c["step_count"], errors="coerce")
+        c["_steps"] = steps.where(steps >= 0)
+        c["_ok"] = c["end_time"].notna() & c["_steps"].notna()
+        c[DATE_COL_STEPS] = al.cycle_waking_day(c)
+        c = c.dropna(subset=[DATE_COL_STEPS])
+        g = c.groupby(DATE_COL_STEPS).agg(n=("_ok", "size"), n_ok=("_ok", "sum"),
+                                          total=("_steps", "sum"))
+        g = g[g["n"] == g["n_ok"]]
+        if g.empty:
             return df
-        f = f.drop_duplicates("calendar_date", keep="last")
+        f = pd.DataFrame({"calendar_date": g.index.astype(str),
+                          WHOOP_STEPS_COL: g["total"].astype(float).to_numpy()})
         out = df.drop(columns=[WHOOP_STEPS_COL], errors="ignore").merge(f, on="calendar_date", how="left")
         assert len(out) == len(df), "WHOOP steps merge changed the row count"
+        multi = int((g["n"] > 1).sum())
         log.info(f"  WHOOP steps: {int(out[WHOOP_STEPS_COL].notna().sum())} days "
-                 f"({len(cycles) - len(f)} open, duplicate or step-less cycle(s) left out)")
+                 f"({multi} day(s) summed from 2+ cycles; days with an open or step-less cycle left NaN)")
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  WHOOP steps merge failed ({e!r}); continuing without WHOOP steps")

@@ -661,9 +661,10 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     saveTags(act, { is_sauna: !act.is_sauna });
   }
 
-  // Steps: Garmin on a day the watch counted any, WHOOP (whoop_cycles.step_count, keyed to
-  // the waking day the cycle counts) on every other day. One device per day, never summed;
-  // each bar and the stat tile name their device (lib/steps.ts).
+  // Steps: one count per day, the larger of Garmin's and WHOOP's (whoop_cycles.step_count,
+  // dated to the waking day each cycle counts): a watch worn for part of the day is not a
+  // low-step day. One device per day, never summed; each bar and the stat tile name their
+  // device (lib/steps.ts).
   const dailySteps = mergeDailySteps(summaries, whoopCycles);
   const latestSteps = dailySteps[dailySteps.length - 1];
   const stepsSource = stepsSourceLabel(dailySteps);

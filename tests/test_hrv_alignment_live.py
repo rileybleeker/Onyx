@@ -87,7 +87,7 @@ def load():
         if c != "calendar_date":
             m[c] = pd.to_numeric(m[c], errors="coerce")
     m = m.sort_values("calendar_date").reset_index(drop=True)
-    cycles = fetch("whoop_cycles", "cycle_id,start_time,end_time,onyx_behavioral_date,step_count")
+    cycles = fetch("whoop_cycles", "cycle_id,start_time,end_time,timezone_offset,onyx_behavioral_date,step_count")
     rec = fetch("whoop_recovery", "cycle_id,hrv_rmssd_milli,score_state")
     sleep = fetch("whoop_sleep", "cycle_id,start_time,is_nap,score_state",
                   [("is_nap", "eq", False)])

@@ -606,6 +606,10 @@ def main():
 
     log.info(f"Syncing {days} days: {start_dt.date()} — {now.date()}")
 
+    # --cycles-only: a deep re-read of one endpoint. Its heartbeats have their own data_type
+    # so they can never stand in for (or mask) the hourly whoop|full_sync on /status.
+    heartbeat_type = "cycles_backfill" if args.cycles_only else "full_sync"
+
     # Profile check
     profile_started = time.time()
     try:
@@ -618,7 +622,7 @@ def main():
         msg = f"WHOOP profile check failed: {e}"
         log.error(msg)
         log_sync(
-            sb, "whoop", "full_sync", "failed",
+            sb, "whoop", heartbeat_type, "failed",
             records=0, error=msg,
             duration=time.time() - profile_started,
         )
@@ -638,12 +642,8 @@ def main():
         ("workouts", lambda: sync_workouts(whoop, sb, start_iso, end_iso)),
         ("body_measurement", lambda: sync_body_measurement(whoop, sb)),
     ]
-    # --cycles-only: a deep re-read of one endpoint. Its heartbeat has its own data_type so
-    # it can never stand in for (or mask) the hourly whoop|full_sync on /status.
-    heartbeat_type = "full_sync"
     if args.cycles_only:
         sync_tasks = sync_tasks[:1]
-        heartbeat_type = "cycles_backfill"
 
     for name, sync_fn in sync_tasks:
         try:
@@ -668,7 +668,11 @@ def main():
 
     duration = time.time() - t0
 
-    log_sync(sb, "whoop", heartbeat_type, "success" if errors == 0 else "partial",
+    # --cycles-only has one endpoint, so an error there means the backfill did nothing:
+    # failed + a red run, not a green "partial".
+    backfill_failed = args.cycles_only and errors > 0
+    log_sync(sb, "whoop", heartbeat_type,
+             "failed" if backfill_failed else ("success" if errors == 0 else "partial"),
              records=total_records, date_start=start_dt.date(), date_end=now.date(),
              duration=duration,
              error=f"{errors} endpoint(s) failed" if errors else None)
@@ -691,6 +695,8 @@ def main():
     # new). A deep cycle re-read must not rewrite time-zone history.
     if args.cycles_only:
         log.info("Skipping whoop_tz_backfill (--cycles-only)")
+        if backfill_failed:
+            sys.exit(1)
         return
     try:
         import subprocess

@@ -37,7 +37,7 @@ import causal_inference as ci  # noqa: E402
 logging.disable(logging.WARNING)
 
 TRUE = {"journal_common_drift": -8.0, "journal_rare": 10.0, "journal_windowed": -6.0,
-        "habit_recent": 7.0, "total_steps": 6.0}
+        "habit_recent": 7.0, "whoop_steps": 6.0}
 SEEDS = range(5)
 MAX_ABS_ERR = 15.0    # ms; ~0.5 SD of nightly HRV in the high era. Old estimator: ~42.
 MEAN_ABS_ERR = 6.0    # ms over 5 seeds x 5 treatments. Old estimator: ~10. Fixed: ~4.
@@ -77,7 +77,7 @@ def make_frame(seed: int = 0, n: int = 700, shift: float = 70.0) -> pd.DataFrame
     above = (dose > np.median(dose)).astype(float)
     y = (base + TRUE["journal_common_drift"] * T_c + TRUE["journal_rare"] * T_r
          + TRUE["journal_windowed"] * T_w + TRUE["habit_recent"] * T_h
-         + TRUE["total_steps"] * above)
+         + TRUE["whoop_steps"] * above)
 
     df = pd.DataFrame({"calendar_date": dates.strftime("%Y-%m-%d"), "whoop_hrv_rmssd": y,
                        "whoop_day_strain": strain, "whoop_sleep_duration_milli": sleep_h * 3.6e6,
@@ -86,7 +86,7 @@ def make_frame(seed: int = 0, n: int = 700, shift: float = 70.0) -> pd.DataFrame
     df["journal_rare"] = T_r
     df["journal_windowed"] = np.where(t < 450, T_w, np.nan)      # only logged in the high era
     df["habit_recent"] = np.where(t >= 0.55 * n, T_h, np.nan)     # tracked from mid-history
-    df["total_steps"] = dose
+    df["whoop_steps"] = dose
     hrv = df["whoop_hrv_rmssd"]
     df["hrv_lag1"] = hrv.shift(1)
     df["hrv_7d_mean"] = hrv.shift(1).rolling(7, min_periods=3).mean()
@@ -107,7 +107,7 @@ def _arrays(df: pd.DataFrame) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndar
     conf = tuple(ci._confounders_for("behavior", set(out.columns)))
     res = {}
     for name in TRUE:
-        kind = "continuous_median_split" if name == "total_steps" else "binary"
+        kind = "continuous_median_split" if name == "whoop_steps" else "binary"
         spec = ci.TreatmentSpec(name=name, family="behavior", label=name,
                                 confounders=conf, kind=kind)
         X, T, Y, meta = ci._prepare_treatment(out, spec)
