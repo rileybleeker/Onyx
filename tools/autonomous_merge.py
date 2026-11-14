@@ -13,7 +13,7 @@ from pathlib import Path
 
 REPO = 'rileybleeker/Onyx'
 NODE_ID = 'R_kgDORt_8EQ'
-REQUIRED = {'offline-checks', 'frontend-types'}
+REQUIRED = {'offline-checks'}  # mirrors branch protection (2026-11-14)
 SHA = re.compile(r'[0-9a-f]{40}')
 # Start with a narrow component-path allowlist. The agent reviews must still
 # establish presentation-only semantics; path checks cannot prove data safety.

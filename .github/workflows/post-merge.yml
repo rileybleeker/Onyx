@@ -1,6 +1,7 @@
 name: Post-merge verify
-# After every merge to master: wait for the Production deploy and master CI, run the production smoke test
-# (one retry for flakiness), and if any of it fails halt the merge train and open a revert PR.
+# After every merge to master: wait for the Production deploy (not for tests: those run on a schedule in
+# scheduled-tests.yml), run the production smoke test (one retry for flakiness), and if either fails halt the merge
+# train and open a revert PR. A failed build is reverted at the commit that broke it, not at a later merge.
 # `drill: true` injects a failure so the rollback path can be exercised on a harmless commit.
 on:
   push:
@@ -69,5 +70,5 @@ jobs:
         run: python3 tools/merge_train.py rollback --sha "$SHA" --reason "$REASON"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SHA: ${{ github.event.inputs.sha || github.sha }}
+          SHA: ${{ needs.verify.outputs.sha || github.event.inputs.sha || github.sha }}
           REASON: ${{ needs.verify.outputs.result == 'fail' && needs.verify.outputs.detail || 'production smoke test failed twice' }}

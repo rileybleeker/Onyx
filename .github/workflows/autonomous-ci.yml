@@ -1,9 +1,12 @@
 name: Autonomous CI
+# The ONLY per-PR gate (Riley 2026-11-14: one user, move fast; test on a schedule; testing and deploying are
+# independent). offline-checks takes about 10 s: Python parses, the HRV clock-boundary tests and the merge-guard and
+# merge-train decision tests. Everything slower (Node tests, tsc, compile build, browser regressions, the Python stats
+# suite) runs in scheduled-tests.yml against master. A type error cannot reach production anyway: Vercel's
+# `next build` type-checks, a failed Production build deploys nothing, and post-merge verify reverts the merge.
 run-name: Autonomous CI ${{ inputs.sha || github.sha }}
 on:
   pull_request:
-  push:
-    branches: [master]
   workflow_dispatch:
     inputs:
       sha:
@@ -43,38 +46,3 @@ jobs:
         run: python -m unittest discover -s tests -p test_autonomous_merge.py -v
       - name: Merge train decision tests (no credentials or network)
         run: python -m unittest discover -s tests -p test_merge_train.py -v
-  frontend-types:
-    name: ${{ inputs.sha && 'frontend-types-pinned' || 'frontend-types' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: frontend
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ inputs.sha || github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-      - run: npm ci --ignore-scripts
-      - name: Offline Node tests (auto-discovered - add a test file, not a workflow line; *-ui.mjs needs a browser and is excluded)
-        run: |
-          shopt -s nullglob
-          for f in tests/*.test.cjs; do node --test "$f"; done
-          for f in scripts/test-*.mjs; do case "$f" in *-ui.mjs) continue;; esac; node "$f"; done
-      - name: Status freshness regression tests (synthetic, no credentials)
-        run: node test-status-freshness.cjs
-      - run: npx --no-install tsc --noEmit
-      - name: Compile production bundles without prerendering or production credentials
-        run: npx --no-install next build --experimental-build-mode compile
-        env:
-          NEXT_TELEMETRY_DISABLED: '1'
-      - name: Install isolated regression browser
-        run: npx --no-install playwright install --with-deps chromium
-      - name: Run synthetic Today component regressions (no credentials or backend)
-        working-directory: .
-        run: node tests/today-regression.cjs

@@ -10,19 +10,19 @@ A pull request can edit `tests/*.py` or the workflow files themselves, so any se
 
 | Check | Workflow | Runs on | Secrets | Touches production |
 |---|---|---|---|---|
-| `offline-checks`, `frontend-types` | `autonomous-ci.yml` | every PR, push to master | none | no |
-| `stats-tests` (Stats Tests, PR check) | `stats-pr-check.yml` | PRs that change Python, `tests/`, `frontend/src/`, requirements, or the workflow | none | no |
+| `offline-checks` (the only required check) | `autonomous-ci.yml` | every PR | none | no |
+| `frontend-types`, `stats-tests` | `scheduled-tests.yml` | master every 30 min (a commit that passed is skipped), manual | none | no |
 | Live DB Checks | `live-checks.yml` | push to master (pipeline and test paths), daily 08:25 UTC, manual | step-scoped Supabase service-role key | read-only; one run at a time |
 | HRV alignment before each retrain | `hrv-retrain-on-backfill.yml` | hourly (conditional) and daily 12:00 UTC | job-level | read-only, writes a failure heartbeat |
 | Production smoke | `smoke-test.yml` | every 6 hours | smoke login | read-only |
 
-For a proven frontend-source-only PR, `stats-tests` runs the unchanged TDEE source guard without installing the Python analytics dependencies. The job/check name and workflow triggers stay the same. The full suite still runs for Python (including Python nested in frontend/src), tests, requirements, workflow changes, the Spotify reconnect source consumed by Python token guards, mixed changes, manual dispatch, empty diffs, missing metadata, or unavailable Git history. Rename detection is disabled so moves cannot hide a backend source path. The guard also runs on full-suite jobs and remains in offline test discovery. No required check is path-skipped and no test is deleted. A tracked-Python-source fingerprint additionally fails closed to the full suite whenever any Python dependency is added, removed or edited after the audited snapshot. Refreshing `tools/stats_ci_dependencies.sha256` requires a fresh frontend-dependency audit; never update it just to make CI faster.
+Since 2026-11-14 `stats-tests` runs on master in `scheduled-tests.yml` and always runs the full suite (the TDEE source guard is part of it). The frontend-only scope in `tools/stats_ci_scope.py` (2026-11-14, #171) only applied to `pull_request` events and is no longer used by any workflow; its dependency fingerprint and inventory are kept as the audit record.
 
 This reduces redundant runner work; it does not guarantee a shorter release when the parallel frontend job is already slower. Measure actual Actions durations before claiming a wall-clock improvement.
 
 `stats-tests` has no `SUPABASE_*` variables at all. Its single install step is `pip install -r requirements-ci.txt` (the pinned `requirements-analysis.lock` plus the one extra package the ETL modules import). Pip downloads are cached on the hash of those two files.
 
-## PR job: `tests/run_offline_tests.py`
+## Offline Python suite: `tests/run_offline_tests.py` (scheduled, since 2026-11-14)
 
 The job runs `python tests/run_offline_tests.py`. It finds every `tests/test_*.py` except the live ones, runs each in its own process (the same `python tests/test_x.py` the file's docstring documents), one process per CPU, and exits non-zero if any file fails. Secret-looking environment variables are stripped from the child processes, so even a developer machine with a loaded `.env` runs the same way CI does.
 

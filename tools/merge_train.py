@@ -24,7 +24,7 @@ REPO = os.environ.get("GITHUB_REPOSITORY", "rileybleeker/Onyx")
 BASE = "master"
 CI_WORKFLOW = "autonomous-ci.yml"
 POST_MERGE_WORKFLOW = "post-merge.yml"
-REQUIRED = ("offline-checks", "frontend-types")  # mirrors branch protection; GitHub still enforces it
+REQUIRED = ("offline-checks",)  # mirrors branch protection; the rest of the suite runs in scheduled-tests.yml
 OWNER_LOGINS = {"rileybleeker"}  # every agent PR is opened with the owner's identity
 BOT_LOGINS = {"github-actions[bot]", "app/github-actions", "github-actions"}
 HOLD, ROLLBACK, HALT = "hold", "rollback", "train-halt"
@@ -39,7 +39,8 @@ PROTECTED = [re.compile(p, re.I) for p in (
     r"^frontend/src/(app/)?(api/)?(auth|login)(/|$)", r"^sql/.*(rls|polic|owner)", r"(^|/)\.env",
     r"(^|/)CODEOWNERS$", r"^vercel\.json$", r"^frontend/vercel\.json$")]
 BAD = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
-MERGEABLE_STATES = {"CLEAN", "UNSTABLE", "HAS_HOOKS"}
+# BEHIND merges as it is (branch protection is not strict): no rebase-and-retest round per PR (Riley 2026-11-14).
+MERGEABLE_STATES = {"CLEAN", "UNSTABLE", "HAS_HOOKS", "BEHIND"}
 
 
 def ignored(name: str) -> bool:
@@ -50,8 +51,8 @@ def ignored(name: str) -> bool:
 # The train's own job shows up as a check on the PR head; waiting on it would wait on itself.
 OWN_CHECKS = {"train"}
 OWN_WORKFLOWS = {"Merge train", "Post-merge verify"}
-# Vercel's preview build status: it queues behind other builds on Vercel and repeats what frontend-types already
-# compiles, so a pending preview does not hold a merge. A failed preview still blocks.
+# Vercel's preview build status: it queues behind other builds on Vercel and repeats what the Production build
+# checks, so a pending preview does not hold a merge. A failed preview still blocks.
 PREVIEW_STATUS = "Vercel"
 
 
@@ -110,8 +111,6 @@ def judge(pr: dict, files: list[str] | None, runs: list[dict], statuses: list[di
     for s in statuses:
         if s["state"] in ("failure", "error") and not ignored(s["context"]):
             return "skip", f"status {s['context']} {s['state']}"
-    if pr["mergeStateStatus"] == "BEHIND":
-        return "update", "behind " + BASE
     pending = active_runs > 0 or any(r["status"] != "completed" for r in latest.values()) or \
         any(s["state"] == "pending" and not ignored(s["context"]) and s["context"] != PREVIEW_STATUS for s in statuses)
     if pending:
@@ -321,73 +320,8 @@ def wait_production(sha: str, timeout: int = 900) -> tuple[str, str]:
     return "fail", f"no successful Production deployment within {timeout // 60} min"
 
 
-def master_ci_verdict(runs: list[dict], master_moved: bool) -> tuple[str, str] | None:
-    """Pure: verdict on the merge commit's Autonomous CI runs, or None while still waiting.
-
-    Autonomous CI cancels an in-progress master run when the next merge lands (concurrency per ref). A run that was
-    only cancelled because master moved on is superseded, not failed: the newer merge's own verification covers it.
-    """
-    done = [r for r in runs if r["status"] == "completed"]
-    if done and any(r["conclusion"] == "success" for r in done):
-        return "ok", "master CI green"
-    if done and all(r["conclusion"] in BAD for r in done) and len(done) == len(runs):
-        if master_moved and all(r["conclusion"] == "cancelled" for r in done):
-            return "skipped", "master CI cancelled because master moved on; that merge's own verification covers this one"
-        return "fail", "master CI " + done[0]["conclusion"]
-    return None
-
-
-def ci_runs_for_sha(runs: list[dict], sha: str) -> list[dict]:
-    """Dispatch metadata head_sha belongs to the workflow ref, not its pinned checkout.
-
-    New runs declare the immutable tested commit in run-name. Legacy runs can only
-    be attributed by head_sha; never let a new pinned run count for its dispatch ref.
-    """
-    title = "Autonomous CI " + sha
-    return [r for r in runs if r.get("display_title") == title or
-            (not r.get("display_title", "").startswith("Autonomous CI ") and r.get("head_sha") == sha)]
-
-
-def wait_master_ci(sha: str, timeout: int = 600) -> tuple[str, str]:
-    """Wait for the immutable merge commit, not the mutable dispatch branch."""
-    if not re.fullmatch(r"[0-9a-f]{40}", sha):
-        raise ValueError("CI verification requires a full commit SHA")
-
-    def runs():
-        # Do not filter head_sha: for workflow_dispatch that is the workflow ref's
-        # commit, which can advance between dispatch and checkout.
-        rows = api_json(f"repos/{REPO}/actions/workflows/{CI_WORKFLOW}/runs?per_page=100")["workflow_runs"]
-        return ci_runs_for_sha(rows, sha)
-
-    current = runs()
-    if not current:
-        if master_sha() != sha:
-            return "skipped", "master moved on before CI dispatch; newer merge verification owns production"
-        gh("workflow", "run", CI_WORKFLOW, "-R", REPO, "--ref", BASE, "-f", f"sha={sha}")
-    end = time.time() + timeout
-    while time.time() < end:
-        current = runs()
-        moved = master_sha() != sha
-        verdict = master_ci_verdict(current, moved)
-        if verdict:
-            return verdict
-        if moved and not current:
-            return "skipped", "master moved on before CI appeared; newer merge verification owns production"
-        time.sleep(20)
-    return ci_timeout_verdict(timeout)
-
-
-def ci_timeout_verdict(timeout: int) -> tuple[str, str]:
-    """Master CI still queued or running when the wait ends is not a failure. Back-to-back merges queue the runs
-    (2026-11-12: #74 and #83 were reverted for exactly this, with green PR checks and a green deploy). The same checks
-    passed on the PR head before the merge, so the production smoke test that runs next is the gate; a real CI failure
-    is still caught by master_ci_verdict whenever it finishes in time."""
-    return "ok", "master CI still queued or running after %d min (PR checks were green); production smoke decides" % (
-        timeout // 60)
-
-
 def moved_on_verdict(result: str, why: str, sha: str, head: str) -> tuple[str, str]:
-    """Pure: an `ok` verdict turns `skipped` when master moved on while we waited for the deploy and CI.
+    """Pure: an `ok` verdict turns `skipped` when master moved on while we waited for the deploy.
 
     The smoke test that runs next checks out THIS commit's tests but loads PRODUCTION, which by then serves the newer
     merge. Old tests against newer pages fail on copy the newer merge changed (2026-11-14: #113's run failed on
@@ -396,6 +330,35 @@ def moved_on_verdict(result: str, why: str, sha: str, head: str) -> tuple[str, s
     if result == "ok" and head != sha:
         return "skipped", f"master moved on to {head[:7]} while this merge was verified; that merge's own verification covers this one"
     return result, why
+
+
+def culprit_of(chain: list[tuple[str, list[str]]]) -> str:
+    """Pure: chain = [(sha, production states)] from the failing merge back through its parents. The commit to revert
+    is the oldest one in the unbroken run of failed builds: reverting a later commit would drop a good change and
+    leave the build broken (likely now that tsc runs on the schedule, not per PR, and merges land back to back)."""
+    culprit = chain[0][0]
+    for commit, states in chain[1:]:
+        if states and all(s in ("failure", "error") for s in states):
+            culprit = commit
+        else:
+            break
+    return culprit
+
+
+def first_broken(sha: str, depth: int = 8) -> str:
+    chain, cur = [], sha
+    for _ in range(depth):
+        deps = api_items(f"repos/{REPO}/deployments?sha={cur}&environment=Production&per_page=5", ".[]|{id}")
+        states = []
+        for d in deps:
+            st = api_items(f"repos/{REPO}/deployments/{d['id']}/statuses?per_page=1", ".[]|{state}")
+            states.append(st[0]["state"] if st else "pending")
+        chain.append((cur, states))
+        parent = gh("api", f"repos/{REPO}/commits/{cur}", "--jq", ".parents[0].sha", check=False).strip()
+        if not parent:
+            break
+        cur = parent
+    return culprit_of(chain)
 
 
 def post_merge(sha: str, drill: bool) -> int:
@@ -413,10 +376,12 @@ def post_merge(sha: str, drill: bool) -> int:
     if head != sha:
         emit("skipped", f"master moved on to {head[:7]}; that merge's own verification covers this one")
         return 0
-    result, why = wait_production(sha)
-    if result == "ok":
-        result, why2 = wait_master_ci(sha)
-        why = why + "; " + why2
+    result, why = wait_production(sha)  # deploys do not wait for tests (scheduled-tests.yml runs them)
+    if result == "fail":
+        culprit = first_broken(sha)
+        if culprit != sha:
+            why += f"; the build was already broken by {culprit[:7]}, which is reverted instead"
+            sha = culprit
     result, why = moved_on_verdict(result, why, sha, master_sha())
     emit(result, why)
     return 0

@@ -1,7 +1,5 @@
 name: Focus iOS checks
 on:
-  pull_request:
-    paths: ["tools/screentime_ios/**", ".github/workflows/focus-ios.yml"]
   push:
     branches: ["master"]
     paths: ["tools/screentime_ios/**", ".github/workflows/focus-ios.yml"]

@@ -40,7 +40,7 @@ WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / '.github' / 'workflows'
 # ---------------------------------------------------------------------------
 # Thresholds (all in one place so docs/watchdog.md and the tests can quote them)
 # ---------------------------------------------------------------------------
-REQUIRED_CHECKS = ('offline-checks', 'frontend-types')
+REQUIRED_CHECKS = ('offline-checks',)  # the rest runs in scheduled-tests.yml (2026-11-14)
 ACTIONS_APP_ID = 15368                       # GitHub Actions; branch protection pins it
 MERGE_STALL_AFTER = dt.timedelta(minutes=20)
 RED_AFTER = dt.timedelta(hours=6)
@@ -120,6 +120,8 @@ SCHEDULED: dict[str, Sched] = {
     'tanita-etl.yml': Sched('Tanita ETL', _h(26), True, '14:00 and 17:30 UTC (20h30 gap); worst seen 21h19'),
     'eight-sleep-etl.yml': Sched('Eight Sleep ETL', _h(28), True, 'daily; worst seen 26h46'),
     'smoke-test.yml': Sched('Production Smoke Test', _h(8), True, 'every 6h; worst seen 7h18'),
+    'scheduled-tests.yml': Sched(
+        'Scheduled tests', _m(90), True, 'every 30 min at :07/:37; new 2026-11-14 (replaced the per-PR test jobs)'),
     'cash-forecast-snapshot.yml': Sched(
         'Cash Forecast Snapshot', _h(8 * 24), True, 'weekly Monday 12:30 UTC; new 2026-11-14, no run history yet'),
     'merge-train.yml': Sched(

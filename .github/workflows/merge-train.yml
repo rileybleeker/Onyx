@@ -1,13 +1,13 @@
 name: Merge train
-# Merges green, routine PRs and keeps exactly one PR at a time up to date with master. Replaces the manual
-# "rebase, wait, merge, repeat" loop. Branch protection (required checks, up-to-date branch, enforced for admins)
+# Merges every green, routine PR as soon as offline-checks passes (about a minute from PR to merge). A PR that is
+# behind master is merged as it is (no rebase-and-retest round; Riley 2026-11-14: move fast, test on a schedule). Branch protection (required checks, up-to-date branch, enforced for admins)
 # stays the gate; this job uses only the repo's GITHUB_TOKEN and never checks out or runs PR code.
 # Brakes: `hold` label on a PR, an open `train-halt` issue (opened by a failed release), or disable this workflow.
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
   workflow_run:
-    workflows: ["Autonomous CI", "Stats Tests (PR check)"]
+    workflows: ["Autonomous CI"]
     types: [completed]
   issues:
     types: [closed, unlabeled]

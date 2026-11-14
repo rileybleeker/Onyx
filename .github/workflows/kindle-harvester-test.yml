@@ -1,7 +1,5 @@
 name: Kindle Harvester Tests
 on:
-  pull_request:
-    paths: ['tools/kindle_harvest/**', '.github/workflows/kindle-harvester-test.yml']
   push:
     branches: [master]
     paths: ['tools/kindle_harvest/**', '.github/workflows/kindle-harvester-test.yml']
