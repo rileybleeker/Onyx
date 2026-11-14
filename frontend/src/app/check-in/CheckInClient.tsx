@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
-import type { CheckinAnswer, CheckinItem, CheckinPayload } from "@/lib/checkin";
+import { kitSummary, type CheckinAnswer, type CheckinItem, type CheckinPayload } from "@/lib/checkin";
 import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortions";
 
 // Daily habit check-in (2026-11-07). One screen per behavior day: Yes / No per question, one Save.
@@ -12,6 +12,10 @@ import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortio
 //   labeled with that source; everything else starts blank. Blank on save = not logged (never a "No").
 // - Taps are kept as a local draft per day, so leaving the page (or the app being killed) loses nothing.
 // - Save writes the whole day in one request, then tells the Agents chat the day is done so the card settles.
+// - Less typing (2026-11-13, rules in lib/checkin.ts): rarely-Yes questions sit in "Also did"; the sleep
+//   questions have their own section (they are about the night that closes the day: tonight, on the Today
+//   tab) with one "usual kit" tap that fills in the last answer given to each kit question; "No for the
+//   other N" answers every blank daytime question at once. Both are ordinary taps: drafted, then saved.
 // - Delivered Uber Eats restaurant dishes get one extra section, "how much did you eat?": every dish of the
 //   day being checked in, plus dishes of the 2 days before whose portion was never set (the harvester runs
 //   every 6 h, so a dinner delivered after the 21:30 card usually lands after that evening's check-in and is
@@ -82,7 +86,8 @@ export default function CheckInClient() {
       }
       setData(payload);
       setCells(next);
-      setShowExtras(payload.items.some((i) => i.group === "extra" && payload.answers[i.name]));
+      // Open "Also did" when it holds a saved or pre-filled answer, so nothing is saved out of sight.
+      setShowExtras(payload.items.some((i) => i.group === "extra" && next[i.name]));
     } catch {
       setError("Couldn't reach Onyx. Check your connection and try again.");
     }
@@ -113,12 +118,32 @@ export default function CheckInClient() {
     });
   };
 
-  const { core, extras, coreByCategory } = useMemo(() => {
+  // Several answers in one tap (usual kit, "No for the rest"): same draft + state path as a single tap.
+  const setMany = (entries: Record<string, CheckinAnswer>) => {
+    if (!data || !Object.keys(entries).length) return;
+    setSavedAt(null);
+    setCells((prev) => {
+      const next = { ...prev };
+      for (const [name, answer] of Object.entries(entries)) next[name] = { answer, origin: "tapped" };
+      try {
+        const key = draftKey(data.date);
+        const draft = JSON.parse(localStorage.getItem(key) || "{}");
+        localStorage.setItem(key, JSON.stringify({ ...draft, ...entries }));
+      } catch {
+        /* storage unavailable: the in-memory state still works */
+      }
+      return next;
+    });
+  };
+
+  const { core, extras, coreByCategory, sleepItems } = useMemo(() => {
     const items = data?.items ?? [];
     const core = items.filter((i) => i.group === "core");
     const extras = items.filter((i) => i.group === "extra");
+    const sleepItems = core.filter((i) => i.sleep);
     const groups = new Map<string, CheckinItem[]>();
     for (const i of core) {
+      if (i.sleep) continue;
       const c = i.category || "general";
       groups.set(c, [...(groups.get(c) || []), i]);
     }
@@ -127,11 +152,26 @@ export default function CheckInClient() {
       const ib = CATEGORY_ORDER.indexOf(b[0]);
       return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
     });
-    return { core, extras, coreByCategory };
+    return { core, extras, coreByCategory, sleepItems };
   }, [data]);
 
   const coreDone = core.filter((i) => cells[i.name]).length;
   const coreLeft = core.length - coreDone;
+
+  // Usual sleep kit: only the kit questions on screen; "applied" once every one of them matches.
+  const kit = useMemo(() => {
+    const out: Record<string, CheckinAnswer> = {};
+    for (const i of sleepItems) {
+      const a = data?.usualKit?.[i.name];
+      if (a) out[i.name] = a;
+    }
+    return out;
+  }, [data, sleepItems]);
+  const kitSize = Object.keys(kit).length;
+  const kitApplied = kitSize > 0 && Object.entries(kit).every(([q, a]) => cells[q]?.answer === a);
+
+  // Blank daytime questions ("No for the other N"). Sleep questions are left out: tonight may not have happened yet.
+  const dayBlanks = core.filter((i) => !i.sleep && !cells[i.name]);
 
   // What Save would change: every set answer that differs from what's stored, plus clears of stored answers.
   const changes = useMemo(() => {
@@ -248,6 +288,17 @@ export default function CheckInClient() {
         <div className="h-1.5 rounded-full bg-white/[0.06] overflow-hidden">
           <div className="h-full bg-accent transition-all" style={{ width: `${core.length ? (coreDone / core.length) * 100 : 0}%` }} />
         </div>
+        {dayBlanks.length > 0 && (
+          <div className="mt-3 flex items-center gap-3">
+            <button
+              onClick={() => setMany(Object.fromEntries(dayBlanks.map((i) => [i.name, "No" as CheckinAnswer])))}
+              className="px-3 py-1.5 rounded-[6px] border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary transition-colors"
+            >
+              No for the other {dayBlanks.length}
+            </button>
+            <span className="text-[12px] text-text-tertiary">Tap Yes on what happened first.</span>
+          </div>
+        )}
       </div>
 
       {coreByCategory.map(([category, items]) => (
@@ -261,6 +312,42 @@ export default function CheckInClient() {
         </section>
       ))}
 
+      {sleepItems.length > 0 && (
+        <section className="mb-6">
+          <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">
+            {data.date === data.today
+              ? "Tonight's sleep"
+              : dayLabel(data.date, data.today) === "Yesterday"
+                ? "Last night's sleep"
+                : `Sleep, ${dayLabel(data.date, data.today)} night`}
+          </h3>
+          <p className="text-[12px] text-text-tertiary mb-2">
+            {data.date === data.today
+              ? "About the night ahead. Answer what you plan, or leave it blank and finish tomorrow."
+              : "About the night that followed this day."}
+          </p>
+          {kitSize > 0 && (
+            <button
+              onClick={() => setMany(kit)}
+              disabled={kitApplied}
+              className={`w-full mb-2 px-3 py-2.5 rounded-[6px] border text-left transition-colors ${
+                kitApplied ? "border-accent/40 bg-accent/10" : "border-border-subtle bg-white/[0.03] hover:bg-white/[0.06]"
+              }`}
+            >
+              <span className={`text-[14px] font-medium inline-flex items-center gap-1.5 ${kitApplied ? "text-accent" : "text-text-primary"}`}>
+                {kitApplied && <Check className="w-4 h-4" />} Usual kit
+              </span>
+              <span className="block text-[12px] text-text-tertiary mt-0.5">{kitSummary(kit)}</span>
+            </button>
+          )}
+          <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
+            {sleepItems.map((item) => (
+              <Row key={item.name} item={item} cell={cells[item.name]} onTap={tap} />
+            ))}
+          </div>
+        </section>
+      )}
+
       {extras.length > 0 && (
         <section className="mb-6">
           <button onClick={() => setShowExtras((s) => !s)} className="flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">
@@ -269,7 +356,7 @@ export default function CheckInClient() {
           </button>
           {showExtras && (
             <>
-              <p className="text-[12px] text-text-tertiary mb-2">Weekly and occasional habits. Leave blank unless you did (or deliberately skipped) one today.</p>
+              <p className="text-[12px] text-text-tertiary mb-2">Weekly and rarely-Yes questions. Leave blank unless you did (or deliberately skipped) one today.</p>
               <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
                 {extras.map((item) => (
                   <Row key={item.name} item={item} cell={cells[item.name]} onTap={tap} />
