@@ -73,7 +73,7 @@ const card = (calendar) => renderToStaticMarkup(React.createElement(Card, { cale
 
 test("events card: synced shows the calendars, their event counts and the last sync age", () => {
   const html = card(view({ lastSync: sync(20), calendars: [{ account: "acct one", calendar: "main", events: 66 }, { account: "acct two", calendar: "side", events: 1 }] }));
-  assert.match(html, /Your calendar events: <span class="text-up">synced \(read-only\)<\/span>/);
+  assert.match(html, /Google Calendar: <span class="text-up">connected<\/span>/);
   assert.match(html, /main <span[^>]*>\(acct one\)<\/span><\/span><span[^>]*>66 events<\/span>/);
   assert.match(html, /side <span[^>]*>\(acct two\)<\/span><\/span><span[^>]*>1 event<\/span>/);
   assert.match(html, /67 events in all/);
@@ -82,7 +82,7 @@ test("events card: synced shows the calendars, their event counts and the last s
 
 test("events card: not synced yet, checking, unreachable and failing are different states", () => {
   const notConnected = card(view({ state: "not_connected" }));
-  assert.match(notConnected, /Your calendar events: <span[^>]*>not synced yet<\/span>/);
+  assert.match(notConnected, /Google Calendar: <span[^>]*>not synced yet<\/span>/);
   const neverRan = card(view({ calendars: [] }));
   assert.match(neverRan, />not synced yet</);
   const checking = card(view({ state: "loading" }));
@@ -91,7 +91,7 @@ test("events card: not synced yet, checking, unreachable and failing are differe
   const unreachable = card(view({ state: "error" }));
   assert.match(unreachable, />couldn&#x27;t be checked</);
   const failing = card(view({ lastSync: sync(30, "failed", "calendar 'main' (acct one): HTTP 404"), calendars: [{ account: "acct one", calendar: "main", events: 3 }] }));
-  assert.match(failing, /Your calendar events: <span class="text-down">sync failing<\/span>/);
+  assert.match(failing, /Google Calendar: <span class="text-down">sync failing<\/span>/);
   assert.match(failing, /Last sync 30 min ago \(that run: failed\)\. calendar &#x27;main&#x27; \(acct one\): HTTP 404/);
   assert.match(failing, />3 events</, "the last good copy is still listed");
   const late = card(view({ lastSync: sync(200), calendars: [] }));
@@ -102,7 +102,7 @@ test("events card: not synced yet, checking, unreachable and failing are differe
     assert.equal(html.includes("<button"), false, "nothing to press: there is no sign-in and no write access");
     assert.match(html, /this sync cannot change your calendars or turn a care item into a calendar event/);
     // The care-items -> Google card above it owns these: the smoke test and the UI test look them up by name.
-    assert.equal(/Google Calendar: (not connected|connected)</.test(html), false, "never the other card's heading");
+    assert.equal(html.includes("Copy care items to Google Calendar"), false, "never the other card's heading");
     assert.equal(html.includes('aria-label="Google Calendar connection"'), false, "never the other card's label");
   }
   for (const html of [notConnected, checking, unreachable]) assert.equal(/\d+ events?</.test(html), false);

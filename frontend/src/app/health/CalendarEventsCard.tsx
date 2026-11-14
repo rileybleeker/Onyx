@@ -2,6 +2,17 @@ import { CALENDAR_SOURCE_LABEL, readConnection, type CalendarReadStatus } from '
 import { ageLabel } from '@/lib/urgent-email';
 import type { CalendarView } from './useCalendarEvents';
 
+// Heading word for each state. "connected" is what Riley looks for: the hourly read sync is the
+// Google Calendar connection; the card below it (copying care items INTO Google) is optional.
+const HEADING: Record<CalendarReadStatus, string> = {
+  checking: 'checking',
+  synced: 'connected',
+  late: 'connected',
+  failing: 'sync failing',
+  'not-synced': 'not synced yet',
+  unavailable: "couldn't be checked",
+};
+
 const TONE: Record<CalendarReadStatus, string> = {
   checking: 'text-text-secondary',
   synced: 'text-up',
@@ -13,7 +24,7 @@ const TONE: Record<CalendarReadStatus, string> = {
 
 // Read-only status of the hourly calendar sync (google_calendar_etl.py, calendar -> Onyx): the
 // events it copied are what the Month and Agenda views show next to the care items. This is NOT
-// the connection above it (care items -> a calendar Onyx created): nothing here signs in to
+// the optional card below it (care items -> a calendar Onyx created): nothing here signs in to
 // Google, holds a token, or writes anywhere, so there is no button.
 export default function CalendarEventsCard({ calendar }: { calendar: CalendarView }) {
   const now = new Date();
@@ -22,7 +33,7 @@ export default function CalendarEventsCard({ calendar }: { calendar: CalendarVie
   const total = calendars.reduce((sum, c) => sum + c.events, 0);
   const hasData = calendar.state === 'ready' && connection.status !== 'not-synced';
   return <div className="mt-4 border-t border-border-default pt-3" aria-label="Calendar events sync">
-    <h3 className="text-sm font-semibold">Your calendar events: <span className={TONE[connection.status]}>{connection.statusLabel.toLowerCase()}</span></h3>
+    <h3 className="text-sm font-semibold">Google Calendar: <span className={TONE[connection.status]}>{HEADING[connection.status]}</span></h3>
     <p className="mt-1 text-sm text-text-secondary" role={connection.status === 'checking' ? 'status' : undefined}>{connection.detail}</p>
     {calendar.stale && <p className="mt-1 text-sm text-amber-300">Couldn&apos;t refresh the calendar events. Showing the ones from the last check.</p>}
     {hasData && <>

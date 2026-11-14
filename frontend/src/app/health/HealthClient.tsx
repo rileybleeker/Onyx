@@ -209,8 +209,8 @@ export default function HealthClient({ initial, calendar }: { initial: CareLoad;
         <button className={`${button} mt-2`} onClick={removeLocal}>Remove the browser copy</button>
       </div>}
       {local.state === 'unreadable' && <p className="mt-3 text-sm text-text-secondary">This browser holds an older saved planner that cannot be read. It has been left untouched and is not used.</p>}
-      <CalendarConnectionCard initial={calendar} />
       <CalendarEventsCard calendar={events} />
+      <CalendarConnectionCard initial={calendar} />
     </section>
     {notice && <p role={notice.error ? 'alert' : 'status'} className={`text-sm ${notice.error ? 'text-amber-400' : 'text-text-secondary'}`}>{notice.text}</p>}
     {undo && load === 'ready' && <button className={button} disabled={busy.has(opId(undo))} onClick={() => { const op = undo; setUndo(null); if (form.editing === opId(op)) setForm(emptyForm(viewerTz)); void run(op, false); }}>Undo last change</button>}
