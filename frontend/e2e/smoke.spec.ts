@@ -362,6 +362,15 @@ const PAGES: SmokePage[] = [
     legitimateEmpty: "No ledger data yet - the harvester has not run.",
   },
   {
+    // Budgets (2026-11-14): server-rendered over pds.finance_* + budgets / category rules, service-role only.
+    // Page-loads check; the failed-load state is a hard fail; no transactions SKIPS. No amounts asserted.
+    route: "/financials/budgets",
+    heading: "Budgets",
+    signal: "page-loads",
+    hardEmpty: ["Budgets could not be loaded"],
+    legitimateEmpty: "No transactions in the last six months yet.",
+  },
+  {
     // Cash forecast (2026-11-14): server-rendered over pds.finance_* + pds.finance_plan_*, service-role only.
     // Must render the chart; the failed-load state is a hard fail; an empty ledger SKIPS. No amounts asserted.
     route: "/financials/forecast",

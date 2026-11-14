@@ -1,0 +1,88 @@
+// Run: node --test tests/finance-budgets.test.cjs
+// Budgets, category fixes and money alerts (lib/finance-budgets.ts, lib/finance-categories.ts,
+// lib/finance-alerts.ts). SYNTHETIC DATA ONLY: invented merchants, amounts and dates.
+const { test } = require("node:test");
+const assert = require("node:assert/strict");
+const { loadTs } = require("./helpers/load-ts.cjs");
+const B = loadTs("lib/finance-budgets.ts");
+const C = loadTs("lib/finance-categories.ts");
+const A = loadTs("lib/finance-alerts.ts");
+
+const TODAY = "2030-06-15";
+let n = 0;
+const tx = (txn_date, amount_cents, name, category, over = {}) => ({
+  txn_key: `k${n++}`, account_key: "card", txn_date, name, custom_name: null, amount_cents, currency: "USD", category, ignored_from: null, ...over,
+});
+function world() {
+  const rows = [];
+  for (const m of ["2030-03", "2030-04", "2030-05"]) {
+    rows.push(tx(`${m}-05`, 20_000, "DEMO DINER", "Dining & Drinks"), tx(`${m}-20`, 20_000, "DEMO BISTRO", "Dining & Drinks"));
+    rows.push(tx(`${m}-10`, 30_000, "DEMO GROCER", "Groceries"));
+    rows.push(tx(`${m}-28`, -500_000, "DEMO EMPLOYER", "Income"));
+    rows.push(tx(`${m}-25`, 100_000, "DEMO CARD PAYMENT", "Credit Card Payment"));
+  }
+  rows.push(tx("2030-06-03", 30_000, "DEMO DINER", "Dining & Drinks"), tx("2030-06-10", 30_000, "DEMO BISTRO", "Dining & Drinks"));
+  rows.push(tx("2030-06-08", 10_000, "DEMO GROCER", "Groceries"));
+  rows.push(tx("2030-06-12", 4_000, "DEMO NEW SHOP", null), tx("2030-05-12", 6_000, "DEMO NEW SHOP", null));
+  return rows;
+}
+
+test("spending by category, pace, projection and suggested budget", () => {
+  const r = B.computeBudgets(world(), new Map([["Dining & Drinks", 40_000]]), TODAY);
+  const dining = r.lines.find((l) => l.category === "Dining & Drinks");
+  assert.equal(dining.spentCents, 60_000);
+  assert.equal(dining.avg3Cents, 40_000);
+  assert.equal(dining.suggestedCents, 40_000);
+  assert.equal(dining.status, "over");
+  assert.equal(dining.sameDaysAvgCents, 20_000); // only the 5th falls in days 1-15
+  const groceries = r.lines.find((l) => l.category === "Groceries");
+  assert.equal(groceries.status, "none");
+  assert.equal(groceries.projectedCents, Math.round(10_000 + 30_000 * (15 / 30)));
+  // Card payments are not spending; income is not a budget line.
+  assert.ok(!r.lines.some((l) => l.category === "Credit Card Payment" || l.category === "Income"));
+  assert.equal(r.incomeAvg3Cents, 500_000);
+  assert.ok(r.increases.some((x) => x.category === "Dining & Drinks"));
+  assert.equal(r.topMerchants[0].cents, 30_000);
+  assert.equal(r.uncategorized.length, 1);
+  assert.equal(r.uncategorized[0].count, 2);
+  assert.equal(r.total.spentCents, 60_000 + 10_000 + 4_000);
+});
+
+test("an overall budget and category budgets roll up", () => {
+  const r = B.computeBudgets(world(), new Map([[B.TOTAL_KEY, 50_000]]), TODAY);
+  assert.equal(r.total.budgetCents, 50_000);
+  assert.equal(r.total.status, "over");
+  const r2 = B.computeBudgets(world(), new Map([["Groceries", 30_000], ["Dining & Drinks", 50_000]]), TODAY);
+  assert.equal(r2.total.budgetCents, 80_000);
+});
+
+test("category fixes: one-off override wins over a merchant rule, which wins over the source", () => {
+  const fixes = { rules: new Map([["demo new shop", "Shopping"]]), overrides: new Map([["t1", "Gifts"]]) };
+  assert.equal(C.fixedCategory({ txn_key: "t0", name: "DEMO NEW SHOP #123", category: null }, fixes), "Shopping");
+  assert.equal(C.fixedCategory({ txn_key: "t1", name: "DEMO NEW SHOP", category: null }, fixes), "Gifts");
+  assert.equal(C.fixedCategory({ txn_key: "t2", name: "OTHER", category: "Travel" }, fixes), "Travel");
+  const rows = C.applyFixes([{ txn_key: "t0", name: "DEMO NEW SHOP", category: null }], fixes);
+  assert.equal(rows[0].category, "Shopping");
+  assert.equal(C.isCategoryName("Dining & Drinks"), true);
+  assert.equal(C.isCategoryName("<script>"), false);
+  assert.ok(C.categoryOptions(["Custom Thing"]).includes("Custom Thing"));
+});
+
+test("money alerts: low cash, promo, tax due, budget", () => {
+  const days = Array.from({ length: 40 }, (_, i) => ({ date: `2030-06-${String(16 + (i % 14)).padStart(2, "0")}`, likely: 50_000, low: i === 10 ? -20_000 : 10_000, high: 90_000 }));
+  const forecast = {
+    state: "ok",
+    days,
+    milestones: [{ label: "Demo Card", date: "2030-07-20", daysAway: 35, ended: false, owedAtEndCents: 300_000, interestPerMonthAfterCents: 6_000 }],
+    lines: [{ sourceId: "tax:2030:GA:2030-06-20", label: "Georgia estimated tax 2030 (calculated)", amountCents: -100_000, date: "2030-06-20" }],
+  };
+  const budgets = B.computeBudgets(world(), new Map([["Dining & Drinks", 40_000]]), TODAY);
+  const alerts = A.moneyAlerts(forecast, budgets, 0, TODAY);
+  const kinds = alerts.map((a) => a.kind);
+  assert.ok(kinds.includes("low-cash"));
+  assert.ok(kinds.includes("promo"));
+  assert.ok(kinds.includes("tax"));
+  assert.ok(kinds.includes("budget"));
+  assert.equal(alerts[0].severity, "high");
+  assert.equal(A.moneyAlerts(null, null, 0, TODAY).length, 0);
+});

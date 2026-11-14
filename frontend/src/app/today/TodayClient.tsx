@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, BookOpen, CalendarClock, CalendarDays, ClipboardCheck, FlaskConical, Mail, Package, RefreshCw, X } from "lucide-react";
+import { ArrowUpRight, BookOpen, CalendarClock, CalendarDays, ClipboardCheck, FlaskConical, Mail, Package, RefreshCw, Wallet, X } from "lucide-react";
+import type { MoneyAlert } from "@/lib/finance-alerts";
 import { agentsApi, clearDeviceNotifications, setBadge, type InboxResponse, type InboxItem } from "@/lib/agents-api";
 import type { ReadingOverview } from "@/lib/reading";
 import type { UrgentEmailResponse } from "@/lib/urgent-email-query";
@@ -74,6 +75,8 @@ export default function TodayClient() {
   // Subscription renewals (GET /api/procurement/renewals/summary) follow the same rule: shown only
   // when one is due within 3 days; a failed check hides the panel, /procurement has the details.
   const [renewals, setRenewals] = useState<RenewalSummary | null>(null);
+  // Money alerts (GET /api/finance/alerts): shown only when there is something to act on; a failed check keeps the last answer.
+  const [money, setMoney] = useState<MoneyAlert[] | null>(null);
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
   const sequence = useRef(0);
   const inFlight = useRef(false);
@@ -143,6 +146,14 @@ export default function TodayClient() {
     })).then((value) => {
       if (sequence.current === current) setRenewals(value);
     }).catch(() => { /* keep the last summary; /procurement has the details */ });
+    const moneyRequest = bounded(fetch("/api/finance/alerts", { cache: "no-store" }).then(async (res) => {
+      if (!res.ok) throw new Error("Money alerts unavailable");
+      const data = await res.json() as { status?: string; alerts?: MoneyAlert[] };
+      if (data.status !== "ready" || !Array.isArray(data.alerts)) throw new Error("Invalid money alerts");
+      return data.alerts;
+    })).then((value) => {
+      if (sequence.current === current) setMoney(value);
+    }).catch(() => { /* keep the last alerts; /financials has the details */ });
     const experimentRequest = bounded(fetch("/api/experiments/today", { cache: "no-store" }).then(async (res) => {
       if (!res.ok) throw new Error("Experiment arm unavailable");
       const data: unknown = await res.json();
@@ -159,7 +170,7 @@ export default function TodayClient() {
     })).then((value) => {
       if (sequence.current === current) setCalendar({ state: "ready", value });
     }).catch(() => { if (sequence.current === current) setCalendar((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
-    void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest, renewalsRequest, experimentRequest, calendarRequest]).then(() => {
+    void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest, renewalsRequest, moneyRequest, experimentRequest, calendarRequest]).then(() => {
       if (sequence.current === current) { inFlight.current = false; setRefreshing(false); }
     });
   }, []);
@@ -414,6 +425,18 @@ export default function TodayClient() {
           {packages.top.map((t, i) => <li key={i} className="text-xs text-text-secondary"><span className="text-text-primary">{t.merchant}: {t.label}.</span> {t.reason}</li>)}
         </ul>}
         <Link href="/orders" className={`${linkStyle} mt-4 inline-block`}>Open orders</Link>
+      </section>}
+      {money && money.length > 0 && <section className={panelStyle} aria-labelledby="money-heading">
+        <div className="flex items-center gap-2"><Wallet aria-hidden="true" className="h-5 w-5 text-accent" />
+          <h2 id="money-heading" className="text-lg font-medium text-text-primary">Money</h2></div>
+        <ul className="mt-3 space-y-2" aria-label="Money alerts">
+          {money.slice(0, 5).map((a, i) => <li key={i} className="break-words">
+            <Link href={a.href} className={`text-sm ${a.severity === "high" ? "text-down" : "text-text-primary"} hover:underline`}>{a.title}</Link>
+            <p className="text-xs text-text-secondary">{a.detail}</p>
+          </li>)}
+        </ul>
+        <p className="mt-2 text-xs text-text-secondary">From your forecast and budgets. Onyx never moves money.</p>
+        <Link href="/financials/budgets" className={`${linkStyle} mt-4 inline-block`}>Open budgets</Link>
       </section>}
       {renewing && <section className={panelStyle} aria-labelledby="renewals-heading">
         <div className="flex items-center gap-2"><CalendarClock aria-hidden="true" className="h-5 w-5 text-accent" />

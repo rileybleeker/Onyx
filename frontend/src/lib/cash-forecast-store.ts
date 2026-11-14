@@ -116,7 +116,7 @@ export function parseDriverBody(
   }
   const m = /^(settings|card|growth)(?::(.+))?$/.exec(key);
   if (!m || (m[1] === "settings") !== !m[2]) return { ok: false, error: "key must be settings, tax, scenario:<name>, card:<account> or growth:<account>" };
-  if (m[2] && !knownAccounts.has(m[2])) return { ok: false, error: "unknown account" };
+  if (m[2] && !knownAccounts.has(m[2]) && !(m[1] === "growth" && /^virtual-[a-z0-9-]{1,40}$/.test(m[2]))) return { ok: false, error: "unknown account" };
   if (b.value === null) return { ok: true, key, value: null };
   if (!b.value || typeof b.value !== "object" || Array.isArray(b.value)) return { ok: false, error: "value must be an object or null" };
   const v = b.value as Record<string, unknown>;
@@ -142,7 +142,7 @@ export function parseDriverBody(
   const allowed: Record<string, string[]> = {
     settings: ["bufferCents", "inflationPct"],
     card: ["aprPct", "promoEnds", "promoAprPct", "standardAprPct", "promoNote"],
-    growth: ["returnPct", "monthlyContributionCents", "contributionStarts"],
+    growth: ["returnPct", "monthlyContributionCents", "contributionStarts", "label", "startCents"],
   };
   for (const k of Object.keys(v)) if (!allowed[m[1]].includes(k)) return { ok: false, error: `unknown value field ${k}` };
   const errs =
@@ -150,10 +150,11 @@ export function parseDriverBody(
       ? [cents("bufferCents"), pct("inflationPct", 20)]
       : m[1] === "card"
         ? [pct("aprPct", 60), day("promoEnds"), pct("promoAprPct", 60), pct("standardAprPct", 60)]
-        : [pct("returnPct", 30), cents("monthlyContributionCents"), day("contributionStarts")];
+        : [pct("returnPct", 30), cents("monthlyContributionCents"), day("contributionStarts"), cents("startCents")];
   const err = errs.find(Boolean);
   if (err) return { ok: false, error: err };
   if (m[1] === "card" && typeof v.promoNote === "string" && v.promoNote.trim()) out.promoNote = v.promoNote.trim().slice(0, 200);
+  if (m[1] === "growth" && typeof v.label === "string" && v.label.trim()) out.label = v.label.trim().slice(0, 80);
   return { ok: true, key, value: out };
 }
 
@@ -187,6 +188,8 @@ export function driversToInputs(rows: readonly DriverRow[]): { settings: Forecas
         returnPct: n(v.returnPct),
         monthlyContributionCents: n(v.monthlyContributionCents),
         contributionStarts: isDay(v.contributionStarts) ? v.contributionStarts : undefined,
+        label: typeof v.label === "string" ? v.label : undefined,
+        startCents: n(v.startCents),
       });
     }
   }

@@ -50,6 +50,7 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
           tax={load.tax}
           scenario={load.scenario}
           saved={load.saved}
+          accuracy={load.accuracy}
         />
       )}
     </main>

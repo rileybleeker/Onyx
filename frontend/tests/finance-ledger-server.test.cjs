@@ -144,7 +144,7 @@ test("default month is the newest with data; flows, trend and month list match a
   assert.equal(d.months[d.months.length - 1], "2029-02", "oldest month with data");
   assert.equal(d.windowTruncated, false);
   assert.equal(d.skippedRows, 0);
-  const windowReads = db.calls.filter((c) => c.table === "finance_transactions" && c.cols === "account_key,txn_date,amount_cents,currency,category,ignored_from");
+  const windowReads = db.calls.filter((c) => c.table === "finance_transactions" && c.cols === "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from");
   assert.ok(windowReads.length >= 3, "the window was read in several capped pages");
 });
 

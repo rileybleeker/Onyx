@@ -31,6 +31,7 @@ import {
   type TxnClass,
 } from "@/lib/finance-ledger";
 import { FINANCE_SOURCE, SIMPLEFIN_THRESHOLDS, financeLedgerCard, type FinanceCard } from "@/lib/finance-status";
+import { NO_FIXES, applyFixes, fixedCategory, type CategoryFixes } from "@/lib/finance-categories";
 
 /**
  * Server-side reads of the finance ledger. SERVICE ROLE ONLY: pds.finance_* has RLS on, no
@@ -45,7 +46,8 @@ import { FINANCE_SOURCE, SIMPLEFIN_THRESHOLDS, financeLedgerCard, type FinanceCa
 const ACCOUNT_COLS = "account_key,institution,account_name,account_type,mask";
 const BALANCE_COLS = "account_key,captured_at,balance_cents,currency,kind";
 // The 12-month window needs only what the arithmetic uses.
-const WINDOW_COLS = "account_key,txn_date,amount_cents,currency,category,ignored_from";
+// txn_key + names are read too, for the category fixes (merchant rules / one-off overrides).
+const WINDOW_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
 const LIST_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
 const HEARTBEAT_COLS = "status,sync_start,records_synced,duration_seconds,error_message";
 const PAGE = 1000; // PostgREST's default max rows per request
@@ -147,6 +149,28 @@ async function heartbeat(db: Db, dataType: string): Promise<Record<string, unkno
   return error ? null : ((data?.[0] as Record<string, unknown> | undefined) ?? null);
 }
 
+/**
+ * Category fixes Riley made (merchant rules, one-off overrides). Fail-open: a missing table or a failed read
+ * shows the source categories, never an error page.
+ */
+export async function loadCategoryFixes(db: Db): Promise<CategoryFixes> {
+  let rules: { data: unknown[] | null; error: unknown };
+  let overrides: { data: unknown[] | null; error: unknown };
+  try {
+    [rules, overrides] = await Promise.all([
+      db.from("finance_category_rules").select("merchant_key,category"),
+      db.from("finance_txn_categories").select("txn_key,category"),
+    ]);
+  } catch {
+    return NO_FIXES;
+  }
+  if (rules.error && overrides.error) return NO_FIXES;
+  return {
+    rules: new Map(((rules.data ?? []) as { merchant_key: string; category: string }[]).map((r) => [r.merchant_key, r.category])),
+    overrides: new Map(((overrides.data ?? []) as { txn_key: string; category: string }[]).map((r) => [r.txn_key, r.category])),
+  };
+}
+
 export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Promise<LedgerLoad> {
   let db: Db;
   try {
@@ -155,6 +179,7 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
     return fail(e);
   }
   try {
+    const fixes = await loadCategoryFixes(db);
     const [accountsRes, minDate, maxDate, txHeartbeat, balHeartbeat] = await Promise.all([
       db.from("finance_accounts").select(ACCOUNT_COLS).order("institution").order("account_name").order("account_key"),
       dateEdge(db, true),
@@ -203,13 +228,13 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
       return qb.order("txn_date", { ascending: false }).order("txn_key", { ascending: true }).range(from, to);
     }, MAX_WINDOW_PAGES);
 
-    const listRead = readList(db, { ...query, month, account }, accounts);
+    const listRead = readList(db, { ...query, month, account }, accounts, fixes);
     const [balanceReadRows, windowRaw, list] = await Promise.all([Promise.all(balanceReads), windowRead, listRead]);
     const balanceRows = balanceReadRows.flatMap((r) => (r.balance ? [r.balance] : []));
 
     const windowRows: LedgerTxn[] = [];
     let skipped = 0;
-    for (const raw of windowRaw.rows) {
+    for (const raw of applyFixes(windowRaw.rows as Record<string, unknown>[], fixes)) {
       const t = parseTxn(raw);
       if (t) windowRows.push(t);
       else skipped++;
@@ -244,6 +269,7 @@ async function readList(
   db: Db,
   q: LedgerQuery & { month: string },
   accounts: readonly LedgerAccount[],
+  fixes: CategoryFixes = NO_FIXES,
 ): Promise<{ list: LedgerData["list"]; skipped: number; clamped: boolean }> {
   const filter = buildSearchFilter(q.q);
   const run = async (page: number) => {
@@ -268,7 +294,8 @@ async function readList(
   const rows: ListRow[] = [];
   let skipped = 0;
   for (const raw of data ?? []) {
-    const r = raw as Record<string, unknown>;
+    const r0 = raw as Record<string, unknown>;
+    const r: Record<string, unknown> = { ...r0, category: fixedCategory(r0, fixes) };
     const t = parseTxn(r);
     const key = typeof r.txn_key === "string" ? r.txn_key : null;
     const name = typeof r.name === "string" ? r.name : "";
