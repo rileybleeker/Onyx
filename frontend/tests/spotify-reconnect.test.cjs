@@ -176,6 +176,11 @@ test("pasted text: the query alone or the bare code", () => {
   assert.deepEqual(lib.parseCallbackInput(`code=${CODE}&state=${state}`), { ok: true, code: CODE, state });
   assert.deepEqual(lib.parseCallbackInput(`code=${CODE}`), { ok: true, code: CODE, state: null });
   assert.deepEqual(lib.parseCallbackInput(CODE), { ok: true, code: CODE, state: null });
+  // Spotify does not document a code's alphabet: anything printable goes through to Spotify, which decides.
+  assert.deepEqual(lib.parseCallbackInput("AQpadded=="), { ok: true, code: "AQpadded==", state: null }, "a bare code with = in it is not a query");
+  const odd = "AQ.x~y+z/w";
+  assert.deepEqual(lib.parseCallbackInput(odd), { ok: true, code: odd, state: null });
+  assert.deepEqual(lib.parseCallbackInput(`${REDIRECT}?code=${encodeURIComponent(odd)}&state=${state}`), { ok: true, code: odd, state });
 });
 
 test("pasted text: refused forms, each with a fixed code", () => {
@@ -213,8 +218,9 @@ test("pasted text: refused forms, each with a fixed code", () => {
   assert.equal(err(`${REDIRECT}?code=has%20space&state=${state}`), "bad_code");
   assert.equal(err(`${REDIRECT}?code=${CODE}&code=${CODE}&state=${state}`), "bad_code");
   assert.equal(err(`${REDIRECT}?code=${"a".repeat(2049)}&state=${state}`), "bad_code");
-  assert.equal(err("not/a/code"), "bad_code");
-  assert.equal(err("<script>"), "bad_code");
+  assert.equal(err("caf" + String.fromCharCode(233) + "-code"), "bad_code", "non-ASCII");
+  assert.equal(err("code" + String.fromCharCode(7) + "bell"), "bad_code", "control character");
+  assert.equal(err("two words"), "not_callback_address", "whitespace inside");
   assert.equal(err(`state=${state}`), "missing_code");
   assert.equal(err("a".repeat(5000)), "body_too_large");
 });

@@ -41,7 +41,14 @@ export const MAX_EXCHANGE_BODY_BYTES = 4096;
 export const MAX_CODE_CHARS = 2048;
 export const MAX_STATE_CHARS = 128;
 
-const TOKEN_CHARS = /^[A-Za-z0-9_-]+$/;
+/** The state is made here (newState), so its alphabet is known exactly. */
+const STATE_CHARS = /^[A-Za-z0-9_-]+$/;
+/**
+ * Spotify does not document the alphabet of an authorization code, so this only refuses what a
+ * code can never be: spaces, control characters and non-ASCII. The code is never echoed or logged;
+ * it is only sent form-encoded to Spotify's token endpoint, which is the real judge of it.
+ */
+const CODE_CHARS = /^[!-~]+$/;
 const DAY_SECONDS = 86_400;
 
 export interface SpotifyTokenBlob {
@@ -100,11 +107,11 @@ export function safeEqual(a: string, b: string): boolean {
 }
 
 export function isValidState(value: unknown): value is string {
-  return typeof value === "string" && value.length >= 16 && value.length <= MAX_STATE_CHARS && TOKEN_CHARS.test(value);
+  return typeof value === "string" && value.length >= 16 && value.length <= MAX_STATE_CHARS && STATE_CHARS.test(value);
 }
 
 export function isValidCode(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= MAX_CODE_CHARS && TOKEN_CHARS.test(value);
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_CODE_CHARS && CODE_CHARS.test(value);
 }
 
 /** 32 random bytes, base64url (43 characters). */
@@ -193,7 +200,8 @@ export function parseCallbackInput(input: unknown): CallbackParse {
     return fromParams(u.searchParams, true);
   }
 
-  if (text.includes("=")) {
+  // The query alone. (A bare code may itself contain "=", so this needs a parameter name.)
+  if (/(?:^|[?&#])(?:code|state|error)=/.test(text)) {
     const query = text.replace(/^[?#]/, "");
     const params = new URLSearchParams(query);
     if (!params.has("code") && !params.has("error")) return { ok: false, error: "missing_code" };
