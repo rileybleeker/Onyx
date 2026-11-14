@@ -3,7 +3,19 @@ import { after, NextRequest, NextResponse } from "next/server";
 import { fetchActiveHabits, NotionHabitsError, type NotionHabit } from "@/lib/habits-notion";
 import {
   addDays,
+  APP_HABITS,
+  appHabitSuggestions,
   CHECKIN_MAX_DAYS_BACK,
+  groupFor,
+  journaledSuggestion,
+  Q_JOURNALED,
+  Q_SAME_BED,
+  Q_SCREEN_IN_BED,
+  sameBedSuggestion,
+  screenInBedSuggestion,
+  SLEEP_KIT,
+  SLEEP_QUESTIONS,
+  usualKit,
   type CheckinAnswer,
   type CheckinItem,
   type CheckinPayload,
@@ -14,7 +26,9 @@ import {
  * Daily habit check-in (2026-11-07). One screen, one write for a whole behavior day.
  *
  * GET  /api/habits/checkin?date=YYYY-MM-DD → CheckinPayload (questions, saved answers, data-backed pre-fills,
- *      progress for today and the two days before). date defaults to behavioral today.
+ *      the usual sleep kit, progress for today and the two days before). date defaults to behavioral today.
+ *      Pre-fills (2026-11-13) are never written by this route: the screen shows them with their source and
+ *      they are stored only when Riley saves. Rules and thresholds live in lib/checkin.ts.
  * POST /api/habits/checkin { date, answers: { [question]: 'Yes' | 'No' | null } } → upserts Yes/No rows and
  *      deletes nulls (row absence = not logged, as in /api/habits/complete). Notion "Last Completed" is mirrored
  *      after the response; the hourly habits-sync self-heals any miss.
@@ -66,14 +80,21 @@ async function loadItems(): Promise<{ items: CheckinItem[]; habits: NotionHabit[
     .filter((h) => h.name)
     .map((h): CheckinItem => {
       const ch = channel.get(h.name) === "whoop" ? "whoop" : "habit";
-      const daily = h.frequency === "daily" || h.frequency === "weekdays";
-      return { name: h.name, notionPageId: h.id, category: h.category, frequency: h.frequency, channel: ch, group: ch === "whoop" || daily ? "core" : "extra" };
+      return {
+        name: h.name,
+        notionPageId: h.id,
+        category: h.category,
+        frequency: h.frequency,
+        channel: ch,
+        group: groupFor(h.name, ch, h.frequency),
+        sleep: SLEEP_QUESTIONS.has(h.name),
+      };
     });
   return { items, habits };
 }
 
 /** Pre-fills from other sources. Each one is only offered when the data is clear; otherwise the question stays blank. */
-async function suggestionsFor(date: string, names: Set<string>): Promise<Record<string, CheckinSuggestion>> {
+async function suggestionsFor(date: string, today: string, names: Set<string>): Promise<Record<string, CheckinSuggestion>> {
   const out: Record<string, CheckinSuggestion> = {};
   const tasks: Promise<void>[] = [];
 
@@ -83,6 +104,59 @@ async function suggestionsFor(date: string, names: Set<string>): Promise<Record<
         const { data } = await supabase.from("cronometer_servings").select("alcohol_g").eq("onyx_behavioral_date", date).gt("alcohol_g", 0);
         const grams = (data ?? []).reduce((s, r: { alcohol_g: number | null }) => s + Number(r.alcohol_g || 0), 0);
         if (grams > 0) out[Q_ALCOHOL] = { answer: "Yes", source: `Cronometer: ${Math.round(grams)} g alcohol` };
+      })()
+    );
+  }
+
+  // Screen Time (the Onyx iPhone app): phone use in the hour before sleep, and minutes in habit apps.
+  if (names.has(Q_SCREEN_IN_BED) || Object.keys(APP_HABITS).some((h) => names.has(h))) {
+    tasks.push(
+      (async () => {
+        const { data } = await supabase
+          .from("phone_usage_daily")
+          .select("minutes_last_hour_before_sleep_est, minutes_by_app")
+          .eq("behavioral_date", date)
+          .maybeSingle();
+        if (!data) return;
+        const row = data as { minutes_last_hour_before_sleep_est: number | string | null; minutes_by_app: Record<string, unknown> | null };
+        if (names.has(Q_SCREEN_IN_BED)) {
+          const s = screenInBedSuggestion(row.minutes_last_hour_before_sleep_est);
+          if (s) out[Q_SCREEN_IN_BED] = s;
+        }
+        Object.assign(out, appHabitSuggestions(row.minutes_by_app, names));
+      })()
+    );
+  }
+
+  // Eight Sleep: was the night that closes this day spent in the usual bed? (a night is keyed by its wake-up date = date + 1)
+  if (names.has(Q_SAME_BED)) {
+    tasks.push(
+      (async () => {
+        const [night, newest] = await Promise.all([
+          supabase.from("eight_sleep_trends").select("time_slept_seconds").eq("calendar_date", addDays(date, 1)).neq("bed_side", "away"),
+          supabase.from("eight_sleep_trends").select("calendar_date").neq("bed_side", "away").order("calendar_date", { ascending: false }).limit(1),
+        ]);
+        if (night.error || newest.error) return;
+        const rows = (night.data ?? []) as { time_slept_seconds: number | null }[];
+        const slept = rows.length ? Math.max(...rows.map((r) => Number(r.time_slept_seconds || 0))) : null;
+        const s = sameBedSuggestion(date, slept, (newest.data?.[0] as { calendar_date: string } | undefined)?.calendar_date ?? null);
+        if (s) out[Q_SAME_BED] = s;
+      })()
+    );
+  }
+
+  // Notion journal: an entry on the day answers "Journaled your thoughts?".
+  if (names.has(Q_JOURNALED)) {
+    tasks.push(
+      (async () => {
+        const { count, error } = await supabase
+          .from("journal_entries")
+          .select("notion_page_id", { count: "exact", head: true })
+          .eq("onyx_behavioral_date", date)
+          .eq("archived", false);
+        if (error || count == null) return;
+        const s = journaledSuggestion(date, today, count);
+        if (s) out[Q_JOURNALED] = s;
       })()
     );
   }
@@ -120,11 +194,17 @@ export async function GET(req: NextRequest) {
     const core = new Set(items.filter((i) => i.group === "core").map((i) => i.name));
     const from = addDays(today, -CHECKIN_MAX_DAYS_BACK);
 
-    const [{ data: rows, error }, suggestions] = await Promise.all([
+    const kitNames = SLEEP_KIT.filter((q) => core.has(q));
+    const [{ data: rows, error }, suggestions, kitRows] = await Promise.all([
       supabase.from("habit_journal").select("cycle_date, question, answer").gte("cycle_date", from).lte("cycle_date", today).in("question", names),
-      suggestionsFor(date, new Set(names)),
+      suggestionsFor(date, today, new Set(names)),
+      // Newest answers to the sleep-kit questions before this day (200 rows = 40 fully answered days).
+      kitNames.length
+        ? supabase.from("habit_journal").select("cycle_date, question, answer").in("question", kitNames).lt("cycle_date", date).order("cycle_date", { ascending: false }).limit(200)
+        : Promise.resolve({ data: [], error: null }),
     ]);
     if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+    const kit = kitRows.error ? {} : usualKit((kitRows.data ?? []) as { cycle_date: string; question: string; answer: string }[], date, kitNames);
 
     const answers: Record<string, CheckinAnswer> = {};
     const answeredByDay = new Map<string, number>();
@@ -136,7 +216,7 @@ export async function GET(req: NextRequest) {
       .filter((d) => d > WHOOP_JOURNAL_FROZEN_THROUGH)
       .map((d) => ({ date: d, answered: answeredByDay.get(d) || 0, total: core.size }));
 
-    const payload: CheckinPayload = { date, today, items, answers, suggestions, days };
+    const payload: CheckinPayload = { date, today, items, answers, suggestions, usualKit: kit, days };
     return NextResponse.json(payload, { headers: { "Cache-Control": "no-store" } });
   } catch (e) {
     if (e instanceof NotionHabitsError) return NextResponse.json({ error: e.message }, { status: 502 });
