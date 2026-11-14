@@ -366,13 +366,17 @@ export function isNewerBlob(candidate: { authorized_at?: unknown; obtained_at?: 
 // ---------------------------------------------------------------------------
 
 /**
- * True when a Spotify sync error means the refresh token is dead (expired after 180 days, revoked,
- * or otherwise refused) and only a new authorization fixes it. Keys on the text spotify_etl.py
- * writes ("Spotify refresh token rejected ...") and on Spotify's invalid_grant.
+ * True when the Spotify card's message means "sign in again": the refresh token is dead (expired
+ * after 180 days, revoked or otherwise refused), is about to expire, or there is no usable token.
+ * Keys on the texts spotify_etl.py writes to its heartbeat ("Spotify refresh token rejected ...",
+ * "Spotify sign-in expires in N days ...", "No Spotify tokens at ...", "... holds no refresh
+ * token") and on Spotify's invalid_grant. Wrong app credentials (invalid_client) are not a
+ * sign-in problem and do not match. tests/test_ci_token_spotify_guard.py checks this pattern
+ * against the real Python strings.
  */
 export function needsSpotifyReconnect(errorMessage: string | null | undefined): boolean {
   if (!errorMessage) return false;
-  return /refresh token (?:was |is |has been )?(?:rejected|expired|revoked)|invalid_grant/i.test(errorMessage);
+  return /refresh token (?:was |is |has been )?(?:rejected|expired|revoked)|invalid_grant|sign-in expires|no spotify tokens|holds no refresh token/i.test(errorMessage);
 }
 
 /** authorized_at (epoch seconds) from the token_data text, or null when unknown. Reads nothing else. */

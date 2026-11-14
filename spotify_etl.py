@@ -15,6 +15,11 @@ Audio features: Spotify deprecated /v1/audio-features for apps registered
 after 2024-11-27. This app is post-cutoff, so we use ReccoBeats (accepts
 Spotify track IDs) as the features source. `features_source` records provenance.
 
+Sign-in: Spotify expires a refresh token 180 days after the sign-in, however often
+it is refreshed. The normal way to renew it is the Reconnect control on the Spotify
+card of the Onyx /status page (no secret on the PC, nothing to run); --auth and
+--exchange-code below are the other routes. See AGENTS.md, Token recovery (Spotify).
+
 Usage:
     python spotify_etl.py --auth        # OAuth sign-in (local; needs the client id + secret in .env)
     python spotify_etl.py --exchange-code <code or callback URL>
@@ -272,8 +277,14 @@ class SpotifyAuthError(Exception):
     """
 
 
+# Every failed or expiring-soon heartbeat ends with this, and /status shows it on the
+# Spotify card next to its Reconnect control. The control appears when the card's error
+# contains "refresh token rejected", "sign-in expires" or "no refresh token" /
+# "No Spotify tokens" (needsSpotifyReconnect in frontend/src/lib/spotify-reconnect.ts):
+# keep those phrases.
 REAUTH_HOWTO = (
-    "Sign in again (AGENTS.md, Token recovery (Spotify)): `python spotify_etl.py --auth` "
+    "Sign in again: open the Onyx /status page and use Reconnect on the Spotify card. "
+    "Other routes (AGENTS.md, Token recovery (Spotify)): `python spotify_etl.py --auth` "
     "then `python ci_token_helper.py upload spotify`."
 )
 REAUTH_INSTRUCTIONS = f"Spotify refresh token rejected. {REAUTH_HOWTO}"

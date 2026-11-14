@@ -315,14 +315,25 @@ test("newer-wins: a later authorization wins, then the later refresh (same rule 
 
 // ----------------------------------------------------------------------------- pure: /status
 
-test("needsSpotifyReconnect matches the ETL's rejected-token error and nothing else", () => {
+test("needsSpotifyReconnect matches the ETL's sign-in-again messages and nothing else", () => {
   const py = fs.readFileSync(path.join(SRC, "..", "..", "spotify_etl.py"), "utf8");
-  const m = /REAUTH_INSTRUCTIONS = \(\s*((?:"[^"]*"\s*)+)\)/.exec(py);
-  assert.ok(m, "REAUTH_INSTRUCTIONS found in spotify_etl.py");
-  const etlText = [...m[1].matchAll(/"([^"]*)"/g)].map((x) => x[1]).join("");
-  assert.ok(etlText.includes("/status") && etlText.includes("Reconnect"));
-  assert.equal(lib.needsSpotifyReconnect(`${etlText} (HTTP 400: {"error":"invalid_grant","error_description":"Refresh token expired"})`), true);
-  assert.equal(lib.needsSpotifyReconnect(etlText), true);
+  const m = /REAUTH_HOWTO = \(\s*((?:"[^"]*"\s*)+)\)/.exec(py);
+  assert.ok(m, "REAUTH_HOWTO found in spotify_etl.py");
+  const howto = [...m[1].matchAll(/"([^"]*)"/g)].map((x) => x[1]).join("");
+  assert.ok(howto.includes("/status") && howto.includes("Reconnect on the Spotify card"), "the heartbeat text points at the Reconnect control");
+  assert.ok(py.includes('REAUTH_INSTRUCTIONS = f"Spotify refresh token rejected. {REAUTH_HOWTO}"'));
+  // the heartbeat texts spotify_etl.py writes (formats copied from the source; see also the Python twin of this test)
+  assert.equal(lib.needsSpotifyReconnect(`Spotify refresh token rejected. ${howto} (HTTP 400 invalid_grant: Refresh token expired)`), true);
+  assert.equal(lib.needsSpotifyReconnect(`Spotify refresh token rejected. ${howto} (HTTP 400 invalid_grant: Refresh token revoked)`), true);
+  assert.ok(py.includes('f"Spotify sign-in expires {when} ('), "the expiring-soon heartbeat text");
+  assert.equal(lib.needsSpotifyReconnect(`Spotify sign-in expires in 14 days (2027-05-13 UTC, 180 days after it was made). ${howto}`), true);
+  assert.equal(lib.needsSpotifyReconnect(`Hit Spotify 50-track recently-played cap — likely lost some plays; Spotify sign-in expires in 3 days (2027-05-13 UTC, 180 days after it was made). ${howto}`), true);
+  assert.ok(py.includes('f"No Spotify tokens at {SPOTIFY_TOKEN_FILE}. {REAUTH_HOWTO}"') && py.includes("holds no refresh token. {REAUTH_HOWTO}"));
+  assert.equal(lib.needsSpotifyReconnect(`No Spotify tokens at /home/runner/.spotify_tokens.json. ${howto}`), true);
+  assert.equal(lib.needsSpotifyReconnect(`Spotify token file /home/runner/.spotify_tokens.json holds no refresh token. ${howto}`), true);
+  assert.equal(lib.needsSpotifyReconnect(howto), false, "the how-to alone is not the trigger");
+  assert.equal(lib.needsSpotifyReconnect("Spotify rejected the app credentials (HTTP 400 invalid_client). Check the SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET secrets against the app at developer.spotify.com/dashboard."), false, "wrong app credentials are not a sign-in problem");
+  assert.equal(lib.needsSpotifyReconnect("Spotify token refresh failed: connection refused"), false, "an outage is not a sign-in problem");
   // the text the pre-2026-11-13 ETL wrote (still in sync_log until the next run)
   assert.equal(lib.needsSpotifyReconnect('Spotify refresh token rejected. Re-run `python spotify_etl.py --auth` locally then `python ci_token_helper.py upload spotify`. (HTTP 400: {"error":"invalid_grant","error_description":"Refresh token revoked"})'), true);
   assert.equal(lib.needsSpotifyReconnect('{"error":"invalid_grant"}'), true);
