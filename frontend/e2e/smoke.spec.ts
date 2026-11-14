@@ -362,6 +362,15 @@ const PAGES: SmokePage[] = [
     legitimateEmpty: "No ledger data yet - the harvester has not run.",
   },
   {
+    // Cash forecast (2026-11-14): server-rendered over pds.finance_* + pds.finance_plan_*, service-role only.
+    // Must render the chart; the failed-load state is a hard fail; an empty ledger SKIPS. No amounts asserted.
+    route: "/financials/forecast",
+    heading: "Cash forecast",
+    signal: "charts",
+    hardEmpty: ["The forecast could not be loaded"],
+    legitimateEmpty: "No ledger data yet.",
+  },
+  {
     // iPhone Screen Time (pds.phone_usage_daily, service-role only, server-rendered). The app
     // syncs once a day and the default window is 30 days, so a month without a sync legitimately
     // shows the empty state: SKIP, like /caffeine. The failed-query state is a hard fail. It never

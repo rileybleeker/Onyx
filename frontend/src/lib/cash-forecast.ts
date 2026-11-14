@@ -74,6 +74,8 @@ export interface CardTerms {
   promoAprPct?: number;
   promoEnds?: string; // YYYY-MM-DD
   standardAprPct?: number;
+  /** Where an entered promo date came from ("estimated: ..."), shown next to it. */
+  promoNote?: string;
 }
 export interface GrowthDriver {
   account_key: string;
@@ -1182,7 +1184,7 @@ function projectCards(
     // Promo: an explicit driver, else the newest balance-transfer row whose text carries "EXPIRES MM/YYYY".
     let promoEnds: string | null = t?.promoEnds ?? null;
     let promoApr = t?.promoAprPct ?? 0;
-    let promoSource: string | null = t?.promoEnds ? "entered" : null;
+    let promoSource: string | null = t?.promoEnds ? t.promoNote?.trim() || "entered" : null;
     if (!promoEnds) {
       for (const r of [...rows].reverse()) {
         const p = parsePromo(rowLabel(r.t));
