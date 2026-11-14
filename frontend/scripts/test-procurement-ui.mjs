@@ -19,6 +19,10 @@ await writeFile(path.join(fixture, 'app/ProcurementClient.tsx'), relative(client
 await writeFile(path.join(fixture, 'app/DetectedSubscriptions.tsx'), relative(await readFile(path.join(frontend, 'src/app/procurement/DetectedSubscriptions.tsx'), 'utf8')));
 await copyFile(path.join(frontend, 'src/lib/procurement-recurring.ts'), path.join(fixture, 'lib/procurement-recurring.ts'));
 await copyFile(path.join(frontend, 'src/lib/procurement-renewals.ts'), path.join(fixture, 'lib/procurement-renewals.ts'));
+await copyFile(path.join(frontend, 'src/lib/procurement-flags.ts'), path.join(fixture, 'lib/procurement-flags.ts'));
+// Purchase suggestions: its own card and pure lib.
+await writeFile(path.join(fixture, 'app/ReorderSuggestions.tsx'), relative(await readFile(path.join(frontend, 'src/app/procurement/ReorderSuggestions.tsx'), 'utf8')));
+await copyFile(path.join(frontend, 'src/lib/procurement-reorder.ts'), path.join(fixture, 'lib/procurement-reorder.ts'));
 await copyFile(path.join(frontend, 'src/lib/finance-ledger.ts'), path.join(fixture, 'lib/finance-ledger.ts'));
 // The real page.tsx reads the ledger on the server; the fixture has no database, so it renders the client with synthetic detected rows.
 await writeFile(path.join(fixture, 'app/page.tsx'), `import ProcurementClient from './ProcurementClient';
@@ -30,7 +34,21 @@ const detected = { state: 'ok', today: '2030-03-15', total: 2400, subs: [
 ], irregular: [
   { id: '00000000000000b1', merchant: 'Demo top-up', typicalCents: 2000, lastCharge: '2030-03-01', chargeCount: 5, medianGapDays: 23 },
 ] } as const;
-export default function Page() { return <ProcurementClient detected={detected as never} />; }
+// Waste flags as the server would send them (synthetic): one open, one already dismissed, one subscription with unknown usage.
+const advice = { usageAvailable: true, canDismiss: true, advice: [
+  { subId: '00000000000000a1', service: 'Demo streaming', category: 'Video streaming', usage: { state: 'known', minutes: 3, matched: ['com.demo.streaming'], basis: 'service list', daysCovered: 30 }, flags: [
+    { key: 'price_increase:00000000000000c1', kind: 'price_increase', title: 'Price went up', reason: 'Synthetic reason: the last charge is 20% above the usual amount.', dismissed: false },
+    { key: 'no_recent_use:00000000000000c2', kind: 'no_recent_use', title: 'No recent use on your iPhone', reason: 'Synthetic reason: 3 min in 30 days.', dismissed: true },
+  ] },
+  { subId: '00000000000000a2', service: null, category: null, usage: { state: 'unknown', why: 'no app or site in Screen Time matches this merchant' }, flags: [] },
+] } as const;
+// Purchase suggestions as the server would send them (synthetic): one due, one not yet.
+const suggestion = { merchant: 'Demo store', purchases: 4, intervalDays: 30, minGapDays: 28, maxGapDays: 33, regularity: 'steady', lastOrdered: '2030-02-14', daysSince: 29, dueOn: '2030-03-16' };
+const reorder = { state: 'ok', today: '2030-03-15', orders: 12, boughtTwice: 2, stopped: 1, suggestions: [
+  { ...suggestion, key: 'demo protein powder', item: 'Demo protein powder', status: 'due', reason: 'Ordered 4 times, last from Demo store; usually reordered every ~30 days (gaps of 28 to 33 days). Last ordered Feb 14, 2030, 29 days ago. Likely due about now.' },
+  { ...suggestion, key: 'demo water filter', item: 'Demo water filter', status: 'later', daysSince: 5, reason: 'Ordered 3 times, last from Demo store; usually reordered every ~60 days (always 60 days apart). Last ordered Mar 10, 2030, 5 days ago. Due in about 55 days.' },
+] } as const;
+export default function Page() { return <ProcurementClient detected={detected as never} advice={advice as never} reorder={reorder as never} />; }
 `);
 await copyFile(path.join(frontend, 'src/app/globals.css'), path.join(fixture, 'app/globals.css'));
 await copyFile(path.join(frontend, 'postcss.config.mjs'), path.join(fixture, 'postcss.config.mjs'));
@@ -62,6 +80,12 @@ try {
     if (new URL(route.request().url()).origin === new URL(url).origin) return route.continue();
     blocked.push(route.request().url()); return route.abort();
   });
+  // The fixture has no API: answer the flag-dismissal PATCH here and record what the page sent.
+  const patches = []; let failPatch = false;
+  await page.route('**/api/procurement/flags', route => {
+    patches.push({ method: route.request().method(), body: route.request().postDataJSON() });
+    return route.fulfill({ status: failPatch ? 500 : 200, contentType: 'application/json', body: failPatch ? '{"error":"could not save"}' : '{"ok":true}' });
+  });
   await page.goto(url, {timeout: 180000}); await page.getByRole('heading',{name:'Procurement',exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:'Place order (unavailable)',exact:true}).isDisabled(),true);
   await page.getByRole('heading',{name:'Detected subscriptions',exact:true}).waitFor();
@@ -77,6 +101,44 @@ try {
   await page.getByText('Estimate: same day of the month as the recent charges. High confidence: the last 4 gaps fit within 1 day.',{exact:true}).waitFor();
   await page.getByText(/1 repeating charge without a regular schedule \(no date estimated\)/).click();
   await page.getByText('No next date: the spacing is too uneven to estimate one.',{exact:true}).waitFor();
+  // Waste flags: the reason is shown, usage is stated or unknown, and a dismissal is one PATCH that sticks.
+  const flags = page.getByTestId('procurement-flag');
+  await page.getByText(/^1 open flag, shown under the subscription it belongs to\./).waitFor();
+  assert.equal(await flags.count(), 1);
+  assert.match(await flags.first().innerText(), /Price went up\. Synthetic reason: the last charge is 20% above the usual amount\./);
+  await page.getByText('iPhone use, last 30 days: 3 min (com.demo.streaming).',{exact:true}).waitFor();
+  await page.getByText('iPhone use: unknown (no app or site in Screen Time matches this merchant).',{exact:true}).waitFor();
+  await page.getByText('1 dismissed flag',{exact:true}).waitFor();
+  failPatch = true;
+  await page.getByRole('button',{name:'Dismiss "Price went up" for Demo streaming plan',exact:true}).click();
+  await page.getByRole('alert').filter({hasText:'Could not save that dismissal, so the flag is still shown.'}).waitFor();
+  assert.equal(await flags.count(), 1, 'a failed save keeps the flag');
+  failPatch = false;
+  await page.getByRole('button',{name:'Dismiss "Price went up" for Demo streaming plan',exact:true}).click();
+  await page.getByText('2 dismissed flags',{exact:true}).waitFor();
+  assert.equal(await flags.count(), 0);
+  await page.getByText(/^No open flags on your active subscriptions\./).waitFor();
+  await page.getByText('2 dismissed flags',{exact:true}).click();
+  await page.getByRole('button',{name:'Restore "No recent use on your iPhone" for Demo streaming plan',exact:true}).click();
+  await page.getByText('1 dismissed flag',{exact:true}).waitFor();
+  assert.equal(await flags.count(), 1);
+  assert.deepEqual(patches, [
+    { method: 'PATCH', body: { sub: '00000000000000a1', flag: 'price_increase:00000000000000c1', dismissed: true } },
+    { method: 'PATCH', body: { sub: '00000000000000a1', flag: 'price_increase:00000000000000c1', dismissed: true } },
+    { method: 'PATCH', body: { sub: '00000000000000a1', flag: 'no_recent_use:00000000000000c2', dismissed: false } },
+  ]);
+  // Purchase suggestions: what is due with its reason, the rest folded away, and nothing to click through to.
+  const reorder = page.getByTestId('procurement-reorder');
+  await reorder.getByRole('heading',{name:'Purchase suggestions',exact:true}).waitFor();
+  assert.equal(await reorder.getByTestId('procurement-reorder-row').count(), 2);
+  await reorder.getByText('Likely due',{exact:true}).waitFor();
+  await reorder.getByText(/usually reordered every ~30 days \(gaps of 28 to 33 days\)\. Last ordered Feb 14, 2030, 29 days ago\. Likely due about now\./).waitFor();
+  assert.equal(await reorder.getByText('Demo water filter',{exact:true}).isVisible(), false, 'items not due yet are folded away');
+  await reorder.getByText('1 repeat item not due yet',{exact:true}).click();
+  await reorder.getByText('Demo water filter',{exact:true}).waitFor();
+  await reorder.getByText(/Left out: 2 items ordered only twice \(too few to estimate an interval\); 1 not ordered for more than three times the usual interval/).waitFor();
+  assert.equal(await reorder.locator('a, button, form, input').count(), 0, 'advice only: no link, button or form in the suggestions card');
+  assert.equal(await page.getByText(/No personalized recommendations yet/).count(), 0);
   await page.getByRole('heading',{name:'What this page reads',exact:true}).waitFor();
   assert.equal(await page.getByText(/Disconnected preview/).count(),0);
   assert.equal(await page.getByText(/Financials is not read/).count(),0);

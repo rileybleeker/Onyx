@@ -12,6 +12,16 @@ let component = ts.transpileModule(fs.readFileSync('frontend/src/app/today/Today
 component = 'const React=require(' + react + ');\n' + component.replace(/require\("react"\)/g, `require(${react})`).replace(/require\("next\/link"\)/g, `({__esModule:true,default:({children,href,...props})=>React.createElement('a',{...props,href,onClick:e=>{e.preventDefault();window.navigated=href;}},children)})`).replace(/require\("lucide-react"\)/g, `new Proxy({},{get:()=>props=>React.createElement('svg',{...props,viewBox:'0 0 24 24'},React.createElement('circle',{cx:12,cy:12,r:8,fill:'none',stroke:'currentColor',strokeWidth:1.5}))})`).replace(/require\("@\/lib\/agents-api"\)/g, '({agentsApi:new Proxy({inbox:()=>window.mockInbox()},{get:(target,key)=>key==="inbox"?target.inbox:()=>{window.unexpectedRequests.push("agentsApi."+String(key));throw Error("Unexpected agentsApi method");}})})');
 const urgentLib = ids.size; ids.set('frontend/src/lib/urgent-email.ts', urgentLib); modules[urgentLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/urgent-email.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/urgent-email"\)/g, `require(${urgentLib})`);
+const experimentsLib = ids.size; ids.set('frontend/src/lib/experiments.ts', experimentsLib); modules[experimentsLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/experiments.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/experiments"\)/g, `require(${experimentsLib})`);
+// GET /api/experiments/today answers (synthetic). "none" is the usual case: no trial registered.
+const experimentFixtures = {
+    none: { status: 'none' },
+    not_connected: { status: 'not_connected' },
+    active: { status: 'active', experimentId: 'EXP-901', title: 'A synthetic evening routine', behavioralDate: '2030-01-18', dayNumber: 12, nDays: 232, plannedEnd: '2030-08-26', arm: 'A', instruction: 'Synthetic instruction for arm A.' },
+    upcoming: { status: 'upcoming', experimentId: 'EXP-901', title: 'A synthetic evening routine', startDate: '2030-01-07', nDays: 232 },
+    invalid: { status: 'active', experimentId: 'EXP-901', title: 'x', arm: 'C', instruction: 'never shown' },
+};
 const script = `const process={env:{NODE_ENV:window.reactEnv||'production'}};const modules={${Object.entries(modules).map(([id, c]) => `${id}:function(module,exports,require){${c}\n}`).join(',')}};const cache={};function require(id){if(cache[id])return cache[id].exports;const m={exports:{}};cache[id]=m;modules[id](m,m.exports,require);return m.exports;}const out={exports:{}};(function(module,exports){${component}\n})(out,out.exports);window.mount=()=>{window.root=require(${dom}).createRoot(document.getElementById('root'));const R=require(${react}),el=R.createElement(out.exports.default);window.root.render(window.strict?R.createElement(R.StrictMode,null,el):el);};window.mount();`;
 const cards = Array.from({ length: 5 }, (_, i) => ({ kind: 'card', thread: 'fixture-agent', messageId: i + 1, card: { code: 'request-' + i, agent: 'Planning assistant', name: ['Review a proposed plan', 'Choose a time for your project', 'Confirm your next step', 'Fourth request', 'Fifth request'][i] } }));
 const fixture = { items: [{ kind: 'message', body: 'FYI should not appear' }, ...cards], threads: [], badge: 6, typing: null };
@@ -39,12 +49,12 @@ assert(css.trim(), 'Compile the frontend before running layout regressions');
     const browser = await chromium.launch({ headless: true });
     const errors = [];
     try {
-        async function setup(mode = 'healthy', width = 390, strict = false, urgent = 'not_connected') { const page = await browser.newPage({ viewport: { width, height: 900 }, serviceWorkers: 'block' }); page.on('pageerror', e => errors.push(e.message)); page.on('request', request => { if (['fetch', 'xhr', 'eventsource', 'ping'].includes(request.resourceType())) errors.push('Unexpected network request: ' + request.resourceType()); }); if (strict) page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); }); await page.routeWebSocket('**/*', socket => { errors.push('Unexpected WebSocket'); socket.close(); }); await page.route('**/*', r => r.abort()); await page.setContent('<style>' + css + '</style><div class="max-w-6xl mx-auto px-4 sm:px-6 pt-8 pb-8"><div id="root"></div></div>'); await page.evaluate(() => { document.documentElement.className = 'dark'; document.body.className = 'bg-surface text-text-primary antialiased font-sans'; }); await page.evaluate(({ fixture, book, mode, strict, urgent, urgentFixtures, fixtureWithEmail }) => { window.urgentMode = urgent; window.urgentFixtures = urgentFixtures; window.fixtureWithEmail = fixtureWithEmail; window.urgentCalls = []; window.strict = strict; window.reactEnv = strict ? 'development' : 'production'; window.fixture = fixture; window.book = book; window.mode = mode; window.calls = []; window.unexpectedRequests = []; window.pending = []; window.mockInbox = () => { window.calls.push({ url: '/onyx/inbox', method: 'GET' }); if (window.mode === 'sync-error')
+        async function setup(mode = 'healthy', width = 390, strict = false, urgent = 'not_connected', experiment = 'none') { const page = await browser.newPage({ viewport: { width, height: 900 }, serviceWorkers: 'block' }); page.on('pageerror', e => errors.push(e.message)); page.on('request', request => { if (['fetch', 'xhr', 'eventsource', 'ping'].includes(request.resourceType())) errors.push('Unexpected network request: ' + request.resourceType()); }); if (strict) page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); }); await page.routeWebSocket('**/*', socket => { errors.push('Unexpected WebSocket'); socket.close(); }); await page.route('**/*', r => r.abort()); await page.setContent('<style>' + css + '</style><div class="max-w-6xl mx-auto px-4 sm:px-6 pt-8 pb-8"><div id="root"></div></div>'); await page.evaluate(() => { document.documentElement.className = 'dark'; document.body.className = 'bg-surface text-text-primary antialiased font-sans'; }); await page.evaluate(({ fixture, book, mode, strict, urgent, urgentFixtures, fixtureWithEmail, experiment, experimentFixtures }) => { window.experimentMode = experiment; window.experimentFixtures = experimentFixtures; window.experimentCalls = 0; window.urgentMode = urgent; window.urgentFixtures = urgentFixtures; window.fixtureWithEmail = fixtureWithEmail; window.urgentCalls = []; window.strict = strict; window.reactEnv = strict ? 'development' : 'production'; window.fixture = fixture; window.book = book; window.mode = mode; window.calls = []; window.unexpectedRequests = []; window.pending = []; window.mockInbox = () => { window.calls.push({ url: '/onyx/inbox', method: 'GET' }); if (window.mode === 'sync-error')
             throw Error('synthetic'); if (['error', 'inbox-error', 'refresh-error'].includes(window.mode))
             return Promise.reject(Error('synthetic')); if (window.mode === 'defer')
-            return new Promise((resolve, reject) => window.pending.push({ kind: 'inbox', resolve, reject })); return Promise.resolve(window.mode === 'empty' ? { ...window.fixture, items: [] } : window.mode === 'email-cards' ? window.fixtureWithEmail : window.fixture); }; window.fetch = (url, init) => { if (url === '/api/urgent-email' && !(init?.method && init.method !== 'GET')) { window.urgentCalls.push(url); return Promise.resolve(window.urgentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.urgentFixtures[window.urgentMode] }); } if (url === '/api/orders/summary' && !(init?.method && init.method !== 'GET')) { window.ordersCalls = (window.ordersCalls || 0) + 1; return Promise.resolve({ ok: true, status: 200, json: async () => ({ status: 'ready', attention: 0, arrivingToday: 0, onTheWay: 0, top: [] }) }); } if (url === '/api/procurement/renewals/summary' && !(init?.method && init.method !== 'GET')) { window.renewalsCalls = (window.renewalsCalls || 0) + 1; return Promise.resolve(window.renewalsFixture === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => (window.renewalsFixture || { status: 'ready', count: 0, soon: [], withinDays: 3 }) }); } if (url !== '/api/reading' || (init?.method && init.method !== 'GET')) { window.unexpectedRequests.push(String(url)); return Promise.reject(Error('Unexpected request')); } window.calls.push({ url, method: init?.method || 'GET' }); if (['error', 'reading-error', 'refresh-error'].includes(window.mode))
+            return new Promise((resolve, reject) => window.pending.push({ kind: 'inbox', resolve, reject })); return Promise.resolve(window.mode === 'empty' ? { ...window.fixture, items: [] } : window.mode === 'email-cards' ? window.fixtureWithEmail : window.fixture); }; window.fetch = (url, init) => { if (url === '/api/urgent-email' && !(init?.method && init.method !== 'GET')) { window.urgentCalls.push(url); return Promise.resolve(window.urgentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.urgentFixtures[window.urgentMode] }); } if (url === '/api/orders/summary' && !(init?.method && init.method !== 'GET')) { window.ordersCalls = (window.ordersCalls || 0) + 1; return Promise.resolve({ ok: true, status: 200, json: async () => ({ status: 'ready', attention: 0, arrivingToday: 0, onTheWay: 0, top: [] }) }); } if (url === '/api/procurement/renewals/summary' && !(init?.method && init.method !== 'GET')) { window.renewalsCalls = (window.renewalsCalls || 0) + 1; return Promise.resolve(window.renewalsFixture === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => (window.renewalsFixture || { status: 'ready', count: 0, soon: [], withinDays: 3 }) }); } if (url === '/api/experiments/today' && !(init?.method && init.method !== 'GET')) { window.experimentCalls++; return Promise.resolve(window.experimentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.experimentFixtures[window.experimentMode] }); } if (url !== '/api/reading' || (init?.method && init.method !== 'GET')) { window.unexpectedRequests.push(String(url)); return Promise.reject(Error('Unexpected request')); } window.calls.push({ url, method: init?.method || 'GET' }); if (['error', 'reading-error', 'refresh-error'].includes(window.mode))
             return Promise.resolve({ ok: false }); if (window.mode === 'defer')
-            return new Promise(resolve => window.pending.push({ kind: 'reading', resolve })); return Promise.resolve({ ok: true, json: async () => ({ overview: window.mode === 'empty' ? null : window.book }) }); }; }, { fixture, book, mode, strict, urgent, urgentFixtures, fixtureWithEmail }); await page.addScriptTag({ content: script }); await page.getByRole('heading', { name: 'Today', exact: true }).waitFor(); assert.equal(await page.locator('[role=status]').evaluate(el => getComputedStyle(el).position), 'absolute', 'compiled CSS must be applied'); return page; }
+            return new Promise(resolve => window.pending.push({ kind: 'reading', resolve })); return Promise.resolve({ ok: true, json: async () => ({ overview: window.mode === 'empty' ? null : window.book }) }); }; }, { fixture, book, mode, strict, urgent, urgentFixtures, fixtureWithEmail, experiment, experimentFixtures }); await page.addScriptTag({ content: script }); await page.getByRole('heading', { name: 'Today', exact: true }).waitFor(); assert.equal(await page.locator('[role=status]').evaluate(el => getComputedStyle(el).position), 'absolute', 'compiled CSS must be applied'); return page; }
         async function close(page) { assert.deepEqual(await page.evaluate(() => window.unexpectedRequests), [], 'Only expected GET endpoints may be requested'); await page.close(); }
         async function settled(page) { await page.waitForFunction(() => document.querySelector('[aria-label="Refresh Today"]')?.getAttribute('aria-disabled') === 'false'); }
         let page = await setup();
@@ -232,6 +242,52 @@ assert(css.trim(), 'Compile the frontend before running layout regressions');
         assert(await page.evaluate(() => window.renewalsCalls) >= 4);
         await close(page);
         console.log('PASS renewals panel: hidden when nothing is due, lists what renews soon without amounts, failed check keeps the last answer, empty ledger hides it');
+        // Experiment arm card (docs/experiment-framework.md 4.4): nothing when no trial is registered.
+        page = await setup();
+        await settled(page);
+        const armCard = () => page.locator('[role=region][aria-labelledby="experiment-heading"]');
+        assert.equal(await armCard().count(), 0, 'no trial registered: no experiment card');
+        assert.equal(await page.getByText(/experiment/i).count(), 0, 'no trial registered: Today does not mention experiments');
+        assert.equal(await page.evaluate(() => window.experimentCalls), 1);
+        await page.evaluate(() => window.experimentMode = 'not_connected');
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert.equal(await page.getByText(/experiment/i).count(), 0, 'tables not applied: nothing shown');
+        await page.evaluate(() => window.experimentMode = 'active');
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert(await armCard().getByRole('heading', { name: "Today's experiment arm" }).isVisible());
+        assert(await armCard().getByText('Arm A', { exact: true }).isVisible());
+        assert(await armCard().getByText('Synthetic instruction for arm A.').isVisible());
+        assert(await armCard().getByText('EXP-901: A synthetic evening routine. Day 12 of 232 (Fri, Jan 18).').isVisible());
+        assert(await armCard().getByText(/Opening Today does not record whether you followed it/).isVisible());
+        assert.equal(await armCard().locator('a, button, input').count(), 0, 'the arm card is read-only: nothing to tap');
+        assert.equal(await page.locator('section').first().locator('li').count(), 3, 'the other panels are unchanged');
+        assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+        await page.evaluate(() => window.experimentMode = 'error');
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert(await armCard().getByText('Arm A', { exact: true }).isVisible(), 'a failed refresh keeps the last arm');
+        assert(await armCard().getByText(/Couldn't refresh the experiment arm/).isVisible());
+        await page.evaluate(() => window.experimentMode = 'upcoming');
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert(await armCard().getByText('EXP-901: A synthetic evening routine starts Mon, Jan 7 and runs 232 days. No arm today.').isVisible());
+        assert.equal(await armCard().getByText(/Arm [AB]/).count(), 0, 'no arm before the first day');
+        assert((await page.evaluate(() => window.calls)).every(c => c.method === 'GET'));
+        await close(page);
+        page = await setup('healthy', 390, false, 'not_connected', 'error');
+        await settled(page);
+        assert(await page.getByText("Couldn't check today's experiment arm. Try refreshing.").isVisible(), 'a failed check is not "no experiment"');
+        assert.equal(await armCard().count(), 0);
+        assert.equal(await page.locator('section').first().locator('li').count(), 3, 'agent requests stay independent of the experiment check');
+        await close(page);
+        page = await setup('healthy', 390, false, 'not_connected', 'invalid');
+        await settled(page);
+        assert(await page.getByText("Couldn't check today's experiment arm. Try refreshing.").isVisible(), 'an unrecognised answer is an error');
+        assert.equal(await page.getByText('never shown').count(), 0);
+        await close(page);
+        console.log('PASS experiment arm: nothing when none / not connected, arm + instruction when active, read-only, failed refresh keeps the arm, error is not none, no arm before the start');
         assert.deepEqual(errors, []);
         console.log('PASS no browser exceptions; no health data, credentials, or screenshots collected');
     }

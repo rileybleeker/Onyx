@@ -1,0 +1,93 @@
+name: Experiment Admin
+
+# Manual only. This is how Riley registers, checks or stops an N-of-1 trial
+# (docs/experiment-framework.md, AGENTS.md "Experiments"). There is NO schedule and no other
+# trigger: a trial starts only because Riley ran this on purpose.
+#
+#   gh workflow run experiment-admin.yml -f action=seed     -f protocol=docs/experiments/EXP-001.md
+#   gh workflow run experiment-admin.yml -f action=register -f protocol=docs/experiments/EXP-001.md -f confirm=EXP-001
+#   gh workflow run experiment-admin.yml -f action=verify   -f experiment=EXP-001
+#   gh workflow run experiment-admin.yml -f action=stop     -f experiment=EXP-001 -f reason="..." -f confirm=EXP-001
+#   gh workflow run experiment-admin.yml -f action=status
+#   gh workflow run experiment-admin.yml -f action=power    -f window=120     (read-only planning check)
+#
+# The logs of this repository are public. experiment_admin.py never prints a seed or an arm:
+# the seed step prints only the sha256 commitment, register prints dates and hashes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'seed | register | verify | stop | status | power'
+        required: true
+        type: choice
+        options: [status, power, seed, register, verify, stop]
+      protocol:
+        description: 'Protocol file for seed / register, e.g. docs/experiments/EXP-001.md'
+        required: false
+        type: string
+      experiment:
+        description: 'Experiment id for verify / stop, e.g. EXP-001'
+        required: false
+        type: string
+      confirm:
+        description: 'register / stop: repeat the experiment id to confirm (both are permanent)'
+        required: false
+        type: string
+      reason:
+        description: 'stop: why the trial is stopped early'
+        required: false
+        type: string
+      window:
+        description: 'power: how many recent days of HRV to use (60 to 900, default 120)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: experiment-admin
+  cancel-in-progress: false
+
+jobs:
+  experiment-admin:
+    # The merge to master is the registration record, so nothing runs from another branch.
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies (the versions the allocation was tested with)
+        run: >
+          pip install numpy==2.4.4 pandas==3.0.2 PyYAML==6.0.3
+          supabase==2.19.0 realtime==2.19.0 supabase-functions==2.19.0 storage3==2.19.0
+          supabase-auth==2.19.0 postgrest==2.19.0 httpx==0.28.1
+      - name: Run experiment_admin.py
+        env:
+          # Inputs go through the environment so they are never interpolated into the shell.
+          ACTION: ${{ inputs.action }}
+          PROTOCOL: ${{ inputs.protocol }}
+          EXPERIMENT: ${{ inputs.experiment }}
+          CONFIRM: ${{ inputs.confirm }}
+          REASON: ${{ inputs.reason }}
+          WINDOW: ${{ inputs.window }}
+        run: |
+          case "$ACTION" in
+            status)   python experiment_admin.py status ;;
+            power)    case "${WINDOW:-120}" in *[!0-9]*) echo "window must be a whole number" >&2; exit 2;; esac
+                      python experiment_admin.py power --window "${WINDOW:-120}" ;;
+            seed)     python experiment_admin.py seed --protocol "$PROTOCOL" ;;
+            register) python experiment_admin.py register --protocol "$PROTOCOL" --confirm "$CONFIRM" ;;
+            verify)   python experiment_admin.py verify --experiment "$EXPERIMENT" ;;
+            stop)     python experiment_admin.py stop --experiment "$EXPERIMENT" --reason "$REASON" --confirm "$CONFIRM" ;;
+            *) echo "unknown action" >&2; exit 2 ;;
+          esac

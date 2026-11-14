@@ -10,7 +10,7 @@ export type Subscription = { name: string; cents: number; currency: 'USD'; cycle
 export const CAPABILITIES = Object.freeze({
   providers: 'subscriptions are detected from the Rocket Money ledger (read-only; Onyx never cancels or pays anything)',
   orders: 'disabled',
-  recommendations: 'examples-only',
+  recommendations: 'reorder suggestions from your own order history (read-only; no product search, no cart, no checkout)',
   tracking: 'typed-by-hand-saved-once-setup-applied',
   reminders: 'calendar-file-you-import-yourself',
 } as const);
