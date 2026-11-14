@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, BookOpen, CalendarClock, CalendarDays, ClipboardCheck, FlaskConical, Mail, Package, RefreshCw } from "lucide-react";
-import { agentsApi, type InboxResponse, type InboxItem } from "@/lib/agents-api";
+import { ArrowUpRight, BookOpen, CalendarClock, CalendarDays, ClipboardCheck, FlaskConical, Mail, Package, RefreshCw, X } from "lucide-react";
+import { agentsApi, clearDeviceNotifications, setBadge, type InboxResponse, type InboxItem } from "@/lib/agents-api";
 import type { ReadingOverview } from "@/lib/reading";
 import type { UrgentEmailResponse } from "@/lib/urgent-email-query";
 import { ageLabel, isEmailCard, isGmailHref, mergeUrgent } from "@/lib/urgent-email";
@@ -11,6 +11,8 @@ import { dayLabel, isExperimentToday, type ExperimentToday } from "@/lib/experim
 import type { RenewalSummary } from "@/lib/procurement-renewals";
 // Import-free helpers (tests/today-regression.cjs bundles this module by name).
 import { type CalendarEventsResponse, CALENDAR_SOURCE_LABEL, eventTitle, eventsByDay, localDate, readCalendarResponse, shiftDate, syncHealth, timeLabel } from "@/lib/calendar-events";
+// Import-free too (bundled by name in the same test).
+import { type EmailClearMark, MAX_CLEAR_ITEMS, clearedLabel, hiddenEmailKey } from "@/lib/today-clear";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -19,6 +21,23 @@ type OrdersSummary = { status: "not_connected" } | { status: "ready"; attention:
   top: { merchant: string; label: string; reason: string }[] };
 const linkStyle = "text-sm text-accent underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-accent";
 const panelStyle = "rounded-2xl border border-border-default bg-surface-card p-5 sm:p-6";
+const clearAllStyle = "text-sm text-accent focus-visible:outline-2 focus-visible:outline-accent";
+const clearOneStyle = "shrink-0 rounded-lg p-2 text-text-secondary hover:text-text-primary focus-visible:outline-2 focus-visible:outline-accent";
+// The Worker's /onyx/dismiss takes at most this many card codes per call.
+const MAX_DISMISS = 200;
+// How long the "Cleared N · Undo" bar stays (same as the Agents inbox).
+const UNDO_MS = 8000;
+type Cleared = { cards: string[]; emails: EmailClearMark[]; text: string };
+
+async function postEmailClear(marks: EmailClearMark[], undo: boolean): Promise<void> {
+  const res = await fetch("/api/urgent-email/clear", {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(undo ? { items: marks.map((m) => ({ key: m.key })), undo: true } : { items: marks.map((m) => ({ key: m.key, receivedAt: m.receivedAt })) }),
+  });
+  if (!res.ok) throw new Error("Clear failed");
+}
 
 // Bound a slow upstream without treating a timeout as an empty inbox.
 async function bounded<T>(promise: Promise<T>): Promise<T> {
@@ -60,6 +79,21 @@ export default function TodayClient() {
   const inFlight = useRef(false);
   const lastStarted = useRef(0);
   const [refreshing, setRefreshing] = useState(false);
+  // Cleared on this screen: card codes (upper case) and email hide keys. They stay hidden while the
+  // servers catch up (a refresh can land before the clear), until Undo.
+  const [hidden, setHidden] = useState<ReadonlySet<string>>(() => new Set());
+  const [cleared, setCleared] = useState<Cleared | null>(null);
+  const [clearError, setClearError] = useState<string | null>(null);
+  const hide = useCallback((cards: string[], emails: EmailClearMark[], on: boolean) => {
+    setHidden((previous) => {
+      const next = new Set(previous);
+      for (const k of [...cards, ...emails.map(hiddenEmailKey)]) {
+        if (on) next.add(k);
+        else next.delete(k);
+      }
+      return next;
+    });
+  }, []);
   const load = useCallback(() => {
     if (inFlight.current) return;
     inFlight.current = true;
@@ -142,7 +176,63 @@ export default function TodayClient() {
     };
   }, [load]);
 
-  const cards = inbox.state === "ready" ? inbox.value.items.filter((item): item is RequestCard => item.kind === "card") : [];
+  useEffect(() => {
+    if (!cleared) return;
+    const timer = setTimeout(() => setCleared(null), UNDO_MS);
+    return () => clearTimeout(timer);
+  }, [cleared]);
+
+  /**
+   * Clear rows from Today. Cards go to the Worker (the same call as the Agents inbox's Clear), labelled
+   * threads to /api/urgent-email/clear. Hidden at once; whichever part fails comes back with a message.
+   */
+  async function clear(cardCodes: string[], emailMarks: EmailClearMark[], count: number) {
+    // Array.from, not spread: tests/today-regression.cjs transpiles this file to ES5.
+    const codes = Array.from(new Set(cardCodes.map((c) => c.toUpperCase()))).slice(0, MAX_DISMISS);
+    const marks = Array.from(new Map(emailMarks.map((m) => [hiddenEmailKey(m), m] as const)).values()).slice(0, MAX_CLEAR_ITEMS);
+    if (codes.length === 0 && marks.length === 0) return;
+    hide(codes, marks, true);
+    setCleared(null);
+    setClearError(null);
+    void clearDeviceNotifications();
+    const [cardsDone, emailsDone] = await Promise.allSettled([
+      codes.length > 0 ? Promise.resolve().then(() => agentsApi.dismiss({ codes })) : Promise.resolve(null),
+      marks.length > 0 ? postEmailClear(marks, false) : Promise.resolve(),
+    ]);
+    if (cardsDone.status === "fulfilled" && cardsDone.value) setBadge(cardsDone.value.badge);
+    const okCards = cardsDone.status === "fulfilled" ? codes : [];
+    const okEmails = emailsDone.status === "fulfilled" ? marks : [];
+    if (cardsDone.status === "rejected") hide(codes, [], false);
+    if (emailsDone.status === "rejected") hide([], marks, false);
+    if (cardsDone.status === "rejected" || emailsDone.status === "rejected") {
+      setClearError(okCards.length + okEmails.length > 0 ? "Some of that couldn't be cleared and is back on the list. Try again." : "Couldn't clear that. Try again.");
+    }
+    if (okCards.length + okEmails.length > 0) setCleared({ cards: okCards, emails: okEmails, text: clearedLabel(count) });
+  }
+
+  async function undoClear() {
+    const last = cleared;
+    setCleared(null);
+    setClearError(null);
+    if (!last) return;
+    const [cardsBack, emailsBack] = await Promise.allSettled([
+      last.cards.length > 0 ? Promise.resolve().then(() => agentsApi.dismiss({ codes: last.cards, undo: true })) : Promise.resolve(null),
+      last.emails.length > 0 ? postEmailClear(last.emails, true) : Promise.resolve(),
+    ]);
+    if (cardsBack.status === "fulfilled") {
+      hide(last.cards, [], false);
+      if (cardsBack.value) setBadge(cardsBack.value.badge);
+    }
+    if (emailsBack.status === "fulfilled") hide([], last.emails, false);
+    const failedCards = cardsBack.status === "rejected" ? last.cards : [];
+    const failedEmails = emailsBack.status === "rejected" ? last.emails : [];
+    if (failedCards.length + failedEmails.length > 0) {
+      setClearError("Couldn't undo that. Try again.");
+      setCleared({ cards: failedCards, emails: failedEmails, text: "Still cleared" });
+    }
+  }
+
+  const cards = inbox.state === "ready" ? inbox.value.items.filter((item): item is RequestCard => item.kind === "card" && !hidden.has(item.card.code.toUpperCase())) : [];
   // inbox-triage's "Urgent: ..." email questions are shown once, under Urgent email.
   const emailCards = cards.filter((item) => isEmailCard(item.card));
   const requests = cards.filter((item) => !isEmailCard(item.card));
@@ -151,7 +241,10 @@ export default function TodayClient() {
   // "none" (no trial registered, the usual case) and "not_connected" render nothing at all.
   const trial = experiment.state === "ready" && experiment.value.status !== "none" && experiment.value.status !== "not_connected" ? experiment.value : null;
   const email = urgent.state === "ready" && urgent.value.status === "ready" ? urgent.value : null;
-  const merged = mergeUrgent(email?.items ?? [], emailCards, URGENT_SHOWN);
+  const emailItems = (email?.items ?? []).filter((item) => !hidden.has(hiddenEmailKey(item)));
+  const merged = mergeUrgent(emailItems, emailCards, URGENT_SHOWN);
+  // Clear all takes everything the panel knows about, not only the rows on screen.
+  const allUrgent = merged.total > merged.items.length ? mergeUrgent(emailItems, emailCards, Infinity).items : merged.items;
   const now = new Date();
   const lastSync = email?.lastSync ?? null;
   const syncStale = !!lastSync && (now.getTime() - new Date(lastSync.at).getTime() > LABEL_SYNC_STALE_MS || lastSync.status !== "success");
@@ -195,7 +288,10 @@ export default function TodayClient() {
       <section className={panelStyle} aria-labelledby="requests-heading" aria-busy={inbox.state === "loading"}>
         <div className="flex items-center justify-between gap-4">
           <h2 id="requests-heading" className="text-lg font-medium text-text-primary">Needs your input</h2>
-          <Link href="/agents?view=unread" className={linkStyle}>Open inbox</Link>
+          <div className="flex items-center gap-4">
+            {requests.length > 0 && <button type="button" onClick={() => void clear(requests.map((r) => r.card.code), [], requests.length)} aria-label="Clear all requests" className={clearAllStyle}>Clear all</button>}
+            <Link href="/agents?view=unread" className={linkStyle}>Open inbox</Link>
+          </div>
         </div>
         {inbox.state === "loading" && <p className="mt-4 text-sm text-text-secondary">Checking agent requests...</p>}
         {inbox.state === "error" && <p className="mt-4 text-sm text-text-secondary">Couldn&apos;t check requests. Open your inbox or try refreshing.</p>}
@@ -204,24 +300,31 @@ export default function TodayClient() {
           {requests.length === 0 ? <p className="mt-4 text-sm text-text-secondary">The last check returned no open requests. Messages and updates are in your inbox.</p> : <>
             <p className="mt-2 text-xs text-text-secondary">Showing {Math.min(requests.length, 3)} of {requests.length} requests returned, in inbox order.</p>
             <ul className="mt-4 divide-y divide-border-subtle">
-              {requests.slice(0, 3).map((item) => <li key={`${item.thread}:${item.messageId}:${item.card.code}`}>
-                <Link href={requestHref(item)} className="group flex items-center justify-between gap-3 rounded-lg py-4 focus-visible:outline-2 focus-visible:outline-accent">
+              {requests.slice(0, 3).map((item) => <li key={`${item.thread}:${item.messageId}:${item.card.code}`} className="flex items-center gap-1">
+                <Link href={requestHref(item)} className="group flex min-w-0 flex-1 items-center justify-between gap-3 rounded-lg py-4 focus-visible:outline-2 focus-visible:outline-accent">
                   <span className="min-w-0"><span className="block text-xs text-text-secondary">{item.card.agent || "Agent"}</span>
                     <span className="mt-1 block break-words text-sm font-medium text-text-primary">{item.card.name}</span>
                     <span className="mt-1 block text-xs text-accent">Review request</span></span>
                   <ArrowUpRight aria-hidden="true" className="h-4 w-4 shrink-0 text-text-secondary" />
                 </Link>
+                <button type="button" onClick={() => void clear([item.card.code], [], 1)} aria-label={`Clear: ${item.card.name}`} className={clearOneStyle}>
+                  <X aria-hidden="true" className="h-4 w-4" />
+                </button>
               </li>)}
             </ul>
             {requests.length > 3 && <Link href="/agents?view=unread" className={linkStyle}>See the rest in your inbox</Link>}
           </>}
           {emailCards.length > 0 && <p className="mt-3 text-xs text-text-secondary">{emailCards.length === 1 ? "1 email request is" : `${emailCards.length} email requests are`} listed under Urgent email instead.</p>}
-          <p className="mt-4 text-xs text-text-secondary">Inbox checked at {checkedAt}. Opening Today does not mark anything read.</p>
+          <p className="mt-4 text-xs text-text-secondary">Inbox checked at {checkedAt}. Opening Today does not mark anything read.{requests.length > 0 ? " Clearing a request also clears it from your inbox's Unread list; the agent still waits for an answer." : ""}</p>
         </>}
       </section>
       <section className={panelStyle} aria-labelledby="urgent-email-heading" aria-busy={urgent.state === "loading"}>
-        <div className="flex items-center gap-2"><Mail aria-hidden="true" className="h-5 w-5 text-accent" />
-          <h2 id="urgent-email-heading" className="text-lg font-medium text-text-primary">Urgent email</h2></div>
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2"><Mail aria-hidden="true" className="h-5 w-5 text-accent" />
+            <h2 id="urgent-email-heading" className="text-lg font-medium text-text-primary">Urgent email</h2></div>
+          {urgent.state !== "loading" && allUrgent.length > 0 && <button type="button" aria-label="Clear all urgent email"
+            onClick={() => void clear(allUrgent.flatMap((i) => i.clear.cards), allUrgent.flatMap((i) => i.clear.emails), allUrgent.length)} className={clearAllStyle}>Clear all</button>}
+        </div>
         <p className="mt-1 text-xs text-text-secondary">From inbox-triage: threads it labelled Agent/Action or Agent/Deadline, and its urgent questions in your agent inbox.</p>
         {urgent.state === "loading" && <p className="mt-3 text-sm text-text-secondary">Checking email...</p>}
         {urgent.state === "error" && <p className="mt-3 text-sm text-text-secondary">{emailCards.length > 0 ? "Couldn't check the email labels. Showing inbox-triage's requests only." : "Couldn't check urgent email. Try refreshing."}</p>}
@@ -231,7 +334,7 @@ export default function TodayClient() {
         {urgent.state !== "loading" && (merged.items.length > 0 ? <>
           <p className="mt-2 text-xs text-text-secondary">Showing {merged.items.length} of {merged.total}, most pressing first.</p>
           <ul className="mt-2 divide-y divide-border-subtle" aria-label="Urgent email">
-            {merged.items.map((item) => <li key={item.key} className="py-4">
+            {merged.items.map((item) => <li key={item.key} className="flex items-start gap-1 py-4"><div className="min-w-0 flex-1">
               <p className="break-words text-xs text-text-secondary">{item.sourceDetail}. {item.atVerb} {ageLabel(item.at, now)}.</p>
               <p className="mt-1 break-words text-sm font-medium text-text-primary">{item.title}</p>
               {item.from && <p className="mt-0.5 break-words text-xs text-text-secondary">From {item.from}</p>}
@@ -241,16 +344,20 @@ export default function TodayClient() {
                 {item.gmailHref && isGmailHref(item.gmailHref) && <a href={item.gmailHref} target="_blank" rel="noopener noreferrer" aria-label={`Open in Gmail: ${item.title}`} className={linkStyle}>Open in Gmail</a>}
                 {item.requestHref && <Link href={item.requestHref} aria-label={`Open request: ${item.title}`} className={linkStyle}>Open request</Link>}
               </p>}
+            </div>
+              <button type="button" onClick={() => void clear(item.clear.cards, item.clear.emails, 1)} aria-label={`Clear: ${item.title}`} className={`${clearOneStyle} -mt-1`}>
+                <X aria-hidden="true" className="h-4 w-4" />
+              </button>
             </li>)}
           </ul>
         </> : email && <>
           <p className="mt-3 text-sm text-text-secondary">Nothing urgent right now.</p>
-          <p className="mt-1 text-xs text-text-secondary">{email.scanned === 0 ? `No labelled threads in the last ${email.windowDays} days.` : `${email.scanned} labelled thread${email.scanned === 1 ? "" : "s"} in the last ${email.windowDays} days; ${email.hidden} left out (archived, older, or past their date).`}</p>
+          <p className="mt-1 text-xs text-text-secondary">{email.scanned === 0 ? `No labelled threads in the last ${email.windowDays} days.` : `${email.scanned} labelled thread${email.scanned === 1 ? "" : "s"} in the last ${email.windowDays} days; ${email.hidden} left out (archived, older, or past their date)${email.cleared ? `; ${email.cleared} cleared on Today` : ""}.`}</p>
         </>)}
         {email && <p className={`mt-3 text-xs ${syncStale ? "text-amber-300" : "text-text-secondary"}`}>{lastSync
           ? `Email labels last synced ${ageLabel(lastSync.at, now)}${lastSync.status !== "success" ? ` (that run: ${lastSync.status})` : ""}${syncStale ? "; newer labels may be missing." : "."}`
           : "The email label sync has not run yet."}</p>}
-        {urgent.state !== "loading" && <p className="mt-1 text-xs text-text-secondary">Opening Today does not mark email read or change any label.</p>}
+        {urgent.state !== "loading" && <p className="mt-1 text-xs text-text-secondary">Opening or clearing on Today does not mark email read or change any label. A cleared thread comes back if a newer message arrives in it.</p>}
       </section>
       <section className={panelStyle} aria-labelledby="calendar-heading" aria-busy={calendar.state === "loading"}>
         <div className="flex items-center justify-between gap-4">
@@ -332,6 +439,12 @@ export default function TodayClient() {
         <Link href="/nyc" className={linkStyle}>NYC search</Link>
         <Link href="/sleep" className={linkStyle}>Sleep &amp; recovery</Link>
       </nav>
+      {(cleared || clearError) && <div role="status" aria-label="Clear result"
+        className="fixed left-1/2 z-40 flex max-w-[calc(100vw-2rem)] -translate-x-1/2 items-center gap-4 rounded-full border border-border-default bg-surface-raised px-4 py-2 text-sm text-text-primary shadow-elevated bottom-[calc(env(safe-area-inset-bottom)+5.5rem)] md:bottom-6">
+        <span className="min-w-0">{clearError ?? cleared?.text}</span>
+        {cleared && (cleared.cards.length > 0 || cleared.emails.length > 0) && <button type="button" onClick={() => void undoClear()} className="shrink-0 font-medium text-accent focus-visible:outline-2 focus-visible:outline-accent">Undo</button>}
+        {clearError && !cleared && <button type="button" onClick={() => setClearError(null)} aria-label="Dismiss message" className="shrink-0 text-text-secondary"><X aria-hidden="true" className="h-4 w-4" /></button>}
+      </div>}
     </div>
   );
 }

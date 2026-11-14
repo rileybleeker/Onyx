@@ -321,7 +321,7 @@ await test("gmailMessageHref refuses unusable ids and cannot be steered off Gmai
 // ---- Query: inbox-triage labels from pds.inbox_emails (fake client, no database) ------
 // The fake records every filter so the tests can check what is read, and answers the
 // inbox_emails and sync_log reads separately.
-function fakeClient({ rows = [], error = null, beat = null, beatError = null } = {}) {
+function fakeClient({ rows = [], error = null, beat = null, beatError = null, cleared = [], clearedError = null } = {}) {
   const calls = [];
   const from = (table) => {
     const call = { table, filters: [], orders: [] };
@@ -336,7 +336,9 @@ function fakeClient({ rows = [], error = null, beat = null, beatError = null } =
         call.limit = n;
         return Promise.resolve(table === "sync_log"
           ? { data: beat ? [beat] : [], error: beatError }
-          : { data: error ? null : rows, error });
+          : table === "today_cleared_emails"
+            ? { data: clearedError ? null : cleared, error: clearedError }
+            : { data: error ? null : rows, error });
       },
     };
     return chain;
@@ -377,6 +379,34 @@ await test("reads only labelled rows in the window, bounded, deterministic order
   assert.ok(!/body|html|attachment/.test(q.columns));
   const s = calls.find((c) => c.table === "sync_log");
   assert.deepEqual(s.filters, [["eq", "source", "urgent_email"], ["eq", "data_type", "labels"]]);
+});
+
+await test("a thread cleared on Today is left out and counted until a newer message arrives", async () => {
+  const { clearKeyHash } = await import("../src/lib/today-clear.ts");
+  const keep = row({ subject: "Still here" });
+  const gone = row({ subject: "Cleared one", received_at: hoursAgo(5) });
+  const back = row({ subject: "Cleared, then replied", received_at: hoursAgo(1) });
+  const key = (r) => `thread:${ACCT}:${r.gmail_thread_id}`;
+  const cleared = [
+    { key_hash: await clearKeyHash(key(gone)), cleared_through: gone.received_at },
+    { key_hash: await clearKeyHash(key(back)), cleared_through: hoursAgo(2) },   // cleared before the newest message
+  ];
+  const { client, calls } = fakeClient({ rows: [keep, gone, back], beat: BEAT, cleared });
+  const out = await getUrgentEmail(client, NOW);
+  assert.deepEqual(out.items.map((i) => i.subject).sort(), ["Cleared, then replied", "Still here"]);
+  assert.deepEqual([out.scanned, out.total, out.hidden, out.cleared], [3, 2, 0, 1]);
+  const q = calls.find((c) => c.table === "today_cleared_emails");
+  assert.equal(q.columns, "key_hash,cleared_through");
+  assert.deepEqual(q.filters, [["gte", "cleared_through", new Date(NOW.getTime() - WINDOW_DAYS_Q * 86_400_000).toISOString()]]);
+  assert.deepEqual(q.orders.map((o) => o[0]), ["cleared_through", "key_hash"]);
+});
+
+await test("a failed read of the clear marks (or no table yet) shows everything", async () => {
+  const rows = [row(), row()];
+  for (const clearedError of [{ code: "PGRST205" }, { code: "XX000" }]) {
+    const out = await getUrgentEmail(fakeClient({ rows, beat: BEAT, cleared: [], clearedError }).client, NOW);
+    assert.deepEqual([out.total, out.cleared], [2, 0]);
+  }
 });
 
 await test("an empty table answers ready with nothing to show and the last sync", async () => {
@@ -511,6 +541,21 @@ await test("a card linking a labelled thread merges into that email: one item, b
   assert.equal(item.gmailHref, e.href);
   assert.equal(item.requestHref, `/agents?t=inbox-triage#m${c.messageId}`);
   assert.equal(item.atVerb, "Received");
+});
+
+await test("each merged item says what a Clear removes: its cards and its threads, twins included", () => {
+  const e = emailItem();
+  const c = card({}, { name: "Urgent: reply today", link: `https://mail.google.com/mail/?authuser=${ACCT}#all/thread-f:${e.threadId}` });
+  const again = card({ messageId: 999 }, { code: "Q77", name: "Urgent: reply today (again)", link: c.card.link });
+  const twin = emailItem({ account: "second@example.com", messageId: e.messageId.toUpperCase() });
+  const alone = card({ messageId: 1000 }, { code: "Z9", name: "Urgent: other thing", link: "https://mail.google.com/mail/?authuser=owner@example.com#search/other+thing" });
+  const out = mergeUrgent([e, twin], [c, again, alone]);
+  const merged = out.items.find((i) => i.key === `email:${e.key}`);
+  assert.deepEqual(merged.clear.cards, [c.card.code.toUpperCase(), "Q77"], "a second card on the same thread is cleared with it");
+  assert.deepEqual(merged.clear.emails, [{ key: e.key, receivedAt: e.receivedAt }, { key: twin.key, receivedAt: twin.receivedAt }],
+    "the copy in the other mailbox is cleared too, so it does not take the item's place");
+  const solo = out.items.find((i) => i.key === "card:Z9");
+  assert.deepEqual(solo.clear, { cards: ["Z9"], emails: [] });
 });
 
 await test("same thread id in another mailbox does not merge; same Message-ID in both mailboxes does", () => {
