@@ -9,3 +9,11 @@ PyYAML==6.0.3
 
 # garmin_etl.py does `from garminconnect import Garmin` at import time (tests/test_garmin_*.py).
 garminconnect==0.3.6
+
+# google_calendar_etl.py imports icalendar + recurring_ical_events at import time
+# (tests/test_google_calendar.py). Pinned together: recurring-ical-events 3.8.2 needs
+# icalendar >=6.1,<8 and python-dateutil <3 (PyPI now has dateutil 3.x and 4.x).
+icalendar==7.3.0
+recurring-ical-events==3.8.2
+x-wr-timezone==2.0.1
+python-dateutil==2.9.0.post0
