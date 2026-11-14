@@ -33,7 +33,7 @@ export default async function FinancialsPage({
       </header>
 
       {load.kind === "error" && (
-        <section role="alert" className="rounded-[4px] border border-red-500/30 bg-red-500/5 p-4">
+        <section role="alert" className="rounded-control border border-red-500/30 bg-red-500/5 p-4">
           <h2 className="font-semibold text-red-300">{load.message}</h2>
           {load.hint && <p className="mt-1 text-[13px] text-text-secondary">{load.hint}</p>}
           <p className="mt-1 text-[12px] text-text-tertiary">This is a failed query, not an empty ledger.</p>
@@ -41,7 +41,7 @@ export default async function FinancialsPage({
       )}
 
       {load.kind === "empty" && (
-        <section className="rounded-[4px] border border-border-subtle bg-surface-card p-4">
+        <section className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
           <p className="font-semibold">
             {load.freshness
               ? "No ledger data yet - the harvester has run but imported nothing."
@@ -58,7 +58,7 @@ export default async function FinancialsPage({
 
       {load.kind === "ok" && <LedgerView data={load.data} now={now} />}
 
-      <details className="rounded-[4px] border border-border-subtle bg-surface-card p-4">
+      <details className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
         <summary className="cursor-pointer text-[13px] font-medium">Preview a CSV</summary>
         <p className="mt-2 text-[12px] text-text-tertiary">
           A separate, browser-only tool for looking at an exported file. It does not read from or write to the saved ledger above.

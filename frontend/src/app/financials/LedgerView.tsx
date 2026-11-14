@@ -18,7 +18,7 @@ import SpendingTrendChart from "./SpendingTrendChart";
 
 /** Server-rendered ledger: every number below is computed per request and sent as HTML. */
 
-const box = "rounded-[4px] border border-border-subtle bg-surface-card p-4";
+const box = "rounded-card shadow-card border border-border-subtle bg-surface-card p-4";
 const STATUS_TEXT: Record<FinanceCard["status"], string> = {
   success: "text-green-400",
   partial: "text-yellow-400",
@@ -122,7 +122,7 @@ function Notice({ children, tone = "warn" }: { children: ReactNode; tone?: "warn
   return (
     <p
       role="note"
-      className={`rounded-[4px] border px-3 py-2 text-[12px] ${
+      className={`rounded-control border px-3 py-2 text-[12px] ${
         tone === "warn" ? "border-yellow-500/30 bg-yellow-500/5 text-yellow-200" : "border-border-subtle text-text-secondary"
       }`}
     >

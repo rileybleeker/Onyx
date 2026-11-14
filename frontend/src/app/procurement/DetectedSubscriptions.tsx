@@ -9,7 +9,7 @@ import { dismissalKey, usageLine, type AdviceLoad, type SubscriptionAdvice, type
 // Read-only advice: every number comes from the server-rendered props. The only request this
 // component makes is the PATCH that remembers a dismissed flag; nothing here pays or cancels.
 const FLAGS_API = '/api/procurement/flags';
-const card = 'rounded-xl border border-border-subtle bg-surface-card p-5 space-y-4';
+const card = 'rounded-card shadow-card border border-border-subtle bg-surface-card p-5 space-y-4';
 const smallButton = 'rounded border border-border-subtle px-2 py-1 text-xs hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed';
 const cadenceWord = { weekly: 'week', monthly: 'month', quarterly: 'quarter', annual: 'year' } as const;
 const dayNum = (iso: string) => Math.round(Date.parse(`${iso}T00:00:00Z`) / 86400000);

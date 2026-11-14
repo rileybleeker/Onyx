@@ -149,14 +149,14 @@ export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInit
       <div className="space-y-6">
         <div className="flex items-baseline justify-between mb-8">
           <div>
-            <div className="h-7 w-64 bg-white/5 animate-pulse rounded-[4px]" />
-            <div className="h-4 w-96 bg-white/5 animate-pulse rounded-[4px] mt-2" />
+            <div className="h-7 w-64 bg-white/5 animate-pulse rounded-control" />
+            <div className="h-4 w-96 bg-white/5 animate-pulse rounded-control mt-2" />
           </div>
         </div>
-        <div className="h-40 bg-white/5 animate-pulse rounded-[6px]" />
+        <div className="h-40 bg-white/5 animate-pulse rounded-control" />
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {[1, 2, 3].map((i) => (
-            <div key={i} className="h-[320px] bg-white/5 animate-pulse rounded-[6px]" />
+            <div key={i} className="h-[320px] bg-white/5 animate-pulse rounded-control" />
           ))}
         </div>
       </div>
@@ -363,7 +363,7 @@ export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInit
         <RangeFilter value={range} onChange={setRange} />
       </div>
 
-      <div className="bg-surface-card border border-border-subtle rounded-[6px] p-5 mb-8 text-sm text-text-secondary space-y-3 max-w-3xl">
+      <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 mb-8 text-sm text-text-secondary space-y-3 max-w-3xl">
         <p>
           <span className="text-text-primary font-medium">What is Bland-Altman?</span>{" "}
           A Bland-Altman plot tests whether two devices <em>agree</em> on the same measurement — not just whether they correlate.

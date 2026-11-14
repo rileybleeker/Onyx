@@ -140,7 +140,7 @@ export default function SweetSpotPanel({ rows }: { rows: SweetSpotRow[] }) {
   }
 
   return (
-    <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 shadow-card">
+    <div className="bg-surface-card border border-border-subtle rounded-card p-6 shadow-card">
       <div className="flex items-start justify-between gap-3 mb-4">
         <div>
           <h3 className="text-[18px] font-medium text-text-primary">Environment Sweet Spot</h3>

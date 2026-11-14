@@ -20,10 +20,10 @@ export default function Sidebar() {
   }
 
   return (
-    <aside className="fixed inset-y-0 left-0 z-50 w-[220px] bg-surface-card border-r border-border-subtle flex flex-col max-md:hidden">
+    <aside className="fixed inset-y-0 left-0 z-50 w-[220px] bg-surface-sunken border-r border-border-subtle flex flex-col max-md:hidden">
       <div className="px-5 py-5 border-b border-border-subtle">
-        <h1 className="text-base font-semibold text-text-primary tracking-tight">Onyx</h1>
-        <p className="text-[11px] text-text-tertiary mt-0.5 font-mono">Personal Data Scientist</p>
+        <h1 className="text-[20px] font-bold lowercase leading-none tracking-[0.01em] text-text-primary">Onyx</h1>
+        <p className="text-[11px] text-text-tertiary mt-1.5 font-mono">Personal Data Scientist</p>
       </div>
 
       {/* Command palette trigger */}
@@ -31,7 +31,7 @@ export default function Sidebar() {
         <button
           type="button"
           onClick={() => window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE))}
-          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-[4px] text-[13px] text-text-tertiary bg-white/[0.02] border border-border-subtle hover:border-border-hover hover:text-text-secondary transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] text-text-tertiary bg-white/[0.02] border border-border-subtle hover:border-border-hover hover:text-text-secondary transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
         >
           <Search className="w-[15px] h-[15px] shrink-0" />
           <span className="flex-1 text-left">Search…</span>
@@ -42,7 +42,7 @@ export default function Sidebar() {
       <nav className="flex-1 px-2 py-3 overflow-y-auto">
         {NAV_SECTIONS.map((section) => (
           <div key={section.title} className="mb-3 last:mb-0">
-            <p className="px-3 pb-1 text-[10px] font-medium uppercase tracking-[0.12em] text-text-tertiary/70">
+            <p className="px-3 pb-1 text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
               {section.title}
             </p>
             <div className="space-y-0.5">
@@ -54,13 +54,13 @@ export default function Sidebar() {
                     key={item.href}
                     href={item.href}
                     aria-current={active ? "page" : undefined}
-                    className={`flex items-center gap-2.5 px-3 py-2 rounded-[4px] text-[13px] font-medium transition-colors relative focus:outline-none focus-visible:ring-1 focus-visible:ring-accent ${
+                    className={`flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium transition-colors relative focus:outline-none focus-visible:ring-1 focus-visible:ring-accent ${
                       active
-                        ? "bg-white/5 text-text-primary before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-[2px] before:bg-accent before:rounded-full"
+                        ? "bg-surface-raised text-text-primary"
                         : "text-text-secondary hover:text-text-primary hover:bg-white/[0.03]"
                     }`}
                   >
-                    <Icon className="w-[17px] h-[17px] shrink-0" strokeWidth={1.75} />
+                    <Icon className={`w-[17px] h-[17px] shrink-0 ${active ? "text-accent" : "text-text-tertiary"}`} strokeWidth={1.75} />
                     <span className="flex-1 truncate">{item.label}</span>
                     <kbd className="text-[10px] font-mono text-text-tertiary/60 ml-auto hidden lg:inline">
                       {item.shortcut}
@@ -77,7 +77,7 @@ export default function Sidebar() {
         <InstallAppButton />
         <button
           onClick={handleSignOut}
-          className="flex items-center gap-2.5 px-3 py-2 rounded-[4px] text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+          className="flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
         >
           <LogOut className="w-[17px] h-[17px] shrink-0" strokeWidth={1.75} />
           Sign out

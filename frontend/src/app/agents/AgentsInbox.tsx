@@ -378,7 +378,7 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
 
           {data && view === "unread" && shown.length === 0 && (
             <div className="text-center mt-20 px-8">
-              <CheckCheck className="w-10 h-10 text-accent mx-auto" />
+              <CheckCheck className="w-10 h-10 text-up mx-auto" />
               <p className="mt-3 text-[17px] font-semibold text-text-primary">You&apos;re all caught up</p>
               <p className="mt-1 text-[14px] text-text-tertiary">Nothing from your agents needs you right now.</p>
               <button type="button" onClick={() => choose("all")} className="mt-5 text-[15px] text-accent font-medium">

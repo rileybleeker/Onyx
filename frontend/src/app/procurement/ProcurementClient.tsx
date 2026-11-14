@@ -11,7 +11,7 @@ import type { AdviceLoad } from '@/lib/procurement-flags';
 import type { ReorderLoad } from '@/lib/procurement-reorder';
 import ReorderSuggestions from './ReorderSuggestions';
 import DetectedSubscriptions from './DetectedSubscriptions';
-const card = 'rounded-xl border border-border-subtle bg-surface-card p-5 space-y-4';
+const card = 'rounded-card shadow-card border border-border-subtle bg-surface-card p-5 space-y-4';
 const field = 'block w-full rounded border border-border-subtle bg-transparent p-2 mt-1';
 const button = 'rounded border border-border-subtle px-3 py-2 text-sm hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed';
 const SUBSCRIPTIONS_API = '/api/procurement/subscriptions';

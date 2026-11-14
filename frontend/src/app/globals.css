@@ -1,70 +1,83 @@
 @import "tailwindcss";
 
 /*
- * Onyx design tokens — Direction A ("Terminal").
- * Dark-only. Bloomberg-meets-Linear: deep cool-slate surfaces, a single rationed
- * cyan accent, consistent HRV-direction encoding (up=green / down=red), and a
- * mono+sans split (JetBrains Mono for numerics, Geist Sans for prose).
+ * Onyx design tokens — Direction D ("Instrument"), adopted 2026-11-14.
+ * Dark-only. Warm graphite hardware: matte surfaces a step apart, one signal-orange
+ * accent rationed to controls and highlights, WHOOP-style status colors
+ * (green / yellow / red) that only ever mean state, Archivo for text and DM Mono
+ * for numerics and small labels, rounded cards with a soft lift, round dials.
+ *
+ * Rules that keep it consistent (also in AGENTS.md, "Theme"):
+ * - Colors come from these tokens (classes like bg-surface-card, text-accent) or
+ *   from lib/chart-theme.ts for charts. No new hex literals in components.
+ * - Orange (accent) = controls, selection, focus, the primary action. Success,
+ *   "saved", "on time" use text-up, never the accent.
+ * - Cards: rounded-card shadow-card. Buttons, inputs, nav items: rounded-control.
+ *   The primary action: bg-accent text-on-accent rounded-full.
  */
 @theme {
-  /* Surfaces — Surface 0 (page) → Surface 3 (hover / row stripe) */
-  --color-surface: #08090B;        /* Surface 0 — page background */
-  --color-surface-card: #0E1014;   /* Surface 1 — card body */
-  --color-surface-raised: #15181E; /* Surface 2 — tooltip / popover / sticky header */
-  --color-surface-hover: #1A1E26;  /* Surface 3 — hover / row stripe */
+  /* Surfaces — page → card → raised (popover, tooltip) → hover; sunken = side rails */
+  --color-surface: #1A1A18;
+  --color-surface-sunken: #151513;
+  --color-surface-card: #232321;
+  --color-surface-raised: #2C2C29;
+  --color-surface-hover: #34342F;
 
   /* Borders */
-  --color-border-subtle: rgba(255, 255, 255, 0.05);
-  --color-border-default: rgba(255, 255, 255, 0.08);
-  --color-border-hover: rgba(255, 255, 255, 0.08);   /* legacy name, mapped to default */
-  --color-border-emphasis: rgba(22, 224, 122, 0.30); /* active row / selected */
+  --color-border-subtle: rgba(236, 235, 230, 0.07);
+  --color-border-default: rgba(236, 235, 230, 0.10);
+  --color-border-hover: rgba(236, 235, 230, 0.16);
+  --color-border-emphasis: rgba(255, 106, 26, 0.45); /* active row / selected */
 
-  /* Accent — WHOOP recovery green (active nav, focus ring, selected row, primary CTA) */
-  --color-accent: #16E07A;
-  --color-accent-muted: rgba(22, 224, 122, 0.15);
+  /* Accent — signal orange (active nav, focus ring, selection, primary action) */
+  --color-accent: #FF6A1A;
+  --color-accent-muted: rgba(255, 106, 26, 0.15);
+  --color-on-accent: #1A0E05;      /* text on a solid accent fill */
 
-  /* Text */
-  --color-text-primary: #E8EAED;
-  --color-text-secondary: #9AA0A6;
-  --color-text-tertiary: #5F6368;
-  --color-text-disabled: #3C4043;
+  /* Text (tertiary passes 4.5:1 on cards; the old Terminal grey did not) */
+  --color-text-primary: #ECEBE6;
+  --color-text-secondary: #B0AEA6;
+  --color-text-tertiary: #97958D;
+  --color-text-disabled: #5E5C56;
 
-  /* Semantic — WHOOP zone encoding (green/yellow/red) used consistently everywhere */
-  --color-up: #16E07A;        /* good / high recovery (WHOOP green) */
-  --color-down: #FF4159;      /* bad / low recovery (WHOOP red) */
-  --color-mid: #FFD23F;       /* caution / mid recovery (WHOOP yellow) */
-  --color-neutral: #9AA0A6;   /* no direction */
-  --color-low-conf: rgba(154, 160, 166, 0.45); /* dimmed / low-confidence */
-  /* Strain — WHOOP's blue 0–21 scale (kept distinct from the recovery zones) */
-  --color-strain: #0093E7;
-  --color-strain-bright: #33B5F5;
+  /* Semantic — WHOOP zone encoding, always shown with an icon or a word */
+  --color-up: #5BC46E;        /* good / high recovery */
+  --color-down: #F0584E;      /* bad / low recovery */
+  --color-mid: #F4C84E;       /* caution / mid recovery */
+  --color-neutral: #B0AEA6;   /* no direction */
+  --color-low-conf: rgba(176, 174, 166, 0.45);
+  /* Strain — blue, kept apart from the recovery zones */
+  --color-strain: #6FA8DC;
+  --color-strain-bright: #8DBDE8;
 
-  /* Source colors (desaturated ~15% from the prior palette) */
-  --color-source-garmin: #5B8DF6;
-  --color-source-whoop: #F5A623;
-  --color-source-eightsleep: #9A7BFA;
-  --color-source-cronometer: #22D3A6;
+  /* Device colors (identity; Garmin / WHOOP / Eight Sleep separate for every
+     color-vision type when charted together) */
+  --color-source-garmin: #3987E5;
+  --color-source-whoop: #C98500;
+  --color-source-eightsleep: #199E70;
+  --color-source-cronometer: #9085E9;
   --color-source-spotify: #1ED760;
 
-  /* Section-tick colors (colored left-edge ticks keyed to section function) */
-  --color-tick-forecast: #0093E7;     /* forecast / prediction (strain blue) */
-  --color-tick-descriptive: #9AA0A6;  /* descriptive stats */
-  --color-tick-causal: #F5A623;       /* causal inference */
-  --color-tick-calibration: #16E07A;  /* calibration / accuracy (recovery green) */
+  /* Section-tick colors keyed to section function */
+  --color-tick-forecast: #6FA8DC;
+  --color-tick-descriptive: #B0AEA6;
+  --color-tick-causal: #C98500;
+  --color-tick-calibration: #5BC46E;
 
-  /* Shadows — Direction A cards are nearly flat (border-only, no float) */
-  --shadow-card: none;
-  --shadow-elevated: 0 4px 16px rgba(0, 0, 0, 0.45);
-  --shadow-floating: 0 8px 30px rgba(0, 0, 0, 0.6);
+  /* Shape */
+  --radius: 6px;           /* bare `rounded` (chips, small badges) */
+  --radius-card: 14px;     /* rounded-card */
+  --radius-control: 10px;  /* rounded-control: buttons, inputs, nav items */
 
-  /* Fonts — CSS vars set by next/font.
-     Mono is JetBrains Mono (Direction A numerics); ui-monospace is the system
-     fallback. (Geist Mono was removed 2026-06-11: it sat behind the
-     always-loaded JetBrains Mono in both stacks, so its font files downloaded
-     on every page without ever rendering a glyph.) */
-  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
-  --font-mono: var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, monospace;
-  --font-display: var(--font-jetbrains-mono), ui-monospace, monospace;
+  /* Shadows — cards sit slightly raised: a top highlight plus a soft drop */
+  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 4px 14px rgba(0, 0, 0, 0.28);
+  --shadow-elevated: 0 6px 20px rgba(0, 0, 0, 0.45);
+  --shadow-floating: 0 12px 36px rgba(0, 0, 0, 0.55);
+
+  /* Fonts — CSS vars set by next/font (vendored WOFF2 in app/fonts). */
+  --font-sans: var(--font-archivo), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-dm-mono), ui-monospace, SFMono-Regular, monospace;
+  --font-display: var(--font-dm-mono), ui-monospace, monospace;
 
   /* Animation */
   --animate-fade-in: fade-in 150ms ease-out both;
@@ -85,42 +98,12 @@
   to { opacity: 1; transform: translateY(0); }
 }
 
-/* JetBrains Mono display numerics get the ss01 stylistic set (slashed zero etc.) */
+/* DM Mono display numerics: tabular figures. */
 .font-display {
   font-family: var(--font-display);
-  font-feature-settings: "ss01", "tnum";
+  font-feature-settings: "tnum";
   font-variant-numeric: tabular-nums;
-}
-
-/* Ambient gradient backdrop — Eight Sleep Pod aesthetic with a little personality.
-   A fixed multi-hue aurora mesh (indigo · cyan · a faint WHOOP-green core · violet ·
-   warm magenta) painted behind the app on the deep base surface, drifting very
-   slowly so it feels alive rather than static. Oversized via negative inset so the
-   drift never exposes a viewport edge; opaque cards sit on top, so it reads through
-   the page background, gaps, and margins. pointer-events:none keeps it decorative. */
-body::before {
-  content: "";
-  position: fixed;
-  inset: -20%;
-  z-index: -1;
-  pointer-events: none;
-  background:
-    radial-gradient(60% 50% at 18% 4%,  rgba(82, 96, 255, 0.16), transparent 60%),   /* indigo, top-left */
-    radial-gradient(55% 45% at 92% 10%, rgba(56, 189, 248, 0.10), transparent 58%),  /* cyan, top-right */
-    radial-gradient(52% 46% at 50% 42%, rgba(22, 224, 122, 0.06), transparent 62%),  /* faint WHOOP-green core */
-    radial-gradient(60% 55% at 86% 96%, rgba(124, 92, 250, 0.13), transparent 60%),  /* violet, bottom-right */
-    radial-gradient(55% 50% at 10% 98%, rgba(236, 72, 153, 0.07), transparent 60%);  /* warm magenta, bottom-left */
-  animation: aura-drift 34s ease-in-out infinite alternate;
-}
-
-@keyframes aura-drift {
-  from { transform: translate3d(-1.5%, -1%, 0) scale(1.02); }
-  to   { transform: translate3d(1.5%, 1.5%, 0) scale(1.06); }
-}
-
-/* Respect reduced-motion: keep the aura, drop the drift. */
-@media (prefers-reduced-motion: reduce) {
-  body::before { animation: none; }
+  letter-spacing: -0.01em;
 }
 
 /* Chart tooltip override */
@@ -130,8 +113,8 @@ body::before {
 
 /* Skeleton loader base */
 .skeleton {
-  background: rgba(255, 255, 255, 0.05);
-  border-radius: 4px;
+  background: rgba(236, 235, 230, 0.06);
+  border-radius: var(--radius-control);
 }
 
 /* Scrollbar styling */
@@ -143,9 +126,9 @@ body::before {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(236, 235, 230, 0.12);
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(236, 235, 230, 0.2);
 }

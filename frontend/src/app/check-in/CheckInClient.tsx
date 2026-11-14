@@ -319,7 +319,7 @@ export default function CheckInClient() {
             router.replace("/check-in", { scroll: false });
             load(null);
           }}
-          className="mt-4 px-3 py-1.5 text-[13px] bg-white/5 border border-border-subtle rounded-[6px]">
+          className="mt-4 px-3 py-1.5 text-[13px] bg-white/5 border border-border-subtle rounded-control">
           Go to today
         </button>
       </div>
@@ -331,7 +331,7 @@ export default function CheckInClient() {
       <div className="max-w-xl space-y-3">
         <div className="h-8 w-40 bg-white/5 animate-pulse rounded" />
         {[...Array(8)].map((_, i) => (
-          <div key={i} className="h-12 bg-white/[0.03] animate-pulse rounded-[6px]" />
+          <div key={i} className="h-12 bg-white/[0.03] animate-pulse rounded-control" />
         ))}
       </div>
     );
@@ -395,7 +395,7 @@ export default function CheckInClient() {
               aria-selected={active}
               disabled={saving}
               onClick={() => goTo(d.date)}
-              className={`flex-1 px-3 py-2 rounded-[6px] border text-left transition-colors ${
+              className={`flex-1 px-3 py-2 rounded-control border text-left transition-colors ${
                 active ? "border-accent/60 bg-accent/10" : "border-border-subtle bg-white/[0.02] hover:bg-white/[0.05]"
               }`}
             >
@@ -407,7 +407,7 @@ export default function CheckInClient() {
       </div>
 
       {/* Say it once: dictated text -> draft Yes/No taps (nothing is saved until Save) */}
-      <details className="mb-4 rounded-[6px] border border-border-subtle bg-white/[0.02] px-3 py-2">
+      <details className="mb-4 rounded-control border border-border-subtle bg-white/[0.02] px-3 py-2">
         <summary className="cursor-pointer text-[13px] text-text-secondary">Say it once</summary>
         <textarea
           value={voiceText}
@@ -415,14 +415,14 @@ export default function CheckInClient() {
           maxLength={VOICE_MAX_TEXT_CHARS}
           rows={4}
           aria-label="Say it once"
-          className="mt-2 w-full rounded-[6px] border border-border-subtle bg-transparent p-2 text-[14px] text-text-primary"
+          className="mt-2 w-full rounded-control border border-border-subtle bg-transparent p-2 text-[14px] text-text-primary"
         />
         <p className="text-[11px] text-text-tertiary mt-1">Type or use the keyboard microphone. Nothing is saved until you press Save.</p>
         <div className="mt-2 flex items-center gap-3">
           <button
             onClick={fillFromVoice}
             disabled={voiceBusy || saving || !voiceText.trim()}
-            className="px-3 py-1.5 rounded-[6px] border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary disabled:opacity-50"
+            className="px-3 py-1.5 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary disabled:opacity-50"
           >
             {voiceBusy ? "Filling…" : "Fill answers"}
           </button>
@@ -448,7 +448,7 @@ export default function CheckInClient() {
           <div className="mt-3 flex items-center gap-3">
             <button
               onClick={() => apply(null, Object.fromEntries(dayBlanks.map((i) => [i.name, "No" as CheckinAnswer])))}
-              className="px-3 py-1.5 rounded-[6px] border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary transition-colors"
+              className="px-3 py-1.5 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary transition-colors"
             >
               No for the other {dayBlanks.length}
             </button>
@@ -460,7 +460,7 @@ export default function CheckInClient() {
       {coreByCategory.map(([category, items]) => (
         <section key={category} className="mb-6">
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">{category}</h3>
-          <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
+          <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
             {items.map((item) => (
               <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} fromVoice={isFromVoice(item.name)} />
             ))}
@@ -477,7 +477,7 @@ export default function CheckInClient() {
           {showExtras && (
             <>
               <p className="text-[12px] text-text-tertiary mb-2">Weekly and rarely-Yes questions. Leave blank unless you did (or deliberately skipped) one {dayName === "Today" ? "today" : "that day"}.</p>
-              <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
+              <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
                 {extras.map((item) => (
                   <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} fromVoice={isFromVoice(item.name)} />
                 ))}
@@ -534,13 +534,13 @@ export default function CheckInClient() {
 
       {/* Save bar: sticks above the mobile tab bar */}
       <div className="sticky bottom-[calc(env(safe-area-inset-bottom)+4.75rem)] md:bottom-4 z-10 mt-8">
-        <div className="rounded-[8px] border border-border-subtle bg-surface-card/95 backdrop-blur px-4 py-3 flex items-center gap-3 shadow-lg">
+        <div className="rounded-card border border-border-subtle bg-surface-card/95 backdrop-blur px-4 py-3 flex items-center gap-3 shadow-lg">
           <div className="flex-1 min-w-0 text-[13px]">
             {error ? (
               <span className="text-red-400">{error}</span>
             ) : savedAt === data.date && changeCount === 0 ? (
               <span className="text-text-secondary inline-flex items-center gap-1.5">
-                <Check className="w-4 h-4 text-accent" /> Saved
+                <Check className="w-4 h-4 text-up" /> Saved
                 {catchUp && (
                   <button onClick={() => goTo(catchUp.date)} className="ml-2 text-accent underline underline-offset-2">
                     Catch up {dayLabel(catchUp.date, data.today).toLowerCase()}
@@ -559,7 +559,7 @@ export default function CheckInClient() {
           <button
             onClick={save}
             disabled={saving || changeCount === 0}
-            className="px-4 py-2 rounded-[6px] text-[14px] font-medium bg-accent text-black disabled:opacity-40 transition-opacity"
+            className="px-4 py-2 rounded-control text-[14px] font-medium bg-accent text-black disabled:opacity-40 transition-opacity"
           >
             {saving ? "Saving…" : "Save"}
           </button>
@@ -614,7 +614,7 @@ function NightBlock({
         <button
           onClick={() => onKit(kit)}
           disabled={kitApplied}
-          className={`w-full mb-2 px-3 py-2.5 rounded-[6px] border text-left transition-colors ${
+          className={`w-full mb-2 px-3 py-2.5 rounded-control border text-left transition-colors ${
             kitApplied ? "border-accent/40 bg-accent/10" : "border-border-subtle bg-white/[0.03] hover:bg-white/[0.06]"
           }`}
         >
@@ -624,7 +624,7 @@ function NightBlock({
           <span className="block text-[12px] text-text-tertiary mt-0.5">{kitSummary(kit)}</span>
         </button>
       )}
-      <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
+      <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
         {asked.map((item) => (
           <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} />
         ))}
@@ -632,7 +632,7 @@ function NightBlock({
       {optional.length > 0 && (
         <>
           <p className="text-[11px] text-text-tertiary mt-2 mb-1">Optional. Leave blank unless it happened.</p>
-          <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card/60">
+          <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card/60">
             {optional.map((item) => (
               <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} />
             ))}
@@ -658,7 +658,7 @@ function Row({ item, cell, onTap, fromVoice }: { item: CheckinItem; cell: Cell |
           onClick={() => onTap(item.name, "Yes")}
           aria-pressed={yes}
           aria-label={`${item.name}: yes`}
-          className={`h-9 w-14 rounded-[6px] border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${
+          className={`h-9 w-14 rounded-control border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${
             yes ? "bg-accent/20 border-accent/70 text-accent" : "border-border-subtle text-text-tertiary hover:text-text-secondary"
           }`}
         >
@@ -668,7 +668,7 @@ function Row({ item, cell, onTap, fromVoice }: { item: CheckinItem; cell: Cell |
           onClick={() => onTap(item.name, "No")}
           aria-pressed={no}
           aria-label={`${item.name}: no`}
-          className={`h-9 w-14 rounded-[6px] border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${
+          className={`h-9 w-14 rounded-control border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${
             no ? "bg-red-500/15 border-red-400/60 text-red-300" : "border-border-subtle text-text-tertiary hover:text-text-secondary"
           }`}
         >

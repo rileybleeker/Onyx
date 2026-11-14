@@ -29,7 +29,7 @@ export default function RangeFilter({
     <div
       role="radiogroup"
       aria-label={ariaLabel}
-      className="inline-flex rounded-[6px] border border-border-subtle bg-black/30 p-0.5 overflow-x-auto"
+      className="inline-flex rounded-control border border-border-subtle bg-black/30 p-0.5 overflow-x-auto"
     >
       {RANGE_OPTIONS.map((opt) => {
         const active = opt.value === value;
@@ -44,7 +44,7 @@ export default function RangeFilter({
                 ? { backgroundColor: `${accent}33`, borderColor: `${accent}66` }
                 : undefined
             }
-            className={`px-2.5 py-1 text-[10px] font-mono tracking-wide rounded-[4px] transition-colors ${
+            className={`px-2.5 py-1 text-[10px] font-mono tracking-wide rounded-control transition-colors ${
               active
                 ? "text-text-primary border"
                 : "text-text-tertiary hover:text-text-secondary border border-transparent"

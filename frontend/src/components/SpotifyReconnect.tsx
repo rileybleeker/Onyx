@@ -56,7 +56,7 @@ export default function SpotifyReconnect({ reconnectBy }: { reconnectBy?: string
   }
 
   return (
-    <div className="mt-3 px-3 py-3 bg-amber-500/10 border border-amber-500/20 rounded-[4px]" data-testid="spotify-reconnect">
+    <div className="mt-3 px-3 py-3 bg-amber-500/10 border border-amber-500/20 rounded-control" data-testid="spotify-reconnect">
       {reconnectBy && !done && (
         <p className="text-[12px] text-amber-300 mb-2" data-testid="spotify-reconnect-warning">
           {reconnectWarningText(reconnectBy, Date.now())}
@@ -68,7 +68,7 @@ export default function SpotifyReconnect({ reconnectBy }: { reconnectBy?: string
           type="button"
           onClick={start}
           disabled={busy !== null}
-          className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-primary border border-border-subtle rounded-[6px] hover:bg-white/10 transition-colors disabled:opacity-50"
+          className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-primary border border-border-subtle rounded-control hover:bg-white/10 transition-colors disabled:opacity-50"
         >
           {busy === "link" ? "Getting the link…" : url ? "Start again" : "Reconnect Spotify"}
         </button>
@@ -101,13 +101,13 @@ export default function SpotifyReconnect({ reconnectBy }: { reconnectBy?: string
             autoComplete="off"
             spellCheck={false}
             placeholder={`${SPOTIFY_REDIRECT_URI}?code=…&state=…`}
-            className="w-full bg-surface-raised border border-border-subtle rounded-[4px] px-3 py-2 text-[12px] font-mono text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent"
+            className="w-full bg-surface-raised border border-border-subtle rounded-control px-3 py-2 text-[12px] font-mono text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent"
           />
           <button
             type="button"
             onClick={finish}
             disabled={busy !== null || !pasted.trim()}
-            className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-primary border border-border-subtle rounded-[6px] hover:bg-white/10 transition-colors disabled:opacity-50"
+            className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-primary border border-border-subtle rounded-control hover:bg-white/10 transition-colors disabled:opacity-50"
           >
             {busy === "finish" ? "Finishing…" : "Finish"}
           </button>

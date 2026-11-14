@@ -28,7 +28,7 @@ interface KpiTileProps {
 }
 
 /**
- * Direction A hero KPI tile — uppercase label, large JetBrains-Mono display
+ * Hero KPI tile — mono uppercase label with a colored dot, large DM Mono display
  * value, inline sparkline, optional CI/sub line, signed delta, and a mono
  * metadata footer. Min height 88px (iOS touch target / horizontal scroll-snap).
  */
@@ -56,22 +56,19 @@ export default function KpiTile({
     <div
       data-testid={testId}
       className={clsx(
-        "relative min-h-[88px] bg-surface-card border border-border-subtle rounded-[4px] pl-4 pr-3 py-3 overflow-hidden transition-colors hover:border-border-hover",
+        "relative min-h-[88px] bg-surface-card border border-border-subtle rounded-card shadow-card px-4 py-3 overflow-hidden transition-colors hover:border-border-hover",
         className,
       )}
     >
-      <span
-        aria-hidden
-        className="absolute left-0 top-0 bottom-0 w-[3px]"
-        style={{ backgroundColor: accent }}
-      />
-
-      <p className="text-[10px] text-text-tertiary font-medium uppercase tracking-[0.1em]">{label}</p>
+      <p className="flex items-center gap-2 text-[10px] text-text-secondary font-mono uppercase tracking-[0.14em]">
+        <span aria-hidden className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: accent }} />
+        {label}
+      </p>
 
       <div className="flex items-end justify-between gap-2 mt-1.5">
         <div className="flex items-baseline gap-1.5 min-w-0">
           <span
-            className="font-display text-[34px] sm:text-[40px] leading-none text-text-primary tabular-nums truncate"
+            className="font-display font-medium text-[32px] sm:text-[36px] leading-none text-text-primary tabular-nums truncate"
             style={valueColor ? { color: valueColor } : undefined}
           >
             {value ?? "—"}

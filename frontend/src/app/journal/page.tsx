@@ -163,7 +163,7 @@ export default function JournalPage() {
       </header>
 
       {/* Filter bar */}
-      <div className="bg-surface-card border border-border-subtle rounded-[6px] p-3 md:p-4 mb-4 space-y-3">
+      <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-3 md:p-4 mb-4 space-y-3">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-[11px] text-text-tertiary uppercase tracking-wider">Mood</span>
           <button
@@ -236,7 +236,7 @@ export default function JournalPage() {
             return (
               <li
                 key={e.notion_page_id}
-                className="bg-surface-card border border-border-subtle rounded-[6px] overflow-hidden"
+                className="bg-surface-card border border-border-subtle rounded-control overflow-hidden"
               >
                 <button
                   onClick={() => toggleExpand(e.notion_page_id)}

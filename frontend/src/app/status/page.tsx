@@ -178,7 +178,7 @@ function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus
   const statusLabel = STATUS_LABEL[info.status];
 
   return (
-    <div className="bg-surface-card border border-border-subtle rounded-[6px] p-5 shadow-card transition-colors hover:border-border-hover">
+    <div className="bg-surface-card border border-border-subtle rounded-card p-5 shadow-card transition-colors hover:border-border-hover">
       {/* Header */}
       <div className="flex items-start justify-between mb-4">
         <div>
@@ -217,7 +217,7 @@ function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus
 
       {/* Error box */}
       {info.errorMessage && (
-        <div className="mt-3 px-3 py-2 bg-red-500/10 border border-red-500/20 rounded-[4px]">
+        <div className="mt-3 px-3 py-2 bg-red-500/10 border border-red-500/20 rounded-control">
           <p className="text-[11px] text-red-400 font-mono break-all">{info.errorMessage}</p>
         </div>
       )}
@@ -387,7 +387,7 @@ export default function StatusPage() {
         <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
               <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
               <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
             </div>
@@ -395,7 +395,7 @@ export default function StatusPage() {
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-5 space-y-4 h-40">
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 space-y-4 h-40">
               <div className="h-4 w-28 bg-white/5 animate-pulse rounded" />
               <div className="space-y-2">
                 {[...Array(3)].map((_, j) => (
@@ -474,7 +474,7 @@ export default function StatusPage() {
         </div>
         <button
           onClick={load}
-          className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-[6px] hover:bg-white/10 transition-colors"
+          className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-control hover:bg-white/10 transition-colors"
         >
           Refresh
         </button>
@@ -484,7 +484,7 @@ export default function StatusPage() {
           cycles whose offset disagrees with pds.tz_for_instant — Riley
           likely traveled but forgot to add a user_tz_log entry. */}
       {tzGapRanges.length > 0 && (
-        <div className="mb-6 border border-yellow-500/30 bg-yellow-500/10 rounded-[6px] p-4">
+        <div className="mb-6 border border-yellow-500/30 bg-yellow-500/10 rounded-control p-4">
           <div className="flex items-center gap-2 mb-2">
             <span className="w-2 h-2 rounded-full bg-yellow-400" />
             <p className="text-[13px] font-medium text-yellow-300">
@@ -515,7 +515,7 @@ export default function StatusPage() {
 
       {/* Drift alerts banner */}
       {driftAlerts.length > 0 && (
-        <div className="mb-6 border border-red-500/30 bg-red-500/10 rounded-[6px] p-4">
+        <div className="mb-6 border border-red-500/30 bg-red-500/10 rounded-control p-4">
           <div className="flex items-center gap-2 mb-2">
             <span className="w-2 h-2 rounded-full bg-red-400" />
             <p className="text-[13px] font-medium text-red-300">
@@ -535,7 +535,7 @@ export default function StatusPage() {
 
       {/* KPI row */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Sources Online"
             value={sourcesOnline}

@@ -20,7 +20,7 @@ import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
+const legendStyle = { fontSize: 11, fontFamily: "var(--font-mono)" };
 
 // Temps come from the Eight Sleep / WHOOP APIs in °C. Convert to °F at the
 // display layer for the US-based reader. Returns null for null/undefined input.
@@ -114,7 +114,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
         <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
               <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
               <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
             </div>
@@ -400,7 +400,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
       {/* ── WHOOP Recovery ──────────────────────────────────────────────────── */}
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Recovery</p>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6 items-stretch">
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Recovery"
             value={avgRecoveryScore ?? NaN}
@@ -411,7 +411,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
               : rangeNote}
           />
         </div>
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Day Strain"
             value={avgStrain ?? NaN}
@@ -696,7 +696,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
 
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
               {[...categoryMap.entries()].map(([cat, qs]) => (
-                <div key={cat} className="bg-surface-card border border-border-subtle rounded-[6px] p-4">
+                <div key={cat} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4">
                   <p className="text-[10px] text-text-tertiary font-mono font-medium uppercase tracking-wider">{cat}</p>
                   <p className="text-lg font-semibold text-text-primary mt-1">{qs.length} behavior{qs.length !== 1 ? "s" : ""}</p>
                   <p className="text-xs text-text-tertiary mt-1">{qs.slice(0, 3).join(", ")}{qs.length > 3 ? "…" : ""}</p>

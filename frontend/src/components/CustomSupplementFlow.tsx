@@ -299,7 +299,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
             />
             <button
               onClick={() => fileRef.current?.click()}
-              className="flex-1 px-3 py-2 text-[12px] font-mono text-text-primary bg-[#1DB954]/15 hover:bg-[#1DB954]/25 border border-[#1DB954]/30 rounded-[4px] transition-colors"
+              className="flex-1 px-3 py-2 text-[12px] font-mono text-on-accent font-semibold bg-accent hover:bg-accent/90 border border-accent rounded-full transition-colors"
             >
               📷 Take or upload photo
             </button>
@@ -319,7 +319,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
           <p className="text-[10px] text-text-tertiary">
             {photoName ?? "photo"} → Claude vision → aligned ingredients
           </p>
-          <div className="inline-block w-6 h-6 border-2 border-[#1DB954]/30 border-t-[#1DB954] rounded-full animate-spin" />
+          <div className="inline-block w-6 h-6 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
         </div>
       )}
 
@@ -340,7 +340,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
               <input
                 value={draft.brand_name}
                 onChange={(e) => setDraft((d) => ({ ...d, brand_name: e.target.value }))}
-                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
               />
             </div>
             <div>
@@ -350,7 +350,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
               <input
                 value={draft.full_name}
                 onChange={(e) => setDraft((d) => ({ ...d, full_name: e.target.value }))}
-                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
               />
             </div>
             <div>
@@ -361,7 +361,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
                 value={draft.serving_size}
                 onChange={(e) => setDraft((d) => ({ ...d, serving_size: e.target.value }))}
                 inputMode="decimal"
-                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
               />
             </div>
             <div>
@@ -372,7 +372,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
                 value={draft.serving_unit}
                 onChange={(e) => setDraft((d) => ({ ...d, serving_unit: e.target.value }))}
                 placeholder="Tablet(s) / Capsule(s) / g"
-                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
               />
             </div>
             <div>
@@ -385,7 +385,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
                   setDraft((d) => ({ ...d, servings_per_container: e.target.value }))
                 }
                 inputMode="numeric"
-                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
               />
             </div>
             <div>
@@ -396,7 +396,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
                 value={draft.physical_state}
                 onChange={(e) => setDraft((d) => ({ ...d, physical_state: e.target.value }))}
                 placeholder="Tablet / Capsule / Softgel / Powder"
-                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                className="w-full px-2 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
               />
             </div>
           </div>
@@ -418,14 +418,14 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
               {draft.ingredients.map((ing, idx) => (
                 <div
                   key={idx}
-                  className="bg-black/30 border border-border-subtle rounded-[4px] p-2 space-y-1.5"
+                  className="bg-black/30 border border-border-subtle rounded-control p-2 space-y-1.5"
                 >
                   <div className="flex items-start gap-2">
                     <input
                       value={ing.name ?? ""}
                       onChange={(e) => updateIngredient(idx, { name: e.target.value })}
                       placeholder="Ingredient (as printed)"
-                      className="flex-1 px-2 py-1 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                      className="flex-1 px-2 py-1 text-[12px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
                     />
                     <button
                       onClick={() => removeIngredient(idx)}
@@ -442,14 +442,14 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
                         updateIngredient(idx, { ingredient_group: e.target.value || null })
                       }
                       placeholder="Group (canonical)"
-                      className="px-2 py-1 text-[11px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                      className="px-2 py-1 text-[11px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
                     />
                     <input
                       value={ing.unii_code ?? ""}
                       onChange={(e) => updateIngredient(idx, { unii_code: e.target.value || null })}
                       placeholder="UNII"
                       title={ing.unii_code ? "Recognized — will roll up cross-brand" : "Leave blank if unknown"}
-                      className={`px-2 py-1 text-[11px] font-mono bg-black/30 border rounded-[4px] focus:border-[#1DB954]/40 outline-none ${
+                      className={`px-2 py-1 text-[11px] font-mono bg-black/30 border rounded-control focus:border-accent/40 outline-none ${
                         ing.unii_code
                           ? "border-amber-400/40 text-amber-300"
                           : "border-border-subtle text-text-primary"
@@ -458,7 +458,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
                     <select
                       value={ing.category ?? ""}
                       onChange={(e) => updateIngredient(idx, { category: e.target.value || null })}
-                      className="px-2 py-1 text-[11px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                      className="px-2 py-1 text-[11px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
                     >
                       <option value="">category…</option>
                       {CATEGORY_OPTIONS.map((c) => (
@@ -478,14 +478,14 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
                       }
                       placeholder="Quantity"
                       inputMode="decimal"
-                      className="px-2 py-1 text-[11px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                      className="px-2 py-1 text-[11px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
                     />
                     <input
                       list={`units-${idx}`}
                       value={ing.unit ?? ""}
                       onChange={(e) => updateIngredient(idx, { unit: e.target.value || null })}
                       placeholder="Unit"
-                      className="px-2 py-1 text-[11px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                      className="px-2 py-1 text-[11px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
                     />
                     <datalist id={`units-${idx}`}>
                       {UNIT_OPTIONS.map((u) => (
@@ -501,7 +501,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
                       }
                       placeholder="% DV"
                       inputMode="decimal"
-                      className="px-2 py-1 text-[11px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+                      className="px-2 py-1 text-[11px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
                     />
                   </div>
                 </div>
@@ -525,7 +525,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
               type="number"
               min="0"
               step="0.5"
-              className="w-full mb-2 px-2 py-1.5 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/40 outline-none"
+              className="w-full mb-2 px-2 py-1.5 text-[13px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
             />
             <p className="text-[10px] text-text-tertiary mb-3">
               Set to <span className="text-text-secondary">0</span> to save the product without logging an intake yet.
@@ -550,7 +550,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
               <button
                 onClick={save}
                 disabled={saving}
-                className="px-4 py-2 text-[12px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 disabled:opacity-40 disabled:cursor-not-allowed border border-[#1DB954]/40 rounded-[4px] transition-colors"
+                className="px-4 py-2 text-[12px] font-medium text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed border border-accent rounded-full transition-colors"
               >
                 {saving
                   ? "Saving…"

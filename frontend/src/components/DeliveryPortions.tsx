@@ -314,7 +314,7 @@ export function PortionControl({ dish, onPick }: { dish: DeliveryDish; onPick: (
             onClick={() => onPick(o.value)}
             aria-pressed={on}
             title={on && assumed ? "Assumed (not set yet). Tap to confirm." : undefined}
-            className={`h-7 min-w-[2.25rem] px-1.5 rounded-[5px] border text-[11px] font-mono transition-colors ${
+            className={`h-7 min-w-[2.25rem] px-1.5 rounded-control border text-[11px] font-mono transition-colors ${
               on
                 ? assumed
                   ? "border-dashed border-accent/50 text-accent/80 bg-accent/5"
@@ -341,7 +341,7 @@ export function DeliveryDishList({
 }) {
   if (items.length === 0) return null;
   return (
-    <div className={`bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle ${className}`}>
+    <div className={`bg-surface-card border border-border-subtle rounded-control divide-y divide-border-subtle ${className}`}>
       {items.map((d) => (
         <div key={d.item_id} className="px-4 py-2.5 text-sm">
           <div className="flex items-start gap-2">
@@ -396,7 +396,7 @@ export function LeftoverList({
   if (questions.length === 0) return null;
   const shared = questions.find((x) => x.time && fractionOfToken(x.token) > 0)?.time ?? null;
   return (
-    <div className={`bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle ${className}`}>
+    <div className={`bg-surface-card border border-border-subtle rounded-control divide-y divide-border-subtle ${className}`}>
       {questions.map((q) => (
         <div key={q.dish.item_id} className="px-4 py-2.5 text-sm">
           <div className="flex items-start gap-2">
@@ -428,7 +428,7 @@ export function LeftoverList({
                   onClick={() => onPick(q, o.key)}
                   aria-pressed={on}
                   title={on ? "Tap again to clear" : o.share != null && o.share > 0 ? `${o.label} of what was left` : undefined}
-                  className={`h-7 min-w-[2.25rem] px-1.5 rounded-[5px] border text-[11px] font-mono transition-colors disabled:opacity-40 ${
+                  className={`h-7 min-w-[2.25rem] px-1.5 rounded-control border text-[11px] font-mono transition-colors disabled:opacity-40 ${
                     on ? "border-accent/70 bg-accent/20 text-accent" : "border-border-subtle text-text-tertiary hover:text-text-secondary"
                   }`}
                 >
@@ -449,13 +449,13 @@ export function LeftoverList({
                   if (v === "") onTime(q, null);
                   else if (/^\d{2}:\d{2}$/.test(v)) onTime(q, v);
                 }}
-                className="h-7 px-1.5 rounded-[5px] border border-border-subtle bg-transparent text-[11px] font-mono text-text-secondary"
+                className="h-7 px-1.5 rounded-control border border-border-subtle bg-transparent text-[11px] font-mono text-text-secondary"
               />
               {showNow && (
                 <button
                   type="button"
                   onClick={() => onTime(q, clockNow())}
-                  className="h-7 px-1.5 rounded-[5px] border border-border-subtle text-[11px] font-mono text-text-tertiary hover:text-text-secondary"
+                  className="h-7 px-1.5 rounded-control border border-border-subtle text-[11px] font-mono text-text-tertiary hover:text-text-secondary"
                 >
                   Now
                 </button>
@@ -464,7 +464,7 @@ export function LeftoverList({
                 <button
                   type="button"
                   onClick={() => onTime(q, shared)}
-                  className="h-7 px-1.5 rounded-[5px] border border-border-subtle text-[11px] font-mono text-text-tertiary hover:text-text-secondary"
+                  className="h-7 px-1.5 rounded-control border border-border-subtle text-[11px] font-mono text-text-tertiary hover:text-text-secondary"
                 >
                   Same as {formatClock(shared)}
                 </button>

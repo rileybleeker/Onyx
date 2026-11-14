@@ -597,7 +597,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         <div className="h-8 w-64 bg-white/5 animate-pulse rounded" />
         <div className="grid grid-cols-3 gap-4">
           {[...Array(3)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 h-28 animate-pulse" />
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 h-28 animate-pulse" />
           ))}
         </div>
       </div>
@@ -649,8 +649,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
 
       {/* ── Row 1: Hero KPI tiles (horizontal scroll-snap on mobile) ── */}
       <div className="flex gap-3 overflow-x-auto snap-x snap-mandatory pb-1 -mx-1 px-1 [scrollbar-width:none] sm:mx-0 sm:px-0 sm:grid sm:grid-cols-3 sm:gap-4 sm:overflow-visible">
-        <div className="min-w-[78%] snap-start sm:min-w-0 relative bg-surface-card border border-border-subtle rounded-[4px] px-4 py-4 flex flex-col items-center">
-          <span aria-hidden className="absolute left-0 top-0 bottom-0 w-[3px] rounded-l-[4px]" style={{ backgroundColor: "var(--color-accent)" }} />
+        <div className="min-w-[78%] snap-start sm:min-w-0 relative bg-surface-card border border-border-subtle rounded-card shadow-card px-4 py-4 flex flex-col items-center">
           <MetricRing
             testId="hero-tomorrow-hrv"
             label="Tonight's sleep"
@@ -753,7 +752,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           source="XGBOOST · SHAP"
           info="Shows what's pushing the forecast for tonight's sleep (the HRV you wake up to) up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes. Journal behaviors appear in a separate section below because they're Yes/No entries — they have smaller numerical impact than continuous metrics like heart rate, but they're still part of the model.">
           {xgbDiagnostics?.shap_unstable && (
-            <div className="mb-3 bg-amber-500/10 border border-amber-500/30 rounded-[4px] px-3 py-2 text-[11px] leading-relaxed text-amber-200">
+            <div className="mb-3 bg-amber-500/10 border border-amber-500/30 rounded-control px-3 py-2 text-[11px] leading-relaxed text-amber-200">
               <strong className="text-amber-100">High feature collinearity detected</strong>
               {xgbDiagnostics.feature_condition_number != null && (
                 <> (condition number ={" "}
@@ -1021,7 +1020,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       {/* ── What's associated with your HRV ── */}
       <DeferredMount minHeight={1400}>
       <div className="space-y-4">
-        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-4 shadow-card">
+        <div className="bg-surface-card border border-border-subtle rounded-card p-4 shadow-card">
           <h3 className="text-[13px] font-medium text-text-secondary mb-2">What&apos;s associated with your HRV</h3>
           <p className="text-[11px] text-text-tertiary leading-relaxed">
             The charts below are <em>associational</em> — they show which factors have historically moved with your HRV across your entire tracking history. No model is involved; these are direct statistical patterns. Start with the broad continuous-metric view, then read on through the behavior-impact, supplement, and lifestyle pairings. Adjusted causal estimates (with confounders held fixed) come further down in the Causal Inference section.
@@ -1588,7 +1587,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         parent, so the inter-block spacing is unchanged.
       */}
       <DeferredMount minHeight={2400}>
-      <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 shadow-card">
+      <div className="bg-surface-card border border-border-subtle rounded-card p-6 shadow-card">
         <div className="flex items-start justify-between gap-3 mb-4">
           <div>
             <h3 className="text-[18px] font-medium text-text-primary">Causal Inference</h3>
@@ -2370,7 +2369,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       {/* Both methods/eval cards render collapsed by default (just their
           toggle headers), hence the small minHeight. */}
       <DeferredMount minHeight={180}>
-      <div className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card overflow-hidden">
+      <div className="bg-surface-card border border-border-subtle rounded-control shadow-card overflow-hidden">
         <button
           onClick={() => setExpandedModels(!expandedModels)}
           className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-white/[0.02] transition-colors"
@@ -2392,7 +2391,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                 because the "FDR-significant only" toggle at the top gates most charts. */}
             <div>
               <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Statistical Significance</p>
-              <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2 border-l-2 border-emerald-500/40">
+              <div className="bg-white/[0.03] rounded-control p-4 space-y-2 border-l-2 border-emerald-500/40">
                 <div className="flex items-center justify-between">
                   <span className="text-[12px] font-medium text-text-primary">FDR-significant (Benjamini–Hochberg)</span>
                   <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">PAGE-WIDE FILTER</span>
@@ -2414,7 +2413,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
               <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Prediction Models</p>
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
 
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                <div className="bg-white/[0.03] rounded-control p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">XGBoost</span>
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">DAY-AHEAD</span>
@@ -2430,7 +2429,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   </p>
                 </div>
 
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                <div className="bg-white/[0.03] rounded-control p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">Prophet</span>
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">30-DAY FORECAST</span>
@@ -2446,7 +2445,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   </p>
                 </div>
 
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                <div className="bg-white/[0.03] rounded-control p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">SARIMAX</span>
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">SEASONAL</span>
@@ -2469,7 +2468,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
               <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Analysis Methods</p>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
 
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                <div className="bg-white/[0.03] rounded-control p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">SHAP Values</span>
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">EXPLAINABILITY</span>
@@ -2482,7 +2481,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   </p>
                 </div>
 
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                <div className="bg-white/[0.03] rounded-control p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">Spearman Correlation</span>
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">HISTORICAL PATTERNS</span>
@@ -2498,7 +2497,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   </p>
                 </div>
 
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                <div className="bg-white/[0.03] rounded-control p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">Welch&apos;s T-Test</span>
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">JOURNAL IMPACT</span>
@@ -2517,7 +2516,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   </p>
                 </div>
 
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                <div className="bg-white/[0.03] rounded-control p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">Baselines &amp; MAE</span>
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">BENCHMARKS</span>
@@ -2537,7 +2536,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
               <p className="text-[10px] font-mono font-medium tracking-wider text-text-tertiary uppercase mb-3">Causal Inference</p>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
 
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                <div className="bg-white/[0.03] rounded-control p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">AIPW (Doubly Robust)</span>
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">CAUSAL ATE</span>
@@ -2553,7 +2552,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   </p>
                 </div>
 
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                <div className="bg-white/[0.03] rounded-control p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">E-value</span>
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">SENSITIVITY</span>
@@ -2566,7 +2565,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
                   </p>
                 </div>
 
-                <div className="bg-white/[0.03] rounded-[6px] p-4 space-y-2">
+                <div className="bg-white/[0.03] rounded-control p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[12px] font-medium text-text-primary">PSM &amp; Block-Bootstrap CI</span>
                     <span className="text-[9px] font-mono text-text-tertiary bg-white/5 px-1.5 py-0.5 rounded-[2px]">CROSS-CHECKS</span>
@@ -2586,7 +2585,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       </div>
 
       {/* ── Model Evaluation Detail (collapsible — at-the-bottom diagnostics) ── */}
-      <div className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card overflow-hidden">
+      <div className="bg-surface-card border border-border-subtle rounded-control shadow-card overflow-hidden">
         <button
           onClick={() => setExpandedEval(!expandedEval)}
           className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-white/[0.02] transition-colors"

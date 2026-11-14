@@ -14,16 +14,6 @@ interface StatCardProps {
   band?: { low: number; high: number; unit?: string };
 }
 
-const sourceColors: Record<string, string> = {
-  GARMIN: "text-source-garmin",
-  WHOOP: "text-source-whoop",
-  "8SLP": "text-source-eightsleep",
-  CRONOMETER: "text-source-cronometer",
-  SPOTIFY: "text-source-spotify",
-  TANITA: "text-amber-500",
-  "UBER EATS EST.": "text-amber-300",
-};
-
 export default function StatCard({
   label,
   value,
@@ -41,18 +31,18 @@ export default function StatCard({
 
   return (
     <div className={clsx(
-      "bg-surface-card border border-border-subtle rounded-[4px] p-4 relative transition-colors hover:border-border-hover",
+      "bg-surface-card border border-border-subtle rounded-card shadow-card p-4 relative transition-colors hover:border-border-hover",
       className
     )}>
       {source && (
-        <span className={clsx("absolute top-3 right-3 text-[9px] font-mono font-medium tracking-wider", sourceColors[source] || "text-text-tertiary")}>
+        <span className="absolute top-3.5 right-4 text-[9px] font-mono font-medium tracking-[0.12em] text-text-tertiary">
           {source}
         </span>
       )}
-      <p className="text-[10px] text-text-tertiary font-medium uppercase tracking-[0.1em]">{label}</p>
+      <p className="text-[10px] text-text-secondary font-mono uppercase tracking-[0.14em]">{label}</p>
       <div className="flex items-end justify-between gap-2 mt-1.5">
         <div className="flex items-baseline gap-1.5 min-w-0">
-          <p className="text-[28px] leading-none font-display text-text-primary tabular-nums truncate">
+          <p className="text-[28px] leading-none font-display font-medium text-text-primary tabular-nums truncate">
             {value ?? "—"}
           </p>
           {unit && <span className="text-xs font-normal text-text-secondary">{unit}</span>}

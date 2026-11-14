@@ -46,7 +46,7 @@ function SyncLine({ sync }: { sync: ScreenSync | null }) {
 
 function Tile({ label, value, sub }: { label: string; value: string; sub: string }) {
   return (
-    <div className="rounded-[4px] border border-border-subtle bg-surface-card p-3">
+    <div className="rounded-card shadow-card border border-border-subtle bg-surface-card p-3">
       <p className="text-[10px] font-medium uppercase tracking-[0.1em] text-text-tertiary">{label}</p>
       <p className="mt-1 font-display text-[28px] leading-none tabular-nums text-text-primary">{value}</p>
       <p className="mt-1.5 text-[11px] text-text-tertiary">{sub}</p>
@@ -57,7 +57,7 @@ function Tile({ label, value, sub }: { label: string; value: string; sub: string
 function TopList({ title, entries, empty }: { title: string; entries: TopEntry[]; empty: string }) {
   const max = entries[0]?.minutes ?? 0;
   return (
-    <section className="rounded-[4px] border border-border-subtle bg-surface-card p-4">
+    <section className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
       <h2 className="text-[12px] font-semibold uppercase tracking-[0.07em] text-text-secondary">{title}</h2>
       {entries.length === 0 ? (
         <p className="mt-3 text-[13px] text-text-tertiary">{empty}</p>
@@ -116,7 +116,7 @@ export default async function ScreenTimePage({
               href={`/screen-time?days=${d}`}
               aria-current={d === windowDays ? "page" : undefined}
               className={clsx(
-                "rounded-[4px] border px-2.5 py-1 font-mono",
+                "rounded-control border px-2.5 py-1 font-mono",
                 d === windowDays
                   ? "border-accent/50 text-accent"
                   : "border-border-subtle text-text-secondary hover:border-border-hover",
@@ -129,7 +129,7 @@ export default async function ScreenTimePage({
       </header>
 
       {load.kind === "error" && (
-        <section role="alert" className="rounded-[4px] border border-red-500/30 bg-red-500/5 p-4">
+        <section role="alert" className="rounded-control border border-red-500/30 bg-red-500/5 p-4">
           <h2 className="font-semibold text-red-300">Couldn&apos;t load Screen Time.</h2>
           <p className="mt-1 text-[13px] text-text-secondary">{load.hint}</p>
           <p className="mt-1 text-[12px] text-text-tertiary">This is a failed query, not a day without phone use.</p>
@@ -137,7 +137,7 @@ export default async function ScreenTimePage({
       )}
 
       {load.kind === "empty" && (
-        <section className="rounded-[4px] border border-border-subtle bg-surface-card p-4">
+        <section className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
           <p className="font-semibold">No Screen Time days in this window.</p>
           <p className="mt-2 text-[13px] text-text-secondary">
             Nothing was reported for the last {load.windowDays} days. Days appear here after the iPhone app&apos;s daily

@@ -3,7 +3,7 @@ import { useRef, useState } from 'react';
 import { defaultMapping, MAX_BYTES, parseCsv, preview, summarize, type Mapping, type Transaction } from '@/lib/financials';
 const currencyFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
 const money = (cents: number) => currencyFormatter.format(cents / 100);
-const box = 'rounded-lg border border-border-subtle bg-surface-card p-4';
+const box = 'rounded-card shadow-card border border-border-subtle bg-surface-card p-4';
 const input = 'rounded border border-border-subtle bg-surface-card p-2 text-text-primary';
 /** `embedded`: shown inside the ledger page's "Preview a CSV" disclosure, so no page header or <main> of its own. */
 export default function FinancialsClient({ embedded = false }: { embedded?: boolean } = {}) {

@@ -112,7 +112,10 @@ export default function ChartCard({
 
   const titleBlock = (
     <div className="min-w-0">
-      <h3 className="text-[12px] font-semibold uppercase tracking-[0.07em] text-text-secondary">
+      <h3 className="flex items-center gap-2 text-[14px] font-semibold text-text-primary">
+        {tickColor && (
+          <span aria-hidden className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: tickColor }} />
+        )}
         {title}
       </h3>
       {subtitle && <p className="text-[11px] text-text-tertiary mt-0.5 normal-case tracking-normal">{subtitle}</p>}
@@ -136,19 +139,12 @@ export default function ChartCard({
     <div
       id={id}
       className={clsx(
-        "relative bg-surface-card border border-border-subtle rounded-[4px] transition-colors hover:border-border-hover",
+        "relative bg-surface-card border border-border-subtle rounded-card shadow-card transition-colors hover:border-border-hover",
         PADDING[variant],
         id && "scroll-mt-24",
         className,
       )}
     >
-      {tickColor && (
-        <span
-          aria-hidden
-          className="absolute left-0 top-0 bottom-0 w-[3px] rounded-l-[4px]"
-          style={{ backgroundColor: tickColor }}
-        />
-      )}
       <div className={clsx("flex items-start justify-between gap-2", collapsed ? "" : "mb-3")}>
         {collapsible ? (
           <button

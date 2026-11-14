@@ -25,7 +25,7 @@ const VIEWS: Array<{ key: View; label: string }> = [
 const PRICE_CAPS = [null, 3000, 3500, 4000] as const;
 const DECISIONS: Array<{ key: RileyDecision; label: string; on: string }> = [
   { key: "Interested", label: "Interested", on: "bg-accent-muted text-accent border-accent/40" },
-  { key: "Toured", label: "Toured", on: "bg-[#9A7BFA]/15 text-[#B9A4FC] border-[#9A7BFA]/40" },
+  { key: "Toured", label: "Toured", on: "bg-[#9085E9]/15 text-[#B3ACF2] border-[#9085E9]/40" },
   { key: "Passed", label: "Pass", on: "bg-down/10 text-down border-down/40" },
 ];
 
@@ -213,7 +213,7 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
       </header>
 
       {error && (
-        <div className="border border-down/40 bg-down/10 rounded-[4px] px-4 py-3 text-[12px] text-down">
+        <div className="border border-down/40 bg-down/10 rounded-control px-4 py-3 text-[12px] text-down">
           Couldn&apos;t load leads: {error}
         </div>
       )}
@@ -245,7 +245,7 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         <select
           value={hood}
           onChange={(e) => setHood(e.target.value)}
-          className="bg-surface-card border border-border-default rounded-[4px] px-2 py-1 text-[12px] text-text-secondary"
+          className="bg-surface-card border border-border-default rounded-control px-2 py-1 text-[12px] text-text-secondary"
           aria-label="Neighborhood"
         >
           {neighborhoods.map((n) => (
@@ -255,7 +255,7 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         <select
           value={priceCap ?? ""}
           onChange={(e) => setPriceCap(e.target.value ? Number(e.target.value) : null)}
-          className="bg-surface-card border border-border-default rounded-[4px] px-2 py-1 text-[12px] text-text-secondary"
+          className="bg-surface-card border border-border-default rounded-control px-2 py-1 text-[12px] text-text-secondary"
           aria-label="Maximum price"
         >
           {PRICE_CAPS.map((p) => (
@@ -276,12 +276,12 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         <NycMap leads={visible} selectedId={selectedId} onSelect={(id) => select(id, true)} />
         <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-text-tertiary">
           {[
-            ["Interested", "#16E07A"],
-            ["Toured", "#9A7BFA"],
-            ["Full fit, not judged", "#F5A623"],
-            ["Meets numbers", "#FFD23F"],
-            ["Partial", "#9AA0A6"],
-            ["Passed", "#5F6368"],
+            ["Interested", "#5BC46E"],
+            ["Toured", "#9085E9"],
+            ["Full fit, not judged", "#FF6A1A"],
+            ["Meets numbers", "#F4C84E"],
+            ["Partial", "#B0AEA6"],
+            ["Passed", "#706E67"],
           ].map(([label, color]) => (
             <span key={label} className="flex items-center gap-1.5">
               <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: color }} />
@@ -432,13 +432,13 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
                                   onChange={(e) => setNoteDraft(e.target.value)}
                                   rows={3}
                                   maxLength={2000}
-                                  className="w-full bg-surface-card border border-border-default rounded-[4px] px-2 py-1.5 text-text-primary"
+                                  className="w-full bg-surface-card border border-border-default rounded-control px-2 py-1.5 text-text-primary"
                                   placeholder="e.g. ask about the second room; skip if no laundry"
                                 />
                                 <button
                                   onClick={() => save(l, { rileyNote: noteDraft })}
                                   disabled={noteDraft.trim() === l.rileyNote}
-                                  className="px-3 py-1 rounded-[4px] border border-accent/50 text-accent text-[12px] disabled:opacity-40"
+                                  className="px-3 py-1 rounded-control border border-accent/50 text-accent text-[12px] disabled:opacity-40"
                                 >
                                   Save note
                                 </button>

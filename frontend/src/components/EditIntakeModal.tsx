@@ -116,7 +116,7 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
       onClick={onClose}
     >
       <div
-        className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card p-5 w-full max-w-md mt-12"
+        className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 w-full max-w-md mt-12"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-3">
@@ -143,7 +143,7 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
           value={doses}
           onChange={(e) => setDoses(e.target.value)}
           disabled={saving}
-          className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none disabled:opacity-50"
+          className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
         />
 
         <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
@@ -154,7 +154,7 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
           value={intakeDate}
           onChange={(e) => setIntakeDate(e.target.value)}
           disabled={saving}
-          className="w-full mb-3 px-3 py-2 text-[13px] font-mono bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none disabled:opacity-50"
+          className="w-full mb-3 px-3 py-2 text-[13px] font-mono bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
         />
 
         <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
@@ -166,7 +166,7 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
             value={intakeTime}
             onChange={(e) => setIntakeTime(e.target.value)}
             disabled={saving}
-            className="flex-1 px-3 py-2 text-[13px] font-mono bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none disabled:opacity-50"
+            className="flex-1 px-3 py-2 text-[13px] font-mono bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
           />
           {intakeTime && (
             <button
@@ -189,7 +189,7 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
           disabled={saving}
           rows={2}
           placeholder="e.g. took with food, half-dose, etc."
-          className="w-full mb-3 px-3 py-2 text-[13px] bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none resize-none disabled:opacity-50"
+          className="w-full mb-3 px-3 py-2 text-[13px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none resize-none disabled:opacity-50"
         />
 
         {error && (
@@ -215,7 +215,7 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
             <button
               onClick={save}
               disabled={saving}
-              className="px-4 py-2 text-[12px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 disabled:opacity-40 disabled:cursor-not-allowed border border-[#1DB954]/40 rounded-[4px] transition-colors"
+              className="px-4 py-2 text-[12px] font-medium text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed border border-accent rounded-full transition-colors"
             >
               {saving ? "Saving…" : "Save"}
             </button>

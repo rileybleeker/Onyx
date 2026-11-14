@@ -21,7 +21,7 @@ import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
-const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
+const legendStyle = { fontSize: 11, fontFamily: "var(--font-mono)" };
 
 // FDA guidance: up to 400 mg/day is generally not associated with negative
 // effects for healthy adults. Rendered as a ReferenceLine on the mg chart.
@@ -266,16 +266,16 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
         <div className="space-y-6">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             {[...Array(4)].map((_, i) => (
-              <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+              <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
                 <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
                 <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
               </div>
             ))}
           </div>
-          <div className="h-[320px] bg-surface-card border border-border-subtle rounded-[6px] animate-pulse" />
+          <div className="h-[320px] bg-surface-card border border-border-subtle rounded-control animate-pulse" />
         </div>
       ) : daily.length === 0 ? (
-        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-8 text-center">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-8 text-center">
           <p className="text-[13px] text-text-secondary">No caffeine days in the database yet.</p>
           <p className="text-[11px] text-text-tertiary mt-2 font-mono">
             Log a caffeine supplement on /supplements or import a Cronometer export with caffeinated food.
@@ -479,7 +479,7 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
                 source="SUPPLEMENTS + CRONOMETER + WHOOP"
               >
                 <div className="grid grid-cols-2 gap-3">
-                  <div className="bg-black/20 border border-border-subtle rounded-[4px] p-4">
+                  <div className="bg-black/20 border border-border-subtle rounded-control p-4">
                     <p className="text-[10px] text-text-tertiary font-medium uppercase tracking-[0.1em]">
                       &lt;6h before bed
                     </p>
@@ -489,7 +489,7 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
                     </p>
                     <p className="text-[11px] text-text-tertiary mt-1.5 font-mono">n={lateGroup.length}</p>
                   </div>
-                  <div className="bg-black/20 border border-border-subtle rounded-[4px] p-4">
+                  <div className="bg-black/20 border border-border-subtle rounded-control p-4">
                     <p className="text-[10px] text-text-tertiary font-medium uppercase tracking-[0.1em]">
                       ≥6h before bed
                     </p>

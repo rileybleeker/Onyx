@@ -63,7 +63,7 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
         <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
               <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
               <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
             </div>
@@ -131,7 +131,7 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} label={axisLabel("bpm", "y")} />
               <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
+              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-mono)" }} />
               <Area type="monotone" dataKey="max" stroke={C.down} fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max" isAnimationActive={false} />
               <Area type="monotone" dataKey="min" stroke={C.up} fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min" isAnimationActive={false} />
             </AreaChart>
@@ -146,7 +146,7 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
               <YAxis yAxisId="rhr" tick={axisTick} width={40} />
               <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
+              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-mono)" }} />
               <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke={C.source.garmin} strokeWidth={2} dot={false} name="RHR (bpm)" isAnimationActive={false} />
               <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="HRV RMSSD (ms)" isAnimationActive={false} />
             </LineChart>

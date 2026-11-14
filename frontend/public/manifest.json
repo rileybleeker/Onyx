@@ -6,8 +6,8 @@
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#08090B",
-  "theme_color": "#08090B",
+  "background_color": "#1A1A18",
+  "theme_color": "#1A1A18",
   "launch_handler": {
     "client_mode": ["focus-existing", "auto"]
   },
