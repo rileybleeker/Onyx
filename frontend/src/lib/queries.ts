@@ -1,6 +1,7 @@
 import { supabase } from "./supabase";
 import { whoopSleepDay, kjToKcal } from "./format";
 import { dishKcal, mergeDeliveryEstimates } from "./delivery-portion";
+import type { LeftoverRow } from "./delivery-leftovers";
 
 // Re-audit 2026-06-07 (units/deepseek/F-003): promoted the workout→sleep gap
 // window from a function-local literal to a named module-level const. The pairing
@@ -563,6 +564,27 @@ export async function getDeliveryItemsForDays(dates: string[]): Promise<Delivery
       est_kcal: dishKcal(unit, i.quantity, fraction),
     };
   });
+}
+
+/**
+ * Leftover rows (pds.delivery_item_leftovers) of the given Uber Eats cart lines: the share of each
+ * dish eaten on a later behavioral day. Feeds the "Leftovers" questions on /check-in and /nutrition.
+ */
+export async function getDeliveryLeftovers(itemIds: number[]): Promise<LeftoverRow[]> {
+  if (itemIds.length === 0) return [];
+  const { data, error } = await supabase
+    .from("delivery_item_leftovers")
+    .select("item_id, eaten_date, fraction, threw_out")
+    .in("item_id", itemIds)
+    .order("item_id", { ascending: true })
+    .order("eaten_date", { ascending: true });
+  if (error) throw error;
+  return (data ?? []).map((r) => ({
+    item_id: Number(r.item_id),
+    eaten_date: String(r.eaten_date),
+    fraction: Number(r.fraction),
+    threw_out: !!r.threw_out,
+  }));
 }
 
 /**

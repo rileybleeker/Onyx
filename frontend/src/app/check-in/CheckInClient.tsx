@@ -7,7 +7,7 @@ import { agentsApi } from "@/lib/agents-api";
 import { VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
 import { kitSummary, nightLabel, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
 import { buildCells, draftSettled, draftWith, parseDraft, savePlan, visibleNights, type Cell, type Cells, type Draft, type Patch } from "@/lib/checkin-cells";
-import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortions";
+import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
 
 // Daily habit check-in (2026-11-07). Yes / No per question, one Save.
 // - Saved answers load as-is; questions another source can answer start pre-filled and labeled with that
@@ -487,7 +487,7 @@ export default function CheckInClient() {
         </section>
       )}
 
-      {(delivery.groups.length > 0 || delivery.loadError) && (
+      {(delivery.groups.length > 0 || delivery.leftovers.length > 0 || delivery.loadError) && (
         <section className="mb-6">
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">Uber Eats: how much did you eat?</h3>
           {delivery.groups.length > 0 && (
@@ -506,6 +506,20 @@ export default function CheckInClient() {
               <DeliveryDishList items={g.items} onPick={delivery.setFraction} />
             </div>
           ))}
+          {delivery.leftovers.length > 0 && (
+            <div className="mb-3">
+              <div className="flex items-baseline justify-between mb-1">
+                <span className="text-[11px] font-mono text-text-secondary">
+                  Leftovers · {dayLabel(data.date, data.today)}
+                </span>
+                {delivery.leftoverKcal != null && (
+                  <span className="text-[11px] font-mono text-text-tertiary">~{Math.round(delivery.leftoverKcal)} kcal counted</span>
+                )}
+              </div>
+              <p className="text-[12px] text-text-tertiary mb-2">Share of what was left. Unanswered counts as thrown out.</p>
+              <LeftoverList questions={delivery.leftovers} onPick={delivery.setLeftover} />
+            </div>
+          )}
           {delivery.loadError && <p className="text-[12px] text-red-400 mt-1.5">{delivery.loadError}</p>}
           {delivery.error && <p className="text-[12px] text-red-400 mt-1.5">{delivery.error}</p>}
         </section>

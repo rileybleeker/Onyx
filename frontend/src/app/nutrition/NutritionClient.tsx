@@ -23,7 +23,7 @@ import { formatDate, kgToLb, lbToKg, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
-import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortions";
+import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
 import { shiftYmd } from "@/lib/delivery-portion";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
@@ -656,7 +656,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
       </div>
       {mealsLoading ? (
         <p className="text-xs text-text-tertiary mb-2">Loading…</p>
-      ) : todayServings.length === 0 && delivery.items.length === 0 && !servingsFailed && !delivery.loadError ? (
+      ) : todayServings.length === 0 && delivery.items.length === 0 && delivery.leftovers.length === 0 && !servingsFailed && !delivery.loadError ? (
         <p className="text-xs text-text-tertiary mb-2">
           Nothing logged for {mealsDayOffset === 0 ? "today" : "this day"} yet. Cronometer entries and Uber Eats orders appear here once they sync.
         </p>
@@ -681,17 +681,25 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
           ))}
         </div>
       )}
-      {delivery.items.length > 0 && (
+      {(delivery.items.length > 0 || delivery.leftovers.length > 0) && (
         <>
           <div className={`flex items-baseline justify-between ${todayServings.length ? "mt-3" : ""} mb-1.5`}>
             <span className="text-[10px] font-mono text-text-tertiary">
-              Tap how much you ate; leftovers count only the part eaten.
+              Tap how much you ate; what you save for later is asked about the next days.
             </span>
             <span className="text-[11px] font-mono text-text-secondary">
               {delivery.totalKcal != null ? `Uber Eats ~${Math.round(delivery.totalKcal)} kcal` : ""}
             </span>
           </div>
           <DeliveryDishList items={delivery.items} onPick={delivery.setFraction} />
+          {delivery.leftovers.length > 0 && (
+            <>
+              <div className={`text-[10px] font-mono text-text-tertiary ${delivery.items.length ? "mt-3" : ""} mb-1.5`}>
+                Leftovers: how much did you eat this day? Unanswered counts as thrown out.
+              </div>
+              <LeftoverList questions={delivery.leftovers} onPick={delivery.setLeftover} />
+            </>
+          )}
           {delivery.error && <p className="text-[11px] text-red-400 mt-1.5">{delivery.error}</p>}
         </>
       )}
