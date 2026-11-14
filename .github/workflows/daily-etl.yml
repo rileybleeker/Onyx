@@ -10,6 +10,10 @@ on:
         description: 'Lookback window in days (raise for catch-up after an outage)'
         type: number
         default: 7
+      whoop_cycles_only:
+        description: 'Deep WHOOP cycle re-read only (e.g. fill step_count for old cycles): skips Garmin, the other WHOOP endpoints and the time-zone pass. Use with a large days value.'
+        type: boolean
+        default: false
 
 concurrency:
   group: hourly-etl
@@ -21,6 +25,8 @@ env:
 
 jobs:
   garmin-etl:
+    # Skipped for a WHOOP-cycles-only run (a deep Garmin re-read is thousands of API calls).
+    if: ${{ !inputs.whoop_cycles_only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -52,7 +58,7 @@ jobs:
       - name: Download WHOOP tokens
         run: python ci_token_helper.py download whoop
       - name: Run WHOOP ETL
-        run: python whoop_etl.py --days ${{ inputs.days || 7 }}
+        run: python whoop_etl.py --days ${{ inputs.days || 7 }} ${{ inputs.whoop_cycles_only && '--cycles-only' || '' }}
         env:
           WHOOP_CLIENT_ID: ${{ secrets.WHOOP_CLIENT_ID }}
           WHOOP_CLIENT_SECRET: ${{ secrets.WHOOP_CLIENT_SECRET }}

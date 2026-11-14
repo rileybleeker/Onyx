@@ -572,6 +572,10 @@ def main():
                         help="Number of days to backfill (e.g., 730 for ~2 years)")
     parser.add_argument("--days", type=int, default=30,
                         help="Number of recent days to sync (default: 30)")
+    parser.add_argument("--cycles-only", action="store_true",
+                        help="Sync only cycles (strain, energy, step count) and skip the "
+                             "time-zone pass. For deep history re-reads, e.g. filling "
+                             "step_count for old cycles: --days 800 --cycles-only")
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -633,6 +637,12 @@ def main():
         ("workouts", lambda: sync_workouts(whoop, sb, start_iso, end_iso)),
         ("body_measurement", lambda: sync_body_measurement(whoop, sb)),
     ]
+    # --cycles-only: a deep re-read of one endpoint. Its heartbeat has its own data_type so
+    # it can never stand in for (or mask) the hourly whoop|full_sync on /status.
+    heartbeat_type = "full_sync"
+    if args.cycles_only:
+        sync_tasks = sync_tasks[:1]
+        heartbeat_type = "cycles_backfill"
 
     for name, sync_fn in sync_tasks:
         try:
@@ -657,7 +667,7 @@ def main():
 
     duration = time.time() - t0
 
-    log_sync(sb, "whoop", "full_sync", "success" if errors == 0 else "partial",
+    log_sync(sb, "whoop", heartbeat_type, "success" if errors == 0 else "partial",
              records=total_records, date_start=start_dt.date(), date_end=now.date(),
              duration=duration,
              error=f"{errors} endpoint(s) failed" if errors else None)
@@ -673,6 +683,14 @@ def main():
     # most reliable trip-detector we have. IANA is history-inferred since
     # WHOOP gives offset not IANA; manual entries always win and are never
     # overridden. Silently skips if anything goes wrong (ETL still succeeds).
+    #
+    # Not run for --cycles-only: over a window of months the pass proposes rows for old
+    # trips that the log already covers through manual / GPS / flight entries at other
+    # instants (a dry run over the full history on 2026-11-13 proposed 23 rows, 21 of them
+    # new). A deep cycle re-read must not rewrite time-zone history.
+    if args.cycles_only:
+        log.info("Skipping whoop_tz_backfill (--cycles-only)")
+        return
     try:
         import subprocess
         since_iso = start_dt.date().isoformat()
