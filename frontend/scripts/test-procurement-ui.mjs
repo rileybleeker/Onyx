@@ -13,14 +13,22 @@ await symlink(path.join(frontend, 'node_modules'), path.join(fixture, 'node_modu
 await copyFile(path.join(frontend, 'src/lib/procurement.ts'), path.join(fixture, 'lib/procurement.ts'));
 const client = await readFile(path.join(frontend, 'src/app/procurement/ProcurementClient.tsx'), 'utf8');
 // The type-only import of the detector is erased at compile time; point it at a relative path anyway.
-await writeFile(path.join(fixture, 'app/ProcurementClient.tsx'), client.replace("'@/lib/procurement-recurring'", "'../lib/procurement-recurring'").replace("'@/lib/procurement'", "'../lib/procurement'"));
+const relative = source => source.replace(/'@\/lib\/(procurement[a-z-]*)'/g, "'../lib/$1'");
+await writeFile(path.join(fixture, 'app/ProcurementClient.tsx'), relative(client));
+// The detected-subscriptions card (renewal estimates) is its own component next to the client.
+await writeFile(path.join(fixture, 'app/DetectedSubscriptions.tsx'), relative(await readFile(path.join(frontend, 'src/app/procurement/DetectedSubscriptions.tsx'), 'utf8')));
 await copyFile(path.join(frontend, 'src/lib/procurement-recurring.ts'), path.join(fixture, 'lib/procurement-recurring.ts'));
+await copyFile(path.join(frontend, 'src/lib/procurement-renewals.ts'), path.join(fixture, 'lib/procurement-renewals.ts'));
 await copyFile(path.join(frontend, 'src/lib/finance-ledger.ts'), path.join(fixture, 'lib/finance-ledger.ts'));
 // The real page.tsx reads the ledger on the server; the fixture has no database, so it renders the client with synthetic detected rows.
 await writeFile(path.join(fixture, 'app/page.tsx'), `import ProcurementClient from './ProcurementClient';
-const detected = { state: 'ok', today: '2030-03-15', total: 1500, subs: [
-  { merchant: 'Demo streaming plan', cadence: 'monthly', typicalCents: 1500, lastCharge: '2030-03-10', nextExpected: '2030-04-09', chargeCount: 6, monthlyCents: 1500, status: 'active' },
-  { merchant: 'Demo old gym', cadence: 'monthly', typicalCents: 3000, lastCharge: '2029-11-01', nextExpected: '2029-12-01', chargeCount: 5, monthlyCents: 3000, status: 'lapsed' },
+const estimate = { nextMethod: 'same day of the month as the recent charges', confidence: 'high', checkedGaps: 4, maxMissDays: 1 };
+const detected = { state: 'ok', today: '2030-03-15', total: 2400, subs: [
+  { id: '00000000000000a1', merchant: 'Demo streaming plan', cadence: 'monthly', typicalCents: 1500, lastCharge: '2030-03-10', nextExpected: '2030-04-10', chargeCount: 6, monthlyCents: 1500, status: 'active', ...estimate },
+  { id: '00000000000000a2', merchant: 'Demo storage plan', cadence: 'monthly', typicalCents: 900, lastCharge: '2030-02-17', nextExpected: '2030-03-17', chargeCount: 5, monthlyCents: 900, status: 'active', ...estimate, confidence: 'low', maxMissDays: 6 },
+  { id: '00000000000000a3', merchant: 'Demo old gym', cadence: 'monthly', typicalCents: 3000, lastCharge: '2029-11-01', nextExpected: '2029-12-01', chargeCount: 5, monthlyCents: 3000, status: 'lapsed', ...estimate },
+], irregular: [
+  { id: '00000000000000b1', merchant: 'Demo top-up', typicalCents: 2000, lastCharge: '2030-03-01', chargeCount: 5, medianGapDays: 23 },
 ] } as const;
 export default function Page() { return <ProcurementClient detected={detected as never} />; }
 `);
@@ -58,8 +66,19 @@ try {
   assert.equal(await page.getByRole('button',{name:'Place order (unavailable)',exact:true}).isDisabled(),true);
   await page.getByRole('heading',{name:'Detected subscriptions',exact:true}).waitFor();
   await page.getByText('Demo streaming plan',{exact:true}).waitFor();
-  await page.getByText(/About \$15\.00 \/ month across 1 active subscription\./).waitFor();
+  await page.getByText(/About \$24\.00 \/ month across 2 active subscriptions\./).waitFor();
   await page.getByText(/1 lapsed/).waitFor();
+  // Renewal estimates: what renews in the next 14 days, the method and confidence, and no date for irregular repeats.
+  const renewals = page.getByTestId('procurement-renewals');
+  await renewals.getByText(/Demo storage plan/).waitFor();
+  assert.match(await renewals.innerText(), /renews in 2 days, Mar 17, 2030 · \$9\.00 · rough date \(low confidence\)/);
+  assert.equal(await renewals.getByText(/Demo streaming plan/).count(), 0, 'a renewal 26 days out is not under Renewing soon');
+  await page.getByText(/next expected Apr 10, 2030 \(renews in 26 days\)/).waitFor();
+  await page.getByText('Estimate: same day of the month as the recent charges. High confidence: the last 4 gaps fit within 1 day.',{exact:true}).waitFor();
+  await page.getByText(/1 repeating charge without a regular schedule \(no date estimated\)/).click();
+  await page.getByText('No next date: the spacing is too uneven to estimate one.',{exact:true}).waitFor();
+  await page.getByRole('heading',{name:'What this page reads',exact:true}).waitFor();
+  assert.equal(await page.getByText(/Disconnected preview/).count(),0);
   assert.equal(await page.getByText(/Financials is not read/).count(),0);
   await page.getByRole('button',{name:'Show synthetic examples'}).click();
   await page.getByText('Demo workspace subscription',{exact:true}).waitFor();
