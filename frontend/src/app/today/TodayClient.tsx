@@ -2,11 +2,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, BookOpen, ClipboardCheck, Mail, Package, RefreshCw } from "lucide-react";
+import { ArrowUpRight, BookOpen, CalendarClock, ClipboardCheck, Mail, Package, RefreshCw } from "lucide-react";
 import { agentsApi, type InboxResponse, type InboxItem } from "@/lib/agents-api";
 import type { ReadingOverview } from "@/lib/reading";
 import type { UrgentEmailResponse } from "@/lib/urgent-email-query";
 import { ageLabel, isEmailCard, isGmailHref, mergeUrgent } from "@/lib/urgent-email";
+import type { RenewalSummary } from "@/lib/procurement-renewals";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -39,6 +40,9 @@ export default function TodayClient() {
   // Packages are shown only when something needs attention or arrives today, and a failed check
   // just hides the panel: /orders is where package status lives.
   const [orders, setOrders] = useState<OrdersSummary | null>(null);
+  // Subscription renewals (GET /api/procurement/renewals/summary) follow the same rule: shown only
+  // when one is due within 3 days; a failed check hides the panel, /procurement has the details.
+  const [renewals, setRenewals] = useState<RenewalSummary | null>(null);
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
   const sequence = useRef(0);
   const inFlight = useRef(false);
@@ -83,7 +87,15 @@ export default function TodayClient() {
     })).then((value) => {
       if (sequence.current === current) setOrders(value);
     }).catch(() => { /* keep the last summary; /orders has the details */ });
-    void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest]).then(() => {
+    const renewalsRequest = bounded(fetch("/api/procurement/renewals/summary", { cache: "no-store" }).then(async (res) => {
+      if (!res.ok) throw new Error("Renewals unavailable");
+      const data = await res.json() as RenewalSummary;
+      if (data.status !== "empty" && !(data.status === "ready" && Array.isArray(data.soon) && typeof data.count === "number")) throw new Error("Invalid renewals");
+      return data;
+    })).then((value) => {
+      if (sequence.current === current) setRenewals(value);
+    }).catch(() => { /* keep the last summary; /procurement has the details */ });
+    void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest, renewalsRequest]).then(() => {
       if (sequence.current === current) { inFlight.current = false; setRefreshing(false); }
     });
   }, []);
@@ -113,6 +125,7 @@ export default function TodayClient() {
   const syncStale = !!lastSync && (now.getTime() - new Date(lastSync.at).getTime() > LABEL_SYNC_STALE_MS || lastSync.status !== "success");
   const book = reading.state === "ready" ? reading.value : null;
   const packages = orders?.status === "ready" && (orders.attention > 0 || orders.arrivingToday > 0) ? orders : null;
+  const renewing = renewals?.status === "ready" && renewals.count > 0 ? renewals : null;
   return (
     <div className="mx-auto max-w-2xl space-y-5">
       <header className="flex items-start justify-between gap-4">
@@ -195,6 +208,17 @@ export default function TodayClient() {
           {packages.top.map((t, i) => <li key={i} className="text-xs text-text-secondary"><span className="text-text-primary">{t.merchant}: {t.label}.</span> {t.reason}</li>)}
         </ul>}
         <Link href="/orders" className={`${linkStyle} mt-4 inline-block`}>Open orders</Link>
+      </section>}
+      {renewing && <section className={panelStyle} aria-labelledby="renewals-heading">
+        <div className="flex items-center gap-2"><CalendarClock aria-hidden="true" className="h-5 w-5 text-accent" />
+          <h2 id="renewals-heading" className="text-lg font-medium text-text-primary">Renewals</h2></div>
+        <p className="mt-3 text-sm text-text-primary">{renewing.count === 1 ? "1 subscription is" : `${renewing.count} subscriptions are`} expected to renew in the next {renewing.withinDays} days.</p>
+        <ul className="mt-2 space-y-1" aria-label="Subscriptions renewing soon">
+          {renewing.soon.map((r, i) => <li key={i} className="break-words text-xs text-text-secondary"><span className="text-text-primary">{r.merchant}</span> {r.label}</li>)}
+        </ul>
+        {renewing.count > renewing.soon.length && <p className="mt-1 text-xs text-text-secondary">And {renewing.count - renewing.soon.length} more.</p>}
+        <p className="mt-2 text-xs text-text-secondary">Estimated from past charges in your ledger. Onyx never pays or cancels anything.</p>
+        <Link href="/procurement" className={`${linkStyle} mt-4 inline-block`}>Open procurement</Link>
       </section>}
       <section className={panelStyle} aria-labelledby="reading-heading" aria-busy={reading.state === "loading"}>
         <div className="flex items-center gap-2"><BookOpen aria-hidden="true" className="h-5 w-5 text-accent" />

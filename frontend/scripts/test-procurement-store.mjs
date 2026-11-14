@@ -151,7 +151,7 @@ const client = read('src/app/procurement/ProcurementClient.tsx');
 assert.match(client, /Not saved yet - setup pending/);
 assert.match(client, /setStore\(body && body\.setupPending === true \? 'pending' : 'unavailable'\)/);
 assert.match(client, /catch \{ if \(!cancelled\) setStore\('unavailable'\); \}/, 'a failed or non-JSON load must not break the page');
-for (const heading of ['Procurement', 'Disconnected preview', 'Track subscriptions', 'Plan an order', 'Why execution is disabled']) assert.ok(client.includes(`>${heading}</h`), heading);   // headings the smoke test and UI test rely on
+for (const heading of ['Procurement', 'What this page reads', 'Track subscriptions', 'Plan an order', 'Why execution is disabled']) assert.ok(client.includes(`>${heading}</h`), heading);   // headings the smoke test and UI test rely on
 assert.ok(client.includes('<button className={button} disabled>Place order (unavailable)</button>'));
 assert.ok(client.includes('No subscriptions tracked yet.'));
 
@@ -163,9 +163,19 @@ assert.equal(client.match(/Place order/g).length, 1, 'only the disabled placehol
 assert.equal((client.match(/<button[^>]*>Place order[^<]*<\/button>/g) ?? []).every(b => /\bdisabled>/.test(b)), true);
 const fetches = [...client.matchAll(/fetch\(([^,)]+)/g)].map(m => m[1].trim());
 assert.ok(fetches.length > 0 && fetches.every(f => f === 'SUBSCRIPTIONS_API' || f.startsWith('`${SUBSCRIPTIONS_API}/')), 'the page only talks to its own subscriptions API: ' + fetches.join(' | '));
+// The other files of the page (the detected-subscriptions card) make no request at all and have no order button.
+const pageFiles = fs.readdirSync(new URL('src/app/procurement/', root)).filter(f => /\.tsx?$/.test(f)).sort();
+assert.deepEqual(pageFiles, ['DetectedSubscriptions.tsx', 'ProcurementClient.tsx', 'page.tsx']);
+for (const file of pageFiles.filter(f => f !== 'ProcurementClient.tsx')) {
+  const src = read('src/app/procurement/' + file);
+  assert.doesNotMatch(src, /\bfetch\(|https?:\/\//, file + ' must not call anything');
+  assert.doesNotMatch(src, /Place order|checkout|add to cart/i, file);
+}
 const routeFiles = [];
 (function walk(dir) { for (const e of fs.readdirSync(new URL(dir, root), { withFileTypes: true })) { const rel = dir + e.name + (e.isDirectory() ? '/' : ''); if (e.isDirectory()) walk(rel); else routeFiles.push(rel); } })('src/app/api/procurement/');
-assert.deepEqual(routeFiles.sort(), ['src/app/api/procurement/subscriptions/[id]/route.ts', 'src/app/api/procurement/subscriptions/route.ts'], 'only the tracker routes exist under /api/procurement');
+// The tracker routes plus the read-only renewals summary Today reads (GET only; see tests/procurement-renewals.test.cjs).
+assert.deepEqual(routeFiles.sort(), ['src/app/api/procurement/renewals/summary/route.ts', 'src/app/api/procurement/subscriptions/[id]/route.ts', 'src/app/api/procurement/subscriptions/route.ts'], 'only the tracker routes and the renewals summary exist under /api/procurement');
+assert.deepEqual([...read('src/app/api/procurement/renewals/summary/route.ts').matchAll(/export async function (\w+)/g)].map(m => m[1]), ['GET'], 'the renewals summary is read-only');
 for (const file of routeFiles) {
   const src = read(file);
   const methods = [...src.matchAll(/export async function (\w+)/g)].map(m => m[1]);

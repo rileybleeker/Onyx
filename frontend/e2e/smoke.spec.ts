@@ -584,14 +584,16 @@ test.describe("Today home", () => {
   });
 });
 
-// /procurement (2026-11-11): planning workspace only. It holds no data of its own
-// and talks to no merchant, so the tripwire is: the page renders behind the login,
-// says it is disconnected, and the order button is still disabled. Read-only:
-// never types into a form, never adds a draft.
-test("/procurement renders as a disconnected planning page with ordering disabled", async ({ page }) => {
+// /procurement (2026-11-11; renewal estimates 2026-11-13): read-only advice. It talks to no
+// merchant, so the tripwire is: the page renders behind the login, the ledger read behind the
+// detected-subscriptions card did not fail, and the order button is still disabled. Read-only:
+// never types into a form, never adds a draft. Never asserts on a merchant, a date or an amount.
+test("/procurement renders read-only advice with ordering disabled", async ({ page }) => {
   await gotoAuthed(page, "/procurement");
   await expect(pageHeading(page, page.getByRole("heading", { name: "Procurement", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
-  await expect(page.getByRole("heading", { name: "Disconnected preview", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Detected subscriptions", exact: true })).toBeVisible();
+  await expect(page.getByTestId("procurement-detected")).not.toHaveAttribute("data-state", "error");
+  await expect(page.getByRole("heading", { name: "What this page reads", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Track subscriptions", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Place order (unavailable)", exact: true })).toBeDisabled();
   await expectNoClientCrash(page);

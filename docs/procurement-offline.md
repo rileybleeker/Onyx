@@ -1,10 +1,25 @@
-# Procurement: offline foundation
+# Procurement: read-only advice
 
-Route: `/procurement`. This is a planning preview, not a functioning purchasing integration.
+Route: `/procurement`. Read-only advice from Riley's own data plus a hand-typed tracker and an order planner. It is not a purchasing integration: nothing here buys, pays, cancels, opens a cart or checks out (ordering / PunchOut was cancelled on 2026-11-11 and stays cancelled).
 
-## What works
+## Detected subscriptions and renewal alerts (2026-11-13)
+- **Source.** `lib/procurement-recurring-server.ts` (`server-only`, service role, explicit column list) reads the last 400 days of `pds.finance_transactions` on every page load; `lib/procurement-recurring.ts` (pure) finds recurring charges by fixed rules. No model reads finance data. The page is `force-dynamic` and `noindex`; nothing is cached.
+- **Cadence.** Charges are grouped by merchant (store numbers stripped); the median gap must fall in a band (weekly 6-8 days, monthly 26-35, quarterly 84-98, annual 350-380), 70% of gaps must be in it, and the last three amounts must be within 25% of each other. Refunds, ignored rows, transfers and non-USD rows never count.
+- **Next charge date.** Two models are tried on the last four gaps and the better fit is used: *calendar* (same day of the month, 1 / 3 / 12 months on) or *interval* (a fixed number of days, e.g. every 28 days). The date is the median of the last three charges carried forward, so one charge that posted late over a weekend does not move it; billing on the 29th-31st is anchored to the latest day of the month seen.
+- **Confidence** says how well that model reproduced the recent charges: *high* = at least 3 gaps checked, none off by more than 2 days; *medium* = none off by more than 4 days (an annual charge seen twice can be medium at best); *low* = anything else. The page prints the method and the confidence under every subscription.
+- **Irregular repeats get no date.** A merchant charged at least 4 times for the same amount (80% of charges within 5%) at uneven intervals is listed under "repeating charges without a regular schedule" with no next date.
+- **On the page.** "Renewing soon" lists every active subscription expected in the next 14 days (and one expected up to 7 days ago that has not posted yet); each row says "renews in N days". A low-confidence date is marked as rough.
+- **On Today.** A small "Renewals" panel renders only when a high- or medium-confidence renewal is due within 3 days. It reads `GET /api/procurement/renewals/summary` (owner session, `no-store`, GET only, nothing written or marked): merchant and "renews tomorrow", no amounts. A failed check keeps the last answer; an empty ledger hides the panel.
+- **Not built: a push card in /agents.** Supplement reminders work because the sms-reminders Worker polls an Onyx claim route with the shared CI token. Doing the same here means a no-session route that reads the finance ledger, which the finance access model and `scripts/test-procurement-store.mjs` (no `/api/procurement` path in the middleware carve-out) forbid today. What it would take is listed under "Renewal card in /agents" below; it needs Riley's decision first.
+
+## Renewal card in /agents (not implemented, needs a decision)
+1. Onyx: one exact-path CI-token route (claim), and a ledger table keyed (subscription id, last charge date) written with `INSERT ... ON CONFLICT DO NOTHING RETURNING` so a renewal is prompted once per billing cycle even if two polls overlap or the estimate moves by a day. The route would be the first no-session path that reads finance data, so the guard test above has to change on purpose.
+2. Decide what leaves Onyx. Safest: the card says only "A subscription renews in 2 days" and links to `/procurement` (no merchant, no amount), so nothing from the ledger is stored in the Worker's D1 or shown to an agent. With the merchant name the card is more useful but the name is then stored outside Onyx. Amounts never go in a card or a push.
+3. sms-reminders Worker (separate repository): poll the claim route from the 15-minute cron like `runSupplementReminders`, post one card per claimed renewal in its own conversation, give the push a title without amounts, and exclude those rows from the Notion inbox sync like the `supplement:` rows.
+
+## What else works
 - Navigation through the shared desktop/mobile/palette catalog (key hint `O`).
-- Honest disconnected state, opt-in synthetic examples, generic buying checklist.
+- "What this page reads" says where the numbers come from and that no merchant is connected; opt-in synthetic examples, generic buying checklist.
 - **Subscription tracker (typed by hand).** Name, USD price, monthly/quarterly/annual billing, next renewal date. Shows approximate monthly and yearly cost, renewals sorted by date (a past date is rolled forward by whole billing cycles, month-end safe, leap-day safe), and plain-words "worth a look" prompts: renewing within 14 days, the same name tracked twice, one item over half the spend. "Load synthetic demo subscriptions" fills it with four obviously fake rows.
 - **Renewal reminders.** "Download renewal reminders (.ics)" builds an all-day calendar file (reminder 1, 3, 7 or 14 days before each renewal, never in the past) in the browser. Riley imports it into his own calendar; Onyx sends nothing and calls no calendar API. The file is deterministic, escapes names and folds long lines per RFC 5545.
 - **Order preparation.** In-memory USD order drafts with exact-cent validation, one-time/monthly commitment, removal and clear. Totals (one-time and recurring), a warning when a recurring draft matches a tracked subscription, and a "Prepared list" grouped by merchant that Riley can copy. The list says in its first lines that nothing was ordered and that he buys it himself.
@@ -23,13 +38,14 @@ Authorization must bind the owner, quote revision and exact terms, have a short 
 
 No live adapter or authorization endpoint exists in this patch; a UI flag cannot enable spending. Recommendation adapters must return evidence, price timestamps and availability, and distinguish stale, unavailable and empty data. Keep recommendations independent of checkout and label sponsored content if introduced.
 
-Financials has a separate unmerged branch; this module neither reads its data nor claims a connection. Integrate later through an explicit reviewed contract, not a duplicate CSV parser or account scraper.
+The finance ledger is read only by the server loader named above, never by the browser, a chat tool or a model.
 
 ## Verification
 Run from repository root:
+- `node --test frontend/tests/procurement-recurring.test.cjs frontend/tests/procurement-renewals.test.cjs` (detection, next-date estimate, confidence, irregular repeats, alert rules, the Today summary route; synthetic data only)
 - `node frontend/scripts/test-procurement.mjs` (pure logic: money, dates, renewal rolling, prompts, prepared list, .ics)
 - `node frontend/scripts/test-procurement-store.mjs` (save validation, missing-table fallback, fake-database store, no purchase action, SQL guards)
 - `node frontend/node_modules/typescript/bin/tsc --project frontend/tsconfig.json --noEmit --incremental false`
 - `node frontend/scripts/test-procurement-ui.mjs`
 
-The browser test (tracker, .ics download, prepared list, copy, overflow) copies only this module and styles into an isolated temporary Next fixture, supplies no secrets, binds localhost and blocks nonlocal browser requests. It does not weaken application authentication. The real Onyx shell/auth and production smoke suite are deliberately not exercised during the outage. `frontend/e2e/smoke.spec.ts` has a read-only `/procurement` check for the post-deploy production smoke run. These scripts are not run by the required CI checks (`offline-checks`, `frontend-types` run tsc and a compile build only), so run them locally before changing this module.
+The browser test (tracker, .ics download, prepared list, copy, overflow) copies only this module and styles into an isolated temporary Next fixture, supplies no secrets, binds localhost and blocks nonlocal browser requests. It does not weaken application authentication. The real Onyx shell/auth and production smoke suite are deliberately not exercised during the outage. `frontend/e2e/smoke.spec.ts` has a read-only `/procurement` check for the post-deploy production smoke run. CI runs every `tests/*.test.cjs` and every `scripts/test-*.mjs` except the `*-ui.mjs` browser tests, plus `tests/today-regression.cjs` (which covers the Today Renewals panel); run the UI test locally before changing this module.

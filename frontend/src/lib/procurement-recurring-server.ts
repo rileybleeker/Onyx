@@ -5,6 +5,7 @@ import {
   RECURRING_WINDOW_DAYS,
   activeMonthlyTotal,
   addDays,
+  detectIrregular,
   detectRecurring,
   parseRecurringInput,
   type DetectedLoad,
@@ -42,7 +43,7 @@ export async function loadDetectedSubscriptions(now: Date = new Date()): Promise
       return p ? [p] : [];
     }) as RecurringInput[];
     const subs = detectRecurring(inputs, today);
-    return { state: "ok", subs, total: activeMonthlyTotal(subs), today };
+    return { state: "ok", subs, irregular: detectIrregular(inputs, today), total: activeMonthlyTotal(subs), today };
   } catch (e) {
     const code = e instanceof LedgerQueryError && e.code ? e.code : "unexpected";
     console.error("[/procurement] recurring-charge query failed", code);
