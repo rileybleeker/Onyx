@@ -373,6 +373,16 @@ const PAGES: SmokePage[] = [
     legitimateEmpty: "No Screen Time days in this window.",
   },
   {
+    // Medical records (pds.medical_documents + pds.lab_results, service-role only, server-rendered).
+    // No lab results yet is a legitimate state: SKIP, like /caffeine. A failed query is a hard
+    // fail. It never asserts on a test name, a value or a document title.
+    route: "/health/records",
+    heading: "Medical records",
+    signal: "page-loads",
+    hardEmpty: ["Couldn't load lab results.", "Couldn't load documents."],
+    legitimateEmpty: "No lab results yet. Add the values from a lab report below.",
+  },
+  {
     route: "/journal",
     heading: "Journal",
     signal: "journal-list",
