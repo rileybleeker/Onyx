@@ -51,6 +51,7 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
           scenario={load.scenario}
           saved={load.saved}
           accuracy={load.accuracy}
+          goals={load.goals}
         />
       )}
     </main>

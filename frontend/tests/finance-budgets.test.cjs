@@ -86,3 +86,26 @@ test("money alerts: low cash, promo, tax due, budget", () => {
   assert.equal(alerts[0].severity, "high");
   assert.equal(A.moneyAlerts(null, null, 0, TODAY).length, 0);
 });
+
+test("savings goals: progress, monthly need and the forecast check", () => {
+  const G = loadTs("lib/finance-goals.ts");
+  const days = [{ date: "2031-03-01", likely: 900_000, low: 0, high: 0 }];
+  const out = G.computeGoals(
+    [
+      { id: "g1", name: "Demo move fund", target_cents: 1_000_000, target_date: "2031-03-01", account_key: null },
+      { id: "g2", name: "Demo cushion", target_cents: 300_000, target_date: "2030-12-15", account_key: "sav" },
+    ],
+    new Map([["sav", 150_000]]),
+    new Map([["sav", "Demo Savings"]]),
+    400_000,
+    days,
+    "2030-06-15",
+  );
+  assert.equal(out[0].pct, 40);
+  assert.equal(out[0].monthsLeft, 8);
+  assert.equal(out[0].perMonthNeededCents, 75_000);
+  assert.equal(out[0].onTrack, false); // forecast has 900k on the date, target 1M
+  assert.equal(out[1].accountLabel, "Demo Savings");
+  assert.equal(out[1].projectedCents, null);
+  assert.equal(out[1].perMonthNeededCents, 25_000);
+});

@@ -10,7 +10,8 @@ import type { AccuracyRow, ForecastAccountView, PlanItemView } from "@/lib/cash-
 import type { ScenarioParams } from "@/lib/cash-forecast-scenario";
 import type { TaxProfile, TaxYearResult } from "@/lib/tax-plan";
 import { CompareTable, TaxSection, WhatIfPanel } from "./TaxAndWhatIf";
-import { NetWorthChart, ProjectionBreakdown } from "./ProjectionParts";
+import { GoalsSection, NetWorthChart, ProjectionBreakdown } from "./ProjectionParts";
+import type { GoalView } from "@/lib/finance-goals";
 
 const usd = (cents: number | null | undefined): string => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -46,6 +47,7 @@ export default function ForecastView({
   scenario,
   saved,
   accuracy,
+  goals,
 }: {
   result: ForecastResult;
   items: PlanItemView[];
@@ -57,6 +59,7 @@ export default function ForecastView({
   scenario: { params: ScenarioParams; result: ForecastResult; tax: TaxYearResult[] } | null;
   saved: { slug: string; name: string; params: ScenarioParams }[];
   accuracy: AccuracyRow[];
+  goals: GoalView[];
 }) {
   const router = useRouter();
   const [range, setRange] = useState<"13w" | "12m">("13w");
@@ -189,6 +192,7 @@ export default function ForecastView({
         </p>
       </section>
 
+      <GoalsSection goals={goals} accounts={accounts} busy={busy} run={run} />
       <ProjectionBreakdown result={result} scenario={scenario?.result ?? null} />
       <NetWorthChart result={result} scenario={scenario?.result ?? null} />
 
