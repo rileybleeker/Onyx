@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { SPOTIFY_REDIRECT_URI, formatReconnectDate, requestAuthorizeUrl, submitCallback } from "@/lib/spotify-reconnect";
+import { SPOTIFY_REDIRECT_URI, formatReconnectDate, reconnectWarningText, requestAuthorizeUrl, submitCallback } from "@/lib/spotify-reconnect";
 
 // Reconnect control on the /status Spotify card. Shown when the sync error says the refresh token
 // was rejected (Spotify expires it 180 days after authorization) and from day 165 as a warning.
@@ -59,7 +59,7 @@ export default function SpotifyReconnect({ reconnectBy }: { reconnectBy?: string
     <div className="mt-3 px-3 py-3 bg-amber-500/10 border border-amber-500/20 rounded-[4px]" data-testid="spotify-reconnect">
       {reconnectBy && !done && (
         <p className="text-[12px] text-amber-300 mb-2" data-testid="spotify-reconnect-warning">
-          Spotify&apos;s authorization runs out soon. Reconnect by {formatReconnectDate(reconnectBy)} to keep the sync running.
+          {reconnectWarningText(reconnectBy, Date.now())}
         </p>
       )}
 
@@ -90,7 +90,8 @@ export default function SpotifyReconnect({ reconnectBy }: { reconnectBy?: string
             and approve if it asks. The tab then shows a page that fails to load. That is expected.
           </p>
           <label htmlFor="spotify-callback" className="block text-[12px] text-text-secondary">
-            2. Paste the address of the page that failed to load ({SPOTIFY_REDIRECT_URI}?code=…)
+            2. Paste the address of the page that failed to load{" "}
+            <span className="break-all">({SPOTIFY_REDIRECT_URI}?code=…)</span>
           </label>
           <input
             id="spotify-callback"

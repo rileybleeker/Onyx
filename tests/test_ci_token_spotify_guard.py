@@ -290,6 +290,50 @@ def test_status_wording() -> None:
           and spotify_etl.REFRESH_TOKEN_LIFETIME_DAYS == 180)
 
 
+def test_signin_blob_shape() -> None:
+    """Every sign-in route stores the same token blob: `--auth` and the workflow's
+    auth_code input (token_blob_from_response here) and Reconnect on /status
+    (buildTokenBlob in the frontend lib). Same keys, same order, authorized_at set."""
+    print("sign-in blob shape shared with /status Reconnect")
+    import re
+    from datetime import datetime, timezone
+
+    ts = (ROOT / "frontend" / "src" / "lib" / "spotify-reconnect.ts").read_text(encoding="utf-8")
+    m = re.search(r"export function buildTokenBlob\(.*?return \{(.*?)\};", ts, re.S)
+    check("buildTokenBlob's returned object is found in the frontend lib", bool(m))
+    site_keys = re.findall(r"^\s*(\w+):", m.group(1), re.M) if m else []
+
+    # Spotify's own key order, plus a key the blob must not carry over.
+    answer = {"access_token": "access-synthetic", "token_type": "Bearer", "scope": spotify_etl.SPOTIFY_SCOPES,
+              "expires_in": 3600, "refresh_token": "refresh-synthetic", "extra": "x"}
+    built = spotify_etl.token_blob_from_response(answer, T0 + 0.7)
+    check("the Python blob has the site's keys in the site's order", built is not None and list(built) == site_keys,
+          f"{list(built or {})} vs {site_keys}")
+    check("authorized_at and obtained_at are the sign-in time (whole seconds)",
+          built is not None and built["authorized_at"] == built["obtained_at"] == T0)
+    check("no access or no refresh token: nothing to store",
+          spotify_etl.token_blob_from_response({"access_token": "a"}, T0) is None
+          and spotify_etl.token_blob_from_response({"refresh_token": "r"}, T0) is None
+          and spotify_etl.token_blob_from_response(None, T0) is None)
+    check("same defaults as the site", spotify_etl.token_blob_from_response(
+        {"access_token": "a", "refresh_token": "r"}, T0) == {
+        "access_token": "a", "token_type": "Bearer", "expires_in": 3600, "refresh_token": "r",
+        "scope": "", "obtained_at": T0, "authorized_at": T0})
+    check("scope check: both granted, any order",
+          spotify_etl.has_required_scopes("playlist-modify-private user-read-recently-played"))
+    check("scope check: one missing is refused", not spotify_etl.has_required_scopes("user-read-recently-played")
+          and not spotify_etl.has_required_scopes(None))
+    check("the site checks scopes too", "hasRequiredScopes(" in ts)
+
+    # The heartbeat names the same reconnect-by day as the card (reconnectByDate): the ET
+    # day before the ET expiry day, by calendar, also across the autumn clock change.
+    at = int(datetime(2027, 5, 12, 4, 30, tzinfo=timezone.utc).timestamp())   # expires 2027-11-07 23:30 EST
+    text = spotify_etl.reauth_warning({"authorized_at": at}, now=at + 175 * 86400) or ""
+    check("heartbeat: reconnect by the ET calendar day before expiry", "reconnect by 2027-11-06" in text, text)
+    late = spotify_etl.reauth_warning({"authorized_at": at}, now=at + 179.8 * 86400) or ""
+    check("heartbeat: after that day it says reconnect now", "reconnect now" in late and "2027-11-06" not in late, late)
+
+
 def test_workflow_uploads_through_the_helper() -> None:
     print("spotify-etl.yml")
     wf = (ROOT / ".github" / "workflows" / "spotify-etl.yml").read_text(encoding="utf-8")
@@ -303,6 +347,7 @@ if __name__ == "__main__":
     test_upload_wiring()
     test_refresh_keeps_authorized_at()
     test_status_wording()
+    test_signin_blob_shape()
     test_workflow_uploads_through_the_helper()
     if failures:
         print(f"\nFAILED ({len(failures)}): " + "; ".join(failures))

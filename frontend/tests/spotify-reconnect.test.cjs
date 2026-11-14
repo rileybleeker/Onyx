@@ -174,7 +174,12 @@ test("pasted text: the query alone or the bare code", () => {
   const state = "st".repeat(20);
   assert.deepEqual(lib.parseCallbackInput(`?code=${CODE}&state=${state}`), { ok: true, code: CODE, state });
   assert.deepEqual(lib.parseCallbackInput(`code=${CODE}&state=${state}`), { ok: true, code: CODE, state });
-  assert.deepEqual(lib.parseCallbackInput(`code=${CODE}`), { ok: true, code: CODE, state: null });
+  // Every form that names its parameters must carry the state: cutting "&state=..." (or the address
+  // in front of "code=") off a paste must not get around the state check. Only the bare code has none.
+  assert.deepEqual(lib.parseCallbackInput(`code=${CODE}`), { ok: false, error: "bad_state" });
+  assert.deepEqual(lib.parseCallbackInput(`?code=${CODE}`), { ok: false, error: "bad_state" });
+  assert.deepEqual(lib.parseCallbackInput(`code=${CODE}&state=`), { ok: false, error: "bad_state" });
+  assert.deepEqual(lib.parseCallbackInput(`${REDIRECT}?code=${CODE}`), { ok: false, error: "bad_state" });
   assert.deepEqual(lib.parseCallbackInput(CODE), { ok: true, code: CODE, state: null });
   // Spotify does not document a code's alphabet: anything printable goes through to Spotify, which decides.
   assert.deepEqual(lib.parseCallbackInput("AQpadded=="), { ok: true, code: "AQpadded==", state: null }, "a bare code with = in it is not a query");
@@ -331,9 +336,11 @@ test("needsSpotifyReconnect matches the ETL's sign-in-again messages and nothing
   // the heartbeat texts spotify_etl.py writes (formats copied from the source; see also the Python twin of this test)
   assert.equal(lib.needsSpotifyReconnect(`Spotify refresh token rejected. ${howto} (HTTP 400 invalid_grant: Refresh token expired)`), true);
   assert.equal(lib.needsSpotifyReconnect(`Spotify refresh token rejected. ${howto} (HTTP 400 invalid_grant: Refresh token revoked)`), true);
-  assert.ok(py.includes('f"Spotify sign-in expires {when} ('), "the expiring-soon heartbeat text");
-  assert.equal(lib.needsSpotifyReconnect(`Spotify sign-in expires in 14 days (2027-05-13 UTC, 180 days after it was made). ${howto}`), true);
-  assert.equal(lib.needsSpotifyReconnect(`Hit Spotify 50-track recently-played cap — likely lost some plays; Spotify sign-in expires in 3 days (2027-05-13 UTC, 180 days after it was made). ${howto}`), true);
+  assert.ok(py.includes('f"Spotify sign-in expires {when}, {lifetime}: {act}. {REAUTH_HOWTO}"'), "the expiring-soon heartbeat text");
+  assert.ok(py.includes('f"Spotify sign-in expires {lifetime} and that day has already passed "'), "the expired heartbeat text");
+  assert.equal(lib.needsSpotifyReconnect(`Spotify sign-in expires in 14 days, 180 days after it was made: reconnect by 2027-05-12 (Eastern time). ${howto}`), true);
+  assert.equal(lib.needsSpotifyReconnect(`Hit Spotify 50-track recently-played cap — likely lost some plays; Spotify sign-in expires in 3 days, 180 days after it was made: reconnect by 2027-05-12 (Eastern time). ${howto}`), true);
+  assert.equal(lib.needsSpotifyReconnect(`Spotify sign-in expires 180 days after it was made and that day has already passed (2027-05-13, Eastern time). ${howto}`), true);
   assert.ok(py.includes('f"No Spotify tokens at {SPOTIFY_TOKEN_FILE}. {REAUTH_HOWTO}"') && py.includes("holds no refresh token. {REAUTH_HOWTO}"));
   assert.equal(lib.needsSpotifyReconnect(`No Spotify tokens at /home/runner/.spotify_tokens.json. ${howto}`), true);
   assert.equal(lib.needsSpotifyReconnect(`Spotify token file /home/runner/.spotify_tokens.json holds no refresh token. ${howto}`), true);
@@ -374,11 +381,28 @@ test("reconnect-by date: nothing before day 165, then the last full ET day befor
   assert.equal(lib.spotifyReconnectBy(undefined, far), null);
   assert.equal(lib.spotifyReconnectBy({ authorized_at: at }, far), null, "only the stored TEXT form is read");
   assert.equal(lib.formatReconnectDate("2027-05-12"), "May 12, 2027");
+  // The autumn clock change: a sign-in at 00:30 ET on 2027-05-12 expires at 23:30 EST on 2027-11-07
+  // (180 x 24 h is 23:30 on the 25-hour day). The last full day in time is Nov 6, not the expiry day.
+  const autumn = Date.UTC(2027, 4, 12, 4, 30) / 1000;
+  assert.equal(lib.reconnectByDate(autumn), "2027-11-06");
+  assert.equal(lib.reconnectByDate(Date.UTC(2027, 4, 12, 3, 59) / 1000), "2027-11-06");
   assert.equal(lib.REFRESH_TOKEN_LIFETIME_DAYS, 180);
   assert.equal(lib.RECONNECT_WARNING_DAY, 165);
 });
 
 // ----------------------------------------------------------------------------- request checks
+
+test("warning line: names the date until it passes, then says the authorization ran out", () => {
+  const noon = (ymd) => Date.parse(`${ymd}T16:00:00Z`); // 11 AM / noon ET
+  assert.equal(lib.reconnectWarningText("2027-05-12", noon("2027-05-01")), "Spotify's authorization runs out soon. Reconnect by May 12, 2027 to keep the sync running.");
+  assert.equal(lib.reconnectWarningText("2027-05-12", noon("2027-05-12")), "Spotify's authorization runs out soon. Reconnect by May 12, 2027 to keep the sync running.");
+  assert.equal(lib.reconnectWarningText("2027-05-12", noon("2027-05-13")), "Spotify's authorization runs out today. Reconnect now to keep the sync running.");
+  assert.equal(lib.reconnectWarningText("2027-05-12", noon("2027-06-01")), "Spotify's authorization has run out. Reconnect to restart the sync.");
+  // ET, not UTC: 02:00 UTC on May 13 is still May 12 in Atlanta.
+  assert.ok(lib.reconnectWarningText("2027-05-12", Date.parse("2027-05-13T02:00:00Z")).includes("Reconnect by May 12, 2027"));
+  assert.equal(lib.shiftDay("2027-03-14", -1), "2027-03-13");
+  assert.equal(lib.shiftDay("2027-01-01", -1), "2026-12-31");
+});
 
 test("exchange request checks: same origin, JSON, small", () => {
   const ok = { origin: ORIGIN, host: "onyx.example", "content-type": "application/json; charset=utf-8", "content-length": "200" };
@@ -580,10 +604,34 @@ test("exchange: nothing is stored unless every step passed; errors are fixed str
     assert.deepEqual(result.body, { ok: false, code, error: lib.RECONNECT_ERRORS[code] }, name);
     assert.equal(spotify.calls.length, fetches, name);
     assert.equal(db.calls.upserts.length, 0, `${name}: the stored token is untouched`);
-    assert.equal(result.headers["Set-Cookie"], lib.clearStateCookieHeader(), name);
+    // Spotify not answering keeps the cookie: the message says to press Finish again.
+    const expectedCookie = code === "spotify_unavailable" ? undefined : lib.clearStateCookieHeader();
+    assert.equal(result.headers["Set-Cookie"], expectedCookie, name);
     assertNoSecrets(result.body, name);
     assertNoSecrets(logged.join("\n"), `${name} log`);
   }
+});
+
+test("exchange: after Spotify did not answer, pressing Finish again with the same paste works", async () => {
+  const { state, cookie } = await startReconnect();
+  db = fakeDb();
+  const body = { callback: `${REDIRECT}?code=${CODE}&state=${state}` };
+  const down = await withEnv(() => exchangeRoute.POST(postReq({ body, cookie })), { fetchImpl: fakeSpotify({ token: jsonResponse(503, {}) }).fetchImpl });
+  assert.equal(down.result.body.code, "spotify_unavailable");
+  assert.ok(lib.RECONNECT_ERRORS.spotify_unavailable.includes("Press Finish again"));
+  const again = await withEnv(() => exchangeRoute.POST(postReq({ body, cookie })), { fetchImpl: fakeSpotify().fetchImpl });
+  assert.equal(again.result.status, 200);
+  assert.equal(db.calls.upserts.length, 1);
+  assert.equal(again.result.headers["Set-Cookie"], lib.clearStateCookieHeader(), "cleared once it is used");
+});
+
+test("exchange: a query pasted without its state is refused before Spotify is called", async () => {
+  const { cookie } = await startReconnect();
+  db = fakeDb();
+  const { result } = await withEnv(() => exchangeRoute.POST(postReq({ body: { callback: `code=${CODE}` }, cookie }))); // any fetch would throw
+  assert.equal(result.status, 400);
+  assert.equal(result.body.code, "bad_state");
+  assert.equal(db.calls.upserts.length, 0);
 });
 
 test("exchange: missing server config is a 500 before Spotify is called; a failed save is a 500", async () => {

@@ -84,7 +84,7 @@ export const RECONNECT_ERRORS = {
   state_mismatch: "That address belongs to a different reconnect attempt. Start again.",
   not_configured: "Spotify is not configured on the server (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET).",
   code_rejected: "Spotify rejected the code: it expired or was already used. Start again.",
-  spotify_unavailable: "Spotify did not answer. Try again in a minute.",
+  spotify_unavailable: "Spotify did not answer. Press Finish again in a minute.",
   bad_token_response: "Spotify answered without a usable token. Start again.",
   missing_scope: "Spotify did not grant both permissions Onyx needs. Start again and approve them.",
   wrong_account: "This Spotify account cannot read listening history for the Onyx app. Nothing was changed.",
@@ -153,7 +153,7 @@ function single(params: URLSearchParams, name: string): string | null | undefine
   return all.length === 1 ? all[0] : null;
 }
 
-function fromParams(params: URLSearchParams, requireState: boolean): CallbackParse {
+function fromParams(params: URLSearchParams): CallbackParse {
   if (params.has("error")) return { ok: false, error: "spotify_denied" };
   const code = single(params, "code");
   if (code === undefined) return { ok: false, error: "bad_code" };
@@ -161,21 +161,21 @@ function fromParams(params: URLSearchParams, requireState: boolean): CallbackPar
   if (!isValidCode(code)) return { ok: false, error: "bad_code" };
   const state = single(params, "state");
   if (state === undefined) return { ok: false, error: "bad_state" };
-  if (state === null || state === "") {
-    return requireState ? { ok: false, error: "bad_state" } : { ok: true, code, state: null };
-  }
-  if (!isValidState(state)) return { ok: false, error: "bad_state" };
+  if (state === null || state === "" || !isValidState(state)) return { ok: false, error: "bad_state" };
   return { ok: true, code, state };
 }
 
 /**
  * Reads what the owner pasted. Accepted forms:
  *   - the full address of the tab that failed to load
- *       http://127.0.0.1:8888/callback?code=...&state=...      (state required)
+ *       http://127.0.0.1:8888/callback?code=...&state=...
  *     also without the "http://" some address bars hide;
  *   - the query alone:  ?code=...&state=...  or  code=...&state=...
- *   - the bare code (no state to compare; the exchange route then relies on the state cookie
- *     being present plus the account probe).
+ *   - the bare code, with nothing else around it.
+ * Every form that names its parameters must carry the state, so cutting "&state=..." (or the
+ * address in front of "code=") off a paste never gets around the state check. The bare code is the
+ * one form with no state to compare; the exchange route then relies on the state cookie being
+ * present plus the account probe.
  * An address on any other host or path is refused: it is not this flow's callback.
  */
 export function parseCallbackInput(input: unknown): CallbackParse {
@@ -197,7 +197,7 @@ export function parseCallbackInput(input: unknown): CallbackParse {
     if (`${u.origin}${u.pathname}` !== SPOTIFY_REDIRECT_URI || u.username || u.password) {
       return { ok: false, error: "not_callback_address" };
     }
-    return fromParams(u.searchParams, true);
+    return fromParams(u.searchParams);
   }
 
   // The query alone. (A bare code may itself contain "=", so this needs a parameter name.)
@@ -205,7 +205,7 @@ export function parseCallbackInput(input: unknown): CallbackParse {
     const query = text.replace(/^[?#]/, "");
     const params = new URLSearchParams(query);
     if (!params.has("code") && !params.has("error")) return { ok: false, error: "missing_code" };
-    return fromParams(params, false);
+    return fromParams(params);
   }
 
   return isValidCode(text) ? { ok: true, code: text, state: null } : { ok: false, error: "bad_code" };
@@ -303,8 +303,9 @@ export function readStateCookie(cookieHeader: string | null | undefined): string
  * The state check at exchange time. The callback never reaches Onyx, so the state cannot be checked
  * on the redirect; it is checked here against the cookie set when the authorize link was made.
  *   - no (valid) cookie: refused. The reconnect was not started in this browser, or it is over 10 minutes old.
- *   - the pasted address carries a state: it must equal the cookie (constant-time).
- *   - a bare code carries none: accepted on the cookie alone.
+ *   - the pasted address or query carries a state: it must equal the cookie (constant-time).
+ *   - a bare code carries none (parseCallbackInput gives a null state for that form only):
+ *     accepted on the cookie alone.
  */
 export function checkState(cookieState: string | null, pastedState: string | null): ReconnectErrorCode | null {
   if (!isValidState(cookieState)) return "no_state_cookie";
@@ -399,13 +400,28 @@ export function authorizedAtFromTokenData(tokenData: unknown): number | null {
   }
 }
 
+const ET_DAY = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" });
+
+/** The Eastern-time calendar day (YYYY-MM-DD) of an instant. */
+export function etDay(ms: number): string {
+  return ET_DAY.format(new Date(ms));
+}
+
+/** A calendar day moved by whole days: pure date arithmetic, so clock changes cannot shift it. */
+export function shiftDay(ymd: string, days: number): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd);
+  if (!m) return ymd;
+  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + days)).toISOString().slice(0, 10);
+}
+
 /**
- * The last full Eastern-time day on which a reconnect is still in time: the calendar day (ET) of
- * the instant 24 hours before the refresh token expires. YYYY-MM-DD.
+ * The last full Eastern-time day on which a reconnect is still in time: the calendar day (ET) on
+ * which the refresh token expires, minus one calendar day. YYYY-MM-DD. (Not "expiry minus 24
+ * hours": on the 25-hour day the clocks go back that can land on the expiry day itself.)
+ * reauth_warning in spotify_etl.py prints the same day in its heartbeat text.
  */
 export function reconnectByDate(authorizedAtSec: number): string {
-  const ms = (authorizedAtSec + (REFRESH_TOKEN_LIFETIME_DAYS - 1) * DAY_SECONDS) * 1000;
-  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+  return shiftDay(etDay((authorizedAtSec + REFRESH_TOKEN_LIFETIME_DAYS * DAY_SECONDS) * 1000), -1);
 }
 
 /**
@@ -418,6 +434,19 @@ export function spotifyReconnectBy(tokenData: unknown, nowMs: number): string | 
   if (at === null) return null;
   if (nowMs / 1000 < at + RECONNECT_WARNING_DAY * DAY_SECONDS) return null;
   return reconnectByDate(at);
+}
+
+/**
+ * The warning line on the Spotify card. `reconnectBy` is the last full ET day in time, so the token
+ * runs out during the day after it; from then on the line says so instead of naming a past date.
+ */
+export function reconnectWarningText(reconnectBy: string, nowMs: number): string {
+  const today = etDay(nowMs);
+  if (today <= reconnectBy) {
+    return `Spotify's authorization runs out soon. Reconnect by ${formatReconnectDate(reconnectBy)} to keep the sync running.`;
+  }
+  if (today === shiftDay(reconnectBy, 1)) return "Spotify's authorization runs out today. Reconnect now to keep the sync running.";
+  return "Spotify's authorization has run out. Reconnect to restart the sync.";
 }
 
 /** "May 11, 2027" from "2027-05-11". */
