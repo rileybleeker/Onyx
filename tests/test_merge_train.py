@@ -1,6 +1,7 @@
 """Decision-logic tests for tools/merge_train.py. No network, no credentials, no gh calls."""
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -152,6 +153,67 @@ class MasterCiVerdict(unittest.TestCase):
     def test_rerun_success_beats_cancel(self):
         runs = [self.run_("cancelled"), dict(id=2, status="completed", conclusion="success")]
         self.assertEqual(mt.master_ci_verdict(runs, False)[0], "ok")
+
+
+class ImmutableCi(unittest.TestCase):
+    SHA = "a" * 40
+    NEXT = "b" * 40
+
+    def run_(self, tested, head, **kwargs):
+        return dict(id=1, display_title="Autonomous CI " + tested, head_sha=head,
+                    status=kwargs.get("status", "completed"), conclusion=kwargs.get("conclusion", "success"))
+
+    def test_pinned_run_counts_for_checkout_not_dispatch_ref(self):
+        row = self.run_(self.SHA, self.NEXT)
+        self.assertEqual(mt.ci_runs_for_sha([row], self.SHA), [row])
+        self.assertEqual(mt.ci_runs_for_sha([row], self.NEXT), [])
+
+    def test_unrelated_green_run_cannot_satisfy_old_commit(self):
+        self.assertEqual(mt.ci_runs_for_sha([self.run_(self.NEXT, self.NEXT)], self.SHA), [])
+
+    def test_legacy_native_run_matches_its_actual_head(self):
+        row = dict(head_sha=self.SHA, display_title="old push run")
+        self.assertEqual(mt.ci_runs_for_sha([row], self.SHA), [row])
+        self.assertEqual(mt.ci_runs_for_sha([row], self.NEXT), [])
+
+    def test_dispatch_passes_immutable_commit_and_observes_matching_run(self):
+        row = self.run_(self.SHA, self.NEXT)
+        with patch.object(mt, "api_json", side_effect=[{"workflow_runs": []}, {"workflow_runs": [row]}]), \
+             patch.object(mt, "master_sha", side_effect=[self.SHA, self.NEXT]), \
+             patch.object(mt, "gh") as gh:
+            self.assertEqual(mt.wait_master_ci(self.SHA)[0], "ok")
+        gh.assert_called_once_with("workflow", "run", mt.CI_WORKFLOW, "-R", mt.REPO,
+                                   "--ref", mt.BASE, "-f", "sha=" + self.SHA)
+
+    def test_superseded_without_run_skips_without_dispatch_or_sleep(self):
+        with patch.object(mt, "api_json", return_value={"workflow_runs": []}), \
+             patch.object(mt, "master_sha", return_value=self.NEXT), \
+             patch.object(mt, "gh") as gh, patch.object(mt.time, "sleep") as sleep:
+            self.assertEqual(mt.wait_master_ci(self.SHA)[0], "skipped")
+        gh.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_existing_failure_is_not_hidden_by_new_master(self):
+        row = self.run_(self.SHA, self.SHA, conclusion="failure")
+        with patch.object(mt, "api_json", return_value={"workflow_runs": [row]}), \
+             patch.object(mt, "master_sha", return_value=self.NEXT), patch.object(mt, "gh") as gh:
+            self.assertEqual(mt.wait_master_ci(self.SHA)[0], "fail")
+        gh.assert_not_called()
+
+    def test_invalid_or_mutable_ref_refused_before_io(self):
+        with patch.object(mt, "api_json") as api:
+            for value in ("master", "abc1234", "a" * 40 + "\n"):
+                with self.assertRaises(ValueError):
+                    mt.wait_master_ci(value)
+        api.assert_not_called()
+
+    def test_workflow_checks_out_and_keys_concurrency_by_input(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/autonomous-ci.yml").read_text()
+        self.assertEqual(workflow.count("ref: ${{ inputs.sha || github.sha }}"), 2)
+        self.assertIn("run-name: Autonomous CI ${{ inputs.sha || github.sha }}", workflow)
+        self.assertIn("group: autonomous-ci-${{ inputs.sha || github.ref }}", workflow)
+        for check in mt.REQUIRED:
+            self.assertIn("name: ${{ inputs.sha && '" + check + "-pinned' || '" + check + "' }}", workflow)
 
 
 class MasterCiTimeout(unittest.TestCase):
