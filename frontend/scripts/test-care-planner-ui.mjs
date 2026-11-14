@@ -162,7 +162,7 @@ try {
 
   // ---- synced calendar events: read-only, next to the care items, never one of them ----
   const eventsCard = page.locator('[aria-label="Calendar events sync"]');
-  await eventsCard.getByRole('heading', { name: 'Your calendar events: synced (read-only)', exact: true }).waitFor();
+  await eventsCard.getByRole('heading', { name: 'Google Calendar: connected', exact: true }).waitFor();
   assert.match(await eventsCard.innerText(), /main \(acct one\)\s*2 events/);
   assert.match(await eventsCard.innerText(), /Last sync 20 min ago\./);
   assert.equal(await eventsCard.locator('button').count(), 0, 'the read-only card has nothing to press');
@@ -180,7 +180,7 @@ try {
   assert.deepEqual(calls, [], 'showing calendar events sends nothing to the care-item routes');
   assert.deepEqual(googleCalls, [], 'and nothing to the care-items -> Google routes');
   // A failed read and a missing table are their own states; the care items are unaffected by either.
-  for (const [mode, heading] of [['error', "Your calendar events: couldn't be checked"], ['not_connected', 'Your calendar events: not synced yet']]) {
+  for (const [mode, heading] of [['error', "Google Calendar: couldn't be checked"], ['not_connected', 'Google Calendar: not synced yet']]) {
     eventsMode = mode;
     await page.goto(url);
     await eventsCard.getByRole('heading', { name: heading, exact: true }).waitFor();
@@ -189,7 +189,7 @@ try {
   }
   eventsMode = 'ready';
   await page.goto(url);
-  await eventsCard.getByRole('heading', { name: 'Your calendar events: synced (read-only)', exact: true }).waitFor();
+  await eventsCard.getByRole('heading', { name: 'Google Calendar: connected', exact: true }).waitFor();
   eventCalls.length = 0;
 
   // ---- add: shown at once, POSTed same-origin as JSON with every field ----
@@ -369,7 +369,7 @@ try {
   const cardAlert = cardBox.locator('p[role="alert"]');
   for (const variant of ['', '/?cal=none']) {
     await page.goto(url + variant);
-    await page.getByRole('heading', { name: 'Google Calendar: not connected', exact: true }).waitFor();
+    await page.getByRole('heading', { name: 'Copy care items to Google Calendar: off', exact: true }).waitFor();
     assert.equal(await page.getByRole('button', { name: 'Connect Google Calendar', exact: true }).isDisabled(), true);
     await cardBox.getByText(/Not set up yet: Onyx has no Google credentials/).waitFor();
     await cardBox.getByText('Never requested', { exact: true }).waitFor();
@@ -390,7 +390,7 @@ try {
   assert.deepEqual(googleCalls.splice(0), ['POST /api/care/google/start origin=true', 'POST /api/care/google/start origin=true']);
   // Back from Google: the result is shown once and removed from the address bar.
   await page.goto(url + '/?cal=on&calendar=connected');
-  await page.getByRole('heading', { name: 'Google Calendar: connected', exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Copy care items to Google Calendar: on', exact: true }).waitFor();
   await cardBox.getByText(/Google Calendar is connected\. The first sync runs in the background/).waitFor();
   await page.waitForFunction(() => !location.search.includes('calendar='));
   assert.equal(new URL(page.url()).search, '?cal=on');
@@ -402,7 +402,7 @@ try {
   await page.getByRole('button', { name: 'Sync now' }).click();
   await cardAlert.filter({ hasText: "Couldn't run the sync." }).waitFor();
   await page.getByRole('button', { name: 'Disconnect' }).click();
-  await page.getByRole('heading', { name: 'Google Calendar: not connected', exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Copy care items to Google Calendar: off', exact: true }).waitFor();
   await cardBox.getByText(/Disconnected\. The "Onyx care" calendar and its events are still in Google Calendar/).waitFor();
   assert.deepEqual(googleCalls.splice(0), ['POST /api/care/google/sync origin=true', 'POST /api/care/google/sync origin=true', 'POST /api/care/google/disconnect origin=true']);
   await page.goto(url + '/?cal=ready&calendar=error&reason=wrong_scope');

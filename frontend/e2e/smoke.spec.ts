@@ -625,7 +625,7 @@ test("/wins renders the Wins board", async ({ page }) => {
 // shows one of its two real states. Read-only: never types, adds, toggles, copies, connects or
 // syncs anything, and never asserts on an item's label or date.
 // Calendar events (2026-11-13): the page also shows read-only copies of the events on Riley's
-// calendars (google_calendar_etl.py, hourly) with a "Your calendar events" card. That card being
+// calendars (google_calendar_etl.py, hourly) with a "Google Calendar: connected" card (renamed from "Your calendar events" 2026-11-14; the care-items card became "Copy care items to Google Calendar: off|on"). That card being
 // "not synced yet", late or failing (the /status card's job) and a month with no events are all
 // legitimate, so the only tripwire is that Onyx could read its own copy: the card settles and is
 // not in the "couldn't be checked" state (= /api/calendar/events is broken). Both lines hold
@@ -638,9 +638,9 @@ test("/health renders the care planner with sample data off and a calendar state
   await expect(page.getByText(/Loading your care items/)).toHaveCount(0, { timeout: LOAD_TIMEOUT });
   await expect(page.getByRole("heading", { name: "Add care item", exact: true })).toBeVisible();
   await expect(page.getByLabel(/Show sample data/), "sample data must be opt-in").not.toBeChecked();
-  await expect(page.getByRole("heading", { name: /^Google Calendar: (not connected|connected)$/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /^Copy care items to Google Calendar: (off|on)$/ })).toBeVisible();
   await expect(page.getByText("Checking the calendar events sync.")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
-  await expect(page.getByRole("heading", { name: /^Your calendar events: couldn't be checked$/i }), "Onyx could not read its copy of the calendar events").toHaveCount(0);
+  await expect(page.getByRole("heading", { name: /^Google Calendar: couldn't be checked$/i }), "Onyx could not read its copy of the calendar events").toHaveCount(0);
   await expectNoClientCrash(page);
 });
 
