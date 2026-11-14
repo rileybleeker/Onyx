@@ -145,7 +145,7 @@ SUPPLEMENT_EXTRA_CONFOUNDERS = (
 
 # Re-audit 2026-06-07 (stats/gemini/F-003): mediator exclusion for multi-day
 # rolling/aggregate treatments. For a treatment that aggregates several past
-# days (e.g. rolling_7d_training_load spans days N-7..N), HRV on night N-1
+# days (e.g. rolling_7d_training_load spans days N-7..N-1), HRV on night N-1
 # (hrv_lag1) lies on the causal path from the EARLIER days of that window to
 # the outcome — training load on day N-2 affects HRV on night N-1, so hrv_lag1
 # is a MEDIATOR for those days, not a pre-treatment confounder. Conditioning on
@@ -178,6 +178,56 @@ ROLLING_TREATMENT_MEDIATOR_CONFOUNDERS = frozenset({
     "hrv_7d_mean",
     "whoop_day_strain_lag1",
 })
+
+# ESTIMAND for a rolling-window treatment (2026-11-13, dot review #6). For a
+# treatment that sums the days D-k..D-1, the reported number is the TOTAL effect,
+# on the HRV of the sleep that closes day D, of that whole window's load being
+# above rather than below its personal median — through every pathway, including
+# the HRV, strain and sleep of the nights inside the window that the window's
+# earlier days already changed. It is NOT "the effect of the window's load with
+# the 7-day total held fixed": that would compare weeks with the same total load
+# distributed differently (recent vs older days), a different question.
+#
+# So the adjustment set may only hold variables decided outside the window or
+# slow baselines. A load aggregate whose own window CONTAINS the treatment's
+# window is neither: the treatment is one of its summands, so conditioning on it
+# absorbs part of the treatment (and, because the 7-day total predicts the 3-day
+# total, it pushes propensities toward 0/1 and costs overlap).
+# rolling_7d_training_load (D-7..D-1) contains rolling_3d_training_load
+# (D-3..D-1), so it is dropped from the 3-day treatment's set.
+#
+# Known cost: the 7-day total was also the only control for the OLDER load
+# (D-7..D-4), which is decided before the 3-day window and can confound it. A
+# non-overlapping covariate (7-day minus 3-day load) would keep that control
+# without absorbing the treatment; it is not in the matrix today.
+#
+# Windows are (first day, last day) offsets from the treatment day D, inclusive,
+# and must match hrv_analysis.build_feature_matrix
+# (total_training_load.shift(1).rolling(k).sum()). Garmin's acute / chronic load
+# and their ratio are device-computed and end on day D, so the 7-day total does
+# not contain them and stays in their set.
+ROLLING_WINDOW_DAYS: dict[str, tuple[int, int]] = {
+    "rolling_3d_training_load": (-3, -1),
+    "rolling_7d_training_load": (-7, -1),
+}
+ROLLING_TREATMENT_ESTIMAND = (
+    "Rolling-window treatments (e.g. 3-day training load = days D-3..D-1): the "
+    "total effect, on the HRV of the sleep that closes day D, of the whole "
+    "window's load being above vs below its personal median, through every "
+    "pathway (including the nights inside the window). Not the effect with the "
+    "7-day total held fixed. Adjusted only for variables decided outside the "
+    "window or slow baselines; an aggregate whose window contains the "
+    "treatment's window is left out because the treatment is part of it."
+)
+
+
+def _window_contains(confounder: str, treatment: str) -> bool:
+    """True when `confounder` aggregates a day window that contains the whole
+    window of the rolling `treatment` (both declared in ROLLING_WINDOW_DAYS)."""
+    cw, tw = ROLLING_WINDOW_DAYS.get(confounder), ROLLING_WINDOW_DAYS.get(treatment)
+    if cw is None or tw is None or confounder == treatment:
+        return False
+    return cw[0] <= tw[0] and cw[1] >= tw[1]
 
 # Re-audit 2026-06-07 (stats/gpt-5/F-007): forward-fill horizon for confounders,
 # configurable per family instead of the prior hard-coded limit=2. Weekly /
@@ -1182,10 +1232,15 @@ def adjustment_set(treatment: str, declared: tuple[str, ...] | list[str]) -> tup
          HRV on night N-1 → outcome), or window-overlapping aggregates of the
          treatment's own days. Adjusting for a mediator blocks part of the effect
          being estimated, so they are dropped for these treatments only.
+      3. dot review #6 (2026-11-13): a rolling treatment also drops any aggregate
+         confounder whose day window contains the treatment's own window
+         (ROLLING_WINDOW_DAYS) — rolling_7d_training_load for the 3-day load.
+         See ROLLING_TREATMENT_ESTIMAND for the estimand this follows from.
     """
     kept = tuple(c for c in declared if c != treatment)
     if treatment in ROLLING_AGGREGATE_TREATMENTS:
         kept = tuple(c for c in kept if c not in ROLLING_TREATMENT_MEDIATOR_CONFOUNDERS)
+        kept = tuple(c for c in kept if not _window_contains(c, treatment))
     return kept
 
 
@@ -1623,8 +1678,15 @@ def run_causal_battery(df: pd.DataFrame, supplements: pd.DataFrame | None = None
             "window-overlapping aggregates of the treatment's own days. Daily "
             "training load (the day's own activities) is a same-day treatment "
             "and keeps the full pre-treatment set.",
+            # dot review #6 (2026-11-13)
+            "For the 3-day training load, rolling_7d_training_load is also "
+            "dropped: the 7-day window (D-7..D-1) contains the whole 3-day "
+            "window (D-3..D-1), so holding it fixed would absorb part of the "
+            "treatment. Cost: load on days D-7..D-4 is no longer adjusted for.",
         ],
         "rolling_aggregate_treatments": sorted(ROLLING_AGGREGATE_TREATMENTS),
+        "rolling_treatment_estimand": ROLLING_TREATMENT_ESTIMAND,
+        "rolling_window_days": {k: list(v) for k, v in sorted(ROLLING_WINDOW_DAYS.items())},
         # Re-audit 2026-06-07 (stats/gpt-5/F-004): day_of_week is expanded into
         # cyclic sin/cos terms before the propensity + outcome models, replacing
         # the previous ordinal 0-6 encoding (which assumed a linear weekday effect).
