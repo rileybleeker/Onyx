@@ -25,10 +25,10 @@ Investment accounts (Fidelity, the Wells Fargo brokerage) are stored as balances
    Do not paste it into a chat.
 3. Run `python simplefin_etl.py --claim --set-github-secret`. This exchanges the token (it works only once) for the
    read-only Access URL, saves it to `~/.simplefin_access_url` and sets the GitHub secret `SIMPLEFIN_ACCESS_URL`.
-4. Check the matching locally: `python simplefin_etl.py --dry-run --days 89`. Every account line should say
+4. Check the matching locally: `python simplefin_etl.py --dry-run`. Every account line should say
    `linked`, `matched` or `new`; a `skip` line means an account could not be matched safely (set its
    `finance_accounts.simplefin_id` by hand, then run again).
-5. `gh workflow run simplefin-etl.yml -f days=89` for the first import; the schedule takes over from there.
+5. `gh workflow run simplefin-etl.yml` for the first import; the schedule takes over from there.
 
 ## When the card is not green
 

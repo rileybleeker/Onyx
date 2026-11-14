@@ -167,6 +167,9 @@ def test_match_accounts():
         sfa("S-DISC", "Discover it Card 1232", "Discover"),
         sfa("S-WFX", "Some Account", "Wells Fargo"),
     ], LEDGER)
+    owner_named = sf.match_accounts([sfa("S-AC", "Riley", "Apple Card (Updated Monthly) ")], LEDGER)
+    assert (owner_named["S-AC"].action, owner_named["S-AC"].account_key) == ("matched", "acard")  # not Apple Cash
+    assert sf.match_accounts([sfa("S-AX", "Riley", "Apple")], LEDGER)["S-AX"].action == "skip"
     assert (m["S-CITI"].action, m["S-CITI"].account_key) == ("linked", "citi")
     assert (m["S-AMEX"].action, m["S-AMEX"].account_key) == ("matched", "amex")
     assert (m["S-WF"].action, m["S-WF"].account_key) == ("matched", "wf1")
