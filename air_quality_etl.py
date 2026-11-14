@@ -21,11 +21,15 @@ Design notes:
     the whole daily series, and the model data is regional (~0.4 degree grid)
     anyway. Latitude/longitude are stored on every row, so a changed location
     stays auditable.
-  - Open-Meteo returns the hours of the requested days in the requested
-    timezone (America/New_York here), so grouping by the date part of each
-    timestamp gives the ET clock day directly. Hours after "now" are forecast
-    values and are never stored: today's row is partial (n_hours < 24) until the
-    day ends, and the HRV pipeline ignores days with fewer than 20 hours.
+  - The ET clock day is built HERE from UTC hours, exactly like weather_etl.py.
+    Open-Meteo applies ONE UTC offset to a whole response (the one in force when
+    the request is made), so asking for America/New_York hours would put every
+    day of the other DST season an hour off (a July day requested in November
+    would be a 01:00-to-01:00 window). The ETL asks for GMT and converts each
+    hour to America/New_York itself; DST days have 23 or 25 hours. Hours after
+    "now" are forecast values and are never stored: today's row is partial
+    (n_hours < 24) until the day ends, and the HRV pipeline ignores days with
+    fewer than 20 hours.
   - Recent hours are revised as CAMS analyses arrive, so every run re-upserts a
     rolling window (7 days) instead of only appending.
   - Global history starts 2022-07-29; earlier hours come back null and are skipped.
@@ -90,12 +94,35 @@ def windows(start: date, end: date, chunk_days: int = CHUNK_DAYS) -> list[tuple[
     return out
 
 
+def _utc_hour(stamp) -> datetime | None:
+    """A UTC hour string from the API ("2026-11-09T14:00") as an aware UTC datetime."""
+    try:
+        return datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _et_local(utc_stamp: datetime) -> datetime:
+    """ET wall-clock time of a UTC hour, naive (same rule as weather_etl._et_local)."""
+    return utc_stamp.astimezone(ET).replace(tzinfo=None)
+
+
+def api_range(start: date, end: date, now_utc: datetime) -> tuple[date, date]:
+    """UTC dates to request so every hour of the ET days [start, end] is covered.
+
+    ET is behind UTC, so the last ET day runs into the next UTC date. Dates after
+    today (UTC) would only add forecast hours, which are dropped anyway.
+    """
+    return start, min(end + timedelta(days=1), now_utc.date())
+
+
 def aggregate_daily(payload: dict, now_et: datetime, lat: float, lon: float) -> list[dict]:
     """Hourly API payload -> one row per ET clock day with at least one PM2.5 value.
 
     `payload["hourly"]` carries parallel lists time / pm2_5 / us_aqi, with times as
-    naive local strings in the requested timezone ("2026-11-09T14:00"). Hours later
-    than `now_et` are forecasts and are dropped. A day with no PM2.5 value produces
+    naive UTC strings ("2026-11-09T14:00", requested with timezone=GMT); each hour is
+    put on the ET clock day of its own timestamp. `now_et` must be timezone-aware;
+    hours later than it are forecasts and are dropped. A day with no PM2.5 value produces
     no row (so an API gap can never overwrite a good day with nulls).
     """
     hourly = payload.get("hourly") if isinstance(payload, dict) else None
@@ -106,15 +133,13 @@ def aggregate_daily(payload: dict, now_et: datetime, lat: float, lon: float) -> 
     if not (len(times) == len(pm) == len(aqi)):
         raise ValueError(f"Open-Meteo hourly arrays differ in length ({len(times)}/{len(pm)}/{len(aqi)})")
 
-    cutoff = now_et.replace(tzinfo=None)
+    cutoff = now_et.astimezone(timezone.utc)
     by_day: dict[str, dict[str, list[float]]] = {}
     for t, p, a in zip(times, pm, aqi):
-        try:
-            local = datetime.fromisoformat(t)
-        except (TypeError, ValueError):
+        utc = _utc_hour(t)
+        if utc is None or utc > cutoff:
             continue
-        if local > cutoff:
-            continue
+        local = _et_local(utc)
         bucket = by_day.setdefault(local.date().isoformat(), {"pm": [], "aqi": []})
         pv, av = _num(p), _num(a)
         if pv is not None:
@@ -170,7 +195,7 @@ def fetch_hourly(client: httpx.Client, lat: float, lon: float, start: date, end:
         "latitude": lat,
         "longitude": lon,
         "hourly": "pm2_5,us_aqi",
-        "timezone": ET_NAME,
+        "timezone": "GMT",   # UTC hours; aggregate_daily builds the ET day (see Design notes)
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
     }
@@ -226,7 +251,10 @@ def run_etl(days: int | None, lat: float, lon: float, dry_run: bool = False, sb=
 
         with httpx.Client(timeout=60.0) as client:
             for w_start, w_end in windows(start, today):
-                rows = aggregate_daily(fetch_hourly(client, lat, lon, w_start, w_end), now_et, lat, lon)
+                a_start, a_end = api_range(w_start, w_end, now_et.astimezone(timezone.utc))
+                rows = aggregate_daily(fetch_hourly(client, lat, lon, a_start, a_end), now_et, lat, lon)
+                # The extra UTC date only completes the last ET day; its own partial row is not this window's.
+                rows = [r for r in rows if w_start.isoformat() <= r["calendar_date"] <= w_end.isoformat()]
                 if not rows:
                     log.info(f"  {w_start} -> {w_end}: no PM2.5 values")
                     continue
