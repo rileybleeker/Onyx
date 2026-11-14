@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { TOTAL_KEY, type BudgetLine, type BudgetsResult } from "@/lib/finance-budgets";
+import { activeMonthly, type SubscriptionView } from "@/lib/finance-subscriptions";
 
 const usd = (cents: number | null | undefined) => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -30,7 +31,7 @@ async function put(url: string, body: unknown): Promise<string | null> {
   }
 }
 
-export default function BudgetsView({ result, categories, rules, setupPending }: { result: BudgetsResult; categories: string[]; rules: { merchantKey: string; category: string }[]; setupPending: boolean }) {
+export default function BudgetsView({ result, categories, rules, setupPending, subscriptions }: { result: BudgetsResult; categories: string[]; rules: { merchantKey: string; category: string }[]; setupPending: boolean; subscriptions: SubscriptionView[] }) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -128,6 +129,45 @@ export default function BudgetsView({ result, categories, rules, setupPending }:
           <tbody>
             {r.lines.map((l) => (
               <BudgetRow key={l.category} l={l} busy={busy} run={run} />
+            ))}
+          </tbody>
+        </table>
+      </section>
+
+      <section className={card} aria-labelledby="bd-subs">
+        <h2 id="bd-subs" className="font-semibold">Subscriptions</h2>
+        <p className="text-[12px] text-text-tertiary">
+          Detected from repeat charges: {subscriptions.filter((s) => s.state !== "stopped").length} active, about {usd(activeMonthly(subscriptions))} a month. To cancel one, cancel it on the merchant&apos;s site, then mark it here: Onyx checks the ledger and tells you whether the charges actually stopped. Onyx never cancels anything itself.
+        </p>
+        <table className="mt-2 w-full text-[13px]">
+          <tbody>
+            {subscriptions.map((s) => (
+              <tr key={s.id} className="border-t border-border-subtle align-top">
+                <td className="py-1 pr-2">
+                  <b>{s.merchant}</b>
+                  <div className="text-[12px] text-text-tertiary">
+                    {s.cadence} · {usd(s.typicalCents)} · next about {s.nextExpected}
+                  </div>
+                  {s.stateText && <div className={`text-[12px] ${s.state === "still-charging" ? "text-down" : s.state === "stopped" ? "text-up" : "text-mid"}`}>{s.stateText}</div>}
+                </td>
+                <td className="py-1 pr-2 text-right">{usd(s.monthlyCents)}/mo</td>
+                <td className="whitespace-nowrap py-1 text-right">
+                  {s.markedOn ? (
+                    <button className={button} disabled={busy} onClick={() => run(() => put("/api/finance/subscriptions", { subId: s.id, cancelling: false }))}>
+                      Undo
+                    </button>
+                  ) : (
+                    <>
+                      <a className="mr-2 text-[12px] text-accent hover:underline" href={s.cancelSearchUrl} target="_blank" rel="noopener noreferrer">
+                        How to cancel
+                      </a>
+                      <button className={button} disabled={busy} onClick={() => run(() => put("/api/finance/subscriptions", { subId: s.id, cancelling: true }))}>
+                        I cancelled it
+                      </button>
+                    </>
+                  )}
+                </td>
+              </tr>
             ))}
           </tbody>
         </table>

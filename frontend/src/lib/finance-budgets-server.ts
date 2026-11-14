@@ -4,6 +4,8 @@ import { toCents } from "@/lib/finance-ledger";
 import { fetchPaged, loadCategoryFixes, serviceClient } from "@/lib/finance-ledger-server";
 import { categoryOptions, fixedCategory } from "@/lib/finance-categories";
 import { computeBudgets, type BudgetTxn, type BudgetsResult } from "@/lib/finance-budgets";
+import { detectRecurring } from "@/lib/procurement-recurring";
+import { subscriptionViews, type SubscriptionView } from "@/lib/finance-subscriptions";
 
 /**
  * Server reads/writes for /financials/budgets. SERVICE ROLE ONLY ("server-only"; the caller is behind the
@@ -12,14 +14,15 @@ import { computeBudgets, type BudgetTxn, type BudgetsResult } from "@/lib/financ
 const COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
 
 export type BudgetsLoad =
-  | { kind: "ok"; result: BudgetsResult; categories: string[]; rules: { merchantKey: string; category: string }[]; setupPending: boolean }
+  | { kind: "ok"; result: BudgetsResult; categories: string[]; rules: { merchantKey: string; category: string }[]; setupPending: boolean; subscriptions: SubscriptionView[] }
   | { kind: "empty" }
   | { kind: "error"; code: string };
 
 export async function loadBudgetData(now: Date = new Date()): Promise<{ txns: BudgetTxn[]; budgets: Map<string, number>; today: string; rules: { merchantKey: string; category: string }[]; setupPending: boolean }> {
   const db = serviceClient();
   const today = etDate(now.toISOString());
-  const since = new Date(Date.parse(`${today.slice(0, 7)}-01T00:00:00Z`) - 200 * 86_400_000).toISOString().slice(0, 10);
+  // 400 days: budgets use about 7 months, subscription detection needs the year (annual renewals).
+  const since = new Date(Date.parse(`${today}T00:00:00Z`) - 400 * 86_400_000).toISOString().slice(0, 10);
   const [rows, fixes, budgetsRes] = await Promise.all([
     fetchPaged((f, t) => db.from("finance_transactions").select(COLS, { count: "exact" }).gte("txn_date", since).order("txn_date", { ascending: true }).order("txn_key", { ascending: true }).range(f, t), 40),
     loadCategoryFixes(db),
@@ -55,7 +58,10 @@ export async function loadBudgets(now: Date = new Date()): Promise<BudgetsLoad> 
     const d = await loadBudgetData(now);
     if (!d.txns.length) return { kind: "empty" };
     const result = computeBudgets(d.txns, d.budgets, d.today);
-    return { kind: "ok", result, categories: categoryOptions(result.categoriesSeen), rules: d.rules.sort((a, b) => a.merchantKey.localeCompare(b.merchantKey)), setupPending: d.setupPending };
+    const marksRes = await serviceClient().from("finance_cancel_marks").select("sub_id,marked_on");
+    const marks = new Map(((marksRes.data ?? []) as { sub_id: string; marked_on: string }[]).map((m) => [m.sub_id, m.marked_on]));
+    const subscriptions = subscriptionViews(detectRecurring(d.txns, d.today), marks, d.today);
+    return { kind: "ok", result, categories: categoryOptions(result.categoriesSeen), rules: d.rules.sort((a, b) => a.merchantKey.localeCompare(b.merchantKey)), setupPending: d.setupPending, subscriptions };
   } catch (e) {
     const code = e && typeof e === "object" && "code" in e ? String((e as { code: unknown }).code) : "unknown";
     console.error(`budgets load failed: ${code}`);

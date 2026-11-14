@@ -134,7 +134,7 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
 
   // Withholding, projected: a pay stub's year-to-date figure plus the paychecks after it, else estimated from the start.
   const regularFed = Math.round(c(bracketTax(Math.max(0, d(profile.salaryAnnualCents - profile.preTaxAnnualCents) - t.federal.standardDeduction), t.federal.single)) / 12);
-  const regularNc = Math.round((Math.max(0, d(profile.salaryAnnualCents) - t.nc.standardDeduction) * t.nc.rate) / 100 * 100 / 12);
+  const regularNc = Math.round((Math.max(0, d(profile.salaryAnnualCents - profile.preTaxAnnualCents) - t.nc.standardDeduction) * t.nc.rate) / 100 * 100 / 12);
   const ytd = profile.ytd && profile.ytd.year === year ? profile.ytd : null;
   let fedWithheld = ytd ? ytd.federalCents : 0;
   let ncWithheld = ytd ? ytd.stateCents : 0;

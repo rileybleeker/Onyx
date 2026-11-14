@@ -32,7 +32,7 @@ export default async function BudgetsPage() {
           <p className="font-semibold">No transactions in the last six months yet.</p>
         </section>
       )}
-      {load.kind === "ok" && <BudgetsView result={load.result} categories={load.categories} rules={load.rules} setupPending={load.setupPending} />}
+      {load.kind === "ok" && <BudgetsView result={load.result} categories={load.categories} rules={load.rules} setupPending={load.setupPending} subscriptions={load.subscriptions} />}
     </main>
   );
 }

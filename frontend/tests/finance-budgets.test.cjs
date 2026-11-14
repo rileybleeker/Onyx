@@ -109,3 +109,16 @@ test("savings goals: progress, monthly need and the forecast check", () => {
   assert.equal(out[1].projectedCents, null);
   assert.equal(out[1].perMonthNeededCents, 25_000);
 });
+
+test("cancel tracker: waiting, stopped, still charging", () => {
+  const S = loadTs("lib/finance-subscriptions.ts");
+  const sub = (id, lastCharge, nextExpected) => ({ id, merchant: `Demo ${id}`, cadence: "monthly", typicalCents: 1_500, monthlyCents: 1_500, lastCharge, nextExpected, status: "active" });
+  const subs = [sub("aaaaaaaaaaaaaaaa", "2030-05-20", "2030-06-20"), sub("bbbbbbbbbbbbbbbb", "2030-04-01", "2030-05-01"), sub("cccccccccccccccc", "2030-06-10", "2030-07-10")];
+  const marks = new Map([["aaaaaaaaaaaaaaaa", "2030-06-01"], ["bbbbbbbbbbbbbbbb", "2030-04-15"], ["cccccccccccccccc", "2030-06-01"]]);
+  const v = Object.fromEntries(S.subscriptionViews(subs, marks, "2030-06-15").map((x) => [x.id, x]));
+  assert.equal(v.aaaaaaaaaaaaaaaa.state, "waiting");
+  assert.equal(v.bbbbbbbbbbbbbbbb.state, "stopped");
+  assert.equal(v.cccccccccccccccc.state, "still-charging");
+  assert.match(v.aaaaaaaaaaaaaaaa.cancelSearchUrl, /^https:\/\/www\.google\.com\/search\?q=how%20to%20cancel/);
+  assert.equal(S.activeMonthly(Object.values(v)), 3_000);
+});

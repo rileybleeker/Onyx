@@ -35,9 +35,10 @@ export const FORECAST = {
   amountBand: 0.4,
   /** A stream is stopped when its last occurrence is older than this many cycles. */
   lapseCycles: 1.6,
-  /** Card payments: a card's monthly total paid = mean of the last N complete months; the range samples the last M months. */
-  cardMeanPayments: 3,
-  cardSamplePayments: 6,
+  /** Card payments: a card's monthly total paid = mean of the last N complete months; the range samples the last M months.
+   *  6 / 12 since the 2026-11-14 backtest: payments are lumpy, and a 3-month mean raised the 13-week error. */
+  cardMeanPayments: 6,
+  cardSamplePayments: 12,
   /** One-off rows (left out of the everyday baseline): above max(this, 3 x the 95th percentile row). */
   oneOffMinCents: 100_000,
   oneOffP95Multiple: 3,
