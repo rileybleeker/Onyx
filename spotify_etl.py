@@ -16,7 +16,10 @@ after 2024-11-27. This app is post-cutoff, so we use ReccoBeats (accepts
 Spotify track IDs) as the features source. `features_source` records provenance.
 
 Usage:
-    python spotify_etl.py --auth        # One-time OAuth bootstrap (local only)
+    python spotify_etl.py --auth        # OAuth sign-in (local; needs the client id + secret in .env)
+    python spotify_etl.py --exchange-code <code or callback URL>
+                                        # Finish a sign-in from the code in the redirect URL
+                                        # (no browser needed on the machine that runs this)
     python spotify_etl.py               # Normal run: pull recent plays + featurize new tracks
     python spotify_etl.py --backfill 50 # No-op past 50 (Spotify's hard ceiling)
     python spotify_etl.py --refeaturize # Re-fetch features for tracks with NULL valence
@@ -61,6 +64,15 @@ SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API = "https://api.spotify.com/v1"
 
+# Spotify refresh tokens stop working 6 months after the user's sign-in, and a refresh
+# does not extend that (developer.spotify.com/blog/2026-06-18-refresh-token-expiration,
+# enforced for existing apps from 2026-07-20). Measured once: the token authorized
+# 2026-05-17 ~02Z was refused from 2026-11-13 ~02Z, i.e. 180 days. The ETL turns its
+# heartbeat `partial` REAUTH_WARNING_DAYS before that so the sign-in can be renewed
+# before plays are lost (Spotify keeps only the last 50).
+REFRESH_TOKEN_LIFETIME_DAYS = 180
+REAUTH_WARNING_DAYS = 14
+
 RECCOBEATS_API = "https://api.reccobeats.com/v1"
 
 # MusicBrainz — used for genre tags because Spotify's Dev Mode strips `genres`,
@@ -81,15 +93,21 @@ log = logging.getLogger("spotify_etl")
 # ---------------------------------------------------------------------------
 
 def load_tokens() -> dict:
+    """Read the token file. A missing or unusable file is a SpotifyAuthError, so the
+    caller writes its failed heartbeats before exiting (this used to exit on its own,
+    with no sync_log row)."""
     if not os.path.exists(SPOTIFY_TOKEN_FILE):
-        log.error(
-            f"No Spotify tokens at {SPOTIFY_TOKEN_FILE}. "
-            "Run `python spotify_etl.py --auth` locally, then "
-            "`python ci_token_helper.py upload spotify`."
+        raise SpotifyAuthError(f"No Spotify tokens at {SPOTIFY_TOKEN_FILE}. {REAUTH_HOWTO}")
+    try:
+        with open(SPOTIFY_TOKEN_FILE, "r") as f:
+            tokens = json.load(f)
+    except ValueError:
+        tokens = None
+    if not isinstance(tokens, dict) or not tokens.get("refresh_token"):
+        raise SpotifyAuthError(
+            f"Spotify token file {SPOTIFY_TOKEN_FILE} holds no refresh token. {REAUTH_HOWTO}"
         )
-        sys.exit(1)
-    with open(SPOTIFY_TOKEN_FILE, "r") as f:
-        return json.load(f)
+    return tokens
 
 
 def save_tokens(tokens: dict):
@@ -157,7 +175,20 @@ def run_auth_flow():
 
     code = _CallbackHandler.auth_code
     log.info("Captured authorization code; exchanging for tokens...")
+    exchange_authorization_code(code)
+    log.info("OAuth bootstrap complete. Run `python ci_token_helper.py upload spotify` next.")
 
+
+def exchange_authorization_code(code: str) -> dict:
+    """Trade a Spotify authorization code for tokens and save them.
+
+    Records `authorized_at`: the 6-month refresh-token clock starts at the sign-in and
+    Spotify does not report it back, so this is the only place it can be written down.
+    Exits 1 (nothing saved) when Spotify refuses the code.
+    """
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        log.error("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set")
+        sys.exit(1)
     basic = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
     resp = httpx.post(
         SPOTIFY_TOKEN_URL,
@@ -169,11 +200,62 @@ def run_auth_flow():
         },
         timeout=30,
     )
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        log.error(
+            f"Spotify refused the authorization code ({_token_error(resp)}). Codes are "
+            "single-use and short-lived: open the authorize URL again for a new one."
+        )
+        sys.exit(1)
     tokens = resp.json()
-    tokens["obtained_at"] = int(time.time())
+    if not tokens.get("refresh_token"):
+        log.error("Spotify's answer carried no refresh token; nothing saved.")
+        sys.exit(1)
+    now = int(time.time())
+    tokens["obtained_at"] = now
+    tokens["authorized_at"] = now
     save_tokens(tokens)
-    log.info("OAuth bootstrap complete. Run `python ci_token_helper.py upload spotify` next.")
+    return tokens
+
+
+def _auth_code_from_github_event() -> str:
+    """The `auth_code` input of a manually dispatched GitHub Actions run, if this is
+    one and it has such an input. Read from the event file so the code never appears in
+    a command line or a step's env block."""
+    path = os.environ.get("GITHUB_EVENT_PATH")
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            event = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(event, dict):
+        return ""
+    return str((event.get("inputs") or {}).get("auth_code") or "")
+
+
+def parse_auth_code(raw: str) -> str:
+    """Accept the bare code or the whole http://127.0.0.1:8888/callback?code=... URL
+    copied from the address bar."""
+    raw = (raw or "").strip()
+    if "code=" in raw:
+        query = urllib.parse.urlparse(raw).query or raw.split("?", 1)[-1]
+        return (urllib.parse.parse_qs(query).get("code") or [""])[0].strip()
+    return raw
+
+
+def run_exchange_code(raw: str | None):
+    """Sign-in without a browser on this machine: the authorize URL is opened anywhere
+    Spotify is signed in, and the code from the redirect is exchanged here, where the
+    client secret is."""
+    code = parse_auth_code(raw or _auth_code_from_github_event())
+    if not code:
+        log.error("No authorization code given.")
+        sys.exit(1)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::add-mask::{code}", flush=True)
+    exchange_authorization_code(code)
+    log.info("Spotify re-authorized; token file written (not yet uploaded).")
 
 
 # ---------------------------------------------------------------------------
@@ -181,26 +263,47 @@ def run_auth_flow():
 # ---------------------------------------------------------------------------
 
 class SpotifyAuthError(Exception):
-    """Raised when Spotify refuses the stored refresh token (expired/revoked).
+    """Raised when Spotify refuses the stored refresh token (expired / revoked), the
+    app credentials, or when there is no usable token file.
 
-    Distinct from transient HTTP errors so the ETL can write an actionable
-    sync_log entry and exit 0 (no retry) instead of looping the cron on a
-    permanently-broken token.
+    Distinct from transient HTTP errors: it is not retried. The run writes its failed
+    sync_log heartbeats and then exits 1, so the GitHub Actions run goes red. (Until
+    2026-11-13 it exited 0, and a dead token failed every hour behind a green run.)
     """
 
 
-REAUTH_INSTRUCTIONS = (
-    "Spotify refresh token rejected. Re-run `python spotify_etl.py --auth` "
-    "locally then `python ci_token_helper.py upload spotify`."
+REAUTH_HOWTO = (
+    "Sign in again (AGENTS.md, Token recovery (Spotify)): `python spotify_etl.py --auth` "
+    "then `python ci_token_helper.py upload spotify`."
 )
+REAUTH_INSTRUCTIONS = f"Spotify refresh token rejected. {REAUTH_HOWTO}"
+
+
+def _token_error(resp) -> str:
+    """`HTTP 400 invalid_grant: Refresh token expired`. Only the status and Spotify's
+    two error fields are quoted, never the raw body."""
+    err, desc = "", ""
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            err = str(body.get("error") or "")[:60]
+            desc = str(body.get("error_description") or "")[:120]
+    except ValueError:
+        pass
+    out = f"HTTP {resp.status_code}"
+    if err:
+        out += f" {err}"
+    if desc:
+        out += f": {desc}"
+    return out
 
 
 def refresh_access_token(tokens: dict) -> dict:
     """Exchange refresh_token for a fresh access_token. Returns updated tokens dict.
 
-    Raises SpotifyAuthError on a 400/401 from /api/token — the documented
-    invalid_grant response when the refresh token has expired or been revoked
-    (Spotify rotates these occasionally; see AGENTS.md).
+    Raises SpotifyAuthError on a 400/401 from /api/token: `invalid_grant` when the
+    refresh token has expired (180 days after sign-in) or was revoked, `invalid_client`
+    when the app id / secret is wrong. The token file is only rewritten on success.
     """
     basic = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
     resp = httpx.post(
@@ -213,7 +316,14 @@ def refresh_access_token(tokens: dict) -> dict:
         timeout=30,
     )
     if resp.status_code in (400, 401):
-        raise SpotifyAuthError(f"{REAUTH_INSTRUCTIONS} (HTTP {resp.status_code}: {resp.text})")
+        detail = _token_error(resp)
+        if "invalid_client" in detail:
+            raise SpotifyAuthError(
+                f"Spotify rejected the app credentials ({detail}). Check the "
+                "SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET secrets against the app at "
+                "developer.spotify.com/dashboard."
+            )
+        raise SpotifyAuthError(f"{REAUTH_INSTRUCTIONS} ({detail})")
     resp.raise_for_status()
     new = resp.json()
     tokens["access_token"] = new["access_token"]
@@ -225,6 +335,25 @@ def refresh_access_token(tokens: dict) -> dict:
         log.info("Refresh token rotated; saving new value.")
     save_tokens(tokens)
     return tokens
+
+
+def reauth_warning(tokens: dict, now: float | None = None) -> str | None:
+    """Text for the heartbeat when the sign-in is within REAUTH_WARNING_DAYS of the
+    6-month limit, else None. Tokens from before `authorized_at` was recorded give
+    None (their age is unknown)."""
+    authorized_at = tokens.get("authorized_at")
+    if not isinstance(authorized_at, (int, float)) or isinstance(authorized_at, bool):
+        return None
+    expires = float(authorized_at) + REFRESH_TOKEN_LIFETIME_DAYS * 86400
+    left = (expires - (time.time() if now is None else now)) / 86400
+    if left > REAUTH_WARNING_DAYS:
+        return None
+    day = datetime.fromtimestamp(expires, tz=timezone.utc).strftime("%Y-%m-%d")
+    when = f"in {int(left)} days" if left >= 1 else ("today" if left >= 0 else "already")
+    return (
+        f"Spotify sign-in expires {when} ({day} UTC, {REFRESH_TOKEN_LIFETIME_DAYS} days "
+        f"after it was made). {REAUTH_HOWTO}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -615,14 +744,13 @@ def run_backfill_artists():
     started = time.time()
     sb = get_supabase()
 
-    tokens = load_tokens()
     try:
-        tokens = refresh_access_token(tokens)
+        tokens = refresh_access_token(load_tokens())
     except SpotifyAuthError as e:
         log.error(str(e))
         log_sync_entry(sb, source="spotify", data_type="artist_backfill",
                        status="failed", records=0, started_at=started, error=str(e))
-        sys.exit(0)
+        sys.exit(1)
     client = SpotifyClient(tokens)
 
     # Pull distinct artist_ids from spotify_plays in pages (Supabase row limit is 1000/req)
@@ -691,17 +819,43 @@ def run_refresh_genres():
     log.info(f"Updated {count}/{len(needs)} artists with MusicBrainz tags in {int(time.time()-started)}s")
 
 
+# The two enrichment subsystems that write their own heartbeat inside run_etl.
+ENRICHMENT_HEARTBEATS = (("reccobeats", "audio_features"), ("musicbrainz", "artist_tags"))
+
+
+def fail_run(sb: Client, started: float, error: str, beats: set[str]):
+    """A sync that failed outright: write the failed heartbeats, then exit 1.
+
+    `spotify|plays` always gets one. ReccoBeats / MusicBrainz get one too unless this
+    run already wrote theirs (`beats`): they did not run, and without a row their
+    /status cards would stay green for hours and then go red with no reason given.
+    Exit 1 turns the GitHub Actions run red; the workflow's token upload still runs
+    and skips a token file this run never refreshed (ci_token_helper.upload_spotify).
+    """
+    log_sync(sb, status="failed", records=0, started_at=started, error=error)
+    for source, data_type in ENRICHMENT_HEARTBEATS:
+        if source not in beats:
+            log_sync_entry(
+                sb, source=source, data_type=data_type, status="failed", records=0,
+                started_at=started, error=f"Not run: the Spotify sync failed first. {error}",
+            )
+    sys.exit(1)
+
+
 def run_etl(refeaturize: bool = False):
     started = time.time()
     sb = get_supabase()
+    beats: set[str] = set()   # enrichment heartbeats already written this run
 
-    tokens = load_tokens()
     try:
-        tokens = refresh_access_token(tokens)
+        tokens = refresh_access_token(load_tokens())
     except SpotifyAuthError as e:
         log.error(str(e))
-        log_sync(sb, status="failed", records=0, started_at=started, error=str(e))
-        sys.exit(0)
+        fail_run(sb, started, str(e), beats)
+    except Exception as e:
+        # Token endpoint unreachable / 5xx: nothing synced, so the run is red too.
+        log.exception("Spotify token refresh failed")
+        fail_run(sb, started, f"Spotify token refresh failed: {e}", beats)
     client = SpotifyClient(tokens)
 
     try:
@@ -760,6 +914,7 @@ def run_etl(refeaturize: bool = False):
             sb, source="reccobeats", data_type="audio_features",
             status=rb_status, records=len(features), started_at=reccobeats_started,
         )
+        beats.add("reccobeats")
 
         # --- Artists BEFORE plays ---
         # Audit P1 fix: previously only the primary artist (artists[0]) was
@@ -809,6 +964,7 @@ def run_etl(refeaturize: bool = False):
             sb, source="musicbrainz", data_type="artist_tags",
             status=mb_status, records=mb_matched, started_at=mb_started, error=mb_error,
         )
+        beats.add("musicbrainz")
 
         # --- Plays LAST, only for plays whose track was landed ---
         # Defensive: if client.track(tid) raised above, that tid is missing
@@ -879,30 +1035,37 @@ def run_etl(refeaturize: bool = False):
                             "features_fetched_at": now,
                         }).eq("track_id", tid).execute()
 
-        final_status = "partial" if cap_hit else "success"
-        final_error = (
-            "Hit Spotify 50-track recently-played cap — likely lost some plays"
-            if cap_hit else None
-        )
+        # A run that synced stays green (exit 0); `partial` only colours the /status
+        # card: the 50-play cap was hit, or the sign-in is about to expire.
+        expiry_note = reauth_warning(client.tokens)
+        if expiry_note:
+            log.warning(expiry_note)
+        notes = [
+            "Hit Spotify 50-track recently-played cap — likely lost some plays" if cap_hit else None,
+            expiry_note,
+        ]
+        final_error = "; ".join(n for n in notes if n) or None
+        final_status = "partial" if final_error else "success"
         log_sync(sb, status=final_status, records=plays_count, started_at=started,
                  error=final_error)
         log.info(f"Spotify ETL complete: {plays_count} plays, {tracks_count} tracks in {int(time.time()-started)}s")
 
     except SpotifyAuthError as e:
         # Refresh token died mid-run (rare: access-token refresh inside _request).
-        # Same actionable message + exit 0 as the pre-flight catch above.
+        # Same failed heartbeats + exit 1 as the pre-flight catch above.
         log.error(str(e))
-        log_sync(sb, status="failed", records=0, started_at=started, error=str(e))
-        sys.exit(0)
+        fail_run(sb, started, str(e), beats)
     except Exception as e:
         log.exception("Spotify ETL failed")
-        log_sync(sb, status="failed", records=0, started_at=started, error=str(e))
-        sys.exit(1)
+        fail_run(sb, started, str(e), beats)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Spotify ETL Pipeline")
-    parser.add_argument("--auth", action="store_true", help="One-time OAuth bootstrap (run locally)")
+    parser.add_argument("--auth", action="store_true", help="OAuth sign-in in a local browser (needs the client id + secret)")
+    parser.add_argument("--exchange-code", nargs="?", const="", default=None, metavar="CODE_OR_URL",
+                        help="Finish a sign-in from an authorization code (or the whole callback URL). "
+                             "With no value: the `auth_code` input of a GitHub Actions run")
     parser.add_argument("--refeaturize", action="store_true", help="Backfill audio features for tracks with NULL valence")
     parser.add_argument("--backfill-artists", action="store_true", help="Enrich every distinct artist in spotify_plays not yet in spotify_artists")
     parser.add_argument("--refresh-genres", action="store_true", help="Re-fetch MusicBrainz tags for spotify_artists rows with empty genres")
@@ -911,6 +1074,10 @@ def main():
 
     if args.auth:
         run_auth_flow()
+        return
+
+    if args.exchange_code is not None:
+        run_exchange_code(args.exchange_code)
         return
 
     if args.backfill_artists:
