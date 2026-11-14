@@ -12,8 +12,9 @@ checks are needed for policy tests or unsigned compilation.
 
 - User chooses time-only, tasks-only, time AND tasks, or time OR tasks. There is
   no silently selected combination. The time defaults to noon, local iPhone time.
-- Daily tasks are currently configured and self-reported in the native Onyx app.
-  Existing web/Notion tasks are NOT imported, verified, or synced yet.
+- Daily tasks are configured and self-reported in the native Onyx app. Real Onyx
+  habits can unlock too: see "Onyx habit unlock" below. Once habits are chosen in
+  Onyx they replace this "Unlock when" choice and the on-phone task list.
 - Select social apps/categories/websites with Apple's picker. Separately select
   LinkedIn and its website as allowed exceptions. Enabling requires at least one
   app AND one website exception plus explicit confirmation of both. App-only
@@ -30,6 +31,96 @@ checks are needed for policy tests or unsigned compilation.
 - Configuration lives only in the shared App Group file. It is not transmitted
   to Onyx servers, logs, or review prompts. Corrupt/missing state clears this
   feature's shields. Turn off stops its schedule and clears its named store.
+  The habit check sends nothing but the token header; what it receives (the
+  chosen habits' names and done flags) is stored in the same App Group.
+
+## Onyx habit unlock (2026-11-13)
+
+Built and compiled; NOT yet seen working on the phone. Test steps:
+`docs/focus-device-test.md`, tests H1 to H6.
+
+What it does. Riley picks a few habits and a rule in Onyx on the web (the
+"Focus: unlock with habits" card on `/install`, stored in
+`pds.focus_unlock_config`). The phone asks `GET /api/focus/unlock-status` with
+the token the app already holds and gets the Onyx behavioral day, the rule and,
+for each chosen habit, whether it is answered Yes for that day.
+
+| Rule (set in Onyx) | Before the unlock time | After the unlock time |
+|---|---|---|
+| Habits OR time (default) | Blocked until the phone learns every chosen habit is Yes | Open |
+| Habits AND time | Blocked | Blocked until the phone learns every chosen habit is Yes |
+| No habits chosen (default) | The phone's own rule, exactly as before | Same |
+| A check today failed (see below) | Blocked | Open: the time alone decides |
+
+The unlock time, the blocked apps and the LinkedIn exception stay on the phone.
+
+When the phone checks. Only when the app can run:
+
+1. The Onyx Screen Time app comes to the foreground (any screen), or is launched.
+2. "Check now" on the Focus screen.
+3. The Shortcuts action "Check Onyx Focus habits" runs (optional, below).
+
+It does NOT check in the background. The Device Activity monitor extension
+(00:00 and the unlock time) never uses the network: it re-applies the rule
+with the last answer the app stored. So:
+
+- OR rule: ticking the habits in Onyx does not unlock anything by itself. Open
+  the Onyx Screen Time app afterwards; the block lifts within a few seconds
+  if the phone is online. Without that, the block lifts at the unlock time.
+- AND rule: "not asked yet today" counts as not done. At the unlock time the
+  monitor leaves the block on, and it stays on until the app is opened after
+  the habits are done (or until a check fails, next section). So under AND the
+  app has to be opened once every day, after the unlock time or after the
+  habits, whichever is later. Nothing on Apple's block screen says so.
+- A change made on `/install` (other habits, the other rule, no habits)
+  reaches the phone at its next check, not before.
+
+Failure behaviour (deliberate trade-off). If a check cannot get the status (no
+token, offline, timeout, token refused, server error, unreadable answer), the
+phone records the failure, says so on the Focus screen ("Last check failed:
+...") and uses the unlock time alone for the rest of that day, or until a
+check succeeds:
+
+- A failed check never keeps apps blocked past the unlock time, under either
+  rule. Under AND this means opening the app offline after the unlock time
+  lifts the block even though the habits are not done. That is accepted: Focus
+  is voluntary friction (there is also a "Turn off" button), and the opposite
+  choice would let an outage lock the phone all day.
+- The one case where being offline still leaves apps blocked past the unlock
+  time: AND rule and the app not opened yet that day. The phone has not tried,
+  so nothing has failed. Opening the app once ends it, online (habits done)
+  or offline (the check fails, time-only).
+- A failed check cannot unlock early (OR rule): before the unlock time the
+  block stays.
+- A failed check does not undo a "done" that Onyx already confirmed today.
+
+Which day counts. A habit counts only when Onyx's behavioral day equals the
+phone's calendar day. Onyx's day runs 06:00 to 06:00, so between midnight and
+06:00 Onyx still reports yesterday; the phone treats an answer fetched then
+as "not asked yet today". From 06:00 the two agree. At midnight the stored
+answer stops counting and the block returns (next-day reset). If Onyx answers
+after 06:00 for a different day than the phone's (a trip where Onyx has not
+learned the new time zone yet), the phone uses the unlock time alone.
+
+Other limits.
+
+- "Done" means an explicit Yes in Onyx for that day (`/habits`, `/check-in` or
+  chat). No and unanswered both count as not done.
+- A chosen habit that is later switched off in Notion can no longer be
+  answered. Under AND that blocks until midnight every day. The `/install`
+  card marks such a habit in red; untick it there.
+- Optional automation: Shortcuts, Automation, Time of Day (or "When Onyx is
+  closed" if the Onyx web app shows up in the app list), action "Check Onyx
+  Focus habits", Run Immediately. Untested; whether iOS applies the shield
+  change from a background shortcut run has to be seen on the phone.
+- No heartbeat and no `/status` card: the route is read-only and the phone
+  reports nothing back.
+
+Code: `FocusCore/Sources/FocusCore/OnyxHabits.swift` (pure rule, parsing;
+`swift test`), `FocusShared/FocusConfiguration.swift` (`FocusHabitStorage`,
+`focus-habits.json`), `FocusUI/FocusHabitSync.swift` (fetch, shared model,
+shortcut action), `frontend/src/lib/focus-unlock.ts` (same decision table in
+TypeScript, `frontend/tests/focus-unlock.test.cjs`).
 
 ## Build and test
 
