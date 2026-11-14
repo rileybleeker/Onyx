@@ -63,7 +63,7 @@ const CADENCE: Record<string, string> = {
   google_calendar: "Hourly :55",
   ubereats: "Every 6h (Riley's PC, while logged on)",
   nyc_scout: "Daily 6:10am ET",
-  rocket_money: "Daily (harvester)",
+  rocket_money: "Daily import; sign-in kept alive every 2h (Riley's PC)",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
   // the frontend matrix reads hit since 2026-06-11). The heartbeat also
   // carries the schema-drift tripwire — a 'failed' here can mean the view
@@ -386,6 +386,8 @@ export async function GET() {
         // balances separately), so the pair needs its own limit-1 reads. Heartbeats only:
         // this endpoint is CDN-cacheable, so no ledger rows or amounts are read here.
         ["rocketmoney", "transactions"], ["rocketmoney", "balances"],
+        // The harvester's keep-alive visits between imports (every 2h): a failing one drags the card down.
+        ["rocketmoney", "keepalive"],
         // Online orders (every 3h): its own read so the shared 100-row window cannot push it out.
         ["online_orders", "email"],
         // Personal Amazon order list (Kindle harvester pass on Riley's PC, every 3h).
@@ -1141,8 +1143,9 @@ export async function GET() {
           methodLabel: METHOD.perf_mats.label,
         };
       })(),
-      // Rocket Money ledger (pds.finance_*, read by /financials): the daily harvester and the
-      // transactions + balances importers each write a rocketmoney heartbeat on every run.
+      // Rocket Money ledger (pds.finance_*, read by /financials): the harvester's daily import and the
+      // transactions + balances importers each write a rocketmoney heartbeat on every import run; the
+      // keep-alive visits in between write rocketmoney|keepalive (a failing one drags the card down).
       // Status is the worse of the two (>36h degraded, >72h or a failed/error row = red, a
       // "login required" failure shows the importer's own text). Heartbeat-only by design:
       // no amounts or row contents ever reach this cacheable endpoint.
@@ -1150,6 +1153,8 @@ export async function GET() {
         const card = financeLedgerCard(
           latestBySrcType["rocketmoney|transactions"],
           latestBySrcType["rocketmoney|balances"],
+          Date.now(),
+          latestBySrcType["rocketmoney|keepalive"],
         );
         return {
           label: "Rocket Money",
