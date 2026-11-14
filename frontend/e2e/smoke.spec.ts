@@ -362,6 +362,17 @@ const PAGES: SmokePage[] = [
     legitimateEmpty: "No ledger data yet - the harvester has not run.",
   },
   {
+    // iPhone Screen Time (pds.phone_usage_daily, service-role only, server-rendered). The app
+    // syncs once a day and the default window is 30 days, so a month without a sync legitimately
+    // shows the empty state: SKIP, like /caffeine. The failed-query state is a hard fail. It never
+    // asserts on an app name or a number of minutes.
+    route: "/screen-time",
+    heading: "Screen Time",
+    signal: "charts",
+    hardEmpty: ["Couldn't load Screen Time."],
+    legitimateEmpty: "No Screen Time days in this window.",
+  },
+  {
     route: "/journal",
     heading: "Journal",
     signal: "journal-list",

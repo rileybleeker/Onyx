@@ -21,6 +21,7 @@ import {
   type CheckinPayload,
   type CheckinSuggestion,
 } from "@/lib/checkin";
+import { CHECKIN_SCREEN_COLUMNS, settledLastHourMinutes } from "@/lib/checkin-screen";
 
 /**
  * Daily habit check-in (2026-11-07). One screen, one write for a whole behavior day.
@@ -103,31 +104,7 @@ async function suggestionsFor(date: string, today: string, names: Set<string>): 
       (async () => {
         const { data } = await supabase.from("cronometer_servings").select("alcohol_g").eq("onyx_behavioral_date", date).gt("alcohol_g", 0);
         const grams = (data ?? []).reduce((s, r: { alcohol_g: number | null }) => s + Number(r.alcohol_g || 0), 0);
-        if (grams > 0) {
-          out[Q_ALCOHOL] = { answer: "Yes", source: `Cronometer: ${Math.round(grams)} g alcohol` };
-          return;
-        }
-        // Uber Eats: a delivered drink the estimator classed as alcohol (dishes marked "ate none" don't count).
-        const { data: dishes } = await supabase
-          .from("delivery_order_items")
-          .select("title, est_key, eaten_fraction")
-          .eq("onyx_behavioral_date", date)
-          .eq("is_cancelled", false);
-        const eaten = ((dishes ?? []) as { title: string | null; est_key: string | null; eaten_fraction: number | null }[]).filter(
-          (d) => d.est_key && Number(d.eaten_fraction ?? 1) !== 0
-        );
-        if (!eaten.length) return;
-        const { data: est } = await supabase
-          .from("delivery_item_nutrition")
-          .select("est_key, kind, alcohol_g")
-          .in("est_key", eaten.map((d) => d.est_key as string));
-        const alcoholic = new Set(
-          ((est ?? []) as { est_key: string; kind: string | null; alcohol_g: number | null }[])
-            .filter((e) => e.kind === "alcohol" || Number(e.alcohol_g || 0) > 0)
-            .map((e) => e.est_key)
-        );
-        const drink = eaten.find((d) => alcoholic.has(d.est_key as string));
-        if (drink) out[Q_ALCOHOL] = { answer: "Yes", source: `Uber Eats: ${(drink.title || "an alcoholic drink").slice(0, 60)}` };
+        if (grams > 0) out[Q_ALCOHOL] = { answer: "Yes", source: `Cronometer: ${Math.round(grams)} g alcohol` };
       })()
     );
   }
@@ -138,13 +115,14 @@ async function suggestionsFor(date: string, today: string, names: Set<string>): 
       (async () => {
         const { data } = await supabase
           .from("phone_usage_daily")
-          .select("minutes_last_hour_before_sleep_est, minutes_by_app")
+          .select(CHECKIN_SCREEN_COLUMNS)
           .eq("behavioral_date", date)
           .maybeSingle();
         if (!data) return;
-        const row = data as { minutes_last_hour_before_sleep_est: number | string | null; minutes_by_app: Record<string, unknown> | null };
+        const row = data as { minutes_by_app: Record<string, unknown> | null };
         if (names.has(Q_SCREEN_IN_BED)) {
-          const s = screenInBedSuggestion(row.minutes_last_hour_before_sleep_est);
+          // Only once that day's sync is complete (lib/checkin-screen.ts): before it, the estimate reads 0 and would suggest No.
+          const s = screenInBedSuggestion(settledLastHourMinutes(data, date));
           if (s) out[Q_SCREEN_IN_BED] = s;
         }
         Object.assign(out, appHabitSuggestions(row.minutes_by_app, names));

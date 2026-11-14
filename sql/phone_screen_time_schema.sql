@@ -1,3 +1,8 @@
+-- RETIRED 2026-11-13: this v1 Shortcuts open/close path was never used (pds.phone_app_events
+-- has no rows) and was replaced by sql/phone_usage_schema.sql (the Onyx Screen Time app).
+-- The route and the /status card are gone; the table and views below still exist, empty.
+-- Kept as the record of what is in the database. Do not re-apply; removing the objects is a
+-- separate step that needs Riley's approval.
 -- ============================================================================
 -- Phone screen time (2026-11-08) — iOS Shortcuts app open/close events
 -- ============================================================================
