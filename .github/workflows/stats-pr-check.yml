@@ -37,8 +37,20 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Select conservative test scope
+        id: scope
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.sha }}
+        run: python3 tools/stats_ci_scope.py
+
+      - name: TDEE source guard (every run, no dependencies)
+        run: python3 tests/test_tdee_source_guard.py
 
       - name: Parse-check Python modules (fails fast, before the install)
+        if: steps.scope.outputs.scope != 'frontend'
         run: |
           python3 -c "import ast; [ast.parse(open(p).read()) for p in (
             'hrv_analysis.py','hrv_predict.py','hrv_alignment.py','causal_inference.py',
@@ -46,7 +58,8 @@ jobs:
             'whoop_tz_backfill.py',
           )]; print('all .py modules parse cleanly')"
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - if: steps.scope.outputs.scope != 'frontend'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
           cache: pip
@@ -55,7 +68,9 @@ jobs:
             requirements-analysis.lock
 
       - name: Install (pinned analysis lock + the few extras the ETL modules import)
+        if: steps.scope.outputs.scope != 'frontend'
         run: pip install -r requirements-ci.txt
 
       - name: Offline tests (all of tests/test_*.py except the live ones, in parallel)
+        if: steps.scope.outputs.scope != 'frontend'
         run: python tests/run_offline_tests.py
