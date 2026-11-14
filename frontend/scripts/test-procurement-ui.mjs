@@ -20,6 +20,9 @@ await writeFile(path.join(fixture, 'app/DetectedSubscriptions.tsx'), relative(aw
 await copyFile(path.join(frontend, 'src/lib/procurement-recurring.ts'), path.join(fixture, 'lib/procurement-recurring.ts'));
 await copyFile(path.join(frontend, 'src/lib/procurement-renewals.ts'), path.join(fixture, 'lib/procurement-renewals.ts'));
 await copyFile(path.join(frontend, 'src/lib/procurement-flags.ts'), path.join(fixture, 'lib/procurement-flags.ts'));
+// Purchase suggestions: its own card and pure lib.
+await writeFile(path.join(fixture, 'app/ReorderSuggestions.tsx'), relative(await readFile(path.join(frontend, 'src/app/procurement/ReorderSuggestions.tsx'), 'utf8')));
+await copyFile(path.join(frontend, 'src/lib/procurement-reorder.ts'), path.join(fixture, 'lib/procurement-reorder.ts'));
 await copyFile(path.join(frontend, 'src/lib/finance-ledger.ts'), path.join(fixture, 'lib/finance-ledger.ts'));
 // The real page.tsx reads the ledger on the server; the fixture has no database, so it renders the client with synthetic detected rows.
 await writeFile(path.join(fixture, 'app/page.tsx'), `import ProcurementClient from './ProcurementClient';
@@ -39,7 +42,13 @@ const advice = { usageAvailable: true, canDismiss: true, advice: [
   ] },
   { subId: '00000000000000a2', service: null, category: null, usage: { state: 'unknown', why: 'no app or site in Screen Time matches this merchant' }, flags: [] },
 ] } as const;
-export default function Page() { return <ProcurementClient detected={detected as never} advice={advice as never} />; }
+// Purchase suggestions as the server would send them (synthetic): one due, one not yet.
+const suggestion = { merchant: 'Demo store', purchases: 4, intervalDays: 30, minGapDays: 28, maxGapDays: 33, regularity: 'steady', lastOrdered: '2030-02-14', daysSince: 29, dueOn: '2030-03-16' };
+const reorder = { state: 'ok', today: '2030-03-15', orders: 12, boughtTwice: 2, stopped: 1, suggestions: [
+  { ...suggestion, key: 'demo protein powder', item: 'Demo protein powder', status: 'due', reason: 'Ordered 4 times, last from Demo store; usually reordered every ~30 days (gaps of 28 to 33 days). Last ordered Feb 14, 2030, 29 days ago. Likely due about now.' },
+  { ...suggestion, key: 'demo water filter', item: 'Demo water filter', status: 'later', daysSince: 5, reason: 'Ordered 3 times, last from Demo store; usually reordered every ~60 days (always 60 days apart). Last ordered Mar 10, 2030, 5 days ago. Due in about 55 days.' },
+] } as const;
+export default function Page() { return <ProcurementClient detected={detected as never} advice={advice as never} reorder={reorder as never} />; }
 `);
 await copyFile(path.join(frontend, 'src/app/globals.css'), path.join(fixture, 'app/globals.css'));
 await copyFile(path.join(frontend, 'postcss.config.mjs'), path.join(fixture, 'postcss.config.mjs'));
@@ -118,6 +127,18 @@ try {
     { method: 'PATCH', body: { sub: '00000000000000a1', flag: 'price_increase:00000000000000c1', dismissed: true } },
     { method: 'PATCH', body: { sub: '00000000000000a1', flag: 'no_recent_use:00000000000000c2', dismissed: false } },
   ]);
+  // Purchase suggestions: what is due with its reason, the rest folded away, and nothing to click through to.
+  const reorder = page.getByTestId('procurement-reorder');
+  await reorder.getByRole('heading',{name:'Purchase suggestions',exact:true}).waitFor();
+  assert.equal(await reorder.getByTestId('procurement-reorder-row').count(), 2);
+  await reorder.getByText('Likely due',{exact:true}).waitFor();
+  await reorder.getByText(/usually reordered every ~30 days \(gaps of 28 to 33 days\)\. Last ordered Feb 14, 2030, 29 days ago\. Likely due about now\./).waitFor();
+  assert.equal(await reorder.getByText('Demo water filter',{exact:true}).isVisible(), false, 'items not due yet are folded away');
+  await reorder.getByText('1 repeat item not due yet',{exact:true}).click();
+  await reorder.getByText('Demo water filter',{exact:true}).waitFor();
+  await reorder.getByText(/Left out: 2 items ordered only twice \(too few to estimate an interval\); 1 not ordered for more than three times the usual interval/).waitFor();
+  assert.equal(await reorder.locator('a, button, form, input').count(), 0, 'advice only: no link, button or form in the suggestions card');
+  assert.equal(await page.getByText(/No personalized recommendations yet/).count(), 0);
   await page.getByRole('heading',{name:'What this page reads',exact:true}).waitFor();
   assert.equal(await page.getByText(/Disconnected preview/).count(),0);
   assert.equal(await page.getByText(/Financials is not read/).count(),0);
