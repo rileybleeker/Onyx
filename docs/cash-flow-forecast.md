@@ -1,6 +1,6 @@
 # Cash flow forecast, tax planning and what-if scenarios: design
 
-Status (2026-11-14): Phase 1 (the engine) in progress on branch `feat/cash-forecast-engine`; nothing on a page yet. Cash pool = checking + savings (D1); no buffer line yet (D2 deferred, default $0). Roadmap row: "Cash flow forecast + tax planning" (Tasks DB,
+Status (2026-11-14): Phase 1 (the engine, `frontend/src/lib/cash-forecast.ts`) is built and backtested (Section 9.1); nothing on a page yet. Cash pool = checking + savings (D1); no buffer line yet (D2 deferred, default $0). Roadmap row: "Cash flow forecast + tax planning" (Tasks DB,
 `Source = "Onyx Roadmap"`). This file holds no personal figures (the repo is public); every real amount lives in the
 service-role tables proposed below and is entered through the page.
 
@@ -298,6 +298,24 @@ needs a round trip and never reads the raw ledger in the browser.
   `pds.finance_forecast_snapshots`, and the page shows forecast versus actual for the last 8 weeks.
 - The job writes a `finance_forecast|snapshot` heartbeat on every run, and `/status` gets a Cash Forecast card
   (the "every integration on /status" rule).
+
+### 9.1 Backtest results (2026-11-14, `cash-forecast-backtest.yml`)
+
+64 weekly as-of dates (about 18 months back to 13 weeks back), 4 cash accounts. Errors are a share of one month
+of the pool's outflows; positive = forecast too high.
+
+| Engine version | Horizon | Median abs. error | Mean error | Actual below low band | Actual above high band |
+|---|---|---|---|---|---|
+| First run | 1 / 4 / 13 weeks | 15% / 18% / 58% | +4% / +15% / +54% | 31% / 38% / 63% | 16% / 2% / 0% |
+| Card payments as monthly totals, large outflows and ignored rows kept | 1 / 4 / 13 weeks | 14% / 13% / 31% | -7% / -8% / -16% | 11% / 9% / 8% | 23% / 11% / 6% |
+
+What changed between the two: (1) card payments are the card's monthly total paid (mean of the last 3 months),
+not one payment a month, because cards are often paid several times a month; (2) only unusually large money IN
+is left out of the everyday baseline, large money out stays in (asymmetric caution); (3) rows the budget marks as
+ignored are counted, because they still moved cash. The bands now cover about 80% of outcomes, as designed. The
+remaining bias is conservative: irregular deposits and transfers in from other accounts are not forecast (13-week
+breakdown: money in 167% forecast vs 233% actual), which is the intended direction. Card payments are still
+under-projected at 13 weeks (162% vs 245%); payments to cards with no card-side rows fall into the baseline.
 
 ## 10. Architecture (follows the existing finance pattern)
 

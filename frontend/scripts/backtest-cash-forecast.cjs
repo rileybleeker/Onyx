@@ -70,6 +70,8 @@ async function main() {
   if (!asOfs.length) fail("not enough history");
 
   const points = [];
+  const parts = { inF: [], inA: [], cardF: [], cardA: [], restF: [], restA: [], xferA: [] };
+  const CARD_CAT = /credit card payment/i;
   let streamsSeen = 0;
   let cardsSeen = 0;
   for (const asOf of asOfs) {
@@ -85,6 +87,23 @@ async function main() {
       .filter((t) => t.txn_date > since && t.txn_date <= asOf && t.amount_cents > 0 && !/internal transfers|savings transfer/i.test(t.category || ""))
       .reduce((s, t) => s + t.amount_cents, 0);
     const scale = gross / 6;
+    // 13-week breakdown (shares of the scale): money in, card payments, everything else.
+    if (scale > 0) {
+      const end = R.addDays(asOf, 91);
+      const fl = out.lines.filter((l) => l.date <= end);
+      const sum = (xs) => xs.reduce((a, b) => a + b, 0);
+      const isCardLine = (l) => out.streams.some((s) => s.kind === "card" && s.id === l.sourceId);
+      parts.inF.push(sum(fl.filter((l) => l.amountCents > 0 && l.layer !== "baseline").map((l) => l.amountCents)) / scale);
+      parts.cardF.push(sum(fl.filter(isCardLine).map((l) => l.amountCents)) / scale);
+      parts.restF.push(sum(fl.filter((l) => !isCardLine(l) && !(l.amountCents > 0 && l.layer !== "baseline")).map((l) => l.amountCents)) / scale);
+      const fut = poolTxns.filter((t) => t.txn_date > asOf && t.txn_date <= end);
+      const delta = (t) => -t.amount_cents;
+      const isIn = (t) => delta(t) > 0 && !/transfer|credit card payment/i.test(t.category || "");
+      parts.inA.push(sum(fut.filter(isIn).map(delta)) / scale);
+      parts.cardA.push(sum(fut.filter((t) => delta(t) < 0 && CARD_CAT.test(t.category || "")).map(delta)) / scale);
+      parts.restA.push(sum(fut.filter((t) => !isIn(t) && !(delta(t) < 0 && CARD_CAT.test(t.category || ""))).map(delta)) / scale);
+      parts.xferA.push(sum(fut.filter((t) => /transfer/i.test(t.category || "")).map(delta)) / scale);
+    }
     for (const h of HORIZONS) {
       const day = out.days[h - 1];
       if (!day) continue;
@@ -104,6 +123,12 @@ async function main() {
     );
   }
   console.log("target for the bands: about 10% below the low band and 10% above the high band");
+  const avg = (xs) => (xs.length ? Math.round((xs.reduce((a, b) => a + b, 0) / xs.length) * 1000) / 10 : 0);
+  console.log("13-week breakdown, mean over runs, % of one month of outflows (forecast | actual):");
+  console.log(`  money in (deposits, not transfers): ${avg(parts.inF)}% | ${avg(parts.inA)}%`);
+  console.log(`  card payments:                      ${avg(parts.cardF)}% | ${avg(parts.cardA)}%`);
+  console.log(`  everything else (net):              ${avg(parts.restF)}% | ${avg(parts.restA)}%`);
+  console.log(`    of which transfers (net, actual):            ${avg(parts.xferA)}%`);
 }
 
 main().catch((e) => fail(e && e.code ? String(e.code) : e && e.name ? e.name : "error"));

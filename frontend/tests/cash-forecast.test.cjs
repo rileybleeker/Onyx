@@ -102,12 +102,15 @@ test("everyday spending: mean weekly net flow, internal transfers and one-offs l
     tx("chk", "2030-06-01", 100_000, "TO SAVINGS", { category: "Internal Transfers" }),
     tx("sav", "2030-06-01", -100_000, "FROM CHECKING", { category: "Internal Transfers" }),
     tx("chk", "2030-05-02", 300_000, "DEMO MOVERS DEPOSIT", { category: "Moving" }),
+    tx("chk", "2030-05-09", -400_000, "DEMO TAX REFUND", { category: "Income" }),
+    tx("chk", "2030-05-12", 26_000, "DEMO IGNORED PURCHASE", { ignored_from: "budget" }),
   ];
   const out = run({ extra });
   assert.equal(out.baseline.projected, true);
-  assert.equal(out.baseline.weeklyMeanCents, -10_000);
+  // Large money out stays in the mean (300k + the 26k ignored row over 26 weeks); the large refund does not.
+  assert.equal(out.baseline.weeklyMeanCents, Math.round(-10_000 - (300_000 + 26_000) / 26));
   assert.equal(out.baseline.oneOffs, 1);
-  assert.ok(out.notes.some((n) => /one-off/.test(n)));
+  assert.ok(out.notes.some((n) => /unusually large deposit/.test(n)));
 });
 
 test("card payments follow what was paid, on the usual day", () => {
@@ -118,6 +121,27 @@ test("card payments follow what was paid, on the usual day", () => {
   assert.equal(card.next, F.nextBusinessDay("2030-06-20"));
   // The everyday baseline does not also count the card payments.
   assert.equal(out.baseline.weeklyMeanCents, -10_000);
+});
+
+test("a card paid several times a month projects its monthly total, minus what is already paid", () => {
+  const extra = [];
+  for (const m of ["2030-03", "2030-04", "2030-05"]) {
+    for (const [day, amt] of [[3, 40_000], [12, 60_000], [24, 50_000]]) {
+      const d = F.nextBusinessDay(`${m}-${String(day).padStart(2, "0")}`);
+      extra.push(tx("chk", d, amt, "DEMO PROMO CARD PAYMENT", { category: "Credit Card Payment" }));
+      extra.push(tx("promo", d, -amt, "PAYMENT RECEIVED", { category: "Credit Card Payment" }));
+    }
+  }
+  extra.push(tx("chk", "2030-06-04", 40_000, "DEMO PROMO CARD PAYMENT", { category: "Credit Card Payment" }));
+  extra.push(tx("promo", "2030-06-04", -40_000, "PAYMENT RECEIVED", { category: "Credit Card Payment" }));
+  const out = run({ extra });
+  const s = out.streams.find((x) => x.kind === "card" && x.label.startsWith("Demo Promo Card"));
+  assert.ok(s);
+  assert.equal(s.typicalCents, -150_000);
+  const lines = out.lines.filter((l) => l.sourceId === s.id);
+  assert.equal(lines[0].amountCents, -110_000); // June: 150k usual, 40k already paid
+  assert.equal(lines[1].amountCents, -150_000);
+  assert.ok(lines.length >= 12);
 });
 
 test("planned items: projected, matched when they happen, late money in dropped, late money out kept", () => {
