@@ -219,7 +219,10 @@ function fakeDb(state) {
 function loadRoutes(state) {
   const stubs = {
     "server-only": {},
-    "next/server": { NextResponse: { json: (body, init) => ({ status: init?.status ?? 200, body, headers: init?.headers ?? {} }) } },
+    "next/server": {
+      NextResponse: { json: (body, init) => ({ status: init?.status ?? 200, body, headers: init?.headers ?? {} }) },
+      after: () => assert.fail("no background sync may be scheduled while Google Calendar is not set up"),
+    },
     "@supabase/supabase-js": { createClient: () => fakeDb(state) },
   };
   return {

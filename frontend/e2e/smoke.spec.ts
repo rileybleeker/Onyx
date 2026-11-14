@@ -613,11 +613,12 @@ test("/wins renders the Wins board", async ({ page }) => {
 
 // /health (PR #30; stored in Onyx since 2026-11-13): care/appointments planner. Items are read
 // server-side from pds.care_items (service-role only), sample data is opt-in, and the Google
-// Calendar card is a read-only "not connected" stub. Tripwire: the list loaded from Onyx (the
-// load-failure panel is absent and the add form rendered; an empty list is legitimate), sample
-// data is NOT on by default, and the calendar connect button is still disabled. Read-only: never
-// types, adds, toggles or copies anything, and never asserts on an item's label or date.
-test("/health renders the care planner with sample data off and calendar disconnected", async ({ page }) => {
+// Calendar card says "not connected" until Riley sets it up and connects (then "connected").
+// Tripwire: the list loaded from Onyx (the load-failure panel is absent and the add form
+// rendered; an empty list is legitimate), sample data is NOT on by default, and the calendar card
+// shows one of its two real states. Read-only: never types, adds, toggles, copies, connects or
+// syncs anything, and never asserts on an item's label or date.
+test("/health renders the care planner with sample data off and a calendar state", async ({ page }) => {
   await gotoAuthed(page, "/health");
   await expect(pageHeading(page, page.getByRole("heading", { name: "Health & appointments", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
   await expect(page.getByRole("heading", { name: "Private planning, saved in Onyx", exact: true })).toBeVisible();
@@ -625,7 +626,7 @@ test("/health renders the care planner with sample data off and calendar disconn
   await expect(page.getByText(/Loading your care items/)).toHaveCount(0, { timeout: LOAD_TIMEOUT });
   await expect(page.getByRole("heading", { name: "Add care item", exact: true })).toBeVisible();
   await expect(page.getByLabel(/Show sample data/), "sample data must be opt-in").not.toBeChecked();
-  await expect(page.getByRole("button", { name: /^Connect Google Calendar$/ })).toBeDisabled();
+  await expect(page.getByRole("heading", { name: /^Google Calendar: (not connected|connected)$/ })).toBeVisible();
   await expectNoClientCrash(page);
 });
 

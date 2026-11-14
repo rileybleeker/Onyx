@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { MAX_CARE_ITEMS, MAX_IMPORT_BODY_BYTES, parseImportBody, toColumns } from "@/lib/care-items";
+import { syncAfterWrite } from "@/lib/care-google-server";
 import { careDb, careJson, liveCareCount, loadCareItems, readCareBody } from "@/lib/care-items-server";
 import { upgradeLocalItem } from "@/lib/care-planner";
 
@@ -36,6 +37,7 @@ export async function POST(req: NextRequest) {
     return careJson({ error: "could not copy" }, 500);
   }
   const copied = data?.length ?? 0;
+  if (copied > 0) syncAfterWrite();
   const current = await loadCareItems();
   if (current.state === "error") return careJson({ error: "copied, but the list could not be re-read" }, 500);
   return careJson({ copied, skipped: rows.length - copied, items: current.items });
