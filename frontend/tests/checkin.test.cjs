@@ -124,7 +124,37 @@ test("the route never writes a pre-fill: habit_journal is only written in POST",
   assert.match(route, /groupFor\(h\.name, ch, h\.frequency\)/);
 });
 
-test("the one-tap buttons leave tonight's sleep questions out of 'No for the rest'", () => {
+// ─── sleep is asked for finished nights only ─────────────────────────────────
+
+test("sleepNights: last night and the one before, never tonight, never the frozen era", () => {
+  assert.deepEqual(C.sleepNights("2031-03-05"), ["2031-03-04", "2031-03-03"]);
+  assert.equal(C.sleepNights("2031-03-05").includes("2031-03-05"), false);
+  assert.deepEqual(C.sleepNights("2031-03-05", "2031-03-03"), ["2031-03-04"]);
+  assert.deepEqual(C.sleepNights("2031-03-05", "2031-03-04"), []);
+  assert.deepEqual(C.sleepNights("2031-03-01"), ["2031-02-28", "2031-02-27"]); // month boundary
+});
+
+test("nightLabel names the night by the evening it started and the morning it ended", () => {
+  // 2031-03-05 is a Wednesday.
+  assert.deepEqual(C.nightLabel("2031-03-04", "2031-03-05"), { title: "Last night", span: "Tue night → Wed morning" });
+  assert.deepEqual(C.nightLabel("2031-03-03", "2031-03-05"), { title: "Monday night", span: "Mon night → Tue morning" });
+});
+
+test("the route builds nights from sleepNights and keeps sleep answers out of the day", () => {
+  const route = fs.readFileSync(path.join(SRC, "app/api/habits/checkin/route.ts"), "utf8");
+  assert.match(route, /sleepNights\(today, WHOOP_JOURNAL_FROZEN_THROUGH\)/);
+  assert.match(route, /suggestionsFor\(date, today, dayNames\)/);
+  assert.match(route, /total: dayCore\.size/);
+  assert.equal(/usualKit: kit\b/.test(route), false);
+});
+
+test("the screen saves each night under the night's own date, and never asks about tonight", () => {
   const client = fs.readFileSync(path.join(SRC, "app/check-in/CheckInClient.tsx"), "utf8");
-  assert.match(client, /core\.filter\(\(i\) => !i\.sleep && !cells\[i\.name\]\)/);
+  assert.match(client, /await post\(n\.date, n\.changes\)/);
+  assert.match(client, /await post\(data\.date, dayChanges\)/);
+  assert.match(client, /Tonight is asked tomorrow/);
+  assert.equal(/Tonight's sleep/.test(client), false);
+  // sleep questions are not part of the day tab: "No for the rest" and the progress bar only see daytime items
+  assert.match(client, /const dayItems = items\.filter\(\(i\) => !isNightItem\(i\)\)/);
+  assert.match(client, /const core = dayItems\.filter/);
 });

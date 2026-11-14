@@ -10,8 +10,17 @@ export interface CheckinItem {
   channel: "whoop" | "habit";
   /** core = answered every day (WHOOP-derived questions + daily habits); extra = weekly / ad-hoc / occasional habits, blank = not logged. */
   group: "core" | "extra";
-  /** About the night that closes the behavior day (tonight, on the Today tab). */
+  /** A sleep question: asked per finished night (CheckinPayload.nights), not on a day tab. */
   sleep: boolean;
+}
+
+/** One finished night. `date` = the behavior day that night closes; its answers are stored on that day. */
+export interface CheckinNight {
+  date: string;
+  answers: Record<string, CheckinAnswer>; // saved sleep answers
+  suggestions: Record<string, CheckinSuggestion>;
+  /** Last answer given to each sleep-kit question before this night: what the "usual kit" tap fills in. */
+  usualKit: Record<string, CheckinAnswer>;
 }
 
 export interface CheckinSuggestion {
@@ -31,9 +40,9 @@ export interface CheckinPayload {
   items: CheckinItem[];
   answers: Record<string, CheckinAnswer>;
   suggestions: Record<string, CheckinSuggestion>;
-  /** Last answer given to each sleep-kit question before `date`: what the "usual kit" tap fills in. */
-  usualKit: Record<string, CheckinAnswer>;
-  /** today and the two days before, with progress, for the catch-up tabs */
+  /** The finished nights the sleep questions are asked for, newest first (last night, then the one before). */
+  nights: CheckinNight[];
+  /** today and the two days before, with progress over the DAYTIME core questions, for the catch-up tabs */
   days: CheckinDay[];
 }
 
@@ -52,6 +61,7 @@ export function addDays(date: string, n: number): string {
 //  1. OCCASIONAL questions move to the collapsed "Also did" section (blank = not logged).
 //  2. More pre-fills from data Onyx already holds, each labeled with its source and only when the data is clear.
 //  3. One tap for the sleep kit (the last answer given to each kit question) and one for "No for the rest".
+//  4. Sleep is asked for nights that already happened ("Last night"), never for tonight.
 // Question titles are the frozen habit names; a rename in Notion simply drops the question out of a list here.
 
 /** What Riley wears to sleep. One "usual kit" tap answers all of them. */
@@ -68,10 +78,34 @@ export const Q_SCREEN_IN_BED = "Viewed a screen device in bed?";
 export const Q_JOURNALED = "Journaled your thoughts?";
 
 /**
- * Questions about the night that CLOSES the behavior day: on the Today tab that is tonight, not last night
- * (the HRV pipeline scores day D's answers against the sleep that ends day D; see hrv_alignment.py).
+ * Questions about a night's sleep. An answer stored on behavior day D describes the night that CLOSES day D
+ * (the HRV pipeline scores day D's answers against that sleep; see hrv_alignment.py), so on day D itself that
+ * night has not happened yet. The check-in therefore never asks them on a day tab: it asks them per finished
+ * night (sleepNights) and stores each night's answers on the day it closes.
  */
 export const SLEEP_QUESTIONS: ReadonlySet<string> = new Set([...SLEEP_KIT, Q_SAME_BED, Q_SCREEN_IN_BED]);
+
+/** How many finished nights the check-in asks about (same reach as the day tabs). */
+export const CHECKIN_NIGHTS_BACK = 2;
+
+/**
+ * The nights that are over, newest first, as the behavior days they close: last night closed (today - 1).
+ * `today` is behavioral today, so at 00:30 before bed "last night" is still the night before.
+ */
+export function sleepNights(today: string, frozenThrough?: string): string[] {
+  return Array.from({ length: CHECKIN_NIGHTS_BACK }, (_, i) => addDays(today, -(i + 1))).filter((d) => !frozenThrough || d > frozenThrough);
+}
+
+const weekday = (date: string, style: "short" | "long") =>
+  new Date(date + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", weekday: style });
+
+/** "Last night" + "Thu night → Fri morning": names a night so it cannot be mistaken for another one. */
+export function nightLabel(night: string, today: string): { title: string; span: string } {
+  return {
+    title: night === addDays(today, -1) ? "Last night" : `${weekday(night, "long")} night`,
+    span: `${weekday(night, "short")} night → ${weekday(addDays(night, 1), "short")} morning`,
+  };
+}
 
 /**
  * Asked only in "Also did". On 2026-11-13 each of these had at most 4 Yes answers ever (most had none), so a
