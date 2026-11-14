@@ -17,7 +17,7 @@
  * and, separately, a monthly net worth projection with card balances, interest, promo end dates and investment
  * growth (Sections 4.3b / 4.3c).
  */
-import { classifyTxn } from "./finance-ledger";
+import { classifyTxn, isNonSpendingCategory } from "./finance-ledger";
 import { addDays, addMonths, daysBetween, displayMerchant, merchantKey, rowLabel, stableId } from "./procurement-recurring";
 import { FORECAST } from "./cash-forecast-config";
 
@@ -469,7 +469,7 @@ function pairRows(pool: Row[], cardRows: Row[]): { internal: Set<number>; cardPa
         n.t.account_key !== o.t.account_key &&
         n.delta === -o.delta &&
         Math.abs(daysBetween(o.t.txn_date, n.t.txn_date)) <= FORECAST.internalPairDays &&
-        (classifyTxn(o.t) === "transfer" || classifyTxn(n.t) === "transfer"),
+        (isNonSpendingCategory(o.t.category) || isNonSpendingCategory(n.t.category)),
     );
     if (match) {
       internal.add(o.i);
@@ -756,12 +756,13 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     if (stale) warnings.push(`A cash balance is older than ${FORECAST.staleBalanceHours} hours, so the starting point may be off.`);
   }
 
-  // Rows: USD, dated up to today, not ignored.
+  // Rows: USD, dated up to today. Rows the budget ignores are KEPT: they still moved cash (the backtest of
+  // 2026-11-14 showed that leaving them out made the forecast too optimistic). Card spending still uses
+  // counted rows only.
   const rows: Row[] = [];
   input.txns.forEach((t, i) => {
     if (!isDay(t.txn_date) || t.txn_date > today) return;
     if ((t.currency ?? "USD").toUpperCase() !== "USD") return;
-    if (classifyTxn(t) === "ignored") return;
     rows.push({ i, t, delta: toBalanceDelta(t.amount_cents) });
   });
   const poolRows = rows.filter((r) => poolSet.has(r.t.account_key));
@@ -817,12 +818,14 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   // The one-off cut comes from the leftover rows themselves (paychecks and other streams would raise it).
   const sizes = residual.map((r) => Math.abs(r.delta)).sort((a, b) => a - b);
   const oneOffCut = Math.max(FORECAST.oneOffMinCents, FORECAST.oneOffP95Multiple * percentile(sizes, 0.95));
-  const oneOffs = residual.filter((r) => Math.abs(r.delta) > oneOffCut);
+  // Asymmetric caution: only unusually large money IN is left out (a refund, a gift). Large money out stays in
+  // the mean: rent paid by transfer, a lump payment to a card, a move all recur in some form (backtest 2026-11-14).
+  const isOneOff = (r: Row) => r.delta > 0 && r.delta > oneOffCut;
+  const oneOffs = residual.filter(isOneOff);
   if (oneOffs.length) {
-    const inn = oneOffs.filter((r) => r.delta > 0).reduce((s, r) => s + r.delta, 0);
-    const out = oneOffs.filter((r) => r.delta < 0).reduce((s, r) => s + r.delta, 0);
+    const inn = oneOffs.reduce((s, r) => s + r.delta, 0);
     notes.push(
-      `${oneOffs.length} one-off transaction${oneOffs.length > 1 ? "s" : ""} in the last ${L} weeks (${fmt(inn)} in, ${fmt(-out)} out) are left out of everyday spending. Add a planned item if one will repeat.`,
+      `${oneOffs.length} unusually large deposit${oneOffs.length > 1 ? "s" : ""} in the last ${L} weeks (${fmt(inn)} in total) ${oneOffs.length > 1 ? "are" : "is"} not counted as everyday money in. Add a planned item if one will repeat.`,
     );
   }
   const weeklySeries: number[] = [];
@@ -831,7 +834,7 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     const start = addDays(end, -6);
     if (!firstPoolDate || start < firstPoolDate) continue;
     let sum = 0;
-    for (const r of residual) if (r.t.txn_date >= start && r.t.txn_date <= end && Math.abs(r.delta) <= oneOffCut) sum += r.delta;
+    for (const r of residual) if (r.t.txn_date >= start && r.t.txn_date <= end && !isOneOff(r)) sum += r.delta;
     weeklySeries.push(sum);
   }
   const baselineProjected = weeklySeries.length >= FORECAST.minBaselineWeeks;

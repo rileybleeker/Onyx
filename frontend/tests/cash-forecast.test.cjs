@@ -102,12 +102,15 @@ test("everyday spending: mean weekly net flow, internal transfers and one-offs l
     tx("chk", "2030-06-01", 100_000, "TO SAVINGS", { category: "Internal Transfers" }),
     tx("sav", "2030-06-01", -100_000, "FROM CHECKING", { category: "Internal Transfers" }),
     tx("chk", "2030-05-02", 300_000, "DEMO MOVERS DEPOSIT", { category: "Moving" }),
+    tx("chk", "2030-05-09", -400_000, "DEMO TAX REFUND", { category: "Income" }),
+    tx("chk", "2030-05-12", 26_000, "DEMO IGNORED PURCHASE", { ignored_from: "budget" }),
   ];
   const out = run({ extra });
   assert.equal(out.baseline.projected, true);
-  assert.equal(out.baseline.weeklyMeanCents, -10_000);
+  // Large money out stays in the mean (300k + the 26k ignored row over 26 weeks); the large refund does not.
+  assert.equal(out.baseline.weeklyMeanCents, Math.round(-10_000 - (300_000 + 26_000) / 26));
   assert.equal(out.baseline.oneOffs, 1);
-  assert.ok(out.notes.some((n) => /one-off/.test(n)));
+  assert.ok(out.notes.some((n) => /unusually large deposit/.test(n)));
 });
 
 test("card payments follow what was paid, on the usual day", () => {
