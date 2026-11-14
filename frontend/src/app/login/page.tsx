@@ -69,7 +69,7 @@ export default function LoginPage() {
         </div>
 
         {sent ? (
-          <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 text-center">
+          <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-6 text-center">
             <p className="text-text-primary font-medium">Check your email</p>
             <p className="text-text-secondary text-sm mt-2">
               We sent a magic link to <span className="text-text-primary">{email}</span>
@@ -78,7 +78,7 @@ export default function LoginPage() {
         ) : (
           <form
             onSubmit={handleSubmit}
-            className="bg-surface-card border border-border-subtle rounded-[6px] p-6 space-y-4"
+            className="bg-surface-card border border-border-subtle rounded-card shadow-card p-6 space-y-4"
           >
             <div>
               <label htmlFor="email" className="block text-sm font-medium text-text-secondary mb-1.5">
@@ -92,7 +92,7 @@ export default function LoginPage() {
                 placeholder="you@example.com"
                 required
                 autoComplete="email"
-                className="w-full bg-surface-raised border border-border-subtle rounded-[4px] px-3 py-2.5 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent"
+                className="w-full bg-surface-raised border border-border-subtle rounded-control px-3 py-2.5 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent"
               />
             </div>
 
@@ -108,7 +108,7 @@ export default function LoginPage() {
                   onChange={(e) => setPassword(e.target.value)}
                   required
                   autoComplete="current-password"
-                  className="w-full bg-surface-raised border border-border-subtle rounded-[4px] px-3 py-2.5 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent"
+                  className="w-full bg-surface-raised border border-border-subtle rounded-control px-3 py-2.5 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent"
                 />
               </div>
             )}
@@ -118,7 +118,7 @@ export default function LoginPage() {
             <button
               type="submit"
               disabled={loading}
-              className="w-full bg-accent hover:bg-accent/90 disabled:opacity-50 text-white font-medium py-2.5 rounded-[4px] text-sm transition-colors"
+              className="w-full bg-accent hover:bg-accent/90 disabled:opacity-50 text-on-accent font-medium py-2.5 rounded-full text-sm transition-colors"
             >
               {loading
                 ? mode === "password"

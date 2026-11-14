@@ -29,7 +29,7 @@ import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
+const legendStyle = { fontSize: 11, fontFamily: "var(--font-mono)" };
 
 // ─── Vitamins & Minerals reference (US RDA/AI for an adult male) ──────────────
 // `tok` is the unit token used in pds.daily_micronutrient_totals column names
@@ -433,13 +433,13 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
         <div className="space-y-6">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             {[...Array(4)].map((_, i) => (
-              <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+              <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
                 <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
                 <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
               </div>
             ))}
           </div>
-          <div className="h-[320px] bg-surface-card border border-border-subtle rounded-[6px] animate-pulse" />
+          <div className="h-[320px] bg-surface-card border border-border-subtle rounded-control animate-pulse" />
         </div>
       ) : (
         <>
@@ -600,7 +600,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                     const pct = total != null && d.rda ? (total / d.rda) * 100 : null;
                     const barColor = pct == null ? "bg-white/10" : pct >= 100 ? "bg-green-500" : pct >= 50 ? "bg-cyan-500" : "bg-amber-500";
                     return (
-                      <div key={d.key} className="bg-surface-card border border-border-subtle rounded-[6px] p-3">
+                      <div key={d.key} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-3">
                         <div className="flex justify-between items-baseline">
                           <span className="text-xs text-text-secondary truncate">{d.label}</span>
                           <span className="text-[10px] font-mono text-text-tertiary shrink-0 ml-1">{pct == null ? "—" : `${Math.round(pct)}%`}</span>
@@ -644,7 +644,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
             role="tab"
             aria-selected={mealsDayOffset === off}
             onClick={() => setMealsDayOffset(off)}
-            className={`px-2.5 py-1 rounded-[5px] border text-[11px] font-mono transition-colors ${
+            className={`px-2.5 py-1 rounded-control border text-[11px] font-mono transition-colors ${
               mealsDayOffset === off
                 ? "border-accent/60 bg-accent/10 text-text-primary"
                 : "border-border-subtle text-text-tertiary hover:text-text-secondary"
@@ -664,7 +664,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
       {servingsFailed && <p className="text-xs text-red-400 mb-2">Couldn&apos;t load Cronometer entries.</p>}
       {delivery.loadError && <p className="text-xs text-red-400 mb-2">{delivery.loadError}</p>}
       {todayServings.length === 0 ? null : (
-        <div className="bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle">
+        <div className="bg-surface-card border border-border-subtle rounded-control divide-y divide-border-subtle">
           {todayServings.map((s) => (
             <div key={s.serving_id} className="flex items-center gap-3 px-4 py-2.5 text-sm">
               <span className="text-[11px] font-mono text-text-tertiary w-20 shrink-0">
@@ -722,7 +722,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
           const last7 = fullNutrients.slice(-7);
           const fmtN = (v: any) => (v == null ? "—" : Number(v) >= 10 ? Number(v).toFixed(0) : Number(v).toFixed(2));
           return (
-            <div className="bg-surface-card border border-border-subtle rounded-[6px] overflow-hidden">
+            <div className="bg-surface-card border border-border-subtle rounded-control overflow-hidden">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="text-[10px] font-mono text-text-tertiary uppercase border-b border-border-subtle">
@@ -799,7 +799,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
               max={etTodayStr()}
               onChange={(e) => setWeightDate(e.target.value || etTodayStr())}
               disabled={savingWeight}
-              className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
+              className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
             />
             {weightDate !== etTodayStr() && (
               <>
@@ -828,7 +828,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
               onChange={(e) => setWeightInput(e.target.value)}
               placeholder="e.g. 178.4"
               disabled={savingWeight}
-              className="w-[120px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
+              className="w-[120px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
             />
             <span className="text-[10px] font-mono text-text-tertiary">lb</span>
             {weightInput && !isNaN(parseFloat(weightInput)) && (
@@ -848,14 +848,14 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
               onChange={(e) => setWeightNotes(e.target.value)}
               placeholder="optional — e.g. 'morning, post-bathroom', 'after workout'"
               disabled={savingWeight}
-              className="flex-1 min-w-[200px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
+              className="flex-1 min-w-[200px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
             />
           </div>
 
           <button
             onClick={saveWeight}
             disabled={savingWeight || !weightInput}
-            className="w-full px-4 py-3 text-[13px] font-medium text-text-primary bg-accent/20 hover:bg-accent/30 disabled:opacity-40 disabled:cursor-not-allowed border border-accent/40 rounded-[4px] transition-colors"
+            className="w-full px-4 py-3 text-[13px] text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed border border-accent rounded-full transition-colors"
           >
             {savingWeight ? "Saving…" : "Save weight"}
           </button>

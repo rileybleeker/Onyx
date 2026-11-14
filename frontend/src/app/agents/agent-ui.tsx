@@ -7,25 +7,25 @@ import type { AgentCard, CardState } from "@/lib/agents-api";
 // Shared pieces of the Agents inbox and conversations: who each agent is, avatars, time labels, cards.
 
 const AGENTS: Record<string, { name: string; about: string; color: string }> = {
-  onyx: { name: "Onyx", about: "reminders, questions, anything", color: "#16E07A" },
-  briefing: { name: "Morning briefing", about: "your day at 8:30", color: "#FFD23F" },
-  "check-in": { name: "Daily check-in", about: "habits, every evening", color: "#16E07A" },
-  coordinator: { name: "Coordinator", about: "goals and tasks", color: "#9A7BFA" },
-  "nyc-scout": { name: "NYC scout", about: "apartment leads", color: "#5B8DF6" },
-  devops: { name: "DevOps", about: "apps, deploys, fixes", color: "#F5A623" },
-  "inbox-triage": { name: "Inbox triage", about: "email that needs you", color: "#22D3A6" },
-  "weekly-review": { name: "Weekly review", about: "how the agents did", color: "#33B5F5" },
+  onyx: { name: "Onyx", about: "reminders, questions, anything", color: "#FF6A1A" },
+  briefing: { name: "Morning briefing", about: "your day at 8:30", color: "#F4C84E" },
+  "check-in": { name: "Daily check-in", about: "habits, every evening", color: "#5BC46E" },
+  coordinator: { name: "Coordinator", about: "goals and tasks", color: "#9085E9" },
+  "nyc-scout": { name: "NYC scout", about: "apartment leads", color: "#3987E5" },
+  devops: { name: "DevOps", about: "apps, deploys, fixes", color: "#C98500" },
+  "inbox-triage": { name: "Inbox triage", about: "email that needs you", color: "#199E70" },
+  "weekly-review": { name: "Weekly review", about: "how the agents did", color: "#6FA8DC" },
   finance: { name: "Finance", about: "money", color: "#1ED760" },
   household: { name: "Household", about: "supplies and orders", color: "#FF8A65" },
-  "morning-brief": { name: "Morning brief", about: "daily summary", color: "#FFD23F" },
-  "dst-shift": { name: "DST shift", about: "clock change", color: "#9AA0A6" },
+  "morning-brief": { name: "Morning brief", about: "daily summary", color: "#F4C84E" },
+  "dst-shift": { name: "DST shift", about: "clock change", color: "#B0AEA6" },
 };
 
 export function agentInfo(id: string): { name: string; about: string; color: string } {
   const known = AGENTS[id];
   if (known) return known;
   const name = id.replace(/[-_]+/g, " ").replace(/^\w/, (c) => c.toUpperCase());
-  return { name, about: "agent", color: "#9AA0A6" };
+  return { name, about: "agent", color: "#B0AEA6" };
 }
 
 export function Avatar({ thread, size = 40 }: { thread: string; size?: number }) {
@@ -171,7 +171,7 @@ export function CardButtons({ card, settled, onSend, onReply }: { card: AgentCar
   if (settled)
     return (
       <div className="px-4 py-2.5 border-t border-border-subtle text-[13px] text-text-secondary flex items-center gap-1.5">
-        <Check className="w-3.5 h-3.5 text-accent" /> {settled}
+        <Check className="w-3.5 h-3.5 text-up" /> {settled}
       </div>
     );
   return (

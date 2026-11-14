@@ -1,10 +1,10 @@
 /**
- * Onyx Recharts theme — Direction A ("Terminal").
+ * Onyx Recharts theme — Direction D ("Instrument").
  *
  * Single source of truth for chart styling so every chart on every page pulls
  * from one place (no per-chart ad-hoc hex strings). Fonts route through the
- * `--font-mono` stack (JetBrains Mono → Geist Mono fallback). All values are
- * dark-only.
+ * `--font-mono` stack (DM Mono). All values are dark-only and mirror the
+ * tokens in app/globals.css.
  *
  * Stable exports (consumed across the app, kept backwards-compatible):
  *   chartTooltip · axisTick · gridStyle · sourceColors · accentColor · axisLabel
@@ -16,15 +16,19 @@ const MONO = "var(--font-mono)";
 
 /* ── Core palette ─────────────────────────────────────────────────────────── */
 
-/** The single rationed accent — WHOOP recovery green. */
-export const accentColor = "#16E07A";
+/** The single rationed accent — signal orange. */
+export const accentColor = "#FF6A1A";
 
-/** Source colors for multi-device charts (desaturated ~15% for Direction A). */
+/**
+ * Source colors for multi-device charts. Garmin / WHOOP / Eight Sleep are the
+ * slots that appear together; that trio passes the color-vision checks for every
+ * pair on the card surface. Cronometer and Spotify are charted on their own.
+ */
 export const sourceColors = {
-  garmin: "#5B8DF6",
-  whoop: "#F5A623",
-  eightsleep: "#9A7BFA",
-  cronometer: "#22D3A6",
+  garmin: "#3987E5",
+  whoop: "#C98500",
+  eightsleep: "#199E70",
+  cronometer: "#9085E9",
   spotify: "#1ED760",
 } as const;
 
@@ -36,58 +40,61 @@ export const sourceColors = {
 export const chartColors = {
   accent: accentColor,
   /** WHOOP zone encoding — green / yellow / red, used everywhere consistently. */
-  up: "#16E07A",
-  down: "#FF4159",
-  mid: "#FFD23F",
-  neutral: "#9AA0A6",
+  up: "#5BC46E",
+  down: "#F0584E",
+  mid: "#F4C84E",
+  neutral: "#B0AEA6",
   /** WHOOP strain — blue 0–21 scale (kept distinct from the recovery zones). */
-  strain: "#0093E7",
-  strainBright: "#33B5F5",
+  strain: "#6FA8DC",
+  strainBright: "#8DBDE8",
   /** Pale up/down — significant-by-IF but block-bootstrap CI crosses zero. */
-  paleUp: "#86EFAC",
-  paleDown: "#FCA5A5",
-  lowConf: "rgba(154,160,166,0.45)",
-  grid: "rgba(255,255,255,0.04)",
+  paleUp: "#A7DDB0",
+  paleDown: "#F6A49D",
+  lowConf: "rgba(176,174,166,0.45)",
+  grid: "rgba(236,235,230,0.05)",
   /** Stronger-than-grid hairline for a zero reference line. */
-  zeroLine: "rgba(255,255,255,0.15)",
+  zeroLine: "rgba(236,235,230,0.18)",
   /** Error-bar / whisker stroke (visible but on-palette). */
-  whisker: "#9AA0A6",
+  whisker: "#B0AEA6",
   /** Card body — used to mask the lower half of a stacked CI band. */
-  cardBg: "#0E1014",
-  axis: "#5F6368",
-  /** Low-chroma categorical 8-step (habit / journal / supplement category bars). */
+  cardBg: "#232321",
+  axis: "#97958D",
+  /**
+   * Categorical 8-step (habit / journal / supplement category bars), assigned in
+   * this order. Validated on the card surface: lightness band, chroma, adjacent
+   * color-vision separation and contrast all pass. No red slot: red means "bad".
+   */
   categorical: [
-    "#7DD3FC", "#F5A623", "#34D399", "#C084FC",
-    "#F472B6", "#FBBF24", "#60A5FA", "#94A3B8",
+    "#3987E5", "#D95926", "#199E70", "#C98500",
+    "#D55181", "#008300", "#9085E9", "#B8862F",
   ],
   source: sourceColors,
   /** Section-tick colors keyed to section function. */
   tick: {
-    forecast: "#0093E7",
-    descriptive: "#9AA0A6",
-    causal: "#F5A623",
-    calibration: "#16E07A",
+    forecast: "#6FA8DC",
+    descriptive: "#B0AEA6",
+    causal: "#C98500",
+    calibration: "#5BC46E",
   },
 } as const;
 
 /* ── Recharts style objects ──────────────────────────────────────────────── */
 
-/** Shared Recharts tooltip style — Surface 2 card, mono numerics, 1px cyan top edge. */
+/** Shared Recharts tooltip style — raised surface, mono numerics, rounded like a control. */
 export const chartTooltip = {
   contentStyle: {
-    backgroundColor: "#15181E",
-    border: "1px solid rgba(255,255,255,0.08)",
-    borderTop: "1px solid #7DD3FC",
-    borderRadius: 4,
-    boxShadow: "0 8px 30px rgba(0,0,0,0.6)",
-    padding: "8px 11px",
+    backgroundColor: "#2C2C29",
+    border: "1px solid rgba(236,235,230,0.10)",
+    borderRadius: 10,
+    boxShadow: "0 12px 36px rgba(0,0,0,0.55)",
+    padding: "8px 12px",
   },
-  labelStyle: { color: "#9AA0A6", fontFamily: MONO, fontSize: 11 },
-  itemStyle: { color: "#E8EAED", fontFamily: MONO, fontSize: 12 },
+  labelStyle: { color: "#B0AEA6", fontFamily: MONO, fontSize: 11 },
+  itemStyle: { color: "#ECEBE6", fontFamily: MONO, fontSize: 12 },
 };
 
 /** Shared axis tick style (mono, tertiary tone). */
-export const axisTick = { fill: "#5F6368", fontSize: 11, fontFamily: MONO };
+export const axisTick = { fill: "#97958D", fontSize: 11, fontFamily: MONO };
 
 /** Shared Recharts <Legend> wrapper style (mono). */
 export const legendStyle = { fontSize: 11, fontFamily: MONO };
@@ -97,8 +104,8 @@ export const legendStyle = { fontSize: 11, fontFamily: MONO };
  * dashed `2 4` keeps the grid quiet under dense data.
  */
 export const gridStyle = {
-  stroke: "#ffffff",
-  strokeOpacity: 0.04,
+  stroke: "#ECEBE6",
+  strokeOpacity: 0.06,
   strokeDasharray: "2 4",
 };
 
@@ -117,7 +124,7 @@ export function axisLabel(value: string, axis: "x" | "y") {
     position: axis === "y" ? ("insideLeft" as const) : ("insideBottom" as const),
     offset: axis === "y" ? 10 : -4,
     style: {
-      fill: "#5F6368",
+      fill: "#97958D",
       fontSize: 10,
       fontFamily: MONO,
       textAnchor: "middle" as const,

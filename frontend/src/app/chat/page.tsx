@@ -107,7 +107,7 @@ export default function ChatPage() {
         {displayed.map((msg, i) => (
           <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
             {msg.role === "user" ? (
-              <div className="max-w-[90%] sm:max-w-[80%] break-words rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap bg-accent text-white">
+              <div className="max-w-[90%] sm:max-w-[80%] break-words rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap bg-accent text-on-accent">
                 <span className="sr-only">You: </span>{msg.content}
               </div>
             ) : (

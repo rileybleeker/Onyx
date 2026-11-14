@@ -92,7 +92,7 @@ export default function BarcodeScannerModal({
       onClick={onClose}
     >
       <div
-        className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card p-5 w-full max-w-md"
+        className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 w-full max-w-md"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-3">
@@ -105,7 +105,7 @@ export default function BarcodeScannerModal({
           </button>
         </div>
 
-        <div className="relative rounded-[4px] overflow-hidden bg-black aspect-[4/3]">
+        <div className="relative rounded-control overflow-hidden bg-black aspect-[4/3]">
           <video
             ref={videoRef}
             className="w-full h-full object-cover"
@@ -115,7 +115,7 @@ export default function BarcodeScannerModal({
           />
           {/* Aiming frame */}
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            <div className="w-3/4 h-1/3 border-2 border-[#1DB954]/70 rounded-[4px]" />
+            <div className="w-3/4 h-1/3 border-2 border-accent/70 rounded-control" />
           </div>
         </div>
 

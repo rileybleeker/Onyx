@@ -8,12 +8,12 @@ import type { NycLead } from "@/lib/nyc";
 // Marker color = where the lead stands with Riley; full fits the scout
 // surfaced but Riley hasn't judged yet stand out in amber.
 export function markerColor(lead: NycLead): string {
-  if (lead.riley === "Interested") return "#16E07A";
-  if (lead.riley === "Toured") return "#9A7BFA";
-  if (lead.riley === "Passed") return "#5F6368";
-  if (lead.fit === "Full fit") return "#F5A623";
-  if (lead.fit === "Meets numbers") return "#FFD23F";
-  return "#9AA0A6";
+  if (lead.riley === "Interested") return "#5BC46E";
+  if (lead.riley === "Toured") return "#9085E9";
+  if (lead.riley === "Passed") return "#706E67";
+  if (lead.fit === "Full fit") return "#FF6A1A";
+  if (lead.fit === "Meets numbers") return "#F4C84E";
+  return "#B0AEA6";
 }
 
 const CENTRAL_PARK: L.LatLngExpression = [40.7812, -73.9665];
@@ -73,7 +73,7 @@ export default function NycMap({
       const gone = lead.status === "Gone";
       const marker = L.circleMarker([lead.lat!, lead.lng!], {
         radius: selected ? 10 : 6,
-        color: selected ? "#E8EAED" : markerColor(lead),
+        color: selected ? "#ECEBE6" : markerColor(lead),
         weight: selected ? 3 : 1.5,
         fillColor: markerColor(lead),
         fillOpacity: gone ? 0.15 : 0.85,
@@ -102,7 +102,7 @@ export default function NycMap({
   return (
     <>
       <style>{`.nyc-dark-tiles { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9) saturate(0.6); }`}</style>
-      <div ref={el} className="h-[420px] w-full rounded-[4px] overflow-hidden bg-surface" aria-label="Map of leads" />
+      <div ref={el} className="h-[420px] w-full rounded-control overflow-hidden bg-surface" aria-label="Map of leads" />
     </>
   );
 }

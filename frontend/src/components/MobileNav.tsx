@@ -105,12 +105,12 @@ export default function MobileNav() {
     <>
       {/* Slim top bar — wordmark + search. Fills the safe-area inset so scrolled
           content can't bleed under the iOS status bar. Mobile only. */}
-      <header className="md:hidden fixed inset-x-0 top-0 z-40 bg-surface-card border-b border-border-subtle pt-[env(safe-area-inset-top)]">
+      <header className="md:hidden fixed inset-x-0 top-0 z-40 bg-surface-sunken border-b border-border-subtle pt-[env(safe-area-inset-top)]">
         <div className="h-12 px-3 flex items-center justify-between">
-          <span className="text-[15px] font-semibold text-text-primary tracking-tight">Onyx</span>
+          <span className="text-[17px] font-bold lowercase tracking-[0.01em] text-text-primary">Onyx</span>
           <button
             onClick={() => window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE))}
-            className="w-9 h-9 -mr-1 flex items-center justify-center rounded-[6px] text-text-secondary hover:text-text-primary transition-colors"
+            className="w-9 h-9 -mr-1 flex items-center justify-center rounded-control text-text-secondary hover:text-text-primary transition-colors"
             aria-label="Search"
           >
             <Search className="w-[18px] h-[18px]" />
@@ -121,7 +121,7 @@ export default function MobileNav() {
       {/* Bottom tab bar — primary mobile navigation. */}
       <nav
         data-testid="mobile-tab-bar"
-        className="md:hidden fixed inset-x-0 bottom-0 z-40 bg-surface-card border-t border-border-subtle pb-[env(safe-area-inset-bottom)]"
+        className="md:hidden fixed inset-x-0 bottom-0 z-40 bg-surface-sunken border-t border-border-subtle pb-[env(safe-area-inset-bottom)]"
         aria-label="Primary"
       >
         <div className="grid grid-cols-5 h-14">
@@ -168,7 +168,7 @@ export default function MobileNav() {
                     key={a.label}
                     href={a.href}
                     onClick={() => setLogOpen(false)}
-                    className="flex items-center gap-2.5 px-3 py-3 rounded-[6px] bg-surface-card border border-border-subtle text-[14px] text-text-primary hover:border-border-hover transition-colors"
+                    className="flex items-center gap-2.5 px-3 py-3 rounded-control bg-surface-card border border-border-subtle text-[14px] text-text-primary hover:border-border-hover transition-colors"
                   >
                     <Icon className="w-[18px] h-[18px] text-accent shrink-0" strokeWidth={1.75} />
                     {a.label}
@@ -193,7 +193,7 @@ export default function MobileNav() {
         aria-modal={drawerOpen ? true : undefined}
         aria-label="Navigation"
         inert={!drawerOpen}
-        className={`md:hidden fixed inset-y-0 left-0 z-50 w-[240px] bg-surface-card border-r border-border-subtle flex flex-col transition-transform duration-200 ease-in-out ${
+        className={`md:hidden fixed inset-y-0 left-0 z-50 w-[240px] bg-surface-sunken border-r border-border-subtle flex flex-col transition-transform duration-200 ease-in-out ${
           drawerOpen ? "translate-x-0" : "-translate-x-full"
         }`}
       >
@@ -215,7 +215,7 @@ export default function MobileNav() {
           <button
             type="button"
             onClick={() => { setDrawerOpen(false); window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE)); }}
-            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-[4px] text-[13px] text-text-tertiary bg-white/[0.02] border border-border-subtle hover:border-border-hover transition-colors"
+            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] text-text-tertiary bg-white/[0.02] border border-border-subtle hover:border-border-hover transition-colors"
           >
             <Search className="w-[15px] h-[15px] shrink-0" />
             <span className="flex-1 text-left">Search…</span>
@@ -238,13 +238,13 @@ export default function MobileNav() {
                       href={item.href}
                       onClick={() => setDrawerOpen(false)}
                       aria-current={active ? "page" : undefined}
-                      className={`flex items-center gap-2.5 px-3 py-2 rounded-[4px] text-[13px] font-medium transition-colors relative ${
+                      className={`flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium transition-colors relative ${
                         active
-                          ? "bg-white/5 text-text-primary before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-[2px] before:bg-accent before:rounded-full"
+                          ? "bg-surface-raised text-text-primary"
                           : "text-text-secondary hover:text-text-primary hover:bg-white/[0.03]"
                       }`}
                     >
-                      <Icon className="w-[17px] h-[17px] shrink-0" strokeWidth={1.75} />
+                      <Icon className={`w-[17px] h-[17px] shrink-0 ${active ? "text-accent" : "text-text-tertiary"}`} strokeWidth={1.75} />
                       <span className="flex-1 truncate">{item.label}</span>
                     </Link>
                   );
@@ -257,7 +257,7 @@ export default function MobileNav() {
         <div className="px-2 py-3 border-t border-border-subtle pb-[max(0.75rem,env(safe-area-inset-bottom))]">
           <button
             onClick={handleSignOut}
-            className="flex items-center gap-2.5 px-3 py-2 rounded-[4px] text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full"
+            className="flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full"
           >
             <LogOut className="w-[17px] h-[17px] shrink-0" strokeWidth={1.75} />
             Sign out

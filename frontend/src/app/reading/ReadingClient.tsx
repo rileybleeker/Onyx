@@ -79,8 +79,8 @@ export default function ReadingClient() {
     return (
       <div className="max-w-3xl space-y-3">
         <div className="h-8 w-40 bg-white/5 animate-pulse rounded" />
-        <div className="h-44 bg-white/[0.03] animate-pulse rounded-[6px]" />
-        <div className="h-28 bg-white/[0.03] animate-pulse rounded-[6px]" />
+        <div className="h-44 bg-white/[0.03] animate-pulse rounded-control" />
+        <div className="h-28 bg-white/[0.03] animate-pulse rounded-control" />
       </div>
     );
   }
@@ -124,7 +124,7 @@ export default function ReadingClient() {
               setSlug(e.target.value);
               load(e.target.value);
             }}
-            className="bg-surface-card border border-border-subtle rounded-[6px] text-[12px] px-2 py-1.5 text-text-secondary"
+            className="bg-surface-card border border-border-subtle rounded-control text-[12px] px-2 py-1.5 text-text-secondary"
           >
             {books.map((b) => (
               <option key={b.slug} value={b.slug}>
@@ -138,7 +138,7 @@ export default function ReadingClient() {
       <QuestCard o={o} />
 
       {/* Burn-up */}
-      <section className="mt-4 bg-surface-card border border-border-subtle rounded-[6px] px-4 pt-3 pb-1">
+      <section className="mt-4 bg-surface-card border border-border-subtle rounded-card shadow-card px-4 pt-3 pb-1">
         <div className="flex items-baseline justify-between mb-1">
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Chapters vs pace</h3>
           <span className="text-[11px] font-mono text-text-tertiary">
@@ -190,10 +190,10 @@ function QuestCard({ o }: { o: ReadingOverview }) {
         : pace.aheadBy > 0
           ? `${pace.aheadBy} chapter${pace.aheadBy === 1 ? "" : "s"} ahead`
           : `${-pace.aheadBy} chapter${pace.aheadBy === -1 ? "" : "s"} behind`;
-  const paceColor = o.book.status === "finished" || pace.aheadBy >= 0 ? "text-accent" : pace.aheadBy >= -2 ? "text-[var(--color-mid)]" : "text-[var(--color-down)]";
+  const paceColor = o.book.status === "finished" || pace.aheadBy >= 0 ? "text-up" : pace.aheadBy >= -2 ? "text-[var(--color-mid)]" : "text-[var(--color-down)]";
 
   return (
-    <section className="bg-surface-card border border-border-subtle rounded-[6px] p-4" data-testid="reading-quest">
+    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-quest">
       <div className="flex gap-4 items-center">
         <MetricRing
           value={o.chaptersDone}
@@ -278,11 +278,11 @@ function Checkpoints({ o }: { o: ReadingOverview }) {
           const border =
             state === "done" ? "border-accent/60" : state === "late" ? "border-[var(--color-mid)]/60" : state === "missed" ? "border-[var(--color-down)]/60" : "border-border-subtle";
           return (
-            <div key={c.key} className={`bg-surface-card border ${border} rounded-[6px] px-3 py-2.5`}>
+            <div key={c.key} className={`bg-surface-card border ${border} rounded-control px-3 py-2.5`}>
               <div className="text-[13px] font-medium text-text-primary">Ch {c.chapter}</div>
               <div className="text-[11px] font-mono text-text-tertiary">by {fmtDate(c.due)}</div>
               <div className="mt-1.5 text-[11px] font-mono">
-                {state === "done" && <span className="text-accent">✓ on time</span>}
+                {state === "done" && <span className="text-up">✓ on time</span>}
                 {state === "late" && <span className="text-[var(--color-mid)]">✓ late</span>}
                 {state === "missed" && <span className="text-[var(--color-down)]">missed</span>}
                 {state === "upcoming" && <span className="text-text-tertiary">upcoming</span>}
@@ -344,7 +344,7 @@ function ReviewCard({ o, onGraded }: { o: ReadingOverview; onGraded: (xp: number
   };
 
   return (
-    <section className="mt-4 bg-surface-card border border-border-subtle rounded-[6px] p-4" data-testid="reading-review">
+    <section className="mt-4 bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-review">
       <div className="flex items-baseline justify-between">
         <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Review</h3>
         <span className="text-[11px] font-mono text-text-tertiary">
@@ -358,7 +358,7 @@ function ReviewCard({ o, onGraded }: { o: ReadingOverview; onGraded: (xp: number
             {cur.chapter != null ? `ch ${cur.chapter}` : ""} {cur.concept ? `· ${cur.concept}` : ""}
           </div>
           {!revealed ? (
-            <button onClick={() => setRevealed(true)} className="mt-3 px-3 py-1.5 text-[13px] rounded-[6px] border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-text-secondary">
+            <button onClick={() => setRevealed(true)} className="mt-3 px-3 py-1.5 text-[13px] rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-text-secondary">
               Say what this means, then reveal your note
             </button>
           ) : (
@@ -381,7 +381,7 @@ function ReviewCard({ o, onGraded }: { o: ReadingOverview; onGraded: (xp: number
 
 function GradeBtn({ label, sub, onClick, disabled, className }: { label: string; sub: string; onClick: () => void; disabled: boolean; className: string }) {
   return (
-    <button onClick={onClick} disabled={disabled} className={`flex-1 h-11 rounded-[6px] border bg-white/[0.02] disabled:opacity-40 ${className}`}>
+    <button onClick={onClick} disabled={disabled} className={`flex-1 h-11 rounded-control border bg-white/[0.02] disabled:opacity-40 ${className}`}>
       <div className="text-[13px] font-medium leading-none">{label}</div>
       <div className="text-[10px] font-mono opacity-70 mt-1">{sub}</div>
     </button>
@@ -424,7 +424,7 @@ function SessionForm({ o, onLogged, onError }: { o: ReadingOverview; onLogged: (
   };
 
   return (
-    <section className="mt-4 bg-surface-card border border-border-subtle rounded-[6px] p-4" data-testid="reading-session-form">
+    <section className="mt-4 bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-session-form">
       <div className="flex items-baseline justify-between">
         <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary flex items-center gap-1.5">
           <BookMarked className="w-3.5 h-3.5" /> Log a session
@@ -434,20 +434,20 @@ function SessionForm({ o, onLogged, onError }: { o: ReadingOverview; onLogged: (
       <div className="mt-3 grid grid-cols-3 gap-2">
         <label className="block">
           <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Through ch.</span>
-          <input type="number" inputMode="numeric" min={0} max={o.totalChapters || undefined} value={through} onChange={(e) => setThrough(e.target.value)} className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-2 text-[15px] font-mono text-text-primary" />
+          <input type="number" inputMode="numeric" min={0} max={o.totalChapters || undefined} value={through} onChange={(e) => setThrough(e.target.value)} className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[15px] font-mono text-text-primary" />
         </label>
         <label className="block">
           <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Minutes</span>
-          <input type="number" inputMode="numeric" min={0} value={minutes} onChange={(e) => setMinutes(e.target.value)} placeholder="31" className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-2 text-[15px] font-mono text-text-primary" />
+          <input type="number" inputMode="numeric" min={0} value={minutes} onChange={(e) => setMinutes(e.target.value)} placeholder="31" className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[15px] font-mono text-text-primary" />
         </label>
         <label className="block">
           <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Day</span>
-          <input type="date" value={date} max={o.today} onChange={(e) => setDate(e.target.value)} className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-2 text-[13px] font-mono text-text-primary" />
+          <input type="date" value={date} max={o.today} onChange={(e) => setDate(e.target.value)} className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary" />
         </label>
       </div>
       <div className="mt-2 flex gap-1.5">
         {MEDIA.map((m) => (
-          <button key={m.key} onClick={() => setMedium(m.key)} aria-pressed={medium === m.key} className={`px-3 h-8 rounded-[6px] border text-[12px] inline-flex items-center gap-1 ${medium === m.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}>
+          <button key={m.key} onClick={() => setMedium(m.key)} aria-pressed={medium === m.key} className={`px-3 h-8 rounded-control border text-[12px] inline-flex items-center gap-1 ${medium === m.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}>
             {m.key === "audio" && <Headphones className="w-3.5 h-3.5" />}
             {m.label}
           </button>
@@ -455,23 +455,23 @@ function SessionForm({ o, onLogged, onError }: { o: ReadingOverview; onLogged: (
       </div>
       <label className="block mt-3">
         <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">
-          Recall, from memory <span className={recallOk ? "text-accent" : ""}>{recallOk ? "· +20 XP" : "· 3 sentences"}</span>
+          Recall, from memory <span className={recallOk ? "text-up" : ""}>{recallOk ? "· +20 XP" : "· 3 sentences"}</span>
         </span>
         <textarea
           value={recall}
           onChange={(e) => setRecall(e.target.value)}
           rows={4}
           placeholder="What happened, what principle it showed, where it shows up in a BC implementation. Dictate it; don't open the book."
-          className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[14px] text-text-primary leading-relaxed"
+          className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary leading-relaxed"
         />
       </label>
       <label className="block mt-2">
         <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">One question for a plant manager</span>
-        <input value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Optional" className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[14px] text-text-primary" />
+        <input value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Optional" className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary" />
       </label>
       <div className="mt-3 flex items-center justify-between">
         <span className="text-[11px] text-text-tertiary">Also marks the &ldquo;{o.book.habit_name ?? "reading"}&rdquo; habit for {fmtDate(date)}.</span>
-        <button onClick={submit} disabled={saving || through === ""} className="px-4 py-2 rounded-[6px] text-[14px] font-medium bg-accent text-black disabled:opacity-40">
+        <button onClick={submit} disabled={saving || through === ""} className="px-4 py-2 rounded-control text-[14px] font-medium bg-accent text-black disabled:opacity-40">
           {saving ? "Saving…" : "Log session"}
         </button>
       </div>
@@ -546,16 +546,16 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
   };
 
   return (
-    <section className="mt-4 bg-surface-card border border-border-subtle rounded-[6px] p-4" data-testid="reading-highlight-form">
+    <section className="mt-4 bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-highlight-form">
       <div className="flex items-center justify-between">
         <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary flex items-center gap-1.5">
           <Highlighter className="w-3.5 h-3.5" /> Highlight + comment
         </h3>
         <div className="flex gap-1 text-[11px] font-mono">
-          <button onClick={() => setMode("one")} className={`px-2 py-1 rounded-[4px] ${mode === "one" ? "bg-white/[0.08] text-text-primary" : "text-text-tertiary"}`}>
+          <button onClick={() => setMode("one")} className={`px-2 py-1 rounded-control ${mode === "one" ? "bg-white/[0.08] text-text-primary" : "text-text-tertiary"}`}>
             one
           </button>
-          <button onClick={() => setMode("import")} className={`px-2 py-1 rounded-[4px] ${mode === "import" ? "bg-white/[0.08] text-text-primary" : "text-text-tertiary"}`}>
+          <button onClick={() => setMode("import")} className={`px-2 py-1 rounded-control ${mode === "import" ? "bg-white/[0.08] text-text-primary" : "text-text-tertiary"}`}>
             paste Kindle export
           </button>
         </div>
@@ -563,11 +563,11 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
 
       {mode === "one" ? (
         <>
-          <textarea value={passage} onChange={(e) => setPassage(e.target.value)} rows={3} placeholder="The passage, as written." className="mt-3 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[14px] text-text-primary leading-relaxed" />
-          <textarea value={comment} onChange={(e) => setComment(e.target.value)} rows={2} placeholder="Your comment. Why it matters, or where it shows up in BC." className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[14px] text-text-primary italic" />
+          <textarea value={passage} onChange={(e) => setPassage(e.target.value)} rows={3} placeholder="The passage, as written." className="mt-3 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary leading-relaxed" />
+          <textarea value={comment} onChange={(e) => setComment(e.target.value)} rows={2} placeholder="Your comment. Why it matters, or where it shows up in BC." className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary italic" />
           <div className="mt-2 grid grid-cols-[88px_1fr] gap-2">
-            <input type="number" inputMode="numeric" min={0} value={chapter} onChange={(e) => setChapter(e.target.value)} placeholder="ch." className="bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-2 text-[13px] font-mono text-text-primary" />
-            <select value={concept} onChange={(e) => setConcept(e.target.value)} className="bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-2 text-[13px] text-text-primary">
+            <input type="number" inputMode="numeric" min={0} value={chapter} onChange={(e) => setChapter(e.target.value)} placeholder="ch." className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary" />
+            <select value={concept} onChange={(e) => setConcept(e.target.value)} className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary">
               <option value="">Concept (optional)</option>
               {CONCEPTS.map((c) => (
                 <option key={c} value={c}>
@@ -577,14 +577,14 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
               <option value="__custom">Other…</option>
             </select>
           </div>
-          {concept === "__custom" && <input value={customConcept} onChange={(e) => setCustomConcept(e.target.value)} placeholder="Concept name" className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[13px] text-text-primary" />}
+          {concept === "__custom" && <input value={customConcept} onChange={(e) => setCustomConcept(e.target.value)} placeholder="Concept name" className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[13px] text-text-primary" />}
           <div className="mt-2 flex flex-wrap gap-1.5">
             {SOURCES.map((s) => (
-              <button key={s.key} onClick={() => setSource(s.key)} aria-pressed={source === s.key} className={`px-2.5 h-7 rounded-[6px] border text-[11px] ${source === s.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}>
+              <button key={s.key} onClick={() => setSource(s.key)} aria-pressed={source === s.key} className={`px-2.5 h-7 rounded-control border text-[11px] ${source === s.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}>
                 {s.label}
               </button>
             ))}
-            <button onClick={addOne} disabled={saving || !passage.trim()} className="ml-auto px-4 h-8 rounded-[6px] text-[13px] font-medium bg-accent text-black disabled:opacity-40">
+            <button onClick={addOne} disabled={saving || !passage.trim()} className="ml-auto px-4 h-8 rounded-control text-[13px] font-medium bg-accent text-black disabled:opacity-40">
               {saving ? "Saving…" : "Add highlight"}
             </button>
           </div>
@@ -602,7 +602,7 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
             }}
             rows={6}
             placeholder="Paste here"
-            className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[12px] font-mono text-text-primary"
+            className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[12px] font-mono text-text-primary"
           />
           <div className="mt-2 flex items-center gap-2">
             {preview && (
@@ -610,10 +610,10 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
                 {preview.count} highlight{preview.count === 1 ? "" : "s"} · {preview.format}
               </span>
             )}
-            <button onClick={doPreview} disabled={saving || !importText.trim()} className="ml-auto px-3 h-8 rounded-[6px] text-[13px] border border-border-subtle text-text-secondary disabled:opacity-40">
+            <button onClick={doPreview} disabled={saving || !importText.trim()} className="ml-auto px-3 h-8 rounded-control text-[13px] border border-border-subtle text-text-secondary disabled:opacity-40">
               Preview
             </button>
-            <button onClick={doImport} disabled={saving || !preview || preview.count === 0} className="px-4 h-8 rounded-[6px] text-[13px] font-medium bg-accent text-black disabled:opacity-40">
+            <button onClick={doImport} disabled={saving || !preview || preview.count === 0} className="px-4 h-8 rounded-control text-[13px] font-medium bg-accent text-black disabled:opacity-40">
               Import
             </button>
           </div>
@@ -631,7 +631,7 @@ function Badges({ o }: { o: ReadingOverview }) {
       </h3>
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
         {o.badges.map((b) => (
-          <div key={b.key} title={b.description} className={`rounded-[6px] border px-3 py-2 ${b.earned ? "bg-accent/10 border-accent/50" : "bg-surface-card border-border-subtle opacity-60"}`}>
+          <div key={b.key} title={b.description} className={`rounded-control border px-3 py-2 ${b.earned ? "bg-accent/10 border-accent/50" : "bg-surface-card border-border-subtle opacity-60"}`}>
             <div className={`text-[12px] font-medium ${b.earned ? "text-accent" : "text-text-secondary"}`}>{b.label}</div>
             <div className="text-[10px] text-text-tertiary leading-snug mt-0.5">{b.description}</div>
           </div>
@@ -689,17 +689,17 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
               <div className="text-[12px] text-text-secondary mb-1.5">
                 {concept} <span className="font-mono text-text-tertiary">· {items.length}</span>
               </div>
-              <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
+              <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
                 {items.map((h) => (
                   <div key={h.highlight_id} className="px-3 py-2.5">
                     <p className="text-[13px] text-text-primary leading-relaxed">&ldquo;{h.passage}&rdquo;</p>
                     {editing === h.highlight_id ? (
                       <div className="mt-1.5 flex gap-2">
-                        <input autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} className="flex-1 bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-1 text-[13px] italic text-text-primary" />
-                        <button onClick={() => saveComment(h)} className="h-8 w-8 rounded-[6px] border border-accent/60 text-accent inline-flex items-center justify-center">
+                        <input autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} className="flex-1 bg-white/[0.03] border border-border-subtle rounded-control px-2 py-1 text-[13px] italic text-text-primary" />
+                        <button onClick={() => saveComment(h)} className="h-8 w-8 rounded-control border border-accent/60 text-accent inline-flex items-center justify-center">
                           <Check className="w-3.5 h-3.5" />
                         </button>
-                        <button onClick={() => setEditing(null)} className="h-8 w-8 rounded-[6px] border border-border-subtle text-text-tertiary inline-flex items-center justify-center">
+                        <button onClick={() => setEditing(null)} className="h-8 w-8 rounded-control border border-border-subtle text-text-tertiary inline-flex items-center justify-center">
                           <X className="w-3.5 h-3.5" />
                         </button>
                       </div>
@@ -719,7 +719,7 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
                       {h.location && <span>{h.location}</span>}
                       <span className="uppercase">{h.source}</span>
                       {h.next_review && <span>review {h.next_review <= o.today ? "due" : fmtDate(h.next_review)}</span>}
-                      <span className={h.notion_block_id ? "text-accent/70" : ""}>{h.notion_block_id ? "notion ✓" : "notion …"}</span>
+                      <span className={h.notion_block_id ? "text-up/70" : ""}>{h.notion_block_id ? "notion ✓" : "notion …"}</span>
                       <button onClick={() => archive(h)} className="ml-auto hover:text-[var(--color-down)]">
                         archive
                       </button>
@@ -746,7 +746,7 @@ function SessionsList({ o }: { o: ReadingOverview }) {
         (o.sessions.length === 0 ? (
           <p className="text-[13px] text-text-tertiary">No sessions yet.</p>
         ) : (
-          <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
+          <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
             {o.sessions.map((s) => (
               <div key={s.session_id} className="px-3 py-2.5">
                 <div className="flex items-center gap-2 text-[12px] font-mono text-text-secondary">
@@ -759,7 +759,7 @@ function SessionsList({ o }: { o: ReadingOverview }) {
                       kindle · auto{s.highlight_count ? ` · ${s.highlight_count} hl` : ""}
                     </span>
                   )}
-                  <span className={`ml-auto text-[10px] ${s.notion_block_id ? "text-accent/70" : "text-text-tertiary"}`}>{s.notion_block_id ? "notion ✓" : ""}</span>
+                  <span className={`ml-auto text-[10px] ${s.notion_block_id ? "text-up/70" : "text-text-tertiary"}`}>{s.notion_block_id ? "notion ✓" : ""}</span>
                 </div>
                 {s.recall && <p className="mt-1 text-[13px] text-text-primary leading-relaxed">{s.recall}</p>}
                 {s.question && <p className="mt-1 text-[12px] text-text-secondary italic">Q: {s.question}</p>}

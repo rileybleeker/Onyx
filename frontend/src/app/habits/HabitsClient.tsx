@@ -314,7 +314,7 @@ export default function HabitsPage() {
         <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
               <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
               <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
             </div>
@@ -500,7 +500,7 @@ export default function HabitsPage() {
             href="https://www.notion.so/29cc936fd5e14ae8b10a4fe5c5f7a6cd"
             target="_blank"
             rel="noopener noreferrer"
-            className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-[6px] hover:bg-white/10 transition-colors"
+            className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-control hover:bg-white/10 transition-colors"
           >
             Manage in Notion
           </a>
@@ -508,7 +508,7 @@ export default function HabitsPage() {
       </div>
 
       {actionError && (
-        <div className="mb-6 px-3 py-2.5 rounded-[6px] border border-red-500/30 bg-red-500/[0.06] flex items-start justify-between gap-3">
+        <div className="mb-6 px-3 py-2.5 rounded-control border border-red-500/30 bg-red-500/[0.06] flex items-start justify-between gap-3">
           <p className="text-[12px] text-red-300/90">{actionError}</p>
           <button
             onClick={() => setActionError(null)}
@@ -521,7 +521,7 @@ export default function HabitsPage() {
       )}
 
       {recentChanges.length > 0 && (
-        <div className="mb-6 px-3 py-2.5 rounded-[6px] border border-amber-500/30 bg-amber-500/[0.04]">
+        <div className="mb-6 px-3 py-2.5 rounded-control border border-amber-500/30 bg-amber-500/[0.04]">
           <p className="text-[11px] font-mono uppercase tracking-wider text-amber-300/80 mb-1.5">
             Metadata changed within this range — rates reflect each day&apos;s in-effect values
           </p>
@@ -542,11 +542,11 @@ export default function HabitsPage() {
 
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing label="Today" value={todayCompleted} max={requiredHabits.length || 1} zone
             centerValue={`${todayCompleted}/${requiredHabits.length}`} sublabel="required habits" size={120} />
         </div>
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing label="7-Day Rate" value={completionRate} zone centerUnit="%"
             sublabel={`${completedLast7}/${possibleLast7}`} size={120} />
         </div>
@@ -755,14 +755,14 @@ export default function HabitsPage() {
               className="fixed z-50 -translate-x-1/2 -translate-y-full pb-1.5"
               style={{ left: clampedX, top: openCell.y }}
             >
-              <div className="rounded-[6px] border border-border-subtle bg-surface-card shadow-xl px-2 py-1.5">
+              <div className="rounded-control border border-border-subtle bg-surface-card shadow-xl px-2 py-1.5">
                 <p className="text-[10px] font-mono text-text-tertiary mb-1 max-w-[180px] truncate">
                   {openCell.habit.name} · {openCell.date}
                 </p>
                 <div className="flex items-center gap-1">
                   <button
                     onClick={() => pick("Yes")}
-                    className={`px-2.5 py-1 text-[12px] font-medium rounded-[4px] transition-colors ${
+                    className={`px-2.5 py-1 text-[12px] font-medium rounded-control transition-colors ${
                       current === "Yes"
                         ? "bg-white/15 text-text-primary"
                         : "text-text-secondary hover:bg-white/10"
@@ -772,7 +772,7 @@ export default function HabitsPage() {
                   </button>
                   <button
                     onClick={() => pick("No")}
-                    className={`px-2.5 py-1 text-[12px] font-medium rounded-[4px] transition-colors ${
+                    className={`px-2.5 py-1 text-[12px] font-medium rounded-control transition-colors ${
                       current === "No"
                         ? "bg-white/15"
                         : "hover:bg-white/10"
@@ -784,7 +784,7 @@ export default function HabitsPage() {
                   {current !== null && (
                     <button
                       onClick={() => pick(null)}
-                      className="px-2.5 py-1 text-[12px] font-medium rounded-[4px] text-text-tertiary hover:bg-white/10 transition-colors"
+                      className="px-2.5 py-1 text-[12px] font-medium rounded-control text-text-tertiary hover:bg-white/10 transition-colors"
                     >
                       Clear
                     </button>
@@ -825,7 +825,7 @@ export default function HabitsPage() {
                   label = streak > 0 ? `${streak} ${unitSingular}${streak !== 1 ? "s" : ""}` : "No streak";
                 }
                 return (
-                  <div key={habit.id} className="flex items-center gap-3 px-3 py-2.5 rounded-[4px] bg-white/[0.02]">
+                  <div key={habit.id} className="flex items-center gap-3 px-3 py-2.5 rounded-control bg-white/[0.02]">
                     <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: color }} />
                     <div className="flex-1 min-w-0">
                       <p className="text-sm text-text-primary font-medium truncate">
@@ -944,7 +944,7 @@ function HabitRow({ habit, answer, isToggling, streak, color, today, onSetAnswer
 
   return (
     <div
-      className={`w-full flex items-center gap-3 px-4 py-3 rounded-[4px] transition-all group ${
+      className={`w-full flex items-center gap-3 px-4 py-3 rounded-control transition-all group ${
         done || declined ? "bg-white/[0.03]" : "hover:bg-white/[0.03]"
       } ${isToggling ? "opacity-50" : ""}`}
     >
@@ -1020,7 +1020,7 @@ function HabitRow({ habit, answer, isToggling, streak, color, today, onSetAnswer
 
       <button
         onClick={openDatePicker}
-        className="relative p-1.5 rounded-[4px] text-text-tertiary hover:text-text-primary hover:bg-white/5 transition-colors"
+        className="relative p-1.5 rounded-control text-text-tertiary hover:text-text-primary hover:bg-white/5 transition-colors"
         title="Log a past date as done (use the heatmap for a backdated No)"
         aria-label={`Backdate ${habit.name}`}
       >

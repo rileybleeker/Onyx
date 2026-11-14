@@ -710,7 +710,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
         <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
         <div className="space-y-3">
           {[...Array(6)].map((_, i) => (
-            <div key={i} className="h-20 bg-white/5 animate-pulse rounded-[6px]" />
+            <div key={i} className="h-20 bg-white/5 animate-pulse rounded-control" />
           ))}
         </div>
       </div>
@@ -755,7 +755,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
               <YAxis tick={axisTick} width={55} label={axisLabel("steps", "y")} />
               <Tooltip {...chartTooltip} />
               {stepsSource === "GARMIN + WHOOP" && (
-                <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
+                <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-mono)" }} />
               )}
               {/* One bar per day: a day has either a Garmin or a WHOOP value, so the stack never adds them. */}
               <Bar dataKey="garmin" stackId="steps" name="Garmin" fill={sourceColors.garmin} radius={[2, 2, 0, 0]} fillOpacity={0.85} isAnimationActive={false} />
@@ -799,7 +799,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} label={axisLabel("bpm", "y")} />
               <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
+              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-mono)" }} />
               <Area type="monotone" dataKey="max" stroke={C.down} fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max HR" isAnimationActive={false} />
               <Area type="monotone" dataKey="min" stroke={C.up} fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min HR" isAnimationActive={false} />
             </AreaChart>
@@ -868,7 +868,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
               : null;
 
             return (
-            <div key={act.id} className="bg-surface-card border border-border-subtle rounded-[6px] hover:border-border-hover transition-colors">
+            <div key={act.id} className="bg-surface-card border border-border-subtle rounded-control hover:border-border-hover transition-colors">
               <div
                 className={`p-4 flex flex-col sm:flex-row sm:items-center gap-3 ${canExpand ? "cursor-pointer" : ""}`}
                 onClick={canExpand ? () => toggleExpanded(act.id) : undefined}

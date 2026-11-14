@@ -126,7 +126,7 @@ export default function CommandPalette() {
       aria-label="Command palette"
     >
       <div
-        className="w-full max-w-lg bg-surface-raised border border-border-default rounded-[6px] shadow-floating overflow-hidden"
+        className="w-full max-w-lg bg-surface-raised border border-border-default rounded-control shadow-floating overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-2.5 px-3.5 border-b border-border-subtle">

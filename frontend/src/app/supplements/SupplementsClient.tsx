@@ -534,13 +534,13 @@ export default function SupplementsPage() {
           <RangeFilter value={range} onChange={setRange} />
           <button
             onClick={() => setScannerOpen(true)}
-            className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-text-primary bg-accent/15 hover:bg-accent/25 border border-accent/30 rounded-[4px] transition-colors"
+            className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-on-accent font-semibold bg-accent hover:bg-accent/90 border border-accent rounded-full transition-colors"
           >
             Scan barcode
           </button>
           <button
             onClick={() => setAddOpen(true)}
-            className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-text-primary bg-black/30 hover:bg-white/5 border border-border-subtle rounded-[4px] transition-colors"
+            className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-text-primary bg-black/30 hover:bg-white/5 border border-border-subtle rounded-control transition-colors"
           >
             + Add product
           </button>
@@ -577,14 +577,14 @@ export default function SupplementsPage() {
                 onClick={() =>
                   setEditingStack({ stack_id: null, name: "", description: null, remind_time: null, items: [] })
                 }
-                className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-text-primary bg-accent/15 hover:bg-accent/25 border border-accent/30 rounded-[4px] transition-colors"
+                className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-on-accent font-semibold bg-accent hover:bg-accent/90 border border-accent rounded-full transition-colors"
               >
                 + New stack
               </button>
             </div>
 
             {lastBatch && (
-              <div className="flex items-center justify-between gap-2 mb-2 px-3 py-1.5 bg-accent/10 border border-accent/25 rounded-[4px] text-[11px] font-mono">
+              <div className="flex items-center justify-between gap-2 mb-2 px-3 py-1.5 bg-accent/10 border border-accent/25 rounded-control text-[11px] font-mono">
                 <span className="text-text-secondary truncate">
                   Logged {lastBatch.name} · {lastBatch.ids.length} products
                 </span>
@@ -606,12 +606,12 @@ export default function SupplementsPage() {
                 {stacks.map((s) => (
                   <div
                     key={s.stack_id}
-                    className="flex items-center gap-2 bg-black/30 border border-border-subtle rounded-[4px]"
+                    className="flex items-center gap-2 bg-black/30 border border-border-subtle rounded-control"
                   >
                     <button
                       onClick={() => logStack(s)}
                       disabled={busyStackId === s.stack_id || s.item_count === 0}
-                      className="flex-1 flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-white/[0.03] active:bg-white/[0.06] disabled:opacity-50 rounded-l-[4px] transition-colors"
+                      className="flex-1 flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-white/[0.03] active:bg-white/[0.06] disabled:opacity-50 rounded-l-control transition-colors"
                     >
                       <div className="min-w-0">
                         <p className="text-[12px] text-text-primary truncate">{s.name}</p>
@@ -670,7 +670,7 @@ export default function SupplementsPage() {
                 value={logDate}
                 max={today}
                 onChange={(e) => setLogDate(e.target.value || today)}
-                className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none"
+                className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
               />
               {!isLoggingForToday && (
                 <>
@@ -720,7 +720,7 @@ export default function SupplementsPage() {
                     type="datetime-local"
                     value={logTimeLocal}
                     onChange={(e) => setLogTimeLocal(e.target.value)}
-                    className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none"
+                    className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
                   />
                   <span className="text-[10px] font-mono text-amber-400/90">
                     stamping at custom clock time
@@ -747,7 +747,7 @@ export default function SupplementsPage() {
                 {products.map((p) => (
                   <div
                     key={p.product_id}
-                    className="flex items-center gap-2 bg-black/30 hover:bg-white/[0.03] border border-border-subtle hover:border-border-hover rounded-[4px] transition-colors"
+                    className="flex items-center gap-2 bg-black/30 hover:bg-white/[0.03] border border-border-subtle hover:border-border-hover rounded-control transition-colors"
                   >
                     <button
                       onClick={() => logIntake(p.product_id)}
@@ -973,7 +973,7 @@ export default function SupplementsPage() {
           }}
         >
           <div
-            className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card p-5 w-full max-w-lg mt-12"
+            className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 w-full max-w-lg mt-12"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-3">
@@ -1017,12 +1017,12 @@ export default function SupplementsPage() {
                 value={searchQ}
                 onChange={(e) => setSearchQ(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && runSearch(searchQ)}
-                className="flex-1 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none"
+                className="flex-1 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
               />
               <button
                 onClick={() => runSearch(searchQ)}
                 disabled={searching || !searchQ.trim()}
-                className="px-3 py-2 text-[11px] font-mono text-text-primary bg-accent/20 hover:bg-accent/30 disabled:opacity-40 border border-accent/40 rounded-[4px] transition-colors"
+                className="px-3 py-2 text-[11px] font-mono text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 border border-accent rounded-full transition-colors"
               >
                 {searching ? "…" : "Search"}
               </button>
@@ -1031,7 +1031,7 @@ export default function SupplementsPage() {
                   setAddOpen(false);
                   setScannerOpen(true);
                 }}
-                className="px-3 py-2 text-[11px] font-mono text-text-secondary hover:text-text-primary bg-black/30 hover:bg-white/[0.05] border border-border-subtle rounded-[4px] transition-colors"
+                className="px-3 py-2 text-[11px] font-mono text-text-secondary hover:text-text-primary bg-black/30 hover:bg-white/[0.05] border border-border-subtle rounded-control transition-colors"
                 title="Scan a barcode"
               >
                 📷
@@ -1046,7 +1046,7 @@ export default function SupplementsPage() {
               <div className="mb-3 pb-3 border-b border-border-subtle/40">
                 <button
                   onClick={() => setCustomMode(true)}
-                  className="w-full px-3 py-2 text-[11px] font-mono text-text-secondary hover:text-text-primary bg-black/20 hover:bg-white/[0.04] border border-dashed border-border-subtle hover:border-border-hover rounded-[4px] transition-colors text-left"
+                  className="w-full px-3 py-2 text-[11px] font-mono text-text-secondary hover:text-text-primary bg-black/20 hover:bg-white/[0.04] border border-dashed border-border-subtle hover:border-border-hover rounded-control transition-colors text-left"
                 >
                   <span className="text-amber-400/80">Not in DSLD?</span>{" "}
                   <span className="text-text-tertiary">Photograph the supplement facts panel — Claude will read it.</span>{" "}
@@ -1064,7 +1064,7 @@ export default function SupplementsPage() {
                       setConfirmHit(h);
                       setConfirmDoses("1");
                     }}
-                    className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left bg-black/30 hover:bg-white/[0.04] border border-border-subtle hover:border-border-hover rounded-[4px] transition-colors"
+                    className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left bg-black/30 hover:bg-white/[0.04] border border-border-subtle hover:border-border-hover rounded-control transition-colors"
                   >
                     <div className="min-w-0">
                       <p className="text-[12px] text-text-primary truncate">{h.full_name ?? "—"}</p>
@@ -1086,7 +1086,7 @@ export default function SupplementsPage() {
             )}
 
             {confirmHit && (
-              <div className="bg-black/40 border border-accent/30 rounded-[4px] p-4">
+              <div className="bg-black/40 border border-accent/30 rounded-control p-4">
                 <p className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono mb-2">
                   Confirm + log
                 </p>
@@ -1107,7 +1107,7 @@ export default function SupplementsPage() {
                   step="0.5"
                   value={confirmDoses}
                   onChange={(e) => setConfirmDoses(e.target.value)}
-                  className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/50 outline-none"
+                  className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none"
                   autoFocus
                 />
                 <p className="text-[10px] text-text-tertiary mb-3 leading-relaxed">
@@ -1133,7 +1133,7 @@ export default function SupplementsPage() {
                       seedAndOptionallyLog(Number(confirmHit.id), doses > 0 ? doses : null);
                     }}
                     disabled={seedingId !== null}
-                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-accent/20 hover:bg-accent/30 disabled:opacity-40 disabled:cursor-not-allowed border border-accent/40 rounded-[4px] transition-colors"
+                    className="px-4 py-2 text-[12px] text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed border border-accent rounded-full transition-colors"
                   >
                     {seedingId !== null
                       ? "Saving…"

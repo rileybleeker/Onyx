@@ -7,7 +7,7 @@ import type { WriteReceipt } from "@/lib/chat-receipts";
  */
 
 const TONE: Record<WriteReceipt["status"], { mark: string; label: string; border: string; text: string }> = {
-  saved: { mark: "✓", label: "Saved", border: "border-accent/40", text: "text-accent" },
+  saved: { mark: "✓", label: "Saved", border: "border-up/40", text: "text-up" },
   unchanged: { mark: "＝", label: "No change", border: "border-border-subtle", text: "text-text-tertiary" },
   not_saved: { mark: "✕", label: "Not saved", border: "border-amber-500/50", text: "text-amber-400" },
   unknown: { mark: "!", label: "Check this", border: "border-amber-500/50", text: "text-amber-400" },
@@ -16,7 +16,7 @@ const TONE: Record<WriteReceipt["status"], { mark: string; label: string; border
 export default function ChatReceipts({ receipts, heading = "Written to Onyx" }: { receipts: WriteReceipt[]; heading?: string }) {
   if (receipts.length === 0) return null;
   return (
-    <section aria-label={heading} data-testid="chat-receipts" className="mt-2 rounded-xl border border-border-subtle bg-surface-card p-3 text-[13px] leading-relaxed">
+    <section aria-label={heading} data-testid="chat-receipts" className="mt-2 rounded-card shadow-card border border-border-subtle bg-surface-card p-3 text-[13px] leading-relaxed">
       <p className="mb-2 text-[11px] font-medium uppercase tracking-wide text-text-tertiary">{heading}</p>
       <ul className="space-y-2">
         {receipts.map((receipt, i) => {

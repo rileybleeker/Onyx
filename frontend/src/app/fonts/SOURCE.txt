@@ -1,9 +1,17 @@
-JetBrains Mono variable font
-Source: https://github.com/google/fonts/tree/5bb28733cec313b63fbd415b574b5ae35c8aa8b8/ofl/jetbrainsmono
-Upstream file: JetBrainsMono[wght].ttf; subset to Latin and converted to WOFF2 with fontTools 4.68.0, preserving the variable weight axis.
-Upstream TTF SHA-256: 48715a42ec242c21e9f02692891e147d022299a52e48d5e413e1a942193ffeda
-License: SIL Open Font License 1.1, reproduced in OFL.txt.
+Archivo (variable weight) and DM Mono (Regular, Medium)
+Source: https://github.com/google/fonts/tree/cc39c4c2c304bc368c9b7c311ea2bcc6013299fe/ofl/archivo
+        https://github.com/google/fonts/tree/cc39c4c2c304bc368c9b7c311ea2bcc6013299fe/ofl/dmmono
+Upstream files and SHA-256:
+  Archivo[wdth,wght].ttf  0e094a7d3c7c4c25cf1310c4b30014f1dae9332220b1c2c88f4fa996f0b05053
+  DMMono-Regular.ttf      55b4c98f123daebb3ed27947ba47b2af00554fc6284d639a540bcef5e6258ad2
+  DMMono-Medium.ttf       fd327daf461db87b44a87def475d251bf03b997f7c07d9680592d75dbbfaad0b
+Processing (fontTools): Archivo width axis pinned to 100 (weight axis kept variable);
+all three subset to Latin and converted to WOFF2.
+License: SIL Open Font License 1.1, reproduced in OFL-Archivo.txt and OFL-DMMono.txt.
 Vendored to make CI builds deterministic and independent of Google's CSS endpoint.
 
-Subset ranges: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+2074,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD
-Vendored WOFF2 SHA-256: 1ddace4b01938fc8f4581b4db5201964fedf003b94da9115e11de8f6ae3dda99
+Subset ranges: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+2074,U+20AC,U+2122,U+2190-2193,U+2212,U+2215,U+2248,U+2264-2265,U+25B2,U+25BC,U+FEFF,U+FFFD
+Vendored WOFF2 SHA-256:
+  Archivo-Latin.woff2         e35c66f10f21439046e6976eb0055abd72d3ba88d69649a9166479e967617af4
+  DMMono-Regular-Latin.woff2  4e386f4b5d3b12d570ed87be08655df2e6706782dafde59966fd242f4433df62
+  DMMono-Medium-Latin.woff2   b4d68df25b317709ff16b12a4180f5eff93a8b36b2f070950292cdf577a69f96

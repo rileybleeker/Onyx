@@ -3,7 +3,7 @@ import type { ReorderLoad, ReorderSuggestion } from '@/lib/procurement-reorder';
 // Purchase suggestions: items bought repeatedly and when they are usually reordered. Read-only:
 // everything comes from the server-rendered `reorder` prop; this component makes no request and
 // has no link, button or form: there is nowhere to buy anything from here.
-const card = 'rounded-xl border border-border-subtle bg-surface-card p-5 space-y-4';
+const card = 'rounded-card shadow-card border border-border-subtle bg-surface-card p-5 space-y-4';
 const statusWord = { due: 'Likely due', soon: 'Due soon', later: 'Not yet' } as const;
 const statusStyle = { due: 'text-amber-300', soon: 'text-text-primary', later: 'text-text-secondary' } as const;
 
