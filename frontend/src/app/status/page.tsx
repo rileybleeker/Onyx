@@ -268,6 +268,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
 const HISTORY_TYPE_LABELS: Record<string, string> = {
   full_sync: "Full Sync",
   trends: "Trends",
+  temp_selfheal: "Temp Self-Heal",
   journal_email: "Journal Email",
   nutrition: "Nutrition",
   daily: "Daily Totals",
