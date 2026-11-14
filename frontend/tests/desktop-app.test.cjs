@@ -8,7 +8,7 @@ const path = require('node:path');
 
 const output = mkdtempSync(path.join(tmpdir(), 'onyx-desktop-app-'));
 execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'), 'src/lib/desktop-app.ts', '--outDir', output, '--module', 'commonjs', '--target', 'ES2022', '--skipLibCheck']);
-const { START_URL, launchTarget, paletteShortcutLabel } = require(path.join(output, 'desktop-app.js'));
+const { START_URL, launchTarget, paletteShortcutLabel, reloadShortcutLabel, isInstalledWindow } = require(path.join(output, 'desktop-app.js'));
 
 const manifest = JSON.parse(readFileSync('public/manifest.json', 'utf8'));
 const ORIGIN = 'https://onyx.example';
@@ -73,4 +73,26 @@ test('palette hint: Ctrl K on Windows, ⌘K on Apple', () => {
   assert.equal(paletteShortcutLabel('MacIntel', ''), '⌘K');
   assert.equal(paletteShortcutLabel('', 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X)'), '⌘K');
   assert.equal(paletteShortcutLabel('Linux x86_64', ''), 'Ctrl K');
+});
+
+test('Reload shows in the installed window only (no browser toolbar there)', () => {
+  const mode = (m) => (q) => q === `(display-mode: ${m})`;
+  assert.equal(isInstalledWindow(mode('standalone')), true);
+  assert.equal(isInstalledWindow(mode('window-controls-overlay')), true);
+  assert.equal(isInstalledWindow(mode('minimal-ui')), false, 'minimal-ui keeps the browser reload button');
+  assert.equal(isInstalledWindow(mode('browser')), false);
+  assert.equal(isInstalledWindow(() => false), false);
+});
+
+test('reload hint: Ctrl R on Windows, ⌘R on Apple', () => {
+  assert.equal(reloadShortcutLabel('Win32', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'), 'Ctrl R');
+  assert.equal(reloadShortcutLabel('MacIntel', ''), '⌘R');
+});
+
+test('the sidebar carries the Reload button, which hides outside the installed window', () => {
+  const sidebar = readFileSync('src/components/Sidebar.tsx', 'utf8');
+  assert.match(sidebar, /<ReloadAppButton \/>/);
+  const desktop = readFileSync('src/components/DesktopApp.tsx', 'utf8');
+  assert.match(desktop, /if \(!installed\) return null;/);
+  assert.match(desktop, /window\.location\.reload\(\)/);
 });

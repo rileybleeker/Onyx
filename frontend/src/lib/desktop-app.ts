@@ -32,3 +32,20 @@ export function launchTarget(targetURL: string | null | undefined, origin: strin
 export function paletteShortcutLabel(platform: string, userAgent: string): string {
   return /Mac|iPhone|iPad|iPod/i.test(platform || userAgent) ? "⌘K" : "Ctrl K";
 }
+
+/** Keyboard hint for reloading the window: ⌘R on Apple devices, Ctrl R everywhere else. */
+export function reloadShortcutLabel(platform: string, userAgent: string): string {
+  return paletteShortcutLabel(platform, userAgent) === "⌘K" ? "⌘R" : "Ctrl R";
+}
+
+/**
+ * Display modes in which Onyx runs in its own window with no browser toolbar, so no reload
+ * button: the installed app (`standalone`, or `window-controls-overlay` when the title bar is
+ * hidden). `minimal-ui` keeps the browser's own back/reload buttons, a normal tab has them too.
+ */
+export const INSTALLED_DISPLAY_MODES = ["standalone", "window-controls-overlay"] as const;
+
+/** True inside the installed app window. `matches` is `(q) => matchMedia(q).matches`. */
+export function isInstalledWindow(matches: (query: string) => boolean): boolean {
+  return INSTALLED_DISPLAY_MODES.some((mode) => matches(`(display-mode: ${mode})`));
+}

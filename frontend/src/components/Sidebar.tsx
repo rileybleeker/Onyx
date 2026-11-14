@@ -6,7 +6,7 @@ import { LogOut, Search } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS } from "@/lib/nav";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
-import { InstallAppButton, usePaletteShortcutLabel } from "./DesktopApp";
+import { InstallAppButton, ReloadAppButton, usePaletteShortcutLabel } from "./DesktopApp";
 
 export default function Sidebar() {
   const pathname = usePathname();
@@ -75,6 +75,7 @@ export default function Sidebar() {
 
       <div className="px-2 py-3 border-t border-border-subtle">
         <InstallAppButton />
+        <ReloadAppButton />
         <button
           onClick={handleSignOut}
           className="flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
