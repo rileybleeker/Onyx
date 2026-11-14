@@ -14,6 +14,8 @@ const urgentLib = ids.size; ids.set('frontend/src/lib/urgent-email.ts', urgentLi
 component = component.replace(/require\("@\/lib\/urgent-email"\)/g, `require(${urgentLib})`);
 const experimentsLib = ids.size; ids.set('frontend/src/lib/experiments.ts', experimentsLib); modules[experimentsLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/experiments.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/experiments"\)/g, `require(${experimentsLib})`);
+const calendarLib = ids.size; ids.set('frontend/src/lib/calendar-events.ts', calendarLib); modules[calendarLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/calendar-events.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/calendar-events"\)/g, `require(${calendarLib})`);
 // GET /api/experiments/today answers (synthetic). "none" is the usual case: no trial registered.
 const experimentFixtures = {
     none: { status: 'none' },
@@ -49,12 +51,34 @@ assert(css.trim(), 'Compile the frontend before running layout regressions');
     const browser = await chromium.launch({ headless: true });
     const errors = [];
     try {
-        async function setup(mode = 'healthy', width = 390, strict = false, urgent = 'not_connected', experiment = 'none') { const page = await browser.newPage({ viewport: { width, height: 900 }, serviceWorkers: 'block' }); page.on('pageerror', e => errors.push(e.message)); page.on('request', request => { if (['fetch', 'xhr', 'eventsource', 'ping'].includes(request.resourceType())) errors.push('Unexpected network request: ' + request.resourceType()); }); if (strict) page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); }); await page.routeWebSocket('**/*', socket => { errors.push('Unexpected WebSocket'); socket.close(); }); await page.route('**/*', r => r.abort()); await page.setContent('<style>' + css + '</style><div class="max-w-6xl mx-auto px-4 sm:px-6 pt-8 pb-8"><div id="root"></div></div>'); await page.evaluate(() => { document.documentElement.className = 'dark'; document.body.className = 'bg-surface text-text-primary antialiased font-sans'; }); await page.evaluate(({ fixture, book, mode, strict, urgent, urgentFixtures, fixtureWithEmail, experiment, experimentFixtures }) => { window.experimentMode = experiment; window.experimentFixtures = experimentFixtures; window.experimentCalls = 0; window.urgentMode = urgent; window.urgentFixtures = urgentFixtures; window.fixtureWithEmail = fixtureWithEmail; window.urgentCalls = []; window.strict = strict; window.reactEnv = strict ? 'development' : 'production'; window.fixture = fixture; window.book = book; window.mode = mode; window.calls = []; window.unexpectedRequests = []; window.pending = []; window.mockInbox = () => { window.calls.push({ url: '/onyx/inbox', method: 'GET' }); if (window.mode === 'sync-error')
+        async function setup(mode = 'healthy', width = 390, strict = false, urgent = 'not_connected', experiment = 'none', calendar = 'not_connected') { const page = await browser.newPage({ viewport: { width, height: 900 }, serviceWorkers: 'block' }); page.on('pageerror', e => errors.push(e.message)); page.on('request', request => { if (['fetch', 'xhr', 'eventsource', 'ping'].includes(request.resourceType())) errors.push('Unexpected network request: ' + request.resourceType()); }); if (strict) page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); }); await page.routeWebSocket('**/*', socket => { errors.push('Unexpected WebSocket'); socket.close(); }); await page.route('**/*', r => r.abort()); await page.setContent('<style>' + css + '</style><div class="max-w-6xl mx-auto px-4 sm:px-6 pt-8 pb-8"><div id="root"></div></div>'); await page.evaluate(() => { document.documentElement.className = 'dark'; document.body.className = 'bg-surface text-text-primary antialiased font-sans'; }); await page.evaluate(({ fixture, book, mode, strict, urgent, urgentFixtures, fixtureWithEmail, experiment, experimentFixtures, calendar }) => { window.calendarMode = calendar; window.calendarCalls = []; (() => {
+            // Synthetic calendar events relative to the page's "now" (deliberately unsorted; two are outside today + tomorrow).
+            const cd = (off, h, m) => { const d = new Date(); d.setDate(d.getDate() + off); d.setHours(h, m || 0, 0, 0); return d; };
+            const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+            const ev = (key, title, s, e, over) => ({ key, title, allDay: false, startAt: s.toISOString(), endAt: e.toISOString(), startDate: ymd(s), endDate: ymd(e), calendar: 'main', account: 'acct one', location: null, status: 'confirmed', recurring: false, ...over });
+            const okSync = { at: new Date(Date.now() - 20 * 60000).toISOString(), status: 'success', error: null };
+            const list = [
+                ev('c-late', 'Synthetic afternoon sync', cd(0, 14, 30), cd(0, 15, 0), { status: 'tentative', calendar: 'side' }),
+                ev('c-tomorrow', 'Synthetic planning session', cd(1, 11, 0), cd(1, 12, 0)),
+                ev('c-morning', 'Synthetic morning review', cd(0, 9, 0), cd(0, 10, 0), { location: 'Room 4, North wing' }),
+                { key: 'c-day', title: 'Synthetic all-day block', allDay: true, startAt: null, endAt: null, startDate: ymd(cd(0, 12)), endDate: ymd(cd(0, 12)), calendar: 'main', account: 'acct one', location: null, status: 'confirmed', recurring: false },
+                ev('c-out', 'Synthetic out of range', cd(2, 9, 0), cd(2, 10, 0)),
+                ev('c-overnight', 'Synthetic overnight', cd(-1, 23, 0), cd(0, 1, 0)),
+            ];
+            window.calendarDays = [ymd(cd(0, 12)), ymd(cd(1, 12))];
+            window.calendarFixtures = {
+                not_connected: { status: 'not_connected', lastSync: null },
+                never_ran: { status: 'ready', events: [], truncated: false, lastSync: null },
+                empty: { status: 'ready', events: [], truncated: false, lastSync: okSync },
+                events: { status: 'ready', events: list, truncated: false, lastSync: okSync },
+                stale_sync: { status: 'ready', events: list, truncated: false, lastSync: { at: new Date(Date.now() - 6.2 * 3600000).toISOString(), status: 'partial', error: 'synthetic' } },
+            };
+        })(); window.experimentMode = experiment; window.experimentFixtures = experimentFixtures; window.experimentCalls = 0; window.urgentMode = urgent; window.urgentFixtures = urgentFixtures; window.fixtureWithEmail = fixtureWithEmail; window.urgentCalls = []; window.strict = strict; window.reactEnv = strict ? 'development' : 'production'; window.fixture = fixture; window.book = book; window.mode = mode; window.calls = []; window.unexpectedRequests = []; window.pending = []; window.mockInbox = () => { window.calls.push({ url: '/onyx/inbox', method: 'GET' }); if (window.mode === 'sync-error')
             throw Error('synthetic'); if (['error', 'inbox-error', 'refresh-error'].includes(window.mode))
             return Promise.reject(Error('synthetic')); if (window.mode === 'defer')
-            return new Promise((resolve, reject) => window.pending.push({ kind: 'inbox', resolve, reject })); return Promise.resolve(window.mode === 'empty' ? { ...window.fixture, items: [] } : window.mode === 'email-cards' ? window.fixtureWithEmail : window.fixture); }; window.fetch = (url, init) => { if (url === '/api/urgent-email' && !(init?.method && init.method !== 'GET')) { window.urgentCalls.push(url); return Promise.resolve(window.urgentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.urgentFixtures[window.urgentMode] }); } if (url === '/api/orders/summary' && !(init?.method && init.method !== 'GET')) { window.ordersCalls = (window.ordersCalls || 0) + 1; return Promise.resolve({ ok: true, status: 200, json: async () => ({ status: 'ready', attention: 0, arrivingToday: 0, onTheWay: 0, top: [] }) }); } if (url === '/api/procurement/renewals/summary' && !(init?.method && init.method !== 'GET')) { window.renewalsCalls = (window.renewalsCalls || 0) + 1; return Promise.resolve(window.renewalsFixture === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => (window.renewalsFixture || { status: 'ready', count: 0, soon: [], withinDays: 3 }) }); } if (url === '/api/experiments/today' && !(init?.method && init.method !== 'GET')) { window.experimentCalls++; return Promise.resolve(window.experimentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.experimentFixtures[window.experimentMode] }); } if (url !== '/api/reading' || (init?.method && init.method !== 'GET')) { window.unexpectedRequests.push(String(url)); return Promise.reject(Error('Unexpected request')); } window.calls.push({ url, method: init?.method || 'GET' }); if (['error', 'reading-error', 'refresh-error'].includes(window.mode))
+            return new Promise((resolve, reject) => window.pending.push({ kind: 'inbox', resolve, reject })); return Promise.resolve(window.mode === 'empty' ? { ...window.fixture, items: [] } : window.mode === 'email-cards' ? window.fixtureWithEmail : window.fixture); }; window.fetch = (url, init) => { if (url === '/api/urgent-email' && !(init?.method && init.method !== 'GET')) { window.urgentCalls.push(url); return Promise.resolve(window.urgentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.urgentFixtures[window.urgentMode] }); } if (String(url).startsWith('/api/calendar/events?') && !(init?.method && init.method !== 'GET')) { window.calendarCalls.push(String(url)); return Promise.resolve(window.calendarMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.calendarFixtures[window.calendarMode] }); } if (url === '/api/orders/summary' && !(init?.method && init.method !== 'GET')) { window.ordersCalls = (window.ordersCalls || 0) + 1; return Promise.resolve({ ok: true, status: 200, json: async () => ({ status: 'ready', attention: 0, arrivingToday: 0, onTheWay: 0, top: [] }) }); } if (url === '/api/procurement/renewals/summary' && !(init?.method && init.method !== 'GET')) { window.renewalsCalls = (window.renewalsCalls || 0) + 1; return Promise.resolve(window.renewalsFixture === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => (window.renewalsFixture || { status: 'ready', count: 0, soon: [], withinDays: 3 }) }); } if (url === '/api/experiments/today' && !(init?.method && init.method !== 'GET')) { window.experimentCalls++; return Promise.resolve(window.experimentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.experimentFixtures[window.experimentMode] }); } if (url !== '/api/reading' || (init?.method && init.method !== 'GET')) { window.unexpectedRequests.push(String(url)); return Promise.reject(Error('Unexpected request')); } window.calls.push({ url, method: init?.method || 'GET' }); if (['error', 'reading-error', 'refresh-error'].includes(window.mode))
             return Promise.resolve({ ok: false }); if (window.mode === 'defer')
-            return new Promise(resolve => window.pending.push({ kind: 'reading', resolve })); return Promise.resolve({ ok: true, json: async () => ({ overview: window.mode === 'empty' ? null : window.book }) }); }; }, { fixture, book, mode, strict, urgent, urgentFixtures, fixtureWithEmail, experiment, experimentFixtures }); await page.addScriptTag({ content: script }); await page.getByRole('heading', { name: 'Today', exact: true }).waitFor(); assert.equal(await page.locator('[role=status]').evaluate(el => getComputedStyle(el).position), 'absolute', 'compiled CSS must be applied'); return page; }
+            return new Promise(resolve => window.pending.push({ kind: 'reading', resolve })); return Promise.resolve({ ok: true, json: async () => ({ overview: window.mode === 'empty' ? null : window.book }) }); }; }, { fixture, book, mode, strict, urgent, urgentFixtures, fixtureWithEmail, experiment, experimentFixtures, calendar }); await page.addScriptTag({ content: script }); await page.getByRole('heading', { name: 'Today', exact: true }).waitFor(); assert.equal(await page.locator('[role=status]').evaluate(el => getComputedStyle(el).position), 'absolute', 'compiled CSS must be applied'); return page; }
         async function close(page) { assert.deepEqual(await page.evaluate(() => window.unexpectedRequests), [], 'Only expected GET endpoints may be requested'); await page.close(); }
         async function settled(page) { await page.waitForFunction(() => document.querySelector('[aria-label="Refresh Today"]')?.getAttribute('aria-disabled') === 'false'); }
         let page = await setup();
@@ -288,6 +312,63 @@ assert(css.trim(), 'Compile the frontend before running layout regressions');
         assert.equal(await page.getByText('never shown').count(), 0);
         await close(page);
         console.log('PASS experiment arm: nothing when none / not connected, arm + instruction when active, read-only, failed refresh keeps the arm, error is not none, no arm before the start');
+        const texts = async locator => (await locator.allTextContents()).map(t => t.replace(/\s+/g, ' ').trim());
+        const refresh = async (p, calendarMode) => { await p.evaluate(m => { window.calendarMode = m; }, calendarMode); await p.getByRole('button', { name: 'Refresh Today' }).click(); await settled(p); };
+        page = await setup();
+        await settled(page);
+        let calendarPanel = page.locator('section[aria-labelledby="calendar-heading"]');
+        assert.equal(await page.locator('section').first().getAttribute('aria-labelledby'), 'requests-heading', 'Needs your input stays the first panel');
+        assert(await calendarPanel.getByText("The calendar sync isn't connected yet.").isVisible());
+        assert.equal(await calendarPanel.locator('li').count(), 0);
+        assert.equal(await calendarPanel.getByText('Nothing on the calendar.').count(), 0, 'not connected is not an empty day');
+        assert.deepEqual(await page.evaluate(() => window.calendarCalls), await page.evaluate(() => ['/api/calendar/events?from=' + window.calendarDays[0] + '&to=' + window.calendarDays[1]]), 'one GET for today..tomorrow in the page zone');
+        assert.equal(await calendarPanel.getByRole('link', { name: 'Open calendar' }).getAttribute('href'), '/health');
+        assert.equal(await calendarPanel.locator('a').count(), 1, 'the panel links only to the calendar page');
+        await refresh(page, 'never_ran');
+        assert(await calendarPanel.getByText("The calendar sync isn't connected yet.").isVisible(), 'a table with no sync run and no events is not an empty calendar');
+        await refresh(page, 'empty');
+        assert.equal(await calendarPanel.getByText('Nothing on the calendar.').count(), 2, 'today and tomorrow are both shown as empty');
+        assert.equal(await calendarPanel.getByText(/isn't connected yet/).count(), 0);
+        assert(await calendarPanel.getByText('Calendar last synced 20 min ago.').isVisible());
+        await refresh(page, 'events');
+        const todayList = calendarPanel.getByRole('list', { name: 'Calendar events today' });
+        const tomorrowList = calendarPanel.getByRole('list', { name: 'Calendar events tomorrow' });
+        assert.deepEqual(await texts(todayList.locator('li p:nth-child(2)')), ['Synthetic all-day block', 'Synthetic morning review', 'Synthetic afternoon sync'], 'all-day first, then by start time');
+        assert.deepEqual(await texts(todayList.locator('li p:first-child')), ['All day · main', '9:00 AM - 10:00 AM · main', '2:30 PM - 3:00 PM · Tentative · side'], 'time in the page zone, calendar label, tentative marked');
+        assert(await todayList.getByText('Room 4, North wing').isVisible());
+        assert.deepEqual(await texts(tomorrowList.locator('li p:nth-child(2)')), ['Synthetic planning session']);
+        assert.equal(await calendarPanel.getByText(/Synthetic out of range|Synthetic overnight/).count(), 0, 'the padded server range is trimmed to today and tomorrow; an event that started yesterday evening is not repeated');
+        assert.equal(await calendarPanel.getByText('Nothing on the calendar.').count(), 0);
+        assert(await calendarPanel.getByText('Read-only: opening Today changes nothing on your calendar.').isVisible());
+        assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+        await refresh(page, 'error');
+        assert(await calendarPanel.getByText(/Couldn't refresh the calendar/).isVisible());
+        assert.equal(await calendarPanel.locator('li').count(), 4, 'a failed refresh keeps the last list');
+        assert.equal(await page.locator('section').first().locator('li').count(), 3, 'agent requests stay independent of the calendar');
+        assert(await page.getByText('A book for steady progress').isVisible());
+        assert((await page.evaluate(() => window.calendarCalls)).every(u => u.startsWith('/api/calendar/events?from=')));
+        assert((await page.evaluate(() => window.calls)).every(c => c.method === 'GET'));
+        await close(page);
+        page = await setup('healthy', 390, false, 'not_connected', 'none', 'error');
+        await settled(page);
+        calendarPanel = page.locator('section[aria-labelledby="calendar-heading"]');
+        assert(await calendarPanel.getByText("Couldn't check the calendar. Try refreshing.").isVisible());
+        assert.equal(await calendarPanel.getByText('Nothing on the calendar.').count(), 0, 'an error is not empty');
+        assert.equal(await calendarPanel.getByText(/isn't connected yet/).count(), 0, 'an error is not the not-connected state');
+        assert.equal(await page.locator('section').first().locator('li').count(), 3);
+        await close(page);
+        page = await setup('healthy', 390, false, 'not_connected', 'none', 'stale_sync');
+        await settled(page);
+        calendarPanel = page.locator('section[aria-labelledby="calendar-heading"]');
+        assert(await calendarPanel.getByText('Calendar last synced 6 h ago (that run: partial); newer changes may be missing.').isVisible());
+        assert.equal(await calendarPanel.locator('li').count(), 4);
+        await close(page);
+        page = await setup('healthy', 390, true, 'not_connected', 'none', 'events');
+        await settled(page);
+        assert.equal(await page.locator('section[aria-labelledby="calendar-heading"] li').count(), 4, 'Strict Mode: same list, no console error');
+        assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+        await close(page);
+        console.log('PASS calendar: not connected vs never ran vs empty vs events, today + tomorrow in the page zone, all-day first, read-only link only, failed refresh keeps list, error is not empty, stale sync flagged');
         assert.deepEqual(errors, []);
         console.log('PASS no browser exceptions; no health data, credentials, or screenshots collected');
     }

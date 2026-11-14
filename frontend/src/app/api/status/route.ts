@@ -59,6 +59,7 @@ const CADENCE: Record<string, string> = {
   supplement_reminders: "Worker poll (heartbeat ~hourly); cards at each stack's reminder time",
   renewal_reminders: "Worker poll, hourly; a card up to 3 days before a renewal",
   urgent_email: "Hourly :15 (both Gmail accounts)",
+  google_calendar: "Hourly :55",
   ubereats: "Every 6h (Riley's PC, while logged on)",
   nyc_scout: "Daily 6:10am ET",
   rocket_money: "Daily (harvester)",
@@ -107,6 +108,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   supplement_reminders: { method: "automated", label: "Worker push cards" },
   renewal_reminders: { method: "automated", label: "Worker push cards" },
   urgent_email:   { method: "automated",      label: "IMAP label reader" },
+  google_calendar: { method: "automated",     label: "iCal feed ETL" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   rocket_money:   { method: "automated",      label: "Harvester import" },
@@ -381,6 +383,9 @@ export async function GET() {
         ["online_orders", "email"],
         // Personal Amazon order list (Kindle harvester pass on Riley's PC, every 3h).
         ["amazon", "orders"],
+        // Google Calendar (hourly): 24 rows a day would otherwise push it, or the daily jobs,
+        // out of the shared 100-row window.
+        ["google_calendar", "events"],
       ].map(async ([source, dataType]) => {
         const { data, error } = await supabase.from("sync_log").select("*")
           .eq("source", source).eq("data_type", dataType)
@@ -1118,6 +1123,36 @@ export async function GET() {
           cadence: CADENCE.rocket_money,
           integrationMethod: METHOD.rocket_money.method,
           methodLabel: METHOD.rocket_money.label,
+        };
+      })(),
+      // Google Calendar (google_calendar_etl.py): the calendars' iCal feeds copied hourly into
+      // pds.calendar_events for /health and Today (read-only, calendar -> Onyx). Freshness =
+      // heartbeat age (an hour without a new event is healthy): hourly cron -> >3h partial, >8h or
+      // a failed run red. 'partial' = one feed failed, or a malformed event or series was skipped.
+      // Heartbeat only: this endpoint is CDN-cacheable, so no event row is read here.
+      google_calendar: (() => {
+        const entry = latestBySrcType["google_calendar|events"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || entry.status === "error" || ageH > 8
+            ? "failed"
+            : entry.status === "partial" || ageH > 3
+              ? "partial"
+              : "success";
+        return {
+          label: "Google Calendar",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No run yet - the Google Calendar ETL workflow has not reported." : ageH > 8 ? `No run for ${Math.floor(ageH)}h - check the Google Calendar ETL workflow.` : null),
+          cadence: CADENCE.google_calendar,
+          integrationMethod: METHOD.google_calendar.method,
+          methodLabel: METHOD.google_calendar.label,
         };
       })(),
       // Urgent email for Today: inbox-triage's Agent/Action + Agent/Deadline labels read

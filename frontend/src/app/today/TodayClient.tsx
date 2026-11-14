@@ -2,13 +2,15 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, BookOpen, CalendarClock, ClipboardCheck, FlaskConical, Mail, Package, RefreshCw } from "lucide-react";
+import { ArrowUpRight, BookOpen, CalendarClock, CalendarDays, ClipboardCheck, FlaskConical, Mail, Package, RefreshCw } from "lucide-react";
 import { agentsApi, type InboxResponse, type InboxItem } from "@/lib/agents-api";
 import type { ReadingOverview } from "@/lib/reading";
 import type { UrgentEmailResponse } from "@/lib/urgent-email-query";
 import { ageLabel, isEmailCard, isGmailHref, mergeUrgent } from "@/lib/urgent-email";
 import { dayLabel, isExperimentToday, type ExperimentToday } from "@/lib/experiments";
 import type { RenewalSummary } from "@/lib/procurement-renewals";
+// Import-free helpers (tests/today-regression.cjs bundles this module by name).
+import { type CalendarEventsResponse, CALENDAR_SOURCE_LABEL, eventTitle, eventsByDay, localDate, readCalendarResponse, shiftDate, syncHealth, timeLabel } from "@/lib/calendar-events";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -30,6 +32,11 @@ async function bounded<T>(promise: Promise<T>): Promise<T> {
 // The email label sync runs hourly; older than this and Today says newer labels may be missing.
 const LABEL_SYNC_STALE_MS = 3 * 3_600_000;
 const URGENT_SHOWN = 5;
+// Calendar panel: today and tomorrow, at most this many events listed per day.
+const CALENDAR_SHOWN = 6;
+function calendarDayLabel(day: string): string {
+  return new Date(`${day}T12:00:00`).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+}
 function requestHref(item: RequestCard): string {
   return `/agents?${new URLSearchParams({ t: item.thread })}#m${item.messageId}`;
 }
@@ -41,6 +48,8 @@ export default function TodayClient() {
   // Packages are shown only when something needs attention or arrives today, and a failed check
   // just hides the panel: /orders is where package status lives.
   const [orders, setOrders] = useState<OrdersSummary | null>(null);
+  // Synced calendar events (read-only copies; see /health). Onyx never writes to the calendar.
+  const [calendar, setCalendar] = useState<Load<CalendarEventsResponse>>({ state: "loading" });
   // Today's arm of the running N-of-1 trial (GET /api/experiments/today). Usually "none": no card.
   const [experiment, setExperiment] = useState<Load<ExperimentToday>>({ state: "loading" });
   // Subscription renewals (GET /api/procurement/renewals/summary) follow the same rule: shown only
@@ -60,6 +69,7 @@ export default function TodayClient() {
     setInbox((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setReading((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setUrgent((previous) => previous.state === "ready" ? previous : { state: "loading" });
+    setCalendar((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setExperiment((previous) => previous.state === "ready" ? previous : { state: "loading" });
     const inboxRequest = bounded(Promise.resolve().then(() => agentsApi.inbox())).then((value) => {
       if (!Array.isArray(value.items) || !Array.isArray(value.threads)) throw new Error("Invalid inbox");
@@ -107,7 +117,15 @@ export default function TodayClient() {
     })).then((value) => {
       if (sequence.current === current) setExperiment({ state: "ready", value });
     }).catch(() => { if (sequence.current === current) setExperiment((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
-    void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest, renewalsRequest, experimentRequest]).then(() => {
+    // Today and tomorrow in this device's zone; the server pads the range by a day on each side.
+    const firstDay = localDate(new Date());
+    const calendarRequest = bounded(fetch(`/api/calendar/events?from=${firstDay}&to=${shiftDate(firstDay, 1)}`, { cache: "no-store" }).then(async (res) => {
+      if (!res.ok) throw new Error("Calendar unavailable");
+      return readCalendarResponse(await res.json());
+    })).then((value) => {
+      if (sequence.current === current) setCalendar({ state: "ready", value });
+    }).catch(() => { if (sequence.current === current) setCalendar((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
+    void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest, renewalsRequest, experimentRequest, calendarRequest]).then(() => {
       if (sequence.current === current) { inFlight.current = false; setRefreshing(false); }
     });
   }, []);
@@ -128,8 +146,8 @@ export default function TodayClient() {
   // inbox-triage's "Urgent: ..." email questions are shown once, under Urgent email.
   const emailCards = cards.filter((item) => isEmailCard(item.card));
   const requests = cards.filter((item) => !isEmailCard(item.card));
-  const pending = refreshing || inbox.state === "loading" || reading.state === "loading" || urgent.state === "loading";
-  const unavailable = inbox.state === "error" || reading.state === "error" || urgent.state === "error" || (inbox.state === "ready" && inbox.stale) || (reading.state === "ready" && reading.stale) || (urgent.state === "ready" && urgent.stale) || experiment.state === "error" || (experiment.state === "ready" && experiment.stale);
+  const pending = refreshing || inbox.state === "loading" || reading.state === "loading" || urgent.state === "loading" || calendar.state === "loading";
+  const unavailable = inbox.state === "error" || reading.state === "error" || urgent.state === "error" || (inbox.state === "ready" && inbox.stale) || (reading.state === "ready" && reading.stale) || (urgent.state === "ready" && urgent.stale) || experiment.state === "error" || (experiment.state === "ready" && experiment.stale) || calendar.state === "error" || (calendar.state === "ready" && calendar.stale);
   // "none" (no trial registered, the usual case) and "not_connected" render nothing at all.
   const trial = experiment.state === "ready" && experiment.value.status !== "none" && experiment.value.status !== "not_connected" ? experiment.value : null;
   const email = urgent.state === "ready" && urgent.value.status === "ready" ? urgent.value : null;
@@ -139,6 +157,13 @@ export default function TodayClient() {
   const syncStale = !!lastSync && (now.getTime() - new Date(lastSync.at).getTime() > LABEL_SYNC_STALE_MS || lastSync.status !== "success");
   const book = reading.state === "ready" ? reading.value : null;
   const packages = orders?.status === "ready" && (orders.attention > 0 || orders.arrivingToday > 0) ? orders : null;
+  // The table can exist before the first sync run: no run and no events is "not connected yet", not "nothing on".
+  const agenda = calendar.state === "ready" && calendar.value.status === "ready" && (calendar.value.lastSync || calendar.value.events.length > 0) ? calendar.value : null;
+  const calendarOff = calendar.state === "ready" && !agenda;
+  const todayDate = localDate(now);
+  const calendarDays = [{ day: todayDate, name: "Today" }, { day: shiftDate(todayDate, 1), name: "Tomorrow" }];
+  const agendaByDay = agenda ? eventsByDay(agenda.events, calendarDays[0].day, calendarDays[1].day) : null;
+  const calendarSync = agenda ? syncHealth(agenda.lastSync, now.getTime()) : "never";
   const renewing = renewals?.status === "ready" && renewals.count > 0 ? renewals : null;
   return (
     <div className="mx-auto max-w-2xl space-y-5">
@@ -226,6 +251,39 @@ export default function TodayClient() {
           ? `Email labels last synced ${ageLabel(lastSync.at, now)}${lastSync.status !== "success" ? ` (that run: ${lastSync.status})` : ""}${syncStale ? "; newer labels may be missing." : "."}`
           : "The email label sync has not run yet."}</p>}
         {urgent.state !== "loading" && <p className="mt-1 text-xs text-text-secondary">Opening Today does not mark email read or change any label.</p>}
+      </section>
+      <section className={panelStyle} aria-labelledby="calendar-heading" aria-busy={calendar.state === "loading"}>
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2"><CalendarDays aria-hidden="true" className="h-5 w-5 text-accent" />
+            <h2 id="calendar-heading" className="text-lg font-medium text-text-primary">Calendar</h2></div>
+          <Link href="/health" className={linkStyle}>Open calendar</Link>
+        </div>
+        <p className="mt-1 text-xs text-text-secondary">Today and tomorrow from {CALENDAR_SOURCE_LABEL}, in this device&apos;s time zone.</p>
+        {calendar.state === "loading" && <p className="mt-3 text-sm text-text-secondary">Checking your calendar...</p>}
+        {calendar.state === "error" && <p className="mt-3 text-sm text-text-secondary">Couldn&apos;t check the calendar. Try refreshing.</p>}
+        {calendar.state === "ready" && calendar.stale && <p className="mt-3 text-sm text-amber-300">Couldn&apos;t refresh the calendar. Showing the last check; it may have changed.</p>}
+        {calendarOff && <p className="mt-3 text-sm text-text-primary">The calendar sync isn&apos;t connected yet.</p>}
+        {agenda && agendaByDay && <>
+          {calendarDays.map(({ day, name }) => {
+            const events = agendaByDay.get(day) ?? [];
+            return <div key={day} className="mt-4">
+              <h3 className="text-xs font-medium text-text-secondary">{name} · {calendarDayLabel(day)}</h3>
+              {events.length === 0 ? <p className="mt-2 text-sm text-text-secondary">Nothing on the calendar.</p>
+                : <ul className="mt-1 divide-y divide-border-subtle" aria-label={`Calendar events ${name.toLowerCase()}`}>
+                  {events.slice(0, CALENDAR_SHOWN).map((event) => <li key={event.key} className="py-3">
+                    <p className="break-words text-xs text-text-secondary">{timeLabel(event, day)}{event.status === "tentative" ? " · Tentative" : ""} · {event.calendar}</p>
+                    <p className="mt-0.5 break-words text-sm font-medium text-text-primary">{eventTitle(event)}</p>
+                    {event.location && <p className="mt-0.5 break-words text-xs text-text-secondary">{event.location}</p>}
+                  </li>)}
+                </ul>}
+              {events.length > CALENDAR_SHOWN && <p className="mt-1 text-xs text-text-secondary">And {events.length - CALENDAR_SHOWN} more {name.toLowerCase()}.</p>}
+            </div>;
+          })}
+          <p className={`mt-4 text-xs ${calendarSync === "ok" ? "text-text-secondary" : "text-amber-300"}`}>{agenda.lastSync
+            ? `Calendar last synced ${ageLabel(agenda.lastSync.at, now)}${agenda.lastSync.status !== "success" ? ` (that run: ${agenda.lastSync.status})` : ""}${calendarSync === "ok" ? "." : "; newer changes may be missing."}`
+            : "The calendar sync has not reported a run yet; these events may be out of date."}</p>
+        </>}
+        {calendar.state !== "loading" && <p className="mt-1 text-xs text-text-secondary">Read-only: opening Today changes nothing on your calendar.</p>}
       </section>
       {packages && <section className={panelStyle} aria-labelledby="packages-heading">
         <div className="flex items-center gap-2"><Package aria-hidden="true" className="h-5 w-5 text-accent" />

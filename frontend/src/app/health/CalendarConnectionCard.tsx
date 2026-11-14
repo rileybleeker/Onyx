@@ -95,7 +95,7 @@ export default function CalendarConnectionCard({ initial }: { initial?: Calendar
     <h3 className="text-sm font-semibold">Google Calendar: {status.connected ? 'connected' : 'not connected'}</h3>
     {status.connected
       ? <p className="mt-1 text-sm text-text-secondary">Active care items are copied to the &quot;{status.calendarName}&quot; calendar in your Google account, one way (Onyx to Google). Only the label, date, time and booked state are sent; notes stay in Onyx. Edit items here: changes made in Google Calendar are overwritten.</p>
-      : <p className="mt-1 text-sm text-text-secondary">Nothing on this page reads from or writes to a calendar. Marking an item booked only records your confirmation here.</p>}
+      : <p className="mt-1 text-sm text-text-secondary">Nothing on this page writes to a calendar. Marking an item booked only records your confirmation here.</p>}
     <p className="mt-2 text-xs font-medium text-text-secondary">{status.connected ? 'The one permission Onyx holds' : 'The one permission a connection asks for'}</p>
     <ul className="mt-1 space-y-1 text-sm">
       <li className="flex flex-wrap justify-between gap-x-3"><span>Create its own calendar (&quot;{status.calendarName}&quot;) and manage the events on it</span><span className={status.connected ? 'text-up' : 'text-text-tertiary'}>{status.connected ? 'Granted' : 'Not granted'}</span></li>

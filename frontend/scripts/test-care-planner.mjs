@@ -231,4 +231,12 @@ assert.deepEqual(upgradeLocalItem(item, MADRID), { ...item, kind: 'other', time:
 assert.equal(upgradeLocalItem(item, 'Nowhere/Land').tz, NY);
 assert.ok(samples.every(s => CARE_KINDS.includes(s.kind) && s.tz === NY && (s.time === null || validTime(s.time))));
 
+// ---- synced calendar events (lib/calendar-events.ts) never come from, or turn into, care items ----
+// The planner only ever builds entries from care items: every entry has an item id and a care status.
+for (const range of [['2026-09-01', '2026-09-30'], ['2026-11-01', '2026-11-30'], ['2027-02-01', '2027-02-28'], ['2027-11-01', '2027-11-30']]) {
+  assert.ok(entriesInRange(items, range[0], range[1], today).every(e => e.status !== 'external' && e.itemId && !('calendar' in e) && !('when' in e)));
+}
+// This file stays import-free and does no I/O: the calendar events are fetched and merged elsewhere.
+assert.ok(!/^import\s/m.test(source) && !/require\(|XMLHttpRequest|(^|[^.\w])fetch\(/.test(source), 'care-planner.ts has no import and no I/O');
+
 console.log('Care planner date, time-zone, storage, calendar and sample-data tests passed');

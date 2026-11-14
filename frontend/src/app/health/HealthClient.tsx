@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
   CARE_KINDS, COPIED_KEY, DEFAULT_TZ, KIND_LABEL, REPEAT_OPTIONS, STORAGE_KEY,
@@ -11,6 +11,8 @@ import type { CareLoad } from '@/lib/care-items-server';
 import type { CalendarStatus } from '@/lib/care-google';
 import { CareCalendar, DueSoon } from './CareCalendar';
 import CalendarConnectionCard from './CalendarConnectionCard';
+import CalendarEventsCard from './CalendarEventsCard';
+import { type CalendarRange, useCalendarEvents } from './useCalendarEvents';
 
 const panel = 'rounded-2xl border border-border-default bg-surface-card p-5';
 const field = 'rounded-lg border border-border-default bg-surface-card px-3 py-2 text-text-primary';
@@ -58,6 +60,12 @@ export default function HealthClient({ initial, calendar }: { initial: CareLoad;
   const [demo, setDemo] = useState(false);
   const [local, setLocal] = useState<LocalCopyState>({ state: 'none' });
   const [copying, setCopying] = useState(false);
+  // Read-only copies of the events on Riley's calendars for the days the month grid shows
+  // (GET /api/calendar/events). Separate from `calendar` above, which is the care-items -> Google
+  // connection: these are only ever read, and never become care items.
+  const [range, setRange] = useState<CalendarRange | null>(null);
+  const showRange = useCallback((start: string, end: string) => setRange(previous => previous && previous.start === start && previous.end === end ? previous : { start, end }), []);
+  const events = useCalendarEvents(range);
 
   // The latest list and form, kept outside render: a save that fails restores only its own item,
   // so overlapping saves on different items never undo each other.
@@ -202,6 +210,7 @@ export default function HealthClient({ initial, calendar }: { initial: CareLoad;
       </div>}
       {local.state === 'unreadable' && <p className="mt-3 text-sm text-text-secondary">This browser holds an older saved planner that cannot be read. It has been left untouched and is not used.</p>}
       <CalendarConnectionCard initial={calendar} />
+      <CalendarEventsCard calendar={events} />
     </section>
     {notice && <p role={notice.error ? 'alert' : 'status'} className={`text-sm ${notice.error ? 'text-amber-400' : 'text-text-secondary'}`}>{notice.text}</p>}
     {undo && load === 'ready' && <button className={button} disabled={busy.has(opId(undo))} onClick={() => { const op = undo; setUndo(null); if (form.editing === opId(op)) setForm(emptyForm(viewerTz)); void run(op, false); }}>Undo last change</button>}
@@ -214,7 +223,7 @@ export default function HealthClient({ initial, calendar }: { initial: CareLoad;
     {load === 'ready' && <>
       <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={demo} onChange={event => setDemo(event.target.checked)} />Show sample data in the calendar and due-soon list (invented examples, not saved, not your records)</label>
       <DueSoon items={shown} today={today} />
-      <CareCalendar items={shown} today={today} />
+      <CareCalendar items={shown} today={today} external={events.events} onRangeChange={showRange} />
       <form onSubmit={submit} className={`${panel} space-y-4`}>
         <h2 className="font-semibold">{form.editing ? 'Edit care item' : 'Add care item'}</h2>
         <div className="grid gap-3 sm:grid-cols-2">

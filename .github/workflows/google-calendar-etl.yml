@@ -1,0 +1,75 @@
+name: Google Calendar ETL
+
+# Reads the calendar iCal feeds listed in the GOOGLE_CALENDAR_ICS_SECRET secret (a JSON list of
+# {account, calendar, url}; Google Calendar's "secret address in iCal format", one per calendar)
+# and upserts one row per event instance into pds.calendar_events for /health and Today.
+# One way only: calendar -> Onyx. Writes one google_calendar|events heartbeat per run.
+#
+# THIS REPO AND ITS ACTIONS LOGS ARE PUBLIC, and a feed URL is a bearer credential. GitHub masks a
+# secret's whole value only, not the URLs inside the JSON, so the script registers every URL with
+# ::add-mask:: before its first request, keeps httpx request logging off, and prints counts only
+# (never a URL, a title or a calendar label). Do not add `set -x`, debug logging or an `env` dump
+# to this job.
+# Needs sql/calendar_events_schema.sql applied; until then every run writes a 'failed' heartbeat
+# that names the file.
+
+on:
+  schedule:
+    # Hourly at :55, clear of the hourly ETL (:00), orders (:05), air quality (:12), urgent email
+    # (:15), retrain check (:20), flights (:25), journal (:35), delivery (:40), habits (:45) and
+    # Spotify (:50). Google builds the feed per request, so each run sees the calendar as it is.
+    # /status: >3h since the last heartbeat = degraded, >8h = error.
+    - cron: '55 * * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Window in days on each side of today (default 400)'
+        required: false
+        type: string
+      allow_large_removal:
+        description: 'Let this run remove more than half of a calendar''s stored events (only after a calendar really was cleared)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: google-calendar-etl
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  google-calendar-etl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        # Same pins as requirements-ci.txt (tests/test_google_calendar.py runs on them).
+        run: pip install httpx supabase python-dotenv icalendar==7.3.0 recurring-ical-events==3.8.2 x-wr-timezone==2.0.1 "python-dateutil<3"
+
+      - name: Sync calendar feeds (read-only GET, counts-only log)
+        env:
+          GOOGLE_CALENDAR_ICS_SECRET: ${{ secrets.GOOGLE_CALENDAR_ICS_SECRET }}
+          # workflow_dispatch inputs, passed through the environment so they are never
+          # interpolated into the shell command (and validated).
+          WINDOW_DAYS: ${{ inputs.days }}
+          ALLOW_LARGE_REMOVAL: ${{ inputs.allow_large_removal }}
+        run: |
+          set -- python google_calendar_etl.py
+          if [ -n "$WINDOW_DAYS" ]; then
+            case "$WINDOW_DAYS" in *[!0-9]*) echo "days must be a whole number" >&2; exit 2;; esac
+            set -- "$@" --days "$WINDOW_DAYS"
+          fi
+          if [ "$ALLOW_LARGE_REMOVAL" = "true" ]; then
+            set -- "$@" --allow-large-removal
+          fi
+          "$@"
