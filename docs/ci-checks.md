@@ -60,3 +60,5 @@ When several branches are in flight at once (one git worktree each), CI checks e
 
 - `autonomous-ci.yml` (including its `offline-checks` and `frontend-types` jobs, the required checks) is unchanged.
 - Dependencies installed by `requirements-ci.txt` come from the lock file, which was last regenerated 2026-04-16 and pins `supabase==2.19.0`. Local development uses newer versions, so a pin bump should be tried through this job first.
+
+The scoped-job dependency inventory and audit limits are in [stats-ci-dependency-inventory.md](stats-ci-dependency-inventory.md).

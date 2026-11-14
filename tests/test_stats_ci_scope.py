@@ -1,5 +1,7 @@
 """Offline checks for the conservative stats CI scope decision."""
 import importlib.util
+import hashlib
+import tempfile
 from pathlib import Path
 import subprocess
 import unittest
@@ -52,6 +54,81 @@ class StatsScopeTests(unittest.TestCase):
         for error in [OSError(), subprocess.CalledProcessError(128, "git"), subprocess.TimeoutExpired("git", 30)]:
             run.side_effect = error
             self.assertEqual(scope.select_scope("pull_request", "a"*40, "b"*40), "full")
+
+
+class DependencySnapshotTests(unittest.TestCase):
+    """Exercise the real fingerprint against an isolated Git index and files."""
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="onyx-stats-scope-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.git("init", "--quiet")
+        (self.root / "tools").mkdir()
+        self.source = self.root / "module.py"
+        self.source.write_bytes(b"VALUE = 1\n")
+        self.git("add", "module.py")
+        self.manifest = self.root / "tools/stats_ci_dependencies.sha256"
+        # Independent known fixture digest, not the implementation under test.
+        self.manifest.write_text(hashlib.sha256(b"module.py\0VALUE = 1\n\0").hexdigest() + "\n")
+        self.assertTrue(scope.dependency_snapshot_matches(self.root))
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.root, check=True, capture_output=True)
+
+    def assert_full(self):
+        self.assertFalse(scope.dependency_snapshot_matches(self.root))
+        self.assertEqual(scope.select_scope("pull_request", "a" * 40, "b" * 40, self.root), "full")
+
+    def test_modified_source(self):
+        self.source.write_bytes(b"VALUE = 2\n")
+        self.assert_full()
+
+    def test_added_tracked_source(self):
+        (self.root / "new.py").write_text("pass\n")
+        self.git("add", "new.py")
+        self.assert_full()
+
+    def test_deleted_source_unstaged(self):
+        self.source.unlink()
+        self.assert_full()
+
+    def test_deleted_source_staged(self):
+        self.git("rm", "--cached", "module.py")
+        self.assert_full()
+
+    def test_crlf_is_equivalent(self):
+        self.source.write_bytes(b"VALUE = 1\r\n")
+        self.assertTrue(scope.dependency_snapshot_matches(self.root))
+
+    def test_missing_manifest(self):
+        self.manifest.unlink()
+        self.assert_full()
+
+    def test_malformed_manifest(self):
+        for content in ["", "invalid", "0" * 64]:
+            with self.subTest(content=content):
+                self.manifest.write_text(content)
+                self.assert_full()
+
+    def test_unreadable_source(self):
+        # Permission chmod is not portable on Windows; fault the actual read boundary.
+        with patch.object(Path, "read_bytes", side_effect=PermissionError("unreadable")):
+            self.assert_full()
+
+    def test_unreadable_manifest(self):
+        with patch.object(Path, "read_text", side_effect=PermissionError("unreadable")):
+            self.assert_full()
+
+    def test_invalid_utf8_git_path(self):
+        result = subprocess.CompletedProcess([], 0, b"bad-\xff.py\0")
+        with patch.object(scope.subprocess, "run", return_value=result):
+            self.assert_full()
+
+    def test_git_failures(self):
+        for error in [OSError("missing git"), subprocess.CalledProcessError(128, "git"), subprocess.TimeoutExpired("git", 30)]:
+            with self.subTest(error=type(error).__name__):
+                with patch.object(scope.subprocess, "run", side_effect=error):
+                    self.assert_full()
 
 
 if __name__ == "__main__":
