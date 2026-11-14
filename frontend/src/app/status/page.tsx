@@ -5,6 +5,8 @@ import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import { sameJson } from "@/lib/format";
+import SpotifyReconnect from "@/components/SpotifyReconnect";
+import { needsSpotifyReconnect } from "@/lib/spotify-reconnect";
 import type { DriftAlert, SourceStatus, StatusResponse, TzGapRow } from "@/app/api/status/route";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -218,6 +220,12 @@ function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus
         <div className="mt-3 px-3 py-2 bg-red-500/10 border border-red-500/20 rounded-[4px]">
           <p className="text-[11px] text-red-400 font-mono break-all">{info.errorMessage}</p>
         </div>
+      )}
+
+      {/* Spotify: the refresh token dies 180 days after authorization. Offer the reconnect when the
+          sync error says so, and from day 165 (reconnectBy) before it happens. */}
+      {sourceKey === "spotify" && (needsSpotifyReconnect(info.errorMessage) || info.reconnectBy) && (
+        <SpotifyReconnect reconnectBy={info.reconnectBy} />
       )}
     </div>
   );
