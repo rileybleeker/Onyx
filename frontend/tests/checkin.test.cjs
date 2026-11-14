@@ -303,9 +303,10 @@ test("the screen wires the save plan: day under its date with the card settle, n
   const dayBranch = save.slice(save.indexOf("if (Object.keys(dayPatch).length)"), save.indexOf("for (const n of nightPatches)"));
   assert.match(dayBranch, /agentsApi\.checkinDone\(data\.date\)/); // only when the day was sent
   assert.equal((save.match(/checkinDone/g) || []).length, 1);
-  // a refused stale page drops its unsaved taps before redrawing
+  // A refused stale page preserves unfinished drafts for dated review before redrawing.
   const stale = save.slice(save.indexOf("e instanceof StaleDayError"));
-  assert.ok(stale.indexOf("settleDraft(dayDraftKey(data.date), dayPatch)") < stale.indexOf("await load(requested)"));
+  assert.ok(stale.indexOf("drafts.holdAll()") < stale.indexOf("await load(null, true)"));
+  assert.doesNotMatch(stale, /drafts\.(settle|discard)\(/);
 });
 
 test("other write paths keep sleep answers off today", () => {
