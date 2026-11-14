@@ -221,6 +221,15 @@ test("card projection: effective APR from interest, promo end from the transfer 
   assert.ok(promo.months.find((m) => m.month === "2031-03").interest > 0);
   assert.ok(promo.warnings.some((w) => /Promo ends 2031-02-28/.test(w)));
   assert.ok(promo.warnings.some((w) => /Standard APR/.test(w)));
+  // The forecast calls out where the 0% ends.
+  const m = out.milestones.find((x) => x.account_key === "promo");
+  assert.equal(m.date, "2031-02-28");
+  assert.equal(m.owedAtEndCents, 500_000);
+  assert.equal(m.interestPerMonthAfterCents, 10_000); // 24% assumed standard APR
+  assert.equal(m.standardAprAssumed, true);
+  assert.equal(m.payPerMonthToClearCents, Math.ceil(500_000 / 9));
+  assert.equal(m.withinHorizon, true);
+  assert.equal(out.headlines.nextPromoEnd.date, "2031-02-28");
 });
 
 test("net worth: investments grow at the expected return, cards and cash included", () => {
