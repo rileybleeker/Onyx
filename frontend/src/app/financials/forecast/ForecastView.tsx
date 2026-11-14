@@ -1,0 +1,451 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { Area, CartesianGrid, ComposedChart, Line, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { accentColor, axisTick, chartColors, chartTooltip, gridStyle } from "@/lib/chart-theme";
+import type { ForecastResult } from "@/lib/cash-forecast";
+import type { DriverRow } from "@/lib/cash-forecast-store";
+import type { ForecastAccountView, PlanItemView } from "@/lib/cash-forecast-server";
+
+const usd = (cents: number | null | undefined): string => {
+  if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
+  const v = Math.round(Math.abs(cents) / 100).toLocaleString("en-US");
+  return cents < 0 ? `-$${v}` : `$${v}`;
+};
+const signed = (cents: number) => (cents > 0 ? `+${usd(cents)}` : usd(cents));
+const dateLabel = (iso: string, opts: Intl.DateTimeFormatOptions = { month: "short", day: "numeric" }) =>
+  new Date(`${iso}T12:00:00Z`).toLocaleDateString("en-US", { ...opts, timeZone: "UTC" });
+const card = "rounded-card shadow-card border border-border-subtle bg-surface-card p-4";
+const input = "rounded-control border border-border-subtle bg-transparent px-2 py-1 text-[13px]";
+const button = "rounded-control border border-border-subtle px-3 py-1 text-[13px] hover:bg-white/5 disabled:opacity-50";
+
+async function send(url: string, method: string, body?: unknown): Promise<string | null> {
+  try {
+    const res = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+    if (res.ok) return null;
+    const j = (await res.json().catch(() => ({}))) as { error?: string };
+    return j.error ?? `failed (${res.status})`;
+  } catch {
+    return "network error";
+  }
+}
+
+export default function ForecastView({
+  result,
+  items,
+  drivers,
+  accounts,
+  setupPending,
+}: {
+  result: ForecastResult;
+  items: PlanItemView[];
+  drivers: DriverRow[];
+  accounts: ForecastAccountView[];
+  setupPending: boolean;
+}) {
+  const router = useRouter();
+  const [range, setRange] = useState<"13w" | "12m">("13w");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const h = result.headlines;
+  const buffer = Number((drivers.find((d) => d.key === "settings")?.value as { bufferCents?: number } | undefined)?.bufferCents ?? 0);
+
+  const run = async (fn: () => Promise<string | null>) => {
+    setBusy(true);
+    setError(null);
+    const err = await fn();
+    setBusy(false);
+    if (err) setError(err);
+    else router.refresh();
+  };
+
+  const shown = range === "13w" ? 91 : 365;
+  const chartData = useMemo(
+    () => result.days.slice(0, shown).map((d) => ({ date: d.date, likely: d.likely / 100, band: [d.low / 100, d.high / 100] })),
+    [result.days, shown],
+  );
+  const lastShown = result.days[Math.min(shown, result.days.length) - 1]?.date ?? result.today;
+  const milestonesShown = result.milestones.filter((m) => !m.ended && m.date <= lastShown);
+  const soon = result.lines.filter((l) => l.layer !== "baseline" && l.date <= addDaysIso(result.today, 30));
+  const weekly = result.baseline.projected ? result.baseline.weeklyMeanCents : null;
+
+  if (result.state !== "ok") {
+    return (
+      <section className={card}>
+        <p className="font-semibold">{result.state === "no-pool" ? "No checking or savings account found." : "No balance yet for your cash accounts."}</p>
+      </section>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {setupPending && <p className="text-[13px] text-mid">Planned items could not be read (the forecast tables may not be set up yet); showing the forecast from your history only.</p>}
+      {error && <p role="alert" className="text-[13px] text-down">Not saved: {error}</p>}
+
+      {/* Headlines */}
+      <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <div className={card}>
+          <p className="text-[12px] text-text-tertiary">Lowest point, next 13 weeks (cautious)</p>
+          <p className="text-xl font-semibold">{usd(h.lowest?.cents)}</p>
+          <p className="text-[12px] text-text-secondary">{h.lowest ? `around ${dateLabel(h.lowest.date)}` : ""} · likely {usd(h.lowestLikely?.cents)}</p>
+        </div>
+        <div className={card}>
+          <p className="text-[12px] text-text-tertiary">Safe to move to savings / investing</p>
+          <p className="text-xl font-semibold">{usd(h.safeToMoveCents)}</p>
+          <p className="text-[12px] text-text-secondary">keeps the cautious path above {buffer > 0 ? usd(buffer) : "$0"} for 13 weeks</p>
+        </div>
+        <div className={card}>
+          <p className="text-[12px] text-text-tertiary">Cash in 13 weeks</p>
+          <p className="text-xl font-semibold">{usd(h.end13w?.likely)}</p>
+          <p className="text-[12px] text-text-secondary">range {usd(h.end13w?.low)} to {usd(h.end13w?.high)} · today {usd(result.opening.cents)}</p>
+        </div>
+        <div className={`${card} ${h.nextPromoEnd ? "border-mid/40" : ""}`}>
+          <p className="text-[12px] text-text-tertiary">Next 0% promo ends</p>
+          {h.nextPromoEnd ? (
+            <>
+              <p className="text-xl font-semibold">{dateLabel(h.nextPromoEnd.date, { month: "short", day: "numeric", year: "numeric" })}</p>
+              <p className="text-[12px] text-text-secondary">
+                {h.nextPromoEnd.label}: {usd(h.nextPromoEnd.owedAtEndCents)} still owed then at current payments
+              </p>
+            </>
+          ) : (
+            <p className="text-[13px] text-text-secondary">No promo end date known.</p>
+          )}
+        </div>
+      </section>
+
+      {result.warnings.length > 0 && (
+        <ul className="space-y-1 text-[13px] text-mid">
+          {result.warnings.map((w) => (
+            <li key={w}>{w}</li>
+          ))}
+        </ul>
+      )}
+
+      {/* Chart */}
+      <section className={card} aria-labelledby="fc-chart">
+        <div className="mb-2 flex items-center justify-between">
+          <h2 id="fc-chart" className="font-semibold">Projected cash (checking + savings)</h2>
+          <div className="flex gap-1">
+            {(["13w", "12m"] as const).map((r) => (
+              <button key={r} className={`${button} ${range === r ? "bg-white/10" : ""}`} onClick={() => setRange(r)}>
+                {r === "13w" ? "13 weeks" : "12 months"}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="h-72">
+          <ResponsiveContainer width="100%" height="100%">
+            <ComposedChart data={chartData} margin={{ top: 10, right: 10, bottom: 0, left: 10 }}>
+              <CartesianGrid {...gridStyle} vertical={false} />
+              <XAxis dataKey="date" tickFormatter={(d: string) => dateLabel(d)} minTickGap={40} tick={axisTick} />
+              <YAxis tickFormatter={(v: number) => `$${Math.round(v / 1000)}k`} tick={axisTick} width={48} />
+              <Tooltip
+                formatter={(v, name) =>
+                  Array.isArray(v) ? [`${usd(Number(v[0]) * 100)} to ${usd(Number(v[1]) * 100)}`, "range"] : [usd(Number(v) * 100), String(name)]
+                }
+                labelFormatter={(d) => dateLabel(String(d), { month: "short", day: "numeric", year: "numeric" })}
+                {...chartTooltip}
+              />
+              <Area dataKey="band" stroke="none" fill={accentColor} fillOpacity={0.15} isAnimationActive={false} name="range" />
+              <Line dataKey="likely" stroke={accentColor} dot={false} strokeWidth={2} isAnimationActive={false} name="likely" />
+              <ReferenceLine y={0} stroke={chartColors.zeroLine} />
+              {buffer > 0 && <ReferenceLine y={buffer / 100} stroke={chartColors.down} strokeDasharray="4 4" label={{ value: "buffer", fill: chartColors.down, fontSize: 11 }} />}
+              {milestonesShown.map((m) => (
+                <ReferenceLine key={m.account_key} x={nearestDay(chartData, m.date)} stroke={chartColors.mid} strokeDasharray="3 3" label={{ value: `${shortCard(m.label)} 0% ends`, fill: chartColors.mid, fontSize: 11, position: "insideTopLeft" }} />
+              ))}
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+        <p className="mt-2 text-[12px] text-text-tertiary">
+          Line = likely; shaded = 10th to 90th percentile of 500 resampled paths. Amber lines mark where a 0% promo ends.
+          {range === "12m" && " Past 13 weeks the forecast is less certain."}
+        </p>
+      </section>
+
+      {/* Promo call-outs */}
+      <section className={card} aria-labelledby="fc-promos">
+        <h2 id="fc-promos" className="font-semibold">0% promos</h2>
+        {result.milestones.length === 0 ? (
+          <p className="mt-1 text-[13px] text-text-secondary">No promo end dates known. Add one under Cards below.</p>
+        ) : (
+          <ul className="mt-2 space-y-2 text-[13px]">
+            {result.milestones.map((m) => (
+              <li key={m.account_key} className={m.ended ? "text-text-tertiary" : ""}>
+                <span className="font-semibold">{m.label}</span>: {m.ended ? "ended" : "ends"} {dateLabel(m.date, { month: "short", day: "numeric", year: "numeric" })}
+                {!m.ended && ` (${m.daysAway} days)`}. At your current payments about <b>{usd(m.owedAtEndCents)}</b> is still owed then, costing about{" "}
+                <b>{usd(m.interestPerMonthAfterCents)}/month</b> at {m.standardAprPct}%{m.standardAprAssumed ? " (assumed: enter the real APR below)" : ""}.
+                {!m.ended && m.payPerMonthToClearCents > 0 && <> Paying <b>{usd(m.payPerMonthToClearCents)}/month</b> clears it in time.</>}
+                <span className="text-text-tertiary"> Date {m.source}.</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {/* Coming up */}
+      <section className={card} aria-labelledby="fc-soon">
+        <h2 id="fc-soon" className="font-semibold">Next 30 days</h2>
+        <table className="mt-2 w-full text-[13px]">
+          <tbody>
+            {soon.map((l, i) => (
+              <tr key={`${l.sourceId}-${l.date}-${i}`} className="border-t border-border-subtle">
+                <td className="py-1 pr-3 text-text-secondary">{dateLabel(l.date)}</td>
+                <td className="py-1 pr-3">{l.label}</td>
+                <td className={`py-1 pr-3 text-right ${l.amountCents > 0 ? "text-up" : ""}`}>{signed(l.amountCents)}</td>
+                <td className="py-1 text-[12px] text-text-tertiary">{l.layer === "planned" ? `planned (${l.certainty})` : l.reason}</td>
+              </tr>
+            ))}
+            {weekly !== null && (
+              <tr className="border-t border-border-subtle">
+                <td className="py-1 pr-3 text-text-secondary">every week</td>
+                <td className="py-1 pr-3">Everyday spending</td>
+                <td className="py-1 pr-3 text-right">{signed(weekly)}</td>
+                <td className="py-1 text-[12px] text-text-tertiary">mean of the last {result.baseline.weeksUsed} weeks after the lines above</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </section>
+
+      <PlannedItems items={items} statuses={result.planned} busy={busy} run={run} />
+      <Cards result={result} drivers={drivers} accounts={accounts} busy={busy} run={run} />
+
+      {/* Detected */}
+      <section className={card} aria-labelledby="fc-detected">
+        <h2 id="fc-detected" className="font-semibold">What the forecast found in your history</h2>
+        <ul className="mt-2 space-y-1 text-[13px]">
+          {result.streams.map((s) => (
+            <li key={s.id}>
+              <span className="font-semibold">{s.label}</span> {signed(s.typicalCents)} ({s.cadence}; {s.method}; {s.certainty})
+            </li>
+          ))}
+        </ul>
+        {result.notes.length > 0 && (
+          <ul className="mt-3 space-y-1 text-[12px] text-text-tertiary">
+            {result.notes.map((n) => (
+              <li key={n}>{n}</li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {/* Net worth */}
+      <section className={card} aria-labelledby="fc-nw">
+        <h2 id="fc-nw" className="font-semibold">Net worth, next 12 months (likely)</h2>
+        <table className="mt-2 w-full text-[13px]">
+          <thead className="text-[12px] text-text-tertiary">
+            <tr>
+              <th className="text-left font-normal">Month</th>
+              <th className="text-right font-normal">Cash</th>
+              <th className="text-right font-normal">Investments</th>
+              <th className="text-right font-normal">Cards owed</th>
+              <th className="text-right font-normal">Net worth</th>
+            </tr>
+          </thead>
+          <tbody>
+            {result.netWorth.map((m) => (
+              <tr key={m.month} className="border-t border-border-subtle">
+                <td className="py-1">{dateLabel(`${m.month}-15`, { month: "short", year: "numeric" })}</td>
+                <td className="py-1 text-right">{usd(m.cash)}</td>
+                <td className="py-1 text-right">{usd(m.investments)}</td>
+                <td className="py-1 text-right">{usd(m.cardsOwed)}</td>
+                <td className="py-1 text-right font-semibold">{usd(m.netWorth)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <p className="mt-2 text-[12px] text-text-tertiary">Investments grow at an assumed 5% a year unless you set otherwise; an assumption, not a promise.</p>
+      </section>
+
+      <Settings buffer={buffer} busy={busy} run={run} />
+    </div>
+  );
+}
+
+function PlannedItems({ items, statuses, busy, run }: { items: PlanItemView[]; statuses: ForecastResult["planned"]; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
+  const [label, setLabel] = useState("");
+  const [date, setDate] = useState("");
+  const [amount, setAmount] = useState("");
+  const [dir, setDir] = useState<"out" | "in">("out");
+  const [certainty, setCertainty] = useState("likely");
+  const [months, setMonths] = useState("1");
+  const statusOf = (id: string) => statuses.filter((s) => s.id === id || s.id.startsWith(`${id}#`));
+  const add = () => {
+    const dollars = Number(amount.replace(/[$,\s]/g, ""));
+    const count = Math.max(1, Math.min(120, Math.round(Number(months) || 1)));
+    if (!label.trim() || !date || !(dollars > 0)) return;
+    run(() =>
+      send("/api/finance/forecast/items", "POST", {
+        label: label.trim(),
+        date,
+        amountCents: Math.round(dollars * 100) * (dir === "in" ? 1 : -1),
+        certainty,
+        ...(count > 1 ? { repeatUnit: "month", repeatEvery: 1, repeatCount: count } : {}),
+      }).then((e) => {
+        if (!e) {
+          setLabel("");
+          setAmount("");
+        }
+        return e;
+      }),
+    );
+  };
+  return (
+    <section className={card} aria-labelledby="fc-planned">
+      <h2 id="fc-planned" className="font-semibold">Planned items</h2>
+      <p className="text-[12px] text-text-tertiary">Bonus, move, trip, tax payment, big purchase. Matched to the real transaction when it happens.</p>
+      <table className="mt-2 w-full text-[13px]">
+        <tbody>
+          {items.map((it) => {
+            const st = statusOf(it.id);
+            const realized = st.filter((s) => s.status === "realized").length;
+            const late = st.filter((s) => s.status.startsWith("late")).length;
+            return (
+              <tr key={it.id} className="border-t border-border-subtle">
+                <td className="py-1 pr-3 text-text-secondary">{dateLabel(it.date, { month: "short", day: "numeric", year: "numeric" })}</td>
+                <td className="py-1 pr-3">
+                  {it.label}
+                  {it.repeat && <span className="text-text-tertiary"> · {it.repeat}</span>}
+                  {it.note && <div className="text-[12px] text-text-tertiary">{it.note}</div>}
+                </td>
+                <td className={`py-1 pr-3 text-right ${it.amountCents > 0 ? "text-up" : ""}`}>{signed(it.amountCents)}</td>
+                <td className="py-1 pr-3 text-[12px] text-text-tertiary">
+                  {it.certainty}
+                  {realized > 0 && " · happened"}
+                  {late > 0 && " · late"}
+                </td>
+                <td className="py-1 text-right">
+                  <button className={button} disabled={busy} onClick={() => run(() => send(`/api/finance/forecast/items/${it.id}`, "DELETE"))}>
+                    Remove
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <input className={input} placeholder="What (e.g. Movers)" value={label} onChange={(e) => setLabel(e.target.value)} maxLength={120} />
+        <input className={input} type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+        <select className={input} value={dir} onChange={(e) => setDir(e.target.value as "in" | "out")}>
+          <option value="out">money out</option>
+          <option value="in">money in</option>
+        </select>
+        <input className={`${input} w-28`} placeholder="$ amount" inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} />
+        <select className={input} value={certainty} onChange={(e) => setCertainty(e.target.value)}>
+          <option value="confirmed">confirmed</option>
+          <option value="likely">likely</option>
+          <option value="possible">possible</option>
+        </select>
+        <label className="text-[12px] text-text-secondary">
+          months <input className={`${input} w-14`} inputMode="numeric" value={months} onChange={(e) => setMonths(e.target.value)} />
+        </label>
+        <button className={button} disabled={busy} onClick={add}>
+          Add
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function Cards({ result, drivers, accounts, busy, run }: { result: ForecastResult; drivers: DriverRow[]; accounts: ForecastAccountView[]; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
+  const cards = result.cards;
+  const known = new Set(cards.map((c) => c.account_key));
+  const extra = accounts.filter((a) => a.type === "card" && !known.has(a.account_key));
+  return (
+    <section className={card} aria-labelledby="fc-cards">
+      <h2 id="fc-cards" className="font-semibold">Cards</h2>
+      <p className="text-[12px] text-text-tertiary">APR comes from the interest each card actually charged unless you enter it. Promo end dates are read from balance-transfer rows when the bank prints them; enter the rest from your statement.</p>
+      <div className="mt-2 space-y-3">
+        {cards.map((c) => (
+          <CardRow key={c.account_key} c={c} driver={drivers.find((d) => d.key === `card:${c.account_key}`)?.value} busy={busy} run={run} />
+        ))}
+        {extra.length > 0 && <p className="text-[12px] text-text-tertiary">{extra.length} other card(s) with no balance or activity.</p>}
+      </div>
+    </section>
+  );
+}
+
+function CardRow({ c, driver, busy, run }: { c: ForecastResult["cards"][number]; driver: Record<string, unknown> | undefined; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
+  const [promoEnds, setPromoEnds] = useState(typeof driver?.promoEnds === "string" ? driver.promoEnds : "");
+  const [apr, setApr] = useState(typeof driver?.aprPct === "number" ? String(driver.aprPct) : "");
+  const [std, setStd] = useState(typeof driver?.standardAprPct === "number" ? String(driver.standardAprPct) : "");
+  const save = () => {
+    const value: Record<string, unknown> = {};
+    if (promoEnds) value.promoEnds = promoEnds;
+    if (apr.trim()) value.aprPct = Number(apr);
+    if (std.trim()) value.standardAprPct = Number(std);
+    if (promoEnds && typeof driver?.promoNote === "string" && promoEnds === driver.promoEnds) value.promoNote = driver.promoNote;
+    if (promoEnds && promoEnds !== driver?.promoEnds) value.promoAprPct = 0;
+    run(() => send("/api/finance/forecast/drivers", "PUT", { key: `card:${c.account_key}`, value: Object.keys(value).length ? value : null }));
+  };
+  return (
+    <div className="border-t border-border-subtle pt-2 text-[13px]">
+      <p>
+        <span className="font-semibold">{c.label}</span>: owed {usd(c.owedNow)} · APR {c.aprPct}% <span className="text-text-tertiary">({c.aprSource})</span> · paid about {usd(c.monthlyPaymentCents)}/month ·
+        interest next 12 months ~{usd(c.interestNext12Cents)}
+        {c.promoEnds && (
+          <>
+            {" "}
+            · <span className="text-mid">promo ends {c.promoEnds}</span> <span className="text-text-tertiary">({c.promoSource})</span>
+          </>
+        )}
+      </p>
+      {c.warnings.map((w) => (
+        <p key={w} className="text-[12px] text-mid">
+          {w}
+        </p>
+      ))}
+      <div className="mt-1 flex flex-wrap items-center gap-2 text-[12px] text-text-secondary">
+        <label>
+          promo ends <input className={input} type="date" value={promoEnds} onChange={(e) => setPromoEnds(e.target.value)} />
+        </label>
+        <label>
+          APR now % <input className={`${input} w-16`} inputMode="decimal" value={apr} onChange={(e) => setApr(e.target.value)} placeholder="auto" />
+        </label>
+        <label>
+          APR after promo % <input className={`${input} w-16`} inputMode="decimal" value={std} onChange={(e) => setStd(e.target.value)} placeholder="24" />
+        </label>
+        <button className={button} disabled={busy} onClick={save}>
+          Save
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Settings({ buffer, busy, run }: { buffer: number; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
+  const [value, setValue] = useState(buffer > 0 ? String(Math.round(buffer / 100)) : "");
+  return (
+    <section className={card} aria-labelledby="fc-settings">
+      <h2 id="fc-settings" className="font-semibold">Settings</h2>
+      <div className="mt-2 flex items-center gap-2 text-[13px]">
+        <label>
+          Low-balance line $ <input className={`${input} w-28`} inputMode="numeric" value={value} onChange={(e) => setValue(e.target.value)} placeholder="0" />
+        </label>
+        <button
+          className={button}
+          disabled={busy}
+          onClick={() => {
+            const dollars = Number(value.replace(/[$,\s]/g, "")) || 0;
+            run(() => send("/api/finance/forecast/drivers", "PUT", { key: "settings", value: dollars > 0 ? { bufferCents: Math.round(dollars * 100) } : null }));
+          }}
+        >
+          Save
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function addDaysIso(iso: string, days: number): string {
+  return new Date(Date.parse(`${iso}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+}
+function nearestDay(data: { date: string }[], iso: string): string {
+  return data.find((d) => d.date >= iso)?.date ?? data[data.length - 1]?.date ?? iso;
+}
+function shortCard(label: string): string {
+  return label.replace(/[®™]/g, "").replace(/\bCard\b/i, "").replace(/\s+/g, " ").trim().split(" ").slice(0, 3).join(" ");
+}
