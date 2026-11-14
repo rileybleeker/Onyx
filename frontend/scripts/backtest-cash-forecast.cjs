@@ -70,7 +70,7 @@ async function main() {
   if (!asOfs.length) fail("not enough history");
 
   const points = [];
-  const parts = { inF: [], inA: [], cardF: [], cardA: [], restF: [], restA: [] };
+  const parts = { inF: [], inA: [], cardF: [], cardA: [], restF: [], restA: [], xferA: [] };
   const CARD_CAT = /credit card payment/i;
   let streamsSeen = 0;
   let cardsSeen = 0;
@@ -102,6 +102,7 @@ async function main() {
       parts.inA.push(sum(fut.filter(isIn).map(delta)) / scale);
       parts.cardA.push(sum(fut.filter((t) => delta(t) < 0 && CARD_CAT.test(t.category || "")).map(delta)) / scale);
       parts.restA.push(sum(fut.filter((t) => !isIn(t) && !(delta(t) < 0 && CARD_CAT.test(t.category || ""))).map(delta)) / scale);
+      parts.xferA.push(sum(fut.filter((t) => /transfer/i.test(t.category || "")).map(delta)) / scale);
     }
     for (const h of HORIZONS) {
       const day = out.days[h - 1];
@@ -127,6 +128,7 @@ async function main() {
   console.log(`  money in (deposits, not transfers): ${avg(parts.inF)}% | ${avg(parts.inA)}%`);
   console.log(`  card payments:                      ${avg(parts.cardF)}% | ${avg(parts.cardA)}%`);
   console.log(`  everything else (net):              ${avg(parts.restF)}% | ${avg(parts.restA)}%`);
+  console.log(`    of which transfers (net, actual):            ${avg(parts.xferA)}%`);
 }
 
 main().catch((e) => fail(e && e.code ? String(e.code) : e && e.name ? e.name : "error"));

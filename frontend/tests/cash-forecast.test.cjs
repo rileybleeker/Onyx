@@ -123,6 +123,27 @@ test("card payments follow what was paid, on the usual day", () => {
   assert.equal(out.baseline.weeklyMeanCents, -10_000);
 });
 
+test("a card paid several times a month projects its monthly total, minus what is already paid", () => {
+  const extra = [];
+  for (const m of ["2030-03", "2030-04", "2030-05"]) {
+    for (const [day, amt] of [[3, 40_000], [12, 60_000], [24, 50_000]]) {
+      const d = F.nextBusinessDay(`${m}-${String(day).padStart(2, "0")}`);
+      extra.push(tx("chk", d, amt, "DEMO PROMO CARD PAYMENT", { category: "Credit Card Payment" }));
+      extra.push(tx("promo", d, -amt, "PAYMENT RECEIVED", { category: "Credit Card Payment" }));
+    }
+  }
+  extra.push(tx("chk", "2030-06-04", 40_000, "DEMO PROMO CARD PAYMENT", { category: "Credit Card Payment" }));
+  extra.push(tx("promo", "2030-06-04", -40_000, "PAYMENT RECEIVED", { category: "Credit Card Payment" }));
+  const out = run({ extra });
+  const s = out.streams.find((x) => x.kind === "card" && x.label.startsWith("Demo Promo Card"));
+  assert.ok(s);
+  assert.equal(s.typicalCents, -150_000);
+  const lines = out.lines.filter((l) => l.sourceId === s.id);
+  assert.equal(lines[0].amountCents, -110_000); // June: 150k usual, 40k already paid
+  assert.equal(lines[1].amountCents, -150_000);
+  assert.ok(lines.length >= 12);
+});
+
 test("planned items: projected, matched when they happen, late money in dropped, late money out kept", () => {
   const extra = [tx("chk", "2030-06-11", 200_000, "DEMO LANDLORD DEPOSIT", { category: "Rent" })];
   const planned = [

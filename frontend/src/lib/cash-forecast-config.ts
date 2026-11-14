@@ -35,7 +35,7 @@ export const FORECAST = {
   amountBand: 0.4,
   /** A stream is stopped when its last occurrence is older than this many cycles. */
   lapseCycles: 1.6,
-  /** Card payments: the projection uses the mean of the last N payments; the range samples the last M. */
+  /** Card payments: a card's monthly total paid = mean of the last N complete months; the range samples the last M months. */
   cardMeanPayments: 3,
   cardSamplePayments: 6,
   /** One-off rows (left out of the everyday baseline): above max(this, 3 x the 95th percentile row). */

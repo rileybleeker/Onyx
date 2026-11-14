@@ -501,6 +501,7 @@ interface StreamPlan {
   dates: string[]; // projected occurrence dates (after today, inside the horizon)
   claimed: number[]; // row indices this stream explains
   sampleCents?: number[]; // card payments: the amounts the range samples
+  amounts?: number[]; // per-occurrence amounts (card payments: this month's remainder, then the monthly total)
 }
 
 function oncePerDay(rows: Row[]): { date: string; cents: number; rows: number[] }[] {
@@ -605,53 +606,83 @@ function detectCardStreams(
     if (list) list.push(r);
     else byCard.set(card, [r]);
   }
+  // Model (backtest 2026-11-14): a card is often paid several times a month in varying amounts, so the
+  // projection is the card's MONTHLY TOTAL paid (mean of the last 3 complete months), on the amount-weighted
+  // usual day of the month, minus whatever was already paid this month. The range samples the last 6 months.
   const plans: StreamPlan[] = [];
+  const thisMonth = monthIndex(monthKeyOf(today));
   for (const acct of accounts) {
     if (!isCardType(acct.account_type)) continue;
-    const rows = byCard.get(acct.account_key) ?? [];
-    const occ = oncePerDay(rows.filter((r) => r.t.txn_date >= addDays(today, -FORECAST.detectWindowDays)));
+    const rows = (byCard.get(acct.account_key) ?? []).filter((r) => r.t.txn_date >= addDays(today, -FORECAST.detectWindowDays));
+    const occ = oncePerDay(rows);
     if (occ.length < 2) {
-      if (occ.length || rows.length) notes.push(`${acct.label}: fewer than 2 payments from your cash accounts, so its payments are counted in everyday spending.`);
+      if (occ.length) notes.push(`${acct.label}: fewer than 2 payments from your cash accounts, so its payments are counted in everyday spending.`);
       continue;
     }
-    const picked = pickSchedule(occ.map((o) => o.date).slice(-12), "next");
     const lastDate = occ[occ.length - 1].date;
-    const meanPay = Math.round(mean(occ.slice(-FORECAST.cardMeanPayments).map((o) => o.cents)));
-    let schedule: Schedule;
-    let minGap = 15;
-    let certainty: Certainty = "likely";
-    let method: string;
-    if (picked) {
-      schedule = picked.schedule;
-      minGap = picked.cls.minGap;
-      certainty = picked.certainty;
-      method = `${scheduleLabel(picked.schedule, picked.cls.cadence)}, amount = mean of the last ${Math.min(FORECAST.cardMeanPayments, occ.length)} payments`;
-    } else {
-      const day = Math.round(median(occ.slice(-3).map((o) => dayOfMonth(o.date))));
-      schedule = { kind: "monthly-day", day, every: 1, anchorMonth: monthKeyOf(lastDate), adjust: "next" };
-      method = `about the ${ordinal(day)} of each month (dates vary), amount = mean of the last ${Math.min(FORECAST.cardMeanPayments, occ.length)} payments`;
-    }
     if (daysBetween(lastDate, today) > 70) {
       notes.push(`${acct.label}: no payment from your cash accounts since ${lastDate}, so none is projected.`);
       continue;
     }
-    const dates = projectDates(schedule, minGap, lastDate, today, horizonEnd, "out", notes, acct.label);
+    const firstMonth = monthIndex(monthKeyOf(occ[0].date));
+    const totals: number[] = [];
+    for (let k = 1; k <= FORECAST.cardSamplePayments; k++) {
+      const mi = thisMonth - k;
+      if (mi < firstMonth) break;
+      const key = monthFromIndex(mi);
+      totals.push(occ.filter((o) => monthKeyOf(o.date) === key).reduce((sum, o) => sum + o.cents, 0));
+    }
+    if (!totals.length) totals.push(occ.reduce((sum, o) => sum + o.cents, 0));
+    const typical = Math.round(mean(totals.slice(0, FORECAST.cardMeanPayments)));
+    if (typical <= 0) continue;
+    // Amount-weighted median day of the month over the last 6 months of payments.
+    const recent = occ.filter((o) => monthIndex(monthKeyOf(o.date)) >= thisMonth - 6);
+    const byDay = [...(recent.length ? recent : occ)].sort((a, b) => dayOfMonth(a.date) - dayOfMonth(b.date));
+    const half = byDay.reduce((sum, o) => sum + o.cents, 0) / 2;
+    let acc = 0;
+    let day = dayOfMonth(byDay[byDay.length - 1].date);
+    for (const o of byDay) {
+      acc += o.cents;
+      if (acc >= half) {
+        day = dayOfMonth(o.date);
+        break;
+      }
+    }
+    const paidThisMonth = occ.filter((o) => monthKeyOf(o.date) === monthKeyOf(today)).reduce((sum, o) => sum + o.cents, 0);
+    const dates: string[] = [];
+    const amounts: number[] = [];
+    const remaining = typical - paidThisMonth;
+    if (remaining > 0) {
+      let d = nextBusinessDay(clampedDay(monthKeyOf(today), day));
+      if (d <= today) d = addDays(today, 1);
+      dates.push(d);
+      amounts.push(-remaining);
+    }
+    for (let k = 1; k <= 25; k++) {
+      const d = nextBusinessDay(clampedDay(monthFromIndex(thisMonth + k), day));
+      if (d > horizonEnd) break;
+      if (dates.includes(d)) continue;
+      dates.push(d);
+      amounts.push(-typical);
+    }
+    const monthsPaid = totals.slice(0, 3).filter((t) => t > 0).length;
     plans.push({
       stream: {
         id: stableId(`card|${acct.account_key}`),
         kind: "card",
         label: `${acct.label} payment`,
         direction: "out",
-        cadence: picked?.cls.cadence ?? "monthly",
-        typicalCents: -meanPay,
+        cadence: "monthly",
+        typicalCents: -typical,
         next: dates[0] ?? null,
-        certainty,
+        certainty: monthsPaid >= 3 ? "confirmed" : "likely",
         occurrences: occ.length,
-        method,
+        method: `monthly total = mean paid in the last ${Math.min(FORECAST.cardMeanPayments, totals.length)} months, around the ${ordinal(day)}${paidThisMonth > 0 ? `; ${fmt(paidThisMonth)} already paid this month` : ""}`,
       },
       dates,
+      amounts,
       claimed: rows.map((r) => r.i),
-      sampleCents: occ.slice(-FORECAST.cardSamplePayments).map((o) => -o.cents),
+      sampleCents: totals.map((t) => -t),
     });
   }
   return plans;
@@ -869,7 +900,7 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     p.dates.forEach((date, k) => {
       const idx = dayIdx(date);
       if (idx < 0 || idx >= H) return;
-      const amt = amountFor(p.stream.id, date, p.stream.typicalCents);
+      const amt = amountFor(p.stream.id, date, p.amounts?.[k] ?? p.stream.typicalCents);
       if (amt === null) return;
       streamOcc.push({ idx, amount: amt, plan: p, k });
       lines.push({ date, amountCents: amt, label: p.stream.label, layer: "detected", certainty: p.stream.certainty, sourceId: p.stream.id, reason: p.stream.method });
@@ -909,7 +940,9 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     for (const o of streamOcc) {
       let amount = o.amount;
       const samples = o.plan.sampleCents;
-      if (rng && samples?.length && amountFor(o.plan.stream.id, addDays(today, o.idx + 1), o.plan.stream.typicalCents) === o.plan.stream.typicalCents) {
+      const normal = o.plan.amounts?.[o.k] ?? o.plan.stream.typicalCents;
+      // Sample full months only (not this month's remainder), and never an amount the user adjusted.
+      if (rng && samples?.length && normal === o.plan.stream.typicalCents && o.amount === normal) {
         amount = samples[Math.floor(rng() * samples.length)];
       }
       F[o.idx] += amount;
