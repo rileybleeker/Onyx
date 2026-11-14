@@ -530,6 +530,20 @@ function pairRows(pool: Row[], cardRows: Row[]): { internal: Set<number>; cardPa
 
 // ─── Streams ──────────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Grouping key for streams: the first three words of the label with digits and punctuation removed. Bank
+ * descriptions often carry a per-deposit reference ("VOLT TECHNOLOGIE PAYROLL 8A2F ...") that a plain
+ * normalized label keeps, which split one paycheck into six one-off deposits (found 2026-11-14).
+ */
+export function streamKey(t: { name: string | null; custom_name: string | null }): string {
+  const words = rowLabel(t)
+    .toLowerCase()
+    .replace(/[^a-z\s]+/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 1);
+  return words.slice(0, 3).join(" ");
+}
+
 interface StreamPlan {
   stream: DetectedStream;
   dates: string[]; // projected occurrence dates (after today, inside the horizon)
@@ -571,7 +585,7 @@ function detectStreams(external: Row[], today: string, horizonEnd: string, notes
   const since = addDays(today, -FORECAST.detectWindowDays);
   for (const r of external) {
     if (r.t.txn_date < since || r.delta === 0) continue;
-    const key = merchantKey(r.t);
+    const key = streamKey(r.t);
     if (!key) continue;
     const g = `${r.delta > 0 ? "in" : "out"}|${key}`;
     const list = groups.get(g);
@@ -687,13 +701,13 @@ function detectCardStreams(
     const amounts: number[] = [];
     const remaining = typical - paidThisMonth;
     if (remaining > 0) {
-      let d = nextBusinessDay(clampedDay(monthKeyOf(today), day));
+      let d = cardPayDay(monthKeyOf(today), day);
       if (d <= today) d = addDays(today, 1);
       dates.push(d);
       amounts.push(-remaining);
     }
     for (let k = 1; k <= 25; k++) {
-      const d = nextBusinessDay(clampedDay(monthFromIndex(thisMonth + k), day));
+      const d = cardPayDay(monthFromIndex(thisMonth + k), day);
       if (d > horizonEnd) break;
       if (dates.includes(d)) continue;
       dates.push(d);
@@ -722,12 +736,18 @@ function detectCardStreams(
   return plans;
 }
 
+/** A card's payment day in a month: the next business day, except days 28+ stay in their month (previous business day). */
+function cardPayDay(monthKey: string, day: number): string {
+  const d = clampedDay(monthKey, day);
+  return day >= 28 ? previousBusinessDay(d) : nextBusinessDay(d);
+}
+
 /** Monthly-total card streams for unpaired card payments, one per payee (e.g. "APPLECARD GSBANK PAYMENT"). */
 function detectPayeeCardStreams(rows: Row[], today: string, horizonEnd: string, notes: string[]): StreamPlan[] {
   const byPayee = new Map<string, Row[]>();
   for (const r of rows) {
     if (r.t.txn_date < addDays(today, -FORECAST.detectWindowDays)) continue;
-    const key = merchantKey(r.t);
+    const key = streamKey(r.t);
     if (!key) continue;
     const list = byPayee.get(key);
     if (list) list.push(r);
@@ -771,13 +791,13 @@ function detectPayeeCardStreams(rows: Row[], today: string, horizonEnd: string, 
     const dates: string[] = [];
     const amounts: number[] = [];
     if (typical - paidThisMonth > 0) {
-      let d = nextBusinessDay(clampedDay(monthKeyOf(today), day));
+      let d = cardPayDay(monthKeyOf(today), day);
       if (d <= today) d = addDays(today, 1);
       dates.push(d);
       amounts.push(-(typical - paidThisMonth));
     }
     for (let k = 1; k <= 25; k++) {
-      const d = nextBusinessDay(clampedDay(monthFromIndex(thisMonth + k), day));
+      const d = cardPayDay(monthFromIndex(thisMonth + k), day);
       if (d > horizonEnd) break;
       if (dates.includes(d)) continue;
       dates.push(d);
@@ -899,7 +919,8 @@ export function forecastCash(input: ForecastInput): ForecastResult {
       found++;
       opening += b.kind === "liability" ? -Math.abs(b.balance_cents) : b.balance_cents;
       if (!asOf || b.captured_at < asOf) asOf = b.captured_at;
-      if (input.now && input.now.getTime() - Date.parse(b.captured_at) > FORECAST.staleBalanceHours * 3_600_000) stale = true;
+      // A small balance that rarely updates (Apple Cash) should not flag the whole forecast.
+      if (input.now && Math.abs(b.balance_cents) >= 10_000 && input.now.getTime() - Date.parse(b.captured_at) > FORECAST.staleBalanceHours * 3_600_000) stale = true;
     }
     if (!found) return { ...base, state: "no-balance" };
     if (stale) warnings.push(`A cash balance is older than ${FORECAST.staleBalanceHours} hours, so the starting point may be off.`);
