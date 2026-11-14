@@ -216,10 +216,12 @@ export interface ExternalEntry {
   itemId: "";
   title: string;
   date: string;
+  /** Care items use `time` for their own HH:MM; a calendar entry's display text is `when`. */
+  time: null;
   status: "external";
   sample: false;
   months: 0;
-  time: string;
+  when: string;
   calendar: string;
   location: string | null;
   tentative: boolean;
@@ -237,10 +239,11 @@ export function externalEntries(events: CalendarEvent[], start: string, end: str
         itemId: "",
         title: eventTitle(event),
         date: day,
+        time: null,
         status: "external",
         sample: false,
         months: 0,
-        time: timeLabel(event, day, timeZone, locale),
+        when: timeLabel(event, day, timeZone, locale),
         calendar: event.calendar,
         location: event.location,
         tentative: event.status === "tentative",
@@ -270,6 +273,48 @@ export function syncHealth(lastSync: CalendarSync | null | undefined, nowMs: num
   if (lastSync.status === "failed" || lastSync.status === "error" || age > CALENDAR_SYNC_FAILING_MS) return "failing";
   if (lastSync.status !== "success" || age > CALENDAR_SYNC_LATE_MS) return "late";
   return "ok";
+}
+
+export type CalendarLoadState = "loading" | "ready" | "not_connected" | "error";
+export type CalendarReadStatus = "checking" | "synced" | "late" | "failing" | "not-synced" | "unavailable";
+export interface CalendarReadConnection {
+  status: CalendarReadStatus;
+  statusLabel: string;
+  detail: string;
+  readOnly: true;
+  writesToCalendar: false;
+}
+
+/**
+ * What the /health "Your calendar events" card says, from what GET /api/calendar/events answered.
+ * checking: no answer yet. unavailable: Onyx could not read its own copy. not-synced: the table
+ * or the first sync run does not exist. late: last run partial or older than 3 h. failing: last
+ * run failed or older than 8 h. Whatever the state, this sync only reads.
+ */
+export function readConnection(load: CalendarLoadState, lastSync: CalendarSync | null, nowMs: number): CalendarReadConnection {
+  const base = { readOnly: true, writesToCalendar: false } as const;
+  if (load === "loading") return { ...base, status: "checking", statusLabel: "Checking", detail: "Checking the calendar events sync." };
+  if (load === "error") {
+    return { ...base, status: "unavailable", statusLabel: "Couldn't be checked", detail: "Onyx couldn't read its copy of your calendar events just now. Your care items are not affected." };
+  }
+  const health = syncHealth(lastSync, nowMs);
+  const failedRun = !!lastSync && (lastSync.status === "failed" || lastSync.status === "error");
+  if (load === "not_connected" || health === "never") {
+    return { ...base, status: "not-synced", statusLabel: "Not synced yet", detail: failedRun
+      ? "The calendar sync ran but its table is not set up yet, so no calendar events are shown."
+      : "The hourly calendar sync has not run yet, so no calendar events are shown." };
+  }
+  if (health === "failing") {
+    return { ...base, status: "failing", statusLabel: "Sync failing", detail: failedRun
+      ? "The last sync run failed. The events shown are from the last run that worked and may be out of date."
+      : "The sync has not run for more than 8 hours. The events shown may be out of date." };
+  }
+  if (health === "late") {
+    return { ...base, status: "late", statusLabel: "Synced (read-only)", detail: lastSync && lastSync.status !== "success"
+      ? "The last sync run was incomplete, so some events may be missing or out of date."
+      : "The sync is running late, so the newest changes may be missing." };
+  }
+  return { ...base, status: "synced", statusLabel: "Synced (read-only)", detail: "Events from your Google Calendar are copied into Onyx about once an hour and shown below, read-only." };
 }
 
 /** Shape check for a fetched /api/calendar/events body (throws on anything else). */
