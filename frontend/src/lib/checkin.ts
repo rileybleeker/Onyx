@@ -76,14 +76,31 @@ export const SLEEP_KIT: readonly string[] = [
 export const Q_SAME_BED = "Slept in the same bed as usual?";
 export const Q_SCREEN_IN_BED = "Viewed a screen device in bed?";
 export const Q_JOURNALED = "Journaled your thoughts?";
+export const Q_READ_IN_BED = "Read (non-screened device) while in bed?";
 
 /**
  * Questions about a night's sleep. An answer stored on behavior day D describes the night that CLOSES day D
  * (the HRV pipeline scores day D's answers against that sleep; see hrv_alignment.py), so on day D itself that
  * night has not happened yet. The check-in therefore never asks them on a day tab: it asks them per finished
- * night (sleepNights) and stores each night's answers on the day it closes.
+ * night (sleepNights) and stores each night's answers on the day it closes. A sleep question that is also
+ * OCCASIONAL (read in bed) is an optional row in the night block: blank = not logged.
+ * Other write paths follow the same rule: the chat tool stores a sleep answer with no date on yesterday
+ * (sleepAnswerDate), and the /habits "Today's Habits" checklist leaves these questions out.
  */
-export const SLEEP_QUESTIONS: ReadonlySet<string> = new Set([...SLEEP_KIT, Q_SAME_BED, Q_SCREEN_IN_BED]);
+export const SLEEP_QUESTIONS: ReadonlySet<string> = new Set([...SLEEP_KIT, Q_SAME_BED, Q_SCREEN_IN_BED, Q_READ_IN_BED]);
+
+/** Where a sleep answer given "now" belongs: the newest finished night = the behavior day before today. */
+export function sleepAnswerDate(today: string): string {
+  return addDays(today, -1);
+}
+
+/**
+ * Behavioral today when pds.behavioral_today_now() cannot be reached: Eastern clock time minus 6 hours.
+ * (The plain Eastern date would be a day ahead between midnight and 06:00 and turn "last night" into tonight.)
+ */
+export function fallbackBehavioralToday(now: Date): string {
+  return new Date(now.getTime() - 6 * 3600_000).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
 
 /** How many finished nights the check-in asks about (same reach as the day tabs). */
 export const CHECKIN_NIGHTS_BACK = 2;
@@ -175,13 +192,25 @@ export function kitSummary(kit: Record<string, CheckinAnswer>): string {
 export const SCREEN_IN_BED_YES_MIN = 10;
 export const SCREEN_IN_BED_NO_MAX = 1;
 
-export function screenInBedSuggestion(minutesLastHour: number | string | null | undefined): CheckinSuggestion | null {
+/**
+ * `syncedPastSleepOnset`: the phone uploaded its usage AFTER that night's sleep began, so the hour before sleep
+ * is fully reported. Without it a low number may only mean "not uploaded yet", so it is never read as No.
+ */
+export function screenInBedSuggestion(minutesLastHour: number | string | null | undefined, syncedPastSleepOnset = true): CheckinSuggestion | null {
   if (minutesLastHour == null || minutesLastHour === "") return null;
   const m = Number(minutesLastHour);
   if (!Number.isFinite(m)) return null;
   if (m >= SCREEN_IN_BED_YES_MIN) return { answer: "Yes", source: `Screen Time: ${Math.round(m)} min on the phone in the hour before sleep` };
-  if (m <= SCREEN_IN_BED_NO_MAX) return { answer: "No", source: "Screen Time: no phone use in the hour before sleep" };
+  if (m <= SCREEN_IN_BED_NO_MAX && syncedPastSleepOnset) return { answer: "No", source: "Screen Time: no phone use in the hour before sleep" };
   return null;
+}
+
+/** True when both instants are known and the upload is later than sleep onset. */
+export function syncedAfter(syncedAt: string | null | undefined, sleepStart: string | null | undefined): boolean {
+  if (!syncedAt || !sleepStart) return false;
+  const a = Date.parse(syncedAt);
+  const b = Date.parse(sleepStart);
+  return Number.isFinite(a) && Number.isFinite(b) && a > b;
 }
 
 /** A night counts as "in the usual bed" when Eight Sleep recorded at least this much sleep. */

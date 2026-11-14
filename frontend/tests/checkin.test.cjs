@@ -27,13 +27,14 @@ test("groupFor: occasional questions move to Also did whatever their channel or 
 });
 
 test("questions the analysis leans on are never demoted", () => {
-  for (const q of ["Have any alcoholic drinks?", "Feeling sick or ill?", "Experienced stress?", ...C.SLEEP_QUESTIONS]) {
+  for (const q of ["Have any alcoholic drinks?", "Feeling sick or ill?", "Experienced stress?", ...C.SLEEP_KIT, C.Q_SAME_BED, C.Q_SCREEN_IN_BED]) {
     assert.equal(C.OCCASIONAL.has(q), false, q);
   }
 });
 
 test("every sleep-kit question is a sleep question", () => {
   assert.equal(C.SLEEP_KIT.length, 5);
+  assert.equal(C.SLEEP_QUESTIONS.size, 8);
   for (const q of C.SLEEP_KIT) assert.equal(C.SLEEP_QUESTIONS.has(q), true, q);
 });
 
@@ -140,6 +141,74 @@ test("nightLabel names the night by the evening it started and the morning it en
   assert.deepEqual(C.nightLabel("2031-03-03", "2031-03-05"), { title: "Monday night", span: "Mon night → Tue morning" });
 });
 
+test("nightLabel after the day rolls over: the same night is no longer 'Last night'", () => {
+  assert.equal(C.nightLabel("2031-03-04", "2031-03-05").title, "Last night");
+  assert.equal(C.nightLabel("2031-03-04", "2031-03-06").title, "Tuesday night");
+  assert.equal(C.nightLabel("2031-03-04", "2031-03-06").span, "Tue night → Wed morning"); // the span never changes
+});
+
+test("read-in-bed is a sleep question that stays optional", () => {
+  assert.equal(C.SLEEP_QUESTIONS.has(C.Q_READ_IN_BED), true);
+  assert.equal(C.groupFor(C.Q_READ_IN_BED, "whoop", "Ad Hoc"), "extra");
+  // every other sleep question is asked (core)
+  for (const q of C.SLEEP_QUESTIONS) if (q !== C.Q_READ_IN_BED) assert.equal(C.groupFor(q, "whoop", "Ad Hoc"), "core", q);
+});
+
+test("a sleep answer given now belongs to yesterday (the night that just ended)", () => {
+  assert.equal(C.sleepAnswerDate("2031-03-05"), "2031-03-04");
+  assert.equal(C.sleepAnswerDate("2031-03-01"), "2031-02-28");
+});
+
+test("fallbackBehavioralToday: Eastern time minus 6 hours", () => {
+  // 2031-03-05 00:30 EST = 05:30 UTC: still behavior day 03-04
+  assert.equal(C.fallbackBehavioralToday(new Date("2031-03-05T05:30:00Z")), "2031-03-04");
+  // 05:59 EST: still 03-04; 06:00 EST: 03-05
+  assert.equal(C.fallbackBehavioralToday(new Date("2031-03-05T10:59:00Z")), "2031-03-04");
+  assert.equal(C.fallbackBehavioralToday(new Date("2031-03-05T11:00:00Z")), "2031-03-05");
+  // 21:30 EDT in July (UTC-4)
+  assert.equal(C.fallbackBehavioralToday(new Date("2031-07-10T01:30:00Z")), "2031-07-09");
+});
+
+test("screen in bed is never pre-filled No before the phone has synced past sleep onset", () => {
+  assert.equal(C.screenInBedSuggestion(0, false), null);
+  assert.equal(C.screenInBedSuggestion(0, true).answer, "No");
+  assert.equal(C.screenInBedSuggestion(25, false).answer, "Yes"); // enough minutes already reported
+  assert.equal(C.syncedAfter("2031-03-05T15:00:00Z", "2031-03-05T07:00:00Z"), true);
+  assert.equal(C.syncedAfter("2031-03-05T06:00:00Z", "2031-03-05T07:00:00Z"), false);
+  assert.equal(C.syncedAfter(null, "2031-03-05T07:00:00Z"), false);
+  assert.equal(C.syncedAfter("2031-03-05T15:00:00Z", null), false);
+  assert.equal(C.syncedAfter("nonsense", "2031-03-05T07:00:00Z"), false);
+});
+
+test("a stale page cannot write: the POST refuses a `today` that is no longer today, before anything else", () => {
+  const route = fs.readFileSync(path.join(SRC, "app/api/habits/checkin/route.ts"), "utf8");
+  const post = route.slice(route.indexOf("export async function POST"));
+  const guard = post.indexOf("body.today !== today");
+  assert.ok(guard > 0);
+  assert.ok(guard < post.indexOf(".upsert("), "the stale check runs before the write");
+  assert.match(post, /status: 409/);
+  const client = fs.readFileSync(path.join(SRC, "app/check-in/CheckInClient.tsx"), "utf8");
+  assert.match(client, /today: data\.today/);
+  assert.match(client, /visibilitychange/);
+});
+
+test("a sleep-only save leaves an untouched day alone and does not mark it done", () => {
+  const client = fs.readFileSync(path.join(SRC, "app/check-in/CheckInClient.tsx"), "utf8");
+  assert.match(client, /const dayPatch = dayTouched \|\| nightChanges\.length === 0 \? dayChanges : \{\}/);
+  const save = client.slice(client.indexOf("const save = async"), client.indexOf("const goTo"));
+  // checkinDone sits inside the branch that posted the day
+  const dayBranch = save.slice(save.indexOf("if (Object.keys(dayPatch).length)"), save.indexOf("for (const n of nightChanges)"));
+  assert.match(dayBranch, /agentsApi\.checkinDone\(data\.date\)/);
+  assert.equal((save.match(/checkinDone/g) || []).length, 1);
+});
+
+test("other write paths keep sleep answers off today", () => {
+  const chat = fs.readFileSync(path.join(SRC, "app/api/chat/route.ts"), "utf8");
+  assert.match(chat, /if \(SLEEP_QUESTIONS\.has\(habit\)\) date = sleepAnswerDate\(date\)/);
+  const habits = fs.readFileSync(path.join(SRC, "app/habits/HabitsClient.tsx"), "utf8");
+  assert.match(habits, /habits\.filter\(\(h\) => !SLEEP_QUESTIONS\.has\(h\.name\)\)\.map/);
+});
+
 test("the route builds nights from sleepNights and keeps sleep answers out of the day", () => {
   const route = fs.readFileSync(path.join(SRC, "app/api/habits/checkin/route.ts"), "utf8");
   assert.match(route, /sleepNights\(today, WHOOP_JOURNAL_FROZEN_THROUGH\)/);
@@ -151,7 +220,7 @@ test("the route builds nights from sleepNights and keeps sleep answers out of th
 test("the screen saves each night under the night's own date, and never asks about tonight", () => {
   const client = fs.readFileSync(path.join(SRC, "app/check-in/CheckInClient.tsx"), "utf8");
   assert.match(client, /await post\(n\.date, n\.changes\)/);
-  assert.match(client, /await post\(data\.date, dayChanges\)/);
+  assert.match(client, /await post\(data\.date, dayPatch\)/);
   assert.match(client, /Tonight is asked tomorrow/);
   assert.equal(/Tonight's sleep/.test(client), false);
   // sleep questions are not part of the day tab: "No for the rest" and the progress bar only see daytime items

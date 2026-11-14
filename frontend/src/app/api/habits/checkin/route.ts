@@ -6,6 +6,7 @@ import {
   APP_HABITS,
   appHabitSuggestions,
   CHECKIN_MAX_DAYS_BACK,
+  fallbackBehavioralToday,
   groupFor,
   journaledSuggestion,
   Q_JOURNALED,
@@ -16,6 +17,7 @@ import {
   SLEEP_KIT,
   SLEEP_QUESTIONS,
   sleepNights,
+  syncedAfter,
   usualKit,
   type CheckinAnswer,
   type CheckinItem,
@@ -68,7 +70,7 @@ async function behavioralToday(): Promise<string> {
   } catch {
     /* fall through */
   }
-  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  return fallbackBehavioralToday(new Date());
 }
 
 function dateError(date: string, today: string): string | null {
@@ -172,9 +174,14 @@ async function sleepSuggestionsFor(night: string, names: Set<string>): Promise<R
   if (names.has(Q_SCREEN_IN_BED)) {
     tasks.push(
       (async () => {
-        const { data } = await supabase.from("phone_usage_daily").select("minutes_last_hour_before_sleep_est").eq("behavioral_date", night).maybeSingle();
+        const { data } = await supabase
+          .from("phone_usage_daily")
+          .select("minutes_last_hour_before_sleep_est, sleep_start, synced_at")
+          .eq("behavioral_date", night)
+          .maybeSingle();
         if (!data) return;
-        const s = screenInBedSuggestion((data as { minutes_last_hour_before_sleep_est: number | string | null }).minutes_last_hour_before_sleep_est);
+        const row = data as { minutes_last_hour_before_sleep_est: number | string | null; sleep_start: string | null; synced_at: string | null };
+        const s = screenInBedSuggestion(row.minutes_last_hour_before_sleep_est, syncedAfter(row.synced_at, row.sleep_start));
         if (s) out[Q_SCREEN_IN_BED] = s;
       })()
     );
@@ -215,7 +222,7 @@ export async function GET(req: NextRequest) {
     const from = addDays(today, -CHECKIN_MAX_DAYS_BACK);
 
     // Sleep questions are asked per finished NIGHT (sleepNights), never per day tab: the day's own lists leave them out.
-    const sleepNames = new Set(items.filter((i) => i.group === "core" && i.sleep).map((i) => i.name));
+    const sleepNames = new Set(items.filter((i) => i.sleep).map((i) => i.name));
     const dayCore = new Set([...core].filter((n) => !sleepNames.has(n)));
     const dayNames = new Set(names.filter((n) => !sleepNames.has(n)));
     const nightDates = sleepNames.size ? sleepNights(today, WHOOP_JOURNAL_FROZEN_THROUGH) : [];
@@ -264,8 +271,13 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const body = (await req.json().catch(() => ({}))) as { date?: unknown; answers?: unknown };
+  const body = (await req.json().catch(() => ({}))) as { date?: unknown; answers?: unknown; today?: unknown };
   const today = await behavioralToday();
+  // The screen sends the `today` it was drawn with. If the day has rolled over since (a page left open
+  // overnight), its "Last night" is now the night before: refuse, and the screen reloads. Optional field.
+  if (isDate(body.today) && body.today !== today) {
+    return NextResponse.json({ error: "A new day started since this page loaded. Check the nights and days, then save again.", today, stale: true }, { status: 409 });
+  }
   if (!isDate(body.date)) return NextResponse.json({ error: "date must be YYYY-MM-DD" }, { status: 400 });
   const date = body.date;
   const bad = dateError(date, today);

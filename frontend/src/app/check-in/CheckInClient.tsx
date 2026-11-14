@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, Moon, Sun, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
@@ -56,13 +56,20 @@ function writeDraft(key: string, patch: Patch) {
   }
 }
 
-function clearDraft(key: string) {
+/** After a save: drop from the draft only what was sent and is still unchanged, so a tap made mid-save survives. */
+function settleDraft(key: string, posted: Patch) {
   try {
-    localStorage.removeItem(key);
+    const draft = readDraft(key);
+    for (const [name, a] of Object.entries(posted)) if (draft[name] === a) delete draft[name];
+    if (Object.keys(draft).length) localStorage.setItem(key, JSON.stringify(draft));
+    else localStorage.removeItem(key);
   } catch {
     /* ignore */
   }
 }
+
+/** The server refused because the day rolled over since the page loaded: reload, don't keep the stale labels. */
+class StaleDayError extends Error {}
 
 /** Saved answers, then pre-fills for what is still blank, then the local draft on top. Only `items` are kept. */
 function buildCells(
@@ -98,7 +105,10 @@ function changesOf(items: CheckinItem[], saved: Record<string, CheckinAnswer>, c
   return out;
 }
 
-const isNightItem = (i: CheckinItem) => i.sleep && i.group === "core";
+/** Sleep questions live in the night blocks; core ones are asked, occasional ones are an optional row there. */
+const isNightItem = (i: CheckinItem) => i.sleep;
+/** Reload when the app comes back after this long: "Last night" must never be a day old. */
+const RELOAD_AFTER_MS = 60_000;
 
 function dayLabel(date: string, today: string): string {
   const d = new Date(date + "T12:00:00Z");
@@ -127,7 +137,11 @@ export default function CheckInClient() {
   const [showExtras, setShowExtras] = useState(false);
   const delivery = useDeliveryDishes(data?.date ?? null, { earlierDays: 2 });
 
+  const lastLoad = useRef(0);
+  const savingRef = useRef(false);
+
   const load = useCallback(async (date: string | null) => {
+    lastLoad.current = Date.now();
     setError(null);
     setSavedAt(null);
     try {
@@ -160,6 +174,17 @@ export default function CheckInClient() {
 
   useEffect(() => {
     load(requested);
+    // A page left open (or an installed app resumed) keeps the `today` it loaded with, so after the day rolls
+    // over its "Last night" would be the night before. Reload on return; unsaved taps come back from the drafts.
+    const back = () => {
+      if (document.visibilityState === "visible" && !savingRef.current && Date.now() - lastLoad.current > RELOAD_AFTER_MS) load(requested);
+    };
+    document.addEventListener("visibilitychange", back);
+    window.addEventListener("pageshow", back);
+    return () => {
+      document.removeEventListener("visibilitychange", back);
+      window.removeEventListener("pageshow", back);
+    };
   }, [load, requested]);
 
   // One or several answers at once. scope = null for the day tab, or the night's date for a sleep block.
@@ -208,9 +233,9 @@ export default function CheckInClient() {
     return { dayItems, sleepItems, core, extras, coreByCategory };
   }, [data]);
 
-  // Last night always; an earlier night only while its SAVED answers are incomplete (so it doesn't vanish mid-tap).
+  // Last night always; an earlier night only while its SAVED required answers are incomplete (so it doesn't vanish mid-tap).
   const nights = useMemo(
-    () => (sleepItems.length ? (data?.nights ?? []).filter((n, i) => i === 0 || sleepItems.some((it) => !n.answers[it.name])) : []),
+    () => (sleepItems.length ? (data?.nights ?? []).filter((n, i) => i === 0 || sleepItems.some((it) => it.group === "core" && !n.answers[it.name])) : []),
     [data, sleepItems]
   );
 
@@ -226,42 +251,60 @@ export default function CheckInClient() {
         .filter((n) => Object.keys(n.changes).length > 0),
     [nights, sleepItems, nightCells]
   );
-  const changeCount = Object.keys(dayChanges).length + nightChanges.reduce((s, n) => s + Object.keys(n.changes).length, 0);
+  // A day Riley has not touched is not saved along with a sleep save: its pre-fills can still change (a workout
+  // later today), and saving them would mark the day's check-in done. With nothing else to save, Save means the day.
+  const dayTouched = Object.entries(dayChanges).some(([name, a]) => a === null || cells[name]?.origin === "tapped");
+  const dayPatch = dayTouched || nightChanges.length === 0 ? dayChanges : {};
+  const nightCount = nightChanges.reduce((s, n) => s + Object.keys(n.changes).length, 0);
+  const changeCount = Object.keys(dayPatch).length + nightCount;
+  // Unsaved answers Riley tapped himself (as opposed to pre-fills waiting to be accepted).
+  const tappedCount =
+    Object.keys(dayChanges).filter((name) => dayChanges[name] === null || cells[name]?.origin === "tapped").length +
+    nightChanges.reduce((s, n) => s + Object.keys(n.changes).filter((name) => n.changes[name] === null || nightCells[n.date]?.[name]?.origin === "tapped").length, 0);
 
   const save = async () => {
     if (!data || saving || changeCount === 0) return;
     setSaving(true);
+    savingRef.current = true;
     setError(null);
     const post = async (date: string, answers: Patch) => {
       const res = await fetch("/api/habits/checkin", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date, answers }),
+        body: JSON.stringify({ date, answers, today: data.today }),
       });
       if (!res.ok) {
         const json = await res.json().catch(() => ({}));
+        if (res.status === 409 && json.stale) throw new StaleDayError(json.error || "A new day started since this page loaded.");
         throw new Error(json.error || `Save failed (${res.status}). Your answers are still here.`);
       }
     };
     try {
       // The day, then each night under ITS date. A part that saved is not lost if a later part fails: its
       // answers stay on screen and saving again just writes the same rows.
-      if (Object.keys(dayChanges).length) {
-        await post(data.date, dayChanges);
-        clearDraft(dayDraftKey(data.date));
+      if (Object.keys(dayPatch).length) {
+        await post(data.date, dayPatch);
+        settleDraft(dayDraftKey(data.date), dayPatch);
+        // Settle the Agents card; best-effort (the card also expires on its own). Only when the day was saved.
+        agentsApi.checkinDone(data.date).catch(() => {});
       }
       for (const n of nightChanges) {
         await post(n.date, n.changes);
-        clearDraft(nightDraftKey(n.date));
+        settleDraft(nightDraftKey(n.date), n.changes);
       }
-      // Settle the Agents card once the day has an answer; best-effort (the card also expires on its own).
-      if (dayItems.some((i) => cells[i.name])) agentsApi.checkinDone(data.date).catch(() => {});
       const date = data.date;
       await load(date);
       setSavedAt(date);
     } catch (e) {
-      setError(e instanceof TypeError ? "Couldn't reach Onyx. Your answers are still here." : e instanceof Error ? e.message : "Save failed. Your answers are still here.");
+      if (e instanceof StaleDayError) {
+        // Redraw with the new day (taps come back from the drafts under their own dates), then say why.
+        await load(requested);
+        setError(e.message);
+      } else {
+        setError(e instanceof TypeError ? "Couldn't reach Onyx. Your answers are still here." : e instanceof Error ? e.message : "Save failed. Your answers are still here.");
+      }
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -301,7 +344,9 @@ export default function CheckInClient() {
       <div className="mb-5">
         <h2 className="text-[28px] font-medium text-text-primary">Check-in</h2>
         <p className="text-sm text-text-tertiary mt-0.5">
-          {nights.length > 0 ? "Two parts: last night's sleep, then the daytime." : "Answer for the daytime; skip anything you're unsure of."}
+          {nights.length > 0
+            ? `Two parts. Sleep: ${nightLabel(nights[0].date, data.today).span}. Daytime: ${dayName === "Today" || dayName === "Yesterday" ? `${dayName.toLowerCase()}, ` : ""}${longDate(data.date)}.`
+            : `Daytime: ${longDate(data.date)}. Skip anything you're unsure of.`}
         </p>
       </div>
 
@@ -331,8 +376,10 @@ export default function CheckInClient() {
       {/* DAYTIME: one behavior day per tab */}
       <div className="flex items-center gap-2 mb-2">
         <Sun className="w-4 h-4 text-amber-300" />
-        <h3 className="text-[15px] font-medium text-text-primary">Daytime</h3>
-        <span className="text-[12px] text-text-tertiary">{longDate(data.date)}</span>
+        <h3 className="text-[15px] font-medium text-text-primary">
+          Daytime{dayName === "Today" || dayName === "Yesterday" ? ` · ${dayName}` : ""}
+        </h3>
+        <span className="text-[13px] text-text-secondary">{longDate(data.date)}</span>
       </div>
 
       {/* Day tabs: today and the two days before, with progress */}
@@ -441,9 +488,10 @@ export default function CheckInClient() {
           <div className="flex-1 min-w-0 text-[13px]">
             {error ? (
               <span className="text-red-400">{error}</span>
-            ) : savedAt === data.date && changeCount === 0 ? (
-              <span className="text-text-secondary inline-flex items-center gap-1.5">
+            ) : savedAt === data.date && tappedCount === 0 ? (
+              <span className="text-text-secondary inline-flex items-center gap-1.5 flex-wrap">
                 <Check className="w-4 h-4 text-accent" /> Saved
+                {changeCount > 0 && <span className="text-text-tertiary">· {changeCount} pre-filled answer{changeCount === 1 ? "" : "s"} not saved yet</span>}
                 {catchUp && (
                   <button onClick={() => goTo(catchUp.date)} className="ml-2 text-accent underline underline-offset-2">
                     Catch up {dayLabel(catchUp.date, data.today).toLowerCase()}
@@ -499,16 +547,19 @@ function NightBlock({
   }
   const kitSize = Object.keys(kit).length;
   const kitApplied = kitSize > 0 && Object.entries(kit).every(([q, a]) => cells[q]?.answer === a);
-  const done = items.filter((i) => cells[i.name]).length;
+  const asked = items.filter((i) => i.group === "core");
+  const optional = items.filter((i) => i.group !== "core");
+  const done = asked.filter((i) => cells[i.name]).length;
 
   return (
     <div className="mb-4 last:mb-0">
+      {/* The weekday span is the main label: it names the night at any hour ("Last night" alone can be misread before 6 AM). */}
       <div className="flex items-baseline justify-between gap-2 mb-1.5">
         <span className="text-[14px] font-medium text-text-primary">
-          {label.title}
-          <span className="ml-2 text-[11px] font-mono font-normal text-indigo-200/80">{label.span}</span>
+          {label.span}
+          <span className="ml-2 text-[11px] font-mono font-normal uppercase tracking-wider text-indigo-200/80">{label.title}</span>
         </span>
-        <span className="text-[11px] font-mono text-text-tertiary shrink-0">{catchUp && done === 0 ? "not answered yet" : `${done}/${items.length}`}</span>
+        <span className="text-[11px] font-mono text-text-tertiary shrink-0">{catchUp && done === 0 ? "not answered yet" : `${done}/${asked.length}`}</span>
       </div>
       {kitSize > 0 && (
         <button
@@ -525,10 +576,20 @@ function NightBlock({
         </button>
       )}
       <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
-        {items.map((item) => (
+        {asked.map((item) => (
           <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} />
         ))}
       </div>
+      {optional.length > 0 && (
+        <>
+          <p className="text-[11px] text-text-tertiary mt-2 mb-1">Optional. Leave blank unless it happened.</p>
+          <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card/60">
+            {optional.map((item) => (
+              <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} />
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }

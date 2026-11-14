@@ -4,6 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist } from "@/lib/spotify-server";
 import { logStackIntake } from "@/lib/supplement-stacks";
+import { SLEEP_QUESTIONS, sleepAnswerDate } from "@/lib/checkin";
 import { behavioralToday, currentTimeZone, logSupplementIntake } from "@/lib/supplement-intake";
 import { addHighlight, getOverview, logSession, recordQuiz, summarizeForChat, type HighlightSource, type Medium } from "@/lib/reading";
 import { mirrorHighlight, mirrorProgress, mirrorSession } from "@/lib/reading-notion";
@@ -181,12 +182,12 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "mark_habit_complete",
-    description: "Record a habit answer for a given date — 'Yes' (did it, default) or 'No' (explicitly did NOT do it, e.g. 'I skipped meditation today'). The habit name must match one defined in the user's Notion Habits database (e.g., 'Meditated', 'Exercised', 'Read'). Defaults to today. Only record 'No' when the user explicitly says they didn't do the habit — an unmentioned habit should stay unlogged.",
+    description: "Record a habit answer for a given date — 'Yes' (did it, default) or 'No' (explicitly did NOT do it, e.g. 'I skipped meditation today'). The habit name must match one defined in the user's Notion Habits database (e.g., 'Meditated', 'Exercised', 'Read'). Defaults to today. Only record 'No' when the user explicitly says they didn't do the habit — an unmentioned habit should stay unlogged. Sleep questions (mouth tape, nightguard or retainer, nasal strip, ear plugs, sleep mask, same bed as usual, screen in bed, read in bed) describe a night that already happened: leave date empty for last night (it is stored on yesterday, the day that night closed), and never log them for tonight.",
     input_schema: {
       type: "object" as const,
       properties: {
         habit: { type: "string", description: "The habit name exactly as defined in Notion (e.g., 'Meditated', 'Exercised')" },
-        date: { type: "string", description: "Date in YYYY-MM-DD format (defaults to today)" },
+        date: { type: "string", description: "Date in YYYY-MM-DD format (defaults to today; a sleep question defaults to yesterday = last night)" },
         category: { type: "string", description: "Optional: habit category (e.g., 'mindfulness', 'fitness')" },
         answer: { type: "string", enum: ["Yes", "No"], description: "'Yes' = completed (default); 'No' = explicitly not done" },
       },
@@ -721,6 +722,9 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       } catch {
         date = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
       }
+      // A sleep question (mouth tape, same bed, ...) describes a finished night, and a night's answers live on
+      // the behavior day it closed. "I wore mouth tape last night" with no date is therefore yesterday, not today.
+      if (SLEEP_QUESTIONS.has(habit)) date = sleepAnswerDate(date);
     }
 
     // WHOOP-era rows (cycle_date <= 2026-06-08, the last WHOOP export) are a

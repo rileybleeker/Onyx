@@ -5,6 +5,7 @@ import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import { getHabitJournal, getHabitMetadataHistory, rangeDays, rangeLabel, type Range, type HabitMetadataInterval } from "@/lib/queries";
 import { axisTick, gridStyle, chartTooltip, chartColors as C } from "@/lib/chart-theme";
 import { formatDate } from "@/lib/format";
+import { SLEEP_QUESTIONS } from "@/lib/checkin";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
@@ -562,7 +563,9 @@ export default function HabitsPage() {
       {habits.length > 0 && (
         <ChartCard title="Today's Habits" subtitle={`${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })} — tap ✓ done or ✕ not done; tap again to clear`}>
           <div className="space-y-1">
-            {habits.map((h) => {
+            {/* Sleep questions are about a finished night and are answered on /check-in ("Last night"), which stores
+                them on the day that night closed. A tap here would write them to today = tonight, so they are left out. */}
+            {habits.filter((h) => !SLEEP_QUESTIONS.has(h.name)).map((h) => {
               const answer = answerMap.get(`${h.name}|${today}`) ?? null;
               const isToggling = toggling.has(`${h.name}|${today}`);
               const streak = calculateStreak(h, completionSet, history);
