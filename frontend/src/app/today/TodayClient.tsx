@@ -259,7 +259,7 @@ export default function TodayClient() {
   const calendarSync = agenda ? syncHealth(agenda.lastSync, now.getTime()) : "never";
   const renewing = renewals?.status === "ready" && renewals.count > 0 ? renewals : null;
   return (
-    <div className="mx-auto max-w-2xl space-y-5">
+    <div className="mx-auto max-w-2xl space-y-5 lg:max-w-5xl">
       <header className="flex items-start justify-between gap-4">
         <div><h1 data-testid="page-heading" className="text-[30px] font-medium text-text-primary">Today</h1>
           <p className="mt-1 text-sm text-text-secondary">A few useful places to pick up.</p></div>
@@ -285,6 +285,15 @@ export default function TodayClient() {
         {trial.status === "paused" && <p className="mt-3 break-words text-sm text-text-primary">{trial.experimentId}: {trial.title} is paused. No arm today.</p>}
         {experiment.state === "ready" && experiment.stale && <p className="mt-3 text-sm text-amber-300">Couldn&apos;t refresh the experiment arm. Showing the last check.</p>}
       </div>}
+      <div role="region" aria-label="Quick capture" className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-2xl border border-border-default bg-surface-card px-5 py-3">
+        <Link href="/check-in" className="inline-flex min-h-11 items-center gap-2 rounded-xl bg-accent px-4 text-sm font-medium text-surface focus-visible:outline-2 focus-visible:outline-accent">
+          <ClipboardCheck aria-hidden="true" className="h-4 w-4" />Start your check-in</Link>
+        <Link href="/supplements" className={`${linkStyle} inline-flex min-h-11 items-center`}>Supplement</Link>
+        <Link href="/habits" className={`${linkStyle} inline-flex min-h-11 items-center`}>Habit</Link>
+        <Link href="/nutrition" className={`${linkStyle} inline-flex min-h-11 items-center`}>Weight</Link>
+      </div>
+      <div className="grid gap-5 lg:grid-cols-2 lg:items-start">
+      <div className="min-w-0 space-y-5">
       <section className={panelStyle} aria-labelledby="requests-heading" aria-busy={inbox.state === "loading"}>
         <div className="flex items-center justify-between gap-4">
           <h2 id="requests-heading" className="text-lg font-medium text-text-primary">Needs your input</h2>
@@ -359,6 +368,8 @@ export default function TodayClient() {
           : "The email label sync has not run yet."}</p>}
         {urgent.state !== "loading" && <p className="mt-1 text-xs text-text-secondary">Opening or clearing on Today does not mark email read or change any label. A cleared thread comes back if a newer message arrives in it.</p>}
       </section>
+      </div>
+      <div className="min-w-0 space-y-5">
       <section className={panelStyle} aria-labelledby="calendar-heading" aria-busy={calendar.state === "loading"}>
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-2"><CalendarDays aria-hidden="true" className="h-5 w-5 text-accent" />
@@ -434,6 +445,8 @@ export default function TodayClient() {
         <p className="mt-3 text-sm text-text-secondary">Start or continue your check-in. Answer what you know; leave the rest blank.</p>
         <Link href="/check-in" className={`${linkStyle} mt-4 inline-block`}>Open check-in</Link>
       </section>
+      </div>
+      </div>
       <nav aria-label="More places" className="flex flex-wrap gap-x-5 gap-y-3 pb-4">
         <Link href="/status" className={linkStyle}>System status</Link>
         <Link href="/nyc" className={linkStyle}>NYC search</Link>

@@ -3,12 +3,13 @@
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { House, BarChart3, Plus, MessageSquare, Menu, X, LogOut, Search, Pill, CircleCheck, Scale } from "lucide-react";
+import { House, BarChart3, Plus, MessageSquare, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS } from "@/lib/nav";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 
 const LOG_ACTIONS = [
+  { label: "Check-in", href: "/check-in", icon: ClipboardCheck },
   { label: "Supplement", href: "/supplements", icon: Pill },
   { label: "Habit", href: "/habits", icon: CircleCheck },
   { label: "Weight", href: "/nutrition", icon: Scale },
@@ -168,7 +169,7 @@ export default function MobileNav() {
                     key={a.label}
                     href={a.href}
                     onClick={() => setLogOpen(false)}
-                    className="flex items-center gap-2.5 px-3 py-3 rounded-control bg-surface-card border border-border-subtle text-[14px] text-text-primary hover:border-border-hover transition-colors"
+                    className={`${a.href === "/check-in" ? "col-span-2 " : ""}flex items-center gap-2.5 px-3 py-3 rounded-control bg-surface-card border border-border-subtle text-[14px] text-text-primary hover:border-border-hover transition-colors`}
                   >
                     <Icon className="w-[18px] h-[18px] text-accent shrink-0" strokeWidth={1.75} />
                     {a.label}
