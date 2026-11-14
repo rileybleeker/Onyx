@@ -15,7 +15,7 @@
  */
 
 import { createClient } from "@supabase/supabase-js";
-import { SPOTIFY_REDIRECT_URI, isNewerBlob, serializeTokenBlob, type SpotifyTokenBlob } from "@/lib/spotify-reconnect";
+import { SPOTIFY_REDIRECT_URI, isNewerBlob, shouldWriteBack, serializeTokenBlob, type SpotifyTokenBlob } from "@/lib/spotify-reconnect";
 
 const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
 const SPOTIFY_API = "https://api.spotify.com/v1";
@@ -58,7 +58,7 @@ async function loadTokens(): Promise<SpotifyTokenBlob> {
  * dropped. Without this, a call that loaded the old blob just before a reconnect would write the
  * old refresh token back over the new one.
  */
-async function saveTokens(tokens: SpotifyTokenBlob): Promise<void> {
+async function saveTokens(tokens: SpotifyTokenBlob, loadedRefreshToken: string): Promise<void> {
   const sb = supabaseAdmin();
   const { data: rows, error: readErr } = await sb.from("ci_tokens").select("token_data").eq("service", "spotify").limit(1);
   if (readErr) {
@@ -69,7 +69,12 @@ async function saveTokens(tokens: SpotifyTokenBlob): Promise<void> {
   if (typeof storedText === "string") {
     try {
       const stored = JSON.parse(storedText) as Partial<SpotifyTokenBlob> | null;
-      if (stored && typeof stored === "object" && !isNewerBlob(tokens, stored)) return;
+      if (stored && typeof stored === "object" && !shouldWriteBack(tokens, loadedRefreshToken, stored)) {
+        if (isNewerBlob(tokens, stored)) {
+          console.error("Spotify token write-back skipped: refresh token rotated elsewhere");
+        }
+        return;
+      }
     } catch {
       // unreadable stored row: fall through and replace it
     }
@@ -181,6 +186,7 @@ export async function getSpotifyAccessToken(): Promise<string> {
   const auth = basicAuthHeader();
   if (!auth) throw new Error("Spotify is not configured on the server (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET)");
   const tokens = await loadTokens();
+  const loadedRefreshToken = tokens.refresh_token;
   const resp = await fetch(SPOTIFY_TOKEN_URL, {
     method: "POST",
     headers: {
@@ -207,7 +213,7 @@ export async function getSpotifyAccessToken(): Promise<string> {
   if (fresh.refresh_token) {
     tokens.refresh_token = fresh.refresh_token;
   }
-  await saveTokens(tokens);
+  await saveTokens(tokens, loadedRefreshToken);
   return tokens.access_token;
 }
 

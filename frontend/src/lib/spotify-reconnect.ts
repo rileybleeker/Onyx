@@ -370,6 +370,30 @@ export function isNewerBlob(candidate: { authorized_at?: unknown; obtained_at?: 
   return epoch(candidate.obtained_at) > epoch(stored.obtained_at);
 }
 
+/**
+ * Should the refresh path write `candidate` over the stored row? `stored` is the parsed stored blob,
+ * or null/undefined/non-object when the row is missing or unreadable (then: write). False when the
+ * candidate is not newer (isNewerBlob), and false when the same authorization's refresh token was
+ * rotated elsewhere (stored token differs from the one this call loaded) and Spotify returned no new
+ * one (candidate still carries the loaded token): writing would put the old token over the rotated one.
+ */
+export function shouldWriteBack(
+  candidate: { authorized_at?: unknown; obtained_at?: unknown; refresh_token?: unknown },
+  loadedRefreshToken: string,
+  stored: { authorized_at?: unknown; obtained_at?: unknown; refresh_token?: unknown } | null | undefined,
+): boolean {
+  if (!stored || typeof stored !== "object") return true;
+  if (!isNewerBlob(candidate, stored)) return false;
+  if (
+    epoch(stored.authorized_at) === epoch(candidate.authorized_at) &&
+    stored.refresh_token !== loadedRefreshToken &&
+    candidate.refresh_token === loadedRefreshToken
+  ) {
+    return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // /status
 // ---------------------------------------------------------------------------
