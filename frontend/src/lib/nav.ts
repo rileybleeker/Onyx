@@ -23,6 +23,7 @@ import {
   Bot,
   Building2,
   BookMarked,
+  Smartphone,
 } from "lucide-react";
 
 /**
@@ -69,6 +70,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { href: "/analytics/hrv", label: "HRV Analysis", shortcut: "V", icon: BarChart3, keywords: ["heart rate variability", "forecast", "prediction", "shap", "causal", "model"] },
       { href: "/analytics/travel", label: "Travel Analysis", shortcut: "R", icon: Plane, keywords: ["timezone", "trip", "jet lag", "tz"] },
       { href: "/bland-altman", label: "Bland-Altman", shortcut: "B", icon: Scale, keywords: ["agreement", "device", "comparison", "rmssd"] },
+      { href: "/screen-time", label: "Screen Time", shortcut: "I", icon: Smartphone, keywords: ["phone", "iphone", "apps", "pickups", "notifications", "late night", "usage", "before sleep"] },
       { href: "/spotify", label: "Spotify", shortcut: "M", icon: Music, keywords: ["music", "listening", "playlist", "tracks", "artists"] },
       { href: "/journal", label: "Journal", shortcut: "J", icon: BookOpen, keywords: ["notion", "entries", "reflection", "mood"] },
     ],

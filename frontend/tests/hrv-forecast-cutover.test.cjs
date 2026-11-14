@@ -99,7 +99,7 @@ test('getHrvResiduals reads the eval view (newest row per date) with model_versi
   };
   const queries = load('queries-hrv.ts', (id) => {
     if (id === '@/lib/supabase') return { supabase: client };
-    if (id === '@/lib/queries') return {};
+    if (id === '@/lib/queries' || id === '@/lib/sweet-spot') return {};
     throw new Error(id);
   });
   const out = await queries.getHrvResiduals();

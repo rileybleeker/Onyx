@@ -9,6 +9,7 @@ Usage:
     python eight_sleep_etl.py --backfill 30      # Backfill last 30 days
     python eight_sleep_etl.py --date 2025-06-15  # Sync a specific date
     python eight_sleep_etl.py --selfheal-max 0   # Skip the temp self-heal step
+    python eight_sleep_etl.py --selfheal-days 200  # Heal NULL temps up to 200 days back
 
 Requirements:
     pip install httpx supabase python-dotenv
@@ -446,6 +447,24 @@ def _prefer_trend(trend: dict, interval: dict, key: str):
     return v if v is not None else interval.get(key)
 
 
+def _split_rows_by_temp(rows: list[dict]) -> list[list[dict]]:
+    """Split upsert rows so a row with no temps never overwrites stored ones.
+
+    A date whose session is no longer among the 10 the /intervals collection
+    returns has both temps None here. Upserting that None would erase a temp
+    stored (or self-healed) earlier, e.g. on a wide --days catch-up. Those
+    rows are sent in their own batch without the two temp columns, so the
+    stored values stay. (One request needs the same keys on every row, hence
+    two batches.)
+    """
+    with_temp = [r for r in rows
+                 if any(r.get(c) is not None for c in TEMP_COLUMNS)]
+    without_temp = [{k: v for k, v in r.items() if k not in TEMP_COLUMNS}
+                    for r in rows
+                    if all(r.get(c) is None for c in TEMP_COLUMNS)]
+    return [b for b in (with_temp, without_temp) if b]
+
+
 def _strip_timeseries(data: dict) -> dict:
     """Return a copy with bulky timeseries arrays removed."""
     stripped = {}
@@ -570,9 +589,11 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
         rows.append(row)
 
     if rows:
-        count = upsert_to_supabase(
-            sb, "eight_sleep_trends", rows, "calendar_date,bed_side"
-        )
+        count = 0
+        for batch in _split_rows_by_temp(rows):
+            count += upsert_to_supabase(
+                sb, "eight_sleep_trends", batch, "calendar_date,bed_side"
+            )
         log.info(f"  [{bed_side}] Upserted {count} records "
                  f"({start_date} → {end_date})")
         return count
@@ -589,13 +610,28 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
 # dates the collection no longer covers) leaves median_bed_temp /
 # median_room_temp NULL. The per-ID endpoint serves any session, and the
 # trends rows already store mainSessionId, so each gap can be recovered.
-# eight_sleep_temp_backfill.py is the one-off, unbounded version of this step.
+# eight_sleep_temp_backfill.py runs this same function with no look-back bound.
 
 SELFHEAL_MAX_ROWS = 20        # per-ID API calls per run, both sides combined
 SELFHEAL_LOOKBACK_DAYS = 60   # only rows newer than this are scanned
 SELFHEAL_SCAN_LIMIT = 500     # rows read from Postgres per run
 SELFHEAL_DELAY_S = 0.3        # politeness delay between per-ID calls
 TEMP_COLUMNS = ("median_bed_temp", "median_room_temp")
+
+
+def _today() -> date:
+    """Today in the Eight Sleep time zone (the trends API is sliced by it).
+
+    A naive date.today() is the UTC date on the Actions runner, which is
+    already tomorrow during the ET evening.
+    """
+    return datetime.now(ZoneInfo(EIGHTSLEEP_TIMEZONE)).date()
+
+
+def _new_heal_stats() -> dict:
+    return {"candidates": 0, "attempted": 0, "lookups": 0, "healed": 0,
+            "no_temp": 0, "not_found": 0, "failed": 0, "skipped": 0,
+            "over_cap": 0, "scan_error": None}
 
 
 def _session_id_from_raw(raw) -> str | None:
@@ -619,33 +655,41 @@ def _session_id_from_raw(raw) -> str | None:
 
 def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
                     max_rows: int = SELFHEAL_MAX_ROWS,
-                    lookback_days: int = SELFHEAL_LOOKBACK_DAYS,
-                    delay_s: float = SELFHEAL_DELAY_S) -> dict:
+                    lookback_days: int | None = SELFHEAL_LOOKBACK_DAYS,
+                    delay_s: float = SELFHEAL_DELAY_S,
+                    dry_run: bool = False,
+                    scan_limit: int = SELFHEAL_SCAN_LIMIT) -> dict:
     """Fill NULL median_bed_temp / median_room_temp from /intervals/{id}.
 
-    Bounded: at most `max_rows` per-ID calls per run (rows with no usable
-    session id or bed side cost nothing and do not count). Idempotent and
-    non-destructive: only columns that are NULL are written, and the UPDATE
-    itself re-checks `IS NULL` so a concurrent writer is never overwritten.
+    Bounded: at most `max_rows` per-ID API calls per run. Rows with no usable
+    session id or bed side cost nothing, and a session shared by both bed
+    sides (one sleeper on a two-sided pod) is fetched once. When more
+    sessions need a lookup than the cap allows, the starting point rotates
+    with the date, so rows that can never be healed (a session without temp
+    readings) cannot keep older, healable rows waiting forever.
+    `lookback_days=None` scans every date (the one-off backfill).
+    Idempotent and non-destructive: only columns that are NULL are written,
+    and the UPDATE itself re-checks `IS NULL` so a concurrent writer is never
+    overwritten. `dry_run=True` does the lookups but writes nothing.
     Today is excluded (the session may still be processing). One failing row
     never stops the others; it stays NULL and is retried next run.
     Returns counters; `scan_error` is set if the candidate query failed.
     """
-    stats = {"candidates": 0, "attempted": 0, "healed": 0, "no_temp": 0,
-             "not_found": 0, "failed": 0, "skipped": 0, "scan_error": None}
+    stats = _new_heal_stats()
     if max_rows <= 0:
         return stats
     try:
+        q = (sb.schema("pds").from_("eight_sleep_trends")
+             .select("calendar_date,bed_side,raw_json,"
+                     "median_bed_temp,median_room_temp"))
+        if lookback_days is not None:
+            q = q.gte("calendar_date",
+                      (today - timedelta(days=lookback_days)).isoformat())
         rows = (
-            sb.schema("pds").from_("eight_sleep_trends")
-            .select("calendar_date,bed_side,raw_json,"
-                    "median_bed_temp,median_room_temp")
-            .gte("calendar_date",
-                 (today - timedelta(days=lookback_days)).isoformat())
-            .lt("calendar_date", today.isoformat())
+            q.lt("calendar_date", today.isoformat())
             .or_("median_bed_temp.is.null,median_room_temp.is.null")
             .order("calendar_date", desc=True)
-            .limit(SELFHEAL_SCAN_LIMIT)
+            .limit(scan_limit)
             .execute()
         ).data or []
     except Exception as e:  # noqa: BLE001 — heal must never fail the ETL
@@ -654,19 +698,41 @@ def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
         return stats
 
     stats["candidates"] = len(rows)
+    work: list[tuple[dict, tuple[str, str]]] = []
     for row in rows:
-        if stats["attempted"] >= max_rows:
-            break
-        cal, side = row.get("calendar_date"), row.get("bed_side")
-        user_id = users.get(side)
+        user_id = users.get(row.get("bed_side"))
         session_id = _session_id_from_raw(row.get("raw_json"))
         if not user_id or not session_id:
             stats["skipped"] += 1
             continue
+        work.append((row, (user_id, session_id)))
 
+    # One API call per distinct (user, session), newest first, capped.
+    keys = list(dict.fromkeys(key for _, key in work))
+    if len(keys) > max_rows:
+        start = (today.toordinal() * max_rows) % len(keys)
+        keys = (keys[start:] + keys[:start])[:max_rows]
+    chosen = set(keys)
+    fetched: dict[tuple[str, str], object] = {}
+
+    for row, key in work:
+        if key not in chosen:
+            stats["over_cap"] += 1
+            continue
+        cal, side = row.get("calendar_date"), row.get("bed_side")
+        session_id = key[1]
         stats["attempted"] += 1
         try:
-            interval = client.get_interval(user_id, session_id)
+            if key not in fetched:
+                stats["lookups"] += 1
+                try:
+                    fetched[key] = client.get_interval(*key)
+                except Exception as e:  # noqa: BLE001 — remembered, not retried for the other side
+                    fetched[key] = e
+                time.sleep(delay_s)
+            interval = fetched[key]
+            if isinstance(interval, Exception):
+                raise interval
             if interval is None:
                 stats["not_found"] += 1
                 log.info(f"  Self-heal [{cal}/{side}]: session {session_id} not found")
@@ -682,25 +748,28 @@ def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
             if not payload:
                 stats["no_temp"] += 1
                 continue
-            q = (sb.schema("pds").from_("eight_sleep_trends").update(payload)
-                 .eq("calendar_date", cal).eq("bed_side", side))
-            for col in payload:
-                q = q.is_(col, "null")
-            q.execute()
+            if not dry_run:
+                q = (sb.schema("pds").from_("eight_sleep_trends").update(payload)
+                     .eq("calendar_date", cal).eq("bed_side", side))
+                for col in payload:
+                    q = q.is_(col, "null")
+                q.execute()
             stats["healed"] += 1
-            log.info(f"  Self-heal [{cal}/{side}]: {payload}")
+            log.info(f"  Self-heal [{cal}/{side}]"
+                     f"{' (dry run, not written)' if dry_run else ''}: {payload}")
         except Exception as e:  # noqa: BLE001 — row stays NULL, retried next run
             stats["failed"] += 1
             log.warning(f"  Self-heal [{cal}/{side}] session {session_id} failed: {e}")
-        time.sleep(delay_s)
     return stats
 
 
 def _selfheal_summary(stats: dict, max_rows: int) -> str:
-    return (f"healed {stats['healed']} of {stats['attempted']} attempted "
-            f"(cap {max_rows}, {stats['candidates']} candidate rows); "
+    return (f"healed {stats['healed']} of {stats['attempted']} rows tried "
+            f"({stats['lookups']} lookups, cap {max_rows}; "
+            f"{stats['candidates']} candidate rows); "
             f"failed={stats['failed']} no_temp={stats['no_temp']} "
-            f"not_found={stats['not_found']} skipped={stats['skipped']}"
+            f"not_found={stats['not_found']} skipped={stats['skipped']} "
+            f"over_cap={stats['over_cap']}"
             + (f"; {stats['scan_error']}" if stats["scan_error"] else ""))
 
 
@@ -760,6 +829,11 @@ def main():
                         help="Max per-ID interval lookups the post-sync temp "
                              f"self-heal may make (default: {SELFHEAL_MAX_ROWS}; "
                              "0 disables)")
+    parser.add_argument("--selfheal-days", type=int,
+                        default=SELFHEAL_LOOKBACK_DAYS,
+                        help="How many days back the temp self-heal looks for "
+                             f"NULL temps (default: {SELFHEAL_LOOKBACK_DAYS}; "
+                             "raise once to recover an older gap)")
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -786,7 +860,7 @@ def main():
         users = all_users
 
     # Determine date range
-    today = date.today()
+    today = _today()
     if args.date:
         start = date.fromisoformat(args.date)
         end = start
@@ -814,26 +888,33 @@ def main():
             log.error(f"[{side}] Sync failed: {e}", exc_info=True)
 
     # Self-heal NULL temps the normal sync could not fill (before the matview
-    # refresh so healed values reach daily_health_matrix this run).
-    heal_t0 = time.time()
-    try:
-        heal = self_heal_temps(client, sb, users, today,
-                               max_rows=args.selfheal_max)
-    except Exception as e:  # noqa: BLE001 — never fail the ETL on the heal step
-        log.warning(f"Temp self-heal crashed: {e}")
-        heal = {"candidates": 0, "attempted": 0, "healed": 0, "no_temp": 0,
-                "not_found": 0, "failed": 0, "skipped": 0,
-                "scan_error": f"self-heal crashed: {e}"}
-    if heal["candidates"] or heal["scan_error"]:
+    # refresh so healed values reach daily_health_matrix this run). It never
+    # fails the ETL: a problem here turns the heartbeats `partial`, with the
+    # counts, and the rows stay NULL for the next run.
+    heal = _new_heal_stats()
+    heal_problem = None
+    if args.selfheal_max > 0:
+        heal_t0 = time.time()
+        try:
+            heal = self_heal_temps(client, sb, users, today,
+                                   max_rows=args.selfheal_max,
+                                   lookback_days=args.selfheal_days)
+        except Exception as e:  # noqa: BLE001 — never fail the ETL on the heal step
+            log.warning(f"Temp self-heal crashed: {e}")
+            heal["scan_error"] = f"self-heal crashed: {e}"
         summary = _selfheal_summary(heal, args.selfheal_max)
-        log.info(f"Temp self-heal: {summary}")
-        clean = not (heal["failed"] or heal["scan_error"])
+        log.info(f"Temp self-heal: {summary}" if heal["candidates"] or heal["scan_error"]
+                 else "Temp self-heal: nothing to heal")
+        if heal["failed"] or heal["scan_error"]:
+            heal_problem = f"temp self-heal: {summary}"[:500]
+        # Written on every run (0 = nothing to heal), so a missing row means
+        # the step did not run, not that there was nothing to do.
         log_sync(sb, "eight_sleep", "temp_selfheal",
-                 "success" if clean else "partial",
+                 "partial" if heal_problem else "success",
                  records=heal["healed"], started_at=heal_t0,
-                 date_range_start=today - timedelta(days=SELFHEAL_LOOKBACK_DAYS),
+                 date_range_start=today - timedelta(days=args.selfheal_days),
                  date_range_end=today,
-                 error=None if clean else summary)
+                 error=heal_problem)
 
     # Refresh materialized views
     log.info("Refreshing materialized views...")
@@ -845,10 +926,14 @@ def main():
 
     duration = time.time() - t0
 
-    log_sync(sb, "eight_sleep", "trends", "success" if errors == 0 else "partial",
+    # The /status Eight Sleep card reads this row only, so a heal problem is
+    # reported here too (the sync itself still counts its records).
+    problems = [p for p in (f"{errors} error(s)" if errors else None,
+                            heal_problem) if p]
+    log_sync(sb, "eight_sleep", "trends", "partial" if problems else "success",
              records=total_records, started_at=t0,
              date_range_start=start, date_range_end=end,
-             error=f"{errors} error(s)" if errors else None)
+             error="; ".join(problems) or None)
 
     log.info("=" * 60)
     log.info(f"Done! {total_records} total records | {heal['healed']} temps healed "

@@ -49,7 +49,6 @@ const CADENCE: Record<string, string> = {
   procurement: "Manual",
   kindle: "Every 3h (Riley's PC, while logged on)",
   amazon_orders: "Every 3h with the Kindle harvest (Riley's PC)",
-  screen_time: "Real-time (iPhone app open/close)",
   screen_usage: "Daily (iPhone Shortcuts automation)",
   notion_journal: "Hourly :35",
   tanita: "Daily 10am + 1:30pm ET",
@@ -97,7 +96,6 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   procurement:    { method: "manual",         label: "Manual entry" },
   kindle:         { method: "automated",      label: "Local Chrome harvest" },
   amazon_orders:  { method: "automated",      label: "Local Chrome harvest" },
-  screen_time:    { method: "automated",      label: "iOS Shortcuts events" },
   screen_usage:   { method: "automated",      label: "iPhone app export" },
   notion_journal: { method: "automated",      label: "Notion sync" },
   tanita:         { method: "automated",      label: "API ETL" },
@@ -254,7 +252,7 @@ export async function GET() {
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, screenTimeRes, deliveryRes, airQualityRes, airQualitySyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -340,10 +338,6 @@ export async function GET() {
         .eq("data_type", "refresh")
         .order("sync_start", { ascending: false })
         .limit(1),
-      // Phone screen time: newest app open/close event posted by the iPhone
-      // Shortcuts automation. No sync_log heartbeat — events arrive in real
-      // time, so the newest event IS the freshness signal.
-      supabase.from("phone_app_events").select("event_time,onyx_behavioral_date").order("event_time", { ascending: false }).limit(1),
       // Delivery orders: newest order date parsed from Uber Eats receipt emails.
       supabase.from("delivery_orders").select("order_date_local").order("order_date_local", { ascending: false }).limit(1),
       // Air quality: newest ET day in pds.air_quality_daily, plus a dedicated limit-1 heartbeat fetch
@@ -756,41 +750,10 @@ export async function GET() {
           methodLabel: METHOD.amazon_orders.label,
         };
       })(),
-      // Phone screen time (/api/screen-time/event): an iOS Shortcuts automation
-      // posts every app open/close in real time. Freshness = hours since the
-      // newest event. The phone sits idle overnight, so >12h = degraded and
-      // >36h = red (automation disabled, token wrong, or iOS stopped firing it).
-      screen_time: (() => {
-        const last = (screenTimeRes.data?.[0]?.event_time as string | undefined) ?? null;
-        const ageH = last ? (Date.now() - new Date(last).getTime()) / 3600000 : Infinity;
-        const status: SourceStatus["status"] = screenTimeRes.error
-          ? "failed"
-          : !last
-            ? "unknown"
-            : ageH > 36
-              ? "failed"
-              : ageH > 12
-                ? "partial"
-                : "success";
-        return {
-          label: "Screen Time",
-          lastSync: last,
-          status,
-          latestDataDate: (screenTimeRes.data?.[0]?.onyx_behavioral_date as string | undefined) ?? null,
-          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
-          recordsSynced: 0,
-          durationSeconds: null,
-          errorMessage: screenTimeRes.error?.message
-            ?? (ageH > 36 && last ? `No app events for ${Math.floor(ageH)}h — check the iPhone Shortcuts automation.` : null),
-          cadence: CADENCE.screen_time,
-          integrationMethod: METHOD.screen_time.method,
-          methodLabel: METHOD.screen_time.label,
-        };
-      })(),
       // Onyx Screen Time iPhone app (tools/screentime_ios -> /api/screen-time/usage):
       // a daily Shortcuts automation runs the app's "Sync Screen Time to Onyx"
-      // intent, and every POST writes a screen_time|usage heartbeat. Kept separate
-      // from the card above (the older open/close events path) while both exist.
+      // intent, and every POST writes a screen_time|usage heartbeat. (The older
+      // Shortcuts open/close path and its "Screen Time" card were retired 2026-11-13.)
       // The app reports its own failures (Screen Time unreadable, network, HTTP)
       // as a failed row (2026-11-11), but a missing or refused token cannot be
       // reported, so the card still ages out: >26h degraded, >36h or a failed
