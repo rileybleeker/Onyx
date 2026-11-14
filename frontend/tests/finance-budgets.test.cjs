@@ -122,3 +122,19 @@ test("cancel tracker: waiting, stopped, still charging", () => {
   assert.match(v.aaaaaaaaaaaaaaaa.cancelSearchUrl, /^https:\/\/www\.google\.com\/search\?q=how%20to%20cancel/);
   assert.equal(S.activeMonthly(Object.values(v)), 3_000);
 });
+
+test("review and rules group per-charge codes under one merchant; interest is not a subscription", () => {
+  const rows = [
+    tx("2030-06-02", 2_000, "PWP DEMO.COM DEMOCOM abc123XYZ RILEY", null),
+    tx("2030-06-03", 3_000, "PWP DEMO.COM DEMOCOM zz9QQ8 RILEY", null),
+  ];
+  const r = B.computeBudgets(rows, new Map(), TODAY);
+  assert.equal(r.uncategorized.length, 1);
+  assert.equal(r.uncategorized[0].count, 2);
+  const key = r.uncategorized[0].key;
+  const fixes = { rules: new Map([[key, "Shopping"]]), overrides: new Map() };
+  assert.equal(C.fixedCategory({ txn_key: "z", name: "PWP DEMO.COM DEMOCOM newcode77 RILEY", category: null }, fixes), "Shopping");
+  const S = loadTs("lib/finance-subscriptions.ts");
+  const views = S.subscriptionViews([{ id: "dddddddddddddddd", merchant: "Interest Charge on Demo Purchases", cadence: "monthly", typicalCents: 100, monthlyCents: 100, lastCharge: "2030-06-01", nextExpected: "2030-07-01", status: "active" }], new Map(), TODAY);
+  assert.equal(views.length, 0);
+});

@@ -22,6 +22,8 @@ export interface SubscriptionView {
 
 export function subscriptionViews(subs: readonly DetectedSubscription[], marks: ReadonlyMap<string, string>, today: string): SubscriptionView[] {
   return subs
+    // Interest charges repeat monthly but are the cost of a card balance, not a subscription (see the forecast's Cards).
+    .filter((s) => !/\binterest\b/i.test(s.merchant))
     .filter((s) => s.status === "active" || marks.has(s.id))
     .map((s) => {
       const markedOn = marks.get(s.id) ?? null;
