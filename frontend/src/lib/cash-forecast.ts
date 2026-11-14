@@ -162,8 +162,31 @@ export interface CardProjection {
   monthlySpendCents: number;
   monthlyPaymentCents: number;
   interestNext12Cents: number;
+  promoAprPct: number | null;
+  standardAprPct: number;
+  standardAprAssumed: boolean;
   months: { month: string; owed: number; interest: number }[];
   warnings: string[];
+}
+/** A dated call-out: a 0% (or low) promo rate ends on a card. */
+export interface PromoMilestone {
+  date: string;
+  kind: "promo-end";
+  account_key: string;
+  label: string;
+  promoAprPct: number;
+  source: string;
+  /** Still owed on that date at the current payments (balance-positive size of the debt). */
+  owedAtEndCents: number;
+  standardAprPct: number;
+  standardAprAssumed: boolean;
+  /** Interest a month once the promo ends, on what would still be owed. */
+  interestPerMonthAfterCents: number;
+  /** Paying this much a month (current spending included) clears the card before the promo ends. */
+  payPerMonthToClearCents: number;
+  daysAway: number;
+  withinHorizon: boolean;
+  ended: boolean;
 }
 export interface NetWorthMonth {
   month: string;
@@ -190,7 +213,9 @@ export interface ForecastResult {
     safeToMoveCents: number;
     end13w: { likely: number; low: number; high: number } | null;
     end12m: { likely: number; low: number; high: number } | null;
+    nextPromoEnd: PromoMilestone | null;
   };
+  milestones: PromoMilestone[];
   cards: CardProjection[];
   netWorth: NetWorthMonth[];
   notes: string[];
@@ -728,7 +753,7 @@ function expandPlanned(items: readonly PlannedItem[]): PlannedOcc[] {
 
 // ─── The forecast ─────────────────────────────────────────────────────────────────────────────
 
-const EMPTY_HEADLINES: ForecastResult["headlines"] = { lowest: null, lowestLikely: null, safeToMoveCents: 0, end13w: null, end12m: null };
+const EMPTY_HEADLINES: ForecastResult["headlines"] = { lowest: null, lowestLikely: null, safeToMoveCents: 0, end13w: null, end12m: null, nextPromoEnd: null };
 
 export function forecastCash(input: ForecastInput): ForecastResult {
   const { today } = input;
@@ -758,6 +783,7 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     headlines: EMPTY_HEADLINES,
     cards: [],
     netWorth: [],
+    milestones: [],
     notes,
     warnings,
   };
@@ -1017,6 +1043,7 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     safeToMoveCents: lowest ? Math.max(0, Math.min(opening, lowest.cents) - buffer) : 0,
     end13w: at(Math.min(91, H)),
     end12m: at(Math.min(365, H)),
+    nextPromoEnd: null,
   };
 
   // Rollups from the likely lines.
@@ -1046,6 +1073,8 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   // Net worth side.
   const cards = projectCards(input, latest, cardRows, streamPlans, today);
   const netWorth = projectNetWorth(input, latest, cards, days, today);
+  const milestones = promoMilestones(cards, today, horizonEnd);
+  headlines.nextPromoEnd = milestones.find((m) => !m.ended) ?? null;
 
   return {
     ...base,
@@ -1059,7 +1088,41 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     headlines,
     cards,
     netWorth,
+    milestones,
   };
+}
+
+/** Promo end dates as dated call-outs, soonest first (Riley, 2026-11-14: the forecast must show where the 0% ends). */
+function promoMilestones(cards: CardProjection[], today: string, horizonEnd: string): PromoMilestone[] {
+  const thisMonth = monthIndex(monthKeyOf(today));
+  const out: PromoMilestone[] = [];
+  for (const c of cards) {
+    if (!c.promoEnds) continue;
+    const end = c.promoEnds;
+    const endMonth = monthKeyOf(end);
+    const ended = end < today;
+    const atEnd = ended || monthIndex(endMonth) <= thisMonth
+      ? c.owedNow
+      : (c.months.find((m) => m.month === endMonth)?.owed ?? c.months[c.months.length - 1]?.owed ?? c.owedNow);
+    const monthsLeft = Math.max(1, monthIndex(endMonth) - thisMonth + 1);
+    out.push({
+      date: end,
+      kind: "promo-end",
+      account_key: c.account_key,
+      label: c.label,
+      promoAprPct: c.promoAprPct ?? 0,
+      source: c.promoSource ?? "entered",
+      owedAtEndCents: atEnd,
+      standardAprPct: c.standardAprPct,
+      standardAprAssumed: c.standardAprAssumed,
+      interestPerMonthAfterCents: Math.round((atEnd * c.standardAprPct) / 100 / 12),
+      payPerMonthToClearCents: ended ? 0 : Math.ceil((c.owedNow + c.monthlySpendCents * monthsLeft) / monthsLeft),
+      daysAway: daysBetween(today, end),
+      withinHorizon: end <= horizonEnd,
+      ended,
+    });
+  }
+  return out.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 }
 
 const fmt = (cents: number): string => `$${Math.round(Math.abs(cents) / 100).toLocaleString("en-US")}`;
@@ -1186,6 +1249,9 @@ function projectCards(
       monthlySpendCents: monthlySpend,
       monthlyPaymentCents: monthlyPayment,
       interestNext12Cents: interestNext12,
+      promoAprPct: promoEnds ? promoApr : null,
+      standardAprPct: standardApr,
+      standardAprAssumed: typeof t?.standardAprPct !== "number",
       months,
       warnings,
     });

@@ -108,6 +108,7 @@ forecast, month by month for 12 months:
   from the statement.
 - **Promo end date per card** (driver, from the statement): after it, the card's remaining balance accrues at its
   standard APR (driver). The page warns 60 days before: "$X on <card> starts accruing about $Y a month on <date>".
+- **Promo end call-outs (built):** every promo end date is a dated milestone in the forecast (`milestones`, soonest first, and `headlines.nextPromoEnd`): the card, the amount still owed then at the current payments, the monthly interest it would then cost, and the monthly payment that clears it in time. The Forecast tab draws them on the balance chart and lists them with the upcoming lines.
 - **Cost of carrying:** projected interest for the next 12 months per card, and a what-if "pay $X off <card> on
   <date>" (for example from the January bonus), which shows the interest saved against the lower cash low point.
 
