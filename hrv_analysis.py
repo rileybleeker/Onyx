@@ -1437,6 +1437,11 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
     stays NaN, so a broken ETL cannot manufacture zero days. `unread_days` (days that may hold
     a receipt the ETL could not read) are never zero-filled either.
 
+    UNEATEN ORDERS — since 2026-11-14 the view does not count a restaurant order whose every
+    food dish was marked None on the delivery day (sql/delivery_item_leftovers.sql): it was not
+    a meal that night. A day left with no meal reads 0 like a store-only day. Leftovers eaten on
+    a later day carry no clock time and never enter these features.
+
     UNKNOWN TIMES — a day with a meal whose receipt carries no clock time keeps its count,
     but its late flag is NaN unless another meal that day is known to be late.
     Pre-Nov-2025 delivery times are estimates (card charge − 70 min); see
