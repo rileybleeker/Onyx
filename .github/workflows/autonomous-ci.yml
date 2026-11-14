@@ -1,21 +1,30 @@
 name: Autonomous CI
+run-name: Autonomous CI ${{ inputs.sha || github.sha }}
 on:
   pull_request:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      sha:
+        description: Immutable commit to test (defaults to event commit)
+        required: false
+        type: string
 permissions:
   contents: read
 concurrency:
-  group: autonomous-ci-${{ github.ref }}
+  group: autonomous-ci-${{ inputs.sha || github.ref }}
   cancel-in-progress: true
 jobs:
   offline-checks:
+    # A pinned checkout must not satisfy required checks on the dispatch ref.
+    name: ${{ inputs.sha && 'offline-checks-pinned' || 'offline-checks' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ inputs.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -35,6 +44,7 @@ jobs:
       - name: Merge train decision tests (no credentials or network)
         run: python -m unittest discover -s tests -p test_merge_train.py -v
   frontend-types:
+    name: ${{ inputs.sha && 'frontend-types-pinned' || 'frontend-types' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     defaults:
@@ -43,6 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ inputs.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:

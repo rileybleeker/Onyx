@@ -337,20 +337,42 @@ def master_ci_verdict(runs: list[dict], master_moved: bool) -> tuple[str, str] |
     return None
 
 
+def ci_runs_for_sha(runs: list[dict], sha: str) -> list[dict]:
+    """Dispatch metadata head_sha belongs to the workflow ref, not its pinned checkout.
+
+    New runs declare the immutable tested commit in run-name. Legacy runs can only
+    be attributed by head_sha; never let a new pinned run count for its dispatch ref.
+    """
+    title = "Autonomous CI " + sha
+    return [r for r in runs if r.get("display_title") == title or
+            (not r.get("display_title", "").startswith("Autonomous CI ") and r.get("head_sha") == sha)]
+
+
 def wait_master_ci(sha: str, timeout: int = 600) -> tuple[str, str]:
-    """Autonomous CI on the merge commit. A token-made merge may start no push run, so dispatch one if none exists."""
+    """Wait for the immutable merge commit, not the mutable dispatch branch."""
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("CI verification requires a full commit SHA")
+
     def runs():
-        return api_items(f"repos/{REPO}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={sha}&per_page=10",
-                         ".workflow_runs[]|{id,status,conclusion}")
-    time.sleep(45)
-    if not runs():
-        gh("workflow", "run", CI_WORKFLOW, "-R", REPO, "--ref", BASE)
+        # Do not filter head_sha: for workflow_dispatch that is the workflow ref's
+        # commit, which can advance between dispatch and checkout.
+        rows = api_json(f"repos/{REPO}/actions/workflows/{CI_WORKFLOW}/runs?per_page=100")["workflow_runs"]
+        return ci_runs_for_sha(rows, sha)
+
+    current = runs()
+    if not current:
+        if master_sha() != sha:
+            return "skipped", "master moved on before CI dispatch; newer merge verification owns production"
+        gh("workflow", "run", CI_WORKFLOW, "-R", REPO, "--ref", BASE, "-f", f"sha={sha}")
     end = time.time() + timeout
     while time.time() < end:
         current = runs()
-        verdict = master_ci_verdict(current, master_sha() != sha)
+        moved = master_sha() != sha
+        verdict = master_ci_verdict(current, moved)
         if verdict:
             return verdict
+        if moved and not current:
+            return "skipped", "master moved on before CI appeared; newer merge verification owns production"
         time.sleep(20)
     return ci_timeout_verdict(timeout)
 
