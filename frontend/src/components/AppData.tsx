@@ -7,6 +7,9 @@ import { AGENTS_API, agentsApi, type InboxResponse } from "@/lib/agents-api";
 import { NAV_ITEMS } from "@/lib/nav";
 import { overviewWarmers } from "@/components/overview/sources";
 import {
+  BEHAVIORAL_TODAY_URL, LOG_EARLIER_DAYS, UBER_EATS_CHECK_KEY, deliveryWindowDays, deliveryWindowKey, initialBehavioralToday,
+} from "@/lib/log-ubereats";
+import {
   CACHE_KEYS, clientCache, fetchJsonValue, reportSessionEnded, sessionEnded, setSessionEndedHandler, wipeClientData, writeInvalidates,
 } from "@/lib/client-cache";
 import { IdbCacheBackend, idbAvailable } from "@/lib/client-cache-idb";
@@ -40,6 +43,17 @@ function localDay(d: Date): string {
 
 const inboxWarmer: DataWarmer = { key: CACHE_KEYS.agentsInbox, fetch: () => agentsApi.inbox() };
 
+function logUberEatsWarmers(): DataWarmer[] {
+  // Same day the section paints first, so the warmed window is the one it reads.
+  const today = initialBehavioralToday(clientCache.peek(BEHAVIORAL_TODAY_URL), clientCache.fetchedAt(BEHAVIORAL_TODAY_URL));
+  const days = deliveryWindowDays(today, LOG_EARLIER_DAYS);
+  return [
+    json(BEHAVIORAL_TODAY_URL),
+    { key: deliveryWindowKey(today, LOG_EARLIER_DAYS), fetch: () => import("@/lib/queries").then((q) => q.getDeliveryWindow(days)) },
+    { key: UBER_EATS_CHECK_KEY, fetch: () => import("@/lib/queries").then((q) => q.getUberEatsCheck()) },
+  ];
+}
+
 // GET reads each page's client makes when it opens. Same keys and the same raw values the pages store.
 // /api/experiments/today is deliberately absent: reading it stamps the arm as revealed, so only Today asks.
 const DATA: Record<string, () => DataWarmer[]> = {
@@ -68,6 +82,8 @@ const DATA: Record<string, () => DataWarmer[]> = {
     json("/api/supplements/today"),
     json("/api/supplements/stacks"),
     json("/api/supplements/products"),
+    // Uber Eats (app/log/sections/UberEats.tsx): behavioral today, today's dish window, the harvester heartbeat.
+    ...logUberEatsWarmers(),
   ],
   "/agents": () => {
     const inbox = clientCache.peek<InboxResponse>(CACHE_KEYS.agentsInbox);

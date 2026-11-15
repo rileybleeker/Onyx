@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getDeliveryItemsForDays, getDeliveryLeftovers, type DeliveryDish } from "@/lib/queries";
+import { getDeliveryWindow, type DeliveryDish, type DeliveryWindow } from "@/lib/queries";
 import {
   PORTION_OPTIONS,
   checkinDishGroups,
@@ -14,7 +14,6 @@ import {
 } from "@/lib/delivery-portion";
 import {
   LEFTOVER_OPTIONS,
-  LEFTOVER_WINDOW_DAYS,
   bodyForToken,
   clockNow,
   formatClock,
@@ -29,12 +28,15 @@ import {
   type LeftoverRow,
   type LeftoverToken,
 } from "@/lib/delivery-leftovers";
+import { deliveryWindowDays } from "@/lib/log-ubereats";
+import { FROM_WHAT_YOU_SAID } from "@/lib/log-drafts";
+import { clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 
 // Uber Eats dishes + the one-tap "Ate: All / 3/4 / 1/2 / 1/4 / None" control.
-// Shared by /nutrition (Today's Meals, one day) and /check-in (the checked-in day plus earlier days'
-// dishes whose portion was never set: the harvester runs every 6 h, so a late dinner usually lands after
-// that evening's check-in). Each tap saves on its own through PATCH /api/delivery/items/[itemId]: the
+// Shared by /nutrition (Today's Meals, one day), /check-in and the Uber Eats section of /log (the day plus
+// earlier days' dishes whose portion was never set: a dinner delivered after the evening check-in is asked
+// the next evening). Each tap saves on its own through PATCH /api/delivery/items/[itemId]: the
 // kcal shown change at once (optimistic). Writes are serialized per dish (createPortionSaver), and a
 // failed save goes back to the last value the server confirmed, with a message.
 //
@@ -43,6 +45,10 @@ import { sameJson } from "@/lib/format";
 // PUT /api/delivery/items/[itemId]/leftovers, saved the same way (one serialized slot per dish and day).
 // Unanswered leftovers count as thrown out. A question appears as soon as the portion is set below All,
 // also when that happens on this screen.
+//
+// /log (2026-11-15) adds two opt-in options: `cacheKey` (paint the last copy from the client cache, then read
+// again) and `reloadKey` (read the same window again when the harvester has run), plus the "from what you said"
+// marks on the controls (`suggestions`). Without them the hook and the lists behave as before.
 
 export type DishGroup = { date: string; items: DeliveryDish[]; totalKcal: number | null };
 
@@ -64,6 +70,14 @@ type Opts = {
   earlierDays?: number;
   /** Called after each successful save (e.g. to refresh charts). The latest callback is used. */
   onSaved?: () => void;
+  /**
+   * Client-cache key of this window (deliveryWindowKey in lib/log-ubereats.ts): the last copy is shown at once,
+   * then the window is read again. Every Uber Eats write drops the key ("delivery:") and the registered fetcher
+   * reads it again in the background. Without a key the window is read from the database on every load.
+   */
+  cacheKey?: string | null;
+  /** Change it to read the same window again. Dishes already on screen stay on screen. */
+  reloadKey?: number;
 };
 
 async function failure(res: Response) {
@@ -112,13 +126,62 @@ type State = {
   keptIds: number[];
   leftovers: LeftoverRow[];
   loadError: string | null;
+  /** A copy is on screen and reading the window again failed. */
+  refreshFailed: boolean;
 };
+
+const EMPTY: State = { key: null, all: [], keptIds: [], leftovers: [], loadError: null, refreshFailed: false };
+
+function isWindow(v: unknown): v is DeliveryWindow {
+  return !!v && typeof v === "object" && Array.isArray((v as DeliveryWindow).rows) && Array.isArray((v as DeliveryWindow).stored);
+}
+
+/**
+ * The screen state for one loaded window. `seedPortion` / `seedLeftover` return the value to show for a dish /
+ * (dish, day) slot (the saver's: a save still in flight wins over the loaded value).
+ */
+function windowState(
+  key: string,
+  date: string,
+  earlierDays: number,
+  { rows, stored }: DeliveryWindow,
+  seedPortion: (itemId: number, stored: number | null) => number | null,
+  seedLeftover: (k: string, stored: LeftoverToken) => LeftoverToken,
+): State {
+  const firstAsked = shiftYmd(date, -earlierDays);
+  // Which dishes get the portion control is decided here, once per load: the day's dishes plus
+  // earlier days' (within earlierDays) still unset, so an earlier dish stays on screen after a tap.
+  const keptIds = checkinDishGroups(
+    rows.filter((r) => r.behavioral_date >= firstAsked),
+    date,
+  ).flatMap((g) => g.items.map((i) => i.item_id));
+  // Dishes with a save still in flight keep the value on screen, not the (older) loaded one.
+  const all = rows.map((r) => {
+    const shown = seedPortion(r.item_id, r.eaten_fraction);
+    return shown === r.eaten_fraction ? r : { ...r, eaten_fraction: shown, est_kcal: dishKcal(r.unit_kcal, r.quantity, shown) };
+  });
+  // Answers for THIS day go through the leftover saver (a save in flight wins); other days as stored.
+  let leftovers = stored.filter((s) => s.eaten_date !== date);
+  for (const r of rows) {
+    if (r.behavioral_date >= date) continue;
+    const row = stored.find((s) => s.item_id === r.item_id && s.eaten_date === date);
+    leftovers = withToken(leftovers, r.item_id, date, seedLeftover(slot(r.item_id, date), tokenOfRow(row)));
+  }
+  leftovers.sort((a, b) => a.item_id - b.item_id || (a.eaten_date < b.eaten_date ? -1 : a.eaten_date > b.eaten_date ? 1 : 0));
+  return { key, all, keptIds, leftovers, loadError: null, refreshFailed: false };
+}
 
 export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
   const earlierDays = opts.earlierDays ?? 0;
-  const span = Math.max(earlierDays, LEFTOVER_WINDOW_DAYS);
+  const cacheKey = opts.cacheKey ?? null;
+  const reloadKey = opts.reloadKey ?? 0;
   const key = date ? `${date}|${earlierDays}` : null;
-  const [state, setState] = useState<State>({ key: null, all: [], keptIds: [], leftovers: [], loadError: null });
+  // With a cache key, the first render already shows the cached copy (no skeleton frame).
+  const [state, setState] = useState<State>(() => {
+    if (!cacheKey || !date || !key) return EMPTY;
+    const hit = clientCache.peek(cacheKey);
+    return isWindow(hit) ? windowState(key, date, earlierDays, hit, (_, v) => v, (_, t) => t) : EMPTY;
+  });
   const [error, setError] = useState<string | null>(null);
 
   const onSavedRef = useRef(opts.onSaved);
@@ -129,6 +192,9 @@ export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
   const shownDays = useRef<Set<string>>(new Set());
   const dishDay = useRef(new Map<number, string>());
   const screenDate = useRef<string | null>(null);
+  // The window last shown by a load (a reload of it shows no cached copy first), and the key the message is for.
+  const loadedKey = useRef<string | null>(null);
+  const errorKey = useRef<string | null>(null);
 
   const apply = useCallback(
     (itemId: number, fraction: number | null) =>
@@ -170,59 +236,88 @@ export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
   );
 
   useEffect(() => {
-    setError(null);
+    if (errorKey.current !== key) {
+      setError(null);
+      errorKey.current = key;
+    }
     screenDate.current = date;
     if (!date || !key) {
       shownDays.current = new Set();
       return;
     }
-    const days = Array.from({ length: span + 1 }, (_, i) => shiftYmd(date, -i));
+    const days = deliveryWindowDays(date, earlierDays);
     const firstAsked = shiftYmd(date, -earlierDays);
     shownDays.current = new Set(days.filter((d) => d >= firstAsked));
     let cancelled = false;
-    (async () => {
-      const rows = await getDeliveryItemsForDays(days);
-      const stored = await getDeliveryLeftovers(rows.map((r) => r.item_id));
-      return { rows, stored };
-    })()
-      .then(({ rows, stored }) => {
-        if (cancelled) return;
-        // Which dishes get the portion control is decided here, once per load: the day's dishes plus
-        // earlier days' (within earlierDays) still unset, so an earlier dish stays on screen after a tap.
-        const keptIds = checkinDishGroups(
-          rows.filter((r) => r.behavioral_date >= firstAsked),
-          date,
-        ).flatMap((g) => g.items.map((i) => i.item_id));
-        // Dishes with a save still in flight keep the value on screen, not the (older) loaded one.
-        const all = rows.map((r) => {
-          dishDay.current.set(r.item_id, r.behavioral_date);
-          const shown = saver.seed(r.item_id, r.eaten_fraction);
-          return shown === r.eaten_fraction ? r : { ...r, eaten_fraction: shown, est_kcal: dishKcal(r.unit_kcal, r.quantity, shown) };
-        });
-        // Answers for THIS day go through the leftover saver (a save in flight wins); other days as stored.
-        let leftovers = stored.filter((s) => s.eaten_date !== date);
-        for (const r of rows) {
-          if (r.behavioral_date >= date) continue;
-          const row = stored.find((s) => s.item_id === r.item_id && s.eaten_date === date);
-          leftovers = withToken(leftovers, r.item_id, date, leftoverSaver.seed(slot(r.item_id, date), tokenOfRow(row)));
-        }
-        leftovers.sort((a, b) => a.item_id - b.item_id || (a.eaten_date < b.eaten_date ? -1 : a.eaten_date > b.eaten_date ? 1 : 0));
-        const next: State = { key, all, keptIds, leftovers, loadError: null };
-        setState((prev) => (prev.key === key && !prev.loadError && sameJson(prev, next) ? prev : next));
-      })
-      .catch((e) => {
-        console.error("Uber Eats dishes:", e);
-        if (!cancelled) setState({ key, all: [], keptIds: [], leftovers: [], loadError: "Couldn't load Uber Eats dishes." });
+    let painted = loadedKey.current === key;
+    let fresh = false;
+    let failed = false;
+
+    const show = (w: DeliveryWindow) => {
+      for (const r of w.rows) dishDay.current.set(r.item_id, r.behavioral_date);
+      const next = windowState(key, date, earlierDays, w, (id, v) => saver.seed(id, v), (k, t) => leftoverSaver.seed(k, t));
+      setState((prev) => {
+        const same = prev.key === key && !prev.loadError;
+        // A reload keeps the dishes already on screen (a dish answered here must not vanish).
+        const ids = new Set(next.all.map((r) => r.item_id));
+        const keptIds = same ? [...next.keptIds, ...prev.keptIds.filter((id) => ids.has(id) && !next.keptIds.includes(id))] : next.keptIds;
+        const merged = keptIds === next.keptIds ? next : { ...next, keptIds };
+        return same && sameJson(prev, merged) ? prev : merged;
       });
+      painted = true;
+      loadedKey.current = key;
+    };
+    const fail = (e: unknown) => {
+      if (cancelled) return;
+      console.error("Uber Eats dishes:", e);
+      failed = true;
+      if (painted) setState((prev) => (prev.key === key && !prev.refreshFailed ? { ...prev, refreshFailed: true } : prev));
+      else setState({ ...EMPTY, key, loadError: "Couldn't load Uber Eats dishes." });
+    };
+    const load = () => getDeliveryWindow(days);
+
+    if (cacheKey) {
+      clientCache.register(cacheKey, load);
+      if (!painted) {
+        const hit = clientCache.peek(cacheKey);
+        if (isWindow(hit)) show(hit);
+        else {
+          void clientCache
+            .read(cacheKey)
+            .then((v) => {
+              if (cancelled || fresh || painted || !isWindow(v)) return;
+              show(v);
+              // The read again already failed: the copy now on screen is the last one.
+              if (failed) setState((prev) => (prev.key === key ? { ...prev, refreshFailed: true } : prev));
+            })
+            .catch(() => {});
+        }
+      }
+      clientCache
+        .revalidate(cacheKey, load)
+        .then((v) => {
+          if (cancelled) return;
+          if (!isWindow(v)) throw new Error("Uber Eats window missing");
+          fresh = true;
+          show(v);
+        })
+        .catch(fail);
+    } else {
+      load()
+        .then((v) => {
+          if (!cancelled) show(v);
+        })
+        .catch(fail);
+    }
     return () => {
       cancelled = true;
     };
-  }, [date, key, earlierDays, span, saver, leftoverSaver]);
+  }, [date, key, earlierDays, cacheKey, reloadKey, saver, leftoverSaver]);
 
   const setFraction = useCallback(
     (dish: DeliveryDish, fraction: number | null) => {
       setError(null);
-      void saver.set(dish.item_id, fraction);
+      return saver.set(dish.item_id, fraction);
     },
     [saver],
   );
@@ -275,6 +370,16 @@ export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
     [date, leftoverSaver],
   );
 
+  /** Store this exact answer for the question's day (a suggestion being saved). Resolves when it settled. */
+  const saveLeftover = useCallback(
+    (q: LeftoverQuestion, token: LeftoverToken) => {
+      if (!date) return Promise.resolve();
+      setError(null);
+      return leftoverSaver.set(slot(q.dish.item_id, date), token);
+    },
+    [date, leftoverSaver],
+  );
+
   const leftoverKcal = dayKcal(leftovers.map((q) => ({ est_kcal: q.kcal, est_kind: q.dish.est_kind })));
   const portionKcal = dayKcal(items.filter((i) => i.behavioral_date === date));
   const totalKcal = portionKcal == null && leftoverKcal == null ? null : (portionKcal ?? 0) + (leftoverKcal ?? 0);
@@ -285,10 +390,15 @@ export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
     leftovers,
     loaded,
     loadError: loaded ? state.loadError : null,
+    /** A copy is on screen and reading it again failed. */
+    refreshFailed: loaded && state.refreshFailed,
+    /** Every dish of the loaded window (also the ones without a control on screen). */
+    dishes: loaded ? state.all : [],
     error,
     setFraction,
     setLeftover,
     setLeftoverTime,
+    saveLeftover,
     leftoverKcal,
     /** Uber Eats kcal eaten on `date`: its own dishes plus leftovers eaten that day. */
     totalKcal,
@@ -299,27 +409,49 @@ function timeOf(iso: string | null): string {
   return iso ? new Date(iso).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" }) : "—";
 }
 
-export function PortionControl({ dish, onPick }: { dish: DeliveryDish; onPick: (fraction: number) => void }) {
+// A suggested answer from the Say it box (/log): drawn dashed, not saved until that section's Save.
+const SUGGESTED_CLASS = "border-dashed border-accent text-accent bg-accent/10";
+
+function SuggestionNote({ text }: { text: string }) {
+  return <div className="mt-1 text-right text-[11px] font-mono text-accent/80">{FROM_WHAT_YOU_SAID}: {text}, not saved yet</div>;
+}
+
+export function PortionControl({
+  dish,
+  onPick,
+  suggested,
+}: {
+  dish: DeliveryDish;
+  onPick: (fraction: number) => void;
+  /** A suggested portion (not saved): drawn dashed. An assumed All yields to it. */
+  suggested?: number | null;
+}) {
   const current = selectedPortion(dish.eaten_fraction);
   const assumed = dish.eaten_fraction == null;
+  const hint = suggested != null && suggested !== dish.eaten_fraction;
   return (
     <div className="flex items-center gap-1" role="group" aria-label={`How much of ${dish.title} you ate`}>
       <span className="text-[10px] font-mono text-text-tertiary mr-0.5">Ate</span>
       {PORTION_OPTIONS.map((o) => {
         const on = current === o.value;
+        const isSuggested = hint && o.value === suggested;
+        // An unset dish shows its assumed All; with a suggestion only the suggestion is marked.
+        const lit = on && !(assumed && hint);
         return (
           <button
             key={o.label}
             type="button"
             onClick={() => onPick(o.value)}
             aria-pressed={on}
-            title={on && assumed ? "Assumed (not set yet). Tap to confirm." : undefined}
+            title={isSuggested ? "From what you said. Not saved yet." : on && assumed ? "Assumed (not set yet). Tap to confirm." : undefined}
             className={`h-7 min-w-[2.25rem] px-1.5 rounded-control border text-[11px] font-mono transition-colors ${
-              on
-                ? assumed
-                  ? "border-dashed border-accent/50 text-accent/80 bg-accent/5"
-                  : "border-accent/70 bg-accent/20 text-accent"
-                : "border-border-subtle text-text-tertiary hover:text-text-secondary"
+              isSuggested
+                ? SUGGESTED_CLASS
+                : lit
+                  ? assumed
+                    ? "border-dashed border-accent/50 text-accent/80 bg-accent/5"
+                    : "border-accent/70 bg-accent/20 text-accent"
+                  : "border-border-subtle text-text-tertiary hover:text-text-secondary"
             }`}
           >
             {o.label}
@@ -333,10 +465,13 @@ export function PortionControl({ dish, onPick }: { dish: DeliveryDish; onPick: (
 export function DeliveryDishList({
   items,
   onPick,
+  suggestions,
   className = "",
 }: {
   items: DeliveryDish[];
   onPick: (dish: DeliveryDish, fraction: number) => void;
+  /** item_id -> suggested portion (the /log Say it box), shown "from what you said" until saved. */
+  suggestions?: ReadonlyMap<number, number>;
   className?: string;
 }) {
   if (items.length === 0) return null;
@@ -359,8 +494,11 @@ export function DeliveryDishList({
             </span>
           </div>
           <div className="mt-1.5 flex justify-end">
-            <PortionControl dish={d} onPick={(f) => onPick(d, f)} />
+            <PortionControl dish={d} onPick={(f) => onPick(d, f)} suggested={suggestions?.get(d.item_id)} />
           </div>
+          {suggestions?.has(d.item_id) && suggestions.get(d.item_id) !== d.eaten_fraction && (
+            <SuggestionNote text={`ate ${PORTION_OPTIONS.find((o) => o.value === suggestions.get(d.item_id))?.label ?? ""}`} />
+          )}
         </div>
       ))}
     </div>
@@ -383,9 +521,12 @@ export function LeftoverList({
   onPick,
   onTime,
   showNow = false,
+  suggestions,
   className = "",
 }: {
   questions: LeftoverQuestion[];
+  /** item_id -> suggested answer (the /log Say it box), shown "from what you said" until saved. */
+  suggestions?: ReadonlyMap<number, { option: string; time: string | null }>;
   onPick: (q: LeftoverQuestion, optionKey: string) => void;
   /** Set ("HH:MM") or clear (null) when it was eaten. Without it no time row is shown. */
   onTime?: (q: LeftoverQuestion, time: string | null) => void;
@@ -418,6 +559,8 @@ export function LeftoverList({
             <span className="text-[10px] font-mono text-text-tertiary mr-0.5 self-center">Ate</span>
             {LEFTOVER_OPTIONS.map((o) => {
               const on = q.option === o.key;
+              const sug = suggestions?.get(q.dish.item_id);
+              const isSuggested = !!sug && sug.option === o.key && !on;
               // Nothing left (all eaten here earlier): only the lit answer and Clear make sense.
               const disabled = q.left <= 0 && !on && o.share != null && o.share > 0;
               return (
@@ -427,9 +570,17 @@ export function LeftoverList({
                   disabled={disabled}
                   onClick={() => onPick(q, o.key)}
                   aria-pressed={on}
-                  title={on ? "Tap again to clear" : o.share != null && o.share > 0 ? `${o.label} of what was left` : undefined}
+                  title={
+                    isSuggested
+                      ? "From what you said. Not saved yet."
+                      : on
+                        ? "Tap again to clear"
+                        : o.share != null && o.share > 0
+                          ? `${o.label} of what was left`
+                          : undefined
+                  }
                   className={`h-7 min-w-[2.25rem] px-1.5 rounded-control border text-[11px] font-mono transition-colors disabled:opacity-40 ${
-                    on ? "border-accent/70 bg-accent/20 text-accent" : "border-border-subtle text-text-tertiary hover:text-text-secondary"
+                    on ? "border-accent/70 bg-accent/20 text-accent" : isSuggested ? SUGGESTED_CLASS : "border-border-subtle text-text-tertiary hover:text-text-secondary"
                   }`}
                 >
                   {o.label}
@@ -471,6 +622,12 @@ export function LeftoverList({
               )}
             </div>
           )}
+          {(() => {
+            const sug = suggestions?.get(q.dish.item_id);
+            if (!sug || (sug.option === q.option && (sug.time == null || sug.time === q.time))) return null;
+            const label = LEFTOVER_OPTIONS.find((o) => o.key === sug.option)?.label ?? sug.option;
+            return <SuggestionNote text={`${label}${sug.time ? ` at ${formatClock(sug.time)}` : ""}`} />;
+          })()}
         </div>
       ))}
     </div>
