@@ -644,6 +644,25 @@ function walk(dir) {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]));
 }
 
+// SQL with its "--" comments removed, line by line. Split on \r?\n: on a Windows (CRLF) checkout a
+// "\n" split leaves "\r" at each line end, and /--.*$/ (no m flag) then strips nothing, so a
+// comment such as "nothing granted to anon" was read as a GRANT (Codex review #168).
+const sqlStatements = (text) => text.split(/\r?\n/).map((line) => line.replace(/--.*$/, "")).join("\n");
+// A GRANT statement (the word, not "granted") that names anon / authenticated / public.
+const GRANTS_TO_CLIENTS = /\bGRANT\b[^;]*\b(anon|authenticated|public)\b/i;
+const lineEndings = (text) => [text.replace(/\r\n/g, "\n"), text.replace(/\r?\n/g, "\r\n")];
+
+test("the SQL checks read LF and CRLF files alike, and still catch a real grant", () => {
+  for (const eol of ["\n", "\r\n"]) {
+    const commentOnly = ["-- nothing granted to anon / authenticated", "REVOKE ALL ON pds.x FROM PUBLIC, anon, authenticated;", ""].join(eol);
+    assert.ok(!GRANTS_TO_CLIENTS.test(sqlStatements(commentOnly)), `a comment is not a grant (${JSON.stringify(eol)})`);
+    const realGrant = ["-- service role only", "GRANT SELECT ON pds.x TO anon;", ""].join(eol);
+    assert.ok(GRANTS_TO_CLIENTS.test(sqlStatements(realGrant)), `a real grant is caught (${JSON.stringify(eol)})`);
+    const trailing = ["GRANT SELECT ON pds.x TO service_role; -- not to authenticated", ""].join(eol);
+    assert.ok(!GRANTS_TO_CLIENTS.test(sqlStatements(trailing)), `a trailing comment is stripped (${JSON.stringify(eol)})`);
+  }
+});
+
 test("one scope in the whole app, owner-session routes, additive service-role-only schema", () => {
   const sources = walk(SRC).filter((f) => /\.(ts|tsx)$/.test(f));
   const scopes = new Set();
@@ -676,12 +695,14 @@ test("one scope in the whole app, owner-session routes, additive service-role-on
 
   const sql = read(SRC, "..", "..", "sql", "care_calendar_sync_schema.sql");
   assert.ok(!/\b(drop|truncate|delete)\b/i.test(sql), "additive only");
-  const statements = sql.split("\n").map((line) => line.replace(/--.*$/, "")).join("\n");
-  for (const table of ["care_calendar_sync", "care_calendar_links"]) {
-    assert.match(statements, new RegExp(`ALTER TABLE pds\\.${table} ENABLE ROW LEVEL SECURITY`));
-    assert.match(statements, new RegExp(`REVOKE ALL ON pds\\.${table} FROM PUBLIC, anon, authenticated`));
+  for (const text of lineEndings(sql)) {
+    const statements = sqlStatements(text);
+    for (const table of ["care_calendar_sync", "care_calendar_links"]) {
+      assert.match(statements, new RegExp(`ALTER TABLE pds\\.${table} ENABLE ROW LEVEL SECURITY`));
+      assert.match(statements, new RegExp(`REVOKE ALL ON pds\\.${table} FROM PUBLIC, anon, authenticated`));
+    }
+    assert.ok(!GRANTS_TO_CLIENTS.test(statements), "nothing granted to anon / authenticated");
+    assert.ok(!/CREATE POLICY/i.test(statements));
+    assert.ok(!/refresh_token|access_token/i.test(statements), "tokens are not in these tables");
   }
-  assert.ok(!/GRANT[^;]*\b(anon|authenticated|public)\b/i.test(statements));
-  assert.ok(!/CREATE POLICY/i.test(statements));
-  assert.ok(!/refresh_token|access_token/i.test(statements), "tokens are not in these tables");
 });
