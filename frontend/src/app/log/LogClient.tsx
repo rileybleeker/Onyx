@@ -19,17 +19,18 @@ import { SectionSkeleton } from "./sections/ui";
  * The Say it box writes suggestions to lib/log-drafts.ts; each section reads its own with useLogDrafts(section).
  */
 
-// Every section's code starts loading with this module, in parallel (a hidden part's code is fetched but the part
-// is never mounted, so it reads and writes nothing).
-if (typeof window !== "undefined") {
-  void import("./sections/SayIt").catch(() => {});
-  void import("./sections/CheckIn").catch(() => {});
-  void import("./sections/Journal").catch(() => {});
-  void import("./sections/Supplements").catch(() => {});
-  void import("./sections/UberEats").catch(() => {});
-  void import("./sections/Weight").catch(() => {});
-  void import("./sections/Reading").catch(() => {});
-}
+// Every section's code ships with this module, and so (LogLoader imports it too) with /log's first scripts, in
+// parallel with the framework: no chunk round trips after hydration (speed budget, 2026-11-15: the frame's chunk
+// and then the section chunks were each fetched one round trip after the code that asked for them, and a second
+// set of import sites downloaded the sections twice). The dynamic() wrappers below keep each section's skeleton for
+// the one frame before its lazy module resolves; a hidden part is still never mounted, so it reads and writes nothing.
+import "./sections/SayIt";
+import "./sections/CheckIn";
+import "./sections/Journal";
+import "./sections/Supplements";
+import "./sections/UberEats";
+import "./sections/Weight";
+import "./sections/Reading";
 
 const SayIt = dynamic(() => import("./sections/SayIt"), { ssr: false, loading: () => <SectionSkeleton section="sayit" /> });
 const CheckIn = dynamic(() => import("./sections/CheckIn"), { ssr: false, loading: () => <SectionSkeleton section="checkin" /> });
