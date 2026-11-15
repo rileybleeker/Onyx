@@ -197,7 +197,9 @@ const FeedSlot = memo(function FeedSlot({
   const body: ReactNode = mounted ? <FeedPage route={route} label={label} /> : <PageSkeleton title={label} />;
   // Unmounted with a known height: exactly that height, so swapping content for the placeholder moves nothing.
   // svh: the small viewport height does not change while the phone's toolbar slides in and out.
-  const style = !mounted && height ? { height, overflow: "hidden" as const } : { minHeight: "80svh" };
+  // Never shown yet: taller than the screen, so one page prepended above the routed page is enough to move the
+  // top edge out of reach (a shorter one let a second page be prepended, and loaded, on every direct visit).
+  const style = mounted ? { minHeight: "80svh" } : height ? { height, overflow: "hidden" as const } : { minHeight: "120svh" };
   return (
     <section ref={bind} data-feed-route={route} aria-label={label} className={separated ? SEPARATOR : undefined} style={style}>
       {body}
@@ -296,6 +298,17 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
           sec,
           secTop: sec ? sec.getBoundingClientRect().top + window.scrollY : 0,
         };
+        return;
+      }
+    }
+    // Nothing of the scroll under the probes (the page at the top is still empty or loading): hold that page
+    // itself. Without this a page loading above an empty one pushed it away, and the next one, up to Today.
+    const pages = Array.from(root.querySelectorAll(":scope > [data-feed-route]"));
+    for (const sec of pages) {
+      const r = sec.getBoundingClientRect();
+      if (r.bottom > 0) {
+        const top = r.top + window.scrollY;
+        anchor.current = { el: sec, docTop: top, sec, secTop: top };
         return;
       }
     }
@@ -604,6 +617,13 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
   useEffect(() => {
     if (live && feedOn) syncUrl(false);
   });
+
+  // A new routed page: the element held for the old one means nothing now (the routed wrapper stays across a
+  // navigation, so holding it would "correct" the scroll by the height of the pages that were above it). Runs
+  // before the correction below, in the same commit.
+  useLayoutEffect(() => {
+    anchor.current = null;
+  }, [routedKey]);
 
   // After the list grows or shrinks: keep the screen still, then look again at both ends (an observer only
   // reports changes, and an end that is still within reach must keep growing).
