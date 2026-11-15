@@ -1,9 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useInFeed } from "@/components/FeedContext";
 import { cachedJson, clientCache } from "@/lib/client-cache";
 import { kgToLb, lbToKg, sameJson } from "@/lib/format";
 import { useLogDrafts } from "@/lib/log-drafts";
+import { LOG_WEIGHT_URL, logEarlyGet } from "@/lib/log-early";
 import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
 
 /**
@@ -15,7 +17,7 @@ import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
  * row per day). A Say it draft (WeightLogDraft) fills the form as a suggestion; nothing is written until Save.
  */
 
-const WEIGHT_URL = "/api/weight?days=365";
+const WEIGHT_URL = LOG_WEIGHT_URL;
 
 interface WeightRow {
   log_date: string;
@@ -75,12 +77,14 @@ export default function WeightSection() {
     if (v && alive.current) setData((prev) => (sameJson(prev, v) ? prev : v));
   }, []);
 
+  // The routed page's first read takes the GET its HTML already started (lib/log-early.ts), once.
+  const routed = !useInFeed();
   const load = useCallback(() => {
     setLoadFailed(false);
-    cachedJson(WEIGHT_URL, { check: checkWeight })
+    cachedJson(WEIGHT_URL, { check: checkWeight, get: logEarlyGet(WEIGHT_URL, routed) })
       .then(show)
       .catch(() => { if (alive.current) setLoadFailed(true); });
-  }, [show]);
+  }, [show, routed]);
 
   useEffect(() => {
     alive.current = true;

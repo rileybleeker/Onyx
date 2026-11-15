@@ -8,7 +8,7 @@ import { sayFromHash, VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
 import { reportCheckinFill, setLogDraft, useLogDrafts } from "@/lib/log-drafts";
 import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, Q_JOURNALED, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
 import { clientCache } from "@/lib/client-cache";
-import { takeEarlyFetch } from "@/lib/early-fetch";
+import { earlyOr } from "@/lib/early-fetch";
 import { buildCells, savePlan, visibleNights, voicePatch, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
 import { CheckinDraftStore, dayDraftKey, nightDraftKey, recoveryTarget, type DatedDraft } from "@/lib/checkin-drafts";
 import {
@@ -130,8 +130,11 @@ function longDate(date: string): string {
  * out, the journal draft of this check-in's own Say it once goes to the Log screen's Journal section
  * (lib/log-drafts.ts, "journal"); words handed over by the Log screen's Say it box get none here (that box drafts
  * its own).
+ *
+ * `earlyRead`: with `feed`, the first load still takes the GET the page's HTML started (lib/early-fetch.ts): the
+ * /log section on the routed /log page (lib/log-early.ts), never a copy drawn in the continuous scroll.
  */
-export default function CheckInClient({ feed = false, embedded = false, omitParts }: { feed?: boolean; embedded?: boolean; omitParts?: readonly string[] } = {}) {
+export default function CheckInClient({ feed = false, embedded = false, omitParts, earlyRead = false }: { feed?: boolean; embedded?: boolean; omitParts?: readonly string[]; earlyRead?: boolean } = {}) {
   const router = useRouter();
   const params = useSearchParams();
   const [feedDate, setFeedDate] = useState<string | null>(null);
@@ -232,9 +235,11 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
     setSavedAt(null);
     try {
       const url = checkinUrl(date);
-      // The first load of a full page visit takes the GET the page's HTML already started (lib/early-fetch.ts).
-      const early = feed || afterSave ? null : takeEarlyFetch(url);
-      const res = await (early ?? fetch(url, { cache: "no-store" }));
+      // The first load of a full page visit takes the GET the page's HTML already started (lib/early-fetch.ts):
+      // /check-in itself, or the /log section on the routed /log page (`earlyRead`).
+      // A 401, a redirect to sign-in or a network error is fetched again, so session-end handling still sees it.
+      const get = () => fetch(url, { cache: "no-store" });
+      const res = await ((feed && !earlyRead) || afterSave ? get() : earlyOr(url, get));
       const json = await res.json().catch(() => ({}));
       if (seq !== loadSeq.current) return;
       if (!res.ok) {
@@ -260,7 +265,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
       }
     }
     finally { if (seq === loadSeq.current) refreshDrafts(); }
-  }, [drafts, refreshDrafts, show, feed]);
+  }, [drafts, refreshDrafts, show, feed, earlyRead]);
 
   useEffect(() => {
     // Discover recovery records even if the requested date has expired or the GET cannot load.

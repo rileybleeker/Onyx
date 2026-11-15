@@ -185,3 +185,44 @@ test("/agents: the inbox read starts on the inbox view only, never for a convers
   // The same rule AgentsApp uses to open a conversation instead of the inbox.
   assert.ok(src("app/agents/AgentsApp.tsx").includes(String.raw`/^[\w][\w.-]{0,39}$/.test(thread)`));
 });
+
+const L = loadTs("lib/log-early.ts");
+const { journalTodayUrl } = loadTs("lib/journal-file.ts");
+
+test("/log: the script starts the sections' read-only GETs, the journal list for today, and sets its mark", (t) => {
+  const calls = withWindow(t);
+  new Function(L.logEarlyScript())();
+  const urls = calls.map((c) => c.url);
+  for (const u of L.LOG_EARLY_GETS) assert.ok(urls.includes(u), u);
+  assert.ok(urls.includes(journalTodayUrl(new Date())), "journal URL = the Journal section's");
+  assert.ok(!urls.some((u) => /experiments/.test(u)), "no experiment read");
+  for (const c of calls) {
+    assert.equal(c.init.method, undefined, "GET only");
+    assert.equal(c.init.body, undefined, "GET only");
+    assert.equal(c.init.cache, "no-store");
+  }
+  assert.equal(L.takeLogEarlyMark(), true, "a full page load of /log is marked");
+  assert.equal(L.takeLogEarlyMark(), false, "once");
+  delete global[L.LOG_EARLY_MARK];
+});
+
+test("/log: the sections read the URLs the script starts", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const SRC = path.join(__dirname, "..", "src");
+  const read = (f) => fs.readFileSync(path.join(SRC, f), "utf8");
+  assert.equal(L.LOG_BEHAVIORAL_TODAY_URL, loadTs("lib/log-ubereats.ts").BEHAVIORAL_TODAY_URL);
+  assert.match(read("app/log/sections/Weight.tsx"), /const WEIGHT_URL = LOG_WEIGHT_URL;/);
+  assert.match(read("app/log/sections/Reading.tsx"), /const READING_URL = LOG_READING_URL;/);
+  assert.match(read("app/log/sections/Supplements.tsx"), /const TODAY_URL = LOG_SUPPLEMENTS_TODAY_URL;/);
+  assert.match(read("app/log/page.tsx"), /<EarlyReads \/>/);
+});
+
+test("/log: logEarlyGet takes the started answer once on the routed page, never in a copy in the scroll", async (t) => {
+  withWindow(t);
+  global[E.EARLY_FETCH_KEY] = { "/api/reading": { at: Date.now(), p: Promise.resolve({ ok: true, status: 200, redirected: false, early: true }) } };
+  assert.equal(L.logEarlyGet("/api/reading", false), undefined, "a copy in the scroll fetches for itself");
+  const get = L.logEarlyGet("/api/reading", true);
+  assert.equal((await get()).early, true);
+  assert.equal((await get()).url, "/api/reading", "the second read is the section's own fetch");
+});

@@ -2,10 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, Plus, X } from "lucide-react";
+import { useInFeed } from "@/components/FeedContext";
 import { cachedJson, clientCache, fetchJsonValue, GONE } from "@/lib/client-cache";
 import { fallbackBehavioralToday } from "@/lib/checkin";
 import { sameJson } from "@/lib/format";
 import { useLogDrafts, type SupplementLogDraft } from "@/lib/log-drafts";
+import { LOG_SUPPLEMENTS_PRODUCTS_URL, LOG_SUPPLEMENTS_STACKS_URL, LOG_SUPPLEMENTS_TODAY_URL, logEarlyGet } from "@/lib/log-early";
 import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
 
 /**
@@ -23,9 +25,9 @@ import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
  * /supplements and the warm-up), then the server.
  */
 
-const TODAY_URL = "/api/supplements/today";
-const STACKS_URL = "/api/supplements/stacks";
-const PRODUCTS_URL = "/api/supplements/products";
+const TODAY_URL = LOG_SUPPLEMENTS_TODAY_URL;
+const STACKS_URL = LOG_SUPPLEMENTS_STACKS_URL;
+const PRODUCTS_URL = LOG_SUPPLEMENTS_PRODUCTS_URL;
 
 interface Intake {
   intake_id: number;
@@ -234,31 +236,33 @@ export default function SupplementsSection() {
     }
   }, [applyToday]);
 
+  // The routed page's first reads take the GETs its HTML already started (lib/log-early.ts), once each.
+  const routed = !useInFeed();
   const loadAll = useCallback(() => {
     const seq = ++loadSeq.current;
     const writes = writeSeq.current;
-    cachedJson<TodayResp>(TODAY_URL, { check: checkToday })
+    cachedJson<TodayResp>(TODAY_URL, { check: checkToday, get: logEarlyGet(TODAY_URL, routed) })
       .then((v) => {
         if (seq !== loadSeq.current || writes !== writeSeq.current) return;
         answered.current.today = true;
         applyToday(v, true);
       })
       .catch(() => setTodayState((s) => (s === "ready" ? s : "failed")));
-    cachedJson<{ stacks: Stack[] }>(STACKS_URL, { check: checkStacks })
+    cachedJson<{ stacks: Stack[] }>(STACKS_URL, { check: checkStacks, get: logEarlyGet(STACKS_URL, routed) })
       .then((v) => {
         answered.current.stacks = true;
         setStacks((prev) => (sameJson(prev, v.stacks) ? prev : v.stacks));
         setStacksState("ready");
       })
       .catch(() => setStacksState((s) => (s === "ready" ? s : "failed")));
-    cachedJson<{ products: Product[] }>(PRODUCTS_URL, { check: checkProducts })
+    cachedJson<{ products: Product[] }>(PRODUCTS_URL, { check: checkProducts, get: logEarlyGet(PRODUCTS_URL, routed) })
       .then((v) => {
         answered.current.products = true;
         setProducts((prev) => (sameJson(prev, v.products) ? prev : v.products));
         setProductsState("ready");
       })
       .catch(() => setProductsState((s) => (s === "ready" ? s : "failed")));
-  }, [applyToday]);
+  }, [applyToday, routed]);
 
   // This device's copy at once (memory, else the persisted cache), then the server.
   useEffect(() => {

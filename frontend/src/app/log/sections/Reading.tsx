@@ -1,9 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useInFeed } from "@/components/FeedContext";
 import { cachedJson, clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 import { useLogDrafts, type ReadingLogDraft } from "@/lib/log-drafts";
+import { LOG_READING_URL, logEarlyGet } from "@/lib/log-early";
 import type { Book, Medium, ReadingOverview, ReadingSession } from "@/lib/reading";
 import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
 
@@ -16,7 +18,7 @@ import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
  * /reading). A Say it draft (ReadingLogDraft) fills the form as a suggestion; nothing is written until Save.
  */
 
-const READING_URL = "/api/reading";
+const READING_URL = LOG_READING_URL;
 
 type ReadingAnswer = { overview: ReadingOverview | null; books?: Book[] };
 function asReading(raw: unknown): ReadingAnswer | null {
@@ -112,12 +114,14 @@ export default function ReadingSection() {
     if (v && alive.current) setData((prev) => (sameJson(prev, v) ? prev : v));
   }, []);
 
+  // The routed page's first read takes the GET its HTML already started (lib/log-early.ts), once.
+  const routed = !useInFeed();
   const load = useCallback(() => {
     setLoadFailed(false);
-    cachedJson(READING_URL, { check: checkReading })
+    cachedJson(READING_URL, { check: checkReading, get: logEarlyGet(READING_URL, routed) })
       .then(show)
       .catch(() => { if (alive.current) setLoadFailed(true); });
-  }, [show]);
+  }, [show, routed]);
 
   useEffect(() => {
     alive.current = true;

@@ -3,12 +3,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes, type LeftoverQuestion } from "@/components/DeliveryPortions";
+import { useInFeed } from "@/components/FeedContext";
 import InfoHint from "@/components/InfoHint";
 import { cachedJson, clientCache } from "@/lib/client-cache";
 import { shiftYmd } from "@/lib/delivery-portion";
 import { formatClock, tokenForOption } from "@/lib/delivery-leftovers";
 import { getUberEatsCheck, type DeliveryDish } from "@/lib/queries";
 import { useLogDrafts } from "@/lib/log-drafts";
+import { logEarlyGet } from "@/lib/log-early";
+import { takeEarlyDeliveryWindow, takeEarlyUberEatsCheck } from "../early-delivery";
 import {
   BEHAVIORAL_TODAY_URL,
   LOG_EARLIER_DAYS,
@@ -50,15 +53,21 @@ function shortDay(ymd: string): string {
   return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
 }
 
-/** Behavioral today: a recent cached server answer or the Eastern clock − 6 h at once, then the server's. */
-function useBehavioralToday(): string {
+/**
+ * Behavioral today: a recent cached server answer or the Eastern clock − 6 h at once, then the server's. `routed`:
+ * the first read takes the GET the page's HTML started (lib/log-early.ts).
+ */
+function useBehavioralToday(routed: boolean): string {
   const [today, setToday] = useState(() =>
     initialBehavioralToday(clientCache.peek(BEHAVIORAL_TODAY_URL), clientCache.fetchedAt(BEHAVIORAL_TODAY_URL)),
   );
   useEffect(() => {
     let alive = true;
+    let first = true;
     const refresh = () => {
-      cachedJson(BEHAVIORAL_TODAY_URL)
+      const get = first ? logEarlyGet(BEHAVIORAL_TODAY_URL, routed) : undefined;
+      first = false;
+      cachedJson(BEHAVIORAL_TODAY_URL, { get })
         .then((raw) => {
           const t = behavioralTodayOf(raw);
           if (alive && t) setToday(t);
@@ -74,12 +83,15 @@ function useBehavioralToday(): string {
       alive = false;
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [routed]);
   return today;
 }
 
-/** The newest ubereats|items heartbeat, read every minute while visible. `fresh`: read from the server this visit. */
-function useUberEatsCheck() {
+/**
+ * The newest ubereats|items heartbeat, read every minute while visible. `fresh`: read from the server this visit.
+ * `routed`: the first read takes the one LogLoader started on a full page load (../early-delivery.ts).
+ */
+function useUberEatsCheck(routed: boolean) {
   const [check, setCheck] = useState<{ value: UberEatsCheck; fresh: boolean } | null>(() => {
     const v = clientCache.peek(UBER_EATS_CHECK_KEY);
     return isUberEatsCheck(v) ? { value: v, fresh: false } : null;
@@ -97,10 +109,13 @@ function useUberEatsCheck() {
         })
         .catch(() => {});
     }
+    let first = routed;
     const refresh = () => {
       setNow(Date.now());
+      const started = first ? takeEarlyUberEatsCheck() : null;
+      first = false;
       clientCache
-        .revalidate(UBER_EATS_CHECK_KEY, getUberEatsCheck)
+        .revalidate(UBER_EATS_CHECK_KEY, started ? () => started.catch(() => getUberEatsCheck()) : getUberEatsCheck)
         .then((v) => {
           if (!alive) return;
           if (!isUberEatsCheck(v)) throw new Error("no heartbeat answer");
@@ -125,7 +140,7 @@ function useUberEatsCheck() {
       clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [routed]);
   return { check: check?.value ?? null, fresh: check?.fresh ?? false, failed, now };
 }
 
@@ -176,12 +191,14 @@ function describe(s: UberEatsSuggestion): string {
 }
 
 export default function UberEatsSection() {
-  const today = useBehavioralToday();
+  // The routed page (not a copy in the scroll) takes the reads its full page load already started.
+  const routed = !useInFeed();
+  const today = useBehavioralToday(routed);
   const [offset, setOffset] = useState(0);
   const [tabTouched, setTabTouched] = useState(false);
   const tabs = useMemo(() => [today, shiftYmd(today, -1), shiftYmd(today, -2)], [today]);
   const date = tabs[offset] ?? today;
-  const { check, fresh, failed: checkFailed, now } = useUberEatsCheck();
+  const { check, fresh, failed: checkFailed, now } = useUberEatsCheck(routed);
 
   // Read the dishes again when the harvester has run since this visit's first fresh check.
   const [reload, setReload] = useState(0);
@@ -200,6 +217,7 @@ export default function UberEatsSection() {
     earlierDays: LOG_EARLIER_DAYS,
     cacheKey: deliveryWindowKey(date, LOG_EARLIER_DAYS),
     reloadKey: reload,
+    early: routed ? takeEarlyDeliveryWindow : undefined,
   });
   const latest = useRef(delivery);
   latest.current = delivery;

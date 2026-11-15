@@ -2,12 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Check } from "lucide-react";
+import { useInFeed } from "@/components/FeedContext";
 import InfoHint from "@/components/InfoHint";
 import { cachedJson, clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 import { easternDate, JOURNAL_MAX_BODY_CHARS, JOURNAL_SOURCES, type JournalSource } from "@/lib/journal-entry";
 import { journalTodayUrl } from "@/lib/journal-file";
 import { useLogDrafts, type JournalLogDraft } from "@/lib/log-drafts";
+import { logEarlyGet } from "@/lib/log-early";
 import { DraftMark, LogCard, LogSaveButton } from "./ui";
 
 /** This section holds /log's journal drafts, so the embedded check-in leaves out its own journal draft card (./CheckIn.tsx). */
@@ -90,16 +92,18 @@ export default function JournalSection() {
     };
   }, []);
 
+  // The routed page's first read takes the GET its HTML already started (lib/log-early.ts), once.
+  const routed = !useInFeed();
   const loadList = useCallback(async (u: string) => {
     try {
-      const data = await cachedJson<ListAnswer>(u, { check: checkList });
+      const data = await cachedJson<ListAnswer>(u, { check: checkList, get: logEarlyGet(u, routed) });
       if (u !== urlRef.current) return; // the day rolled over meanwhile
       setList((prev) => (sameJson(prev, data) ? prev : data));
       setListFailed(false);
     } catch {
       if (u === urlRef.current) setListFailed(true);
     }
-  }, []);
+  }, [routed]);
 
   // Show the cached copy at once (memory, then the persisted store), then revalidate. GET only.
   useEffect(() => {

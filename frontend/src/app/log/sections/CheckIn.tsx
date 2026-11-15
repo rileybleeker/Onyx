@@ -1,7 +1,7 @@
 "use client";
 
 import { Suspense } from "react";
-import { InFeed } from "@/components/FeedContext";
+import { InFeed, useInFeed } from "@/components/FeedContext";
 import CheckInClient from "@/app/check-in/CheckInClient";
 import { REPLACES_CHECKIN_JOURNAL_DRAFT } from "./Journal";
 import { REPLACES_CHECKIN_SAY_IT_ONCE } from "./SayIt";
@@ -22,10 +22,13 @@ const OMIT: readonly string[] = [
  * without claiming the Personalize entry or syncing it (the /log grid owns those), like a page drawn in the scroll.
  */
 export default function CheckInSection() {
+  // Read outside <InFeed>: on the routed /log page (not a copy in the scroll) the check-in's first load takes the
+  // GET the page's HTML started (lib/log-early.ts).
+  const routed = !useInFeed();
   return (
     <InFeed>
       <Suspense fallback={<SectionSkeleton section="checkin" />}>
-        <CheckInClient feed embedded omitParts={OMIT} />
+        <CheckInClient feed embedded omitParts={OMIT} earlyRead={routed} />
       </Suspense>
     </InFeed>
   );
