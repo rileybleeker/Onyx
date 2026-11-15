@@ -16,7 +16,7 @@ const path = require("path");
 const stats = require("./perf-stats.cjs");
 
 const ORDER = [
-  "today", "check-in", "analytics-hrv", "sleep", "nutrition", "supplements", "agents", "status", "caffeine", "caffeine-720",
+  "today", "log", "check-in", "analytics-hrv", "sleep", "nutrition", "supplements", "agents", "status", "caffeine", "caffeine-720",
   "financials", "financials-budgets", "financials-forecast",
 ];
 // In-app (clicked) navigations are written as nav-<slug>.json and listed after the full page loads, same order.
