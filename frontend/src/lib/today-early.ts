@@ -49,9 +49,27 @@ export function todayEarlyScript(supabaseUrl: string | undefined, agentsApi: str
   const calendar =
     `var n=new Date(),p=function(x){return(x<10?"0":"")+x},y=n.getFullYear(),mo=n.getMonth(),dd=n.getDate();` +
     `go(${JSON.stringify(TODAY_CALENDAR_PATH)}+"?from="+y+"-"+p(mo+1)+"-"+p(dd)+"&to="+new Date(Date.UTC(y,mo,dd+1,12)).toISOString().slice(0,10),o);`;
+  return earlyFetchWrap(same + calendar + inboxEarlyBody(supabaseUrl, agentsApi));
+}
+
+/**
+ * Plain-ES5 inline script for /agents (app/agents/EarlyInbox.tsx): the Worker's inbox, as on Today, unless the URL
+ * opens one conversation (`?t=<agent>`, which AgentsApp shows as AgentsChat and which never reads the inbox).
+ */
+export function agentsEarlyScript(supabaseUrl: string | undefined, agentsApi: string): string {
+  const body = inboxEarlyBody(supabaseUrl, agentsApi);
+  if (!body) return "";
+  return earlyFetchWrap(`var t=new URLSearchParams(location.search).get("t");if(!(t&&/^[\\w][\\w.-]{0,39}$/.test(t))){${body}}`);
+}
+
+/**
+ * Script body (uses the early-fetch prelude's `go`) that starts the agents Worker's inbox GET with the session's
+ * access token read from the Supabase cookie; "" without a Supabase URL. Never throws.
+ */
+export function inboxEarlyBody(supabaseUrl: string | undefined, agentsApi: string): string {
   const cookie = supabaseUrl ? authCookieName(supabaseUrl) : null;
-  const inbox = cookie
-    ? `try{var K=${JSON.stringify(cookie)},c=document.cookie.split(";"),v=null,ch=[],j,k,x;` +
+  return cookie
+    ? `try{var K=${JSON.stringify(cookie)},c=document.cookie.split(";"),v=null,ch=[],i,j,k,x;` +
       `for(i=0;i<c.length;i++){c[i]=c[i].replace(/^ +/,"");j=c[i].indexOf("=");if(j<0)continue;k=c[i].slice(0,j);x=c[i].slice(j+1);` +
       `try{x=decodeURIComponent(x);}catch(e){}` +
       `if(k===K)v=x;else if(k.indexOf(K+".")===0&&/^(0|[1-9][0-9]*)$/.test(k.slice(K.length+1)))ch[+k.slice(K.length+1)]=x;}` +
@@ -61,5 +79,4 @@ export function todayEarlyScript(supabaseUrl: string | undefined, agentsApi: str
       `var S=JSON.parse(v);if(S&&typeof S.access_token==="string"&&S.expires_at*1000-Date.now()>90000)` +
       `go(${JSON.stringify(agentsApi + AGENTS_INBOX_PATH)},{cache:"no-store",headers:{Authorization:"Bearer "+S.access_token}});}}catch(e){}`
     : "";
-  return earlyFetchWrap(same + calendar + inbox);
 }

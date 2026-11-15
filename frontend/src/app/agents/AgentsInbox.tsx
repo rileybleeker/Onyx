@@ -162,9 +162,14 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
   const [hiddenTick, setHiddenTick] = useState(0);
   const [cleared, setCleared] = useState<{ codes: string[]; text: string } | null>(null);
 
+  // The first load of a full page visit takes the inbox GET the page's HTML started (app/agents/EarlyInbox.tsx).
+  const firstLoadRef = useRef(true);
+
   const load = useCallback(async () => {
     try {
-      const res = await agentsApi.inbox();
+      const early = firstLoadRef.current;
+      firstLoadRef.current = false;
+      const res = await agentsApi.inbox({ early });
       clientCache.put(CACHE_KEYS.agentsInbox, res);
       setData((prev) => (prev && sameJson(prev, res) ? prev : res));
       setBadge(res.badge);
