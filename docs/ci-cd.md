@@ -23,7 +23,7 @@ Drafts, forks, PRs from anyone but the owner login, PRs with the `hold` label, c
 
 ## Conventions
 
-- **Tests are discovered, not listed.** Add `frontend/tests/<name>.test.cjs` (run with `node --test`) or `frontend/scripts/test-<name>.mjs` (files ending `-ui.mjs` need a browser and are not auto-run); `scheduled-tests.yml` picks them up. Do not edit the workflows to add a test line: they are protected paths, and every PR appending to the same lines conflicts. Run the relevant test locally before opening the PR; CI will not run it for you.
+- **Tests are discovered, not listed.** Add `frontend/tests/<name>.test.cjs` (run with `node --test`) or `frontend/scripts/test-<name>.mjs` (files ending `-ui.mjs` need a browser and are not auto-run); `scheduled-tests.yml` picks them up. Do not edit the workflows to add a test line: they are protected paths, and every PR appending to the same lines conflicts. Do not run it before merging, not even locally (Riley, 2026-11-15): the scheduled suite runs it against each deployed revision, and a red run comes back as a fix PR.
 - **Stop a PR:** `hold` label or draft. **Stop everything:** open an issue labeled `train-halt`, or disable the "Merge train" workflow.
 - **Audit:** every action is in the run summary of Merge train / Post-merge verify and as a comment on the PR; halts and reverts are issues/PRs; git history is the release log.
 - **Rollback drill** (exercise the path without breaking prod): Actions > Post-merge verify > Run workflow, `sha` = any harmless commit on master (a docs-only one), `drill` = true.
