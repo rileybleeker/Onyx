@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import styles from "./Today.module.css";
 import { ArrowUpRight, BookOpen, CalendarClock, CalendarDays, ClipboardCheck, FlaskConical, Mail, Package, RefreshCw, Wallet, X } from "lucide-react";
 import type { MoneyAlert } from "@/lib/finance-alerts";
 import { agentsApi, clearDeviceNotifications, setBadge, type InboxResponse, type InboxItem } from "@/lib/agents-api";
@@ -21,9 +22,9 @@ type RequestCard = Extract<InboxItem, { kind: "card" }>;
 type OrdersSummary = { status: "not_connected" } | { status: "ready"; attention: number; arrivingToday: number; onTheWay: number;
   top: { merchant: string; label: string; reason: string }[] };
 const linkStyle = "text-sm text-accent underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-accent";
-const panelStyle = "rounded-2xl border border-border-default bg-surface-card p-5 sm:p-6";
+const panelStyle = `${styles.panel} rounded-2xl border border-border-default bg-surface-card p-5 sm:p-6`;
 const clearAllStyle = "text-sm text-accent focus-visible:outline-2 focus-visible:outline-accent";
-const clearOneStyle = "shrink-0 rounded-lg p-2 text-text-secondary hover:text-text-primary focus-visible:outline-2 focus-visible:outline-accent";
+const clearOneStyle = "inline-flex min-h-11 min-w-11 items-center justify-center shrink-0 rounded-lg p-2 text-text-secondary hover:text-text-primary focus-visible:outline-2 focus-visible:outline-accent";
 // The Worker's /onyx/dismiss takes at most this many card codes per call.
 const MAX_DISMISS = 200;
 // How long the "Cleared N · Undo" bar stays (same as the Agents inbox).
@@ -270,15 +271,37 @@ export default function TodayClient() {
   const calendarSync = agenda ? syncHealth(agenda.lastSync, now.getTime()) : "never";
   const renewing = renewals?.status === "ready" && renewals.count > 0 ? renewals : null;
   return (
-    <div className="mx-auto max-w-2xl space-y-5 lg:max-w-5xl">
-      <header className="flex items-start justify-between gap-4">
-        <div><h1 data-testid="page-heading" className="text-[30px] font-medium text-text-primary">Today</h1>
-          <p className="mt-1 text-sm text-text-secondary">A few useful places to pick up.</p></div>
+    <div className={styles.today}>
+      <header className={styles.header}>
+        <div><p className={styles.eyebrow}>YOUR DAILY OVERVIEW</p>
+          <h1 data-testid="page-heading" className={styles.title}>Today</h1>
+          <p className="mt-2 text-sm text-text-secondary">Less catching up. More moving forward.</p></div>
         <button type="button" onClick={() => { if (!pending) load(); }} aria-disabled={pending} aria-label="Refresh Today"
-          className="rounded-xl border border-border-default p-3 text-text-secondary aria-disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-accent">
+          className={styles.refresh}>
           <RefreshCw aria-hidden="true" className={`h-4 w-4 ${pending ? "animate-spin motion-reduce:animate-none" : ""}`} />
+          <span>{pending ? "Refreshing" : "Refresh"}</span>
         </button>
       </header>
+      <section aria-label="Quick capture" className={styles.capture}>
+        <div className={styles.captureLead}>
+          <span className={styles.captureIcon}><ClipboardCheck aria-hidden="true" className="h-6 w-6" /></span>
+          <div><p className={styles.eyebrow}>START HERE</p><h2 className="mt-2 text-2xl font-medium text-text-primary">A moment for you.</h2>
+            <p className="mt-2 max-w-md text-sm leading-relaxed text-text-secondary">Start or continue your check-in. Capture what you know, and leave the rest for later.</p></div>
+          <Link href="/check-in" className={styles.primaryAction}>Start your check-in <ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
+        </div>
+        <div className={styles.captureOptions}>
+          <p className={styles.eyebrow}>OR LOG SOMETHING QUICKLY</p>
+          <Link href="/supplements" className={styles.captureLink}><span>Supplement<span className={styles.caption}>Your stack &amp; intake</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
+          <Link href="/habits" className={styles.captureLink}><span>Habit<span className={styles.caption}>Record a daily habit</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
+          <Link href="/nutrition" className={styles.captureLink}><span>Weight<span className={styles.caption}>Nutrition &amp; measurements</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
+        </div>
+      </section>
+      <nav aria-label="Today sections" className={styles.jumpLinks}>
+        <a href="#requests-heading"><span>Needs your input</span><span>{inbox.state === "ready" ? requests.length : "—"}</span></a>
+        <a href="#urgent-email-heading"><span>Urgent email</span><span>{urgent.state === "ready" && inbox.state === "ready" ? merged.total : "—"}</span></a>
+        <a href="#calendar-heading"><span>Your schedule</span><CalendarDays aria-hidden="true" className="h-4 w-4" /></a>
+        <a href="#reading-heading"><span>Keep reading</span><BookOpen aria-hidden="true" className="h-4 w-4" /></a>
+      </nav>
       <p role="status" aria-live="polite" className="sr-only">{pending ? "Refreshing Today" : unavailable ? "Some information could not be refreshed. Check the section messages." : "Today refresh finished"}</p>
       {experiment.state === "error" && <div role="region" aria-label="Experiment arm" className={panelStyle}>
         <p className="text-sm text-text-secondary">Couldn&apos;t check today&apos;s experiment arm. Try refreshing.</p>
@@ -296,15 +319,9 @@ export default function TodayClient() {
         {trial.status === "paused" && <p className="mt-3 break-words text-sm text-text-primary">{trial.experimentId}: {trial.title} is paused. No arm today.</p>}
         {experiment.state === "ready" && experiment.stale && <p className="mt-3 text-sm text-amber-300">Couldn&apos;t refresh the experiment arm. Showing the last check.</p>}
       </div>}
-      <div role="region" aria-label="Quick capture" className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-2xl border border-border-default bg-surface-card px-5 py-3">
-        <Link href="/check-in" className="inline-flex min-h-11 items-center gap-2 rounded-xl bg-accent px-4 text-sm font-medium text-surface focus-visible:outline-2 focus-visible:outline-accent">
-          <ClipboardCheck aria-hidden="true" className="h-4 w-4" />Start your check-in</Link>
-        <Link href="/supplements" className={`${linkStyle} inline-flex min-h-11 items-center`}>Supplement</Link>
-        <Link href="/habits" className={`${linkStyle} inline-flex min-h-11 items-center`}>Habit</Link>
-        <Link href="/nutrition" className={`${linkStyle} inline-flex min-h-11 items-center`}>Weight</Link>
-      </div>
-      <div className="grid gap-5 lg:grid-cols-2 lg:items-start">
-      <div className="min-w-0 space-y-5">
+      <div className={styles.workspace}>
+      <div className={styles.attention}>
+        <div className={styles.sectionLabel}><span>01</span><h2>What needs you</h2></div>
       <section className={panelStyle} aria-labelledby="requests-heading" aria-busy={inbox.state === "loading"}>
         <div className="flex items-center justify-between gap-4">
           <h2 id="requests-heading" className="text-lg font-medium text-text-primary">Needs your input</h2>
@@ -380,7 +397,8 @@ export default function TodayClient() {
         {urgent.state !== "loading" && <p className="mt-1 text-xs text-text-secondary">Opening or clearing on Today does not mark email read or change any label. A cleared thread comes back if a newer message arrives in it.</p>}
       </section>
       </div>
-      <div className="min-w-0 space-y-5">
+      <div className={styles.agenda}>
+        <div className={styles.sectionLabel}><span>02</span><h2>Your day, at a glance</h2></div>
       <section className={panelStyle} aria-labelledby="calendar-heading" aria-busy={calendar.state === "loading"}>
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-2"><CalendarDays aria-hidden="true" className="h-5 w-5 text-accent" />
@@ -414,6 +432,10 @@ export default function TodayClient() {
         </>}
         {calendar.state !== "loading" && <p className="mt-1 text-xs text-text-secondary">Read-only: opening Today changes nothing on your calendar.</p>}
       </section>
+      </div>
+      </div>
+      <div className={styles.sectionLabel}><span>03</span><h2>Keep life moving</h2></div>
+      <div className={styles.lifeGrid}>
       {packages && <section className={panelStyle} aria-labelledby="packages-heading">
         <div className="flex items-center gap-2"><Package aria-hidden="true" className="h-5 w-5 text-accent" />
           <h2 id="packages-heading" className="text-lg font-medium text-text-primary">Packages</h2></div>
@@ -469,8 +491,7 @@ export default function TodayClient() {
         <Link href="/check-in" className={`${linkStyle} mt-4 inline-block`}>Open check-in</Link>
       </section>
       </div>
-      </div>
-      <nav aria-label="More places" className="flex flex-wrap gap-x-5 gap-y-3 pb-4">
+      <nav aria-label="More places" className={styles.footer}>
         <Link href="/status" className={linkStyle}>System status</Link>
         <Link href="/nyc" className={linkStyle}>NYC search</Link>
         <Link href="/sleep" className={linkStyle}>Sleep &amp; recovery</Link>
