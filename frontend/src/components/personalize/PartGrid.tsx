@@ -39,6 +39,7 @@ import {
 } from "@/lib/personalize-store";
 import { registerTarget } from "@/lib/personalize-registry";
 import { loadEditor, preloadEditor, type EditorModule } from "./editor-loader";
+import { useInFeed } from "../FeedContext";
 
 /**
  * Personalize (Business Central-style): a page's personalizable parts.
@@ -166,7 +167,9 @@ export function PartGrid({ page, title, zone = MAIN_ZONE, initial, className, ga
   const editing = useSyncExternalStore(subscribe, () => isEditing(key), notEditing);
   const editor = useSyncExternalStore(subscribe, editorSnapshot, noEditor) as EditorModule | null;
   const container = useRef<HTMLDivElement>(null);
-  const main = zone === MAIN_ZONE && target;
+  // A page drawn inside the continuous scroll shows its saved layout; the routed page owns the Personalize entry.
+  const inFeed = useInFeed();
+  const main = zone === MAIN_ZONE && target && !inFeed;
   const label = title ?? page;
 
   const { specs, extras } = collect(children, parts);
