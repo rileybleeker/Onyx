@@ -29,7 +29,7 @@ import {
   type StoredLayout,
 } from "./personalize-layout";
 import { setEditingKey, setEditorRef } from "./personalize-registry";
-import { AREAS_KEY, LAYOUT_EVENT } from "./nav-areas";
+import { AREAS_KEY, LAYOUT_EVENT, areaId } from "./nav-areas";
 
 export const PULL_EVERY_MS = 15 * 60_000;
 
@@ -122,7 +122,8 @@ export function layoutSnapshot(key: string): PageLayout {
 
 /** The page (key) of the open Personalize session is this one. */
 export function isEditing(key: string): boolean {
-  return session !== null && session.key === key;
+  // The app's area order (Today's overview cards, the side panel) can be rearranged in any Personalize session.
+  return session !== null && (session.key === key || key === AREAS_KEY);
 }
 
 /** A Personalize session is open (any page): the side panel can be rearranged. */
@@ -263,6 +264,21 @@ async function pull(key: string, applyNow: boolean) {
   const local = read(key);
   const now = Date.now();
   if (pref.value === null) {
+    // First read of the area order: the overview's old arrangement (overview.cards) becomes its start, once.
+    if (key === AREAS_KEY && !local) {
+      const migrated = await migrateOverviewCards();
+      if (migrated) {
+        write(key, { layout: migrated, updatedAt: null, savedAt: now, dirty: true, checkedAt: now });
+        const d = session?.drafts[key];
+        if (session && d && !d.touched) {
+          session = { ...session, drafts: { ...session.drafts, [key]: { draft: migrated, base: migrated, touched: false } } };
+        }
+        emit();
+        announceLayout(key);
+        void push(key);
+        return;
+      }
+    }
     // Nothing on the server: a layout made here before it could sync goes up.
     if (local && !isEmptyLayout(local.layout) && !local.updatedAt) {
       write(key, { ...local, dirty: true, checkedAt: now });
@@ -299,6 +315,35 @@ async function pull(key: string, applyNow: boolean) {
     pending.set(key, rec);
   }
   announceLayout(key);
+}
+
+/**
+ * The Today overview's arrangement before Personalize owned it (UI preference "overview.cards": {v, order, hidden}
+ * of card ids) as an area layout: card ids become area ids (the page each card opens), hidden cards are hidden
+ * from the scroll. Null when there is none.
+ */
+async function migrateOverviewCards(): Promise<PageLayout | null> {
+  try {
+    const { OVERVIEW_CARDS, OVERVIEW_PREF_KEY, parseArrangement } = await import("./overview-cards");
+    const raw = await fetchJsonValue(uiPrefUrl(OVERVIEW_PREF_KEY));
+    const pref = parseUiPref(raw, OVERVIEW_PREF_KEY);
+    const arr = parseArrangement(pref.value);
+    if (!arr) return null;
+    const idOf = (cardId: string) => {
+      const c = OVERVIEW_CARDS.find((x) => x.id === cardId);
+      return c ? (c.href ? areaId(c.href) : c.id) : null;
+    };
+    const order = arr.order.map(idOf).filter((x): x is string => !!x);
+    const hide: Record<string, boolean> = {};
+    for (const h of arr.hidden) {
+      const id = idOf(h);
+      if (id) hide[id] = true;
+    }
+    if (!order.length) return null;
+    return sanitizeLayout({ v: 1, grids: { main: { order, ...(Object.keys(hide).length ? { hide } : {}) } } });
+  } catch {
+    return null;
+  }
 }
 
 /** A grid mounted (normal mode): in an idle slot after the page has loaded, sync this page with the server. */

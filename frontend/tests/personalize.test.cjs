@@ -230,3 +230,59 @@ test('keyboard moves use the same targets: position among the others', () => {
   const l = O.movePart(L.EMPTY_LAYOUT, Z, defs, 'd', O.keyboardTarget(ITEMS, 'd', 2).beforeId);
   assert.deepEqual(ids(L.resolveGrid(defs, l.grids.main)), ['a', 'b', 'd', 'c']);
 });
+
+// ---- groups (nested parts) -------------------------------------------------------------------------------
+const MODEL = { top: [def('g1'), def('g2'), def('lone')], groups: { g1: [def('a'), def('b')], g2: [def('c')] } };
+
+test('groups: default membership and order', () => {
+  const r = L.resolvePage(MODEL, L.EMPTY_LAYOUT);
+  assert.deepEqual(ids(r.top), ['g1', 'g2', 'lone']);
+  assert.deepEqual(ids(r.members.g1), ['a', 'b']);
+  assert.deepEqual(ids(r.members.g2), ['c']);
+  assert.equal(r.groupOf.a, 'g1');
+});
+
+test('groups: a part moves into another group and back; back home stores nothing', () => {
+  let l = O.movePartToGroup(L.EMPTY_LAYOUT, MODEL, 'a', 'g2', 'c');
+  let r = L.resolvePage(MODEL, l);
+  assert.deepEqual(ids(r.members.g1), ['b']);
+  assert.deepEqual(ids(r.members.g2), ['a', 'c']);
+  assert.equal(r.groupOf.a, 'g2');
+  l = O.movePartToGroup(l, MODEL, 'a', 'g1', 'b');
+  r = L.resolvePage(MODEL, l);
+  assert.deepEqual(ids(r.members.g1), ['a', 'b']);
+  assert.deepEqual(ids(r.members.g2), ['c']);
+  assert.deepEqual(l, { v: 1 });
+});
+
+test('groups: to the end of a group, within a group by one, to the top', () => {
+  let l = O.movePartToGroup(L.EMPTY_LAYOUT, MODEL, 'b', 'g2', null);
+  assert.deepEqual(ids(L.resolvePage(MODEL, l).members.g2), ['c', 'b']);
+  l = O.movePartInGroupBy(L.EMPTY_LAYOUT, MODEL, 'a', 1);
+  assert.deepEqual(ids(L.resolvePage(MODEL, l).members.g1), ['b', 'a']);
+  l = O.movePartToGroupTop(l, MODEL, 'a');
+  assert.deepEqual(l, { v: 1 });
+});
+
+test('groups: flags are page-wide and follow a part into another group', () => {
+  let l = O.setPartHidden(L.EMPTY_LAYOUT, 'main', O.modelDefs(MODEL), 'a', true);
+  assert.equal(L.resolvePage(MODEL, l).members.g1.find((p) => p.id === 'a').hidden, true);
+  l = O.movePartToGroup(l, MODEL, 'a', 'g2', null);
+  assert.equal(L.resolvePage(MODEL, l).members.g2.find((p) => p.id === 'a').hidden, true);
+  l = O.setPartWidth(l, 'main', O.modelDefs(MODEL), 'c', 'quarter');
+  assert.equal(L.resolvePage(MODEL, l).members.g2.find((p) => p.id === 'c').width, 'quarter');
+});
+
+test('groups: new parts take their default spot, removed parts and removed groups drop out safely', () => {
+  const l = O.movePartToGroup(L.EMPTY_LAYOUT, MODEL, 'a', 'g2', null); // g2: c a
+  const grown = { top: MODEL.top, groups: { g1: [def('a'), def('n'), def('b')], g2: [def('c'), def('m')] } };
+  const r = L.resolvePage(grown, l);
+  assert.deepEqual(ids(r.members.g1), ['n', 'b']);
+  assert.deepEqual(ids(r.members.g2), ['c', 'm', 'a']);
+  // g2 removed from the page: a goes home to g1.
+  const noG2 = { top: [def('g1'), def('lone')], groups: { g1: [def('a'), def('b')] } };
+  assert.deepEqual(ids(L.resolvePage(noG2, l).members.g1), ['a', 'b']);
+  // a removed from the page: g2 shows c only.
+  const noA = { top: MODEL.top, groups: { g1: [def('b')], g2: [def('c')] } };
+  assert.deepEqual(ids(L.resolvePage(noA, l).members.g2), ['c']);
+});

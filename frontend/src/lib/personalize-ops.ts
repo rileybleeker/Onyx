@@ -11,7 +11,9 @@
 import {
   EMPTY_LAYOUT,
   resolveOrder,
+  resolvePage,
   type ColumnDef,
+  type PageModel,
   type GridOverlay,
   type PageLayout,
   type PartDef,
@@ -229,6 +231,72 @@ export function setPartCollapsed(layout: PageLayout, zone: string, defs: readonl
     if (!g.collapse) delete g.collapse;
     return g;
   });
+}
+
+// ---- parts in groups (nested) -----------------------------------------------------------------------------
+
+/** Every part and group of a page model (for the defaults of page-wide flags). */
+export function modelDefs(model: PageModel): PartDef[] {
+  const out: PartDef[] = [...model.top];
+  for (const defs of Object.values(model.groups)) for (const d of defs) if (!out.some((x) => x.id === d.id)) out.push(d);
+  return out;
+}
+
+/**
+ * Part `id` moved into group `group`, before `beforeId` (null: at the end of the group). Works within a group
+ * and between groups of the same page. The target group stores its full order (so the part's membership is
+ * explicit); every other group's saved order loses the part.
+ */
+export function movePartToGroup(layout: PageLayout, model: PageModel, id: string, group: string, beforeId: string | null): PageLayout {
+  if (!model.groups[group]) return normalizeLayout(layout);
+  const page = resolvePage(model, layout);
+  const grids: Record<string, GridOverlay> = { ...(layout.grids ?? {}) };
+  for (const g of Object.keys(model.groups)) {
+    if (g === group) continue;
+    const saved = grids[g]?.order;
+    if (saved && saved.includes(id)) {
+      const left = saved.filter((x) => x !== id);
+      const rest: GridOverlay = { ...grids[g] };
+      // Back to the group's own default: nothing to store.
+      if (sameIds(left, model.groups[g].map((d) => d.id))) delete rest.order;
+      else rest.order = left;
+      grids[g] = rest;
+    }
+  }
+  const current = (page.members[group] ?? []).map((p) => p.id).filter((x) => x !== id);
+  const at = beforeId === null ? current.length : current.indexOf(beforeId);
+  current.splice(at === -1 ? current.length : at, 0, id);
+  const declared = model.groups[group].map((d) => d.id);
+  const next: GridOverlay = { ...(grids[group] ?? {}) };
+  if (sameIds(current, declared)) delete next.order;
+  else next.order = current;
+  grids[group] = next;
+  return normalizeLayout({ ...layout, grids });
+}
+
+/** Part `id` moved `delta` places among the visible parts of the group it is shown in. */
+export function movePartInGroupBy(layout: PageLayout, model: PageModel, id: string, delta: number): PageLayout {
+  const page = resolvePage(model, layout);
+  const group = page.groupOf[id];
+  if (!group) return normalizeLayout(layout);
+  const visible = (page.members[group] ?? []).filter((p) => !p.hidden).map((p) => p.id);
+  const i = visible.indexOf(id);
+  const j = Math.max(0, Math.min(visible.length - 1, i + delta));
+  if (i === -1 || j === i) return normalizeLayout(layout);
+  const all = (page.members[group] ?? []).map((p) => p.id);
+  let beforeId: string | null;
+  if (delta < 0) beforeId = visible[j];
+  else beforeId = all[all.indexOf(visible[j]) + 1] ?? null;
+  return movePartToGroup(layout, model, id, group, beforeId);
+}
+
+/** Part `id` moved to the top of the group it is shown in. */
+export function movePartToGroupTop(layout: PageLayout, model: PageModel, id: string): PageLayout {
+  const page = resolvePage(model, layout);
+  const group = page.groupOf[id];
+  if (!group) return normalizeLayout(layout);
+  const list = (page.members[group] ?? []).map((p) => p.id).filter((x) => x !== id);
+  return movePartToGroup(layout, model, id, group, list[0] ?? null);
 }
 
 // ---- column operations ------------------------------------------------------------------------------------

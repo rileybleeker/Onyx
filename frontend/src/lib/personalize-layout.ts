@@ -15,8 +15,8 @@
  * Import-free on purpose (tests/personalize.test.cjs runs it in plain node).
  */
 
-export type PartWidth = "full" | "half" | "third";
-export const PART_WIDTHS: readonly PartWidth[] = ["full", "half", "third"];
+export type PartWidth = "full" | "half" | "third" | "quarter";
+export const PART_WIDTHS: readonly PartWidth[] = ["full", "half", "third", "quarter"];
 
 export interface PartDef {
   id: string;
@@ -311,6 +311,89 @@ export function resolveColumns(
     const hidden = locked ? false : typeof hide === "boolean" ? hide : d.hidden === true;
     return { id, label: d.label, hidden, locked, frozen: !hidden && i <= freezeAt };
   });
+}
+
+// ---- pages with groups (nested parts) -------------------------------------------------------------------------
+
+/**
+ * A page with groups: top-level items (groups and lone parts) and, per group, the parts declared in it. A part can
+ * be moved into another group of the same page: it then belongs to the group whose saved order lists it.
+ * Order: `grids.main.order` (top level) and `grids[<group>].order` (inside a group). Flags (hide, width,
+ * collapse) are page-wide in `grids.main`, so they follow a part into another group.
+ */
+export interface PageModel {
+  top: PartDef[];
+  groups: Record<string, PartDef[]>;
+}
+
+export interface ResolvedPage {
+  top: ResolvedPart[];
+  /** Parts shown in each group, in display order (moved-in parts included, moved-out ones not). */
+  members: Record<string, ResolvedPart[]>;
+  /** The group each declared part is shown in. */
+  groupOf: Record<string, string>;
+}
+
+function flagOf<T>(layout: PageLayout, field: "hide" | "width" | "collapse", zone: string, id: string): T | undefined {
+  const main = layout.grids?.[MAIN_ZONE]?.[field] as Record<string, T> | undefined;
+  if (main && id in main) return main[id];
+  const own = layout.grids?.[zone]?.[field] as Record<string, T> | undefined;
+  return own && id in own ? own[id] : undefined;
+}
+
+function resolvePart(d: PartDef, layout: PageLayout, zone: string, pos: number): ResolvedPart {
+  const hide = flagOf<boolean>(layout, "hide", zone, d.id);
+  const width = flagOf<PartWidth>(layout, "width", zone, d.id);
+  const collapse = flagOf<boolean>(layout, "collapse", zone, d.id);
+  return {
+    id: d.id,
+    title: d.title,
+    width: width && (PART_WIDTHS as readonly string[]).includes(width) ? width : d.width,
+    hidden: typeof hide === "boolean" ? hide : d.hidden,
+    collapsed: typeof collapse === "boolean" ? collapse : d.collapsed,
+    pos,
+  };
+}
+
+/** Which group each part is in: a group other than its own whose saved order lists it, else its own. */
+export function groupMembership(model: PageModel, layout: PageLayout): Record<string, string> {
+  const groupIds = Object.keys(model.groups);
+  const out: Record<string, string> = {};
+  for (const g of groupIds) {
+    for (const d of model.groups[g]) {
+      if (d.id in out) continue;
+      const moved = groupIds.find((x) => x !== g && (layout.grids?.[x]?.order ?? []).includes(d.id));
+      out[d.id] = moved ?? g;
+    }
+  }
+  return out;
+}
+
+export function resolvePage(model: PageModel, layout: PageLayout, zone: string = MAIN_ZONE): ResolvedPage {
+  const groupOf = groupMembership(model, layout);
+  const defOf = new Map<string, PartDef>();
+  const declared = new Map<string, string>();
+  for (const [g, defs] of Object.entries(model.groups)) {
+    for (const d of defs) {
+      if (!defOf.has(d.id)) {
+        defOf.set(d.id, d);
+        declared.set(d.id, g);
+      }
+    }
+  }
+  const members: Record<string, ResolvedPart[]> = {};
+  for (const [g, defs] of Object.entries(model.groups)) {
+    const saved = layout.grids?.[g]?.order;
+    const own = defs.filter((d) => groupOf[d.id] === g).map((d) => d.id);
+    const movedIn = (saved ?? []).filter((id) => groupOf[id] === g && declared.get(id) !== g);
+    const order = resolveOrder([...own, ...movedIn], saved);
+    members[g] = order.map((id, pos) => resolvePart(defOf.get(id) as PartDef, layout, g, pos));
+  }
+  const topDef = new Map(model.top.map((d) => [d.id, d] as const));
+  const top = resolveOrder(model.top.map((d) => d.id), layout.grids?.[zone]?.order).map((id, pos) =>
+    resolvePart(topDef.get(id) as PartDef, layout, zone, pos),
+  );
+  return { top, members, groupOf };
 }
 
 /** Ids of the visible parts in display order (for a table of contents that follows the layout). */
