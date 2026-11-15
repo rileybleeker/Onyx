@@ -67,13 +67,15 @@ function main(argv) {
   const dirs = [];
   let mdOut = null;
   let jsonOut = null;
+  let budget = false;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--md") mdOut = argv[++i];
+    if (argv[i] === "--budget") budget = true;
+    else if (argv[i] === "--md") mdOut = argv[++i];
     else if (argv[i] === "--json") jsonOut = argv[++i];
     else dirs.push(argv[i]);
   }
   if (dirs.length === 0) {
-    console.error("usage: perf-report.cjs <results-dir>... [--md out.md] [--json out.json]");
+    console.error("usage: perf-report.cjs <results-dir>... [--md out.md] [--json out.json] [--budget]");
     process.exit(2);
   }
   const runs = dirs.map(loadRun).filter((r) => r.pages.length > 0);
@@ -85,6 +87,14 @@ function main(argv) {
   if (mdOut) fs.writeFileSync(mdOut, md);
   if (jsonOut) fs.writeFileSync(jsonOut, JSON.stringify(runs.map((r) => ({ meta: r.meta, pages: r.pages })), null, 1));
   if (!mdOut) process.stdout.write(md);
+  if (budget) {
+    const over = runs.flatMap((r) => stats.budgetViolations(r.pages));
+    if (over.length) {
+      console.error(`Speed budget broken (nothing may take ${stats.SPEED_BUDGET_MS} ms):\n- ` + over.join("\n- "));
+      process.exit(1);
+    }
+    console.log(`Speed budget met: every page's data under ${stats.SPEED_BUDGET_MS} ms, no call over it.`);
+  }
 }
 
 if (require.main === module) main(process.argv.slice(2));
