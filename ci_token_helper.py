@@ -271,7 +271,10 @@ def spotify_upload_decision(local_text, stored_text):
       3. otherwise compare (authorized_at, obtained_at): a later sign-in always wins;
          within one sign-in the later refresh wins. Upload only when the local blob is
          strictly newer. A blob without authorized_at counts as the oldest sign-in.
-    Mirrors isNewerBlob in frontend/src/lib/spotify-reconnect.ts.
+    Mirrors isNewerBlob in frontend/src/lib/spotify-reconnect.ts and pds.spotify_token_decision
+    (sql/spotify_token_atomic_save.sql). upload_spotify does not run this itself: the write goes
+    through pds.save_spotify_token, which applies the same rule under the row lock. This is the
+    offline model the tests use.
     """
     local = _spotify_blob(local_text)
     if local is None:
@@ -292,6 +295,17 @@ def spotify_upload_decision(local_text, stored_text):
     return "skip", "the stored token was refreshed more recently"
 
 
+# What pds.save_spotify_token answers (an outcome code, never a token) -> the log wording.
+SPOTIFY_SAVE_OUTCOMES = {
+    "written": "the local token is newer than the stored one, or none was stored",
+    "same": "the stored token is already this one",
+    "older_signin": "the stored token comes from a newer sign-in",
+    "older_refresh": "the stored token was refreshed more recently",
+    "rotated": "the stored refresh token was rotated elsewhere",
+    "invalid": "the local token file is not a Spotify token blob",
+}
+
+
 def upload_spotify():
     """Read Spotify tokens from ~/.spotify_tokens.json and upload to Supabase.
 
@@ -303,8 +317,10 @@ def upload_spotify():
         whatever was stored in the meantime (a fresh sign-in, or a token the frontend
         rotated). Until 2026-11-13 a failing run re-uploaded the dead token every hour.
       * a file that is not newer than the stored row is not uploaded (exit 0): see
-        spotify_upload_decision. The stored row is read first; if that read fails the
-        command fails without writing, rather than risk replacing a newer token.
+        spotify_upload_decision. The comparison and the write are ONE call to
+        pds.save_spotify_token, which locks the row, so a sign-in stored while this run was
+        in flight is compared against, never overwritten. If the call fails nothing is
+        written and the command fails.
     A refreshed file is uploaded even when the ETL failed later in the run, so a rotated
     refresh token is not lost. With no download baseline (local use after --auth) only
     the newer-wins rule applies.
@@ -333,33 +349,23 @@ def upload_spotify():
             return
 
     sb = get_supabase()
-    # `service` is the table's key, so this is one row at most. (No .single(): it raises
-    # when the row is missing, and "no row yet" must upload.)
-    found = (
+    # Compare and write in one transaction under the row lock (sql/spotify_token_atomic_save.sql).
+    # No loaded refresh token: the rotated-elsewhere rule is the site's refresh path only.
+    outcome = (
         sb.schema("pds")
-        .table("ci_tokens")
-        .select("token_data")
-        .eq("service", "spotify")
+        .rpc("save_spotify_token", {"p_token_data": token_data, "p_loaded_refresh_token": None})
         .execute()
     ).data
-    if isinstance(found, list):
-        found = found[0] if found else None
-    stored = found.get("token_data") if isinstance(found, dict) else None
-
-    action, reason = spotify_upload_decision(token_data, stored)
-    if action == "invalid":
+    reason = SPOTIFY_SAVE_OUTCOMES.get(outcome) if isinstance(outcome, str) else None
+    if reason is None:
+        log.error("Spotify tokens NOT uploaded: unexpected answer from pds.save_spotify_token")
+        sys.exit(1)
+    if outcome == "invalid":
         log.error(f"Spotify tokens NOT uploaded: {reason}")
         sys.exit(1)
-    if action == "skip":
+    if outcome != "written":
         log.info(f"Spotify tokens not uploaded: {reason}")
         return
-
-    sb.schema("pds").table("ci_tokens").upsert({
-        "service": "spotify",
-        "token_data": token_data,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).execute()
-
     log.info(f"Spotify tokens uploaded to Supabase ({reason})")
 
 

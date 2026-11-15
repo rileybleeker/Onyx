@@ -19,9 +19,17 @@ const SCOPE_FROM_SPOTIFY = "playlist-modify-private user-read-recently-played"; 
 
 // ----------------------------------------------------------------------------- fakes
 
-/** Fake supabase-js client: one ci_tokens row, recorded upserts. */
-function fakeDb({ stored = null, upsertError = null, readError = null } = {}) {
-  const calls = { upserts: [], reads: 0 };
+/**
+ * Fake supabase-js client: one ci_tokens row (state.stored), recorded upserts and RPCs.
+ * rpc("save_spotify_token") is applied atomically with the offline model of
+ * pds.save_spotify_token (sql/spotify_token_atomic_save.sql). hooks.beforeCommit runs at the last
+ * moment before a write commits (inside the RPC before its compare, or before an upsert lands),
+ * so a test can land a reconnect exactly there.
+ */
+function fakeDb({ stored = null, upsertError = null, readError = null, rpcError = null } = {}) {
+  const calls = { upserts: [], reads: 0, rpcs: [] };
+  const state = { stored };
+  const hooks = { beforeCommit: null };
   const from = (table) => {
     const b = {
       select() { return b; },
@@ -29,21 +37,52 @@ function fakeDb({ stored = null, upsertError = null, readError = null } = {}) {
       limit() { return b; },
       single() {
         calls.reads++;
-        return Promise.resolve(stored === null ? { data: null, error: { code: "PGRST116" } } : { data: { token_data: stored }, error: null });
+        return Promise.resolve(state.stored === null ? { data: null, error: { code: "PGRST116" } } : { data: { token_data: state.stored }, error: null });
       },
       upsert(row) {
         calls.upserts.push({ table, row });
-        return Promise.resolve({ error: upsertError ? { code: upsertError } : null });
+        if (upsertError) return Promise.resolve({ error: { code: upsertError } });
+        if (hooks.beforeCommit) hooks.beforeCommit(state);
+        state.stored = row.token_data;
+        return Promise.resolve({ error: null });
       },
       then(resolve, reject) {
         calls.reads++;
-        const res = readError ? { data: null, error: { code: readError } } : { data: stored === null ? [] : [{ token_data: stored }], error: null };
+        const res = readError ? { data: null, error: { code: readError } } : { data: state.stored === null ? [] : [{ token_data: state.stored }], error: null };
         return Promise.resolve(res).then(resolve, reject);
       },
     };
     return b;
   };
-  return { client: { from }, calls };
+  const rpc = (name, args) => {
+    calls.rpcs.push({ name, args });
+    if (rpcError) return Promise.resolve({ data: null, error: { code: rpcError } });
+    assert.equal(name, "save_spotify_token");
+    if (hooks.beforeCommit) hooks.beforeCommit(state);
+    const outcome = modelSave(state.stored, args.p_token_data, args.p_loaded_refresh_token);
+    if (outcome === "written") state.stored = args.p_token_data;
+    return Promise.resolve({ data: outcome, error: null });
+  };
+  return { client: { from, rpc }, calls, state, hooks };
+}
+
+/** The outcome pds.save_spotify_token answers, from the offline model (isNewerBlob / shouldWriteBack). */
+function modelSave(storedText, candidateText, loadedRefreshToken) {
+  const blobOf = (t) => {
+    try {
+      const v = JSON.parse(t);
+      return v && typeof v === "object" && !Array.isArray(v) && typeof v.refresh_token === "string" && v.refresh_token ? v : null;
+    } catch {
+      return null;
+    }
+  };
+  const cand = blobOf(candidateText);
+  if (!cand) return "invalid";
+  const stored = blobOf(storedText);
+  if (!stored) return "written";
+  if (lib.shouldWriteBack(cand, loadedRefreshToken ?? "", stored)) return "written";
+  if (!lib.isNewerBlob(cand, stored)) return (cand.authorized_at ?? 0) < (stored.authorized_at ?? 0) ? "older_signin" : "older_refresh";
+  return "rotated";
 }
 
 const jsonResponse = (status, body) => ({
@@ -70,7 +109,7 @@ function fakeSpotify({ token = jsonResponse(200, TOKEN_OK), probe = jsonResponse
 
 let db = fakeDb();
 const stubs = {
-  "@supabase/supabase-js": { createClient: () => ({ from: (t) => db.client.from(t) }) },
+  "@supabase/supabase-js": { createClient: () => ({ from: (t) => db.client.from(t), rpc: (n, a) => db.client.rpc(n, a) }) },
   "next/server": {
     NextResponse: { json: (body, init) => ({ status: (init && init.status) || 200, body, headers: (init && init.headers) || {} }) },
   },
@@ -672,7 +711,7 @@ test("exchange: missing server config is a 500 before Spotify is called; a faile
 
 // ----------------------------------------------------------------------------- refresh path (spotify-server.ts)
 
-test("refresh path: keeps authorized_at, and never writes an old blob over a newer authorization", async () => {
+test("refresh path: keeps authorized_at, and writes back through the atomic save only", async () => {
   const refreshOk = jsonResponse(200, { access_token: "synthetic-access-2", token_type: "Bearer", expires_in: 3600, scope: SCOPE_FROM_SPOTIFY });
   const old = { access_token: "a", token_type: "Bearer", expires_in: 3600, refresh_token: REFRESH, scope: SCOPE_FROM_SPOTIFY, obtained_at: 1000, authorized_at: 900 };
 
@@ -682,30 +721,25 @@ test("refresh path: keeps authorized_at, and never writes an old blob over a new
   let run = await withEnv(() => server.getSpotifyAccessToken(), { fetchImpl: spotify.fetchImpl });
   assert.equal(run.result, "synthetic-access-2");
   assert.equal(new URLSearchParams(String(spotify.calls[0].init.body)).get("grant_type"), "refresh_token");
-  assert.equal(db.calls.upserts.length, 1);
-  const saved = JSON.parse(db.calls.upserts[0].row.token_data);
+  assert.equal(db.calls.rpcs.length, 1);
+  assert.equal(db.calls.rpcs[0].name, "save_spotify_token");
+  assert.deepEqual(Object.keys(db.calls.rpcs[0].args).sort(), ["p_loaded_refresh_token", "p_token_data"]);
+  assert.equal(db.calls.rpcs[0].args.p_loaded_refresh_token, REFRESH, "the loaded refresh token goes along for the rotated rule");
+  assert.equal(db.calls.upserts.length, 0, "the refresh path never upserts the row itself");
+  assert.equal(db.calls.reads, 1, "one read (the load) and no second read before the write: no read-then-write window");
+  const saved = JSON.parse(db.state.stored);
   assert.equal(saved.authorized_at, 900, "authorized_at survives the refresh");
   assert.equal(saved.refresh_token, REFRESH);
   assert.ok(saved.obtained_at > 1000);
+  assert.equal(db.state.stored, db.calls.rpcs[0].args.p_token_data, "stored as pretty JSON, exactly as sent");
 
-  // a reconnect stored a newer authorization between this call's load and its save
-  const reconnected = { ...old, refresh_token: "synthetic-new-refresh", obtained_at: 2_000_000_000_000, authorized_at: 2_000_000_000_000 };
-  let reads = 0;
-  const racing = fakeDb({ stored: JSON.stringify(old) });
-  const realFrom = racing.client.from;
-  racing.client.from = (t) => {
-    const b = realFrom(t);
-    const then = b.then;
-    b.then = (res, rej) => { reads++; return Promise.resolve({ data: [{ token_data: JSON.stringify(reconnected) }], error: null }).then(res, rej); };
-    void then;
-    return b;
-  };
-  db = racing;
+  // a failed save is non-fatal (the call still gets its token) and logs a code, never a token
+  db = fakeDb({ stored: JSON.stringify(old), rpcError: "57014" });
   spotify = fakeSpotify({ token: refreshOk });
   run = await withEnv(() => server.getSpotifyAccessToken(), { fetchImpl: spotify.fetchImpl });
-  assert.equal(run.result, "synthetic-access-2", "the call still gets its access token");
-  assert.equal(reads, 1, "the stored row is re-read before the write-back");
-  assert.equal(db.calls.upserts.length, 0, "the old blob is not written over the reconnect's token");
+  assert.equal(run.result, "synthetic-access-2");
+  assert.ok(run.logged.some((l) => l.includes("57014")));
+  for (const line of run.logged) for (const secret of [...SECRETS, "synthetic-access-2"]) assert.ok(!line.includes(secret), "no token in a log line");
 
   // a dead refresh token: a clear pointer to /status, no Spotify body, nothing written
   db = fakeDb({ stored: JSON.stringify(old) });
@@ -714,11 +748,73 @@ test("refresh path: keeps authorized_at, and never writes an old blob over a new
     withEnv(() => server.getSpotifyAccessToken(), { fetchImpl: spotify.fetchImpl }),
     (e) => /refresh token rejected/i.test(e.message) && e.message.includes("/status") && !e.message.includes(REFRESH),
   );
-  assert.equal(db.calls.upserts.length, 0);
+  assert.equal(db.calls.upserts.length + db.calls.rpcs.length, 0);
 
   // not configured: fails before any network call
   db = fakeDb({ stored: JSON.stringify(old) });
   await assert.rejects(withEnv(() => server.getSpotifyAccessToken(), { env: {} }), /not configured/);
+});
+
+test("refresh path interleaving: a reconnect landing at any point is never overwritten (Codex #168)", async () => {
+  const refreshOk = jsonResponse(200, { access_token: "synthetic-access-2", token_type: "Bearer", expires_in: 3600, scope: SCOPE_FROM_SPOTIFY });
+  const old = { access_token: "a", token_type: "Bearer", expires_in: 3600, refresh_token: REFRESH, scope: SCOPE_FROM_SPOTIFY, obtained_at: 1000, authorized_at: 900 };
+  const reconnected = { ...old, refresh_token: "synthetic-new-refresh", obtained_at: 2_000_000_000, authorized_at: 2_000_000_000 };
+  const reconnectedText = JSON.stringify(reconnected, null, 2);
+
+  // 1. while Spotify answers the refresh (after the load, before the save)
+  db = fakeDb({ stored: JSON.stringify(old, null, 2) });
+  let spotify = fakeSpotify({ token: () => { db.state.stored = reconnectedText; return refreshOk; } });
+  let run = await withEnv(() => server.getSpotifyAccessToken(), { fetchImpl: spotify.fetchImpl });
+  assert.equal(run.result, "synthetic-access-2", "the call still gets its access token");
+  assert.equal(db.state.stored, reconnectedText, "reconnect during the refresh call: kept");
+
+  // 2. at the last moment before the write commits: where the old code's re-read was already done
+  //    and its upsert not yet sent. With the atomic save the compare happens after this point.
+  db = fakeDb({ stored: JSON.stringify(old, null, 2) });
+  db.hooks.beforeCommit = (st) => { st.stored = reconnectedText; };
+  spotify = fakeSpotify({ token: refreshOk });
+  await withEnv(() => server.getSpotifyAccessToken(), { fetchImpl: spotify.fetchImpl });
+  assert.equal(db.state.stored, reconnectedText, "reconnect just before the write: kept");
+  assert.equal(db.calls.upserts.length, 0);
+
+  // 3. right after the refresh's write: the reconnect's own write follows it
+  db = fakeDb({ stored: JSON.stringify(old, null, 2) });
+  spotify = fakeSpotify({ token: refreshOk });
+  await withEnv(() => server.getSpotifyAccessToken(), { fetchImpl: spotify.fetchImpl });
+  assert.notEqual(db.state.stored, reconnectedText);
+  const stored = await withEnv(() => server.storeSpotifyTokens(reconnected));
+  assert.equal(stored.result, true);
+  assert.equal(db.state.stored, reconnectedText, "reconnect after the write: kept");
+
+  // 4. the same sign-in's refresh token rotated elsewhere meanwhile, and Spotify sent this call
+  //    no new one: writing would put the old refresh token back over the rotated one
+  const rotated = { ...old, refresh_token: "synthetic-rotated-refresh", obtained_at: 1500 };
+  db = fakeDb({ stored: JSON.stringify(old, null, 2) });
+  db.hooks.beforeCommit = (st) => { st.stored = JSON.stringify(rotated, null, 2); };
+  spotify = fakeSpotify({ token: refreshOk });
+  run = await withEnv(() => server.getSpotifyAccessToken(), { fetchImpl: spotify.fetchImpl });
+  assert.equal(JSON.parse(db.state.stored).refresh_token, "synthetic-rotated-refresh", "the rotated token is kept");
+  assert.ok(run.logged.some((l) => /rotated elsewhere/.test(l)));
+
+  // 5. a later refresh of the same sign-in lands first: it is kept over this call's older one
+  const later = { ...old, access_token: "site-later", obtained_at: 4_000_000_000 };
+  db = fakeDb({ stored: JSON.stringify(old, null, 2) });
+  db.hooks.beforeCommit = (st) => { st.stored = JSON.stringify(later, null, 2); };
+  spotify = fakeSpotify({ token: refreshOk });
+  await withEnv(() => server.getSpotifyAccessToken(), { fetchImpl: spotify.fetchImpl });
+  assert.equal(JSON.parse(db.state.stored).access_token, "site-later");
+});
+
+test("the refresh write-back has no read-then-write: one atomic call, no upsert", () => {
+  const src = fs.readFileSync(path.join(SRC, "lib", "spotify-server.ts"), "utf8").replace(/\r/g, "");
+  const body = src.slice(src.indexOf("async function saveTokens"), src.indexOf("\n}\n", src.indexOf("async function saveTokens")));
+  assert.ok(body.includes('.rpc("save_spotify_token"'), "saveTokens writes through pds.save_spotify_token");
+  assert.ok(!/\.upsert\(|\.update\(|\.select\(/.test(body), "saveTokens neither reads nor writes the table itself");
+  const sql = fs.readFileSync(path.join(SRC, "..", "..", "sql", "spotify_token_atomic_save.sql"), "utf8").replace(/\r/g, "");
+  assert.ok(!/\bdrop\b/i.test(sql), "additive and safe to send through the Supabase connector");
+  assert.match(sql, /FOR UPDATE/, "the compare happens under the row lock");
+  assert.match(sql, /REVOKE ALL ON FUNCTION pds\.save_spotify_token\(text, text\) FROM PUBLIC, anon, authenticated/);
+  assert.match(sql, /GRANT EXECUTE ON FUNCTION pds\.save_spotify_token\(text, text\) TO service_role/);
 });
 
 // ----------------------------------------------------------------------------- browser-side helpers

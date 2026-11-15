@@ -118,36 +118,105 @@ def test_decision() -> None:
 
 
 # ------------------------------------------------------------------ upload_spotify wiring
-def fake_supabase(stored_text: str | None, as_list: bool = True):
-    """A stand-in for the supabase client: records upserts, serves one ci_tokens row
-    (as the list a plain select returns, or as the dict .single() returns)."""
-    sb = MagicMock()
-    table = sb.schema.return_value.table.return_value
-    row = {"token_data": stored_text}
-    data = ([row] if stored_text is not None else []) if as_list else (row if stored_text is not None else None)
-    table.select.return_value.eq.return_value.execute.return_value = MagicMock(data=data)
-    table.select.return_value.eq.return_value.single.return_value.execute.return_value = MagicMock(data=row)
-    return sb, table
+def model_outcome(candidate_text, stored_text) -> str:
+    """The outcome code pds.save_spotify_token answers, from the offline model
+    (spotify_upload_decision mirrors pds.spotify_token_decision; without a loaded refresh
+    token the rotated rule never applies, as in upload_spotify)."""
+    action, reason = helper.spotify_upload_decision(candidate_text, stored_text)
+    if action == "upload":
+        return "written"
+    if action == "invalid":
+        return "invalid"
+    return {helper.SPOTIFY_SAVE_OUTCOMES["same"]: "same",
+            helper.SPOTIFY_SAVE_OUTCOMES["older_signin"]: "older_signin"}.get(reason, "older_refresh")
 
 
-def run_upload(local_text: str, stored_text: str | None, download_first: bool = False, as_list: bool = True):
+class FakeTokenStore:
+    """A stand-in for the supabase client with ONE pds.ci_tokens spotify row.
+
+    `download spotify` reads it through the table API. `upload spotify` must write it ONLY
+    through the save_spotify_token RPC, applied here atomically with the offline model.
+    `before_commit`, when set, runs at the last moment before the uploader's write: inside the
+    RPC right before its compare-and-write (what another writer commits then is what the atomic
+    call compares against; in the database that is the row lock), or, for a direct table upsert,
+    after whatever read preceded it. A read-then-upsert uploader therefore reproduces the race
+    of Codex review #168 here: the reconnect lands between its read and its write."""
+
+    def __init__(self, stored: str | None):
+        self.stored = stored
+        self.rpcs: list[dict] = []
+        self.upserts: list[dict] = []
+        self.reads = 0
+        self.before_commit = None
+        self.rpc_error: Exception | None = None
+        self.answer = None                 # force an RPC answer (e.g. an unexpected value)
+
+    def schema(self, name):
+        assert name == "pds", name
+        return self
+
+    def table(self, name):
+        assert name == "ci_tokens", name
+        store = self
+
+        class Query:
+            def select(self, *_a, **_k): return self
+            def eq(self, *_a, **_k): return self
+            def single(self):
+                self._single = True
+                return self
+            def upsert(self, row):
+                store.upserts.append(row)
+                if store.before_commit:
+                    store.before_commit(store)
+                store.stored = row.get("token_data")
+                return self
+            def execute(self):
+                store.reads += 1
+                row = {"token_data": store.stored} if store.stored is not None else None
+                return MagicMock(data=row if getattr(self, "_single", False) else ([row] if row else []))
+        return Query()
+
+    def rpc(self, name, params):
+        store = self
+
+        class Call:
+            def execute(self):
+                assert name == "save_spotify_token", name
+                assert set(params) == {"p_token_data", "p_loaded_refresh_token"}, params
+                store.rpcs.append(params)
+                if store.rpc_error:
+                    raise store.rpc_error
+                if store.before_commit:
+                    store.before_commit(store)
+                code = model_outcome(params["p_token_data"], store.stored)
+                if code == "written":
+                    store.stored = params["p_token_data"]
+                return MagicMock(data=store.answer if store.answer is not None else code)
+        return Call()
+
+
+def run_upload(local_text: str, stored_text: str | None, download_first: bool = False, before_commit=None):
     """Runs `upload spotify` against a fake stored row. With download_first, the helper's
     own `download spotify` runs first (writing the baseline) and local_text then replaces
-    the token file, as the ETL's refresh would."""
+    the token file, as the ETL's refresh would. Returns (store, exit code)."""
     with tempfile.TemporaryDirectory() as tmp:
         token_file = Path(tmp) / "tokens.json"
-        sb, table = fake_supabase(stored_text, as_list)
+        store = FakeTokenStore(stored_text)
         exit_code = 0
         with patch.object(helper, "SPOTIFY_TOKEN_FILE", str(token_file)), \
-             patch.object(helper, "get_supabase", return_value=sb):
+             patch.object(helper, "get_supabase", return_value=store):
             if download_first:
                 helper.download_spotify()
             token_file.write_text(local_text, encoding="utf-8")
+            store.before_commit = before_commit
+            reads_before = store.reads
             try:
                 helper.upload_spotify()
             except SystemExit as e:
                 exit_code = e.code
-        return table.upsert, exit_code
+            store.upload_reads = store.reads - reads_before
+        return store, exit_code
 
 
 def test_upload_wiring() -> None:
@@ -155,58 +224,88 @@ def test_upload_wiring() -> None:
     reconnected = blob("new-refresh", REAUTH, REAUTH)
     old_refreshed = blob("old-refresh", REAUTH + 30, T0)
 
-    for as_list in (True, False):
-        upsert, code = run_upload(old_refreshed, reconnected, as_list=as_list)
-        check(f"refreshed old sign-in vs a stored new sign-in: nothing written, exit 0 (row as {'list' if as_list else 'dict'})",
-              upsert.call_count == 0 and code == 0, f"calls={upsert.call_count} exit={code}")
-
-    # Same race with the real download step first: the file differs from the baseline
-    # (it was refreshed), so only the newer-wins rule stands between it and the row.
-    with tempfile.TemporaryDirectory() as tmp:
-        token_file = Path(tmp) / "tokens.json"
-        sb, table = fake_supabase(blob("old-refresh", REAUTH - 3600, T0))
-        with patch.object(helper, "SPOTIFY_TOKEN_FILE", str(token_file)), \
-             patch.object(helper, "get_supabase", return_value=sb):
-            helper.download_spotify()                                   # the run downloads the old sign-in
-            token_file.write_text(old_refreshed, encoding="utf-8")       # ...and refreshes it
-            table.select.return_value.eq.return_value.execute.return_value = MagicMock(
-                data=[{"token_data": reconnected}])                      # meanwhile: Reconnect stored a new one
-            helper.upload_spotify()
-        check("download -> refresh -> reconnect lands -> upload: the new sign-in is kept", table.upsert.call_count == 0)
+    store, code = run_upload(old_refreshed, reconnected)
+    check("refreshed old sign-in vs a stored new sign-in: not written, exit 0",
+          store.stored == reconnected and code == 0, f"exit={code}")
 
     stored = blob("r", T1, T0)
     refreshed = blob("r", T2, T0, access="access-synthetic-2")
-    upsert, code = run_upload(refreshed, stored, download_first=True)
-    check("refreshed run: exactly one upsert, exit 0", upsert.call_count == 1 and code == 0)
-    row = upsert.call_args[0][0] if upsert.call_count else {}
-    check("the upsert is {service, token_data, updated_at} with the file's exact text",
-          set(row) == {"service", "token_data", "updated_at"} and row.get("service") == "spotify"
-          and row.get("token_data") == refreshed)
+    store, code = run_upload(refreshed, stored, download_first=True)
+    check("refreshed run: one save_spotify_token call with the file's exact text, exit 0",
+          len(store.rpcs) == 1 and store.rpcs[0] == {"p_token_data": refreshed, "p_loaded_refresh_token": None}
+          and store.stored == refreshed and code == 0)
+    check("...and no direct read or upsert of ci_tokens: the compare is inside the atomic call",
+          store.upload_reads == 0 and store.upserts == [], f"reads={store.upload_reads} upserts={len(store.upserts)}")
 
-    upsert, code = run_upload(stored, stored, download_first=True)
-    check("unrefreshed run: nothing written, exit 0 (the download baseline)", upsert.call_count == 0 and code == 0)
+    store, code = run_upload(stored, stored, download_first=True)
+    check("unrefreshed run: nothing sent, exit 0 (the download baseline)", store.rpcs == [] and code == 0)
 
-    upsert, code = run_upload("not json", stored)
-    check("a broken token file is never stored, exit 1", upsert.call_count == 0 and code == 1)
+    store, code = run_upload("not json", stored)
+    check("a broken token file is never sent, exit 1", store.rpcs == [] and store.stored == stored and code == 1)
 
-    for as_list in (True, False):
-        upsert, code = run_upload(refreshed, None, as_list=as_list)
-        check(f"no stored row: uploaded (row as {'list' if as_list else 'dict'})", upsert.call_count == 1 and code == 0)
+    store, code = run_upload(refreshed, None)
+    check("no stored row: written", store.stored == refreshed and code == 0)
 
-    # If the stored row cannot be read, fail without writing.
+    # An RPC that fails or answers something unexpected: nothing was written, the command fails.
     with tempfile.TemporaryDirectory() as tmp:
         token_file = Path(tmp) / "tokens.json"
         token_file.write_text(refreshed, encoding="utf-8")
-        sb, table = fake_supabase(stored)
-        table.select.return_value.eq.return_value.execute.side_effect = RuntimeError("read failed")
+        store = FakeTokenStore(stored)
+        store.rpc_error = RuntimeError("database unavailable")
         raised = False
         with patch.object(helper, "SPOTIFY_TOKEN_FILE", str(token_file)), \
-             patch.object(helper, "get_supabase", return_value=sb):
+             patch.object(helper, "get_supabase", return_value=store):
             try:
                 helper.upload_spotify()
             except RuntimeError:
                 raised = True
-        check("a failed read of the stored row raises and writes nothing", raised and table.upsert.call_count == 0)
+        check("a failed save call raises and the stored row is untouched", raised and store.stored == stored)
+    store = FakeTokenStore(stored)
+    store.answer = {"token_data": "x"}
+    with tempfile.TemporaryDirectory() as tmp:
+        token_file = Path(tmp) / "tokens.json"
+        token_file.write_text(refreshed, encoding="utf-8")
+        code = 0
+        with patch.object(helper, "SPOTIFY_TOKEN_FILE", str(token_file)), \
+             patch.object(helper, "get_supabase", return_value=store):
+            try:
+                helper.upload_spotify()
+            except SystemExit as e:
+                code = e.code
+        check("an unexpected answer from the save call exits 1", code == 1)
+
+
+def test_upload_interleaving() -> None:
+    """The race Codex review #168 found: the old upload read the row, compared, then upserted.
+    A reconnect committed between that read and the upsert was overwritten. Now the compare
+    and the write are one atomic call, so whatever lands before it is compared against and
+    whatever lands after it simply follows it."""
+    print("upload_spotify interleaving")
+    reconnected = blob("new-refresh", REAUTH, REAUTH)
+    old_signin = blob("old-refresh", REAUTH - 3600, T0)
+    old_refreshed = blob("old-refresh", REAUTH + 30, T0)
+
+    def reconnect_lands(store):
+        store.stored = reconnected            # Reconnect's plain write, committed just before the lock
+
+    # download the OLD sign-in -> the ETL refreshes it -> Reconnect lands -> upload
+    store, code = run_upload(old_refreshed, old_signin, download_first=True, before_commit=reconnect_lands)
+    check("reconnect committed while the upload was in flight: the new sign-in is kept",
+          store.stored == reconnected and code == 0 and len(store.rpcs) == 1, store.stored[:40])
+    check("...the upload never read the row itself (no read-then-write window)",
+          store.upload_reads == 0 and store.upserts == [])
+
+    # the other order: the upload's atomic write commits first, then Reconnect writes over it
+    store, code = run_upload(old_refreshed, old_signin, download_first=True)
+    check("upload first: the refreshed old sign-in is written", store.stored == old_refreshed)
+    store.stored = reconnected                 # Reconnect afterwards (a plain write)
+    check("...and Reconnect afterwards still ends with the new sign-in", store.stored == reconnected)
+
+    # the site refreshed the same sign-in while the run was in flight: its later refresh wins
+    site = blob("r", T2 + 60, T0, access="site-access")
+    store, code = run_upload(blob("r", T2, T0, access="run-access"), blob("r", T1, T0), download_first=True,
+                             before_commit=lambda s: setattr(s, "stored", site))
+    check("a later site refresh landing meanwhile is kept over the run's earlier one", store.stored == site and code == 0)
 
 
 # ------------------------------------------------------------------ spotify_etl.py
@@ -345,6 +444,7 @@ def test_workflow_uploads_through_the_helper() -> None:
 if __name__ == "__main__":
     test_decision()
     test_upload_wiring()
+    test_upload_interleaving()
     test_refresh_keeps_authorized_at()
     test_status_wording()
     test_signin_blob_shape()
