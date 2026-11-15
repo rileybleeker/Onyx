@@ -12,6 +12,7 @@ import {
   rangeDays, rangeLabel,
 } from "@/lib/queries";
 import { formatDate, formatDuration, formatDurationMs, etDate, sameJson } from "@/lib/format";
+import { hoursToSeconds, minutesToSeconds, type Milliseconds, type Seconds } from "@/lib/units";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
@@ -236,7 +237,7 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
       nap_awake: nap ? +nap.awake.toFixed(2) : 0,
     };
   });
-  const avgWhoopNapMs = whoopNapsByDate.size
+  const avgWhoopNapMs: Milliseconds = whoopNapsByDate.size
     ? Array.from(whoopNapsByDate.values()).reduce((a, b) => a + b.inBedMs, 0) / whoopSleep.length
     : 0;
 
@@ -310,16 +311,19 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
 
   // ── Eight Sleep ───────────────────────────────────────────────────────────────
   const avgEightSleep    = avg(eightSleep, "sleep_score");
-  const avgEightDuration = avg(eightSleep, "time_slept_seconds");
+  const avgEightDuration: Seconds | null = avg(eightSleep, "time_slept_seconds");
   const avgEightHrv      = avg(eightSleep, "avg_hrv");
-  const avgEightLatency  = avg(eightSleep, "latency_asleep_seconds");
+  const avgEightLatency: Seconds | null = avg(eightSleep, "latency_asleep_seconds");
 
   // ── WHOOP Sleep aggregates ───────────────────────────────────────────────────
-  const avgInBedMs       = avg(whoopSleep, "total_in_bed_time_milli");
+  // WHOOP durations are milliseconds and Eight Sleep's are seconds, both on this
+  // page. The unit tags (lib/units.ts) turn formatDuration(avgInBedMs) into a
+  // compile error instead of a label 1000 times too long.
+  const avgInBedMs: Milliseconds | null = avg(whoopSleep, "total_in_bed_time_milli");
   const avgSleepPerf     = avg(whoopSleep, "sleep_performance_percentage");
   const avgSleepEff      = avg(whoopSleep, "sleep_efficiency_percentage");
-  const avgDeepMs        = avg(whoopSleep, "total_slow_wave_sleep_time_milli");
-  const avgRemMs         = avg(whoopSleep, "total_rem_sleep_time_milli");
+  const avgDeepMs: Milliseconds | null = avg(whoopSleep, "total_slow_wave_sleep_time_milli");
+  const avgRemMs: Milliseconds | null = avg(whoopSleep, "total_rem_sleep_time_milli");
   const hoursVsNeededVals = whoopSleep.map(hoursVsNeeded).filter((v): v is number => v != null);
   const avgHoursVsNeeded = hoursVsNeededVals.length
     ? hoursVsNeededVals.reduce((a, b) => a + b, 0) / hoursVsNeededVals.length
@@ -358,8 +362,8 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
   // Range averages: main sleep duration + average nap duration across the range
   // (nap-less days contribute 0, so this is a per-day average that adds back to
   // avgEightDuration when both are summed).
-  const avgEightMainSec = avg(eightSleep, "time_slept_main_session_seconds");
-  const avgEightNapSec  = avgEightDuration != null && avgEightMainSec != null
+  const avgEightMainSec: Seconds | null = avg(eightSleep, "time_slept_main_session_seconds");
+  const avgEightNapSec: Seconds | null = avgEightDuration != null && avgEightMainSec != null
     ? Math.max(0, avgEightDuration - avgEightMainSec)
     : null;
 
@@ -655,7 +659,7 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
                 <CartesianGrid {...gridStyle} />
                 <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
                 <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
-                <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
+                <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(hoursToSeconds(Number(v))), name]} />
                 <Legend wrapperStyle={legendStyle} />
                 <Bar isAnimationActive={false} dataKey="deep"  stackId="a" fill={C.source.garmin} name="Deep" />
                 <Bar isAnimationActive={false} dataKey="light" stackId="a" fill={C.categorical[6]} name="Light" />
@@ -855,7 +859,7 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
                 <CartesianGrid {...gridStyle} />
                 <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
                 <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
-                <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
+                <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(hoursToSeconds(Number(v))), name]} />
                 <Legend wrapperStyle={legendStyle} />
                 <Bar isAnimationActive={false} dataKey="deep"  stackId="a" fill={C.source.garmin} name="Deep" />
                 <Bar isAnimationActive={false} dataKey="light" stackId="a" fill={C.categorical[6]} name="Light" />
@@ -950,7 +954,7 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
                 <CartesianGrid {...gridStyle} />
                 <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
                 <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
-                <Tooltip {...chartTooltip} formatter={(v: any) => [formatDuration(Math.round(Number(v) * 60)), "Latency"]} />
+                <Tooltip {...chartTooltip} formatter={(v: any) => [formatDuration(minutesToSeconds(Number(v))), "Latency"]} />
                 <ReferenceLine y={15} stroke={C.up} strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "15 min", position: "right", fill: C.up, fontSize: 10 }} />
                 <Bar isAnimationActive={false} dataKey="minutes" name="Latency" radius={[3, 3, 0, 0]}>
                   {eightLatencyData.map((d, i) => (
