@@ -10,7 +10,7 @@ import {
 import AirQualityPanel from "@/components/AirQualityPanel";
 import ChartCard from "@/components/ChartCard";
 import DeferredMount from "@/components/DeferredMount";
-import { Part, PartGrid, usePartOrder } from "@/components/personalize/PartGrid";
+import { Part, PartGrid, PartGroup, usePartOrder } from "@/components/personalize/PartGrid";
 import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import KpiTile from "@/components/KpiTile";
@@ -673,11 +673,13 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         </div>
       </div>
 
+      {/* Personalize: every section is a <PartGroup> and every card / tile / chart in it a <Part>, so each one
+          moves within its section or into another, hides, resizes and collapses on its own. */}
       <PartGrid page="/analytics/hrv" title="HRV Deep Analysis">
-      <Part id="kpis" title="Forecast tiles">
-      {/* ── Row 1: Hero KPI tiles (horizontal scroll-snap on mobile) ── */}
-      <div className="flex gap-3 overflow-x-auto snap-x snap-mandatory pb-1 -mx-1 px-1 [scrollbar-width:none] sm:mx-0 sm:px-0 sm:grid sm:grid-cols-3 sm:gap-4 sm:overflow-visible">
-        <div className="min-w-[78%] snap-start sm:min-w-0 relative bg-surface-card border border-border-subtle rounded-card shadow-card px-4 py-4 flex flex-col items-center">
+      {/* ── Row 1: Hero KPI tiles ── */}
+      <PartGroup id="kpis" title="Forecast tiles">
+        <Part id="tonight-hrv" title="Tonight's sleep (forecast)" width="quarter">
+        <div className="relative bg-surface-card border border-border-subtle rounded-card shadow-card px-4 py-4 flex flex-col items-center">
           <MetricRing
             testId="hero-tomorrow-hrv"
             label="Tonight's sleep"
@@ -705,11 +707,12 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
           )}
           <p className="mt-1 font-mono text-[10px] uppercase tracking-[0.06em] text-text-tertiary/70">XGBOOST</p>
         </div>
+        </Part>
         {/* Live 30-day accuracy once 5 nights since the 2026-11-11 alignment fix are
             scored; until then the walk-forward backtest (the only apples-to-apples
             comparison with the naive baseline). */}
+        <Part id="accuracy-tile" title="Model accuracy" width="quarter">
         <KpiTile
-          className="min-w-[78%] snap-start sm:min-w-0"
           label={xgbLive ? "Model Accuracy (live 30d)" : "Model Accuracy (backtest)"}
           value={accuracyTile ? Number(accuracyTile.mae).toFixed(1) : "—"}
           unit={accuracyTile ? "ms MAE" : undefined}
@@ -723,8 +726,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             : undefined}
           meta={[{ text: xgbLive ? "XGBOOST · LIVE" : "XGBOOST · WALK-FORWARD" }]}
         />
+        </Part>
+        <Part id="top-driver-tile" title="Top driver today" width="quarter">
         <KpiTile
-          className="min-w-[78%] snap-start sm:min-w-0"
           label="Top Driver Today"
           value={topDrivers[0]
             ? `${(topDrivers[0].shap_value ?? topDrivers[0].importance) > 0 ? "+" : ""}${Number(topDrivers[0].shap_value ?? topDrivers[0].importance).toFixed(1)}`
@@ -736,14 +740,14 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
           sub={topDrivers[0] ? topDrivers[0].label : undefined}
           meta={[{ text: "XGBOOST · SHAP" }]}
         />
-      </div>
-      </Part>
+        </Part>
+      </PartGroup>
 
-      <Part id="forecast" title="Forecast & Drivers">
-      <SectionHeader id="forecast" tick="forecast" title="Forecast & Drivers" kicker="What tonight's sleep should bring, and why" />
       {/* ── Forward-looking: what's predicted and why (today) ── */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <PartGroup id="forecast" title="Forecast & Drivers" gap={24}
+        header={<SectionHeader id="forecast" tick="forecast" title="Forecast & Drivers" kicker="What tonight's sleep should bring, and why" />}>
         {/* 30-Day Prophet Forecast */}
+        <Part id="prophet-forecast" title="30-Day HRV Forecast" width="half">
         <ChartCard collapsible title="30-Day HRV Forecast" source="PROPHET + SARIMAX"
           info="Prophet projects the next 30 days using your weekly patterns and long-term trend (orange dashed line + shaded uncertainty band — your HRV should land inside it about 4 out of 5 nights). The purple dotted line overlays SARIMAX's independent 7-day short-term forecast as a cross-check: when both models agree on the near-term, confidence is higher; when they diverge, recent dynamics look unusual.">
           <ResponsiveContainer width="100%" height={260}>
@@ -777,7 +781,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             </p>
           )}
         </ChartCard>
+        </Part>
 
+        <Part id="prediction-drivers" title="Prediction Drivers (Today)" width="half">
         <ChartCard collapsible title="Prediction Drivers (Today)" subtitle="What's driving tonight's forecast right now"
           source="XGBOOST · SHAP"
           info="Shows what's pushing the forecast for tonight's sleep (the HRV you wake up to) up or down. Green bars are factors that raised the forecast; red bars lowered it. The longer the bar, the bigger the impact. This updates every day as your data changes. Journal behaviors appear in a separate section below because they're Yes/No entries — they have smaller numerical impact than continuous metrics like heart rate, but they're still part of the model.">
@@ -915,23 +921,24 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             )}
           </div>
         </ChartCard>
-      </div>
+        </Part>
+      </PartGroup>
 
-      {/* Below-fold sections are wrapped in <DeferredMount> (perf round 3,
+      {/* Below-fold charts are wrapped in <DeferredMount> (perf round 3,
           2026-06-11) so the first commit builds only the above-fold hero +
-          forecast charts; each later section mounts one-per-frame in document
-          order (everything is mounted within ~a dozen frames — no scroll
-          dependency, the Playwright below-fold assertions still pass).
-          SectionHeader anchors stay OUTSIDE the wrappers so #fragment nav
-          finds its targets before the section content mounts. minHeight
-          approximates each section's rendered height to limit scroll shift. */}
-      </Part>
-      <Part id="accuracy" title="Model Accuracy">
-      <SectionHeader id="accuracy" tick="calibration" title="Model Accuracy" kicker="Backtested next-day prediction error" />
+          forecast charts; each later chart mounts one-per-frame in document
+          order (no scroll dependency, the Playwright below-fold assertions
+          still pass). Each <DeferredMount> sits INSIDE its <Part>, so a hidden
+          part mounts nothing. SectionHeader anchors are the group headers,
+          OUTSIDE the wrappers, so #fragment nav finds its targets before the
+          section content mounts. minHeight approximates each chart's rendered
+          height to limit scroll shift. Text-only cards are not deferred. */}
       {/* ── How well does the model actually predict? ── */}
-      <DeferredMount minHeight={420}>
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <PartGroup id="accuracy" title="Model Accuracy" gap={24}
+        header={<SectionHeader id="accuracy" tick="calibration" title="Model Accuracy" kicker="Backtested next-day prediction error" />}>
         {/* Prediction vs Actual */}
+        <Part id="prediction-vs-actual" title="Prediction vs Actual" width="half">
+        <DeferredMount minHeight={420}>
         <ChartCard collapsible storageKey="prediction-vs-actual" title={`Prediction vs Actual (${rangeLabel(rangeView.shown)})`}
                    subtitle={cutoverDay
                      ? "Red dots = miss > 15ms · yellow line = first forecast after the 2026-11-11 same-night fix"
@@ -970,8 +977,12 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             </p>
           )}
         </ChartCard>
+        </DeferredMount>
+        </Part>
 
         {/* Accuracy by Horizon */}
+        <Part id="horizon-accuracy" title="Accuracy by Forecast Horizon" width="half">
+        <DeferredMount minHeight={420}>
         <ChartCard collapsible title="Accuracy by Forecast Horizon"
                    subtitle="MAE (ms) — lower is better · 5 models × 7 horizons"
                    info="Accuracy drops the further ahead you predict — this shows how much. Each grouped bar set is the average miss in ms for that horizon. Two real models (XGBoost, SARIMAX) sit alongside three trivial baselines: Naive (repeat yesterday), 7d Avg (last 7-day mean), and Day-of-week (same DOW last week). If the real models can't beat the cheapest baselines, they aren't actually learning anything. Prophet is excluded because it only writes h=1 — it's a long-horizon forecaster, not a per-horizon evaluator.">
@@ -1010,13 +1021,14 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             );
           })()}
         </ChartCard>
-      </div>
-      </DeferredMount>
-      </Part>
+        </DeferredMount>
+        </Part>
+      </PartGroup>
 
-      <Part id="trend" title="HRV Trend">
-      <SectionHeader id="trend" tick="descriptive" title="HRV Trend" />
       {/* ── Where is HRV trending overall? ── */}
+      <PartGroup id="trend" title="HRV Trend" gap={24}
+        header={<SectionHeader id="trend" tick="descriptive" title="HRV Trend" />}>
+      <Part id="hrv-trend" title="HRV Trend chart">
       <DeferredMount minHeight={420}>
       <ChartCard collapsible storageKey="hrv-trend" title={`HRV Trend (${rangeLabel(rangeView.shown)})`}
                  subtitle="WHOOP HRV + 7-day rolling average"
@@ -1050,19 +1062,22 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
       </ChartCard>
       </DeferredMount>
       </Part>
+      </PartGroup>
 
-      <Part id="associations" title="Associations">
-      <SectionHeader id="associations" tick="descriptive" title="Associations" kicker="What historically moves with your HRV" />
       {/* ── What's associated with your HRV ── */}
-      <DeferredMount minHeight={1400}>
-      <div className="space-y-4">
+      <PartGroup id="associations" title="Associations"
+        header={<SectionHeader id="associations" tick="descriptive" title="Associations" kicker="What historically moves with your HRV" />}>
+        <Part id="associations-intro" title="What's associated with your HRV">
         <div className="bg-surface-card border border-border-subtle rounded-card p-4 shadow-card">
           <h3 className="text-[13px] font-medium text-text-secondary mb-2">What&apos;s associated with your HRV</h3>
           <p className="text-[11px] text-text-tertiary leading-relaxed">
             The charts below are <em>associational</em> — they show which factors have historically moved with your HRV across your entire tracking history. No model is involved; these are direct statistical patterns. Start with the broad continuous-metric view, then read on through the behavior-impact, supplement, and lifestyle pairings. Adjusted causal estimates (with confounders held fixed) come further down in the Causal Inference section.
           </p>
         </div>
+        </Part>
 
+        <Part id="hrv-correlates" title="HRV Correlates (Historical)">
+        <DeferredMount minHeight={1280}>
         <ChartCard collapsible title="HRV Correlates (Historical)" subtitle="What has historically moved with your HRV"
           source="SPEARMAN ρ"
           info="What it shows: how strongly each factor is linked to your HRV across your entire history. A bar near +1.0 means that factor almost always rises when your HRV rises; near −1.0 means the opposite. Long-term pattern, doesn't change day to day. Method: Spearman ρ — a rank-based correlation that's robust to outliers and skewed distributions; scores range −1.0 to +1.0. Journal behaviors and habits appear in separate sub-sections below because Yes/No features have a narrower correlation range than continuous metrics.">
@@ -1164,16 +1179,16 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             )}
           </div>
         </ChartCard>
-      </div>
-      </DeferredMount>
-      </Part>
+        </DeferredMount>
+        </Part>
+      </PartGroup>
 
-      <Part id="impact" title="Behavior Impact">
-      <SectionHeader id="impact" tick="descriptive" title="Behavior Impact" kicker="Mean HRV difference on the night after the behavior (Welch's t-test)" />
       {/* ── Behavior t-tests: Journal + Habit Impact ── */}
-      <DeferredMount minHeight={480}>
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <PartGroup id="impact" title="Behavior Impact" gap={24}
+        header={<SectionHeader id="impact" tick="descriptive" title="Behavior Impact" kicker="Mean HRV difference on the night after the behavior (Welch's t-test)" />}>
         {/* Journal Impact */}
+        <Part id="journal-impact" title="Journal Behavior Impact" width="half">
+        <DeferredMount minHeight={480}>
         <ChartCard collapsible title="Journal Behavior Impact" subtitle="Mean HRV difference: Yes vs No"
           source="WELCH'S T-TEST"
           info="How each logged behavior affects the HRV of that night's sleep — the sleep that ends the day you did it, which you wake up from the next morning. A +15ms bar means your HRV was 15ms higher, on average, after days you did that thing. Green = helps recovery; red = hurts it. Method: Welch's two-sample t-test (unequal variance) on HRV distributions for Yes vs No nights. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise. Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Yes-nights / No-nights) that fed the comparison.">
@@ -1242,7 +1257,11 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             </div>
           )}
         </ChartCard>
+        </DeferredMount>
+        </Part>
 
+        <Part id="habit-impact" title="Habit Impact" width="half">
+        <DeferredMount minHeight={480}>
         <ChartCard collapsible title="Habit Impact" subtitle="Mean HRV difference: nights you completed the habit vs nights you didn't"
           source="WELCH'S T-TEST"
           info="Same statistical treatment as Journal Behavior Impact, applied to Notion-managed habits (from /habits). A +Xms bar means HRV averaged X ms higher in the sleep that ended the days you completed that habit. Method: Welch's two-sample t-test on that night's HRV for Yes vs No days. Whiskers on each bar are the 95% confidence interval — the range the true HRV difference is likely to land in; if the whiskers cross 0, the apparent effect could be noise (and for habits with few completed-nights the whiskers will be wide — that's the chart honestly signaling 'trust this less'). Tooltip shorthand: 'd' is Cohen's d (standardized effect size — the HRV gap divided by typical night-to-night HRV variability; |d|<0.2 trivial, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large), 'n=Y/N' is the sample sizes (Y completed-nights, N skipped-nights). Habits need at least 5 Yes-nights and 5 No-nights before they appear (the t-test isn't meaningful with smaller groups). Add more habits or toggle them more consistently at /habits to populate this view.">
@@ -1313,16 +1332,16 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             </div>
           )}
         </ChartCard>
-      </div>
-      </DeferredMount>
-      </Part>
+        </DeferredMount>
+        </Part>
+      </PartGroup>
 
-      <Part id="supplements" title="Supplements">
-      <SectionHeader id="supplements" tick="descriptive" title="Supplements" />
       {/* ── Supplements: Yes/No impact + Dose-Response ── */}
-      <DeferredMount minHeight={460}>
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <PartGroup id="supplements" title="Supplements" gap={24}
+        header={<SectionHeader id="supplements" tick="descriptive" title="Supplements" />}>
         {/* Supplement Yes/No Impact */}
+        <Part id="supplement-impact" title="Supplement Impact (Yes vs No)" width="half">
+        <DeferredMount minHeight={460}>
         <ChartCard collapsible
           title="Supplement Impact (Yes vs No)"
           subtitle="Mean HRV difference: nights compound taken vs not"
@@ -1396,9 +1415,13 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             </div>
           )}
         </ChartCard>
+        </DeferredMount>
+        </Part>
 
         {/* Supplement Dose-Response — conditional render */}
         {supplementDoseResponse.length > 0 && (
+          <Part id="supplement-dose-response" title="Supplement Dose-Response" width="half">
+          <DeferredMount minHeight={460}>
           <ChartCard collapsible
             title="Supplement Dose-Response"
             subtitle="Spearman ρ between daily amount and that night's HRV (compounds with ≥3 distinct doses)"
@@ -1460,17 +1483,17 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
               );
             })()}
           </ChartCard>
+          </DeferredMount>
+          </Part>
         )}
-      </div>
-      </DeferredMount>
-      </Part>
+      </PartGroup>
 
-      <Part id="lifestyle" title="Lifestyle">
-      <SectionHeader id="lifestyle" tick="descriptive" title="Lifestyle" />
       {/* ── Lifestyle: Nutrition + Workout-to-Bed Gap ── */}
-      <DeferredMount minHeight={440}>
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <PartGroup id="lifestyle" title="Lifestyle" gap={24}
+        header={<SectionHeader id="lifestyle" tick="descriptive" title="Lifestyle" />}>
         {/* Nutrition Spearman */}
+        <Part id="nutrition-correlations" title="Nutrition Correlations" width="half">
+        <DeferredMount minHeight={440}>
         <ChartCard collapsible
           title="Nutrition Correlations"
           subtitle="Spearman ρ between daily nutrient totals and that night's HRV"
@@ -1534,7 +1557,11 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             </div>
           )}
         </ChartCard>
+        </DeferredMount>
+        </Part>
 
+        <Part id="workout-gap" title="Workout-to-Bed Gap vs Next-Morning HRV" width="half">
+        <DeferredMount minHeight={440}>
         <ChartCard collapsible
           title="Workout-to-Bed Gap vs Next-Morning HRV"
           subtitle={`${rangeLabel(rangeView.shown)} · each dot = one night`}
@@ -1610,12 +1637,10 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             })()}</span></div>
           </div>
         </ChartCard>
-      </div>
-      </DeferredMount>
-      </Part>
+        </DeferredMount>
+        </Part>
+      </PartGroup>
 
-      <Part id="causal" title="Causal Inference">
-      <SectionHeader id="causal" tick="causal" title="Causal Inference" kicker="Adjusted effects — from association to causation" />
       {/* ── Causal Inference: from association to causation ── */}
       {/*
         Where the other charts on this page measure ASSOCIATION (Spearman, Welch),
@@ -1625,12 +1650,13 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         Empty unless `python hrv_analysis.py` has populated the causal/* rows
         in pds.hrv_analysis_results.
 
-        One DeferredMount spans the section's 5 sibling blocks (explainer,
-        coverage callout, forest plot, comparison table, continuous+DAG grid) —
-        after mount the fragment's children land directly in the space-y-6
-        parent, so the inter-block spacing is unchanged.
+        Each block is its own part: explainer (text only, not deferred),
+        supplement coverage callout, forest plot, comparison table, continuous
+        treatments and the DAG card.
       */}
-      <DeferredMount minHeight={2400}>
+      <PartGroup id="causal" title="Causal Inference" gap={24}
+        header={<SectionHeader id="causal" tick="causal" title="Causal Inference" kicker="Adjusted effects — from association to causation" />}>
+      <Part id="causal-explainer" title="How the causal estimates work">
       <div className="bg-surface-card border border-border-subtle rounded-card p-6 shadow-card">
         <div className="flex items-start justify-between gap-3 mb-4">
           <div>
@@ -1751,10 +1777,15 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
           </div>
         </div>
       </div>
+      </Part>
 
       {/* Supplements coverage callout — surfaces what's been dropped for low-n
           so the user doesn't have to scroll into the DAG card to discover that
           supplements are missing from the main forest plot. */}
+      {(causalDropped.some((d: any) => d.family === "supplement") ||
+        causalBinary.some((d: any) => d.family === "supplement")) && (
+      <Part id="causal-supplement-coverage" title="Supplements · coverage status">
+      <DeferredMount minHeight={360}>
       {(() => {
         const droppedSupps = causalDropped.filter((d: any) => d.family === "supplement");
         const includedSupps = causalBinary.filter((d: any) => d.family === "supplement");
@@ -1833,8 +1864,13 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
           </ChartCard>
         );
       })()}
+      </DeferredMount>
+      </Part>
+      )}
 
       {/* Causal Forest Plot: Binary Treatments */}
+      <Part id="causal-binary" title="Causal Effects · Binary Treatments">
+      <DeferredMount minHeight={700}>
       <ChartCard collapsible
         title="Causal Effects · Binary Treatments"
         subtitle={`AIPW ATE on that night's HRV (ms) · 95% CI shown as error bars · top ${Math.min(causalBinary.length, 20)} by |effect|`}
@@ -1940,8 +1976,12 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
           </div>
         )}
       </ChartCard>
+      </DeferredMount>
+      </Part>
 
       {/* Naive vs Adjusted Comparison Table */}
+      <Part id="causal-comparison" title="Naive vs Adjusted">
+      <DeferredMount minHeight={600}>
       <ChartCard collapsible
         title="Naive vs Adjusted: where confounding mattered"
         subtitle="Treatments where adjustment changed the answer most"
@@ -2096,9 +2136,12 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
           </p>
         )}
       </ChartCard>
+      </DeferredMount>
+      </Part>
 
       {/* Continuous treatments + DAG / Assumptions */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <Part id="causal-continuous" title="Continuous Treatments (median-split)" width="half">
+      <DeferredMount minHeight={600}>
         <ChartCard collapsible
           title="Continuous Treatments (median-split)"
           subtitle="Adjusted contrast: above-median vs below-median day"
@@ -2200,7 +2243,11 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             </div>
           )}
         </ChartCard>
+      </DeferredMount>
+      </Part>
 
+      <Part id="causal-dag" title="Causal DAG & Assumptions" width="half">
+      <DeferredMount minHeight={600}>
         <ChartCard collapsible
           title="Causal DAG &amp; Assumptions"
           subtitle="What we adjust for, and what we deliberately don't"
@@ -2379,12 +2426,10 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
             </p>
           )}
         </ChartCard>
-      </div>
       </DeferredMount>
       </Part>
+      </PartGroup>
 
-      <Part id="environment" title="Environment Sweet Spot">
-      <SectionHeader id="environment" tick="descriptive" title="Environment" />
       {/* ── Environment Sweet Spot: descriptive dose-response for day-D inputs ── */}
       {/*
         The causal layer above answers "does more / less than usual move HRV?"
@@ -2396,6 +2441,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         parabola over the nightly points. Logic: lib/sweet-spot.ts; data:
         getEnvDoseResponseData (matview, no python pipeline dependency).
       */}
+      <PartGroup id="environment" title="Environment" gap={24}
+        header={<SectionHeader id="environment" tick="descriptive" title="Environment" />}>
+      <Part id="sweet-spot" title="Environment Sweet Spot">
       <DeferredMount minHeight={900}>
         <SweetSpotPanel rows={envMatrix} />
       </DeferredMount>
@@ -2414,13 +2462,14 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         <WeatherPanel />
       </DeferredMount>
       </Part>
+      </PartGroup>
 
-      <Part id="methods" title="Methods & Evaluation">
-      <SectionHeader id="methods" tick="calibration" title="Methods & Evaluation" />
+      <PartGroup id="methods" title="Methods & Evaluation" gap={24}
+        header={<SectionHeader id="methods" tick="calibration" title="Methods & Evaluation" />}>
       {/* ── Models & Methods ── */}
       {/* Both methods/eval cards render collapsed by default (just their
-          toggle headers), hence the small minHeight. */}
-      <DeferredMount minHeight={180}>
+          toggle headers), so they are not deferred. */}
+      <Part id="models-methods" title="Models & Methods">
       <div className="bg-surface-card border border-border-subtle rounded-control shadow-card overflow-hidden">
         <button
           onClick={() => setExpandedModels(!expandedModels)}
@@ -2635,8 +2684,10 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
           </div>
         )}
       </div>
+      </Part>
 
       {/* ── Model Evaluation Detail (collapsible — at-the-bottom diagnostics) ── */}
+      <Part id="model-eval" title="Model Evaluation Detail">
       <div className="bg-surface-card border border-border-subtle rounded-control shadow-card overflow-hidden">
         <button
           onClick={() => setExpandedEval(!expandedEval)}
@@ -2791,8 +2842,8 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
           </div>
         )}
       </div>
-      </DeferredMount>
       </Part>
+      </PartGroup>
       </PartGrid>
     </div>
     <aside className="hidden xl:block w-[170px] shrink-0">
