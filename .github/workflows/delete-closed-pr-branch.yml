@@ -1,0 +1,34 @@
+name: Delete closed PR branch
+# Riley 2026-11-14: a closed PR's branch is removed immediately, merged or not. GitHub's "Automatically delete head
+# branches" setting only covers merges, so this covers PRs closed without merging. The branch can be brought back
+# with "Restore branch" on the PR page (GitHub keeps the PR's commits). Never checks out or runs PR code; the branch
+# name only reaches the shell through an environment variable. Local copies on RileyPC are removed by the hourly
+# Branch Cleanup task (personal-agents local/branch_cleanup.py).
+on:
+  pull_request_target:
+    types: [closed]
+permissions:
+  contents: write
+  pull-requests: read
+jobs:
+  delete:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref != github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Delete the head branch unless another open PR uses it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          others=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json number --jq 'length')
+          if [ "$others" != "0" ]; then echo "PR #$NUMBER closed; another open PR uses its branch, kept"; exit 0; fi
+          ref=$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["BRANCH"], safe="/"))')
+          if gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$ref" --silent 2>/dev/null; then
+            echo "PR #$NUMBER closed: deleted its branch"
+          else
+            echo "PR #$NUMBER closed: branch already gone (merged and auto-deleted, or deleted by hand)"
+          fi
