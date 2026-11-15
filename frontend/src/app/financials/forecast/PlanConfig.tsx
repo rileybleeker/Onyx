@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import type { NetWorthMonth } from "@/lib/cash-forecast";
+import type { DetectedStream, NetWorthMonth } from "@/lib/cash-forecast";
 import type { DriverRow } from "@/lib/cash-forecast-store";
 import type { ForecastAccountView } from "@/lib/cash-forecast-server";
 import type { MovePlan } from "@/lib/finance-plan";
@@ -33,7 +33,6 @@ export function PlanConfig({ move, drivers, accounts, netWorth, busy, run }: { m
       </p>
       <MoveEditor move={move} busy={busy} run={run} />
       <GrowthEditor drivers={drivers} accounts={accounts} netWorth={netWorth} busy={busy} run={run} />
-      <InflationEditor drivers={drivers} busy={busy} run={run} />
     </section>
   );
 }
@@ -199,26 +198,89 @@ function GrowthRow({ row, value, projected, busy, run }: { row: { key: string; l
   );
 }
 
-function InflationEditor({ drivers, busy, run }: { drivers: DriverRow[]; busy: boolean; run: Run }) {
+/** Settings for the forecast model itself; every save merges into the one "settings" driver. */
+export function ModelSettings({ drivers, busy, run }: { drivers: DriverRow[]; busy: boolean; run: Run }) {
   const settings = (drivers.find((d) => d.key === "settings")?.value ?? {}) as Record<string, unknown>;
-  const [v, setV] = useState(typeof settings.inflationPct === "number" ? String(settings.inflationPct) : "");
+  const str = (k: string, scale = 1) => (typeof settings[k] === "number" ? String((settings[k] as number) / scale) : "");
+  const [f, setF] = useState({ buffer: str("bufferCents", 100), inflation: str("inflationPct"), lookback: str("lookbackWeeks"), cardMonths: str("cardMonths"), low: str("lowPercentile") });
+  const set = (k: keyof typeof f) => (e: { target: { value: string } }) => setF((x) => ({ ...x, [k]: e.target.value }));
+  const field = (label: string, k: keyof typeof f, ph: string, hint: string) => (
+    <label className="flex flex-col gap-1 text-[12px] text-text-secondary" title={hint}>
+      {label}
+      <input className={`${input} w-24`} value={f[k]} placeholder={ph} onChange={set(k)} inputMode="decimal" />
+    </label>
+  );
+  const save = () => {
+    const num = (v: string) => (v.trim() === "" ? undefined : Number(v.replace(/[$,\s]/g, "")));
+    const next: Record<string, unknown> = {};
+    const buffer = num(f.buffer);
+    if (buffer && buffer > 0) next.bufferCents = Math.round(buffer * 100);
+    for (const [k, v] of [["inflationPct", num(f.inflation)], ["lookbackWeeks", num(f.lookback)], ["cardMonths", num(f.cardMonths)], ["lowPercentile", num(f.low)]] as const) if (v !== undefined && Number.isFinite(v)) next[k] = v;
+    run(() => put("settings", Object.keys(next).length ? next : null));
+  };
   return (
-    <div className="mt-5 flex flex-wrap items-center gap-2 text-[13px]">
-      <h3 className="text-[13px] font-semibold">Inflation on everyday spending</h3>
-      <input className={`${input} w-16`} value={v} placeholder="0" onChange={(e) => setV(e.target.value)} inputMode="decimal" aria-label="Inflation percent per year" />
-      <span className="text-[12px] text-text-secondary">% a year</span>
-      <button
-        className={button}
-        disabled={busy}
-        onClick={() => {
-          const next: Record<string, unknown> = { ...settings };
-          if (v.trim()) next.inflationPct = Number(v);
-          else delete next.inflationPct;
-          run(() => put("settings", Object.keys(next).length ? next : null));
-        }}
-      >
-        Save
+    <section className={card} aria-labelledby="fc-settings">
+      <h2 id="fc-settings" className="font-semibold">Forecast settings</h2>
+      <p className="text-[12px] text-text-tertiary">Blank = the default. These change how the forecast reads your history, not your data.</p>
+      <div className="mt-2 flex flex-wrap gap-3">
+        {field("Low-balance line ($)", "buffer", "0", "Alerts and safe-to-move keep the cautious path above this")}
+        {field("Inflation (%/yr)", "inflation", "0", "Grows everyday spending")}
+        {field("Spending history (weeks)", "lookback", "26", "Weeks of history the everyday-spending average uses (4 to 104)")}
+        {field("Card average (months)", "cardMonths", "6", "Months of payments averaged for each card (1 to 12)")}
+        {field("Cautious band (percentile)", "low", "10", "Lower = more cautious (5 to 25)")}
+      </div>
+      <button className={`${button} mt-2`} disabled={busy} onClick={save}>
+        Save settings
       </button>
-    </div>
+    </section>
+  );
+}
+
+/** Detected streams with an editor: change the amount from a date, stop it, or reset to what the history shows. */
+export function StreamEditorList({ streams, drivers, today, busy, run }: { streams: DetectedStream[]; drivers: DriverRow[]; today: string; busy: boolean; run: Run }) {
+  return (
+    <ul className="mt-2 space-y-2 text-[13px]">
+      {streams.map((s) => (
+        <StreamRow key={s.id} s={s} adj={drivers.find((d) => d.key === `adjust:${s.id}`)?.value as Record<string, unknown> | undefined} today={today} busy={busy} run={run} />
+      ))}
+    </ul>
+  );
+}
+
+function StreamRow({ s, adj, today, busy, run }: { s: DetectedStream; adj: Record<string, unknown> | undefined; today: string; busy: boolean; run: Run }) {
+  const [open, setOpen] = useState(false);
+  const [amount, setAmount] = useState(String(Math.abs(Math.round(s.typicalCents / 100))));
+  const [from, setFrom] = useState(typeof adj?.from === "string" ? adj.from : today);
+  const sign = s.typicalCents < 0 ? -1 : 1;
+  const money = (c: number) => `${c < 0 ? "-" : "+"}$${Math.abs(Math.round(c / 100)).toLocaleString("en-US")}`;
+  return (
+    <li>
+      <span className="font-semibold">{s.label}</span> {money(s.typicalCents)} <span className="text-text-tertiary">({s.cadence}; {s.method}; {s.certainty})</span>
+      {adj && (
+        <span className="ml-2 text-[12px] text-mid">
+          {adj.stop ? `stopped from ${String(adj.from)}` : `set to ${money(Number(adj.amountCents))} from ${String(adj.from)}`}
+        </span>
+      )}{" "}
+      <button className="text-[12px] text-accent hover:underline" onClick={() => setOpen((o) => !o)}>
+        {open ? "close" : "edit"}
+      </button>
+      {open && (
+        <div className="mt-1 flex flex-wrap items-center gap-2 text-[12px] text-text-secondary">
+          from <input className={input} type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
+          amount $<input className={`${input} w-24`} value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" />
+          <button className={button} disabled={busy || !from} onClick={() => run(() => put(`adjust:${s.id}`, { from, amountCents: sign * Math.round((Number(amount.replace(/[$,\s]/g, "")) || 0) * 100) }))}>
+            Set amount
+          </button>
+          <button className={button} disabled={busy || !from} onClick={() => run(() => put(`adjust:${s.id}`, { from, stop: true }))}>
+            Stop from then
+          </button>
+          {adj && (
+            <button className={button} disabled={busy} onClick={() => run(() => put(`adjust:${s.id}`, null))}>
+              Reset
+            </button>
+          )}
+        </div>
+      )}
+    </li>
   );
 }

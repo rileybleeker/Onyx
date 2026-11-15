@@ -13,7 +13,7 @@ import { CompareTable, TaxSection, WhatIfPanel } from "./TaxAndWhatIf";
 import { GoalsSection, NetWorthChart, ProjectionBreakdown } from "./ProjectionParts";
 import type { GoalView } from "@/lib/finance-goals";
 import type { MovePlan } from "@/lib/finance-plan";
-import { PlanConfig } from "./PlanConfig";
+import { ModelSettings, PlanConfig, StreamEditorList } from "./PlanConfig";
 
 const usd = (cents: number | null | undefined): string => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -255,13 +255,8 @@ export default function ForecastView({
       {/* Detected */}
       <section className={card} aria-labelledby="fc-detected">
         <h2 id="fc-detected" className="font-semibold">What the forecast found in your history</h2>
-        <ul className="mt-2 space-y-1 text-[13px]">
-          {result.streams.map((s) => (
-            <li key={s.id}>
-              <span className="font-semibold">{s.label}</span> {signed(s.typicalCents)} ({s.cadence}; {s.method}; {s.certainty})
-            </li>
-          ))}
-        </ul>
+        <p className="text-[12px] text-text-tertiary">Change any amount from a date (a raise, a new card payment plan) or stop one; Reset goes back to what your history shows.</p>
+        <StreamEditorList streams={result.streams} drivers={drivers} today={result.today} busy={busy} run={run} />
         {result.notes.length > 0 && (
           <ul className="mt-3 space-y-1 text-[12px] text-text-tertiary">
             {result.notes.map((n) => (
@@ -305,7 +300,7 @@ export default function ForecastView({
         )}
       </section>
 
-      <Settings buffer={buffer} busy={busy} run={run} />
+      <ModelSettings drivers={drivers} busy={busy} run={run} />
     </div>
   );
 }
@@ -317,6 +312,7 @@ function PlannedItems({ items, statuses, busy, run }: { items: PlanItemView[]; s
   const [dir, setDir] = useState<"out" | "in">("out");
   const [certainty, setCertainty] = useState("likely");
   const [months, setMonths] = useState("1");
+  const [unit, setUnit] = useState<"once" | "month" | "year">("once");
   const statusOf = (id: string) => statuses.filter((s) => s.id === id || s.id.startsWith(`${id}#`));
   const add = () => {
     const dollars = Number(amount.replace(/[$,\s]/g, ""));
@@ -328,7 +324,7 @@ function PlannedItems({ items, statuses, busy, run }: { items: PlanItemView[]; s
         date,
         amountCents: Math.round(dollars * 100) * (dir === "in" ? 1 : -1),
         certainty,
-        ...(count > 1 ? { repeatUnit: "month", repeatEvery: 1, repeatCount: count } : {}),
+        ...(unit !== "once" && count > 1 ? { repeatUnit: "month", repeatEvery: unit === "year" ? 12 : 1, repeatCount: count } : {}),
       }).then((e) => {
         if (!e) {
           setLabel("");
@@ -386,7 +382,12 @@ function PlannedItems({ items, statuses, busy, run }: { items: PlanItemView[]; s
           <option value="possible">possible</option>
         </select>
         <label className="text-[12px] text-text-secondary">
-          months <input className={`${input} w-14`} inputMode="numeric" value={months} onChange={(e) => setMonths(e.target.value)} />
+          <select className={input} value={unit} onChange={(e) => setUnit(e.target.value as "once" | "month" | "year")} aria-label="Repeats">
+            <option value="once">once</option>
+            <option value="month">every month</option>
+            <option value="year">every year</option>
+          </select>{" "}
+          times <input className={`${input} w-14`} inputMode="numeric" value={months} onChange={(e) => setMonths(e.target.value)} />
         </label>
         <button className={button} disabled={busy} onClick={add}>
           Add
@@ -459,30 +460,6 @@ function CardRow({ c, driver, busy, run }: { c: ForecastResult["cards"][number];
         </button>
       </div>
     </div>
-  );
-}
-
-function Settings({ buffer, busy, run }: { buffer: number; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
-  const [value, setValue] = useState(buffer > 0 ? String(Math.round(buffer / 100)) : "");
-  return (
-    <section className={card} aria-labelledby="fc-settings">
-      <h2 id="fc-settings" className="font-semibold">Settings</h2>
-      <div className="mt-2 flex items-center gap-2 text-[13px]">
-        <label>
-          Low-balance line $ <input className={`${input} w-28`} inputMode="numeric" value={value} onChange={(e) => setValue(e.target.value)} placeholder="0" />
-        </label>
-        <button
-          className={button}
-          disabled={busy}
-          onClick={() => {
-            const dollars = Number(value.replace(/[$,\s]/g, "")) || 0;
-            run(() => send("/api/finance/forecast/drivers", "PUT", { key: "settings", value: dollars > 0 ? { bufferCents: Math.round(dollars * 100) } : null }));
-          }}
-        >
-          Save
-        </button>
-      </div>
-    </section>
   );
 }
 

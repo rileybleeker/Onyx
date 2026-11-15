@@ -2,7 +2,7 @@
  * Validation and row mapping for the cash forecast inputs (pds.finance_plan_items, pds.finance_plan_drivers).
  * PURE: no I/O. Used by /api/finance/forecast/* and the server loader. Design: docs/cash-flow-forecast.md.
  */
-import type { CardTerms, Certainty, ForecastSettings, GrowthDriver, PlannedItem } from "./cash-forecast";
+import type { CardTerms, Certainty, ForecastSettings, GrowthDriver, PlannedItem, StreamAdjustment } from "./cash-forecast";
 import { parseScenarioParams } from "./cash-forecast-scenario";
 import { parseTaxProfile } from "./tax-plan";
 import { parseMovePlan } from "./finance-plan";
@@ -110,6 +110,15 @@ export function parseDriverBody(
     const plan = parseMovePlan(b.value);
     return plan ? { ok: true, key, value: plan as unknown as Record<string, unknown> } : { ok: false, error: "move plan needs a date and whole-cent amounts" };
   }
+  const am = /^adjust:([0-9a-f]{16})$/.exec(key);
+  if (am) {
+    if (b.value === null) return { ok: true, key, value: null };
+    const v = b.value as Record<string, unknown> | undefined;
+    if (!v || !isDay(v.from)) return { ok: false, error: "adjustment needs from (YYYY-MM-DD)" };
+    if (v.stop === true) return { ok: true, key, value: { from: v.from, stop: true } };
+    if (!isNum(v.amountCents) || !Number.isInteger(v.amountCents) || Math.abs(v.amountCents) > 100_000_000_000) return { ok: false, error: "adjustment needs whole-cent amountCents or stop" };
+    return { ok: true, key, value: { from: v.from, amountCents: v.amountCents } };
+  }
   const sm = /^scenario:([a-z0-9-]{1,40})$/.exec(key);
   if (sm) {
     if (b.value === null) return { ok: true, key, value: null };
@@ -146,14 +155,14 @@ export function parseDriverBody(
     return null;
   };
   const allowed: Record<string, string[]> = {
-    settings: ["bufferCents", "inflationPct"],
+    settings: ["bufferCents", "inflationPct", "lookbackWeeks", "cardMonths", "lowPercentile"],
     card: ["aprPct", "promoEnds", "promoAprPct", "standardAprPct", "promoNote"],
     growth: ["returnPct", "monthlyContributionCents", "contributionStarts", "label", "startCents"],
   };
   for (const k of Object.keys(v)) if (!allowed[m[1]].includes(k)) return { ok: false, error: `unknown value field ${k}` };
   const errs =
     m[1] === "settings"
-      ? [cents("bufferCents"), pct("inflationPct", 20)]
+      ? [cents("bufferCents"), pct("inflationPct", 20), pct("lookbackWeeks", 104), pct("cardMonths", 12), pct("lowPercentile", 25)]
       : m[1] === "card"
         ? [pct("aprPct", 60), day("promoEnds"), pct("promoAprPct", 60), pct("standardAprPct", 60)]
         : [pct("returnPct", 30), cents("monthlyContributionCents"), day("contributionStarts"), cents("startCents")];
@@ -169,8 +178,9 @@ export interface DriverRow {
   value: Record<string, unknown>;
 }
 /** Drivers -> the engine's settings, card terms and growth inputs (unknown or malformed entries are skipped). */
-export function driversToInputs(rows: readonly DriverRow[]): { settings: ForecastSettings; cardTerms: CardTerms[]; growth: GrowthDriver[] } {
+export function driversToInputs(rows: readonly DriverRow[]): { settings: ForecastSettings; cardTerms: CardTerms[]; growth: GrowthDriver[]; adjustments: StreamAdjustment[] } {
   const settings: ForecastSettings = {};
+  const adjustments: StreamAdjustment[] = [];
   const cardTerms: CardTerms[] = [];
   const growth: GrowthDriver[] = [];
   const n = (v: unknown) => (isNum(v) ? v : undefined);
@@ -179,6 +189,12 @@ export function driversToInputs(rows: readonly DriverRow[]): { settings: Forecas
     if (r.key === "settings") {
       settings.bufferCents = n(v.bufferCents);
       settings.inflationPct = n(v.inflationPct);
+      const lw = n(v.lookbackWeeks);
+      if (lw && lw >= 4) settings.lookbackWeeks = Math.round(lw);
+      const cm = n(v.cardMonths);
+      if (cm && cm >= 1) settings.cardMonths = Math.round(cm);
+      const lp = n(v.lowPercentile);
+      if (lp && lp >= 5) settings.lowPercentile = lp / 100;
     } else if (r.key.startsWith("card:")) {
       cardTerms.push({
         account_key: r.key.slice(5),
@@ -188,6 +204,8 @@ export function driversToInputs(rows: readonly DriverRow[]): { settings: Forecas
         standardAprPct: n(v.standardAprPct),
         promoNote: typeof v.promoNote === "string" ? v.promoNote : undefined,
       });
+    } else if (r.key.startsWith("adjust:")) {
+      if (isDay(v.from)) adjustments.push({ streamId: r.key.slice(7), from: v.from, stop: v.stop === true ? true : undefined, amountCents: n(v.amountCents) });
     } else if (r.key.startsWith("growth:")) {
       growth.push({
         account_key: r.key.slice(7),
@@ -199,5 +217,5 @@ export function driversToInputs(rows: readonly DriverRow[]): { settings: Forecas
       });
     }
   }
-  return { settings, cardTerms, growth };
+  return { settings, cardTerms, growth, adjustments };
 }
