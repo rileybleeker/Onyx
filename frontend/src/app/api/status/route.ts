@@ -75,6 +75,7 @@ const CADENCE: Record<string, string> = {
   care_calendar: "After each /health change + every 6h :20 catch-up",
   ubereats: "Every 6h (Riley's PC, while logged on)",
   pc_activity: "Hourly (Riley's PC, while signed in)",
+  ai_usage: "Every 3h (Riley's PC, while signed in)",
   nyc_scout: "Daily 6:10am ET",
   simplefin: "Every 6h :30 (GitHub Actions); banks refresh about daily, Apple Card monthly",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
@@ -131,6 +132,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   care_calendar:  { method: "automated",      label: "Calendar API (Onyx → Google)" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   pc_activity:    { method: "automated",      label: "Local PC logger" },
+  ai_usage:       { method: "automated",      label: "Local log harvest" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   simplefin:      { method: "automated",      label: "Bank feed API" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
@@ -453,6 +455,8 @@ export async function GET() {
         ["google_calendar", "events"],
         // PC activity logger (Riley's PC, hourly upload while signed in).
         ["pc_activity", "usage"],
+        // AI tool usage harvester (Riley's PC, every 3h while signed in).
+        ["ai_usage", "sessions"],
         // N-of-1 trial report job: one heartbeat a day.
         ["experiments", "report"],
         // Pollen ETL (twice a day): a 19 h gap between runs, far outside the shared window.
@@ -1244,6 +1248,36 @@ export async function GET() {
           cadence: CADENCE.pc_activity,
           integrationMethod: METHOD.pc_activity.method,
           methodLabel: METHOD.pc_activity.label,
+        };
+      })(),
+      // AI tool usage harvester (tools/ai_usage_harvest on Riley's PC): Claude Code + Codex session
+      // METADATA (times, token counts, prompt / tool-call counts, project folder name; never content),
+      // upserted every 3h to pds.ai_tool_usage_daily with an ai_usage|sessions heartbeat per run.
+      // Same PC-off allowance as PC Activity: >26h degraded, >72h or a failed row red; 'partial' =
+      // some log files could not be read (their days stay open for the next run).
+      ai_usage: (() => {
+        const entry = latestBySrcType["ai_usage|sessions"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 72
+            ? "failed"
+            : entry.status === "partial" || ageH > 26
+              ? "partial"
+              : "success";
+        return {
+          label: "AI Tool Usage",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No upload yet - apply sql/ai_tool_usage_schema.sql, then run tools/ai_usage_harvest/register-task.ps1 on the PC." : null),
+          cadence: CADENCE.ai_usage,
+          integrationMethod: METHOD.ai_usage.method,
+          methodLabel: METHOD.ai_usage.label,
         };
       })(),
       // Body weight via Tanita Health Planet (tanita_etl.py): scale → phone
