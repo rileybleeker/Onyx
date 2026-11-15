@@ -8,7 +8,7 @@ name: Production Performance Timing
 # any single call takes 1 s or more, when a page's data does in any warm view or on the cold first visit, or when a
 # page was not measured completely (a missing navigation is never a pass). Each breach says whether it is repeatable
 # (slow in two or more warm views) or isolated, with the warm p95. A red run is devops's to fix with a normal PR; the cloud watchdog raises it as
-# `speed-budget-broken`. Coverage: Today (every panel), Check-in, HRV, Sleep, Nutrition, Supplements, Agents, Status,
+# `speed-budget-broken`. Coverage: Today (every panel), Log (every section), Check-in, HRV, Sleep, Nutrition, Supplements, Agents, Status,
 # Caffeine, Financials, Budgets, Cash forecast. It samples production hourly; it is not tied to one deployment.
 # The runner is often served from a far-away edge, so its numbers are pessimistic; a pass here means fast at home.
 # Manual deep run:  gh workflow run perf-timing.yml -f navigations=15

@@ -109,6 +109,14 @@ const TODAY_PENDING = /checking\.\.\.|checking agent requests|checking email|che
 const todayReady = ready(
   `${h("Today", "h1")} && !${TODAY_PANELS}.some((e) => e.getAttribute("aria-busy") === "true" || ${TODAY_PENDING}.test(e.innerText))`
 );
+// The Log screen (app/log/LogClient.tsx): the routed copy's root (a copy in the continuous scroll sits in a
+// section[data-feed-route]), with the loaded frame's heading (the server skeleton's h1 has no test id), every shown
+// section past its loading state (SectionSkeleton, the Uber Eats body and the inline list skeletons use .skeleton or
+// aria-busy, the check-in's own loading rows .animate-pulse) and, when the check-in part is shown, its day loaded.
+const LOG_ROOT = `[...document.querySelectorAll("[data-log-root]")].find(e => ${notFeed})`;
+const logReady = ready(
+  `((r) => !!r && !!r.querySelector('[data-testid="page-heading"]') && !r.querySelector('.skeleton, .animate-pulse, [aria-busy="true"]') && (!r.querySelector("#log-part-check-in") || /Daytime: /.test(r.innerText)))(${LOG_ROOT})`
+);
 // Server-rendered finance pages: the real heading (the loading.tsx skeleton's has no test id) with no skeleton left.
 const serverPageReady = ready(
   `!!document.querySelector('[data-testid="page-heading"]') && ![...document.querySelectorAll('p[role="status"]')].some((e) => ${notFeed} && /^Loading /.test(e.textContent))`
@@ -128,6 +136,13 @@ const PAGES: PageSpec[] = [
     route: "/check-in",
     // The subtitle with "Daytime:" renders only once the day's questions have loaded (not on the error screen).
     ready: ready(`${h("Check-in", "h2")} && /Daytime: /.test(${ROUTED_TEXT})`),
+  },
+  {
+    slug: "log",
+    label: "/log",
+    route: "/log",
+    // Every section of the Log screen with its data (Say it, Check-in, Journal, Supplements, Uber Eats, Weight, Reading).
+    ready: logReady,
   },
   {
     slug: "analytics-hrv",
@@ -179,7 +194,7 @@ const PAGES: PageSpec[] = [
 ];
 
 // Pages timed as in-app navigations (sidebar links). Routes with a query string have no sidebar link.
-const IN_APP = ["/check-in", "/sleep", "/nutrition", "/supplements", "/analytics/hrv", "/caffeine", "/status", "/financials", "/financials/budgets", "/financials/forecast"];
+const IN_APP = ["/log", "/check-in", "/sleep", "/nutrition", "/supplements", "/analytics/hrv", "/caffeine", "/status", "/financials", "/financials/budgets", "/financials/forecast"];
 
 interface Sample {
   i: number;
