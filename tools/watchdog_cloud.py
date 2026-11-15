@@ -101,7 +101,8 @@ SCHEDULED: dict[str, Sched] = {
         'a manual dispatch forces an unconditional full retrain, and the 12:00 UTC safety net already covers it'),
     'hrv-prediction.yml': Sched('HRV Prediction', _h(26), True, 'daily crons plus a run after every hourly ETL'),
     'flights-email.yml': Sched('Flights Email ETL', _h(4), True, 'every 3h; routinely 3h19 in practice'),
-    'delivery-email.yml': Sched('Delivery Email ETL', _h(4), True, 'every 3h; worst seen 3h08'),
+    'delivery-email.yml': Sched(
+        'Delivery Email ETL', _m(90), True, 'every 15 min since #286 (2026-11-15); was every 3h, worst seen 3h08'),
     'air-quality-etl.yml': Sched(
         'Air Quality ETL', _h(4), True, 'every 3h at :12; new 2026-11-11, same cadence as the email ETLs'),
     'weather-etl.yml': Sched(
