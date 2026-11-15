@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 import { fetchActiveHabitsCached } from "@/lib/habits-notion";
+import { SLEEP_QUESTIONS } from "@/lib/checkin";
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_HABITS_DB = process.env.NOTION_HABITS_DB || "29cc936fd5e14ae8b10a4fe5c5f7a6cd";
@@ -201,7 +202,11 @@ export async function POST() {
     // retrains), and overwriting an explicit 'No' (tri-state, 2026-06-11)
     // would silently flip a deliberate in-Onyx answer — Notion only carries
     // a completion date, so it can never out-rank a direct answer.
-    if (lastCompleted) {
+    // Sleep questions are never synced from Notion: an answer on day D describes the night that CLOSES day D, and a
+    // Notion date cannot say which night a tick meant (ticked in the morning = last night = D - 1), so sleep is
+    // answered per night on the check-in only. Skipped quietly: the mirror keeps their Last Completed in Notion, and
+    // a reported skip would count as a change on every /habits visit.
+    if (lastCompleted && !SLEEP_QUESTIONS.has(name)) {
       const lcDate = String(lastCompleted).slice(0, 10); // Notion may return a datetime
       if (channel === "whoop" && lcDate <= WHOOP_JOURNAL_FROZEN_THROUGH) {
         synced.push(`${name}: SKIPPED (Last Completed ${lcDate} is inside the frozen historical era)`);
