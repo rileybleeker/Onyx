@@ -143,7 +143,7 @@ export default function MobileNav() {
           content can't bleed under the iOS status bar. Mobile only. */}
       <header className="md:hidden fixed inset-x-0 top-0 z-40 bg-surface-sunken border-b border-border-subtle pt-[env(safe-area-inset-top)]">
         <div className="h-12 px-3 flex items-center justify-between">
-          <span className="flex items-center gap-2 text-[17px] font-bold lowercase tracking-[0.01em] text-text-primary"><img src="/icons/logo-mark-64.png?v=2" width={20} height={20} alt="" aria-hidden="true" className="shrink-0" />Onyx</span>
+          <span className="flex items-center gap-2 text-[17px] font-bold lowercase tracking-[0.01em] text-text-primary"><img src="/icons/logo-mark-64.png?v=3" width={20} height={20} alt="" aria-hidden="true" className="shrink-0" />Onyx</span>
           <button
             onClick={() => window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE))}
             className="w-11 h-11 -mr-1 flex items-center justify-center rounded-control text-text-secondary hover:text-text-primary transition-colors"
@@ -254,7 +254,7 @@ export default function MobileNav() {
       >
         <div className="px-5 py-5 border-b border-border-subtle flex items-center justify-between pt-[max(1.25rem,env(safe-area-inset-top))]">
           <div>
-            <h1 className="flex items-center gap-2 text-base font-semibold text-text-primary tracking-tight"><img src="/icons/logo-mark-64.png?v=2" width={20} height={20} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
+            <h1 className="flex items-center gap-2 text-base font-semibold text-text-primary tracking-tight"><img src="/icons/logo-mark-64.png?v=3" width={20} height={20} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
             <p className="text-[11px] text-text-tertiary mt-0.5 font-mono">Personal Data Scientist</p>
           </div>
           <button
