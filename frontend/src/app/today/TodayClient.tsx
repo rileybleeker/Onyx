@@ -26,9 +26,9 @@ type RequestCard = Extract<InboxItem, { kind: "card" }>;
 type OrdersSummary = { status: "not_connected" } | { status: "ready"; attention: number; arrivingToday: number; onTheWay: number;
   top: { merchant: string; label: string; reason: string }[] };
 const linkStyle = "text-sm text-accent underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-accent";
-const panelStyle = `${styles.panel} rounded-2xl border border-border-default bg-surface-card p-5 sm:p-6`;
+const panelStyle = `${styles.panel} rounded-card border border-border-default bg-surface-card p-5 sm:p-6`; // shadow-card via styles.panel
 const clearAllStyle = "text-sm text-accent focus-visible:outline-2 focus-visible:outline-accent";
-const clearOneStyle = "inline-flex min-h-11 min-w-11 items-center justify-center shrink-0 rounded-lg p-2 text-text-secondary hover:text-text-primary focus-visible:outline-2 focus-visible:outline-accent";
+const clearOneStyle = "inline-flex min-h-11 min-w-11 items-center justify-center shrink-0 rounded-control p-2 text-text-secondary hover:text-text-primary focus-visible:outline-2 focus-visible:outline-accent";
 // The Worker's /onyx/dismiss takes at most this many card codes per call.
 const MAX_DISMISS = 200;
 // How long the "Cleared N · Undo" bar stays (same as the Agents inbox).
@@ -406,7 +406,7 @@ export default function TodayClient() {
         </>}
         {trial.status === "upcoming" && <p className="mt-3 break-words text-sm text-text-primary">{trial.experimentId}: {trial.title} starts {dayLabel(trial.startDate)} and runs {trial.nDays} days. No arm today.</p>}
         {trial.status === "paused" && <p className="mt-3 break-words text-sm text-text-primary">{trial.experimentId}: {trial.title} is paused. No arm today.</p>}
-        {experiment.state === "ready" && experiment.stale && <p className="mt-3 text-sm text-amber-300">Couldn&apos;t refresh the experiment arm. Showing the last check.</p>}
+        {experiment.state === "ready" && experiment.stale && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh the experiment arm. Showing the last check.</p>}
       </div>}
       <div className={styles.workspace}>
       <div className={styles.attention}>
@@ -422,12 +422,12 @@ export default function TodayClient() {
         {inbox.state === "loading" && <p className="mt-4 text-sm text-text-secondary">Checking agent requests...</p>}
         {inbox.state === "error" && <p className="mt-4 text-sm text-text-secondary">Couldn&apos;t check requests. Open your inbox or try refreshing.</p>}
         {inbox.state === "ready" && <>
-          {inbox.stale && <p className="mt-3 text-sm text-amber-300">Couldn&apos;t refresh requests. Showing the last check from {checkedAt}; these requests may have changed.</p>}
+          {inbox.stale && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh requests. Showing the last check from {checkedAt}; these requests may have changed.</p>}
           {requests.length === 0 ? <p className="mt-4 text-sm text-text-secondary">The last check returned no open requests. Messages and updates are in your inbox.</p> : <>
             <p className="mt-2 text-xs text-text-secondary">Showing {Math.min(requests.length, 3)} of {requests.length} requests returned, in inbox order.</p>
             <ul className="mt-4 divide-y divide-border-subtle">
               {requests.slice(0, 3).map((item) => <li key={`${item.thread}:${item.messageId}:${item.card.code}`} className="flex items-center gap-1">
-                <Link href={requestHref(item)} className="group flex min-w-0 flex-1 items-center justify-between gap-3 rounded-lg py-4 focus-visible:outline-2 focus-visible:outline-accent">
+                <Link href={requestHref(item)} className="group flex min-w-0 flex-1 items-center justify-between gap-3 rounded-control py-4 focus-visible:outline-2 focus-visible:outline-accent">
                   <span className="min-w-0"><span className="block text-xs text-text-secondary">{item.card.agent || "Agent"}</span>
                     <span className="mt-1 block break-words text-sm font-medium text-text-primary">{item.card.name}</span>
                     <span className="mt-1 block text-xs text-accent">Review request</span></span>
@@ -454,7 +454,7 @@ export default function TodayClient() {
         <p className="mt-1 text-xs text-text-secondary">From inbox-triage: threads it labelled Agent/Action or Agent/Deadline, and its urgent questions in your agent inbox.</p>
         {urgent.state === "loading" && <p className="mt-3 text-sm text-text-secondary">Checking email...</p>}
         {urgent.state === "error" && <p className="mt-3 text-sm text-text-secondary">{emailCards.length > 0 ? "Couldn't check the email labels. Showing inbox-triage's requests only." : "Couldn't check urgent email. Try refreshing."}</p>}
-        {urgent.state === "ready" && urgent.stale && <p className="mt-3 text-sm text-amber-300">Couldn&apos;t refresh the email labels. Showing the last check; it may have changed.</p>}
+        {urgent.state === "ready" && urgent.stale && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh the email labels. Showing the last check; it may have changed.</p>}
         {urgent.state === "ready" && urgent.value.status === "not_connected" && <p className="mt-3 text-sm text-text-primary">The email label sync isn&apos;t connected yet{emailCards.length > 0 ? ", so only inbox-triage's requests are shown." : "."}</p>}
         {inbox.state === "error" && urgent.state !== "loading" && <p className="mt-3 text-xs text-text-secondary">Agent requests couldn&apos;t be checked, so inbox-triage&apos;s urgent questions may be missing here.</p>}
         {urgent.state !== "loading" && (merged.items.length > 0 ? <>
@@ -480,7 +480,7 @@ export default function TodayClient() {
           <p className="mt-3 text-sm text-text-secondary">Nothing urgent right now.</p>
           <p className="mt-1 text-xs text-text-secondary">{email.scanned === 0 ? `No labelled threads in the last ${email.windowDays} days.` : `${email.scanned} labelled thread${email.scanned === 1 ? "" : "s"} in the last ${email.windowDays} days; ${email.hidden} left out (archived, older, or past their date)${email.cleared ? `; ${email.cleared} cleared on Today` : ""}.`}</p>
         </>)}
-        {email && <p className={`mt-3 text-xs ${syncStale ? "text-amber-300" : "text-text-secondary"}`}>{lastSync
+        {email && <p className={`mt-3 text-xs ${syncStale ? "text-mid" : "text-text-secondary"}`}>{lastSync
           ? `Email labels last synced ${ageLabel(lastSync.at, now)}${lastSync.status !== "success" ? ` (that run: ${lastSync.status})` : ""}${syncStale ? "; newer labels may be missing." : "."}`
           : "The email label sync has not run yet."}</p>}
         {urgent.state !== "loading" && <p className="mt-1 text-xs text-text-secondary">Opening or clearing on Today does not mark email read or change any label. A cleared thread comes back if a newer message arrives in it.</p>}
@@ -497,7 +497,7 @@ export default function TodayClient() {
         <p className="mt-1 text-xs text-text-secondary">Today and tomorrow from {CALENDAR_SOURCE_LABEL}, in this device&apos;s time zone.</p>
         {calendar.state === "loading" && <p className="mt-3 text-sm text-text-secondary">Checking your calendar...</p>}
         {calendar.state === "error" && <p className="mt-3 text-sm text-text-secondary">Couldn&apos;t check the calendar. Try refreshing.</p>}
-        {calendar.state === "ready" && calendar.stale && <p className="mt-3 text-sm text-amber-300">Couldn&apos;t refresh the calendar. Showing the last check; it may have changed.</p>}
+        {calendar.state === "ready" && calendar.stale && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh the calendar. Showing the last check; it may have changed.</p>}
         {calendarOff && <p className="mt-3 text-sm text-text-primary">The calendar sync isn&apos;t connected yet.</p>}
         {agenda && agendaByDay && <>
           {calendarDays.map(({ day, name }) => {
@@ -515,7 +515,7 @@ export default function TodayClient() {
               {events.length > CALENDAR_SHOWN && <p className="mt-1 text-xs text-text-secondary">And {events.length - CALENDAR_SHOWN} more {name.toLowerCase()}.</p>}
             </div>;
           })}
-          <p className={`mt-4 text-xs ${calendarSync === "ok" ? "text-text-secondary" : "text-amber-300"}`}>{agenda.lastSync
+          <p className={`mt-4 text-xs ${calendarSync === "ok" ? "text-text-secondary" : "text-mid"}`}>{agenda.lastSync
             ? `Calendar last synced ${ageLabel(agenda.lastSync.at, now)}${agenda.lastSync.status !== "success" ? ` (that run: ${agenda.lastSync.status})` : ""}${calendarSync === "ok" ? "." : "; newer changes may be missing."}`
             : "The calendar sync has not reported a run yet; these events may be out of date."}</p>
         </>}
@@ -566,7 +566,7 @@ export default function TodayClient() {
           <h2 id="reading-heading" className="text-lg font-medium text-text-primary">Keep reading</h2></div>
         {reading.state === "loading" && <p className="mt-3 text-sm text-text-secondary">Loading reading progress...</p>}
         {reading.state === "error" && <p className="mt-3 text-sm text-text-secondary">Reading progress is unavailable right now.</p>}
-        {reading.state === "ready" && reading.stale && <p className="mt-3 text-sm text-amber-300">Couldn&apos;t refresh reading. Showing previously loaded progress.</p>}
+        {reading.state === "ready" && reading.stale && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh reading. Showing previously loaded progress.</p>}
         {reading.state === "ready" && (book ? <>
           <p className="mt-3 text-base font-medium text-text-primary">{book.book.title}</p>
           <p className="mt-1 text-sm text-text-secondary">{Number.isFinite(book.chaptersDone) && Number.isFinite(book.totalChapters) && book.totalChapters > 0 && book.chaptersDone >= 0 && book.chaptersDone <= book.totalChapters ? `${book.chaptersDone} of ${book.totalChapters} chapters recorded.` : "Chapter progress is not available."}</p>
