@@ -1,5 +1,6 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
 import { ExternalLink } from "lucide-react";
@@ -78,6 +79,8 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
       })
       .then((next) => {
         if (cancelled) return;
+        // Also seeds this page in the continuous scroll (lib/feed-seed.ts).
+        writeFeedSeed("/nyc", next);
         setError(null);
         setLeads((prev) => (sameJson(prev, next) ? prev : next));
       })

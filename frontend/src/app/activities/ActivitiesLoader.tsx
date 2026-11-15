@@ -28,6 +28,7 @@ export interface ActivitiesInitial {
   recoveryContext: unknown[];
 }
 
-export default function ActivitiesLoader({ initial }: { initial: ActivitiesInitial | null }) {
-  return <ActivitiesClient initial={initial} />;
+// headingTestId: "feed-page-heading" when the continuous scroll renders this page (its FeedSection).
+export default function ActivitiesLoader({ initial, headingTestId }: { initial: ActivitiesInitial | null; headingTestId?: string }) {
+  return <ActivitiesClient initial={initial} headingTestId={headingTestId} />;
 }

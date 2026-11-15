@@ -32,7 +32,22 @@ async function put(url: string, body: unknown): Promise<string | null> {
   }
 }
 
-export default function BudgetsView({ result, categories, rules, setupPending, subscriptions }: { result: BudgetsResult; categories: string[]; rules: { merchantKey: string; category: string }[]; setupPending: boolean; subscriptions: SubscriptionView[] }) {
+export default function BudgetsView({
+  result,
+  categories,
+  rules,
+  setupPending,
+  subscriptions,
+  onChanged,
+}: {
+  result: BudgetsResult;
+  categories: string[];
+  rules: { merchantKey: string; category: string }[];
+  setupPending: boolean;
+  subscriptions: SubscriptionView[];
+  /** Re-read the data after a save (the scroll section); without it the server page refreshes. */
+  onChanged?: () => void;
+}) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -42,6 +57,7 @@ export default function BudgetsView({ result, categories, rules, setupPending, s
     const e = await fn();
     setBusy(false);
     if (e) setError(e);
+    else if (onChanged) onChanged();
     else router.refresh();
   };
   const r = result;

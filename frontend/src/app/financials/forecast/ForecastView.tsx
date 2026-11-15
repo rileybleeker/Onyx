@@ -52,6 +52,7 @@ export default function ForecastView({
   accuracy,
   goals,
   move,
+  onChanged,
 }: {
   result: ForecastResult;
   items: PlanItemView[];
@@ -65,6 +66,8 @@ export default function ForecastView({
   accuracy: AccuracyRow[];
   goals: GoalView[];
   move: MovePlan | null;
+  /** Re-read the data after a save (the scroll section); without it the server page refreshes. */
+  onChanged?: () => void;
 }) {
   const router = useRouter();
   const [range, setRange] = useState<"13w" | "12m">("13w");
@@ -79,6 +82,7 @@ export default function ForecastView({
     const err = await fn();
     setBusy(false);
     if (err) setError(err);
+    else if (onChanged) onChanged();
     else router.refresh();
   };
 

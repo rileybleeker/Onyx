@@ -1,5 +1,6 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { useEffect, useRef, useState } from "react";
 import { AreaChart, Area, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, getRunningRecoveryContext, getActivityLaps, rangeDays, rangeLabel } from "@/lib/queries";
@@ -8,6 +9,7 @@ import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { Part, PartGrid } from "@/components/personalize/PartGrid";
 import { chartTooltip, axisTick, gridStyle, axisLabel, sourceColors, chartColors as C } from "@/lib/chart-theme";
 import { mergeDailySteps, stepsSourceLabel } from "@/lib/steps";
 import {
@@ -386,7 +388,8 @@ function buildWorkoutRows(segments: SegmentTarget[], laps: Lap[]): WorkoutRow[] 
 
 import type { ActivitiesInitial } from "./ActivitiesLoader";
 
-export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitial | null }) {
+export default function ActivitiesPage({ initial, headingTestId = "page-heading" }: { initial?: ActivitiesInitial | null; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // Server-prefetched initial data (ISR, default 30d range) seeds the page so
   // it paints immediately; the mount effect still runs as a SILENT
   // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
@@ -437,6 +440,8 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts(), getDailySummaries(days), getWhoopCycles(days), getHeartRateData(days), getRunningRecoveryContext(days)])
       .then(([garmin, whoop, wkts, sums, cycles, h, recCtx]) => {
         if (cancelled) return;
+        // The default view also seeds this page in the continuous scroll (lib/feed-seed.ts).
+        if (range === "30d") writeFeedSeed("/activities", { garmin, whoop, workouts: wkts, summaries: sums, cycles, hr: h, recoveryContext: recCtx });
         // sameJson bail-out: the silent revalidation's data is usually
         // byte-identical to the server-seeded state — returning the previous
         // reference lets React skip the commit (and a full chart re-render).
@@ -730,7 +735,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Activities</h2>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Activities</h2>
           <p className="text-sm text-text-tertiary mt-0.5">Training — {rangeLabel(shownRange)}</p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-3">
@@ -739,7 +744,9 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
         </div>
       </div>
 
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+      <PartGrid page="/activities" title="Activities">
+      <Part id="summary" title="Steps, heart rate & stress tiles">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
         <StatCard
           label="Steps"
           value={latestSteps ? latestSteps.steps.toLocaleString() : null}
@@ -757,8 +764,9 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
         <StatCard label="Min HR" value={avgMinHr != null ? avgMinHr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
         <StatCard label="Stress Level" value={avgStress != null ? avgStress.toFixed(0) : null} sublabel={rangeNote} source="GARMIN" />
       </div>
+      </Part>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+        <Part id="daily-steps" title="Daily Steps" width="half">
         <ChartCard title="Daily Steps" subtitle={rangeLabel(shownRange)} source={stepsSource}>
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={stepsData}>
@@ -775,7 +783,9 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="avg-heart-rate" title="Avg Heart Rate" width="half">
         <ChartCard title="Avg Heart Rate" subtitle={rangeLabel(shownRange)} source="WHOOP">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={cycleHrData}>
@@ -793,7 +803,9 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="heart-rate-range" title="Heart Rate Range" width="half">
         <ChartCard title="Heart Rate Range" source="GARMIN">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={hrData}>
@@ -817,7 +829,9 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="stress" title="Stress Level" width="half">
         <ChartCard title="Stress Level" source="GARMIN">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={stressData}>
@@ -835,8 +849,9 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
-      </div>
+        </Part>
 
+      <Part id="activity-list" title="Activity list">
       {rows.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-center">
           <svg className="w-10 h-10 text-text-tertiary mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -1164,6 +1179,8 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
           })}
         </div>
       )}
+      </Part>
+      </PartGrid>
     </>
   );
 }

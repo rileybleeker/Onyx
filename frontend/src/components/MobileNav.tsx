@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Plus, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck } from "lucide-react";
+import { Plus, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck, Camera } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS } from "@/lib/nav";
 import { CACHE_KEYS, clientCache, wipeClientData } from "@/lib/client-cache";
@@ -11,12 +11,15 @@ import { AGENTS_BADGE_EVENT, lastAgentsBadge } from "@/lib/agents-api";
 import { badgeText, isTabActive, mobileTabs, tabLabel } from "@/lib/mobile-tabs";
 import { navIntentProps } from "@/lib/warmup";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
+import { useActiveRoute } from "./FeedContext";
+import PersonalizeButton from "./personalize/PersonalizeButton";
 
 const LOG_ACTIONS = [
   { label: "Check-in", href: "/check-in", icon: ClipboardCheck },
   { label: "Supplement", href: "/supplements", icon: Pill },
   { label: "Habit", href: "/habits", icon: CircleCheck },
   { label: "Weight", href: "/nutrition?log=weight", icon: Scale }, // opens the weight quick-log first, field focused
+  { label: "Meal photo", href: "/nutrition?log=photo", icon: Camera }, // opens the plate-photo logger first
 ];
 
 /**
@@ -49,6 +52,8 @@ export default function MobileNav() {
   const drawerRef = useRef<HTMLElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
+  // The page in view (follows the continuous scroll); `pathname` stays the routed page for closing overlays.
+  const current = useActiveRoute();
   const agentsUnread = useAgentsBadge();
 
   // Close every overlay on route change.
@@ -143,7 +148,7 @@ export default function MobileNav() {
           content can't bleed under the iOS status bar. Mobile only. */}
       <header className="md:hidden fixed inset-x-0 top-0 z-40 bg-surface-sunken border-b border-border-subtle pt-[env(safe-area-inset-top)]">
         <div className="h-12 px-3 flex items-center justify-between">
-          <span className="flex items-center gap-2 text-[17px] font-bold lowercase tracking-[0.01em] text-text-primary"><img src="/icons/logo-mark-64.png?v=2" width={20} height={20} alt="" aria-hidden="true" className="shrink-0" />Onyx</span>
+          <span className="flex items-center gap-2 text-[17px] font-bold lowercase tracking-[0.01em] text-text-primary"><img src="/icons/logo-mark-64.png?v=4" width={26} height={26} alt="" aria-hidden="true" className="shrink-0" />Onyx</span>
           <button
             onClick={() => window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE))}
             className="w-11 h-11 -mr-1 flex items-center justify-center rounded-control text-text-secondary hover:text-text-primary transition-colors"
@@ -166,7 +171,7 @@ export default function MobileNav() {
             if (tab.kind === "page") {
               const item = navItems.get(tab.href)!;
               const Icon = item.icon;
-              const active = isTabActive(item.href, pathname);
+              const active = isTabActive(item.href, current);
               const count = item.href === "/agents" ? badgeText(agentsUnread) : "";
               return (
                 <Link key={item.href} href={item.href} className={`${cell} ${active ? "text-accent" : "text-text-tertiary hover:text-text-secondary"}`} aria-current={active ? "page" : undefined} {...navIntentProps(item.href)}>
@@ -254,7 +259,7 @@ export default function MobileNav() {
       >
         <div className="px-5 py-5 border-b border-border-subtle flex items-center justify-between pt-[max(1.25rem,env(safe-area-inset-top))]">
           <div>
-            <h1 className="flex items-center gap-2 text-base font-semibold text-text-primary tracking-tight"><img src="/icons/logo-mark-64.png?v=2" width={20} height={20} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
+            <h1 className="flex items-center gap-2 text-base font-semibold text-text-primary tracking-tight"><img src="/icons/logo-mark-64.png?v=4" width={26} height={26} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
             <p className="text-[11px] text-text-tertiary mt-0.5 font-mono">Personal Data Scientist</p>
           </div>
           <button
@@ -285,7 +290,7 @@ export default function MobileNav() {
               </p>
               <div className="space-y-0.5">
                 {section.items.map((item) => {
-                  const active = (pathname === "/" ? "/today" : pathname) === item.href;
+                  const active = current === item.href;
                   const Icon = item.icon;
                   return (
                     <Link
@@ -311,6 +316,10 @@ export default function MobileNav() {
         </nav>
 
         <div className="px-2 py-3 border-t border-border-subtle pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+          <PersonalizeButton
+            onStart={() => setDrawerOpen(false)}
+            className="min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full disabled:text-accent"
+          />
           <button
             onClick={handleSignOut}
             className="min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full"

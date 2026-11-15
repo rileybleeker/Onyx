@@ -47,7 +47,9 @@ function cachedReading(raw: unknown): ReadingAnswer | null {
   return v && "overview" in v && (v.overview === null || !!v.overview?.book?.slug) ? v : null;
 }
 
-export default function ReadingClient() {
+/** `feed`: drawn inside the continuous scroll (FeedSection.tsx); the heading is then marked feed-page-heading. */
+export default function ReadingClient({ feed = false }: { feed?: boolean } = {}) {
+  const headingTestId = feed ? "feed-page-heading" : "page-heading";
   // Start from the cached answer (Today and the warm-up read the same URL), then revalidate.
   const [seed] = useState(() => cachedReading(clientCache.peek(readingUrl(null))));
   const [overview, setOverview] = useState<ReadingOverview | null>(seed?.overview ?? null);
@@ -102,7 +104,7 @@ export default function ReadingClient() {
   if (error && !overview) {
     return (
       <div className="max-w-3xl">
-        <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Reading</h2>
+        <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Reading</h2>
         <p className="mt-3 text-sm text-red-400">{error}</p>
         <p className="mt-1 text-[12px] text-text-tertiary">If this is a fresh deploy, apply sql/reading_schema.sql in Supabase first.</p>
       </div>
@@ -112,7 +114,7 @@ export default function ReadingClient() {
   if (!overview) {
     return (
       <div className="max-w-3xl">
-        <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Reading</h2>
+        <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Reading</h2>
         <p className="mt-3 text-sm text-text-secondary">No book in progress. Add one with POST /api/reading/books or the chat.</p>
       </div>
     );
@@ -125,7 +127,7 @@ export default function ReadingClient() {
       {/* Header */}
       <div className="mb-5 flex items-start justify-between gap-3">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Reading</h2>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Reading</h2>
           <p className="text-sm text-text-secondary mt-0.5">
             <span className="text-text-primary">{o.book.title}</span>
             {o.book.author && <span className="text-text-tertiary"> · {o.book.author}</span>}

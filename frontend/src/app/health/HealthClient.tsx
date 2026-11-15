@@ -49,7 +49,8 @@ function whenText(item: CareItem, viewerTz: string): string {
   return `${base} (${zoneLabel(item.tz)}; ${formatTime(here.time)}${here.date === item.due ? '' : ` on ${here.date}`} your time)`;
 }
 
-export default function HealthClient({ initial, calendar }: { initial: CareLoad; calendar?: CalendarStatus }) {
+// headingTestId: "feed-page-heading" when rendered as a section of the continuous scroll (FeedSection.tsx).
+export default function HealthClient({ initial, calendar, headingTestId = 'page-heading' }: { initial: CareLoad; calendar?: CalendarStatus; headingTestId?: string }) {
   const [items, setItems] = useState<CareItem[]>(initial.state === 'ready' ? initial.items : []);
   const [load, setLoad] = useState<'ready' | 'loading' | 'failed'>(initial.state === 'ready' ? 'ready' : 'failed');
   const [busy, setBusy] = useState<Set<string>>(new Set());
@@ -197,7 +198,7 @@ export default function HealthClient({ initial, calendar }: { initial: CareLoad;
   const zones = [...new Set([form.tz, viewerTz, ...COMMON_ZONES])].filter(validTimeZone);
 
   return <div className="mx-auto max-w-4xl space-y-6 p-4 sm:p-8">
-    <header><h1 data-testid="page-heading" className="text-2xl font-semibold">Health & appointments</h1></header>
+    <header><h1 data-testid={headingTestId} className="text-2xl font-semibold">Health & appointments</h1></header>
     <section className={panel} aria-label="Privacy and calendar connection">
       <div className="flex items-center gap-2">
         <h2 className="font-semibold">Private planning, saved in Onyx</h2>

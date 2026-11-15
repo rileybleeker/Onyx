@@ -20,6 +20,7 @@ const HrvAnalysisClient = dynamic(() => import("./HrvAnalysisClient"), {
 // its state from this and then silently revalidates on mount.
 export type HrvInitial = HrvDashboardData;
 
-export default function HrvLoader({ initial }: { initial: HrvInitial | null }) {
-  return <HrvAnalysisClient initial={initial} />;
+// headingTestId: "feed-page-heading" when the continuous scroll renders this page (its FeedSection).
+export default function HrvLoader({ initial, headingTestId }: { initial: HrvInitial | null; headingTestId?: string }) {
+  return <HrvAnalysisClient initial={initial} headingTestId={headingTestId} />;
 }

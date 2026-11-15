@@ -1,5 +1,6 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { useEffect, useRef, useState } from "react";
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
@@ -125,7 +126,8 @@ function chipClass(active: boolean, disabled = false): string {
 
 import type { SpotifyInitial } from "./SpotifyLoader";
 
-export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | null }) {
+export default function SpotifyPage({ initial, headingTestId = "page-heading" }: { initial?: SpotifyInitial | null; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // Server-prefetched initial data (ISR, default 30d range) seeds the charts
   // so they paint immediately; the mount effect still runs as a SILENT
   // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
@@ -330,6 +332,8 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
     ])
       .then(([dash, v, d]) => {
         if (cancelled) return;
+        // The default view also seeds this page in the continuous scroll (lib/feed-seed.ts, memory only).
+        if (range === "30d") writeFeedSeed("/spotify", { dashboard: dash, volume: v, drift: d });
         // sameJson bail-out: the silent revalidation's data is usually
         // byte-identical to the server-seeded state — returning the previous
         // reference lets React skip the commit (and a full chart re-render).
@@ -371,7 +375,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <div className="flex items-center gap-2">
-            <h1 data-testid="page-heading" className="text-[20px] font-medium text-text-primary tracking-tight">Spotify</h1>
+            <h1 data-testid={headingTestId} className="text-[20px] font-medium text-text-primary tracking-tight">Spotify</h1>
             <InfoHint label="Spotify coverage">
               Only plays that Spotify&apos;s servers receive appear here. Offline playback on partner devices
               (Garmin watches, some car head units, older wearables) is never reported, even after the device

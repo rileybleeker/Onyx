@@ -133,18 +133,51 @@ class Plan(unittest.TestCase):
 
 
 class Culprit(unittest.TestCase):
-    """A failed build is reverted at the commit that broke it, not at the merge that happened to be verified."""
+    """A failed build is reverted at the commit that broke it, and only when the deployment history proves which one
+    that is; otherwise nothing is reverted and the train halts (Codex review 2026-11-14)."""
     A, B, C = "a" * 40, "b" * 40, "c" * 40
 
     def test_head_broke_it(self):
         self.assertEqual(mt.culprit_of([(self.C, ["failure"]), (self.B, ["success"])]), self.C)
 
     def test_parent_already_broken(self):
-        chain = [(self.C, ["failure"]), (self.B, ["error"]), (self.A, ["inactive"])]
+        chain = [(self.C, ["failure"]), (self.B, ["failure"]), (self.A, ["success"])]
         self.assertEqual(mt.culprit_of(chain), self.B)
 
-    def test_parent_without_a_deployment_stops_the_walk(self):
-        self.assertEqual(mt.culprit_of([(self.C, ["failure"]), (self.B, [])]), self.C)
+    def test_a_commit_without_a_build_inside_the_run_is_unknown(self):
+        # Codex: A broke it, B was never built (superseded, like #187), C failed with A's fault. Reverting C is wrong.
+        self.assertIsNone(mt.culprit_of([(self.C, ["failure"]), (self.B, []), (self.A, ["failure"])]))
+        self.assertIsNone(mt.culprit_of([(self.C, ["failure"]), (self.B, []), (self.A, ["success"])]))
+
+    def test_canceled_errored_or_pending_parent_is_unknown(self):
+        # Vercel's `inactive` is "Canceled from the Vercel Dashboard": that commit never built.
+        for states in (["inactive"], ["error"], ["pending"], ["failure", "error"]):
+            self.assertIsNone(mt.culprit_of([(self.C, ["failure"]), (self.B, states), (self.A, ["success"])]), states)
+
+    def test_failing_merge_without_a_failed_build_is_unknown(self):
+        # A deploy that never finished (timeout) or an infrastructure error is not evidence against the source.
+        for states in ([], ["pending"], ["error"], ["inactive"]):
+            self.assertIsNone(mt.culprit_of([(self.C, states), (self.B, ["success"])]), states)
+
+    def test_no_good_build_within_the_commits_read_is_unknown(self):
+        self.assertIsNone(mt.culprit_of([(self.C, ["failure"]), (self.B, ["failure"])]))
+        self.assertIsNone(mt.culprit_of([]))
+
+    def test_build_state(self):
+        self.assertEqual(mt.build_state(["failure", "success"]), "good")
+        self.assertEqual(mt.build_state(["failure", "failure"]), "failed")
+        for states in ([], ["inactive"], ["error"], ["queued"], ["failure", "pending"]):
+            self.assertEqual(mt.build_state(states), "unknown", states)
+
+    def test_describe_chain_is_one_line_of_evidence(self):
+        self.assertEqual(mt.describe_chain([(self.C, ["failure"]), (self.B, [])]), "ccccccc failure, bbbbbbb no deployment")
+
+
+class PostMergeWorkflow(unittest.TestCase):
+    def test_unknown_provenance_halts_without_a_revert(self):
+        wf = (Path(__file__).resolve().parents[1] / ".github/workflows/post-merge.yml").read_text()
+        self.assertIn("needs.verify.outputs.result == 'halt'", wf)
+        self.assertIn("--halt-only", wf)
 
 
 class PinnedCiWorkflow(unittest.TestCase):

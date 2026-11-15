@@ -25,6 +25,7 @@ export interface NutritionInitial {
   fullNutrients: unknown[];
 }
 
-export default function NutritionLoader({ initial }: { initial: NutritionInitial | null }) {
-  return <NutritionClient initial={initial} />;
+// headingTestId: "feed-page-heading" when the continuous scroll renders this page (its FeedSection).
+export default function NutritionLoader({ initial, headingTestId }: { initial: NutritionInitial | null; headingTestId?: string }) {
+  return <NutritionClient initial={initial} headingTestId={headingTestId} />;
 }

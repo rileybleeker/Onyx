@@ -1,5 +1,6 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { useEffect, useRef, useState } from "react";
 import {
   ScatterChart, Scatter, XAxis, YAxis, Tooltip, ResponsiveContainer,
@@ -110,7 +111,8 @@ function BAPlot({
 
 import type { BlandAltmanInitial } from "./BlandAltmanLoader";
 
-export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInitial | null }) {
+export default function BlandAltmanPage({ initial, headingTestId = "page-heading" }: { initial?: BlandAltmanInitial | null; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // Server-prefetched initial data (ISR, default 30d range) seeds the charts
   // so they paint immediately; the mount effect still runs as a SILENT
   // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
@@ -132,6 +134,8 @@ export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInit
     getHealthMatrix(rangeDays(range))
       .then((rows) => {
         if (cancelled) return;
+        // The default view also seeds this page in the continuous scroll (lib/feed-seed.ts).
+        if (range === "30d") writeFeedSeed("/bland-altman", { data: rows });
         // sameJson bail-out: the silent revalidation's data is usually
         // byte-identical to the server-seeded state — returning the previous
         // reference lets React skip the commit (and a full chart re-render).
@@ -168,7 +172,7 @@ export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInit
       <>
         <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
           <div>
-            <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Bland-Altman Analysis</h2>
+            <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Bland-Altman Analysis</h2>
             <p className="text-sm text-text-tertiary mt-0.5">Method agreement analysis — {rangeLabel(range)}</p>
           </div>
           <RangeFilter value={range} onChange={setRange} />
@@ -355,7 +359,7 @@ export default function BlandAltmanPage({ initial }: { initial?: BlandAltmanInit
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Bland-Altman Analysis</h2>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Bland-Altman Analysis</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
             Method agreement between Garmin, WHOOP, and Eight Sleep — {rangeLabel(range)}, pairwise.
           </p>

@@ -1,6 +1,7 @@
 import { supabase } from "./supabase";
 import { whoopSleepDay, kjToKcal } from "./format";
 import { dishKcal, mergeDeliveryEstimates } from "./delivery-portion";
+import { combineEstimateDays, isMissingRelation, type PhotoMealItem } from "./photo-meal";
 import type { LeftoverRow } from "./delivery-leftovers";
 
 // Re-audit 2026-06-07 (units/deepseek/F-003): promoted the workout→sleep gap
@@ -449,43 +450,104 @@ export async function getEightSleepTrends(days: number = 30, side: string = "lef
 export async function getNutrition(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
+  const sinceYmd = since.toISOString().split("T")[0];
 
   // Matview read (15-min refresh): Cronometer data lands via the manual local
   // importer, not in-app writes, so the only staleness case is opening
   // /nutrition within ~15 min of running an import. (The Today's Meals widget
   // reads the LIVE cronometer_servings table and stays instant.)
-  const { data, error } = await supabase
-    .from("daily_health_matrix_behavioral_mat")
-    .select(
-      "calendar_date, nutrition_source, " +
-        "calories:nutrition_calories, protein_g:nutrition_protein_g, " +
-        "carbs_g:nutrition_carbs_g, fat_g:nutrition_fat_g, fiber_g:nutrition_fiber_g, " +
-        "sugar_g:nutrition_sugar_g, sodium_mg:nutrition_sodium_mg, water_ml:nutrition_water_ml"
-    )
-    .gte("calendar_date", since.toISOString().split("T")[0])
-    .not("nutrition_calories", "is", null)
-    .order("calendar_date", { ascending: true });
-
-  if (error) throw error;
-
-  // Uber Eats estimates fill days with no Cronometer/MFP log (Cronometer has
-  // been quiet since 2026-06-29, so delivery orders are often the only food
-  // signal). A logged day always wins — a Cronometer diary usually already
-  // contains the delivered meal, so adding both would double-count.
-  // Estimates are per-dish guesses from the Uber Eats cart (restaurant orders
-  // only, each dish times the eaten portion), tagged nutrition_source='uber_eats'.
-  // est_kcal > 0: a day where every dish was marked "None" has no food signal;
-  // it must not show as a 0 kcal day (mergeDeliveryEstimates skips it too).
-  const { data: est, error: estErr } = await supabase
-    .from("delivery_nutrition_daily")
-    .select("behavioral_date, est_kcal, est_protein_g, est_carbs_g, est_fat_g")
-    .gte("behavioral_date", since.toISOString().split("T")[0])
-    .gt("est_kcal", 0)
-    .order("behavioral_date", { ascending: true });
-  if (estErr) throw estErr;
+  //
+  // Uber Eats estimates and photo-logged meals fill days with no Cronometer/MFP
+  // log (Cronometer has been quiet since 2026-06-29, so they are often the only
+  // food signal). A logged day always wins: a Cronometer diary usually already
+  // contains the meal, so adding both would double-count. On other days the two
+  // estimates add up (different meals; combineEstimateDays in lib/photo-meal.ts),
+  // tagged nutrition_source 'uber_eats' | 'photo' | 'uber_eats+photo'.
+  // Uber Eats: per-dish guesses from the cart (restaurant orders only, each dish
+  // times the eaten portion). est_kcal > 0: a day where every dish was marked
+  // "None" has no food signal; it must not show as a 0 kcal day.
+  // The three reads are independent, so they run in parallel.
+  const [matrix, delivery, photo] = await Promise.all([
+    supabase
+      .from("daily_health_matrix_behavioral_mat")
+      .select(
+        "calendar_date, nutrition_source, " +
+          "calories:nutrition_calories, protein_g:nutrition_protein_g, " +
+          "carbs_g:nutrition_carbs_g, fat_g:nutrition_fat_g, fiber_g:nutrition_fiber_g, " +
+          "sugar_g:nutrition_sugar_g, sodium_mg:nutrition_sodium_mg, water_ml:nutrition_water_ml"
+      )
+      .gte("calendar_date", sinceYmd)
+      .not("nutrition_calories", "is", null)
+      .order("calendar_date", { ascending: true }),
+    supabase
+      .from("delivery_nutrition_daily")
+      .select("behavioral_date, est_kcal, est_protein_g, est_carbs_g, est_fat_g")
+      .gte("behavioral_date", sinceYmd)
+      .gt("est_kcal", 0)
+      .order("behavioral_date", { ascending: true }),
+    supabase
+      .from("photo_meal_daily")
+      .select("behavioral_date, est_kcal, est_protein_g, est_carbs_g, est_fat_g")
+      .gte("behavioral_date", sinceYmd)
+      .gt("est_kcal", 0)
+      .order("behavioral_date", { ascending: true }),
+  ]);
+  if (matrix.error) throw matrix.error;
+  if (delivery.error) throw delivery.error;
+  // Photo meals are an add-on: until sql/photo_meals.sql is applied the view does not exist, and no other
+  // failure there may take the macro charts down with it.
+  if (photo.error && !isMissingRelation(photo.error.code)) console.error("photo_meal_daily:", photo.error.message);
 
   type NutritionRow = Record<string, unknown> & { calendar_date: string };
-  return mergeDeliveryEstimates((data as unknown as NutritionRow[]) ?? [], est ?? []) as NutritionRow[];
+  const estimates = combineEstimateDays(delivery.data ?? [], photo.error ? [] : (photo.data ?? []));
+  return mergeDeliveryEstimates((matrix.data as unknown as NutritionRow[]) ?? [], estimates) as NutritionRow[];
+}
+
+export interface PhotoMeal {
+  meal_id: number;
+  /** Behavioral day. */
+  eaten_date: string;
+  /** "HH:MM" local wall clock as confirmed (before 06:00 = the small hours after eaten_date). */
+  eaten_time: string;
+  eaten_at: string | null;
+  time_source: string;
+  items: PhotoMealItem[];
+  kcal: number;
+  protein_g: number;
+  carbs_g: number;
+  fat_g: number;
+  confidence: string | null;
+}
+
+/**
+ * Photo-logged meals (pds.photo_meals) of the given behavioral days, oldest first. Feeds "Today's Meals"
+ * on /nutrition. [] while sql/photo_meals.sql is not applied (missing table); throws on other errors.
+ */
+export async function getPhotoMealsForDays(dates: string[]): Promise<PhotoMeal[]> {
+  if (dates.length === 0) return [];
+  const { data, error } = await supabase
+    .from("photo_meals")
+    .select("meal_id, eaten_date, eaten_time, eaten_at, time_source, items, kcal, protein_g, carbs_g, fat_g, confidence")
+    .in("eaten_date", dates)
+    .order("eaten_at", { ascending: true })
+    .order("meal_id", { ascending: true });
+  if (error) {
+    if (isMissingRelation(error.code)) return [];
+    throw error;
+  }
+  return (data ?? []).map((r) => ({
+    meal_id: Number(r.meal_id),
+    eaten_date: String(r.eaten_date),
+    eaten_time: String(r.eaten_time).slice(0, 5),
+    eaten_at: r.eaten_at ?? null,
+    time_source: String(r.time_source),
+    items: Array.isArray(r.items) ? (r.items as PhotoMealItem[]) : [],
+    kcal: Number(r.kcal),
+    protein_g: Number(r.protein_g),
+    carbs_g: Number(r.carbs_g),
+    fat_g: Number(r.fat_g),
+    confidence: r.confidence ?? null,
+  }));
 }
 
 export interface DeliveryDish {

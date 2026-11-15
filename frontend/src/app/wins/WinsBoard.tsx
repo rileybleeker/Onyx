@@ -47,7 +47,8 @@ function WinCard({ win }: { win: Win }) {
   );
 }
 
-export default function WinsBoard({ board }: { board: Board }) {
+export default function WinsBoard({ board, headingTestId = "page-heading" }: { board: Board; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   const [filter, setFilter] = useState<(typeof filters)[number]>("All");
   const count = (state: WinState) => board.wins.filter((win) => win.state === state).length;
   const live = count("deployed");
@@ -64,7 +65,7 @@ export default function WinsBoard({ board }: { board: Board }) {
       <header className="space-y-5">
         <div>
           <div className="mb-2 flex items-center gap-2 text-text-secondary"><Sparkles size={16} aria-hidden="true" /><span className="text-xs font-medium">Small wins. Better Onyx.</span></div>
-          <h1 data-testid="page-heading" className="text-3xl font-semibold tracking-tight text-text-primary sm:text-4xl">Worth celebrating</h1>
+          <h1 data-testid={headingTestId} className="text-3xl font-semibold tracking-tight text-text-primary sm:text-4xl">Worth celebrating</h1>
         </div>
         <div role="group" aria-label="Progress overview" className="grid grid-cols-3 gap-2 sm:gap-4">
           <StatCard label="Live on the site" value={live} className="flex flex-col justify-between" />

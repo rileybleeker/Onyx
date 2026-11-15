@@ -7,7 +7,8 @@ import path from "path";
 const stats = require("./perf-stats.cjs");
 
 /**
- * Production timing run (manual, workflow_dispatch only: .github/workflows/perf-timing.yml).
+ * Production timing run (.github/workflows/perf-timing.yml: hourly at :23 and on workflow_dispatch). It samples
+ * whatever production serves at that moment; it is not tied to one deployment.
  *
  * For each key page: N full-document navigations in ONE browser context created
  * from the saved smoke-test login (auth.setup.ts). Navigation 1 starts with an
@@ -20,6 +21,11 @@ const stats = require("./perf-stats.cjs");
  * made (class, path only, duration, transferred bytes) until the page has been
  * network-quiet for QUIET_MS. Query strings, headers, cookies and response bodies
  * are never recorded, so the JSON holds no credentials and no health data.
+ *
+ * A second test opens the app at / (Today), lets it settle (the idle warm-up included) and then CLICKS each page's
+ * sidebar link in turn, timing click to data-ready: the in-app navigation Riley actually does, served from the client
+ * cache. Its first round is the first visit of the session ("cold"), later rounds are warm. Written as
+ * nav-<slug>.json, labelled "<route> (in-app)".
  *
  * This is NOT part of the smoke suite: playwright.config.ts only matches
  * smoke.spec.ts, and this file is run through e2e/perf.config.ts.
@@ -40,16 +46,42 @@ const OUT_DIR = path.join(__dirname, "..", "perf-results");
 // <aside>, and legend icons are excluded, so neither can fake "chart drawn").
 const CHART = "main svg.recharts-surface path:not(.recharts-legend-icon)";
 
+// The continuous scroll (components/ContinuousScroll.tsx) draws the neighbouring pages above and below the routed
+// one, each in a <section data-feed-route>; the routed page itself sits in a <div data-feed-route>. Only the routed
+// page counts for its own data-ready and chart times (a neighbour's chart or skeleton must not decide them). Their
+// network requests stay in the window: they are part of what opening the page costs.
+const FEED_PAGE = "section[data-feed-route]";
+// Text of the routed page alone (the whole body while the scroll is off or before it existed).
+const ROUTED_TEXT = `((document.querySelector("[data-feed-root] > div[data-feed-route]") || document.body).innerText)`;
+
 // Installed in every page before its scripts run: records the first frame in
-// which a chart mark exists, on the page's own performance.now() clock.
+// which a chart mark exists, on the page's own performance.now() clock. An in-app
+// navigation restarts it with window.__pfWatchChart(); marks left over from the
+// previous page (inside [data-pf-old]) never count.
 const INIT_SCRIPT = `(() => {
   const SEL = ${JSON.stringify(CHART)};
-  const tick = () => {
-    if (window.__pfChart == null && document.querySelector(SEL)) window.__pfChart = performance.now();
-    if (window.__pfChart == null) requestAnimationFrame(tick);
+  window.__pfWatchChart = () => {
+    window.__pfChart = null;
+    const tick = () => {
+      if (window.__pfChart == null && [...document.querySelectorAll(SEL)].some((e) => !e.closest("[data-pf-old]") && !e.closest(${JSON.stringify(FEED_PAGE)}))) window.__pfChart = performance.now();
+      if (window.__pfChart == null) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
   };
-  requestAnimationFrame(tick);
+  window.__pfWatchChart();
 })();`;
+
+// The route content sits in AppShell's <main><div>, inside the continuous scroll's routed wrapper
+// ([data-feed-root] > div[data-feed-route]) next to the neighbouring pages' sections. Before an in-app click the
+// routed page's elements and those sections are marked old, and the new page counts as shown only once none of them
+// is left (the old page's chart cannot satisfy the new page's check). The scroll's own wrappers stay across a
+// navigation, so they are never marked.
+const ROUTE_CONTENT = [
+  "main > div > :not([data-feed-root])",
+  "main > div > [data-feed-root] > div[data-feed-route] > *",
+  "main > div > [data-feed-root] > section[data-feed-route]",
+].join(", ");
+const OLD_CONTENT = "main [data-pf-old]";
 
 interface PageSpec {
   slug: string;
@@ -63,21 +95,39 @@ interface PageSpec {
 }
 
 const ready = (cond: string) => `(() => { if (!(${cond})) return false; return performance.now(); })()`;
-const hasChart = `!!document.querySelector(${JSON.stringify(CHART)})`;
+const notFeed = `!e.closest(${JSON.stringify(FEED_PAGE)})`;
+const hasChart = `[...document.querySelectorAll(${JSON.stringify(CHART)})].some(e => ${notFeed})`;
 const h = (text: string, tag = "h1,h2,h3,h4,h5,h6") =>
-  `[...document.querySelectorAll(${JSON.stringify(tag)})].some(e => e.textContent.trim() === ${JSON.stringify(text)})`;
+  `[...document.querySelectorAll(${JSON.stringify(tag)})].some(e => ${notFeed} && e.textContent.trim() === ${JSON.stringify(text)})`;
 const leafText = (text: string) =>
-  `[...document.querySelectorAll("p,div,span")].some(e => e.children.length === 0 && e.textContent.trim() === ${JSON.stringify(text)})`;
+  `[...document.querySelectorAll("p,div,span")].some(e => ${notFeed} && e.children.length === 0 && e.textContent.trim() === ${JSON.stringify(text)})`;
+
+// Today's own panels (not the overview cards, which read only near the screen): every panel settled, none busy, and
+// no "Checking..." left in the Also checked list (Codex review 2026-11-14: readiness covered only three panels).
+const TODAY_PANELS = `[...document.querySelectorAll("main section:not([data-card])")].filter(e => ${notFeed})`;
+const TODAY_PENDING = /checking\.\.\.|checking agent requests|checking email|checking your calendar|loading reading progress/i;
+const todayReady = ready(
+  `${h("Today", "h1")} && !${TODAY_PANELS}.some((e) => e.getAttribute("aria-busy") === "true" || ${TODAY_PENDING}.test(e.innerText))`
+);
+// Server-rendered finance pages: the real heading (the loading.tsx skeleton's has no test id) with no skeleton left.
+const serverPageReady = ready(
+  `!!document.querySelector('[data-testid="page-heading"]') && ![...document.querySelectorAll('p[role="status"]')].some((e) => ${notFeed} && /^Loading /.test(e.textContent))`
+);
 
 const PAGES: PageSpec[] = [
   {
     slug: "today",
-    label: "/today",
-    route: "/today",
-    // Three client fetches (inbox, reading, urgent email); ready once none of the loading lines remain.
-    ready: ready(
-      `${h("Today", "h1")} && !/Checking agent requests|Checking email|Loading reading progress/i.test(document.body.innerText)`
-    ),
+    label: "/ (Today)",
+    route: "/",
+    // The start page (manifest start_url): what opening the app loads.
+    ready: todayReady,
+  },
+  {
+    slug: "check-in",
+    label: "/check-in",
+    route: "/check-in",
+    // The subtitle with "Daytime:" renders only once the day's questions have loaded (not on the error screen).
+    ready: ready(`${h("Check-in", "h2")} && /Daytime: /.test(${ROUTED_TEXT})`),
   },
   {
     slug: "analytics-hrv",
@@ -104,14 +154,14 @@ const PAGES: PageSpec[] = [
     slug: "status",
     label: "/status",
     route: "/status",
-    ready: ready(`(document.body.innerText.match(/last sync/gi) || []).length > 4`),
+    ready: ready(`(${ROUTED_TEXT}.match(/last sync/gi) || []).length > 4`),
   },
   {
     slug: "caffeine",
     label: "/caffeine",
     route: "/caffeine",
     // The default 60-day window is empty during a caffeine logging pause; the empty state then IS the settled page.
-    ready: ready(`${hasChart} || document.body.innerText.toLowerCase().includes("no caffeine days in the database yet.")`),
+    ready: ready(`${hasChart} || ${ROUTED_TEXT}.toLowerCase().includes("no caffeine days in the database yet.")`),
     emptyText: "No caffeine days in the database yet.",
     note: "default 60-day window; the empty state counts as settled",
   },
@@ -123,7 +173,13 @@ const PAGES: PageSpec[] = [
     ready: ready(`${hasChart}`),
     note: "extra: non-default window, client fetch with no ISR seed",
   },
+  { slug: "financials", label: "/financials", route: "/financials", ready: serverPageReady },
+  { slug: "financials-budgets", label: "/financials/budgets", route: "/financials/budgets", ready: serverPageReady },
+  { slug: "financials-forecast", label: "/financials/forecast", route: "/financials/forecast", ready: serverPageReady },
 ];
+
+// Pages timed as in-app navigations (sidebar links). Routes with a query string have no sidebar link.
+const IN_APP = ["/check-in", "/sleep", "/nutrition", "/supplements", "/analytics/hrv", "/caffeine", "/status", "/financials", "/financials/budgets", "/financials/forecast"];
 
 interface Sample {
   i: number;
@@ -150,9 +206,9 @@ interface Sample {
   endpoints?: Record<string, unknown>;
 }
 
-async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number): Promise<Sample> {
+async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number, mode: "load" | "click" = "load"): Promise<Sample> {
   const sample: Sample = { i, cold: i === 0, ok: false };
-  await page.goto("about:blank");
+  if (mode === "load") await page.goto("about:blank");
 
   const records: Array<{
     cls: string;
@@ -202,24 +258,38 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
   page.on("requestfinished", onFinished);
   page.on("requestfailed", onFailed);
 
+  let clickedAt = 0; // page clock at the click (in-app mode); its timings are measured from it
   try {
-    const resp = await page.goto(spec.route, { waitUntil: "domcontentloaded", timeout: 45_000 });
-    sample.status = resp ? resp.status() : null;
-    const headers = resp ? resp.headers() : {};
-    sample.cache = headers["x-vercel-cache"] ?? null;
-    const vid = headers["x-vercel-id"];
-    // "iad1::<request-id>" (CDN) or "iad1::iad1::<request-id>" (function ran): keep the regions only.
-    sample.region = vid ? vid.split("::").slice(0, -1).join(">") : null;
+    if (mode === "load") {
+      const resp = await page.goto(spec.route, { waitUntil: "domcontentloaded", timeout: 45_000 });
+      sample.status = resp ? resp.status() : null;
+      const headers = resp ? resp.headers() : {};
+      sample.cache = headers["x-vercel-cache"] ?? null;
+      const vid = headers["x-vercel-id"];
+      // "iad1::<request-id>" (CDN) or "iad1::iad1::<request-id>" (function ran): keep the regions only.
+      sample.region = vid ? vid.split("::").slice(0, -1).join(">") : null;
+    } else {
+      const link = page.locator(`aside a[href="${spec.route}"]`).first();
+      await link.scrollIntoViewIfNeeded({ timeout: 10_000 });
+      clickedAt = await page.evaluate((sel) => {
+        document.querySelectorAll(sel).forEach((e) => e.setAttribute("data-pf-old", ""));
+        (window as unknown as { __pfWatchChart: () => void }).__pfWatchChart();
+        return performance.now();
+      }, ROUTE_CONTENT);
+      await link.click({ timeout: 10_000 });
+    }
 
     const finalPath = new URL(page.url()).pathname;
     if (/^\/login/.test(finalPath)) throw new Error("bounced-to-login: saved session is not valid");
 
+    const readyExpr = mode === "load" ? spec.ready
+      : `(location.pathname === ${JSON.stringify(spec.route)} && !document.querySelector(${JSON.stringify(OLD_CONTENT)})) ? ${spec.ready} : false`;
     try {
-      const handle = await page.waitForFunction(spec.ready, undefined, {
+      const handle = await page.waitForFunction(readyExpr, undefined, {
         timeout: READY_TIMEOUT_MS,
         polling: "raf",
       });
-      sample.ready = (await handle.jsonValue()) as number;
+      sample.ready = ((await handle.jsonValue()) as number) - clickedAt;
     } catch (e) {
       if ((e as Error).message.includes("bounced")) throw e;
       sample.error = "ready-timeout";
@@ -239,7 +309,7 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     await Promise.allSettled(sizeJobs);
 
     const m = await page.evaluate(
-      async ({ emptyText }) => {
+      async ({ emptyText, routedSel }) => {
         const nav = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming;
         const fcpEntry = performance.getEntriesByName("first-contentful-paint")[0];
         const lcp = await new Promise<number | null>((resolve) => {
@@ -259,6 +329,8 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
           }, 150);
         });
         const text = document.body.innerText;
+        // The empty state is the routed page's own, not a neighbour's in the continuous scroll.
+        const routedText = (document.querySelector(routedSel) as HTMLElement | null)?.innerText ?? text;
         return {
           ttfb: nav.responseStart,
           serverWait: nav.responseStart - nav.requestStart,
@@ -269,12 +341,17 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
           lcp,
           firstChart: (window as unknown as { __pfChart?: number }).__pfChart ?? null,
           degraded: /Application error|client-side exception/i.test(text),
-          emptyState: emptyText ? text.toLowerCase().includes(emptyText.toLowerCase()) : false,
+          emptyState: emptyText ? routedText.toLowerCase().includes(emptyText.toLowerCase()) : false,
         };
       },
-      { emptyText: spec.emptyText ?? "" }
+      { emptyText: spec.emptyText ?? "", routedSel: "[data-feed-root] > div[data-feed-route]" }
     );
-    Object.assign(sample, m);
+    if (mode === "click") {
+      // The document was loaded before the click: its TTFB / FCP / LCP belong to Today, not to this page.
+      Object.assign(sample, { degraded: m.degraded, emptyState: m.emptyState, firstChart: m.firstChart == null ? null : m.firstChart - clickedAt });
+    } else {
+      Object.assign(sample, m);
+    }
 
     const folded = stats.foldRequests(records);
     sample.req = folded.req;
@@ -352,6 +429,64 @@ for (const spec of PAGES) {
     const okCount = samples.filter((s) => s.ok).length;
     console.log(`${spec.label}: ${okCount}/${samples.length} navigations reached data-ready`);
     // A page that never reached data-ready in ANY navigation is a failed measurement, not a slow one.
+    // (A page that reached it only sometimes is caught by the speed budget: every missing navigation is a breach.)
     expect(okCount, `${spec.label} never reached its data-ready state`).toBeGreaterThan(0);
   });
 }
+
+function writeResult(slug: string, label: string, route: string, note: string | null, navigations: number, startedAt: string, browserVersion: string, samples: Sample[]) {
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  const payload = {
+    meta: {
+      slug, label, route, note, navigations, startedAt,
+      finishedAt: new Date().toISOString(),
+      quietMs: QUIET_MS,
+      windowCapMs: WINDOW_CAP_MS,
+      github: {
+        runId: process.env.GITHUB_RUN_ID ?? null,
+        runAttempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+        sha: process.env.GITHUB_SHA ?? null,
+        ref: process.env.GITHUB_REF_NAME ?? null,
+      },
+      runner: { platform: process.platform, cpus: os.cpus().length, memGB: Math.round(os.totalmem() / 2 ** 30), chromium: browserVersion },
+    },
+    samples,
+  };
+  fs.writeFileSync(path.join(OUT_DIR, `${slug}.json`), JSON.stringify(payload, null, 1));
+}
+
+// In-app navigation: open the app, let Today and the idle warm-up settle, then click through the sidebar.
+const ROUNDS = Math.min(4, NAVIGATIONS);
+test("timing in-app navigation from Today", async ({ browser }) => {
+  test.setTimeout((ROUNDS * IN_APP.length + 1) * (READY_TIMEOUT_MS + WINDOW_CAP_MS + PAUSE_MS + 15_000) + 60_000);
+  const context = await browser.newContext({ ...devices["Desktop Chrome"], storageState: AUTH_FILE });
+  await context.addInitScript(INIT_SCRIPT);
+  const page = await context.newPage();
+  const origin = new URL(test.info().project.use.baseURL as string).origin;
+  const startedAt = new Date().toISOString();
+  const specs = IN_APP.map((route) => PAGES.find((p) => p.route === route)).filter((p): p is PageSpec => !!p);
+  const byRoute = new Map<string, Sample[]>(specs.map((p) => [p.route, []]));
+  try {
+    const opened = await measureOnce(page, PAGES.find((p) => p.slug === "today")!, origin, 0, "load");
+    expect(opened.ok, "Today did not load, so no in-app navigation could be timed").toBe(true);
+    for (let round = 0; round < ROUNDS; round++) {
+      for (const spec of specs) {
+        byRoute.get(spec.route)!.push(await measureOnce(page, spec, origin, round, "click"));
+        await page.waitForTimeout(PAUSE_MS);
+      }
+      // A first round with no page reaching data-ready means the clicking itself is broken: stop (the missing rounds
+      // are reported as incomplete pages by the speed budget) instead of burning 45 s per click.
+      if (round === 0 && ![...byRoute.values()].some((xs) => xs[0]?.ok)) break;
+    }
+  } finally {
+    await context.close();
+    for (const spec of specs) {
+      writeResult(`nav-${spec.slug}`, `${spec.route} (in-app)`, spec.route,
+        "clicked from the sidebar after Today settled; the first round is the first visit of the session",
+        ROUNDS, startedAt, browser.version(), byRoute.get(spec.route)!);
+    }
+  }
+  const ok = [...byRoute.values()].flat().filter((s) => s.ok).length;
+  console.log(`in-app: ${ok}/${ROUNDS * specs.length} navigations reached data-ready`);
+  expect(ok, "no in-app navigation reached its data-ready state").toBeGreaterThan(0);
+});

@@ -1,7 +1,7 @@
 import { GARMIN_WEARABLE_FILTER, garminNoWearMessage, ingestionHeartbeatStatus } from "@/lib/status-freshness";
 import { NextResponse } from "next/server";
 import { getNycScoutFreshness } from "@/lib/nyc";
-import { swrCache } from "@/lib/swr-cache";
+import { staleCheckNote, swrCacheTimed } from "@/lib/swr-cache";
 import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
 import { SIMPLEFIN_THRESHOLDS, financeLedgerCard } from "@/lib/finance-status";
@@ -51,7 +51,8 @@ const CADENCE: Record<string, string> = {
   supplements: "Manual",
   reading: "Manual",
   procurement: "Manual",
-  kindle: "Every 3h (Riley's PC, while logged on)",
+  photo_meals: "Manual (a plate photo on /nutrition)",
+  kindle:"Every 3h (Riley's PC, while logged on)",
   amazon_orders: "Every 3h with the Kindle harvest (Riley's PC)",
   screen_usage: "Daily (iPhone Shortcuts automation)",
   notion_journal: "Hourly :35",
@@ -102,6 +103,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   supplements:    { method: "manual",         label: "Manual entry" },
   reading:        { method: "manual",         label: "Manual entry" },
   procurement:    { method: "manual",         label: "Manual entry" },
+  photo_meals:    { method: "manual",         label: "Photo + Claude estimate" },
   kindle:         { method: "automated",      label: "Local Chrome harvest" },
   amazon_orders:  { method: "automated",      label: "Local Chrome harvest" },
   screen_usage:   { method: "automated",      label: "iPhone app export" },
@@ -233,11 +235,14 @@ function enrichmentSource({
 
 // The NYC Scout card's freshness is a Notion query (0.3-0.6 s, the slowest read here). The scout runs once a day,
 // so a shared cached answer (lib/swr-cache.ts: refreshed in the background once it is 5 minutes old, never more
-// than 6 hours old) keeps Notion off the request path. A failed Notion read is not cached: the card turns red as before.
-const nycScoutFreshness = swrCache("status-nyc-scout-freshness-v1", () => getNycScoutFreshness(), {
+// than 6 hours old) keeps Notion off the request path. A failed Notion read with nothing cached turns the card red as
+// before. A failed background refresh keeps the older answer, so an answer older than NYC_CHECK_STALE_MS (three
+// refresh intervals) is shown as Degraded with its age, never as current health (Codex review 2026-11-14).
+const nycScoutFreshness = swrCacheTimed("status-nyc-scout-freshness-v1", () => getNycScoutFreshness(), {
   revalidateSeconds: 300,
   maxAgeMs: 6 * 60 * 60 * 1000,
 });
+const NYC_CHECK_STALE_MS = 15 * 60 * 1000;
 
 export async function GET() {
   try {
@@ -257,6 +262,9 @@ export async function GET() {
       .then((res) => res);
     // Procurement subscription tracker (/procurement): hand-typed, so data age says nothing. The card reports whether saving is set up (table answers) and how many are tracked.
     const procurementPromise = supabase.from("procurement_subscriptions").select("updated_at", { count: "exact" }).eq("is_active", true).order("updated_at", { ascending: false }).limit(1).then((res) => res);
+    // Meal photos (/nutrition, pds.photo_meals): logged only when Riley takes one, so a quiet week is not stale.
+    // Same shape as Procurement: "unknown" until sql/photo_meals.sql is applied, green once the table answers.
+    const photoMealsPromise = supabase.from("photo_meals").select("eaten_date,created_at", { count: "exact" }).order("created_at", { ascending: false }).limit(1).then((res) => res);
     // Renewal cards (sms-reminders Worker -> /api/procurement/renewals/claim): heartbeat age, own limit-1
     // query so a Worker that stops polling reads red instead of dropping out of the shared window.
     const renewalRemindersPromise = supabase.from("sync_log").select("status,sync_start,records_synced,duration_seconds,error_message")
@@ -282,7 +290,7 @@ export async function GET() {
     // one Notion call overlaps the Supabase reads; a Notion failure turns the
     // card red but never breaks /status.
     const nycPromise = nycScoutFreshness().then(
-      (v) => ({ ok: true as const, ...v }),
+      ({ value, checkedAt }) => ({ ok: true as const, ...value, stale: staleCheckNote(checkedAt, Date.now(), NYC_CHECK_STALE_MS, "Notion") }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
     const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
@@ -522,6 +530,9 @@ export async function GET() {
     const procurementRes = await procurementPromise;
     const procurementPending = procurementRes.error?.code === "PGRST205" || procurementRes.error?.code === "42P01";
     const procurementLast = (procurementRes.data?.[0]?.updated_at as string | undefined) ?? null;
+    const photoMealsRes = await photoMealsPromise;
+    const photoMealsPending = photoMealsRes.error?.code === "PGRST205" || photoMealsRes.error?.code === "42P01";
+    const photoMealsLast = (photoMealsRes.data?.[0]?.created_at as string | undefined) ?? null;
     const renewalRemindersRes = await renewalRemindersPromise;
     const cashForecastRes = await cashForecastPromise;
     const urgentEmailCard = await urgentEmailCardPromise;
@@ -787,6 +798,20 @@ export async function GET() {
         cadence: CADENCE.procurement,
         integrationMethod: METHOD.procurement.method,
         methodLabel: METHOD.procurement.label,
+      },
+      // Food by photo (/nutrition, 2026-11-14): Claude vision estimate, confirmed by Riley, saved to pds.photo_meals.
+      photo_meals: {
+        label: photoMealsPending ? "Meal photos (saving not set up)" : "Meal photos",
+        lastSync: photoMealsLast,
+        status: photoMealsPending ? "unknown" : photoMealsRes.error ? "failed" : "success",
+        latestDataDate: (photoMealsRes.data?.[0]?.eaten_date as string | undefined) ?? null,
+        daysLag: 0,
+        recordsSynced: photoMealsRes.count ?? 0,
+        durationSeconds: null,
+        errorMessage: photoMealsRes.error && !photoMealsPending ? photoMealsRes.error.message : null,
+        cadence: CADENCE.photo_meals,
+        integrationMethod: METHOD.photo_meals.method,
+        methodLabel: METHOD.photo_meals.label,
       },
       // Kindle Notebook harvester (tools/kindle_harvest): a Task Scheduler job on
       // Riley's PC scrapes read.amazon.com/notebook in a signed-in Chrome and posts
@@ -1125,12 +1150,12 @@ export async function GET() {
       nyc_scout: {
         label: "NYC Scout",
         lastSync: nycDate,
-        status: nyc.ok ? deriveStatus(null, nycLag) : "failed",
+        status: !nyc.ok ? "failed" : nyc.stale && deriveStatus(null, nycLag) === "success" ? "partial" : deriveStatus(null, nycLag),
         latestDataDate: nycDate,
         daysLag: nycLag,
         recordsSynced: nyc.ok ? nyc.liveCount : 0,
         durationSeconds: null,
-        errorMessage: nyc.ok ? null : nyc.error,
+        errorMessage: nyc.ok ? nyc.stale : nyc.error,
         cadence: CADENCE.nyc_scout,
         integrationMethod: METHOD.nyc_scout.method,
         methodLabel: METHOD.nyc_scout.label,

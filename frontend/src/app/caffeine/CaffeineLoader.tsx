@@ -24,6 +24,7 @@ export interface CaffeineInitial {
   quality: CaffeineQualityFlag[];
 }
 
-export default function CaffeineLoader({ initial }: { initial: CaffeineInitial | null }) {
-  return <CaffeineClient initial={initial} />;
+// headingTestId: "feed-page-heading" when the continuous scroll renders this page (its FeedSection).
+export default function CaffeineLoader({ initial, headingTestId }: { initial: CaffeineInitial | null; headingTestId?: string }) {
+  return <CaffeineClient initial={initial} headingTestId={headingTestId} />;
 }
