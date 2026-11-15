@@ -59,7 +59,7 @@ const DATA: Record<string, () => DataWarmer[]> = {
   },
   "/check-in": () => [json("/api/habits/checkin")],
   // The Log screen: each section's GET reads (same keys as the section). Section files add theirs here.
-  "/log": () => [json("/api/habits/checkin")],
+  "/log": () => [json("/api/habits/checkin"), json("/api/weight?days=90"), json("/api/reading")],
   "/agents": () => {
     const inbox = clientCache.peek<InboxResponse>(CACHE_KEYS.agentsInbox);
     const threads = Array.isArray(inbox?.threads)
