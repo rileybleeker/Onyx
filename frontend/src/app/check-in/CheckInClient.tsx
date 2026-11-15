@@ -8,6 +8,7 @@ import { sayFromHash, VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
 import { useLogDrafts } from "@/lib/log-drafts";
 import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, Q_JOURNALED, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
 import { clientCache } from "@/lib/client-cache";
+import { takeEarlyFetch } from "@/lib/early-fetch";
 import { buildCells, savePlan, visibleNights, voicePatch, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
 import { CheckinDraftStore, dayDraftKey, nightDraftKey, recoveryTarget, type DatedDraft } from "@/lib/checkin-drafts";
 import {
@@ -224,7 +225,9 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
     setSavedAt(null);
     try {
       const url = checkinUrl(date);
-      const res = await fetch(url, { cache: "no-store" });
+      // The first load of a full page visit takes the GET the page's HTML already started (lib/early-fetch.ts).
+      const early = feed || afterSave ? null : takeEarlyFetch(url);
+      const res = await (early ?? fetch(url, { cache: "no-store" }));
       const json = await res.json().catch(() => ({}));
       if (seq !== loadSeq.current) return;
       if (!res.ok) {
@@ -250,7 +253,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
       }
     }
     finally { if (seq === loadSeq.current) refreshDrafts(); }
-  }, [drafts, refreshDrafts, show]);
+  }, [drafts, refreshDrafts, show, feed]);
 
   useEffect(() => {
     // Discover recovery records even if the requested date has expired or the GET cannot load.
