@@ -15,7 +15,12 @@ const fs = require("fs");
 const path = require("path");
 const stats = require("./perf-stats.cjs");
 
-const ORDER = ["today", "analytics-hrv", "sleep", "nutrition", "supplements", "agents", "status", "caffeine", "caffeine-720"];
+const ORDER = [
+  "today", "check-in", "analytics-hrv", "sleep", "nutrition", "supplements", "agents", "status", "caffeine", "caffeine-720",
+  "financials", "financials-budgets", "financials-forecast",
+];
+// In-app (clicked) navigations are written as nav-<slug>.json and listed after the full page loads, same order.
+const rank = (slug) => (String(slug).startsWith("nav-") ? ORDER.length + ORDER.indexOf(slug.slice(4)) : ORDER.indexOf(slug));
 
 function loadRun(dir) {
   // First page start .. last page finish (older result files only have a finish time, mislabelled startedAt).
@@ -30,9 +35,10 @@ function loadRun(dir) {
     const t0 = raw.meta.startedAt, t1 = raw.meta.finishedAt || raw.meta.startedAt;
     window_.first = !window_.first || t0 < window_.first ? t0 : window_.first;
     window_.last = !window_.last || t1 > window_.last ? t1 : window_.last;
-    pages.push({ slug: raw.meta.slug, label: raw.meta.label, note: raw.meta.note, summary: stats.summarizePage(raw.samples) });
+    // `expected` = navigations planned for this page, so a run that stopped early is an incomplete page, not a pass.
+    pages.push({ slug: raw.meta.slug, label: raw.meta.label, note: raw.meta.note, expected: raw.meta.navigations, summary: stats.summarizePage(raw.samples) });
   }
-  pages.sort((a, b) => ORDER.indexOf(a.slug) - ORDER.indexOf(b.slug));
+  pages.sort((a, b) => rank(a.slug) - rank(b.slug));
   return { dir, meta, pages, window: window_ };
 }
 
@@ -93,7 +99,7 @@ function main(argv) {
       console.error(`Speed budget broken (nothing may take ${stats.SPEED_BUDGET_MS} ms):\n- ` + over.join("\n- "));
       process.exit(1);
     }
-    console.log(`Speed budget met: every page's data under ${stats.SPEED_BUDGET_MS} ms, no call over it.`);
+    console.log(`Speed budget met: every page measured completely, its data under ${stats.SPEED_BUDGET_MS} ms warm and cold, no single call over it.`);
   }
 }
 

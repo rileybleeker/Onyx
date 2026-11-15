@@ -119,12 +119,81 @@ test('normRegion drops per-request ids and tells CDN answers from function runs'
   assert.equal(stats.normRegion(null), null);
 });
 
-test('speed budget flags a slow page or a slow call, and nothing else', () => {
-  const page = (slug, readyP95, calls) => ({ slug, label: '/' + slug, summary: {
-    timing: { ready: { p95: readyP95 } },
-    endpoints: calls.map(([key, ms]) => ({ key, callMsP50: ms })) } });
-  assert.deepEqual(stats.budgetViolations([page('fast', 420, [['api /x', 180]])]), []);
-  const over = stats.budgetViolations([page('slow', 1200, [['api /y', 1500], ['api /z', 999]]), page('ok', null, [])]);
-  assert.deepEqual(over, ['/slow: data ready p95 1200 ms', '/slow: api /y p50 1500 ms']);
+function budgetPage(slug, over = {}) {
+  // A complete, fast page: 4 navigations planned and measured, warm data ready under a second, every call fast.
+  const summary = {
+    total: 4, ok: 4, failed: 0,
+    cold: { ready: 600 },
+    coldEndpoints: [{ cls: 'api', key: '/api/x', maxMs: 300 }],
+    timing: { ready: { p95: 480, max: 500, n: 3, values: [420, 450, 500] } },
+    endpoints: [{ cls: 'api', key: '/api/x', callMsP50: 180, callMsMax: 240, callMaxP95: 230, maxPerView: [180, 200, 240] }],
+    ...over,
+  };
+  return { slug, label: '/' + slug, expected: 4, summary };
+}
+
+test('speed budget: a complete fast page passes', () => {
+  assert.deepEqual(stats.budgetViolations([budgetPage('fast')]), []);
   assert.equal(stats.SPEED_BUDGET_MS, 1000);
+});
+
+test('speed budget: one slow call is caught even when the per-view mean is fast (1500 + 100 ms)', () => {
+  // Codex 2026-11-14: two calls of 1500 and 100 ms averaged to 800 ms and passed.
+  const recs = [
+    { cls: 'rest', key: '/rest/v1/a', startMs: 0, endMs: 1500, durMs: 1500, bytes: 1, failed: false },
+    { cls: 'rest', key: '/rest/v1/a', startMs: 0, endMs: 100, durMs: 100, bytes: 1, failed: false },
+  ];
+  const samples = [sample(0, 400, 0)];
+  for (let i = 1; i <= 3; i++) {
+    const f = stats.foldRequests(i === 2 ? recs : [recs[1]]);
+    samples.push({ ...sample(i, 400, 0), req: f.req, total: f.total, endpoints: f.endpoints });
+  }
+  const summary = stats.summarizePage(samples);
+  const e = summary.endpoints.find((x) => x.key === '/rest/v1/a');
+  assert.equal(e.callMsP50, 100, 'the old per-view mean statistic hides it');
+  assert.equal(e.callMsMax, 1500);
+  assert.deepEqual(stats.budgetViolations([{ slug: 'p', label: '/p', expected: 4, summary }]),
+    ['/p: /rest/v1/a took 1500 ms (isolated: 1 of 3 warm views, warm p95 1360 ms)']);
+});
+
+test('speed budget: a repeatable slow call or page is labelled repeatable', () => {
+  const over = stats.budgetViolations([budgetPage('slow', {
+    timing: { ready: { p95: 1180, max: 1200, n: 3, values: [1100, 1150, 1200] } },
+    endpoints: [{ cls: 'api', key: '/api/y', callMsP50: 1300, callMsMax: 1500, callMaxP95: 1480, maxPerView: [1200, 1300, 1500] },
+      { cls: 'static', key: '/_next/*', callMsMax: 3000, maxPerView: [3000] }],
+  })]);
+  assert.deepEqual(over, [
+    '/slow: data ready 1200 ms in the slowest warm view (repeatable: 3 of 3 warm views, warm p95 1180 ms)',
+    '/slow: /api/y took 1500 ms (repeatable: 3 of 3 warm views, warm p95 1480 ms)',
+  ], 'static chunks are not API calls');
+});
+
+test('speed budget: the cold first visit counts, for data ready and for its calls', () => {
+  const over = stats.budgetViolations([budgetPage('cold', { cold: { ready: 1361 }, coldEndpoints: [{ cls: 'worker', key: '/onyx/inbox', maxMs: 1100 }] })]);
+  assert.deepEqual(over, ['/cold: data ready 1361 ms on the cold first visit', '/cold: /onyx/inbox took 1100 ms on the cold first visit']);
+});
+
+test('speed budget: an incomplete page is a breach, never a pass', () => {
+  assert.deepEqual(stats.budgetViolations([budgetPage('failed', { failed: 1, ok: 3 })]),
+    ['/failed: 1 of 4 navigations never reached data-ready (counts as over 1000 ms)']);
+  assert.deepEqual(stats.budgetViolations([budgetPage('short', { total: 2, ok: 2 })]), ['/short: only 2 of 4 navigations were measured']);
+  // Only the cold navigation succeeded: no warm number at all used to mean "no violation".
+  const onlyCold = stats.budgetViolations([budgetPage('cold-only', { ok: 1, failed: 3, timing: { ready: { p95: null, max: null, n: 0, values: [] } } })]);
+  assert.deepEqual(onlyCold, ['/cold-only: 3 of 4 navigations never reached data-ready (counts as over 1000 ms)', '/cold-only: no warm navigation reached data-ready']);
+});
+
+test('report passes the planned navigation count to the budget and orders in-app pages after full loads', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'perf-report-'));
+  const write = (slug, label, navigations, n) => {
+    const samples = [sample(0, 400, 2)];
+    for (let i = 1; i < n; i++) samples.push(sample(i, 400 + i, 2));
+    fs.writeFileSync(path.join(dir, `${slug}.json`), JSON.stringify({ meta: { slug, label, navigations, startedAt: 'T', github: {}, runner: {} }, samples }));
+  };
+  write('nav-sleep', '/sleep (in-app)', 4, 4);
+  write('sleep', '/sleep', 4, 2);
+  const run = report.loadRun(dir);
+  assert.deepEqual(run.pages.map((p) => p.slug), ['sleep', 'nav-sleep']);
+  assert.equal(run.pages[0].expected, 4);
+  assert.deepEqual(stats.budgetViolations(run.pages), ['/sleep: only 2 of 4 navigations were measured']);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
