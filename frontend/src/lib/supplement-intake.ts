@@ -39,7 +39,10 @@ interface Product {
 }
 
 export interface LogIntakeInput {
+  /** Name, brand or ingredient text (resolveProduct). With `product_id` it only helps pick the ingredient. */
   product: string;
+  /** An exact pds.supplement_products.product_id (the /log picker): skips the name match. */
+  product_id?: string | null;
   amount?: number | null;
   unit?: string | null;
   times?: string[] | null;
@@ -244,8 +247,9 @@ export async function behavioralToday(supabase: Pds): Promise<string> {
 // ---------- the write ----------
 
 export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput): Promise<LogIntakeResult> {
-  const query = (input.product ?? "").trim();
-  if (!query) return { ok: false, error: "product is required" };
+  const byId = (input.product_id ?? "").trim();
+  let query = (input.product ?? "").trim();
+  if (!query && !byId) return { ok: false, error: "product is required" };
 
   const { data: products, error: prodErr } = await supabase
     .from("supplement_products")
@@ -253,7 +257,15 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
     .eq("is_active", true);
   if (prodErr) return { ok: false, error: prodErr.message };
 
-  const { match, candidates } = resolveProduct((products ?? []) as Product[], query);
+  let match: Product | undefined;
+  let candidates: Product[] = [];
+  if (byId) {
+    match = ((products ?? []) as Product[]).find((p) => p.product_id === byId);
+    if (!match) return { ok: false, error: "That product is not in the active supplements list." };
+    if (!query) query = label(match);
+  } else {
+    ({ match, candidates } = resolveProduct((products ?? []) as Product[], query));
+  }
   if (!match) {
     return candidates.length > 1
       ? { ok: false, error: `"${query}" matches more than one product. Ask which one.`, candidates: candidates.map(label) }
