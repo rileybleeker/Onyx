@@ -123,7 +123,7 @@ test("route rules: POST only, session only (not a CI route), same-origin, Notion
   assert.match(route, /from "@\/lib\/journal-file-server"/);
   const server = fs.readFileSync(path.join(SRC, "lib/journal-file-server.ts"), "utf8");
   assert.match(server, /NOTION_JOURNAL_DB \|\| "96541038264d45aba2a9601d9b175a7e"/, "the database journal_etl.py syncs");
-  assert.equal(/\.(upsert|insert|update|delete)\(|journal_entries"\)|createClient|console\./.test(server), false, "Notion only; nothing logged");
+  assert.equal(/\.(upsert|insert|update|delete)\(|journal_entries"\)|createClient|console\./.test(server.replace(/createHash\("sha256"\)\.update\(/g, "")), false, "Notion only; nothing logged");
   assert.equal(/\.(upsert|insert|update|delete)\(|journal_entries"\)|createClient/.test(route), false, "Notion is the journal's only write surface");
   assert.equal(/console\.(log|info)/.test(route), false);
   for (const line of route.split("\n").filter((l) => /console\./.test(l))) assert.equal(/text|body|title|entry\b(?!\])/i.test(line.replace(/\[journal-entry\]/, "")), false, line);

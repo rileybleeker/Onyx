@@ -329,7 +329,7 @@ test("the settings card is on /install and writes with PUT", () => {
 
 test("the settings card autosaves: no Save button, every change goes through useAutosave", () => {
   const card = fs.readFileSync(path.join(SRC, "components/FocusUnlockSettings.tsx"), "utf8");
-  assert.match(card, /useAutosave<FocusValue>\("focus-unlock"/);
+  assert.match(card, /useAutosave<FocusValue>\(\s*"focus-unlock"/);
   assert.match(card, /<AutosaveStatus /);
   assert.doesNotMatch(card, />\s*\{saving \? "Saving…"/);
   assert.match(card, /changeAutosave\(\{ rule, selected: next \}\)/, "a tick is sent");
