@@ -14,6 +14,11 @@ const HrvAnalysisClient = dynamic(() => import("./HrvAnalysisClient"), {
   ),
 });
 
+// Speed (2026-11-15): start loading the page's code as soon as this module runs (with the page's first scripts)
+// instead of after hydration, when the component above first renders; next/dynamic then finds the chunk on its
+// way (one request, webpack shares it). A cold or freshly deployed load waited ~0.8 s for this request.
+if (typeof window !== "undefined") void import("./HrvAnalysisClient").catch(() => {});
+
 // Shape of the server-prefetched initial data. Mirrors loadHrvDashboard's
 // return type exactly (same functions, same args as the Client's mount
 // effect — both call loadHrvDashboard(rangeDays("30d"))); the Client seeds
