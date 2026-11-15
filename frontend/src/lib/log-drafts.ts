@@ -229,6 +229,38 @@ export function subscribeLogDrafts(fn: () => void): () => void {
 
 const noDraft = () => null;
 
+// ---- what the embedded check-in did with the words -----------------------------------------------------------
+
+/**
+ * The embedded check-in reads the Say it box's words with its own route, after the box's own call. Its result
+ * ("Filled 5 answers (2 for last night)…", "Nothing in the text matched a question.", a failure) is reported here so
+ * the box can show it under its other sections; on /log the check-in's own Say it once box (where that message used
+ * to appear) is left out. `pending` = the words are waiting for the check-in to load, or being read. Memory only.
+ */
+export interface CheckinFillStatus {
+  pending: boolean;
+  message: string | null;
+}
+
+let checkinFill: CheckinFillStatus | null = null;
+
+/** Set by the embedded check-in (and reset by the Say it box when it sends new words). */
+export function reportCheckinFill(status: CheckinFillStatus | null): void {
+  if (status === checkinFill) return;
+  if (status && checkinFill && status.pending === checkinFill.pending && status.message === checkinFill.message) return;
+  checkinFill = status;
+  emit();
+}
+
+export function getCheckinFill(): CheckinFillStatus | null {
+  return checkinFill;
+}
+
+/** The embedded check-in's fill result for the Say it box (re-renders when it changes). */
+export function useCheckinFill(): CheckinFillStatus | null {
+  return useSyncExternalStore(subscribeLogDrafts, getCheckinFill, noDraft);
+}
+
 /**
  * A section's current draft (re-renders when it changes) and `clear(id?)`. Apply `draft.value` to the form as a
  * suggestion marked FROM_WHAT_YOU_SAID; call `clear(draft.id)` after the section's Save succeeded or on dismiss.

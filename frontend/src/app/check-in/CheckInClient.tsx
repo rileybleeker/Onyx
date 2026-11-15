@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, Moon, Sun, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
 import { sayFromHash, VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
-import { setLogDraft, useLogDrafts } from "@/lib/log-drafts";
+import { reportCheckinFill, setLogDraft, useLogDrafts } from "@/lib/log-drafts";
 import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, Q_JOURNALED, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
 import { clientCache } from "@/lib/client-cache";
 import { takeEarlyFetch } from "@/lib/early-fetch";
@@ -144,6 +144,8 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   const headingTestId = feed && !embedded ? "feed-page-heading" : undefined;
   const headingClass = embedded ? "text-[15px] font-medium text-text-primary" : "text-[28px] font-medium text-text-primary";
   const omit = new Set(omitParts ?? []);
+  // On /log the check-in lines up with the other sections (full width); on its own page it keeps its column.
+  const wrapClass = embedded ? "" : "max-w-xl";
 
   const [data, setData] = useState<CheckinPayload | null>(null);
   const [cells, setCells] = useState<Cells>({}); // the day tab's questions
@@ -580,15 +582,29 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   }, [handoff, data, refreshFailed]);
   // /log: the Log screen's Say it box hands its words over the same way (taken once, then cleared).
   const { draft: logDraft, clear: clearLogDraft } = useLogDrafts("checkin");
+  // Set once this check-in took words from the Log Say it box (a remount after that leaves the box's result alone).
+  const tookLogWords = useRef(false);
   useEffect(() => {
     if (!embedded || !logDraft) return;
     clearLogDraft(logDraft.id);
     const words = logDraft.value.text.trim().slice(0, VOICE_MAX_TEXT_CHARS);
     if (!words) return;
+    tookLogWords.current = true;
+    setVoiceMsg(null);
     setVoiceText(words);
     setVoiceOpen(true);
     setHandoff(words);
   }, [embedded, logDraft, clearLogDraft]);
+  // /log leaves out this screen's Say it once box, where the fill's result is written: the Log Say it box shows it.
+  useEffect(() => {
+    if (!embedded || !tookLogWords.current) return;
+    // Words waiting for a check-in that could not load fresh are never filled into a stale copy: say so.
+    if (handoff !== null && !voiceBusy && refreshFailed) {
+      reportCheckinFill({ pending: false, message: "Not filled yet: the check-in couldn't load. It fills once the check-in loads." });
+      return;
+    }
+    reportCheckinFill({ pending: voiceBusy || handoff !== null, message: voiceMsg });
+  }, [embedded, voiceBusy, handoff, voiceMsg, refreshFailed]);
 
   // "Journaled your thoughts?" once the entry for the day on screen is saved: a draft Yes like any other tap,
   // never over a saved or tapped answer.
@@ -655,7 +671,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   const visibleError = [saveError, error].filter(Boolean).join(" ");
   if (visibleError && !data) {
     return (
-      <div className="max-w-xl">
+      <div className={wrapClass}>
         <h2 data-testid={headingTestId} className={headingClass}>Check-in</h2>
         <p className="mt-4 text-sm text-text-secondary">{visibleError}</p>
         {draftRecovery}
@@ -674,7 +690,8 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
 
   if (!data) {
     return (
-      <div className="max-w-xl space-y-3">
+      <div className={`${wrapClass} space-y-3`}>
+        {embedded && <h2 className={headingClass}>Check-in</h2>}
         {draftRecovery}
         <div className="h-8 w-40 bg-white/5 animate-pulse rounded" />
         {[...Array(8)].map((_, i) => (
@@ -689,7 +706,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   const dayName = labelDay(data.date);
 
   return (
-    <div className="max-w-xl">
+    <div className={wrapClass}>
       <div className="mb-5">
         <h2 data-testid={headingTestId} className={headingClass}>Check-in</h2>
         <p className="text-sm text-text-tertiary mt-0.5">

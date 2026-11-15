@@ -38,8 +38,8 @@
       ]
     },
     {
-      "name": "Check-in",
-      "url": "/check-in",
+      "name": "Log",
+      "url": "/log",
       "icons": [
         {
           "src": "/icons/icon-192.png?v=4",

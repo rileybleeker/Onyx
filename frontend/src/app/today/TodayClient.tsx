@@ -442,15 +442,16 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
           <span className={styles.captureIcon}><ClipboardCheck aria-hidden="true" className="h-6 w-6" /></span>
           <div><p className={styles.eyebrow}>START HERE</p><h2 className="mt-2 text-2xl font-medium text-text-primary">A moment for you.</h2>
             <p className="mt-2 max-w-md text-sm leading-relaxed text-text-secondary">Start or continue your check-in. Capture what you know, and leave the rest for later.</p></div>
-          <Link href="/check-in" className={styles.primaryAction}>Start your check-in <ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
+          {/* The Log screen: the check-in and every other daily entry on one page (app/log/jump.ts anchors). */}
+          <Link href="/log" className={styles.primaryAction}>Start your check-in <ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
       </section>
       </Part>
       <Part id="quick-log" title="Log something quickly" width="half">
       <section aria-label="Quick capture" className={styles.captureOptions}>
           <p className={styles.eyebrow}>OR LOG SOMETHING QUICKLY</p>
-          <Link href="/supplements" className={styles.captureLink}><span>Supplement<span className={styles.caption}>Your stack &amp; intake</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
-          <Link href="/habits" className={styles.captureLink}><span>Habit<span className={styles.caption}>Record a daily habit</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
-          <Link href="/nutrition?log=weight" className={styles.captureLink}><span>Weight<span className={styles.caption}>Log today&apos;s weight</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
+          <Link href="/log#log-part-supplements" className={styles.captureLink}><span>Supplement<span className={styles.caption}>Your stack &amp; intake</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
+          <Link href="/log#log-part-check-in" className={styles.captureLink}><span>Habit<span className={styles.caption}>Record a daily habit</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
+          <Link href="/log#log-part-weight" className={styles.captureLink}><span>Weight<span className={styles.caption}>Log today&apos;s weight</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
       </section>
       </Part>
       <Part id="jump-links" title="Section shortcuts">
@@ -676,7 +677,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         <div className="flex items-center gap-2"><ClipboardCheck aria-hidden="true" className="h-5 w-5 text-accent" />
           <h2 id="checkin-heading" className="text-lg font-medium text-text-primary">A moment to check in</h2></div>
         <p className="mt-3 text-sm text-text-secondary">Start or continue your check-in. Answer what you know; leave the rest blank.</p>
-        <Link href="/check-in" className={`${linkStyle} mt-4 inline-block`}>Open check-in</Link>
+        <Link href="/log#log-part-check-in" className={`${linkStyle} mt-4 inline-block`}>Open check-in</Link>
       </section>
       </Part>
       </PartGrid>

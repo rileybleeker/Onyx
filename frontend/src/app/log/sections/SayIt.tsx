@@ -1,11 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { ChevronDown } from "lucide-react";
 import InfoHint from "@/components/InfoHint";
+import { usePartOrder } from "@/components/personalize/PartGrid";
 import { VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
 import { sayItJournalDraft } from "@/lib/journal-file";
-import { FROM_WHAT_YOU_SAID, setLogDraft, setLogDrafts, type LogDraftMap } from "@/lib/log-drafts";
+import { FROM_WHAT_YOU_SAID, reportCheckinFill, setLogDraft, setLogDrafts, useCheckinFill, type LogDraftMap } from "@/lib/log-drafts";
 import type { LogVoiceResult } from "@/lib/log-voice";
+import { LOG_PART_IDS, jumpToLogPart, type LogPartId } from "../jump";
 import { LogCard } from "./ui";
 
 /**
@@ -32,6 +35,8 @@ type Shown =
 // Memory only (see above).
 let keptText = "";
 let keptShown: Shown | null = null;
+/** Words went to the check-in (its result is shown under the box until the box is cleared). */
+let keptCheckinSent = false;
 
 const SECTION_NAMES: Record<string, string> = { journal: "Journal", supplements: "Supplements", ubereats: "Uber Eats", weight: "Weight", reading: "Reading" };
 
@@ -39,6 +44,7 @@ export default function SayItSection() {
   const [text, setText] = useState(keptText);
   const [busy, setBusy] = useState(false);
   const [shown, setShown] = useState<Shown | null>(keptShown);
+  const [checkinSent, setCheckinSent] = useState(keptCheckinSent);
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -62,7 +68,11 @@ export default function SayItSection() {
     if (!words || busy) return;
     setBusy(true);
     show(null);
-    // The check-in reads the same words with its own questions straight away (in parallel with the call below).
+    // The check-in reads the same words with its own questions straight away (in parallel with the call below);
+    // its result replaces this "pending" under the box (reportCheckinFill in CheckInClient).
+    reportCheckinFill({ pending: true, message: null });
+    keptCheckinSent = true;
+    setCheckinSent(true);
     setLogDraft("checkin", { text: words }, words);
     try {
       const res = await fetch("/api/log/voice", {
@@ -120,6 +130,8 @@ export default function SayItSection() {
   const clear = () => {
     edit("");
     show(null);
+    keptCheckinSent = false;
+    setCheckinSent(false);
   };
 
   return (
@@ -172,52 +184,109 @@ export default function SayItSection() {
         </span>
       </div>
       <div role="status" aria-live="polite">
-        {shown?.kind === "error" ? <p className="mt-3 text-[13px] text-down">{shown.message}</p> : null}
+        {shown?.kind === "error" ? (
+          <>
+            {checkinSent ? <ul className="mt-3"><CheckinRow /></ul> : null}
+            <p className="mt-3 text-[13px] text-down">{shown.message}</p>
+          </>
+        ) : null}
         {shown?.kind === "filled" ? <Filled result={shown.result} /> : null}
+        {busy && checkinSent ? <ul className="mt-3"><CheckinRow /></ul> : null}
       </div>
     </LogCard>
   );
 }
 
+/** The Log screen's parts Riley has not hidden in Personalize. */
+function useShownParts(): Set<string> {
+  return new Set(usePartOrder("/log", LOG_PART_IDS));
+}
+
+const ROW = "grid grid-cols-[96px_1fr_16px] gap-x-3 py-1.5 text-[13px]";
+
+/**
+ * One section's line under the box. The whole row is a button that scrolls to the section, where the suggestion
+ * waits for that section's Save. A section hidden in Personalize says so (its suggestion stays for when it shows).
+ */
+function SectionRow({ name, part, lines, tone = "text-text-primary" }: { name: string; part: LogPartId; lines: string[]; tone?: string }) {
+  const shown = useShownParts().has(part);
+  const body = (
+    <>
+      <span className="text-text-tertiary">{name}</span>
+      <span className={tone}>
+        {lines.map((l, i) => (
+          <span key={i} className="block">{l}</span>
+        ))}
+        {!shown ? <span className="block text-mid">Hidden on this screen (Personalize).</span> : null}
+      </span>
+    </>
+  );
+  if (!shown) return <li className={ROW}>{body}</li>;
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={() => jumpToLogPart(part, { smooth: true })}
+        aria-label={`${name}: ${lines.join(" ")} Go to ${name}.`}
+        className={`${ROW} w-full min-h-11 items-start rounded-control text-left hover:bg-white/[0.03] focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent/60`}
+      >
+        {body}
+        <ChevronDown aria-hidden="true" className="mt-0.5 h-4 w-4 text-text-tertiary" />
+      </button>
+    </li>
+  );
+}
+
+/** What the embedded check-in did with the words (its own read-only fill), live. */
+function CheckinRow() {
+  const fill = useCheckinFill();
+  const shown = useShownParts().has("check-in");
+  if (!shown) {
+    return (
+      <li className={ROW}>
+        <span className="text-text-tertiary">Check-in</span>
+        <span className="text-mid">Not filled: the check-in is hidden on this screen (Personalize).</span>
+      </li>
+    );
+  }
+  const done = !!fill && !fill.pending && !!fill.message;
+  const line = done ? fill!.message! : "Filling the questions below…";
+  const tone = done && /couldn't/i.test(line) ? "text-down" : "text-text-primary";
+  return <SectionRow name="Check-in" part="check-in" lines={[line]} tone={tone} />;
+}
+
 /** What one Fill suggested, per section. */
 function Filled({ result }: { result: LogVoiceResult & { unavailable?: string[]; error?: string } }) {
   const { summary } = result;
-  const rows: Array<{ name: string; lines: string[] }> = [
-    { name: "Check-in", lines: ["Filling the questions below"] },
-    { name: "Journal", lines: summary.journal ?? [] },
-    { name: "Supplements", lines: summary.supplements },
-    { name: "Uber Eats", lines: summary.ubereats },
-    { name: "Weight", lines: summary.weight },
-    { name: "Reading", lines: summary.reading },
+  const rows: Array<{ name: string; part: LogPartId; lines: string[] }> = [
+    { name: "Journal", part: "journal", lines: summary.journal ?? [] },
+    { name: "Supplements", part: "supplements", lines: summary.supplements },
+    { name: "Uber Eats", part: "uber-eats", lines: summary.ubereats },
+    { name: "Weight", part: "weight", lines: summary.weight },
+    { name: "Reading", part: "reading", lines: summary.reading },
   ];
   const filled = rows.filter((r) => r.lines.length > 0);
   const empty = rows.filter((r) => r.lines.length === 0).map((r) => r.name);
   const unavailable = (result.unavailable ?? []).map((s) => SECTION_NAMES[s]).filter(Boolean);
   return (
     <div className="mt-3 space-y-2">
-      <dl className="space-y-1.5">
+      <ul>
+        <CheckinRow />
         {filled.map((r) => (
-          <div key={r.name} className="grid grid-cols-[96px_1fr] gap-x-3 text-[13px]">
-            <dt className="text-text-tertiary">{r.name}</dt>
-            <dd className="text-text-primary">
-              {r.lines.map((l, i) => (
-                <div key={i}>{l}</div>
-              ))}
-            </dd>
-          </div>
+          <SectionRow key={r.name} name={r.name} part={r.part} lines={r.lines} />
         ))}
         {result.not_matched.length > 0 ? (
-          <div className="grid grid-cols-[96px_1fr] gap-x-3 text-[13px]">
-            <dt className="text-text-tertiary">Not matched</dt>
-            <dd className="text-mid">{result.not_matched.join(", ")}</dd>
-          </div>
+          <li className={ROW}>
+            <span className="text-text-tertiary">Not matched</span>
+            <span className="text-mid">{result.not_matched.join(", ")}</span>
+          </li>
         ) : null}
-      </dl>
+      </ul>
       {result.error ? <p className="text-[13px] text-down">{result.error}</p> : null}
       {unavailable.length > 0 ? <p className="text-[12px] text-mid">Couldn&apos;t load {unavailable.join(", ")}; not filled.</p> : null}
       <p className="text-[12px] text-text-secondary">
         {!result.error && empty.length > 0 ? `Nothing for ${empty.map((n) => (n === "Uber Eats" ? n : n.toLowerCase())).join(", ")}. ` : ""}
-        Check each section, then press its Save.
+        Tap a line to go there, check it, then press that section&apos;s Save.
       </p>
     </div>
   );
