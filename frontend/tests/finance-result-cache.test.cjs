@@ -238,7 +238,7 @@ const quiet = async (fn) => {
 test("first call computes inline and stores after the answer; the next call is served without computing", async () => {
   const h = harness({ budgets: { kind: "ok", result: { lines: [], daysInMonth: 30, dayOfMonth: 15 }, categories: [], rules: [], setupPending: false, subscriptions: [] } });
   const first = await h.S.cachedMoneyAlerts(NOW);
-  assert.deepEqual(first, { status: "ready", alerts: [] });
+  assert.deepEqual(first, { status: "ready", alerts: [], asOf: NOW.toISOString() }, "computed now: current, no marker");
   assert.deepEqual([h.calls.forecast, h.calls.budgets], [1, 1]);
   assert.equal(h.queue.length, 1, "the store runs after the response");
   assert.equal(h.db.rows.has("alerts"), false);
@@ -248,7 +248,7 @@ test("first call computes inline and stores after the answer; the next call is s
   assert.ok(h.db.rows.has("forecast") && h.db.rows.has("budgets"), "the page loads computed on the way are stored too");
 
   const second = await h.S.cachedMoneyAlerts(addMs(NOW, 5 * 60_000));
-  assert.deepEqual(second, first);
+  assert.deepEqual(second, first, "a fresh stored answer keeps the time it was computed");
   assert.deepEqual([h.calls.forecast, h.calls.budgets], [1, 1], "served from the stored row");
   assert.equal(h.queue.length, 0, "a fresh row schedules nothing");
   // The pages find their stored loads fresh.
@@ -306,15 +306,39 @@ test("a failed refresh is remembered: the next call computes before answering, a
   assert.equal(h.db.rows.get("renewals").failed_at, null, "a good result clears the mark");
 });
 
-test("half-failed alerts are answered but never stored", async () => {
+test("half-failed alerts are answered marked partial, and never stored", async () => {
   const h = harness({ forecast: { kind: "error", code: "57014" }, budgets: { kind: "empty" } });
-  assert.deepEqual(await h.S.cachedMoneyAlerts(NOW), { status: "ready", alerts: [] });
+  assert.deepEqual(await h.S.cachedMoneyAlerts(NOW), { status: "ready", alerts: [], asOf: NOW.toISOString(), partial: "forecast" });
   await h.drain();
   assert.equal(h.db.rows.has("alerts"), false);
   assert.equal(h.db.rows.has("forecast"), false, "an error load is never stored");
   assert.equal(h.db.rows.has("budgets"), true);
   h.state.budgets = { kind: "error", code: "57014" };
   assert.equal(await h.S.cachedMoneyAlerts(NOW), null, "both failed: unavailable");
+  h.state.forecast = { kind: "empty" };
+  assert.equal((await h.S.cachedMoneyAlerts(NOW)).partial, "budgets");
+});
+
+test("an older stored answer is marked updating with the time it was computed; fresh-only computes before answering", async () => {
+  const h = harness();
+  await h.S.cachedMoneyAlerts(NOW);
+  await h.drain();
+  // The next ET day (or an ETL run): Today gets the old answer at once, marked, and a refresh is queued.
+  const tomorrow = new Date("2030-06-16T13:00:00Z");
+  const stale = await h.S.cachedMoneyAlerts(tomorrow);
+  assert.deepEqual(stale, { status: "ready", alerts: [], asOf: NOW.toISOString(), updating: true });
+  assert.equal(h.calls.forecast, 1);
+  assert.equal(h.queue.length, 1);
+  // Today's follow-up before the refresh landed: computed now, current.
+  const followUp = await h.S.cachedMoneyAlerts(addMs(tomorrow, 4_000), "fresh-only");
+  assert.deepEqual(followUp, { status: "ready", alerts: [], asOf: addMs(tomorrow, 4_000).toISOString() });
+  assert.equal(h.calls.forecast, 2);
+  // Once a refresh has landed, both reads are current and nothing is computed.
+  await h.drain();
+  const after = await h.S.cachedMoneyAlerts(addMs(tomorrow, 10_000));
+  assert.ok(!("updating" in after));
+  assert.equal((await h.S.cachedMoneyAlerts(addMs(tomorrow, 11_000), "fresh-only")).asOf, after.asOf);
+  assert.ok(h.calls.forecast <= 3);
 });
 
 test("a new ET day or another build: stale for Today, recomputed before answering on the pages", async () => {
@@ -333,8 +357,8 @@ test("a new ET day or another build: stale for Today, recomputed before answerin
   const forecastCalls = h.calls.forecast;
   process.env.VERCEL_DEPLOYMENT_ID = "dpl_next_build";
   try {
-    assert.deepEqual(await h.S.cachedMoneyAlerts(addMs(tomorrow, 1_000)), { status: "ready", alerts: [] });
-    assert.equal(h.calls.forecast, forecastCalls, "Today: the old build's answer, at once");
+    assert.deepEqual(await h.S.cachedMoneyAlerts(addMs(tomorrow, 1_000)), { status: "ready", alerts: [], asOf: tomorrow.toISOString(), updating: true });
+    assert.equal(h.calls.forecast, forecastCalls, "Today: the old build's answer, at once, marked as being updated");
     assert.equal(h.queue.length, 1);
     await h.S.cachedBudgets(addMs(tomorrow, 1_000));
     assert.equal(h.calls.budgets, 2, "the page does not trust another build's stored load");
@@ -346,7 +370,7 @@ test("a new ET day or another build: stale for Today, recomputed before answerin
 test("an unreadable cache table: computed every time, nothing stored, only a code logged", async () => {
   const h = harness({ readError: "42P01" });
   const { value, lines } = await quiet(async () => [await h.S.cachedMoneyAlerts(NOW), await h.S.cachedMoneyAlerts(NOW)]);
-  assert.deepEqual(value, [{ status: "ready", alerts: [] }, { status: "ready", alerts: [] }]);
+  assert.deepEqual(value, [{ status: "ready", alerts: [], asOf: NOW.toISOString() }, { status: "ready", alerts: [], asOf: NOW.toISOString() }]);
   assert.equal(h.calls.forecast, 2);
   assert.equal(h.queue.length, 0);
   assert.ok(!h.db.ops.includes("upsert"));
@@ -378,14 +402,25 @@ test("alerts route: same shape and HTTP semantics, answered from the stored row"
   const route = loadTs("app/api/finance/alerts/route.ts", h.stubs);
   assert.equal(route.dynamic, "force-dynamic");
   const a = await route.GET();
-  assert.deepEqual([a.status, a.body, a.headers["Cache-Control"]], [200, { status: "ready", alerts: [] }, "no-store"]);
+  assert.deepEqual([a.status, a.body.status, a.body.alerts, a.headers["Cache-Control"]], [200, "ready", [], "no-store"]);
+  assert.ok(Number.isFinite(Date.parse(a.body.asOf)) && !("updating" in a.body));
   await h.drain();
   const b = await route.GET();
-  assert.deepEqual([b.status, b.body], [200, { status: "ready", alerts: [] }]);
+  assert.deepEqual([b.status, b.body], [200, a.body]);
   assert.equal(h.calls.forecast, 1, "the second answer came from the stored row");
+  // After an input write: the plain read answers the older result marked updating; ?fresh=1 computes it first.
+  h.db.bump();
+  const c1 = await route.GET(new Request("http://localhost/api/finance/alerts"));
+  assert.deepEqual([c1.body.updating, c1.body.asOf, h.calls.forecast], [true, a.body.asOf, 1]);
+  h.queue.length = 0; // the background refresh has not landed yet
+  const c2 = await route.GET(new Request("http://localhost/api/finance/alerts?fresh=1"));
+  assert.equal(h.calls.forecast, 2, "?fresh=1 computed before answering");
+  assert.ok(!("updating" in c2.body));
   const failing = harness({ forecast: { kind: "error", code: "x" }, budgets: { kind: "error", code: "x" } });
   const c = await loadTs("app/api/finance/alerts/route.ts", failing.stubs).GET();
   assert.deepEqual([c.status, c.body, c.headers["Cache-Control"]], [500, { status: "unavailable" }, "no-store"]);
+  const cf = await loadTs("app/api/finance/alerts/route.ts", failing.stubs).GET(new Request("http://localhost/api/finance/alerts?fresh=1"));
+  assert.deepEqual([cf.status, cf.body], [500, { status: "unavailable" }]);
 });
 
 test("renewals route: ready / empty / 500, uncached, from the stored form", async () => {
