@@ -9,6 +9,7 @@ import { sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import NycMap, { markerColor } from "./NycMap";
+import { usePageHeadingTestId } from "@/components/FeedContext";
 
 const NOTION_DB_URL = "https://www.notion.so/967fdf52d6ee4aab9a5854298e564b43";
 const BRIEF =
@@ -53,6 +54,8 @@ function median(xs: number[]): number | null {
 }
 
 export default function NycClient({ initial }: { initial: NycLead[] | null }) {
+  // "page-heading" on /nyc itself, "feed-page-heading" inside the continuous scroll.
+  const headingTestId = usePageHeadingTestId();
   const [leads, setLeads] = useState<NycLead[]>(initial ?? []);
   const [loading, setLoading] = useState(!initial);
   const [error, setError] = useState<string | null>(null);
@@ -205,7 +208,7 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
   return (
     <div className="space-y-6">
       <header className="space-y-1">
-        <h1 className="text-[22px] font-display text-text-primary">NYC Apartment Search</h1>
+        <h1 data-testid={headingTestId} className="text-[22px] font-display text-text-primary">NYC Apartment Search</h1>
         <p className="text-[12px] text-text-secondary">{BRIEF}</p>
         <p className="text-[11px] font-mono text-text-tertiary">
           Last checked {lastChecked ? shortDate(lastChecked) : "—"} ·{" "}
