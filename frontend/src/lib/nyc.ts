@@ -121,11 +121,14 @@ function notionError(status: number, body: string): Error {
  * sameJson revalidation bail-out depends on it). Throws on any Notion error
  * so page.tsx's fail-open try/catch actually fails open.
  *
- * `fresh` = bypass the data cache (API route / client revalidation). The ISR
- * page passes fresh=false so its fetch shares the page's hourly revalidate
- * window — a no-store fetch would silently make the page dynamic.
+ * `fresh` = bypass the data cache. The ISR page passes fresh=false so its
+ * fetch shares the page's hourly revalidate window — a no-store fetch would
+ * silently make the page dynamic.
+ * `maxAgeSec` = how old a cached answer may be before it is refreshed in the
+ * background (default 3600, the ISR page's window). Every entry carries
+ * NYC_LEADS_TAG, so Riley's own edits (PATCH /api/nyc/leads/[id]) drop it at once.
  */
-export async function getNycLeads({ fresh = false }: { fresh?: boolean } = {}): Promise<NycLead[]> {
+export async function getNycLeads({ fresh = false, maxAgeSec = 3600 }: { fresh?: boolean; maxAgeSec?: number } = {}): Promise<NycLead[]> {
   const leads: NycLead[] = [];
   let cursor: string | undefined;
   for (let i = 0; i < 10; i++) {
@@ -137,7 +140,7 @@ export async function getNycLeads({ fresh = false }: { fresh?: boolean } = {}): 
         start_cursor: cursor,
         sorts: [{ property: "Number", direction: "descending" }],
       }),
-      ...(fresh ? { cache: "no-store" as const } : { next: { revalidate: 3600, tags: [NYC_LEADS_TAG] } }),
+      ...(fresh ? { cache: "no-store" as const } : { next: { revalidate: maxAgeSec, tags: [NYC_LEADS_TAG] } }),
     });
     if (!res.ok) throw notionError(res.status, await res.text());
     const data = await res.json();
