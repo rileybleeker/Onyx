@@ -62,6 +62,7 @@ const CADENCE: Record<string, string> = {
   online_orders: "Every 3h :05 (both Gmail accounts)",
   air_quality: "Every 3h :12",
   weather: "Every 3h :32",
+  pollen: "Twice daily, 16:20 + 21:20 UTC",
   supplement_reminders: "Worker poll (heartbeat ~hourly); cards at each stack's reminder time",
   renewal_reminders: "Worker poll, hourly; a card up to 3 days before a renewal",
   cash_forecast: "Weekly, Monday 12:30 UTC (forecast snapshot)",
@@ -115,6 +116,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   online_orders:  { method: "automated",      label: "IMAP email parser" },
   air_quality:    { method: "automated",      label: "API ETL" },
   weather:        { method: "automated",      label: "API ETL" },
+  pollen:         { method: "automated",      label: "Web page ETL" },
   supplement_reminders: { method: "automated", label: "Worker push cards" },
   renewal_reminders: { method: "automated", label: "Worker push cards" },
   cash_forecast:  { method: "automated",      label: "Snapshot job" },
@@ -286,6 +288,11 @@ export async function GET() {
     const garminWornPromise = supabase.from("garmin_daily_summary").select("calendar_date")
       .or(GARMIN_WEARABLE_FILTER).order("calendar_date", { ascending: false }).limit(1)
       .then((res) => res);
+    // Pollen (pollen_etl.py): newest published count in pds.pollen_daily. A missing table
+    // (sql/pollen_schema.sql not applied yet) comes back as an error and is shown on the card.
+    const pollenLatestPromise = supabase.from("pollen_daily").select("count_date")
+      .order("count_date", { ascending: false }).limit(1)
+      .then((res) => res);
 
     // NYC scout freshness lives in Notion (the "NYC Leads" database the
     // nyc-scout agent upserts every run), not in sync_log. Started here so the
@@ -432,6 +439,8 @@ export async function GET() {
         ["google_calendar", "events"],
         // PC activity logger (Riley's PC, hourly upload while signed in).
         ["pc_activity", "usage"],
+        // Pollen ETL (twice a day): a 19 h gap between runs, far outside the shared window.
+        ["pollen", "daily"],
       ].map(async ([source, dataType]) => {
         const { data, error } = await supabase.from("sync_log").select("*")
           .eq("source", source).eq("data_type", dataType)
@@ -540,6 +549,9 @@ export async function GET() {
     const renewalRemindersRes = await renewalRemindersPromise;
     const cashForecastRes = await cashForecastPromise;
     const urgentEmailCard = await urgentEmailCardPromise;
+    const pollenRes = await pollenLatestPromise;
+    const pollenPending = pollenRes.error?.code === "PGRST205" || pollenRes.error?.code === "42P01";
+    const pollenLatest = (pollenRes.data?.[0]?.count_date as string | undefined) ?? null;
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -1066,6 +1078,43 @@ export async function GET() {
           cadence: CADENCE.weather,
           integrationMethod: METHOD.weather.method,
           methodLabel: METHOD.weather.label,
+        };
+      })(),
+      // Pollen (pollen_etl.py): the daily Atlanta count from atlantaallergy.com (one page request
+      // per run) into pds.pollen_daily. Freshness = heartbeat age: two runs a day, 19 h apart at
+      // most -> >21h partial, >27h or a failed row red. The station skips weekends and holidays,
+      // so a count 2-4 days old is normal; more than 4 days behind the spine reads partial. A
+      // 'partial' heartbeat means the page was read but part of it was not recognised.
+      pollen: (() => {
+        const entry = latestBySrcType["pollen|daily"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const countLag = pollenLatest ? daysLag(pollenLatest, spineMaxDate) : 999;
+        const countStale = entry !== null && pollenLatest !== null && countLag > 4;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || entry.status === "error" || ageH > 27
+            ? "failed"
+            : entry.status === "partial" || ageH > 21 || countStale
+              ? "partial"
+              : "success";
+        return {
+          label: "Pollen",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: pollenLatest,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (countStale ? `No new count since ${pollenLatest} (${countLag} days). The station skips weekends and holidays.` : null)
+            ?? (entry ? null
+              : pollenPending
+                ? "pds.pollen_daily is missing - apply sql/pollen_schema.sql, then add the Pollen ETL workflow (YAML in the roadmap row)."
+                : pollenRes.error?.message
+                  ?? "No run yet - add .github/workflows/pollen-etl.yml (YAML in the roadmap row)."),
+          cadence: CADENCE.pollen,
+          integrationMethod: METHOD.pollen.method,
+          methodLabel: METHOD.pollen.label,
         };
       })(),
       // Supplement stack reminders (sms-reminders Worker -> /api/supplements/reminders/*):
