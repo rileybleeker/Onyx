@@ -302,7 +302,27 @@ function stabilityTable(runs) {
   return out.join("\n");
 }
 
+/**
+ * Speed budget (Riley 2026-11-14: nothing may take a full second). Pure: `pages` are summarizePage() results with
+ * their slug. A page breaks the budget when its warm time-to-data (p95) or any single API / database call it makes
+ * (p50) reaches `ms`. Returns one human-readable line per breach; empty = within budget.
+ */
+const SPEED_BUDGET_MS = 1000;
+function budgetViolations(pages, ms = SPEED_BUDGET_MS) {
+  const out = [];
+  for (const p of pages) {
+    const ready = p.summary?.timing?.ready?.p95;
+    if (finite(ready) && ready >= ms) out.push(`${p.label || p.slug}: data ready p95 ${Math.round(ready)} ms`);
+    for (const e of p.summary?.endpoints || []) {
+      if (finite(e.callMsP50) && e.callMsP50 >= ms) out.push(`${p.label || p.slug}: ${e.key} p50 ${Math.round(e.callMsP50)} ms`);
+    }
+  }
+  return out;
+}
+
 module.exports = {
+  SPEED_BUDGET_MS,
+  budgetViolations,
   REQUEST_CLASSES,
   percentile,
   median,

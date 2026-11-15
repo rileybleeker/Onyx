@@ -1,17 +1,15 @@
 name: Production Performance Timing
 
-# MANUAL ONLY. Measures authenticated page loads against PRODUCTION from a GitHub-hosted
-# runner: per key page, N full navigations (first = cold browser cache), recording TTFB, FCP,
-# LCP, time to the page's data, and every Supabase /rest/v1 + /api + Worker request (path,
-# duration, bytes - no query strings, no bodies, no cookies). Results go to the job summary
-# and to a JSON artifact. See docs/perf-evidence-2026-11-12.md for method and caveats.
-#
-# Start it with:  gh workflow run perf-timing.yml   (GitHub only dispatches a workflow file that is
-# already on the default branch; --ref <branch> then runs that branch's copy of it.)
-# It has no schedule and no pull_request trigger on purpose: it signs in to production and
-# loads every key page 15 times, which is a load nobody should get by opening a PR.
-
+# The speed budget, checked AFTER deployment (Riley 2026-11-14: nothing may take a full second; testing never slows a
+# deploy). Every hour it signs in to production from a GitHub-hosted runner, loads each key page a few times and
+# records TTFB, FCP, LCP, time to the page's data and every Supabase /rest/v1 + /api + Worker request (path, duration,
+# bytes - no query strings, no bodies, no cookies). The run turns red when a page's data takes 1 s or more (warm p95)
+# or any single call does (p50): `perf-report.cjs --budget`. A red run is devops's to fix with a normal PR.
+# The runner is often served from a far-away edge, so its numbers are pessimistic; a pass here means fast at home.
+# Manual deep run:  gh workflow run perf-timing.yml -f navigations=15
 on:
+  schedule:
+    - cron: "23 * * * *"   # hourly, 4 navigations per page
   workflow_dispatch:
     inputs:
       navigations:
@@ -59,7 +57,7 @@ jobs:
           SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
           SMOKE_TEST_EMAIL: ${{ secrets.SMOKE_TEST_EMAIL }}
           SMOKE_TEST_PASSWORD: ${{ secrets.SMOKE_TEST_PASSWORD }}
-          PERF_NAVIGATIONS: ${{ inputs.navigations }}
+          PERF_NAVIGATIONS: ${{ inputs.navigations || '4' }}
         run: npx --no-install playwright test -c e2e/perf.config.ts
 
       - name: Summarize (job summary)
@@ -71,6 +69,9 @@ jobs:
           else
             echo "No timing results were written (the sign-in or the first page failed)." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Speed budget (red when anything takes a second)
+        run: node e2e/perf-report.cjs perf-results --budget > /dev/null
 
       - name: Upload results
         if: always()

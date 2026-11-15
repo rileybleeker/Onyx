@@ -120,6 +120,8 @@ SCHEDULED: dict[str, Sched] = {
     'tanita-etl.yml': Sched('Tanita ETL', _h(26), True, '14:00 and 17:30 UTC (20h30 gap); worst seen 21h19'),
     'eight-sleep-etl.yml': Sched('Eight Sleep ETL', _h(28), True, 'daily; worst seen 26h46'),
     'smoke-test.yml': Sched('Production Smoke Test', _h(8), True, 'every 6h; worst seen 7h18'),
+    'perf-timing.yml': Sched(
+        'Production Performance Timing', _m(150), True, 'hourly at :23; speed budget, new 2026-11-14'),
     'scheduled-tests.yml': Sched(
         'Scheduled tests', _m(90), True, 'every 30 min at :07/:37; new 2026-11-14 (replaced the per-PR test jobs)'),
     'cash-forecast-snapshot.yml': Sched(

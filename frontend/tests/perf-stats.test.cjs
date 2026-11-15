@@ -118,3 +118,13 @@ test('normRegion drops per-request ids and tells CDN answers from function runs'
   assert.equal(stats.normRegion('iad1>zqs8v-1794452282628-11b03cce4640'), 'iad1 (cdn)', 'run-1 samples kept the request id');
   assert.equal(stats.normRegion(null), null);
 });
+
+test('speed budget flags a slow page or a slow call, and nothing else', () => {
+  const page = (slug, readyP95, calls) => ({ slug, label: '/' + slug, summary: {
+    timing: { ready: { p95: readyP95 } },
+    endpoints: calls.map(([key, ms]) => ({ key, callMsP50: ms })) } });
+  assert.deepEqual(stats.budgetViolations([page('fast', 420, [['api /x', 180]])]), []);
+  const over = stats.budgetViolations([page('slow', 1200, [['api /y', 1500], ['api /z', 999]]), page('ok', null, [])]);
+  assert.deepEqual(over, ['/slow: data ready p95 1200 ms', '/slow: api /y p50 1500 ms']);
+  assert.equal(stats.SPEED_BUDGET_MS, 1000);
+});
