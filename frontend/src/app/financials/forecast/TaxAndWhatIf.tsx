@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { usePathname, useRouter } from "next/navigation";
+import { useRouter } from "next/navigation";
 import type { ForecastResult } from "@/lib/cash-forecast";
 import { scenarioToQuery, type ScenarioParams } from "@/lib/cash-forecast-scenario";
 import type { ForecastAccountView } from "@/lib/cash-forecast-server";
@@ -17,6 +17,7 @@ const card = "rounded-card shadow-card border border-border-subtle bg-surface-ca
 const input = "rounded-control border border-border-subtle bg-transparent px-2 py-1 text-[13px]";
 const button = "rounded-control border border-border-subtle px-3 py-1 text-[13px] hover:bg-white/5 disabled:opacity-50";
 type Run = (fn: () => Promise<string | null>) => void;
+const FORECAST_PATH = "/financials/forecast";
 
 async function put(key: string, value: unknown): Promise<string | null> {
   try {
@@ -37,7 +38,9 @@ const dollars = (s: string): number | undefined => {
 
 export function WhatIfPanel({ params, accounts, saved, busy, run }: { params: ScenarioParams | null; accounts: ForecastAccountView[]; saved: { slug: string; name: string; params: ScenarioParams }[]; busy: boolean; run: Run }) {
   const router = useRouter();
-  const pathname = usePathname();
+  // Always the routed page: in the continuous scroll the address follows whichever page is in view, and a
+  // what-if (levers in the query) is only computed by the routed page.
+  const pathname = FORECAST_PATH;
   const p = params ?? {};
   const [f, setF] = useState<Record<string, string>>({
     bonusPct: p.bonusPct?.toString() ?? "100",

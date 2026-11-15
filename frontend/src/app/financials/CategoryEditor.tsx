@@ -7,7 +7,18 @@ import { STANDARD_CATEGORIES } from "@/lib/finance-categories";
  * Change one transaction's category, or every transaction from its merchant (a rule). Writes through
  * PUT /api/finance/categories (owner session); the bank data itself is not changed.
  */
-export default function CategoryEditor({ txnKey, merchantKey, category }: { txnKey: string; merchantKey: string; category: string | null }) {
+export default function CategoryEditor({
+  txnKey,
+  merchantKey,
+  category,
+  onSaved,
+}: {
+  txnKey: string;
+  merchantKey: string;
+  category: string | null;
+  /** Re-read the data after a save (the scroll section); without it the page reloads. */
+  onSaved?: () => void;
+}) {
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState(category ?? "");
   const [busy, setBusy] = useState(false);
@@ -20,7 +31,8 @@ export default function CategoryEditor({ txnKey, merchantKey, category }: { txnK
       if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as { error?: string }).error ?? `failed (${res.status})`);
       setOpen(false);
       // A full reload (not router.refresh) so this also works where the app router is not mounted.
-      window.location.reload();
+      if (onSaved) onSaved();
+      else window.location.reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed");
     } finally {
