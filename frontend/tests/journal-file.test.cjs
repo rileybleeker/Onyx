@@ -265,12 +265,14 @@ function fakeNotion() {
   const DB = "96541038264d45aba2a9601d9b175a7e";
   const pages = new Map();
   const calls = [];
+  const fail = { deleteAt: -1 }; // the n-th DELETE (0-based) answers 429
+  let deletes = 0;
   let nextBlock = 1;
   const para = (text) => ({ id: `blk-${nextBlock++}`, type: "paragraph", paragraph: { rich_text: [{ type: "text", text: { content: text }, plain_text: text }] } });
   const addPage = (id, body, over = {}) => {
     pages.set(id, { id, parent: { type: "database_id", database_id: DB }, archived: false, url: `https://www.notion.so/${id.replace(/-/g, "")}`, properties: {
       Title: { title: [{ plain_text: LABELS.title }] }, Mood: { select: { name: LABELS.mood } }, Confidence: { select: { name: LABELS.confidence } }, Topics: { multi_select: LABELS.topics.map((name) => ({ name })) },
-    }, blocks: J.bodyParagraphs(body).map(para), ...over });
+    }, blocks: J.bodyParagraphs(body).map(para), date: TODAY, created_time: "2031-03-05T15:00:00.000Z", ...over });
   };
   const text = (id) => F.pageBodyText(pages.get(id).blocks);
   const json = (status, body) => ({ ok: status < 300, status, json: async () => body });
@@ -301,12 +303,21 @@ function fakeNotion() {
       return json(200, { results: page.blocks, has_more: false });
     }
     if ((m = /^blocks\/(.+)$/.exec(p)) && method === "DELETE") {
+      if (deletes++ === fail.deleteAt) return json(429, {});
       for (const page of pages.values()) page.blocks = page.blocks.filter((b) => b.id !== m[1]);
       return json(200, {});
     }
+    if (/^databases\/.+\/query$/.test(p) && method === "POST") {
+      const q = JSON.parse(init.body);
+      const clauses = q.filter.and ?? [q.filter];
+      const day = clauses.find((c) => c.property === "Date").date.equals;
+      const since = clauses.find((c) => c.timestamp === "created_time")?.created_time.on_or_after;
+      const results = [...pages.values()].filter((pg) => pg.date === day && (!since || pg.created_time >= since));
+      return json(200, { results });
+    }
     return json(400, {});
   };
-  return { pages, calls, addPage, text, fetch };
+  return { pages, calls, addPage, text, fetch, fail };
 }
 
 function loadServer(notion) {
@@ -395,4 +406,102 @@ test("update route rules: PATCH only, session only, same-origin, strict, page id
   for (const line of route.split("\n").filter((l) => /console\./.test(l))) assert.equal(/input|text|body|title|entry\b|pageId/i.test(line.replace(/\[journal-file\]/, "")), false, line);
   const post = fs.readFileSync(path.join(SRC, "app/api/journal/file/route.ts"), "utf8");
   assert.match(post, /findRetriedEntry\(input\.date, input\.body, now, known\)/, "a lost answer is recognised by its hash");
+});
+
+// ---- Review fixes (2026-11-15): lost sends across tabs, restored words, interrupted updates ---------------------
+
+test("hashes: the browser's synchronous SHA-256 equals node:crypto (ASCII, Unicode, every padding edge)", () => {
+  for (const t of ["", "abc", "a".repeat(55), "a".repeat(56), "a".repeat(64), "Synthetic \u00fcn\u00efc\u00f8d\u00e9 \ud83d\ude42\n\nline", "x".repeat(8000)]) {
+    assert.equal(F.sha256Hex(t), crypto.createHash("sha256").update(t, "utf8").digest("hex"), `length ${t.length}`);
+  }
+  assert.equal(F.journalVersionSha("\n" + BODY + " "), sha(BODY), "a version = the words as written");
+  assert.deepEqual(plain(F.journalParaHashes(BODY)), J.bodyParagraphs(BODY).map((x) => crypto.createHash("sha256").update(x, "utf8").digest("hex").slice(0, 16)));
+});
+
+test("hashes: paragraph hash lists, merging, and the day query", () => {
+  assert.deepEqual(plain(F.parseKnownParas(undefined)), []);
+  assert.deepEqual(plain(F.parseKnownParas(["0123456789abcdef", "0123456789abcdef"])), ["0123456789abcdef"]);
+  assert.equal(F.parseKnownParas([sha("a")]), null, "a full hash is not a paragraph hash");
+  assert.equal(F.parseKnownParas(Array.from({ length: F.JOURNAL_MAX_KNOWN_PARAS + 1 }, (_, i) => i.toString(16).padStart(16, "0"))), null);
+  assert.deepEqual(plain(F.mergeHashes([["a", "b"], ["b", "c"]], 2)), ["b", "c"], "newest kept, no repeats");
+  const q = plain(F.dayEntriesQuery(TODAY));
+  assert.deepEqual(q.filter, { property: "Date", date: { equals: TODAY } }, "the whole day: no 15-minute limit");
+  const v = F.validateJournalUpdate({ body: BODY, source: "typed", known_sha: [sha(BODY)], known_paras: F.journalParaHashes(BODY) });
+  assert.equal(v.ok, true);
+  assert.deepEqual(plain(v.input.knownParas), plain(F.journalParaHashes(BODY)));
+  assert.equal(F.validateJournalUpdate({ body: BODY, source: "typed", known_sha: [sha(BODY)], known_paras: ["nope"] }).ok, false);
+});
+
+test("own write: a known version, the new words, or only this box's paragraphs; anything else is a Notion edit", () => {
+  const base = { ok: true, holdsSha: sha("x"), newSha: sha("y"), paraHashes: ["aaaaaaaaaaaaaaaa"], known: [], knownParas: [] };
+  assert.equal(F.pageHoldsOwnWrite({ ...base, holdsSha: sha("y") }), "new");
+  assert.equal(F.pageHoldsOwnWrite({ ...base, known: [sha("x")] }), "known");
+  assert.equal(F.pageHoldsOwnWrite({ ...base, knownParas: ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"] }), "partial");
+  assert.equal(F.pageHoldsOwnWrite({ ...base, paraHashes: [], knownParas: ["bbbbbbbbbbbbbbbb"] }), "partial", "every paragraph removed, none added yet");
+  assert.equal(F.pageHoldsOwnWrite({ ...base, paraHashes: ["aaaaaaaaaaaaaaaa", "cccccccccccccccc"], knownParas: ["aaaaaaaaaaaaaaaa"] }), null, "a paragraph Riley wrote in Notion");
+  assert.equal(F.pageHoldsOwnWrite({ ...base, ok: false, known: [sha("x")] }), null, "a heading or list added in Notion");
+  assert.equal(F.pageHoldsOwnWrite(base), null);
+});
+
+test("device copy: the entry's day and the paragraph hashes of unconfirmed sends come back", () => {
+  const now = Date.UTC(2031, 2, 5, 12);
+  const rec = { v: 1, at: now, body: "Synthetic words typed before the tab closed.", source: "typed", pinned: false, filed: null, date: "2031-03-04", known: [sha("Synthetic words typed before the tab closed.")], knownParas: F.journalParaHashes("Synthetic words typed before the tab closed.") };
+  const back = plain(F.parseUnsavedJournal(JSON.stringify(rec), now));
+  assert.equal(back.date, "2031-03-04");
+  assert.deepEqual(back.known, rec.known);
+  assert.deepEqual(back.knownParas, rec.knownParas);
+  assert.equal(plain(F.parseUnsavedJournal(JSON.stringify({ ...rec, date: "2031-02-30", knownParas: ["x"] }), now)).date, null, "a bad day is dropped");
+});
+
+test("server retry: a restored copy's lost send is found by its hash on its own day, however long ago", async () => {
+  const n = fakeNotion();
+  const words = "Synthetic words typed before the tab closed.";
+  n.addPage(PAGE_DASHED, words, { date: "2031-03-04", created_time: "2031-03-04T22:00:00.000Z" });
+  const S = loadServer(n);
+  const now = new Date("2031-03-05T15:00:00Z");
+  // The same words a day later, with the hash the closing tab registered: that page, not a new one.
+  const same = await S.findRetriedEntry("2031-03-04", words, now, [sha(words)]);
+  assert.equal(same.id, PAGE_DASHED);
+  assert.equal(same.stale, false);
+  // Edited since: still that page, marked stale (the box then sends the newer words to the PATCH).
+  const edited = await S.findRetriedEntry("2031-03-04", words + " And more.", now, [sha(words)]);
+  assert.equal(edited.id, PAGE_DASHED);
+  assert.equal(edited.stale, true);
+  assert.equal(edited.sha, sha(words));
+  // Without a hash, only the last 15 minutes count (an old page with the same words is a different entry).
+  assert.equal(await S.findRetriedEntry("2031-03-04", words, now, []), null);
+  assert.equal(await S.findRetriedEntry("2031-03-05", words, now, [sha(words)]), null, "bounded to the entry's day");
+});
+
+test("server update: one that stopped halfway (429 between removing and adding) is finished by the retry", async () => {
+  const n = fakeNotion();
+  const first = "Synthetic first paragraph.\n\nSecond one.\n\nThird one.";
+  n.addPage(PAGE_DASHED, first);
+  const S = loadServer(n);
+  const next = "Synthetic first paragraph.\n\nSecond one, rewritten.";
+  // What the box sends: the confirmed version's paragraphs plus the new version's (registered before the send).
+  const input = { ...upd(next, { known_sha: [sha(first), sha(next)] }), knownParas: [...F.journalParaHashes(first), ...F.journalParaHashes(next)] };
+  n.fail.deleteAt = 1; // removes "Second one.", then Notion answers 429 on "Third one."
+  await assert.rejects(() => S.updateJournalPage(PAGE_DASHED, input, async () => null), S.NotionRefused);
+  assert.equal(n.text(PAGE_DASHED), "Synthetic first paragraph.\n\nThird one.", "a state no version hash describes");
+  await S.updateJournalPage(PAGE_DASHED, input, async () => null);
+  assert.equal(n.text(PAGE_DASHED), F.bodyAsWritten(next), "finished, not refused as edited in Notion");
+  // Without the paragraph hashes that same state would read as a Notion edit.
+  n.addPage(PAGE_DASHED, "Synthetic first paragraph.\n\nThird one.");
+  await assert.rejects(() => S.updateJournalPage(PAGE_DASHED, { ...input, knownParas: [] }, async () => null), S.JournalEntryChanged);
+});
+
+test("client: every send registers its hash on the device first; restored words are never dropped by New entry", () => {
+  const section = fs.readFileSync(path.join(SRC, "app/log/sections/Journal.tsx"), "utf8");
+  // registerSend (hash + paragraph hashes + device copy, synchronous) comes before each fetch.
+  assert.match(section, /registerSend\(w\.body\);\s*const json = await send\("\/api\/journal\/file", "POST"/);
+  assert.match(section, /registerSend\(w\.body\);\s*const payload = \{/);
+  assert.equal(/crypto\.subtle/.test(section), false, "no async hash between pagehide and the send");
+  // A restored entry files on its own day with its known hashes.
+  assert.match(section, /entryDateRef\.current = rec\.filed\?\.date \?\? rec\.date;/);
+  assert.match(section, /const date = entryDateRef\.current \?\? easternDate\(new Date\(\)\);/);
+  // New entry saves restored words first and clears nothing unless the flush says all is saved.
+  assert.match(section, /if \(heldRef\.current === "restored" && bodyRef\.current\.trim\(\)\) \{\s*setHeld\(null\);\s*push\(/);
+  assert.match(section, /const allSaved = await autosave\.flush\(\);/);
+  assert.match(section, /!allSaved \|\|/);
 });

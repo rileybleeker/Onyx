@@ -79,15 +79,19 @@ export async function POST(req: NextRequest) {
 
 /**
  * PATCH /api/weight
- * Body: { log_date, weight_kg?, notes? }
+ * Body: { log_date, weight_kg?, notes?, source? }
  *
- * Edits an existing row in place. Pass notes as "" to clear.
+ * Edits an existing row in place. Pass notes as "" to clear. `source` ("manual" | "tanita") is only for putting a
+ * day back the way it was (the Log weight form's Undo / moved day, lib/weight-entry.ts): a Tanita reading the form
+ * replaced gets its value AND its Tanita ownership back, so the scale ETL keeps owning it. A DELETE would lose it
+ * for good once the day is older than the ETL's 14-day window.
  */
 export async function PATCH(req: NextRequest) {
   const body = (await req.json()) as {
     log_date?: string;
     weight_kg?: number;
     notes?: string | null;
+    source?: string;
   };
 
   if (!body.log_date) {
@@ -103,6 +107,12 @@ export async function PATCH(req: NextRequest) {
   }
   if (body.notes !== undefined) {
     patch.notes = body.notes === null || body.notes.trim() === "" ? null : body.notes.trim();
+  }
+  if (body.source !== undefined) {
+    if (body.source !== "manual" && body.source !== "tanita") {
+      return NextResponse.json({ error: "source must be manual or tanita" }, { status: 400 });
+    }
+    patch.source = body.source;
   }
 
   if (Object.keys(patch).length === 0) {

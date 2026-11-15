@@ -53,6 +53,16 @@ function formOf(name: string, description: string, remindTime: string, items: St
   };
 }
 
+/** One random id per new stack: a retried create (lost answer) then returns the same stack instead of a second. */
+function newClientKey(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const hex = Array.from(b, (n) => n.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function notReady(f: StackForm): string | null {
   if (!f.name.trim()) return "Give the stack a name.";
   if (f.items.length === 0) return "Add at least one product.";
@@ -62,8 +72,10 @@ function notReady(f: StackForm): string | null {
 /**
  * Autosave (Riley 2026-11-15, lib/autosave.ts): an existing stack's changes are sent on their own (taps almost at
  * once, typing after a pause and when the field is left) through PATCH /api/supplements/stacks. A new stack is
- * created (POST) as soon as it has a name and a product, and later changes PATCH that stack. Done (or a tap outside)
- * sends what is waiting and closes; a failed save keeps the editor open with its message.
+ * created (POST) as soon as it has a name and a product, and later changes PATCH that stack. The create carries a
+ * client_key (one UUID per new stack), so a create retried after a lost answer returns that stack instead of a second
+ * copy (sql/supplement_stack_client_key.sql). Done (or a tap outside) sends what is waiting and closes; a failed save
+ * keeps the editor open with its message.
  */
 export default function StackEditorModal({ open, stack, products, onClose, onSaved }: Props) {
   const [name, setName] = useState("");
@@ -76,14 +88,13 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
   /** The stack being edited: the one opened, or the one this editor created. State so the Delete button follows. */
   const [stackId, setStackId] = useState<number | null>(null);
   const stackIdRef = useRef<number | null>(null);
+  const clientKey = useRef<string | null>(null);
   const savedAny = useRef(false);
-  const failed = useRef(false);
 
   const autosave = useAutosave<StackForm>("stack-editor", {
     delayMs: 500,
     ready: notReady,
     save: async (f, { keepalive }) => {
-      failed.current = true; // until the server accepts it
       const body = {
         name: f.name.trim(),
         description: f.description.trim() || null,
@@ -92,7 +103,8 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
         items: f.items,
       };
       if (stackIdRef.current === null) {
-        const json = await saveRequest("/api/supplements/stacks", { method: "POST", body, keepalive });
+        clientKey.current ??= newClientKey();
+        const json = await saveRequest("/api/supplements/stacks", { method: "POST", body: { ...body, client_key: clientKey.current }, keepalive });
         const id = Number(json.stack_id);
         if (Number.isFinite(id)) {
           stackIdRef.current = id;
@@ -101,7 +113,6 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
       } else {
         await saveRequest("/api/supplements/stacks", { method: "PATCH", body: { stack_id: stackIdRef.current, ...body }, keepalive });
       }
-      failed.current = false;
       savedAny.current = true;
     },
   });
@@ -117,8 +128,8 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
     setError(null);
     stackIdRef.current = stack.stack_id ?? null;
     setStackId(stack.stack_id ?? null);
+    clientKey.current = stack.stack_id ? null : newClientKey();
     savedAny.current = false;
-    failed.current = false;
     resetAutosave(stack.stack_id ? formOf(stack.name, stack.description ?? "", stack.remind_time ?? "", stack.items) : undefined);
   }, [stack, resetAutosave]);
 
@@ -174,10 +185,13 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
     await closeNow();
   }
 
-  /** Close (top right): leave even when the form is incomplete; whatever is complete and waiting is sent first. */
+  /**
+   * Close (top right): leave even when the form is incomplete; whatever is complete and waiting is sent first. A
+   * complete change that could not be saved keeps the editor open (its status line has Retry).
+   */
   async function closeNow() {
-    await autosave.flush();
-    if (failed.current) return;
+    const ok = await autosave.flush();
+    if (!ok && !notReady(formOf(name, description, remindTime, items))) return;
     if (savedAny.current) onSaved();
     else onClose();
   }

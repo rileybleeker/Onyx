@@ -26,6 +26,12 @@ import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
  * /supplements and the warm-up), then the server.
  */
 
+// Say it drafts this page already logged, for the page's life (module memory, like the drafts themselves): the
+// section can unmount and mount again (the continuous scroll, leaving /log and coming back), and must never log the
+// same suggestion twice. A draft is auto-saved once; what failed stays listed with Retry.
+const triedDrafts = new Set<number>();
+const loggedItems = new Map<number, Set<number>>(); // draft id -> indexes of items already logged
+
 const TODAY_URL = LOG_SUPPLEMENTS_TODAY_URL;
 const STACKS_URL = LOG_SUPPLEMENTS_STACKS_URL;
 const PRODUCTS_URL = LOG_SUPPLEMENTS_PRODUCTS_URL;
@@ -544,12 +550,16 @@ export default function SupplementsSection() {
       setSuggestions(null);
       return;
     }
-    setSuggestions((cur) =>
-      cur && cur.draftId === draft.id
-        ? cur
-        : { draftId: draft.id, items: draft.value.map((item, i) => ({ key: i, item, state: "ready" as const, error: null })) },
-    );
-  }, [draft]);
+    const logged = loggedItems.get(draft.id);
+    const items = draft.value
+      .map((item, i) => ({ key: i, item, state: "ready" as const, error: null }))
+      .filter((s) => !logged?.has(s.key));
+    if (items.length === 0) {
+      clear(draft.id);
+      return;
+    }
+    setSuggestions((cur) => (cur && cur.draftId === draft.id ? cur : { draftId: draft.id, items }));
+  }, [draft, clear]);
 
   const openSuggestions = suggestions?.items ?? [];
   function dropSuggestion(key: number) {
@@ -616,6 +626,9 @@ export default function SupplementsSection() {
       if (err) items = items.map((x) => (x.key === s.key ? { ...x, state: "failed", error: err } : x));
       else {
         done.push(s.key);
+        const logged = loggedItems.get(draftId) ?? new Set<number>();
+        logged.add(s.key);
+        loggedItems.set(draftId, logged);
         items = items.filter((x) => x.key !== s.key);
       }
       setSuggestions((cur) => (cur && cur.draftId === draftId ? { draftId, items } : cur));
@@ -629,17 +642,16 @@ export default function SupplementsSection() {
   // with Undo; a suggestion that fails stays listed with its reason, Edit and Retry.
   const saveSuggestionsRef = useRef(saveSuggestions);
   saveSuggestionsRef.current = saveSuggestions;
-  const autoSaved = useRef<number | null>(null);
   const suggestionDraftId = suggestions?.draftId ?? null;
   useEffect(() => {
-    if (suggestionDraftId == null || autoSaved.current === suggestionDraftId || !stacks || !day) return;
+    if (suggestionDraftId == null || triedDrafts.has(suggestionDraftId) || !stacks || !day) return;
     const t = setTimeout(() => {
-      autoSaved.current = suggestionDraftId;
+      triedDrafts.add(suggestionDraftId);
       void saveSuggestionsRef.current();
     }, 800);
     return () => clearTimeout(t);
   }, [suggestionDraftId, stacks, day]);
-  const suggestionsWaiting = suggestionDraftId != null && autoSaved.current !== suggestionDraftId;
+  const suggestionsWaiting = suggestionDraftId != null && !triedDrafts.has(suggestionDraftId);
 
   // ---- render ----
 

@@ -10,7 +10,7 @@ import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type Readin
 import { clientCache } from "@/lib/client-cache";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { AutosaveRefused, saveRequest } from "@/lib/autosave";
-import { highlightValue, sameReadingValue, type HighlightValue } from "@/lib/reading-autosave";
+import { highlightValue, ownRetriedHighlight, sameReadingValue, type HighlightValue } from "@/lib/reading-autosave";
 import { useAutosave } from "@/lib/use-autosave";
 import { sameJson } from "@/lib/format";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
@@ -468,6 +468,9 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
   const [removing, setRemoving] = useState(false);
   // The highlight this form made or attached to: its id, whether it existed before, and its saved passage.
   const hlRef = useRef<{ id: number; existing: boolean; passage: string } | null>(null);
+  // A create this form sent without hearing back (network error, timeout): its passage and when it was first sent.
+  // A retry that finds that row is this form's own highlight, not one saved before (ownRetriedHighlight).
+  const unconfirmed = useRef<{ passage: string; at: number } | null>(null);
   const fields = useRef({ passage, comment, chapter, concept, customConcept, source });
   const oRef = useRef(o);
   oRef.current = o;
@@ -492,10 +495,19 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
       const hl = hlRef.current;
       // A new highlight, or a different passage after attaching to one saved before: create.
       if (!hl || (hl.existing && v.body.passage !== hl.passage)) {
+        if (unconfirmed.current?.passage !== v.body.passage) unconfirmed.current = { passage: v.body.passage, at: Date.now() };
         const json = await saveRequest("/api/reading/highlights", { method: "POST", body: { ...v.body, book: oRef.current.book.slug }, keepalive });
-        const h = json.highlight as { highlight_id?: number; passage?: string } | undefined;
-        if (h?.highlight_id) setHighlight({ id: h.highlight_id, existing: !json.created, passage: h.passage ?? v.body.passage });
-        if (json.created) onAdded(1);
+        const h = json.highlight as { highlight_id?: number; passage?: string; created_at?: string } | undefined;
+        const own = !!json.created || (!!h && ownRetriedHighlight(h, unconfirmed.current));
+        unconfirmed.current = null;
+        if (!h?.highlight_id) return;
+        setHighlight({ id: h.highlight_id, existing: !own, passage: h.passage ?? v.body.passage });
+        if (own && !json.created) {
+          // The retry found the row this form's lost send made: it is ours, so it takes the values on screen.
+          const body = { passage: v.body.passage, comment: v.body.comment, chapter: v.body.chapter, concept: v.body.concept, source: v.body.source };
+          await saveRequest(`/api/reading/highlights/${h.highlight_id}`, { method: "PATCH", body, keepalive });
+        }
+        if (own) onAdded(1);
         else onSaved();
         return;
       }
@@ -538,6 +550,7 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
 
   const startNew = () => {
     setHighlight(null);
+    unconfirmed.current = null;
     autosave.reset();
     fields.current = { ...fields.current, passage: "", comment: "" };
     setPassage("");
@@ -702,7 +715,7 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
                 </button>
                 <button
                   type="button"
-                  onClick={() => void autosave.flush().then(() => { if (alive.current) startNew(); })}
+                  onClick={() => void autosave.flush().then((ok) => { if (ok && alive.current) startNew(); })}
                   disabled={busy || st === "error"}
                   className="px-3 h-8 rounded-control text-[13px] font-medium border border-border-subtle text-text-secondary hover:text-text-primary disabled:opacity-40"
                 >

@@ -291,6 +291,44 @@ test("client: the Agents card settles only once every core daytime question is s
   assert.deepEqual(h.done, ["2031-03-05"], "not again for the same day");
 });
 
+test("client: on today a tap is saved alone; the day's pre-fills are stored only in the save that completes the day", async (t) => {
+  const SUGGESTED = "Synthetic pre-filled question?";
+  const LAST = "Synthetic last daytime question?";
+  const base = page();
+  base.items.push(question(SUGGESTED, false), question(LAST, false));
+  base.suggestions = { [SUGGESTED]: { answer: "Yes", source: "synthetic data" } };
+  const stored = {};
+  const h = await mount(t, {
+    initial: base,
+    onPost: async (body) => { Object.assign(stored, body.answers); return response({ success: true }); },
+    onGet: (date, current) => ({ ...current, date: date ?? current.date, answers: { ...stored } }),
+  });
+  h.click(`${DAY}: yes`); await h.flush();
+  await h.tick();
+  assert.deepEqual(h.posts, [{ date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" }], "the pre-fill waits: it can still change today");
+  assert.deepEqual(h.done, []);
+  assert.match(h.text(), /from synthetic data/, "still shown as a suggestion");
+  await h.tick(60_000);
+  assert.equal(h.posts.length, 1, "a pre-fill alone is never sent");
+  h.click(`${LAST}: no`); await h.flush();
+  await h.tick();
+  assert.deepEqual(h.posts[1], { date: "2031-03-05", answers: { [SUGGESTED]: "Yes", [LAST]: "No" }, today: "2031-03-05" }, "complete counting the pre-fill: stored with the last answer");
+  assert.deepEqual(h.done, ["2031-03-05"], "and the card settles in the same save");
+});
+
+test("client: on a catch-up day the day's pre-fills go with the first tap", async (t) => {
+  const SUGGESTED = "Synthetic pre-filled question?";
+  const LAST = "Synthetic last daytime question?";
+  const base = page();
+  base.items.push(question(SUGGESTED, false), question(LAST, false));
+  base.suggestions = { [SUGGESTED]: { answer: "Yes", source: "synthetic data" } };
+  const h = await mount(t, { initial: base });
+  h.navigate("2031-03-04"); await h.flush();
+  h.click(`${DAY}: yes`); await h.flush();
+  await h.tick();
+  assert.deepEqual(h.posts, [{ date: "2031-03-04", answers: { [DAY]: "Yes", [SUGGESTED]: "Yes" }, today: "2031-03-05" }]);
+});
+
 test("client: a sleep-only save never settles the card", async (t) => {
   const h = await mount(t);
   h.click(`${SLEEP}: yes`); await h.flush();

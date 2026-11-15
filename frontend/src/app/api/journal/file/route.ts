@@ -16,9 +16,10 @@ import { bodySha, createJournalPageRef, findRetriedEntry, inferJournalLabels, no
 //   - title, mood, confidence, topics: Riley's when sent; any left blank are inferred in ONE model call
 //     (structured output, existing topic tags preferred). The model only labels: its output never touches the body.
 // A save repeated within 15 minutes with the same day and words returns the entry already there (`existing`).
-// `known_sha`: hashes of earlier versions the box sent whose answer never came. A page of the last 15 minutes that
-// holds one of them is that same entry: returned with `existing` and `stale` (the box then sends the newer words
-// to the PATCH), so a lost answer never leaves two entries.
+// `known_sha`: hashes of earlier versions the box sent whose answer never came (registered on the device before each
+// send, so they survive a closed tab; a restored entry also sends its own `date`). A page of that day holding one of
+// them is that same entry, however long ago it was created: returned with `existing` and `stale` (the box then sends
+// the newer words to the PATCH), so a lost answer never leaves two entries.
 //
 // Answers: 200 { id, url, sha, title, mood, confidence, topics, date, existing?, stale? } (`sha` = hash of the words
 // the page holds), 400 with the reason, 502 when the

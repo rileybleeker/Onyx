@@ -9,7 +9,7 @@ import { sameJson } from "@/lib/format";
 import { useLogDrafts, type ReadingLogDraft } from "@/lib/log-drafts";
 import { LOG_READING_URL, logEarlyGet } from "@/lib/log-early";
 import type { Book, Medium, ReadingOverview, ReadingSession } from "@/lib/reading";
-import { isBlankSession, readingSaveTarget, sameReadingValue, sessionValue, type SessionValue } from "@/lib/reading-autosave";
+import { isBlankSession, newClientKey, readingSaveTarget, sameReadingValue, sessionValue, type SessionValue } from "@/lib/reading-autosave";
 import { useAutosave } from "@/lib/use-autosave";
 import { DraftMark, LogCard, SectionSkeleton } from "./ui";
 
@@ -120,7 +120,12 @@ export default function ReadingSection() {
   // The session this form made (POST), edited by every later save (PATCH); null = the next save creates one.
   const [sessionId, setSessionIdState] = useState<number | null>(null);
   const sessionRef = useRef<number | null>(null);
+  // Idempotency key of the session being made (a retried create returns the same row), and the day of the habit
+  // row that session made as the server reported it (sent back so a later move or removal can take it back).
+  const clientKey = useRef<string>("");
+  const habitCreatedOn = useRef<string | null>(null);
   const [saved, setSaved] = useState<SavedInfo>(null);
+  const [heldDraft, setHeldDraft] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [removeError, setRemoveError] = useState<string | null>(null);
   const { draft, clear } = useLogDrafts("reading");
@@ -180,19 +185,37 @@ export default function ReadingSection() {
       if (!v.body) return;
       const id = sessionRef.current;
       const target = readingSaveTarget("sessions", id);
+      const send = (url: string, method: string, body: Record<string, unknown>) => saveRequest(url, { method, body, keepalive });
       let json: Record<string, unknown>;
       try {
-        json = await saveRequest(target.url, { method: target.method, body: v.body, keepalive });
+        if (id === null) {
+          if (!clientKey.current) clientKey.current = newClientKey();
+          json = await send(target.url, "POST", { ...v.body, client_key: clientKey.current });
+        } else {
+          json = await send(target.url, "PATCH", { ...v.body, habit_created_on: habitCreatedOn.current });
+        }
       } catch (e) {
         if (id !== null && e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
-          // Removed elsewhere: Retry logs it again as a new session.
-          if (sessionRef.current === id) setSessionId(null);
+          // Removed elsewhere: Retry logs it again as a new session (a new key: the old one named a removed row).
+          if (sessionRef.current === id) {
+            setSessionId(null);
+            clientKey.current = newClientKey();
+            habitCreatedOn.current = null;
+          }
           throw new AutosaveRefused("That session was removed elsewhere. Retry logs it again.");
         }
         throw e;
       }
       const session = json.session as ReadingSession | undefined;
-      if (id === null && session?.session_id && sessionRef.current === null) setSessionId(session.session_id);
+      if (id === null && session?.session_id && sessionRef.current === null) {
+        setSessionId(session.session_id);
+        if (json.replayed) {
+          // A retry of a create whose answer was lost: the stored row holds the values of the first send, so the
+          // values on screen now are written onto it.
+          json = await send(readingSaveTarget("sessions", session.session_id).url, "PATCH", { ...v.body, habit_created_on: habitCreatedOn.current });
+        }
+      }
+      if (typeof json.habit_created_on === "string" || json.habit_created_on === null) habitCreatedOn.current = (json.habit_created_on as string | null) ?? null;
       if (alive.current) setSaved({ xp: Number(json.xp_gained) || 0, finished: !!json.finished });
       showOverview(json.overview as ReadingOverview | null | undefined);
       const savedDraft = pendingDraft.current;
@@ -242,6 +265,9 @@ export default function ReadingSection() {
   /** Start the next session: the one on screen is kept as saved. */
   const startNew = useCallback(() => {
     setSessionId(null);
+    clientKey.current = newClientKey();
+    habitCreatedOn.current = null;
+    setHeldDraft(false);
     touched.current = { ...EMPTY_FIELDS };
     setFromDraft(null);
     setSaved(null);
@@ -255,10 +281,15 @@ export default function ReadingSection() {
     if (!draft) return;
     const d = draft;
     // Words about another session: the session already made from this form keeps its values (anything still
-    // waiting is sent first), and the words fill a new one.
-    if (sessionRef.current !== null && !force) {
-      await autosave.flush();
+    // waiting is sent first), and the words fill a new one. If that send fails the form stays as it is and the
+    // words wait (Use, once it is saved).
+    if (sessionRef.current !== null) {
+      const ok = await autosave.flush();
       if (!alive.current) return;
+      if (!ok) {
+        setHeldDraft(true);
+        return;
+      }
       startNew();
     }
     const vals = draftFields(d.value);
@@ -316,7 +347,8 @@ export default function ReadingSection() {
     setRemoving(true);
     setRemoveError(null);
     try {
-      const res = await fetch(`/api/reading/sessions/${id}`, { method: "DELETE" });
+      const day = habitCreatedOn.current;
+      const res = await fetch(`/api/reading/sessions/${id}${day ? `?habit_created_on=${encodeURIComponent(day)}` : ""}`, { method: "DELETE" });
       const json = (await res.json().catch(() => ({}))) as { error?: string; overview?: ReadingOverview | null };
       if (!res.ok && res.status !== 404) throw new Error(json.error || `HTTP ${res.status}`);
       if (!alive.current) return;
@@ -436,6 +468,9 @@ export default function ReadingSection() {
           )}
         </div>
 
+        {heldDraft && draftUnused && draft && (
+          <p className="mt-1 text-[12px] text-text-secondary">The session above isn&apos;t saved yet, so these words wait. Tap Use once it is saved.</p>
+        )}
         {draftUnused && draft && (
           <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px]">
             <DraftMark />
@@ -560,7 +595,7 @@ export default function ReadingSection() {
               </button>
               <button
                 type="button"
-                onClick={() => void autosave.flush().then(() => { if (alive.current) startNew(); })}
+                onClick={() => void autosave.flush().then((ok) => { if (ok && alive.current) startNew(); })}
                 disabled={busy || st === "error"}
                 className="min-h-11 px-4 rounded-full text-[13px] font-medium border border-border-subtle text-text-secondary hover:text-text-primary disabled:opacity-40"
               >

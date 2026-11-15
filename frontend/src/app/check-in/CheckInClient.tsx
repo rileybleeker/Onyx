@@ -407,10 +407,12 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   const coreLeft = core.length - coreDone;
   const dayBlanks = core.filter((i) => !cells[i.name]);
 
-  // What each autosave sends: only the parts Riley touched (see savePlan).
+  // What each autosave sends: only the parts Riley touched; on behavioral today, the day's pre-fills only once the
+  // day is complete counting them (see savePlan).
+  const dayIsToday = !!data && data.date === data.today;
   const { dayPatch, nightPatches, changeCount } = useMemo(
-    () => savePlan({ dayItems, dayAnswers: data?.answers ?? {}, cells, sleepItems, nights, nightCells }),
-    [data, dayItems, cells, sleepItems, nights, nightCells]
+    () => savePlan({ dayItems, dayAnswers: data?.answers ?? {}, cells, sleepItems, nights, nightCells, dayIsToday }),
+    [data, dayItems, cells, sleepItems, nights, nightCells, dayIsToday]
   );
 
   // Run by the autosave scheduler only (never on open): the newest render's plan. Throws so the scheduler shows

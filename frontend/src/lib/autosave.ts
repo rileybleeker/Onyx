@@ -144,13 +144,16 @@ export class Autosaver<T> {
     }
   }
 
-  /** Forget everything waiting (the form was reset on purpose). */
+  /**
+   * Forget everything waiting (the form was reset on purpose: a new entry, an Undo, a removal). The last saved value
+   * is forgotten too unless `baseline` says what the server holds now, so typing the same value again is sent.
+   */
   reset(baseline?: T): void {
     this.clearTimers();
     this.latest = null;
     this.refused = null;
     this.retries = 0;
-    if (baseline !== undefined) this.saved = { value: baseline };
+    this.saved = baseline === undefined ? null : { value: baseline };
     this.set({ status: "idle", error: null, retrying: false });
   }
 
@@ -183,8 +186,17 @@ export class Autosaver<T> {
     }, delay);
   }
 
-  /** Save now whatever is waiting (blur, Enter, page hidden). Resolves when nothing is left in flight. */
-  async flush(keepalive = false): Promise<void> {
+  /**
+   * Save now whatever is waiting (blur, Enter, page hidden). Resolves when nothing is left in flight: true when
+   * nothing is left unsaved (false after a failure, or with incomplete input), so a caller about to clear the form
+   * (New entry, switching items) can keep it instead of dropping an edit.
+   */
+  async flush(keepalive = false): Promise<boolean> {
+    await this.send(keepalive);
+    return !this.dirty;
+  }
+
+  private async send(keepalive: boolean): Promise<void> {
     if (this.timer !== null) {
       this.timers.clear(this.timer);
       this.timer = null;
@@ -212,12 +224,12 @@ export class Autosaver<T> {
     // A value that waits for flush() (delayMs: null) stays waiting.
     const after = this.latest;
     if (after && after !== next && !after.manual && this.timer === null && this.retryTimer === null && this.state.status !== "error") {
-      await this.flush(keepalive);
+      await this.send(keepalive);
     }
   }
 
-  /** Try again now after a failure. */
-  retry(): Promise<void> {
+  /** Try again now after a failure. Same answer as flush(). */
+  retry(): Promise<boolean> {
     this.refused = null;
     this.retries = 0;
     return this.flush();

@@ -8,9 +8,9 @@ export type UseAutosave<T> = {
   state: AutosaveState;
   /** A new value from the form (see Autosaver.change). */
   change: (value: T, opts?: { delayMs?: number | null }) => void;
-  /** Save now (blur, Enter). */
-  flush: () => Promise<void>;
-  retry: () => Promise<void>;
+  /** Save now (blur, Enter). True when nothing is left unsaved (false after a failure or with incomplete input). */
+  flush: () => Promise<boolean>;
+  retry: () => Promise<boolean>;
   setBaseline: (value: T) => void;
   reset: (baseline?: T) => void;
   /** Anything not saved yet. */
@@ -56,9 +56,12 @@ export function useAutosave<T>(name: string, opts: Omit<AutosaverOptions<T>, "on
       document.removeEventListener("visibilitychange", hidden);
       window.removeEventListener("pagehide", leave);
       alive.current = false;
-      // Unmount (navigation, the scroll dropping the section): send what is waiting. Not disposed: React's dev
-      // double mount runs this cleanup and then mounts the same saver again.
-      void saver.flush(true);
+      // Unmount (navigation, the scroll dropping the section): send what is waiting once, then stop (no retries
+      // with nothing on screen to show them). React's dev double mount runs this cleanup and mounts the same saver
+      // again before the flush settles, so it is only stopped when it is still unmounted then.
+      void saver.flush(true).finally(() => {
+        if (!alive.current) saver.dispose();
+      });
     };
   }, [saver]);
 

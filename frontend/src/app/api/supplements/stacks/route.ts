@@ -91,14 +91,39 @@ export async function GET(req: NextRequest) {
   return NextResponse.json({ stacks: decorated });
 }
 
+const STACK_COLS = "stack_id,name,description,remind_time,is_active,sort_order,created_at,updated_at";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** True when the error is the client_key column not existing yet (sql/supplement_stack_client_key.sql not applied). */
+function missingKeyColumn(e: { code?: string; message?: string } | null): boolean {
+  return !!e && (e.code === "42703" || e.code === "PGRST204" || /client_key/.test(e.message ?? ""));
+}
+
+/** Replace all items of a stack (delete-by-stack_id + insert). Answers the error text, or null. */
+async function replaceItems(stack_id: number, items: IncomingItem[] | undefined): Promise<{ error: string | null; count: number }> {
+  const { error: delErr } = await supabase.from("supplement_stack_item").delete().eq("stack_id", stack_id);
+  if (delErr) return { error: delErr.message, count: 0 };
+  const { rows } = buildItemRows(stack_id, items);
+  if (rows.length > 0) {
+    const { error: insErr } = await supabase.from("supplement_stack_item").insert(rows);
+    if (insErr) return { error: insErr.message, count: 0 };
+  }
+  return { error: null, count: rows.length };
+}
+
 /**
  * POST /api/supplements/stacks
- * Body: { name, description?, remind_time?, items: [{ product_id, doses }] }
+ * Body: { name, description?, remind_time?, items: [{ product_id, doses }], client_key?: uuid }
  *
  * Creates a new stack (header + items). Items with a blank product_id are
  * skipped; duplicates within the payload are de-duped (the table also enforces
  * a unique (stack_id, product_id)). remind_time is a local 'HH:MM' for the push
  * reminder; empty / null = reminders off.
+ *
+ * client_key (the stack editor's autosave sends one random UUID per new stack): when a stack with that key exists
+ * already (the editor retried after a lost answer), it is brought up to this body and returned with existing: true
+ * instead of inserting a second stack. Works without the key column (sql/supplement_stack_client_key.sql) too:
+ * the stack is then created without a key, as before.
  */
 export async function POST(req: NextRequest) {
   const body = (await req.json()) as {
@@ -106,18 +131,53 @@ export async function POST(req: NextRequest) {
     description?: string;
     remind_time?: string | null;
     items?: IncomingItem[];
+    client_key?: unknown;
   };
   const name = body.name?.trim();
   if (!name) return NextResponse.json({ error: "name is required" }, { status: 400 });
   const remind = parseRemindTime(body.remind_time ?? null);
   if (!remind.ok) return NextResponse.json({ error: remind.error }, { status: 400 });
+  if (body.client_key !== undefined && body.client_key !== null && (typeof body.client_key !== "string" || !UUID_RE.test(body.client_key))) {
+    return NextResponse.json({ error: "client_key must be a UUID" }, { status: 400 });
+  }
+  const key = typeof body.client_key === "string" ? body.client_key.toLowerCase() : null;
+  const header = { name, description: body.description?.trim() || null, remind_time: remind.value };
 
-  const { data: stack, error: stackErr } = await supabase
+  // The stack this key already created: update it to this body (the editor may have changed since) and return it.
+  const adopt = async (): Promise<NextResponse | null> => {
+    if (!key) return null;
+    const { data: found, error: findErr } = await supabase.from("supplement_stack").select(STACK_COLS).eq("client_key", key).maybeSingle();
+    if (findErr) return missingKeyColumn(findErr) ? null : NextResponse.json({ error: findErr.message }, { status: 500 });
+    if (!found) return null;
+    const { data: updated, error: upErr } = await supabase
+      .from("supplement_stack")
+      .update({ ...header, updated_at: new Date().toISOString() })
+      .eq("stack_id", found.stack_id)
+      .select(STACK_COLS)
+      .single();
+    if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 });
+    const items = await replaceItems(found.stack_id, body.items);
+    if (items.error) return NextResponse.json({ error: items.error }, { status: 500 });
+    return NextResponse.json({ ...updated, item_count: items.count, existing: true });
+  };
+
+  const earlier = await adopt();
+  if (earlier) return earlier;
+
+  let { data: stack, error: stackErr } = await supabase
     .from("supplement_stack")
-    .insert({ name, description: body.description?.trim() || null, remind_time: remind.value })
-    .select("stack_id,name,description,remind_time,is_active,sort_order,created_at,updated_at")
+    .insert({ ...header, ...(key ? { client_key: key } : {}) })
+    .select(STACK_COLS)
     .single();
-  if (stackErr) return NextResponse.json({ error: stackErr.message }, { status: 500 });
+  if (stackErr && key && stackErr.code === "23505") {
+    // The same key was inserted by a request still in flight: answer with that stack.
+    const again = await adopt();
+    if (again) return again;
+  }
+  if (stackErr && key && missingKeyColumn(stackErr)) {
+    ({ data: stack, error: stackErr } = await supabase.from("supplement_stack").insert(header).select(STACK_COLS).single());
+  }
+  if (stackErr || !stack) return NextResponse.json({ error: stackErr?.message ?? "insert failed" }, { status: 500 });
 
   const { rows } = buildItemRows(stack.stack_id, body.items);
   if (rows.length > 0) {

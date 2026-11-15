@@ -551,8 +551,12 @@ export interface LogSessionInput {
   question?: string | null;
   /** 'manual' (the /reading form) or 'chat' (the Claude tool). Kindle-derived sessions are written by lib/reading-kindle.ts only. */
   source?: "manual" | "chat" | null;
+  /**
+   * Idempotency key (a UUID) from the autosaving /log form: a POST retried after a lost answer returns the session
+   * the first one made, with no second XP, habit stamp or Notion entry (sql/reading_sessions_client_key.sql).
+   */
+  client_key?: string | null;
 }
-
 export interface LogSessionResult {
   ok: true;
   book: Book;
@@ -560,6 +564,93 @@ export interface LogSessionResult {
   xpGained: number;
   finished: boolean;
   habitMarked: boolean;
+  /** True when this call made the day's habit row (none existed); null when unknown (a replay). */
+  habitCreated: boolean | null;
+  /** A retry of an earlier create (same client_key): the stored session, nothing written. */
+  replayed: boolean;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The client_key column is new (sql/reading_sessions_client_key.sql): until it is applied, keys are ignored.
+ * Codes only: a unique violation (23505) also names the client_key index and must never read as "no column".
+ */
+function missingColumn(error: { code?: string } | null | undefined): boolean {
+  return !!error && (error.code === "42703" || error.code === "PGRST204");
+}
+
+async function sessionByClientKey(supabase: Supa, key: string): Promise<ReadingSession | null> {
+  const { data, error } = await supabase.from("reading_sessions").select(SESSION_COLS).eq("client_key", key).maybeSingle();
+  if (error) return null; // column not there yet, or a read failure: behave as before (plain insert)
+  return (data as ReadingSession | null) ?? null;
+}
+
+/** The furthest chapter of the book's sessions, leaving one session out (null = none left out). */
+async function furthestChapter(supabase: Supa, bookId: number, except: number | null): Promise<number> {
+  let q = supabase.from("reading_sessions").select("chapter_through").eq("book_id", bookId);
+  if (except !== null) q = q.neq("session_id", except);
+  const { data } = await q.order("chapter_through", { ascending: false }).limit(1);
+  return (data?.[0]?.chapter_through as number | undefined) ?? 0;
+}
+
+const sessionXp = (through: number, prevMax: number, recall: string | null) =>
+  Math.max(0, through - prevMax) * XP.perChapter + ((recall ?? "").length >= 40 ? XP.perRecall : 0);
+
+/** Stamp the book's habit Yes on `date`; `created` = no row for that day existed before. */
+async function stampHabit(supabase: Supa, book: Book, date: string): Promise<{ marked: boolean; created: boolean }> {
+  if (!book.habit_name) return { marked: false, created: false };
+  const { data: had } = await supabase.from("habit_journal").select("answer").eq("cycle_date", date).eq("question", book.habit_name).maybeSingle();
+  const { error } = await supabase
+    .from("habit_journal")
+    .upsert({ cycle_date: date, question: book.habit_name, category: "learning", answer: "Yes" }, { onConflict: "cycle_date,question" });
+  if (error) {
+    console.error("reading: habit stamp failed:", error.message);
+    return { marked: false, created: false };
+  }
+  return { marked: true, created: !had };
+}
+
+/**
+ * Take back a habit Yes a session made on `date` (the session moved to another day, or was removed): only when no
+ * other session of a book with the same habit is on that day. A row the session did not create is never touched
+ * (the caller decides that).
+ */
+async function unstampHabitIfUnused(supabase: Supa, book: Book, date: string, exceptSession: number): Promise<boolean> {
+  if (!book.habit_name) return false;
+  const { data: sameHabit } = await supabase.from("books").select("book_id").eq("habit_name", book.habit_name);
+  const ids = new Set<number>([book.book_id, ...((sameHabit ?? []) as Array<{ book_id: number }>).map((b) => b.book_id)]);
+  const { data: others, error } = await supabase
+    .from("reading_sessions")
+    .select("session_id")
+    .eq("session_date", date)
+    .in("book_id", [...ids])
+    .neq("session_id", exceptSession)
+    .limit(1);
+  if (error || others?.length) return false;
+  const { error: dErr } = await supabase.from("habit_journal").delete().eq("cycle_date", date).eq("question", book.habit_name).eq("answer", "Yes");
+  if (dErr) console.error("reading: habit unstamp failed:", dErr.message);
+  return !dErr;
+}
+
+/**
+ * The book was finished by `previous` (its day is the finish day and it reached the last chapter) and that session
+ * no longer does (edited below the end, moved to another book, or removed): back to reading when no other session
+ * reaches the last chapter.
+ */
+async function undoFinishIfOnlyThis(supabase: Supa, book: Book, previous: ReadingSession, exceptSession: number): Promise<boolean> {
+  const total = book.total_chapters;
+  if (book.status !== "finished" || !total || (previous.chapter_through ?? 0) < total || book.finished_on !== previous.session_date) return false;
+  const { data: rest } = await supabase
+    .from("reading_sessions")
+    .select("session_id")
+    .eq("book_id", book.book_id)
+    .gte("chapter_through", total)
+    .neq("session_id", exceptSession)
+    .limit(1);
+  if (rest?.length) return false;
+  const { error } = await supabase.from("books").update({ status: "reading", finished_on: null }).eq("book_id", book.book_id);
+  return !error;
 }
 
 export async function logSession(supabase: Supa, input: LogSessionInput): Promise<LogSessionResult | { ok: false; error: string }> {
@@ -567,6 +658,26 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
     ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
     : await getBook(supabase, input.slug ?? null);
   if (!book) return { ok: false, error: "No active book found" };
+
+  const key = typeof input.client_key === "string" && UUID_RE.test(input.client_key) ? input.client_key.toLowerCase() : null;
+  const replay = async (prior: ReadingSession): Promise<LogSessionResult> => {
+    const { data: b } = await supabase.from("books").select(BOOK_COLS).eq("book_id", prior.book_id).maybeSingle();
+    const prevMax = await furthestChapter(supabase, prior.book_id, prior.session_id);
+    return {
+      ok: true,
+      book: (b as Book | null) ?? book,
+      session: prior,
+      xpGained: sessionXp(prior.chapter_through ?? 0, prevMax, prior.recall),
+      finished: false,
+      habitMarked: false,
+      habitCreated: null,
+      replayed: true,
+    };
+  };
+  if (key) {
+    const prior = await sessionByClientKey(supabase, key);
+    if (prior) return replay(prior);
+  }
 
   const through = Math.floor(Number(input.chapter_through));
   if (!Number.isFinite(through) || through < 0) return { ok: false, error: "chapter_through must be a non-negative integer" };
@@ -578,13 +689,7 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
 
   // chapter_from defaults to (previous max chapter) + 1.
   let from = input.chapter_from ?? null;
-  const { data: prevRows } = await supabase
-    .from("reading_sessions")
-    .select("chapter_through")
-    .eq("book_id", book.book_id)
-    .order("chapter_through", { ascending: false })
-    .limit(1);
-  const prevMax = (prevRows?.[0]?.chapter_through as number | undefined) ?? 0;
+  const prevMax = await furthestChapter(supabase, book.book_id, null);
   if (from === null) from = Math.min(through, prevMax + 1);
 
   const medium = input.medium && ["audio", "kindle", "paper", "other"].includes(input.medium) ? input.medium : null;
@@ -599,13 +704,18 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
     question: input.question?.trim() || null,
     source: input.source === "chat" ? "chat" : "manual",
   };
-  const { data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single();
+  let { data, error } = await supabase.from("reading_sessions").insert(key ? { ...row, client_key: key } : row).select(SESSION_COLS).single();
+  if (error && key && error.code === "23505") {
+    // The same create arrived twice at once: the other one made the session.
+    const prior = await sessionByClientKey(supabase, key);
+    if (prior) return replay(prior);
+  }
+  if (error && key && missingColumn(error)) ({ data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single());
   if (error) return { ok: false, error: error.message };
   const session = data as ReadingSession;
 
   // XP gained by this session (chapters newly advanced + recall).
-  const newChapters = Math.max(0, through - prevMax);
-  const xpGained = newChapters * XP.perChapter + ((row.recall ?? "").length >= 40 ? XP.perRecall : 0);
+  const xpGained = sessionXp(through, prevMax, row.recall);
 
   // Finished?
   let finished = false;
@@ -615,16 +725,18 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
   }
 
   // Stamp the habit (Yes) for the session day so /habits + the HRV pipeline see it.
-  let habitMarked = false;
-  if (book.habit_name) {
-    const { error: hErr } = await supabase
-      .from("habit_journal")
-      .upsert({ cycle_date: date, question: book.habit_name, category: "learning", answer: "Yes" }, { onConflict: "cycle_date,question" });
-    habitMarked = !hErr;
-    if (hErr) console.error("reading: habit stamp failed:", hErr.message);
-  }
+  const habit = await stampHabit(supabase, book, date);
 
-  return { ok: true, book: { ...book, status: finished ? "finished" : book.status }, session, xpGained, finished, habitMarked };
+  return {
+    ok: true,
+    book: { ...book, status: finished ? "finished" : book.status, finished_on: finished ? date : book.finished_on },
+    session,
+    xpGained,
+    finished,
+    habitMarked: habit.marked,
+    habitCreated: habit.created,
+    replayed: false,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -641,13 +753,26 @@ export interface SessionUpdate {
   medium: Medium | null;
   recall: string | null;
   question: string | null;
+  /**
+   * The day this session's create (or last move) made the book's habit row on, as the server reported it
+   * (`habit_created_on`); null = it made none, or unknown. Moving the session off that day takes the row back
+   * when no other session is on it.
+   */
+  habit_created_on: string | null;
 }
 
-const SESSION_UPDATE_FIELDS = new Set(["book", "date", "chapter_through", "chapter_from", "minutes", "medium", "recall", "question"]);
+const SESSION_UPDATE_FIELDS = new Set(["book", "date", "chapter_through", "chapter_from", "minutes", "medium", "recall", "question", "habit_created_on"]);
 const SESSION_TEXT_MAX = 20000;
 
+/** A real calendar date as YYYY-MM-DD, or null. */
+export function ymdOrNull(v: unknown): string | null | undefined {
+  if (v === undefined || v === null || v === "") return null;
+  if (typeof v !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(v) || Number.isNaN(Date.parse(`${v}T12:00:00Z`))) return undefined;
+  return new Date(`${v}T12:00:00Z`).toISOString().slice(0, 10) === v ? v : undefined;
+}
+
 /**
- * Parse a session PATCH body (pure). Unknown fields are refused, numbers must be whole and not negative, the date a
+ * Parse a session PATCH body (pure). Unknown fields are refused, numbers must be whole and not negative, dates
  * real YYYY-MM-DD; the recall note and question are strings (stored as typed apart from the surrounding whitespace,
  * like logSession). The chapter limit and "not after today" need the book and the day, so updateSession checks them.
  */
@@ -669,14 +794,10 @@ export function parseSessionUpdate(raw: unknown): { ok: true; input: SessionUpda
   if (from !== null && from > through) return { ok: false, error: "chapter_from must be at most chapter_through" };
   const minutes = whole(b.minutes, "minutes");
   if (minutes !== null && typeof minutes === "object") return { ok: false, error: minutes.error };
-  let date: string | null = null;
-  if (b.date !== undefined && b.date !== null && b.date !== "") {
-    const d = b.date;
-    if (typeof d !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(d) || Number.isNaN(Date.parse(`${d}T12:00:00Z`)) || new Date(`${d}T12:00:00Z`).toISOString().slice(0, 10) !== d) {
-      return { ok: false, error: "date must be YYYY-MM-DD" };
-    }
-    date = d;
-  }
+  const date = ymdOrNull(b.date);
+  if (date === undefined) return { ok: false, error: "date must be YYYY-MM-DD" };
+  const habitCreatedOn = ymdOrNull(b.habit_created_on);
+  if (habitCreatedOn === undefined) return { ok: false, error: "habit_created_on must be YYYY-MM-DD" };
   let medium: Medium | null = null;
   if (b.medium !== undefined && b.medium !== null && b.medium !== "") {
     if (typeof b.medium !== "string" || !["audio", "kindle", "paper", "other"].includes(b.medium)) return { ok: false, error: "medium must be audio, kindle, paper or other" };
@@ -697,11 +818,24 @@ export function parseSessionUpdate(raw: unknown): { ok: true; input: SessionUpda
     if (typeof b.book !== "string" || b.book.length > 200) return { ok: false, error: "book must be a slug" };
     book = b.book;
   }
-  return { ok: true, input: { book, date, chapter_through: through, chapter_from: from, minutes, medium, recall, question } };
+  return { ok: true, input: { book, date, chapter_through: through, chapter_from: from, minutes, medium, recall, question, habit_created_on: habitCreatedOn } };
 }
 
 export type SessionEditResult =
-  | { ok: true; book: Book; previousBook: Book; session: ReadingSession; previous: ReadingSession; xpGained: number; finished: boolean; habitMarked: boolean }
+  | {
+      ok: true;
+      book: Book;
+      previousBook: Book;
+      session: ReadingSession;
+      previous: ReadingSession;
+      xpGained: number;
+      finished: boolean;
+      /** The edit took back a finish this session had caused. */
+      unfinished: boolean;
+      habitMarked: boolean;
+      /** The day of the habit row this session made, after the edit (send it back with the next edit); null = none. */
+      habitCreatedOn: string | null;
+    }
   | { ok: false; status: number; error: string };
 
 async function editableSession(
@@ -721,16 +855,22 @@ async function editableSession(
 }
 
 /**
- * Update a manual or chat session in place (the autosaving forms on /log and /reading edit the session they
- * created). Same rules as logSession: chapter_through not past the book's last chapter, chapter_from defaulting to
- * the furthest chapter of the book's OTHER sessions + 1, the day not after behavioral today. Reaching the last
- * chapter finishes the book; a new day (or book) stamps that book's habit Yes on the new day. The old day's habit
- * row is left alone: it may be Riley's own answer. Kindle sessions are refused (409).
+ * Update a manual or chat session in place (the autosaving /log form edits the session it created). Same rules as
+ * logSession: chapter_through not past the book's last chapter, chapter_from defaulting to the furthest chapter of
+ * the book's OTHER sessions + 1, the day not after behavioral today. Kindle sessions are refused (409).
+ * What an earlier saved value did is undone when the edit takes it away:
+ *  - reaching the last chapter finishes the book; editing back below it (or moving the session to another book)
+ *    sets a finish this session caused back to reading when no other session reaches the last chapter; a moved
+ *    finishing session moves the finish day with it;
+ *  - a new day (or book) stamps that book's habit Yes there; the old day's Yes is taken back only when this
+ *    session made it (`habit_created_on`, which the server reported) and no other session of a book with the same
+ *    habit is on that day. A row the session did not make (Riley's own answer) is never touched.
  */
 export async function updateSession(supabase: Supa, sessionId: number, input: SessionUpdate): Promise<SessionEditResult> {
   const cur = await editableSession(supabase, sessionId);
   if (!cur.ok) return cur;
   const previous = cur.session;
+  const previousBook = cur.book;
   let book = cur.book;
   if (input.book && input.book !== book.slug) {
     const other = await getBook(supabase, input.book);
@@ -748,14 +888,7 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
     date = input.date;
   }
 
-  const { data: prevRows } = await supabase
-    .from("reading_sessions")
-    .select("chapter_through")
-    .eq("book_id", book.book_id)
-    .neq("session_id", sessionId)
-    .order("chapter_through", { ascending: false })
-    .limit(1);
-  const prevMax = (prevRows?.[0]?.chapter_through as number | undefined) ?? 0;
+  const prevMax = await furthestChapter(supabase, book.book_id, sessionId);
   const from = input.chapter_from ?? Math.min(through, prevMax + 1);
   if (from > through) return { ok: false, status: 400, error: "chapter_from must be at most chapter_through" };
 
@@ -773,45 +906,78 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
   if (error) return { ok: false, status: 500, error: error.message };
   const session = data as ReadingSession;
 
-  const xpGained = Math.max(0, through - prevMax) * XP.perChapter + ((patch.recall ?? "").length >= 40 ? XP.perRecall : 0);
+  const xpGained = sessionXp(through, prevMax, patch.recall);
+  const sameBook = book.book_id === previousBook.book_id;
+  const total = book.total_chapters;
+  const reachesEnd = !!total && through >= total;
 
+  // Finished: set it, move it with its session, or take back the finish this session caused.
   let finished = false;
-  if (book.total_chapters && through >= book.total_chapters && book.status !== "finished") {
+  let unfinished = false;
+  let finishedOn = book.finished_on;
+  let status = book.status;
+  if (reachesEnd && book.status !== "finished") {
     await supabase.from("books").update({ status: "finished", finished_on: date }).eq("book_id", book.book_id);
     finished = true;
+    status = "finished";
+    finishedOn = date;
+  } else if (
+    reachesEnd &&
+    sameBook &&
+    date !== previous.session_date &&
+    book.finished_on === previous.session_date &&
+    (previous.chapter_through ?? 0) >= (total ?? Infinity)
+  ) {
+    await supabase.from("books").update({ finished_on: date }).eq("book_id", book.book_id);
+    finishedOn = date;
+  }
+  if (!(sameBook && reachesEnd)) {
+    unfinished = await undoFinishIfOnlyThis(supabase, previousBook, previous, sessionId);
+    if (unfinished && sameBook) {
+      status = "reading";
+      finishedOn = null;
+    }
   }
 
+  // The habit: stamp the new day; take back the old day's row only when this session made it.
   let habitMarked = false;
-  const moved = date !== previous.session_date || book.book_id !== previous.book_id;
-  if (moved && book.habit_name) {
-    const { error: hErr } = await supabase
-      .from("habit_journal")
-      .upsert({ cycle_date: date, question: book.habit_name, category: "learning", answer: "Yes" }, { onConflict: "cycle_date,question" });
-    habitMarked = !hErr;
-    if (hErr) console.error("reading: habit stamp failed:", hErr.message);
+  let habitCreatedOn = input.habit_created_on;
+  const moved = date !== previous.session_date || !sameBook;
+  if (moved) {
+    const sameRow = book.habit_name === previousBook.habit_name && date === previous.session_date;
+    const stamp = await stampHabit(supabase, book, date);
+    habitMarked = stamp.marked;
+    if (!sameRow && input.habit_created_on && input.habit_created_on === previous.session_date) {
+      await unstampHabitIfUnused(supabase, previousBook, previous.session_date, sessionId);
+    }
+    habitCreatedOn = sameRow ? input.habit_created_on : stamp.created ? date : null;
   }
 
   return {
     ok: true,
-    book: { ...book, status: finished ? "finished" : book.status, finished_on: finished ? date : book.finished_on },
-    previousBook: cur.book,
+    book: { ...book, status, finished_on: finishedOn },
+    previousBook,
     session,
     previous,
     xpGained,
     finished,
+    unfinished,
     habitMarked,
+    habitCreatedOn,
   };
 }
 
 /**
- * Remove a manual or chat session (the autosaving forms' "Remove this session"). A book this session finished
- * (finished on its day, and no other session reaches the last chapter) goes back to reading. The habit row of
- * that day is left alone, as for an edit.
+ * Remove a manual or chat session (the autosaving form's "Remove this session"). A book this session finished
+ * (finished on its day, and no other session reaches the last chapter) goes back to reading. The day's habit Yes
+ * is taken back only when this session made it (`habitCreatedOn`) and no other session with the same habit is on
+ * that day.
  */
 export async function deleteSession(
   supabase: Supa,
   sessionId: number,
-): Promise<{ ok: true; book: Book; session: ReadingSession; unfinished: boolean } | { ok: false; status: number; error: string }> {
+  habitCreatedOn: string | null = null,
+): Promise<{ ok: true; book: Book; session: ReadingSession; unfinished: boolean; habitRemoved: boolean } | { ok: false; status: number; error: string }> {
   const cur = await editableSession(supabase, sessionId);
   if (!cur.ok) return cur;
   const { session } = cur;
@@ -819,22 +985,10 @@ export async function deleteSession(
   const { error } = await supabase.from("reading_sessions").delete().eq("session_id", sessionId);
   if (error) return { ok: false, status: 500, error: error.message };
 
-  let unfinished = false;
-  const total = book.total_chapters;
-  if (book.status === "finished" && total && (session.chapter_through ?? 0) >= total && book.finished_on === session.session_date) {
-    const { data: rest } = await supabase
-      .from("reading_sessions")
-      .select("session_id")
-      .eq("book_id", book.book_id)
-      .gte("chapter_through", total)
-      .limit(1);
-    if (!rest?.length) {
-      await supabase.from("books").update({ status: "reading", finished_on: null }).eq("book_id", book.book_id);
-      book = { ...book, status: "reading", finished_on: null };
-      unfinished = true;
-    }
-  }
-  return { ok: true, book, session, unfinished };
+  const unfinished = await undoFinishIfOnlyThis(supabase, book, session, sessionId);
+  if (unfinished) book = { ...book, status: "reading", finished_on: null };
+  const habitRemoved = habitCreatedOn !== null && habitCreatedOn === session.session_date ? await unstampHabitIfUnused(supabase, book, session.session_date, sessionId) : false;
+  return { ok: true, book, session, unfinished, habitRemoved };
 }
 
 export interface AddHighlightInput {

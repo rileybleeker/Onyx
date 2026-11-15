@@ -280,6 +280,134 @@ export function parseKnownSha(raw: unknown): string[] | null {
   return out;
 }
 
+const SHA256_K = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+/**
+ * SHA-256 of the text's UTF-8 bytes, hex. Synchronous on purpose: the browser must register a version's hash on the
+ * device BEFORE sending it, and a send started from `pagehide` cannot wait for Web Crypto's promise. The server
+ * hashes with node:crypto; tests/journal-file.test.cjs checks the two agree.
+ */
+export function sha256Hex(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  const padded = (((bytes.length + 9 + 63) / 64) | 0) * 64;
+  const buf = new Uint8Array(padded);
+  buf.set(bytes);
+  buf[bytes.length] = 0x80;
+  const view = new DataView(buf.buffer);
+  const bits = bytes.length * 8;
+  view.setUint32(padded - 8, Math.floor(bits / 0x100000000));
+  view.setUint32(padded - 4, bits >>> 0);
+  const h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  const w = new Uint32Array(64);
+  const rotr = (x: number, n: number) => (x >>> n) | (x << (32 - n));
+  for (let off = 0; off < padded; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, k] = h;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (k + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + SHA256_K[i] + w[i]) >>> 0;
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      k = g;
+      g = f;
+      f = e;
+      e = (d + t1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (t1 + t2) >>> 0;
+    }
+    h[0] = (h[0] + a) >>> 0;
+    h[1] = (h[1] + b) >>> 0;
+    h[2] = (h[2] + c) >>> 0;
+    h[3] = (h[3] + d) >>> 0;
+    h[4] = (h[4] + e) >>> 0;
+    h[5] = (h[5] + f) >>> 0;
+    h[6] = (h[6] + g) >>> 0;
+    h[7] = (h[7] + k) >>> 0;
+  }
+  return h.map((x) => x.toString(16).padStart(8, "0")).join("");
+}
+
+/** The hash that identifies a version of an entry (its words as written to Notion). */
+export const journalVersionSha = (body: string) => sha256Hex(bodyAsWritten(body));
+
+/** A paragraph's short hash (64 bits): what a partly finished update is recognised by (see pageHoldsOwnWrite). */
+export const PARA_HASH_RE = /^[0-9a-f]{16}$/;
+export const JOURNAL_MAX_KNOWN_PARAS = 200;
+export const paraHash = (paragraph: string) => sha256Hex(paragraph).slice(0, 16);
+/** The paragraph hashes of a body, in order (the paragraphs as written to Notion). */
+export const journalParaHashes = (body: string) => bodyParagraphs(body).map(paraHash);
+
+/** `known_paras` of a request: short paragraph hashes (empty when absent), or null when malformed. */
+export function parseKnownParas(raw: unknown): string[] | null {
+  if (raw == null) return [];
+  if (!Array.isArray(raw) || raw.length > JOURNAL_MAX_KNOWN_PARAS) return null;
+  const out = new Set<string>();
+  for (const s of raw) {
+    if (typeof s !== "string" || !PARA_HASH_RE.test(s)) return null;
+    out.add(s);
+  }
+  return [...out];
+}
+
+/** Merge hash lists, newest last, without repeats, keeping at most `max` (the newest). */
+export function mergeHashes(lists: string[][], max: number): string[] {
+  const out: string[] = [];
+  for (const list of lists) for (const s of list) {
+    const i = out.indexOf(s);
+    if (i >= 0) out.splice(i, 1);
+    out.push(s);
+  }
+  return out.slice(-max);
+}
+
+/**
+ * May an update write over what the page holds now? "new": it already holds the new words (a retry after a lost
+ * answer: properties only). "known": exactly a version this box filed or sent. "partial": only paragraphs this box
+ * filed or sent, so an update of its own that stopped halfway (Notion failed between removing and adding paragraphs,
+ * e.g. a 429). null: anything else, i.e. edited in Notion (a changed or added paragraph, a heading, a list), which is
+ * never overwritten without `force`. (A paragraph deleted in Notion still reads as "partial": the update puts it back.)
+ */
+export function pageHoldsOwnWrite(args: {
+  ok: boolean;
+  holdsSha: string;
+  newSha: string;
+  paraHashes: string[];
+  known: string[];
+  knownParas: string[];
+}): "new" | "known" | "partial" | null {
+  if (!args.ok) return null;
+  if (args.holdsSha === args.newSha) return "new";
+  if (args.known.includes(args.holdsSha)) return "known";
+  if (args.knownParas.length && args.paraHashes.every((h) => args.knownParas.includes(h))) return "partial";
+  return null;
+}
+
+/**
+ * The query for every page of one day (a restored entry's lost save is looked for by its hash on its own date,
+ * without the 15-minute limit of a plain retry). Newest first; a day rarely holds more than a few entries.
+ */
+export function dayEntriesQuery(date: string) {
+  return {
+    filter: { property: "Date", date: { equals: date } },
+    sorts: [{ timestamp: "created_time", direction: "descending" }],
+    page_size: 20,
+  };
+}
+
 /** A Notion page id (32 hex digits, with or without dashes) -> the dashed lowercase form, or null. */
 export function normalizePageId(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
@@ -311,8 +439,10 @@ export interface JournalLabels {
 export interface JournalUpdateInput {
   body: string;
   source: JournalSource;
-  /** Hashes of versions this box filed: the page must hold one of them (or already the new words). */
+  /** Hashes of versions this box filed or sent: the page must hold one of them (or already the new words). */
   known: string[];
+  /** Short hashes of the paragraphs of those versions: a page holding only these is an update that stopped halfway. */
+  knownParas: string[];
   /** Write over the page even when it holds none of them (Riley chose "Replace it with these words"). */
   force: boolean;
   /** Re-infer the labels this box wrote (never a label changed in Notion). */
@@ -323,7 +453,7 @@ export interface JournalUpdateInput {
   explicit: JournalLabels;
 }
 
-const UPDATE_KEYS = new Set(["body", "source", "known_sha", "force", "relabel", "last_labels", "title", "mood", "confidence", "topics"]);
+const UPDATE_KEYS = new Set(["body", "source", "known_sha", "known_paras", "force", "relabel", "last_labels", "title", "mood", "confidence", "topics"]);
 const LABEL_KEYS = new Set(["title", "mood", "confidence", "topics"]);
 
 function parseLabels(r: Record<string, unknown>): { ok: true; labels: JournalLabels } | { ok: false; error: string } {
@@ -360,6 +490,8 @@ export function validateJournalUpdate(raw: unknown): { ok: true; input: JournalU
   if (body.length > JOURNAL_MAX_BODY_CHARS) return { ok: false, error: `The entry must be at most ${JOURNAL_MAX_BODY_CHARS} characters.` };
   const known = parseKnownSha(r.known_sha);
   if (!known) return { ok: false, error: "known_sha must be a list of SHA-256 hex strings" };
+  const knownParas = parseKnownParas(r.known_paras);
+  if (!knownParas) return { ok: false, error: "known_paras must be a list of paragraph hashes" };
   if (r.force != null && typeof r.force !== "boolean") return { ok: false, error: "force must be true or false" };
   if (r.relabel != null && typeof r.relabel !== "boolean") return { ok: false, error: "relabel must be true or false" };
   if (r.force !== true && !known.length) return { ok: false, error: "known_sha is required" };
@@ -377,7 +509,7 @@ export function validateJournalUpdate(raw: unknown): { ok: true; input: JournalU
   if (r.relabel === true && !last) return { ok: false, error: "relabel needs last_labels" };
   return {
     ok: true,
-    input: { body, source: r.source as JournalSource, known, force: r.force === true, relabel: r.relabel === true, last, explicit: explicit.labels },
+    input: { body, source: r.source as JournalSource, known, knownParas, force: r.force === true, relabel: r.relabel === true, last, explicit: explicit.labels },
   };
 }
 
@@ -468,6 +600,8 @@ export interface FiledJournalEntry {
   date: string;
   /** Hash of the words the page holds (bodyAsWritten). */
   sha: string;
+  /** Short hashes of those words' paragraphs (journalParaHashes). */
+  paras: string[];
   labels: JournalLabels;
   /** Word count of the words the labels were inferred from (shouldRelabel). */
   labeledWords: number;
@@ -481,8 +615,13 @@ export interface UnsavedJournal {
   source: JournalSource;
   pinned: boolean;
   filed: FiledJournalEntry | null;
-  /** Hashes of versions sent whose answer never came. */
+  /** The entry's day once a first save was sent (a restored entry is filed on it, not on the day it is restored). */
+  date: string | null;
+  /** Hashes of versions sent and not confirmed yet: written here BEFORE each send, so a page saved by a send whose
+   *  answer never came (a closed tab) is found again by its hash. */
   known: string[];
+  /** Short hashes of those versions' paragraphs (pageHoldsOwnWrite). */
+  knownParas: string[];
 }
 
 function parseFiled(raw: unknown): FiledJournalEntry | null {
@@ -496,6 +635,7 @@ function parseFiled(raw: unknown): FiledJournalEntry | null {
     url: typeof f.url === "string" && f.url.startsWith("https://") ? f.url : null,
     date: f.date,
     sha: f.sha,
+    paras: parseKnownParas(f.paras) ?? [],
     labels: labels?.ok ? labels.labels : { title: "", mood: null, confidence: null, topics: [] },
     labeledWords: typeof f.labeledWords === "number" && Number.isFinite(f.labeledWords) && f.labeledWords >= 0 ? Math.floor(f.labeledWords) : 0,
   };
@@ -523,6 +663,8 @@ export function parseUnsavedJournal(raw: unknown, now: number): UnsavedJournal |
     source: r.source as JournalSource,
     pinned: r.pinned === true,
     filed: parseFiled(r.filed),
+    date: isDate(r.date) ? r.date : null,
     known: parseKnownSha(r.known) ?? [],
+    knownParas: parseKnownParas(r.knownParas) ?? [],
   };
 }

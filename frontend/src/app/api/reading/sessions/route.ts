@@ -16,8 +16,10 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * flips the book to finished when the last chapter is reached, and returns the
  * XP gained plus the refreshed overview. The Notion mirror (session quote block
  * + progress callout) runs after the response via `after()` — best-effort.
- * The autosaving forms (/log Reading, /reading) create here, then edit the same
- * session through PATCH /api/reading/sessions/[id].
+ * The autosaving /log Reading form creates here, then edits the same session
+ * through PATCH /api/reading/sessions/[id]. It sends `client_key` (a UUID per
+ * new session): a create retried after a lost answer returns the stored
+ * session (`replayed: true`) with no second XP, habit stamp or Notion entry.
  */
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
@@ -30,12 +32,14 @@ export async function POST(req: NextRequest) {
     medium: (body.medium as Medium) || null,
     recall: (body.recall as string) || null,
     question: (body.question as string) || null,
+    client_key: typeof body.client_key === "string" ? body.client_key : null,
   });
   if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 });
 
   const overview = await getOverview(supabase, result.book.slug).catch(() => null);
 
-  after(async () => {
+  // A retried create (same client_key): the first request made the session and its Notion entry.
+  if (!result.replayed) after(async () => {
     const id = result.session.session_id;
     const blockId = await mirrorSession(result.book, result.session);
     if (blockId) {
@@ -65,6 +69,9 @@ export async function POST(req: NextRequest) {
     xp_gained: result.xpGained,
     finished: result.finished,
     habit_marked: result.habitMarked,
+    // The day of the habit row this create made (null = none, or unknown): the form sends it back with its edits.
+    habit_created_on: result.habitCreated ? result.session.session_date : null,
+    replayed: result.replayed,
     overview,
   });
 }

@@ -116,10 +116,22 @@ export interface SavePlan {
   changeCount: number;
 }
 
+/** The answer each question shows: saved, tapped or pre-filled (a blank question has no cell). */
+export function shownAnswers(cells: Cells): Record<string, CheckinAnswer> {
+  return Object.fromEntries(Object.entries(cells).map(([name, c]) => [name, c.answer]));
+}
+
 /**
  * What each autosave sends (taps save on their own, a short delay after the last one). A part (the day, or one
- * night) is sent only when Riley touched it: tapped or cleared something in it. Its pre-fills then go with it. Untouched pre-fills stay suggestions: today's can still
- * change (a workout later), and storing them would mark the day's check-in done.
+ * night) is sent only when Riley touched it: tapped or cleared something in it. Its pre-fills then go with it.
+ * Untouched pre-fills stay suggestions.
+ *
+ * Behavioral today (`dayIsToday`) is the exception for the day part: its pre-fills can still change (a workout
+ * later turns "rest day: Yes" into No), and a stored answer outranks every later suggestion. So an autosave on
+ * today sends only what Riley tapped or cleared, and the day's pre-fills go along only once the day is complete
+ * counting them (every core daytime question shows a saved, tapped or pre-filled answer): the moment the check-in
+ * is effectively done, which is also when its Agents card settles (dayComplete on the stored result). Earlier days
+ * (the catch-up tabs) and the nights keep "pre-fills go with the first touch".
  */
 export function savePlan(args: {
   dayItems: CheckinItem[];
@@ -128,9 +140,15 @@ export function savePlan(args: {
   sleepItems: CheckinItem[];
   nights: CheckinNight[]; // the visible ones
   nightCells: Record<string, Cells>;
+  /** The day tab is behavioral today (its date equals the payload's `today`). */
+  dayIsToday?: boolean;
 }): SavePlan {
   const dayChanges = changesOf(args.dayItems, args.dayAnswers, args.cells);
-  const dayPatch = touched(dayChanges, args.cells) ? dayChanges : {};
+  let dayPatch = touched(dayChanges, args.cells) ? dayChanges : {};
+  if (args.dayIsToday && Object.keys(dayPatch).length && !dayComplete(args.dayItems, shownAnswers(args.cells))) {
+    // Not done yet: only Riley's own taps and clears; the pre-fills wait (they are still suggestions).
+    dayPatch = Object.fromEntries(Object.entries(dayPatch).filter(([name, a]) => a === null || args.cells[name]?.origin === "tapped"));
+  }
   const nightPatches = args.nights
     .filter((n) => !!args.nightCells[n.date]) // no cells built for a night = nothing to send, never "clear it all"
     .map((n) => ({ date: n.date, changes: changesOf(args.sleepItems, n.answers, args.nightCells[n.date]), cells: args.nightCells[n.date] }))
@@ -142,7 +160,8 @@ export function savePlan(args: {
 
 /**
  * The day's check-in is done once every core daytime question has a SAVED Yes or No: only then is the Agents card
- * settled (POST /onyx/checkin/done). Answers save as they are tapped (autosave, 2026-11-15), so there is no "Save
+ * settled (POST /onyx/checkin/done). (savePlan also asks it of the SHOWN answers, pre-fills included, to decide when
+ * today's pre-fills are stored: they are stored in the same save that completes the day, so the card settles then.) Answers save as they are tapped (autosave, 2026-11-15), so there is no "Save
  * = done" moment any more; a half-answered day keeps its card, and the 9 AM re-post still reminds. Sleep questions
  * and "Also did" (extra) questions never count: a day with no core daytime question is never "done" here.
  */

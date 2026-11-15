@@ -1,7 +1,7 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
-import { deleteSession, getOverview, parseSessionUpdate, updateSession, type Book, type ReadingOverview } from "@/lib/reading";
+import { deleteSession, getOverview, parseSessionUpdate, updateSession, ymdOrNull, type Book, type ReadingOverview } from "@/lib/reading";
 import { mirrorProgress, mirrorSession, removeMirroredBlock, updateMirroredSession } from "@/lib/reading-notion";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
@@ -10,12 +10,15 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
 
 /**
  * PATCH  /api/reading/sessions/[id]  Body: { chapter_through, chapter_from?, minutes?, medium?, recall?, question?,
- *                                            date?, book? }   (date / book absent or null = keep the session's own)
- * DELETE /api/reading/sessions/[id]
+ *                                            date?, book?, habit_created_on? }   (date / book absent or null = keep)
+ * DELETE /api/reading/sessions/[id]?habit_created_on=YYYY-MM-DD
  *
  * The autosaving session forms (/log Reading, /reading "Log a session") create a session with POST
  * /api/reading/sessions, then send every later edit of the same form here (lib/reading.ts updateSession: the same
  * rules as logSession; Kindle sessions are refused with 409), and "Remove this session" deletes it (deleteSession).
+ * An edit or removal undoes what the session's earlier values did: a finish it caused goes back to reading when no
+ * other session reaches the last chapter, and the habit Yes it MADE (`habit_created_on`, reported by the create and
+ * by every edit, sent back by the form) is taken back from a day it leaves when no other session is on that day.
  * The Notion quote block follows best-effort after the response (updated in place, moved to the other book's page,
  * or trashed), and the progress callout is rewritten.
  * Auth: owner session only (middleware; NOT in isCiRoute), plus a same-origin check, JSON only and a size cap.
@@ -88,7 +91,16 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
     await mirrorProgress(r.book, overview?.chaptersDone ?? r.session.chapter_through ?? 0, newestDate(overview, r.session.session_date));
   });
 
-  return NextResponse.json({ success: true, session: r.session, xp_gained: r.xpGained, finished: r.finished, habit_marked: r.habitMarked, overview });
+  return NextResponse.json({
+    success: true,
+    session: r.session,
+    xp_gained: r.xpGained,
+    finished: r.finished,
+    unfinished: r.unfinished,
+    habit_marked: r.habitMarked,
+    habit_created_on: r.habitCreatedOn,
+    overview,
+  });
 }
 
 export async function DELETE(req: NextRequest, ctx: Ctx) {
@@ -96,8 +108,10 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
   if (refused) return NextResponse.json({ error: refused.error }, { status: refused.status });
   const id = sessionIdOf((await ctx.params).id);
   if (!id) return NextResponse.json({ error: "bad id" }, { status: 400 });
+  const habitCreatedOn = ymdOrNull(req.nextUrl.searchParams.get("habit_created_on"));
+  if (habitCreatedOn === undefined) return NextResponse.json({ error: "habit_created_on must be YYYY-MM-DD" }, { status: 400 });
 
-  const r = await deleteSession(supabase, id);
+  const r = await deleteSession(supabase, id, habitCreatedOn);
   if (!r.ok) return NextResponse.json({ error: r.error }, { status: r.status });
   const overview = await getOverview(supabase, r.book.slug).catch(() => null);
 
@@ -106,5 +120,5 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
     await mirrorProgress(r.book, overview?.chaptersDone ?? 0, newestDate(overview, null));
   });
 
-  return NextResponse.json({ success: true, removed: r.session.session_id, unfinished: r.unfinished, overview });
+  return NextResponse.json({ success: true, removed: r.session.session_id, unfinished: r.unfinished, habit_removed: r.habitRemoved, overview });
 }

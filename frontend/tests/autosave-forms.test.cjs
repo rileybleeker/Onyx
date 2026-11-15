@@ -48,6 +48,45 @@ test("a new stack and a new care item are created once complete, then edited in 
   assert.match(care, /Enter a label and a valid date\./);
 });
 
+test("a retried stack create returns the same stack (client_key), and the SQL is additive", () => {
+  const modal = read("components/StackEditorModal.tsx");
+  assert.match(modal, /body: \{ \.\.\.body, client_key: clientKey\.current \}/, "the create carries the key");
+  assert.match(modal, /clientKey\.current = stack\.stack_id \? null : newClientKey\(\)/, "one key per new stack");
+  const route = read("app/api/supplements/stacks/route.ts");
+  assert.match(route, /\.eq\("client_key", key\)\.maybeSingle\(\)/, "looks the key up first");
+  assert.match(route, /existing: true/, "answers with the stack already there");
+  assert.match(route, /stackErr\.code === "23505"/, "a concurrent insert of the same key is adopted");
+  assert.match(route, /missingKeyColumn/, "works before the column exists");
+  const sql = fs.readFileSync(path.join(SRC, "..", "..", "sql", "supplement_stack_client_key.sql"), "utf8");
+  assert.doesNotMatch(sql, /drop/i, "no DROP anywhere (the Supabase connector declines it)");
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS client_key uuid/);
+  assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS [\s\S]*WHERE client_key IS NOT NULL/);
+});
+
+test("a care item create retried after a lost answer keeps the newer edits", () => {
+  const care = read("app/health/HealthClient.tsx");
+  assert.match(care, /const stale = !!stored &&/);
+  assert.match(care, /if \(stale && !\(await run\(\{ type: 'update', id, patch: fields \}, 'autosave'\)\)\)/);
+});
+
+test("an edit that could not be saved is kept, not dropped, when the form switches", () => {
+  const care = read("app/health/HealthClient.tsx");
+  assert.match(care, /\(hasInput\(cur\) \|\| cur\.editing\) && !\(await autosave\.flush\(\)\)/);
+  assert.match(care, /is not saved yet\. Retry it/);
+  const nyc = read("app/nyc/NycClient.tsx");
+  assert.match(nyc, /if \(!\(await noteSave\.flush\(\)\)\) \{/);
+  assert.match(nyc, /is not saved yet\. Retry it/);
+  for (const file of ["components/EditIntakeModal.tsx", "components/StackEditorModal.tsx", "app/health/HealthClient.tsx", "app/health/records/RecordsClient.tsx"]) {
+    assert.doesNotMatch(read(file), /failed\.current|formSaveFailed/, `${file}: flush() answers whether anything is left unsaved`);
+  }
+});
+
+test("the overall budget: an empty field changes nothing, 0 clears it", () => {
+  const budgets = read("app/financials/budgets/BudgetsView.tsx");
+  assert.match(budgets, /if \(x\.trim\(\)\) autosave\.change\(x\);\s*else autosave\.reset\(lastSaved\.current\);/);
+  assert.match(budgets, /monthlyCents: n > 0 \? Math\.round\(n \* 100\) : null/);
+});
+
 test("a tax payment never races the profile autosave (both write the whole profile)", () => {
   const tax = read("app/financials/forecast/TaxAndWhatIf.tsx");
   assert.match(tax, /await autosave\.flush\(\);\s*paying\.current = true;/);
@@ -89,9 +128,12 @@ test("weight entry: the Log weight form saves through the shared hook, no Save b
   const hook = read("lib/weight-entry.ts");
   // Moving the day after a save restores the earlier day first; Undo restores the day it wrote.
   assert.match(hook, /if \(prev && prev\.day !== v\.day\) \{\s*const restored = await restoreWeightDay\(prev\.day/);
-  // A manual row gets its old value back; a Tanita or empty day is cleared (the scale run restores Tanita).
-  assert.match(hook, /prior && prior\.source === "manual"/);
+  // A replaced row gets its value, note AND source back (a Tanita reading stays the scale's: never deleted, the
+  // ETL only re-reads 14 days); only a day that had no row is cleared.
+  assert.match(hook, /method: "PATCH",\s*body: \{ log_date: day, weight_kg: Number\(prior\.weight_kg\), notes: prior\.notes \?\? "", source: prior\.source \}/);
   assert.match(hook, /method: "DELETE"/);
+  const route = read("app/api/weight/route.ts");
+  assert.match(route, /body\.source !== "manual" && body\.source !== "tanita"/);
   // An older day than the rows on screen is read from the server before the first write.
   assert.match(hook, /if \(back < coversDays\) return rows\.find/);
 });
@@ -116,8 +158,11 @@ test("weight rules: what can be saved and how long to wait", () => {
 
 test("Say it suggestions save on their own in Supplements and Uber Eats (each tried once, then Retry)", () => {
   const sup = read("app/log/sections/Supplements.tsx");
-  assert.match(sup, /autoSaved\.current = suggestionDraftId;\s*void saveSuggestionsRef\.current\(\);/);
-  assert.match(sup, /if \(suggestionDraftId == null \|\| autoSaved\.current === suggestionDraftId \|\| !stacks \|\| !day\) return;/);
+  assert.match(sup, /triedDrafts\.add\(suggestionDraftId\);\s*void saveSuggestionsRef\.current\(\);/);
+  assert.match(sup, /if \(suggestionDraftId == null \|\| triedDrafts\.has\(suggestionDraftId\) \|\| !stacks \|\| !day\) return;/);
+  // Module memory, not a ref: a remount (scroll, leaving /log) never logs the same suggestion twice.
+  assert.match(sup, /^const triedDrafts = new Set<number>\(\);$/m);
+  assert.match(sup, /\.filter\(\(s\) => !logged\?\.has\(s\.key\)\)/);
   assert.match(sup, /label="Retry"/);
   // "Log a product" keeps its Log tap on purpose: logging a dose is the action itself.
   assert.match(sup, /onClick=\{\(\) => void onLogProduct\(\)\}/);

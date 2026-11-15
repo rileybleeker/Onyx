@@ -97,7 +97,6 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
   const setForm = (next: Form) => { formRef.current = next; setFormState(next); };
   // The item as it was when the form opened it (null for a new one): Undo takes the whole edit back to it.
   const sessionBefore = useRef<CareItem | null>(null);
-  const formSaveFailed = useRef(false);
 
   // Sample items are display-only: never in `items`, never saved, never sent, never editable.
   const shown = useMemo(() => (demo && today ? [...items, ...sampleItems(today)] : items), [demo, items, today]);
@@ -193,9 +192,12 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
       const exists = itemsRef.current.some(item => item.id === id);
       const op: CareOp = exists ? { type: 'update', id, patch: fields } : { type: 'create', item: { id, ...fields, archived: false, completedOn: null } };
       // run() has already taken the change back and said so; Retry (or the next change) sends it again.
-      formSaveFailed.current = true;
       if (!(await run(op, 'autosave'))) throw new AutosaveRefused("Couldn't save that to Onyx.");
-      formSaveFailed.current = false;
+      // A create retried after a lost answer gets the stored row back (the route is idempotent on the id), which
+      // may predate edits made since: send those as an update.
+      const stored = exists ? null : itemsRef.current.find(item => item.id === id);
+      const stale = !!stored && (Object.keys(fields) as (keyof typeof fields)[]).some(key => JSON.stringify(stored[key]) !== JSON.stringify(fields[key]));
+      if (stale && !(await run({ type: 'update', id, patch: fields }, 'autosave'))) throw new AutosaveRefused("Couldn't save that to Onyx.");
       const before = sessionBefore.current;
       setUndo(before ? inverseOp({ type: 'update', id, patch: fields }, before) : { type: 'remove', id });
       if (formRef.current.id === id && !formRef.current.editing) setForm({ ...formRef.current, editing: id });
@@ -217,20 +219,28 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
     if (!hasInput(cur) && !cur.editing) return;
     const why = formReady(valueOf(cur));
     if (why) { setNotice({ text: why, error: true }); return; }
-    await autosave.flush();
-    if (formSaveFailed.current || formRef.current.id !== cur.id) return; // not saved: the status line has Retry
+    if (!(await autosave.flush()) || formRef.current.id !== cur.id) return; // not saved: the status line has Retry
     sessionBefore.current = null;
-    formSaveFailed.current = false;
     const fresh = emptyForm(viewerTz);
     setForm(fresh);
     autosave.reset();
   }
 
   async function edit(item: CareItem) {
-    // Send what the form still holds before it switches to another item.
-    if (hasInput(formRef.current) || formRef.current.editing) await autosave.flush();
+    // Send what the form still holds before it switches to another item. If that is not saved (it failed, or the
+    // entry is incomplete), the form keeps it and says so instead of dropping it.
+    const cur = formRef.current;
+    if ((hasInput(cur) || cur.editing) && !(await autosave.flush())) {
+      setNotice({
+        text: formReady(valueOf(cur))
+          ? 'Finish or clear the item in the form before editing another one.'
+          : 'The item in the form is not saved yet. Retry it (next to Done) before editing another one.',
+        error: true,
+      });
+      return;
+    }
+    if (formRef.current.id !== cur.id) return; // the form changed while saving
     sessionBefore.current = item;
-    formSaveFailed.current = false;
     const next: Form = { id: item.id, editing: item.id, title: item.title, kind: item.kind, due: item.due, time: item.time ?? '', tz: item.tz, months: item.months, booked: item.booked, notes: item.notes };
     setForm(next);
     autosave.reset(valueOf(next));
@@ -337,6 +347,7 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <button className={button} type="submit" disabled={!hasInput(form) && !form.editing}>Done</button>
+              {!form.editing && hasInput(form) && <button className={button} type="button" onClick={() => { autosave.reset(); setForm(emptyForm(viewerTz)); }}>Clear</button>}
               <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} showIncomplete={hasInput(form)} savedText={form.editing && !sessionBefore.current ? 'Added' : 'Saved'} />
             </div>
             <p className="text-xs text-text-tertiary">Saves on its own once it has a label and a date. Done starts a new item.</p>

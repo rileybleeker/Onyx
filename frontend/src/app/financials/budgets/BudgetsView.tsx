@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { TOTAL_KEY, type BudgetLine, type BudgetsResult } from "@/lib/finance-budgets";
 import { activeMonthly, type SubscriptionView } from "@/lib/finance-subscriptions";
@@ -332,15 +332,24 @@ function TotalBudget({ current, busy, run }: { current: number | null; busy: boo
   // The field starts empty (the current overall budget is its placeholder). Typing saves after a pause; an empty
   // field changes nothing, 0 clears the overall budget (back to the sum of categories).
   const [v, setV] = useState("");
-  const autosave = useFinanceAutosave<string>("budget:overall", run, (x) => {
+  const lastSaved = useRef("");
+  const autosave = useFinanceAutosave<string>("budget:overall", run, async (x) => {
     const n = Number(x.replace(/[$,\s]/g, ""));
-    return put("/api/finance/budgets", { category: TOTAL_KEY, monthlyCents: x.trim() && n > 0 ? Math.round(n * 100) : null });
+    const err = await put("/api/finance/budgets", { category: TOTAL_KEY, monthlyCents: n > 0 ? Math.round(n * 100) : null });
+    if (!err) lastSaved.current = x;
+    return err;
   }, { baseline: "" });
+  const onOverall = (x: string) => {
+    setV(x);
+    // Empty is not a value: nothing is sent and the saved budget stays (the last saved value is the baseline again).
+    if (x.trim()) autosave.change(x);
+    else autosave.reset(lastSaved.current);
+  };
   void busy;
   return (
     <span className="flex items-center gap-1 text-[12px] text-text-secondary">
       Overall $
-      <input className={`${input} w-24`} inputMode="numeric" value={v} placeholder={current ? String(Math.round(current / 100)) : "sum of categories"} onChange={(e) => { setV(e.target.value); autosave.change(e.target.value); }} onBlur={() => void autosave.flush()} aria-label="Overall budget" />
+      <input className={`${input} w-24`} inputMode="numeric" value={v} placeholder={current ? String(Math.round(current / 100)) : "sum of categories"} onChange={(e) => onOverall(e.target.value)} onBlur={() => void autosave.flush()} aria-label="Overall budget" title="0 clears the overall budget" />
       <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} />
     </span>
   );

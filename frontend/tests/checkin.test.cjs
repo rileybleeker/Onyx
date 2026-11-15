@@ -249,6 +249,40 @@ test("a touched day is sent with its pre-fills; an untouched night's pre-fill is
   assert.deepEqual(plan({ nights: [n], nightCells: tapped }).nightPatches, [{ date: n.date, changes: { [TAPE]: "Yes", [C.Q_SAME_BED]: "Yes" } }]);
 });
 
+test("today: an autosave sends only Riley's taps until the day is complete counting its pre-fills", () => {
+  const CALM = "Felt calm?";
+  const items = [...DAY_ITEMS, item(CALM)];
+  const sug = { [REST]: { answer: "Yes", source: "No workouts recorded" } };
+  // one tap at 10 AM: the rest-day pre-fill waits (an evening workout can still change it)
+  const first = K.buildCells(items, {}, sug, K.draftWith({}, { [STRESS]: "No" }, {}));
+  assert.deepEqual(plan({ dayItems: items, cells: first, dayIsToday: true }).dayPatch, { [STRESS]: "No" });
+  // an earlier day (a catch-up tab) keeps the old rule: the pre-fill goes with the first touch
+  assert.deepEqual(plan({ dayItems: items, cells: first }).dayPatch, { [REST]: "Yes", [STRESS]: "No" });
+  // after that save the pre-fill alone is nothing to send
+  const afterFirst = K.buildCells(items, { [STRESS]: "No" }, sug, {});
+  assert.equal(plan({ dayItems: items, dayAnswers: { [STRESS]: "No" }, cells: afterFirst, dayIsToday: true }).changeCount, 0);
+  // the last blank core question answered: complete counting the pre-fill, so it is stored now
+  const last = K.buildCells(items, { [STRESS]: "No" }, sug, K.draftWith({}, { [CALM]: "Yes" }, { [STRESS]: "No" }));
+  const done = plan({ dayItems: items, dayAnswers: { [STRESS]: "No" }, cells: last, dayIsToday: true });
+  assert.deepEqual(done.dayPatch, { [REST]: "Yes", [CALM]: "Yes" });
+  assert.equal(K.dayComplete(items, { [STRESS]: "No", ...done.dayPatch }), true, "the same save completes the stored day (the card settles)");
+  // a pre-fill Riley tapped over is his own answer and goes at once
+  const over = K.buildCells(items, {}, sug, K.draftWith({}, { [REST]: "No" }, {}));
+  assert.deepEqual(plan({ dayItems: items, cells: over, dayIsToday: true }).dayPatch, { [REST]: "No" });
+  // a clear is his own change and goes at once; the pre-fill still waits
+  const cleared = K.buildCells(items, { [STRESS]: "No" }, sug, K.draftWith({}, { [STRESS]: null }, { [STRESS]: "No" }));
+  assert.deepEqual(plan({ dayItems: items, dayAnswers: { [STRESS]: "No" }, cells: cleared, dayIsToday: true }).dayPatch, { [STRESS]: null });
+  // a blank "Also did" question does not hold the pre-fills back
+  const withExtra = [...DAY_ITEMS, item("Some weekly habit?", "extra")];
+  const extraDone = K.buildCells(withExtra, {}, sug, K.draftWith({}, { [STRESS]: "No" }, {}));
+  assert.deepEqual(plan({ dayItems: withExtra, cells: extraDone, dayIsToday: true }).dayPatch, { [REST]: "Yes", [STRESS]: "No" });
+  // the nights are unchanged on today: a touched night sends its pre-fill with the first tap
+  const n = night("2031-03-04", {}, { [C.Q_SAME_BED]: { answer: "Yes", source: "Eight Sleep: 7.0 h in your bed" } });
+  const nightCells = { [n.date]: K.buildCells(SLEEP_ITEMS, n.answers, n.suggestions, K.draftWith({}, { [TAPE]: "Yes" }, {})) };
+  assert.deepEqual(plan({ dayItems: items, cells: afterFirst, dayAnswers: { [STRESS]: "No" }, nights: [n], nightCells, dayIsToday: true }).nightPatches,
+    [{ date: n.date, changes: { [TAPE]: "Yes", [C.Q_SAME_BED]: "Yes" } }]);
+});
+
 test("pre-fills alone are never sent; clearing a saved answer is", () => {
   const cells = K.buildCells(DAY_ITEMS, {}, { [REST]: { answer: "Yes", source: "x" } }, {});
   assert.equal(plan({ cells }).changeCount, 0);
@@ -309,7 +343,8 @@ test("dayComplete: done only when every core daytime question has a saved Yes or
 
 test("the screen wires the save plan: day under its date, the card settled only when the day is complete, nights under theirs", () => {
   const client = fs.readFileSync(path.join(SRC, "app/check-in/CheckInClient.tsx"), "utf8");
-  assert.match(client, /savePlan\(\{ dayItems, dayAnswers: data\?\.answers \?\? \{\}, cells, sleepItems, nights, nightCells \}\)/);
+  assert.match(client, /savePlan\(\{ dayItems, dayAnswers: data\?\.answers \?\? \{\}, cells, sleepItems, nights, nightCells, dayIsToday \}\)/);
+  assert.match(client, /const dayIsToday = !!data && data\.date === data\.today;/);
   const save = client.slice(client.indexOf("const save = async"), client.indexOf("const goTo"));
   const dayBranch = save.slice(save.indexOf("if (Object.keys(dayPatch).length)"), save.indexOf("for (const n of nightPatches)"));
   assert.match(dayBranch, /agentsApi\.checkinDone\(data\.date\)/); // only when the day was sent...

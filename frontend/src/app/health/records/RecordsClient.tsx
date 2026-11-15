@@ -450,13 +450,11 @@ const labFieldsOf = (r: LabResult): LabFields => ({
 function LabEditForm({ result, docs, onDone, onSaved }: { result: LabResult; docs: MedicalDocument[]; onDone: () => void; onSaved: (r: LabResult) => void }) {
   const [f, setF] = useState<LabFields>(() => labFieldsOf(result));
   const saved = useRef(result);
-  const failed = useRef(false);
   const parse = (v: LabFields) => parseLabResult({ ...saved.current, test: v.test, ...parseLabValue(v.value), unit: v.unit, ...parseRange(v.range), collectedOn: v.collectedOn, lab: v.lab, documentId: v.documentId || null, notes: v.notes });
   const autosave = useAutosave<LabFields>('lab-edit', {
     delayMs: 1200,
     ready: v => { const next = parse(v); return next.ok ? null : next.error; },
     save: async v => {
-      failed.current = true;
       const next = parse(v);
       if (!next.ok) throw new AutosaveRefused(next.error);
       // Send only what changed: an unchanged link to a since-removed document is left alone.
@@ -471,7 +469,6 @@ function LabEditForm({ result, docs, onDone, onSaved }: { result: LabResult; doc
         saved.current = row;
         onSaved(row);
       }
-      failed.current = false;
     },
   }, labFieldsOf(result));
   const edit = (patch: Partial<LabFields>, typed = true) => {
@@ -481,9 +478,8 @@ function LabEditForm({ result, docs, onDone, onSaved }: { result: LabResult; doc
   };
   const flush = () => void autosave.flush();
   async function done() {
-    if (parse(f).ok) await autosave.flush();
-    else return; // the status line says what is wrong; the last valid version stays saved
-    if (!failed.current) onDone();
+    // Incomplete or not saved: stay open (the status line says what is wrong or has Retry).
+    if (await autosave.flush()) onDone();
   }
 
   return <div className="space-y-2 rounded-xl border border-border-emphasis p-3">
@@ -640,17 +636,14 @@ type DocFields = { title: string; kind: DocKind; date: string; provider: string;
 /** Autosave, as LabEditForm: each change goes through PATCH /api/medical/documents/[id]; Done closes. */
 function DocumentEditForm({ doc, onDone, onSaved }: { doc: MedicalDocument; onDone: () => void; onSaved: (d: MedicalDocument) => void }) {
   const [f, setF] = useState<DocFields>({ title: doc.title, kind: doc.kind, date: doc.date, provider: doc.provider, notes: doc.notes });
-  const failed = useRef(false);
   const autosave = useAutosave<DocFields>('document-edit', {
     delayMs: 1200,
     ready: v => (v.title.trim() ? null : 'Give the document a title.'),
     save: async v => {
-      failed.current = true;
       const a = await call('PATCH', `/api/medical/documents/${doc.id}`, v);
       const row = a.ok ? rowFromApiDoc(a.data.document) : null;
       if (!row) throw autosaveFailure(a);
       onSaved(row);
-      failed.current = false;
     },
   }, { title: doc.title, kind: doc.kind, date: doc.date, provider: doc.provider, notes: doc.notes });
   const edit = (patch: Partial<DocFields>, typed = true) => {
@@ -660,9 +653,7 @@ function DocumentEditForm({ doc, onDone, onSaved }: { doc: MedicalDocument; onDo
   };
   const flush = () => void autosave.flush();
   async function done() {
-    if (!f.title.trim()) return;
-    await autosave.flush();
-    if (!failed.current) onDone();
+    if (await autosave.flush()) onDone();
   }
 
   return <div className="space-y-2">

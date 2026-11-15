@@ -75,13 +75,11 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const savedAny = useRef(false);
-  const failed = useRef(false);
 
   const autosave = useAutosave<IntakeForm>("edit-intake", {
     delayMs: 1000,
     ready: notReady,
     save: async (f, { keepalive }) => {
-      failed.current = true; // until the server accepts it
       await saveRequest("/api/supplements/log-intake", {
         method: "PATCH",
         keepalive,
@@ -93,7 +91,6 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
           notes: f.notes.trim() === "" ? null : f.notes.trim(),
         },
       });
-      failed.current = false;
       savedAny.current = true;
     },
   });
@@ -108,7 +105,6 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
     setForm(f);
     resetAutosave(f);
     savedAny.current = false;
-    failed.current = false;
     setError(null);
   }, [intake, resetAutosave]);
 
@@ -122,8 +118,7 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
 
   async function done() {
     if (form && notReady(form)) return; // the status line says why; nothing is lost by staying open
-    await autosave.flush();
-    if (failed.current) return;
+    if (!(await autosave.flush())) return; // not saved: the status line has Retry
     if (savedAny.current) onSaved();
     else onClose();
   }

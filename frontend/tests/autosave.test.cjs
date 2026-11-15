@@ -227,3 +227,39 @@ test('reset forgets what is waiting', async () => {
   assert.deepEqual(r.sent, []);
   assert.equal(s.state.status, 'idle');
 });
+
+test('reset() forgets the saved value too: the same value typed again after an Undo is sent', async () => {
+  const t = fakeTimers();
+  const r = recorder();
+  const s = new Autosaver({ save: r.save, timers: t, delayMs: 10 });
+  s.change('185');
+  await t.advance(10);
+  s.reset(); // Undo put the day back
+  s.change('185');
+  await t.advance(10);
+  assert.deepEqual(r.sent, ['185', '185']);
+});
+
+test('reset(baseline) keeps what the server holds: that value sends nothing', async () => {
+  const t = fakeTimers();
+  const r = recorder();
+  const s = new Autosaver({ save: r.save, timers: t, delayMs: 10 });
+  s.reset('on server');
+  s.change('on server');
+  await t.advance(1000);
+  assert.deepEqual(r.sent, []);
+});
+
+test('flush() answers whether anything is left unsaved', async () => {
+  const t = fakeTimers();
+  let down = true;
+  const r = recorder({ fail: () => (down ? new TypeError('Failed to fetch') : null) });
+  const s = new Autosaver({ save: r.save, timers: t, delayMs: 10, ready: (v) => (v ? null : 'Type something') });
+  assert.equal(await s.flush(), true, 'nothing waiting');
+  s.change('x');
+  assert.equal(await s.flush(), false, 'the save failed: keep the form');
+  down = false;
+  assert.equal(await s.retry(), true);
+  s.change('');
+  assert.equal(await s.flush(), false, 'incomplete input is not saved');
+});

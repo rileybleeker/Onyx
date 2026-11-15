@@ -177,8 +177,14 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
   async function toggleExpand(lead: NycLead) {
     setSelectedId(lead.id);
     setSaveError(null);
-    // A note still waiting for the lead being closed is sent first, then the box follows the new lead.
-    await noteSave.flush();
+    // A note still waiting for the lead being closed is sent first, then the box follows the new lead. A note that
+    // could not be saved keeps its lead open (its status line has Retry) instead of being dropped.
+    if (!(await noteSave.flush())) {
+      const open = leadsRef.current.find((l) => l.id === expandedId);
+      setSelectedId(expandedId);
+      setSaveError(`Your note${open ? ` for lead ${open.number}` : ""} is not saved yet. Retry it (under the note) before opening another lead.`);
+      return;
+    }
     if (expandedId === lead.id) {
       setExpandedId(null);
     } else {

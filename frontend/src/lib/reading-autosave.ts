@@ -102,3 +102,27 @@ export function highlightValue(f: HighlightFields): HighlightValue {
   if (chapter !== null && (!/^\d+$/.test(chText) || !Number.isInteger(chapter))) return { body: null, reason: "The chapter must be a whole number." };
   return { body: { passage, comment: f.comment, chapter, concept: f.concept.trim() || null, source: f.source }, reason: null };
 }
+
+/** A random UUID v4: the idempotency key of one new session (POST /api/reading/sessions `client_key`). */
+export function newClientKey(rand: (bytes: Uint8Array) => Uint8Array = (b) => globalThis.crypto.getRandomValues(b)): string {
+  const b = rand(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+/**
+ * The highlight a create answered with is this form's own when the form sent the same passage before without
+ * hearing back (a lost answer: the retry finds the row the first send made), and the row is no older than that
+ * first send (two minutes of clock slack). Otherwise it was saved before (e.g. by the Kindle harvester).
+ */
+export function ownRetriedHighlight(
+  row: { passage?: string; created_at?: string },
+  unconfirmed: { passage: string; at: number } | null,
+  slackMs = 120_000,
+): boolean {
+  if (!unconfirmed || !row.passage || row.passage !== unconfirmed.passage) return false;
+  const created = row.created_at ? Date.parse(row.created_at) : NaN;
+  return Number.isFinite(created) && created >= unconfirmed.at - slackMs;
+}

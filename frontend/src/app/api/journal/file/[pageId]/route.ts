@@ -14,15 +14,19 @@ import {
 } from "@/lib/journal-file-server";
 
 // PATCH /api/journal/file/[pageId]
-// Body: { body, source, known_sha: [sha...], force?, relabel?, last_labels?, title?, mood?, confidence?, topics? }
+// Body: { body, source, known_sha: [sha...], known_paras?: [hash16...], force?, relabel?, last_labels?, title?, mood?,
+//         confidence?, topics? }
 //
 // The /log Journal section's autosave keeps the entry it filed (POST /api/journal/file) up to date while Riley goes
 // on writing in the same box: ONE page per entry, never a second one.
-//   - body: replaces the page's words VERBATIM (only the paragraphs that changed are rewritten). The date never
-//     changes.
-//   - known_sha: hashes (SHA-256 of the words as written) of the versions this box filed. The page must still hold
-//     one of them: if it was edited in Notion meanwhile, nothing is written (409 `changed`), unless `force` (Riley
-//     chose "Replace it with these words"). A page that already holds the new words gets only its properties.
+//   - body: replaces the page's words VERBATIM (only the paragraphs that changed are rewritten: old ones removed,
+//     then new ones added). The date never changes.
+//   - known_sha: hashes (SHA-256 of the words as written) of the versions this box filed or sent (the box registers
+//     each one before sending). known_paras: short hashes of those versions' paragraphs. The page must hold one of
+//     those versions, or only those paragraphs (an update of the box's own that Notion stopped halfway, e.g. a 429
+//     between removing and adding: the retry finishes it). Anything else was edited in Notion meanwhile: nothing is
+//     written (409 `changed`), unless `force` (Riley chose "Replace it with these words"). A page that already holds
+//     the new words gets only its properties.
 //   - source: always set. title / mood / confidence / topics: set when sent (Riley's own).
 //   - relabel: re-infer the labels in ONE model call, written only where the page still holds `last_labels` (the
 //     labels this box wrote), so a label changed in Notion is never overwritten. The box asks only when the entry

@@ -15,8 +15,8 @@ export { etToday, parseLb, weightDelayMs, weightNotReady, type WeightEntry };
  *  - Typing saves 1 s after the last keystroke, or 4 s when the number is far (over 30 %) from the last weigh-in
  *    (a half-typed "18" on the way to "185"); Enter, leaving the field and hiding the page save at once.
  *  - Later edits replace the same day's row. Moving the day after a save MOVES the entry: the earlier day gets
- *    back what it had before this form wrote it (a manual row its old value and note; a Tanita or empty day is
- *    cleared, and the next scale run writes the Tanita reading back).
+ *    back exactly what it had before this form wrote it (the old value, note and source, Tanita included; an
+ *    empty day is cleared).
  *  - Undo does the same for the day the form wrote. An emptied field saves nothing (it never removes a weight).
  */
 
@@ -29,12 +29,16 @@ export interface StoredWeight {
 }
 type Prior = StoredWeight | null;
 
-/** Put a day back the way it was before this form wrote it. */
+/**
+ * Put a day back the way it was before this form wrote it: the old row's value, note AND source (a Tanita reading
+ * stays the scale's: PATCH with source "tanita", never a DELETE, which the ETL would not undo for a day older than
+ * its 14-day window), or no row at all.
+ */
 export async function restoreWeightDay(day: string, prior: Prior, keepalive = false): Promise<StoredWeight | null> {
-  if (prior && prior.source === "manual") {
+  if (prior) {
     const row = await saveRequest("/api/weight", {
-      method: "POST",
-      body: { log_date: day, weight_kg: Number(prior.weight_kg), ...(prior.notes ? { notes: prior.notes } : {}) },
+      method: "PATCH",
+      body: { log_date: day, weight_kg: Number(prior.weight_kg), notes: prior.notes ?? "", source: prior.source },
       keepalive,
     });
     return row as unknown as StoredWeight;
