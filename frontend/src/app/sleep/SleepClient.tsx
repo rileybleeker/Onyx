@@ -8,7 +8,7 @@ import {
 import {
   getWhoopSleepAll, getWhoopRecovery, getWhoopCycles, getBehaviorLog,
   getEightSleepTrends, getDailySummaries,
-  rangeDays, rangeLabel, type Range,
+  rangeDays, rangeLabel,
 } from "@/lib/queries";
 import { formatDate, formatDuration, formatDurationMs, etDate, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
@@ -16,6 +16,7 @@ import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import DeferredMount from "@/components/DeferredMount";
 import RangeFilter from "@/components/RangeFilter";
+import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -49,13 +50,13 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
   const [eightSleep, setEightSleep]     = useState<any[]>(initial?.eightSleep ?? []);
   const [summaries, setSummaries]       = useState<any[]>(initial?.summaries ?? []);
   // `loading` only gates the no-initial COLD path (skeleton until the first
-  // fetch resolves — same behavior as pre-ISR). Range changes flip the narrow
-  // `rangeLoading` flag instead (perf round 3): the stale charts stay visible
-  // and re-render in place when the new window lands, with a small
-  // "updating…" hint next to the RangeFilter rather than a page-wide skeleton.
+  // fetch resolves — same behavior as pre-ISR). Range changes keep the charts
+  // visible (perf round 3) and re-render them in place when the new window
+  // lands. The labels follow the range of the rows ON SCREEN (`rangeView.shown`),
+  // never the one still loading; a failed load says so with Retry
+  // (components/RangeLoadStatus.tsx, Codex #191 UI 4).
   const [loading, setLoading]           = useState(!initial);
-  const [rangeLoading, setRangeLoading] = useState(false);
-  const [range, setRange]               = useState<Range>("30d");
+  const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange } = useRangeLoad("30d");
   const firstRun = useRef(true);
   const firstRunWithInitial = useRef(!!initial);
 
@@ -68,7 +69,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
     firstRun.current = false;
     const silent = isFirst && firstRunWithInitial.current;
     firstRunWithInitial.current = false;
-    if (!isFirst) setRangeLoading(true);
+    const seq = beginRange(range, silent);
     const days = rangeDays(range);
     Promise.all([
       getWhoopSleepAll(days),
@@ -92,21 +93,25 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
         setJournal((prev) => (sameJson(prev, j) ? prev : j));
         setEightSleep((prev) => (sameJson(prev, e) ? prev : e));
         setSummaries((prev) => (sameJson(prev, sum) ? prev : sum));
+        finishRange(seq, range, true);
       })
-      .catch(console.error)
+      .catch((e) => {
+        console.error(e);
+        // The rows on screen keep their own range's labels; the status line offers Retry.
+        if (!cancelled) finishRange(seq, range, false);
+      })
       .finally(() => {
         if (cancelled) return;
-        // Clear BOTH flags unconditionally (no-op setState bails when the
-        // value is unchanged). Gating setLoading on `isFirst` left a hole
-        // under dev StrictMode: the doubled mount consumed the firstRun ref
-        // on the cancelled first invocation, so the second run never reached
-        // the only setLoading(false) site and a cold (initial=null) load
-        // showed the skeleton forever.
-        setRangeLoading(false);
+        // Clear the flag unconditionally (no-op setState bails when the value
+        // is unchanged). Gating setLoading on `isFirst` left a hole under dev
+        // StrictMode: the doubled mount consumed the firstRun ref on the
+        // cancelled first invocation, so the second run never reached the
+        // only setLoading(false) site and a cold (initial=null) load showed
+        // the skeleton forever.
         setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [range]);
+  }, [range, attempt, beginRange, finishRange]);
 
   if (loading) {
     return (
@@ -132,7 +137,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
       .map(Number);
     return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
   };
-  const rangeNote = range === "1d" ? "today" : `${rangeLabel(range)} avg`;
+  // Labels describe the rows on screen, which stay the previous range's until a new range has loaded.
+  const shownRange = rangeView.shown;
+  const rangeNote = shownRange === "1d" ? "today" : `${rangeLabel(shownRange)} avg`;
 
   // ── WHOOP ────────────────────────────────────────────────────────────────────
   // Main-only sleep rows derived from the nap-inclusive set (perf round 3):
@@ -387,13 +394,11 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Sleep &amp; Recovery</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">Sleep, recovery, and cardiac trends — {rangeLabel(range)}</p>
+          <p className="text-sm text-text-tertiary mt-0.5">Sleep, recovery, and cardiac trends — {rangeLabel(shownRange)}</p>
         </div>
-        <div className="flex items-center gap-3">
-          {rangeLoading && (
-            <span className="text-[11px] font-mono text-text-tertiary animate-pulse">updating…</span>
-          )}
-          <RangeFilter value={range} onChange={setRange} />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <RangeLoadStatus view={rangeView} onRetry={retryRange} />
+          <RangeFilter value={selectedRange} onChange={selectRange} />
         </div>
       </div>
 

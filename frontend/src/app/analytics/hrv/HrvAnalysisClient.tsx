@@ -10,6 +10,7 @@ import AirQualityPanel from "@/components/AirQualityPanel";
 import ChartCard from "@/components/ChartCard";
 import DeferredMount from "@/components/DeferredMount";
 import RangeFilter from "@/components/RangeFilter";
+import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import KpiTile from "@/components/KpiTile";
 import MetricRing from "@/components/MetricRing";
 import SectionHeader from "@/components/SectionHeader";
@@ -290,11 +291,10 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
   const [xgbDiagnostics, setXgbDiagnostics] = useState<any | null>(initial?.xgbDiagnostics ?? null);
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
-  const [range, setRange] = useState<Range>(DEFAULT_RANGE);
-  // Narrow loading flag for range changes — only the 3 range-dependent series
-  // refetch, and the stale charts stay visible while they do (no page-wide
-  // skeleton; see the range effect below).
-  const [rangeLoading, setRangeLoading] = useState(false);
+  // Requested vs shown range (components/RangeLoadStatus.tsx, Codex #191 UI 4). Only the 3 range-dependent
+  // series refetch on a range change and the stale charts stay visible while they do (no page-wide skeleton;
+  // see the range effect below); their labels use the SHOWN range until the new one has loaded.
+  const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange } = useRangeLoad(DEFAULT_RANGE);
   // Global FDR filter — when ON (default), every chart whose rows carry a
   // `passes_fdr` flag hides the non-survivors. BH-FDR is applied per family
   // in the pipeline (causal binary/continuous, journal/habit/supplement
@@ -421,7 +421,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       return;
     }
     let cancelled = false;
-    setRangeLoading(true);
+    const seq = beginRange(range);
     loadHrvRangeDependent(rangeDays(range))
       .then((d) => {
         if (cancelled) return;
@@ -431,13 +431,15 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         setAccuracy(prev => sameJson(prev, d.accuracy) ? prev : d.accuracy);
         setHistoricalHrv(prev => sameJson(prev, d.historicalHrv) ? prev : d.historicalHrv);
         setWorkoutGap(prev => sameJson(prev, d.workoutGap) ? prev : d.workoutGap);
+        finishRange(seq, range, true);
       })
-      .catch(console.error)
-      .finally(() => {
-        if (!cancelled) setRangeLoading(false);
+      .catch((e) => {
+        console.error(e);
+        // The 3 series keep the shown range's rows and labels; the status line offers Retry.
+        if (!cancelled) finishRange(seq, range, false);
       });
     return () => { cancelled = true; };
-  }, [range]);
+  }, [range, attempt, beginRange, finishRange]);
 
   // ---------------------------------------------------------------------------
   // Derived state
@@ -614,7 +616,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
         <div>
           <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">HRV Deep Analysis</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Predictive modeling · Statistical drivers · {rangeLabel(range)} · {historicalHrv.length} days of data
+            Predictive modeling · Statistical drivers · {rangeLabel(rangeView.shown)} · {historicalHrv.length} days of data
           </p>
           <p className="text-[11px] text-text-tertiary/80 mt-1 max-w-2xl leading-relaxed">
             Driver, impact &amp; causal charts default to <span className="text-emerald-300/90">FDR-significant</span> rows
@@ -635,10 +637,8 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
           >
             FDR-significant only {fdrOnly ? "✓" : "○"}
           </button>
-          {rangeLoading && (
-            <span className="text-[11px] font-mono text-text-tertiary animate-pulse">updating…</span>
-          )}
-          <RangeFilter value={range} onChange={setRange} />
+          <RangeLoadStatus view={rangeView} onRetry={retryRange} />
+          <RangeFilter value={selectedRange} onChange={selectRange} />
           {!hasData && (
             <div className="text-sm text-text-tertiary bg-amber-500/10 border border-amber-500/20 rounded px-3 py-1.5">
               Run <code className="font-mono text-amber-400">python hrv_analysis.py</code> to generate predictions
@@ -900,7 +900,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       <DeferredMount minHeight={420}>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Prediction vs Actual */}
-        <ChartCard collapsible storageKey="prediction-vs-actual" title={`Prediction vs Actual (${rangeLabel(range)})`}
+        <ChartCard collapsible storageKey="prediction-vs-actual" title={`Prediction vs Actual (${rangeLabel(rangeView.shown)})`}
                    subtitle={cutoverDay
                      ? "Red dots = miss > 15ms · yellow line = first forecast after the 2026-11-11 same-night fix"
                      : "Red dots = miss > 15ms"}
@@ -984,7 +984,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       <SectionHeader id="trend" tick="descriptive" title="HRV Trend" />
       {/* ── Where is HRV trending overall? ── */}
       <DeferredMount minHeight={420}>
-      <ChartCard collapsible storageKey="hrv-trend" title={`HRV Trend (${rangeLabel(range)})`}
+      <ChartCard collapsible storageKey="hrv-trend" title={`HRV Trend (${rangeLabel(rangeView.shown)})`}
                  subtitle="WHOOP HRV + 7-day rolling average"
                  info="Your daily WHOOP HRV (faint line) swings a lot day-to-day — that's normal. The brighter line averages the last 7 days to show your real trend.">
         <ResponsiveContainer width="100%" height={280}>
@@ -1495,7 +1495,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
 
         <ChartCard collapsible
           title="Workout-to-Bed Gap vs Next-Morning HRV"
-          subtitle={`${rangeLabel(range)} · each dot = one night`}
+          subtitle={`${rangeLabel(rangeView.shown)} · each dot = one night`}
           info="Hours between your last logged workout and the moment you fell asleep, plotted against the HRV measured from that night's sleep. Late-evening workouts (gap < 2h) are known to depress HRV; this chart lets you see whether that pattern shows up in your data. Dot color encodes WHOOP strain when available."
         >
           {(() => {
