@@ -3,8 +3,10 @@ import clsx from "clsx";
 import type { ScreenSync } from "@/lib/screen-time-server";
 import { WINDOW_CHOICES, formatMinutes, type TopEntry } from "@/lib/screen-time";
 import type { ScreenTimeViewData } from "@/lib/screen-time-view";
-import ScreenTimeCharts from "./ScreenTimeCharts";
+import { DailyTotalChart, LateNightChart, PickupsChart, SleepOnsetChart } from "./ScreenTimeCharts";
 import InfoHint from "@/components/InfoHint";
+import { PartGrid, type PartSpec } from "@/components/personalize/PartGrid";
+import type { PageLayout } from "@/lib/personalize-layout";
 
 /**
  * The /screen-time screen. No "use client": the server page renders it during its own render (the window
@@ -12,6 +14,10 @@ import InfoHint from "@/components/InfoHint";
  * (FeedSection.tsx) renders the same markup in the browser with `feed` (a section instead of the page's
  * main landmark, the feed's heading test id) and `onWindow` (the window choices become buttons, so picking
  * one stays in the scroll). Data arrives as props (lib/screen-time-view.ts); nothing here fetches.
+ *
+ * Personalize: every tile, chart, list and note is its own part (plain `parts` data, since the server renders
+ * this); parts move within their section and into any other section. The routed page passes the layout from its
+ * cookie (`layout`), so the server already renders the saved arrangement and nothing moves after hydration.
  */
 
 const SYNC_TIME = new Intl.DateTimeFormat("en-US", {
@@ -82,6 +88,89 @@ function TopList({ title, entries, empty }: { title: string; entries: TopEntry[]
   );
 }
 
+type OkData = Extract<ScreenTimeViewData, { kind: "ok" }>;
+
+/** The page's parts in default order: sections (groups) of tiles, charts and lists. */
+function screenTimeParts(data: OkData, s: OkData["summary"]): PartSpec[] {
+  const noDay = "No complete day in this window yet.";
+  return [
+    {
+      id: "averages",
+      title: "Averages",
+      node: null,
+      gap: 12,
+      members: [
+        { id: "avg-total", title: "Daily total", width: "quarter", node: <Tile label="Daily total" value={formatMinutes(s.avgTotalMin)} sub="average per day" /> },
+        { id: "avg-late-night", title: "Late night", width: "quarter", node: <Tile label="Late night" value={formatMinutes(s.avgLateNightMin)} sub="10 PM to 6 AM, per day" /> },
+        { id: "avg-after-midnight", title: "After midnight", width: "quarter", node: <Tile label="After midnight" value={formatMinutes(s.avgAfterMidnightMin)} sub="midnight to 6 AM, per day" /> },
+        {
+          id: "avg-pickups",
+          title: "Pickups",
+          width: "quarter",
+          node: (
+            <Tile
+              label="Pickups"
+              value={s.avgPickups === null ? "-" : String(Math.round(s.avgPickups))}
+              sub={s.avgNotifications === null ? "per day" : `per day, ${Math.round(s.avgNotifications)} notifications`}
+            />
+          ),
+        },
+        {
+          id: "avg-hour-before-sleep",
+          title: "Hour before sleep",
+          width: "quarter",
+          node: (
+            <Tile
+              label="Hour before sleep"
+              value={formatMinutes(s.avgLastHourBeforeSleepMin)}
+              sub={s.bedtimeDays > 0 ? `estimate, ${s.bedtimeDays} nights` : "needs a scored sleep"}
+            />
+          ),
+        },
+      ],
+    },
+    {
+      id: "charts",
+      title: "Charts",
+      node: null,
+      members: [
+        { id: "chart-total", title: "Daily total chart", width: "half", node: <DailyTotalChart points={data.points} /> },
+        { id: "chart-late-night", title: "Late night chart", width: "half", node: <LateNightChart points={data.points} /> },
+        { id: "chart-pickups", title: "Pickups and notifications", width: "half", node: <PickupsChart points={data.points} /> },
+        { id: "chart-sleep-onset", title: "Around sleep onset", width: "half", node: <SleepOnsetChart points={data.points} /> },
+      ],
+    },
+    {
+      id: "top",
+      title: "Top apps and categories",
+      node: null,
+      members: [
+        { id: "top-apps", title: "Top apps", width: "half", node: <TopList title="Top apps" entries={data.topApps} empty={noDay} /> },
+        { id: "top-categories", title: "Top categories", width: "half", node: <TopList title="Top categories" entries={data.topCategories} empty={noDay} /> },
+      ],
+    },
+    {
+      id: "notes",
+      title: "Notes",
+      node: null,
+      members: [
+        {
+          id: "sleep-estimates",
+          title: "About the sleep estimates",
+          node: (
+            <InfoHint variant="disclosure" label="Sleep estimates" summary="About the sleep estimates">
+              <p>
+                Apple reports use in one-hour blocks, so the minutes before and after sleep onset are estimates: an
+                hour that straddles sleep onset is split in proportion to the overlap. Sleep onset is WHOOP&apos;s.
+              </p>
+            </InfoHint>
+          ),
+        },
+      ],
+    },
+  ];
+}
+
 const windowClass = (on: boolean) =>
   clsx(
     "rounded-control border px-2.5 py-1 font-mono",
@@ -94,6 +183,7 @@ export default function ScreenTimeView({
   feed = false,
   onWindow,
   busy = false,
+  layout,
 }: {
   /** null: the scroll's section is still waiting for its first answer (the loading line shows). */
   data: ScreenTimeViewData | null;
@@ -104,6 +194,8 @@ export default function ScreenTimeView({
   onWindow?: (days: number) => void;
   /** Scroll section only: the answer for the picked window has not arrived yet. */
   busy?: boolean;
+  /** Routed page only: the saved Personalize layout read from the page's cookie. */
+  layout?: PageLayout;
 }) {
   const Root = feed ? "section" : "main";
   return (
@@ -192,38 +284,7 @@ export default function ScreenTimeView({
                 </p>
               </div>
 
-              <section aria-label="Averages" className="grid grid-cols-2 gap-3 md:grid-cols-5">
-                <Tile label="Daily total" value={formatMinutes(s.avgTotalMin)} sub="average per day" />
-                <Tile label="Late night" value={formatMinutes(s.avgLateNightMin)} sub="10 PM to 6 AM, per day" />
-                <Tile label="After midnight" value={formatMinutes(s.avgAfterMidnightMin)} sub="midnight to 6 AM, per day" />
-                <Tile
-                  label="Pickups"
-                  value={s.avgPickups === null ? "-" : String(Math.round(s.avgPickups))}
-                  sub={
-                    s.avgNotifications === null
-                      ? "per day"
-                      : `per day, ${Math.round(s.avgNotifications)} notifications`
-                  }
-                />
-                <Tile
-                  label="Hour before sleep"
-                  value={formatMinutes(s.avgLastHourBeforeSleepMin)}
-                  sub={s.bedtimeDays > 0 ? `estimate, ${s.bedtimeDays} nights` : "needs a scored sleep"}
-                />
-              </section>
-
-              <ScreenTimeCharts points={data.points} />
-
-              <div className="grid gap-4 md:grid-cols-2">
-                <TopList title="Top apps" entries={data.topApps} empty="No complete day in this window yet." />
-                <TopList title="Top categories" entries={data.topCategories} empty="No complete day in this window yet." />
-              </div>
-              <InfoHint variant="disclosure" label="Sleep estimates" summary="About the sleep estimates">
-                <p>
-                  Apple reports use in one-hour blocks, so the minutes before and after sleep onset are estimates: an
-                  hour that straddles sleep onset is split in proportion to the overlap. Sleep onset is WHOOP&apos;s.
-                </p>
-              </InfoHint>
+              <PartGrid page="/screen-time" title="Screen Time" initial={layout} parts={screenTimeParts(data, s)} />
             </div>
           );
         })()}

@@ -6,6 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
 import { SIMPLEFIN_THRESHOLDS, financeLedgerCard } from "@/lib/finance-status";
 import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
+import { CARE_CALENDAR_SYNC_COLUMNS, careCalendarCard, careCalendarConfigured, type CareCalendarSyncRow } from "@/lib/care-calendar-status";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -65,11 +66,13 @@ const CADENCE: Record<string, string> = {
   online_orders: "Every 3h :05 (both Gmail accounts)",
   air_quality: "Every 3h :12",
   weather: "Every 3h :32",
+  pollen: "Twice daily, 16:20 + 21:20 UTC",
   supplement_reminders: "Worker poll (heartbeat ~hourly); cards at each stack's reminder time",
   renewal_reminders: "Worker poll, hourly; a card up to 3 days before a renewal",
   cash_forecast: "Weekly, Monday 12:30 UTC (forecast snapshot)",
   urgent_email: "Hourly :15 (both Gmail accounts)",
   google_calendar: "Hourly :55",
+  care_calendar: "After each /health change + every 6h :20 catch-up",
   ubereats: "Every 6h (Riley's PC, while logged on)",
   pc_activity: "Hourly (Riley's PC, while signed in)",
   nyc_scout: "Daily 6:10am ET",
@@ -119,11 +122,13 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   online_orders:  { method: "automated",      label: "IMAP email parser" },
   air_quality:    { method: "automated",      label: "API ETL" },
   weather:        { method: "automated",      label: "API ETL" },
+  pollen:         { method: "automated",      label: "Web page ETL" },
   supplement_reminders: { method: "automated", label: "Worker push cards" },
   renewal_reminders: { method: "automated", label: "Worker push cards" },
   cash_forecast:  { method: "automated",      label: "Snapshot job" },
   urgent_email:   { method: "automated",      label: "IMAP label reader" },
   google_calendar: { method: "automated",     label: "iCal feed ETL" },
+  care_calendar:  { method: "automated",      label: "Calendar API (Onyx → Google)" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   pc_activity:    { method: "automated",      label: "Local PC logger" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
@@ -280,6 +285,13 @@ export async function GET() {
       .eq("source", "finance_forecast").eq("data_type", "snapshot").order("sync_start", { ascending: false }).limit(1).then((res) => res);
     // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
     const urgentEmailCardPromise = getUrgentEmailStatusCard(supabase);
+    // Google Calendar WRITE side (care items -> the "Onyx care" calendar): the one sync-state row,
+    // which holds timestamps, counts and a short code only (never pds.ci_tokens, never an item).
+    // Inert until set up: without the two Google variables nothing is read, as in care-google-server.ts.
+    const careCalendarIsSetUp = careCalendarConfigured(process.env);
+    const careCalendarPromise = careCalendarIsSetUp
+      ? supabase.from("care_calendar_sync").select(CARE_CALENDAR_SYNC_COLUMNS).eq("id", 1).limit(1).then((res) => res)
+      : Promise.resolve(null);
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
@@ -289,6 +301,11 @@ export async function GET() {
     // lazy; .then() sends it now so it overlaps the reads below.
     const garminWornPromise = supabase.from("garmin_daily_summary").select("calendar_date")
       .or(GARMIN_WEARABLE_FILTER).order("calendar_date", { ascending: false }).limit(1)
+      .then((res) => res);
+    // Pollen (pollen_etl.py): newest published count in pds.pollen_daily. A missing table
+    // (sql/pollen_schema.sql not applied yet) comes back as an error and is shown on the card.
+    const pollenLatestPromise = supabase.from("pollen_daily").select("count_date")
+      .order("count_date", { ascending: false }).limit(1)
       .then((res) => res);
 
     // NYC scout freshness lives in Notion (the "NYC Leads" database the
@@ -438,6 +455,8 @@ export async function GET() {
         ["pc_activity", "usage"],
         // N-of-1 trial report job: one heartbeat a day.
         ["experiments", "report"],
+        // Pollen ETL (twice a day): a 19 h gap between runs, far outside the shared window.
+        ["pollen", "daily"],
       ].map(async ([source, dataType]) => {
         const { data, error } = await supabase.from("sync_log").select("*")
           .eq("source", source).eq("data_type", dataType)
@@ -546,6 +565,10 @@ export async function GET() {
     const renewalRemindersRes = await renewalRemindersPromise;
     const cashForecastRes = await cashForecastPromise;
     const urgentEmailCard = await urgentEmailCardPromise;
+    const pollenRes = await pollenLatestPromise;
+    const pollenPending = pollenRes.error?.code === "PGRST205" || pollenRes.error?.code === "42P01";
+    const pollenLatest = (pollenRes.data?.[0]?.count_date as string | undefined) ?? null;
+    const careCalendarRes = await careCalendarPromise;
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -1099,6 +1122,43 @@ export async function GET() {
           methodLabel: METHOD.weather.label,
         };
       })(),
+      // Pollen (pollen_etl.py): the daily Atlanta count from atlantaallergy.com (one page request
+      // per run) into pds.pollen_daily. Freshness = heartbeat age: two runs a day, 19 h apart at
+      // most -> >21h partial, >27h or a failed row red. The station skips weekends and holidays,
+      // so a count 2-4 days old is normal; more than 4 days behind the spine reads partial. A
+      // 'partial' heartbeat means the page was read but part of it was not recognised.
+      pollen: (() => {
+        const entry = latestBySrcType["pollen|daily"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const countLag = pollenLatest ? daysLag(pollenLatest, spineMaxDate) : 999;
+        const countStale = entry !== null && pollenLatest !== null && countLag > 4;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || entry.status === "error" || ageH > 27
+            ? "failed"
+            : entry.status === "partial" || ageH > 21 || countStale
+              ? "partial"
+              : "success";
+        return {
+          label: "Pollen",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: pollenLatest,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (countStale ? `No new count since ${pollenLatest} (${countLag} days). The station skips weekends and holidays.` : null)
+            ?? (entry ? null
+              : pollenPending
+                ? "pds.pollen_daily is missing - apply sql/pollen_schema.sql, then add the Pollen ETL workflow (YAML in the roadmap row)."
+                : pollenRes.error?.message
+                  ?? "No run yet - add .github/workflows/pollen-etl.yml (YAML in the roadmap row)."),
+          cadence: CADENCE.pollen,
+          integrationMethod: METHOD.pollen.method,
+          methodLabel: METHOD.pollen.label,
+        };
+      })(),
       // Supplement stack reminders (sms-reminders Worker -> /api/supplements/reminders/*):
       // the Worker claims due stacks on a schedule and posts Log it / Skip cards to /agents.
       // Freshness = heartbeat age, because a day with nothing due (stacks logged early, reminders
@@ -1344,6 +1404,23 @@ export async function GET() {
           methodLabel: METHOD.google_calendar.label,
         };
       })(),
+      // Care Calendar (the other direction: care items on /health -> the "Onyx care" calendar,
+      // lib/care-google-server.ts). No sync_log rows: the heartbeat is care_calendar_sync.last_sync_at,
+      // moved by every sync (after each /health change, Sync now, and the 6-hourly catch-up at
+      // /api/jobs/care-calendar-catch-up). "unknown" while not set up or not connected; once connected
+      // a failed sync is red, and a good one is degraded after 14 h and red after 30 h without a sync.
+      // Thresholds and messages: lib/care-calendar-status.ts.
+      care_calendar: {
+        ...careCalendarCard({
+          configured: careCalendarIsSetUp,
+          row: (careCalendarRes?.data?.[0] as CareCalendarSyncRow | undefined) ?? null,
+          readError: careCalendarRes?.error ?? null,
+          nowMs: Date.now(),
+        }),
+        cadence: CADENCE.care_calendar,
+        integrationMethod: METHOD.care_calendar.method,
+        methodLabel: METHOD.care_calendar.label,
+      },
       // Urgent email for Today: inbox-triage's Agent/Action + Agent/Deadline labels read
       // over IMAP (read-only) into pds.inbox_emails. Thresholds in getUrgentEmailStatusCard.
       urgent_email: {

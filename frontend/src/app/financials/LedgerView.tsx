@@ -169,238 +169,334 @@ export default function LedgerView({
   const shownTo = (list.page - 1) * list.pageSize + list.rows.length;
   const excludedTotal = flows.transfers + flows.ignored;
 
-  // Each part of the page can be moved, resized, collapsed or hidden (Personalize; components/personalize).
-  // The page renders the saved layout from its cookie on the server, so nothing moves after hydration.
-  const parts: PartSpec[] = [
+  // Personalize (components/personalize): every tile, notice, balance list, chart and card is its own part. Parts
+  // move within and between the sections (groups) below, and hide / resize / collapse. The routed page renders
+  // the saved layout from its cookie on the server, so nothing moves after hydration.
+  const heading = "mb-3 text-[15px] font-semibold";
+  const hasNotes = nw.unclassified.length + nw.nonUsdCount + nw.staleCount + nw.noBalance.length > 0;
+  const noBalances = nw.assets.length + nw.liabilities.length + nw.unclassified.length === 0;
+
+  const netWorthParts: PartSpec[] = [
     {
-      id: "net-worth",
+      id: "nw-total",
       title: "Net worth",
+      width: "quarter",
       node: (
-          <section aria-labelledby="networth-h" className="space-y-3">
-            <h2 id="networth-h" className="text-[15px] font-semibold">
-              Net worth
-            </h2>
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              <StatCard
-                label="Net worth"
-                value={nw.includedCount > 0 ? formatCents(nw.netWorthCents) : null}
-                sublabel={
-                  nw.includedCount > 0
-                    ? `${nw.includedCount} account${nw.includedCount === 1 ? "" : "s"} counted · oldest balance ${ageLabel(nw.oldestCapturedAt, now)}`
-                    : "No classified USD balances yet"
-                }
-              />
-              <StatCard label="Assets" value={nw.includedCount > 0 ? formatCents(nw.assetsCents) : null} />
-              <StatCard label="Liabilities (owed)" value={nw.includedCount > 0 ? formatCents(nw.liabilitiesCents) : null} />
-            </div>
-            {nw.unclassified.length > 0 && (
-              <Notice>
-                {nw.unclassified.length} account{nw.unclassified.length === 1 ? " has" : "s have"} no asset or liability label
-                from the source (listed under Unclassified).
-              </Notice>
-            )}
-            {nw.nonUsdCount > 0 && (
-              <Notice>
-                {nw.nonUsdCount} balance{nw.nonUsdCount === 1 ? " is" : "s are"} not in USD and not converted; left out of the totals.
-              </Notice>
-            )}
-            {nw.staleCount > 0 && (
-              <Notice>
-                {nw.staleCount} balance{nw.staleCount === 1 ? " is" : "s are"} older than {STALE_BALANCE_HOURS} hours. Check the bank sync
-                on Status.
-              </Notice>
-            )}
-            {nw.noBalance.length > 0 && (
-              <Notice tone="info">
-                {nw.noBalance.length} account{nw.noBalance.length === 1 ? " has" : "s have"} no balance snapshot yet
-                (transactions only), so {nw.noBalance.length === 1 ? "it is" : "they are"} not in net worth.
-              </Notice>
-            )}
-            <div className={`${box} space-y-4`}>
-              <Group title="Assets" lines={nw.assets} now={now} />
-              <Group title="Liabilities" lines={nw.liabilities} now={now} liability />
-              <Group title="Unclassified" note="Not counted in net worth until the source labels them." lines={nw.unclassified} now={now} />
-              {nw.assets.length + nw.liabilities.length + nw.unclassified.length === 0 && (
-                <p className="text-[13px] text-text-secondary">No balances captured yet. Transactions below are still shown.</p>
-              )}
-            </div>
-          </section>
+        <StatCard
+          label="Net worth"
+          value={nw.includedCount > 0 ? formatCents(nw.netWorthCents) : null}
+          sublabel={
+            nw.includedCount > 0
+              ? `${nw.includedCount} account${nw.includedCount === 1 ? "" : "s"} counted · oldest balance ${ageLabel(nw.oldestCapturedAt, now)}`
+              : "No classified USD balances yet"
+          }
+        />
       ),
     },
+    {
+      id: "nw-assets",
+      title: "Assets",
+      width: "quarter",
+      node: <StatCard label="Assets" value={nw.includedCount > 0 ? formatCents(nw.assetsCents) : null} />,
+    },
+    {
+      id: "nw-liabilities",
+      title: "Liabilities (owed)",
+      width: "quarter",
+      node: <StatCard label="Liabilities (owed)" value={nw.includedCount > 0 ? formatCents(nw.liabilitiesCents) : null} />,
+    },
+  ];
+  if (hasNotes) {
+    netWorthParts.push({
+      id: "nw-notes",
+      title: "Net worth notes",
+      node: (
+        <div className="space-y-2">
+          {nw.unclassified.length > 0 && (
+            <Notice>
+              {nw.unclassified.length} account{nw.unclassified.length === 1 ? " has" : "s have"} no asset or liability label
+              from the source (listed under Unclassified).
+            </Notice>
+          )}
+          {nw.nonUsdCount > 0 && (
+            <Notice>
+              {nw.nonUsdCount} balance{nw.nonUsdCount === 1 ? " is" : "s are"} not in USD and not converted; left out of the totals.
+            </Notice>
+          )}
+          {nw.staleCount > 0 && (
+            <Notice>
+              {nw.staleCount} balance{nw.staleCount === 1 ? " is" : "s are"} older than {STALE_BALANCE_HOURS} hours. Check the bank sync
+              on Status.
+            </Notice>
+          )}
+          {nw.noBalance.length > 0 && (
+            <Notice tone="info">
+              {nw.noBalance.length} account{nw.noBalance.length === 1 ? " has" : "s have"} no balance snapshot yet
+              (transactions only), so {nw.noBalance.length === 1 ? "it is" : "they are"} not in net worth.
+            </Notice>
+          )}
+        </div>
+      ),
+    });
+  }
+  if (nw.assets.length > 0) {
+    netWorthParts.push({
+      id: "bal-assets",
+      title: "Asset accounts",
+      width: "half",
+      node: (
+        <div className={box}>
+          <Group title="Assets" lines={nw.assets} now={now} />
+        </div>
+      ),
+    });
+  }
+  if (nw.liabilities.length > 0) {
+    netWorthParts.push({
+      id: "bal-liabilities",
+      title: "Liability accounts",
+      width: "half",
+      node: (
+        <div className={box}>
+          <Group title="Liabilities" lines={nw.liabilities} now={now} liability />
+        </div>
+      ),
+    });
+  }
+  if (nw.unclassified.length > 0) {
+    netWorthParts.push({
+      id: "bal-unclassified",
+      title: "Unclassified accounts",
+      node: (
+        <div className={box}>
+          <Group title="Unclassified" note="Not counted in net worth until the source labels them." lines={nw.unclassified} now={now} />
+        </div>
+      ),
+    });
+  }
+  if (noBalances) {
+    netWorthParts.push({
+      id: "bal-none",
+      title: "Balances",
+      node: (
+        <div className={box}>
+          <p className="text-[13px] text-text-secondary">No balances captured yet. Transactions below are still shown.</p>
+        </div>
+      ),
+    });
+  }
+
+  const cashflowParts: PartSpec[] = [
     {
       id: "filters",
       title: "Filters",
       node: (
-          <section aria-label="Filters" className={box}>
-            <FilterBar
-              month={query.month}
-              months={data.months.map((m) => ({ value: m, label: monthLabel(m) }))}
-              account={query.account ?? ""}
-              accounts={data.accounts.map((a) => ({ value: a.account_key, label: data.accountLabels[a.account_key] }))}
-              q={query.q}
-              allMonths={query.allMonths}
-            />
-          </section>
+        <section aria-label="Filters" className={box}>
+          <FilterBar
+            month={query.month}
+            months={data.months.map((m) => ({ value: m, label: monthLabel(m) }))}
+            account={query.account ?? ""}
+            accounts={data.accounts.map((a) => ({ value: a.account_key, label: data.accountLabels[a.account_key] }))}
+            q={query.q}
+            allMonths={query.allMonths}
+          />
+        </section>
       ),
     },
     {
-      id: "cashflow",
-      title: "Cashflow",
+      id: "cf-in",
+      title: "Money in",
+      width: "quarter",
+      node: <StatCard label="Money in" value={formatCents(flows.moneyInCents)} sublabel="Includes refunds" />,
+    },
+    {
+      id: "cf-out",
+      title: "Money out",
+      width: "quarter",
+      node: <StatCard label="Money out" value={formatCents(flows.moneyOutCents)} />,
+    },
+    {
+      id: "cf-net",
+      title: "Net cashflow",
+      width: "quarter",
+      node: <StatCard label="Net cashflow" value={formatCents(flows.netCents, { signed: true })} />,
+    },
+    {
+      id: "cf-counted",
+      title: "What is counted",
       node: (
-          <section aria-labelledby="cashflow-h" className="space-y-3">
-            <h2 id="cashflow-h" className="text-[15px] font-semibold">
-              Cashflow · {scopeNote}
-            </h2>
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              <StatCard label="Money in" value={formatCents(flows.moneyInCents)} sublabel="Includes refunds" />
-              <StatCard label="Money out" value={formatCents(flows.moneyOutCents)} />
-              <StatCard label="Net cashflow" value={formatCents(flows.netCents, { signed: true })} />
-            </div>
-            <p className="text-[12px] text-text-tertiary">
-              {nothingThisMonth
-                ? "No transactions for this month and account."
-                : `${flows.counted} transaction${flows.counted === 1 ? "" : "s"} counted. Left out: ${excludedTotal} transfer, card-payment or ignored row${excludedTotal === 1 ? "" : "s"}${
-                    flows.foreign > 0 ? `, and ${flows.foreign} non-USD row${flows.foreign === 1 ? "" : "s"} (not converted)` : ""
-                  }.`}
-            </p>
-          </section>
+        <p className="text-[12px] text-text-tertiary">
+          {nothingThisMonth
+            ? "No transactions for this month and account."
+            : `${flows.counted} transaction${flows.counted === 1 ? "" : "s"} counted. Left out: ${excludedTotal} transfer, card-payment or ignored row${excludedTotal === 1 ? "" : "s"}${
+                flows.foreign > 0 ? `, and ${flows.foreign} non-USD row${flows.foreign === 1 ? "" : "s"} (not converted)` : ""
+              }.`}
+        </p>
       ),
     },
     {
       id: "spending-trend",
       title: "Spending, last 12 months",
       node: (
-          <ChartCard
-            title="Spending, last 12 months"
-            subtitle={`Money out per month, ending ${monthName}${query.account ? " · selected account only" : ""}`}
-            hint="Transfers between your own accounts, card payments and rows marked ignored are left out, so paying a card does not count twice."
-          >
-            <SpendingTrendChart
-              data={data.trend.map((t) => ({ month: t.month, label: t.label, outCents: t.outCents }))}
-              selectedMonth={query.month}
-            />
-          </ChartCard>
+        <ChartCard
+          title="Spending, last 12 months"
+          subtitle={`Money out per month, ending ${monthName}${query.account ? " · selected account only" : ""}`}
+          hint="Transfers between your own accounts, card payments and rows marked ignored are left out, so paying a card does not count twice."
+        >
+          <SpendingTrendChart
+            data={data.trend.map((t) => ({ month: t.month, label: t.label, outCents: t.outCents }))}
+            selectedMonth={query.month}
+          />
+        </ChartCard>
       ),
     },
     {
       id: "categories",
       title: "Money out by category",
       node: (
-          <section aria-labelledby="cats-h" className={box}>
-            <h2 id="cats-h" className="text-[15px] font-semibold">
-              Money out by category · {scopeNote}
-            </h2>
-            {ranked.top.length === 0 ? (
-              <p className="mt-2 text-[13px] text-text-secondary">No money-out transactions in this selection.</p>
-            ) : (
-              <ul className="mt-3 space-y-2">
-                {ranked.top.map((c) => (
-                  <li key={c.category}>
-                    <div className="flex items-baseline justify-between gap-4 text-[13px]">
-                      <span className="truncate">{c.category}</span>
-                      <span className="shrink-0 font-mono tabular-nums">
-                        {formatCents(c.outCents)}
-                        <span className="ml-2 text-[11px] text-text-tertiary">
-                          {flows.moneyOutCents > 0 ? `${Math.round((c.outCents / flows.moneyOutCents) * 100)}%` : ""}
-                        </span>
+        <section aria-labelledby="cats-h" className={box}>
+          <h2 id="cats-h" className="text-[15px] font-semibold">
+            Money out by category · {scopeNote}
+          </h2>
+          {ranked.top.length === 0 ? (
+            <p className="mt-2 text-[13px] text-text-secondary">No money-out transactions in this selection.</p>
+          ) : (
+            <ul className="mt-3 space-y-2">
+              {ranked.top.map((c) => (
+                <li key={c.category}>
+                  <div className="flex items-baseline justify-between gap-4 text-[13px]">
+                    <span className="truncate">{c.category}</span>
+                    <span className="shrink-0 font-mono tabular-nums">
+                      {formatCents(c.outCents)}
+                      <span className="ml-2 text-[11px] text-text-tertiary">
+                        {flows.moneyOutCents > 0 ? `${Math.round((c.outCents / flows.moneyOutCents) * 100)}%` : ""}
                       </span>
-                    </div>
-                    <div className="mt-1 h-1.5 rounded-full bg-white/5" aria-hidden>
-                      <div
-                        className="h-1.5 rounded-full bg-[var(--color-tick-forecast)]"
-                        style={{ width: `${ranked.maxCents > 0 ? Math.max(2, (c.outCents / ranked.maxCents) * 100) : 0}%` }}
-                      />
-                    </div>
-                  </li>
-                ))}
-                {ranked.otherCount > 0 && (
-                  <li className="flex justify-between gap-4 text-[13px] text-text-secondary">
-                    <span>
-                      {ranked.otherCount} other categor{ranked.otherCount === 1 ? "y" : "ies"}
                     </span>
-                    <span className="font-mono tabular-nums">{formatCents(ranked.otherCents)}</span>
-                  </li>
-                )}
-              </ul>
-            )}
-          </section>
+                  </div>
+                  <div className="mt-1 h-1.5 rounded-full bg-white/5" aria-hidden>
+                    <div
+                      className="h-1.5 rounded-full bg-[var(--color-tick-forecast)]"
+                      style={{ width: `${ranked.maxCents > 0 ? Math.max(2, (c.outCents / ranked.maxCents) * 100) : 0}%` }}
+                    />
+                  </div>
+                </li>
+              ))}
+              {ranked.otherCount > 0 && (
+                <li className="flex justify-between gap-4 text-[13px] text-text-secondary">
+                  <span>
+                    {ranked.otherCount} other categor{ranked.otherCount === 1 ? "y" : "ies"}
+                  </span>
+                  <span className="font-mono tabular-nums">{formatCents(ranked.otherCents)}</span>
+                </li>
+              )}
+            </ul>
+          )}
+        </section>
       ),
     },
+  ];
+
+  const transactionParts: PartSpec[] = [
     {
       id: "transactions",
       title: "Transactions",
       node: (
-          <section aria-labelledby="txns-h" className={box}>
-            <h2 id="txns-h" className="text-[15px] font-semibold">
-              Transactions · {query.allMonths ? "all months" : monthName}
-              {query.q && <span className="font-normal text-text-secondary"> · matching “{query.q}”</span>}
-            </h2>
-            <p className="mt-1 text-[12px] text-text-tertiary" aria-live="polite">
-              {list.total === 0
-                ? "No matching transactions."
-                : `Showing ${shownFrom}–${shownTo} of ${list.total.toLocaleString("en-US")}.`}
-              {data.pageClamped && " That page is past the end, so page 1 is shown."}
-            </p>
-            {list.rows.length > 0 && (
-              <div className="mt-3 overflow-x-auto">
-                <PersonalTable
-                  id="transactions"
-                  className="w-full min-w-[34rem] text-left text-[13px]"
-                  headRowClassName="text-[11px] uppercase tracking-[0.08em] text-text-tertiary"
-                  columns={TXN_COLUMNS}
-                  rows={list.rows.map((r) => ({
-                    key: r.txn_key,
-                    className: `border-t border-border-subtle ${r.excluded ? "opacity-60" : ""}`,
-                    cells: {
-                      date: r.txn_date,
-                      description: r.title,
-                      account: data.accountLabels[r.account_key] ?? "Unknown account",
-                      category: (
-                        <>
-                          <CategoryEditor txnKey={r.txn_key} merchantKey={r.merchant_key} category={r.category} onSaved={onChanged} />
-                          {r.excluded && (
-                            <span className="ml-2 rounded-[3px] border border-border-subtle px-1 py-px text-[10px] uppercase tracking-wide text-text-tertiary">
-                              {r.excluded === "transfer" ? "not spending" : "ignored"}
-                            </span>
-                          )}
-                        </>
-                      ),
-                      amount: (
-                        <span className={r.amount_cents < 0 ? "text-up" : undefined}>
-                          {formatCents(-r.amount_cents, { signed: true, currency: r.currency })}
-                        </span>
-                      ),
-                      merchant: r.merchant_key,
-                      currency: r.currency,
-                    },
-                  }))}
-                />
-              </div>
-            )}
-            {list.pageCount > 1 && (
-              <nav className="mt-3 flex items-center justify-between text-[13px]" aria-label="Transaction pages">
-                {list.page > 1 ? (
-                  <Link className="underline" prefetch={false} href={ledgerHref(query, { page: list.page - 1 })}>
-                    Newer
-                  </Link>
-                ) : (
-                  <span className="text-text-tertiary">Newer</span>
-                )}
-                <span className="text-text-tertiary">
-                  Page {list.page} of {list.pageCount}
-                </span>
-                {list.page < list.pageCount ? (
-                  <Link className="underline" prefetch={false} href={ledgerHref(query, { page: list.page + 1 })}>
-                    Older
-                  </Link>
-                ) : (
-                  <span className="text-text-tertiary">Older</span>
-                )}
-              </nav>
-            )}
-          </section>
+        <section aria-labelledby="txns-h" className={box}>
+          <h2 id="txns-h" className="text-[15px] font-semibold">
+            Transactions · {query.allMonths ? "all months" : monthName}
+            {query.q && <span className="font-normal text-text-secondary"> · matching “{query.q}”</span>}
+          </h2>
+          <p className="mt-1 text-[12px] text-text-tertiary" aria-live="polite">
+            {list.total === 0
+              ? "No matching transactions."
+              : `Showing ${shownFrom}–${shownTo} of ${list.total.toLocaleString("en-US")}.`}
+            {data.pageClamped && " That page is past the end, so page 1 is shown."}
+          </p>
+          {list.rows.length > 0 && (
+            <div className="mt-3 overflow-x-auto">
+              <PersonalTable
+                id="transactions"
+                className="w-full min-w-[34rem] text-left text-[13px]"
+                headRowClassName="text-[11px] uppercase tracking-[0.08em] text-text-tertiary"
+                columns={TXN_COLUMNS}
+                rows={list.rows.map((r) => ({
+                  key: r.txn_key,
+                  className: `border-t border-border-subtle ${r.excluded ? "opacity-60" : ""}`,
+                  cells: {
+                    date: r.txn_date,
+                    description: r.title,
+                    account: data.accountLabels[r.account_key] ?? "Unknown account",
+                    category: (
+                      <>
+                        <CategoryEditor txnKey={r.txn_key} merchantKey={r.merchant_key} category={r.category} onSaved={onChanged} />
+                        {r.excluded && (
+                          <span className="ml-2 rounded-[3px] border border-border-subtle px-1 py-px text-[10px] uppercase tracking-wide text-text-tertiary">
+                            {r.excluded === "transfer" ? "not spending" : "ignored"}
+                          </span>
+                        )}
+                      </>
+                    ),
+                    amount: (
+                      <span className={r.amount_cents < 0 ? "text-up" : undefined}>
+                        {formatCents(-r.amount_cents, { signed: true, currency: r.currency })}
+                      </span>
+                    ),
+                    merchant: r.merchant_key,
+                    currency: r.currency,
+                  },
+                }))}
+              />
+            </div>
+          )}
+          {list.pageCount > 1 && (
+            <nav className="mt-3 flex items-center justify-between text-[13px]" aria-label="Transaction pages">
+              {list.page > 1 ? (
+                <Link className="underline" prefetch={false} href={ledgerHref(query, { page: list.page - 1 })}>
+                  Newer
+                </Link>
+              ) : (
+                <span className="text-text-tertiary">Newer</span>
+              )}
+              <span className="text-text-tertiary">
+                Page {list.page} of {list.pageCount}
+              </span>
+              {list.page < list.pageCount ? (
+                <Link className="underline" prefetch={false} href={ledgerHref(query, { page: list.page + 1 })}>
+                  Older
+                </Link>
+              ) : (
+                <span className="text-text-tertiary">Older</span>
+              )}
+            </nav>
+          )}
+        </section>
       ),
     },
+  ];
+
+  // Sections (groups): the heading is the group's header; a part dragged into another section moves there.
+  const parts: PartSpec[] = [
+    {
+      id: "section-net-worth",
+      title: "Net worth",
+      node: (
+        <h2 id="networth-h" className={heading}>
+          Net worth
+        </h2>
+      ),
+      members: netWorthParts,
+    },
+    {
+      id: "section-cashflow",
+      title: "Cashflow",
+      node: (
+        <h2 id="cashflow-h" className={heading}>
+          Cashflow · {scopeNote}
+        </h2>
+      ),
+      members: cashflowParts,
+    },
+    { id: "section-transactions", title: "Transactions", node: null, members: transactionParts },
   ];
 
   return (

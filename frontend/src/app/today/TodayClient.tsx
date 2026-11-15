@@ -21,6 +21,10 @@ import { sameJson } from "@/lib/format";
 import { MONEY_FRESH_URL, MONEY_RECHECK_MS, MONEY_URL, moneyNote, parseMoneyAnswer, showMoneyPanel, type MoneyView } from "@/lib/money-alerts-view";
 // One card per area of the app under Today's own panels (loaded as its own chunk; components/overview/).
 import TodayOverview from "@/components/overview/TodayOverview";
+// Personalize: every panel of Today is a part. Today is rendered on the server (static) and hydrates, so the grid
+// runs in CSS mode: the DOM keeps the default order and a saved order / hidden part is painted before React runs.
+// One container holds every panel and the three section headings, so a panel can be moved into another section.
+import { Part, PartGrid } from "@/components/personalize/PartGrid";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -142,8 +146,10 @@ function fromDevice<T>(value: T) {
   return (previous: Load<T>): Load<T> => previous.state === "loading" ? { state: "ready", value } : previous.state === "error" ? { state: "ready", value, stale: true } : previous;
 }
 
-export default function TodayClient({ headingTestId = "page-heading" }: { headingTestId?: string } = {}) {
+export default function TodayClient({ headingTestId = "page-heading", feed = false }: { headingTestId?: string; feed?: boolean } = {}) {
   // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
+  // feed: drawn inside that scroll (FeedSection.tsx). Scrolling never writes, and reading today's experiment arm
+  // stamps it as revealed, so the scroll's Today never asks; it shows the copy /today read this session, if any.
   // Each panel starts from the cached copy when there is one (a revisit is instant), then revalidates.
   const [inbox, setInbox] = useState<Load<InboxResponse>>(() => cachedLoad(CACHE_KEYS.agentsInbox, parseInbox));
   const [reading, setReading] = useState<Load<ReadingOverview | null>>(() => cachedLoad(READING_URL, parseReading));
@@ -201,7 +207,7 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
     setReading((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setUrgent((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setCalendar((previous) => previous.state === "ready" ? previous : { state: "loading" });
-    setExperiment((previous) => previous.state === "ready" ? previous : { state: "loading" });
+    if (!feed) setExperiment((previous) => previous.state === "ready" ? previous : { state: "loading" });
     const inboxRequest = bounded(Promise.resolve().then(() => agentsApi.inbox())).then((data) => {
       const value = parseInbox(data);
       if (sequence.current !== current) return;
@@ -255,7 +261,7 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
         }).catch(() => { if (sequence.current === current) setMoney(keepMarked); });
       }, MONEY_RECHECK_MS);
     }).catch(() => { if (sequence.current === current) { setMoney(keepMarked); markCheck("money", false); } });
-    const experimentRequest = request(EXPERIMENT_URL, parseExperiment).then((value) => {
+    const experimentRequest = feed ? Promise.resolve() : request(EXPERIMENT_URL, parseExperiment).then((value) => {
       if (sequence.current === current) setExperiment(fresh(value));
     }).catch(() => { if (sequence.current === current) setExperiment((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
     const calendarRequest = request(calendarUrl(), readCalendarResponse).then((value) => {
@@ -264,7 +270,7 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
     void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest, renewalsRequest, moneyRequest, experimentRequest, calendarRequest]).then(() => {
       if (sequence.current === current) { inFlight.current = false; setRefreshing(false); }
     });
-  }, [markCheck]);
+  }, [feed, markCheck]);
   // Reopening the app: fill empty panels from the copy kept on this device (IndexedDB) while the network
   // answers. Finance, procurement and experiment answers are never on the device, so they wait for the network.
   useEffect(() => {
@@ -428,27 +434,34 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
           <span>{pending ? "Refreshing" : "Refresh"}</span>
         </button>
       </header>
-      <section aria-label="Quick capture" className={styles.capture}>
-        <div className={styles.captureLead}>
+      <p role="status" aria-live="polite" className="sr-only">{pending ? "Refreshing Today" : unavailable ? "Some information could not be refreshed. Check the section messages." : "Today refresh finished"}</p>
+      {/* Default layout: section order, each heading full width; the panels of a section side by side. */}
+      <PartGrid page="/today" title="Today" mode="css" gap={18}>
+      <Part id="start-here" title="Start here: check-in" width="half">
+      <section aria-label="Start here" className={styles.captureLead}>
           <span className={styles.captureIcon}><ClipboardCheck aria-hidden="true" className="h-6 w-6" /></span>
           <div><p className={styles.eyebrow}>START HERE</p><h2 className="mt-2 text-2xl font-medium text-text-primary">A moment for you.</h2>
             <p className="mt-2 max-w-md text-sm leading-relaxed text-text-secondary">Start or continue your check-in. Capture what you know, and leave the rest for later.</p></div>
           <Link href="/check-in" className={styles.primaryAction}>Start your check-in <ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
-        </div>
-        <div className={styles.captureOptions}>
+      </section>
+      </Part>
+      <Part id="quick-log" title="Log something quickly" width="half">
+      <section aria-label="Quick capture" className={styles.captureOptions}>
           <p className={styles.eyebrow}>OR LOG SOMETHING QUICKLY</p>
           <Link href="/supplements" className={styles.captureLink}><span>Supplement<span className={styles.caption}>Your stack &amp; intake</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
           <Link href="/habits" className={styles.captureLink}><span>Habit<span className={styles.caption}>Record a daily habit</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
           <Link href="/nutrition?log=weight" className={styles.captureLink}><span>Weight<span className={styles.caption}>Log today&apos;s weight</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
-        </div>
       </section>
+      </Part>
+      <Part id="jump-links" title="Section shortcuts">
       <nav aria-label="Today sections" className={styles.jumpLinks}>
         <a href="#requests-heading"><span>Needs your input</span><span>{inbox.state === "ready" ? requests.length : "—"}</span></a>
         <a href="#urgent-email-heading"><span>Urgent email</span><span>{urgent.state === "ready" && inbox.state === "ready" ? merged.total : "—"}</span></a>
         <a href="#calendar-heading"><span>Your schedule</span><CalendarDays aria-hidden="true" className="h-4 w-4" /></a>
         <a href="#reading-heading"><span>Keep reading</span><BookOpen aria-hidden="true" className="h-4 w-4" /></a>
       </nav>
-      <p role="status" aria-live="polite" className="sr-only">{pending ? "Refreshing Today" : unavailable ? "Some information could not be refreshed. Check the section messages." : "Today refresh finished"}</p>
+      </Part>
+      {(experiment.state === "error" || trial) && <Part id="experiment" title="Experiment arm">
       {experiment.state === "error" && <div role="region" aria-label="Experiment arm" className={panelStyle}>
         <p className="text-sm text-text-secondary">Couldn&apos;t check today&apos;s experiment arm. Try refreshing.</p>
       </div>}
@@ -465,9 +478,11 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
         {trial.status === "paused" && <p className="mt-3 break-words text-sm text-text-primary">{trial.experimentId}: {trial.title} is paused. No arm today.</p>}
         {experiment.state === "ready" && experiment.stale && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh the experiment arm. Showing the last check.</p>}
       </div>}
-      <div className={styles.workspace}>
-      <div className={styles.attention}>
+      </Part>}
+      <Part id="heading-needs-you" title="Heading: What needs you">
         <div className={styles.sectionLabel}><span>01</span><h2>What needs you</h2></div>
+      </Part>
+      <Part id="requests" title="Needs your input" width="half">
       <section className={panelStyle} aria-labelledby="requests-heading" aria-busy={inbox.state === "loading"}>
         <div className="flex items-center justify-between gap-4">
           <h2 id="requests-heading" className="text-lg font-medium text-text-primary">Needs your input</h2>
@@ -501,6 +516,8 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
           <p className="mt-4 text-xs text-text-secondary">Inbox checked at {checkedAt}. Opening Today does not mark anything read.{requests.length > 0 ? " Clearing a request also clears it from your inbox's Unread list; the agent still waits for an answer." : ""}</p>
         </>}
       </section>
+      </Part>
+      <Part id="urgent-email" title="Urgent email" width="half">
       <section className={panelStyle} aria-labelledby="urgent-email-heading" aria-busy={urgent.state === "loading"}>
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-2"><Mail aria-hidden="true" className="h-5 w-5 text-accent" />
@@ -542,9 +559,11 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
           : "The email label sync has not run yet."}</p>}
         {urgent.state !== "loading" && <p className="mt-1 text-xs text-text-secondary">Opening or clearing on Today does not mark email read or change any label. A cleared thread comes back if a newer message arrives in it.</p>}
       </section>
-      </div>
-      <div className={styles.agenda}>
+      </Part>
+      <Part id="heading-your-day" title="Heading: Your day, at a glance">
         <div className={styles.sectionLabel}><span>02</span><h2>Your day, at a glance</h2></div>
+      </Part>
+      <Part id="calendar" title="Calendar">
       <section className={panelStyle} aria-labelledby="calendar-heading" aria-busy={calendar.state === "loading"}>
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-2"><CalendarDays aria-hidden="true" className="h-5 w-5 text-accent" />
@@ -578,11 +597,12 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
         </>}
         {calendar.state !== "loading" && <p className="mt-1 text-xs text-text-secondary">Read-only: opening Today changes nothing on your calendar.</p>}
       </section>
-      </div>
-      </div>
+      </Part>
+      <Part id="heading-keep-moving" title="Heading: Keep life moving">
       <div className={styles.sectionLabel}><span>03</span><h2>Keep life moving</h2></div>
-      <div className={styles.lifeGrid}>
-      {checkLines.length > 0 && <section className={panelStyle} aria-labelledby="checks-heading">
+      </Part>
+      {checkLines.length > 0 && <Part id="also-checked" title="Also checked" width="third">
+      <section className={panelStyle} aria-labelledby="checks-heading">
         <h2 id="checks-heading" className="text-lg font-medium text-text-primary">Also checked</h2>
         <ul className="mt-3 divide-y divide-border-subtle" aria-label="Checks with nothing due">
           {checkLines.map((line) => <li key={line.key} className="py-3">
@@ -590,8 +610,10 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
             <p className={`mt-0.5 break-words text-sm ${line.warn ? "text-mid" : "text-text-secondary"}`}>{line.text}</p>
           </li>)}
         </ul>
-      </section>}
-      {packages && <section className={panelStyle} aria-labelledby="packages-heading">
+      </section>
+      </Part>}
+      {packages && <Part id="packages" title="Packages" width="third">
+      <section className={panelStyle} aria-labelledby="packages-heading">
         <div className="flex items-center gap-2"><Package aria-hidden="true" className="h-5 w-5 text-accent" />
           <h2 id="packages-heading" className="text-lg font-medium text-text-primary">Packages</h2></div>
         <p className="mt-3 text-sm text-text-primary">{[
@@ -603,8 +625,10 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
         </ul>}
         {lifeFailed("orders") && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh packages. Showing {clock(lifeChecks.orders.at) ? `the check at ${clock(lifeChecks.orders.at)}` : "an earlier check"}; it may have changed.</p>}
         <Link href="/orders" className={`${linkStyle} mt-4 inline-block`}>Open orders</Link>
-      </section>}
-      {money && moneyPanel && <section className={panelStyle} aria-labelledby="money-heading" aria-busy={money.updating && !money.refreshFailed}>
+      </section>
+      </Part>}
+      {money && moneyPanel && <Part id="money" title="Money" width="third">
+      <section className={panelStyle} aria-labelledby="money-heading" aria-busy={money.updating && !money.refreshFailed}>
         <div className="flex items-center gap-2"><Wallet aria-hidden="true" className="h-5 w-5 text-accent" />
           <h2 id="money-heading" className="text-lg font-medium text-text-primary">Money</h2></div>
         {money.alerts.length > 0 && <ul className="mt-3 space-y-2" aria-label="Money alerts">
@@ -616,8 +640,10 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
         {moneyStatus && <p className={`mt-3 text-sm ${moneyStatus.tone === "warn" ? "text-mid" : "text-text-secondary"}`}>{moneyStatus.text}</p>}
         <p className="mt-2 text-xs text-text-secondary">From your forecast and budgets. Onyx never moves money.</p>
         <Link href="/financials/budgets" className={`${linkStyle} mt-4 inline-block`}>Open budgets</Link>
-      </section>}
-      {renewing && <section className={panelStyle} aria-labelledby="renewals-heading">
+      </section>
+      </Part>}
+      {renewing && <Part id="renewals" title="Renewals" width="third">
+      <section className={panelStyle} aria-labelledby="renewals-heading">
         <div className="flex items-center gap-2"><CalendarClock aria-hidden="true" className="h-5 w-5 text-accent" />
           <h2 id="renewals-heading" className="text-lg font-medium text-text-primary">Renewals</h2></div>
         <p className="mt-3 text-sm text-text-primary">{renewing.count === 1 ? "1 subscription is" : `${renewing.count} subscriptions are`} expected to renew in the next {renewing.withinDays} days.</p>
@@ -628,7 +654,9 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
         <p className="mt-2 text-xs text-text-secondary">Estimated from past charges in your ledger. Onyx never pays or cancels anything.</p>
         {lifeFailed("renewals") && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh renewals. Showing {clock(lifeChecks.renewals.at) ? `the check at ${clock(lifeChecks.renewals.at)}` : "an earlier check"}; it may have changed.</p>}
         <Link href="/procurement" className={`${linkStyle} mt-4 inline-block`}>Open procurement</Link>
-      </section>}
+      </section>
+      </Part>}
+      <Part id="reading" title="Keep reading" width="third">
       <section className={panelStyle} aria-labelledby="reading-heading" aria-busy={reading.state === "loading"}>
         <div className="flex items-center gap-2"><BookOpen aria-hidden="true" className="h-5 w-5 text-accent" />
           <h2 id="reading-heading" className="text-lg font-medium text-text-primary">Keep reading</h2></div>
@@ -642,13 +670,16 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
         </> : <p className="mt-3 text-sm text-text-secondary">No book is currently in progress.</p>)}
         <Link href="/reading" className={`${linkStyle} mt-4 inline-block`}>{book ? "Continue reading" : "Open reading"}</Link>
       </section>
+      </Part>
+      <Part id="check-in" title="A moment to check in" width="third">
       <section className={panelStyle} aria-labelledby="checkin-heading">
         <div className="flex items-center gap-2"><ClipboardCheck aria-hidden="true" className="h-5 w-5 text-accent" />
           <h2 id="checkin-heading" className="text-lg font-medium text-text-primary">A moment to check in</h2></div>
         <p className="mt-3 text-sm text-text-secondary">Start or continue your check-in. Answer what you know; leave the rest blank.</p>
         <Link href="/check-in" className={`${linkStyle} mt-4 inline-block`}>Open check-in</Link>
       </section>
-      </div>
+      </Part>
+      </PartGrid>
       <TodayOverview />
       <nav aria-label="More places" className={styles.footer}>
         <Link href="/status" className={linkStyle}>System status</Link>

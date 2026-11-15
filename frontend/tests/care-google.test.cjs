@@ -3,7 +3,9 @@
 // the /api/care/google/* routes), against a FAKE Google and an in-memory database:
 //   - the sign-in asks for exactly one scope, with state + PKCE;
 //   - the sync creates / rewrites / removes only events that carry Onyx's tag for that item;
-//   - nothing calls Google until the credentials exist AND a connection was made.
+//   - nothing calls Google until the credentials exist AND a connection was made;
+//   - the scheduled catch-up (/api/jobs/care-calendar-catch-up) answers the CI token only and runs
+//     the same sync, and the /status Care Calendar card (lib/care-calendar-status.ts) reads its result.
 // SYNTHETIC DATA ONLY: invented labels, dates, ids and tokens; no network, no database.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -412,7 +414,7 @@ function setup({ configured = true } = {}) {
     status: load("app/api/care/google/status/route.ts"), start: load("app/api/care/google/start/route.ts"),
     callback: load("app/api/care/google/callback/route.ts"), sync: load("app/api/care/google/sync/route.ts"),
     disconnect: load("app/api/care/google/disconnect/route.ts"), items: load("app/api/care/items/route.ts"),
-    one: load("app/api/care/items/[id]/route.ts"),
+    one: load("app/api/care/items/[id]/route.ts"), catchUp: load("app/api/jobs/care-calendar-catch-up/route.ts"),
   };
   world.done = () => { globalThis.fetch = realFetch; delete process.env.GOOGLE_CALENDAR_CLIENT_ID; delete process.env.GOOGLE_CALENDAR_CLIENT_SECRET; };
   world.runAfter = async () => { while (world.afterQueue.length) await world.afterQueue.shift()(); };
@@ -637,6 +639,150 @@ test("a revoked token or a failing Google is reported as a code, with no token o
   } finally { console.error = original; w.done(); }
 });
 
+// ---------- the scheduled catch-up (POST /api/jobs/care-calendar-catch-up) and the /status card ----------
+
+const S = loadTs("lib/care-calendar-status.ts");
+const CI = "ci-token-fixture-0123456789abcdef";
+const ciRequest = (token) => ({ headers: headers(token === undefined ? {} : { "x-onyx-ci-token": token }) });
+/** The sync-state row exactly as the card reads it (only CARE_CALENDAR_SYNC_COLUMNS). */
+const syncRowOf = (w) => Object.fromEntries(S.CARE_CALENDAR_SYNC_COLUMNS.split(",").map((col) => [col, w.tables.care_calendar_sync[0][col]]));
+
+test("the catch-up answers only the CI token, and does nothing until set up and connected", async () => {
+  process.env.ONYX_CI_TOKEN = CI;
+  let w = setup({ configured: false });
+  try {
+    for (const token of [undefined, "", "wrong-token", CI.slice(0, -1), `${CI}x`]) {
+      const res = await w.routes.catchUp.POST(ciRequest(token));
+      assert.equal(res.status, 401, String(token));
+      assert.deepEqual(res.body, { error: "unauthorized" });
+    }
+    const off = await w.routes.catchUp.POST(ciRequest(CI));
+    assert.deepEqual({ status: off.status, body: off.body }, { status: 200, body: { ran: false, reason: "not_set_up" } });
+    assert.equal(off.headers.get("Cache-Control"), "no-store");
+    assert.deepEqual(w.tables.calls, [], "not set up: no database call");
+    assert.deepEqual(w.fetches, [], "and Google is never contacted");
+  } finally { w.done(); }
+
+  w = setup();
+  try {
+    const idle = await w.routes.catchUp.POST(ciRequest(CI));
+    assert.deepEqual({ status: idle.status, body: idle.body }, { status: 200, body: { ran: false, reason: "not_connected" } });
+    assert.deepEqual(w.fetches, [], "set up but not connected: Google is never contacted");
+    assert.ok(w.tables.calls.every((c) => c.startsWith("select ")), "and nothing is written");
+    delete process.env.ONYX_CI_TOKEN;
+    assert.equal((await w.routes.catchUp.POST(ciRequest(CI))).status, 401, "no CI token configured on the server: refused");
+  } finally { delete process.env.ONYX_CI_TOKEN; w.done(); }
+});
+
+test("the catch-up runs the same sync as Sync now: it writes what a failed save left behind, and a failed run is a 502", async () => {
+  process.env.ONYX_CI_TOKEN = CI;
+  const w = setup();
+  const original = console.error;
+  const logged = [];
+  console.error = (...args) => logged.push(args.join(" "));
+  try {
+    w.tables.care_items.push(row(item()));
+    await connect(w);
+    await w.runAfter();
+    assert.ok(w.google.events.has(E1));
+
+    // A save whose background sync failed (Google answered 500): the new item has no event yet.
+    w.google.fail = { op: "insert", status: 500 };
+    const saved = await w.routes.items.POST(request({ body: item({ id: ID2, title: "Dental cleaning" }) }));
+    assert.equal(saved.status, 201);
+    await w.runAfter();
+    assert.ok(!w.google.events.has(E2));
+    const afterSave = S.careCalendarCard({ configured: true, row: syncRowOf(w), readError: null, nowMs: Date.now() });
+    assert.equal(afterSave.status, "failed");
+    assert.equal(afterSave.errorMessage, "Last sync failed (google_500), 1 item not written. It is retried at the next change, by Sync now and by the catch-up run.");
+
+    // Google still failing: the catch-up says so with a code and HTTP 502 (the workflow goes red).
+    const still = await w.routes.catchUp.POST(ciRequest(CI));
+    assert.equal(still.status, 502);
+    assert.deepEqual({ ran: still.body.ran, ok: still.body.sync.ok, failed: still.body.sync.failed, error: still.body.sync.error }, { ran: true, ok: false, failed: 1, error: "google_500" });
+
+    // Google is back: the next run writes the missing event; the item already right costs no call.
+    w.google.fail = null;
+    w.google.calls.length = 0;
+    const caught = await w.routes.catchUp.POST(ciRequest(CI));
+    assert.equal(caught.status, 200);
+    assert.deepEqual(
+      { ran: caught.body.ran, ok: caught.body.sync.ok, created: caught.body.sync.created, unchanged: caught.body.sync.unchanged, error: caught.body.sync.error },
+      { ran: true, ok: true, created: 1, unchanged: 1, error: null },
+    );
+    assert.deepEqual(w.google.calls, [["insert", E2]]);
+    assert.ok(w.google.events.has(E2));
+    const healthy = S.careCalendarCard({ configured: true, row: syncRowOf(w), readError: null, nowMs: Date.now() });
+    assert.deepEqual({ status: healthy.status, recordsSynced: healthy.recordsSynced, errorMessage: healthy.errorMessage, label: healthy.label }, { status: "success", recordsSynced: 1, errorMessage: null, label: "Care Calendar" });
+    assert.equal(healthy.lastSync, caught.body.sync.at);
+
+    // Nothing to do: one token refresh, no calendar call.
+    w.fetches.length = 0;
+    const quiet = await w.routes.catchUp.POST(ciRequest(CI));
+    assert.deepEqual({ status: quiet.status, unchanged: quiet.body.sync.unchanged }, { status: 200, unchanged: 2 });
+    assert.deepEqual(w.fetches.map((f) => f.url), [G.GOOGLE_TOKEN_URL]);
+
+    // Access removed in Google: 502 google_auth, and the card says what to do.
+    w.revoked = true;
+    const lost = await w.routes.catchUp.POST(ciRequest(CI));
+    assert.deepEqual({ status: lost.status, error: lost.body.sync.error }, { status: 502, error: "google_auth" });
+    const card = S.careCalendarCard({ configured: true, row: syncRowOf(w), readError: null, nowMs: Date.now() });
+    assert.equal(card.status, "failed");
+    assert.match(card.errorMessage, /^Google access was lost \(google_auth\): on \/health press Disconnect/);
+
+    const everything = JSON.stringify([still.body, caught.body, quiet.body, lost.body, afterSave, healthy, card, w.tables.care_calendar_sync, logged]);
+    for (const secret of ["Routine checkup", "Dental cleaning", "Private note", TOKENS.access, TOKENS.refresh, "secret-fixture", CI]) assert.ok(!everything.includes(secret), secret);
+  } finally { console.error = original; delete process.env.ONYX_CI_TOKEN; w.done(); }
+});
+
+test("the /status card: unknown until connected, then the last sync's result and age decide", () => {
+  const NOW = Date.parse("2030-06-01T12:00:00Z");
+  const ago = (h) => new Date(NOW - h * 3_600_000).toISOString();
+  const connected = { calendar_id: CAL, connected_at: ago(100), last_sync_at: ago(2), last_sync_ok: true, last_sync_counts: { created: 2, updated: 1, removed: 1, unchanged: 7, failed: 0, foreign: 0 }, last_error: null };
+  const card = (over = {}, rowOver = {}) => S.careCalendarCard({ configured: true, row: { ...connected, ...rowOver }, readError: null, nowMs: NOW, ...over });
+
+  assert.equal(S.careCalendarConfigured({ GOOGLE_CALENDAR_CLIENT_ID: "a", GOOGLE_CALENDAR_CLIENT_SECRET: "b" }), true);
+  for (const env of [{}, { GOOGLE_CALENDAR_CLIENT_ID: "a" }, { GOOGLE_CALENDAR_CLIENT_SECRET: "b" }, { GOOGLE_CALENDAR_CLIENT_ID: " ", GOOGLE_CALENDAR_CLIENT_SECRET: "b" }]) {
+    assert.equal(S.careCalendarConfigured(env), false, JSON.stringify(env));
+  }
+
+  const notSetUp = card({ configured: false });
+  assert.deepEqual({ status: notSetUp.status, label: notSetUp.label, lastSync: notSetUp.lastSync }, { status: "unknown", label: "Care Calendar (not set up)", lastSync: null });
+  assert.match(notSetUp.errorMessage, /docs\/health-google-calendar\.md/);
+  const notConnected = S.careCalendarCard({ configured: true, row: null, readError: null, nowMs: NOW });
+  assert.deepEqual({ status: notConnected.status, label: notConnected.label, errorMessage: notConnected.errorMessage },
+    { status: "unknown", label: "Care Calendar (not connected)", errorMessage: "Not connected: press Connect Google Calendar on /health." });
+  assert.equal(card({}, { connected_at: null }).status, "unknown", "after Disconnect: not connected again");
+  assert.equal(card({ readError: { code: "PGRST205", message: "relation missing" } }).status, "unknown");
+  const unreadable = card({ readError: { code: "08006", message: "connection failure text" } });
+  assert.deepEqual({ status: unreadable.status, errorMessage: unreadable.errorMessage }, { status: "failed", errorMessage: "Could not read the sync state (08006)." });
+
+  // Connected, first sync not reported yet: unknown at first, then the catch-up is overdue.
+  const fresh = { last_sync_at: null, last_sync_ok: null, last_sync_counts: null };
+  assert.deepEqual([1, 15, 31].map((h) => card({}, { ...fresh, connected_at: ago(h) }).status), ["unknown", "partial", "failed"]);
+  assert.equal(card({}, { ...fresh, connected_at: ago(1) }).errorMessage, "Connected; no sync has run yet.");
+
+  const ok = card();
+  assert.deepEqual(
+    { status: ok.status, lastSync: ok.lastSync, latestDataDate: ok.latestDataDate, daysLag: ok.daysLag, recordsSynced: ok.recordsSynced, errorMessage: ok.errorMessage },
+    { status: "success", lastSync: ago(2), latestDataDate: ago(2).slice(0, 10), daysLag: 0, recordsSynced: 4, errorMessage: null },
+  );
+  // Age: degraded after 14 h, red after 30 h without any sync (the 6-hourly catch-up stopped).
+  assert.deepEqual([13, 15, 29, 31, 60].map((h) => card({}, { last_sync_at: ago(h) }).status), ["success", "partial", "partial", "failed", "failed"]);
+  assert.equal(card({}, { last_sync_at: ago(31) }).errorMessage, "No sync for 31h: check the Care Calendar Catch-up workflow.");
+  assert.equal(card({}, { last_sync_at: ago(60) }).daysLag, 2);
+
+  // A failed run is red at once, with what to do.
+  assert.match(card({}, { last_sync_ok: false, last_error: "google_auth", last_sync_counts: {} }).errorMessage, /^Google access was lost \(google_auth\)/);
+  assert.match(card({}, { last_sync_ok: false, last_error: "calendar_missing", last_sync_counts: {} }).errorMessage, /^The Onyx care calendar is gone from Google/);
+  const partly = card({}, { last_sync_ok: false, last_error: "google_503", last_sync_counts: { created: 1, failed: 2 } });
+  assert.deepEqual({ status: partly.status, recordsSynced: partly.recordsSynced }, { status: "failed", recordsSynced: 1 });
+  assert.equal(partly.errorMessage, "Last sync failed (google_503), 2 items not written. It is retried at the next change, by Sync now and by the catch-up run.");
+  // Only something shaped like a code is ever repeated (the endpoint is cacheable).
+  assert.match(card({}, { last_sync_ok: false, last_error: "Bearer ya29.something private" }).errorMessage, /^Last sync failed \(unknown\)\./);
+  assert.equal(card({}, { last_sync_counts: { created: "9", updated: -1, removed: null } }).recordsSynced, 0);
+});
+
 // ---------- boundaries checked from the source ----------
 
 const read = (...parts) => fs.readFileSync(path.join(...parts), "utf8");
@@ -705,4 +851,33 @@ test("one scope in the whole app, owner-session routes, additive service-role-on
     assert.ok(!/CREATE POLICY/i.test(statements));
     assert.ok(!/refresh_token|access_token/i.test(statements), "tokens are not in these tables");
   }
+});
+
+test("the catch-up route, its CI carve-out and the /status card stay inside their boundaries", () => {
+  const route = read(SRC, "app", "api", "jobs", "care-calendar-catch-up", "route.ts");
+  assert.match(route, /export const dynamic = "force-dynamic"/);
+  assert.deepEqual([...route.matchAll(/export async function (\w+)/g)].map((m) => m[1]), ["POST"], "POST only");
+  assert.match(route, /sameToken\(provided, expected\)/, "the CI token is checked in the route as well, so a browser session alone cannot run it");
+  assert.match(route, /syncCareCalendar\(\)/, "the same sync as Sync now and every save");
+  assert.match(route, /"Cache-Control": "no-store"/);
+  assert.ok(!/console\.(log|info|warn)\(/.test(route));
+
+  // The carve-out (Riley adds it to middleware.ts) may only ever be this one exact path.
+  const middleware = read(SRC, "middleware.ts");
+  const m = /function isCiRoute\(pathname: string\): boolean \{([\s\S]*?)\r?\n\}/.exec(middleware);
+  assert.ok(m, "isCiRoute not found");
+  const isCiRoute = new Function("pathname", m[1]);
+  for (const p of ["/api/jobs/care-calendar-catch-up/", "/api/jobs/care-calendar-catch-up/x", "/api/jobs", "/api/jobs/other", "/api/care/google/sync", "/api/care/items", "/api/care/page-data"]) {
+    assert.equal(isCiRoute(p), false, p);
+  }
+
+  const status = read(SRC, "app", "api", "status", "route.ts");
+  assert.ok(!/^import[^;]*care-google(-server)?"/m.test(status), "/api/status never loads the sign-in or token code");
+  assert.match(status, /from\("care_calendar_sync"\)\.select\(CARE_CALENDAR_SYNC_COLUMNS\)\.eq\("id", 1\)\.limit\(1\)/);
+  assert.ok(!/"care_items"|"care_calendar_links"/.test(status), "the cacheable endpoint reads no care item or link row");
+  assert.ok(!/^import\s/m.test(read(SRC, "lib", "care-calendar-status.ts")), "the card logic is pure");
+  const page = read(SRC, "app", "status", "page.tsx");
+  assert.match(page, /care_calendar: "GOOGLE"/);
+  assert.match(page, /care_calendar: "text-/);
+  assert.match(page, /SOURCE_ORDER = \[[^\]]*"care_calendar"/s);
 });

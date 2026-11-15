@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { cookies } from "next/headers";
+import { layoutCookieName, layoutFromCookie } from "@/lib/personalize-layout";
 import { cachedBudgets } from "@/lib/finance-result-cache-server";
 import InfoHint from "@/components/InfoHint";
 import BudgetsView from "./BudgetsView";
@@ -12,6 +14,8 @@ export const metadata: Metadata = { title: "Budgets - Onyx", robots: { index: fa
 
 export default async function BudgetsPage() {
   const load = await cachedBudgets(new Date());
+  // Personalize: the saved layout rides in a cookie scoped to this page, so the server renders it as is.
+  const layout = layoutFromCookie((await cookies()).get(layoutCookieName("/financials/budgets"))?.value);
   return (
     <main className="mx-auto max-w-6xl space-y-6 p-4 md:p-8">
       <header>
@@ -42,7 +46,7 @@ export default async function BudgetsPage() {
           <p className="font-semibold">No transactions in the last six months yet.</p>
         </section>
       )}
-      {load.kind === "ok" && <BudgetsView result={load.result} categories={load.categories} rules={load.rules} setupPending={load.setupPending} subscriptions={load.subscriptions} />}
+      {load.kind === "ok" && <BudgetsView result={load.result} categories={load.categories} rules={load.rules} setupPending={load.setupPending} subscriptions={load.subscriptions} layout={layout} />}
     </main>
   );
 }

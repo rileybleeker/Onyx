@@ -15,6 +15,8 @@ import type { GoalView } from "@/lib/finance-goals";
 import type { MovePlan } from "@/lib/finance-plan";
 import { ModelSettings, PlanConfig, StreamEditorList } from "./PlanConfig";
 import InfoHint from "@/components/InfoHint";
+import { Part, PartGrid, PartGroup } from "@/components/personalize/PartGrid";
+import type { PageLayout } from "@/lib/personalize-layout";
 
 const usd = (cents: number | null | undefined): string => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -53,6 +55,7 @@ export default function ForecastView({
   goals,
   move,
   onChanged,
+  layout,
 }: {
   result: ForecastResult;
   items: PlanItemView[];
@@ -68,6 +71,8 @@ export default function ForecastView({
   move: MovePlan | null;
   /** Re-read the data after a save (the scroll section); without it the server page refreshes. */
   onChanged?: () => void;
+  /** The saved Personalize layout read from the page's cookie (the routed page only). */
+  layout?: PageLayout;
 }) {
   const router = useRouter();
   const [range, setRange] = useState<"13w" | "12m">("13w");
@@ -115,218 +120,263 @@ export default function ForecastView({
       {setupPending && <p className="text-[13px] text-mid">Planned items could not be read; showing the forecast from your history only.</p>}
       {error && <p role="alert" className="text-[13px] text-down">Not saved: {error}</p>}
 
-      {/* Headlines */}
-      <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <div className={card}>
-          <p className="text-[12px] text-text-tertiary">Lowest point, next 13 weeks (cautious)</p>
-          <p className="text-xl font-semibold">{usd(h.lowest?.cents)}</p>
-          <p className="text-[12px] text-text-secondary">{h.lowest ? `around ${dateLabel(h.lowest.date)}` : ""} · likely {usd(h.lowestLikely?.cents)}</p>
-        </div>
-        <div className={card}>
-          <p className="text-[12px] text-text-tertiary">Safe to move to savings / investing</p>
-          <p className="text-xl font-semibold">{usd(h.safeToMoveCents)}</p>
-          <p className="text-[12px] text-text-secondary">
-            keeps the cautious path above {buffer > 0 ? usd(buffer) : "$0"} for 13 weeks{h.safeToMoveCents > 0 ? ` · or about ${usd(Math.floor(h.safeToMoveCents / 13))} a week` : ""}
-          </p>
-        </div>
-        <div className={card}>
-          <p className="text-[12px] text-text-tertiary">Cash in 13 weeks</p>
-          <p className="text-xl font-semibold">{usd(h.end13w?.likely)}</p>
-          <p className="text-[12px] text-text-secondary">range {usd(h.end13w?.low)} to {usd(h.end13w?.high)} · today {usd(result.opening.cents)}</p>
-        </div>
-        <div className={`${card} ${h.nextPromoEnd ? "border-mid/40" : ""}`}>
-          <p className="text-[12px] text-text-tertiary">Next 0% promo ends</p>
-          {h.nextPromoEnd ? (
-            <>
-              <p className="text-xl font-semibold">{dateLabel(h.nextPromoEnd.date, { month: "short", day: "numeric", year: "numeric" })}</p>
+      {/* Personalize: every tile, chart and card is its own part; parts move within and between the sections below. */}
+      <PartGrid page="/financials/forecast" title="Cash forecast" initial={layout}>
+        <PartGroup id="section-headlines" title="Headlines">
+          <Part id="lowest" title="Lowest point, next 13 weeks" width="quarter">
+            <div className={card}>
+              <p className="text-[12px] text-text-tertiary">Lowest point, next 13 weeks (cautious)</p>
+              <p className="text-xl font-semibold">{usd(h.lowest?.cents)}</p>
+              <p className="text-[12px] text-text-secondary">{h.lowest ? `around ${dateLabel(h.lowest.date)}` : ""} · likely {usd(h.lowestLikely?.cents)}</p>
+            </div>
+          </Part>
+          <Part id="safe-to-move" title="Safe to move to savings" width="quarter">
+            <div className={card}>
+              <p className="text-[12px] text-text-tertiary">Safe to move to savings / investing</p>
+              <p className="text-xl font-semibold">{usd(h.safeToMoveCents)}</p>
               <p className="text-[12px] text-text-secondary">
-                {h.nextPromoEnd.label}: {usd(h.nextPromoEnd.owedAtEndCents)} still owed then at current payments
+                keeps the cautious path above {buffer > 0 ? usd(buffer) : "$0"} for 13 weeks{h.safeToMoveCents > 0 ? ` · or about ${usd(Math.floor(h.safeToMoveCents / 13))} a week` : ""}
               </p>
-            </>
-          ) : (
-            <p className="text-[13px] text-text-secondary">No promo end date known.</p>
+            </div>
+          </Part>
+          <Part id="cash-13w" title="Cash in 13 weeks" width="quarter">
+            <div className={card}>
+              <p className="text-[12px] text-text-tertiary">Cash in 13 weeks</p>
+              <p className="text-xl font-semibold">{usd(h.end13w?.likely)}</p>
+              <p className="text-[12px] text-text-secondary">range {usd(h.end13w?.low)} to {usd(h.end13w?.high)} · today {usd(result.opening.cents)}</p>
+            </div>
+          </Part>
+          <Part id="promo-end" title="Next 0% promo ends" width="quarter">
+            <div className={`${card} ${h.nextPromoEnd ? "border-mid/40" : ""}`}>
+              <p className="text-[12px] text-text-tertiary">Next 0% promo ends</p>
+              {h.nextPromoEnd ? (
+                <>
+                  <p className="text-xl font-semibold">{dateLabel(h.nextPromoEnd.date, { month: "short", day: "numeric", year: "numeric" })}</p>
+                  <p className="text-[12px] text-text-secondary">
+                    {h.nextPromoEnd.label}: {usd(h.nextPromoEnd.owedAtEndCents)} still owed then at current payments
+                  </p>
+                </>
+              ) : (
+                <p className="text-[13px] text-text-secondary">No promo end date known.</p>
+              )}
+            </div>
+          </Part>
+          {result.warnings.length > 0 && (
+            <Part id="warnings" title="Forecast warnings">
+              <ul className="space-y-1 text-[13px] text-mid">
+                {result.warnings.map((w) => (
+                  <li key={w}>{w}</li>
+                ))}
+              </ul>
+            </Part>
           )}
-        </div>
-      </section>
+        </PartGroup>
 
-      {result.warnings.length > 0 && (
-        <ul className="space-y-1 text-[13px] text-mid">
-          {result.warnings.map((w) => (
-            <li key={w}>{w}</li>
-          ))}
-        </ul>
-      )}
+        <PartGroup id="section-what-if" title="What-if">
+          <Part id="what-if" title="What-if">
+            <WhatIfPanel params={scenario?.params ?? null} accounts={accounts} saved={saved} busy={busy} run={run} />
+          </Part>
+          {scenario && (
+            <Part id="compare" title="Base plan vs what-if">
+              <CompareTable base={result} baseTax={tax} scen={scenario.result} scenTax={scenario.tax} />
+            </Part>
+          )}
+        </PartGroup>
 
-      <WhatIfPanel params={scenario?.params ?? null} accounts={accounts} saved={saved} busy={busy} run={run} />
-      {scenario && <CompareTable base={result} baseTax={tax} scen={scenario.result} scenTax={scenario.tax} />}
+        <PartGroup id="section-projection" title="Projection">
+          <Part id="cash-chart" title="Projected cash">
+            <section className={card} aria-labelledby="fc-chart">
+              <div className="mb-2 flex items-center justify-between">
+                <h2 id="fc-chart" className="font-semibold">Projected cash (checking + savings)</h2>
+                <div className="flex gap-1">
+                  {(["13w", "12m"] as const).map((r) => (
+                    <button key={r} className={`${button} ${range === r ? "bg-white/10" : ""}`} onClick={() => setRange(r)}>
+                      {r === "13w" ? "13 weeks" : "12 months"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="h-72">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={chartData} margin={{ top: 10, right: 10, bottom: 0, left: 10 }}>
+                    <CartesianGrid {...gridStyle} vertical={false} />
+                    <XAxis dataKey="date" tickFormatter={(d: string) => dateLabel(d)} minTickGap={40} tick={axisTick} />
+                    <YAxis tickFormatter={(v: number) => `$${Math.round(v / 1000)}k`} tick={axisTick} width={48} />
+                    <Tooltip
+                      formatter={(v, name) =>
+                        Array.isArray(v) ? [`${usd(Number(v[0]) * 100)} to ${usd(Number(v[1]) * 100)}`, "range"] : [usd(Number(v) * 100), String(name)]
+                      }
+                      labelFormatter={(d) => dateLabel(String(d), { month: "short", day: "numeric", year: "numeric" })}
+                      {...chartTooltip}
+                    />
+                    <Area dataKey="band" stroke="none" fill={accentColor} fillOpacity={0.15} isAnimationActive={false} name="range" />
+                    <Line dataKey="likely" stroke={accentColor} dot={false} strokeWidth={2} isAnimationActive={false} name={scenario ? "base plan" : "likely"} />
+                    {scenario && <Line dataKey="whatif" stroke={chartColors.strain} dot={false} strokeWidth={2} strokeDasharray="6 3" isAnimationActive={false} name="what-if" />}
+                    <ReferenceLine y={0} stroke={chartColors.zeroLine} />
+                    {buffer > 0 && <ReferenceLine y={buffer / 100} stroke={chartColors.down} strokeDasharray="4 4" label={{ value: "buffer", fill: chartColors.down, fontSize: 11 }} />}
+                    {milestonesShown.map((m) => (
+                      <ReferenceLine key={m.account_key} x={nearestDay(chartData, m.date)} stroke={chartColors.mid} strokeDasharray="3 3" label={{ value: `${shortCard(m.label)} 0% ends`, fill: chartColors.mid, fontSize: 11, position: "insideTopLeft" }} />
+                    ))}
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+              <p className="mt-2 text-[12px] text-text-tertiary">
+                Line = likely · shaded = 10th–90th percentile of 500 resampled paths · amber = a 0% promo ends
+                {scenario && " · dashed blue = the what-if"}
+                {range === "12m" && " · less certain past 13 weeks"}
+              </p>
+            </section>
+          </Part>
+          <Part id="goals" title="Goals">
+            <GoalsSection goals={goals} accounts={accounts} busy={busy} run={run} />
+          </Part>
+          <Part id="breakdown" title="Projection, month by month">
+            <ProjectionBreakdown result={result} scenario={scenario?.result ?? null} />
+          </Part>
+          <Part id="net-worth" title="Net worth projection">
+            <NetWorthChart result={result} scenario={scenario?.result ?? null} />
+          </Part>
+        </PartGroup>
 
-      {/* Chart */}
-      <section className={card} aria-labelledby="fc-chart">
-        <div className="mb-2 flex items-center justify-between">
-          <h2 id="fc-chart" className="font-semibold">Projected cash (checking + savings)</h2>
-          <div className="flex gap-1">
-            {(["13w", "12m"] as const).map((r) => (
-              <button key={r} className={`${button} ${range === r ? "bg-white/10" : ""}`} onClick={() => setRange(r)}>
-                {r === "13w" ? "13 weeks" : "12 months"}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="h-72">
-          <ResponsiveContainer width="100%" height="100%">
-            <ComposedChart data={chartData} margin={{ top: 10, right: 10, bottom: 0, left: 10 }}>
-              <CartesianGrid {...gridStyle} vertical={false} />
-              <XAxis dataKey="date" tickFormatter={(d: string) => dateLabel(d)} minTickGap={40} tick={axisTick} />
-              <YAxis tickFormatter={(v: number) => `$${Math.round(v / 1000)}k`} tick={axisTick} width={48} />
-              <Tooltip
-                formatter={(v, name) =>
-                  Array.isArray(v) ? [`${usd(Number(v[0]) * 100)} to ${usd(Number(v[1]) * 100)}`, "range"] : [usd(Number(v) * 100), String(name)]
-                }
-                labelFormatter={(d) => dateLabel(String(d), { month: "short", day: "numeric", year: "numeric" })}
-                {...chartTooltip}
-              />
-              <Area dataKey="band" stroke="none" fill={accentColor} fillOpacity={0.15} isAnimationActive={false} name="range" />
-              <Line dataKey="likely" stroke={accentColor} dot={false} strokeWidth={2} isAnimationActive={false} name={scenario ? "base plan" : "likely"} />
-              {scenario && <Line dataKey="whatif" stroke={chartColors.strain} dot={false} strokeWidth={2} strokeDasharray="6 3" isAnimationActive={false} name="what-if" />}
-              <ReferenceLine y={0} stroke={chartColors.zeroLine} />
-              {buffer > 0 && <ReferenceLine y={buffer / 100} stroke={chartColors.down} strokeDasharray="4 4" label={{ value: "buffer", fill: chartColors.down, fontSize: 11 }} />}
-              {milestonesShown.map((m) => (
-                <ReferenceLine key={m.account_key} x={nearestDay(chartData, m.date)} stroke={chartColors.mid} strokeDasharray="3 3" label={{ value: `${shortCard(m.label)} 0% ends`, fill: chartColors.mid, fontSize: 11, position: "insideTopLeft" }} />
-              ))}
-            </ComposedChart>
-          </ResponsiveContainer>
-        </div>
-        <p className="mt-2 text-[12px] text-text-tertiary">
-          Line = likely · shaded = 10th–90th percentile of 500 resampled paths · amber = a 0% promo ends
-          {scenario && " · dashed blue = the what-if"}
-          {range === "12m" && " · less certain past 13 weeks"}
-        </p>
-      </section>
+        <PartGroup id="section-upcoming" title="Promos and next 30 days">
+          <Part id="promos" title="0% promos">
+            <section className={card} aria-labelledby="fc-promos">
+              <h2 id="fc-promos" className="font-semibold">0% promos</h2>
+              {result.milestones.length === 0 ? (
+                <p className="mt-1 text-[13px] text-text-secondary">No promo end dates known. Add one under Cards below.</p>
+              ) : (
+                <ul className="mt-2 space-y-2 text-[13px]">
+                  {result.milestones.map((m) => (
+                    <li key={m.account_key} className={m.ended ? "text-text-tertiary" : ""}>
+                      <span className="font-semibold">{m.label}</span>: {m.ended ? "ended" : "ends"} {dateLabel(m.date, { month: "short", day: "numeric", year: "numeric" })}
+                      {!m.ended && ` (${m.daysAway} days)`}. At your current payments about <b>{usd(m.owedAtEndCents)}</b> is still owed then, costing about{" "}
+                      <b>{usd(m.interestPerMonthAfterCents)}/month</b> at {m.standardAprPct}%{m.standardAprAssumed ? " (assumed: enter the real APR below)" : ""}.
+                      {!m.ended && m.payPerMonthToClearCents > 0 && <> Paying <b>{usd(m.payPerMonthToClearCents)}/month</b> clears it in time.</>}
+                      <span className="text-text-tertiary"> Date {m.source}.</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          </Part>
+          <Part id="next-30" title="Next 30 days">
+            <section className={card} aria-labelledby="fc-soon">
+              <h2 id="fc-soon" className="font-semibold">Next 30 days</h2>
+              <table className="mt-2 w-full text-[13px]">
+                <tbody>
+                  {soon.map((l, i) => (
+                    <tr key={`${l.sourceId}-${l.date}-${i}`} className="border-t border-border-subtle">
+                      <td className="py-1 pr-3 text-text-secondary">{dateLabel(l.date)}</td>
+                      <td className="py-1 pr-3">{l.label}</td>
+                      <td className={`py-1 pr-3 text-right ${l.amountCents > 0 ? "text-up" : ""}`}>{signed(l.amountCents)}</td>
+                      <td className="py-1 text-[12px] text-text-tertiary">{l.layer === "planned" ? `planned (${l.certainty})` : l.reason}</td>
+                    </tr>
+                  ))}
+                  {weekly !== null && (
+                    <tr className="border-t border-border-subtle">
+                      <td className="py-1 pr-3 text-text-secondary">every week</td>
+                      <td className="py-1 pr-3">Everyday spending</td>
+                      <td className="py-1 pr-3 text-right">{signed(weekly)}</td>
+                      <td className="py-1 text-[12px] text-text-tertiary">mean of the last {result.baseline.weeksUsed} weeks after the lines above</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </section>
+          </Part>
+        </PartGroup>
 
-      <GoalsSection goals={goals} accounts={accounts} busy={busy} run={run} />
-      <ProjectionBreakdown result={result} scenario={scenario?.result ?? null} />
-      <NetWorthChart result={result} scenario={scenario?.result ?? null} />
+        <PartGroup id="section-plan" title="Plan">
+          <Part id="plan" title="Plan and assumptions">
+            <PlanConfig move={move} drivers={drivers} accounts={accounts} netWorth={result.netWorth} busy={busy} run={run} />
+          </Part>
+          <Part id="taxes" title="Taxes">
+            <TaxSection tax={tax} profile={profile} busy={busy} run={run} />
+          </Part>
+          <Part id="planned" title="Planned items">
+            <PlannedItems
+              items={items}
+              statuses={result.planned}
+              busy={busy}
+              run={run}
+              accountOptions={[
+                ...accounts.filter((a) => a.type === "investment").map((a) => ({ key: a.account_key, label: a.label })),
+                ...drivers.filter((d) => d.key.startsWith("growth:virtual-")).map((d) => ({ key: d.key.slice(7), label: String((d.value as { label?: unknown }).label ?? d.key.slice(7)) })),
+              ]}
+            />
+          </Part>
+          <Part id="cards" title="Cards">
+            <Cards result={result} drivers={drivers} accounts={accounts} busy={busy} run={run} />
+          </Part>
+        </PartGroup>
 
-      {/* Promo call-outs */}
-      <section className={card} aria-labelledby="fc-promos">
-        <h2 id="fc-promos" className="font-semibold">0% promos</h2>
-        {result.milestones.length === 0 ? (
-          <p className="mt-1 text-[13px] text-text-secondary">No promo end dates known. Add one under Cards below.</p>
-        ) : (
-          <ul className="mt-2 space-y-2 text-[13px]">
-            {result.milestones.map((m) => (
-              <li key={m.account_key} className={m.ended ? "text-text-tertiary" : ""}>
-                <span className="font-semibold">{m.label}</span>: {m.ended ? "ended" : "ends"} {dateLabel(m.date, { month: "short", day: "numeric", year: "numeric" })}
-                {!m.ended && ` (${m.daysAway} days)`}. At your current payments about <b>{usd(m.owedAtEndCents)}</b> is still owed then, costing about{" "}
-                <b>{usd(m.interestPerMonthAfterCents)}/month</b> at {m.standardAprPct}%{m.standardAprAssumed ? " (assumed: enter the real APR below)" : ""}.
-                {!m.ended && m.payPerMonthToClearCents > 0 && <> Paying <b>{usd(m.payPerMonthToClearCents)}/month</b> clears it in time.</>}
-                <span className="text-text-tertiary"> Date {m.source}.</span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-
-      {/* Coming up */}
-      <section className={card} aria-labelledby="fc-soon">
-        <h2 id="fc-soon" className="font-semibold">Next 30 days</h2>
-        <table className="mt-2 w-full text-[13px]">
-          <tbody>
-            {soon.map((l, i) => (
-              <tr key={`${l.sourceId}-${l.date}-${i}`} className="border-t border-border-subtle">
-                <td className="py-1 pr-3 text-text-secondary">{dateLabel(l.date)}</td>
-                <td className="py-1 pr-3">{l.label}</td>
-                <td className={`py-1 pr-3 text-right ${l.amountCents > 0 ? "text-up" : ""}`}>{signed(l.amountCents)}</td>
-                <td className="py-1 text-[12px] text-text-tertiary">{l.layer === "planned" ? `planned (${l.certainty})` : l.reason}</td>
-              </tr>
-            ))}
-            {weekly !== null && (
-              <tr className="border-t border-border-subtle">
-                <td className="py-1 pr-3 text-text-secondary">every week</td>
-                <td className="py-1 pr-3">Everyday spending</td>
-                <td className="py-1 pr-3 text-right">{signed(weekly)}</td>
-                <td className="py-1 text-[12px] text-text-tertiary">mean of the last {result.baseline.weeksUsed} weeks after the lines above</td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </section>
-
-      <PlanConfig move={move} drivers={drivers} accounts={accounts} netWorth={result.netWorth} busy={busy} run={run} />
-      <TaxSection tax={tax} profile={profile} busy={busy} run={run} />
-      <PlannedItems
-        items={items}
-        statuses={result.planned}
-        busy={busy}
-        run={run}
-        accountOptions={[
-          ...accounts.filter((a) => a.type === "investment").map((a) => ({ key: a.account_key, label: a.label })),
-          ...drivers.filter((d) => d.key.startsWith("growth:virtual-")).map((d) => ({ key: d.key.slice(7), label: String((d.value as { label?: unknown }).label ?? d.key.slice(7)) })),
-        ]}
-      />
-      <Cards result={result} drivers={drivers} accounts={accounts} busy={busy} run={run} />
-
-      {/* Detected */}
-      <section className={card} aria-labelledby="fc-detected">
-        <div className="flex items-center gap-2">
-          <h2 id="fc-detected" className="font-semibold">What the forecast found in your history</h2>
-          <InfoHint label="What the forecast found">
-            <p>Change any amount from a date (a raise, a new card payment plan) or stop one; Reset goes back to what your history shows.</p>
-          </InfoHint>
-        </div>
-        <StreamEditorList streams={result.streams} drivers={drivers} today={result.today} busy={busy} run={run} />
-        {result.notes.length > 0 && (
-          <ul className="mt-3 space-y-1 text-[12px] text-text-tertiary">
-            {result.notes.map((n) => (
-              <li key={n}>{n}</li>
-            ))}
-          </ul>
-        )}
-      </section>
-
-      <section className={card} aria-labelledby="fc-acc">
-        <div className="flex items-center gap-2">
-          <h2 id="fc-acc" className="font-semibold">How accurate has the forecast been?</h2>
-          <InfoHint label="Forecast accuracy">
-            <p>
-              Backtest on 18 months of history (64 weekly runs): typically off by about 17% of a month&apos;s outflows at 4 weeks and 32%
-              at 13 weeks, with no average bias; about 85% of outcomes landed inside the range.
-            </p>
-          </InfoHint>
-        </div>
-        {accuracy.length === 0 ? (
-          <p className="mt-1 text-[13px] text-text-secondary">A snapshot is saved every Monday; this fills in as weeks pass.</p>
-        ) : (
-          <table className="mt-2 w-full text-[13px]">
-            <thead className="text-[12px] text-text-tertiary">
-              <tr>
-                <th className="text-left font-normal">Week ending</th>
-                <th className="text-left font-normal">Forecast made</th>
-                <th className="text-right font-normal">Said</th>
-                <th className="text-right font-normal">Range</th>
-                <th className="text-right font-normal">Actual</th>
-                <th className="text-right font-normal">Off by</th>
-              </tr>
-            </thead>
-            <tbody>
-              {accuracy.map((a) => (
-                <tr key={a.weekEnd} className="border-t border-border-subtle">
-                  <td className="py-1">{dateLabel(a.weekEnd)}</td>
-                  <td className="py-1 text-text-secondary">{dateLabel(a.asOf)}</td>
-                  <td className="py-1 text-right">{usd(a.likely)}</td>
-                  <td className="py-1 text-right text-text-tertiary">
-                    {usd(a.low)} to {usd(a.high)}
-                  </td>
-                  <td className="py-1 text-right font-semibold">{usd(a.actual)}</td>
-                  <td className={`py-1 text-right ${a.actual < a.low || a.actual > a.high ? "text-mid" : "text-text-secondary"}`}>{signed(a.likely - a.actual)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </section>
-
-      <ModelSettings drivers={drivers} busy={busy} run={run} />
+        <PartGroup id="section-history" title="History and accuracy">
+          <Part id="detected" title="What the forecast found">
+            <section className={card} aria-labelledby="fc-detected">
+              <div className="flex items-center gap-2">
+                <h2 id="fc-detected" className="font-semibold">What the forecast found in your history</h2>
+                <InfoHint label="What the forecast found">
+                  <p>Change any amount from a date (a raise, a new card payment plan) or stop one; Reset goes back to what your history shows.</p>
+                </InfoHint>
+              </div>
+              <StreamEditorList streams={result.streams} drivers={drivers} today={result.today} busy={busy} run={run} />
+              {result.notes.length > 0 && (
+                <ul className="mt-3 space-y-1 text-[12px] text-text-tertiary">
+                  {result.notes.map((n) => (
+                    <li key={n}>{n}</li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          </Part>
+          <Part id="accuracy" title="Forecast accuracy">
+            <section className={card} aria-labelledby="fc-acc">
+              <div className="flex items-center gap-2">
+                <h2 id="fc-acc" className="font-semibold">How accurate has the forecast been?</h2>
+                <InfoHint label="Forecast accuracy">
+                  <p>
+                    Backtest on 18 months of history (64 weekly runs): typically off by about 17% of a month&apos;s outflows at 4 weeks and 32%
+                    at 13 weeks, with no average bias; about 85% of outcomes landed inside the range.
+                  </p>
+                </InfoHint>
+              </div>
+              {accuracy.length === 0 ? (
+                <p className="mt-1 text-[13px] text-text-secondary">A snapshot is saved every Monday; this fills in as weeks pass.</p>
+              ) : (
+                <table className="mt-2 w-full text-[13px]">
+                  <thead className="text-[12px] text-text-tertiary">
+                    <tr>
+                      <th className="text-left font-normal">Week ending</th>
+                      <th className="text-left font-normal">Forecast made</th>
+                      <th className="text-right font-normal">Said</th>
+                      <th className="text-right font-normal">Range</th>
+                      <th className="text-right font-normal">Actual</th>
+                      <th className="text-right font-normal">Off by</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {accuracy.map((a) => (
+                      <tr key={a.weekEnd} className="border-t border-border-subtle">
+                        <td className="py-1">{dateLabel(a.weekEnd)}</td>
+                        <td className="py-1 text-text-secondary">{dateLabel(a.asOf)}</td>
+                        <td className="py-1 text-right">{usd(a.likely)}</td>
+                        <td className="py-1 text-right text-text-tertiary">
+                          {usd(a.low)} to {usd(a.high)}
+                        </td>
+                        <td className="py-1 text-right font-semibold">{usd(a.actual)}</td>
+                        <td className={`py-1 text-right ${a.actual < a.low || a.actual > a.high ? "text-mid" : "text-text-secondary"}`}>{signed(a.likely - a.actual)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </section>
+          </Part>
+          <Part id="model-settings" title="Model settings">
+            <ModelSettings drivers={drivers} busy={busy} run={run} />
+          </Part>
+        </PartGroup>
+      </PartGrid>
     </div>
   );
 }

@@ -11,6 +11,16 @@ const source = fs.readFileSync(path.join(__dirname, '../src/components/MobileNav
 const tabsJs = ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/lib/mobile-tabs.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 const mobileTabs = { exports: {} };
 vm.runInNewContext(tabsJs, { module: mobileTabs, exports: mobileTabs.exports });
+// Personalize (#230/#235/#240): the real dependency-free libs, and a stand-in for the button (its module loads the editor).
+const loadLib = (file) => {
+  const lib = { exports: {} };
+  const js = ts.transpileModule(fs.readFileSync(path.join(__dirname, '..', file), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+  vm.runInNewContext(js, { module: lib, exports: lib.exports });
+  return lib.exports;
+};
+const navAreas = loadLib('src/lib/nav-areas.ts');
+const personalizeRegistry = loadLib('src/lib/personalize-registry.ts');
+const PersonalizeButton = ({ className }) => React.createElement('button', { type: 'button', className }, 'Personalize');
 const icon = () => null;
 const NAV = [
   { title: 'Home', items: [{ href: '/today', label: 'Today', icon }] },
@@ -33,6 +43,9 @@ function render(drawerOpen = false, logOpen = false, unread = 0, pathname = '/to
     if (id === '@/lib/mobile-tabs') return mobileTabs.exports;
     if (id === '@/lib/warmup') return { navIntentProps: () => ({}) };
     if (id === './CommandPalette') return { OPEN_COMMAND_PALETTE: 'open-command-palette' };
+    if (id === '@/lib/nav-areas') return navAreas;
+    if (id === '@/lib/personalize-registry') return personalizeRegistry;
+    if (id === './personalize/PersonalizeButton') return { __esModule: true, default: PersonalizeButton };
     if (id === './FeedContext') return { useActiveRoute: () => (pathname === '/' ? '/today' : pathname) };
     throw new Error(`Unexpected dependency: ${id}`);
   };

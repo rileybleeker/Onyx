@@ -13,6 +13,8 @@ import {
 } from "@/lib/online-orders";
 import type { OrdersLoad } from "@/lib/online-orders-server";
 import InfoHint from "@/components/InfoHint";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
+import type { PageLayout } from "@/lib/personalize-layout";
 
 const panel = "rounded-2xl border border-border-default bg-surface-card p-5 sm:p-6";
 const link = "text-xs text-accent underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-accent";
@@ -30,8 +32,22 @@ function ago(iso: string, now: Date): string {
 /**
  * The /orders screen. `feed`: drawn as this page's section of the continuous scroll (app/orders/FeedSection.tsx):
  * the heading carries the feed's test id and the section ids get a prefix, so they never clash with the routed page.
+ *
+ * Personalize: each list panel is its own part, in two sections (Open orders, Delivered); a panel moves within its
+ * section or into the other one. `layout` (routed page only) is the saved layout from the page's cookie, so the
+ * server renders the saved arrangement and nothing moves after hydration.
  */
-export default function OrdersClient({ data, nowIso, feed = false }: { data: OrdersLoad; nowIso: string; feed?: boolean }) {
+export default function OrdersClient({
+  data,
+  nowIso,
+  feed = false,
+  layout,
+}: {
+  data: OrdersLoad;
+  nowIso: string;
+  feed?: boolean;
+  layout?: PageLayout;
+}) {
   const idPrefix = feed ? "feed-orders-" : "";
   const [now, setNow] = useState(() => new Date(nowIso));
   const [marks, setMarks] = useState<OrderMark[]>(data.state === "ready" ? data.marks : []);
@@ -173,23 +189,47 @@ export default function OrdersClient({ data, nowIso, feed = false }: { data: Ord
         <section className={panel}><p className="text-sm text-text-secondary">Nothing on the way right now.</p></section>
       )}
 
-      {section("attention-heading", "Needs attention", <AlertTriangle aria-hidden="true" className="h-5 w-5 text-amber-300" />, groups.attention,
-        "Late, a delivery problem, or not shipped after a week. If it arrived, tap Got it.")}
-      {section("arriving-heading", "On the way", <Truck aria-hidden="true" className="h-5 w-5 text-accent" />, groups.arriving)}
-      {section("processing-heading", "Ordered, not shipped yet", <Clock aria-hidden="true" className="h-5 w-5 text-accent" />, groups.processing)}
-      {section("unconfirmed-heading", "No delivery email", <Package aria-hidden="true" className="h-5 w-5 text-text-secondary" />, groups.unconfirmed,
-        "These stores don't email on delivery. Tap Got it once it's here.")}
+      <PartGrid page="/orders" title="Orders" initial={layout} gap={20}>
+        <PartGroup id="open" title="Open orders" gap={20}>
+          {groups.attention.length > 0 && (
+            <Part id="attention" title="Needs attention">
+              {section("attention-heading", "Needs attention", <AlertTriangle aria-hidden="true" className="h-5 w-5 text-amber-300" />, groups.attention,
+                "Late, a delivery problem, or not shipped after a week. If it arrived, tap Got it.")}
+            </Part>
+          )}
+          {groups.arriving.length > 0 && (
+            <Part id="arriving" title="On the way">
+              {section("arriving-heading", "On the way", <Truck aria-hidden="true" className="h-5 w-5 text-accent" />, groups.arriving)}
+            </Part>
+          )}
+          {groups.processing.length > 0 && (
+            <Part id="processing" title="Ordered, not shipped yet">
+              {section("processing-heading", "Ordered, not shipped yet", <Clock aria-hidden="true" className="h-5 w-5 text-accent" />, groups.processing)}
+            </Part>
+          )}
+          {groups.unconfirmed.length > 0 && (
+            <Part id="unconfirmed" title="No delivery email">
+              {section("unconfirmed-heading", "No delivery email", <Package aria-hidden="true" className="h-5 w-5 text-text-secondary" />, groups.unconfirmed,
+                "These stores don't email on delivery. Tap Got it once it's here.")}
+            </Part>
+          )}
+        </PartGroup>
 
-      {groups.recent.length > 0 && (
-        <section className={panel} aria-labelledby={`${idPrefix}recent-heading`}>
-          <div className="flex items-center gap-2"><CheckCircle2 aria-hidden="true" className="h-5 w-5 text-emerald-400" />
-            <h2 id={`${idPrefix}recent-heading`} className="text-lg font-medium text-text-primary">Delivered, last 30 days <span className="text-text-secondary">({groups.recent.length})</span></h2>
-          </div>
-          <ul className="mt-2 divide-y divide-border-subtle">
-            {groups.recent.map((c) => row(c, c.markedReceived ? "undo" : "none"))}
-          </ul>
-        </section>
-      )}
+        <PartGroup id="delivered" title="Delivered" gap={20}>
+          {groups.recent.length > 0 && (
+            <Part id="recent" title="Delivered, last 30 days">
+              <section className={panel} aria-labelledby={`${idPrefix}recent-heading`}>
+                <div className="flex items-center gap-2"><CheckCircle2 aria-hidden="true" className="h-5 w-5 text-emerald-400" />
+                  <h2 id={`${idPrefix}recent-heading`} className="text-lg font-medium text-text-primary">Delivered, last 30 days <span className="text-text-secondary">({groups.recent.length})</span></h2>
+                </div>
+                <ul className="mt-2 divide-y divide-border-subtle">
+                  {groups.recent.map((c) => row(c, c.markedReceived ? "undo" : "none"))}
+                </ul>
+              </section>
+            </Part>
+          )}
+        </PartGroup>
+      </PartGrid>
     </div>
   );
 }

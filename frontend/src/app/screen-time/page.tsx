@@ -1,7 +1,9 @@
 import type { Metadata } from "next";
+import { cookies } from "next/headers";
 import { loadScreenTime } from "@/lib/screen-time-server";
 import { parseWindowDays } from "@/lib/screen-time";
 import { screenTimeViewData } from "@/lib/screen-time-view";
+import { layoutCookieName, layoutFromCookie } from "@/lib/personalize-layout";
 import ScreenTimeView from "./ScreenTimeView";
 
 // Private data (every app used, by day): rendered per request on the server, never ISR, never
@@ -22,5 +24,7 @@ export default async function ScreenTimePage({
 }) {
   const windowDays = parseWindowDays((await searchParams).days);
   const load = await loadScreenTime(windowDays);
-  return <ScreenTimeView data={screenTimeViewData(load)} windowDays={windowDays} />;
+  // Personalize: the saved layout rides in a cookie scoped to this page, so the server renders it as is.
+  const layout = layoutFromCookie((await cookies()).get(layoutCookieName("/screen-time"))?.value);
+  return <ScreenTimeView data={screenTimeViewData(load)} windowDays={windowDays} layout={layout} />;
 }

@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { cookies } from "next/headers";
+import { layoutCookieName, layoutFromCookie } from "@/lib/personalize-layout";
 import { loadForecast } from "@/lib/cash-forecast-server";
 import { cachedForecast } from "@/lib/finance-result-cache-server";
 import { hasLevers, parseScenarioParams } from "@/lib/cash-forecast-scenario";
@@ -21,6 +23,8 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
   const levers = parseScenarioParams((k) => (typeof sp[k] === "string" ? (sp[k] as string) : null));
   const now = new Date();
   const load = hasLevers(levers) ? await loadForecast(now, levers) : await cachedForecast(now);
+  // Personalize: the saved layout rides in a cookie scoped to this page, so the server renders it as is.
+  const layout = layoutFromCookie((await cookies()).get(layoutCookieName("/financials/forecast"))?.value);
   return (
     <main className="mx-auto max-w-6xl space-y-6 p-4 md:p-8">
       <header>
@@ -63,6 +67,7 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
           accuracy={load.accuracy}
           goals={load.goals}
           move={load.move}
+          layout={layout}
         />
       )}
     </main>

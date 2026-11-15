@@ -77,6 +77,8 @@ function mountSleep() {
       "@/components/MetricRing": { __esModule: true, default: () => null },
       "@/components/ChartCard": { __esModule: true, default: () => null },
       "@/components/DeferredMount": { __esModule: true, default: () => null },
+      // Personalize (#230): the page's parts render as plain wrappers here (the real grid needs React context).
+      "@/components/personalize/PartGrid": { PartGrid: ({ children }) => children, Part: ({ children }) => children },
       "@/components/RangeFilter": { __esModule: true, default: (p) => { picker.current = p; return null; } },
     },
   });
