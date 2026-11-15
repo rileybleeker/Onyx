@@ -16,7 +16,7 @@ const LOG_ACTIONS = [
   { label: "Check-in", href: "/check-in", icon: ClipboardCheck },
   { label: "Supplement", href: "/supplements", icon: Pill },
   { label: "Habit", href: "/habits", icon: CircleCheck },
-  { label: "Weight", href: "/nutrition", icon: Scale },
+  { label: "Weight", href: "/nutrition?log=weight", icon: Scale }, // opens the weight quick-log first, field focused
 ];
 
 /**
