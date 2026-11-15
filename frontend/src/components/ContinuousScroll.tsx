@@ -254,6 +254,14 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
     setRoutes([routerRoute]);
     setMounted(new Set());
     setLive(false);
+  } else if (!routes.includes(routedKey)) {
+    // The routed page is always in the list. A nav click that lands while the scroll starts (its 2 s timer) can
+    // leave the list built around the page being left: an update queued for the old page is applied after the reset
+    // above, so the two states disagree. Seen on production 2026-11-15 (Today -> Sleep clicked ~2.3 s after
+    // opening: routedKey "/sleep", routes [/today, /log, /activities]): the new page was not rendered at all, Today's
+    // copy filled the screen and the address was then rewritten to /today. Start again from the routed page.
+    setRoutes([routedKey]);
+    setMounted(new Set());
   }
 
   const saved = useAreaOrder(enabled);
