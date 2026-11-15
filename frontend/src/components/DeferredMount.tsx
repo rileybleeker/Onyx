@@ -50,11 +50,14 @@ export default function DeferredMount({
   children,
   minHeight = 320,
   className,
+  placeholder,
 }: {
   children: ReactNode;
   /** Approximate height of the real content, to avoid layout shift. */
   minHeight?: number;
   className?: string;
+  /** Shown until the turn comes (e.g. a skeleton of the final size) instead of an empty box. */
+  placeholder?: ReactNode;
 }) {
   const [show, setShow] = useState(false);
 
@@ -68,6 +71,6 @@ export default function DeferredMount({
     };
   }, []);
 
-  if (!show) return <div style={{ minHeight }} className={className} aria-hidden />;
+  if (!show) return placeholder !== undefined ? <>{placeholder}</> : <div style={{ minHeight }} className={className} aria-hidden />;
   return <>{children}</>;
 }

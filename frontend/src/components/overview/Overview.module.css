@@ -1,0 +1,21 @@
+/* Overview under Today. Every card has one fixed height so the skeleton, the loaded card and an error all
+   take the same space: nothing below moves when a card fills in. Tokens only. */
+.overview { display: flex; flex-direction: column; gap: 16px; }
+.grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+@media (min-width: 1024px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.card { height: 272px; overflow: hidden; }
+.middle { height: 64px; overflow: hidden; }
+
+/* Edit mode */
+.row { position: relative; }
+.row[data-dragging="true"] { opacity: .45; }
+/* The insertion marker: where the dragged card will land (above this row, or below the last one). */
+.row[data-drop="before"]::before, .row[data-drop="after"]::after {
+  content: ""; position: absolute; left: 8px; right: 8px; height: 3px; border-radius: 9999px;
+  background: var(--color-accent); box-shadow: 0 0 0 3px var(--color-accent-muted); pointer-events: none; z-index: 1;
+}
+.row[data-drop="before"]::before { top: -6px; }
+.row[data-drop="after"]::after { bottom: -6px; }
+/* Drag is for a mouse or trackpad; a phone uses the up / down buttons. */
+.grip { display: none; cursor: grab; }
+@media (pointer: fine) { .grip { display: inline-flex; } }

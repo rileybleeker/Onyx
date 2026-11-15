@@ -19,6 +19,8 @@ import { CACHE_KEYS, clientCache, isGoneStatus } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 // Import-free too: how current the money alerts are (bundled by name in the same test).
 import { MONEY_FRESH_URL, MONEY_RECHECK_MS, MONEY_URL, moneyNote, parseMoneyAnswer, showMoneyPanel, type MoneyView } from "@/lib/money-alerts-view";
+// One card per area of the app under Today's own panels (loaded as its own chunk; components/overview/).
+import TodayOverview from "@/components/overview/TodayOverview";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -581,6 +583,7 @@ export default function TodayClient() {
         <Link href="/check-in" className={`${linkStyle} mt-4 inline-block`}>Open check-in</Link>
       </section>
       </div>
+      <TodayOverview />
       <nav aria-label="More places" className={styles.footer}>
         <Link href="/status" className={linkStyle}>System status</Link>
         <Link href="/nyc" className={linkStyle}>NYC search</Link>
