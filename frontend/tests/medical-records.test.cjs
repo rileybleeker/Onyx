@@ -461,6 +461,7 @@ const read = (...parts) => fs.readFileSync(path.join(...parts), "utf8");
 const ROUTES = [
   "app/api/medical/documents/route.ts", "app/api/medical/documents/[id]/route.ts", "app/api/medical/documents/[id]/complete/route.ts",
   "app/api/medical/documents/[id]/file/route.ts", "app/api/medical/labs/route.ts", "app/api/medical/labs/[id]/route.ts",
+  "app/api/medical/page-data/route.ts",
 ];
 
 test("the medical routes are owner-session only, never cached, and log codes only", () => {

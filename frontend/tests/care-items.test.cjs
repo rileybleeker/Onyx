@@ -377,7 +377,7 @@ test("the care routes are owner-session only and nothing is cached", () => {
   assert.ok(ciBlock.length > 0);
   assert.ok(!ciBlock.includes("/api/care"), "/api/care must not be admitted by the CI token");
   assert.ok(!middleware.slice(middleware.indexOf("matcher")).includes("api/care"), "middleware must run on /api/care");
-  for (const file of ["app/api/care/items/route.ts", "app/api/care/items/[id]/route.ts", "app/api/care/items/import/route.ts"]) {
+  for (const file of ["app/api/care/items/route.ts", "app/api/care/items/[id]/route.ts", "app/api/care/items/import/route.ts", "app/api/care/page-data/route.ts"]) {
     const src = read(SRC, file);
     assert.match(src, /export const dynamic = "force-dynamic"/, file);
     assert.ok(!/console\.(log|info|warn)\(/.test(src), file);
