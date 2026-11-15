@@ -4,11 +4,25 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, Moon, Sun, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
-import { VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
-import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
+import { sayFromHash, VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
+import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, Q_JOURNALED, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
 import { clientCache } from "@/lib/client-cache";
 import { buildCells, savePlan, visibleNights, voicePatch, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
 import { CheckinDraftStore, dayDraftKey, nightDraftKey, recoveryTarget, type DatedDraft } from "@/lib/checkin-drafts";
+import {
+  easternDate,
+  journalDraftFrom,
+  JOURNAL_CONFIDENCES,
+  JOURNAL_MAX_BODY_CHARS,
+  JOURNAL_MAX_TITLE_CHARS,
+  JOURNAL_MAX_TOPICS,
+  JOURNAL_MOODS,
+  JOURNAL_SOURCES,
+  JOURNAL_TOPICS,
+  type JournalConfidence,
+  type JournalMood,
+  type JournalSource,
+} from "@/lib/journal-entry";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
 
 // Daily habit check-in (2026-11-07). Yes / No per question, one Save.
@@ -32,6 +46,31 @@ import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/
 //   asked the next evening). It loads on its own after the questions (never delays them), shows nothing when
 //   there is nothing to ask, and each tap saves immediately through PATCH /api/delivery/items/[itemId]
 //   (not part of the Save bar).
+// - "Say it once" (2026-11-14): one dictated or typed note fills the day tab's questions AND last night's sleep
+//   block as ordinary draft taps, and drafts a journal entry of the same words (the body verbatim, the model's
+//   title / mood / confidence / topics) that Riley reviews and saves on its own with "Save to journal". The
+//   iPhone Shortcut opens /check-in#say=<words>: the words land in the box and Fill runs once (writes nothing).
+
+const FROM_VOICE = "from what you said";
+const FROM_JOURNAL = "from the journal entry you saved";
+
+/** The journal draft under the box: these words, labels Riley can change, saved only by "Save to journal". */
+type JournalForm = {
+  date: string;
+  title: string;
+  mood: JournalMood | null;
+  confidence: JournalConfidence;
+  topics: string[];
+  source: JournalSource;
+  body: string;
+  status: "draft" | "saving" | "saved";
+  url: string | null;
+  existing: boolean;
+  error: string | null;
+};
+
+/** Rows filled by the box (or the saved journal entry), per part: "day:<date>" or "night:<date>". */
+type Marks = Record<string, Record<string, { answer: CheckinAnswer; label: string }>>;
 
 const CATEGORY_ORDER = ["health", "fitness", "nutrition", "mindfulness", "productivity", "social", "learning", "general"];
 const withAnswers = (saved: Record<string, CheckinAnswer>, patch: Patch) => {
@@ -103,15 +142,28 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
   const [voiceText, setVoiceText] = useState("");
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
-  const [voiceMarks, setVoiceMarks] = useState<{ date: string; marks: Record<string, CheckinAnswer> }>({ date: "", marks: {} });
+  const [voiceOpen, setVoiceOpen] = useState(false);
+  const [marks, setMarks] = useState<Marks>({});
+  const [journal, setJournal] = useState<JournalForm | null>(null);
+  const journalRef = useRef<JournalForm | null>(null);
+  journalRef.current = journal;
+  // Words handed over by the iPhone Shortcut (#say=), waiting for the check-in to load.
+  const [handoff, setHandoff] = useState<string | null>(null);
+  const dataRef = useRef<CheckinPayload | null>(null);
+  dataRef.current = data;
   const dataDateRef = useRef<string | null>(null);
   dataDateRef.current = data?.date ?? null;
   // "Say it once" answers arrive after a round trip. They are merged into the cells as they are THEN, and never
-  // over a daytime row changed meanwhile: every day-tab change bumps `editGen` and stamps the rows it touched.
+  // over a row changed meanwhile: every change bumps `editGen` and stamps the rows it touched, per part
+  // ("day", or the night's date).
   const cellsRef = useRef<Cells>({});
   cellsRef.current = cells;
+  const nightCellsRef = useRef<Record<string, Cells>>({});
+  nightCellsRef.current = nightCells;
   const editGen = useRef(0);
-  const lastEdit = useRef<Record<string, number>>({});
+  const lastEdit = useRef<Record<string, Record<string, number>>>({});
+  const changedSince = (part: string, since: number) =>
+    new Set(Object.entries(lastEdit.current[part] ?? {}).filter(([, gen]) => gen > since).map(([name]) => name));
 
   const lastLoad = useRef(0);
   const savingRef = useRef(false);
@@ -239,10 +291,9 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
     refreshDrafts();
     setSaveError(null);
     setSavedAt(null);
-    if (scope === null) {
-      const gen = ++editGen.current;
-      for (const name of Object.keys(patch)) lastEdit.current[name] = gen;
-    }
+    const gen = ++editGen.current;
+    const stamps = (lastEdit.current[scope ?? "day"] ??= {});
+    for (const name of Object.keys(patch)) stamps[name] = gen;
     const update = (prev: Cells): Cells => {
       const next = { ...prev };
       for (const [name, a] of Object.entries(patch)) {
@@ -288,6 +339,8 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
   }, [data]);
   const dayItemsRef = useRef<CheckinItem[]>([]);
   dayItemsRef.current = dayItems;
+  const sleepItemsRef = useRef<CheckinItem[]>([]);
+  sleepItemsRef.current = sleepItems;
 
   // Last night always; an earlier night while it is incomplete or holds an unsaved tap (lib/checkin-cells.ts).
   const nights = useMemo(() => visibleNights(data?.nights ?? [], sleepItems, nightCells), [data, sleepItems, nightCells]);
@@ -378,12 +431,37 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
     }
   };
 
-  // "Say it once": the server maps the text to Yes/No answers (it writes nothing); they become ordinary draft taps.
-  // Rows saved or tapped by the time the answer arrives, or changed while it was read, are never overwritten
-  // (voicePatch); a data pre-fill is. The answer buttons stay live while it fills.
-  const fillFromVoice = async () => {
-    if (!data || voiceBusy || !voiceText.trim()) return;
-    const date = data.date;
+  const addMarks = (part: string, patch: Patch, label: string) =>
+    setMarks((prev) => {
+      const next = { ...(prev[part] ?? {}) };
+      for (const [name, a] of Object.entries(patch)) if (a) next[name] = { answer: a, label };
+      return { ...prev, [part]: next };
+    });
+  // The note stays while the row still holds the answer it was filled with; any change by Riley removes it.
+  const noteFor = (part: string, name: string, cell: Cell | undefined) => {
+    const m = marks[part]?.[name];
+    return m && cell && cell.answer === m.answer ? m.label : undefined;
+  };
+
+  // The journal draft for these words (the body is the text itself) with the model's labels. Not over an entry
+  // being saved, nor over one already saved from the same words.
+  const offerJournal = (date: string, text: string, labels: unknown): boolean => {
+    const cur = journalRef.current;
+    if (cur?.status === "saving" || (cur?.status === "saved" && cur.body === text)) return false;
+    const l = journalDraftFrom(labels);
+    setJournal({ date, title: l.title, mood: l.mood, confidence: l.confidence, topics: l.topics, source: "voice", body: text, status: "draft", url: null, existing: false, error: null });
+    return true;
+  };
+
+  // "Say it once": the server maps the text to Yes/No answers for the day tab and for last night (it writes
+  // nothing); they become ordinary draft taps. Rows saved or tapped by the time the answer arrives, or changed while
+  // it was read, are never overwritten (voicePatch); a data pre-fill is. The answer buttons stay live while it fills.
+  // Sleep answers go only into the night block on screen with the date the server named, a night already over.
+  const fillFromVoice = async (given?: string) => {
+    const page = dataRef.current;
+    const text = (given ?? voiceText).trim();
+    if (!page || voiceBusy || !text) return;
+    const date = page.date;
     const sentAt = editGen.current;
     setVoiceBusy(true);
     setVoiceMsg(null);
@@ -391,24 +469,50 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
       const res = await fetch("/api/habits/checkin/voice", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date, text: voiceText.trim() }),
+        body: JSON.stringify({ date, text, today: page.today }),
       });
       const json = await res.json().catch(() => ({}));
       if (date !== dataDateRef.current) return; // switched day meanwhile: drop it
+      if (res.status === 409 && json.stale) {
+        // The day rolled over since the page was drawn: "last night" moved. Reload today, then fill again.
+        setVoiceMsg("A new day started since this page loaded. It has reloaded; press Fill answers again.");
+        if (requested) showDate(null);
+        else void load(null);
+        return;
+      }
       if (!res.ok || json.failed || !json.answers || typeof json.answers !== "object") {
         setVoiceMsg("Couldn't read that, try again.");
         return;
       }
-      const changed = new Set(Object.entries(lastEdit.current).filter(([, gen]) => gen > sentAt).map(([name]) => name));
+      const now = dataRef.current ?? page;
+      const changed = changedSince("day", sentAt);
       const patch = voicePatch(dayItemsRef.current, json.answers as Record<string, unknown>, cellsRef.current, changed);
-      const n = Object.keys(patch).length;
+      const dayN = Object.keys(patch).length;
+      if (dayN) {
+        applyRef.current(null, patch);
+        addMarks(`day:${date}`, patch, FROM_VOICE);
+      }
+      let nightN = 0;
+      const night = json.night as { date?: unknown; answers?: unknown } | null | undefined;
+      if (
+        night && typeof night.date === "string" && night.answers && typeof night.answers === "object" &&
+        night.date < now.today && now.nights.some((n) => n.date === night.date)
+      ) {
+        const nightDate = night.date;
+        const nightPatch = voicePatch(sleepItemsRef.current, night.answers as Record<string, unknown>, nightCellsRef.current[nightDate] ?? {}, changedSince(nightDate, sentAt));
+        nightN = Object.keys(nightPatch).length;
+        if (nightN) {
+          applyRef.current(nightDate, nightPatch);
+          addMarks(`night:${nightDate}`, nightPatch, FROM_VOICE);
+        }
+      }
+      const journalNote = offerJournal(date, text, json.journal) ? " A journal draft of your words is below." : "";
+      const n = dayN + nightN;
       if (n === 0) {
-        setVoiceMsg(changed.size ? "Nothing new to fill: you already answered those." : "Nothing in the text matched a question.");
+        setVoiceMsg((changed.size ? "Nothing new to fill: you already answered those." : "Nothing in the text matched a question.") + journalNote);
         return;
       }
-      applyRef.current(null, patch);
-      setVoiceMarks((prev) => ({ date, marks: { ...(prev.date === date ? prev.marks : {}), ...(patch as Record<string, CheckinAnswer>) } }));
-      setVoiceMsg(`Filled ${n} answer${n === 1 ? "" : "s"}. Check them, then Save.`);
+      setVoiceMsg(`Filled ${n} answer${n === 1 ? "" : "s"}${nightN ? ` (${nightN} for last night)` : ""}. Check them, then Save.${journalNote}`);
     } catch {
       setVoiceMsg("Couldn't read that, try again.");
     } finally {
@@ -416,8 +520,58 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
     }
   };
 
-  // The marker stays while the row still holds the answer the text gave; any change by Riley removes it.
-  const isFromVoice = (name: string) => !!data && voiceMarks.date === data.date && !!cells[name] && voiceMarks.marks[name] === cells[name].answer;
+  // iPhone Shortcut hand-off: /check-in#say=<URL-encoded words>. The words go in the box and Fill runs once the
+  // check-in has loaded fresh (Fill writes nothing). The hash is removed at once, so a reload doesn't fill again
+  // and the words don't stay in the address bar. Not in the continuous scroll (it doesn't own the address).
+  useEffect(() => {
+    if (feed) return;
+    const words = sayFromHash(window.location?.hash ?? "");
+    if (words === null) return;
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    setVoiceText(words);
+    setVoiceOpen(true);
+    setHandoff(words);
+  }, [feed]);
+  const fillRef = useRef(fillFromVoice);
+  fillRef.current = fillFromVoice;
+  useEffect(() => {
+    if (handoff === null || !data || refreshFailed || !answeredRef.current) return; // not on a cached copy
+    setHandoff(null);
+    void fillRef.current(handoff);
+  }, [handoff, data, refreshFailed]);
+
+  // "Journaled your thoughts?" once the entry for the day on screen is saved: a draft Yes like any other tap,
+  // never over a saved or tapped answer.
+  const markJournaled = (date: string) => {
+    if (dataRef.current?.date !== date) return;
+    const patch = voicePatch(dayItemsRef.current.filter((i) => i.name === Q_JOURNALED), { [Q_JOURNALED]: "Yes" }, cellsRef.current, new Set());
+    if (!Object.keys(patch).length) return;
+    applyRef.current(null, patch);
+    addMarks(`day:${date}`, patch, FROM_JOURNAL);
+  };
+
+  // "Save to journal": the only write of the journal draft (POST /api/journal/entry creates the Notion entry).
+  const saveJournal = async () => {
+    const j = journalRef.current;
+    if (!j || j.status !== "draft") return;
+    setJournal({ ...j, status: "saving", error: null });
+    try {
+      const res = await fetch("/api/journal/entry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date: j.date, title: j.title, mood: j.mood, confidence: j.confidence, source: j.source, topics: j.topics, body: j.body }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json || typeof json !== "object" || !("url" in json)) {
+        setJournal((cur) => cur && { ...cur, status: "draft", error: json?.error || `Couldn't save the journal entry (${res.status}). It is still here.` });
+        return;
+      }
+      setJournal((cur) => cur && { ...cur, status: "saved", url: typeof json.url === "string" ? json.url : null, existing: !!json.existing });
+      markJournaled(j.date);
+    } catch {
+      setJournal((cur) => cur && { ...cur, status: "draft", error: "Couldn't reach Onyx. The entry is still here." });
+    }
+  };
 
   const goTo = (date: string) => showDate(date);
 
@@ -514,6 +668,7 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
               catchUp={i > 0}
               items={sleepItems}
               cells={nightCells[n.date] ?? {}}
+              noteFor={(name, cell) => noteFor(`night:${n.date}`, name, cell)}
               onTap={(name, a) => tap(n.date, name, a)}
               onKit={(kit) => apply(n.date, kit)}
             />
@@ -553,8 +708,12 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
         })}
       </div>
 
-      {/* Say it once: dictated text -> draft Yes/No taps (nothing is saved until Save) */}
-      <details className="mb-4 rounded-control border border-border-subtle bg-white/[0.02] px-3 py-2">
+      {/* Say it once: dictated text -> draft Yes/No taps for the day and last night, and a journal draft (nothing is saved until Save / Save to journal) */}
+      <details
+        open={voiceOpen}
+        onToggle={(e) => setVoiceOpen(e.currentTarget.open)}
+        className="mb-4 rounded-control border border-border-subtle bg-white/[0.02] px-3 py-2"
+      >
         <summary className="cursor-pointer py-3 text-[13px] leading-5 text-text-secondary">Say it once</summary>
         <textarea
           value={voiceText}
@@ -564,10 +723,12 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
           aria-label="Say it once"
           className="mt-2 w-full rounded-control border border-border-subtle bg-transparent p-2 text-[14px] text-text-primary"
         />
-        <p className="text-[11px] text-text-tertiary mt-1">Type or use the keyboard microphone. Nothing is saved until you press Save.</p>
+        <p className="text-[11px] text-text-tertiary mt-1">
+          Type or use the keyboard microphone: the day, and last night&apos;s sleep. It fills answers and drafts a journal entry of your words. Nothing is saved until you press Save (or Save to journal).
+        </p>
         <div className="mt-2 flex items-center gap-3">
           <button
-            onClick={fillFromVoice}
+            onClick={() => fillFromVoice()}
             disabled={voiceBusy || saving || !voiceText.trim()}
             className="min-h-11 px-4 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary disabled:opacity-50"
           >
@@ -579,6 +740,16 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
         </div>
         {voiceMsg && <p className="text-[12px] text-text-secondary mt-2">{voiceMsg}</p>}
       </details>
+
+      {journal && (
+        <JournalDraftCard
+          form={journal}
+          maxDate={easternDate(new Date())}
+          onChange={(change) => setJournal((cur) => (cur && cur.status === "draft" ? { ...cur, ...change, error: null } : cur))}
+          onSave={() => saveJournal()}
+          onDiscard={() => setJournal((cur) => (cur?.status === "saving" ? cur : null))}
+        />
+      )}
 
       {/* Progress */}
       <div className="mb-6">
@@ -609,7 +780,7 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">{category}</h3>
           <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
             {items.map((item) => (
-              <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} fromVoice={isFromVoice(item.name)} />
+              <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} note={noteFor(`day:${data.date}`, item.name, cells[item.name])} />
             ))}
           </div>
         </section>
@@ -626,7 +797,7 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
               <p className="text-[12px] text-text-tertiary mb-2">Weekly and rarely-Yes questions. Leave blank unless you did (or deliberately skipped) one {dayName === "Today" ? "today" : "that day"}.</p>
               <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
                 {extras.map((item) => (
-                  <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} fromVoice={isFromVoice(item.name)} />
+                  <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} note={noteFor(`day:${data.date}`, item.name, cells[item.name])} />
                 ))}
               </div>
             </>
@@ -770,6 +941,7 @@ function NightBlock({
   catchUp,
   items,
   cells,
+  noteFor,
   onTap,
   onKit,
 }: {
@@ -779,6 +951,7 @@ function NightBlock({
   catchUp: boolean;
   items: CheckinItem[];
   cells: Cells;
+  noteFor: (name: string, cell: Cell | undefined) => string | undefined;
   onTap: (name: string, a: CheckinAnswer) => void;
   onKit: (kit: Record<string, CheckinAnswer>) => void;
 }) {
@@ -821,7 +994,7 @@ function NightBlock({
       )}
       <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
         {asked.map((item) => (
-          <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} />
+          <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} note={noteFor(item.name, cells[item.name])} />
         ))}
       </div>
       {optional.length > 0 && (
@@ -829,7 +1002,7 @@ function NightBlock({
           <p className="text-[11px] text-text-tertiary mt-2 mb-1">Optional. Leave blank unless it happened.</p>
           <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card/60">
             {optional.map((item) => (
-              <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} />
+              <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} note={noteFor(item.name, cells[item.name])} />
             ))}
           </div>
         </>
@@ -845,7 +1018,153 @@ function answerStyle(selected: boolean, suggested: boolean): string {
   return suggested ? "border-dashed border-accent/60 text-accent" : "bg-accent/20 border-accent/70 text-accent";
 }
 
-function Row({ item, cell, onTap, fromVoice }: { item: CheckinItem; cell: Cell | undefined; onTap: (name: string, a: CheckinAnswer) => void; fromVoice?: boolean }) {
+/** The journal draft: the words as written (editable), the labels the journal requires, one explicit save. */
+function JournalDraftCard({
+  form,
+  maxDate,
+  onChange,
+  onSave,
+  onDiscard,
+}: {
+  form: JournalForm;
+  maxDate: string;
+  onChange: (change: Partial<Pick<JournalForm, "date" | "title" | "mood" | "confidence" | "topics" | "source" | "body">>) => void;
+  onSave: () => void | Promise<void>;
+  onDiscard: () => void;
+}) {
+  const busy = form.status === "saving";
+  const ready = !!form.title.trim() && !!form.mood && form.topics.length > 0 && !!form.body.trim();
+  const missing = [!form.title.trim() && "a title", !form.mood && "a mood", !form.topics.length && "a topic"].filter(Boolean).join(", ");
+  const addable = JOURNAL_TOPICS.filter((t) => !form.topics.includes(t));
+  const field = "mt-1 w-full rounded-control border border-border-subtle bg-transparent p-2 text-[14px] text-text-primary disabled:opacity-60";
+  const label = "block text-[11px] font-mono uppercase tracking-wider text-text-tertiary";
+
+  if (form.status === "saved") {
+    return (
+      <section aria-label="Journal entry" className="mb-4 rounded-card border border-border-subtle bg-surface-card p-3">
+        <p className="text-[13px] text-text-secondary inline-flex flex-wrap items-center gap-1.5">
+          <Check className="w-4 h-4 text-up" />
+          {form.existing ? "Already in your journal (same date and title)." : "Saved to your journal."} It shows on Journal after the hourly sync.
+          {form.url && (
+            <a href={form.url} target="_blank" rel="noreferrer" className="text-accent underline underline-offset-2">
+              Open in Notion
+            </a>
+          )}
+        </p>
+      </section>
+    );
+  }
+
+  return (
+    <section aria-label="Journal entry" className="mb-4 rounded-card border border-border-subtle bg-surface-card p-3">
+      <div className="flex items-baseline justify-between gap-2">
+        <h3 className="text-[14px] font-medium text-text-primary">Journal entry</h3>
+        <span className="text-[11px] font-mono text-text-tertiary">draft · not saved</span>
+      </div>
+      <p className="mt-0.5 text-[12px] text-text-tertiary">Your words as written. Check the title and labels, then save it to the journal, or discard it.</p>
+
+      <label className={`${label} mt-3`}>
+        Title
+        <input value={form.title} maxLength={JOURNAL_MAX_TITLE_CHARS} disabled={busy} onChange={(e) => onChange({ title: e.target.value })} className={field} />
+      </label>
+      <label className={`${label} mt-3`}>
+        Date
+        <input type="date" value={form.date} max={maxDate} disabled={busy} onChange={(e) => e.target.value && onChange({ date: e.target.value })} className={field} />
+      </label>
+      <Choice label="Mood" options={JOURNAL_MOODS} value={form.mood} disabled={busy} onPick={(mood) => onChange({ mood })} />
+      <Choice label="How sure" options={JOURNAL_CONFIDENCES} value={form.confidence} disabled={busy} onPick={(confidence) => onChange({ confidence })} />
+
+      <div className="mt-3" role="group" aria-label="Topics">
+        <div className={label}>Topics</div>
+        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+          {form.topics.map((t) => (
+            <button
+              key={t}
+              type="button"
+              disabled={busy}
+              onClick={() => onChange({ topics: form.topics.filter((x) => x !== t) })}
+              aria-label={`Remove topic ${t}`}
+              className="min-h-11 px-3 rounded-control border border-accent/60 bg-accent/10 text-[13px] text-accent inline-flex items-center gap-1"
+            >
+              {t} <X className="w-3.5 h-3.5" />
+            </button>
+          ))}
+          {form.topics.length < JOURNAL_MAX_TOPICS && addable.length > 0 && (
+            <select
+              value=""
+              disabled={busy}
+              aria-label="Add topic"
+              onChange={(e) => e.target.value && onChange({ topics: [...form.topics, e.target.value] })}
+              className="min-h-11 px-2 rounded-control border border-border-subtle bg-transparent text-[13px] text-text-secondary"
+            >
+              <option value="">Add topic…</option>
+              {addable.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      </div>
+
+      <Choice label="Captured by" options={JOURNAL_SOURCES} value={form.source} disabled={busy} onPick={(source) => onChange({ source })} />
+
+      <label className={`${label} mt-3`}>
+        Entry
+        <textarea
+          value={form.body}
+          rows={5}
+          maxLength={JOURNAL_MAX_BODY_CHARS}
+          disabled={busy}
+          onChange={(e) => onChange({ body: e.target.value })}
+          className={field}
+        />
+      </label>
+
+      {form.error && <p role="alert" className="mt-2 text-[12px] text-down">{form.error}</p>}
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          onClick={onSave}
+          disabled={busy || !ready}
+          className="min-h-11 px-4 rounded-full text-[13px] font-semibold bg-accent text-on-accent disabled:opacity-40 transition-opacity"
+        >
+          {busy ? "Saving…" : "Save to journal"}
+        </button>
+        <button type="button" onClick={onDiscard} disabled={busy} className="min-h-11 px-3 rounded-control text-[13px] text-text-secondary disabled:opacity-50">
+          Discard
+        </button>
+        {!ready && missing && <span className="text-[12px] text-text-tertiary">Add {missing} first.</span>}
+      </div>
+    </section>
+  );
+}
+
+/** One choice out of a few (mood, how sure, captured by): the same accent selection as the Yes / No buttons. */
+function Choice<T extends string>({ label, options, value, disabled, onPick }: { label: string; options: readonly T[]; value: T | null; disabled?: boolean; onPick: (v: T) => void }) {
+  return (
+    <div className="mt-3" role="group" aria-label={label}>
+      <div className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">{label}</div>
+      <div className="mt-1 flex flex-wrap gap-1.5">
+        {options.map((o) => (
+          <button
+            key={o}
+            type="button"
+            aria-pressed={value === o}
+            disabled={disabled}
+            onClick={() => onPick(o)}
+            className={`min-h-11 px-3 rounded-control border text-[13px] font-medium transition-colors ${answerStyle(value === o, false)}`}
+          >
+            {o}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Row({ item, cell, onTap, note }: { item: CheckinItem; cell: Cell | undefined; onTap: (name: string, a: CheckinAnswer) => void; note?: string }) {
   const yes = cell?.answer === "Yes";
   const no = cell?.answer === "No";
   const suggested = cell?.origin === "suggested";
@@ -853,7 +1172,7 @@ function Row({ item, cell, onTap, fromVoice }: { item: CheckinItem; cell: Cell |
     <div className="flex items-center gap-3 px-3 py-2.5">
       <div className="flex-1 min-w-0">
         <p className="text-[14px] text-text-primary leading-snug">{item.name}</p>
-        {fromVoice && <p className="text-[11px] font-mono text-accent/80 mt-0.5">from what you said</p>}
+        {note && <p className="text-[11px] font-mono text-accent/80 mt-0.5">{note}</p>}
         {cell?.origin === "suggested" && cell.source && <p className="text-[11px] font-mono text-accent/80 mt-0.5">from {cell.source} · tap to change</p>}
       </div>
       <div className="flex gap-1.5 shrink-0">

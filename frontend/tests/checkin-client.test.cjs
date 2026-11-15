@@ -34,7 +34,8 @@ function storage(initial = {}, unavailable = false) {
   };
 }
 
-async function mount(t, { initial = page(), draftStorage = storage(), onPost, onGet, onVoice } = {}) {
+async function mount(t, { initial = page(), draftStorage = storage(), onPost, onGet, onVoice, onJournal, hash } = {}) {
+  const replaced = []; // addresses written by history.replaceState (the #say= hand-off clears its hash)
   let current = initial;
   let requested = null;
   let dirty = true;
@@ -73,9 +74,14 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
   const replacements = {
     localStorage: draftStorage,
     document: { visibilityState: "visible", addEventListener() {}, removeEventListener() {} },
-    window: { addEventListener: (name, fn) => windowEvents.set(name, fn), removeEventListener: (name) => windowEvents.delete(name) },
+    window: {
+      addEventListener: (name, fn) => windowEvents.set(name, fn),
+      removeEventListener: (name) => windowEvents.delete(name),
+      ...(hash === undefined ? {} : { location: { hash, pathname: "/check-in", search: "" }, history: { replaceState: (_state, _title, url) => replaced.push(url) } }),
+    },
     fetch: async (url, options = {}) => {
       if (url === "/api/habits/checkin/voice" && onVoice) return onVoice(JSON.parse(options.body));
+      if (url === "/api/journal/entry" && onJournal) return onJournal(JSON.parse(options.body));
       assert.match(url, /^\/api\/habits\/checkin(?:\?date=\d{4}-\d{2}-\d{2})?$/);
       if (options.method === "POST") {
         const body = JSON.parse(options.body);
@@ -147,7 +153,7 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
   };
   await flush();
   let resumeOffset = 0;
-  return { posts, gets, done, flush, text, button, click, windowEvents, storage: draftStorage,
+  return { posts, gets, done, flush, text, button, click, windowEvents, replaced, storage: draftStorage,
     type: (label, value) => {
       const field = nodes().find((n) => n.props?.["aria-label"] === label && typeof n.props.onChange === "function");
       assert.ok(field, `field exists: ${label}`);
@@ -430,4 +436,109 @@ test("client: a voice fill that answers late keeps the taps and clears made whil
   assert.match(h.text(), /Filled 1 answer\./);
   await h.click("Save"); await h.flush();
   assert.deepEqual(h.posts[0].answers, { [DAY]: "No", [THIRD]: "Yes" });
+});
+
+// ─── Say it once: last night's sleep, the journal draft, the Shortcut hand-off (2026-11-14) ────────────────
+
+test("client: a voice fill puts last night's sleep answers in that night's block only, saved under that night", async (t) => {
+  const sent = [];
+  const h = await mount(t, {
+    onVoice: async (body) => {
+      sent.push(body);
+      return response({ answers: { [DAY]: "Yes", [SLEEP]: "Yes" }, night: { date: "2031-03-04", answers: { [SLEEP]: "No" } }, journal: null });
+    },
+  });
+  h.type("Say it once", "Synthetic note about the day and last night."); await h.flush();
+  await h.click("Fill answers"); await h.flush();
+  assert.deepEqual(sent, [{ date: "2031-03-05", text: "Synthetic note about the day and last night.", today: "2031-03-05" }]);
+  assert.equal(h.button(`${SLEEP}: no`, 0).props["aria-pressed"], true, "last night's block");
+  assert.equal(h.button(`${SLEEP}: no`, 1).props["aria-pressed"], false, "the night before is untouched");
+  assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true, "a sleep name in the day answers is ignored");
+  assert.match(h.text(), /Filled 2 answers \(1 for last night\)\./);
+  assert.equal(h.posts.length, 0, "nothing is saved by Fill");
+  await h.click("Save"); await h.flush();
+  assert.deepEqual(h.posts, [
+    { date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" },
+    { date: "2031-03-04", answers: { [SLEEP]: "No" }, today: "2031-03-05" },
+  ]);
+});
+
+for (const [night, what] of [["2031-03-05", "tonight"], ["2031-03-01", "a night not on screen"]]) {
+  test(`client: sleep answers for ${what} are dropped`, async (t) => {
+    const h = await mount(t, { onVoice: async () => response({ answers: {}, night: { date: night, answers: { [SLEEP]: "Yes" } }, journal: null }) });
+    h.type("Say it once", "Synthetic note."); await h.flush();
+    await h.click("Fill answers"); await h.flush();
+    assert.equal(h.button(`${SLEEP}: yes`, 0).props["aria-pressed"], false);
+    assert.equal(h.button(`${SLEEP}: yes`, 1).props["aria-pressed"], false);
+    assert.match(h.text(), /Nothing in the text matched a question\./);
+  });
+}
+
+test("client: a stale screen reloads instead of filling", async (t) => {
+  const h = await mount(t, { onVoice: async () => response({ error: "A new day started since this page loaded.", stale: true }, 409) });
+  h.type("Say it once", "Synthetic note."); await h.flush();
+  await h.click("Fill answers"); await h.flush();
+  assert.equal(h.gets.length, 2, "reloaded");
+  assert.match(h.text(), /A new day started since this page loaded\. It has reloaded/);
+  assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], false);
+});
+
+test("client: the journal draft is written only by Save to journal, with the words verbatim and every label", async (t) => {
+  const JOURNALED = "Journaled your thoughts?";
+  const base = page();
+  base.items.push(question(JOURNALED, false));
+  const words = "Synthetic reflection, first part.\n\nSynthetic second part.";
+  const written = [];
+  const h = await mount(t, {
+    initial: base,
+    onVoice: async () => response({ answers: {}, night: null, journal: { title: "Synthetic reflective evening", mood: "good", confidence: "high", topics: ["reflection"] } }),
+    onJournal: async (body) => { written.push(body); return response({ url: "https://www.notion.so/synthetic-page" }); },
+  });
+  h.type("Say it once", words); await h.flush();
+  await h.click("Fill answers"); await h.flush();
+  assert.match(h.text(), /Journal entry/);
+  assert.match(h.text(), /draft · not saved/);
+  assert.equal(written.length, 0, "Fill never writes the journal");
+  await h.click("Save to journal"); await h.flush();
+  assert.deepEqual(written, [{ date: "2031-03-05", title: "Synthetic reflective evening", mood: "good", confidence: "high", source: "voice", topics: ["reflection"], body: words }]);
+  assert.match(h.text(), /Saved to your journal/);
+  assert.equal(h.button(`${JOURNALED}: yes`).props["aria-pressed"], true, "a draft Yes for the day");
+  assert.match(h.text(), /from the journal entry you saved/);
+  assert.equal(h.posts.length, 0, "the check-in answer still waits for Save");
+  await h.click("Save"); await h.flush();
+  assert.deepEqual(h.posts[0].answers, { [JOURNALED]: "Yes" });
+});
+
+test("client: the journal draft needs a mood and a topic, and a refused save keeps it", async (t) => {
+  const written = [];
+  const h = await mount(t, {
+    onVoice: async () => response({ answers: {}, night: null, journal: { title: "Synthetic title words", mood: null, confidence: "medium", topics: [] } }),
+    onJournal: async (body) => { written.push(body); return response({ error: "Synthetic Notion refusal" }, 502); },
+  });
+  h.type("Say it once", "Synthetic words."); await h.flush();
+  await h.click("Fill answers"); await h.flush();
+  assert.equal(h.button("Save to journal").props.disabled, true);
+  assert.match(h.text(), /Add a mood, a topic first\./);
+  h.click("neutral"); await h.flush();
+  h.type("Add topic", "reflection"); await h.flush();
+  await h.click("Save to journal"); await h.flush();
+  assert.equal(written.length, 1);
+  assert.equal(written[0].mood, "neutral");
+  assert.deepEqual(written[0].topics, ["reflection"]);
+  assert.match(h.text(), /Synthetic Notion refusal/);
+  assert.equal(h.button("Save to journal").props.disabled, false, "still there to try again");
+});
+
+test("client: the Shortcut hand-off (#say=) clears the address and fills once from the fresh check-in", async (t) => {
+  const sent = [];
+  const h = await mount(t, {
+    hash: "#say=Synthetic%20handed%20over%20words",
+    onVoice: async (body) => { sent.push(body); return response({ answers: { [DAY]: "Yes" }, night: null, journal: null }); },
+  });
+  await h.flush();
+  assert.deepEqual(h.replaced, ["/check-in"], "the words leave the address bar at once");
+  assert.equal(sent.length, 1, "filled exactly once");
+  assert.equal(sent[0].text, "Synthetic handed over words");
+  assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true);
+  assert.equal(h.posts.length, 0, "nothing is saved until Save");
 });
