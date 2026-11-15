@@ -85,7 +85,7 @@ function holdClick(e: MouseEvent) {
 const tiny =
   "w-6 h-6 shrink-0 flex items-center justify-center rounded-control text-text-tertiary hover:text-text-primary hover:bg-white/[0.06] focus:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:invisible";
 const option =
-  "flex items-center gap-1.5 rounded-control px-2 py-1 text-left text-[11px] text-text-secondary hover:bg-white/[0.06] hover:text-text-primary focus:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-40";
+  "flex items-center gap-1.5 whitespace-nowrap rounded-control px-2 py-1 text-left text-[11px] text-text-secondary hover:bg-white/[0.06] hover:text-text-primary focus:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-40";
 
 function Marker({ after }: { after: boolean }) {
   return (
@@ -241,7 +241,9 @@ export function SidebarArranger({ current }: { current: string }) {
           dropOnQuick(null);
         }}
       >
-        <p className="px-1.5 pb-1 text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">Quick access · first in the scroll</p>
+        <p className="px-1.5 pb-1 text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary" title="Pinned pages also come first in the continuous scroll">
+          Quick access
+        </p>
         {pinned.map((item, i) => {
           const key = `pin:${item.href}`;
           return (
