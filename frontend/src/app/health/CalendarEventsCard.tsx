@@ -33,7 +33,7 @@ export default function CalendarEventsCard({ calendar }: { calendar: CalendarVie
   const calendars = calendar.calendars ?? [];
   const total = calendars.reduce((sum, c) => sum + c.events, 0);
   const hasData = calendar.state === 'ready' && connection.status !== 'not-synced';
-  return <div className="mt-4 border-t border-border-default pt-3" aria-label="Calendar events sync">
+  return <section className="h-full rounded-2xl border border-border-default bg-surface-card p-5" aria-label="Calendar events sync">
     <h3 className="text-sm font-semibold">Google Calendar: <span className={TONE[connection.status]}>{HEADING[connection.status]}</span></h3>
     <p className="mt-1 text-sm text-text-secondary" role={connection.status === 'checking' ? 'status' : undefined}>{connection.detail}</p>
     {calendar.stale && <p className="mt-1 text-sm text-amber-300">Couldn&apos;t refresh the calendar events. Showing the ones from the last check.</p>}
@@ -49,5 +49,5 @@ export default function CalendarEventsCard({ calendar }: { calendar: CalendarVie
       <p>One way only, {CALENDAR_SOURCE_LABEL} to Onyx: about once an hour Onyx copies each event&apos;s title, time, location and calendar name from your calendars&apos; private iCal addresses, from about 13 months back to 13 months ahead.</p>
       <p>It does not copy descriptions, guests or meeting links, and this sync cannot change your calendars or turn a care item into a calendar event.</p>
     </InfoHint>
-  </div>;
+  </section>;
 }

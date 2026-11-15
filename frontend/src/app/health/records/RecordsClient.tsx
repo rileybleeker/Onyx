@@ -6,6 +6,8 @@ import { createSupabaseBrowser } from '@/lib/supabase-browser';
 import { todayLocal } from '@/lib/care-planner';
 import type { Section } from '@/lib/medical-records-server';
 import InfoHint from '@/components/InfoHint';
+import { Part, PartGroup, PartGrid } from '@/components/personalize/PartGrid';
+import type { PageLayout } from '@/lib/personalize-layout';
 import {
   DOC_KINDS, DOC_KIND_LABEL, FLAG_LABEL, MAX_DOC_NOTES, MAX_FILE_BYTES, MAX_LAB_BATCH, MAX_LAB_NOTES, MEDICAL_BUCKET,
   compareDocuments, compareNewestFirst, documentMatches, formatBytes, formatRange, formatResult, labFlag, labSeries,
@@ -50,7 +52,8 @@ function FlagChip({ result }: { result: LabResult }) {
 }
 
 // headingTestId: "feed-page-heading" when rendered as a section of the continuous scroll (FeedSection.tsx).
-export default function RecordsClient({ documents, labs, headingTestId = 'page-heading' }: { documents: Section<MedicalDocument>; labs: Section<LabResult>; headingTestId?: string }) {
+// layout: the saved Personalize layout from the page's cookie (routed page only).
+export default function RecordsClient({ documents, labs, headingTestId = 'page-heading', layout }: { documents: Section<MedicalDocument>; labs: Section<LabResult>; headingTestId?: string; layout?: PageLayout }) {
   const [docs, setDocs] = useState<MedicalDocument[]>(documents.state === 'ready' ? documents.items : []);
   const [docsLoad, setDocsLoad] = useState<Load>(documents.state === 'ready' ? 'ready' : 'failed');
   const [results, setResults] = useState<LabResult[]>(labs.state === 'ready' ? labs.items : []);
@@ -148,51 +151,75 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
       <button className={button} onClick={() => { const u = undo; setUndo(null); void u.run(); }}>Undo</button>
     </div>}
 
-    <section className="space-y-4" aria-labelledby="labs-heading">
-      <h2 id="labs-heading" className="text-lg font-semibold">Lab results</h2>
-      {labsLoad === 'loading' && <p role="status">Loading lab results…</p>}
-      {labsLoad === 'failed' && <div className={`${panel} space-y-3`} role="alert">
-        <p>Couldn&apos;t load lab results.</p>
-        <button className={button} onClick={reloadLabs}>Try again</button>
-      </div>}
-      {labsLoad === 'ready' && <>
-        {series.length === 0
-          ? <p className="text-text-secondary">No lab results yet. Add the values from a lab report below.</p>
-          : <LabTrends series={series} onPick={key => setTestFilter(key)} />}
-        <LabEntryForm
-          today={today} docs={listedDocs} series={series}
-          onSaved={saved => {
-            setResults(cur => [...cur.filter(x => !saved.some(s => s.id === x.id)), ...saved]);
-            setUndo(null);
-            setNotice({ text: `Saved ${saved.length} result${saved.length === 1 ? '' : 's'}.` });
-          }}
-        />
-        {results.length > 0 && <LabTable
-          results={results} series={series} filter={testFilter} setFilter={setTestFilter} docById={docById}
-          busy={busy} editing={editing} setEditing={setEditing} docs={listedDocs}
-          onRemove={removeLab}
-          onEdited={r => { setResults(cur => cur.map(x => (x.id === r.id ? r : x))); setEditing(null); setNotice({ text: 'Saved.' }); }}
-        />}
-      </>}
-    </section>
+    {/* Personalize: every block is its own part, in two sections (Lab results, Documents); a part moves within its
+        section or into the other. Each section's heading and its loading / failed state stay with the section.
+        `layout` (routed page only) is the saved layout from the page's cookie, so the server renders it. */}
+    <PartGrid page="/health/records" title="Medical records" initial={layout}>
+      <PartGroup
+        id="labs"
+        title="Lab results"
+        header={<div className="mb-4 space-y-4">
+          <h2 id="labs-heading" className="text-lg font-semibold">Lab results</h2>
+          {labsLoad === 'loading' && <p role="status">Loading lab results…</p>}
+          {labsLoad === 'failed' && <div className={`${panel} space-y-3`} role="alert">
+            <p>Couldn&apos;t load lab results.</p>
+            <button className={button} onClick={reloadLabs}>Try again</button>
+          </div>}
+        </div>}
+      >
+        {labsLoad === 'ready' && <Part id="lab-trends" title="Lab trends">
+          {series.length === 0
+            ? <p className="text-text-secondary">No lab results yet. Add the values from a lab report below.</p>
+            : <LabTrends series={series} onPick={key => setTestFilter(key)} />}
+        </Part>}
+        {labsLoad === 'ready' && <Part id="lab-entry" title="Add lab results">
+          {/* A div, so the closed form's single button keeps its own width inside the part. */}
+          <div>
+          <LabEntryForm
+            today={today} docs={listedDocs} series={series}
+            onSaved={saved => {
+              setResults(cur => [...cur.filter(x => !saved.some(s => s.id === x.id)), ...saved]);
+              setUndo(null);
+              setNotice({ text: `Saved ${saved.length} result${saved.length === 1 ? '' : 's'}.` });
+            }}
+          />
+          </div>
+        </Part>}
+        {labsLoad === 'ready' && results.length > 0 && <Part id="lab-table" title="All lab results">
+          <LabTable
+            results={results} series={series} filter={testFilter} setFilter={setTestFilter} docById={docById}
+            busy={busy} editing={editing} setEditing={setEditing} docs={listedDocs}
+            onRemove={removeLab}
+            onEdited={r => { setResults(cur => cur.map(x => (x.id === r.id ? r : x))); setEditing(null); setNotice({ text: 'Saved.' }); }}
+          />
+        </Part>}
+      </PartGroup>
 
-    <section className="space-y-4" aria-labelledby="docs-heading">
-      <h2 id="docs-heading" className="text-lg font-semibold">Documents</h2>
-      {docsLoad === 'loading' && <p role="status">Loading documents…</p>}
-      {docsLoad === 'failed' && <div className={`${panel} space-y-3`} role="alert">
-        <p>Couldn&apos;t load documents.</p>
-        <button className={button} onClick={reloadDocs}>Try again</button>
-      </div>}
-      {docsLoad === 'ready' && <>
-        <DocumentUpload today={today} onUploaded={d => { setDocs(cur => [...cur.filter(x => x.id !== d.id), d]); setUndo(null); setNotice({ text: `Uploaded "${d.title}".` }); }} />
-        {listedDocs.length === 0
-          ? <p className="text-text-secondary">No documents yet. Upload a PDF or a photo of a record above.</p>
-          : <DocumentList
-              docs={listedDocs} busy={busy} resultsPerDoc={resultsPerDoc} onRemove={removeDoc}
-              onEdited={d => { setDocs(cur => cur.map(x => (x.id === d.id ? d : x))); setNotice({ text: 'Saved.' }); }}
-            />}
-      </>}
-    </section>
+      <PartGroup
+        id="docs"
+        title="Documents"
+        header={<div className="mb-4 space-y-4">
+          <h2 id="docs-heading" className="text-lg font-semibold">Documents</h2>
+          {docsLoad === 'loading' && <p role="status">Loading documents…</p>}
+          {docsLoad === 'failed' && <div className={`${panel} space-y-3`} role="alert">
+            <p>Couldn&apos;t load documents.</p>
+            <button className={button} onClick={reloadDocs}>Try again</button>
+          </div>}
+        </div>}
+      >
+        {docsLoad === 'ready' && <Part id="doc-upload" title="Upload a document">
+          <DocumentUpload today={today} onUploaded={d => { setDocs(cur => [...cur.filter(x => x.id !== d.id), d]); setUndo(null); setNotice({ text: `Uploaded "${d.title}".` }); }} />
+        </Part>}
+        {docsLoad === 'ready' && <Part id="doc-list" title="Documents list">
+          {listedDocs.length === 0
+            ? <p className="text-text-secondary">No documents yet. Upload a PDF or a photo of a record above.</p>
+            : <DocumentList
+                docs={listedDocs} busy={busy} resultsPerDoc={resultsPerDoc} onRemove={removeDoc}
+                onEdited={d => { setDocs(cur => cur.map(x => (x.id === d.id ? d : x))); setNotice({ text: 'Saved.' }); }}
+              />}
+        </Part>}
+      </PartGroup>
+    </PartGrid>
   </div>;
 }
 

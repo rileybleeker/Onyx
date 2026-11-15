@@ -1,4 +1,6 @@
 import type { Metadata } from 'next';
+import { cookies } from 'next/headers';
+import { layoutCookieName, layoutFromCookie } from '@/lib/personalize-layout';
 import { loadDocuments, loadLabs, type Section } from '@/lib/medical-records-server';
 import type { LabResult, MedicalDocument } from '@/lib/medical-records';
 import RecordsClient from './RecordsClient';
@@ -14,5 +16,7 @@ export default async function MedicalRecordsPage() {
     loadDocuments().catch((): Section<MedicalDocument> => ({ state: 'error' })),
     loadLabs().catch((): Section<LabResult> => ({ state: 'error' })),
   ]);
-  return <RecordsClient documents={documents} labs={labs} />;
+  // Personalize: the saved layout rides in a cookie scoped to this page, so the server renders it as is.
+  const layout = layoutFromCookie((await cookies()).get(layoutCookieName('/health/records'))?.value);
+  return <RecordsClient documents={documents} labs={labs} layout={layout} />;
 }

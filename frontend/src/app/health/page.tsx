@@ -1,4 +1,6 @@
 import type { Metadata } from 'next';
+import { cookies } from 'next/headers';
+import { layoutCookieName, layoutFromCookie } from '@/lib/personalize-layout';
 import { NOT_CONNECTED } from '@/lib/care-google';
 import { calendarStatus } from '@/lib/care-google-server';
 import { loadCareItems, type CareLoad } from '@/lib/care-items-server';
@@ -14,5 +16,7 @@ export default async function HealthPage() {
     loadCareItems().catch((): CareLoad => ({ state: 'error' })),
     calendarStatus().catch(() => NOT_CONNECTED),
   ]);
-  return <HealthClient initial={initial} calendar={calendar} />;
+  // Personalize: the saved layout rides in a cookie scoped to this page, so the server renders it as is.
+  const layout = layoutFromCookie((await cookies()).get(layoutCookieName('/health'))?.value);
+  return <HealthClient initial={initial} calendar={calendar} layout={layout} />;
 }
