@@ -112,6 +112,95 @@ test("route rules: POST only, body cap, under /api/habits, read-only, text never
   assert.equal(/voice/i.test(ci.slice(0, ci.indexOf("\n}\n"))), false);
 });
 
+// ─── Last night's sleep and the journal draft (2026-11-14) ──────────────────────────────────────────────────
+const sleepQs = [...C.SLEEP_QUESTIONS];
+const TODAY = "2031-03-05";
+const LAST_NIGHT = C.sleepAnswerDate(TODAY); // 2031-03-04
+
+test("voiceSleepNames keeps only sleep questions and sleep-flagged items", () => {
+  const items = [
+    { name: "Question A?", sleep: false },
+    { name: sleepQs[0], sleep: false },
+    { name: "Question B?", sleep: true },
+  ];
+  assert.deepEqual(V.voiceSleepNames(items), [sleepQs[0], "Question B?"]);
+});
+
+test("sleep validator keeps allowed sleep Yes/No for a night that already happened", () => {
+  const raw = { sleep_answers: [{ question: sleepQs[0], answer: "Yes" }, { question: sleepQs[1], answer: "No" }, { question: sleepQs[0], answer: "No" }] };
+  assert.deepEqual({ ...V.parseSleepAnswers(raw, sleepQs, LAST_NIGHT, TODAY) }, { [sleepQs[0]]: "Yes", [sleepQs[1]]: "No" });
+});
+
+test("sleep validator drops daytime questions, unknown names and non-Yes/No answers", () => {
+  const raw = { sleep_answers: [{ question: "Question A?", answer: "Yes" }, { question: sleepQs[0], answer: "maybe" }, { question: "Not asked?", answer: "Yes" }, null] };
+  assert.deepEqual({ ...V.parseSleepAnswers(raw, [...sleepQs, "Question A?"], LAST_NIGHT, TODAY) }, {});
+  assert.deepEqual({ ...V.parseSleepAnswers({ sleep_answers: [{ question: sleepQs[0], answer: "Yes" }] }, [], LAST_NIGHT, TODAY) }, {}, "not in the allowed list");
+});
+
+test("sleep validator never answers tonight or a later night (sleepDateError)", () => {
+  const raw = { sleep_answers: [{ question: sleepQs[0], answer: "Yes" }] };
+  assert.deepEqual({ ...V.parseSleepAnswers(raw, sleepQs, TODAY, TODAY) }, {});
+  assert.deepEqual({ ...V.parseSleepAnswers(raw, sleepQs, C.addDays(TODAY, 1), TODAY) }, {});
+});
+
+test("voiceResult returns the day, last night and the journal labels", async () => {
+  const model = {
+    answers: [{ question: "Question A?", answer: "Yes" }, { question: sleepQs[0], answer: "Yes" }],
+    sleep_answers: [{ question: sleepQs[0], answer: "No" }, { question: "Question B?", answer: "Yes" }],
+    journal: { title: "Synthetic gym day and early night", mood: "good", confidence: "high", topics: ["gym", "Sleep", "gym", "bad tag!"] },
+  };
+  const r = await V.voiceResult(async () => JSON.stringify(model), ALLOWED, { names: sleepQs, date: LAST_NIGHT, today: TODAY });
+  assert.deepEqual({ ...r.answers }, { "Question A?": "Yes" }, "a sleep question never lands on the day");
+  assert.equal(r.night.date, LAST_NIGHT);
+  assert.deepEqual({ ...r.night.answers }, { [sleepQs[0]]: "No" });
+  assert.deepEqual({ ...r.journal, topics: [...r.journal.topics] }, { title: "Synthetic gym day and early night", mood: "good", confidence: "high", topics: ["gym", "sleep"] });
+});
+
+test("voiceResult without sleep questions has no night; missing labels give a blank draft", async () => {
+  const r = await V.voiceResult(async () => out([{ question: "Question A?", answer: "No" }]), ALLOWED);
+  assert.equal(r.night, null);
+  assert.deepEqual({ ...r.journal, topics: [...r.journal.topics] }, { title: "", mood: null, confidence: "medium", topics: [] });
+});
+
+test("#say= hand-off: decodes the words, ignores other hashes, caps the length", () => {
+  assert.equal(V.sayFromHash("#say=Synthetic%20words%2C%20one%20%2B%20two"), "Synthetic words, one + two");
+  assert.equal(V.sayFromHash("#say=Synthetic+form+encoded"), "Synthetic form encoded");
+  assert.equal(V.sayFromHash("#say=%20%20"), null);
+  assert.equal(V.sayFromHash("#say=%E0%A4%A"), null, "malformed encoding");
+  assert.equal(V.sayFromHash("#other=x"), null);
+  assert.equal(V.sayFromHash(""), null);
+  assert.equal(V.sayFromHash("#say=" + "x".repeat(V.VOICE_MAX_TEXT_CHARS + 50)).length, V.VOICE_MAX_TEXT_CHARS);
+});
+
+test("request checks take a larger cap when asked (the journal route)", () => {
+  const h = (o) => ({ get: (k) => o[k.toLowerCase()] ?? null });
+  const base = { origin: "https://app.example", host: "app.example", "content-type": "application/json", "content-length": "20000" };
+  assert.equal(V.checkVoiceRequest(h(base), "https://app.example").status, 413);
+  assert.equal(V.checkVoiceRequest(h(base), "https://app.example", 32 * 1024), null);
+});
+
+test("route rules: last night is sleepAnswerDate(today), a stale screen gets 409, still read-only", () => {
+  const route = fs.readFileSync(path.join(SRC, "app/api/habits/checkin/voice/route.ts"), "utf8");
+  assert.match(route, /sleepAnswerDate\(today\)/);
+  assert.match(route, /voiceSleepNames/);
+  assert.match(route, /stale: true/);
+  assert.match(route, /status: 409/);
+  assert.match(route, /sleep_answers/);
+  assert.match(route, /known_topics/);
+  assert.equal(/journal\/entry|api\.notion\.com/.test(route.replace(/^\/\/.*$/gm, "")), false, "the voice route never writes the journal");
+});
+
+test("the screen puts last night's answers in that night's block and offers a journal draft", () => {
+  const client = fs.readFileSync(path.join(SRC, "app/check-in/CheckInClient.tsx"), "utf8");
+  assert.match(client, /applyRef\.current\(nightDate, nightPatch\)/);
+  assert.match(client, /night\.date < now\.today && now\.nights\.some/);
+  assert.match(client, /today: page\.today/);
+  assert.match(client, /\/api\/journal\/entry/);
+  assert.match(client, /Save to journal/);
+  assert.match(client, /sayFromHash\(/);
+  assert.match(client, /history\.replaceState/);
+});
+
 test("the screen applies answers as draft taps and marks them 'from what you said'", () => {
   const client = fs.readFileSync(path.join(SRC, "app/check-in/CheckInClient.tsx"), "utf8");
   assert.match(client, /\/api\/habits\/checkin\/voice/);
