@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { listBooks } from "@/lib/reading";
+import { BOOK_COLS, listBooks } from "@/lib/reading";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
     notion_page_id: (body.notion_page_id as string)?.trim() || null,
     status: "reading",
   };
-  const { data, error } = await supabase.from("books").insert(row).select("*").single();
+  const { data, error } = await supabase.from("books").insert(row).select(BOOK_COLS).single();
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   return NextResponse.json({ success: true, book: data });
 }

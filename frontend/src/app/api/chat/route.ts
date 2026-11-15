@@ -402,6 +402,48 @@ const tools: Anthropic.Tool[] = [
   },
 ];
 
+// Explicit column lists for the chat tools that hand whole rows to the model
+// (re-audit 2026-06-07, units/gpt-5/F-004: select("*") lets a new, similarly
+// named column reach the model unnoticed). Each list is every column the tool
+// returned before, i.e. every column of the relation minus the raw blobs that
+// stripRawFields dropped anyway (raw_json, raw_hr_values, raw_stress_values,
+// raw_hrv_readings). Checked against information_schema on 2026-11-14. These
+// differ from the queries.ts lists on purpose: the model also gets
+// garmin_training_status.load_focus, and garmin_activities has no
+// raw_json->workoutId pick. If the ETL adds a column the model should see,
+// append it here.
+const CHAT_TABLE_COLS: Record<string, string> = {
+  garmin_daily_summary:
+    "ts, calendar_date, total_steps, daily_step_goal, total_distance_meters, floors_ascended, floors_descended, total_kilocalories, active_kilocalories, bmr_kilocalories, resting_heart_rate, min_heart_rate, max_heart_rate, last_seven_days_avg_rhr, avg_stress_level, max_stress_level, stress_duration_minutes, rest_stress_duration_min, low_stress_duration_min, medium_stress_duration_min, high_stress_duration_min, stress_qualifier, body_battery_charged, body_battery_drained, body_battery_highest, body_battery_lowest, body_battery_most_recent, avg_spo2, lowest_spo2, avg_waking_respiration, highest_respiration, lowest_respiration, moderate_intensity_minutes, vigorous_intensity_minutes, intensity_minutes_goal, highly_active_seconds, active_seconds, sedentary_seconds, sleeping_seconds, abnormal_hr_count, min_avg_heart_rate, max_avg_heart_rate, source, synced_at",
+  garmin_sleep:
+    "ts, calendar_date, sleep_id, sleep_start, sleep_end, sleep_duration_seconds, unmeasurable_seconds, deep_sleep_seconds, light_sleep_seconds, rem_sleep_seconds, awake_seconds, overall_sleep_score, quality_score, duration_score, recovery_score, rem_score, light_score, deep_score, restlessness_score, avg_sleep_heart_rate, avg_respiration_rate, avg_spo2, lowest_spo2, avg_hrv, hrv_status, avg_sleep_stress, sleep_need_seconds, sleep_debt_seconds, is_nap, auto_detected, sleep_result_type, source, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source",
+  garmin_hrv:
+    "ts, calendar_date, weekly_avg_ms, last_night_avg_ms, last_night_5min_high_ms, baseline_low_upper_ms, baseline_balanced_low_ms, baseline_balanced_upper_ms, baseline_marker_upper_ms, hrv_status, start_timestamp, end_timestamp, create_timestamp, source, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source",
+  garmin_stress:
+    "ts, calendar_date, overall_stress_level, rest_stress_duration_sec, low_stress_duration_sec, medium_stress_duration_sec, high_stress_duration_sec, stress_qualifier, source, synced_at",
+  garmin_training_status:
+    "ts, calendar_date, training_readiness_score, training_readiness_level, sleep_score_factor, recovery_time_factor, hrv_factor, sleep_history_factor, stress_history_factor, training_load_factor, training_status, training_status_message, acute_training_load, chronic_training_load, training_load_balance, load_focus, vo2_max_running, vo2_max_cycling, fitness_age, recovery_time_hours, recovery_heart_rate, source, synced_at",
+  eight_sleep_trends:
+    "calendar_date, bed_side, sleep_score, sleep_fitness_score, sleep_quality_score, sleep_duration_score, latency_asleep_score, latency_out_score, wakeup_consistency_score, sleep_routine_score, avg_heart_rate, avg_hrv, avg_breath_rate, median_bed_temp, median_room_temp, time_slept_seconds, awake_seconds, light_sleep_seconds, deep_sleep_seconds, rem_sleep_seconds, toss_and_turns, session_date, synced_at, latency_asleep_seconds, snore_duration_seconds, heavy_snore_duration_seconds, time_slept_main_session_seconds, awake_main_session_seconds, light_sleep_main_session_seconds, deep_sleep_main_session_seconds, rem_sleep_main_session_seconds, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source",
+  garmin_activities:
+    "ts, activity_id, activity_type, activity_type_id, activity_name, sport_type, start_time_local, start_time_gmt, duration_seconds, elapsed_duration_seconds, moving_duration_seconds, distance_meters, avg_speed_mps, max_speed_mps, avg_heart_rate, max_heart_rate, avg_running_cadence, max_running_cadence, avg_pace_min_per_km, avg_cycling_cadence, max_cycling_cadence, avg_power_watts, max_power_watts, normalized_power, elevation_gain_meters, elevation_loss_meters, min_elevation_meters, max_elevation_meters, calories, avg_stress, aerobic_training_effect, anaerobic_training_effect, training_effect_label, training_load, vo2_max, avg_temperature_c, max_temperature_c, min_temperature_c, start_latitude, start_longitude, performance_condition, total_sets, total_reps, avg_strokes_per_length, pool_length_meters, total_lengths, manual_activity, has_splits, has_polyline, source, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source, is_excluded, split_label, split_labels, muscle_groups, is_sauna",
+  whoop_cycles:
+    "cycle_id, user_id, created_at, updated_at, start_time, end_time, timezone_offset, score_state, strain, kilojoule, average_heart_rate, max_heart_rate, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source, onyx_is_transition_day, step_count",
+  whoop_recovery:
+    "cycle_id, sleep_id, user_id, created_at, updated_at, score_state, recovery_score, resting_heart_rate, hrv_rmssd_milli, spo2_percentage, skin_temp_celsius, user_calibrating, synced_at",
+  whoop_sleep:
+    "sleep_id, cycle_id, user_id, created_at, updated_at, start_time, end_time, timezone_offset, is_nap, score_state, total_in_bed_time_milli, total_awake_time_milli, total_no_data_time_milli, total_light_sleep_time_milli, total_slow_wave_sleep_time_milli, total_rem_sleep_time_milli, sleep_cycle_count, disturbance_count, baseline_milli, need_from_sleep_debt_milli, need_from_recent_strain_milli, need_from_recent_nap_milli, respiratory_rate, sleep_performance_percentage, sleep_consistency_percentage, sleep_efficiency_percentage, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source",
+  whoop_workouts:
+    "workout_id, user_id, created_at, updated_at, start_time, end_time, timezone_offset, sport_id, sport_name, score_state, strain, average_heart_rate, max_heart_rate, kilojoule, percent_recorded, distance_meter, altitude_gain_meter, altitude_change_meter, zone_zero_milli, zone_one_milli, zone_two_milli, zone_three_milli, zone_four_milli, zone_five_milli, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source, is_excluded, split_label, split_labels, muscle_groups, is_sauna",
+};
+// pds.daily_micronutrient_totals: all 76 columns. query_vitamins returns every
+// nutrient, and query_micronutrient_trend picks columns by name fragment, so a
+// column left out here would silently drop out of both answers.
+const CHAT_MICRONUTRIENT_COLS =
+  "onyx_behavioral_date, vit_a_dietary_mcg, vit_a_supplement_mcg, vit_a_total_mcg, vit_c_dietary_mg, vit_c_supplement_mg, vit_c_total_mg, vit_d_dietary_iu, vit_d_supplement_iu, vit_d_total_iu, vit_e_dietary_mg, vit_e_supplement_mg, vit_e_total_mg, vit_k_dietary_mcg, vit_k_supplement_mcg, vit_k_total_mcg, b1_dietary_mg, b1_supplement_mg, b1_total_mg, b2_dietary_mg, b2_supplement_mg, b2_total_mg, b3_dietary_mg, b3_supplement_mg, b3_total_mg, b5_dietary_mg, b5_supplement_mg, b5_total_mg, b6_dietary_mg, b6_supplement_mg, b6_total_mg, b12_dietary_mcg, b12_supplement_mcg, b12_total_mcg, folate_dietary_mcg, folate_supplement_mcg, folate_total_mcg, calcium_dietary_mg, calcium_supplement_mg, calcium_total_mg, iron_dietary_mg, iron_supplement_mg, iron_total_mg, magnesium_dietary_mg, magnesium_supplement_mg, magnesium_total_mg, phosphorus_dietary_mg, phosphorus_supplement_mg, phosphorus_total_mg, potassium_dietary_mg, potassium_supplement_mg, potassium_total_mg, zinc_dietary_mg, zinc_supplement_mg, zinc_total_mg, copper_dietary_mg, copper_supplement_mg, copper_total_mg, manganese_dietary_mg, manganese_supplement_mg, manganese_total_mg, selenium_dietary_mcg, selenium_supplement_mcg, selenium_total_mcg, sodium_dietary_mg, sodium_supplement_mg, sodium_total_mg, omega3_dietary_g, omega3_supplement_g, omega3_total_g, epa_dietary_g, epa_supplement_g, epa_total_g, dha_dietary_g, dha_supplement_g, dha_total_g";
+// pds.journal view: all 8 columns (query_behaviors and query_journal return whole rows).
+const CHAT_JOURNAL_COLS = "cycle_date, behaviors_date, question, category, answer, notes, synced_at, source";
+
 function stripRawFields(rows: Record<string, unknown>[]): Record<string, unknown>[] {
   return rows.map((row) => {
     const { raw_json, raw_hr_values, raw_stress_values, raw_hrv_readings, ...rest } = row;
@@ -523,7 +565,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
   if (name === "query_vitamins") {
     const { data, error } = await supabase
       .from("daily_micronutrient_totals")
-      .select("*")
+      .select(CHAT_MICRONUTRIENT_COLS)
       .gte("onyx_behavioral_date", sinceStr)
       .order("onyx_behavioral_date", { ascending: false });
     if (error) return JSON.stringify({ error: error.message });
@@ -538,7 +580,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     trendSince.setDate(trendSince.getDate() - trendDays);
     const { data, error } = await supabase
       .from("daily_micronutrient_totals")
-      .select("*")
+      .select(CHAT_MICRONUTRIENT_COLS)
       .gte("onyx_behavioral_date", trendSince.toISOString().split("T")[0])
       .order("onyx_behavioral_date", { ascending: false });
     if (error) return JSON.stringify({ error: error.message });
@@ -641,7 +683,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     // view (source='whoop'); pds.whoop_journal is a frozen archive.
     // Descending so the 200-row cap keeps the most RECENT entries (ascending
     // returned the oldest week of the window).
-    let query = supabase.from("journal").select("*")
+    let query = supabase.from("journal").select(CHAT_JOURNAL_COLS)
       .eq("source", "whoop")
       .gte("cycle_date", jSince.toISOString().split("T")[0])
       .order("cycle_date", { ascending: false })
@@ -660,7 +702,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     jSince.setDate(jSince.getDate() - journalDays);
     // Descending so the 500-row cap keeps the most RECENT entries (the merged
     // table is ~12k rows; ascending returned only the oldest slice).
-    let query = supabase.from("journal").select("*")
+    let query = supabase.from("journal").select(CHAT_JOURNAL_COLS)
       .gte("cycle_date", jSince.toISOString().split("T")[0])
       .order("cycle_date", { ascending: false })
       .limit(500);
@@ -1002,7 +1044,9 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
   // Handle timestamp-based tables
   if (name in timestampTables) {
     const { table, timeCol, extra } = timestampTables[name];
-    let query = supabase.from(table).select("*").gte(timeCol, since.toISOString()).order(timeCol, { ascending: true }).limit(50);
+    const cols = CHAT_TABLE_COLS[table];
+    if (!cols) return JSON.stringify({ error: `No column list for ${table}` });
+    let query = supabase.from(table).select<string, Record<string, unknown>>(cols).gte(timeCol, since.toISOString()).order(timeCol, { ascending: true }).limit(50);
     if (extra) {
       for (const [k, v] of Object.entries(extra)) {
         query = query.eq(k, v);
@@ -1016,10 +1060,12 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
   // Handle calendar_date-based tables
   const table = calendarDateTables[name];
   if (!table) return JSON.stringify({ error: "Unknown tool" });
+  const cols = CHAT_TABLE_COLS[table];
+  if (!cols) return JSON.stringify({ error: `No column list for ${table}` });
 
   const { data, error } = await supabase
     .from(table)
-    .select("*")
+    .select<string, Record<string, unknown>>(cols)
     .gte("calendar_date", sinceStr)
     .order("calendar_date", { ascending: true })
     .limit(60);

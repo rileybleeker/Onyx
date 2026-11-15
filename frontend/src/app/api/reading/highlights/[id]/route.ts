@@ -1,6 +1,6 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import type { Highlight } from "@/lib/reading";
+import { HIGHLIGHT_COLS, type Highlight } from "@/lib/reading";
 import { updateMirroredHighlight } from "@/lib/reading-notion";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
@@ -23,7 +23,7 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
   if ("archived" in body) patch.archived = Boolean(body.archived);
   if (!Object.keys(patch).length) return NextResponse.json({ error: "nothing to update" }, { status: 400 });
 
-  const { data, error } = await supabase.from("book_highlights").update(patch).eq("highlight_id", highlight_id).select("*").single();
+  const { data, error } = await supabase.from("book_highlights").update(patch).eq("highlight_id", highlight_id).select(HIGHLIGHT_COLS).single();
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   const h = data as Highlight;
   if (h.notion_block_id && !("archived" in patch)) after(() => updateMirroredHighlight(h));

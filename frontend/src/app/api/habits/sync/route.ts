@@ -59,7 +59,7 @@ export async function POST() {
 
   // Load existing name map (channel routes WHOOP-derived habits: their names
   // are frozen pipeline variable identities — see sql/whoop_journal_merge.sql)
-  const { data: nameMap } = await supabase.from("habit_name_map").select("*");
+  const { data: nameMap } = await supabase.from("habit_name_map").select("notion_page_id, habit_name, channel");
   const mapByPageId = new Map<string, { name: string; channel: string }>();
   (nameMap || []).forEach((row: any) =>
     mapByPageId.set(row.notion_page_id, { name: row.habit_name, channel: row.channel || "habit" })
