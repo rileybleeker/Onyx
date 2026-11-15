@@ -63,7 +63,7 @@ test('all quick capture destinations remain available and check-in remains first
   const html = render(false, true);
   const links = [...html.matchAll(/href="([^"]+)"/g)].map(m => m[1]);
   const checkin = links.indexOf('/check-in');
-  assert.deepEqual(links.slice(checkin, checkin + 4), ['/check-in', '/supplements', '/habits', '/nutrition']);
+  assert.deepEqual(links.slice(checkin, checkin + 4), ['/check-in', '/supplements', '/habits', '/nutrition?log=weight']);
 });
 test('drawer navigation and search/sign-out have minimum 44px height', () => {
   const html = render(true);

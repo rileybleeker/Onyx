@@ -384,7 +384,7 @@ export default function TodayClient() {
           <p className={styles.eyebrow}>OR LOG SOMETHING QUICKLY</p>
           <Link href="/supplements" className={styles.captureLink}><span>Supplement<span className={styles.caption}>Your stack &amp; intake</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
           <Link href="/habits" className={styles.captureLink}><span>Habit<span className={styles.caption}>Record a daily habit</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
-          <Link href="/nutrition" className={styles.captureLink}><span>Weight<span className={styles.caption}>Nutrition &amp; measurements</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
+          <Link href="/nutrition?log=weight" className={styles.captureLink}><span>Weight<span className={styles.caption}>Log today&apos;s weight</span></span><ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
         </div>
       </section>
       <nav aria-label="Today sections" className={styles.jumpLinks}>

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import {
   AreaChart, Area,
   BarChart, Bar, Cell,
@@ -162,6 +163,16 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   const [weightDate, setWeightDate] = useState<string>("");
   const [weightNotes, setWeightNotes] = useState<string>("");
   const [savingWeight, setSavingWeight] = useState(false);
+  // /nutrition?log=weight: weight first, pounds field focused (the page's charts stay below it).
+  const logWeightFirst = useSearchParams().get("log") === "weight";
+  const weightInputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!logWeightFirst) return;
+    const input = weightInputRef.current;
+    if (!input) return;
+    input.focus({ preventScroll: true });
+    document.getElementById("log-weight")?.scrollIntoView({ block: "start" });
+  }, [logWeightFirst]);
 
   // Behavioral "today" for the Today's Meals widget — seeded with ET-clock-today
   // as a synchronous best-guess, then overridden on mount via /api/behavioral-today
@@ -415,6 +426,95 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     estDays === 0 ? "CRONOMETER" : loggedDays === 0 ? "UBER EATS EST." : "CRONOMETER + UBER EATS EST.";
   const latestSource = latest?.nutrition_source === "uber_eats" ? "UBER EATS EST." : "CRONOMETER";
 
+  // The weight quick-log. A "Log weight" shortcut (Log sheet, Today) opens /nutrition?log=weight: the card is
+  // then drawn first, right under the header, and its pounds field is focused, instead of sitting below every
+  // nutrition chart (Codex #191 UI 5).
+  const weightLogCard = (
+    <div id="log-weight" className="scroll-mt-24">
+    <ChartCard
+      title={weightDate === etTodayStr() ? "Log weight — today" : `Log weight for ${formatShortDate(weightDate)}`}
+      subtitle={
+        todayWeight && weightDate === etTodayStr()
+          ? `Already logged today (${kgToLb(Number(todayWeight.weight_kg))!.toFixed(1)} lb). Saving overwrites.`
+          : "One entry per day, in pounds"
+      }
+    >
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
+          Date
+        </label>
+        <input
+          type="date"
+          value={weightDate}
+          max={etTodayStr()}
+          onChange={(e) => setWeightDate(e.target.value || etTodayStr())}
+          disabled={savingWeight}
+          className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
+        />
+        {weightDate !== etTodayStr() && (
+          <>
+            <span className="text-[10px] font-mono text-amber-400/90">
+              logging to {formatShortDate(weightDate)} — not today
+            </span>
+            <button
+              onClick={() => setWeightDate(etTodayStr())}
+              className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
+            >
+              reset to today
+            </button>
+          </>
+        )}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
+          Weight
+        </label>
+        <input
+          type="number"
+          step="0.1"
+          inputMode="decimal"
+          ref={weightInputRef}
+          aria-label="Weight in pounds"
+          value={weightInput}
+          onChange={(e) => setWeightInput(e.target.value)}
+          placeholder="e.g. 178.4"
+          disabled={savingWeight}
+          className="w-[140px] min-h-11 px-3 text-[16px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
+        />
+        <span className="text-[10px] font-mono text-text-tertiary">lb</span>
+        {weightInput && !isNaN(parseFloat(weightInput)) && (
+          <span className="text-[10px] font-mono text-text-tertiary">
+            = {lbToKg(parseFloat(weightInput)).toFixed(2)} kg
+          </span>
+        )}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono shrink-0">
+          Notes
+        </label>
+        <input
+          type="text"
+          value={weightNotes}
+          onChange={(e) => setWeightNotes(e.target.value)}
+          placeholder="optional — e.g. 'morning, post-bathroom', 'after workout'"
+          disabled={savingWeight}
+          className="flex-1 min-w-[200px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
+        />
+      </div>
+
+      <button
+        onClick={saveWeight}
+        disabled={savingWeight || !weightInput}
+        className="w-full px-4 py-3 text-[13px] text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed border border-accent rounded-full transition-colors"
+      >
+        {savingWeight ? "Saving…" : "Save weight"}
+      </button>
+    </ChartCard>
+    </div>
+  );
+
   return (
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
@@ -434,6 +534,8 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
           <RangeFilter value={selectedRange} onChange={selectRange} />
         </div>
       </div>
+
+      {logWeightFirst && <div className="mb-8">{weightLogCard}</div>}
 
       {/* Meal timing is now automatic from Cronometer Gold per-entry timestamps
           (manual meal_events logging removed 2026-05-31). Per-meal log shows in
@@ -806,86 +908,8 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
       </div>
 
       <div className="space-y-6 mb-10">
-        {/* Quick-log card */}
-        <ChartCard
-          title={weightDate === etTodayStr() ? "Log weight — today" : `Log weight for ${formatShortDate(weightDate)}`}
-          subtitle={
-            todayWeight && weightDate === etTodayStr()
-              ? `Already logged today (${kgToLb(Number(todayWeight.weight_kg))!.toFixed(1)} lb). Saving overwrites.`
-              : "One entry per day, in pounds"
-          }
-        >
-          <div className="flex flex-wrap items-center gap-2 mb-3">
-            <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
-              Date
-            </label>
-            <input
-              type="date"
-              value={weightDate}
-              max={etTodayStr()}
-              onChange={(e) => setWeightDate(e.target.value || etTodayStr())}
-              disabled={savingWeight}
-              className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
-            />
-            {weightDate !== etTodayStr() && (
-              <>
-                <span className="text-[10px] font-mono text-amber-400/90">
-                  logging to {formatShortDate(weightDate)} — not today
-                </span>
-                <button
-                  onClick={() => setWeightDate(etTodayStr())}
-                  className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
-                >
-                  reset to today
-                </button>
-              </>
-            )}
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 mb-3">
-            <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
-              Weight
-            </label>
-            <input
-              type="number"
-              step="0.1"
-              inputMode="decimal"
-              value={weightInput}
-              onChange={(e) => setWeightInput(e.target.value)}
-              placeholder="e.g. 178.4"
-              disabled={savingWeight}
-              className="w-[120px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
-            />
-            <span className="text-[10px] font-mono text-text-tertiary">lb</span>
-            {weightInput && !isNaN(parseFloat(weightInput)) && (
-              <span className="text-[10px] font-mono text-text-tertiary">
-                = {lbToKg(parseFloat(weightInput)).toFixed(2)} kg
-              </span>
-            )}
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 mb-3">
-            <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono shrink-0">
-              Notes
-            </label>
-            <input
-              type="text"
-              value={weightNotes}
-              onChange={(e) => setWeightNotes(e.target.value)}
-              placeholder="optional — e.g. 'morning, post-bathroom', 'after workout'"
-              disabled={savingWeight}
-              className="flex-1 min-w-[200px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
-            />
-          </div>
-
-          <button
-            onClick={saveWeight}
-            disabled={savingWeight || !weightInput}
-            className="w-full px-4 py-3 text-[13px] text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed border border-accent rounded-full transition-colors"
-          >
-            {savingWeight ? "Saving…" : "Save weight"}
-          </button>
-        </ChartCard>
+        {/* Quick-log card (moved to the top of the page when opened from a Log weight shortcut) */}
+        {!logWeightFirst && weightLogCard}
 
         {/* Trend chart */}
         <ChartCard
