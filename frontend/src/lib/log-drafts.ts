@@ -3,15 +3,17 @@
  *
  * The "Say it" box at the top of /log turns what Riley said or typed into SUGGESTIONS for the sections below it
  * (Check-in, Journal, Supplements, Uber Eats, Weight, Reading). It writes them here; each section subscribes to its own
- * key with `useLogDrafts(section)`, shows the suggestion in its own form with the mark FROM_WHAT_YOU_SAID, and
- * stores nothing until Riley taps THAT section's own Save, which goes through the section's existing write route
- * with its existing validation and date rules. A section clears its draft (`clear(draft.id)`) after a successful
- * save or when Riley dismisses the suggestion.
+ * key with `useLogDrafts(section)`, shows the suggestion in its own form with the mark FROM_WHAT_YOU_SAID and saves
+ * it on its own like Riley's own input (autosave, 2026-11-15: they are his words), through the section's existing
+ * write route with its existing validation and date rules. The one exception: a journal entry the model picked out
+ * as a reflection (no "journal:" prefix, `asked` false) waits for Keep. A section clears its draft
+ * (`clear(draft.id)`) after a successful save or when Riley dismisses the suggestion.
  *
  * Rules:
  *   - Memory only: nothing here reaches localStorage, IndexedDB or the server. A reload or sign-out (a full page
  *     load) drops every draft, and the words are never logged.
- *   - Nothing writes on page open: setting a draft never triggers a request; only a tap on a section's Save does.
+ *   - Nothing writes on page open: drafts exist only after a Fill tap, and setting one sends nothing by itself; the
+ *     section that shows it saves it.
  *   - One draft per section, the newest wins (a second "Say it" replaces the first). `id` increases with every
  *     write, so a section applies each draft once and `clear(id)` never removes a newer one.
  *   - A draft is a suggestion: a section never lets it overwrite something Riley tapped or typed since it loaded.
@@ -121,9 +123,13 @@ export interface ReadingLogDraft {
  * New York, Source, Confidence, Mood, Topics all set; AGENTS.md journal rules). `body` is the person's own words
  * VERBATIM, never a rewrite or summary: the words after a "journal:" prefix, or an exact quote of what was said
  * (journalPrefixText / verbatimExcerpt in lib/journal-file.ts), or the whole text. The labels are suggestions: the
- * section sends them only while the words are unchanged, and any left null / empty is filled in at Save.
+ * section sends them only while the words are unchanged, and any left null / empty is filled in when it is filed.
+ * The section files a draft by itself only when `asked` (a "journal:" note: Riley asked for an entry); any other
+ * draft (a reflection the model picked out, the check-in's Say it once) waits for Keep or an edit.
  */
 export interface JournalLogDraft {
+  /** True when Riley asked for the entry ("journal:" prefix): filed automatically. Absent / false: offered only. */
+  asked?: boolean;
   body: string;
   /** "voice" when the words were spoken or came through the Say it box (the journal's default), else "typed". */
   source: "voice" | "typed";

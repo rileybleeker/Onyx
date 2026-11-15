@@ -18,8 +18,9 @@ import { LogCard } from "./ui";
  *     answers, last night's sleep) at once, and
  *   - POST /api/log/voice (one model call, read-only) returns drafts for Journal (the words verbatim, when they are
  *     a reflection or start with "journal:"), Supplements, Uber Eats, Weight and Reading.
- * Every draft is a suggestion marked FROM_WHAT_YOU_SAID in its section; nothing is stored until Riley taps that
- * section's own Save. Nothing is sent on page open or on scroll: only the Fill tap sends.
+ * Every draft is marked FROM_WHAT_YOU_SAID in its section and saved there on its own (autosave), except a journal
+ * entry the model picked out as a reflection, which waits for Keep. Nothing is sent on page open or on scroll: only
+ * the Fill tap starts it.
  *
  * The words and the last result stay in memory only (module variables, so scrolling away and back keeps them;
  * a reload drops them). They are never written to storage and never logged.
@@ -141,8 +142,9 @@ export default function SayItSection() {
         <InfoHint label="Say it">
           Type, or use your keyboard&apos;s microphone. Fill reads it once and suggests answers in the check-in,
           journal, supplements, Uber Eats, weight and reading below, marked &ldquo;{FROM_WHAT_YOU_SAID}&rdquo;. Start
-          with &ldquo;journal:&rdquo; to make the rest a journal entry. Nothing is saved until you press each
-          section&apos;s Save. The words go to Anthropic for that read and are not stored.
+          with &ldquo;journal:&rdquo; to make the rest a journal entry. Each section saves what it filled on its own
+          (Undo or change it there); a journal entry without &ldquo;journal:&rdquo; waits for Keep. The words go to
+          Anthropic for that read and are not stored.
         </InfoHint>
       }
     >
@@ -205,8 +207,8 @@ function useShownParts(): Set<string> {
 const ROW = "grid grid-cols-[96px_1fr_16px] gap-x-3 py-1.5 text-[13px]";
 
 /**
- * One section's line under the box. The whole row is a button that scrolls to the section, where the suggestion
- * waits for that section's Save. A section hidden in Personalize says so (its suggestion stays for when it shows).
+ * One section's line under the box. The whole row is a button that scrolls to the section, where what was filled
+ * is saved on its own. A section hidden in Personalize says so (its suggestion stays for when it shows).
  */
 function SectionRow({ name, part, lines, tone = "text-text-primary" }: { name: string; part: LogPartId; lines: string[]; tone?: string }) {
   const shown = useShownParts().has(part);
@@ -286,7 +288,7 @@ function Filled({ result }: { result: LogVoiceResult & { unavailable?: string[];
       {unavailable.length > 0 ? <p className="text-[12px] text-mid">Couldn&apos;t load {unavailable.join(", ")}; not filled.</p> : null}
       <p className="text-[12px] text-text-secondary">
         {!result.error && empty.length > 0 ? `Nothing for ${empty.map((n) => (n === "Uber Eats" ? n : n.toLowerCase())).join(", ")}. ` : ""}
-        Tap a line to go there, check it, then press that section&apos;s Save.
+        Each section saves what it filled on its own. Tap a line to go there and check or undo it.
       </p>
     </div>
   );

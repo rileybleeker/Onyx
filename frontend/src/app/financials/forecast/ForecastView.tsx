@@ -15,6 +15,8 @@ import type { GoalView } from "@/lib/finance-goals";
 import type { MovePlan } from "@/lib/finance-plan";
 import { ModelSettings, PlanConfig, StreamEditorList } from "./PlanConfig";
 import InfoHint from "@/components/InfoHint";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
+import { useFinanceAutosave } from "@/lib/use-finance-autosave";
 import { Part, PartGrid, PartGroup } from "@/components/personalize/PartGrid";
 import type { PageLayout } from "@/lib/personalize-layout";
 
@@ -520,15 +522,32 @@ function CardRow({ c, driver, busy, run }: { c: ForecastResult["cards"][number];
   const [promoEnds, setPromoEnds] = useState(typeof driver?.promoEnds === "string" ? driver.promoEnds : "");
   const [apr, setApr] = useState(typeof driver?.aprPct === "number" ? String(driver.aprPct) : "");
   const [std, setStd] = useState(typeof driver?.standardAprPct === "number" ? String(driver.standardAprPct) : "");
-  const save = () => {
+  type CardForm = { promoEnds: string; apr: string; std: string };
+  const toValue = (g: CardForm) => {
     const value: Record<string, unknown> = {};
-    if (promoEnds) value.promoEnds = promoEnds;
-    if (apr.trim()) value.aprPct = Number(apr);
-    if (std.trim()) value.standardAprPct = Number(std);
-    if (promoEnds && typeof driver?.promoNote === "string" && promoEnds === driver.promoEnds) value.promoNote = driver.promoNote;
-    if (promoEnds && promoEnds !== driver?.promoEnds) value.promoAprPct = 0;
-    run(() => send("/api/finance/forecast/drivers", "PUT", { key: `card:${c.account_key}`, value: Object.keys(value).length ? value : null }));
+    if (g.promoEnds) value.promoEnds = g.promoEnds;
+    if (g.apr.trim()) value.aprPct = Number(g.apr);
+    if (g.std.trim()) value.standardAprPct = Number(g.std);
+    if (g.promoEnds && typeof driver?.promoNote === "string" && g.promoEnds === driver.promoEnds) value.promoNote = driver.promoNote;
+    if (g.promoEnds && g.promoEnds !== driver?.promoEnds) value.promoAprPct = 0;
+    // An unchanged promo keeps its stored promo APR (autosave sends this value again whenever an APR changes).
+    else if (g.promoEnds && typeof driver?.promoAprPct === "number") value.promoAprPct = driver.promoAprPct;
+    return Object.keys(value).length ? value : null;
   };
+  // Autosave (lib/use-finance-autosave.ts): sent after a pause or when the field is left, then the forecast re-reads.
+  const autosave = useFinanceAutosave<CardForm>(`forecast-card:${c.account_key}`, run, (g) => send("/api/finance/forecast/drivers", "PUT", { key: `card:${c.account_key}`, value: toValue(g) }), {
+    ready: (g) => (g.apr.trim() && !Number.isFinite(Number(g.apr))) || (g.std.trim() && !Number.isFinite(Number(g.std))) ? "APR must be a number." : null,
+    baseline: { promoEnds, apr, std },
+  });
+  const edit = (patch: Partial<CardForm>) => {
+    const next = { promoEnds, apr, std, ...patch };
+    setPromoEnds(next.promoEnds);
+    setApr(next.apr);
+    setStd(next.std);
+    autosave.change(next);
+  };
+  const flush = () => void autosave.flush();
+  void busy;
   return (
     <div className="border-t border-border-subtle pt-2 text-[13px]">
       <p>
@@ -548,17 +567,15 @@ function CardRow({ c, driver, busy, run }: { c: ForecastResult["cards"][number];
       ))}
       <div className="mt-1 flex flex-wrap items-center gap-2 text-[12px] text-text-secondary">
         <label>
-          promo ends <input className={input} type="date" value={promoEnds} onChange={(e) => setPromoEnds(e.target.value)} />
+          promo ends <input className={input} type="date" value={promoEnds} onChange={(e) => edit({ promoEnds: e.target.value })} onBlur={flush} />
         </label>
         <label>
-          APR now % <input className={`${input} w-16`} inputMode="decimal" value={apr} onChange={(e) => setApr(e.target.value)} placeholder="auto" />
+          APR now % <input className={`${input} w-16`} inputMode="decimal" value={apr} onChange={(e) => edit({ apr: e.target.value })} onBlur={flush} placeholder="auto" />
         </label>
         <label>
-          APR after promo % <input className={`${input} w-16`} inputMode="decimal" value={std} onChange={(e) => setStd(e.target.value)} placeholder="24" />
+          APR after promo % <input className={`${input} w-16`} inputMode="decimal" value={std} onChange={(e) => edit({ std: e.target.value })} onBlur={flush} placeholder="24" />
         </label>
-        <button className={button} disabled={busy} onClick={save}>
-          Save
-        </button>
+        <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} showIncomplete />
       </div>
     </div>
   );

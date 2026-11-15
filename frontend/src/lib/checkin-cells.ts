@@ -1,5 +1,5 @@
 // Pure state rules of the /check-in screen (no React, no storage): what a question shows, what an unsaved tap
-// is worth, and what Save sends. Kept apart from CheckInClient.tsx so they can be tested for real
+// is worth, what each autosave sends, and when the day counts as done. Kept apart from CheckInClient.tsx so they can be tested for real
 // (frontend/tests/checkin.test.cjs).
 import type { CheckinAnswer, CheckinItem, CheckinNight, CheckinSuggestion } from "./checkin";
 
@@ -109,7 +109,7 @@ export function visibleNights(nights: CheckinNight[], sleepItems: CheckinItem[],
 }
 
 export interface SavePlan {
-  /** Sent under the day tab's date. Empty = the day is not sent (and its reminder card is not settled). */
+  /** Sent under the day tab's date. Empty = the day is not sent. */
   dayPatch: Patch;
   /** Sent one request each, under the night's own date. */
   nightPatches: { date: string; changes: Patch }[];
@@ -117,8 +117,8 @@ export interface SavePlan {
 }
 
 /**
- * What Save sends. A part (the day, or one night) is sent only when Riley touched it: tapped or cleared
- * something in it. Its pre-fills then go with it. Untouched pre-fills stay suggestions: today's can still
+ * What each autosave sends (taps save on their own, a short delay after the last one). A part (the day, or one
+ * night) is sent only when Riley touched it: tapped or cleared something in it. Its pre-fills then go with it. Untouched pre-fills stay suggestions: today's can still
  * change (a workout later), and storing them would mark the day's check-in done.
  */
 export function savePlan(args: {
@@ -138,6 +138,17 @@ export function savePlan(args: {
     .map(({ date, changes }) => ({ date, changes }));
   const changeCount = Object.keys(dayPatch).length + nightPatches.reduce((sum, n) => sum + Object.keys(n.changes).length, 0);
   return { dayPatch, nightPatches, changeCount };
+}
+
+/**
+ * The day's check-in is done once every core daytime question has a SAVED Yes or No: only then is the Agents card
+ * settled (POST /onyx/checkin/done). Answers save as they are tapped (autosave, 2026-11-15), so there is no "Save
+ * = done" moment any more; a half-answered day keeps its card, and the 9 AM re-post still reminds. Sleep questions
+ * and "Also did" (extra) questions never count: a day with no core daytime question is never "done" here.
+ */
+export function dayComplete(dayItems: CheckinItem[], saved: Record<string, CheckinAnswer>): boolean {
+  const core = dayItems.filter((i) => i.group === "core" && !i.sleep);
+  return core.length > 0 && core.every((i) => saved[i.name] === "Yes" || saved[i.name] === "No");
 }
 
 /**

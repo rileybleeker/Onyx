@@ -201,7 +201,7 @@ try {
   assert.equal(await page.getByLabel('Time zone of the appointment').inputValue(), 'America/New_York');
   await page.getByLabel('Time zone of the appointment').selectOption('Europe/Madrid');
   await page.getByLabel('Note (optional)').fill('Synthetic reminder text');
-  await page.getByRole('button', { name: 'Add item', exact: true }).click();
+  await page.getByRole('button', { name: 'Done', exact: true }).click();
   await card('Synthetic new visit').waitFor();
   await idle();
   assert.equal(last().method, 'POST');
@@ -220,7 +220,7 @@ try {
   failNext = true;
   await page.getByLabel('Short label').fill('Synthetic failing item');
   await page.getByLabel('Due date').fill('2031-08-01');
-  await page.getByRole('button', { name: 'Add item', exact: true }).click();
+  await page.getByRole('button', { name: 'Done', exact: true }).click();
   await alerts.filter({ hasText: "Couldn't save that to Onyx, so it was not changed." }).waitFor();
   assert.equal(await card('Synthetic failing item').count(), 0);
   assert.equal(await page.getByLabel('Short label').inputValue(), 'Synthetic failing item');
@@ -273,12 +273,23 @@ try {
   assert.equal(await card('Synthetic one-off errand').getByRole('button', { name: 'Archive' }).isDisabled(), true);
   await page.getByLabel('Repeat after completion').selectOption('6');
   await page.getByLabel('I have already booked this appointment').check();
-  await page.getByRole('button', { name: 'Save changes' }).click();
+  await page.getByRole('button', { name: 'Done', exact: true }).click();
   await page.getByRole('heading', { name: 'Add care item', exact: true }).waitFor();
   await idle();
   assert.equal(last().method, 'PATCH');
   assert.deepEqual(last().body, { title: 'Synthetic one-off errand', kind: 'personal', due: '2031-07-01', time: null, tz: 'America/New_York', months: 6, booked: true, notes: '' });
   assert.match(await card('Synthetic one-off errand').innerText(), /Booked by you · Every 6 months after completion/);
+
+  // ---- autosave: an edit is sent on its own after a pause, no button ----
+  await card('Synthetic one-off errand').getByRole('button', { name: 'Edit' }).click();
+  await page.getByLabel('Note (optional)').fill('Synthetic autosaved note');
+  await page.getByText('Saved', { exact: true }).waitFor();
+  await idle();
+  assert.equal(last().method, 'PATCH');
+  assert.equal(last().path, `/api/care/items/${B}`);
+  assert.equal(last().body.notes, 'Synthetic autosaved note');
+  await page.getByRole('button', { name: 'Done', exact: true }).click();
+  await page.getByRole('heading', { name: 'Add care item', exact: true }).waitFor();
 
   // ---- archive, remove (soft), undo the removal ----
   await card('Synthetic new visit').getByRole('button', { name: 'Archive' }).click();

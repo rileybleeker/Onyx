@@ -296,13 +296,30 @@ test("visibleNights: last night always; an earlier night while incomplete or hol
   assert.deepEqual(K.visibleNights([last], [], {}), []);
 });
 
-test("the screen wires the save plan: day under its date with the card settle, nights under theirs", () => {
+test("dayComplete: done only when every core daytime question has a saved Yes or No", () => {
+  const EXTRA = "Some weekly habit?";
+  const items = [...DAY_ITEMS, item(EXTRA, "extra"), item(TAPE, "core", true)];
+  assert.equal(K.dayComplete(items, {}), false);
+  assert.equal(K.dayComplete(items, { [REST]: "Yes" }), false, "half answered");
+  assert.equal(K.dayComplete(items, { [REST]: "Yes", [STRESS]: "No" }), true, "a No counts as answered");
+  assert.equal(K.dayComplete(items, { [REST]: "No", [STRESS]: "No", [TAPE]: "Yes" }), true);
+  // "Also did" and sleep questions never hold the day open, and a day with no core question is never done here.
+  assert.equal(K.dayComplete([item(EXTRA, "extra"), item(TAPE, "core", true)], { [EXTRA]: "Yes", [TAPE]: "Yes" }), false);
+});
+
+test("the screen wires the save plan: day under its date, the card settled only when the day is complete, nights under theirs", () => {
   const client = fs.readFileSync(path.join(SRC, "app/check-in/CheckInClient.tsx"), "utf8");
   assert.match(client, /savePlan\(\{ dayItems, dayAnswers: data\?\.answers \?\? \{\}, cells, sleepItems, nights, nightCells \}\)/);
   const save = client.slice(client.indexOf("const save = async"), client.indexOf("const goTo"));
   const dayBranch = save.slice(save.indexOf("if (Object.keys(dayPatch).length)"), save.indexOf("for (const n of nightPatches)"));
-  assert.match(dayBranch, /agentsApi\.checkinDone\(data\.date\)/); // only when the day was sent
+  assert.match(dayBranch, /agentsApi\.checkinDone\(data\.date\)/); // only when the day was sent...
+  assert.match(dayBranch, /dayComplete\(dayItems, withAnswers\(data\.answers, dayPatch\)\) && !settledDays\.current\.has\(data\.date\)/); // ...complete, once
+  assert.ok(dayBranch.indexOf("dayComplete(") < dayBranch.indexOf("checkinDone"));
   assert.equal((save.match(/checkinDone/g) || []).length, 1);
+  // Autosave: no Save button; taps queue a save, nothing is queued on open (only apply, review and Save now do).
+  assert.doesNotMatch(client, />\s*\{saving \? "Saving…" : "Save"\}/);
+  assert.match(client, /useAutosave<number>\("checkin"/);
+  assert.equal((client.match(/queueSave\(\)/g) || []).length, 3);
   // A refused stale page preserves unfinished drafts for dated review before redrawing.
   const stale = save.slice(save.indexOf("e instanceof StaleDayError"));
   assert.ok(stale.indexOf("drafts.holdAll()") < stale.indexOf("await load(null, true)"));

@@ -9,7 +9,7 @@ import { reportCheckinFill, setLogDraft, useLogDrafts } from "@/lib/log-drafts";
 import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, Q_JOURNALED, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
 import { clientCache } from "@/lib/client-cache";
 import { earlyOr } from "@/lib/early-fetch";
-import { buildCells, savePlan, visibleNights, voicePatch, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
+import { buildCells, dayComplete, savePlan, visibleNights, voicePatch, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
 import { CheckinDraftStore, dayDraftKey, nightDraftKey, recoveryTarget, type DatedDraft } from "@/lib/checkin-drafts";
 import {
   easternDate,
@@ -25,14 +25,19 @@ import {
   type JournalMood,
   type JournalSource,
 } from "@/lib/journal-entry";
+import { AutosaveRefused } from "@/lib/autosave";
+import { useAutosave, type UseAutosave } from "@/lib/use-autosave";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
 import ExperimentAdherence from "./ExperimentAdherence";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 
-// Daily habit check-in (2026-11-07). Yes / No per question, one Save.
+// Daily habit check-in (2026-11-07). Yes / No per question; answers save as they are tapped (autosave, 2026-11-15).
 // - Saved answers load as-is; questions another source can answer start pre-filled and labeled with that
-//   source; everything else starts blank. Blank on save = not logged (never a "No").
-// - Taps are kept as dated local drafts. Reopened drafts require review; storage failures are surfaced.
+//   source; everything else starts blank. Blank = not logged (never a "No").
+// - Taps are kept as dated local drafts first (the safety copy), then saved a short delay after the last tap
+//   (AUTOSAVE_DELAY_MS, so a burst of taps is one request per part). Reopened drafts require review and are never
+//   saved until reviewed; storage failures are surfaced. Leaving or hiding the page sends what is waiting.
 // - Two parts (2026-11-13, rules in lib/checkin.ts):
 //     SLEEP   one block per night that already happened ("Last night", and the night before while it is
 //             unanswered). It does not follow the day tabs and never asks about tonight. A night's answers
@@ -42,18 +47,19 @@ import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 //     DAYTIME the day tabs (today and the two days before). Rarely-Yes questions sit in "Also did";
 //             "No for the other N" answers every blank daytime question at once.
 //   Kit and "No for the rest" are ordinary taps: drafted, then saved.
-// - Save writes the day and each changed night (one request each), then tells the Agents chat the day is
-//   done so the card settles.
+// - Each save writes the day and each changed night Riley touched (one request each). Once every core daytime
+//   question of the day has a saved answer, the Agents chat is told the day is done so the card settles (once).
 // - Delivered Uber Eats restaurant dishes get one extra section, "how much did you eat?": every dish of the
 //   day being checked in, plus dishes of the 2 days before whose portion was never set (the harvester runs
 //   every 6 h, so a dinner delivered after the 21:30 card usually lands after that evening's check-in and is
 //   asked the next evening). It loads on its own after the questions (never delays them), shows nothing when
 //   there is nothing to ask, and each tap saves immediately through PATCH /api/delivery/items/[itemId]
-//   (not part of the Save bar).
+//   (its own saves, not the check-in's).
 // - "Say it once" (2026-11-14): one dictated or typed note fills the day tab's questions AND last night's sleep
-//   block as ordinary draft taps, and drafts a journal entry of the same words (the body verbatim, the model's
-//   title / mood / confidence / topics) that Riley reviews and saves on its own with "Save to journal". The
-//   iPhone Shortcut opens /check-in#say=<words>: the words land in the box and Fill runs once (writes nothing).
+//   block as ordinary taps (they save like taps: his own words), and drafts a journal entry of the same words (the
+//   body verbatim, the model's title / mood / confidence / topics) that Riley reviews and saves on its own with
+//   "Save to journal" (never automatic: the page drafted it, he did not ask to file it). The iPhone Shortcut opens
+//   /check-in#say=<words>: the words land in the box and Fill runs once (its answers then save like taps).
 
 const FROM_VOICE = "from what you said";
 const FROM_JOURNAL = "from the journal entry you saved";
@@ -77,7 +83,7 @@ type JournalForm = {
 type Marks = Record<string, Record<string, { answer: CheckinAnswer; label: string }>>;
 // - While an N-of-1 trial runs, the day tab of today (or yesterday, answered the next morning) also asks
 //   "Followed today's arm?" (ExperimentAdherence.tsx). It renders nothing when no trial is running, saves
-//   each tap at once through /api/experiments/adherence (not part of the Save bar) and never writes a habit.
+//   each tap at once through /api/experiments/adherence (not part of the check-in's habit save) and never writes a habit.
 
 const CATEGORY_ORDER = ["health", "fitness", "nutrition", "mindfulness", "productivity", "social", "learning", "general"];
 const withAnswers = (saved: Record<string, CheckinAnswer>, patch: Patch) => {
@@ -96,6 +102,9 @@ class StaleDayError extends Error {}
 const isNightItem = (i: CheckinItem) => i.sleep;
 /** Reload when the app comes back after this long: "Last night" must never be a day old. */
 const RELOAD_AFTER_MS = 60_000;
+/** Taps save this long after the last one (a burst of taps, the kit, "No for the rest" = one request per part). */
+const AUTOSAVE_DELAY_MS = 600;
+const STALE_MESSAGE = "A new day started. Unsaved answers are preserved under their original dates. Review them below before using them.";
 // The GET this screen makes; its answer is cached under this URL (shared with the warm-up).
 const checkinUrl = (date: string | null) => `/api/habits/checkin${date ? `?date=${date}` : ""}`;
 
@@ -125,7 +134,7 @@ function longDate(date: string): string {
  *
  * `embedded`: drawn as the Check-in section of /log (app/log/sections/CheckIn.tsx, always with `feed`): a section
  * heading, and words from the Log screen's "Say it" box (lib/log-drafts.ts, "checkin") fill this check-in exactly
- * like this screen's own Say it once (draft taps only; Save stores them). `omitParts`: parts another /log section
+ * like this screen's own Say it once (ordinary taps: they save on their own). `omitParts`: parts another /log section
  * covers ("say-it-once", "journal-draft", "uber-eats", "uber-eats-leftovers"), left out. With "journal-draft" left
  * out, the journal draft of this check-in's own Say it once goes to the Log screen's Journal section
  * (lib/log-drafts.ts, "journal"); words handed over by the Log screen's Say it box get none here (that box drafts
@@ -157,7 +166,6 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   const [saveError, setSaveError] = useState<string | null>(null);
   const [refreshFailed, setRefreshFailed] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [savedAt, setSavedAt] = useState<string | null>(null);
   const [showExtras, setShowExtras] = useState(false);
   const [drafts] = useState(() => new CheckinDraftStore(() => localStorage));
   const [recovery, setRecovery] = useState<DatedDraft[]>([]);
@@ -203,6 +211,19 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   // Set once a GET answered: a cached copy is shown only before that.
   const answeredRef = useRef(false);
 
+  // Autosave (2026-11-15, lib/autosave.ts): every tap bumps the revision and the scheduler runs save() a short
+  // delay after the last one; single flight, so a tap made mid-save is sent by the next run. save() reads the
+  // newest render (the hook always calls the latest options). Nothing calls queueSave on open or on scroll.
+  const revision = useRef(0);
+  const settledDays = useRef(new Set<string>());
+  const autosave = useAutosave<number>("checkin", {
+    delayMs: AUTOSAVE_DELAY_MS,
+    save: (_rev, { keepalive }) => save(keepalive),
+  });
+  const autosaveRef = useRef<UseAutosave<number>>(autosave);
+  autosaveRef.current = autosave;
+  const queueSave = () => autosaveRef.current.change(++revision.current);
+
   // Draw the screen from a check-in answer (fresh, or the cached copy shown while the fresh one loads).
   const show = useCallback((payload: CheckinPayload) => {
     drafts.prepare(payload);
@@ -224,7 +245,9 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   }, [drafts]);
 
   const load = useCallback(async (date: string | null, afterSave = false) => {
-    // Back/forward can change the URL even while the tabs are disabled. Finish the dated save first.
+    // A tap still waiting to be saved goes first, under the day it was made on: the GET below replaces the screen.
+    if (!afterSave) await autosaveRef.current.flush().catch(() => {});
+    // Back/forward can change the URL while a save runs. Finish the dated save first.
     if (savingRef.current && !afterSave) {
       deferredLoad.current = { date };
       return;
@@ -232,7 +255,6 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
     lastLoad.current = Date.now();
     const seq = ++loadSeq.current; // a newer load (tab switch, resume) makes this one's result irrelevant
     setError(null);
-    setSavedAt(null);
     try {
       const url = checkinUrl(date);
       // The first load of a full page visit takes the GET the page's HTML already started (lib/early-fetch.ts):
@@ -289,6 +311,8 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
     answeredRef.current = false;
     const seed = (cached: CheckinPayload | undefined) => {
       if (!alive || !cached || answeredRef.current || !Array.isArray(cached.items)) return;
+      // A tap waiting to be saved (or being saved) keeps its screen: the save reads the page it was made on.
+      if (autosaveRef.current.dirty) return;
       if (cached.today !== fallbackBehavioralToday(new Date())) return;
       // Only drafts for the day and nights this copy shows matter (an old held draft for another date does not).
       const parts = [dayDraftKey(cached.date), ...(cached.nights ?? []).map((n) => nightDraftKey(n.date))];
@@ -324,7 +348,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
     }
     refreshDrafts();
     setSaveError(null);
-    setSavedAt(null);
+    queueSave(); // saved a short delay after the last tap
     const gen = ++editGen.current;
     const stamps = (lastEdit.current[scope ?? "day"] ??= {});
     for (const name of Object.keys(patch)) stamps[name] = gen;
@@ -383,13 +407,15 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   const coreLeft = core.length - coreDone;
   const dayBlanks = core.filter((i) => !cells[i.name]);
 
-  // What Save sends: only the parts Riley touched (see savePlan).
+  // What each autosave sends: only the parts Riley touched (see savePlan).
   const { dayPatch, nightPatches, changeCount } = useMemo(
     () => savePlan({ dayItems, dayAnswers: data?.answers ?? {}, cells, sleepItems, nights, nightCells }),
     [data, dayItems, cells, sleepItems, nights, nightCells]
   );
 
-  const save = async () => {
+  // Run by the autosave scheduler only (never on open): the newest render's plan. Throws so the scheduler shows
+  // the failure: AutosaveRefused for a refusal (not retried until the next tap), anything else is retried.
+  const save = async (keepalive = false) => {
     if (!data || savingRef.current || changeCount === 0) return;
     setSaving(true);
     savingRef.current = true;
@@ -420,11 +446,15 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ date, answers, today: data.today }),
+        keepalive,
       });
       if (!res.ok) {
         const json = await res.json().catch(() => ({}));
         if (res.status === 409 && json.stale) throw new StaleDayError(json.error || "A new day started since this page loaded.");
-        throw new Error(json.error || `Save failed (${res.status}). Your answers are still here.`);
+        const message = json.error || `Save failed (${res.status}). Your answers are still here.`;
+        // A refusal (bad date, a sleep answer for tonight) is not retried until the next tap; an outage is.
+        if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) throw new AutosaveRefused(message);
+        throw new Error(message);
       }
     };
     try {
@@ -432,28 +462,30 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
       if (Object.keys(dayPatch).length) {
         await post(data.date, dayPatch);
         settled(data.date, dayPatch, false);
-        // Settle the Agents card; best-effort (the card also expires on its own). Only when the day was saved.
-        agentsApi.checkinDone(data.date).catch(() => {});
+        // Settle the Agents card once every core daytime question has a saved answer, once per day (best-effort;
+        // the card also expires on its own). A half-answered day keeps its card.
+        if (dayComplete(dayItems, withAnswers(data.answers, dayPatch)) && !settledDays.current.has(data.date)) {
+          settledDays.current.add(data.date);
+          agentsApi.checkinDone(data.date).catch(() => {});
+        }
       }
       for (const n of nightPatches) {
         await post(n.date, n.changes);
         settled(n.date, n.changes, true);
       }
-      const date = data.date;
-      await load(date, true);
-      setSavedAt(date);
+      await load(data.date, true);
     } catch (e) {
       if (e instanceof StaleDayError) {
-        // Keep every unfinished tap under its original date, outside Save until explicitly reviewed.
+        // Keep every unfinished tap under its original date, outside autosave until explicitly reviewed.
         drafts.holdAll();
         refreshDrafts();
         setData(null);
         showDate(null);
         await load(null, true);
-        setSaveError("A new day started. Unsaved answers are preserved under their original dates. Review them below before using them.");
-      } else {
-        setSaveError(e instanceof TypeError ? "Couldn't reach Onyx. Your answers are still here." : e instanceof Error ? e.message : "Save failed. Your answers are still here.");
+        setSaveError(STALE_MESSAGE);
+        throw new AutosaveRefused(STALE_MESSAGE); // nothing to retry: the preserved answers wait for review
       }
+      throw e; // shown by the status line ("Couldn't reach Onyx." for a network failure) and retried
     } finally {
       savingRef.current = false;
       setSaving(false);
@@ -463,6 +495,15 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
         void load(date);
       }
     }
+  };
+
+  // Safety net: active answers on screen that no save is handling (none waiting, saving or failing). Drafts from an
+  // earlier visit never get here (they are held for review), so this is rare; it offers a one-tap "Save now" and is
+  // never sent on its own. Any tap in that part sends them anyway.
+  const unsent = changeCount > 0 && autosave.state.status !== "waiting" && autosave.state.status !== "saving" && autosave.state.status !== "error";
+  const saveUnsent = () => {
+    queueSave();
+    void autosaveRef.current.flush();
   };
 
   const addMarks = (part: string, patch: Patch, label: string) =>
@@ -494,7 +535,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   };
 
   // "Say it once": the server maps the text to Yes/No answers for the day tab and for last night (it writes
-  // nothing); they become ordinary draft taps. Rows saved or tapped by the time the answer arrives, or changed while
+  // nothing); they become ordinary taps, saved like taps. Rows saved or tapped by the time the answer arrives, or changed while
   // it was read, are never overwritten (voicePatch); a data pre-fill is. The answer buttons stay live while it fills.
   // Sleep answers go only into the night block on screen with the date the server named, a night already over.
   const fillFromVoice = async (given?: string) => {
@@ -558,7 +599,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
         setVoiceMsg((changed.size ? "Nothing new to fill: you already answered those." : "Nothing in the text matched a question.") + journalNote);
         return;
       }
-      setVoiceMsg(`Filled ${n} answer${n === 1 ? "" : "s"}${nightN ? ` (${nightN} for last night)` : ""}. Check them, then Save.${journalNote}`);
+      setVoiceMsg(`Filled ${n} answer${n === 1 ? "" : "s"}${nightN ? ` (${nightN} for last night)` : ""}. They save on their own; tap one to change it.${journalNote}`);
     } catch {
       setVoiceMsg("Couldn't read that, try again.");
     } finally {
@@ -567,7 +608,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   };
 
   // iPhone Shortcut hand-off: /check-in#say=<URL-encoded words>. The words go in the box and Fill runs once the
-  // check-in has loaded fresh (Fill writes nothing). The hash is removed at once, so a reload doesn't fill again
+  // check-in has loaded fresh (Fill itself writes nothing; the answers it fills then save like taps). The hash is removed at once, so a reload doesn't fill again
   // and the words don't stay in the address bar. Not in the continuous scroll (it doesn't own the address).
   useEffect(() => {
     if (feed) return;
@@ -611,8 +652,8 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
     reportCheckinFill({ pending: voiceBusy || handoff !== null, message: voiceMsg });
   }, [embedded, voiceBusy, handoff, voiceMsg, refreshFailed]);
 
-  // "Journaled your thoughts?" once the entry for the day on screen is saved: a draft Yes like any other tap,
-  // never over a saved or tapped answer.
+  // "Journaled your thoughts?" once the entry for the day on screen is saved: a Yes like any other tap (so it
+  // saves on its own), never over a saved or tapped answer.
   const markJournaled = (date: string) => {
     if (dataRef.current?.date !== date) return;
     const patch = voicePatch(dayItemsRef.current.filter((i) => i.name === Q_JOURNALED), { [Q_JOURNALED]: "Yes" }, cellsRef.current, new Set());
@@ -644,13 +685,17 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
     }
   };
 
-  const goTo = (date: string) => showDate(date);
+  // A tap still waiting is saved under its own day before the tab changes (the cached copy of the next day must
+  // not be drawn under it).
+  const goTo = (date: string) => {
+    void autosaveRef.current.flush().catch(() => {}).then(() => showDate(date));
+  };
 
   const reviewDraft = (entry: DatedDraft) => {
     if (!data || savingRef.current || !drafts.recover(entry.key, data)) return;
     setError(null);
     setSaveError(null);
-    setSavedAt(null);
+    queueSave(); // reviewed: the answers are active again and save like taps
     if (entry.night) {
       const n = data.nights.find((n) => n.date === entry.date)!;
       setNightCells((prev) => ({ ...prev, [n.date]: buildCells(sleepItems, n.answers, n.suggestions, drafts.active(entry.key)) }));
@@ -664,7 +709,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
 
   const draftRecovery = (
     <>
-      {storageFailed && <p role="alert" className="my-4 text-sm text-mid">Some drafts could not be read or stored in this browser. Answers entered here are kept in this open page, but may be lost if you close or refresh it. Keep it open until saved, or copy the answers.</p>}
+      {storageFailed && <p role="alert" className="my-4 text-sm text-mid">Some drafts could not be read or stored in this browser. Answers entered here are kept in this open page, but may be lost if you close or refresh it. Keep it open until it says Saved, or copy the answers.</p>}
       <DraftRecovery entries={recovery} page={data} saving={saving} onReview={reviewDraft} onGo={goTo} onDiscard={(entry) => {
         if (savingRef.current) return;
         drafts.discard(entry.key, entry.draft);
@@ -723,7 +768,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
 
       {draftRecovery}
 
-      {/* Personalize: every block is its own part; sections get no extra heading on screen. The Save bar stays fixed. */}
+      {/* Personalize: every block is its own part; sections get no extra heading on screen. The save status bar stays fixed. */}
       <PartGrid page="/check-in" title="Check-in">
       <PartGroup id="section-sleep" title="Sleep">
       {/* SLEEP: nights that already happened. Not tied to the day tabs below. */}
@@ -774,7 +819,6 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
               key={d.date}
               role="tab"
               aria-selected={active}
-              disabled={saving}
               onClick={() => goTo(d.date)}
               className={`flex-1 min-h-11 px-3 py-2 rounded-control border text-left transition-colors ${
                 active ? "border-accent/60 bg-accent/10" : "border-border-subtle bg-white/[0.02] hover:bg-white/[0.05]"
@@ -788,7 +832,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
       </div>
       </>}>
 
-      {/* Say it once: dictated text -> draft Yes/No taps for the day and last night, and a journal draft (nothing is saved until Save / Save to journal) */}
+      {/* Say it once: dictated text -> Yes/No taps for the day and last night (saved like taps), and a journal draft (saved only with Save to journal) */}
       {!omit.has("say-it-once") && <Part id="say-it-once" title="Say it once">
       <details
         open={voiceOpen}
@@ -805,12 +849,12 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
           className="mt-2 w-full rounded-control border border-border-subtle bg-transparent p-2 text-[14px] text-text-primary"
         />
         <p className="text-[11px] text-text-tertiary mt-1">
-          Type or use the keyboard microphone: the day, and last night&apos;s sleep. It fills answers and drafts a journal entry of your words. Nothing is saved until you press Save (or Save to journal).
+          Type or use the keyboard microphone: the day, and last night&apos;s sleep. It fills answers, which save on their own like taps, and drafts a journal entry of your words, which is saved only when you press Save to journal.
         </p>
         <div className="mt-2 flex items-center gap-3">
           <button
             onClick={() => fillFromVoice()}
-            disabled={voiceBusy || saving || !voiceText.trim()}
+            disabled={voiceBusy || !voiceText.trim()}
             className="min-h-11 px-4 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary disabled:opacity-50"
           >
             {voiceBusy ? "Filling…" : "Fill answers"}
@@ -960,44 +1004,52 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
       </PartGroup>
       </PartGrid>
 
-      {/* Save bar: sticks above the mobile tab bar */}
+      {/* Save status: sticks above the mobile tab bar. Answers save as they are tapped; this says how that went. */}
       <div className="sticky bottom-[calc(env(safe-area-inset-bottom)+4.75rem)] md:bottom-4 z-10 mt-8">
-        <div className="rounded-card border border-border-subtle bg-surface-card/95 backdrop-blur px-4 py-3 flex items-center gap-3 shadow-elevated">
+        <div className="rounded-card border border-border-subtle bg-surface-card/95 backdrop-blur px-4 py-3 flex items-center gap-3 shadow-elevated min-h-[3.75rem]">
           <div className="flex-1 min-w-0 text-[13px]">
-            {visibleError ? (
-              <span className="text-down">{visibleError}</span>
-            ) : savedAt === data.date && changeCount === 0 ? (
-              <span className="text-text-secondary inline-flex items-center gap-1.5">
-                <Check className="w-4 h-4 text-up" /> Saved
-                {catchUp && (
-                  <button onClick={() => goTo(catchUp.date)} className="ml-2 text-accent underline underline-offset-2">
-                    Catch up {labelDay(catchUp.date).toLowerCase()}
-                  </button>
-                )}
-              </span>
-            ) : changeCount === 0 ? (
-              <span className="text-text-tertiary">Nothing to save yet</span>
-            ) : (
+            {visibleError && <span className="text-down">{visibleError} </span>}
+            {unsent ? (
               <span className="text-text-secondary">
-                {changeCount} change{changeCount === 1 ? "" : "s"}
-                {coreLeft > 0 && <span className="text-text-tertiary"> · {coreLeft} daytime left blank</span>}
+                {changeCount} answer{changeCount === 1 ? "" : "s"} from earlier not saved yet
               </span>
+            ) : (
+              // The stale refusal is already the visible error; its status line would only repeat it.
+              !(autosave.state.status === "error" && autosave.state.error === saveError) && (
+                <>
+                  <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} className="text-[13px]" />
+                  {autosave.state.status === "idle" && !visibleError && (
+                    <span className="text-text-tertiary">Answers save as you tap</span>
+                  )}
+                  {autosave.state.status === "saved" && changeCount === 0 && (
+                    <>
+                      {coreLeft > 0 && <span className="text-text-tertiary"> · {coreLeft} daytime left blank</span>}
+                      {catchUp && (
+                        <button onClick={() => goTo(catchUp.date)} className="ml-2 min-h-11 text-accent underline underline-offset-2">
+                          Catch up {labelDay(catchUp.date).toLowerCase()}
+                        </button>
+                      )}
+                    </>
+                  )}
+                </>
+              )
             )}
           </div>
-          <button
-            onClick={save}
-            disabled={saving || changeCount === 0}
-            className="min-h-11 px-5 rounded-full text-[14px] font-semibold bg-accent text-on-accent disabled:opacity-40 transition-opacity"
-          >
-            {saving ? "Saving…" : "Save"}
-          </button>
+          {unsent && (
+            <button
+              onClick={saveUnsent}
+              className="min-h-11 px-5 rounded-full text-[14px] font-semibold bg-accent text-on-accent transition-opacity"
+            >
+              Save now
+            </button>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-/** Review is local only. Restoring fills the original dated form; a separate Save is still required. */
+/** Review is local only until Riley picks it: using a draft fills the original dated form, which then saves like taps. */
 function DraftRecovery({ entries, page, saving, onReview, onDiscard, onGo }: {
   entries: DatedDraft[];
   page: CheckinPayload | null;
@@ -1011,7 +1063,7 @@ function DraftRecovery({ entries, page, saving, onReview, onDiscard, onGo }: {
   return (
     <section aria-label="Preserved check-in drafts" className="my-4 rounded-card border border-border-subtle bg-surface-card p-3">
       <h3 className="text-sm font-medium text-text-primary">Review preserved answers</h3>
-      <p className="mt-1 text-xs text-text-secondary">These answers are excluded from Save until you review their original dates. Using them fills that dated form; then press Save. You can also select and copy the text.</p>
+      <p className="mt-1 text-xs text-text-secondary">These answers are not saved until you review their original dates. Using them fills that dated form and saves them there. You can also select and copy the text.</p>
       {entries.map((entry) => {
         const label = entry.night ? `Night ${entry.date} → ${addDays(entry.date, 1)} morning` : `Daytime ${entry.date}`;
         const target = recoveryTarget(entry, page);

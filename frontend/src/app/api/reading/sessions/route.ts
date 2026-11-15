@@ -1,7 +1,7 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { getOverview, logSession, type Medium } from "@/lib/reading";
-import { mirrorProgress, mirrorSession } from "@/lib/reading-notion";
+import { BOOK_COLS, getOverview, logSession, SESSION_COLS, type Book, type Medium, type ReadingSession } from "@/lib/reading";
+import { mirrorProgress, mirrorSession, removeMirroredBlock, sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -16,6 +16,8 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * flips the book to finished when the last chapter is reached, and returns the
  * XP gained plus the refreshed overview. The Notion mirror (session quote block
  * + progress callout) runs after the response via `after()` — best-effort.
+ * The autosaving forms (/log Reading, /reading) create here, then edit the same
+ * session through PATCH /api/reading/sessions/[id].
  */
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
@@ -34,8 +36,22 @@ export async function POST(req: NextRequest) {
   const overview = await getOverview(supabase, result.book.slug).catch(() => null);
 
   after(async () => {
+    const id = result.session.session_id;
     const blockId = await mirrorSession(result.book, result.session);
-    if (blockId) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
+    if (blockId) {
+      await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", id);
+      // The autosaving forms may edit or remove the session while its entry is being written: an edit that ran
+      // before the block id was stored could not update the entry, so compare with the row as it is now.
+      const { data: fresh } = await supabase.from("reading_sessions").select(SESSION_COLS).eq("session_id", id).maybeSingle();
+      const now = fresh as ReadingSession | null;
+      if (!now) await removeMirroredBlock(blockId);
+      else if (now.book_id !== result.session.book_id) {
+        await removeMirroredBlock(blockId);
+        const { data: other } = await supabase.from("books").select(BOOK_COLS).eq("book_id", now.book_id).maybeSingle();
+        const moved = other ? await mirrorSession(other as Book, now) : null;
+        await supabase.from("reading_sessions").update({ notion_block_id: moved }).eq("session_id", id);
+      } else if (sessionMirrorDiffers(result.session, now)) await updateMirroredSession({ ...now, notion_block_id: blockId });
+    }
     await mirrorProgress(
       { ...result.book, finished_on: result.finished ? result.session.session_date : result.book.finished_on },
       overview?.chaptersDone ?? result.session.chapter_through ?? 0,

@@ -126,9 +126,13 @@ test("journal drafts: the Journal section reads them; the embedded check-in send
   const checkin = read("app/check-in/CheckInClient.tsx");
   assert.match(checkin, /if \(omit\.has\("journal-draft"\)\) \{[\s\S]{0,400}setLogDraft\("journal"/);
   assert.match(checkin, /\{journal && !omit\.has\("journal-draft"\) && \(/);
-  // The only write: Save -> POST /api/journal/file.
-  assert.deepEqual([...section.matchAll(/fetch\("([^"]+)"/g)].map((m) => m[1]), ["/api/journal/file"]);
-  assert.match(section, /method: "POST"/);
+  // The only writes (autosave): file once (POST /api/journal/file), then update that page (PATCH .../[pageId]).
+  assert.deepEqual([...section.matchAll(/send\(\s*("[^"]+"|`[^`]+`)/g)].map((m) => m[1]), ['`/api/journal/file/${encodeURIComponent(f.id)}`', '"/api/journal/file"']);
+  assert.equal((section.match(/fetch\(/g) || []).length, 1, "one fetch, inside send()");
+  assert.match(section, /"POST" \| "PATCH"/);
+  // A draft is filed by itself only when Riley asked for it ("journal:"); otherwise it waits for Keep.
+  assert.match(section, /if \(value\.asked\) \{[\s\S]{0,200}push\(/);
+  assert.match(section, /setHeld\("draft"\)/);
   assert.match(read("components/AppData.tsx"), /"\/log": \(\) => \[[^\]]*journalTodayUrl\(new Date\(\)\)/);
 });
 

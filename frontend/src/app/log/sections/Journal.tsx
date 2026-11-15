@@ -1,17 +1,32 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { Check } from "lucide-react";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { useInFeed } from "@/components/FeedContext";
 import InfoHint from "@/components/InfoHint";
+import { AutosaveRefused } from "@/lib/autosave";
 import { cachedJson, clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
-import { easternDate, JOURNAL_MAX_BODY_CHARS, JOURNAL_SOURCES, type JournalSource } from "@/lib/journal-entry";
-import { journalTodayUrl } from "@/lib/journal-file";
+import { easternDate, JOURNAL_CONFIDENCES, JOURNAL_MAX_BODY_CHARS, JOURNAL_MOODS, JOURNAL_SOURCES, type JournalSource } from "@/lib/journal-entry";
+import {
+  bodyAsWritten,
+  JOURNAL_MAX_KNOWN_SHA,
+  JOURNAL_UNSAVED_KEY,
+  journalTodayUrl,
+  journalWordCount,
+  normalizePageId,
+  parseUnsavedJournal,
+  SHA_RE,
+  shouldRelabel,
+  type FiledJournalEntry,
+  type JournalLabels,
+  type UnsavedJournal,
+} from "@/lib/journal-file";
 import { useLogDrafts, type JournalLogDraft } from "@/lib/log-drafts";
 import { logEarlyGet } from "@/lib/log-early";
+import { useAutosave } from "@/lib/use-autosave";
 import { useUnsavedWork } from "@/lib/use-unsaved-work";
-import { DraftMark, LogCard, LogSaveButton } from "./ui";
+import { DraftMark, LogCard } from "./ui";
 
 /** This section holds /log's journal drafts, so the embedded check-in leaves out its own journal draft card (./CheckIn.tsx). */
 export const REPLACES_CHECKIN_JOURNAL_DRAFT = true;
@@ -19,18 +34,32 @@ export const REPLACES_CHECKIN_JOURNAL_DRAFT = true;
 // /log Journal: write a journal entry from the same screen as every other entry (AGENTS.md "Log screen").
 //   - The entry is typed, or dictated with the device's own dictation (keyboard microphone, Win+H). "Captured by"
 //     follows that (voice when a whole phrase arrives in one go, typed otherwise) until Riley picks it himself.
-//   - Save files it: POST /api/journal/file writes ONE page in the Notion journal with the words VERBATIM, today's
-//     date (America/New_York), the source, and a title, mood, confidence and topics from one model call (or the
-//     Say it box's labels while the words are unchanged). The page shows the Notion link at once; Onyx's Journal
-//     gets the entry on the next hourly sync (journal_etl.py at :35).
+//   - Autosave (2026-11-15), no Save button. A few seconds after Riley stops typing, or when he leaves the box or
+//     the page, the entry is filed by itself: POST /api/journal/file writes ONE page in the Notion journal with the
+//     words VERBATIM, today's date (America/New_York), the source, and a title, mood, confidence and topics from one
+//     model call (or the Say it box's labels while the words are unchanged). Writing on in the same box updates THAT
+//     page (PATCH /api/journal/file/[pageId], only the paragraphs that changed; labels re-inferred only when the
+//     entry changed a lot, never over a label changed in Notion), never a second one; "New entry" starts the next.
+//     A page edited in Notion meanwhile is not overwritten: Riley chooses Replace or File as a new entry.
+//   - Until the words are saved they are also kept on this device (localStorage JOURNAL_UNSAVED_KEY, an "onyx"
+//     key wiped on sign-out; removed as soon as they are saved), so a reload or a closed tab never loses them. Words
+//     restored that way, and a Say it draft the model picked out, are filed only after Keep or an edit (nothing is
+//     written on open or on scroll). A "journal:" note from the Say it box (draft.asked) is filed by itself.
 //   - Today's entries already in Onyx: GET /api/journal/list for today (journalTodayUrl), through the shared client
-//     cache (memory only: journal text never goes to disk, see isSensitiveKey) and the /log warm-up.
-//   - A draft (useLogDrafts("journal"): the Say it box, or the embedded check-in's own Say it once) fills an empty
-//     box; over words Riley already typed it is offered, never forced. Nothing is written until Save.
+//     cache (memory only: journal text never goes to disk there, see isSensitiveKey) and the /log warm-up; entries
+//     filed from this box are listed at once, before the hourly sync (journal_etl.py at :35) brings them in.
 
 type TodayEntry = { notion_page_id: string; title: string | null; mood: string | null; topics: string[] | null };
 type ListAnswer = { entries: TodayEntry[] };
-type Saved = { title: string; url: string | null; existing: boolean };
+/** What autosave sends. `rev` changes only to send the same words again on purpose (Replace / File as new). */
+type Words = { body: string; source: JournalSource; rev: number };
+/** Words in the box that are not filed until Keep or an edit. */
+type Held = "draft" | "restored" | null;
+type Conflict = "changed" | "gone" | null;
+
+const FIRST_FILE_DELAY_MS = 5000;
+const UPDATE_DELAY_MS = 3000;
+const TAP_DELAY_MS = 800;
 
 const checkList = (data: unknown) => {
   if (!data || typeof data !== "object" || !Array.isArray((data as ListAnswer).entries)) throw new Error("bad journal list");
@@ -44,6 +73,7 @@ const MOOD_BADGE: Record<string, string> = {
 };
 
 const notionLink = (pageId: string) => `https://www.notion.so/${pageId.replace(/-/g, "")}`;
+const dayOfUrl = (url: string) => /from=(\d{4}-\d{2}-\d{2})/.exec(url)?.[1] ?? "";
 
 /**
  * Did this input put a whole dictated phrase in at once? Typing adds a character (or one predicted / swiped word);
@@ -58,6 +88,47 @@ export function looksDictated(ev: Event): boolean {
   return /\S+\s+\S+\s+\S/.test(data);
 }
 
+/** SHA-256 hex of the words as written to Notion (the server hashes the same), or null without Web Crypto. */
+async function versionSha(words: string): Promise<string | null> {
+  try {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(bodyAsWritten(words)));
+    return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+  } catch {
+    return null;
+  }
+}
+
+function labelsFrom(json: Record<string, unknown>, fallback?: JournalLabels): JournalLabels {
+  const mood = (JOURNAL_MOODS as readonly unknown[]).includes(json.mood) ? (json.mood as JournalLabels["mood"]) : (fallback?.mood ?? null);
+  const confidence = (JOURNAL_CONFIDENCES as readonly unknown[]).includes(json.confidence) ? (json.confidence as JournalLabels["confidence"]) : (fallback?.confidence ?? null);
+  return {
+    title: typeof json.title === "string" ? json.title : (fallback?.title ?? ""),
+    mood,
+    confidence,
+    topics: Array.isArray(json.topics) ? json.topics.filter((t): t is string => typeof t === "string") : (fallback?.topics ?? []),
+  };
+}
+
+const readLocal = (): UnsavedJournal | null => {
+  try {
+    const raw = localStorage.getItem(JOURNAL_UNSAVED_KEY);
+    if (raw === null) return null;
+    const rec = parseUnsavedJournal(raw, Date.now());
+    if (!rec) localStorage.removeItem(JOURNAL_UNSAVED_KEY);
+    return rec;
+  } catch {
+    return null;
+  }
+};
+const writeLocal = (rec: UnsavedJournal | null) => {
+  try {
+    if (rec) localStorage.setItem(JOURNAL_UNSAVED_KEY, JSON.stringify(rec));
+    else localStorage.removeItem(JOURNAL_UNSAVED_KEY);
+  } catch {
+    /* storage full or blocked: the words are still on screen and the autosave still runs */
+  }
+};
+
 export default function JournalSection() {
   const [url, setUrl] = useState(() => journalTodayUrl(new Date()));
   const urlRef = useRef(url);
@@ -66,24 +137,198 @@ export default function JournalSection() {
   const [listFailed, setListFailed] = useState(false);
 
   const [body, setBody] = useState("");
-  const [source, setSource] = useState<JournalSource>("typed");
-  const sourcePinned = useRef(false); // Riley picked "Captured by" himself: dictation detection stops
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [saved, setSaved] = useState<Saved | null>(null);
-
-  // The Say it box's draft: applied once per id. `applied` = the draft in the box now (its labels count only while
-  // the words are exactly the draft's); `offered` = a draft held back because Riley had already typed something.
-  const { draft, clear } = useLogDrafts("journal");
-  const [applied, setApplied] = useState<{ id: number; value: JournalLogDraft } | null>(null);
-  const [offered, setOffered] = useState<{ id: number; value: JournalLogDraft } | null>(null);
-  const seenDraft = useRef(0);
   const bodyRef = useRef(body);
   bodyRef.current = body;
-  // Unsaved words (or a save in flight) keep the automatic updater from reloading the page (Onyx#326).
-  useUnsavedWork(body.trim() !== "" || saving, "journal");
+  const [source, setSourceState] = useState<JournalSource>("typed");
+  const sourceRef = useRef(source);
+  const setSource = (s: JournalSource) => {
+    sourceRef.current = s;
+    setSourceState(s);
+  };
+  const sourcePinned = useRef(false); // Riley picked "Captured by" himself: dictation detection stops
 
-  // The day rolls over while the screen is open: the list (and the entry's date) follow the New York calendar.
+  // The entry this box keeps up to date once filed (none of its words, only how to find and check the page).
+  const [filed, setFiledState] = useState<FiledJournalEntry | null>(null);
+  const filedRef = useRef<FiledJournalEntry | null>(null);
+  const setFiled = (f: FiledJournalEntry | null) => {
+    filedRef.current = f;
+    setFiledState(f);
+  };
+  /** Hashes of versions sent whose answer never came (the page may hold one of them). */
+  const knownRef = useRef<string[]>([]);
+  const forceRef = useRef(false);
+  const revRef = useRef(0);
+  const [held, setHeld] = useState<Held>(null);
+  const [conflict, setConflict] = useState<Conflict>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  // What the server holds now: the device copy goes once the box equals it.
+  const saved = useRef<{ body: string; source: JournalSource } | null>(null);
+  const [savedTick, setSavedTick] = useState(0);
+  // Entries filed from this box, listed until the hourly sync brings them into Today's list.
+  const [filedHere, setFiledHere] = useState<{ id: string; date: string; title: string; mood: string | null }[]>([]);
+
+  // The Say it box's draft: applied once per id. `applied` = the draft in the box now (its labels count only while
+  // the words are exactly the draft's); `offered` = a draft held back because the box already had words.
+  const { draft, clear } = useLogDrafts("journal");
+  const [applied, setAppliedState] = useState<{ id: number; value: JournalLogDraft } | null>(null);
+  const appliedRef = useRef<typeof applied>(null);
+  const setApplied = (a: typeof applied) => {
+    appliedRef.current = a;
+    setAppliedState(a);
+  };
+  const [offered, setOffered] = useState<{ id: number; value: JournalLogDraft } | null>(null);
+  const seenDraft = useRef(0);
+
+  const rememberUnconfirmed = async (words: string) => {
+    const sha = await versionSha(words);
+    if (!sha || knownRef.current.includes(sha)) return;
+    knownRef.current = [...knownRef.current, sha].slice(-(JOURNAL_MAX_KNOWN_SHA - 1));
+  };
+
+  /** One request of the autosave. 4xx = refused (shown, not retried); offline / 5xx = retried. */
+  const send = async (target: string, method: "POST" | "PATCH", payload: unknown, keepalive: boolean, words: string) => {
+    let res: Response;
+    try {
+      res = await fetch(target, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), keepalive });
+    } catch (e) {
+      await rememberUnconfirmed(words); // it may have reached Notion: the next attempt must recognise that page
+      throw e;
+    }
+    const json = ((await res.json().catch(() => null)) ?? {}) as Record<string, unknown>;
+    if (res.ok) return json;
+    const msg = typeof json.error === "string" && json.error ? json.error : `Couldn't save the entry (${res.status}). It is still here.`;
+    if (res.status === 409 && json.changed) {
+      setConflict("changed");
+      throw new AutosaveRefused(msg);
+    }
+    if (res.status === 410 && json.gone) {
+      setConflict("gone");
+      throw new AutosaveRefused(msg);
+    }
+    if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) throw new AutosaveRefused(msg);
+    await rememberUnconfirmed(words); // a timeout may still have written it
+    throw new Error(msg);
+  };
+
+  const update = async (f: FiledJournalEntry, w: Words, keepalive: boolean): Promise<FiledJournalEntry> => {
+    const relabel = shouldRelabel(f.labeledWords, journalWordCount(w.body));
+    const payload = {
+      body: w.body,
+      source: w.source,
+      known_sha: [f.sha, ...knownRef.current.filter((s) => s !== f.sha)].slice(0, JOURNAL_MAX_KNOWN_SHA),
+      ...(forceRef.current ? { force: true } : {}),
+      ...(relabel ? { relabel: true, last_labels: f.labels } : {}),
+    };
+    const json = await send(`/api/journal/file/${encodeURIComponent(f.id)}`, "PATCH", payload, keepalive, w.body);
+    const sha = typeof json.sha === "string" && SHA_RE.test(json.sha) ? json.sha : f.sha;
+    return {
+      ...f,
+      sha,
+      url: typeof json.url === "string" && json.url.startsWith("https://") ? json.url : f.url,
+      labels: labelsFrom(json, f.labels),
+      labeledWords: json.relabeled === true ? journalWordCount(w.body) : f.labeledWords,
+    };
+  };
+
+  const autosave = useAutosave<Words>("journal", {
+    delayMs: FIRST_FILE_DELAY_MS,
+    ready: (w) => (w.body ? null : "An entry can't be empty. Type something, or start a new entry."),
+    save: async (w, { keepalive }) => {
+      let f = filedRef.current;
+      if (!f) {
+        const a = appliedRef.current;
+        const labels = a && a.value.body.trim() === w.body
+          ? {
+              title: a.value.title || undefined,
+              mood: a.value.mood ?? undefined,
+              confidence: a.value.confidence ?? undefined,
+              topics: a.value.topics.length ? a.value.topics : undefined,
+            }
+          : {};
+        const date = easternDate(new Date());
+        const known = knownRef.current.slice(0, JOURNAL_MAX_KNOWN_SHA);
+        const json = await send("/api/journal/file", "POST", { body: w.body, source: w.source, date, ...labels, ...(known.length ? { known_sha: known } : {}) }, keepalive, w.body);
+        const id = normalizePageId(json.id);
+        const sha = typeof json.sha === "string" && SHA_RE.test(json.sha) ? json.sha : null;
+        if (!id || !sha) throw new AutosaveRefused("Notion didn't say which page it saved. Check Journal, then start a new entry.");
+        f = {
+          id,
+          url: typeof json.url === "string" && json.url.startsWith("https://") ? json.url : null,
+          date: typeof json.date === "string" ? json.date : date,
+          sha,
+          labels: labelsFrom(json),
+          // A page found holding an earlier version: its labels came from fewer words, so the update relabels.
+          labeledWords: json.stale === true ? 0 : journalWordCount(w.body),
+        };
+        knownRef.current = [];
+        setFiled(f);
+        const entry = f;
+        setFiledHere((cur) => (cur.some((e) => e.id === entry.id) ? cur : [...cur, { id: entry.id, date: entry.date, title: entry.labels.title, mood: entry.labels.mood }]));
+        if (a) {
+          clear(a.id);
+          setApplied(null);
+        }
+        if (json.stale === true) {
+          f = await update(f, w, keepalive); // that page holds an earlier version: bring it up to date
+          setFiled(f);
+        }
+      } else {
+        f = await update(f, w, keepalive);
+        setFiled(f);
+      }
+      knownRef.current = [];
+      forceRef.current = false;
+      setConflict(null);
+      const entry = f;
+      setFiledHere((cur) => cur.map((e) => (e.id === entry.id ? { ...e, title: entry.labels.title, mood: entry.labels.mood } : e)));
+      saved.current = { body: w.body, source: w.source };
+      setSavedTick((t) => t + 1);
+    },
+  });
+
+  /** The box changed: autosave it (or nothing to save: an empty box that was never filed). */
+  const push = (text: string, src: JournalSource, delayMs?: number) => {
+    const words = text.trim();
+    if (!words && !filedRef.current) {
+      autosave.reset();
+      return;
+    }
+    autosave.change({ body: words, source: src, rev: revRef.current }, { delayMs: delayMs ?? (filedRef.current ? UPDATE_DELAY_MS : FIRST_FILE_DELAY_MS) });
+  };
+
+  // Words not filed yet (held), or not saved yet, keep the automatic updater from reloading (Onyx#326). The autosave
+  // registers its own waiting / saving / failed states.
+  useUnsavedWork(held !== null && body.trim() !== "", "journal-held");
+
+  // The device copy: written while the box holds words the server does not have, removed as soon as it does.
+  // A Say it draft not kept yet stays memory-only, like every draft (lib/log-drafts.ts).
+  const restoredOnce = useRef(false);
+  useEffect(() => {
+    if (!restoredOnce.current) return; // not before the restore below has looked
+    const words = body.trim();
+    const s = saved.current;
+    if (!words || held === "draft" || (held === null && s && s.body === words && s.source === source)) {
+      writeLocal(null);
+      return;
+    }
+    writeLocal({ v: 1, at: Date.now(), body, source, pinned: sourcePinned.current, filed, known: knownRef.current });
+  }, [body, source, filed, held, savedTick]);
+
+  // Words left unsaved by a reload or a closed tab come back, waiting for Keep (nothing is written on open).
+  useEffect(() => {
+    const rec = readLocal();
+    restoredOnce.current = true;
+    if (!rec || bodyRef.current.trim()) return;
+    setBody(rec.body);
+    setSource(rec.source);
+    sourcePinned.current = rec.pinned;
+    setFiled(rec.filed);
+    knownRef.current = rec.known;
+    setHeld("restored");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // The day rolls over while the screen is open: the list follows the New York calendar (a filed entry keeps its day).
   useEffect(() => {
     const check = () => setUrl(journalTodayUrl(new Date()));
     const onVisible = () => document.visibilityState === "visible" && check();
@@ -134,31 +379,82 @@ export default function JournalSection() {
     if (!draft || draft.id === seenDraft.current) return;
     seenDraft.current = draft.id;
     const value = draft.value;
-    if (!value.body.trim()) return;
-    if (bodyRef.current.trim() && bodyRef.current.trim() !== value.body.trim()) {
-      setOffered({ id: draft.id, value }); // never over words Riley typed
+    const words = value.body.trim();
+    if (!words) return;
+    const cur = bodyRef.current.trim();
+    if (cur === words) {
+      if (!filedRef.current) setApplied({ id: draft.id, value }); // same words: its labels may still apply
+      return;
+    }
+    if (cur || filedRef.current) {
+      setOffered({ id: draft.id, value }); // never over words in the box, nor over an entry being kept up to date
       return;
     }
     setBody(value.body);
-    if (!sourcePinned.current) setSource(value.source);
+    const src = sourcePinned.current ? sourceRef.current : value.source;
+    setSource(src);
     setApplied({ id: draft.id, value });
     setOffered(null);
-    setSaved(null);
-    setError(null);
+    setNotice(null);
+    if (value.asked) {
+      setHeld(null); // "journal: ..." = Riley asked for an entry: filed by itself
+      push(value.body, src, TAP_DELAY_MS);
+    } else {
+      setHeld("draft"); // a reflection the model picked out: offered, filed after Keep or an edit
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft]);
 
-  const takeOffered = (mode: "replace" | "add") => {
-    if (!offered) return;
-    const words = offered.value.body;
-    if (mode === "replace") {
-      setBody(words);
-      setApplied({ id: offered.id, value: offered.value });
-    } else {
-      setBody((cur) => `${cur.trimEnd()}\n\n${words}`);
-      setApplied(null); // mixed words: the draft's labels no longer describe them
+  /** Start the next entry: what is waiting is saved first; nothing is dropped if that fails. */
+  const startNew = async (): Promise<boolean> => {
+    await autosave.flush();
+    const words = bodyRef.current.trim();
+    const s = saved.current;
+    if (words && held === null && (!s || s.body !== words || s.source !== sourceRef.current)) {
+      setNotice("This entry isn't saved yet, so it stays here. Try again once it says Saved.");
+      return false;
     }
-    if (!sourcePinned.current) setSource(offered.value.source);
+    autosave.reset();
+    setBody("");
+    setFiled(null);
+    knownRef.current = [];
+    forceRef.current = false;
+    saved.current = null;
+    setHeld(null);
+    setConflict(null);
+    setNotice(null);
+    setApplied(null);
+    sourcePinned.current = false;
+    setSource("typed");
+    writeLocal(null);
+    return true;
+  };
+
+  const takeOffered = async (mode: "replace" | "add") => {
+    if (!offered) return;
+    const { id, value } = offered;
     setOffered(null);
+    if (mode === "replace") {
+      // A new entry with the draft's words: what the box holds is saved first and stays its own entry (typed words
+      // are filed by themselves anyway, so they are never dropped here).
+      if ((filedRef.current || bodyRef.current.trim()) && !(await startNew())) {
+        setOffered({ id, value });
+        return;
+      }
+      setBody(value.body);
+      setApplied({ id, value });
+      const src = sourcePinned.current ? sourceRef.current : value.source;
+      setSource(src);
+      setHeld(null);
+      push(value.body, src, TAP_DELAY_MS);
+    } else {
+      const next = `${bodyRef.current.trimEnd()}\n\n${value.body}`;
+      setBody(next);
+      setApplied(null); // mixed words: the draft's labels no longer describe them
+      clear(id);
+      setHeld(null);
+      push(next, sourceRef.current, TAP_DELAY_MS);
+    }
   };
 
   const dismissOffered = () => {
@@ -167,72 +463,73 @@ export default function JournalSection() {
     setOffered(null);
   };
 
+  /** Keep: the held words (a Say it draft, or words restored from this device) are filed like typed ones. */
+  const keep = () => {
+    setHeld(null);
+    push(bodyRef.current, sourceRef.current, 0);
+  };
+
+  /** Dismiss the held words. A restored entry that was already filed keeps its last saved words in Notion. */
+  const dropHeld = () => {
+    if (held === "draft" && applied) clear(applied.id);
+    setApplied(null);
+    autosave.reset();
+    setBody("");
+    setFiled(null);
+    knownRef.current = [];
+    saved.current = null;
+    setHeld(null);
+    sourcePinned.current = false;
+    setSource("typed");
+    writeLocal(null);
+  };
+
   const onInput = (e: FormEvent<HTMLTextAreaElement>) => {
     if (!sourcePinned.current && looksDictated(e.nativeEvent)) setSource("voice");
   };
 
   const onChange = (text: string) => {
     setBody(text);
-    setError(null);
-    if (saved) setSaved(null);
-    if (!text.trim() && !sourcePinned.current) setSource("typed");
+    setNotice(null);
+    if (!text.trim() && !sourcePinned.current && !filedRef.current) setSource("typed");
+    if (held) setHeld(null); // an edit keeps the held words
+    push(text, sourceRef.current);
   };
 
   const pickSource = (s: JournalSource) => {
     sourcePinned.current = true;
     setSource(s);
+    if (!held && bodyRef.current.trim()) push(bodyRef.current, s, TAP_DELAY_MS);
+  };
+
+  /** After "changed": write over the Notion page with the words here. */
+  const replaceInNotion = () => {
+    forceRef.current = true;
+    revRef.current += 1;
+    setConflict(null);
+    push(bodyRef.current, sourceRef.current, 0);
+  };
+
+  /** After "changed" or "gone": file the words here as a new entry (the other page stays as it is). */
+  const fileAsNew = () => {
+    setFiled(null);
+    knownRef.current = [];
+    forceRef.current = false;
+    revRef.current += 1;
+    setConflict(null);
+    push(bodyRef.current, sourceRef.current, 0);
   };
 
   // Labels from the Say it box count only while the words are exactly the ones they were made for.
-  const draftLabels = applied && applied.value.body.trim() === body.trim() ? applied.value : null;
-
-  const save = async () => {
-    const words = body.trim();
-    if (!words || saving) return;
-    setSaving(true);
-    setError(null);
-    const labels = draftLabels
-      ? {
-          title: draftLabels.title || undefined,
-          mood: draftLabels.mood ?? undefined,
-          confidence: draftLabels.confidence ?? undefined,
-          topics: draftLabels.topics.length ? draftLabels.topics : undefined,
-        }
-      : {};
-    try {
-      const res = await fetch("/api/journal/file", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body: words, source, date: easternDate(new Date()), ...labels }),
-      });
-      const json = (await res.json().catch(() => null)) as { url?: unknown; title?: unknown; existing?: unknown; error?: unknown } | null;
-      if (!res.ok || !json) {
-        setError(typeof json?.error === "string" ? json.error : `Couldn't save the entry (${res.status}). It is still here.`);
-        return;
-      }
-      setSaved({ title: typeof json.title === "string" ? json.title : "", url: typeof json.url === "string" ? json.url : null, existing: !!json.existing });
-      if (applied) clear(applied.id);
-      setApplied(null);
-      setBody("");
-      sourcePinned.current = false;
-      setSource("typed");
-      void loadList(urlRef.current); // unchanged until the hourly sync; refreshed so a sync that just ran shows it
-    } catch {
-      setError("Couldn't reach Onyx. The entry is still here.");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const discardDraft = () => {
-    if (!applied) return;
-    clear(applied.id);
-    if (body.trim() === applied.value.body.trim()) setBody("");
-    setApplied(null);
-  };
-
-  const entries = list?.entries ?? [];
+  const draftLabels = !filed && applied && applied.value.body.trim() === body.trim() ? applied.value : null;
+  const day = dayOfUrl(url);
+  const listed = new Set((list?.entries ?? []).map((e) => normalizePageId(e.notion_page_id)));
+  const entries: TodayEntry[] = [
+    ...(list?.entries ?? []),
+    ...filedHere.filter((e) => e.date === day && !listed.has(e.id)).map((e) => ({ notion_page_id: e.id, title: e.title || null, mood: e.mood, topics: null })),
+  ];
   const label = "block text-[11px] font-mono uppercase tracking-wider text-text-tertiary";
+  const showStatus = !held && autosave.state.status !== "idle";
 
   return (
     <LogCard title="Journal">
@@ -241,10 +538,10 @@ export default function JournalSection() {
           <div className="flex items-center gap-1.5">
             <span className={label}>Today</span>
             <InfoHint label="today's journal entries">
-              Entries in Onyx for today (New York date). A new entry shows here, and on Journal, after the hourly sync.
+              Entries for today (New York date). One filed here shows at once; on Journal it shows after the hourly sync.
             </InfoHint>
           </div>
-          {list ? (
+          {list || entries.length ? (
             entries.length ? (
               <ul className="mt-1 divide-y divide-border-subtle rounded-control border border-border-subtle">
                 {entries.map((e) => (
@@ -267,29 +564,16 @@ export default function JournalSection() {
           {list && listFailed && <p className="mt-1 text-[12px] text-text-tertiary">Couldn&apos;t refresh; showing the last list.</p>}
         </div>
 
-        {saved && (
-          <p role="status" className="text-[13px] text-text-secondary inline-flex flex-wrap items-center gap-1.5">
-            <Check className="w-4 h-4 text-up" />
-            {saved.existing ? "Already in your journal" : "Saved to your journal"}
-            {saved.title ? <>: <span className="text-text-primary">{saved.title}</span>.</> : "."} It shows on Journal after the hourly sync.
-            {saved.url && (
-              <a href={saved.url} target="_blank" rel="noreferrer" className="text-accent underline underline-offset-2">
-                Open in Notion
-              </a>
-            )}
-          </p>
-        )}
-
         {offered && (
           <div className="rounded-control border border-dashed border-accent/60 p-3">
             <DraftMark />
             <p className="mt-1 whitespace-pre-wrap text-[13px] text-text-secondary line-clamp-4">{offered.value.body}</p>
             <div className="mt-2 flex flex-wrap gap-2">
-              <button type="button" onClick={() => takeOffered("add")} className="min-h-11 px-3 rounded-control border border-border-subtle text-[13px] text-text-primary">
+              <button type="button" onClick={() => void takeOffered("add")} className="min-h-11 px-3 rounded-control border border-border-subtle text-[13px] text-text-primary">
                 Add to entry
               </button>
-              <button type="button" onClick={() => takeOffered("replace")} className="min-h-11 px-3 rounded-control border border-border-subtle text-[13px] text-text-primary">
-                Use instead
+              <button type="button" onClick={() => void takeOffered("replace")} className="min-h-11 px-3 rounded-control border border-border-subtle text-[13px] text-text-primary">
+                New entry with these words
               </button>
               <button type="button" onClick={dismissOffered} className="min-h-11 px-3 rounded-control text-[13px] text-text-secondary">
                 Dismiss
@@ -301,20 +585,22 @@ export default function JournalSection() {
         <div>
           <div className="flex items-center justify-between gap-2">
             <label htmlFor="log-journal-body" className={label}>
-              New entry
+              {filed ? "Entry" : "New entry"}
             </label>
-            {draftLabels && <DraftMark />}
+            {held === "draft" && <DraftMark />}
           </div>
           <textarea
             id="log-journal-body"
             value={body}
             rows={5}
             maxLength={JOURNAL_MAX_BODY_CHARS}
-            disabled={saving}
             onInput={onInput}
             onChange={(e) => onChange(e.target.value)}
-            placeholder="Type, or use the keyboard microphone."
-            className="mt-1 w-full rounded-control border border-border-subtle bg-transparent p-2 text-[14px] text-text-primary disabled:opacity-60"
+            onBlur={() => {
+              if (!held) void autosave.flush();
+            }}
+            placeholder="Type, or use the keyboard microphone. It saves by itself."
+            className="mt-1 w-full rounded-control border border-border-subtle bg-transparent p-2 text-[14px] text-text-primary"
           />
           {draftLabels?.title && (
             <p className="mt-1 text-[12px] text-text-tertiary">
@@ -322,6 +608,19 @@ export default function JournalSection() {
               {draftLabels.mood ? ` · ${draftLabels.mood}` : ""}
               {draftLabels.topics.length ? ` · ${draftLabels.topics.join(", ")}` : ""}
             </p>
+          )}
+          {held && (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <p className="text-[12px] text-text-secondary">
+                {held === "draft" ? "From what you said. Not in your journal until you keep it." : "Words you hadn't saved yet. Not in your journal until you keep them."}
+              </p>
+              <button type="button" onClick={keep} className="min-h-11 px-4 rounded-full text-[13px] font-semibold bg-accent text-on-accent">
+                Keep
+              </button>
+              <button type="button" onClick={dropHeld} className="min-h-11 px-3 rounded-control text-[13px] text-text-secondary">
+                {held === "draft" ? "Dismiss" : "Discard"}
+              </button>
+            </div>
           )}
         </div>
 
@@ -333,7 +632,6 @@ export default function JournalSection() {
                 key={s}
                 type="button"
                 aria-pressed={source === s}
-                disabled={saving}
                 onClick={() => pickSource(s)}
                 className={`min-h-11 px-3 rounded-control border text-[13px] font-medium transition-colors ${
                   source === s ? "bg-accent/20 border-accent/70 text-accent" : "border-border-subtle text-text-secondary"
@@ -345,19 +643,45 @@ export default function JournalSection() {
           </div>
         </div>
 
-        {error && <p role="alert" className="text-[12px] text-down">{error}</p>}
-        <div className="flex flex-wrap items-center gap-3">
-          <LogSaveButton onClick={() => void save()} disabled={!body.trim()} saving={saving} />
-          {applied && (
-            <button type="button" onClick={discardDraft} disabled={saving} className="min-h-11 px-3 rounded-control text-[13px] text-text-secondary disabled:opacity-50">
-              Discard
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          {showStatus && (
+            <AutosaveStatus
+              state={autosave.state}
+              onRetry={conflict ? undefined : () => void autosave.retry()}
+              showIncomplete={!!filed}
+              savedText={filed?.labels.title ? `Saved to journal: ${filed.labels.title}` : "Saved to journal"}
+            />
+          )}
+          {filed?.url && !held && autosave.state.status === "saved" && (
+            <a href={filed.url} target="_blank" rel="noreferrer" className="min-h-11 inline-flex items-center text-[12px] text-accent underline underline-offset-2">
+              Open in Notion
+            </a>
+          )}
+          {conflict && autosave.state.status === "error" && (
+            <span className="flex flex-wrap gap-2">
+              {conflict === "changed" && (
+                <button type="button" onClick={replaceInNotion} className="min-h-11 px-3 rounded-control border border-border-subtle text-[13px] text-text-primary">
+                  Replace it with these words
+                </button>
+              )}
+              <button type="button" onClick={fileAsNew} className="min-h-11 px-3 rounded-control border border-border-subtle text-[13px] text-text-primary">
+                File as a new entry
+              </button>
+            </span>
+          )}
+          {filed && !held && (
+            <button type="button" onClick={() => void startNew()} className="min-h-11 px-3 rounded-control border border-border-subtle text-[13px] text-text-primary">
+              New entry
             </button>
           )}
           <InfoHint label="how a journal entry is saved">
-            Save files the entry in your Notion journal with your words as written and today&apos;s date. The title, mood,
-            confidence and topics are filled in for you; change them in Notion if needed.
+            Your words are filed in your Notion journal by themselves, a few seconds after you stop typing or when you
+            leave the box, with today&apos;s date and your words exactly as written. Writing on updates the same entry; New
+            entry starts the next one. The title, mood, confidence and topics are filled in for you; a change you make to
+            them in Notion is never overwritten.
           </InfoHint>
         </div>
+        {notice && <p role="alert" className="text-[12px] text-down">{notice}</p>}
       </div>
     </LogCard>
   );

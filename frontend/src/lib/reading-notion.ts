@@ -186,6 +186,26 @@ export async function updateMirroredHighlight(h: Highlight): Promise<boolean> {
   }
 }
 
+/** True when the two rows would render a different Notion entry (pure; used after a create raced an edit). */
+export function sessionMirrorDiffers(a: ReadingSession, b: ReadingSession): boolean {
+  return a.book_id !== b.book_id || JSON.stringify(sessionBlock(a)) !== JSON.stringify(sessionBlock(b));
+}
+export function highlightMirrorDiffers(a: Highlight, b: Highlight): boolean {
+  return JSON.stringify(highlightBlock(a)) !== JSON.stringify(highlightBlock(b));
+}
+
+/** Move a mirrored entry to Notion's trash (a session removed in Onyx, or moved to another book's page). */
+export async function removeMirroredBlock(blockId: string | null): Promise<boolean> {
+  if (!blockId || !NOTION_API_KEY) return false;
+  try {
+    const res = await notion(`/blocks/${blockId}`, { method: "DELETE" });
+    return res.ok;
+  } catch (e) {
+    console.error("reading-notion: removeMirroredBlock failed:", e);
+    return false;
+  }
+}
+
 /** Rewrite the progress callout's title line at the top of the page. */
 export async function mirrorProgress(book: Book, chaptersDone: number, lastSessionDate: string | null): Promise<boolean> {
   if (!book.notion_page_id || !NOTION_API_KEY) return false;

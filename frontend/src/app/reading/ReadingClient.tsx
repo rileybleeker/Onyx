@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import { BookMarked, Check, ChevronDown, Flame, Headphones, Highlighter, Sparkles, Trophy, X } from "lucide-react";
@@ -8,6 +8,10 @@ import MetricRing from "@/components/MetricRing";
 import InfoHint from "@/components/InfoHint";
 import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type Medium, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
+import { AutosaveRefused, saveRequest } from "@/lib/autosave";
+import { highlightValue, isBlankSession, readingSaveTarget, sameReadingValue, sessionValue, type HighlightValue, type SessionValue } from "@/lib/reading-autosave";
+import { useAutosave } from "@/lib/use-autosave";
 import { sameJson } from "@/lib/format";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 
@@ -20,6 +24,8 @@ const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading
  * streak, XP / level, badges, three checkpoints, a burn-up chart, today's
  * spaced-repetition review, and the two capture forms (session with a from-
  * memory recall note; highlight with a comment, or a pasted Kindle export).
+ * Both forms save as they are entered (lib/autosave.ts): created on the first
+ * valid entry, then edited in place.
  * Writes go to /api/reading/*; each write mirrors to the book's Notion
  * reading-log page server-side. All numbers are derived in lib/reading.ts.
  */
@@ -193,11 +199,11 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         </Part>
 
         <Part id="log-session" title="Log a session">
-          <SessionForm o={o} onLogged={(xp, finished) => { showToast({ text: finished ? `Finished! +${xp} XP` : `+${xp} XP`, kind: "xp" }); load(slug, true); }} onError={(m) => showToast({ text: m, kind: "err" })} />
+          <SessionForm key={o.book.slug} o={o} onLogged={(xp, finished) => { showToast({ text: finished ? `Finished! +${xp} XP` : `+${xp} XP`, kind: "xp" }); load(slug, true); }} onSaved={() => load(slug, true)} />
         </Part>
 
         <Part id="add-highlight" title="Highlight + comment">
-          <HighlightForm o={o} onAdded={(n) => { showToast({ text: n === 1 ? "+5 XP · highlight" : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onError={(m) => showToast({ text: m, kind: "err" })} />
+          <HighlightForm key={o.book.slug} o={o} onAdded={(n) => { showToast({ text: n === 1 ? "+5 XP · highlight" : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onSaved={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
         </Part>
       </PartGroup>
 
@@ -440,66 +446,231 @@ function GradeBtn({ label, sub, onClick, disabled, className }: { label: string;
   );
 }
 
-function SessionForm({ o, onLogged, onError }: { o: ReadingOverview; onLogged: (xp: number, finished: boolean) => void; onError: (m: string) => void }) {
-  const suggested = Math.min(o.totalChapters || 9999, o.chaptersDone + 2);
-  const [through, setThrough] = useState<string>(String(suggested));
+/**
+ * "Log a session", saved as it is entered (lib/autosave.ts, 2026-11-15): the first valid entry creates the session
+ * (POST /api/reading/sessions) once Riley pauses or leaves a field, every later edit updates that same session
+ * (PATCH /api/reading/sessions/[id]). The day is sent only when changed (the server takes behavioral today).
+ * Nothing is saved until "Through ch." is set.
+ * "New session" starts the next one; "Remove this session" deletes the one just made.
+ */
+function SessionForm({ o, onLogged, onSaved }: { o: ReadingOverview; onLogged: (xp: number, finished: boolean) => void; onSaved: () => void }) {
+  // "Through" starts blank (the next chapters are one tap away): a guessed chapter must never be saved by a tap
+  // on something else.
+  const [through, setThroughState] = useState<string>("");
   const [minutes, setMinutes] = useState<string>("");
   const [medium, setMedium] = useState<Medium>("audio");
   const [recall, setRecall] = useState("");
   const [question, setQuestion] = useState("");
   const [date, setDate] = useState(o.today);
-  const [saving, setSaving] = useState(false);
-  useEffect(() => setThrough(String(Math.min(o.totalChapters || 9999, o.chaptersDone + 2))), [o.chaptersDone, o.totalChapters]);
-  useEffect(() => setDate(o.today), [o.today]);
+  const [sessionId, setSessionIdState] = useState<number | null>(null);
+  const [saved, setSaved] = useState<{ xp: number; finished: boolean } | null>(null);
+  const [removing, setRemoving] = useState(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const sessionRef = useRef<number | null>(null);
+  const touched = useRef({ date: false });
+  const fields = useRef({ through, minutes, medium, recall, question, date });
+  const oRef = useRef(o);
+  oRef.current = o;
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  const setSessionId = (id: number | null) => {
+    sessionRef.current = id;
+    setSessionIdState(id);
+  };
 
-  const recallOk = recall.trim().length >= 40;
-  const submit = async () => {
-    if (saving) return;
-    setSaving(true);
+  const autosave = useAutosave<SessionValue>("reading-session", {
+    delayMs: 1500,
+    ready: (v) => v.reason,
+    same: sameReadingValue,
+    save: async (v, { keepalive }) => {
+      if (!v.body) return;
+      const id = sessionRef.current;
+      const target = readingSaveTarget("sessions", id);
+      let json: Record<string, unknown>;
+      try {
+        json = await saveRequest(target.url, { method: target.method, body: v.body, keepalive });
+      } catch (e) {
+        if (id !== null && e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
+          if (sessionRef.current === id) setSessionId(null);
+          throw new AutosaveRefused("That session was removed elsewhere. Retry logs it again.");
+        }
+        throw e;
+      }
+      const s = json.session as { session_id?: number } | undefined;
+      const xp = Number(json.xp_gained) || 0;
+      if (alive.current) setSaved({ xp, finished: !!json.finished });
+      if (id === null && s?.session_id && sessionRef.current === null) {
+        setSessionId(s.session_id);
+        onLogged(xp, !!json.finished);
+      } else onSaved();
+    },
+  });
+
+  // Not an entry: an unchanged day follows behavioral today.
+  useEffect(() => {
+    if (touched.current.date) return;
+    fields.current.date = o.today;
+    setDate(o.today);
+  }, [o.today]);
+
+  const commit = (patch: Partial<typeof fields.current>) => {
+    const f = { ...fields.current, ...patch };
+    fields.current = f;
+    setRemoveError(null);
+    const ov = oRef.current;
+    const entry = { from: "", through: f.through, minutes: f.minutes, recall: f.recall, question: f.question, medium: f.medium };
+    if (sessionRef.current === null && !touched.current.date && isBlankSession(entry, { medium: "audio" })) {
+      autosave.reset(); // back to nothing entered: nothing to save, nothing unsaved
+      return;
+    }
+    autosave.change(
+      sessionValue(
+        { from: "", through: f.through, minutes: f.minutes, recall: f.recall, question: f.question, medium: f.medium },
+        { book: ov.book.slug, chosenDay: touched.current.date ? f.date : null, today: ov.today, total: ov.totalChapters || null },
+      ),
+    );
+  };
+
+  const startNew = () => {
+    setSessionId(null);
+    setSaved(null);
+    setRemoveError(null);
+    touched.current = { date: false };
+    autosave.reset();
+    const ov = oRef.current;
+    fields.current = { through: "", minutes: "", medium: "audio", recall: "", question: "", date: ov.today };
+    setThroughState("");
+    setMinutes("");
+    setMedium("audio");
+    setRecall("");
+    setQuestion("");
+    setDate(ov.today);
+  };
+
+  const removeSession = async () => {
+    const id = sessionRef.current;
+    if (id === null || removing) return;
+    autosave.reset();
+    setRemoving(true);
+    setRemoveError(null);
     try {
-      const res = await fetch("/api/reading/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ book: o.book.slug, date, chapter_through: Number(through), minutes: minutes ? Number(minutes) : null, medium, recall, question }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "failed");
-      setRecall("");
-      setQuestion("");
-      setMinutes("");
-      onLogged(json.xp_gained ?? 0, !!json.finished);
+      const res = await fetch(`/api/reading/sessions/${id}`, { method: "DELETE" });
+      const json = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok && res.status !== 404) throw new Error(json.error || `HTTP ${res.status}`);
+      if (!alive.current) return;
+      startNew();
+      onSaved();
     } catch (e) {
-      onError(e instanceof Error ? e.message : "Couldn't log the session");
+      if (alive.current) setRemoveError(`Couldn't remove the session: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      setSaving(false);
+      if (alive.current) setRemoving(false);
     }
   };
 
+  const recallOk = recall.trim().length >= 40;
+  const nextChapter = o.totalChapters ? Math.min(o.totalChapters, o.chaptersDone + 1) : o.chaptersDone + 1;
+  const chips = [nextChapter, nextChapter + 1].filter((n, i, all) => (!o.totalChapters || n <= o.totalChapters) && all.indexOf(n) === i);
+  const anyEntered = !!(through || minutes || recall || question || touched.current.date || medium !== "audio");
+  const st = autosave.state.status;
+  const busy = st === "saving" || removing;
+  const savedText = `Saved${saved?.finished ? " · book finished" : ""}${saved?.xp ? ` · +${saved.xp} XP` : ""}`;
+
   return (
-    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-session-form">
+    <section
+      className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4"
+      data-testid="reading-session-form"
+      onBlur={() => void autosave.flush()}
+    >
       <div className="flex items-baseline justify-between">
         <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary flex items-center gap-1.5">
-          <BookMarked className="w-3.5 h-3.5" /> Log a session
+          <BookMarked className="w-3.5 h-3.5" /> {sessionId !== null ? "This session" : "Log a session"}
         </h3>
         <span className="text-[11px] font-mono text-text-tertiary">10 XP / chapter · 20 XP for a recall note</span>
       </div>
       <div className="mt-3 grid grid-cols-3 gap-2">
         <label className="block">
           <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Through ch.</span>
-          <input type="number" inputMode="numeric" min={0} max={o.totalChapters || undefined} value={through} onChange={(e) => setThrough(e.target.value)} className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[15px] font-mono text-text-primary" />
+          <input
+            type="number"
+            inputMode="numeric"
+            min={0}
+            max={o.totalChapters || undefined}
+            value={through}
+            onChange={(e) => {
+              setThroughState(e.target.value);
+              commit({ through: e.target.value });
+            }}
+            placeholder={String(Math.min(o.totalChapters || 9999, o.chaptersDone + 1))}
+            className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[15px] font-mono text-text-primary"
+          />
         </label>
         <label className="block">
           <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Minutes</span>
-          <input type="number" inputMode="numeric" min={0} value={minutes} onChange={(e) => setMinutes(e.target.value)} placeholder="31" className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[15px] font-mono text-text-primary" />
+          <input
+            type="number"
+            inputMode="numeric"
+            min={0}
+            value={minutes}
+            onChange={(e) => {
+              setMinutes(e.target.value);
+              commit({ minutes: e.target.value });
+            }}
+            placeholder="31"
+            className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[15px] font-mono text-text-primary"
+          />
         </label>
         <label className="block">
           <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Day</span>
-          <input type="date" value={date} max={o.today} onChange={(e) => setDate(e.target.value)} className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary" />
+          <input
+            type="date"
+            value={date}
+            max={o.today}
+            onChange={(e) => {
+              touched.current.date = true;
+              const d = e.target.value || o.today;
+              setDate(d);
+              commit({ date: d });
+            }}
+            className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary"
+          />
         </label>
       </div>
+      {chips.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+          <span className="text-[11px] text-text-tertiary">Through</span>
+          {chips.map((n) => (
+            <button
+              key={n}
+              type="button"
+              onClick={() => {
+                setThroughState(String(n));
+                commit({ through: String(n) });
+              }}
+              aria-pressed={through === String(n)}
+              className={`px-2.5 h-8 rounded-control border font-mono text-[12px] ${through === String(n) ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-secondary"}`}
+            >
+              ch {n}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="mt-2 flex gap-1.5">
         {MEDIA.map((m) => (
-          <button key={m.key} onClick={() => setMedium(m.key)} aria-pressed={medium === m.key} className={`px-3 h-8 rounded-control border text-[12px] inline-flex items-center gap-1 ${medium === m.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}>
+          <button
+            key={m.key}
+            type="button"
+            onClick={() => {
+              setMedium(m.key);
+              commit({ medium: m.key });
+            }}
+            aria-pressed={medium === m.key}
+            className={`px-3 h-8 rounded-control border text-[12px] inline-flex items-center gap-1 ${medium === m.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}
+          >
             {m.key === "audio" && <Headphones className="w-3.5 h-3.5" />}
             {m.label}
           </button>
@@ -511,7 +682,10 @@ function SessionForm({ o, onLogged, onError }: { o: ReadingOverview; onLogged: (
         </span>
         <textarea
           value={recall}
-          onChange={(e) => setRecall(e.target.value)}
+          onChange={(e) => {
+            setRecall(e.target.value);
+            commit({ recall: e.target.value });
+          }}
           rows={4}
           placeholder="What happened, what principle it showed, where it shows up in a BC implementation. Dictate it; don't open the book."
           className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary leading-relaxed"
@@ -519,19 +693,56 @@ function SessionForm({ o, onLogged, onError }: { o: ReadingOverview; onLogged: (
       </label>
       <label className="block mt-2">
         <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">One question for a plant manager</span>
-        <input value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Optional" className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary" />
+        <input
+          value={question}
+          onChange={(e) => {
+            setQuestion(e.target.value);
+            commit({ question: e.target.value });
+          }}
+          placeholder="Optional"
+          className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary"
+        />
       </label>
-      <div className="mt-3 flex items-center justify-between">
-        <span className="text-[11px] text-text-tertiary">Also marks the &ldquo;{o.book.habit_name ?? "reading"}&rdquo; habit for {fmtDate(date)}.</span>
-        <button onClick={submit} disabled={saving || through === ""} className="px-4 py-2 rounded-control text-[14px] font-medium bg-accent text-black disabled:opacity-40">
-          {saving ? "Saving…" : "Log session"}
-        </button>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <span className="text-[11px] text-text-tertiary">
+          Also marks the &ldquo;{o.book.habit_name ?? "reading"}&rdquo; habit for {fmtDate(date)}.{" "}
+          <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} savedText={savedText} showIncomplete={anyEntered} />
+        </span>
+        {sessionId !== null && (
+          <span className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => void removeSession()}
+              disabled={busy}
+              className="px-2 h-8 text-[12px] text-text-tertiary hover:text-[var(--color-down)] underline underline-offset-2 disabled:opacity-40"
+            >
+              {removing ? "Removing…" : "Remove this session"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void autosave.flush().then(() => { if (alive.current) startNew(); })}
+              disabled={busy || st === "error"}
+              className="px-4 py-2 rounded-control text-[13px] font-medium border border-border-subtle text-text-secondary hover:text-text-primary disabled:opacity-40"
+            >
+              New session
+            </button>
+          </span>
+        )}
       </div>
+      {removeError && <p role="alert" className="mt-2 text-[12px] text-[var(--color-down)]">{removeError}</p>}
     </section>
   );
 }
 
-function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (n: number) => void; onError: (m: string) => void }) {
+/**
+ * "Highlight + comment". One highlight, saved as it is entered: created (POST /api/reading/highlights, idempotent
+ * on the passage) once the passage is not empty and Riley pauses or leaves a field, then every later edit updates
+ * the same highlight (PATCH /api/reading/highlights/[id]). A passage that was already saved (e.g. by the Kindle
+ * harvester) is attached as it is: later edits write only the comment, chapter and concept filled in here (never
+ * its source, never a clear), and changing its passage starts a new highlight. "New highlight" starts the next one; "Remove" archives the one
+ * just made. The Kindle export paste stays a Preview / Import action.
+ */
+function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; onAdded: (n: number) => void; onSaved: () => void; onError: (m: string) => void }) {
   const [mode, setMode] = useState<"one" | "import">("one");
   const [passage, setPassage] = useState("");
   const [comment, setComment] = useState("");
@@ -542,27 +753,101 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
   const [importText, setImportText] = useState("");
   const [preview, setPreview] = useState<{ format: string; count: number } | null>(null);
   const [saving, setSaving] = useState(false);
+  const [highlightId, setHighlightIdState] = useState<number | null>(null);
+  const [removing, setRemoving] = useState(false);
+  // The highlight this form made or attached to: its id, whether it existed before, and its saved passage.
+  const hlRef = useRef<{ id: number; existing: boolean; passage: string } | null>(null);
+  const fields = useRef({ passage, comment, chapter, concept, customConcept, source });
+  const oRef = useRef(o);
+  oRef.current = o;
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  const setHighlight = (h: { id: number; existing: boolean; passage: string } | null) => {
+    hlRef.current = h;
+    setHighlightIdState(h?.id ?? null);
+  };
 
-  const effectiveConcept = concept === "__custom" ? customConcept.trim() : concept;
+  const autosave = useAutosave<HighlightValue>("reading-highlight", {
+    delayMs: 1500,
+    ready: (v) => v.reason,
+    same: sameReadingValue,
+    save: async (v, { keepalive }) => {
+      if (!v.body) return;
+      const hl = hlRef.current;
+      // A new highlight, or a different passage after attaching to one saved before: create.
+      if (!hl || (hl.existing && v.body.passage !== hl.passage)) {
+        const json = await saveRequest("/api/reading/highlights", { method: "POST", body: { ...v.body, book: oRef.current.book.slug }, keepalive });
+        const h = json.highlight as { highlight_id?: number; passage?: string } | undefined;
+        if (h?.highlight_id) setHighlight({ id: h.highlight_id, existing: !json.created, passage: h.passage ?? v.body.passage });
+        if (json.created) onAdded(1);
+        else onSaved();
+        return;
+      }
+      let body: Record<string, unknown>;
+      if (hl.existing) {
+        // Saved before (e.g. by the harvester): only what is filled in here is written, like the POST's re-import
+        // rule, so an empty field never clears its stored comment, chapter or concept.
+        body = {};
+        if (v.body.comment.trim()) body.comment = v.body.comment;
+        if (v.body.chapter !== null) body.chapter = v.body.chapter;
+        if (v.body.concept) body.concept = v.body.concept;
+        if (!Object.keys(body).length) return;
+      } else {
+        body = { passage: v.body.passage, comment: v.body.comment, chapter: v.body.chapter, concept: v.body.concept, source: v.body.source };
+      }
+      try {
+        await saveRequest(`/api/reading/highlights/${hl.id}`, { method: "PATCH", body, keepalive });
+      } catch (e) {
+        if (e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
+          if (hlRef.current?.id === hl.id) setHighlight(null);
+          throw new AutosaveRefused("That highlight was removed elsewhere. Retry saves it again.");
+        }
+        throw e;
+      }
+      if (hlRef.current?.id === hl.id && !hl.existing) hlRef.current = { ...hl, passage: v.body.passage };
+      onSaved();
+    },
+  });
 
-  const addOne = async () => {
-    if (saving || !passage.trim()) return;
-    setSaving(true);
+  const commit = (patch: Partial<typeof fields.current>) => {
+    const f = { ...fields.current, ...patch };
+    fields.current = f;
+    const blank = !f.passage.trim() && !f.comment.trim() && !f.chapter.trim();
+    if (blank && !hlRef.current) {
+      autosave.reset();
+      return;
+    }
+    autosave.change(highlightValue({ passage: f.passage, comment: f.comment, chapter: f.chapter, concept: f.concept === "__custom" ? f.customConcept : f.concept, source: f.source }));
+  };
+
+  const startNew = () => {
+    setHighlight(null);
+    autosave.reset();
+    fields.current = { ...fields.current, passage: "", comment: "" };
+    setPassage("");
+    setComment("");
+  };
+
+  const removeHighlight = async () => {
+    const hl = hlRef.current;
+    if (!hl || removing) return;
+    autosave.reset();
+    setRemoving(true);
     try {
-      const res = await fetch("/api/reading/highlights", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ book: o.book.slug, passage, comment, chapter: chapter ? Number(chapter) : null, concept: effectiveConcept || null, source }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "failed");
-      setPassage("");
-      setComment("");
-      onAdded(1);
+      const res = await fetch(`/api/reading/highlights/${hl.id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as { error?: string }).error || `HTTP ${res.status}`);
+      if (!alive.current) return;
+      startNew();
+      onSaved();
     } catch (e) {
-      onError(e instanceof Error ? e.message : "Couldn't save the highlight");
+      onError(e instanceof Error ? `Couldn't remove the highlight: ${e.message}` : "Couldn't remove the highlight");
     } finally {
-      setSaving(false);
+      if (alive.current) setRemoving(false);
     }
   };
 
@@ -597,6 +882,9 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
     }
   };
 
+  const st = autosave.state.status;
+  const busy = st === "saving" || removing;
+
   return (
     <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-highlight-form">
       <div className="flex items-center justify-between">
@@ -614,12 +902,48 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
       </div>
 
       {mode === "one" ? (
-        <>
-          <textarea value={passage} onChange={(e) => setPassage(e.target.value)} rows={3} placeholder="The passage, as written." className="mt-3 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary leading-relaxed" />
-          <textarea value={comment} onChange={(e) => setComment(e.target.value)} rows={2} placeholder="Your comment. Why it matters, or where it shows up in BC." className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary italic" />
+        <div onBlur={() => void autosave.flush()}>
+          <textarea
+            value={passage}
+            onChange={(e) => {
+              setPassage(e.target.value);
+              commit({ passage: e.target.value });
+            }}
+            rows={3}
+            placeholder="The passage, as written."
+            className="mt-3 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary leading-relaxed"
+          />
+          <textarea
+            value={comment}
+            onChange={(e) => {
+              setComment(e.target.value);
+              commit({ comment: e.target.value });
+            }}
+            rows={2}
+            placeholder="Your comment. Why it matters, or where it shows up in BC."
+            className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary italic"
+          />
           <div className="mt-2 grid grid-cols-[88px_1fr] gap-2">
-            <input type="number" inputMode="numeric" min={0} value={chapter} onChange={(e) => setChapter(e.target.value)} placeholder="ch." className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary" />
-            <select value={concept} onChange={(e) => setConcept(e.target.value)} className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary">
+            <input
+              type="number"
+              inputMode="numeric"
+              min={0}
+              value={chapter}
+              onChange={(e) => {
+                setChapter(e.target.value);
+                commit({ chapter: e.target.value });
+              }}
+              placeholder="ch."
+              className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary"
+            />
+            <select
+              value={concept}
+              onChange={(e) => {
+                setConcept(e.target.value);
+                commit({ concept: e.target.value });
+              }}
+              className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary"
+            >
               <option value="">Concept (optional)</option>
               {CONCEPTS.map((c) => (
                 <option key={c} value={c}>
@@ -629,18 +953,57 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
               <option value="__custom">Other…</option>
             </select>
           </div>
-          {concept === "__custom" && <input value={customConcept} onChange={(e) => setCustomConcept(e.target.value)} placeholder="Concept name" className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[13px] text-text-primary" />}
-          <div className="mt-2 flex flex-wrap gap-1.5">
+          {concept === "__custom" && (
+            <input
+              value={customConcept}
+              onChange={(e) => {
+                setCustomConcept(e.target.value);
+                commit({ customConcept: e.target.value });
+              }}
+              placeholder="Concept name"
+              className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[13px] text-text-primary"
+            />
+          )}
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
             {SOURCES.map((s) => (
-              <button key={s.key} onClick={() => setSource(s.key)} aria-pressed={source === s.key} className={`px-2.5 h-7 rounded-control border text-[11px] ${source === s.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}>
+              <button
+                key={s.key}
+                type="button"
+                onClick={() => {
+                  setSource(s.key);
+                  commit({ source: s.key });
+                }}
+                aria-pressed={source === s.key}
+                className={`px-2.5 h-7 rounded-control border text-[11px] ${source === s.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}
+              >
                 {s.label}
               </button>
             ))}
-            <button onClick={addOne} disabled={saving || !passage.trim()} className="ml-auto px-4 h-8 rounded-control text-[13px] font-medium bg-accent text-black disabled:opacity-40">
-              {saving ? "Saving…" : "Add highlight"}
-            </button>
+            {highlightId !== null && (
+              <span className="ml-auto flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => void removeHighlight()}
+                  disabled={busy}
+                  className="px-2 h-8 text-[12px] text-text-tertiary hover:text-[var(--color-down)] underline underline-offset-2 disabled:opacity-40"
+                >
+                  {removing ? "Removing…" : "Remove"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void autosave.flush().then(() => { if (alive.current) startNew(); })}
+                  disabled={busy || st === "error"}
+                  className="px-3 h-8 rounded-control text-[13px] font-medium border border-border-subtle text-text-secondary hover:text-text-primary disabled:opacity-40"
+                >
+                  New highlight
+                </button>
+              </span>
+            )}
           </div>
-        </>
+          <p className="mt-2 text-[11px]">
+            <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} />
+          </p>
+        </div>
       ) : (
         <>
           <div className="mt-2 flex items-center gap-2">

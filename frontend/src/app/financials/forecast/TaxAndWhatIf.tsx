@@ -1,12 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { ForecastResult } from "@/lib/cash-forecast";
 import { scenarioToQuery, type ScenarioParams } from "@/lib/cash-forecast-scenario";
 import type { ForecastAccountView } from "@/lib/cash-forecast-server";
 import type { Jur, TaxProfile, TaxYearResult } from "@/lib/tax-plan";
 import InfoHint from "@/components/InfoHint";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
+import { useFinanceAutosave } from "@/lib/use-finance-autosave";
 
 const usd = (cents: number | null | undefined): string => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -311,11 +313,34 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
     ncRate: typeof p?.ncRatePct === "number" ? String(p.ncRatePct) : "",
     withholds: p?.employerStateWithholding ?? "NC",
   });
-  const [oneOffs, setOneOffs] = useState(p?.oneOffs.map((o) => ({ date: o.date, gross: String(Math.round(o.grossCents / 100)), label: o.label })) ?? []);
+  const [oneOffs, setOneOffsState] = useState(p?.oneOffs.map((o) => ({ date: o.date, gross: String(Math.round(o.grossCents / 100)), label: o.label })) ?? []);
   const [est, setEst] = useState({ jur: "GA" as Jur, date: "", amount: "" });
-  const set = (k: string) => (e: { target: { value: string } }) => setF((x) => ({ ...x, [k]: e.target.value }));
+  // Payments recorded so far, kept here so an autosave of the profile never drops one the page has not re-read yet.
+  const paid = useRef(p?.estimatesPaid ?? []);
+  // While a payment is being recorded nothing else is sent (both write the whole profile).
+  const paying = useRef(false);
   const cents = (s: string) => Math.round((dollars(s) ?? 0) * 100);
-  const build = (extraEstimate?: { jur: Jur; date: string; cents: number }) => ({
+  type ProfileForm = { f: Record<string, string>; oneOffs: { date: string; gross: string; label: string }[] };
+  // Autosave (lib/use-finance-autosave.ts): the profile is sent after a pause or when a field is left, once it has
+  // a salary and a job start date, then the forecast re-reads. Recording a payment stays a button (it adds an event).
+  const autosave = useFinanceAutosave<ProfileForm>("forecast-tax", run, (v) => put("tax", buildFrom(v.f, v.oneOffs)), {
+    ready: (v) => (paying.current ? "Recording the payment…" : v.f.salary && v.f.start ? null : "Enter the salary and the job start date to save the tax profile."),
+    baseline: { f, oneOffs },
+  });
+  const latest = useRef<ProfileForm>({ f, oneOffs });
+  const set = (k: string) => (e: { target: { value: string } }) => {
+    const next = { ...f, [k]: e.target.value };
+    setF(next);
+    latest.current = { f: next, oneOffs };
+    autosave.change(latest.current);
+  };
+  const setOneOffs = (fn: (xs: typeof oneOffs) => typeof oneOffs) => {
+    const next = fn(oneOffs);
+    setOneOffsState(next);
+    latest.current = { f, oneOffs: next };
+    autosave.change(latest.current);
+  };
+  const buildFrom = (f: Record<string, string>, oneOffs: { date: string; gross: string; label: string }[], extraEstimate?: { jur: Jur; date: string; cents: number }) => ({
     salaryAnnualCents: cents(f.salary),
     employmentStart: f.start,
     moveDate: f.move || null,
@@ -333,12 +358,13 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
     gaRatePct: f.gaRate.trim() ? (dollars(f.gaRate) ?? null) : null,
     ncRatePct: f.ncRate.trim() ? (dollars(f.ncRate) ?? null) : null,
     employerStateWithholding: f.withholds === "none" ? "none" : "NC",
-    estimatesPaid: [...(p?.estimatesPaid ?? []), ...(extraEstimate ? [{ year: Number(extraEstimate.date.slice(0, 4)) - (extraEstimate.date.slice(5, 7) === "01" ? 1 : 0), ...extraEstimate }] : [])],
+    estimatesPaid: [...paid.current, ...(extraEstimate ? [estimateOf(extraEstimate)] : [])],
   });
+  const estimateOf = (e: { jur: Jur; date: string; cents: number }) => ({ year: Number(e.date.slice(0, 4)) - (e.date.slice(5, 7) === "01" ? 1 : 0), ...e });
   const field = (label: string, k: string, type = "text", w = "w-28", ph = "") => (
     <label className="flex flex-col gap-1 text-[12px] text-text-secondary">
       {label}
-      <input className={`${input} ${w}`} type={type} value={f[k]} onChange={set(k)} placeholder={ph} />
+      <input className={`${input} ${w}`} type={type} value={f[k]} onChange={set(k)} onBlur={() => void autosave.flush()} placeholder={ph} />
     </label>
   );
   return (
@@ -365,7 +391,7 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
         {field("NC rate (%)", "ncRate", "text", "w-20", "3.99")}
         <label className="flex flex-col gap-1 text-[12px] text-text-secondary">
           Employer withholds state tax for
-          <select className={input} value={f.withholds} onChange={(e) => setF((x) => ({ ...x, withholds: e.target.value }))}>
+          <select className={input} value={f.withholds} onChange={set("withholds")}>
             <option value="NC">North Carolina</option>
             <option value="none">no state</option>
           </select>
@@ -393,9 +419,7 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
         + one-off pay
       </button>
       <div className="mt-3">
-        <button className={button} disabled={busy || !f.salary || !f.start} onClick={() => run(() => put("tax", build()))}>
-          Save tax profile
-        </button>
+        <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} showIncomplete={Object.values(f).some((x) => x.trim() && x !== "0" && x !== "NC")} />
       </div>
       <p className="mt-4 text-[12px] text-text-secondary">Record an estimated payment you made:</p>
       <div className="mt-1 flex flex-wrap items-center gap-2">
@@ -411,7 +435,23 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
         <button
           className={button}
           disabled={busy || !profile || !est.date || !(dollars(est.amount) ?? 0)}
-          onClick={() => run(() => put("tax", build({ jur: est.jur, date: est.date, cents: cents(est.amount) })))}
+          onClick={() => {
+            const extra = { jur: est.jur, date: est.date, cents: cents(est.amount) };
+            run(async () => {
+              // What was waiting goes first; then the payment, with the profile as shown, in one write.
+              await autosave.flush();
+              paying.current = true;
+              const value = latest.current;
+              const e = await put("tax", buildFrom(value.f, value.oneOffs, extra));
+              paying.current = false;
+              if (!e) {
+                paid.current = [...paid.current, estimateOf(extra)];
+                autosave.setBaseline(value);
+              }
+              autosave.change(latest.current); // anything typed meanwhile (nothing is sent if it is unchanged)
+              return e;
+            });
+          }}
         >
           Record payment
         </button>

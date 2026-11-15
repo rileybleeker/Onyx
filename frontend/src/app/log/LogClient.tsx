@@ -12,8 +12,8 @@ import { SectionSkeleton } from "./sections/ui";
 
 /**
  * The Log screen (AGENTS.md "Log screen"): every daily entry on one page. Each section is a Personalize part with
- * its own chunk, data (client cache first) and Save; the frame paints at once with each section's skeleton.
- * Nothing is written on open; a section writes only when Riley taps its own Save.
+ * its own chunk and data (client cache first); the frame paints at once with each section's skeleton. Every section
+ * saves Riley's input on its own (autosave, lib/autosave.ts). Nothing is written on open or on scroll.
  *
  * Section files (app/log/sections/*.tsx, one per section): SayIt, CheckIn, Journal, Supplements, UberEats, Weight, Reading.
  * The Say it box writes suggestions to lib/log-drafts.ts; each section reads its own with useLogDrafts(section).

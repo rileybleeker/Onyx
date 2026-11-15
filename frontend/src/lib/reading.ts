@@ -627,6 +627,216 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
   return { ok: true, book: { ...book, status: finished ? "finished" : book.status }, session, xpGained, finished, habitMarked };
 }
 
+/* ------------------------------------------------------------------ */
+/* Editing a session the form just created (autosave, 2026-11-15)       */
+/* ------------------------------------------------------------------ */
+
+/** A PATCH /api/reading/sessions/[id] body. `date` / `book` absent or null = keep the session's own. */
+export interface SessionUpdate {
+  book: string | null;
+  date: string | null;
+  chapter_through: number;
+  chapter_from: number | null;
+  minutes: number | null;
+  medium: Medium | null;
+  recall: string | null;
+  question: string | null;
+}
+
+const SESSION_UPDATE_FIELDS = new Set(["book", "date", "chapter_through", "chapter_from", "minutes", "medium", "recall", "question"]);
+const SESSION_TEXT_MAX = 20000;
+
+/**
+ * Parse a session PATCH body (pure). Unknown fields are refused, numbers must be whole and not negative, the date a
+ * real YYYY-MM-DD; the recall note and question are strings (stored as typed apart from the surrounding whitespace,
+ * like logSession). The chapter limit and "not after today" need the book and the day, so updateSession checks them.
+ */
+export function parseSessionUpdate(raw: unknown): { ok: true; input: SessionUpdate } | { ok: false; error: string } {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "body must be an object" };
+  const b = raw as Record<string, unknown>;
+  for (const k of Object.keys(b)) if (!SESSION_UPDATE_FIELDS.has(k)) return { ok: false, error: `unknown field ${k}` };
+  const whole = (v: unknown, name: string): number | null | { error: string } => {
+    if (v === undefined || v === null || v === "") return null;
+    const n = typeof v === "number" ? v : typeof v === "string" && /^\s*\d+\s*$/.test(v) ? Number(v) : NaN;
+    if (!Number.isInteger(n) || n < 0) return { error: `${name} must be a whole number, 0 or more` };
+    return n;
+  };
+  const through = whole(b.chapter_through, "chapter_through");
+  if (through !== null && typeof through === "object") return { ok: false, error: through.error };
+  if (through === null) return { ok: false, error: "chapter_through is required" };
+  const from = whole(b.chapter_from, "chapter_from");
+  if (from !== null && typeof from === "object") return { ok: false, error: from.error };
+  if (from !== null && from > through) return { ok: false, error: "chapter_from must be at most chapter_through" };
+  const minutes = whole(b.minutes, "minutes");
+  if (minutes !== null && typeof minutes === "object") return { ok: false, error: minutes.error };
+  let date: string | null = null;
+  if (b.date !== undefined && b.date !== null && b.date !== "") {
+    const d = b.date;
+    if (typeof d !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(d) || Number.isNaN(Date.parse(`${d}T12:00:00Z`)) || new Date(`${d}T12:00:00Z`).toISOString().slice(0, 10) !== d) {
+      return { ok: false, error: "date must be YYYY-MM-DD" };
+    }
+    date = d;
+  }
+  let medium: Medium | null = null;
+  if (b.medium !== undefined && b.medium !== null && b.medium !== "") {
+    if (typeof b.medium !== "string" || !["audio", "kindle", "paper", "other"].includes(b.medium)) return { ok: false, error: "medium must be audio, kindle, paper or other" };
+    medium = b.medium as Medium;
+  }
+  const text = (v: unknown, name: string): string | null | { error: string } => {
+    if (v === undefined || v === null) return null;
+    if (typeof v !== "string") return { error: `${name} must be text` };
+    if (v.length > SESSION_TEXT_MAX) return { error: `${name} is too long` };
+    return v;
+  };
+  const recall = text(b.recall, "recall");
+  if (recall !== null && typeof recall === "object") return { ok: false, error: recall.error };
+  const question = text(b.question, "question");
+  if (question !== null && typeof question === "object") return { ok: false, error: question.error };
+  let book: string | null = null;
+  if (b.book !== undefined && b.book !== null && b.book !== "") {
+    if (typeof b.book !== "string" || b.book.length > 200) return { ok: false, error: "book must be a slug" };
+    book = b.book;
+  }
+  return { ok: true, input: { book, date, chapter_through: through, chapter_from: from, minutes, medium, recall, question } };
+}
+
+export type SessionEditResult =
+  | { ok: true; book: Book; previousBook: Book; session: ReadingSession; previous: ReadingSession; xpGained: number; finished: boolean; habitMarked: boolean }
+  | { ok: false; status: number; error: string };
+
+async function editableSession(
+  supabase: Supa,
+  sessionId: number,
+): Promise<{ ok: true; session: ReadingSession; book: Book } | { ok: false; status: number; error: string }> {
+  const { data, error } = await supabase.from("reading_sessions").select(SESSION_COLS).eq("session_id", sessionId).maybeSingle();
+  if (error) return { ok: false, status: 500, error: error.message };
+  const session = data as ReadingSession | null;
+  if (!session) return { ok: false, status: 404, error: "That session no longer exists." };
+  if (session.source !== "manual" && session.source !== "chat") {
+    return { ok: false, status: 409, error: "Kindle sessions are written by the harvester and can't be edited here." };
+  }
+  const { data: bookRow } = await supabase.from("books").select(BOOK_COLS).eq("book_id", session.book_id).maybeSingle();
+  if (!bookRow) return { ok: false, status: 404, error: "The session's book no longer exists." };
+  return { ok: true, session, book: bookRow as Book };
+}
+
+/**
+ * Update a manual or chat session in place (the autosaving forms on /log and /reading edit the session they
+ * created). Same rules as logSession: chapter_through not past the book's last chapter, chapter_from defaulting to
+ * the furthest chapter of the book's OTHER sessions + 1, the day not after behavioral today. Reaching the last
+ * chapter finishes the book; a new day (or book) stamps that book's habit Yes on the new day. The old day's habit
+ * row is left alone: it may be Riley's own answer. Kindle sessions are refused (409).
+ */
+export async function updateSession(supabase: Supa, sessionId: number, input: SessionUpdate): Promise<SessionEditResult> {
+  const cur = await editableSession(supabase, sessionId);
+  if (!cur.ok) return cur;
+  const previous = cur.session;
+  let book = cur.book;
+  if (input.book && input.book !== book.slug) {
+    const other = await getBook(supabase, input.book);
+    if (!other) return { ok: false, status: 400, error: "No such book" };
+    book = other;
+  }
+  const through = input.chapter_through;
+  if (book.total_chapters && through > book.total_chapters) {
+    return { ok: false, status: 400, error: `chapter_through cannot exceed ${book.total_chapters}` };
+  }
+  let date = previous.session_date;
+  if (input.date && input.date !== previous.session_date) {
+    const today = await behavioralToday(supabase);
+    if (input.date > today) return { ok: false, status: 400, error: "Pick today or an earlier day." };
+    date = input.date;
+  }
+
+  const { data: prevRows } = await supabase
+    .from("reading_sessions")
+    .select("chapter_through")
+    .eq("book_id", book.book_id)
+    .neq("session_id", sessionId)
+    .order("chapter_through", { ascending: false })
+    .limit(1);
+  const prevMax = (prevRows?.[0]?.chapter_through as number | undefined) ?? 0;
+  const from = input.chapter_from ?? Math.min(through, prevMax + 1);
+  if (from > through) return { ok: false, status: 400, error: "chapter_from must be at most chapter_through" };
+
+  const patch = {
+    book_id: book.book_id,
+    session_date: date,
+    chapter_from: from,
+    chapter_through: through,
+    minutes: input.minutes,
+    medium: input.medium,
+    recall: input.recall?.trim() || null,
+    question: input.question?.trim() || null,
+  };
+  const { data, error } = await supabase.from("reading_sessions").update(patch).eq("session_id", sessionId).select(SESSION_COLS).single();
+  if (error) return { ok: false, status: 500, error: error.message };
+  const session = data as ReadingSession;
+
+  const xpGained = Math.max(0, through - prevMax) * XP.perChapter + ((patch.recall ?? "").length >= 40 ? XP.perRecall : 0);
+
+  let finished = false;
+  if (book.total_chapters && through >= book.total_chapters && book.status !== "finished") {
+    await supabase.from("books").update({ status: "finished", finished_on: date }).eq("book_id", book.book_id);
+    finished = true;
+  }
+
+  let habitMarked = false;
+  const moved = date !== previous.session_date || book.book_id !== previous.book_id;
+  if (moved && book.habit_name) {
+    const { error: hErr } = await supabase
+      .from("habit_journal")
+      .upsert({ cycle_date: date, question: book.habit_name, category: "learning", answer: "Yes" }, { onConflict: "cycle_date,question" });
+    habitMarked = !hErr;
+    if (hErr) console.error("reading: habit stamp failed:", hErr.message);
+  }
+
+  return {
+    ok: true,
+    book: { ...book, status: finished ? "finished" : book.status, finished_on: finished ? date : book.finished_on },
+    previousBook: cur.book,
+    session,
+    previous,
+    xpGained,
+    finished,
+    habitMarked,
+  };
+}
+
+/**
+ * Remove a manual or chat session (the autosaving forms' "Remove this session"). A book this session finished
+ * (finished on its day, and no other session reaches the last chapter) goes back to reading. The habit row of
+ * that day is left alone, as for an edit.
+ */
+export async function deleteSession(
+  supabase: Supa,
+  sessionId: number,
+): Promise<{ ok: true; book: Book; session: ReadingSession; unfinished: boolean } | { ok: false; status: number; error: string }> {
+  const cur = await editableSession(supabase, sessionId);
+  if (!cur.ok) return cur;
+  const { session } = cur;
+  let book = cur.book;
+  const { error } = await supabase.from("reading_sessions").delete().eq("session_id", sessionId);
+  if (error) return { ok: false, status: 500, error: error.message };
+
+  let unfinished = false;
+  const total = book.total_chapters;
+  if (book.status === "finished" && total && (session.chapter_through ?? 0) >= total && book.finished_on === session.session_date) {
+    const { data: rest } = await supabase
+      .from("reading_sessions")
+      .select("session_id")
+      .eq("book_id", book.book_id)
+      .gte("chapter_through", total)
+      .limit(1);
+    if (!rest?.length) {
+      await supabase.from("books").update({ status: "reading", finished_on: null }).eq("book_id", book.book_id);
+      book = { ...book, status: "reading", finished_on: null };
+      unfinished = true;
+    }
+  }
+  return { ok: true, book, session, unfinished };
+}
+
 export interface AddHighlightInput {
   slug?: string | null;
   book_id?: number | null;

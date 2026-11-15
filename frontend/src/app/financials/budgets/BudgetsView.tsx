@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import { TOTAL_KEY, type BudgetLine, type BudgetsResult } from "@/lib/finance-budgets";
 import { activeMonthly, type SubscriptionView } from "@/lib/finance-subscriptions";
 import InfoHint from "@/components/InfoHint";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
+import { useFinanceAutosave } from "@/lib/use-finance-autosave";
 import { Part, PartGrid, PartGroup } from "@/components/personalize/PartGrid";
 import type { PageLayout } from "@/lib/personalize-layout";
 
@@ -292,6 +294,12 @@ export default function BudgetsView({
 
 function BudgetRow({ l, busy, run }: { l: BudgetLine; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
   const [v, setV] = useState(l.budgetCents ? String(Math.round(l.budgetCents / 100)) : "");
+  // Autosave (lib/use-finance-autosave.ts): the budget is sent after a pause or when the field is left; blank = none.
+  const autosave = useFinanceAutosave<string>(`budget:${l.category}`, run, (x) => {
+    const n = Number(x.replace(/[$,\s]/g, ""));
+    return put("/api/finance/budgets", { category: l.category, monthlyCents: x.trim() && n > 0 ? Math.round(n * 100) : null });
+  }, { baseline: v });
+  void busy;
   const scale = Math.max(l.budgetCents ?? 0, l.projectedCents, l.spentCents, 1);
   const pct = (x: number) => `${Math.min(100, (x / scale) * 100)}%`;
   const color = l.status === "over" ? "bg-down" : l.status === "at-risk" ? "bg-mid" : "bg-accent";
@@ -311,53 +319,49 @@ function BudgetRow({ l, busy, run }: { l: BudgetLine; busy: boolean; run: (fn: (
       <td className="py-1 text-right">{usd(l.spentCents)}</td>
       <td className="py-1 text-right text-text-secondary">{usd(l.projectedCents)}</td>
       <td className="py-1 text-right">
-        <input className={`${input} w-20 text-right`} inputMode="numeric" value={v} placeholder={String(Math.round(l.suggestedCents / 100))} onChange={(e) => setV(e.target.value)} aria-label={`Budget for ${l.category}`} />
+        <input className={`${input} w-20 text-right`} inputMode="numeric" value={v} placeholder={String(Math.round(l.suggestedCents / 100))} onChange={(e) => { setV(e.target.value); autosave.change(e.target.value); }} onBlur={() => void autosave.flush()} aria-label={`Budget for ${l.category}`} />
       </td>
       <td className="py-1 pl-2">
-        <button
-          className={button}
-          disabled={busy}
-          onClick={() => {
-            const n = Number(v.replace(/[$,\s]/g, ""));
-            run(() => put("/api/finance/budgets", { category: l.category, monthlyCents: v.trim() && n > 0 ? Math.round(n * 100) : null }));
-          }}
-        >
-          Save
-        </button>
+        <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} />
       </td>
     </tr>
   );
 }
 
 function TotalBudget({ current, busy, run }: { current: number | null; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
+  // The field starts empty (the current overall budget is its placeholder). Typing saves after a pause; an empty
+  // field changes nothing, 0 clears the overall budget (back to the sum of categories).
   const [v, setV] = useState("");
+  const autosave = useFinanceAutosave<string>("budget:overall", run, (x) => {
+    const n = Number(x.replace(/[$,\s]/g, ""));
+    return put("/api/finance/budgets", { category: TOTAL_KEY, monthlyCents: x.trim() && n > 0 ? Math.round(n * 100) : null });
+  }, { baseline: "" });
+  void busy;
   return (
     <span className="flex items-center gap-1 text-[12px] text-text-secondary">
       Overall $
-      <input className={`${input} w-24`} inputMode="numeric" value={v} placeholder={current ? String(Math.round(current / 100)) : "sum of categories"} onChange={(e) => setV(e.target.value)} />
-      <button
-        className={button}
-        disabled={busy}
-        onClick={() => {
-          const n = Number(v.replace(/[$,\s]/g, ""));
-          run(() => put("/api/finance/budgets", { category: TOTAL_KEY, monthlyCents: v.trim() && n > 0 ? Math.round(n * 100) : null }));
-        }}
-      >
-        Set
-      </button>
+      <input className={`${input} w-24`} inputMode="numeric" value={v} placeholder={current ? String(Math.round(current / 100)) : "sum of categories"} onChange={(e) => { setV(e.target.value); autosave.change(e.target.value); }} onBlur={() => void autosave.flush()} aria-label="Overall budget" />
+      <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} />
     </span>
   );
 }
 
 function ReviewRow({ m, categories, busy, run }: { m: BudgetsResult["uncategorized"][number]; categories: string[]; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
   const [cat, setCat] = useState("");
+  // Picking a category files every transaction from this merchant under it (the row's only action), saved at once.
+  const autosave = useFinanceAutosave<string>(`merchant-rule:${m.key}`, run, (c) => put("/api/finance/categories", { merchantKey: m.key, category: c }), {
+    baseline: "",
+    delayMs: 400,
+    ready: (c) => (c ? null : "Pick a category."),
+  });
+  void busy;
   return (
     <tr className="border-t border-border-subtle">
       <td className="py-1 pr-2">{m.label}</td>
       <td className="py-1 pr-2 text-right">{usd(m.cents)}</td>
       <td className="py-1 pr-2 text-text-tertiary">{m.count}× · last {m.lastDate}</td>
       <td className="py-1">
-        <select className={input} value={cat} onChange={(e) => setCat(e.target.value)} aria-label={`Category for ${m.label}`}>
+        <select className={input} value={cat} onChange={(e) => { setCat(e.target.value); autosave.change(e.target.value); }} aria-label={`Category for ${m.label}`}>
           <option value="">(category)</option>
           {categories.map((c) => (
             <option key={c} value={c}>
@@ -365,9 +369,7 @@ function ReviewRow({ m, categories, busy, run }: { m: BudgetsResult["uncategoriz
             </option>
           ))}
         </select>{" "}
-        <button className={button} disabled={busy || !cat} onClick={() => run(() => put("/api/finance/categories", { merchantKey: m.key, category: cat }))}>
-          Always
-        </button>
+        <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} savedText="Always filed here" />
       </td>
     </tr>
   );

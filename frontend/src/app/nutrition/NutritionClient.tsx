@@ -31,6 +31,8 @@ import ChartCard from "@/components/ChartCard";
 import { Part, PartGrid, PartGroup } from "@/components/personalize/PartGrid";
 import PersonalTable, { type TableColumn } from "@/components/personalize/PersonalTable";
 import InfoHint from "@/components/InfoHint";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
+import { useWeightAutosave } from "@/lib/weight-entry";
 import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
@@ -203,7 +205,9 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   const [weightInput, setWeightInput] = useState<string>("");
   const [weightDate, setWeightDate] = useState<string>("");
   const [weightNotes, setWeightNotes] = useState<string>("");
-  const [savingWeight, setSavingWeight] = useState(false);
+  const weightRowsRef = useRef<WeightRow[]>([]);
+  weightRowsRef.current = weightRows;
+  const [weightUndoErr, setWeightUndoErr] = useState<string | null>(null);
   // /nutrition?log=weight: weight first, pounds field focused (the page's charts stay below it).
   // /nutrition?log=photo (Log > Meal photo): the photo logger first.
   const logParam = useSearchParams().get("log");
@@ -380,33 +384,34 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   useEffect(() => { loadWeight(); }, [loadWeight]);
   useEffect(() => { setWeightDate(etTodayStr()); }, []);
 
-  async function saveWeight() {
-    const lb = parseFloat(weightInput);
-    if (!Number.isFinite(lb) || lb <= 0 || lb > 1000) {
-      alert("Enter a weight in pounds between 0 and 1000.");
+  // The quick-log saves itself (lib/weight-entry.ts): typing, Enter, leaving a field, moving the Date, Undo.
+  const weightAuto = useWeightAutosave("nutrition-weight", {
+    rows: () => weightRowsRef.current,
+    coversDays: () => (weightLoading ? 0 : Math.max(rangeDays(range), 90)),
+    onRow: (day, row) =>
+      setWeightRows((prev) => {
+        const kept = prev.filter((r) => r.log_date !== day);
+        return row ? [...kept, row].sort((a, b) => (a.log_date < b.log_date ? -1 : a.log_date > b.log_date ? 1 : 0)) : kept;
+      }),
+  });
+  const savingWeight = weightAuto.undoing;
+  const editWeight = (next: { lb?: string; day?: string; notes?: string }) => {
+    setWeightUndoErr(null);
+    weightAuto.edit({
+      day: next.day ?? (weightDate || etTodayStr()),
+      lb: next.lb ?? weightInput,
+      notes: next.notes ?? weightNotes,
+    });
+  };
+  async function undoWeight() {
+    const err = await weightAuto.undo();
+    if (err) {
+      setWeightUndoErr(err);
       return;
     }
-    setSavingWeight(true);
-    try {
-      const res = await fetch("/api/weight", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          log_date: weightDate || etTodayStr(),
-          weight_kg: lbToKg(lb),
-          notes: weightNotes.trim() || undefined,
-        }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      setWeightInput("");
-      setWeightNotes("");
-      await loadWeight();
-    } catch (e) {
-      console.error("Save weight:", e);
-      alert(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSavingWeight(false);
-    }
+    setWeightInput("");
+    setWeightNotes("");
+    setWeightDate(etTodayStr());
   }
 
   async function deleteWeight(log_date: string) {
@@ -528,7 +533,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
       title={weightDate === etTodayStr() ? "Log weight — today" : `Log weight for ${formatShortDate(weightDate)}`}
       subtitle={
         todayWeight && weightDate === etTodayStr()
-          ? `Already logged today (${kgToLb(Number(todayWeight.weight_kg))!.toFixed(1)} lb). Saving overwrites.`
+          ? `Already logged today (${kgToLb(Number(todayWeight.weight_kg))!.toFixed(1)} lb). Typing a weight replaces it.`
           : "One entry per day, in pounds"
       }
     >
@@ -540,7 +545,11 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
           type="date"
           value={weightDate}
           max={etTodayStr()}
-          onChange={(e) => setWeightDate(e.target.value || etTodayStr())}
+          onChange={(e) => {
+            const d = e.target.value || etTodayStr();
+            setWeightDate(d);
+            editWeight({ day: d });
+          }}
           disabled={savingWeight}
           className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
         />
@@ -550,7 +559,10 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
               logging to {formatShortDate(weightDate)} — not today
             </span>
             <button
-              onClick={() => setWeightDate(etTodayStr())}
+              onClick={() => {
+                setWeightDate(etTodayStr());
+                editWeight({ day: etTodayStr() });
+              }}
               className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
             >
               reset to today
@@ -570,7 +582,14 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
           ref={weightInputRef}
           aria-label="Weight in pounds"
           value={weightInput}
-          onChange={(e) => setWeightInput(e.target.value)}
+          onChange={(e) => {
+            setWeightInput(e.target.value);
+            editWeight({ lb: e.target.value });
+          }}
+          onBlur={() => void weightAuto.saver.flush()}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void weightAuto.saver.flush();
+          }}
           placeholder="e.g. 178.4"
           disabled={savingWeight}
           className="w-[140px] min-h-11 px-3 text-[16px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
@@ -590,20 +609,43 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
         <input
           type="text"
           value={weightNotes}
-          onChange={(e) => setWeightNotes(e.target.value)}
+          onChange={(e) => {
+            setWeightNotes(e.target.value);
+            editWeight({ notes: e.target.value });
+          }}
+          onBlur={() => void weightAuto.saver.flush()}
           placeholder="optional — e.g. 'morning, post-bathroom', 'after workout'"
           disabled={savingWeight}
           className="flex-1 min-w-[200px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
         />
       </div>
 
-      <button
-        onClick={saveWeight}
-        disabled={savingWeight || !weightInput}
-        className="w-full px-4 py-3 text-[13px] text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed border border-accent rounded-full transition-colors"
-      >
-        {savingWeight ? "Saving…" : "Save weight"}
-      </button>
+      <div className="flex flex-wrap items-center gap-x-3 min-h-11">
+        <AutosaveStatus
+          state={weightAuto.saver.state}
+          onRetry={() => void weightAuto.saver.retry()}
+          showIncomplete={!!weightInput.trim()}
+          savedText={
+            weightAuto.written
+              ? `Saved ${weightAuto.written.lb.toFixed(1)} lb for ${weightAuto.written.day === etTodayStr() ? "today" : formatShortDate(weightAuto.written.day)}`
+              : "Saved"
+          }
+        />
+        {weightAuto.written && weightAuto.saver.state.status === "saved" && (
+          <button
+            type="button"
+            onClick={() => void undoWeight()}
+            disabled={savingWeight}
+            className="min-h-11 px-1 text-[12px] text-text-tertiary hover:text-text-primary underline underline-offset-2 disabled:opacity-40"
+          >
+            {savingWeight ? "Undoing…" : "Undo"}
+          </button>
+        )}
+        {!weightInput.trim() && weightAuto.saver.state.status === "idle" && (
+          <span className="text-[12px] text-text-tertiary">Saves as you type</span>
+        )}
+      </div>
+      {weightUndoErr && <p role="alert" className="mt-1 text-[13px] text-down">{weightUndoErr}</p>}
     </ChartCard>
     </div>
   );

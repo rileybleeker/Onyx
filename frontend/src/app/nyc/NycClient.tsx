@@ -11,6 +11,9 @@ import ChartCard from "@/components/ChartCard";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import NycMap, { markerColor } from "./NycMap";
 import { usePageHeadingTestId } from "@/components/FeedContext";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
+import { AutosaveRefused } from "@/lib/autosave";
+import { useAutosave } from "@/lib/use-autosave";
 
 const NOTION_DB_URL = "https://www.notion.so/967fdf52d6ee4aab9a5854298e564b43";
 const BRIEF =
@@ -71,6 +74,8 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const seq = useRef<Record<string, number>>({});
   const rowRefs = useRef<Record<string, HTMLTableRowElement | null>>({});
+  const leadsRef = useRef(leads);
+  leadsRef.current = leads;
 
   // Silent revalidation on mount (skeleton only when there was no seed).
   useEffect(() => {
@@ -156,20 +161,37 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
     if (fromMap) rowRefs.current[id]?.scrollIntoView({ block: "center", behavior: "smooth" });
   }
 
-  function toggleExpand(lead: NycLead) {
+  // Riley's note autosaves (lib/autosave.ts): sent after a pause and when the box is left, through the same PATCH.
+  const noteSave = useAutosave<{ id: string; note: string }>("nyc-note", {
+    delayMs: 1200,
+    same: (a, b) => a.id === b.id && a.note.trim() === b.note.trim(),
+    save: async (v) => {
+      const lead = leadsRef.current.find((l) => l.id === v.id);
+      if (!lead) return; // the lead left the list: nothing to write to
+      const err = await save(lead, { rileyNote: v.note }, true);
+      if (err === "network") throw new Error("Couldn't reach Onyx.");
+      if (err) throw new AutosaveRefused(err);
+    },
+  });
+
+  async function toggleExpand(lead: NycLead) {
     setSelectedId(lead.id);
     setSaveError(null);
+    // A note still waiting for the lead being closed is sent first, then the box follows the new lead.
+    await noteSave.flush();
     if (expandedId === lead.id) {
       setExpandedId(null);
     } else {
       setExpandedId(lead.id);
       setNoteDraft(lead.rileyNote);
+      noteSave.reset({ id: lead.id, note: lead.rileyNote });
     }
   }
 
   // Optimistic write: apply locally, revert on failure. The per-lead sequence
-  // number stops a slow earlier response from undoing a newer tap.
-  async function save(lead: NycLead, patch: { riley?: RileyDecision; rileyNote?: string }) {
+  // number stops a slow earlier response from undoing a newer tap. Answers null, or why it failed ("network" when
+  // Onyx could not be reached). `quiet`: the caller shows the failure itself (the note's status line).
+  async function save(lead: NycLead, patch: { riley?: RileyDecision; rileyNote?: string }, quiet = false): Promise<string | null> {
     const my = (seq.current[lead.id] = (seq.current[lead.id] ?? 0) + 1);
     const before = lead;
     setSaveError(null);
@@ -180,14 +202,16 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
       });
-      const body = await res.json();
+      const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
       if (seq.current[lead.id] === my) setLeads((prev) => prev.map((l) => (l.id === lead.id ? body.lead : l)));
+      return null;
     } catch (e) {
       if (seq.current[lead.id] === my) {
         setLeads((prev) => prev.map((l) => (l.id === lead.id ? before : l)));
-        setSaveError(`Couldn't save lead ${lead.number}: ${(e as Error).message}`);
+        if (!quiet) setSaveError(`Couldn't save lead ${lead.number}: ${(e as Error).message}`);
       }
+      return e instanceof TypeError ? "network" : (e as Error).message;
     }
   }
 
@@ -459,19 +483,17 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
                                 <textarea
                                   id={`note-${l.id}`}
                                   value={noteDraft}
-                                  onChange={(e) => setNoteDraft(e.target.value)}
+                                  onChange={(e) => {
+                                    setNoteDraft(e.target.value);
+                                    noteSave.change({ id: l.id, note: e.target.value });
+                                  }}
+                                  onBlur={() => void noteSave.flush()}
                                   rows={3}
                                   maxLength={2000}
                                   className="w-full bg-surface-card border border-border-default rounded-control px-2 py-1.5 text-text-primary"
                                   placeholder="e.g. ask about the second room; skip if no laundry"
                                 />
-                                <button
-                                  onClick={() => save(l, { rileyNote: noteDraft })}
-                                  disabled={noteDraft.trim() === l.rileyNote}
-                                  className="px-3 py-1 rounded-control border border-accent/50 text-accent text-[12px] disabled:opacity-40"
-                                >
-                                  Save note
-                                </button>
+                                <AutosaveStatus state={noteSave.state} onRetry={() => void noteSave.retry()} />
                               </div>
                             </div>
                           </td>

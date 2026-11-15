@@ -6,6 +6,9 @@ import { createSupabaseBrowser } from '@/lib/supabase-browser';
 import { todayLocal } from '@/lib/care-planner';
 import type { Section } from '@/lib/medical-records-server';
 import InfoHint from '@/components/InfoHint';
+import { AutosaveStatus } from '@/components/AutosaveStatus';
+import { AutosaveRefused } from '@/lib/autosave';
+import { useAutosave } from '@/lib/use-autosave';
 import { Part, PartGroup, PartGrid } from '@/components/personalize/PartGrid';
 import type { PageLayout } from '@/lib/personalize-layout';
 import {
@@ -40,8 +43,16 @@ async function call(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', path: string, b
     if (!res.ok) return { ok: false, error: typeof data.error === 'string' ? data.error : `request failed (${res.status})` };
     return { ok: true, data };
   } catch {
-    return { ok: false, error: 'Onyx could not be reached. Check the connection and try again.' };
+    return { ok: false, error: UNREACHABLE };
   }
+}
+
+const UNREACHABLE = 'Onyx could not be reached. Check the connection and try again.';
+
+/** A failed autosave: offline is retried on its own, anything the server refused waits for a change or Retry. */
+function autosaveFailure(a: Answer): Error {
+  if (!a.ok && a.error === UNREACHABLE) return new Error(a.error);
+  return new AutosaveRefused(a.ok ? 'unexpected answer' : a.error);
 }
 
 function FlagChip({ result }: { result: LabResult }) {
@@ -190,7 +201,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
             results={results} series={series} filter={testFilter} setFilter={setTestFilter} docById={docById}
             busy={busy} editing={editing} setEditing={setEditing} docs={listedDocs}
             onRemove={removeLab}
-            onEdited={r => { setResults(cur => cur.map(x => (x.id === r.id ? r : x))); setEditing(null); setNotice({ text: 'Saved.' }); }}
+            onEdited={r => setResults(cur => cur.map(x => (x.id === r.id ? r : x)))}
           />
         </Part>}
       </PartGroup>
@@ -215,7 +226,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
             ? <p className="text-text-secondary">No documents yet. Upload a PDF or a photo of a record above.</p>
             : <DocumentList
                 docs={listedDocs} busy={busy} resultsPerDoc={resultsPerDoc} onRemove={removeDoc}
-                onEdited={d => { setDocs(cur => cur.map(x => (x.id === d.id ? d : x))); setNotice({ text: 'Saved.' }); }}
+                onEdited={d => setDocs(cur => cur.map(x => (x.id === d.id ? d : x)))}
               />}
         </Part>}
       </PartGroup>
@@ -403,7 +414,7 @@ function LabTable(props: {
         </thead>
         <tbody>
           {rows.slice(0, limit).map(r => editing === r.id
-            ? <tr key={r.id}><td colSpan={7} className="py-2"><LabEditForm result={r} docs={docs} onCancel={() => setEditing(null)} onSaved={onEdited} /></td></tr>
+            ? <tr key={r.id}><td colSpan={7} className="py-2"><LabEditForm result={r} docs={docs} onDone={() => setEditing(null)} onSaved={onEdited} /></td></tr>
             : <tr key={r.id} className="border-t border-border-subtle align-top">
                 <td className="py-2 pr-3 whitespace-nowrap">{r.collectedOn}</td>
                 <td className="pr-3">{r.test}{r.notes && <p className="text-xs whitespace-pre-wrap text-text-tertiary">{r.notes}</p>}</td>
@@ -426,55 +437,73 @@ function LabTable(props: {
   </div>;
 }
 
-function LabEditForm({ result, docs, onCancel, onSaved }: { result: LabResult; docs: MedicalDocument[]; onCancel: () => void; onSaved: (r: LabResult) => void }) {
-  const [test, setTest] = useState(result.test);
-  const [value, setValue] = useState(result.value === null ? result.valueText : String(result.value));
-  const [unit, setUnit] = useState(result.unit);
-  const [range, setRange] = useState(formatRange(result));
-  const [collectedOn, setCollectedOn] = useState(result.collectedOn);
-  const [lab, setLab] = useState(result.lab);
-  const [documentId, setDocumentId] = useState(result.documentId ?? '');
-  const [notes, setNotes] = useState(result.notes);
-  const [error, setError] = useState('');
-  const [saving, setSaving] = useState(false);
+type LabFields = { test: string; value: string; unit: string; range: string; collectedOn: string; lab: string; documentId: string; notes: string };
+const labFieldsOf = (r: LabResult): LabFields => ({
+  test: r.test, value: r.value === null ? r.valueText : String(r.value), unit: r.unit, range: formatRange(r),
+  collectedOn: r.collectedOn, lab: r.lab, documentId: r.documentId ?? '', notes: r.notes,
+});
 
-  async function save() {
-    setError('');
-    const next = parseLabResult({ ...result, test, ...parseLabValue(value), unit, ...parseRange(range), collectedOn, lab, documentId: documentId || null, notes });
-    if (!next.ok) { setError(next.error); return; }
-    // Send only what changed: an unchanged link to a since-removed document is left alone.
-    const patch: Partial<Record<keyof LabResult, unknown>> = {};
-    for (const key of Object.keys(next.result) as (keyof LabResult)[]) {
-      if (key !== 'id' && next.result[key] !== result[key]) patch[key] = next.result[key];
-    }
-    if (!Object.keys(patch).length) { onSaved(result); return; }
-    setSaving(true);
-    const a = await call('PATCH', `/api/medical/labs/${result.id}`, patch);
-    setSaving(false);
-    const saved = a.ok ? rowFromApiLab(a.data.result) : null;
-    if (!saved) { setError(`Not saved: ${a.ok ? 'unexpected answer' : a.error}`); return; }
-    onSaved(saved);
+/**
+ * Autosave (Riley 2026-11-15, lib/autosave.ts): each change is checked with the same parser and sent on its own
+ * through PATCH /api/medical/labs/[id] (only the fields that differ from what is saved); Done closes the editor.
+ */
+function LabEditForm({ result, docs, onDone, onSaved }: { result: LabResult; docs: MedicalDocument[]; onDone: () => void; onSaved: (r: LabResult) => void }) {
+  const [f, setF] = useState<LabFields>(() => labFieldsOf(result));
+  const saved = useRef(result);
+  const failed = useRef(false);
+  const parse = (v: LabFields) => parseLabResult({ ...saved.current, test: v.test, ...parseLabValue(v.value), unit: v.unit, ...parseRange(v.range), collectedOn: v.collectedOn, lab: v.lab, documentId: v.documentId || null, notes: v.notes });
+  const autosave = useAutosave<LabFields>('lab-edit', {
+    delayMs: 1200,
+    ready: v => { const next = parse(v); return next.ok ? null : next.error; },
+    save: async v => {
+      failed.current = true;
+      const next = parse(v);
+      if (!next.ok) throw new AutosaveRefused(next.error);
+      // Send only what changed: an unchanged link to a since-removed document is left alone.
+      const patch: Partial<Record<keyof LabResult, unknown>> = {};
+      for (const key of Object.keys(next.result) as (keyof LabResult)[]) {
+        if (key !== 'id' && next.result[key] !== saved.current[key]) patch[key] = next.result[key];
+      }
+      if (Object.keys(patch).length) {
+        const a = await call('PATCH', `/api/medical/labs/${result.id}`, patch);
+        const row = a.ok ? rowFromApiLab(a.data.result) : null;
+        if (!row) throw autosaveFailure(a);
+        saved.current = row;
+        onSaved(row);
+      }
+      failed.current = false;
+    },
+  }, labFieldsOf(result));
+  const edit = (patch: Partial<LabFields>, typed = true) => {
+    const next = { ...f, ...patch };
+    setF(next);
+    autosave.change(next, { delayMs: typed ? 1200 : 400 });
+  };
+  const flush = () => void autosave.flush();
+  async function done() {
+    if (parse(f).ok) await autosave.flush();
+    else return; // the status line says what is wrong; the last valid version stays saved
+    if (!failed.current) onDone();
   }
 
   return <div className="space-y-2 rounded-xl border border-border-emphasis p-3">
     <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-      <input className={`${field} col-span-2`} aria-label="Test" maxLength={80} value={test} onChange={e => setTest(e.target.value)} />
-      <input className={field} aria-label="Value" maxLength={40} value={value} onChange={e => setValue(e.target.value)} />
-      <input className={field} aria-label="Unit" placeholder="Unit" maxLength={24} value={unit} onChange={e => setUnit(e.target.value)} />
-      <input className={field} aria-label="Range" placeholder="Range" maxLength={40} value={range} onChange={e => setRange(e.target.value)} />
-      <input type="date" className={field} aria-label="Collected on" value={collectedOn} onChange={e => setCollectedOn(e.target.value)} />
-      <input className={field} aria-label="Lab" placeholder="Lab" maxLength={100} value={lab} onChange={e => setLab(e.target.value)} />
-      <select className={field} aria-label="From document" value={documentId} onChange={e => setDocumentId(e.target.value)}>
+      <input className={`${field} col-span-2`} aria-label="Test" maxLength={80} value={f.test} onChange={e => edit({ test: e.target.value })} onBlur={flush} />
+      <input className={field} aria-label="Value" maxLength={40} value={f.value} onChange={e => edit({ value: e.target.value })} onBlur={flush} />
+      <input className={field} aria-label="Unit" placeholder="Unit" maxLength={24} value={f.unit} onChange={e => edit({ unit: e.target.value })} onBlur={flush} />
+      <input className={field} aria-label="Range" placeholder="Range" maxLength={40} value={f.range} onChange={e => edit({ range: e.target.value })} onBlur={flush} />
+      <input type="date" className={field} aria-label="Collected on" value={f.collectedOn} onChange={e => edit({ collectedOn: e.target.value })} onBlur={flush} />
+      <input className={field} aria-label="Lab" placeholder="Lab" maxLength={100} value={f.lab} onChange={e => edit({ lab: e.target.value })} onBlur={flush} />
+      <select className={field} aria-label="From document" value={f.documentId} onChange={e => edit({ documentId: e.target.value }, false)}>
         <option value="">No document</option>
         {result.documentId && !docs.some(d => d.id === result.documentId) && <option value={result.documentId}>(removed document)</option>}
         {docs.map(d => <option key={d.id} value={d.id}>{d.date} · {d.title}</option>)}
       </select>
-      <textarea className={`${field} col-span-2 sm:col-span-4`} aria-label="Note" placeholder="Note (optional)" maxLength={MAX_LAB_NOTES} rows={2} value={notes} onChange={e => setNotes(e.target.value)} />
+      <textarea className={`${field} col-span-2 sm:col-span-4`} aria-label="Note" placeholder="Note (optional)" maxLength={MAX_LAB_NOTES} rows={2} value={f.notes} onChange={e => edit({ notes: e.target.value })} onBlur={flush} />
     </div>
     <div className="flex flex-wrap items-center gap-2">
-      <button className={`${small} border-accent text-accent`} disabled={saving} onClick={save}>{saving ? 'Saving…' : 'Save'}</button>
-      <button className={small} disabled={saving} onClick={onCancel}>Cancel</button>
-      {error && <p role="alert" className="text-sm text-amber-400">{error}</p>}
+      <button className={`${small} border-accent text-accent`} onClick={() => void done()}>Done</button>
+      <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} showIncomplete />
     </div>
   </div>;
 }
@@ -585,7 +614,7 @@ function DocumentList({ docs, busy, resultsPerDoc, onRemove, onEdited }: {
     <ul className="divide-y divide-border-subtle">
       {shown.map(d => <li key={d.id} className="py-3">
         {editing === d.id
-          ? <DocumentEditForm doc={d} onCancel={() => setEditing(null)} onSaved={saved => { setEditing(null); onEdited(saved); }} />
+          ? <DocumentEditForm doc={d} onDone={() => setEditing(null)} onSaved={onEdited} />
           : <div className="flex flex-wrap items-start justify-between gap-2">
               <div className="min-w-0">
                 <a className="font-medium text-accent hover:underline" href={`/api/medical/documents/${d.id}/file`} target="_blank" rel="noopener noreferrer">{d.title}</a>
@@ -606,39 +635,49 @@ function DocumentList({ docs, busy, resultsPerDoc, onRemove, onEdited }: {
   </div>;
 }
 
-function DocumentEditForm({ doc, onCancel, onSaved }: { doc: MedicalDocument; onCancel: () => void; onSaved: (d: MedicalDocument) => void }) {
-  const [title, setTitle] = useState(doc.title);
-  const [kind, setKind] = useState<DocKind>(doc.kind);
-  const [date, setDate] = useState(doc.date);
-  const [provider, setProvider] = useState(doc.provider);
-  const [notes, setNotes] = useState(doc.notes);
-  const [error, setError] = useState('');
-  const [saving, setSaving] = useState(false);
+type DocFields = { title: string; kind: DocKind; date: string; provider: string; notes: string };
 
-  async function save() {
-    setError('');
-    setSaving(true);
-    const a = await call('PATCH', `/api/medical/documents/${doc.id}`, { title, kind, date, provider, notes });
-    setSaving(false);
-    const saved = a.ok ? rowFromApiDoc(a.data.document) : null;
-    if (!saved) { setError(`Not saved: ${a.ok ? 'unexpected answer' : a.error}`); return; }
-    onSaved(saved);
+/** Autosave, as LabEditForm: each change goes through PATCH /api/medical/documents/[id]; Done closes. */
+function DocumentEditForm({ doc, onDone, onSaved }: { doc: MedicalDocument; onDone: () => void; onSaved: (d: MedicalDocument) => void }) {
+  const [f, setF] = useState<DocFields>({ title: doc.title, kind: doc.kind, date: doc.date, provider: doc.provider, notes: doc.notes });
+  const failed = useRef(false);
+  const autosave = useAutosave<DocFields>('document-edit', {
+    delayMs: 1200,
+    ready: v => (v.title.trim() ? null : 'Give the document a title.'),
+    save: async v => {
+      failed.current = true;
+      const a = await call('PATCH', `/api/medical/documents/${doc.id}`, v);
+      const row = a.ok ? rowFromApiDoc(a.data.document) : null;
+      if (!row) throw autosaveFailure(a);
+      onSaved(row);
+      failed.current = false;
+    },
+  }, { title: doc.title, kind: doc.kind, date: doc.date, provider: doc.provider, notes: doc.notes });
+  const edit = (patch: Partial<DocFields>, typed = true) => {
+    const next = { ...f, ...patch };
+    setF(next);
+    autosave.change(next, { delayMs: typed ? 1200 : 400 });
+  };
+  const flush = () => void autosave.flush();
+  async function done() {
+    if (!f.title.trim()) return;
+    await autosave.flush();
+    if (!failed.current) onDone();
   }
 
   return <div className="space-y-2">
     <div className="grid gap-2 sm:grid-cols-2">
-      <input className={field} aria-label="Title" maxLength={120} value={title} onChange={e => setTitle(e.target.value)} />
-      <select className={field} aria-label="Kind" value={kind} onChange={e => setKind(e.target.value as DocKind)}>
+      <input className={field} aria-label="Title" maxLength={120} value={f.title} onChange={e => edit({ title: e.target.value })} onBlur={flush} />
+      <select className={field} aria-label="Kind" value={f.kind} onChange={e => edit({ kind: e.target.value as DocKind }, false)}>
         {DOC_KINDS.map(k => <option key={k} value={k}>{DOC_KIND_LABEL[k]}</option>)}
       </select>
-      <input type="date" className={field} aria-label="Date of service" value={date} onChange={e => setDate(e.target.value)} />
-      <input className={field} aria-label="Provider" placeholder="Provider" maxLength={120} value={provider} onChange={e => setProvider(e.target.value)} />
-      <textarea className={`${field} sm:col-span-2`} aria-label="Note" placeholder="Note" maxLength={MAX_DOC_NOTES} rows={2} value={notes} onChange={e => setNotes(e.target.value)} />
+      <input type="date" className={field} aria-label="Date of service" value={f.date} onChange={e => edit({ date: e.target.value })} onBlur={flush} />
+      <input className={field} aria-label="Provider" placeholder="Provider" maxLength={120} value={f.provider} onChange={e => edit({ provider: e.target.value })} onBlur={flush} />
+      <textarea className={`${field} sm:col-span-2`} aria-label="Note" placeholder="Note" maxLength={MAX_DOC_NOTES} rows={2} value={f.notes} onChange={e => edit({ notes: e.target.value })} onBlur={flush} />
     </div>
     <div className="flex flex-wrap items-center gap-2">
-      <button className={`${small} border-accent text-accent`} disabled={saving || !title.trim()} onClick={save}>{saving ? 'Saving…' : 'Save'}</button>
-      <button className={small} disabled={saving} onClick={onCancel}>Cancel</button>
-      {error && <p role="alert" className="text-sm text-amber-400">{error}</p>}
+      <button className={`${small} border-accent text-accent`} onClick={() => void done()}>Done</button>
+      <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} showIncomplete />
     </div>
   </div>;
 }

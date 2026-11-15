@@ -2,6 +2,9 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import InfoHint from "./InfoHint";
+import { AutosaveStatus } from "./AutosaveStatus";
+import { AutosaveRefused } from "@/lib/autosave";
+import { useAutosave } from "@/lib/use-autosave";
 import {
   describeStatus,
   FOCUS_RULES,
@@ -16,7 +19,10 @@ import {
  * Reads and writes /api/focus/config (owner session); the habit list comes from /api/habits/list
  * (active habits in Notion); "Today" shows the same answer the phone gets from
  * /api/focus/unlock-status. Default (nothing chosen) = the phone's time-only rule, as before.
+ * Autosave (lib/autosave.ts): every tick and rule change is saved on its own after a short pause; no Save button.
  */
+
+type FocusValue = { rule: FocusUnlockRule; selected: string[] };
 
 interface Option {
   id: string;
@@ -34,10 +40,7 @@ export default function FocusUnlockSettings() {
   const [options, setOptions] = useState<Option[]>([]);
   const [rule, setRule] = useState<FocusUnlockRule>("or");
   const [selected, setSelected] = useState<string[]>([]);
-  const [saved, setSaved] = useState<{ rule: FocusUnlockRule; ids: string[] }>({ rule: "or", ids: [] });
   const [filter, setFilter] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [saveMessage, setSaveMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [status, setStatus] = useState<FocusUnlockStatus | null>(null);
   const [statusFailed, setStatusFailed] = useState(false);
 
@@ -52,6 +55,31 @@ export default function FocusUnlockSettings() {
       setStatusFailed(true);
     }
   }, []);
+
+  // The phone reads this on its next check, so a change is sent after a short pause (a burst of ticks = one PUT).
+  const autosave = useAutosave<FocusValue>(
+    "focus-unlock",
+    {
+      delayMs: 700,
+      save: async ({ rule, selected }, { keepalive }) => {
+        const res = await fetch("/api/focus/config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ rule, habit_page_ids: selected }),
+          keepalive,
+        });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const text = json.error ?? `HTTP ${res.status}`;
+          if (res.status >= 400 && res.status < 500) throw new AutosaveRefused(text);
+          throw new Error(text);
+        }
+        void loadStatus();
+      },
+    },
+    { rule: "or", selected: [] },
+  );
+  const { change: changeAutosave, setBaseline } = autosave;
 
   useEffect(() => {
     let cancelled = false;
@@ -87,7 +115,7 @@ export default function FocusUnlockSettings() {
         setListError(listFailed);
         setRule(nextRule);
         setSelected(ids);
-        setSaved({ rule: nextRule, ids });
+        setBaseline({ rule: nextRule, selected: ids });
         setLoad("ready");
       } catch (e) {
         if (cancelled) return;
@@ -99,9 +127,8 @@ export default function FocusUnlockSettings() {
     return () => {
       cancelled = true;
     };
-  }, [loadStatus]);
+  }, [loadStatus, setBaseline]);
 
-  const dirty = rule !== saved.rule || selected.length !== saved.ids.length || selected.some((id, i) => id !== saved.ids[i]);
   const atLimit = selected.length >= MAX_FOCUS_HABITS;
 
   const visible = useMemo(() => {
@@ -113,33 +140,14 @@ export default function FocusUnlockSettings() {
   }, [options, selected, filter]);
 
   function toggle(id: string) {
-    setSaveMessage(null);
-    setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : prev.length >= MAX_FOCUS_HABITS ? prev : [...prev, id]));
+    const next = selected.includes(id) ? selected.filter((x) => x !== id) : selected.length >= MAX_FOCUS_HABITS ? selected : [...selected, id];
+    setSelected(next);
+    changeAutosave({ rule, selected: next });
   }
 
-  async function save() {
-    setSaving(true);
-    setSaveMessage(null);
-    try {
-      const res = await fetch("/api/focus/config", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rule, habit_page_ids: selected }),
-      });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
-      const ids = ((json.chosen ?? []) as { id: string }[]).map((c) => c.id);
-      const nextRule: FocusUnlockRule = json.rule === "and" ? "and" : "or";
-      setRule(nextRule);
-      setSelected(ids);
-      setSaved({ rule: nextRule, ids });
-      setSaveMessage({ ok: true, text: "Saved. The phone picks it up the next time the Onyx app is opened." });
-      void loadStatus();
-    } catch (e) {
-      setSaveMessage({ ok: false, text: `Not saved: ${e instanceof Error ? e.message : String(e)}` });
-    } finally {
-      setSaving(false);
-    }
+  function pickRule(r: FocusUnlockRule) {
+    setRule(r);
+    changeAutosave({ rule: r, selected });
   }
 
   return (
@@ -175,10 +183,7 @@ export default function FocusUnlockSettings() {
                   name="focus-rule"
                   className="mt-1"
                   checked={rule === r}
-                  onChange={() => {
-                    setRule(r);
-                    setSaveMessage(null);
-                  }}
+                  onChange={() => pickRule(r)}
                 />
                 <span>
                   <span className="text-text-primary text-sm">{FOCUS_RULE_TEXT[r].label}</span>
@@ -237,15 +242,8 @@ export default function FocusUnlockSettings() {
           </div>
 
           <div className="space-y-1.5">
-            <button
-              type="button"
-              onClick={save}
-              disabled={!dirty || saving}
-              className="block w-full text-center bg-accent hover:bg-accent/90 disabled:opacity-50 text-on-accent font-medium py-2.5 rounded-full text-sm transition-colors"
-            >
-              {saving ? "Saving…" : dirty ? "Save" : "Saved"}
-            </button>
-            {saveMessage && <p className={`text-xs ${saveMessage.ok ? "text-text-tertiary" : "text-down"}`}>{saveMessage.text}</p>}
+            <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} />
+            <p className="text-text-tertiary text-xs">Changes save on their own. The phone picks them up the next time the Onyx app is opened.</p>
           </div>
         </>
       )}

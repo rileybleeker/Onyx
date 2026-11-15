@@ -9,7 +9,9 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
 
 type Ctx = { params: Promise<{ id: string }> };
 
-/** PATCH /api/reading/highlights/:id — body: { comment?, concept?, chapter?, location?, archived? } */
+const SOURCES = ["manual", "kindle", "audible", "paper", "photo"];
+
+/** PATCH /api/reading/highlights/:id — body: { passage?, comment?, concept?, chapter?, location?, source?, archived? } */
 export async function PATCH(req: NextRequest, ctx: Ctx) {
   const { id } = await ctx.params;
   const highlight_id = Number(id);
@@ -21,10 +23,25 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
   if ("location" in body) patch.location = String(body.location ?? "").trim() || null;
   if ("chapter" in body) patch.chapter = body.chapter === null || body.chapter === "" ? null : Math.round(Number(body.chapter));
   if ("archived" in body) patch.archived = Boolean(body.archived);
+  // The autosaving highlight form (/reading) edits the passage and source of the highlight it just created.
+  if ("passage" in body) {
+    const passage = typeof body.passage === "string" ? body.passage.trim() : "";
+    if (!passage) return NextResponse.json({ error: "passage is required" }, { status: 400 });
+    patch.passage = passage;
+  }
+  if ("source" in body) {
+    if (typeof body.source !== "string" || !SOURCES.includes(body.source)) return NextResponse.json({ error: "bad source" }, { status: 400 });
+    patch.source = body.source;
+  }
   if (!Object.keys(patch).length) return NextResponse.json({ error: "nothing to update" }, { status: 400 });
 
   const { data, error } = await supabase.from("book_highlights").update(patch).eq("highlight_id", highlight_id).select(HIGHLIGHT_COLS).single();
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    // (book_id, passage) is unique: the same passage is already saved for this book.
+    if (error.code === "23505") return NextResponse.json({ error: "That passage is already saved for this book." }, { status: 409 });
+    if (error.code === "PGRST116") return NextResponse.json({ error: "That highlight no longer exists." }, { status: 404 });
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
   const h = data as Highlight;
   if (h.notion_block_id && !("archived" in patch)) after(() => updateMirroredHighlight(h));
   return NextResponse.json({ success: true, highlight: h });

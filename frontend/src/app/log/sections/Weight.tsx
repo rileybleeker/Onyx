@@ -6,7 +6,9 @@ import { cachedJson, clientCache } from "@/lib/client-cache";
 import { kgToLb, lbToKg, sameJson } from "@/lib/format";
 import { useLogDrafts } from "@/lib/log-drafts";
 import { LOG_WEIGHT_URL, logEarlyGet } from "@/lib/log-early";
-import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
+import { etToday, useWeightAutosave } from "@/lib/weight-entry";
+import { DraftMark, LogCard, SectionSkeleton } from "./ui";
 
 /**
  * /log Weight. Shows the day's weight with its source (Tanita scale rollup or a manual entry) and takes one pounds
@@ -14,7 +16,9 @@ import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
  * one row per ET calendar day, no day after today, 0 to 1000 lb, and saving a day that already has a row replaces
  * it (a manual entry then owns that day, so the scale rollup stops touching it). Reads GET /api/weight?days=365
  * through the client cache: a year, so the last weigh-in still shows after a long gap (the table holds at most one
- * row per day). A Say it draft (WeightLogDraft) fills the form as a suggestion; nothing is written until Save.
+ * row per day). No Save button: the entry saves itself (lib/weight-entry.ts: typing, Enter, leaving the field,
+ * moving the Day, Undo). A Say it draft (WeightLogDraft) fills the fields Riley has not changed and is saved the same
+ * way (his own words), then cleared.
  */
 
 const WEIGHT_URL = LOG_WEIGHT_URL;
@@ -36,10 +40,6 @@ function checkWeight(raw: unknown) {
   if (!asWeight(raw)) throw new Error("unexpected weight answer");
 }
 
-/** ET calendar today (the POST's own default for log_date). */
-function etToday(): string {
-  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-}
 function shortDate(ymd: string): string {
   return new Date(`${ymd}T12:00:00Z`).toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric" });
 }
@@ -54,28 +54,53 @@ function SourceTag({ source }: { source: WeightRow["source"] }) {
   );
 }
 
-type Msg = { kind: "ok" | "err"; text: string } | null;
-
 export default function WeightSection() {
   const [data, setData] = useState<WeightAnswer | null>(() => asWeight(clientCache.peek(WEIGHT_URL)));
   const [loadFailed, setLoadFailed] = useState(false);
   const [today, setToday] = useState(etToday);
   const [input, setInput] = useState("");
   const [date, setDate] = useState(today);
-  const [saving, setSaving] = useState(false);
-  const [msg, setMsg] = useState<Msg>(null);
+  const [undoErr, setUndoErr] = useState<string | null>(null);
   const alive = useRef(true);
+  const rowsRef = useRef<WeightRow[]>([]);
+  rowsRef.current = data?.rows ?? [];
 
   // Draft (Say it): fields filled from it, fields Riley changed since load.
   const { draft, clear } = useLogDrafts("weight");
   const [fromDraft, setFromDraft] = useState<{ id: number; lb: boolean; date: boolean } | null>(null);
   const touched = useRef({ lb: false, date: false });
   const seenDraft = useRef<number | null>(null);
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
 
   const show = useCallback((raw: unknown) => {
     const v = asWeight(raw);
     if (v && alive.current) setData((prev) => (sameJson(prev, v) ? prev : v));
   }, []);
+
+  /** Put a stored row (or its removal) into the list on screen. */
+  const placeRow = useCallback((day: string, row: WeightRow | null) => {
+    if (!alive.current) return;
+    setData((prev) => {
+      const kept = (prev?.rows ?? []).filter((r) => r.log_date !== day);
+      const next = row ? [...kept, row].sort((a, b) => (a.log_date < b.log_date ? -1 : a.log_date > b.log_date ? 1 : 0)) : kept;
+      return { days: prev?.days ?? 365, rows: next };
+    });
+  }, []);
+
+  const { saver, written, edit: editEntry, undo, undoing, priorOf } = useWeightAutosave("log-weight", {
+    rows: () => rowsRef.current,
+    coversDays: () => (rowsRef.current.length || data ? 365 : 0),
+    onRow: placeRow,
+    onSaved: () => {
+      const d = draftRef.current;
+      if (d) clear(d.id);
+    },
+  });
+  const edit = useCallback((next: { day: string; lb: string }) => {
+    setUndoErr(null);
+    editEntry(next);
+  }, [editEntry]);
 
   // The routed page's first read takes the GET its HTML already started (lib/log-early.ts), once.
   const routed = !useInFeed();
@@ -115,30 +140,51 @@ export default function WeightSection() {
     const v = draft.value;
     const useLb = Number.isFinite(v.lb) && (force || !touched.current.lb);
     const useDate = (force || !touched.current.date) && !!v.date && isYmd(v.date);
-    if (useLb) setInput(String(Math.round(v.lb * 10) / 10));
-    if (useDate) setDate(v.date!);
-    else if ((force || !touched.current.date) && !v.date) setDate(today);
+    const nextLb = useLb ? String(Math.round(v.lb * 10) / 10) : input;
+    let nextDate = date;
+    if (useDate) nextDate = v.date!;
+    else if ((force || !touched.current.date) && !v.date) nextDate = today;
+    setInput(nextLb);
+    setDate(nextDate);
     if (force) touched.current = { lb: false, date: false };
     setFromDraft({ id: draft.id, lb: useLb, date: useDate });
-    setMsg(null);
-  }, [draft, today]);
+    if (useLb || nextDate !== date) edit({ day: nextDate || today, lb: nextLb });
+  }, [draft, today, input, date, edit]);
 
-  // Each new draft once: fill what Riley has not changed.
+  // Each new draft once: fill what Riley has not changed (then it saves like his own entry).
   useEffect(() => {
     if (!draft || seenDraft.current === draft.id) return;
     seenDraft.current = draft.id;
     applyDraft(false);
   }, [draft, applyDraft]);
 
-  // Draft gone (cleared elsewhere or a newer one replaced it): the marks go.
+  // A newer draft replaced the one the marks came from: the marks go (a saved draft keeps its marks).
   useEffect(() => {
-    // Functional: runs after a new draft's own setFromDraft in the same commit and keeps it.
-    setFromDraft((f) => (f && (!draft || draft.id !== f.id) ? null : f));
+    setFromDraft((f) => (f && draft && draft.id !== f.id ? null : f));
   }, [draft]);
 
+  /** Undo: the day gets back what it had before this screen wrote it; the form empties. */
+  const onUndo = async () => {
+    setUndoErr(null);
+    const err = await undo();
+    if (!alive.current) return;
+    if (err) {
+      setUndoErr(err);
+      return;
+    }
+    touched.current = { lb: false, date: false };
+    setInput("");
+    setDate(etToday());
+    setFromDraft(null);
+  };
+
+  /** Dismiss a draft that is not saved yet: the fields it filled go back to empty / today. */
   const dismissDraft = () => {
-    if (fromDraft?.lb && !touched.current.lb) setInput("");
-    if (fromDraft?.date && !touched.current.date) setDate(today);
+    const lb = fromDraft?.lb && !touched.current.lb ? "" : input;
+    const d = fromDraft?.date && !touched.current.date ? today : date;
+    setInput(lb);
+    setDate(d);
+    edit({ day: d, lb });
     setFromDraft(null);
     clear(draft?.id);
   };
@@ -150,53 +196,9 @@ export default function WeightSection() {
   const existing = rows.find((r) => r.log_date === day) ?? null;
   const lbValue = parseFloat(input);
   const draftUnused = !!draft && (!fromDraft || fromDraft.id !== draft.id || (!fromDraft.lb && !fromDraft.date));
-
-  async function save() {
-    if (saving) return;
-    const lb = parseFloat(input);
-    if (!Number.isFinite(lb) || lb <= 0 || lb > 1000) {
-      setMsg({ kind: "err", text: "Enter a weight in pounds between 0 and 1000." });
-      return;
-    }
-    const now = etToday();
-    if (!isYmd(day) || day > now) {
-      setMsg({ kind: "err", text: "Pick today or an earlier day." });
-      return;
-    }
-    setSaving(true);
-    setMsg(null);
-    try {
-      const res = await fetch("/api/weight", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ log_date: day, weight_kg: lbToKg(lb) }),
-      });
-      const json = (await res.json().catch(() => ({}))) as Partial<WeightRow> & { error?: string };
-      if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
-      if (!alive.current) return;
-      if (json.log_date && typeof json.weight_kg === "number") {
-        const row = json as WeightRow;
-        setData((prev) => {
-          const kept = (prev?.rows ?? []).filter((r) => r.log_date !== row.log_date);
-          const next = [...kept, row].sort((a, b) => (a.log_date < b.log_date ? -1 : a.log_date > b.log_date ? 1 : 0));
-          return { days: prev?.days ?? 365, rows: next };
-        });
-      }
-      setInput("");
-      touched.current = { lb: false, date: false };
-      setDate(now);
-      todayRef.current = now;
-      setToday(now);
-      setFromDraft(null);
-      if (draft) clear(draft.id);
-      setMsg({ kind: "ok", text: `Saved ${lb.toFixed(1)} lb for ${day === now ? "today" : shortDate(day)}` });
-      void cachedJson(WEIGHT_URL, { check: checkWeight }).then(show).catch(() => {});
-    } catch (e) {
-      if (alive.current) setMsg({ kind: "err", text: `Couldn't save the weight: ${e instanceof Error ? e.message : String(e)}` });
-    } finally {
-      if (alive.current) setSaving(false);
-    }
-  }
+  const savedHere = !!written && written.day === day;
+  // Before a save: the row this entry will replace. After: the row it replaced (what the day held before).
+  const replaced = savedHere ? priorOf(day) ?? null : existing;
 
   if (!data && !loadFailed) return <SectionSkeleton section="weight" />;
 
@@ -243,7 +245,7 @@ export default function WeightSection() {
 
       <form
         noValidate
-        onSubmit={(e) => { e.preventDefault(); void save(); }}
+        onSubmit={(e) => { e.preventDefault(); void saver.flush(); }}
         className="flex items-center gap-2"
       >
         <label className="sr-only" htmlFor="log-weight-lb">Weight in pounds</label>
@@ -258,15 +260,15 @@ export default function WeightSection() {
           onChange={(e) => {
             touched.current.lb = true;
             setInput(e.target.value);
-            setMsg(null);
             if (fromDraft?.lb) setFromDraft({ ...fromDraft, lb: false });
+            edit({ day, lb: e.target.value });
           }}
+          onBlur={() => void saver.flush()}
           placeholder={latest ? (kgToLb(Number(latest.weight_kg)) ?? 0).toFixed(1) : "lb"}
-          disabled={saving}
+          disabled={undoing}
           className="min-w-0 flex-1 min-h-11 px-3 text-[16px] font-mono tabular-nums bg-surface-sunken border border-border-subtle rounded-control text-text-primary placeholder:text-text-tertiary/60 focus:border-accent/60 outline-none disabled:opacity-40"
         />
         <span className="text-[13px] font-mono text-text-tertiary">lb</span>
-        <LogSaveButton onClick={() => void save()} disabled={!input.trim()} saving={saving} />
       </form>
 
       <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -278,17 +280,18 @@ export default function WeightSection() {
           max={today}
           onChange={(e) => {
             touched.current.date = true;
-            setDate(e.target.value || today);
-            setMsg(null);
+            const d = e.target.value || today;
+            setDate(d);
             if (fromDraft?.date) setFromDraft({ ...fromDraft, date: false });
+            edit({ day: d, lb: input });
           }}
-          disabled={saving}
+          disabled={undoing}
           className="min-h-11 px-2 text-[16px] font-mono bg-surface-sunken border border-border-subtle rounded-control text-text-primary focus:border-accent/60 outline-none disabled:opacity-40"
         />
         {day !== today && (
           <button
             type="button"
-            onClick={() => { touched.current.date = false; setDate(today); }}
+            onClick={() => { touched.current.date = false; setDate(today); edit({ day: today, lb: input }); }}
             className="min-h-11 px-1 text-[12px] text-text-tertiary hover:text-text-primary underline underline-offset-2"
           >
             Today
@@ -297,9 +300,11 @@ export default function WeightSection() {
         {fromDraft && (fromDraft.lb || fromDraft.date) && (
           <span className="flex items-center gap-2">
             <DraftMark />
-            <button type="button" onClick={dismissDraft} className="min-h-11 px-1 text-[12px] text-text-tertiary hover:text-text-primary underline underline-offset-2">
-              Dismiss
-            </button>
+            {!written && (
+              <button type="button" onClick={dismissDraft} className="min-h-11 px-1 text-[12px] text-text-tertiary hover:text-text-primary underline underline-offset-2">
+                Dismiss
+              </button>
+            )}
           </span>
         )}
       </div>
@@ -307,16 +312,25 @@ export default function WeightSection() {
       {input.trim() && Number.isFinite(lbValue) && lbValue > 0 && (
         <p className="mt-1 text-[12px] font-mono text-text-tertiary">= {lbToKg(lbValue).toFixed(2)} kg</p>
       )}
-      {existing && input.trim() && (
+      {replaced && input.trim() && (
         <p className="mt-1 text-[12px] text-text-secondary">
-          Replaces {existing.source === "tanita" ? "the Tanita reading" : "the entry"} ({fmtLb(existing.weight_kg)}) for {day === today ? "today" : shortDate(day)}.
+          {savedHere ? "Replaced" : "Replaces"} {replaced.source === "tanita" ? "the Tanita reading" : "the entry"} ({fmtLb(replaced.weight_kg)}) for {day === today ? "today" : shortDate(day)}.
         </p>
       )}
-      {msg && (
-        <p role={msg.kind === "err" ? "alert" : "status"} className={`mt-2 text-[13px] ${msg.kind === "ok" ? "text-up" : "text-down"}`}>
-          {msg.text}
-        </p>
-      )}
+      <div className="mt-2 flex flex-wrap items-center gap-x-3">
+        <AutosaveStatus
+          state={saver.state}
+          onRetry={() => void saver.retry()}
+          showIncomplete={!!input.trim()}
+          savedText={written ? `Saved ${written.lb.toFixed(1)} lb for ${written.day === today ? "today" : shortDate(written.day)}` : "Saved"}
+        />
+        {written && saver.state.status === "saved" && (
+          <button type="button" onClick={() => void onUndo()} disabled={undoing} className="min-h-11 px-1 text-[12px] text-text-tertiary hover:text-text-primary underline underline-offset-2 disabled:opacity-40">
+            {undoing ? "Undoing…" : "Undo"}
+          </button>
+        )}
+      </div>
+      {undoErr && <p role="alert" className="mt-1 text-[13px] text-down">{undoErr}</p>}
     </LogCard>
   );
 }
