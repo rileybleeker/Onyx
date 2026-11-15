@@ -66,10 +66,22 @@ function longDate(date: string): string {
   return new Date(date + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" });
 }
 
-export default function CheckInClient() {
+/**
+ * `feed`: drawn inside the continuous scroll (FeedSection.tsx) instead of on /check-in itself. The day tabs then
+ * keep the chosen day in this component instead of the address (the scroll owns the address bar, and a
+ * router.replace would leave the scroll for /check-in), and the heading is marked feed-page-heading.
+ */
+export default function CheckInClient({ feed = false }: { feed?: boolean } = {}) {
   const router = useRouter();
   const params = useSearchParams();
-  const requested = params.get("date");
+  const [feedDate, setFeedDate] = useState<string | null>(null);
+  const requested = feed ? feedDate : params.get("date");
+  // Switch the day being checked in (null = the server's today).
+  const showDate = useCallback((date: string | null) => {
+    if (feed) setFeedDate(date);
+    else router.replace(date ? `/check-in?date=${date}` : "/check-in", { scroll: false });
+  }, [feed, router]);
+  const headingTestId = feed ? "feed-page-heading" : undefined;
 
   const [data, setData] = useState<CheckinPayload | null>(null);
   const [cells, setCells] = useState<Cells>({}); // the day tab's questions
@@ -349,7 +361,7 @@ export default function CheckInClient() {
         drafts.holdAll();
         refreshDrafts();
         setData(null);
-        router.replace("/check-in", { scroll: false });
+        showDate(null);
         await load(null, true);
         setSaveError("A new day started. Unsaved answers are preserved under their original dates. Review them below before using them.");
       } else {
@@ -407,9 +419,7 @@ export default function CheckInClient() {
   // The marker stays while the row still holds the answer the text gave; any change by Riley removes it.
   const isFromVoice = (name: string) => !!data && voiceMarks.date === data.date && !!cells[name] && voiceMarks.marks[name] === cells[name].answer;
 
-  const goTo = (date: string) => {
-    router.replace(`/check-in?date=${date}`, { scroll: false });
-  };
+  const goTo = (date: string) => showDate(date);
 
   const reviewDraft = (entry: DatedDraft) => {
     if (!data || savingRef.current || !drafts.recover(entry.key, data)) return;
@@ -442,13 +452,13 @@ export default function CheckInClient() {
   if (visibleError && !data) {
     return (
       <div className="max-w-xl">
-        <h2 className="text-[28px] font-medium text-text-primary">Check-in</h2>
+        <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Check-in</h2>
         <p className="mt-4 text-sm text-text-secondary">{visibleError}</p>
         {draftRecovery}
         <button
           onClick={() => {
             // No date: the server decides which day it is (before 06:00 the clock date is a day ahead).
-            router.replace("/check-in", { scroll: false });
+            showDate(null);
             load(null);
           }}
           className="mt-4 min-h-11 px-4 text-[13px] bg-white/5 border border-border-subtle rounded-control">
@@ -477,7 +487,7 @@ export default function CheckInClient() {
   return (
     <div className="max-w-xl">
       <div className="mb-5">
-        <h2 className="text-[28px] font-medium text-text-primary">Check-in</h2>
+        <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Check-in</h2>
         <p className="text-sm text-text-tertiary mt-0.5">
           {refreshFailed ? `Showing the last loaded check-in for daytime ${data.date}. Dates are unchanged; refresh could not confirm today's date.` : nights.length > 0
             ? `Two parts. Sleep: ${nightLabel(nights[0].date, data.today).span}. Daytime: ${dayName === "Today" || dayName === "Yesterday" ? `${dayName.toLowerCase()}, ` : ""}${longDate(data.date)}.`
