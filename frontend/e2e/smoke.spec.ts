@@ -461,7 +461,9 @@ for (const p of PAGES) {
     await gotoAuthed(page, p.route, p.finalUrl);
     await settle(page);
     await expect(
-      pageHeading(page, page.getByText(p.heading, { exact: true })),
+      // The copy fallback is looked up inside <main>: since #281 the sidebar keeps nav labels ("Journal",
+      // "Caffeine", ...) in hidden rows that come first in the page, and .first() would pick one of those.
+      pageHeading(page, page.locator("main").getByText(p.heading, { exact: true })),
       `${p.route} did not render its "${p.heading}" heading`
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
@@ -506,7 +508,7 @@ test.describe("Caffeine — renders real historical rows", () => {
     await gotoAuthed(page, "/caffeine?days=720", /\/caffeine\?days=720/);
     await settle(page);
     await expect(
-      page.getByText("Caffeine", { exact: true }).first()
+      pageHeading(page, page.locator("main").getByText("Caffeine", { exact: true }))
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
     // Wait for the non-silent fetch to land (the ISR seed is discarded for a

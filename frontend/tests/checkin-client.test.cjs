@@ -110,6 +110,9 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
     "@/components/DeliveryPortions": { useDeliveryDishes: () => ({ groups: [], leftovers: [] }), DeliveryDishList: () => null, LeftoverList: () => null },
     // The trial question loads on its own (its own route, covered by tests/experiments.test.cjs).
     "./ExperimentAdherence": { __esModule: true, default: () => null },
+    // /check-in is a personalized page since #272; the grid uses React context, which this hook shim does not
+    // provide. Pass its parts through so the client renders as before.
+    "@/components/personalize/PartGrid": { PartGrid: ({ children }) => children, PartGroup: ({ children }) => children, Part: ({ children }) => children },
   }).default;
   function expand(node, id = "root") {
     if (node == null || typeof node === "boolean") return null;
