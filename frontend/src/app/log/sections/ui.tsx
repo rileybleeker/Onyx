@@ -1,8 +1,11 @@
 import type { ReactNode } from "react";
-import { FROM_WHAT_YOU_SAID } from "@/lib/log-drafts";
 
 // Shared pieces of the /log sections (AGENTS.md "Log screen"). Hook-free and without "use client", so the server
-// loading screen (../loading.tsx) can use the skeletons too; a client section imports them as client code.
+// loading screen (../loading.tsx) can use the skeletons too; a client section imports them as client code. It must
+// not import lib/log-drafts.ts (React hooks): that breaks the server build of loading.tsx.
+
+/** Same text as FROM_WHAT_YOU_SAID in lib/log-drafts.ts. */
+const FROM_WHAT_YOU_SAID = "from what you said";
 
 export type LogSkeletonId = "sayit" | "checkin" | "supplements" | "ubereats" | "weight" | "reading";
 

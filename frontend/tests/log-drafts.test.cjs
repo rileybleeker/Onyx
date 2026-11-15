@@ -105,6 +105,16 @@ test("the Check-in section is the real check-in, not a copy, and never owns Pers
   assert.match(checkin, /if \(!embedded \|\| !logDraft\) return;/, "only the embedded check-in takes Log drafts");
 });
 
+test("the skeletons stay server-safe (loading.tsx renders them on the server)", () => {
+  for (const f of ["app/log/sections/ui.tsx", "app/log/LogSkeleton.tsx", "app/log/loading.tsx"]) {
+    const text = read(f);
+    assert.ok(!/^"use client"/.test(text), `${f} is not a client module`);
+    assert.ok(!/^import (?!type )[^;]*from "react"/m.test(text), `${f} imports no React runtime`);
+    assert.ok(!/from "@\/lib\/log-drafts"/.test(text), `${f} must not import lib/log-drafts.ts (hooks)`);
+  }
+  assert.match(read("app/log/sections/ui.tsx"), /const FROM_WHAT_YOU_SAID = "from what you said";/);
+});
+
 test("nothing on /log writes on open: no write in the frame or the placeholders", () => {
   for (const f of ["app/log/LogClient.tsx", "app/log/FeedSection.tsx", "app/log/LogLoader.tsx", "app/log/sections/CheckIn.tsx", "app/log/sections/ui.tsx"]) {
     assert.ok(!/method:\s*["'](POST|PATCH|PUT|DELETE)["']/.test(read(f)), f);
