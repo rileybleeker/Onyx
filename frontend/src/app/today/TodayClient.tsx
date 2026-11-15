@@ -142,8 +142,10 @@ function fromDevice<T>(value: T) {
   return (previous: Load<T>): Load<T> => previous.state === "loading" ? { state: "ready", value } : previous.state === "error" ? { state: "ready", value, stale: true } : previous;
 }
 
-export default function TodayClient({ headingTestId = "page-heading" }: { headingTestId?: string } = {}) {
+export default function TodayClient({ headingTestId = "page-heading", feed = false }: { headingTestId?: string; feed?: boolean } = {}) {
   // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
+  // feed: drawn inside that scroll (FeedSection.tsx). Scrolling never writes, and reading today's experiment arm
+  // stamps it as revealed, so the scroll's Today never asks; it shows the copy /today read this session, if any.
   // Each panel starts from the cached copy when there is one (a revisit is instant), then revalidates.
   const [inbox, setInbox] = useState<Load<InboxResponse>>(() => cachedLoad(CACHE_KEYS.agentsInbox, parseInbox));
   const [reading, setReading] = useState<Load<ReadingOverview | null>>(() => cachedLoad(READING_URL, parseReading));
@@ -201,7 +203,7 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
     setReading((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setUrgent((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setCalendar((previous) => previous.state === "ready" ? previous : { state: "loading" });
-    setExperiment((previous) => previous.state === "ready" ? previous : { state: "loading" });
+    if (!feed) setExperiment((previous) => previous.state === "ready" ? previous : { state: "loading" });
     const inboxRequest = bounded(Promise.resolve().then(() => agentsApi.inbox())).then((data) => {
       const value = parseInbox(data);
       if (sequence.current !== current) return;
@@ -255,7 +257,7 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
         }).catch(() => { if (sequence.current === current) setMoney(keepMarked); });
       }, MONEY_RECHECK_MS);
     }).catch(() => { if (sequence.current === current) { setMoney(keepMarked); markCheck("money", false); } });
-    const experimentRequest = request(EXPERIMENT_URL, parseExperiment).then((value) => {
+    const experimentRequest = feed ? Promise.resolve() : request(EXPERIMENT_URL, parseExperiment).then((value) => {
       if (sequence.current === current) setExperiment(fresh(value));
     }).catch(() => { if (sequence.current === current) setExperiment((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
     const calendarRequest = request(calendarUrl(), readCalendarResponse).then((value) => {
@@ -264,7 +266,7 @@ export default function TodayClient({ headingTestId = "page-heading" }: { headin
     void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest, renewalsRequest, moneyRequest, experimentRequest, calendarRequest]).then(() => {
       if (sequence.current === current) { inFlight.current = false; setRefreshing(false); }
     });
-  }, [markCheck]);
+  }, [feed, markCheck]);
   // Reopening the app: fill empty panels from the copy kept on this device (IndexedDB) while the network
   // answers. Finance, procurement and experiment answers are never on the device, so they wait for the network.
   useEffect(() => {
