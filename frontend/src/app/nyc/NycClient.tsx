@@ -8,6 +8,7 @@ import type { NycLead, RileyDecision } from "@/lib/nyc";
 import { sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import NycMap, { markerColor } from "./NycMap";
 import { usePageHeadingTestId } from "@/components/FeedContext";
 
@@ -224,15 +225,33 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         </div>
       )}
 
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        <StatCard label="Active leads" value={active.length} sublabel="not gone, not passed" />
-        <StatCard label="Fit the brief" value={fits.length} sublabel="full fit or meets numbers" />
-        <StatCard label="Interested" value={interested.length} sublabel="incl. toured" />
-        <StatCard label="New this week" value={newThisWeek.length} />
-        <StatCard label="Median ask" value={medianAsk == null ? null : money(medianAsk)} sublabel="active leads" />
-      </div>
+      {/* Personalize: each KPI tile is its own part (Overview); the map and the leads table are parts of "Map & leads",
+          whose header keeps the view / neighborhood / price filters. A part moves within its section or into the other. */}
+      <PartGrid page="/nyc" title="NYC Apartment Search">
+      <PartGroup id="overview" title="Overview">
+        <Part id="active-leads" title="Active leads" width="quarter">
+          <StatCard label="Active leads" value={active.length} sublabel="not gone, not passed" />
+        </Part>
+        <Part id="fit-brief" title="Fit the brief" width="quarter">
+          <StatCard label="Fit the brief" value={fits.length} sublabel="full fit or meets numbers" />
+        </Part>
+        <Part id="interested" title="Interested" width="quarter">
+          <StatCard label="Interested" value={interested.length} sublabel="incl. toured" />
+        </Part>
+        <Part id="new-this-week" title="New this week" width="quarter">
+          <StatCard label="New this week" value={newThisWeek.length} />
+        </Part>
+        <Part id="median-ask" title="Median ask" width="quarter">
+          <StatCard label="Median ask" value={medianAsk == null ? null : money(medianAsk)} sublabel="active leads" />
+        </Part>
+      </PartGroup>
 
-      <div className="flex flex-wrap items-center gap-2">
+      <PartGroup
+        id="leads"
+        title="Map & leads"
+        gap={24}
+        header={
+      <div className="mb-4 flex flex-wrap items-center gap-2">
         {VIEWS.map((v) => (
           <button
             key={v.key}
@@ -273,7 +292,10 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
           Fits the brief only
         </label>
       </div>
+        }
+      >
 
+      <Part id="map" title="Map">
       <ChartCard
         title="Map"
         subtitle={`${visible.length - unmapped} of ${visible.length} shown${unmapped ? ` · ${unmapped} without a location` : ""}`}
@@ -296,7 +318,9 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
           ))}
         </div>
       </ChartCard>
+      </Part>
 
+      <Part id="leads-table" title="Leads">
       <ChartCard title="Leads" subtitle="Tap a row for details and notes" variant="secondary">
         {saveError && <p className="mb-3 text-[12px] text-down">{saveError}</p>}
         {loading ? (
@@ -461,6 +485,9 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
           </div>
         )}
       </ChartCard>
+      </Part>
+      </PartGroup>
+      </PartGrid>
     </div>
   );
 }

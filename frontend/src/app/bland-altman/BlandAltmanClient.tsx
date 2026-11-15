@@ -11,6 +11,7 @@ import { blandAltman } from "@/lib/stats";
 import { sameJson } from "@/lib/format";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -29,6 +30,9 @@ const PAIRS: [string, string, string][] = [
   ["Garmin", "Eight Sleep", C.source.eightsleep],
   ["WHOOP", "Eight Sleep", C.up],
 ];
+
+/** Stable Personalize id from a label ("Deep Sleep Duration" -> "deep-sleep-duration", "Eight Sleep" -> "eight-sleep"). */
+const slug = (label: string) => label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 
 function fmtBA(ba: BAResult | null): string {
   if (!ba) return "Insufficient overlapping data";
@@ -367,98 +371,115 @@ export default function BlandAltmanPage({ initial, headingTestId = "page-heading
         <RangeFilter value={range} onChange={setRange} />
       </div>
 
-      <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 mb-8 text-sm text-text-secondary space-y-3 max-w-3xl">
-        <p>
-          <span className="text-text-primary font-medium">What is Bland-Altman?</span>{" "}
-          A Bland-Altman plot tests whether two devices <em>agree</em> on the same measurement — not just whether they correlate.
-          Two devices can be perfectly correlated (r = 1.0) yet still disagree if one consistently reads higher.
-          Each dot plots <span className="text-text-primary">the difference</span> (Device A − Device B) against{" "}
-          <span className="text-text-primary">the mean</span> of both readings for that day.
-        </p>
-        <p>
-          <span className="text-amber-400 font-medium">Bias</span> (amber line) is the average difference between two devices.
-          A bias of 0 means no systematic offset. Positive bias means Device A reads higher on average;
-          negative means Device B reads higher. Small bias = the devices are calibrated similarly.
-        </p>
-        <p>
-          <span className="text-red-400 font-medium">Limits of Agreement</span> (red dashed lines) mark the range where 95% of day-to-day differences fall (bias ± 1.96 × SD).
-          Narrow LoA = devices give similar readings on any given day.
-          Wide LoA = even if the average bias is small, individual readings can differ substantially.
-        </p>
-        <p>
-          <span className="text-text-primary font-medium">What to look for:</span>{" "}
-          Dots should be randomly scattered with no pattern. A fan/funnel shape means the devices diverge more at higher or lower values (proportional bias).
-          If most dots cluster near the zero line with narrow LoA, the devices are effectively interchangeable for that metric.
-        </p>
+      {/* Personalize: the explainer and the guide are parts of "About this analysis"; each metric is a section whose
+          three device-pair plots are its own parts, movable within the metric or into another section. */}
+      <PartGrid page="/bland-altman" title="Bland-Altman Analysis" gap={32}>
+        <PartGroup id="about" title="About this analysis" gap={24}>
+          <Part id="explainer" title="What is Bland-Altman?" width="half">
+            <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 text-sm text-text-secondary space-y-3">
+              <p>
+                <span className="text-text-primary font-medium">What is Bland-Altman?</span>{" "}
+                A Bland-Altman plot tests whether two devices <em>agree</em> on the same measurement — not just whether they correlate.
+                Two devices can be perfectly correlated (r = 1.0) yet still disagree if one consistently reads higher.
+                Each dot plots <span className="text-text-primary">the difference</span> (Device A − Device B) against{" "}
+                <span className="text-text-primary">the mean</span> of both readings for that day.
+              </p>
+              <p>
+                <span className="text-amber-400 font-medium">Bias</span> (amber line) is the average difference between two devices.
+                A bias of 0 means no systematic offset. Positive bias means Device A reads higher on average;
+                negative means Device B reads higher. Small bias = the devices are calibrated similarly.
+              </p>
+              <p>
+                <span className="text-red-400 font-medium">Limits of Agreement</span> (red dashed lines) mark the range where 95% of day-to-day differences fall (bias ± 1.96 × SD).
+                Narrow LoA = devices give similar readings on any given day.
+                Wide LoA = even if the average bias is small, individual readings can differ substantially.
+              </p>
+              <p>
+                <span className="text-text-primary font-medium">What to look for:</span>{" "}
+                Dots should be randomly scattered with no pattern. A fan/funnel shape means the devices diverge more at higher or lower values (proportional bias).
+                If most dots cluster near the zero line with narrow LoA, the devices are effectively interchangeable for that metric.
+              </p>
+            </div>
+          </Part>
+          <Part id="guide" title="Interpretation guide" width="half">
+            <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 text-sm text-text-secondary">
+              <p className="text-text-primary font-medium mb-2">Interpretation guide</p>
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-text-tertiary uppercase text-[10px] font-mono tracking-wider">
+                    <th className="text-left py-1 font-medium">Metric</th>
+                    <th className="text-center py-1 font-medium">Excellent bias</th>
+                    <th className="text-center py-1 font-medium">Moderate bias</th>
+                    <th className="text-center py-1 font-medium">Poor bias</th>
+                    <th className="text-center py-1 font-medium">Tight LoA width</th>
+                  </tr>
+                </thead>
+                <tbody className="text-text-secondary">
+                  <tr className="border-t border-white/5">
+                    <td className="py-1.5">Sleep Score (%)</td>
+                    <td className="text-center text-green-400 font-mono">&lt; 5 pts</td>
+                    <td className="text-center text-amber-400 font-mono">5 – 10 pts</td>
+                    <td className="text-center text-red-400 font-mono">&gt; 10 pts</td>
+                    <td className="text-center font-mono">± 10 pts</td>
+                  </tr>
+                  <tr className="border-t border-white/5">
+                    <td className="py-1.5">HRV (ms)</td>
+                    <td className="text-center text-green-400 font-mono">&lt; 5 ms</td>
+                    <td className="text-center text-amber-400 font-mono">5 – 15 ms</td>
+                    <td className="text-center text-red-400 font-mono">&gt; 15 ms</td>
+                    <td className="text-center font-mono">± 15 ms</td>
+                  </tr>
+                  <tr className="border-t border-white/5">
+                    <td className="py-1.5">Resting HR (bpm)</td>
+                    <td className="text-center text-green-400 font-mono">&lt; 2 bpm</td>
+                    <td className="text-center text-amber-400 font-mono">2 – 5 bpm</td>
+                    <td className="text-center text-red-400 font-mono">&gt; 5 bpm</td>
+                    <td className="text-center font-mono">± 5 bpm</td>
+                  </tr>
+                  <tr className="border-t border-white/5">
+                    <td className="py-1.5">Respiratory Rate (br/min)</td>
+                    <td className="text-center text-green-400 font-mono">&lt; 1 br/min</td>
+                    <td className="text-center text-amber-400 font-mono">1 – 2 br/min</td>
+                    <td className="text-center text-red-400 font-mono">&gt; 2 br/min</td>
+                    <td className="text-center font-mono">± 2 br/min</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </Part>
+        </PartGroup>
 
-        <div className="border-t border-border-subtle pt-3">
-          <p className="text-text-primary font-medium mb-2">Interpretation guide</p>
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="text-text-tertiary uppercase text-[10px] font-mono tracking-wider">
-                <th className="text-left py-1 font-medium">Metric</th>
-                <th className="text-center py-1 font-medium">Excellent bias</th>
-                <th className="text-center py-1 font-medium">Moderate bias</th>
-                <th className="text-center py-1 font-medium">Poor bias</th>
-                <th className="text-center py-1 font-medium">Tight LoA width</th>
-              </tr>
-            </thead>
-            <tbody className="text-text-secondary">
-              <tr className="border-t border-white/5">
-                <td className="py-1.5">Sleep Score (%)</td>
-                <td className="text-center text-green-400 font-mono">&lt; 5 pts</td>
-                <td className="text-center text-amber-400 font-mono">5 – 10 pts</td>
-                <td className="text-center text-red-400 font-mono">&gt; 10 pts</td>
-                <td className="text-center font-mono">± 10 pts</td>
-              </tr>
-              <tr className="border-t border-white/5">
-                <td className="py-1.5">HRV (ms)</td>
-                <td className="text-center text-green-400 font-mono">&lt; 5 ms</td>
-                <td className="text-center text-amber-400 font-mono">5 – 15 ms</td>
-                <td className="text-center text-red-400 font-mono">&gt; 15 ms</td>
-                <td className="text-center font-mono">± 15 ms</td>
-              </tr>
-              <tr className="border-t border-white/5">
-                <td className="py-1.5">Resting HR (bpm)</td>
-                <td className="text-center text-green-400 font-mono">&lt; 2 bpm</td>
-                <td className="text-center text-amber-400 font-mono">2 – 5 bpm</td>
-                <td className="text-center text-red-400 font-mono">&gt; 5 bpm</td>
-                <td className="text-center font-mono">± 5 bpm</td>
-              </tr>
-              <tr className="border-t border-white/5">
-                <td className="py-1.5">Respiratory Rate (br/min)</td>
-                <td className="text-center text-green-400 font-mono">&lt; 1 br/min</td>
-                <td className="text-center text-amber-400 font-mono">1 – 2 br/min</td>
-                <td className="text-center text-red-400 font-mono">&gt; 2 br/min</td>
-                <td className="text-center font-mono">± 2 br/min</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {metrics.map((metric) => (
-        <div key={metric.label} className="mb-8">
-          <h3 className="text-lg font-semibold text-text-primary mb-1">{metric.label}</h3>
-          {metric.footnote && (
-            <p className="text-[11px] text-text-tertiary leading-relaxed mb-3 max-w-3xl">
-              {metric.footnote}
-            </p>
-          )}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {metrics.map((metric) => (
+          <PartGroup
+            key={metric.label}
+            id={slug(metric.label)}
+            title={metric.label}
+            gap={24}
+            header={
+              <div className="mb-3">
+                <h3 className="text-lg font-semibold text-text-primary mb-1">{metric.label}</h3>
+                {metric.footnote && (
+                  <p className="text-[11px] text-text-tertiary leading-relaxed max-w-3xl">
+                    {metric.footnote}
+                  </p>
+                )}
+              </div>
+            }
+          >
             {PAIRS.map(([a, b, color], i) => (
-              <BAPlot
-                key={`${metric.label}-${a}-${b}`}
-                title={`${a} vs ${b}`}
-                subtitle={fmtBA(metric.results[i])}
-                result={metric.results[i]}
-                color={color}
-                unit={metric.unit}
-              />
+              <Part key={`${metric.label}-${a}-${b}`} id={`${slug(metric.label)}-${slug(a)}-${slug(b)}`} title={`${metric.label}: ${a} vs ${b}`} width="third">
+                <BAPlot
+                  title={`${a} vs ${b}`}
+                  subtitle={fmtBA(metric.results[i])}
+                  result={metric.results[i]}
+                  color={color}
+                  unit={metric.unit}
+                />
+              </Part>
             ))}
-          </div>
-        </div>
-      ))}
+          </PartGroup>
+        ))}
+      </PartGrid>
     </>
   );
 }
