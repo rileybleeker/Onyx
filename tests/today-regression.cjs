@@ -112,7 +112,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert.equal(await page.getByRole('link', { name: 'See the rest in your inbox' }).getAttribute('href'), '/agents?view=unread');
         assert.equal(await page.getByRole('link', { name: /Review a proposed plan/ }).getAttribute('href'), '/agents?t=fixture-agent#m1');
         assert.equal(await page.getByRole('link', { name: 'Continue reading' }).getAttribute('href'), '/reading');
-        assert.equal(await page.getByRole('link', { name: 'Open check-in' }).getAttribute('href'), '/check-in');
+        assert.equal(await page.getByRole('link', { name: 'Open check-in' }).getAttribute('href'), '/log#log-part-check-in');
         assert(await page.getByText('3 of 12 chapters recorded.').isVisible());
         assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
         await page.setViewportSize({ width: 1440, height: 1000 });
