@@ -65,7 +65,7 @@ test("batchUndoResult splits confirmed and refused deletes", () => {
 const PRODUCT = { product_id: "p-mag", dsld_id: null, brand_name: "Synthetic Brand", full_name: "Synthetic Magnesium", upc_sku: null, serving_size: 1, serving_unit: "tablet", physical_state: null, ingredient_count: 1, categories: [] };
 const STACK = { stack_id: 3, name: "Synthetic Night", description: null, remind_time: null, items: [], item_count: 3, total_doses: 3 };
 
-function mountPage(t, { onPost, onDelete, today = () => ({ date: TODAY, intakes: [], compounds: [] }) } = {}) {
+function mountPage(t, { onPost, onDelete, today = () => ({ date: TODAY, intakes: [], compounds: [] }), products = () => response({ products: [PRODUCT] }), extraStubs = {} } = {}) {
   const calls = { posts: [], deletes: [], todayGets: 0 };
   withGlobals(t, {
     confirm: () => true,
@@ -81,7 +81,7 @@ function mountPage(t, { onPost, onDelete, today = () => ({ date: TODAY, intakes:
         return onDelete ? onDelete(url, calls.deletes.length) : response({ ok: true });
       }
       if (url === "/api/behavioral-today") return response({ behavioral_today: TODAY });
-      if (url === "/api/supplements/products") return response({ products: [PRODUCT] });
+      if (url === "/api/supplements/products") return products();
       if (url === "/api/supplements/today") { calls.todayGets++; const r = today(calls.todayGets); return typeof r?.json === "function" ? r : response(r); }
       if (url.startsWith("/api/supplements/history")) return response({ rows: [] });
       if (url === "/api/supplements/stacks") return response({ stacks: [STACK] });
@@ -105,6 +105,7 @@ function mountPage(t, { onPost, onDelete, today = () => ({ date: TODAY, intakes:
       // shim does not provide. Same passthrough as tests/range-load.test.cjs; no assertion reads the totals table.
       "@/components/personalize/PartGrid": { PartGrid: ({ children }) => children, PartGroup: ({ children }) => children, Part: ({ children }) => children },
       "@/components/personalize/PersonalTable": none,
+      ...extraStubs,
     },
   });
   t.after(() => h.unmount());
@@ -184,4 +185,39 @@ test("page: stack undo keeps the bar until deletes are confirmed and keeps what 
   assert.equal(h.calls.deletes.length, 4);
   assert.match(h.calls.deletes[3], /intake_id=42$/, "only the refused delete is tried again");
   assert.doesNotMatch(h.text(), /Synthetic Night · 3 products|Not removed/);
+});
+
+test("page: this device's cached copy shows before the server answers, and the answer is stored (speed, 2026-11-15)", async (t) => {
+  const day = loadTs("lib/checkin.ts").fallbackBehavioralToday(new Date());
+  const held = deferred();
+  const store = new Map([
+    ["/api/supplements/products", { products: [PRODUCT] }],
+    ["/api/supplements/today", { date: day, intakes: [], compounds: [] }],
+  ]);
+  const stored = [];
+  const clientCache = {
+    peek: (k) => store.get(k),
+    read: async (k) => store.get(k),
+    put: (k, v) => { stored.push(k); store.set(k, v); return true; },
+  };
+  const h = mountPage(t, { products: () => held.promise, extraStubs: { "@/lib/client-cache": { clientCache } } });
+  await h.flush();
+  assert.ok(h.find((n) => n.type === "button" && h.text(n).includes("Synthetic Magnesium")).length > 0, "the cached product list is on screen while the read is pending");
+  held.resolve(response({ products: [PRODUCT] }));
+  await h.flush();
+  assert.deepEqual([...stored].sort(), ["/api/supplements/products", "/api/supplements/today"]);
+});
+
+test("page: a cached copy for another day is not shown (speed, 2026-11-15)", async (t) => {
+  const held = deferred();
+  const store = new Map([
+    ["/api/supplements/products", { products: [PRODUCT] }],
+    ["/api/supplements/today", { date: "2001-01-01", intakes: [], compounds: [] }],
+  ]);
+  const clientCache = { peek: (k) => store.get(k), read: async (k) => store.get(k), put: () => true };
+  const h = mountPage(t, { products: () => held.promise, extraStubs: { "@/lib/client-cache": { clientCache } } });
+  await h.flush();
+  assert.equal(h.find((n) => n.type === "button" && h.text(n).includes("Synthetic Magnesium")).length, 0, "nothing from yesterday's copy");
+  held.resolve(response({ products: [PRODUCT] }));
+  await h.flush();
 });
