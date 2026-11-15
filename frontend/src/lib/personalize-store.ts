@@ -29,7 +29,7 @@ import {
   type StoredLayout,
 } from "./personalize-layout";
 import { setEditingKey, setEditorRef } from "./personalize-registry";
-import { AREAS_KEY, LAYOUT_EVENT, areaId } from "./nav-areas";
+import { AREAS_KEY, LAYOUT_DRAFT_EVENT, LAYOUT_DRAFT_REQUEST_EVENT, LAYOUT_EVENT, areaId, type LayoutDraftDetail } from "./nav-areas";
 
 export const PULL_EVERY_MS = 15 * 60_000;
 
@@ -168,6 +168,7 @@ export function updateDraftFor(key: string, fn: (layout: PageLayout) => PageLayo
   if (draft === cur.draft) return;
   session = { ...session, drafts: { ...session.drafts, [key]: { ...cur, draft, touched: true } } };
   emit();
+  announceDraft(key, draft);
 }
 
 export function updateDraft(fn: (layout: PageLayout) => PageLayout) {
@@ -189,6 +190,7 @@ export function endEdit(save: boolean) {
   setEditingKey(null);
   if (save) commitTouched(s);
   emit();
+  endDraft(s);
 }
 
 /** "Clear personalization": this page goes back to its default layout, here and on the other devices. */
@@ -200,6 +202,7 @@ export function clearAndEnd() {
   commitTouched(s, s.key);
   commit(s.key, EMPTY_LAYOUT);
   emit();
+  endDraft(s);
 }
 
 function commit(key: string, layout: PageLayout) {
@@ -215,6 +218,28 @@ function commit(key: string, layout: PageLayout) {
 /** The sidebar and the continuous scroll re-read this device's copy (other tabs get a storage event). */
 function announceLayout(key: string) {
   try { window.dispatchEvent(new CustomEvent(LAYOUT_EVENT, { detail: key })); } catch { /* ignore */ }
+}
+
+/** The area layout's draft changed: the continuous scroll follows it live (null = back to the saved copy). */
+function announceDraft(key: string, layout: PageLayout | null) {
+  if (key !== AREAS_KEY) return;
+  const detail: LayoutDraftDetail = { key, layout };
+  try { window.dispatchEvent(new CustomEvent(LAYOUT_DRAFT_EVENT, { detail })); } catch { /* ignore */ }
+}
+
+/** A session ended: after its commit (if any), so the scroll goes from the draft straight to the saved copy. */
+function endDraft(s: Session) {
+  if (s.drafts[AREAS_KEY]?.touched) announceDraft(AREAS_KEY, null);
+}
+
+// A scroll that mounts mid-session (e.g. Riley went from /agents to Today while arranging) missed the draft: send it.
+if (typeof window !== "undefined") {
+  try {
+    window.addEventListener(LAYOUT_DRAFT_REQUEST_EVENT, () => {
+      const d = session?.drafts[AREAS_KEY];
+      if (d?.touched) announceDraft(AREAS_KEY, d.draft);
+    });
+  } catch { /* ignore */ }
 }
 
 // ---- server copy ------------------------------------------------------------------------------------------

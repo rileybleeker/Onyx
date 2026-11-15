@@ -5,14 +5,14 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { NAV_ITEMS } from "@/lib/nav";
 import {
-  AREAS_LOCAL_KEY, AREAS_PREF_KEY, FEED_OFF_SESSION_KEY, areaOrder, feedRouteOf, feedSequence, feedTitle, isFeedExcluded, neighbourOf,
-  parseAreaOrder,
+  AREAS_LOCAL_KEY, AREAS_PREF_KEY, FEED_OFF_SESSION_KEY, areaOrder, feedRouteOf, feedSequence, feedTitle, isFeedExcluded, keepInOrder,
+  neighbourOf, parseAreaOrder,
   type AreaOrder,
 } from "@/lib/feed-order";
 import { hasFeedSection, loadFeedSection, loadedFeedSection } from "@/lib/feed-registry";
 import { GONE, clientCache, fetchJsonValue } from "@/lib/client-cache";
 import { parseUiPref, uiPrefUrl } from "@/lib/ui-preferences";
-import { LAYOUT_EVENT, QUICK_ACCESS } from "@/lib/nav-areas";
+import { LAYOUT_DRAFT_EVENT, LAYOUT_DRAFT_REQUEST_EVENT, LAYOUT_EVENT, QUICK_ACCESS, type LayoutDraftDetail } from "@/lib/nav-areas";
 import { browserIdle } from "@/lib/warmup";
 import PageSkeleton from "./PageSkeleton";
 import { InFeed, useSetActiveRoute } from "./FeedContext";
@@ -72,12 +72,16 @@ function sameOrder(a: AreaOrder | null, b: AreaOrder | null): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-function readLocalOrder(): AreaOrder | null {
+/**
+ * This device's copy: undefined when there is none (or it cannot be read), so the server preference applies; else its
+ * order, null = the default order (a cleared layout is a copy too: Clear must not bring back the server's old order).
+ */
+function readLocalOrder(): AreaOrder | null | undefined {
   try {
     const raw = localStorage.getItem(AREAS_LOCAL_KEY);
-    return raw ? parseAreaOrder(JSON.parse(raw), KNOWN) : null;
+    return raw ? parseAreaOrder(JSON.parse(raw), KNOWN) : undefined;
   } catch {
-    return null;
+    return undefined;
   }
 }
 
@@ -89,14 +93,27 @@ function orderFromPref(v: unknown): AreaOrder | null {
   }
 }
 
-/** Riley's area order: this device's copy first, else the server preference (cached, revalidated when idle). */
+/**
+ * Riley's area order: this device's copy first, else the server preference (cached, revalidated when idle). While
+ * Personalize mode edits the side panel on this tab, its unsaved draft instead, so the scroll changes as the side
+ * panel does; Done keeps it, Cancel goes back to the saved order.
+ */
 function useAreaOrder(enabled: boolean): AreaOrder | null {
   const [order, setOrder] = useState<AreaOrder | null>(null);
   useEffect(() => {
     if (!enabled) return;
     let alive = true;
+    /** Personalize's draft of the area layout is on (it wins over every saved copy until the session ends). */
+    let drafting = false;
+    /** The server preference as last read (used when this device has no copy of its own). */
+    let fromServer: AreaOrder | null = null;
     const apply = (next: AreaOrder | null) => {
       if (alive) setOrder((prev) => (sameOrder(prev, next) ? prev : next));
+    };
+    const applySaved = () => {
+      if (drafting) return;
+      const local = readLocalOrder();
+      apply(local === undefined ? fromServer : local);
     };
     const fetcher = async () => {
       const data = await fetchJsonValue(PREF_URL);
@@ -105,39 +122,51 @@ function useAreaOrder(enabled: boolean): AreaOrder | null {
     };
     clientCache.register(PREF_URL, fetcher);
     const off = clientCache.subscribe(PREF_URL, (v) => {
-      if (!readLocalOrder()) apply(v === undefined ? null : orderFromPref(v));
+      fromServer = v === undefined ? null : orderFromPref(v);
+      applySaved();
     });
-    const local = readLocalOrder();
-    if (local) apply(local);
-    else void clientCache.read(PREF_URL).then((v) => { if (v !== undefined && !readLocalOrder()) apply(orderFromPref(v)); });
+    if (readLocalOrder() !== undefined) applySaved();
+    else void clientCache.read(PREF_URL).then((v) => {
+      if (v === undefined) return;
+      fromServer = orderFromPref(v);
+      applySaved();
+    });
     void browserIdle().then(() => (alive ? clientCache.revalidate(PREF_URL, fetcher) : undefined)).catch(() => {});
     const onStorage = (e: StorageEvent) => {
-      if (e.key === AREAS_LOCAL_KEY) apply(readLocalOrder());
+      if (e.key === AREAS_LOCAL_KEY) applySaved();
     };
     // Personalize saved or adopted the area order on this tab (lib/personalize-store.ts).
     const onLayout = (e: Event) => {
-      if ((e as CustomEvent<string>).detail === AREAS_PREF_KEY) apply(readLocalOrder());
+      if ((e as CustomEvent<string>).detail === AREAS_PREF_KEY) applySaved();
+    };
+    // Personalize changed the side panel's draft on this tab (null: the session ended).
+    const onDraft = (e: Event) => {
+      const d = (e as CustomEvent<LayoutDraftDetail | undefined>).detail;
+      if (!d || d.key !== AREAS_PREF_KEY) return;
+      if (d.layout === null || d.layout === undefined) {
+        drafting = false;
+        applySaved();
+        return;
+      }
+      drafting = true;
+      let next: AreaOrder | null = null;
+      try { next = parseAreaOrder(d.layout, KNOWN); } catch { next = null; }
+      apply(next);
     };
     window.addEventListener("storage", onStorage);
     window.addEventListener(LAYOUT_EVENT, onLayout);
+    window.addEventListener(LAYOUT_DRAFT_EVENT, onDraft);
+    // Mounted (or switched on) while the side panel is being rearranged: ask for the draft we missed.
+    try { window.dispatchEvent(new CustomEvent(LAYOUT_DRAFT_REQUEST_EVENT)); } catch { /* ignore */ }
     return () => {
       alive = false;
       off();
       window.removeEventListener("storage", onStorage);
       window.removeEventListener(LAYOUT_EVENT, onLayout);
+      window.removeEventListener(LAYOUT_DRAFT_EVENT, onDraft);
     };
   }, [enabled]);
   return enabled ? order : null;
-}
-
-function isContiguous(list: readonly string[], sequence: readonly string[]): boolean {
-  let prev = -1;
-  for (const r of list) {
-    const i = sequence.indexOf(r);
-    if (i === -1 || (prev !== -1 && i !== prev + 1)) return false;
-    prev = i;
-  }
-  return true;
 }
 
 function docTopOf(el: Element): number {
@@ -584,9 +613,10 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
   // Leaving the scroll altogether (e.g. to the Agents chat): nothing stays highlighted.
   useEffect(() => () => setActiveRoute({ routed: null, active: null }), [setActiveRoute]);
 
-  // Riley changed the order: keep what is on screen if it still fits, else start again from the routed page.
+  // Riley changed the order (Personalize, live while the side panel is rearranged): keep the pages around the routed
+  // one that still follow each other; the scroll grows again from there in the new order.
   useEffect(() => {
-    setRoutes((list) => (list.length <= 1 || isContiguous(list, sequence) ? list : [routedRef.current]));
+    setRoutes((list) => (list.length <= 1 ? list : keepInOrder(list, sequence, routedRef.current)));
   }, [sequence]);
 
   // Observers: only while the scroll is live and has somewhere to go.
