@@ -34,7 +34,7 @@ function storage(initial = {}, unavailable = false) {
   };
 }
 
-async function mount(t, { initial = page(), draftStorage = storage(), onPost, onGet } = {}) {
+async function mount(t, { initial = page(), draftStorage = storage(), onPost, onGet, onVoice } = {}) {
   let current = initial;
   let requested = null;
   let dirty = true;
@@ -75,6 +75,7 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
     document: { visibilityState: "visible", addEventListener() {}, removeEventListener() {} },
     window: { addEventListener: (name, fn) => windowEvents.set(name, fn), removeEventListener: (name) => windowEvents.delete(name) },
     fetch: async (url, options = {}) => {
+      if (url === "/api/habits/checkin/voice" && onVoice) return onVoice(JSON.parse(options.body));
       assert.match(url, /^\/api\/habits\/checkin(?:\?date=\d{4}-\d{2}-\d{2})?$/);
       if (options.method === "POST") {
         const body = JSON.parse(options.body);
@@ -147,6 +148,11 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
   await flush();
   let resumeOffset = 0;
   return { posts, gets, done, flush, text, button, click, windowEvents, storage: draftStorage,
+    type: (label, value) => {
+      const field = nodes().find((n) => n.props?.["aria-label"] === label && typeof n.props.onChange === "function");
+      assert.ok(field, `field exists: ${label}`);
+      field.props.onChange({ target: { value } });
+    },
     hasButton: (label) => nodes().some((n) => n.type === "button" && (n.props["aria-label"] === label || text(n) === label)),
     setPage: (value) => { current = value; },
     navigate: (date) => { requested = date; dirty = true; },
@@ -400,4 +406,28 @@ test("client: a transient failed day switch keeps the old date explicit and cann
   await h.click("Save"); await h.flush();
   assert.deepEqual(h.posts, [{ date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" }]);
   assert.equal(h.storage.values.has(dayKey("2031-03-04")), false);
+});
+
+test("client: a voice fill that answers late keeps the taps and clears made while it was read", async (t) => {
+  const OTHER = "Synthetic second daytime question?";
+  const THIRD = "Synthetic third daytime question?";
+  const base = page();
+  base.items.push(question(OTHER, false), question(THIRD, false));
+  const reply = deferred();
+  const h = await mount(t, { initial: base, onVoice: () => reply.promise });
+  h.click(`${OTHER}: yes`); await h.flush(); // tapped before the text was sent: never overwritten either
+  h.type("Say it once", "Synthetic dictation that answers everything."); await h.flush();
+  const filling = h.click("Fill answers"); await h.flush();
+  assert.equal(h.button("Filling…").props.disabled, true);
+  h.click(`${DAY}: no`); await h.flush(); // tapped while the text is read
+  h.click(`${OTHER}: yes`); await h.flush(); // cleared while the text is read
+  reply.resolve(response({ answers: { [DAY]: "Yes", [OTHER]: "No", [THIRD]: "Yes" } }));
+  await filling; await h.flush();
+  assert.equal(h.button(`${DAY}: no`).props["aria-pressed"], true, "the tap made during the fill stands");
+  assert.equal(h.button(`${OTHER}: yes`).props["aria-pressed"], false, "the clear made during the fill stands");
+  assert.equal(h.button(`${OTHER}: no`).props["aria-pressed"], false);
+  assert.equal(h.button(`${THIRD}: yes`).props["aria-pressed"], true, "an untouched row is filled");
+  assert.match(h.text(), /Filled 1 answer\./);
+  await h.click("Save"); await h.flush();
+  assert.deepEqual(h.posts[0].answers, { [DAY]: "No", [THIRD]: "Yes" });
 });
