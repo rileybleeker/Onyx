@@ -132,7 +132,16 @@ function Notice({ children, tone = "warn" }: { children: ReactNode; tone?: "warn
   );
 }
 
-export default function LedgerView({ data, now }: { data: LedgerData; now: Date }) {
+export default function LedgerView({
+  data,
+  now,
+  onChanged,
+}: {
+  data: LedgerData;
+  now: Date;
+  /** Called after a category change is saved; without it the page reloads (the server page). */
+  onChanged?: () => void;
+}) {
   const { netWorth: nw, flows, query } = data;
   const monthName = monthLabel(query.month);
   const scopeNote = query.account ? `${data.accountLabels[query.account] ?? "this account"}, ${monthName}` : monthName;
@@ -319,7 +328,7 @@ export default function LedgerView({ data, now }: { data: LedgerData; now: Date 
                     <td className="p-2">{r.title}</td>
                     <td className="p-2 text-text-secondary">{data.accountLabels[r.account_key] ?? "Unknown account"}</td>
                     <td className="p-2 text-text-secondary">
-                      <CategoryEditor txnKey={r.txn_key} merchantKey={r.merchant_key} category={r.category} />
+                      <CategoryEditor txnKey={r.txn_key} merchantKey={r.merchant_key} category={r.category} onSaved={onChanged} />
                       {r.excluded && (
                         <span className="ml-2 rounded-[3px] border border-border-subtle px-1 py-px text-[10px] uppercase tracking-wide text-text-tertiary">
                           {r.excluded === "transfer" ? "not spending" : "ignored"}
