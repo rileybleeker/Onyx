@@ -320,6 +320,11 @@ test("other write paths keep sleep answers off today", () => {
   assert.match(checkin, /sleepDateError\(name, date, today, raw\)/);
   const habits = fs.readFileSync(path.join(SRC, "app/habits/HabitsClient.tsx"), "utf8");
   assert.match(habits, /habits\.filter\(\(h\) => !SLEEP_QUESTIONS\.has\(h\.name\)\)\.map/);
+  // The hourly Notion sync never turns a "Last Completed" date into a sleep answer: a date cannot say which night.
+  const sync = fs.readFileSync(path.join(SRC, "app/api/habits/sync/route.ts"), "utf8");
+  assert.match(sync, /if \(lastCompleted && !SLEEP_QUESTIONS\.has\(name\)\) \{/);
+  assert.equal((sync.match(/\.from\("habit_journal"\)\s*\.upsert\(/g) || []).length, 1);
+  assert.ok(sync.indexOf("!SLEEP_QUESTIONS.has(name)") < sync.search(/\.from\("habit_journal"\)\s*\.upsert\(/));
 });
 
 test("the route builds nights from sleepNights and keeps sleep answers out of the day", () => {
