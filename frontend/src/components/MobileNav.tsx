@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Plus, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck } from "lucide-react";
+import { Plus, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck, Camera } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS } from "@/lib/nav";
 import { CACHE_KEYS, clientCache, wipeClientData } from "@/lib/client-cache";
@@ -19,6 +19,7 @@ const LOG_ACTIONS = [
   { label: "Supplement", href: "/supplements", icon: Pill },
   { label: "Habit", href: "/habits", icon: CircleCheck },
   { label: "Weight", href: "/nutrition?log=weight", icon: Scale }, // opens the weight quick-log first, field focused
+  { label: "Meal photo", href: "/nutrition?log=photo", icon: Camera }, // opens the plate-photo logger first
 ];
 
 /**

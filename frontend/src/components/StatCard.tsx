@@ -7,7 +7,7 @@ interface StatCardProps {
   unit?: string;
   sublabel?: string;
   trend?: { delta: number; favorable: "up" | "down" };
-  source?: "GARMIN" | "WHOOP" | "8SLP" | "MFP" | "CRONOMETER" | "SPOTIFY" | "TANITA" | "UBER EATS EST.";
+  source?: "GARMIN" | "WHOOP" | "8SLP" | "MFP" | "CRONOMETER" | "SPOTIFY" | "TANITA" | "UBER EATS EST." | "PHOTO EST." | "UBER EATS + PHOTO EST.";
   className?: string;
   // ── Stage 2 (Direction A) additions — optional / additive ─────────────────
   sparkline?: { values: number[]; color?: string; favorable?: "up" | "down" };

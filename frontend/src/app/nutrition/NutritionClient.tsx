@@ -17,9 +17,14 @@ import {
   getCronometerServings,
   getDailyVitamins,
   getDailyNutrientsFull,
+  getPhotoMealsForDays,
   rangeDays,
   rangeLabel,
+  type PhotoMeal,
 } from "@/lib/queries";
+import PhotoMealLogger from "@/components/PhotoMealLogger";
+import { daySourceLabel, isEstimateSource, rangeSourceLabel } from "@/lib/photo-meal";
+import { formatClock } from "@/lib/delivery-leftovers";
 import { formatDate, kgToLb, lbToKg, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -167,7 +172,10 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   const [weightNotes, setWeightNotes] = useState<string>("");
   const [savingWeight, setSavingWeight] = useState(false);
   // /nutrition?log=weight: weight first, pounds field focused (the page's charts stay below it).
-  const logWeightFirst = useSearchParams().get("log") === "weight";
+  // /nutrition?log=photo (Log > Meal photo): the photo logger first.
+  const logParam = useSearchParams().get("log");
+  const logWeightFirst = logParam === "weight";
+  const logPhotoFirst = logParam === "photo";
   const weightInputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (!logWeightFirst) return;
@@ -277,7 +285,50 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   const servingsLoaded = servingsState.date === mealsDay;
   const servingsFailed = servingsLoaded && !!servingsState.failed;
   const todayServings = servingsLoaded ? servingsState.rows : [];
-  const mealsLoading = !servingsLoaded || !delivery.loaded;
+
+  // Photo-logged meals of the shown day (pds.photo_meals); reloaded after a save or a removal.
+  const [photoState, setPhotoState] = useState<{ date: string | null; rows: PhotoMeal[]; failed?: boolean }>({ date: null, rows: [] });
+  const [photoReload, setPhotoReload] = useState(0);
+  const [photoError, setPhotoError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    getPhotoMealsForDays([mealsDay])
+      .then((rows) => {
+        if (!cancelled) setPhotoState((prev) => (prev.date === mealsDay && !prev.failed && sameJson(prev.rows, rows) ? prev : { date: mealsDay, rows }));
+      })
+      .catch((e) => {
+        console.error(e);
+        if (!cancelled) setPhotoState({ date: mealsDay, rows: [], failed: true });
+      });
+    return () => { cancelled = true; };
+  }, [mealsDay, photoReload]);
+  const photoLoaded = photoState.date === mealsDay;
+  const photoMeals = photoLoaded ? photoState.rows : [];
+  const photoKcal = photoMeals.reduce((s, m) => s + m.kcal, 0);
+  const onPhotoSaved = useCallback(() => {
+    setPhotoReload((n) => n + 1);
+    refreshNutritionSilently();
+  }, [refreshNutritionSilently]);
+  async function removePhotoMeal(m: PhotoMeal) {
+    if (!window.confirm(`Remove this meal (${Math.round(m.kcal)} kcal)?`)) return;
+    setPhotoError(null);
+    try {
+      const res = await fetch("/api/nutrition/photo-meals", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ meal_id: m.meal_id }),
+      });
+      if (!res.ok && res.status !== 404) {
+        const j = await res.json().catch(() => null);
+        setPhotoError(`Not removed: ${j?.error ?? res.status}`);
+        return;
+      }
+      onPhotoSaved();
+    } catch {
+      setPhotoError("Network error: the meal was not removed.");
+    }
+  }
+  const mealsLoading = !servingsLoaded || !delivery.loaded || !photoLoaded;
 
   // ─── Weight loader + default date init ───
   const loadWeight = useCallback(async () => {
@@ -423,13 +474,11 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   const avgCarbs = avg(nutritionData, "carbs_g");
   const avgFat = avg(nutritionData, "fat_g");
 
-  // Days without a Cronometer log are filled with Uber Eats estimates
-  // (getNutrition) — label the source honestly.
-  const estDays = nutritionData.filter((d) => d.nutrition_source === "uber_eats").length;
-  const loggedDays = nutritionData.length - estDays;
-  const macroSource =
-    estDays === 0 ? "CRONOMETER" : loggedDays === 0 ? "UBER EATS EST." : "CRONOMETER + UBER EATS EST.";
-  const latestSource = latest?.nutrition_source === "uber_eats" ? "UBER EATS EST." : "CRONOMETER";
+  // Days without a Cronometer log are filled with Uber Eats estimates and
+  // photo-logged meals (getNutrition) — label the source honestly.
+  const estDays = nutritionData.filter((d) => isEstimateSource(d.nutrition_source)).length;
+  const macroSource = rangeSourceLabel(nutritionData.map((d) => d.nutrition_source));
+  const latestSource = daySourceLabel(latest?.nutrition_source);
 
   // The weight quick-log. A "Log weight" shortcut (Log sheet, Today) opens /nutrition?log=weight: the card is
   // then drawn first, right under the header, and its pounds field is focused, instead of sitting below every
@@ -527,7 +576,8 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
           <div className="flex items-center gap-2">
             <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Nutrition</h2>
             <InfoHint label="Nutrition">
-              Food comes from Cronometer. On days with no Cronometer log, Uber Eats dish estimates fill in.
+              Food comes from Cronometer. On days with no Cronometer log, Uber Eats dish estimates and meals
+              logged by photo fill in.
             </InfoHint>
           </div>
           <p className="text-sm text-text-tertiary mt-0.5">
@@ -541,6 +591,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
       </div>
 
       {logWeightFirst && <div className="mb-8">{weightLogCard}</div>}
+      {logPhotoFirst && <div className="mb-8"><PhotoMealLogger first onSaved={onPhotoSaved} /></div>}
 
       {/* Meal timing is now automatic from Cronometer Gold per-entry timestamps
           (manual meal_events logging removed 2026-05-31). Per-meal log shows in
@@ -553,12 +604,12 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
       {estDays > 0 && (
         <div className="flex items-center gap-2 -mt-2 mb-3">
           <p className="text-xs text-text-tertiary">
-            {estDays} of {nutritionData.length} days use Uber Eats estimates.
+            {estDays} of {nutritionData.length} days use estimates.
           </p>
-          <InfoHint label="Uber Eats estimates">
-            Estimated from dish names (kcal and macros) on days with no Cronometer log. They count what you
-            marked as eaten under Meals below or in the check-in (All unless you change it), and miss anything
-            not delivered.
+          <InfoHint label="Estimates">
+            On days with no Cronometer log: Uber Eats dishes estimated from their names, counting what you
+            marked as eaten under Meals below or in the check-in (All unless you change it), plus meals you
+            logged by photo. Food that was neither delivered nor photographed is missing.
           </InfoHint>
         </div>
       )}
@@ -774,8 +825,9 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
         <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">
           {mealsDayOffset === 0 ? "Today's Meals" : "Meals"}
         </p>
-        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + UBER EATS · {mealsDay}</span>
+        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + UBER EATS + PHOTOS · {mealsDay}</span>
       </div>
+      {!logPhotoFirst && <PhotoMealLogger onSaved={onPhotoSaved} />}
       <div className="flex gap-1.5 mb-3" role="tablist" aria-label="Meals day">
         {[0, 1, 2].map((off) => (
           <button
@@ -795,7 +847,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
       </div>
       {mealsLoading ? (
         <p className="text-xs text-text-tertiary mb-2">Loading…</p>
-      ) : todayServings.length === 0 && delivery.items.length === 0 && delivery.leftovers.length === 0 && !servingsFailed && !delivery.loadError ? (
+      ) : todayServings.length === 0 && photoMeals.length === 0 && delivery.items.length === 0 && delivery.leftovers.length === 0 && !servingsFailed && !photoState.failed && !delivery.loadError ? (
         <p className="text-xs text-text-tertiary mb-2">
           Nothing logged for {mealsDayOffset === 0 ? "today" : "this day"} yet. Cronometer entries and Uber Eats orders appear here once they sync.
         </p>
@@ -820,9 +872,37 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
           ))}
         </div>
       )}
-      {(delivery.items.length > 0 || delivery.leftovers.length > 0) && (
+      {photoLoaded && photoState.failed && <p className="text-xs text-red-400 mb-2">Couldn&apos;t load photo meals.</p>}
+      {photoMeals.length > 0 && (
         <>
           <div className={`flex items-baseline justify-between ${todayServings.length ? "mt-3" : ""} mb-1.5`}>
+            <span className="text-[10px] font-mono text-text-tertiary">By photo</span>
+            <span className="text-[11px] font-mono text-text-secondary">Photos ~{Math.round(photoKcal)} kcal</span>
+          </div>
+          <div className="bg-surface-card border border-border-subtle rounded-control divide-y divide-border-subtle">
+            {photoMeals.map((m) => (
+              <div key={m.meal_id} className="flex items-start gap-2 px-4 py-2.5 text-sm">
+                <span className="text-[11px] font-mono text-text-tertiary w-14 shrink-0 pt-0.5">{formatClock(m.eaten_time)}</span>
+                <span className="flex-1 min-w-0 text-text-secondary line-clamp-2 break-words">
+                  {m.items.map((i) => i.name).join(", ")}
+                </span>
+                <span className="text-[11px] font-mono text-text-tertiary w-16 text-right shrink-0 pt-0.5">~{Math.round(m.kcal)} kcal</span>
+                <button
+                  onClick={() => removePhotoMeal(m)}
+                  aria-label={`Remove photo meal at ${formatClock(m.eaten_time)}`}
+                  className="w-11 h-11 -my-2.5 -mr-2 shrink-0 flex items-center justify-center text-text-tertiary hover:text-text-primary"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+          {photoError && <p className="text-[11px] text-red-400 mt-1.5">{photoError}</p>}
+        </>
+      )}
+      {(delivery.items.length > 0 || delivery.leftovers.length > 0) && (
+        <>
+          <div className={`flex items-baseline justify-between ${todayServings.length || photoMeals.length ? "mt-3" : ""} mb-1.5`}>
             <span className="text-[10px] font-mono text-text-tertiary">
               Tap how much you ate
             </span>
