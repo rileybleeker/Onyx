@@ -13,8 +13,8 @@ import { CACHE_KEYS, clientCache, fetchJsonValue, GONE } from "@/lib/client-cach
 import { agentsApi } from "@/lib/agents-api";
 import { localDate, shiftDate } from "@/lib/calendar-events";
 import { CHECKS } from "@/lib/overview-views";
-import { OVERVIEW_CARD_IDS, OVERVIEW_PREF_KEY, mergeArrangement, parseArrangement, visibleIds } from "@/lib/overview-cards";
-import { parseUiPref, uiPrefUrl } from "@/lib/ui-preferences";
+import { OVERVIEW_CARDS } from "@/lib/overview-cards";
+import { AREAS_STORAGE, areaId } from "@/lib/nav-areas";
 
 export interface OverviewSource {
   key: string;
@@ -107,14 +107,21 @@ export function checkedFetch(s: OverviewSource): () => Promise<unknown> {
   };
 }
 
-export const ARRANGEMENT_URL = uiPrefUrl(OVERVIEW_PREF_KEY);
-
-/** The cards shown in the cached arrangement (default when none is cached yet). */
+/**
+ * The cards shown on this device: every card whose area is not hidden in the app's area order (layout.areas,
+ * Personalize; this device's copy, read without the Personalize code). Hidden cards are not warmed.
+ */
 export function cachedVisibleCards(): string[] {
-  const raw = clientCache.peek(ARRANGEMENT_URL);
-  let saved = null;
-  try { saved = raw === undefined ? null : parseArrangement(parseUiPref(raw, OVERVIEW_PREF_KEY).value); } catch { saved = null; }
-  return visibleIds(mergeArrangement(saved, OVERVIEW_CARD_IDS));
+  let hide: Record<string, unknown> = {};
+  try {
+    const raw = localStorage.getItem(AREAS_STORAGE);
+    const o = raw ? (JSON.parse(raw) as { l?: unknown }) : null;
+    const l = (o && typeof o === "object" && "l" in o ? o.l : o) as { grids?: { main?: { hide?: Record<string, unknown> } } } | null;
+    hide = l?.grids?.main?.hide ?? {};
+  } catch {
+    hide = {};
+  }
+  return OVERVIEW_CARDS.filter((c) => hide[c.href ? areaId(c.href) : c.id] !== true).map((c) => c.id);
 }
 
 /**

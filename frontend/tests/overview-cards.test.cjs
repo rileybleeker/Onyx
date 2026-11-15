@@ -241,7 +241,7 @@ test("speed rules: one IntersectionObserver, DeferredMount bodies, no chart libr
   const card = fs.readFileSync(path.join(SRC, "components/overview/OverviewCard.tsx"), "utf8");
   assert.match(card, /new IntersectionObserver/);
   assert.match(card, /DeferredMount/);
-  for (const f of ["OverviewCard.tsx", "Spark.tsx", "Overview.tsx", "OverviewEditor.tsx"]) {
+  for (const f of ["OverviewCard.tsx", "Spark.tsx", "Overview.tsx"]) {
     const src = fs.readFileSync(path.join(SRC, "components/overview", f), "utf8");
     assert.doesNotMatch(src, /from "recharts"/, `${f}: hand-drawn SVG only`);
     assert.doesNotMatch(src, /animate-/, `${f}: no animation`);
