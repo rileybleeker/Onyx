@@ -397,13 +397,33 @@ test("the care routes are owner-session only and nothing is cached", () => {
   }
 });
 
+// SQL with its "--" comments removed, line by line. Split on \r?\n: on a Windows (CRLF) checkout a
+// "\n" split leaves "\r" at each line end, and /--.*$/ (no m flag) then strips nothing, so a
+// comment such as "nothing granted to anon" was read as a GRANT (Codex review #168).
+const sqlStatements = (text) => text.split(/\r?\n/).map((line) => line.replace(/--.*$/, "")).join("\n");
+// A GRANT statement (the word, not "granted") that names anon / authenticated / public.
+const GRANTS_TO_CLIENTS = /\bGRANT\b[^;]*\b(anon|authenticated|public)\b/i;
+const lineEndings = (text) => [text.replace(/\r\n/g, "\n"), text.replace(/\r?\n/g, "\r\n")];
+
+test("the SQL checks read LF and CRLF files alike, and still catch a real grant", () => {
+  for (const eol of ["\n", "\r\n"]) {
+    const commentOnly = ["-- nothing granted to anon / authenticated", "REVOKE ALL ON pds.x FROM PUBLIC, anon, authenticated;", ""].join(eol);
+    assert.ok(!GRANTS_TO_CLIENTS.test(sqlStatements(commentOnly)), `a comment is not a grant (${JSON.stringify(eol)})`);
+    const realGrant = ["-- service role only", "GRANT SELECT ON pds.x TO anon;", ""].join(eol);
+    assert.ok(GRANTS_TO_CLIENTS.test(sqlStatements(realGrant)), `a real grant is caught (${JSON.stringify(eol)})`);
+    const trailing = ["GRANT SELECT ON pds.x TO service_role; -- not to authenticated", ""].join(eol);
+    assert.ok(!GRANTS_TO_CLIENTS.test(sqlStatements(trailing)), `a trailing comment is stripped (${JSON.stringify(eol)})`);
+  }
+});
+
 test("the schema is additive and service-role only", () => {
   const sql = read(SRC, "..", "..", "sql", "care_items_schema.sql");
   assert.ok(!/\b(drop|truncate|delete)\b/i.test(sql), "additive only");
   assert.match(sql, /ALTER TABLE pds\.care_items ENABLE ROW LEVEL SECURITY/);
   assert.match(sql, /REVOKE ALL ON pds\.care_items FROM PUBLIC, anon, authenticated/);
-  const statements = sql.split("\n").map((line) => line.replace(/--.*$/, "")).join("\n");
-  assert.ok(!/GRANT[^;]*\b(anon|authenticated|public)\b/i.test(statements), "nothing granted to anon / authenticated");
+  for (const text of lineEndings(sql)) {
+    assert.ok(!GRANTS_TO_CLIENTS.test(sqlStatements(text)), "nothing granted to anon / authenticated");
+  }
   assert.ok(!/CREATE POLICY/i.test(sql), "no policies: service role only");
   for (const col of L.CARE_COLUMNS.split(",")) assert.match(sql, new RegExp(`\\b${col}\\b`), col);
 });

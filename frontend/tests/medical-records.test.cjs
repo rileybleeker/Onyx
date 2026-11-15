@@ -521,7 +521,7 @@ test("the schema is additive, private and service-role only", () => {
     assert.match(sql, new RegExp(`REVOKE ALL ON pds\\.${t} FROM PUBLIC, anon, authenticated`));
   }
   const statements = sql.split("\n").map((line) => line.replace(/--.*$/, "")).join("\n");
-  assert.ok(!/GRANT[^;]*\b(anon|authenticated|public)\b/i.test(statements), "nothing granted to anon / authenticated");
+  assert.ok(!/\bGRANT\b[^;]*\b(anon|authenticated|public)\b/i.test(statements), "nothing granted to anon / authenticated (a GRANT statement, not the word \"granted\")");
   assert.ok(!/CREATE POLICY/i.test(sql), "no policies: service role only (tables and bucket)");
   assert.match(statements, /'medical-records', 'medical-records', false, 26214400/, "the bucket is private with a 25 MB cap");
   for (const mime of L.DOC_MIME_TYPES) assert.ok(statements.includes(`'${mime}'`), mime);
