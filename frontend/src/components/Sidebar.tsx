@@ -7,6 +7,7 @@ import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS, type NavItem } from "@/lib/nav";
 import { wipeClientData } from "@/lib/client-cache";
 import { navIntentProps } from "@/lib/warmup";
+import { goHint } from "@/lib/go-shortcuts";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 import { InstallAppButton, ReloadAppButton, usePaletteShortcutLabel } from "./DesktopApp";
 
@@ -43,8 +44,8 @@ export default function Sidebar() {
                   >
                     <Icon className={`w-[17px] h-[17px] shrink-0 ${active ? "text-accent" : "text-text-tertiary"}`} strokeWidth={1.75} />
                     <span className="flex-1 truncate">{item.label}</span>
-                    <kbd className="text-[10px] font-mono text-text-tertiary/60 ml-auto hidden lg:inline">
-                      {item.shortcut}
+                    <kbd className="text-[10px] font-mono text-text-tertiary/60 ml-auto hidden lg:inline" title={`Press G, then ${item.shortcut}`}>
+                      {goHint(item.shortcut)}
                     </kbd>
                   </Link>
                 );

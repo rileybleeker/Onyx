@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Search, CornerDownLeft } from "lucide-react";
 import { NAV_ITEMS, type NavItem } from "@/lib/nav";
 import { warmRoute } from "@/lib/warmup";
+import { createGoShortcuts, goHint } from "@/lib/go-shortcuts";
 
 /** Fire this to open the palette from a button: window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE)) */
 export const OPEN_COMMAND_PALETTE = "onyx:open-command-palette";
@@ -70,6 +71,21 @@ export default function CommandPalette() {
       window.removeEventListener(OPEN_COMMAND_PALETTE, onOpen);
     };
   }, []);
+
+  // "Go to" shortcuts: G, then a page's key (lib/nav.ts), within 1.5 s. Client-side navigation onto the
+  // warmed page. Ignored while typing or with a modifier held, so Ctrl/Cmd + K stays the palette's.
+  useEffect(() => {
+    const keys = createGoShortcuts(NAV_ITEMS);
+    function onKey(e: KeyboardEvent) {
+      const href = keys.onKey(e);
+      if (!href) return;
+      e.preventDefault();
+      warmRoute(href);
+      router.push(href);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [router]);
 
   // Focus input + reset selection on open.
   useEffect(() => {
@@ -182,6 +198,7 @@ export default function CommandPalette() {
                 >
                   <Icon className="w-4 h-4 shrink-0 text-text-tertiary" />
                   <span className="flex-1 truncate">{item.label}</span>
+                  {item.shortcut && <kbd className="hidden lg:inline text-[10px] font-mono text-text-tertiary border border-border-subtle rounded px-1.5 py-0.5" aria-label={`Shortcut G then ${item.shortcut}`}>{goHint(item.shortcut)}</kbd>}
                   <span className="text-[10px] font-mono text-text-tertiary/70">{item.href}</span>
                   {isActive && <CornerDownLeft className="w-3.5 h-3.5 text-text-tertiary" />}
                 </button>
