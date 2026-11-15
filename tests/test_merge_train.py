@@ -29,6 +29,32 @@ class Judge(unittest.TestCase):
     def test_green_clean_merges(self):
         self.assertEqual(judge()[0], "merge")
 
+    def test_builder_branch_never_enters_the_train(self):
+        # Ordinary green CI on a new head cannot replace the local worker's exact-head receipt. Missing CI
+        # and behind branches must not dispatch or update either; the worker exclusively owns this lane.
+        for state in ("CLEAN", "BEHIND"):
+            for runs in (GREEN, []):
+                for head in ("a" * 40, "b" * 40):
+                    with self.subTest(state=state, runs=runs, head=head):
+                        p = pr(headRefName="builder/task-1", headRefOid=head, mergeStateStatus=state)
+                        decision = judge(p, runs=runs)
+                        self.assertEqual(decision[0], "skip")
+                        self.assertIn("feature worker", decision[1])
+                        self.assertEqual(mt.plan([(p, *decision)])[0], "idle")
+
+    def test_builder_skip_does_not_stall_other_release_lanes(self):
+        worker = pr(headRefName="builder/task-1")
+        ordinary = pr(number=2, headRefName="feat/builder-settings")
+        rollback = pr(number=3, author="github-actions[bot]", labels=["rollback"],
+                      title="Revert abc1234: x", headRefName="rollback/abc1234")
+        for candidate, halted in ((ordinary, False), (rollback, True)):
+            with self.subTest(branch=candidate["headRefName"]):
+                decisions = [(worker, *judge(worker, halted=halted)),
+                             (candidate, *judge(candidate, halted=halted))]
+                move, selected, _ = mt.plan(decisions)
+                self.assertEqual(move, "merge")
+                self.assertEqual(selected["number"], candidate["number"])
+
     def test_unstable_only_from_ignored_vercel_preview(self):
         runs = GREEN + [dict(id=3, name="Vercel Preview Comments", status="completed", conclusion="failure")]
         self.assertEqual(judge(pr(mergeStateStatus="UNSTABLE"), runs=runs)[0], "merge")

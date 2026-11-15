@@ -87,6 +87,10 @@ def is_rollback(pr: dict) -> bool:
 def judge(pr: dict, files: list[str] | None, runs: list[dict], statuses: list[dict], active_runs: int,
           halted: bool) -> tuple[str, str]:
     """-> (action, reason); action is merge | update | dispatch | wait | skip."""
+    # Only the local feature worker has the exact-head review/typecheck receipt. A ready PR can gain a new
+    # head after that check, so ordinary CI cannot authorize this train to release a worker-owned branch.
+    if pr["headRefName"].startswith("builder/"):
+        return "skip", "builder branch: feature worker owns review, type check and merge"
     if pr["isDraft"]:
         return "skip", "draft"
     if pr["baseRefName"] != BASE or pr["isCrossRepository"]:
