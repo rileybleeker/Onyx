@@ -616,6 +616,19 @@ test("/check-in lists today's habit questions", async ({ page }) => {
   await expectNoClientCrash(page);
 });
 
+// /log (2026-11-15): every daily entry on one screen. The tripwire: the frame renders behind the login and its
+// Check-in section (the real check-in) loads today's questions. Read-only: never taps or saves.
+test("/log shows the check-in questions inside the Log screen", async ({ page }) => {
+  await gotoAuthed(page, "/log");
+  await settle(page);
+  await expect(page.locator('[data-testid="page-heading"]', { hasText: "Log" })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(page.getByText(/Couldn't load|Couldn't reach Onyx/)).toHaveCount(0);
+  const yesButtons = page.getByRole("button", { name: /: yes$/ });
+  await expect(yesButtons.first()).toBeVisible({ timeout: LOAD_TIMEOUT });
+  expect(await yesButtons.count(), "expected the core check-in questions on /log").toBeGreaterThanOrEqual(10);
+  await expectNoClientCrash(page);
+});
+
 // Today is a read-only entry point. A legitimate empty inbox/book is allowed;
 // unavailable data must be visible, never mistaken for an all-clear.
 test.describe("Today home", () => {

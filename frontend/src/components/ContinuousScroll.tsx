@@ -38,8 +38,9 @@ import { InFeed, useSetActiveRoute } from "./FeedContext";
  *   its checks are about the routed page alone).
  */
 
-// The scroll follows the sidebar as Riley sees it: the Quick access pages (Today, Check-in) first, then the sections
-// (Riley 2026-11-15: "scroll from Today -> Check-in -> Activities"). Personalize's saved order still wins over this.
+// The scroll follows the sidebar as Riley sees it: the Quick access pages (Today, Log) first, then the sections
+// (Riley 2026-11-15: "scroll from Today -> Check-in -> Activities"; the check-in now sits inside Log). Personalize's
+// saved order still wins over this.
 const NAV_HREFS = [
   ...QUICK_ACCESS.filter((h) => NAV_ITEMS.some((i) => i.href === h)),
   ...NAV_ITEMS.map((i) => i.href).filter((h) => !QUICK_ACCESS.includes(h)),

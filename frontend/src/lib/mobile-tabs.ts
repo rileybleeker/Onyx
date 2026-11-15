@@ -1,5 +1,5 @@
 /**
- * The phone's bottom tab bar: [slot, slot, Log, slot, slot]. Log (the quick-log sheet) sits in the centre; the four
+ * The phone's bottom tab bar: [slot, slot, Log, slot, slot]. Log (the Log screen, /log) sits in the centre; the four
  * slots around it are pages from lib/nav.ts or More (the drawer), by default Today, Agents | Log | Chat, More, and
  * Riley can choose them in Personalize (phone drawer). Each tab's label is the name of the page it opens.
  * Import-free (tests/mobile-tabs.test.cjs).

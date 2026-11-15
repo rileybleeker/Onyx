@@ -48,7 +48,7 @@ export interface AreaOrder {
 }
 
 /** The default Quick access pages. Keep equal to QUICK_ACCESS in lib/nav-areas.ts (both files are import-free). */
-export const DEFAULT_PINNED: readonly string[] = ["/today", "/check-in"];
+export const DEFAULT_PINNED: readonly string[] = ["/today", "/log"];
 
 /** Ways an area can be named in a stored value: "/analytics/hrv", "analytics/hrv", "analytics.hrv", "analytics-hrv". */
 export function areaIdsOf(href: string): string[] {
