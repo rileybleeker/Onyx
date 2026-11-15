@@ -72,6 +72,8 @@ export default function CheckInClient() {
   const [cells, setCells] = useState<Cells>({}); // the day tab's questions
   const [nightCells, setNightCells] = useState<Record<string, Cells>>({}); // sleep questions, per night
   const [error, setError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [refreshFailed, setRefreshFailed] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [showExtras, setShowExtras] = useState(false);
@@ -108,12 +110,17 @@ export default function CheckInClient() {
     setSavedAt(null);
     try {
       const res = await fetch(`/api/habits/checkin${date ? `?date=${date}` : ""}`, { cache: "no-store" });
-      const json = await res.json();
+      const json = await res.json().catch(() => ({}));
       if (seq !== loadSeq.current) return;
       if (!res.ok) {
-        drafts.holdAll();
+        // A rejected date/session is unusable. A transient outage leaves the last loaded form editable,
+        // still on its original dates; POST's `today` guard remains the authority on rollover.
+        if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+          drafts.holdAll();
+          setData(null);
+        }
+        setRefreshFailed(true);
         setError(json.error || `Couldn't load the check-in (${res.status}).`);
-        setData(null);
         return;
       }
       const payload = json as CheckinPayload;
@@ -128,14 +135,14 @@ export default function CheckInClient() {
       const nights: Record<string, Cells> = {};
       for (const n of payload.nights ?? []) nights[n.date] = buildCells(sleepItems, n.answers, n.suggestions, drafts.active(nightDraftKey(n.date)));
       setData(payload);
+      setRefreshFailed(false);
       setCells(day);
       setNightCells(nights);
       // Open "Also did" when it holds a saved or pre-filled answer, so nothing is saved out of sight.
       setShowExtras(payload.items.some((i) => i.group === "extra" && day[i.name]));
     } catch {
       if (seq === loadSeq.current) {
-        drafts.holdAll();
-        setData(null);
+        setRefreshFailed(true);
         setError("Couldn't reach Onyx. Check your connection and try again.");
       }
     }
@@ -181,6 +188,7 @@ export default function CheckInClient() {
       return;
     }
     refreshDrafts();
+    setSaveError(null);
     setSavedAt(null);
     const update = (prev: Cells): Cells => {
       const next = { ...prev };
@@ -241,6 +249,7 @@ export default function CheckInClient() {
     savingRef.current = true;
     ++loadSeq.current; // an older in-flight GET must not replace a just-saved baseline
     setError(null);
+    setSaveError(null);
     const sentDrafts = new Map([
       [dayDraftKey(data.date), drafts.read(dayDraftKey(data.date))],
       ...nightPatches.map((n) => [nightDraftKey(n.date), drafts.read(nightDraftKey(n.date))] as const),
@@ -295,9 +304,9 @@ export default function CheckInClient() {
         setData(null);
         router.replace("/check-in", { scroll: false });
         await load(null, true);
-        setError("A new day started. Unsaved answers are preserved under their original dates. Review them below before using them.");
+        setSaveError("A new day started. Unsaved answers are preserved under their original dates. Review them below before using them.");
       } else {
-        setError(e instanceof TypeError ? "Couldn't reach Onyx. Your answers are still here." : e instanceof Error ? e.message : "Save failed. Your answers are still here.");
+        setSaveError(e instanceof TypeError ? "Couldn't reach Onyx. Your answers are still here." : e instanceof Error ? e.message : "Save failed. Your answers are still here.");
       }
     } finally {
       savingRef.current = false;
@@ -360,6 +369,7 @@ export default function CheckInClient() {
   const reviewDraft = (entry: DatedDraft) => {
     if (!data || savingRef.current || !drafts.recover(entry.key, data)) return;
     setError(null);
+    setSaveError(null);
     setSavedAt(null);
     if (entry.night) {
       const n = data.nights.find((n) => n.date === entry.date)!;
@@ -374,20 +384,21 @@ export default function CheckInClient() {
 
   const draftRecovery = (
     <>
-      {storageFailed && <p role="alert" className="my-4 text-sm text-mid">Browser storage is unavailable. Pending answers are kept in this open page, but may be lost if you close or refresh it. Keep it open until saved, or copy the answers.</p>}
-      <DraftRecovery entries={recovery} page={data} saving={saving} onReview={reviewDraft} onGo={goTo} onDiscard={(key) => {
+      {storageFailed && <p role="alert" className="my-4 text-sm text-mid">Some drafts could not be read or stored in this browser. Answers entered here are kept in this open page, but may be lost if you close or refresh it. Keep it open until saved, or copy the answers.</p>}
+      <DraftRecovery entries={recovery} page={data} saving={saving} onReview={reviewDraft} onGo={goTo} onDiscard={(entry) => {
         if (savingRef.current) return;
-        drafts.discard(key);
+        drafts.discard(entry.key, entry.draft);
         refreshDrafts();
       }} />
     </>
   );
 
-  if (error && !data) {
+  const visibleError = [saveError, error].filter(Boolean).join(" ");
+  if (visibleError && !data) {
     return (
       <div className="max-w-xl">
         <h2 className="text-[28px] font-medium text-text-primary">Check-in</h2>
-        <p className="mt-4 text-sm text-text-secondary">{error}</p>
+        <p className="mt-4 text-sm text-text-secondary">{visibleError}</p>
         {draftRecovery}
         <button
           onClick={() => {
@@ -415,14 +426,15 @@ export default function CheckInClient() {
   }
 
   const catchUp = data.days.find((d) => d.date !== data.date && d.date !== data.today && d.answered === 0);
-  const dayName = dayLabel(data.date, data.today);
+  const labelDay = (date: string) => refreshFailed ? date : dayLabel(date, data.today);
+  const dayName = labelDay(data.date);
 
   return (
     <div className="max-w-xl">
       <div className="mb-5">
         <h2 className="text-[28px] font-medium text-text-primary">Check-in</h2>
         <p className="text-sm text-text-tertiary mt-0.5">
-          {nights.length > 0
+          {refreshFailed ? `Showing the last loaded check-in for daytime ${data.date}. Dates are unchanged; refresh could not confirm today's date.` : nights.length > 0
             ? `Two parts. Sleep: ${nightLabel(nights[0].date, data.today).span}. Daytime: ${dayName === "Today" || dayName === "Yesterday" ? `${dayName.toLowerCase()}, ` : ""}${longDate(data.date)}.`
             : `Daytime: ${longDate(data.date)}. Skip anything you're unsure of.`}
         </p>
@@ -443,6 +455,7 @@ export default function CheckInClient() {
               key={n.date}
               night={n}
               today={data.today}
+              unconfirmed={refreshFailed}
               catchUp={i > 0}
               items={sleepItems}
               cells={nightCells[n.date] ?? {}}
@@ -459,7 +472,7 @@ export default function CheckInClient() {
         <h3 className="text-[15px] font-medium text-text-primary">
           Daytime{dayName === "Today" || dayName === "Yesterday" ? ` · ${dayName}` : ""}
         </h3>
-        <span className="text-[13px] text-text-secondary">{longDate(data.date)}</span>
+        <span className="text-[13px] text-text-secondary">{refreshFailed ? data.date : longDate(data.date)}</span>
       </div>
 
       {/* Day tabs: today and the two days before, with progress */}
@@ -478,7 +491,7 @@ export default function CheckInClient() {
                 active ? "border-accent/60 bg-accent/10" : "border-border-subtle bg-white/[0.02] hover:bg-white/[0.05]"
               }`}
             >
-              <div className={`text-[13px] font-medium ${active ? "text-text-primary" : "text-text-secondary"}`}>{dayLabel(d.date, data.today)}</div>
+              <div className={`text-[13px] font-medium ${active ? "text-text-primary" : "text-text-secondary"}`}>{labelDay(d.date)}</div>
               <div className="text-[11px] font-mono text-text-tertiary">{complete ? "done" : d.answered ? `${d.answered}/${d.total}` : "not started"}</div>
             </button>
           );
@@ -576,7 +589,7 @@ export default function CheckInClient() {
             <div key={g.date} className="mb-3">
               <div className="flex items-baseline justify-between mb-1">
                 <span className="text-[11px] font-mono text-text-secondary">
-                  {g.date === data.date ? dayLabel(g.date, data.today) : `${dayLabel(g.date, data.today)} · not answered yet`}
+                  {g.date === data.date ? labelDay(g.date) : `${labelDay(g.date)} · not answered yet`}
                 </span>
                 {g.totalKcal != null && (
                   <span className="text-[11px] font-mono text-text-tertiary">~{Math.round(g.totalKcal)} kcal counted</span>
@@ -589,7 +602,7 @@ export default function CheckInClient() {
             <div className="mb-3">
               <div className="flex items-baseline justify-between mb-1">
                 <span className="text-[11px] font-mono text-text-secondary">
-                  Leftovers · {dayLabel(data.date, data.today)}
+                  Leftovers · {labelDay(data.date)}
                 </span>
                 {delivery.leftoverKcal != null && (
                   <span className="text-[11px] font-mono text-text-tertiary">~{Math.round(delivery.leftoverKcal)} kcal counted</span>
@@ -615,14 +628,14 @@ export default function CheckInClient() {
       <div className="sticky bottom-[calc(env(safe-area-inset-bottom)+4.75rem)] md:bottom-4 z-10 mt-8">
         <div className="rounded-card border border-border-subtle bg-surface-card/95 backdrop-blur px-4 py-3 flex items-center gap-3 shadow-lg">
           <div className="flex-1 min-w-0 text-[13px]">
-            {error ? (
-              <span className="text-red-400">{error}</span>
+            {visibleError ? (
+              <span className="text-red-400">{visibleError}</span>
             ) : savedAt === data.date && changeCount === 0 ? (
               <span className="text-text-secondary inline-flex items-center gap-1.5">
                 <Check className="w-4 h-4 text-up" /> Saved
                 {catchUp && (
                   <button onClick={() => goTo(catchUp.date)} className="ml-2 text-accent underline underline-offset-2">
-                    Catch up {dayLabel(catchUp.date, data.today).toLowerCase()}
+                    Catch up {labelDay(catchUp.date).toLowerCase()}
                   </button>
                 )}
               </span>
@@ -654,10 +667,10 @@ function DraftRecovery({ entries, page, saving, onReview, onDiscard, onGo }: {
   page: CheckinPayload | null;
   saving: boolean;
   onReview: (entry: DatedDraft) => void;
-  onDiscard: (key: string) => void;
+  onDiscard: (entry: DatedDraft) => void;
   onGo: (date: string) => void;
 }) {
-  const [discardKey, setDiscardKey] = useState<string | null>(null);
+  const [discardDraft, setDiscardDraft] = useState<DatedDraft | null>(null);
   if (!entries.length) return null;
   return (
     <section aria-label="Preserved check-in drafts" className="my-4 rounded-card border border-border-subtle bg-surface-card p-3">
@@ -681,11 +694,11 @@ function DraftRecovery({ entries, page, saving, onReview, onDiscard, onGo }: {
               <p className="mt-2 text-xs text-text-tertiary">This date or a question is no longer offered in check-in. The draft stays here for review and copying; it will not be moved to another date.</p>
             )}
             <div className="mt-2">
-              {discardKey === entry.key ? <>
+              {discardDraft?.key === entry.key ? <>
                 <span className="text-xs text-text-secondary">Discard these unsaved answers for {label}?</span>
-                <button disabled={saving} onClick={() => { onDiscard(entry.key); setDiscardKey(null); }} className="ml-2 rounded-control border border-border-subtle px-3 py-2 text-down">Discard these answers</button>
-                <button onClick={() => setDiscardKey(null)} className="ml-2 rounded-control px-3 py-2 text-text-secondary">Keep draft</button>
-              </> : <button disabled={saving} onClick={() => setDiscardKey(entry.key)} className="rounded-control border border-border-subtle px-3 py-2 text-text-secondary">Discard draft…</button>}
+                <button disabled={saving} onClick={() => { onDiscard(discardDraft); setDiscardDraft(null); }} className="ml-2 rounded-control border border-border-subtle px-3 py-2 text-down">Discard these answers</button>
+                <button onClick={() => setDiscardDraft(null)} className="ml-2 rounded-control px-3 py-2 text-text-secondary">Keep draft</button>
+              </> : <button disabled={saving} onClick={() => setDiscardDraft(entry)} className="rounded-control border border-border-subtle px-3 py-2 text-text-secondary">Discard draft…</button>}
             </div>
           </details>
         );
@@ -698,6 +711,7 @@ function DraftRecovery({ entries, page, saving, onReview, onDiscard, onGo }: {
 function NightBlock({
   night,
   today,
+  unconfirmed,
   catchUp,
   items,
   cells,
@@ -706,6 +720,7 @@ function NightBlock({
 }: {
   night: CheckinNight;
   today: string;
+  unconfirmed: boolean;
   catchUp: boolean;
   items: CheckinItem[];
   cells: Cells;
@@ -730,8 +745,8 @@ function NightBlock({
       {/* The weekday span is the main label: it names the night at any hour ("Last night" alone can be misread before 6 AM). */}
       <div className="flex items-baseline justify-between gap-2 mb-1.5">
         <span className="text-[14px] font-medium text-text-primary">
-          {label.span}
-          <span className="ml-2 text-[11px] font-mono font-normal uppercase tracking-wider text-indigo-200/80">{label.title}</span>
+          {unconfirmed ? `${night.date} → ${addDays(night.date, 1)} morning` : label.span}
+          {!unconfirmed && <span className="ml-2 text-[11px] font-mono font-normal uppercase tracking-wider text-indigo-200/80">{label.title}</span>}
         </span>
         <span className="text-[11px] font-mono text-text-tertiary shrink-0">{catchUp && done === 0 ? "not answered yet" : `${done}/${asked.length}`}</span>
       </div>
