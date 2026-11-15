@@ -96,7 +96,7 @@ export default function AirQualityPanel() {
   }
 
   return (
-    <ChartCard title="Air quality (PM2.5)" subtitle="Daily PM2.5, last 90 days" tick="descriptive" className="mt-4">
+    <ChartCard title="Air quality (PM2.5)" subtitle="Daily PM2.5, last 90 days" tick="descriptive">
       {body}
       <p className="text-[11px] text-text-tertiary mt-3">
         Regional model estimate (Open-Meteo / CAMS) for the fixed location, not a sensor at home; exploratory, no seasonal adjustment.
