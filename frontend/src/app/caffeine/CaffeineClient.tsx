@@ -1,5 +1,6 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { useEffect, useRef, useState } from "react";
 import {
   BarChart, Bar,
@@ -107,7 +108,8 @@ function windowDaysFromUrl(): number {
   return Math.min(730, Math.max(7, n));
 }
 
-export default function CaffeinePage({ initial: initialProp }: { initial?: CaffeineInitial | null }) {
+export default function CaffeinePage({ initial: initialProp, headingTestId = "page-heading" }: { initial?: CaffeineInitial | null; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // Server-prefetched initial data (ISR, fixed 60/90/45-day windows) seeds the
   // charts so they paint immediately; the mount effect still runs as a SILENT
   // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
@@ -138,6 +140,8 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
     Promise.all([getCaffeineDaily(windowDays), getCaffeineHrvPairs(hrvDays), getCaffeineDataQuality(qualityDays)])
       .then(([d, p, q]) => {
         if (cancelled) return;
+        // The default windows also seed this page in the continuous scroll (lib/feed-seed.ts).
+        if (windowDays === DEFAULT_DAYS) writeFeedSeed("/caffeine", { daily: d, hrvPairs: p, quality: q });
         // sameJson bail-out: the silent revalidation's data is usually
         // byte-identical to the server-seeded state — returning the previous
         // reference lets React skip the commit (and a full chart re-render).
@@ -248,7 +252,7 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <div className="flex items-center gap-2">
-            <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Caffeine</h2>
+            <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Caffeine</h2>
             <InfoHint label="Caffeine data">
               Supplement doses (from 2026-05-19) and Cronometer food (from 2026-05-31) are the only sources, so
               the charts cover that era only. The yes/no caffeine habit is ignored: it proved unreliable.

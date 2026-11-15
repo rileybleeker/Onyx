@@ -1,5 +1,6 @@
 "use client";
 
+import { usePageHeadingTestId } from "@/components/FeedContext";
 import { useEffect, useState, useCallback, useRef, type RefObject } from "react";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
@@ -342,6 +343,8 @@ function RefreshedLabel({ refreshedAtRef }: { refreshedAtRef: RefObject<Date | n
 const STATUS_URL = "/api/status";
 
 export default function StatusPage() {
+  // "feed-page-heading" when this page is shown inside the continuous scroll (components/ContinuousScroll.tsx).
+  const headingTestId = usePageHeadingTestId();
   // Start from the cached copy (instant revisit / reopen), then revalidate.
   const [data, setData] = useState<StatusResponse | null>(() => clientCache.peek<StatusResponse>(STATUS_URL) ?? null);
   const [loading, setLoading] = useState(() => data === null);
@@ -487,7 +490,7 @@ export default function StatusPage() {
       {/* Page header */}
       <div className="flex items-baseline justify-between mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">System Status</h2>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">System Status</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
             ETL pipeline health and data freshness
             <RefreshedLabel refreshedAtRef={refreshedAtRef} />

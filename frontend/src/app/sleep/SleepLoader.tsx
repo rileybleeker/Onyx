@@ -27,6 +27,7 @@ export interface SleepInitial {
   summaries: unknown[];
 }
 
-export default function SleepLoader({ initial }: { initial: SleepInitial | null }) {
-  return <SleepClient initial={initial} />;
+// headingTestId: "feed-page-heading" when the continuous scroll renders this page (its FeedSection).
+export default function SleepLoader({ initial, headingTestId }: { initial: SleepInitial | null; headingTestId?: string }) {
+  return <SleepClient initial={initial} headingTestId={headingTestId} />;
 }

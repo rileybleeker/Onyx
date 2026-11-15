@@ -127,7 +127,8 @@ async function getJson(url: string) {
   return res.json();
 }
 
-export default function SupplementsPage() {
+export default function SupplementsPage({ headingTestId = "page-heading" }: { headingTestId?: string } = {}) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   const [products, setProducts] = useState<Product[]>([]);
   const [intakes, setIntakes] = useState<Intake[]>([]);
   const [compounds, setCompounds] = useState<CompoundRow[]>([]);
@@ -578,7 +579,7 @@ export default function SupplementsPage() {
     <div className="space-y-6">
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 data-testid="page-heading" className="text-[20px] font-medium text-text-primary tracking-tight">Supplements</h1>
+          <h1 data-testid={headingTestId} className="text-[20px] font-medium text-text-primary tracking-tight">Supplements</h1>
           <p className="text-[12px] text-text-tertiary mt-0.5">
             DSLD-backed library · ingredient-level intake tracking — {rangeLabel(range)}
           </p>

@@ -11,6 +11,7 @@ import { AGENTS_BADGE_EVENT, lastAgentsBadge } from "@/lib/agents-api";
 import { badgeText, isTabActive, mobileTabs, tabLabel } from "@/lib/mobile-tabs";
 import { navIntentProps } from "@/lib/warmup";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
+import { useActiveRoute } from "./FeedContext";
 
 const LOG_ACTIONS = [
   { label: "Check-in", href: "/check-in", icon: ClipboardCheck },
@@ -49,6 +50,8 @@ export default function MobileNav() {
   const drawerRef = useRef<HTMLElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
+  // The page in view (follows the continuous scroll); `pathname` stays the routed page for closing overlays.
+  const current = useActiveRoute();
   const agentsUnread = useAgentsBadge();
 
   // Close every overlay on route change.
@@ -166,7 +169,7 @@ export default function MobileNav() {
             if (tab.kind === "page") {
               const item = navItems.get(tab.href)!;
               const Icon = item.icon;
-              const active = isTabActive(item.href, pathname);
+              const active = isTabActive(item.href, current);
               const count = item.href === "/agents" ? badgeText(agentsUnread) : "";
               return (
                 <Link key={item.href} href={item.href} className={`${cell} ${active ? "text-accent" : "text-text-tertiary hover:text-text-secondary"}`} aria-current={active ? "page" : undefined} {...navIntentProps(item.href)}>
@@ -285,7 +288,7 @@ export default function MobileNav() {
               </p>
               <div className="space-y-0.5">
                 {section.items.map((item) => {
-                  const active = (pathname === "/" ? "/today" : pathname) === item.href;
+                  const active = current === item.href;
                   const Icon = item.icon;
                   return (
                     <Link

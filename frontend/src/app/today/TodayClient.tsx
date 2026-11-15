@@ -142,7 +142,8 @@ function fromDevice<T>(value: T) {
   return (previous: Load<T>): Load<T> => previous.state === "loading" ? { state: "ready", value } : previous.state === "error" ? { state: "ready", value, stale: true } : previous;
 }
 
-export default function TodayClient() {
+export default function TodayClient({ headingTestId = "page-heading" }: { headingTestId?: string } = {}) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // Each panel starts from the cached copy when there is one (a revisit is instant), then revalidates.
   const [inbox, setInbox] = useState<Load<InboxResponse>>(() => cachedLoad(CACHE_KEYS.agentsInbox, parseInbox));
   const [reading, setReading] = useState<Load<ReadingOverview | null>>(() => cachedLoad(READING_URL, parseReading));
@@ -419,7 +420,7 @@ export default function TodayClient() {
     <div className={styles.today}>
       <header className={styles.header}>
         <div><p className={styles.eyebrow}>YOUR DAILY OVERVIEW</p>
-          <h1 data-testid="page-heading" className={styles.title}>Today</h1>
+          <h1 data-testid={headingTestId} className={styles.title}>Today</h1>
           <p className="mt-2 text-sm text-text-secondary">Less catching up. More moving forward.</p></div>
         <button type="button" onClick={() => { if (!pending) load(); }} aria-disabled={pending} aria-label="Refresh Today"
           className={styles.refresh}>

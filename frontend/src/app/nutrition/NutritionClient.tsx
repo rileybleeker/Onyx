@@ -1,5 +1,6 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import {
@@ -132,7 +133,8 @@ interface WeightRow {
 
 import type { NutritionInitial } from "./NutritionLoader";
 
-export default function NutritionPage({ initial }: { initial?: NutritionInitial | null }) {
+export default function NutritionPage({ initial, headingTestId = "page-heading" }: { initial?: NutritionInitial | null; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // ─── Nutrition state ───
   // Server-prefetched initial data (ISR, default 30d range) seeds the analytics
   // charts so they paint immediately; the range effect still runs as a SILENT
@@ -210,6 +212,8 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     ])
       .then(([n, b, v, f]) => {
         if (cancelled) return;
+        // The default view also seeds this page in the continuous scroll (lib/feed-seed.ts).
+        if (range === "30d") writeFeedSeed("/nutrition", { nutritionData: n, burntData: b, vitaminsData: v, fullNutrients: f });
         // sameJson bail-out: the silent revalidation's data is usually
         // byte-identical to the server-seeded state — returning the previous
         // reference lets React skip the commit (and a full chart re-render).
@@ -520,7 +524,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <div className="flex items-center gap-2">
-            <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Nutrition</h2>
+            <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Nutrition</h2>
             <InfoHint label="Nutrition">
               Food comes from Cronometer. On days with no Cronometer log, Uber Eats dish estimates fill in.
             </InfoHint>
