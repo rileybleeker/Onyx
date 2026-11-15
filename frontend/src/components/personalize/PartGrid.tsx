@@ -246,7 +246,6 @@ export function PartGrid({ page, title, zone = MAIN_ZONE, initial, className, ga
           );
         })}
         {live && api ? <live.GridEditor api={api} /> : null}
-        {live && api && main ? <live.Banner api={api} /> : null}
       </div>
     </GridContext.Provider>
   );

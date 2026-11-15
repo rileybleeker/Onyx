@@ -7,6 +7,7 @@ import CommandPalette from "./CommandPalette";
 import { DesktopLaunchHandler } from "./DesktopApp";
 import AppData, { SignedOutWipe } from "./AppData";
 import UpdateChecker from "./UpdateChecker";
+import PersonalizeHost from "./personalize/PersonalizeHost";
 import ContinuousScroll from "./ContinuousScroll";
 import { ActiveRouteProvider } from "./FeedContext";
 
@@ -31,6 +32,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <CommandPalette />
         <DesktopLaunchHandler />
         <UpdateChecker />
+        <PersonalizeHost />
       </ActiveRouteProvider>
     );
   }
@@ -53,6 +55,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <CommandPalette />
       <DesktopLaunchHandler />
       <UpdateChecker />
+      <PersonalizeHost />
     </ActiveRouteProvider>
   );
 }

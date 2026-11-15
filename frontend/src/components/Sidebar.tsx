@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { LogOut, Search } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
@@ -11,8 +12,17 @@ import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 import { InstallAppButton, ReloadAppButton, usePaletteShortcutLabel } from "./DesktopApp";
 import { useActiveRoute, useRevealActiveNavItem } from "./FeedContext";
 import PersonalizeButton from "./personalize/PersonalizeButton";
+import type { EditorModule } from "./personalize/editor-loader";
+import {
+  QUICK_ACCESS, areaId, dropNavBootStyle, navBootScript, orderNav, savedAreaIds, subscribeAreaIds,
+} from "@/lib/nav-areas";
+import { currentEditingKey, editorRef, subscribeTargets } from "@/lib/personalize-registry";
 
 const SIDEBAR_LIST_SELECTOR = 'nav[data-nav-list="sidebar"]';
+// Paints Riley's saved order (Personalize, `layout.areas`) before React runs on a full page load.
+const NAV_BOOT = navBootScript(NAV_SECTIONS);
+const noIds = () => null;
+const none = () => null;
 
 export default function Sidebar() {
   // The page in view: the routed page, or the page the continuous scroll has reached ("/" counts as Today).
@@ -21,10 +31,19 @@ export default function Sidebar() {
   // Keep the active item visible in the scrolling list as the continuous scroll moves through the pages.
   useRevealActiveNavItem(SIDEBAR_LIST_SELECTOR, current);
 
+  // Riley's area order (Personalize; the continuous scroll follows the same order). Server render and hydration
+  // use the default; the inline script below has already painted the saved order, which React then renders.
+  const savedIds = useSyncExternalStore(subscribeAreaIds, savedAreaIds, noIds);
+  useEffect(() => {
+    if (savedIds !== null) dropNavBootStyle();
+  }, [savedIds]);
+  const editing = useSyncExternalStore(subscribeTargets, currentEditingKey, none) !== null;
+  const editor = useSyncExternalStore(subscribeTargets, editorRef, none) as EditorModule | null;
+
   // Derive both groups from the shared route catalog; no destination is removed.
-  const pinnedHrefs = new Set(["/today", "/check-in"]);
+  const pinnedHrefs = new Set(QUICK_ACCESS);
   const pinnedItems = NAV_SECTIONS.flatMap((section) => section.items).filter((item) => pinnedHrefs.has(item.href));
-  const librarySections = NAV_SECTIONS.map((section) => ({
+  const librarySections = orderNav(NAV_SECTIONS, savedIds).map((section) => ({
     ...section,
     items: section.items.filter((item) => !pinnedHrefs.has(item.href)),
   })).filter((section) => section.items.length > 0);
@@ -38,6 +57,7 @@ export default function Sidebar() {
       <Link
         key={item.href}
         href={item.href}
+        data-nav-area={areaId(item.href)}
         aria-current={active ? "page" : undefined}
         {...navIntentProps(item.href)}
         className={`flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium transition-colors relative focus:outline-none focus-visible:ring-1 focus-visible:ring-accent ${
@@ -66,6 +86,7 @@ export default function Sidebar() {
 
   return (
     <aside className="fixed inset-y-0 left-0 z-50 w-[220px] bg-surface-sunken border-r border-border-subtle flex flex-col max-md:hidden">
+      <script dangerouslySetInnerHTML={{ __html: NAV_BOOT }} />
       <div className="shrink-0 px-5 py-5 border-b border-border-subtle">
         <h1 className="flex items-center gap-2 text-[20px] font-bold lowercase leading-none tracking-[0.01em] text-text-primary"><img src="/icons/logo-mark-64.png?v=4" width={30} height={30} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
         <p className="text-[11px] text-text-tertiary mt-1.5 font-mono">Personal Data Scientist</p>
@@ -84,22 +105,29 @@ export default function Sidebar() {
         </button>
       </div>
 
-      <nav aria-label="Quick access" className="shrink-0 px-2 py-3 border-b border-border-subtle space-y-0.5">
-        {pinnedItems.map(renderLink)}
-      </nav>
+      {editing && editor ? (
+        // Personalize mode: drag pages within a section, or sections, to rearrange (components/personalize/NavArranger.tsx).
+        <editor.SidebarArranger current={current} />
+      ) : (
+        <>
+          <nav aria-label="Quick access" className="shrink-0 px-2 py-3 border-b border-border-subtle space-y-0.5">
+            {pinnedItems.map(renderLink)}
+          </nav>
 
-      <nav aria-label="All sections" className="flex-1 min-h-0 px-2 py-3 overflow-y-auto" data-nav-list="sidebar">
-        {librarySections.map((section) => (
-          <div key={section.title} className="mb-3 last:mb-0">
-            <p className="px-3 pb-1 text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
-              {section.title}
-            </p>
-            <div className="space-y-0.5">
-              {section.items.map(renderLink)}
-            </div>
-          </div>
-        ))}
-      </nav>
+          <nav aria-label="All sections" className="flex-1 min-h-0 px-2 py-3 overflow-y-auto flex flex-col" data-nav-list="sidebar">
+            {librarySections.map((section) => (
+              <div key={section.title} data-nav-section={section.index} className="shrink-0 mb-3 last:mb-0">
+                <p className="px-3 pb-1 text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
+                  {section.title}
+                </p>
+                <div className="flex flex-col gap-0.5">
+                  {section.items.map(renderLink)}
+                </div>
+              </div>
+            ))}
+          </nav>
+        </>
+      )}
 
       <div className="shrink-0 px-2 py-3 border-t border-border-subtle">
         <InstallAppButton />

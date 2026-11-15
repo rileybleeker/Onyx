@@ -12,6 +12,7 @@ import {
 import { hasFeedSection, loadFeedSection, loadedFeedSection } from "@/lib/feed-registry";
 import { GONE, clientCache, fetchJsonValue } from "@/lib/client-cache";
 import { parseUiPref, uiPrefUrl } from "@/lib/ui-preferences";
+import { LAYOUT_EVENT } from "@/lib/nav-areas";
 import { browserIdle } from "@/lib/warmup";
 import PageSkeleton from "./PageSkeleton";
 import { InFeed, useSetActiveRoute } from "./FeedContext";
@@ -105,11 +106,17 @@ function useAreaOrder(enabled: boolean): AreaOrder | null {
     const onStorage = (e: StorageEvent) => {
       if (e.key === AREAS_LOCAL_KEY) apply(readLocalOrder());
     };
+    // Personalize saved or adopted the area order on this tab (lib/personalize-store.ts).
+    const onLayout = (e: Event) => {
+      if ((e as CustomEvent<string>).detail === AREAS_PREF_KEY) apply(readLocalOrder());
+    };
     window.addEventListener("storage", onStorage);
+    window.addEventListener(LAYOUT_EVENT, onLayout);
     return () => {
       alive = false;
       off();
       window.removeEventListener("storage", onStorage);
+      window.removeEventListener(LAYOUT_EVENT, onLayout);
     };
   }, [enabled]);
   return enabled ? order : null;

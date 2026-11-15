@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Plus, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck, Camera } from "lucide-react";
@@ -13,6 +13,12 @@ import { navIntentProps } from "@/lib/warmup";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 import { useActiveRoute } from "./FeedContext";
 import PersonalizeButton from "./personalize/PersonalizeButton";
+import type { EditorModule } from "./personalize/editor-loader";
+import { orderNav, savedAreaIds, subscribeAreaIds } from "@/lib/nav-areas";
+import { currentEditingKey, editorRef, subscribeTargets } from "@/lib/personalize-registry";
+
+const noIds = () => null;
+const none = () => null;
 
 const LOG_ACTIONS = [
   { label: "Check-in", href: "/check-in", icon: ClipboardCheck },
@@ -48,6 +54,11 @@ function useAgentsBadge(): number {
 
 export default function MobileNav() {
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // Riley's area order (Personalize, `layout.areas`): the drawer lists sections and pages in it, like the sidebar.
+  const savedIds = useSyncExternalStore(subscribeAreaIds, savedAreaIds, noIds);
+  const orderedSections = orderNav(NAV_SECTIONS, savedIds);
+  const arranging = useSyncExternalStore(subscribeTargets, currentEditingKey, none) !== null;
+  const editor = useSyncExternalStore(subscribeTargets, editorRef, none) as EditorModule | null;
   const [logOpen, setLogOpen] = useState(false);
   const drawerRef = useRef<HTMLElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
@@ -282,8 +293,12 @@ export default function MobileNav() {
           </button>
         </div>
 
+        {arranging && editor ? (
+          // Personalize mode: up / down buttons for pages and sections (components/personalize/NavArranger.tsx).
+          <editor.DrawerArranger />
+        ) : (
         <nav className="flex-1 px-2 py-3 overflow-y-auto">
-          {NAV_SECTIONS.map((section) => (
+          {orderedSections.map((section) => (
             <div key={section.title} className="mb-3 last:mb-0">
               <p className="px-3 pb-1 text-[10px] font-medium uppercase tracking-[0.12em] text-text-tertiary/70">
                 {section.title}
@@ -314,10 +329,11 @@ export default function MobileNav() {
             </div>
           ))}
         </nav>
+        )}
 
         <div className="px-2 py-3 border-t border-border-subtle pb-[max(0.75rem,env(safe-area-inset-bottom))]">
           <PersonalizeButton
-            onStart={() => setDrawerOpen(false)}
+            onStart={(kind) => { if (kind === "page") setDrawerOpen(false); }}
             className="min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full disabled:text-accent"
           />
           <button
