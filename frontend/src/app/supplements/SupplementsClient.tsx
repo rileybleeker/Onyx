@@ -12,6 +12,11 @@ import EditIntakeModal, { type EditableIntake } from "@/components/EditIntakeMod
 import StackEditorModal, { type EditableStack } from "@/components/StackEditorModal";
 import CustomSupplementFlow from "@/components/CustomSupplementFlow";
 import { rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { Check, X } from "lucide-react";
+import {
+  batchUndoResult, claimedIds, findSavedCopy, newWrite, receiptText, updateWrite,
+  type SupplementWrite,
+} from "@/lib/supplement-writes";
 
 interface Product {
   product_id: string;
@@ -115,6 +120,13 @@ function formatShortDate(ymd: string): string {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+/** GET JSON; a non-OK answer throws, so a failed read never replaces a list with "nothing". */
+async function getJson(url: string) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} answered ${res.status}`);
+  return res.json();
+}
+
 export default function SupplementsPage() {
   const [products, setProducts] = useState<Product[]>([]);
   const [intakes, setIntakes] = useState<Intake[]>([]);
@@ -127,8 +139,18 @@ export default function SupplementsPage() {
   const [stacks, setStacks] = useState<Stack[]>([]);
   const [busyStackId, setBusyStackId] = useState<number | null>(null);
   const [editingStack, setEditingStack] = useState<EditableStack | null>(null);
-  // Most-recent stack-log batch, for one-click "undo all".
-  const [lastBatch, setLastBatch] = useState<{ name: string; ids: number[] } | null>(null);
+  // Most-recent stack-log batch, for one-click "undo all". `ids` = the intakes not yet confirmed deleted.
+  const [lastBatch, setLastBatch] = useState<{ name: string; ids: number[]; status: "ready" | "undoing" | "failed" } | null>(null);
+  // Every write this page started (lib/supplement-writes.ts): saving rows show in Today's intakes, failed ones
+  // stay in the Not saved bar with Retry. Saved ones are kept (capped) so a Retry never adopts their rows.
+  const [writes, setWrites] = useState<SupplementWrite[]>([]);
+  const writesRef = useRef<SupplementWrite[]>([]);
+  writesRef.current = writes;
+  const writeSeq = useRef(0);
+  // Single-row deletes the server refused: the row is back on the list, listed here with Retry.
+  const [failedDeletes, setFailedDeletes] = useState<{ intake_id: number; label: string }[]>([]);
+  // The behavioral day /api/supplements/today answered for (its rows are "Today's intakes").
+  const [listDate, setListDate] = useState<string | null>(null);
 
   // History (older intakes, paginated). Window driven by the global range filter.
   const [history, setHistory] = useState<Intake[]>([]);
@@ -139,18 +161,18 @@ export default function SupplementsPage() {
   // Edit-intake modal
   const [editing, setEditing] = useState<EditableIntake | null>(null);
 
-  // Center-screen "logged 👍" confirmation toast. Fires on every successful
-  // intake write (quick-tap, seed+log, custom-product log). pointer-events-none
-  // so it never blocks rapid tapping; the timer resets on each fire so a burst
-  // of taps keeps it on screen until ~1.5s after the last one.
-  const [toast, setToast] = useState<{ msg: string; id: number } | null>(null);
+  // Center-screen receipt toast. "Saved" only after the server answered OK (quick-tap, stack, seed+log,
+  // custom-product log); "Not saved" when it did not (the failure also stays in the Not saved bar below with
+  // Retry). pointer-events-none so it never blocks rapid tapping; the timer resets on each fire so a burst of
+  // taps keeps it on screen until shortly after the last answer.
+  const [toast, setToast] = useState<{ msg: string; ok: boolean; id: number } | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toastSeq = useRef(0);
-  const showToast = useCallback((msg = "logged 👍") => {
+  const showToast = useCallback((msg = "Saved", ok = true) => {
     toastSeq.current += 1;
-    setToast({ msg, id: toastSeq.current });
+    setToast({ msg, ok, id: toastSeq.current });
     if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 1500);
+    toastTimer.current = setTimeout(() => setToast(null), ok ? 1500 : 2500);
   }, []);
   useEffect(() => () => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -211,20 +233,14 @@ export default function SupplementsPage() {
   const loadAll = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
     if (!silent) setLoading(true);
     try {
-      const [pRes, tRes] = await Promise.all([
-        fetch("/api/supplements/products").then((r) => r.json()),
-        fetch("/api/supplements/today").then((r) => r.json()),
-      ]);
+      const [pRes, tRes] = await Promise.all([getJson("/api/supplements/products"), getJson("/api/supplements/today")]);
       setProducts(pRes.products ?? []);
-      // Preserve any still-pending optimistic intake rows (negative intake_id)
-      // so a silent refresh doesn't blow them away mid-POST.
-      const serverIntakes: Intake[] = tRes.intakes ?? [];
-      setIntakes((prev) => {
-        const pending = prev.filter((i) => i.intake_id < 0);
-        return pending.length === 0 ? serverIntakes : [...pending, ...serverIntakes];
-      });
+      // Only server-confirmed rows live in `intakes`; rows still saving are drawn from `writes`.
+      setIntakes(tRes.intakes ?? []);
       setCompounds(tRes.compounds ?? []);
+      if (typeof tRes.date === "string") setListDate(tRes.date);
     } catch (e) {
+      // A failed read keeps what is on screen (never an empty "nothing logged").
       console.error("Supplements load:", e);
     } finally {
       if (!silent) setLoading(false);
@@ -234,10 +250,7 @@ export default function SupplementsPage() {
   const loadHistory = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
     if (!silent) setHistoryLoading(true);
     try {
-      const res = await fetch(
-        `/api/supplements/history?days=${historyDays}&perPage=100`,
-      );
-      const json = await res.json();
+      const json = await getJson(`/api/supplements/history?days=${historyDays}&perPage=100`);
       const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
       // Exclude today's rows (already shown in "Today's intakes" above).
       setHistory((json.rows ?? []).filter((r: Intake) => r.intake_date !== todayStr));
@@ -250,8 +263,7 @@ export default function SupplementsPage() {
 
   const loadStacks = useCallback(async () => {
     try {
-      const res = await fetch("/api/supplements/stacks");
-      const json = await res.json();
+      const json = await getJson("/api/supplements/stacks");
       setStacks(json.stacks ?? []);
     } catch (e) {
       console.error("Stacks load:", e);
@@ -278,19 +290,15 @@ export default function SupplementsPage() {
 
   // Debounced silent refresh of /today only — used after rapid log taps so
   // the compounds-rollup table catches up without re-fetching on every click.
-  // Optimistic intake rows are kept alive by loadAll's pending-merge logic.
   const todayRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scheduleSilentTodayRefresh = useCallback(() => {
     if (todayRefreshTimer.current) clearTimeout(todayRefreshTimer.current);
     todayRefreshTimer.current = setTimeout(async () => {
       try {
-        const tRes = await fetch("/api/supplements/today").then((r) => r.json());
-        const serverIntakes: Intake[] = tRes.intakes ?? [];
-        setIntakes((prev) => {
-          const pending = prev.filter((i) => i.intake_id < 0);
-          return pending.length === 0 ? serverIntakes : [...pending, ...serverIntakes];
-        });
+        const tRes = await getJson("/api/supplements/today");
+        setIntakes(tRes.intakes ?? []);
         setCompounds(tRes.compounds ?? []);
+        if (typeof tRes.date === "string") setListDate(tRes.date);
       } catch (e) {
         console.error("Silent today refresh:", e);
       }
@@ -300,13 +308,88 @@ export default function SupplementsPage() {
     if (todayRefreshTimer.current) clearTimeout(todayRefreshTimer.current);
   }, []);
 
+  // The day "Today's intakes" shows (behavioral today from the server; the ET date until it answered).
+  const todayList = listDate ?? today;
+  const visibleIds = () => [...intakes, ...history].map((i) => i.intake_id);
+
+  // Send one write and record what the server said. Only an OK answer is "Saved".
+  async function sendWrite(w: SupplementWrite) {
+    const url = w.kind === "intake" ? "/api/supplements/log-intake" : "/api/supplements/stacks/log";
+    let res: Response;
+    try {
+      res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(w.body) });
+    } catch {
+      failWrite(w, "no answer from Onyx");
+      return;
+    }
+    if (!res.ok) {
+      failWrite(w, `refused (${res.status})`);
+      return;
+    }
+    const saved = (await res.json().catch(() => ({}))) as { intake_id?: number; intake_ids?: number[] };
+    const ids = w.kind === "intake" ? (typeof saved.intake_id === "number" ? [saved.intake_id] : []) : (saved.intake_ids ?? []);
+    savedWrite(w, ids);
+  }
+
+  function failWrite(w: SupplementWrite, error: string) {
+    setWrites((l) => updateWrite(l, w.id, { status: "failed", error }));
+    showToast(`Not saved: ${w.label}`, false);
+  }
+
+  function savedWrite(w: SupplementWrite, ids: number[]) {
+    setWrites((l) => updateWrite(l, w.id, { status: "saved", savedIds: ids, error: null }));
+    showToast(w.kind === "stack" ? `Saved ${w.label}` : "Saved");
+    if (w.kind === "stack") setLastBatch({ name: w.label, ids, status: "ready" });
+    if (w.kind === "intake" && w.date === todayList && ids.length === 1 && w.productId) {
+      // Show the confirmed row at once; the debounced refresh brings the compound totals.
+      const product = products.find((p) => p.product_id === w.productId);
+      const row: Intake = {
+        intake_id: ids[0], intake_date: w.date, intake_time: w.time, product_id: w.productId,
+        doses: Number(w.body.doses ?? 1), notes: null,
+        brand_name: product?.brand_name ?? null, full_name: product?.full_name ?? w.label,
+      };
+      setIntakes((prev) => (prev.some((i) => i.intake_id === row.intake_id) ? prev : [row, ...prev]));
+    }
+    if (w.date === todayList) scheduleSilentTodayRefresh();
+    else void loadHistory({ silent: true });
+  }
+
+  // Retry a failed write. Its answer may simply have been lost, so look for its row first (findSavedCopy).
+  async function retryWrite(w: SupplementWrite) {
+    setWrites((l) => updateWrite(l, w.id, { status: "saving", error: null }));
+    if (w.time && w.date === todayList) {
+      try {
+        const tRes = await getJson("/api/supplements/today");
+        const rows: Intake[] = tRes.intakes ?? [];
+        const copy = findSavedCopy(w, rows, claimedIds(writesRef.current, w.id));
+        if (copy.length > 0) {
+          setIntakes(rows);
+          setCompounds(tRes.compounds ?? []);
+          savedWrite(w, copy);
+          return;
+        }
+      } catch {
+        // Could not look: send it again (the read failing usually means the write would fail too).
+      }
+    }
+    await sendWrite(w);
+  }
+
+  function dismissWrite(id: string) {
+    setWrites((l) => l.filter((w) => w.id !== id));
+  }
+
+  function startWrite(args: Parameters<typeof newWrite>[0]): SupplementWrite {
+    const w = newWrite(args);
+    // Saved writes are kept so a later Retry never adopts their rows; cap the list.
+    setWrites((l) => [w, ...l].slice(0, 60));
+    return w;
+  }
+
   async function logIntake(product_id: string) {
     const product = products.find((p) => p.product_id === product_id);
     if (!product) return;
 
-    // Negative ID marks this row as optimistic / unconfirmed — replaced with
-    // the real intake_id once POST resolves, or removed on error.
-    const tempId = -(Date.now() + Math.floor(Math.random() * 10000));
     const logDateIsToday = logDate === today;
     // Backdated logs get NO timestamp unless the user set one explicitly:
     // stamping "now" on a past intake_date produced retro-log artifacts the
@@ -314,119 +397,87 @@ export default function SupplementsPage() {
     // different behavioral day than claimed). NULL = "took it that day, time
     // unspecified" — mg totals still count, timing aggregates stay clean.
     const stampIso = logTimeIso() ?? (logDateIsToday ? new Date().toISOString() : null);
-    const optimistic: Intake = {
-      intake_id: tempId,
-      intake_date: logDate,
-      intake_time: stampIso,
-      product_id,
-      doses: 1,
-      notes: null,
-      brand_name: product.brand_name,
-      full_name: product.full_name,
-    };
-    if (logDateIsToday) {
-      setIntakes((prev) => [optimistic, ...prev]);
-    }
-    // Optimistic confirmation — matches the optimistic row above. A failed POST
-    // rolls the row back below; the brief toast is an acceptable cost.
-    showToast();
-
-    try {
-      const res = await fetch("/api/supplements/log-intake", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          product_id,
-          intake_date: logDate,
-          intake_time: stampIso,
-        }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      const saved = (await res.json()) as { intake_id: number };
-      if (logDateIsToday) {
-        setIntakes((prev) =>
-          prev.map((i) => (i.intake_id === tempId ? { ...i, intake_id: saved.intake_id } : i)),
-        );
-        scheduleSilentTodayRefresh();
-      } else {
-        // Logged to a past date → row shows up in history, not today.
-        void loadHistory({ silent: true });
-      }
-    } catch (e) {
-      // Roll back the optimistic row so the UI matches the server.
-      if (logDateIsToday) {
-        setIntakes((prev) => prev.filter((i) => i.intake_id !== tempId));
-      }
-      console.error("Log intake:", e);
-    }
+    // The row shows as "Saving…" in Today's intakes until the server answers; no "Saved" before that.
+    const w = startWrite({
+      id: `w${++writeSeq.current}`,
+      kind: "intake",
+      label: product.full_name ?? product_id,
+      date: logDate,
+      time: stampIso,
+      productId: product_id,
+      body: { product_id, intake_date: logDate, intake_time: stampIso },
+      knownIds: visibleIds(),
+    });
+    await sendWrite(w);
   }
 
   async function undoIntake(intake_id: number) {
     // Optimistic remove — keep refs so we can re-insert on failure.
     const removedToday = intakes.find((i) => i.intake_id === intake_id);
     const removedHistory = history.find((i) => i.intake_id === intake_id);
+    const label = (removedToday ?? removedHistory)?.full_name ?? "intake";
+    setFailedDeletes((l) => l.filter((d) => d.intake_id !== intake_id));
     setIntakes((prev) => prev.filter((i) => i.intake_id !== intake_id));
     setHistory((prev) => prev.filter((i) => i.intake_id !== intake_id));
     try {
       const res = await fetch(`/api/supplements/log-intake?intake_id=${intake_id}`, { method: "DELETE" });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw new Error(`refused (${res.status})`);
       scheduleSilentTodayRefresh();
     } catch (e) {
-      if (removedToday) setIntakes((prev) => [removedToday, ...prev]);
-      if (removedHistory) setHistory((prev) => [removedHistory, ...prev]);
+      // The row comes back, and the failure stays listed with Retry.
+      if (removedToday) setIntakes((prev) => (prev.some((i) => i.intake_id === intake_id) ? prev : [removedToday, ...prev]));
+      if (removedHistory) setHistory((prev) => (prev.some((i) => i.intake_id === intake_id) ? prev : [removedHistory, ...prev]));
+      setFailedDeletes((l) => [...l.filter((d) => d.intake_id !== intake_id), { intake_id, label }]);
+      showToast(`Not deleted: ${label}`, false);
       console.error("Undo intake:", e);
     }
   }
 
   // Log an entire stack — writes one intake per item server-side, honoring the
   // page's logDate / logTime overrides (so a pre-bed stack can attribute to
-  // yesterday). Records the batch for one-click undo.
+  // yesterday). Records the batch for one-click undo once the server confirmed it.
   async function logStack(stack: Stack) {
     setBusyStackId(stack.stack_id);
     // Same backdate rule as addIntake: no explicit time + past date → null
     // timestamp (the server passes null through; it no longer coerces to now).
     const stampIso = logTimeIso() ?? (isLoggingForToday ? new Date().toISOString() : null);
-    showToast(`logged ${stack.name} 👍`);
+    const w = startWrite({
+      id: `w${++writeSeq.current}`,
+      kind: "stack",
+      label: stack.name,
+      date: logDate,
+      time: stampIso,
+      stackName: stack.name,
+      body: { stack_id: stack.stack_id, intake_date: logDate, intake_time: stampIso },
+      knownIds: visibleIds(),
+    });
     try {
-      const res = await fetch("/api/supplements/stacks/log", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          stack_id: stack.stack_id,
-          intake_date: logDate,
-          intake_time: stampIso,
-        }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      const saved = (await res.json()) as { intake_ids: number[] };
-      setLastBatch({ name: stack.name, ids: saved.intake_ids ?? [] });
-      if (logDate === today) {
-        await loadAll({ silent: true });
-      } else {
-        await loadHistory({ silent: true });
-      }
-    } catch (e) {
-      console.error("Log stack:", e);
+      await sendWrite(w);
     } finally {
       setBusyStackId(null);
     }
   }
 
-  // Undo the most-recent stack-log batch by deleting every intake it wrote.
+  // Undo the most-recent stack-log batch by deleting every intake it wrote. The bar stays until every delete
+  // is confirmed; whatever the server did not confirm stays listed for another try.
   async function undoLastBatch() {
-    if (!lastBatch) return;
-    const { ids } = lastBatch;
-    setLastBatch(null);
-    try {
-      await Promise.all(
-        ids.map((id) =>
-          fetch(`/api/supplements/log-intake?intake_id=${id}`, { method: "DELETE" }),
-        ),
-      );
-      await Promise.all([loadAll({ silent: true }), loadHistory({ silent: true })]);
-    } catch (e) {
-      console.error("Undo stack batch:", e);
+    if (!lastBatch || lastBatch.status === "undoing") return;
+    const { name, ids } = lastBatch;
+    setLastBatch({ name, ids, status: "undoing" });
+    const ok = await Promise.all(
+      ids.map((id) =>
+        fetch(`/api/supplements/log-intake?intake_id=${id}`, { method: "DELETE" }).then((r) => r.ok, () => false),
+      ),
+    );
+    const { failed } = batchUndoResult(ids, ok);
+    if (failed.length === 0) {
+      setLastBatch(null);
+      showToast(`Removed ${name}`);
+    } else {
+      setLastBatch({ name, ids: failed, status: "failed" });
+      showToast(`Not removed: ${failed.length} of ${ids.length}`, false);
     }
+    await Promise.all([loadAll({ silent: true }), loadHistory({ silent: true })]);
   }
 
   async function runSearch(q: string) {
@@ -520,6 +571,8 @@ export default function SupplementsPage() {
 
   const intakeCount = intakes.length;
   const distinctCompounds = compounds.length;
+  const savingToday = writes.filter((w) => w.kind === "intake" && w.status === "saving" && w.date === todayList);
+  const failedWrites = writes.filter((w) => w.status === "failed");
 
   return (
     <div className="space-y-6">
@@ -584,15 +637,32 @@ export default function SupplementsPage() {
             </div>
 
             {lastBatch && (
-              <div className="flex items-center justify-between gap-2 mb-2 px-3 py-1.5 bg-accent/10 border border-accent/25 rounded-control text-[11px] font-mono">
-                <span className="text-text-secondary truncate">
-                  Logged {lastBatch.name} · {lastBatch.ids.length} products
+              <div
+                role="status"
+                className={`flex items-center justify-between gap-2 mb-2 px-3 py-1.5 border rounded-control text-[11px] font-mono ${
+                  lastBatch.status === "failed" ? "bg-down/10 border-down/30" : "bg-surface-raised border-border-subtle"
+                }`}
+              >
+                <span className="truncate">
+                  {lastBatch.status === "undoing" ? (
+                    <span className="text-text-secondary">Removing {lastBatch.name}…</span>
+                  ) : lastBatch.status === "failed" ? (
+                    <span className="text-down">
+                      Not removed: {lastBatch.ids.length} intake{lastBatch.ids.length === 1 ? "" : "s"} from {lastBatch.name}
+                    </span>
+                  ) : (
+                    <span className="text-text-secondary inline-flex items-center gap-1.5">
+                      <Check aria-hidden="true" className="w-3.5 h-3.5 text-up" />
+                      <span className="text-up">Saved</span> {lastBatch.name} · {lastBatch.ids.length} products
+                    </span>
+                  )}
                 </span>
                 <button
                   onClick={undoLastBatch}
-                  className="text-text-tertiary hover:text-red-400 underline underline-offset-2 shrink-0"
+                  disabled={lastBatch.status === "undoing"}
+                  className="min-h-11 px-2 text-text-tertiary hover:text-text-primary underline underline-offset-2 shrink-0 disabled:opacity-50"
                 >
-                  undo all
+                  {lastBatch.status === "failed" ? "retry undo" : "undo all"}
                 </button>
               </div>
             )}
@@ -779,14 +849,26 @@ export default function SupplementsPage() {
             )}
           </ChartCard>
 
-          {/* Today's intakes */}
-          {intakes.length > 0 && (
+          {/* Today's intakes: rows still saving first (no edit/delete until the server has them), then saved rows */}
+          {(intakes.length > 0 || savingToday.length > 0) && (
             <ChartCard
               title="Today's intakes"
-              subtitle={`${intakes.length} events · newest first`}
+              subtitle={`${intakes.length} saved${savingToday.length ? ` · ${savingToday.length} saving` : ""} · newest first`}
               source="DSLD"
             >
               <div className="space-y-1.5">
+                {savingToday.map((w) => (
+                  <div
+                    key={w.id}
+                    className="flex items-center justify-between gap-3 py-1.5 border-b border-border-subtle/40 last:border-b-0 text-[12px] font-mono"
+                  >
+                    <div className="flex items-baseline gap-2 min-w-0">
+                      <span className="text-text-tertiary tabular-nums shrink-0 w-[68px]">{formatDoseTime(w.time)}</span>
+                      <span className="text-text-secondary truncate">{w.label}</span>
+                    </div>
+                    <span className="text-[10px] text-text-tertiary shrink-0">Saving…</span>
+                  </div>
+                ))}
                 {intakes.map((i) => (
                   <div
                     key={i.intake_id}
@@ -1161,16 +1243,62 @@ export default function SupplementsPage() {
         />
       )}
 
-      {/* Center-screen "logged" confirmation. z above the add-product modal (z-50)
-          so seed+log / custom-product logs flash over it; pointer-events-none so
+      {/* Writes the server did not confirm. Fixed above the mobile tab bar so a failure is seen wherever the
+          tap was made; each one keeps its request for Retry (which first checks it wasn't saved after all). */}
+      {(failedWrites.length > 0 || failedDeletes.length > 0) && (
+        <div
+          role="region"
+          aria-label="Not saved"
+          className="fixed left-1/2 z-40 w-[min(32rem,calc(100vw-2rem))] -translate-x-1/2 rounded-card border border-down/30 bg-surface-raised shadow-elevated px-3 py-2 bottom-[calc(env(safe-area-inset-bottom)+5.5rem)] md:bottom-6"
+        >
+          <ul className="divide-y divide-border-subtle">
+            {failedWrites.slice(0, 4).map((w) => (
+              <li key={w.id} className="flex items-center gap-2 py-1">
+                <span className="min-w-0 flex-1 text-[12px]">
+                  <span className="block truncate text-down">{receiptText(w, todayList, formatShortDate)}</span>
+                  {w.error && <span className="block truncate text-[11px] text-text-tertiary">{w.error}</span>}
+                </span>
+                <button onClick={() => void retryWrite(w)} className="min-h-11 px-3 text-[13px] font-medium text-accent shrink-0">
+                  Retry
+                </button>
+                <button onClick={() => dismissWrite(w.id)} aria-label={`Dismiss: ${w.label}`} className="min-h-11 min-w-11 inline-flex items-center justify-center text-text-tertiary hover:text-text-primary shrink-0">
+                  <X aria-hidden="true" className="w-4 h-4" />
+                </button>
+              </li>
+            ))}
+            {failedDeletes.slice(0, 3).map((d) => (
+              <li key={`del${d.intake_id}`} className="flex items-center gap-2 py-1">
+                <span className="min-w-0 flex-1 truncate text-[12px] text-down">Not deleted: {d.label} (still logged)</span>
+                <button onClick={() => void undoIntake(d.intake_id)} className="min-h-11 px-3 text-[13px] font-medium text-accent shrink-0">
+                  Retry
+                </button>
+                <button
+                  onClick={() => setFailedDeletes((l) => l.filter((x) => x.intake_id !== d.intake_id))}
+                  aria-label={`Dismiss: ${d.label}`}
+                  className="min-h-11 min-w-11 inline-flex items-center justify-center text-text-tertiary hover:text-text-primary shrink-0"
+                >
+                  <X aria-hidden="true" className="w-4 h-4" />
+                </button>
+              </li>
+            ))}
+          </ul>
+          {failedWrites.length > 4 && <p className="text-[11px] text-text-tertiary pb-1">And {failedWrites.length - 4} more not saved.</p>}
+        </div>
+      )}
+
+      {/* Center-screen receipt: "Saved" only after the server answered OK, "Not saved" otherwise. z above the
+          add-product modal (z-50) so seed+log / custom-product logs flash over it; pointer-events-none so
           it never intercepts taps. Keyed by id to re-run the fade on every fire. */}
       {toast && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center pointer-events-none">
+        <div className="fixed inset-0 z-[100] flex items-center justify-center pointer-events-none" role="status" aria-live="polite">
           <div
             key={toast.id}
-            className="animate-fade-in flex items-center gap-2 px-6 py-4 rounded-[10px] bg-surface-raised/95 border border-accent/40 shadow-floating backdrop-blur-sm"
+            className={`animate-fade-in flex items-center gap-2 px-6 py-4 rounded-card bg-surface-raised/95 border shadow-floating backdrop-blur-sm ${
+              toast.ok ? "border-up/40" : "border-down/40"
+            }`}
           >
-            <span className="text-[15px] font-medium text-text-primary tracking-tight">
+            {toast.ok ? <Check aria-hidden="true" className="w-4 h-4 text-up" /> : <X aria-hidden="true" className="w-4 h-4 text-down" />}
+            <span className={`text-[15px] font-medium tracking-tight ${toast.ok ? "text-text-primary" : "text-down"}`}>
               {toast.msg}
             </span>
           </div>
