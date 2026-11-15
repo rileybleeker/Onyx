@@ -57,7 +57,7 @@ export const VIEW_URL_SECONDS = 60;
 
 /** Columns read from the tables. Explicit on purpose: never `*`. */
 export const DOC_COLUMNS = "id,title,kind,doc_date,provider,notes,mime_type,size_bytes,uploaded_at";
-export const LAB_COLUMNS = "id,test_name,value_num,value_text,unit,ref_low,ref_high,ref_text,collected_on,lab,document_id,notes";
+export const LAB_COLUMNS = "id,test_name,value_num,value_text,unit,ref_low,ref_high,ref_low_strict,ref_high_strict,ref_text,collected_on,lab,document_id,notes";
 
 export type MedicalDocument = {
   id: string;
@@ -82,6 +82,10 @@ export type LabResult = {
   unit: string;
   refLow: number | null;
   refHigh: number | null;
+  // Whether a bound is strict: "<200" / ">40" (the bound itself is out of range) vs "≤ 200" /
+  // "<=200" / "70-99" (inclusive). Always false when the bound is null.
+  refLowStrict: boolean;
+  refHighStrict: boolean;
   refText: string;
   collectedOn: string; // YYYY-MM-DD
   lab: string;
@@ -292,7 +296,18 @@ export function formatBytes(n: number): string {
 
 // ---- lab results ------------------------------------------------------------
 
-const LAB_KEYS = ["id", "test", "value", "valueText", "unit", "refLow", "refHigh", "refText", "collectedOn", "lab", "documentId", "notes"] as const;
+const LAB_KEYS = [
+  "id", "test", "value", "valueText", "unit", "refLow", "refHigh", "refLowStrict", "refHighStrict", "refText", "collectedOn", "lab", "documentId", "notes",
+] as const;
+
+function boolField(name: string, v: unknown): Field<boolean> {
+  return typeof v === "boolean" ? { ok: true, value: v } : { ok: false, error: `${name} must be true or false` };
+}
+
+/** True when the bounds leave no value in range: low above high, or equal with either end strict. */
+function emptyRange(lo: number, hi: number, loStrict: boolean, hiStrict: boolean): boolean {
+  return lo > hi || (lo === hi && (loStrict || hiStrict));
+}
 
 /** A whole lab result: every field present, nothing extra. */
 export function parseLabResult(body: unknown): Result<{ result: LabResult }> {
@@ -315,7 +330,16 @@ export function parseLabResult(body: unknown): Result<{ result: LabResult }> {
   if (!refLow.ok) return refLow;
   const refHigh = numberField("refHigh", o.refHigh);
   if (!refHigh.ok) return refHigh;
-  if (refLow.value !== null && refHigh.value !== null && refLow.value > refHigh.value) return { ok: false, error: `${test.value}: the range's low end is above its high end` };
+  const refLowStrictIn = boolField("refLowStrict", o.refLowStrict);
+  if (!refLowStrictIn.ok) return refLowStrictIn;
+  const refHighStrictIn = boolField("refHighStrict", o.refHighStrict);
+  if (!refHighStrictIn.ok) return refHighStrictIn;
+  // A strict flag means nothing without its bound: normalised to false so it is never stored.
+  const refLowStrict = refLow.value !== null && refLowStrictIn.value;
+  const refHighStrict = refHigh.value !== null && refHighStrictIn.value;
+  if (refLow.value !== null && refHigh.value !== null && emptyRange(refLow.value, refHigh.value, refLowStrict, refHighStrict)) {
+    return { ok: false, error: `${test.value}: the range's low end is above its high end` };
+  }
   const refText = lineField("refText", o.refText, 0, MAX_REF_TEXT);
   if (!refText.ok) return refText;
   const collectedOn = dateField("collectedOn", o.collectedOn);
@@ -330,7 +354,7 @@ export function parseLabResult(body: unknown): Result<{ result: LabResult }> {
     ok: true,
     result: {
       id, test: test.value, value: value.value, valueText: valueText.value, unit: unit.value, refLow: refLow.value, refHigh: refHigh.value,
-      refText: refText.value, collectedOn: collectedOn.value, lab: lab.value, documentId: documentId.value, notes: notes.value,
+      refLowStrict, refHighStrict, refText: refText.value, collectedOn: collectedOn.value, lab: lab.value, documentId: documentId.value, notes: notes.value,
     },
   };
 }
@@ -370,6 +394,8 @@ export function parseLabPatch(body: unknown): Result<{ patch: LabPatch }> {
       case "unit": f = lineField("unit", v, 0, MAX_UNIT); if (f.ok) patch.unit = f.value as string; break;
       case "refLow": f = numberField("refLow", v); if (f.ok) patch.refLow = f.value as number | null; break;
       case "refHigh": f = numberField("refHigh", v); if (f.ok) patch.refHigh = f.value as number | null; break;
+      case "refLowStrict": f = boolField("refLowStrict", v); if (f.ok) patch.refLowStrict = f.value as boolean; break;
+      case "refHighStrict": f = boolField("refHighStrict", v); if (f.ok) patch.refHighStrict = f.value as boolean; break;
       case "refText": f = lineField("refText", v, 0, MAX_REF_TEXT); if (f.ok) patch.refText = f.value as string; break;
       case "collectedOn": f = dateField("collectedOn", v); if (f.ok) patch.collectedOn = f.value as string; break;
       case "lab": f = lineField("lab", v, 0, MAX_LAB); if (f.ok) patch.lab = f.value as string; break;
@@ -384,7 +410,18 @@ export function parseLabPatch(body: unknown): Result<{ patch: LabPatch }> {
     if (!f.ok) return f;
   }
   if ("value" in patch && "valueText" in patch && patch.value === null && !patch.valueText) return { ok: false, error: "a result needs a value" };
-  if (patch.refLow != null && patch.refHigh != null && patch.refLow > patch.refHigh) return { ok: false, error: "the range's low end is above its high end" };
+  // Clearing a bound clears its strict flag (the table refuses a strict flag with no bound).
+  if (patch.refLow === null) {
+    if (patch.refLowStrict) return { ok: false, error: "refLowStrict needs refLow" };
+    patch.refLowStrict = false;
+  }
+  if (patch.refHigh === null) {
+    if (patch.refHighStrict) return { ok: false, error: "refHighStrict needs refHigh" };
+    patch.refHighStrict = false;
+  }
+  if (patch.refLow != null && patch.refHigh != null && emptyRange(patch.refLow, patch.refHigh, !!patch.refLowStrict, !!patch.refHighStrict)) {
+    return { ok: false, error: "the range's low end is above its high end" };
+  }
   return { ok: true, patch };
 }
 
@@ -399,7 +436,7 @@ export function rowToLab(row: unknown): LabResult | null {
   if (!r) return null;
   const parsed = parseLabResult({
     id: r.id, test: r.test_name, value: num(r.value_num), valueText: r.value_text ?? "", unit: r.unit ?? "", refLow: num(r.ref_low),
-    refHigh: num(r.ref_high), refText: r.ref_text ?? "", collectedOn: r.collected_on, lab: r.lab ?? "", documentId: r.document_id ?? null,
+    refHigh: num(r.ref_high), refLowStrict: r.ref_low_strict ?? false, refHighStrict: r.ref_high_strict ?? false, refText: r.ref_text ?? "", collectedOn: r.collected_on, lab: r.lab ?? "", documentId: r.document_id ?? null,
     notes: r.notes ?? "",
   });
   return parsed.ok ? parsed.result : null;
@@ -413,6 +450,8 @@ export function labColumns(fields: LabPatch | LabResult): Record<string, unknown
   if (fields.unit !== undefined) out.unit = fields.unit;
   if (fields.refLow !== undefined) out.ref_low = fields.refLow;
   if (fields.refHigh !== undefined) out.ref_high = fields.refHigh;
+  if (fields.refLowStrict !== undefined) out.ref_low_strict = fields.refLowStrict;
+  if (fields.refHighStrict !== undefined) out.ref_high_strict = fields.refHighStrict;
   if (fields.refText !== undefined) out.ref_text = fields.refText;
   if (fields.collectedOn !== undefined) out.collected_on = fields.collectedOn;
   if (fields.lab !== undefined) out.lab = fields.lab;
@@ -437,40 +476,49 @@ export function parseLabValue(text: string): { value: number | null; valueText: 
   return n === null ? { value: null, valueText: t } : { value: n, valueText: "" };
 }
 
+/** What the range box holds once parsed: the numbers, whether each is strict, and the text as typed. */
+export type ParsedRange = Pick<LabResult, "refLow" | "refHigh" | "refLowStrict" | "refHighStrict" | "refText">;
+
 /**
- * The range box as printed: "70-99", "70 – 99", "<200", "≤ 5.7", ">40", "≥ 60". The text is kept
- * as typed; the numbers are what the High / Low flag uses. Anything else keeps the text only.
+ * The range box as printed: "70-99", "70 – 99", "<200", "<=200", "≤ 5.7", ">40", ">=60", "≥ 60".
+ * The text is kept as typed; the numbers and their strictness are what the High / Low flag uses:
+ * "<" and ">" exclude the bound itself, "<=" "≤" ">=" "≥" and a span "70-99" include it.
+ * Anything else keeps the text only.
  */
-export function parseRange(text: string): { refLow: number | null; refHigh: number | null; refText: string } {
+export function parseRange(text: string): ParsedRange {
   const t = text.trim();
-  const none = { refLow: null, refHigh: null, refText: t };
+  const none: ParsedRange = { refLow: null, refHigh: null, refLowStrict: false, refHighStrict: false, refText: t };
   if (!t) return none;
-  const below = t.match(/^(?:<|≤|<=)\s*(.+)$/);
+  // Two-character operators first: "<" alone would leave "=200" behind, which is not a number.
+  const below = t.match(/^(<=|≤|<)\s*(.+)$/);
   if (below) {
-    const n = parseNumber(below[1]);
-    return n === null ? none : { refLow: null, refHigh: n, refText: t };
+    const n = parseNumber(below[2]);
+    return n === null ? none : { ...none, refHigh: n, refHighStrict: below[1] === "<" };
   }
-  const above = t.match(/^(?:>|≥|>=)\s*(.+)$/);
+  const above = t.match(/^(>=|≥|>)\s*(.+)$/);
   if (above) {
-    const n = parseNumber(above[1]);
-    return n === null ? none : { refLow: n, refHigh: null, refText: t };
+    const n = parseNumber(above[2]);
+    return n === null ? none : { ...none, refLow: n, refLowStrict: above[1] === ">" };
   }
   const span = t.match(/^(-?[\d.,]+)\s*(?:-|–|—|to)\s*(-?[\d.,]+)$/i);
   if (span) {
     const lo = parseNumber(span[1]);
     const hi = parseNumber(span[2]);
-    if (lo !== null && hi !== null && lo <= hi) return { refLow: lo, refHigh: hi, refText: t };
+    if (lo !== null && hi !== null && lo <= hi) return { ...none, refLow: lo, refHigh: hi };
   }
   return none;
 }
 
 export type LabFlag = "low" | "high" | "in-range";
 
-/** High / Low against the stored range; null when the result is not a number or there is no range. */
-export function labFlag(r: Pick<LabResult, "value" | "refLow" | "refHigh">): LabFlag | null {
+/**
+ * High / Low against the stored range; null when the result is not a number or there is no range.
+ * A strict bound is itself out of range ("<200": 200 is High); an inclusive one is in range.
+ */
+export function labFlag(r: Pick<LabResult, "value" | "refLow" | "refHigh" | "refLowStrict" | "refHighStrict">): LabFlag | null {
   if (r.value === null || (r.refLow === null && r.refHigh === null)) return null;
-  if (r.refLow !== null && r.value < r.refLow) return "low";
-  if (r.refHigh !== null && r.value > r.refHigh) return "high";
+  if (r.refLow !== null && (r.refLowStrict ? r.value <= r.refLow : r.value < r.refLow)) return "low";
+  if (r.refHigh !== null && (r.refHighStrict ? r.value >= r.refHigh : r.value > r.refHigh)) return "high";
   return "in-range";
 }
 
@@ -487,11 +535,16 @@ export function formatNumber(n: number): string {
 }
 
 /** The range as one line: the printed text when there is one, else built from the numbers. */
-export function formatRange(r: Pick<LabResult, "refLow" | "refHigh" | "refText">): string {
+export function formatRange(r: Pick<LabResult, "refLow" | "refHigh" | "refLowStrict" | "refHighStrict" | "refText">): string {
   if (r.refText) return r.refText;
-  if (r.refLow !== null && r.refHigh !== null) return `${formatNumber(r.refLow)}-${formatNumber(r.refHigh)}`;
-  if (r.refHigh !== null) return `≤ ${formatNumber(r.refHigh)}`;
-  if (r.refLow !== null) return `≥ ${formatNumber(r.refLow)}`;
+  const lowOp = r.refLowStrict ? ">" : "≥";
+  const highOp = r.refHighStrict ? "<" : "≤";
+  if (r.refLow !== null && r.refHigh !== null) {
+    if (!r.refLowStrict && !r.refHighStrict) return `${formatNumber(r.refLow)}-${formatNumber(r.refHigh)}`;
+    return `${lowOp} ${formatNumber(r.refLow)} and ${highOp} ${formatNumber(r.refHigh)}`;
+  }
+  if (r.refHigh !== null) return `${highOp} ${formatNumber(r.refHigh)}`;
+  if (r.refLow !== null) return `${lowOp} ${formatNumber(r.refLow)}`;
   return "";
 }
 

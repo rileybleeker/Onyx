@@ -83,3 +83,18 @@ REVOKE ALL ON pds.medical_documents FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON pds.lab_results FROM PUBLIC, anon, authenticated;
 GRANT SELECT, INSERT, UPDATE ON pds.medical_documents TO service_role;
 GRANT SELECT, INSERT, UPDATE ON pds.lab_results TO service_role;
+
+-- 2026-11-14: strict or inclusive reference bounds (Codex review #168). "<200" means a value of
+-- 200 is out of range (High); "<=200", "≤ 200" and a span "70-99" mean it is in range. The
+-- printed text stays in ref_text; these two flags carry the distinction for the High / Low flag.
+-- false = inclusive, and always false when the bound itself is NULL. Additive: two columns with a
+-- default and one CHECK; nothing that exists changes (the table was empty when this was added).
+ALTER TABLE pds.lab_results ADD COLUMN IF NOT EXISTS ref_low_strict BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE pds.lab_results ADD COLUMN IF NOT EXISTS ref_high_strict BOOLEAN NOT NULL DEFAULT false;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'lab_results_strict_needs_bound') THEN
+        ALTER TABLE pds.lab_results ADD CONSTRAINT lab_results_strict_needs_bound
+            CHECK ((ref_low IS NOT NULL OR NOT ref_low_strict) AND (ref_high IS NOT NULL OR NOT ref_high_strict));
+    END IF;
+END $$;
