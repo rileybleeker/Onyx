@@ -97,6 +97,7 @@ Onyx/
 │   ├── delivery-email.yml       # Delivery Email ETL — every 3h at :40 (`40 */3 * * *`)
 │   ├── air-quality-etl.yml      # Air Quality ETL — every 3h at :12 (`12 */3 * * *`), SUPABASE_* secrets only
 │   ├── weather-etl.yml          # Weather ETL — every 3h at :32 (`32 1-23/3 * * *`), SUPABASE_* secrets only
+│   ├── pollen-etl.yml           # Pollen ETL — 16:20 + 21:20 UTC (`20 16,21 * * *`), SUPABASE_* secrets only
 │   ├── urgent-email.yml         # Urgent Email Labels — hourly at :15 (`15 * * * *`)
 │   ├── google-calendar-etl.yml  # Google Calendar ETL — hourly at :55 (`55 * * * *`)
 │   ├── orders-email.yml         # Online Orders Email — every 3h at :05 (`5 */3 * * *`)
@@ -470,6 +471,7 @@ All data sources run **hourly** on a staggered schedule to spread load and avoid
 | Delivery Email ETL | `delivery-email.yml` | `*/15 * * * *` | Parses Uber Eats receipt emails over IMAP (read-only, All Mail) → `pds.delivery_orders`; `delivery\|email` heartbeat. `workflow_dispatch` inputs `days` (backfill window, e.g. 1500) + `reprocess`. |
 | Air Quality ETL | `air-quality-etl.yml` | `12 */3 * * *` | Open-Meteo hourly PM2.5 / US AQI (no key) → daily means in `pds.air_quality_daily`; `air_quality\|daily` heartbeat. `workflow_dispatch` input `days` (backfill window). Needs `sql/air_quality_schema.sql` applied once. |
 | Weather ETL | `weather-etl.yml` | `32 1-23/3 * * *` | Open-Meteo hourly weather (no key) → daily rows in `pds.weather_daily` (+ UV index from the historical-forecast API); `weather\|daily` heartbeat. `workflow_dispatch` input `days` (backfill window). Table from `sql/weather_schema.sql` (applied 2026-11-13). |
+| Pollen ETL | `pollen-etl.yml` | `20 16,21 * * *` | Atlanta Allergy & Asthma pollen page (no key, one request per run) → `pds.pollen_daily`; `pollen\|daily` heartbeat. `workflow_dispatch` input `months` (backfill, one request per month). Needs `sql/pollen_schema.sql` applied once. |
 | Online Orders Email | `orders-email.yml` | `5 */3 * * *` | Reads shipping / delivery emails (stores, Amazon, carriers) from BOTH Gmail accounts over IMAP (read-only) → `pds.online_order_events`, then rebuilds `pds.online_orders`; `online_orders\|email` heartbeat. `workflow_dispatch` inputs `days` + `reprocess`. First run (empty table) reads 400 days. |
 | Urgent Email Labels | `urgent-email.yml` | `15 * * * *` | Reads inbox-triage's `Agent/Action` + `Agent/Deadline` labels in BOTH Gmail accounts over IMAP (read-only: EXAMINE + BODY.PEEK, no flag or label change) → `pds.inbox_emails` metadata; `urgent_email\|labels` heartbeat. Needs `sql/inbox_emails_schema.sql` applied first. |
 | SimpleFIN ETL | `simplefin-etl.yml` | `30 */6 * * *` | One read-only `GET /accounts` from SimpleFIN Bridge (secret `SIMPLEFIN_ACCESS_URL`) -> `pds.finance_*` (account matching, Rocket Money cutover, rule-based categories, balance snapshots); `simplefin\|transactions` + `simplefin\|balances` heartbeats; counts-only log. `workflow_dispatch` input `days` (1-90). |

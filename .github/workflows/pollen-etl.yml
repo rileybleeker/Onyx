@@ -1,0 +1,53 @@
+name: Pollen ETL
+
+on:
+  schedule:
+    # 16:20 and 21:20 UTC (11:20 / 16:20 EST, 12:20 / 17:20 EDT): after the morning count is
+    # posted, plus a later retry for a late post. ONE page request per run (polite to the site).
+    # /status: >21h since the last heartbeat = degraded, >27h = error.
+    - cron: '20 16,21 * * *'
+  workflow_dispatch:
+    inputs:
+      months:
+        description: 'Backfill the last N calendar months (one request per month, 5 s apart; 35 = from 2024-01). Leave empty for the routine run.'
+        required: false
+        type: string
+
+concurrency:
+  group: pollen-etl
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# The only credentials are the two SUPABASE_* secrets. The pollen page needs no key.
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  pollen-etl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install httpx supabase python-dotenv
+
+      - name: Run Pollen ETL
+        env:
+          # workflow_dispatch input, passed through the environment so it is never
+          # interpolated into the shell command (and validated as digits).
+          BACKFILL_MONTHS: ${{ inputs.months }}
+        run: |
+          if [ -n "$BACKFILL_MONTHS" ]; then
+            case "$BACKFILL_MONTHS" in *[!0-9]*) echo "months must be a whole number" >&2; exit 2;; esac
+            python pollen_etl.py --backfill-months "$BACKFILL_MONTHS"
+          else
+            python pollen_etl.py
+          fi
