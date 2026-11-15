@@ -1,8 +1,8 @@
 {
   "id": "/",
-  "name": "Onyx — Personal Data Scientist",
+  "name": "Onyx — Personal OS",
   "short_name": "Onyx",
-  "description": "Your health and fitness data, visualized.",
+  "description": "Health, money, and everyday life in one place.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

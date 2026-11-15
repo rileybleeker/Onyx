@@ -29,8 +29,8 @@ export const viewport: Viewport = {
 };
 
 export const metadata: Metadata = {
-  title: "Onyx — Personal Data Scientist",
-  description: "Your health and fitness data, visualized.",
+  title: "Onyx — Personal OS",
+  description: "Health, money, and everyday life in one place.",
   manifest: "/manifest.json",
   themeColor: "#1A1A18",
   appleWebApp: {
