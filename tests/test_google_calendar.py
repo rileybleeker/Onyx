@@ -810,6 +810,38 @@ def test_run_malformed_series_is_partial_but_stores_the_rest():
     assert (status, total) == ("partial", 1) and "malformed" in note and sb.titles() == ["One"]
 
 
+def test_run_partial_parse_keeps_the_last_known_events_of_a_malformed_series():
+    # Run 1: the series parses and its five instances are stored, next to a one-off event.
+    sb = FakeSupabase()
+    assert _run(sb, {URL_A: cal(ONE + SERIES)})[0] == "success"
+    assert len(sb.rows) == 6
+    # Run 2: the same series now carries a rule the expander cannot read, and a new event appears.
+    broken = SERIES.replace("RRULE:FREQ=DAILY", "RRULE:FREQ=NOPE")
+    assert broken != SERIES
+    status, total, note = _run(sb, {URL_A: cal(ONE + TWO + broken)})
+    assert status == "partial" and total == 2 and "malformed" in note
+    assert sb.titles().count("Daily") == 5, "the malformed series keeps its last known instances"
+    assert {"One", "Two"} <= set(sb.titles()), "what parsed is still written"
+    assert sb.removed == 0 and "kept" in note
+    # Run 3: the series is readable again and one event left the feed: removal resumes.
+    status, total, _ = _run(sb, {URL_A: cal(ONE + SERIES)})
+    assert status == "success" and sb.titles() == ["Daily"] * 5 + ["One"] and sb.removed == 1
+
+
+def test_run_skipped_event_suppresses_removal_for_that_calendar_only():
+    sb = FakeSupabase()
+    feeds = (FEED_A, FEED_B)
+    _run(sb, {URL_A: cal(ONE + TWO), URL_B: cal(ONE.replace("one@", "b-one@") + TWO.replace("two@", "b-two@"))}, feeds=feeds)
+    assert len(sb.rows) == 4
+    # Calendar A: "Two" lost its start (skipped), so A removes nothing. Calendar B: "Two" really left.
+    no_start = TWO.replace("DTSTART:20261114T150000Z\n", "")
+    assert no_start != TWO
+    status, total, note = _run(sb, {URL_A: cal(ONE + no_start), URL_B: cal(ONE.replace("one@", "b-one@"))}, feeds=feeds)
+    assert status == "partial" and "skipped" in note
+    assert sb.titles("main") == ["One", "Two"], "a partly parsed calendar keeps its stored events"
+    assert sb.titles("side") == ["One"], "a fully parsed calendar still reconciles"
+    assert sb.removed == 1
+
 def test_dry_run_touches_no_database():
     status, total, note = _run(None, {URL_A: cal(ONE + TWO)}, dry_run=True)
     assert (status, total, note) == ("success", 2, None)

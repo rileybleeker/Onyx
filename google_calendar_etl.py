@@ -52,8 +52,11 @@ Parsing rules that matter (measured against real Google feeds, 2026-11-13):
   - The feed lists what exists NOW. A deleted event simply stops appearing, so
     after a fully validated fetch + parse the rows of that calendar that were
     not seen this run (inside the window) are removed. This is NEVER done for a
-    calendar whose fetch or parse failed, and a removal of more than half of a
-    calendar's rows is refused unless --allow-large-removal is passed.
+    calendar whose fetch or parse failed, nor for one that parsed only partly
+    (a malformed series or a skipped event: what parsed is still written, but
+    nothing is removed, so the unreadable events keep their last known rows),
+    and a removal of more than half of a calendar's rows is refused unless
+    --allow-large-removal is passed.
 
 Heartbeat: one pds.sync_log row per run (source='google_calendar',
 data_type='events'): success / partial (a feed failed, a malformed series or
@@ -435,6 +438,12 @@ def expand_events(ics_text: str, account: str, calendar: str, win_start: date, w
     return rows, stats
 
 
+def parsed_completely(stats: dict) -> bool:
+    """True when every event in the feed was read. A malformed series or a skipped event means
+    the feed holds events this run could not see, so their stored rows must not be removed."""
+    return not stats["bad_series"] and not stats["skipped"]
+
+
 def calendar_notes(stats: dict) -> list[str]:
     """Reasons a successfully parsed calendar still makes the run partial."""
     notes = []
@@ -521,15 +530,18 @@ def safe_db_error(exc: Exception) -> str:
 
 
 def store_calendar(sb, feed: Feed, rows: list[dict], stamp: str, win_start: date, win_end: date,
-                   allow_large_removal: bool = False) -> tuple[int, str | None]:
+                   allow_large_removal: bool = False, reconcile: bool = True) -> tuple[int, str | None]:
     """Upsert this run's rows, then remove the calendar's rows it did not see inside the window.
 
-    Call ONLY after a validated fetch + parse. Returns (rows removed, guard note or None).
+    Call ONLY after a validated fetch + parse. reconcile=False (a partly parsed feed) upserts and
+    removes nothing. Returns (rows removed, guard note or None).
     """
     table = lambda: sb.schema("pds").table(TABLE)  # noqa: E731
     stamped = [{**r, "last_seen_at": stamp, "synced_at": stamp} for r in rows]
     for i in range(0, len(stamped), UPSERT_BATCH):
         table().upsert(stamped[i:i + UPSERT_BATCH], on_conflict="event_key").execute()
+    if not reconcile:
+        return 0, None
 
     lo, hi = (d.isoformat() for d in reconcile_range(win_start, win_end))
 
@@ -576,13 +588,18 @@ def run(sb, feeds: list[Feed], days: int = DEFAULT_WINDOW_DAYS, dry_run: bool = 
                 failures.append(f"{name}: {exc}")
                 continue                                             # never reconcile a failed calendar
             removed = 0
+            complete = parsed_completely(stats)
             if not dry_run:
-                removed, guard = store_calendar(sb, feed, rows, stamp, win_start, win_end, allow_large_removal)
+                removed, guard = store_calendar(sb, feed, rows, stamp, win_start, win_end, allow_large_removal,
+                                                reconcile=complete)
                 if guard:
                     notes.append(f"{name}: {guard}")
                     log.warning(f"{tag}: {guard}")
             total += stats["events"]
-            for note in calendar_notes(stats):
+            calendar_warnings = calendar_notes(stats)
+            if not complete and not dry_run:
+                calendar_warnings.append("stored events missing from this run were kept (the feed did not parse completely)")
+            for note in calendar_warnings:
                 notes.append(f"{name}: {note}")
                 log.warning(f"{tag}: {note}")
             log.info(f"{tag}: {stats['events']} event(s) ({stats['recurring']} recurring instance(s), "
