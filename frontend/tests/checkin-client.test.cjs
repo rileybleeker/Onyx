@@ -1,8 +1,11 @@
 // Execute the real CheckInClient and its event callbacks with a tiny hook scheduler.
 // Synthetic data only: no DOM/browser, credentials, requests, database or delivery writes.
+// Autosave (2026-11-15): answers save a short delay after the last tap. The real scheduler (lib/autosave.ts) runs on
+// a manual clock here: h.tick() fires what is due (default: the check-in's 600 ms delay).
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { loadTs } = require("./helpers/load-ts.cjs");
+const { Autosaver } = loadTs("lib/autosave.ts");
 
 const DAY = "Synthetic daytime question?";
 const SLEEP = "Synthetic sleep question?";
@@ -16,6 +19,26 @@ const page = (today = "2031-03-05", date = today) => ({
   days: [0, -1, -2].map((n) => ({ date: addDay(today, n), answered: 0, total: 1 })),
 });
 const response = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => structuredClone(body) });
+/** Manual clock for the autosave scheduler only (other code keeps real timers). */
+function manualTimers() {
+  let now = 0;
+  let next = 1;
+  const pending = new Map();
+  return {
+    set: (fn, ms) => { const id = next++; pending.set(id, { at: now + ms, fn }); return id; },
+    clear: (id) => { pending.delete(id); },
+    due(ms) {
+      const until = now + ms;
+      const hit = [...pending.entries()].filter(([, t]) => t.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+      if (!hit) { now = until; return null; }
+      pending.delete(hit[0]);
+      const left = until - hit[1].at;
+      now = hit[1].at;
+      return { fn: hit[1].fn, left };
+    },
+    count: () => pending.size,
+  };
+}
 const deferred = () => {
   let resolve;
   const promise = new Promise((r) => { resolve = r; });
@@ -44,12 +67,16 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
   let tree;
   const frames = new Map();
   const posts = [];
+  const postOptions = [];
   const gets = [];
   const done = [];
+  const timers = manualTimers();
+  let saver = null;
   const windowEvents = new Map();
   const equal = (a, b) => a && b && a.length === b.length && a.every((x, i) => Object.is(x, b[i]));
   const slot = () => [frame.slots, frame.index++];
   const hooks = {
+    useId() { const [slots, i] = slot(); return slots[i] ??= `:synthetic${i}:`; },
     useState(initialValue) {
       const [slots, i] = slot();
       if (!(i in slots)) slots[i] = typeof initialValue === "function" ? initialValue() : initialValue;
@@ -86,6 +113,7 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
       if (options.method === "POST") {
         const body = JSON.parse(options.body);
         posts.push(body);
+        postOptions.push({ keepalive: !!options.keepalive });
         return onPost ? onPost(body, posts.length) : response({ success: true });
       }
       const date = new URL(url, "https://synthetic.invalid").searchParams.get("date");
@@ -115,6 +143,19 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
     "@/components/personalize/PartGrid": { PartGrid: ({ children }) => children, PartGroup: ({ children }) => children, Part: ({ children }) => children },
     // The /log Say it drafts (only the embedded check-in reads them; covered by tests/log-drafts.test.cjs).
     "@/lib/log-drafts": { useLogDrafts: () => ({ draft: null, clear: () => {} }), setLogDraft: () => {} },
+    // The real scheduler on the manual clock; the hook's page-hidden / unmount listeners are lib/use-autosave.ts
+    // (h.hide() stands in for "the page was hidden": flush with keepalive).
+    "@/lib/use-autosave": {
+      useAutosave: (_name, opts) => {
+        const [state, setState] = hooks.useState({ status: "idle", error: null, retrying: false, savedAt: null });
+        const optsRef = hooks.useRef(opts);
+        optsRef.current = opts;
+        const [s] = hooks.useState(() => new Autosaver({ save: (v, c) => optsRef.current.save(v, c), delayMs: opts.delayMs, timers, onState: (next) => setState({ ...next }) }));
+        saver = s;
+        const dirty = ["waiting", "saving", "error", "incomplete"].includes(state.status);
+        return { state, dirty, change: (v, o) => s.change(v, o), flush: () => s.flush(), retry: () => s.retry(), setBaseline: (v) => s.setBaseline(v), reset: (b) => s.reset(b) };
+      },
+    },
   }).default;
   function expand(node, id = "root") {
     if (node == null || typeof node === "boolean") return null;
@@ -160,7 +201,20 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
   };
   await flush();
   let resumeOffset = 0;
-  return { posts, gets, done, flush, text, button, click, windowEvents, replaced, storage: draftStorage,
+  /** Advance the autosave clock: run every scheduler timer due within `ms`, rendering after each. */
+  async function tick(ms = 600) {
+    for (let left = ms; ;) {
+      const hit = timers.due(left);
+      if (!hit) break;
+      left = hit.left;
+      hit.fn();
+      await flush();
+    }
+    await flush();
+  }
+  return { posts, postOptions, gets, done, flush, tick, text, button, click, windowEvents, replaced, storage: draftStorage,
+    timersPending: () => timers.count(),
+    hide: async () => { await saver.flush(true); await flush(); },
     type: (label, value) => {
       const field = nodes().find((n) => n.props?.["aria-label"] === label && typeof n.props.onChange === "function");
       assert.ok(field, `field exists: ${label}`);
@@ -179,50 +233,216 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
   };
 }
 
-test("client: stale before the first write preserves both original dates and requires review before Save", async (t) => {
+test("client: taps save on their own after a short pause, one request per part touched, nothing before", async (t) => {
+  const h = await mount(t);
+  assert.equal(h.hasButton("Save"), false, "no Save button");
+  assert.match(h.text(), /Answers save as you tap/);
+  h.click(`${DAY}: yes`); await h.flush();
+  h.click(`${SLEEP}: yes`); await h.flush();
+  assert.ok(h.storage.values.has(dayKey("2031-03-05")), "the local draft is written first");
+  await h.tick(599);
+  assert.equal(h.posts.length, 0, "nothing until the pause after the last tap");
+  await h.tick(1);
+  assert.deepEqual(h.posts, [
+    { date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" },
+    { date: "2031-03-04", answers: { [SLEEP]: "Yes" }, today: "2031-03-05" },
+  ]);
+  assert.match(h.text(), /Saved/);
+  assert.equal(h.storage.values.has(dayKey("2031-03-05")), false, "the saved draft is settled");
+  assert.equal(h.storage.values.has(nightKey("2031-03-04")), false);
+  await h.tick(60_000);
+  assert.equal(h.posts.length, 2, "nothing more to send");
+});
+
+test("client: opening the check-in writes nothing, and a burst of taps is one request", async (t) => {
+  const OTHER = "Synthetic second daytime question?";
+  const base = page();
+  base.items.push(question(OTHER, false));
+  const h = await mount(t, { initial: base });
+  await h.tick(60_000);
+  assert.equal(h.posts.length, 0, "nothing is written on open");
+  h.click("No for the other 2"); await h.flush();
+  h.click(`${DAY}: yes`); await h.flush();
+  await h.tick();
+  assert.deepEqual(h.posts, [{ date: "2031-03-05", answers: { [DAY]: "Yes", [OTHER]: "No" }, today: "2031-03-05" }]);
+});
+
+test("client: the Agents card settles only once every core daytime question is saved, once per day", async (t) => {
+  const OTHER = "Synthetic second daytime question?";
+  const base = page();
+  base.items.push(question(OTHER, false));
+  // A synthetic server that keeps the day's answers, so the reload after each save shows them.
+  const stored = {};
+  const h = await mount(t, {
+    initial: base,
+    onPost: async (body) => { Object.assign(stored, body.answers); return response({ success: true }); },
+    onGet: (date, current) => ({ ...current, date: date ?? current.date, answers: { ...stored } }),
+  });
+  h.click(`${DAY}: yes`); await h.flush();
+  await h.tick();
+  assert.equal(h.posts.length, 1);
+  assert.deepEqual(h.done, [], "a half-answered day keeps its card");
+  h.click(`${OTHER}: no`); await h.flush();
+  await h.tick();
+  assert.deepEqual(h.done, ["2031-03-05"], "settled when the day is complete");
+  h.click(`${OTHER}: yes`); await h.flush();
+  await h.tick();
+  assert.equal(h.posts.length, 3);
+  assert.deepEqual(h.done, ["2031-03-05"], "not again for the same day");
+});
+
+test("client: on today a tap is saved alone; the day's pre-fills are stored only in the save that completes the day", async (t) => {
+  const SUGGESTED = "Synthetic pre-filled question?";
+  const LAST = "Synthetic last daytime question?";
+  const base = page();
+  base.items.push(question(SUGGESTED, false), question(LAST, false));
+  base.suggestions = { [SUGGESTED]: { answer: "Yes", source: "synthetic data" } };
+  const stored = {};
+  const h = await mount(t, {
+    initial: base,
+    onPost: async (body) => { Object.assign(stored, body.answers); return response({ success: true }); },
+    onGet: (date, current) => ({ ...current, date: date ?? current.date, answers: { ...stored } }),
+  });
+  h.click(`${DAY}: yes`); await h.flush();
+  await h.tick();
+  assert.deepEqual(h.posts, [{ date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" }], "the pre-fill waits: it can still change today");
+  assert.deepEqual(h.done, []);
+  assert.match(h.text(), /from synthetic data/, "still shown as a suggestion");
+  await h.tick(60_000);
+  assert.equal(h.posts.length, 1, "a pre-fill alone is never sent");
+  h.click(`${LAST}: no`); await h.flush();
+  await h.tick();
+  assert.deepEqual(h.posts[1], { date: "2031-03-05", answers: { [SUGGESTED]: "Yes", [LAST]: "No" }, today: "2031-03-05" }, "complete counting the pre-fill: stored with the last answer");
+  assert.deepEqual(h.done, ["2031-03-05"], "and the card settles in the same save");
+});
+
+test("client: on a catch-up day the day's pre-fills go with the first tap", async (t) => {
+  const SUGGESTED = "Synthetic pre-filled question?";
+  const LAST = "Synthetic last daytime question?";
+  const base = page();
+  base.items.push(question(SUGGESTED, false), question(LAST, false));
+  base.suggestions = { [SUGGESTED]: { answer: "Yes", source: "synthetic data" } };
+  const h = await mount(t, { initial: base });
+  h.navigate("2031-03-04"); await h.flush();
+  h.click(`${DAY}: yes`); await h.flush();
+  await h.tick();
+  assert.deepEqual(h.posts, [{ date: "2031-03-04", answers: { [DAY]: "Yes", [SUGGESTED]: "Yes" }, today: "2031-03-05" }]);
+});
+
+test("client: a sleep-only save never settles the card", async (t) => {
+  const h = await mount(t);
+  h.click(`${SLEEP}: yes`); await h.flush();
+  await h.tick();
+  assert.deepEqual(h.posts.map((p) => p.date), ["2031-03-04"]);
+  assert.deepEqual(h.done, []);
+});
+
+test("client: hiding the page sends a waiting tap at once, with keepalive", async (t) => {
+  const h = await mount(t);
+  h.click(`${DAY}: yes`); await h.flush();
+  await h.hide();
+  assert.deepEqual(h.posts, [{ date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" }]);
+  assert.deepEqual(h.postOptions, [{ keepalive: true }]);
+});
+
+test("client: a refused save is shown, not retried by itself, and Retry sends it again", async (t) => {
+  let refuse = true;
+  const h = await mount(t, { onPost: async () => refuse ? response({ error: "Synthetic refusal" }, 400) : response({ success: true }) });
+  h.click(`${DAY}: yes`); await h.flush();
+  await h.tick();
+  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  await h.tick(120_000);
+  assert.equal(h.posts.length, 1, "a refusal waits for Riley");
+  refuse = false;
+  h.click("Retry"); await h.flush();
+  assert.equal(h.posts.length, 2);
+  assert.match(h.text(), /Saved/);
+});
+
+test("client: an outage is retried on its own", async (t) => {
+  let down = true;
+  const h = await mount(t, { onPost: async () => down ? response({ error: "Synthetic outage" }, 503) : response({ success: true }) });
+  h.click(`${DAY}: yes`); await h.flush();
+  await h.tick();
+  assert.match(h.text(), /Not saved: Synthetic outage Trying again…/);
+  down = false;
+  await h.tick(2000);
+  assert.equal(h.posts.length, 2);
+  assert.match(h.text(), /Saved/);
+  assert.equal(h.storage.values.has(dayKey("2031-03-05")), false);
+});
+
+test("client: answers left from an earlier visit are never sent on open; reviewing them saves them", async (t) => {
+  const h = await mount(t, { draftStorage: storage({ [dayKey("2031-03-05")]: JSON.stringify({ [DAY]: { a: "Yes", base: null } }) }) });
+  assert.match(h.text(), /Review preserved answers/);
+  assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], false, "held for review, not on the form");
+  assert.equal(h.hasButton("Save now"), false);
+  await h.tick(60_000);
+  assert.equal(h.posts.length, 0, "never on open");
+  h.click("Use answers for Daytime 2031-03-05"); await h.flush();
+  assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true);
+  await h.tick();
+  assert.deepEqual(h.posts, [{ date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" }]);
+});
+
+test("client: switching the day tab saves a waiting tap under its own day first", async (t) => {
+  const h = await mount(t);
+  h.click(`${DAY}: yes`); await h.flush();
+  h.click("Yesterdaynot started"); await h.flush();
+  assert.deepEqual(h.posts, [{ date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" }]);
+  assert.equal(h.gets.at(-1), "2031-03-04", "then the tab changes");
+  assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], false, "the other day is independent");
+  assert.equal(h.storage.values.has(dayKey("2031-03-04")), false);
+});
+
+test("client: stale before the first write preserves both original dates and requires review", async (t) => {
   const h = await mount(t, { onPost: async () => response({ stale: true }, 409) });
   h.click(`${DAY}: yes`); await h.flush();
   h.click(`${SLEEP}: yes`); await h.flush();
   h.setPage(page("2031-03-06"));
-  await h.click("Save"); await h.flush();
+  await h.tick();
   assert.equal(h.posts.length, 1, "the rejected day stops the night request");
   assert.match(h.text(), /Daytime 2031-03-05/);
   assert.match(h.text(), /Night 2031-03-04 → 2031-03-05 morning/);
   assert.match(h.text(), /Unsaved answers are preserved/);
-  assert.equal(h.button("Save").props.disabled, true);
+  assert.equal(h.hasButton("Save now"), false, "preserved answers are not offered for saving");
+  await h.tick(120_000);
+  assert.equal(h.posts.length, 1, "nothing is retried");
   assert.ok(h.storage.values.has(dayKey("2031-03-05")));
   assert.ok(h.storage.values.has(nightKey("2031-03-04")));
 });
 
-test("client: day success then night stale settles only the day; review is local and saves the original night", async (t) => {
+test("client: day success then night stale settles only the day; review saves the original night", async (t) => {
   const h = await mount(t, { onPost: async (_body, count) => count === 2 ? response({ stale: true }, 409) : response({ success: true }) });
   h.click(`${DAY}: yes`); await h.flush();
   h.click(`${SLEEP}: yes`); await h.flush();
   h.setPage(page("2031-03-06"));
-  await h.click("Save"); await h.flush();
-  assert.deepEqual(h.done, ["2031-03-05"]);
+  await h.tick();
+  assert.deepEqual(h.done, ["2031-03-05"], "the one core daytime question is saved: the day is complete");
   assert.equal(h.storage.values.has(dayKey("2031-03-05")), false);
-  assert.equal(h.button("Save").props.disabled, true);
+  assert.equal(h.hasButton("Save now"), false);
   h.click("Use answers for Night 2031-03-04 → 2031-03-05 morning"); await h.flush();
-  assert.equal(h.posts.length, 2, "review never POSTs");
-  await h.click("Save"); await h.flush();
-  assert.deepEqual(h.posts.map((p) => p.date), ["2031-03-05", "2031-03-04", "2031-03-04"]);
+  assert.equal(h.posts.length, 2, "review itself sends nothing at once");
+  await h.tick();
+  assert.deepEqual(h.posts.map((p) => p.date), ["2031-03-05", "2031-03-04", "2031-03-04"], "the reviewed night then saves like a tap");
   assert.deepEqual(h.posts[2], { date: "2031-03-04", answers: { [SLEEP]: "Yes" }, today: "2031-03-06" });
 });
 
-test("client: a newer tap during a successful save survives reload and can be saved next", async (t) => {
+test("client: a newer tap during a save survives the reload and is sent by the next save", async (t) => {
   const pending = deferred();
   const h = await mount(t, { onPost: (_body, count) => count === 1 ? pending.promise : response({ success: true }) });
   h.click(`${DAY}: yes`); await h.flush();
-  const saving = h.click("Save"); await h.flush();
+  await h.tick(); // the save of Yes starts and waits
+  assert.match(h.text(), /Saving…/);
   h.click(`${DAY}: no`); await h.flush();
   const savedPage = page(); savedPage.answers[DAY] = "Yes";
   h.setPage(savedPage);
   pending.resolve(response({ success: true }));
-  await saving; await h.flush();
+  await h.flush();
   assert.equal(h.button(`${DAY}: no`).props["aria-pressed"], true);
   assert.deepEqual(JSON.parse(h.storage.values.get(dayKey(savedPage.date))), { [DAY]: { a: "No", base: "Yes" } });
-  await h.click("Save"); await h.flush();
+  assert.equal(h.posts.length, 1, "single flight: one save at a time");
+  await h.tick();
   assert.deepEqual(h.posts.map((p) => p.answers[DAY]), ["Yes", "No"]);
 });
 
@@ -234,7 +454,7 @@ test("client: failed storage retains drafts through stale reload and warns befor
   h.windowEvents.get("beforeunload")({ preventDefault: () => { warned = true; } });
   assert.equal(warned, true);
   h.setPage(page("2031-03-06"));
-  await h.click("Save"); await h.flush();
+  await h.tick();
   assert.match(h.text(), /Daytime 2031-03-05/);
   assert.match(h.text(), /Synthetic daytime question\?: Yes/);
   assert.equal(h.posts.length, 1);
@@ -244,11 +464,11 @@ test("client: ordinary night failure retains pending answers without resubmittin
   const h = await mount(t, { onPost: async (_body, count) => count === 2 ? response({ error: "Synthetic save failure" }, 500) : response({ success: true }) });
   h.click(`${DAY}: yes`); await h.flush();
   h.click(`${SLEEP}: no`); await h.flush();
-  await h.click("Save"); await h.flush();
+  await h.tick();
   assert.match(h.text(), /Synthetic save failure/);
   assert.equal(h.storage.values.has(dayKey("2031-03-05")), false);
   assert.ok(h.storage.values.has(nightKey("2031-03-04")));
-  await h.click("Save"); await h.flush();
+  h.click("Retry"); await h.flush();
   assert.deepEqual(h.posts.map((p) => p.date), ["2031-03-05", "2031-03-04", "2031-03-04"]);
   assert.deepEqual(h.done, ["2031-03-05"]);
 });
@@ -265,14 +485,14 @@ test("client: navigation during a save waits for settlement and never copies ans
     },
   });
   h.click(`${DAY}: yes`); await h.flush();
-  const saving = h.click("Save"); await h.flush();
+  await h.tick(); // the save starts and waits
   h.navigate("2031-03-04"); await h.flush();
   assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true, "the pending save keeps its original dated form");
   saved = true;
   pending.resolve(response({ success: true }));
-  await saving; await h.flush();
+  await h.flush();
   assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], false, "the newly selected day's answers are independent");
-  assert.equal(h.button("Save").props.disabled, true);
+  assert.equal(h.hasButton("Save now"), false);
   assert.deepEqual(h.posts, [{ date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" }]);
   assert.equal(h.storage.values.has(dayKey("2031-03-04")), false);
 });
@@ -282,7 +502,8 @@ test("client: reopening an old draft shows its original date, cannot submit it, 
   const h = await mount(t, { draftStorage: storage({ [oldKey]: JSON.stringify({ [DAY]: { a: "No", base: null } }) }) });
   assert.match(h.text(), /Daytime 2030-01-01/);
   assert.match(h.text(), /no longer offered in check-in/);
-  assert.equal(h.button("Save").props.disabled, true);
+  assert.equal(h.hasButton("Save now"), false, "an old draft is never offered for saving");
+  await h.tick(60_000);
   h.click("Discard draft…"); await h.flush();
   assert.ok(h.storage.values.has(oldKey), "asking to discard does not remove the draft");
   h.click("Keep draft"); await h.flush();
@@ -303,21 +524,27 @@ test("client: reopening a non-null draft already equal to the saved answer does 
   h.click(`${DAY}: no`); await h.flush();
   assert.equal(h.button(`${DAY}: no`).props["aria-pressed"], true);
   assert.deepEqual(JSON.parse(h.storage.values.get(dayKey(saved.date))), { [DAY]: { a: "No", base: "Yes" } });
-  assert.equal(h.posts.length, 0);
+  assert.equal(h.posts.length, 0, "the draft is written before the save");
+  await h.tick();
+  assert.deepEqual(h.posts, [{ date: saved.date, answers: { [DAY]: "No" }, today: saved.today }]);
 });
 
 for (const failure of ["network", "server"]) {
   test(`client: transient ${failure} failure on resume keeps the dated form and active draft editable`, async (t) => {
     const h = await mount(t, {
       onGet: (_date, current, count) => {
-        if (count === 1) return current;
+        if (count <= 2) return current; // the first load, and the reload after the save
         if (failure === "network") throw new TypeError("Synthetic offline transport");
         return response({ error: "Synthetic reload outage" }, 500);
       },
     });
     h.click(`${DAY}: yes`); await h.flush();
+    const savedPage = page(); savedPage.answers[DAY] = "Yes";
+    h.setPage(savedPage);
+    await h.tick();
+    assert.equal(h.posts.length, 1, "the tap saved");
     await h.resume();
-    assert.equal(h.gets.length, 2, "resume issued a new GET");
+    assert.equal(h.gets.length, 3, "resume issued a new GET");
     assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true, "failed refresh retains the visible original answer");
     assert.match(h.text(), /2031-03-05/, "the retained form identifies its original date explicitly");
     assert.match(h.text(), /2031-03-04/, "the retained night also identifies its original date");
@@ -326,23 +553,30 @@ for (const failure of ["network", "server"]) {
     assert.match(h.text(), failure === "network" ? /Couldn't reach Onyx/ : /Synthetic reload outage/);
     h.click(`${DAY}: no`); await h.flush();
     assert.equal(h.button(`${DAY}: no`).props["aria-pressed"], true);
-    assert.equal(h.button("Save").props.disabled, false);
-    assert.deepEqual(JSON.parse(h.storage.values.get(dayKey("2031-03-05"))), { [DAY]: { a: "No", base: null } });
-    assert.equal(h.posts.length, 0, "refresh or local editing must not submit anything");
+    assert.deepEqual(JSON.parse(h.storage.values.get(dayKey("2031-03-05"))), { [DAY]: { a: "No", base: "Yes" } });
+    assert.equal(h.posts.length, 1, "a failed refresh sends nothing by itself");
+    await h.tick();
+    assert.deepEqual(h.posts[1], { date: "2031-03-05", answers: { [DAY]: "No" }, today: "2031-03-05" }, "the new tap still saves under the original date");
   });
 }
 
 for (const status of [400, 401, 403]) {
   test(`client: authoritative GET refusal ${status} removes the usable form and preserves dated review`, async (t) => {
-    const h = await mount(t, { onGet: (_date, current, count) => count === 1 ? current : response({ error: "Synthetic date or session refusal" }, status) });
+    // The tap's save fails (an outage), so it is still a draft when the refresh is refused.
+    const h = await mount(t, {
+      onPost: async () => response({ error: "Synthetic save outage" }, 503),
+      onGet: (_date, current, count) => count === 1 ? current : response({ error: "Synthetic date or session refusal" }, status),
+    });
     h.click(`${DAY}: yes`); await h.flush();
-    await h.resume();
+    await h.tick();
+    await h.resume(); // tries the save once more first (it fails again), then the refused GET
     assert.equal(h.hasButton(`${DAY}: yes`), false);
-    assert.equal(h.hasButton("Save"), false);
+    assert.equal(h.hasButton("Save now"), false);
     assert.match(h.text(), /Synthetic date or session refusal/);
     assert.match(h.text(), /Review preserved answers/);
     assert.match(h.text(), /Daytime 2031-03-05/);
-    assert.equal(h.posts.length, 0);
+    assert.equal(h.posts.length, 2, "both attempts failed; nothing was stored");
+    assert.ok(h.storage.values.has(dayKey("2031-03-05")));
   });
 }
 
@@ -351,15 +585,15 @@ for (const stale of [false, true]) {
     const pending = deferred();
     const h = await mount(t, { onPost: () => pending.promise });
     h.click(`${DAY}: yes`); await h.flush();
-    const saving = h.click("Save"); await h.flush();
+    await h.tick(); // the save starts and waits
     h.navigate("2031-03-04"); await h.flush();
     if (stale) h.setPage(page("2031-03-06"));
     pending.resolve(response(stale ? { stale: true } : { error: "Synthetic save failure that must stay visible" }, stale ? 409 : 500));
-    await saving; await h.flush();
+    await h.flush();
     assert.match(h.text(), stale ? /A new day started.*Unsaved answers are preserved/ : /Synthetic save failure that must stay visible/);
     assert.match(h.text(), /Daytime 2031-03-05/);
     assert.equal(h.posts.length, 1);
-    assert.equal(h.button("Save").props.disabled, true, "unreviewed drafts cannot follow navigation into Save");
+    assert.equal(h.hasButton("Save now"), false, "unreviewed drafts never follow navigation into a save");
   });
 }
 
@@ -372,11 +606,11 @@ test("client: failed refresh after a known stale-day rejection never restores th
     },
   });
   h.click(`${DAY}: yes`); await h.flush();
-  await h.click("Save"); await h.flush();
+  await h.tick();
   assert.match(h.text(), /A new day started.*Unsaved answers are preserved/);
   assert.match(h.text(), /Daytime 2031-03-05/);
   assert.equal(h.hasButton(`${DAY}: yes`), false);
-  assert.equal(h.hasButton("Save"), false);
+  assert.equal(h.hasButton("Save now"), false);
   assert.equal(h.posts.length, 1);
 });
 
@@ -405,19 +639,22 @@ test("client: malformed stored JSON is retained while fresh in-memory answers re
   assert.doesNotMatch(h.text(), /Browser storage is unavailable/);
   h.click(`${DAY}: yes`); await h.flush();
   assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true);
-  assert.equal(h.button("Save").props.disabled, false);
   assert.equal(shared.getItem(key), raw, "a failed read must not overwrite the unread original record");
   assert.equal(h.posts.length, 0);
+  await h.tick();
+  assert.equal(h.posts.length, 1, "the tap kept in memory still saves");
+  assert.equal(shared.getItem(key), raw, "and the unread original record is still untouched");
 });
 
 test("client: a transient failed day switch keeps the old date explicit and cannot submit onto the requested date", async (t) => {
   const h = await mount(t, { onGet: (_date, current, count) => count === 1 ? current : response({ error: "Synthetic navigation outage" }, 500) });
   h.click(`${DAY}: yes`); await h.flush();
-  h.navigate("2031-03-04"); await h.flush();
+  h.navigate("2031-03-04"); await h.flush(); // the waiting tap is saved under its own day before the switch
   assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true);
   assert.match(h.text(), /2031-03-05/);
-  await h.click("Save"); await h.flush();
   assert.deepEqual(h.posts, [{ date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" }]);
+  await h.tick(60_000);
+  assert.equal(h.posts.length, 1);
   assert.equal(h.storage.values.has(dayKey("2031-03-04")), false);
 });
 
@@ -440,8 +677,8 @@ test("client: a voice fill that answers late keeps the taps and clears made whil
   assert.equal(h.button(`${OTHER}: yes`).props["aria-pressed"], false, "the clear made during the fill stands");
   assert.equal(h.button(`${OTHER}: no`).props["aria-pressed"], false);
   assert.equal(h.button(`${THIRD}: yes`).props["aria-pressed"], true, "an untouched row is filled");
-  assert.match(h.text(), /Filled 1 answer\./);
-  await h.click("Save"); await h.flush();
+  assert.match(h.text(), /Filled 1 answer\. They save on their own/);
+  await h.tick();
   assert.deepEqual(h.posts[0].answers, { [DAY]: "No", [THIRD]: "Yes" });
 });
 
@@ -462,8 +699,8 @@ test("client: a voice fill puts last night's sleep answers in that night's block
   assert.equal(h.button(`${SLEEP}: no`, 1).props["aria-pressed"], false, "the night before is untouched");
   assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true, "a sleep name in the day answers is ignored");
   assert.match(h.text(), /Filled 2 answers \(1 for last night\)\./);
-  assert.equal(h.posts.length, 0, "nothing is saved by Fill");
-  await h.click("Save"); await h.flush();
+  assert.equal(h.posts.length, 0, "Fill itself writes nothing");
+  await h.tick(); // the filled answers save like taps
   assert.deepEqual(h.posts, [
     { date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" },
     { date: "2031-03-04", answers: { [SLEEP]: "No" }, today: "2031-03-05" },
@@ -490,7 +727,7 @@ test("client: a stale screen reloads instead of filling", async (t) => {
   assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], false);
 });
 
-test("client: the journal draft is written only by Save to journal, with the words verbatim and every label", async (t) => {
+test("client: the journal draft is written only by Save to journal (never automatically), with the words verbatim and every label", async (t) => {
   const JOURNALED = "Journaled your thoughts?";
   const base = page();
   base.items.push(question(JOURNALED, false));
@@ -505,14 +742,15 @@ test("client: the journal draft is written only by Save to journal, with the wor
   await h.click("Fill answers"); await h.flush();
   assert.match(h.text(), /Journal entry/);
   assert.match(h.text(), /draft · not saved/);
-  assert.equal(written.length, 0, "Fill never writes the journal");
+  await h.tick(60_000);
+  assert.equal(written.length, 0, "Fill never writes the journal, and autosave never files it");
   await h.click("Save to journal"); await h.flush();
   assert.deepEqual(written, [{ date: "2031-03-05", title: "Synthetic reflective evening", mood: "good", confidence: "high", source: "voice", topics: ["reflection"], body: words }]);
   assert.match(h.text(), /Saved to your journal/);
   assert.equal(h.button(`${JOURNALED}: yes`).props["aria-pressed"], true, "a draft Yes for the day");
   assert.match(h.text(), /from the journal entry you saved/);
-  assert.equal(h.posts.length, 0, "the check-in answer still waits for Save");
-  await h.click("Save"); await h.flush();
+  assert.equal(h.posts.length, 0, "the check-in answer waits for the autosave pause");
+  await h.tick();
   assert.deepEqual(h.posts[0].answers, { [JOURNALED]: "Yes" });
 });
 
@@ -547,5 +785,7 @@ test("client: the Shortcut hand-off (#say=) clears the address and fills once fr
   assert.equal(sent.length, 1, "filled exactly once");
   assert.equal(sent[0].text, "Synthetic handed over words");
   assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true);
-  assert.equal(h.posts.length, 0, "nothing is saved until Save");
+  assert.equal(h.posts.length, 0, "Fill itself writes nothing");
+  await h.tick();
+  assert.deepEqual(h.posts, [{ date: "2031-03-05", answers: { [DAY]: "Yes" }, today: "2031-03-05" }], "its answers save like taps");
 });

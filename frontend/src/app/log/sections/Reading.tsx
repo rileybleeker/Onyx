@@ -1,21 +1,29 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { useInFeed } from "@/components/FeedContext";
+import { AutosaveRefused, saveRequest } from "@/lib/autosave";
 import { cachedJson, clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 import { useLogDrafts, type ReadingLogDraft } from "@/lib/log-drafts";
 import { LOG_READING_URL, logEarlyGet } from "@/lib/log-early";
 import type { Book, Medium, ReadingOverview, ReadingSession } from "@/lib/reading";
-import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
+import { isBlankSession, newClientKey, readingSaveTarget, sameReadingValue, sessionValue, type SessionValue } from "@/lib/reading-autosave";
+import { useAutosave } from "@/lib/use-autosave";
+import { DraftMark, LogCard, SectionSkeleton } from "./ui";
 
 /**
  * /log Reading. The book being read (chapters done, pace, the Kindle position) and the day's sessions, read-only:
- * Kindle days are written automatically by the harvester. Below them one audio / paper session through
- * POST /api/reading/sessions, the same route as the /reading form (chapter_through required and not past the
- * book's last chapter; the day defaults to behavioral today on the server; the recall note is stored verbatim; the
- * book's habit is stamped Yes for that day). Reads GET /api/reading through the client cache (same key as Today and
- * /reading). A Say it draft (ReadingLogDraft) fills the form as a suggestion; nothing is written until Save.
+ * Kindle days are written automatically by the harvester. Below them one audio / paper session, saved as it is
+ * entered (lib/autosave.ts, Riley 2026-11-15): once the fields hold a valid session (chapter_through set and not past
+ * the book's last chapter) it is created through POST /api/reading/sessions when Riley pauses or leaves a field,
+ * and every later edit of the same form updates that session (PATCH /api/reading/sessions/[id]). The day is sent
+ * only when chosen (the server takes behavioral today); the recall note is stored verbatim; the book's habit is
+ * stamped Yes for that day. "New session" starts the next one; "Remove this session" deletes the one just made.
+ * Reads GET /api/reading through the client cache (same key as Today and /reading). A Say it draft
+ * (ReadingLogDraft) fills the fields Riley has not changed and is saved like his own entry, marked "from what you
+ * said"; a new draft after a session was saved starts a new session. Nothing is written on open or on scroll.
  */
 
 const READING_URL = LOG_READING_URL;
@@ -38,13 +46,14 @@ const MEDIA: Array<{ key: Medium; label: string }> = [
   { key: "other", label: "Other" },
 ];
 const MEDIUM_LABEL: Record<Medium, string> = { audio: "Audio", paper: "Paper", kindle: "Kindle", other: "Other" };
+const DEFAULT_MEDIUM: Medium = "audio";
 
 type Field = "from" | "through" | "minutes" | "date" | "medium" | "recall" | "book";
 type Form = { from: string; through: string; minutes: string; date: string; medium: Medium; recall: string; book: string | null };
 const EMPTY_FIELDS: Record<Field, boolean> = { from: false, through: false, minutes: false, date: false, medium: false, recall: false, book: false };
 
 function blankForm(today: string): Form {
-  return { from: "", through: "", minutes: "", date: today, medium: "audio", recall: "", book: null };
+  return { from: "", through: "", minutes: "", date: today, medium: DEFAULT_MEDIUM, recall: "", book: null };
 }
 
 /** The draft's values as form fields (only the ones it carries). */
@@ -92,7 +101,7 @@ function SessionLine({ s }: { s: ReadingSession }) {
   );
 }
 
-type Msg = { kind: "ok" | "err"; text: string } | null;
+type SavedInfo = { xp: number; finished: boolean } | null;
 
 export default function ReadingSection() {
   const [data, setData] = useState<ReadingAnswer | null>(() => asReading(clientCache.peek(READING_URL)));
@@ -100,14 +109,42 @@ export default function ReadingSection() {
   const alive = useRef(true);
   const o = data?.overview ?? null;
   const today = o?.today ?? "";
+  const overviewRef = useRef(o);
+  overviewRef.current = o;
 
-  const [form, setForm] = useState<Form>(() => blankForm(today));
+  const [form, setFormState] = useState<Form>(() => blankForm(today));
+  const formRef = useRef(form);
   const touched = useRef<Record<Field, boolean>>({ ...EMPTY_FIELDS });
-  const [fromDraft, setFromDraft] = useState<{ id: number; fields: Record<Field, boolean> } | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [msg, setMsg] = useState<Msg>(null);
+  const [fromDraft, setFromDraftState] = useState<{ id: number; fields: Record<Field, boolean> } | null>(null);
+  const fromDraftRef = useRef(fromDraft);
+  // The session this form made (POST), edited by every later save (PATCH); null = the next save creates one.
+  const [sessionId, setSessionIdState] = useState<number | null>(null);
+  const sessionRef = useRef<number | null>(null);
+  // Idempotency key of the session being made (a retried create returns the same row), and the day of the habit
+  // row that session made as the server reported it (sent back so a later move or removal can take it back).
+  const clientKey = useRef<string>("");
+  const habitCreatedOn = useRef<string | null>(null);
+  const [saved, setSaved] = useState<SavedInfo>(null);
+  const [heldDraft, setHeldDraft] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
   const { draft, clear } = useLogDrafts("reading");
   const seenDraft = useRef<number | null>(null);
+  // The draft whose values are in the form now (cleared from the store once saved; its marks stay).
+  const pendingDraft = useRef<number | null>(null);
+
+  const setForm = (next: Form) => {
+    formRef.current = next;
+    setFormState(next);
+  };
+  const setFromDraft = (next: { id: number; fields: Record<Field, boolean> } | null) => {
+    fromDraftRef.current = next;
+    setFromDraftState(next);
+  };
+  const setSessionId = (id: number | null) => {
+    sessionRef.current = id;
+    setSessionIdState(id);
+  };
 
   const show = useCallback((raw: unknown) => {
     const v = asReading(raw);
@@ -133,22 +170,129 @@ export default function ReadingSection() {
     return () => { alive.current = false; unsub(); };
   }, [load, show]);
 
-  // The behavioral day the server reports: an untouched date follows it (first load, a new day).
+  /** The server answered with a fresh overview of the book on screen: show it, and let other screens refetch. */
+  const showOverview = (overview: ReadingOverview | null | undefined) => {
+    const cur = overviewRef.current;
+    if (overview && cur && overview.book.slug === cur.book.slug && alive.current) setData((prev) => (prev ? { ...prev, overview } : prev));
+    void cachedJson(READING_URL, { check: checkReading }).then(show).catch(() => {});
+  };
+
+  const autosave = useAutosave<SessionValue>("log-reading", {
+    delayMs: 1500,
+    ready: (v) => v.reason,
+    same: sameReadingValue,
+    save: async (v, { keepalive }) => {
+      if (!v.body) return;
+      const id = sessionRef.current;
+      const target = readingSaveTarget("sessions", id);
+      const send = (url: string, method: string, body: Record<string, unknown>) => saveRequest(url, { method, body, keepalive });
+      let json: Record<string, unknown>;
+      try {
+        if (id === null) {
+          if (!clientKey.current) clientKey.current = newClientKey();
+          json = await send(target.url, "POST", { ...v.body, client_key: clientKey.current });
+        } else {
+          json = await send(target.url, "PATCH", { ...v.body, habit_created_on: habitCreatedOn.current });
+        }
+      } catch (e) {
+        if (id !== null && e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
+          // Removed elsewhere: Retry logs it again as a new session (a new key: the old one named a removed row).
+          if (sessionRef.current === id) {
+            setSessionId(null);
+            clientKey.current = newClientKey();
+            habitCreatedOn.current = null;
+          }
+          throw new AutosaveRefused("That session was removed elsewhere. Retry logs it again.");
+        }
+        throw e;
+      }
+      const session = json.session as ReadingSession | undefined;
+      if (id === null && session?.session_id && sessionRef.current === null) {
+        setSessionId(session.session_id);
+        if (json.replayed) {
+          // A retry of a create whose answer was lost: the stored row holds the values of the first send, so the
+          // values on screen now are written onto it.
+          json = await send(readingSaveTarget("sessions", session.session_id).url, "PATCH", { ...v.body, habit_created_on: habitCreatedOn.current });
+        }
+      }
+      if (typeof json.habit_created_on === "string" || json.habit_created_on === null) habitCreatedOn.current = (json.habit_created_on as string | null) ?? null;
+      if (alive.current) setSaved({ xp: Number(json.xp_gained) || 0, finished: !!json.finished });
+      showOverview(json.overview as ReadingOverview | null | undefined);
+      const savedDraft = pendingDraft.current;
+      if (savedDraft !== null) {
+        pendingDraft.current = null; // first: dropping it from the store must not read as "dismissed before saving"
+        clear(savedDraft);
+      }
+    },
+  });
+
+  /** What the form is worth as a request right now. */
+  const valueOf = (f: Form): SessionValue => {
+    const cur = overviewRef.current;
+    const marks = fromDraftRef.current?.fields;
+    const otherBook = cur && f.book && f.book !== cur.book.slug ? f.book : null;
+    const day = f.date || cur?.today || "";
+    const chosenDay = touched.current.date || marks?.date ? day : null;
+    return sessionValue(f, { book: otherBook ?? cur?.book.slug ?? "", chosenDay, today: cur?.today ?? "", total: otherBook ? null : cur?.totalChapters || null });
+  };
+
+  /** The form changed by Riley or his Say it words: show it and hand it to the autosaver. */
+  const commit = (next: Form) => {
+    setForm(next);
+    setRemoveError(null);
+    const anyBook = !!next.book && next.book !== overviewRef.current?.book.slug;
+    if (sessionRef.current === null && !anyBook && !touched.current.date && isBlankSession(next, { medium: DEFAULT_MEDIUM })) {
+      autosave.reset(); // back to nothing typed: nothing to save, nothing unsaved
+      return;
+    }
+    autosave.change(valueOf(next));
+  };
+
+  // The behavioral day the server reports: an untouched date follows it (first load, a new day). Not an entry.
   useEffect(() => {
-    if (!today || touched.current.date) return;
-    setForm((f) => (fromDraft?.fields.date || f.date === today ? f : { ...f, date: today }));
-  }, [today, fromDraft]);
+    if (!today || touched.current.date || fromDraftRef.current?.fields.date) return;
+    if (formRef.current.date !== today) setForm({ ...formRef.current, date: today });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [today]);
 
   const set = (field: Field, patch: Partial<Form>) => {
     touched.current[field] = true;
-    setForm((f) => ({ ...f, ...patch }));
-    setMsg(null);
-    if (fromDraft?.fields[field]) setFromDraft({ ...fromDraft, fields: { ...fromDraft.fields, [field]: false } });
+    const fd = fromDraftRef.current;
+    if (fd?.fields[field]) setFromDraft({ ...fd, fields: { ...fd.fields, [field]: false } });
+    commit({ ...formRef.current, ...patch });
   };
 
-  const applyDraft = useCallback((force: boolean) => {
+  /** Start the next session: the one on screen is kept as saved. */
+  const startNew = useCallback(() => {
+    setSessionId(null);
+    clientKey.current = newClientKey();
+    habitCreatedOn.current = null;
+    setHeldDraft(false);
+    touched.current = { ...EMPTY_FIELDS };
+    setFromDraft(null);
+    setSaved(null);
+    setRemoveError(null);
+    autosave.reset();
+    setForm(blankForm(overviewRef.current?.today ?? ""));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autosave.reset]);
+
+  const applyDraft = async (force: boolean) => {
     if (!draft) return;
-    const vals = draftFields(draft.value);
+    const d = draft;
+    // Words about another session: the session already made from this form keeps its values (anything still
+    // waiting is sent first), and the words fill a new one. If that send fails the form stays as it is and the
+    // words wait (Use, once it is saved).
+    if (sessionRef.current !== null) {
+      const ok = await autosave.flush();
+      if (!alive.current) return;
+      if (!ok) {
+        setHeldDraft(true);
+        return;
+      }
+      startNew();
+    }
+    const vals = draftFields(d.value);
     const applied: Record<Field, boolean> = { ...EMPTY_FIELDS };
     const patch: Partial<Form> = {};
     for (const key of Object.keys(vals) as Field[]) {
@@ -157,40 +301,71 @@ export default function ReadingSection() {
       applied[key] = true;
       if (force) touched.current[key] = false;
     }
-    setForm((f) => ({ ...f, ...patch }));
-    setFromDraft({ id: draft.id, fields: applied });
-    setMsg(null);
-  }, [draft]);
+    setFromDraft({ id: d.id, fields: applied });
+    pendingDraft.current = d.id;
+    commit({ ...formRef.current, ...patch });
+  };
 
   useEffect(() => {
     if (!draft || seenDraft.current === draft.id) return;
     seenDraft.current = draft.id;
-    applyDraft(false);
-  }, [draft, applyDraft]);
+    void applyDraft(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft]);
+
+  /** Take the draft's values out of the fields Riley has not changed (they were never kept). */
+  const revertDraftFields = () => {
+    const fd = fromDraftRef.current;
+    if (!fd) return;
+    const blank = blankForm(overviewRef.current?.today ?? "");
+    const next = { ...formRef.current };
+    for (const key of Object.keys(fd.fields) as Field[]) {
+      if (fd.fields[key] && !touched.current[key]) (next as Record<string, unknown>)[key] = blank[key];
+    }
+    setFromDraft(null);
+    pendingDraft.current = null;
+    commit(next);
+  };
 
   useEffect(() => {
-    // Functional: runs after a new draft's own setFromDraft in the same commit and keeps it.
-    setFromDraft((f) => (f && (!draft || draft.id !== f.id) ? null : f));
+    // The draft left the store before its values were saved (dismissed elsewhere): they go too, so nothing Riley
+    // did not keep is saved. A newer draft is handled by applyDraft above. A saved draft keeps its marks.
+    const f = fromDraftRef.current;
+    if (f && !draft && pendingDraft.current === f.id && sessionRef.current === null) revertDraftFields();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft]);
 
   const dismissDraft = () => {
-    if (fromDraft) {
-      const blank = blankForm(today);
-      setForm((f) => {
-        const next = { ...f };
-        for (const key of Object.keys(fromDraft.fields) as Field[]) {
-          if (fromDraft.fields[key] && !touched.current[key]) (next as Record<string, unknown>)[key] = blank[key];
-        }
-        return next;
-      });
-    }
-    setFromDraft(null);
+    revertDraftFields();
     clear(draft?.id);
+  };
+
+  const removeSession = async () => {
+    const id = sessionRef.current;
+    if (id === null || removing) return;
+    autosave.reset(); // an edit still waiting belongs to the session being removed
+    setRemoving(true);
+    setRemoveError(null);
+    try {
+      const day = habitCreatedOn.current;
+      const res = await fetch(`/api/reading/sessions/${id}${day ? `?habit_created_on=${encodeURIComponent(day)}` : ""}`, { method: "DELETE" });
+      const json = (await res.json().catch(() => ({}))) as { error?: string; overview?: ReadingOverview | null };
+      if (!res.ok && res.status !== 404) throw new Error(json.error || `HTTP ${res.status}`);
+      if (!alive.current) return;
+      startNew();
+      showOverview(json.overview);
+    } catch (e) {
+      if (alive.current) setRemoveError(`Couldn't remove the session: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      if (alive.current) setRemoving(false);
+    }
   };
 
   const marked = (field: Field) => !!fromDraft?.fields[field];
   const anyMarked = !!fromDraft && Object.values(fromDraft.fields).some(Boolean);
   const draftUnused = !!draft && (!fromDraft || fromDraft.id !== draft.id || !anyMarked);
+  const st = autosave.state.status;
+  const busy = st === "saving" || removing;
 
   if (!data && !loadFailed) return <SectionSkeleton section="reading" />;
   if (!data) {
@@ -231,73 +406,11 @@ export default function ReadingSection() {
   const paceClass = o.book.status === "finished" || pace.aheadBy >= 0 ? "text-up" : pace.aheadBy >= -2 ? "text-[var(--color-mid)]" : "text-down";
   const mediaOptions = form.medium === "kindle" ? [...MEDIA, { key: "kindle" as Medium, label: "Kindle" }] : MEDIA;
   const day = form.date || o.today;
-
-  async function save() {
-    if (saving || !o) return;
-    const through = Number(form.through);
-    if (form.through.trim() === "" || !Number.isInteger(through) || through < 0) {
-      setMsg({ kind: "err", text: "Enter the chapter you read through." });
-      return;
-    }
-    if (!otherBook && total && through > total) {
-      setMsg({ kind: "err", text: `This book has ${total} chapters.` });
-      return;
-    }
-    const from = form.from.trim() === "" ? null : Number(form.from);
-    if (from !== null && (!Number.isInteger(from) || from < 0 || from > through)) {
-      setMsg({ kind: "err", text: "The first chapter must be at most the last one." });
-      return;
-    }
-    const minutes = form.minutes.trim() === "" ? null : Number(form.minutes);
-    if (minutes !== null && (!Number.isFinite(minutes) || minutes < 0)) {
-      setMsg({ kind: "err", text: "Minutes must be 0 or more." });
-      return;
-    }
-    // The day is sent only when Riley (or the draft) chose one; otherwise the server takes behavioral today.
-    const chosenDay = touched.current.date || marked("date") ? day : null;
-    if (chosenDay && (!isYmd(chosenDay) || chosenDay > o.today)) {
-      setMsg({ kind: "err", text: "Pick today or an earlier day." });
-      return;
-    }
-    setSaving(true);
-    setMsg(null);
-    try {
-      const res = await fetch("/api/reading/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          book: otherBook ?? o.book.slug,
-          date: chosenDay,
-          chapter_from: from,
-          chapter_through: through,
-          minutes,
-          medium: form.medium,
-          recall: form.recall,
-        }),
-      });
-      const json = (await res.json().catch(() => ({}))) as { error?: string; xp_gained?: number; finished?: boolean; overview?: ReadingOverview | null };
-      if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
-      if (!alive.current) return;
-      if (json.overview && json.overview.book.slug === o.book.slug) {
-        const updated = json.overview;
-        setData((prev) => (prev ? { ...prev, overview: updated } : prev));
-      }
-      touched.current = { ...EMPTY_FIELDS };
-      setForm(blankForm(json.overview?.today ?? o.today));
-      setFromDraft(null);
-      if (draft) clear(draft.id);
-      const xp = json.xp_gained ?? 0;
-      setMsg({ kind: "ok", text: json.finished ? `Saved · book finished · +${xp} XP` : `Saved${xp ? ` · +${xp} XP` : ""}` });
-      void cachedJson(READING_URL, { check: checkReading }).then(show).catch(() => {});
-    } catch (e) {
-      if (alive.current) setMsg({ kind: "err", text: `Couldn't log the session: ${e instanceof Error ? e.message : String(e)}` });
-    } finally {
-      if (alive.current) setSaving(false);
-    }
-  }
+  const anyTouched = Object.values(touched.current).some(Boolean) || anyMarked;
+  const savedText = `Saved${saved?.finished ? " · book finished" : ""}${saved?.xp ? ` · +${saved.xp} XP` : ""}`;
 
   const inputCls =
-    "mt-1 w-full min-h-11 px-3 text-[16px] font-mono tabular-nums bg-surface-sunken border border-border-subtle rounded-control text-text-primary placeholder:text-text-tertiary/60 focus:border-accent/60 outline-none disabled:opacity-40";
+    "mt-1 w-full min-h-11 px-3 text-[16px] font-mono tabular-nums bg-surface-sunken border border-border-subtle rounded-control text-text-primary placeholder:text-text-tertiary/60 focus:border-accent/60 outline-none";
   const labelCls = "text-[11px] font-mono uppercase tracking-wider text-text-tertiary";
 
   return (
@@ -335,24 +448,34 @@ export default function ReadingSection() {
         )}
       </div>
 
-      <form noValidate onSubmit={(e) => { e.preventDefault(); void save(); }} className="mt-4 border-t border-border-subtle pt-3">
+      <form
+        noValidate
+        onSubmit={(e) => { e.preventDefault(); void autosave.flush(); }}
+        onBlur={() => void autosave.flush()}
+        className="mt-4 border-t border-border-subtle pt-3"
+      >
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <h3 className={labelCls}>Audio or paper session</h3>
+          <h3 className={labelCls}>{sessionId !== null ? "This session" : "Audio or paper session"}</h3>
           {anyMarked && (
             <span className="flex items-center gap-2">
               <DraftMark />
-              <button type="button" onClick={dismissDraft} className="min-h-11 px-1 text-[12px] text-text-tertiary hover:text-text-primary underline underline-offset-2">
-                Dismiss
-              </button>
+              {sessionId === null && (
+                <button type="button" onClick={dismissDraft} className="min-h-11 px-1 text-[12px] text-text-tertiary hover:text-text-primary underline underline-offset-2">
+                  Dismiss
+                </button>
+              )}
             </span>
           )}
         </div>
 
+        {heldDraft && draftUnused && draft && (
+          <p className="mt-1 text-[12px] text-text-secondary">The session above isn&apos;t saved yet, so these words wait. Tap Use once it is saved.</p>
+        )}
         {draftUnused && draft && (
           <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px]">
             <DraftMark />
             <span className="font-mono text-text-secondary">{draftSummary(draft.value)}</span>
-            <button type="button" onClick={() => applyDraft(true)} className="min-h-11 px-1 text-accent underline underline-offset-2">Use</button>
+            <button type="button" onClick={() => void applyDraft(true)} className="min-h-11 px-1 text-accent underline underline-offset-2">Use</button>
             <button type="button" onClick={dismissDraft} className="min-h-11 px-1 text-text-tertiary hover:text-text-primary underline underline-offset-2">Dismiss</button>
           </div>
         )}
@@ -370,7 +493,6 @@ export default function ReadingSection() {
               type="button"
               onClick={() => set("medium", { medium: m.key })}
               aria-pressed={form.medium === m.key}
-              disabled={saving}
               className={`min-h-11 px-4 rounded-control border text-[13px] ${form.medium === m.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary hover:text-text-primary"}`}
             >
               {m.label}
@@ -390,7 +512,6 @@ export default function ReadingSection() {
               value={form.from}
               onChange={(e) => set("from", { from: e.target.value })}
               placeholder="auto"
-              disabled={saving}
               className={inputCls}
             />
           </label>
@@ -401,7 +522,6 @@ export default function ReadingSection() {
               value={form.through}
               onChange={(e) => set("through", { through: e.target.value })}
               placeholder={String(next)}
-              disabled={saving}
               className={inputCls}
             />
           </label>
@@ -415,7 +535,6 @@ export default function ReadingSection() {
                 type="button"
                 onClick={() => set("through", { through: String(n) })}
                 aria-pressed={form.through === String(n)}
-                disabled={saving}
                 className={`min-h-11 min-w-11 px-3 rounded-control border font-mono text-[13px] ${form.through === String(n) ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-secondary hover:text-text-primary"}`}
               >
                 ch {n}
@@ -432,7 +551,6 @@ export default function ReadingSection() {
               value={form.minutes}
               onChange={(e) => set("minutes", { minutes: e.target.value })}
               placeholder="30"
-              disabled={saving}
               className={inputCls}
             />
           </label>
@@ -443,7 +561,6 @@ export default function ReadingSection() {
               value={day}
               max={o.today}
               onChange={(e) => set("date", { date: e.target.value || o.today })}
-              disabled={saving}
               className={inputCls}
             />
           </label>
@@ -456,21 +573,39 @@ export default function ReadingSection() {
             onChange={(e) => set("recall", { recall: e.target.value })}
             rows={2}
             placeholder="Optional, from memory"
-            disabled={saving}
-            className="mt-1 w-full px-3 py-2 text-[16px] leading-relaxed bg-surface-sunken border border-border-subtle rounded-control text-text-primary placeholder:text-text-tertiary/60 focus:border-accent/60 outline-none disabled:opacity-40"
+            className="mt-1 w-full px-3 py-2 text-[16px] leading-relaxed bg-surface-sunken border border-border-subtle rounded-control text-text-primary placeholder:text-text-tertiary/60 focus:border-accent/60 outline-none"
           />
         </label>
 
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
           <span className="text-[12px] text-text-tertiary">
             {day !== o.today ? `For ${fmtDate(day)}` : "For today"}
+            {" · "}
+            <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} savedText={savedText} showIncomplete={anyTouched} />
           </span>
-          <LogSaveButton onClick={() => void save()} disabled={form.through.trim() === ""} saving={saving} />
+          {sessionId !== null && (
+            <span className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => void removeSession()}
+                disabled={busy}
+                className="min-h-11 px-2 text-[12px] text-text-tertiary hover:text-down underline underline-offset-2 disabled:opacity-40"
+              >
+                {removing ? "Removing…" : "Remove this session"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void autosave.flush().then((ok) => { if (ok && alive.current) startNew(); })}
+                disabled={busy || st === "error"}
+                className="min-h-11 px-4 rounded-full text-[13px] font-medium border border-border-subtle text-text-secondary hover:text-text-primary disabled:opacity-40"
+              >
+                New session
+              </button>
+            </span>
+          )}
         </div>
-        {msg && (
-          <p role={msg.kind === "err" ? "alert" : "status"} className={`mt-2 text-[13px] ${msg.kind === "ok" ? "text-up" : "text-down"}`}>
-            {msg.text}
-          </p>
+        {removeError && (
+          <p role="alert" className="mt-2 text-[13px] text-down">{removeError}</p>
         )}
       </form>
     </LogCard>

@@ -1,7 +1,7 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { HIGHLIGHT_COLS, addHighlight, getBook, type HighlightSource } from "@/lib/reading";
-import { mirrorHighlight } from "@/lib/reading-notion";
+import { HIGHLIGHT_COLS, addHighlight, getBook, type Highlight, type HighlightSource } from "@/lib/reading";
+import { highlightMirrorDiffers, mirrorHighlight, updateMirroredHighlight } from "@/lib/reading-notion";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -39,8 +39,15 @@ export async function POST(req: NextRequest) {
 
   if (result.created) {
     after(async () => {
+      const id = result.highlight.highlight_id;
       const blockId = await mirrorHighlight(result.book, result.highlight);
-      if (blockId) await supabase.from("book_highlights").update({ notion_block_id: blockId }).eq("highlight_id", result.highlight.highlight_id);
+      if (!blockId) return;
+      await supabase.from("book_highlights").update({ notion_block_id: blockId }).eq("highlight_id", id);
+      // The autosaving highlight form may have edited it before the block id was stored (that edit could not
+      // update the entry): compare with the row as it is now.
+      const { data: fresh } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("highlight_id", id).maybeSingle();
+      const now = fresh as Highlight | null;
+      if (now && !now.archived && highlightMirrorDiffers(result.highlight, now)) await updateMirroredHighlight({ ...now, notion_block_id: blockId });
     });
   }
   return NextResponse.json({ success: true, created: result.created, highlight: result.highlight });

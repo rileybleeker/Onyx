@@ -37,7 +37,8 @@ import { LogCard, LogSaveButton } from "./ui";
  * with the same components and rules as /check-in (the day's dishes plus the 2 days before still unanswered,
  * leftovers with the time they were eaten). Each tap saves on its own through PATCH /api/delivery/items/[id] /
  * PUT .../leftovers (createPortionSaver), exactly as on /check-in and /nutrition. Say it suggestions
- * (useLogDrafts("ubereats")) are drawn dashed "from what you said" and are stored only by this section's Save.
+ * (useLogDrafts("ubereats")) are drawn dashed "from what you said" and stored on their own 0.8 s later, each tried
+ * once (a failed one gets Retry).
  * "Uber Eats checked N min ago" is the newest ubereats|items heartbeat (the PC harvester, every 10 min); when it
  * moves, the dishes are read again. Everything paints from the client cache first. Nothing is written on open.
  */
@@ -327,6 +328,27 @@ export default function UberEatsSection() {
     }
   }, [draft, suggestions]);
 
+  // Autosave (2026-11-15): what the Say it box filled from Riley's words is stored on its own, 0.8 s after it shows
+  // (the dashed marks stay visible meanwhile). Each suggestion is tried once on its own; one still waiting after
+  // that (a failed save) gets a Retry button.
+  const saveRef = useRef(save);
+  saveRef.current = save;
+  const attempted = useRef(new Set<string>());
+  const keyOf = useCallback(
+    (s: (typeof suggestions)[number]) => `${draft?.id ?? ""}:${s.kind}:${s.item_id}:${s.day ?? ""}`,
+    [draft],
+  );
+  const freshKey = actionable.map(keyOf).filter((k) => !attempted.current.has(k)).join("|");
+  useEffect(() => {
+    if (!freshKey || saving || !delivery.loaded) return;
+    const t = setTimeout(() => {
+      for (const k of freshKey.split("|")) attempted.current.add(k);
+      void saveRef.current();
+    }, 800);
+    return () => clearTimeout(t);
+  }, [freshKey, saving, delivery.loaded]);
+  const retryable = !saving && !freshKey && actionable.length > 0;
+
   const dayName = (d: string) => (d === today ? "Today" : d === shiftYmd(today, -1) ? "Yesterday" : shortDay(d));
   const kcal = delivery.totalKcal;
   const nothing = delivery.loaded && !delivery.loadError && delivery.groups.length === 0 && delivery.leftovers.length === 0;
@@ -382,12 +404,14 @@ export default function UberEatsSection() {
             ))}
           </ul>
           <div className="mt-2 flex items-center gap-3">
-            <LogSaveButton
-              onClick={() => void save()}
-              disabled={actionable.length === 0}
-              saving={saving}
-              label={actionable.length > 1 ? `Save ${actionable.length}` : "Save"}
-            />
+            {saving || freshKey ? (
+              <span role="status" className="text-[12px] text-text-tertiary">Saving what you said…</span>
+            ) : retryable ? (
+              <>
+                <span role="alert" className="text-[12px] text-down">Not saved yet.</span>
+                <LogSaveButton onClick={() => void save()} saving={saving} label="Retry" />
+              </>
+            ) : null}
             <button
               type="button"
               onClick={() => draft && clear(draft.id)}

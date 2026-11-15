@@ -1,6 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
+import { saveRequest } from "@/lib/autosave";
+import { useAutosave } from "@/lib/use-autosave";
 
 /** A product from the /supplements library picker (subset of the page's Product). */
 export interface StackPickerProduct {
@@ -34,17 +37,86 @@ interface Props {
   stack: EditableStack | null; // null while closed; {stack_id:null,...} for a new stack
   products: StackPickerProduct[];
   onClose: () => void;
+  /** Called on close when anything was saved (the caller re-reads the stacks). */
   onSaved: () => void;
 }
 
+/** What is sent: the editor's fields, items as the API takes them. */
+type StackForm = { name: string; description: string; remind_time: string; items: { product_id: string; doses: number }[] };
+
+function formOf(name: string, description: string, remindTime: string, items: StackItemDraft[]): StackForm {
+  return {
+    name,
+    description,
+    remind_time: remindTime,
+    items: items.filter((i) => i.product_id).map((i) => ({ product_id: i.product_id, doses: i.doses > 0 ? i.doses : 1 })),
+  };
+}
+
+/** One random id per new stack: a retried create (lost answer) then returns the same stack instead of a second. */
+function newClientKey(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const hex = Array.from(b, (n) => n.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function notReady(f: StackForm): string | null {
+  if (!f.name.trim()) return "Give the stack a name.";
+  if (f.items.length === 0) return "Add at least one product.";
+  return null;
+}
+
+/**
+ * Autosave (Riley 2026-11-15, lib/autosave.ts): an existing stack's changes are sent on their own (taps almost at
+ * once, typing after a pause and when the field is left) through PATCH /api/supplements/stacks. A new stack is
+ * created (POST) as soon as it has a name and a product, and later changes PATCH that stack. The create carries a
+ * client_key (one UUID per new stack), so a create retried after a lost answer returns that stack instead of a second
+ * copy (sql/supplement_stack_client_key.sql). Done (or a tap outside) sends what is waiting and closes; a failed save
+ * keeps the editor open with its message.
+ */
 export default function StackEditorModal({ open, stack, products, onClose, onSaved }: Props) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [remindTime, setRemindTime] = useState("");
   const [items, setItems] = useState<StackItemDraft[]>([]);
   const [addProductId, setAddProductId] = useState("");
-  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** The stack being edited: the one opened, or the one this editor created. State so the Delete button follows. */
+  const [stackId, setStackId] = useState<number | null>(null);
+  const stackIdRef = useRef<number | null>(null);
+  const clientKey = useRef<string | null>(null);
+  const savedAny = useRef(false);
+
+  const autosave = useAutosave<StackForm>("stack-editor", {
+    delayMs: 500,
+    ready: notReady,
+    save: async (f, { keepalive }) => {
+      const body = {
+        name: f.name.trim(),
+        description: f.description.trim() || null,
+        // Empty = reminders off (the API stores NULL).
+        remind_time: f.remind_time || null,
+        items: f.items,
+      };
+      if (stackIdRef.current === null) {
+        clientKey.current ??= newClientKey();
+        const json = await saveRequest("/api/supplements/stacks", { method: "POST", body: { ...body, client_key: clientKey.current }, keepalive });
+        const id = Number(json.stack_id);
+        if (Number.isFinite(id)) {
+          stackIdRef.current = id;
+          setStackId(id);
+        }
+      } else {
+        await saveRequest("/api/supplements/stacks", { method: "PATCH", body: { stack_id: stackIdRef.current, ...body }, keepalive });
+      }
+      savedAny.current = true;
+    },
+  });
+  const { reset: resetAutosave } = autosave;
 
   useEffect(() => {
     if (!stack) return;
@@ -54,7 +126,12 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
     setItems(stack.items.map((i) => ({ ...i })));
     setAddProductId("");
     setError(null);
-  }, [stack]);
+    stackIdRef.current = stack.stack_id ?? null;
+    setStackId(stack.stack_id ?? null);
+    clientKey.current = stack.stack_id ? null : newClientKey();
+    savedAny.current = false;
+    resetAutosave(stack.stack_id ? formOf(stack.name, stack.description ?? "", stack.remind_time ?? "", stack.items) : undefined);
+  }, [stack, resetAutosave]);
 
   const isNew = !stack?.stack_id;
 
@@ -71,79 +148,71 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
 
   if (!open || !stack) return null;
 
+  /** Every edit goes through here: typing waits for a pause, a tap is sent almost at once. */
+  function send(next: Partial<{ name: string; description: string; remindTime: string; items: StackItemDraft[] }>, typed = false) {
+    const f = formOf(next.name ?? name, next.description ?? description, next.remindTime ?? remindTime, next.items ?? items);
+    autosave.change(f, { delayMs: typed ? 1200 : 400 });
+  }
+
   function addItem(product_id: string) {
     if (!product_id) return;
     const p = productById[product_id];
-    setItems((prev) => [
-      ...prev,
-      { product_id, doses: 1, full_name: p?.full_name ?? null, brand_name: p?.brand_name ?? null },
-    ]);
+    const next = [...items, { product_id, doses: 1, full_name: p?.full_name ?? null, brand_name: p?.brand_name ?? null }];
+    setItems(next);
     setAddProductId("");
+    send({ items: next });
   }
 
   function setDoses(product_id: string, value: string) {
     const n = Number(value);
-    setItems((prev) =>
-      prev.map((i) => (i.product_id === product_id ? { ...i, doses: Number.isFinite(n) ? n : i.doses } : i)),
-    );
+    const next = items.map((i) => (i.product_id === product_id ? { ...i, doses: Number.isFinite(n) ? n : i.doses } : i));
+    setItems(next);
+    send({ items: next }, true);
   }
 
   function removeItem(product_id: string) {
-    setItems((prev) => prev.filter((i) => i.product_id !== product_id));
+    const next = items.filter((i) => i.product_id !== product_id);
+    setItems(next);
+    send({ items: next });
   }
 
-  async function save() {
-    const trimmed = name.trim();
-    if (!trimmed) {
-      setError("Give the stack a name.");
-      return;
-    }
-    const cleanItems = items
-      .filter((i) => i.product_id)
-      .map((i) => ({ product_id: i.product_id, doses: i.doses > 0 ? i.doses : 1 }));
-    if (cleanItems.length === 0) {
-      setError("Add at least one product.");
-      return;
-    }
-    setSaving(true);
-    setError(null);
-    try {
-      const res = await fetch("/api/supplements/stacks", {
-        method: isNew ? "POST" : "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ...(isNew ? {} : { stack_id: stack!.stack_id }),
-          name: trimmed,
-          description: description.trim() || null,
-          // Empty = reminders off (the API stores NULL).
-          remind_time: remindTime || null,
-          items: cleanItems,
-        }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      onSaved();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
-    }
+  /**
+   * Done / a tap outside: send what is waiting, then close. A failed save keeps the editor open; so does a stack
+   * already saved and now left without a name or products (its last complete version stays saved; Close leaves).
+   */
+  async function done() {
+    if (notReady(formOf(name, description, remindTime, items)) && stackIdRef.current !== null) return;
+    await closeNow();
+  }
+
+  /**
+   * Close (top right): leave even when the form is incomplete; whatever is complete and waiting is sent first. A
+   * complete change that could not be saved keeps the editor open (its status line has Retry).
+   */
+  async function closeNow() {
+    const ok = await autosave.flush();
+    if (!ok && !notReady(formOf(name, description, remindTime, items))) return;
+    if (savedAny.current) onSaved();
+    else onClose();
   }
 
   async function archive() {
-    if (isNew) return;
+    const id = stackIdRef.current;
+    if (id === null) return;
     if (!confirm(`Delete the "${name}" stack?\n\nYour logged intake history is kept — only the saved template is removed.`)) {
       return;
     }
-    setSaving(true);
+    autosave.reset();
+    setDeleting(true);
     setError(null);
     try {
-      const res = await fetch(`/api/supplements/stacks?stack_id=${stack!.stack_id}`, { method: "DELETE" });
+      const res = await fetch(`/api/supplements/stacks?stack_id=${id}`, { method: "DELETE" });
       if (!res.ok) throw new Error(await res.text());
       onSaved();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setSaving(false);
+      setDeleting(false);
     }
   }
 
@@ -152,7 +221,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
   return (
     <div
       className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-start justify-center p-4 overflow-y-auto"
-      onClick={onClose}
+      onClick={() => void done()}
     >
       <div
         className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 w-full max-w-lg mt-12"
@@ -163,8 +232,8 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
             {isNew ? "New stack" : "Edit stack"}
           </h2>
           <button
-            onClick={onClose}
-            disabled={saving}
+            onClick={() => void closeNow()}
+            disabled={deleting}
             className="text-[11px] text-text-tertiary hover:text-text-secondary font-mono disabled:opacity-40"
           >
             Close
@@ -177,8 +246,12 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
         <input
           type="text"
           value={name}
-          onChange={(e) => setName(e.target.value)}
-          disabled={saving}
+          onChange={(e) => {
+            setName(e.target.value);
+            send({ name: e.target.value }, true);
+          }}
+          onBlur={() => void autosave.flush()}
+          disabled={deleting}
           placeholder="e.g. Morning stack"
           className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
         />
@@ -189,8 +262,12 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
         <input
           type="text"
           value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          disabled={saving}
+          onChange={(e) => {
+            setDescription(e.target.value);
+            send({ description: e.target.value }, true);
+          }}
+          onBlur={() => void autosave.flush()}
+          disabled={deleting}
           placeholder="e.g. taken right after waking"
           className="w-full mb-4 px-3 py-2 text-[13px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
         />
@@ -202,16 +279,23 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
           <input
             type="time"
             value={remindTime}
-            onChange={(e) => setRemindTime(e.target.value)}
-            disabled={saving}
+            onChange={(e) => {
+              setRemindTime(e.target.value);
+              send({ remindTime: e.target.value }, true);
+            }}
+            onBlur={() => void autosave.flush()}
+            disabled={deleting}
             aria-label="Reminder time"
             className="px-3 py-2 text-[13px] tabular-nums bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
           />
           {remindTime && (
             <button
               type="button"
-              onClick={() => setRemindTime("")}
-              disabled={saving}
+              onClick={() => {
+                setRemindTime("");
+                send({ remindTime: "" });
+              }}
+              disabled={deleting}
               className="px-2 py-1 text-[11px] font-mono text-text-tertiary hover:text-text-primary disabled:opacity-40 transition-colors"
             >
               clear
@@ -259,14 +343,15 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
                     step="0.5"
                     value={it.doses}
                     onChange={(e) => setDoses(it.product_id, e.target.value)}
-                    disabled={saving}
+                    onBlur={() => void autosave.flush()}
+                    disabled={deleting}
                     className="w-[64px] px-2 py-1 text-[13px] tabular-nums bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
                     title="Doses logged for this product"
                   />
                   <span className="text-[10px] text-text-tertiary font-mono shrink-0">dose</span>
                   <button
                     onClick={() => removeItem(it.product_id)}
-                    disabled={saving}
+                    disabled={deleting}
                     className="px-1 text-[14px] text-text-tertiary/60 hover:text-red-400 disabled:opacity-40 transition-colors"
                     aria-label="Remove product"
                   >
@@ -283,7 +368,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
           <select
             value={addProductId}
             onChange={(e) => addItem(e.target.value)}
-            disabled={saving || available.length === 0}
+            disabled={deleting || available.length === 0}
             className="flex-1 px-3 py-2 text-[12px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
           >
             <option value="">
@@ -299,11 +384,11 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
 
         {error && <p className="text-[11px] font-mono text-red-400 mb-3 break-words">{error}</p>}
 
-        <div className="flex justify-between gap-2">
-          {!isNew ? (
+        <div className="flex items-center justify-between gap-2">
+          {stackId !== null ? (
             <button
               onClick={archive}
-              disabled={saving}
+              disabled={deleting}
               className="px-3 py-2 text-[12px] text-red-400/80 hover:text-red-400 disabled:opacity-40 transition-colors"
             >
               Delete stack
@@ -311,20 +396,19 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
           ) : (
             <span />
           )}
-          <div className="flex gap-2">
+          <div className="flex items-center gap-3">
+            <AutosaveStatus
+              state={autosave.state}
+              onRetry={() => void autosave.retry()}
+              showIncomplete
+              savedText={isNew && stackId !== null ? "Stack created" : "Saved"}
+            />
             <button
-              onClick={onClose}
-              disabled={saving}
-              className="px-3 py-2 text-[12px] text-text-secondary hover:text-text-primary disabled:opacity-40 transition-colors"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={save}
-              disabled={saving}
+              onClick={() => void done()}
+              disabled={deleting}
               className="px-4 py-2 text-[12px] font-medium text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed border border-accent rounded-full transition-colors"
             >
-              {saving ? "Saving…" : isNew ? "Create stack" : "Save changes"}
+              Done
             </button>
           </div>
         </div>

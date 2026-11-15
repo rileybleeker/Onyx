@@ -20,10 +20,17 @@ import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
  *     /api/supplements/log-product, which runs the chat tool's logSupplementIntake (lib/supplement-intake.ts), so
  *     amounts, times, the awake tail and the no-time rule are the same as "log 15 mg of X at 8:30" in chat.
  *   - Logged today: single products logged on behavioral today, each with Undo (DELETE /api/supplements/log-intake).
- * Say it drafts (useLogDrafts("supplements")) are listed as suggestions marked "from what you said" and written only
- * on this section's Save. Nothing is written on open or on scroll. Reads: the client cache first (same keys as
+ * Say it drafts (useLogDrafts("supplements")) are listed marked "from what you said" and logged on their own 0.8 s
+ * later (autosave; each row then has Undo); a failed one stays listed with Edit and Retry. "Log a product" keeps its
+ * Log tap: logging a dose is the action itself, like a stack's Log it. Nothing is written on open or on scroll. Reads: the client cache first (same keys as
  * /supplements and the warm-up), then the server.
  */
+
+// Say it drafts this page already logged, for the page's life (module memory, like the drafts themselves): the
+// section can unmount and mount again (the continuous scroll, leaving /log and coming back), and must never log the
+// same suggestion twice. A draft is auto-saved once; what failed stays listed with Retry.
+const triedDrafts = new Set<number>();
+const loggedItems = new Map<number, Set<number>>(); // draft id -> indexes of items already logged
 
 const TODAY_URL = LOG_SUPPLEMENTS_TODAY_URL;
 const STACKS_URL = LOG_SUPPLEMENTS_STACKS_URL;
@@ -543,12 +550,16 @@ export default function SupplementsSection() {
       setSuggestions(null);
       return;
     }
-    setSuggestions((cur) =>
-      cur && cur.draftId === draft.id
-        ? cur
-        : { draftId: draft.id, items: draft.value.map((item, i) => ({ key: i, item, state: "ready" as const, error: null })) },
-    );
-  }, [draft]);
+    const logged = loggedItems.get(draft.id);
+    const items = draft.value
+      .map((item, i) => ({ key: i, item, state: "ready" as const, error: null }))
+      .filter((s) => !logged?.has(s.key));
+    if (items.length === 0) {
+      clear(draft.id);
+      return;
+    }
+    setSuggestions((cur) => (cur && cur.draftId === draft.id ? cur : { draftId: draft.id, items }));
+  }, [draft, clear]);
 
   const openSuggestions = suggestions?.items ?? [];
   function dropSuggestion(key: number) {
@@ -615,6 +626,9 @@ export default function SupplementsSection() {
       if (err) items = items.map((x) => (x.key === s.key ? { ...x, state: "failed", error: err } : x));
       else {
         done.push(s.key);
+        const logged = loggedItems.get(draftId) ?? new Set<number>();
+        logged.add(s.key);
+        loggedItems.set(draftId, logged);
         items = items.filter((x) => x.key !== s.key);
       }
       setSuggestions((cur) => (cur && cur.draftId === draftId ? { draftId, items } : cur));
@@ -622,6 +636,22 @@ export default function SupplementsSection() {
     setSavingSuggestions(false);
     if (items.length === 0) clear(draftId);
   }
+
+  // Autosave (2026-11-15): what the Say it box filled from Riley's words is logged on its own, 0.8 s after it shows,
+  // once the stack list is in (a stack is matched by name). Each logged row lands under "Logged today" / its stack
+  // with Undo; a suggestion that fails stays listed with its reason, Edit and Retry.
+  const saveSuggestionsRef = useRef(saveSuggestions);
+  saveSuggestionsRef.current = saveSuggestions;
+  const suggestionDraftId = suggestions?.draftId ?? null;
+  useEffect(() => {
+    if (suggestionDraftId == null || triedDrafts.has(suggestionDraftId) || !stacks || !day) return;
+    const t = setTimeout(() => {
+      triedDrafts.add(suggestionDraftId);
+      void saveSuggestionsRef.current();
+    }, 800);
+    return () => clearTimeout(t);
+  }, [suggestionDraftId, stacks, day]);
+  const suggestionsWaiting = suggestionDraftId != null && !triedDrafts.has(suggestionDraftId);
 
   // ---- render ----
 
@@ -667,7 +697,7 @@ export default function SupplementsSection() {
                     <div className="text-[12px] font-mono text-text-tertiary">{detail}</div>
                     {s.error && <div role="alert" className="text-[12px] text-down">{s.error}</div>}
                   </div>
-                  {it.kind === "product" && (
+                  {it.kind === "product" && s.state === "failed" && (
                     <button type="button" className={btn} disabled={savingSuggestions} onClick={() => editSuggestion(s)}>Edit</button>
                   )}
                   <button type="button" aria-label={`Remove ${name}`} className={`${btn} px-2`} disabled={savingSuggestions} onClick={() => dropSuggestion(s.key)}>
@@ -678,7 +708,11 @@ export default function SupplementsSection() {
             })}
           </ul>
           <div className="mt-3">
-            <LogSaveButton onClick={() => void saveSuggestions()} saving={savingSuggestions} label={openSuggestions.length > 1 ? `Save ${openSuggestions.length}` : "Save"} />
+            {savingSuggestions || suggestionsWaiting ? (
+              <span role="status" className="text-[12px] text-text-tertiary">Logging what you said…</span>
+            ) : (
+              <LogSaveButton onClick={() => void saveSuggestions()} saving={savingSuggestions} label="Retry" />
+            )}
           </div>
         </div>
       )}

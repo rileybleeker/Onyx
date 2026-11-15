@@ -1,21 +1,28 @@
 import { NextRequest, NextResponse } from "next/server";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
 import { easternDate, JOURNAL_MAX_REQUEST_BYTES } from "@/lib/journal-entry";
-import { completeEntry, needsLabels, validateJournalFile } from "@/lib/journal-file";
-import { createJournalPage, findRetriedEntry, inferJournalLabels, notionConfigured, notionRefusalMessage, NotionRefused } from "@/lib/journal-file-server";
+import { completeEntry, needsLabels, parseKnownSha, validateJournalFile } from "@/lib/journal-file";
+import { bodySha, createJournalPageRef, findRetriedEntry, inferJournalLabels, notionConfigured, notionRefusalMessage, NotionRefused } from "@/lib/journal-file-server";
 
-// POST /api/journal/file   Body: { body, source: "voice" | "typed", date?, title?, mood?, confidence?, topics? }
+// POST /api/journal/file   Body: { body, source: "voice" | "typed", date?, title?, mood?, confidence?, topics?, known_sha? }
 //
-// The /log Journal section's Save: files ONE entry in the personal Notion journal ("Entries", synced into
-// pds.journal_entries hourly at :35 by journal_etl.py; this route never writes pds.journal_entries).
+// The /log Journal section files ONE entry here by itself (autosave, 2026-11-15: a few seconds after Riley stops
+// typing, or when he leaves the box); later edits of that entry go to PATCH /api/journal/file/[pageId], never here.
+// The entry goes to the personal Notion journal ("Entries", synced into pds.journal_entries hourly at :35 by
+// journal_etl.py; this route never writes pds.journal_entries).
 //   - body: written exactly as sent (paragraphs at blank lines; only the whitespace around it is dropped).
 //   - date: today in America/New_York unless sent (never a future day).
 //   - source: as sent (the section sets voice when the words were dictated, else typed).
 //   - title, mood, confidence, topics: Riley's when sent; any left blank are inferred in ONE model call
 //     (structured output, existing topic tags preferred). The model only labels: its output never touches the body.
 // A save repeated within 15 minutes with the same day and words returns the entry already there (`existing`).
+// `known_sha`: hashes of earlier versions the box sent whose answer never came (registered on the device before each
+// send, so they survive a closed tab; a restored entry also sends its own `date`). A page of that day holding one of
+// them is that same entry, however long ago it was created: returned with `existing` and `stale` (the box then sends
+// the newer words to the PATCH), so a lost answer never leaves two entries.
 //
-// Answers: 200 { url, title, mood, confidence, topics, date, existing? }, 400 with the reason, 502 when the
+// Answers: 200 { id, url, sha, title, mood, confidence, topics, date, existing?, stale? } (`sha` = hash of the words
+// the page holds), 400 with the reason, 502 when the
 // labels or Notion fail (nothing written; the text stays on the screen).
 // Privacy: the text goes to Anthropic (labels) and Notion only. It is never logged; errors log a short code.
 // Auth: session only (middleware; NOT in isCiRoute), plus a same-origin JSON check and a size cap.
@@ -39,12 +46,14 @@ export async function POST(req: NextRequest) {
   const today = easternDate(now);
   const v = validateJournalFile(parsed, today);
   if (!v.ok) return NextResponse.json({ error: v.error }, { status: 400 });
+  const known = parseKnownSha((parsed as { known_sha?: unknown }).known_sha);
+  if (!known) return NextResponse.json({ error: "known_sha must be a list of SHA-256 hex strings" }, { status: 400 });
   if (!notionConfigured()) return NextResponse.json({ error: "NOTION_API_KEY not configured" }, { status: 500 });
   const input = v.input;
 
   // The retry check and the labels run side by side: a retry is rare, so the common save does not wait twice.
   const [retry, labels] = await Promise.allSettled([
-    findRetriedEntry(input.date, input.body, now),
+    findRetriedEntry(input.date, input.body, now, known),
     needsLabels(input) ? inferJournalLabels(input.body) : Promise.resolve(null),
   ]);
 
@@ -66,8 +75,8 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const url = await createJournalPage(entry);
-    return NextResponse.json({ url, title: entry.title, mood: entry.mood, confidence: entry.confidence, topics: entry.topics, date: entry.date });
+    const { id, url } = await createJournalPageRef(entry);
+    return NextResponse.json({ id, url, sha: bodySha(entry.body), title: entry.title, mood: entry.mood, confidence: entry.confidence, topics: entry.topics, date: entry.date });
   } catch (e) {
     if (e instanceof NotionRefused) {
       console.error("[journal-file] notion create", e.status);

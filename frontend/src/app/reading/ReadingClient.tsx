@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import { Check, ChevronDown, Flame, Highlighter, Sparkles, Trophy, X } from "lucide-react";
@@ -8,6 +8,10 @@ import MetricRing from "@/components/MetricRing";
 import InfoHint from "@/components/InfoHint";
 import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
+import { AutosaveRefused, saveRequest } from "@/lib/autosave";
+import { highlightValue, ownRetriedHighlight, sameReadingValue, type HighlightValue } from "@/lib/reading-autosave";
+import { useAutosave } from "@/lib/use-autosave";
 import { sameJson } from "@/lib/format";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import LogLink from "@/components/LogLink";
@@ -20,7 +24,9 @@ const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading
  * One book at a time: progress ring + pace against the target date, session
  * streak, XP / level, badges, three checkpoints, a burn-up chart, today's
  * spaced-repetition review, and the highlight capture form (a comment, or a
- * pasted Kindle export). Sessions are logged on /log (one place to enter data).
+ * pasted Kindle export), which saves as it is entered (lib/autosave.ts): created on
+ * the first non-empty passage, then edited in place. Sessions are logged on /log
+ * (one place to enter data).
  * Writes go to /api/reading/*; each write mirrors to the book's Notion
  * reading-log page server-side. All numbers are derived in lib/reading.ts.
  */
@@ -196,7 +202,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         </Part>
 
         <Part id="add-highlight" title="Highlight + comment">
-          <HighlightForm o={o} onAdded={(n) => { showToast({ text: n === 1 ? "+5 XP · highlight" : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onError={(m) => showToast({ text: m, kind: "err" })} />
+          <HighlightForm key={o.book.slug} o={o} onAdded={(n) => { showToast({ text: n === 1 ? "+5 XP · highlight" : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onSaved={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
         </Part>
       </PartGroup>
 
@@ -439,7 +445,15 @@ function GradeBtn({ label, sub, onClick, disabled, className }: { label: string;
   );
 }
 
-function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (n: number) => void; onError: (m: string) => void }) {
+/**
+ * "Highlight + comment". One highlight, saved as it is entered: created (POST /api/reading/highlights, idempotent
+ * on the passage) once the passage is not empty and Riley pauses or leaves a field, then every later edit updates
+ * the same highlight (PATCH /api/reading/highlights/[id]). A passage that was already saved (e.g. by the Kindle
+ * harvester) is attached as it is: later edits write only the comment, chapter and concept filled in here (never
+ * its source, never a clear), and changing its passage starts a new highlight. "New highlight" starts the next one; "Remove" archives the one
+ * just made. The Kindle export paste stays a Preview / Import action.
+ */
+function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; onAdded: (n: number) => void; onSaved: () => void; onError: (m: string) => void }) {
   const [mode, setMode] = useState<"one" | "import">("one");
   const [passage, setPassage] = useState("");
   const [comment, setComment] = useState("");
@@ -450,27 +464,114 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
   const [importText, setImportText] = useState("");
   const [preview, setPreview] = useState<{ format: string; count: number } | null>(null);
   const [saving, setSaving] = useState(false);
+  const [highlightId, setHighlightIdState] = useState<number | null>(null);
+  const [removing, setRemoving] = useState(false);
+  // The highlight this form made or attached to: its id, whether it existed before, and its saved passage.
+  const hlRef = useRef<{ id: number; existing: boolean; passage: string } | null>(null);
+  // A create this form sent without hearing back (network error, timeout): its passage and when it was first sent.
+  // A retry that finds that row is this form's own highlight, not one saved before (ownRetriedHighlight).
+  const unconfirmed = useRef<{ passage: string; at: number } | null>(null);
+  const fields = useRef({ passage, comment, chapter, concept, customConcept, source });
+  const oRef = useRef(o);
+  oRef.current = o;
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  const setHighlight = (h: { id: number; existing: boolean; passage: string } | null) => {
+    hlRef.current = h;
+    setHighlightIdState(h?.id ?? null);
+  };
 
-  const effectiveConcept = concept === "__custom" ? customConcept.trim() : concept;
+  const autosave = useAutosave<HighlightValue>("reading-highlight", {
+    delayMs: 1500,
+    ready: (v) => v.reason,
+    same: sameReadingValue,
+    save: async (v, { keepalive }) => {
+      if (!v.body) return;
+      const hl = hlRef.current;
+      // A new highlight, or a different passage after attaching to one saved before: create.
+      if (!hl || (hl.existing && v.body.passage !== hl.passage)) {
+        if (unconfirmed.current?.passage !== v.body.passage) unconfirmed.current = { passage: v.body.passage, at: Date.now() };
+        const json = await saveRequest("/api/reading/highlights", { method: "POST", body: { ...v.body, book: oRef.current.book.slug }, keepalive });
+        const h = json.highlight as { highlight_id?: number; passage?: string; created_at?: string } | undefined;
+        const own = !!json.created || (!!h && ownRetriedHighlight(h, unconfirmed.current));
+        unconfirmed.current = null;
+        if (!h?.highlight_id) return;
+        setHighlight({ id: h.highlight_id, existing: !own, passage: h.passage ?? v.body.passage });
+        if (own && !json.created) {
+          // The retry found the row this form's lost send made: it is ours, so it takes the values on screen.
+          const body = { passage: v.body.passage, comment: v.body.comment, chapter: v.body.chapter, concept: v.body.concept, source: v.body.source };
+          await saveRequest(`/api/reading/highlights/${h.highlight_id}`, { method: "PATCH", body, keepalive });
+        }
+        if (own) onAdded(1);
+        else onSaved();
+        return;
+      }
+      let body: Record<string, unknown>;
+      if (hl.existing) {
+        // Saved before (e.g. by the harvester): only what is filled in here is written, like the POST's re-import
+        // rule, so an empty field never clears its stored comment, chapter or concept.
+        body = {};
+        if (v.body.comment.trim()) body.comment = v.body.comment;
+        if (v.body.chapter !== null) body.chapter = v.body.chapter;
+        if (v.body.concept) body.concept = v.body.concept;
+        if (!Object.keys(body).length) return;
+      } else {
+        body = { passage: v.body.passage, comment: v.body.comment, chapter: v.body.chapter, concept: v.body.concept, source: v.body.source };
+      }
+      try {
+        await saveRequest(`/api/reading/highlights/${hl.id}`, { method: "PATCH", body, keepalive });
+      } catch (e) {
+        if (e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
+          if (hlRef.current?.id === hl.id) setHighlight(null);
+          throw new AutosaveRefused("That highlight was removed elsewhere. Retry saves it again.");
+        }
+        throw e;
+      }
+      if (hlRef.current?.id === hl.id && !hl.existing) hlRef.current = { ...hl, passage: v.body.passage };
+      onSaved();
+    },
+  });
 
-  const addOne = async () => {
-    if (saving || !passage.trim()) return;
-    setSaving(true);
+  const commit = (patch: Partial<typeof fields.current>) => {
+    const f = { ...fields.current, ...patch };
+    fields.current = f;
+    const blank = !f.passage.trim() && !f.comment.trim() && !f.chapter.trim();
+    if (blank && !hlRef.current) {
+      autosave.reset();
+      return;
+    }
+    autosave.change(highlightValue({ passage: f.passage, comment: f.comment, chapter: f.chapter, concept: f.concept === "__custom" ? f.customConcept : f.concept, source: f.source }));
+  };
+
+  const startNew = () => {
+    setHighlight(null);
+    unconfirmed.current = null;
+    autosave.reset();
+    fields.current = { ...fields.current, passage: "", comment: "" };
+    setPassage("");
+    setComment("");
+  };
+
+  const removeHighlight = async () => {
+    const hl = hlRef.current;
+    if (!hl || removing) return;
+    autosave.reset();
+    setRemoving(true);
     try {
-      const res = await fetch("/api/reading/highlights", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ book: o.book.slug, passage, comment, chapter: chapter ? Number(chapter) : null, concept: effectiveConcept || null, source }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "failed");
-      setPassage("");
-      setComment("");
-      onAdded(1);
+      const res = await fetch(`/api/reading/highlights/${hl.id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as { error?: string }).error || `HTTP ${res.status}`);
+      if (!alive.current) return;
+      startNew();
+      onSaved();
     } catch (e) {
-      onError(e instanceof Error ? e.message : "Couldn't save the highlight");
+      onError(e instanceof Error ? `Couldn't remove the highlight: ${e.message}` : "Couldn't remove the highlight");
     } finally {
-      setSaving(false);
+      if (alive.current) setRemoving(false);
     }
   };
 
@@ -505,6 +606,9 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
     }
   };
 
+  const st = autosave.state.status;
+  const busy = st === "saving" || removing;
+
   return (
     <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-highlight-form">
       <div className="flex items-center justify-between">
@@ -522,12 +626,48 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
       </div>
 
       {mode === "one" ? (
-        <>
-          <textarea value={passage} onChange={(e) => setPassage(e.target.value)} rows={3} placeholder="The passage, as written." className="mt-3 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary leading-relaxed" />
-          <textarea value={comment} onChange={(e) => setComment(e.target.value)} rows={2} placeholder="Your comment. Why it matters, or where it shows up in BC." className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary italic" />
+        <div onBlur={() => void autosave.flush()}>
+          <textarea
+            value={passage}
+            onChange={(e) => {
+              setPassage(e.target.value);
+              commit({ passage: e.target.value });
+            }}
+            rows={3}
+            placeholder="The passage, as written."
+            className="mt-3 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary leading-relaxed"
+          />
+          <textarea
+            value={comment}
+            onChange={(e) => {
+              setComment(e.target.value);
+              commit({ comment: e.target.value });
+            }}
+            rows={2}
+            placeholder="Your comment. Why it matters, or where it shows up in BC."
+            className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary italic"
+          />
           <div className="mt-2 grid grid-cols-[88px_1fr] gap-2">
-            <input type="number" inputMode="numeric" min={0} value={chapter} onChange={(e) => setChapter(e.target.value)} placeholder="ch." className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary" />
-            <select value={concept} onChange={(e) => setConcept(e.target.value)} className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary">
+            <input
+              type="number"
+              inputMode="numeric"
+              min={0}
+              value={chapter}
+              onChange={(e) => {
+                setChapter(e.target.value);
+                commit({ chapter: e.target.value });
+              }}
+              placeholder="ch."
+              className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary"
+            />
+            <select
+              value={concept}
+              onChange={(e) => {
+                setConcept(e.target.value);
+                commit({ concept: e.target.value });
+              }}
+              className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary"
+            >
               <option value="">Concept (optional)</option>
               {CONCEPTS.map((c) => (
                 <option key={c} value={c}>
@@ -537,18 +677,57 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
               <option value="__custom">Other…</option>
             </select>
           </div>
-          {concept === "__custom" && <input value={customConcept} onChange={(e) => setCustomConcept(e.target.value)} placeholder="Concept name" className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[13px] text-text-primary" />}
-          <div className="mt-2 flex flex-wrap gap-1.5">
+          {concept === "__custom" && (
+            <input
+              value={customConcept}
+              onChange={(e) => {
+                setCustomConcept(e.target.value);
+                commit({ customConcept: e.target.value });
+              }}
+              placeholder="Concept name"
+              className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[13px] text-text-primary"
+            />
+          )}
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
             {SOURCES.map((s) => (
-              <button key={s.key} onClick={() => setSource(s.key)} aria-pressed={source === s.key} className={`px-2.5 h-7 rounded-control border text-[11px] ${source === s.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}>
+              <button
+                key={s.key}
+                type="button"
+                onClick={() => {
+                  setSource(s.key);
+                  commit({ source: s.key });
+                }}
+                aria-pressed={source === s.key}
+                className={`px-2.5 h-7 rounded-control border text-[11px] ${source === s.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}
+              >
                 {s.label}
               </button>
             ))}
-            <button onClick={addOne} disabled={saving || !passage.trim()} className="ml-auto px-4 h-8 rounded-control text-[13px] font-medium bg-accent text-black disabled:opacity-40">
-              {saving ? "Saving…" : "Add highlight"}
-            </button>
+            {highlightId !== null && (
+              <span className="ml-auto flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => void removeHighlight()}
+                  disabled={busy}
+                  className="px-2 h-8 text-[12px] text-text-tertiary hover:text-[var(--color-down)] underline underline-offset-2 disabled:opacity-40"
+                >
+                  {removing ? "Removing…" : "Remove"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void autosave.flush().then((ok) => { if (ok && alive.current) startNew(); })}
+                  disabled={busy || st === "error"}
+                  className="px-3 h-8 rounded-control text-[13px] font-medium border border-border-subtle text-text-secondary hover:text-text-primary disabled:opacity-40"
+                >
+                  New highlight
+                </button>
+              </span>
+            )}
           </div>
-        </>
+          <p className="mt-2 text-[11px]">
+            <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} />
+          </p>
+        </div>
       ) : (
         <>
           <div className="mt-2 flex items-center gap-2">

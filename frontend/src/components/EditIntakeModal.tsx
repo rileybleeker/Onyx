@@ -1,6 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { AutosaveStatus } from "@/components/AutosaveStatus";
+import { saveRequest } from "@/lib/autosave";
+import { useAutosave } from "@/lib/use-autosave";
 
 /**
  * Editable intake row. Mirror of the SourceIntake shape used by /supplements,
@@ -19,6 +22,7 @@ export interface EditableIntake {
 interface Props {
   intake: EditableIntake | null;
   onClose: () => void;
+  /** Called on close when at least one change was saved (the caller re-reads the day). */
   onSaved: () => void;
 }
 
@@ -43,59 +47,87 @@ function localInputToIso(input: string): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+/** The form as typed. Saved through PATCH /api/supplements/log-intake. */
+type IntakeForm = { intake_id: number; doses: string; intake_date: string; intake_time: string; notes: string };
+
+function notReady(f: IntakeForm): string | null {
+  const n = Number(f.doses);
+  if (f.doses.trim() === "" || !Number.isFinite(n) || n < 0) return "Doses must be 0 or higher.";
+  if (!f.intake_date) return "Pick a date.";
+  return null;
+}
+
+const formOf = (i: EditableIntake): IntakeForm => ({
+  intake_id: i.intake_id,
+  doses: String(i.doses),
+  intake_date: i.intake_date,
+  intake_time: isoToLocalInput(i.intake_time),
+  notes: i.notes ?? "",
+});
+
+/**
+ * Edits autosave (Riley 2026-11-15, lib/autosave.ts): each change is sent on its own after a short pause and when a
+ * typed field is left, through the same PATCH as before. Done (or a tap outside) sends what is still waiting and
+ * closes; a failed save keeps the editor open with its message. Delete is unchanged.
+ */
 export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
-  const [doses, setDoses] = useState("1");
-  const [intakeDate, setIntakeDate] = useState("");
-  const [intakeTime, setIntakeTime] = useState("");
-  const [notes, setNotes] = useState("");
-  const [saving, setSaving] = useState(false);
+  const [form, setForm] = useState<IntakeForm | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const savedAny = useRef(false);
+
+  const autosave = useAutosave<IntakeForm>("edit-intake", {
+    delayMs: 1000,
+    ready: notReady,
+    save: async (f, { keepalive }) => {
+      await saveRequest("/api/supplements/log-intake", {
+        method: "PATCH",
+        keepalive,
+        body: {
+          intake_id: f.intake_id,
+          doses: Number(f.doses),
+          intake_date: f.intake_date,
+          intake_time: localInputToIso(f.intake_time),
+          notes: f.notes.trim() === "" ? null : f.notes.trim(),
+        },
+      });
+      savedAny.current = true;
+    },
+  });
+  const { reset: resetAutosave } = autosave;
 
   useEffect(() => {
-    if (!intake) return;
-    setDoses(String(intake.doses));
-    setIntakeDate(intake.intake_date);
-    setIntakeTime(isoToLocalInput(intake.intake_time));
-    setNotes(intake.notes ?? "");
-    setError(null);
-  }, [intake]);
-
-  if (!intake) return null;
-
-  async function save() {
-    if (!intake) return;
-    const dosesNum = Number(doses);
-    if (!Number.isFinite(dosesNum) || dosesNum < 0) {
-      setError("Doses must be 0 or higher.");
+    if (!intake) {
+      setForm(null);
       return;
     }
-    setSaving(true);
+    const f = formOf(intake);
+    setForm(f);
+    resetAutosave(f);
+    savedAny.current = false;
     setError(null);
-    try {
-      const res = await fetch("/api/supplements/log-intake", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          intake_id: intake.intake_id,
-          doses: dosesNum,
-          intake_date: intakeDate,
-          intake_time: localInputToIso(intakeTime),
-          notes: notes.trim() === "" ? null : notes.trim(),
-        }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      onSaved();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
-    }
+  }, [intake, resetAutosave]);
+
+  if (!intake || !form) return null;
+
+  const edit = (patch: Partial<IntakeForm>) => {
+    const next = { ...form, ...patch };
+    setForm(next);
+    autosave.change(next);
+  };
+
+  async function done() {
+    if (form && notReady(form)) return; // the status line says why; nothing is lost by staying open
+    if (!(await autosave.flush())) return; // not saved: the status line has Retry
+    if (savedAny.current) onSaved();
+    else onClose();
   }
 
   async function remove() {
     if (!intake) return;
     if (!confirm("Delete this intake entry? This can't be undone from the UI.")) return;
-    setSaving(true);
+    autosave.reset();
+    setDeleting(true);
     setError(null);
     try {
       const res = await fetch(`/api/supplements/log-intake?intake_id=${intake.intake_id}`, {
@@ -106,14 +138,14 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setSaving(false);
+      setDeleting(false);
     }
   }
 
   return (
     <div
       className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-start justify-center p-4 overflow-y-auto"
-      onClick={onClose}
+      onClick={() => void done()}
     >
       <div
         className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 w-full max-w-md mt-12"
@@ -122,8 +154,8 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-[14px] font-medium text-text-primary">Edit intake</h2>
           <button
-            onClick={onClose}
-            disabled={saving}
+            onClick={() => void done()}
+            disabled={deleting}
             className="text-[11px] text-text-tertiary hover:text-text-secondary font-mono disabled:opacity-40"
           >
             Close
@@ -140,9 +172,10 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
           inputMode="decimal"
           min="0"
           step="0.5"
-          value={doses}
-          onChange={(e) => setDoses(e.target.value)}
-          disabled={saving}
+          value={form.doses}
+          onChange={(e) => edit({ doses: e.target.value })}
+          onBlur={() => void autosave.flush()}
+          disabled={deleting}
           className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
         />
 
@@ -151,9 +184,9 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
         </label>
         <input
           type="date"
-          value={intakeDate}
-          onChange={(e) => setIntakeDate(e.target.value)}
-          disabled={saving}
+          value={form.intake_date}
+          onChange={(e) => edit({ intake_date: e.target.value })}
+          disabled={deleting}
           className="w-full mb-3 px-3 py-2 text-[13px] font-mono bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
         />
 
@@ -163,15 +196,15 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
         <div className="flex gap-2 mb-3">
           <input
             type="datetime-local"
-            value={intakeTime}
-            onChange={(e) => setIntakeTime(e.target.value)}
-            disabled={saving}
+            value={form.intake_time}
+            onChange={(e) => edit({ intake_time: e.target.value })}
+            disabled={deleting}
             className="flex-1 px-3 py-2 text-[13px] font-mono bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
           />
-          {intakeTime && (
+          {form.intake_time && (
             <button
-              onClick={() => setIntakeTime("")}
-              disabled={saving}
+              onClick={() => edit({ intake_time: "" })}
+              disabled={deleting}
               className="px-2 text-[11px] font-mono text-text-tertiary hover:text-text-secondary disabled:opacity-40"
               title="Clear time"
             >
@@ -184,9 +217,10 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
           Notes
         </label>
         <textarea
-          value={notes}
-          onChange={(e) => setNotes(e.target.value)}
-          disabled={saving}
+          value={form.notes}
+          onChange={(e) => edit({ notes: e.target.value })}
+          onBlur={() => void autosave.flush()}
+          disabled={deleting}
           rows={2}
           placeholder="e.g. took with food, half-dose, etc."
           className="w-full mb-3 px-3 py-2 text-[13px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none resize-none disabled:opacity-50"
@@ -196,28 +230,22 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
           <p className="text-[11px] font-mono text-red-400 mb-3 break-words">{error}</p>
         )}
 
-        <div className="flex justify-between gap-2">
+        <div className="flex items-center justify-between gap-2">
           <button
             onClick={remove}
-            disabled={saving}
+            disabled={deleting}
             className="px-3 py-2 text-[12px] text-red-400/80 hover:text-red-400 disabled:opacity-40 transition-colors"
           >
             Delete
           </button>
-          <div className="flex gap-2">
+          <div className="flex items-center gap-3">
+            <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} showIncomplete />
             <button
-              onClick={onClose}
-              disabled={saving}
-              className="px-3 py-2 text-[12px] text-text-secondary hover:text-text-primary disabled:opacity-40 transition-colors"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={save}
-              disabled={saving}
+              onClick={() => void done()}
+              disabled={deleting}
               className="px-4 py-2 text-[12px] font-medium text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed border border-accent rounded-full transition-colors"
             >
-              {saving ? "Saving…" : "Save"}
+              Done
             </button>
           </div>
         </div>
