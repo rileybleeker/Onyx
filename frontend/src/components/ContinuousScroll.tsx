@@ -165,6 +165,23 @@ class SectionBoundary extends Component<{ route: string; label: string; children
   }
 }
 
+/**
+ * The page itself. Memoised on the route alone, so nothing the scroll does around it (another page mounting, the
+ * list growing, a placeholder's height) re-renders a page that is already on screen: a page renders when it
+ * mounts and then only on its own updates.
+ */
+const FeedPage = memo(function FeedPage({ route, label }: { route: string; label: string }) {
+  const Comp = loadedFeedSection(route);
+  if (!Comp) return <FeedFailed route={route} label={label} />;
+  return (
+    <InFeed>
+      <SectionBoundary route={route} label={label}>
+        <Comp />
+      </SectionBoundary>
+    </InFeed>
+  );
+});
+
 const FeedSlot = memo(function FeedSlot({
   route, mounted, height, separated, bind,
 }: {
@@ -172,26 +189,12 @@ const FeedSlot = memo(function FeedSlot({
   mounted: boolean;
   /** Not the first page of the scroll: a rule and some space above it. */
   separated: boolean;
-  /** Measured height (px) when the page was last mounted; null = never shown. */
+  /** Unmounted only: measured height (px) when the page was last mounted; null = never shown (or mounted). */
   height: number | null;
   bind: (el: HTMLElement | null) => void;
 }) {
   const label = LABELS.get(route) ?? route;
-  const Comp = mounted ? loadedFeedSection(route) : null;
-  let body: ReactNode;
-  if (Comp) {
-    body = (
-      <InFeed>
-        <SectionBoundary route={route} label={label}>
-          <Comp />
-        </SectionBoundary>
-      </InFeed>
-    );
-  } else if (mounted) {
-    body = <FeedFailed route={route} label={label} />;
-  } else {
-    body = <PageSkeleton title={label} />;
-  }
+  const body: ReactNode = mounted ? <FeedPage route={route} label={label} /> : <PageSkeleton title={label} />;
   // Unmounted with a known height: exactly that height, so swapping content for the placeholder moves nothing.
   // svh: the small viewport height does not change while the phone's toolbar slides in and out.
   const style = !mounted && height ? { height, overflow: "hidden" as const } : { minHeight: "80svh" };
@@ -625,7 +628,16 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
             {children}
           </div>
         ) : (
-          <FeedSlot key={route} route={route} mounted={mounted.has(route)} height={heights.current.get(route) ?? null} separated={i > 0} bind={refFor(route)} />
+          // A mounted page gets no height (its own content sets it): the slot's props stay the same while it is
+          // on screen, so the memo holds and the page is not re-rendered by the scroll.
+          <FeedSlot
+            key={route}
+            route={route}
+            mounted={mounted.has(route)}
+            height={mounted.has(route) ? null : heights.current.get(route) ?? null}
+            separated={i > 0}
+            bind={refFor(route)}
+          />
         ),
       )}
       {feedOn && <div ref={bottomRef} aria-hidden="true" style={{ height: 1 }} />}
