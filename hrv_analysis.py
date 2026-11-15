@@ -340,6 +340,10 @@ FEATURE_LABELS: dict[str, str] = {
     "hrv_lag3": "HRV 3 Days Ago",
     "hrv_7d_mean": "7-Day HRV Average",
     "hrv_7d_std": "7-Day HRV Std Dev",
+    # Causal-layer confounders that had no label (the Sweet Spot "Adjusted" view names them).
+    "whoop_day_strain_lag1": "Previous Day Strain",
+    "whoop_sleep_duration_milli_lag1": "Previous Night's Sleep Duration (WHOOP)",
+    "sleep_debt_7d": "7-Day Sleep Debt",
     "delta_hrv": "HRV Change from Yesterday",
     "whoop_hrv_rmssd": "WHOOP HRV (RMSSD)",
     "whoop_recovery_score": "WHOOP Recovery Score",
@@ -3572,6 +3576,473 @@ def run_statistical_analysis(
 
 
 # ===========================================================================
+# PHASE 2.6 – ENVIRONMENT SWEET SPOT (continuous dose-response, pre-baked)
+# ===========================================================================
+#
+# The /analytics/hrv "Environment Sweet Spot" panel asks: at which LEVEL of an input did
+# the better nights sit? Nights are grouped into equal-width buckets of the input, the mean
+# of one outcome of the SAME night is reported per bucket (+/- 1 SEM), and a least-squares
+# parabola is fitted to the nightly points. This block computes that for every
+# (input, outcome) pair and stores it as ONE row of pds.hrv_analysis_results
+# (dose_response_continuous / sweet_spot) on every retrain. The page reads the row and
+# falls back to computing the same numbers in the browser (frontend/src/lib/sweet-spot.ts)
+# while the row is missing, failed or incomplete.
+#
+# Two versions per pair:
+#   * unadjusted  - the plain bucket means and parabola. Same arithmetic as
+#                   lib/sweet-spot.ts (bucketSweetSpot / fitQuadratic); both sides are
+#                   tested on the same analytic cases (tests/test_dose_response_continuous.py,
+#                   frontend/tests/sweet-spot.test.cjs).
+#   * adjusted    - the same chart after removing the part of the outcome that the causal
+#                   layer's pre-treatment lag-1 confounders predict (imported from
+#                   causal_inference.py). It is an ADJUSTED ASSOCIATION, not a causal
+#                   estimate: no propensity model, no overlap check, nothing that happened
+#                   on the same day is controlled, and unmeasured causes stay in.
+#
+# Alignment (hrv_alignment.py): the frame is the feature matrix, whose Eight Sleep columns
+# were already re-keyed onto the row of the sleep they describe, and every outcome is read
+# from the SAME row (row D = the sleep that closes behavioral day D). Dates are the
+# matrix's behavioral dates; this block does no clock arithmetic and moves nothing by row.
+#
+# Fail-open: run_dose_response_continuous never raises. A failure is logged and stored as
+# a payload with status "failed" (so the page falls back and the reason is on record), and
+# the retrain carries on.
+
+DOSE_RESPONSE_RESULT_TYPE = "dose_response_continuous"
+DOSE_RESPONSE_RESULT_KEY = "sweet_spot"
+DOSE_RESPONSE_VERSION = 1
+
+# Thresholds: keep equal to the SWEET_SPOT_* constants in frontend/src/lib/sweet-spot.ts
+# (frontend/tests/sweet-spot.test.cjs fails if they or the two tables below drift).
+DOSE_MIN_NIGHTS_CHART = 20      # fewer nights: no buckets at all
+DOSE_MIN_NIGHTS_FIT = 30        # fewer nights: bars only, no fitted curve
+DOSE_MIN_CURVATURE_T = 2.0      # a peak needs the bend this many standard errors from zero
+DOSE_MAX_BUCKETS = 24           # the bucket width is doubled until at most this many remain
+# The adjusted version needs this many nights with a complete confounder history (the
+# causal layer's floor for a continuous treatment) and some residual degrees of freedom.
+DOSE_MIN_NIGHTS_ADJUSTED = 50
+DOSE_MIN_ADJUSTED_DOF = 10
+# An exact fit has an infinite curvature t; JSON has no infinity, so it is capped.
+DOSE_T_CAP = 1e6
+
+# (panel key, matrix column, stored -> display transform, bucket width in display units)
+DOSE_RESPONSE_INPUTS = (
+    ("room", "eight_sleep_room_temp", "c_to_f", 2.0),
+    ("bed", "eight_sleep_bed_temp", "c_to_f", 2.0),
+    ("mealGap", "meal_last_meal_to_bedtime_min", "identity", 60.0),
+    ("kcal", "nutrition_calories", "identity", 250.0),
+    ("caf", "caffeine_total_mg", "identity", 100.0),
+    ("cafBed", "caffeine_mg_at_bedtime", "identity", 50.0),
+)
+# (panel key, matrix column, stored -> display transform). Every column is measured from
+# the sleep on the same row (checked with al.is_same_sleep at run time).
+DOSE_RESPONSE_OUTCOMES = (
+    ("hrv", TARGET, "identity"),
+    ("recovery", "whoop_recovery_score", "identity"),
+    ("efficiency", "whoop_sleep_efficiency", "identity"),
+    ("deep", "whoop_deep_sleep_milli", "ms_to_min"),
+)
+_DOSE_TRANSFORMS = {
+    "identity": lambda v: v,
+    "c_to_f": lambda c: c * 9.0 / 5.0 + 32.0,
+    "ms_to_min": lambda ms: ms / 60000.0,
+}
+
+
+def _dose_round2(values: np.ndarray) -> np.ndarray:
+    """Stored value rounded to 2 decimals the way the page does (JS Math.round: half up)."""
+    return np.floor(np.asarray(values, dtype=float) * 100.0 + 0.5) / 100.0
+
+
+def _dose_num(value, digits: int = 4):
+    """A finite float rounded for the payload, or None."""
+    if value is None:
+        return None
+    f = float(value)
+    return round(f, digits) if np.isfinite(f) else None
+
+
+def _dose_sig(value):
+    """A finite float kept to 10 significant digits (curve coefficients can be tiny)."""
+    if value is None:
+        return None
+    f = float(value)
+    return float(f"{f:.10g}") if np.isfinite(f) else None
+
+
+def dose_response_buckets(x, y, bucket_size: float,
+                          max_buckets: int = DOSE_MAX_BUCKETS) -> dict:
+    """Equal-width buckets of x with the mean / SD / SEM of y in each.
+
+    Twin of bucketSweetSpot in lib/sweet-spot.ts: bucket index = floor(x / size); the width
+    is doubled until at most `max_buckets` remain; every bucket between the lowest and the
+    highest is returned, empty ones included (mean None), so the axis stays evenly spaced.
+    Returns {"size", "lo" (index of the first bucket), "buckets": [...]}.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    size = float(bucket_size) if bucket_size and np.isfinite(bucket_size) and bucket_size > 0 else 1.0
+    if len(x) == 0:
+        return {"size": size, "lo": 0, "buckets": []}
+    while True:
+        idx = np.floor(x / size).astype(np.int64)
+        lo, hi = int(idx.min()), int(idx.max())
+        if hi - lo + 1 <= max(1, int(max_buckets)):
+            break
+        size *= 2.0
+    buckets = []
+    for j in range(hi - lo + 1):
+        ys = y[idx == lo + j]
+        n = int(len(ys))
+        start = (lo + j) * size
+        row = {"start": start, "end": start + size, "mid": start + size / 2.0, "n": n,
+               "mean": None, "sem": None, "sd": None}
+        if n:
+            sd = float(np.std(ys, ddof=1)) if n > 1 else 0.0
+            row.update(mean=float(np.mean(ys)), sd=sd, sem=sd / np.sqrt(n) if n > 1 else 0.0)
+        buckets.append(row)
+    return {"size": size, "lo": lo, "buckets": buckets}
+
+
+def _dose_standardize(Z: np.ndarray) -> np.ndarray:
+    """Columns centered and scaled to unit variance; constant columns are left out."""
+    Z = np.asarray(Z, dtype=float)
+    if Z.ndim != 2 or Z.shape[1] == 0:
+        return np.zeros((len(Z), 0))
+    sd = Z.std(axis=0)
+    keep = sd > 1e-12
+    return (Z[:, keep] - Z[:, keep].mean(axis=0)) / sd[keep]
+
+
+def dose_response_fit(x, y, min_n: int = DOSE_MIN_NIGHTS_FIT, covariates=None) -> dict:
+    """Least-squares parabola through the nightly points (not through the bucket means).
+
+    Twin of fitQuadratic in lib/sweet-spot.ts, with one addition: `covariates` (an n x k
+    array, one row per point) are entered next to x^2, x and the constant, standardized, so
+    the curve is the fitted outcome at the AVERAGE covariate values. Without covariates the
+    numbers equal the TypeScript ones.
+
+    status: "too_few" (fewer than `min_n` nights) and "degenerate" (fewer than three
+    distinct x values) have no curve. "flat" (the bend is under DOSE_MIN_CURVATURE_T
+    standard errors from zero), "convex" (bends upward) and "outside_range" (the high point
+    is not strictly inside the observed x range) have a curve and no peak. "ok" has a peak.
+    The standard error treats nights as independent, which they are not, so the threshold
+    is a noise filter, not a significance test.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    Z = None
+    if covariates is not None:
+        Z = np.asarray(covariates, dtype=float)
+        if Z.ndim == 1:
+            Z = Z.reshape(-1, 1)
+        ok &= np.isfinite(Z).all(axis=1)
+        Z = Z[ok]
+    x, y = x[ok], y[ok]
+    n = int(len(x))
+    out = {"n": n, "status": "too_few", "curve": None, "peak": None, "x_min": None, "x_max": None}
+    if n == 0:
+        return out
+    x_min, x_max = float(x.min()), float(x.max())
+    out.update(x_min=x_min, x_max=x_max)
+    # Four is the floor for a residual degree of freedom; the pipeline uses the 30-night default.
+    if n < max(int(min_n), 4):
+        return out
+    if len(np.unique(x)) < 3:
+        return {**out, "status": "degenerate"}
+    x_mean, y_mean = float(x.mean()), float(y.mean())
+    x_sd = float(np.sqrt(np.mean((x - x_mean) ** 2)))
+    y_sd = float(np.sqrt(np.mean((y - y_mean) ** 2)))
+    if not x_sd > 0:
+        return {**out, "status": "degenerate"}
+
+    def curve(A: float, B: float, C: float, r2: float, t: float, sd: float) -> dict:
+        return {
+            "a": sd * A / x_sd ** 2,
+            "b": sd * (B / x_sd - 2 * A * x_mean / x_sd ** 2),
+            "c": y_mean + sd * (A * x_mean ** 2 / x_sd ** 2 - B * x_mean / x_sd + C),
+            "r2": r2, "t": t,
+            # Centered / scaled form used for evaluation (numerically stable for large x).
+            "x_mean": x_mean, "x_sd": x_sd, "y_mean": y_mean, "y_sd": sd, "A": A, "B": B, "C": C,
+        }
+
+    # Every night has (numerically) the same outcome: a horizontal line, no peak.
+    if not y_sd > 1e-12 * max(1.0, abs(y_mean)):
+        return {**out, "status": "flat", "curve": curve(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)}
+
+    # Fit on centered, unit-variance x and y so the system is well conditioned.
+    u = (x - x_mean) / x_sd
+    v = (y - y_mean) / y_sd
+    design = np.column_stack([u * u, u, np.ones(n)])
+    if np.linalg.matrix_rank(design) < 3:
+        return {**out, "status": "degenerate"}
+    if Z is not None:
+        design = np.column_stack([design, _dose_standardize(Z)])
+    p = design.shape[1]
+    if n - p < 1:
+        return out
+    inv = np.linalg.pinv(design.T @ design)
+    beta = inv @ (design.T @ v)
+    A, B, C = float(beta[0]), float(beta[1]), float(beta[2])
+    sse = float(np.sum((v - design @ beta) ** 2))
+    r2 = min(1.0, max(0.0, 1.0 - sse / n))
+
+    # No measurable bend at all (e.g. points exactly on a straight line).
+    if abs(A) < 1e-9:
+        return {**out, "status": "flat", "curve": curve(0.0, B, C, r2, 0.0, y_sd)}
+
+    exact = sse / n < 1e-18
+    se_a = float(np.sqrt(max(sse / (n - p) * inv[0, 0], 0.0)))
+    t = float(np.copysign(DOSE_T_CAP, A)) if exact or not se_a > 0 else A / se_a
+    t = float(np.clip(t, -DOSE_T_CAP, DOSE_T_CAP))
+    fitted = {**out, "curve": curve(A, B, C, r2, t, y_sd)}
+    if abs(t) < DOSE_MIN_CURVATURE_T:
+        return {**fitted, "status": "flat"}
+    if A > 0:
+        return {**fitted, "status": "convex"}
+    x_star = x_mean + x_sd * (-B / (2 * A))
+    if not (x_min < x_star < x_max):
+        return {**fitted, "status": "outside_range"}
+    return {**fitted, "status": "ok",
+            "peak": {"x": x_star, "y": y_mean + y_sd * (C - B * B / (4 * A))}}
+
+
+def dose_response_predict(curve: dict, x: float) -> float:
+    """The fitted outcome at input `x` (display units)."""
+    u = (x - curve["x_mean"]) / curve["x_sd"]
+    return curve["y_mean"] + curve["y_sd"] * (curve["A"] * u * u + curve["B"] * u + curve["C"])
+
+
+def dose_response_adjusted_values(y, Z, groups):
+    """Each night's outcome with the confounder-predicted part removed.
+
+    Regression of y on the standardized confounders WITH one intercept per bucket
+    (`groups`), so the confounder slopes are estimated from night-to-night differences
+    inside a bucket and cannot soak up a real difference between buckets. Returns
+    y - Zs @ beta: the outcome every night would be expected to show at the AVERAGE
+    confounder values. The mean of the returned values over all nights equals the mean of
+    y, and the mean inside a bucket is that bucket's least-squares mean.
+
+    Returns None when there are no usable confounders or fewer than DOSE_MIN_ADJUSTED_DOF
+    residual degrees of freedom.
+    """
+    y = np.asarray(y, dtype=float)
+    groups = np.asarray(groups)
+    Zs = _dose_standardize(Z)
+    k = Zs.shape[1]
+    present = np.unique(groups)
+    if k == 0 or len(y) - len(present) - k < DOSE_MIN_ADJUSTED_DOF:
+        return None
+    y_within = y.copy()
+    z_within = Zs.copy()
+    for g in present:
+        m = groups == g
+        y_within[m] -= y[m].mean()
+        z_within[m] -= Zs[m].mean(axis=0)
+    beta, *_ = np.linalg.lstsq(z_within, y_within, rcond=None)
+    return y - Zs @ beta
+
+
+def dose_response_confounders(frame: pd.DataFrame, x_col: str):
+    """The causal layer's pre-treatment confounders for `x_col`, prepared the way
+    causal_inference._prepare_treatment prepares them: the family's declared set
+    (COMMON_CONFOUNDERS; the treatment itself and, for a rolling treatment, its mediators
+    are left out by ci.adjustment_set), forward-filled on the full daily spine with the
+    per-column limit, day_of_week expanded to cyclic sin / cos.
+
+    `frame` must be the whole matrix sorted by date. Returns (Z DataFrame, complete-row
+    mask, confounder names), or (None, None, []) when the causal module is unavailable or
+    none of the confounders is in the frame.
+    """
+    if not HAS_CAUSAL:
+        return None, None, []
+    family = next((f for c, f, *_ in ci.CONTINUOUS_TREATMENTS if c == x_col), "behavior")
+    declared = ci._confounders_for(family, set(frame.columns))
+    used = list(ci.adjustment_set(x_col, declared))
+    if not used:
+        return None, None, []
+    Z = frame[used].apply(pd.to_numeric, errors="coerce")
+    for c in used:
+        Z[c] = Z[c].ffill(limit=ci._confounder_ffill_limit(c))
+    keep = Z.notna().all(axis=1).to_numpy()
+    return ci._expand_cyclic_day_of_week(Z), keep, used
+
+
+def _dose_fit_payload(fit: dict) -> dict:
+    cv = fit["curve"]
+    return {
+        "n": fit["n"], "status": fit["status"],
+        "a": _dose_sig(cv["a"]) if cv else None,
+        "b": _dose_sig(cv["b"]) if cv else None,
+        "c": _dose_sig(cv["c"]) if cv else None,
+        "r2": _dose_num(cv["r2"]) if cv else None,
+        "t": _dose_num(cv["t"], 3) if cv else None,
+        "peak": ({"x": _dose_num(fit["peak"]["x"]), "y": _dose_num(fit["peak"]["y"])}
+                 if fit["peak"] else None),
+        "x_min": _dose_num(fit["x_min"]), "x_max": _dose_num(fit["x_max"]),
+    }
+
+
+def dose_response_pair(x, y, bucket_size: float, Z=None, z_complete=None) -> dict:
+    """One (input, outcome) pair. `x` and `y` are display-unit arrays, one entry per row of
+    the matrix (NaN where a night has no value); `Z` holds the confounders for the same
+    rows and `z_complete` marks the rows where all of them are known."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    use = np.isfinite(x) & np.isfinite(y)
+    n = int(use.sum())
+    adjusted = {"status": "unavailable", "n": 0}
+    if Z is not None and z_complete is not None:
+        use_adj = use & np.asarray(z_complete, dtype=bool)
+        adjusted = {"status": "too_few", "n": int(use_adj.sum())}
+    fit = dose_response_fit(x[use], y[use])
+    out = {"n": n, "size": float(bucket_size), "buckets": [],
+           "fit": _dose_fit_payload(fit), "adj": adjusted}
+    if n < DOSE_MIN_NIGHTS_CHART:
+        return out
+
+    grid = dose_response_buckets(x[use], y[use], bucket_size)
+    out["size"] = grid["size"]
+    out["buckets"] = [{
+        "start": _dose_num(b["start"]), "n": b["n"], "mean": _dose_num(b["mean"]),
+        "sem": _dose_num(b["sem"]), "sd": _dose_num(b["sd"]),
+        "fit": _dose_num(dose_response_predict(fit["curve"], b["mid"])) if fit["curve"] else None,
+    } for b in grid["buckets"]]
+
+    if adjusted["status"] != "too_few" or adjusted["n"] < DOSE_MIN_NIGHTS_ADJUSTED:
+        return out
+    xa, ya = x[use_adj], y[use_adj]
+    za = np.asarray(Z, dtype=float)[use_adj]
+    # Same bucket grid as the unadjusted chart, so the two sets of bars line up.
+    groups = np.floor(xa / grid["size"]).astype(np.int64) - grid["lo"]
+    y_adj = dose_response_adjusted_values(ya, za, groups)
+    if y_adj is None:
+        # Enough nights, but no usable confounder (all constant) or too few residual degrees
+        # of freedom: say "unavailable", not "too few nights", so the page does not ask for
+        # nights the pair already has.
+        out["adj"] = {"status": "unavailable", "n": int(len(xa))}
+        return out
+    fit_adj = dose_response_fit(xa, ya, covariates=za)
+    adj_buckets = []
+    for j, b in enumerate(grid["buckets"]):
+        m = groups == j
+        nj = int(m.sum())
+        row = {"n": nj, "mean": None, "sem": None, "raw": None,
+               "fit": (_dose_num(dose_response_predict(fit_adj["curve"], b["mid"]))
+                       if fit_adj["curve"] else None)}
+        if nj:
+            sd = float(np.std(y_adj[m], ddof=1)) if nj > 1 else 0.0
+            row.update(mean=_dose_num(np.mean(y_adj[m])),
+                       sem=_dose_num(sd / np.sqrt(nj) if nj > 1 else 0.0),
+                       # The plain mean of the same nights, so the effect of the adjustment
+                       # can be told apart from the effect of using fewer nights.
+                       raw=_dose_num(np.mean(ya[m])))
+        adj_buckets.append(row)
+    out["adj"] = {"status": "ok", "n": int(len(xa)), "buckets": adj_buckets,
+                  "fit": _dose_fit_payload(fit_adj)}
+    return out
+
+
+def compute_dose_response_continuous(df: pd.DataFrame) -> dict:
+    """The dose_response_continuous / sweet_spot payload for the feature matrix `df`.
+
+    A pair whose own computation fails is stored as {"x", "y", "error"} and the payload's
+    status becomes "partial"; the page then computes that pair itself.
+    """
+    frame = df.sort_values(al.DATE_COL, kind="stable").reset_index(drop=True)
+    # Row D's HRV is the HRV of the sleep that closes day D (hrv_alignment.py). A night
+    # counts only when it has that HRV, whichever outcome is charted (as on the page).
+    hrv = al.outcome_series(frame, 1).to_numpy(dtype=float)
+    night = np.isfinite(hrv)
+
+    def column(col: str) -> np.ndarray:
+        if col not in frame.columns:
+            return np.full(len(frame), np.nan)
+        return pd.to_numeric(frame[col], errors="coerce").to_numpy(dtype=float)
+
+    outcomes = {}
+    for key, col, transform in DOSE_RESPONSE_OUTCOMES:
+        if not al.is_same_sleep(col):
+            raise ValueError(f"dose-response outcome {col} is not measured from the row's own sleep")
+        raw = hrv if col == TARGET else column(col)
+        outcomes[key] = np.where(night, _DOSE_TRANSFORMS[transform](_dose_round2(raw)), np.nan)
+
+    inputs: dict = {}
+    pairs: list[dict] = []
+    failed: list[str] = []
+    for x_key, x_col, transform, bucket_size in DOSE_RESPONSE_INPUTS:
+        x = _DOSE_TRANSFORMS[transform](_dose_round2(column(x_col)))
+        try:
+            Z, z_complete, used = dose_response_confounders(frame, x_col)
+        except Exception as e:  # the unadjusted chart does not depend on the confounders
+            log.warning(f"  Sweet spot: confounders for {x_col} unavailable ({type(e).__name__}: {e})")
+            Z, z_complete, used = None, None, []
+        inputs[x_key] = {
+            "column": x_col, "transform": transform, "bucket_size": bucket_size,
+            "in_matrix": x_col in frame.columns,
+            # Nights whose input is exactly 0 (for caffeine: logged-era days with no
+            # caffeine entry, which the feature matrix counts as 0 mg).
+            "zero_nights": int((night & (x == 0)).sum()),
+            "confounders": used,
+            "confounder_labels": [FEATURE_LABELS.get(c, c) for c in used],
+        }
+        for y_key, _, _ in DOSE_RESPONSE_OUTCOMES:
+            try:
+                pair = dose_response_pair(x, outcomes[y_key], bucket_size,
+                                          None if Z is None else Z.to_numpy(dtype=float), z_complete)
+                pairs.append({"x": x_key, "y": y_key, **pair})
+            except Exception as e:
+                failed.append(f"{x_key}/{y_key}")
+                pairs.append({"x": x_key, "y": y_key, "error": f"{type(e).__name__}: {e}"[:300]})
+                log.warning(f"  Sweet spot: {x_key}/{y_key} failed ({type(e).__name__}: {e})")
+
+    dates = frame.loc[night, al.DATE_COL].astype(str)
+    return {
+        "version": DOSE_RESPONSE_VERSION,
+        "status": "partial" if failed else "ok",
+        "alignment": al.ALIGNMENT_VERSION,
+        "nights": int(night.sum()),
+        "through": dates.max() if len(dates) else None,
+        "thresholds": {
+            "chart": DOSE_MIN_NIGHTS_CHART, "fit": DOSE_MIN_NIGHTS_FIT,
+            "curvature_t": DOSE_MIN_CURVATURE_T, "max_buckets": DOSE_MAX_BUCKETS,
+            "adjusted": DOSE_MIN_NIGHTS_ADJUSTED,
+        },
+        "adjusted_method": (
+            "Adjusted association, not a causal estimate. Regression of the outcome on the "
+            "causal layer's pre-treatment lag-1 confounders with one intercept per bucket; "
+            "bars are the outcome at average confounder values. The curve is a parabola "
+            "fitted jointly with the same confounders."
+        ),
+        "inputs": inputs,
+        "pairs": pairs,
+    }
+
+
+def run_dose_response_continuous(df: pd.DataFrame) -> dict:
+    """Fail-open wrapper: always returns a JSON-safe payload and never raises, so a problem
+    in this block cannot fail the retrain. A failure is logged and returned as a payload
+    with status "failed" (the page then computes the chart itself)."""
+    try:
+        payload = compute_dose_response_continuous(df)
+        # Round-trip through JSON here, inside the guard: a value the store could not
+        # encode must fail this block, not the store.
+        payload = json.loads(json.dumps(_json_safe(payload), allow_nan=False))
+        drawn = sum(1 for p in payload["pairs"] if p.get("buckets"))
+        adjusted = sum(1 for p in payload["pairs"] if (p.get("adj") or {}).get("status") == "ok")
+        log.info(f"  Sweet spot dose-response: {len(payload['pairs'])} pairs, {drawn} with a chart, "
+                 f"{adjusted} with an adjusted version ({payload['status']})")
+        return payload
+    except Exception as e:
+        log.warning(f"  Sweet spot dose-response failed (retrain continues): {type(e).__name__}: {e}")
+        return {"version": DOSE_RESPONSE_VERSION, "status": "failed",
+                "error": f"{type(e).__name__}: {e}"[:300], "pairs": []}
+
+
+# ===========================================================================
 # PHASE 3 – PREDICTION MODELS
 # ===========================================================================
 
@@ -4982,7 +5453,8 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
                            error_modes: list | None = None,
                            error_modes_habits: list | None = None,
                            causal_results: dict | None = None,
-                           xgb_diagnostics: dict | None = None) -> None:
+                           xgb_diagnostics: dict | None = None,
+                           dose_response: dict | None = None) -> None:
     """Store pre-computed analysis results for the frontend."""
     rows: list[dict] = []
 
@@ -5226,6 +5698,26 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             ).execute()
             log.info(f"    Upserted: {row['result_type']}/{row['result_key']}")
 
+    # Environment Sweet Spot (Phase 2.6): written last and on its own, so a problem with
+    # this one row cannot stop the rows above from being stored or fail the retrain. It is
+    # stored even when the block failed (status "failed", no pairs): the page then stops
+    # using an older result and computes the chart itself, and the reason is on record.
+    if dose_response:
+        try:
+            supa.schema("pds").from_("hrv_analysis_results").upsert(
+                _json_safe({
+                    "result_type": DOSE_RESPONSE_RESULT_TYPE,
+                    "result_key": DOSE_RESPONSE_RESULT_KEY,
+                    "result_json": dose_response,
+                    "computed_at": datetime.now(timezone.utc).isoformat(),
+                    "input_data_hash": INPUT_DATA_HASH,
+                }), on_conflict="result_type,result_key"
+            ).execute()
+            log.info(f"    Upserted: {DOSE_RESPONSE_RESULT_TYPE}/{DOSE_RESPONSE_RESULT_KEY}")
+        except Exception as e:
+            log.warning(f"    {DOSE_RESPONSE_RESULT_TYPE}/{DOSE_RESPONSE_RESULT_KEY} not stored "
+                        f"(retrain continues): {type(e).__name__}: {e}")
+
 
 # ===========================================================================
 # SUMMARY REPORT
@@ -5423,6 +5915,13 @@ def main() -> str | None:
             log.warning(f"  Causal inference failed: {e}")
             causal_results = None
 
+    # ---------- Phase 2.6: Environment Sweet Spot (pre-baked dose-response) ----------
+    # Cheap (24 small least-squares fits), so it runs on every retrain, --skip-analysis
+    # included; it is stored with the other analysis results below. Fail-open: it returns
+    # a "failed" payload instead of raising.
+    log.info("=== PHASE 2.6: ENVIRONMENT SWEET SPOT ===")
+    dose_response = run_dose_response_continuous(df)
+
     if args.skip_models:
         log.info("Skipping ML models (--skip-models set).")
         print_summary(df, {}, {}, {}, {}, stat_results)
@@ -5524,6 +6023,7 @@ def main() -> str | None:
             "feature_condition_number": xgb_results.get("feature_condition_number"),
             "shap_unstable": xgb_results.get("shap_unstable", False),
         },
+        dose_response=dose_response,
     )
 
     # ---------- Run-Manifest Artifact (audit fix 4#38) ----------

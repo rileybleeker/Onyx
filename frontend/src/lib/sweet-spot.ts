@@ -2,7 +2,20 @@
 // code runs in the ISR prefetch, in the browser and in tests/sweet-spot.test.cjs.
 //
 // The panel is DESCRIPTIVE: it groups nights by the level of one input and shows the mean of
-// one outcome of the same night. Nothing is adjusted for, so it shows association, not cause.
+// one outcome of the same night. The default view adjusts for nothing (association, not cause);
+// the optional adjusted view (pipeline only) is still an association, not a causal estimate.
+//
+// Two sources feed the same view (SweetSpotView, bottom of this file):
+//   * the analysis pipeline: hrv_analysis.py computes every (input, outcome) pair on each
+//     retrain and stores it as pds.hrv_analysis_results dose_response_continuous / sweet_spot,
+//     with an extra confounder-ADJUSTED version (an adjusted association, still not a causal
+//     estimate). parseSweetSpotBaked validates that row.
+//   * the browser: bucketSweetSpot + fitQuadratic on the nightly rows from the matview. This
+//     is the fallback while the pipeline row is missing, failed, incomplete or out of step
+//     with the tables below. It has no adjusted version.
+// The pipeline's unadjusted arithmetic is a twin of the functions here: both are tested on the
+// same analytic cases (tests/sweet-spot.test.cjs, tests/test_dose_response_continuous.py), and
+// the Node test checks the pipeline's thresholds and input / outcome tables against this file.
 //
 // Row semantics (hrv_alignment.py): matrix row D holds the HRV / recovery / sleep of the sleep
 // that CLOSES behavioral day D. Day-D inputs (meals, calories, caffeine) sit on the same row.
@@ -34,6 +47,8 @@ export interface SweetSpotXMeta {
   pairing: "same_row" | "next_row";
   /** Stored value -> displayed value (the Pod stores Celsius). */
   toDisplay: (raw: number) => number;
+  /** Name of `toDisplay`, as hrv_analysis.py spells it (DOSE_RESPONSE_INPUTS). */
+  transform: "identity" | "c_to_f";
   unit: string;
   /** Decimals used when a single input value is printed. */
   decimals: number;
@@ -41,6 +56,12 @@ export interface SweetSpotXMeta {
   axisLabel: string;
   /** What the value is and how far to trust it. */
   caveat: string;
+  /**
+   * Replaces `caveat` when the chart comes from the analysis pipeline and the pipeline's
+   * value differs from the matview's (caffeine: the feature matrix counts a logged-era day
+   * with no caffeine entry as 0 mg, the matview leaves it empty).
+   */
+  pipelineCaveat?: string;
   /** How new nights arrive, for the "not enough nights yet" state. */
   fillsBy: string;
 }
@@ -55,6 +76,7 @@ export const SWEET_SPOT_X: Record<SweetSpotXKey, SweetSpotXMeta> = {
     column: "eight_sleep_room_temp",
     pairing: "next_row",
     toDisplay: cToF,
+    transform: "c_to_f",
     unit: "°F",
     decimals: 1,
     bucketSize: 2,
@@ -69,6 +91,7 @@ export const SWEET_SPOT_X: Record<SweetSpotXKey, SweetSpotXMeta> = {
     column: "eight_sleep_bed_temp",
     pairing: "next_row",
     toDisplay: cToF,
+    transform: "c_to_f",
     unit: "°F",
     decimals: 1,
     bucketSize: 2,
@@ -83,6 +106,7 @@ export const SWEET_SPOT_X: Record<SweetSpotXKey, SweetSpotXMeta> = {
     column: "meal_last_meal_to_bedtime_min",
     pairing: "same_row",
     toDisplay: same,
+    transform: "identity",
     unit: "min",
     decimals: 0,
     bucketSize: 60,
@@ -97,6 +121,7 @@ export const SWEET_SPOT_X: Record<SweetSpotXKey, SweetSpotXMeta> = {
     column: "nutrition_calories",
     pairing: "same_row",
     toDisplay: same,
+    transform: "identity",
     unit: "kcal",
     decimals: 0,
     bucketSize: 250,
@@ -111,12 +136,15 @@ export const SWEET_SPOT_X: Record<SweetSpotXKey, SweetSpotXMeta> = {
     column: "caffeine_total_mg",
     pairing: "same_row",
     toDisplay: same,
+    transform: "identity",
     unit: "mg",
     decimals: 0,
     bucketSize: 100,
     axisLabel: "logged caffeine that day (mg, food + supplements)",
     caveat:
       "Caffeine logged for the day, food and supplements combined. Only days with at least one logged caffeine entry are included, so there is no zero-caffeine bucket to compare against.",
+    pipelineCaveat:
+      "Caffeine logged for the day, food and supplements combined. Since caffeine logging began, a day with no caffeine entry but other logging that day (a supplement dose or a food entry) counts as 0 mg, so the lowest bucket mixes real caffeine-free days with days when the caffeine was not logged.",
     fillsBy: "A night is added when caffeine is logged that day (Cronometer or /supplements).",
   },
   cafBed: {
@@ -125,12 +153,15 @@ export const SWEET_SPOT_X: Record<SweetSpotXKey, SweetSpotXMeta> = {
     column: "caffeine_mg_at_bedtime",
     pairing: "same_row",
     toDisplay: same,
+    transform: "identity",
     unit: "mg",
     decimals: 0,
     bucketSize: 50,
     axisLabel: "estimated caffeine left at sleep onset (mg)",
     caveat:
       "An estimate of the caffeine still in your body at sleep onset: every logged dose decayed with a 5-hour half-life. Only days where every caffeine entry has a trustworthy clock time are included.",
+    pipelineCaveat:
+      "An estimate of the caffeine still in your body at sleep onset: every logged dose decayed with a 5-hour half-life. Days where a caffeine entry has no trustworthy clock time are left out. Since caffeine logging began, a day with no caffeine entry but other logging that day counts as 0 mg, so the lowest bucket mixes real caffeine-free days with days when the caffeine was not logged.",
     fillsBy: "A night is added when every caffeine entry that day has a real clock time and the sleep is scored.",
   },
 };
@@ -143,13 +174,15 @@ export interface SweetSpotYMeta {
   unit: string;
   axisLabel: string;
   toDisplay: (raw: number) => number;
+  /** Name of `toDisplay`, as hrv_analysis.py spells it (DOSE_RESPONSE_OUTCOMES). */
+  transform: "identity" | "ms_to_min";
 }
 
 export const SWEET_SPOT_Y: Record<SweetSpotYKey, SweetSpotYMeta> = {
-  hrv: { label: "WHOOP HRV", noun: "HRV", column: "whoop_hrv_rmssd", unit: "ms", axisLabel: "WHOOP HRV (ms)", toDisplay: same },
-  recovery: { label: "Recovery Score", noun: "recovery score", column: "whoop_recovery_score", unit: "%", axisLabel: "WHOOP Recovery (%)", toDisplay: same },
-  efficiency: { label: "Sleep Efficiency", noun: "sleep efficiency", column: "whoop_sleep_efficiency", unit: "%", axisLabel: "WHOOP Sleep Efficiency (%)", toDisplay: same },
-  deep: { label: "Deep Sleep", noun: "deep sleep", column: "whoop_deep_sleep_milli", unit: "min", axisLabel: "WHOOP Deep Sleep (min)", toDisplay: (ms) => ms / 60000 },
+  hrv: { label: "WHOOP HRV", noun: "HRV", column: "whoop_hrv_rmssd", unit: "ms", axisLabel: "WHOOP HRV (ms)", toDisplay: same, transform: "identity" },
+  recovery: { label: "Recovery Score", noun: "recovery score", column: "whoop_recovery_score", unit: "%", axisLabel: "WHOOP Recovery (%)", toDisplay: same, transform: "identity" },
+  efficiency: { label: "Sleep Efficiency", noun: "sleep efficiency", column: "whoop_sleep_efficiency", unit: "%", axisLabel: "WHOOP Sleep Efficiency (%)", toDisplay: same, transform: "identity" },
+  deep: { label: "Deep Sleep", noun: "deep sleep", column: "whoop_deep_sleep_milli", unit: "min", axisLabel: "WHOOP Deep Sleep (min)", toDisplay: (ms) => ms / 60000, transform: "ms_to_min" },
 };
 
 export const SWEET_SPOT_X_KEYS = Object.keys(SWEET_SPOT_X) as SweetSpotXKey[];
@@ -444,4 +477,352 @@ export function fitQuadratic(
 export function predictQuadratic(curve: QuadraticCurve, x: number): number {
   const u = (x - curve.xMean) / curve.xSd;
   return curve.yMean + curve.ySd * (curve.A * u * u + curve.B * u + curve.C);
+}
+
+// ---------------------------------------------------------------------------
+// Pre-baked result from the analysis pipeline
+// ---------------------------------------------------------------------------
+// hrv_analysis.py (Phase 2.6) writes one row, pds.hrv_analysis_results
+// dose_response_continuous / sweet_spot, on every retrain: every (input, outcome) pair,
+// unadjusted (same arithmetic as above) and confounder-adjusted. Everything below treats that
+// JSON as untrusted: a row that is missing, failed, from another payload version, or built
+// from different columns / bucket widths / thresholds is not used, and the panel computes the
+// chart from the nightly rows instead.
+
+/** [result_type, result_key] of the pipeline row. */
+export const SWEET_SPOT_RESULT = ["dose_response_continuous", "sweet_spot"] as const;
+/** Payload version this code understands (DOSE_RESPONSE_VERSION in hrv_analysis.py). */
+export const SWEET_SPOT_BAKED_VERSION = 1;
+/** Nights with a complete confounder history the adjusted version needs (pipeline side). */
+export const SWEET_SPOT_MIN_NIGHTS_ADJUSTED = 50;
+
+export interface SweetSpotBakedFit {
+  n: number;
+  status: QuadraticFitStatus;
+  /** y = a*x^2 + b*x + c in display units; null when no curve was fitted. */
+  a: number | null;
+  b: number | null;
+  r2: number | null;
+  /** Quadratic coefficient divided by its standard error. */
+  t: number | null;
+  peak: SweetSpotPoint | null;
+  xMin: number | null;
+  xMax: number | null;
+}
+
+export interface SweetSpotBakedBucket {
+  start: number;
+  n: number;
+  mean: number | null;
+  sem: number | null;
+  sd: number | null;
+  /** The fitted curve at the middle of the bucket; null when no curve was fitted. */
+  fit: number | null;
+}
+
+export interface SweetSpotBakedAdjusted {
+  /** "too_few": under SWEET_SPOT_MIN_NIGHTS_ADJUSTED complete nights. "unavailable": no confounders. */
+  status: "ok" | "too_few" | "unavailable";
+  /** Nights with the input, the outcome and every confounder. */
+  n: number;
+  /** One entry per unadjusted bucket, same order. `raw` = the plain mean of the same nights. */
+  buckets: { n: number; mean: number | null; sem: number | null; raw: number | null; fit: number | null }[];
+  fit: SweetSpotBakedFit | null;
+}
+
+export interface SweetSpotBakedPair {
+  n: number;
+  /** Bucket width actually used (the configured width, doubled until the chart fits). */
+  size: number;
+  /** Empty under SWEET_SPOT_MIN_NIGHTS_CHART nights. */
+  buckets: SweetSpotBakedBucket[];
+  fit: SweetSpotBakedFit;
+  adj: SweetSpotBakedAdjusted;
+}
+
+export interface SweetSpotBaked {
+  /** "failed": the last retrain could not compute it (no pairs). "partial": some pairs missing. */
+  status: "ok" | "partial" | "failed";
+  /** When the retrain wrote the row (ISO timestamp). */
+  computedAt: string | null;
+  /** Behavioral date of the newest night included. */
+  through: string | null;
+  /** Usable pairs, keyed `${xKey}/${yKey}`. */
+  pairs: Record<string, SweetSpotBakedPair>;
+  /** Per input: nights whose value is exactly 0, and what the adjusted version adjusts for. */
+  inputs: Partial<Record<SweetSpotXKey, { zeroNights: number; confounders: string[] }>>;
+}
+
+export const sweetSpotPairKey = (xKey: SweetSpotXKey, yKey: SweetSpotYKey) => `${xKey}/${yKey}`;
+
+const FIT_STATUSES: readonly QuadraticFitStatus[] = ["ok", "too_few", "degenerate", "flat", "convex", "outside_range"];
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+/** A finite number, or null. Unlike `num`, a string is not accepted (the payload is typed JSON). */
+function fin(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+function count(v: unknown): number | null {
+  const n = fin(v);
+  return n !== null && n >= 0 && Number.isInteger(n) ? n : null;
+}
+
+function parseBakedFit(v: unknown): SweetSpotBakedFit | null {
+  if (!isObj(v)) return null;
+  const n = count(v.n);
+  const status = FIT_STATUSES.find((s) => s === v.status);
+  if (n === null || !status) return null;
+  const a = fin(v.a);
+  const b = fin(v.b);
+  const hasCurve = a !== null && b !== null;
+  // A status that draws a curve must come with one, and a labelled peak with its point.
+  if (hasCurve === (status === "too_few" || status === "degenerate")) return null;
+  let peak: SweetSpotPoint | null = null;
+  if (isObj(v.peak)) {
+    const x = fin(v.peak.x);
+    const y = fin(v.peak.y);
+    if (x !== null && y !== null) peak = { x, y };
+  }
+  if ((status === "ok") !== (peak !== null)) return null;
+  return { n, status, a, b, r2: fin(v.r2), t: fin(v.t), peak, xMin: fin(v.x_min), xMax: fin(v.x_max) };
+}
+
+function parseBakedPair(v: Record<string, unknown>): SweetSpotBakedPair | null {
+  const n = count(v.n);
+  const size = fin(v.size);
+  const fit = parseBakedFit(v.fit);
+  if (n === null || size === null || !(size > 0) || !fit || !Array.isArray(v.buckets)) return null;
+  const buckets: SweetSpotBakedBucket[] = [];
+  let nights = 0;
+  for (const b of v.buckets) {
+    if (!isObj(b)) return null;
+    const start = fin(b.start);
+    const bn = count(b.n);
+    const mean = fin(b.mean);
+    if (start === null || bn === null || (bn > 0) !== (mean !== null)) return null;
+    nights += bn;
+    buckets.push({ start, n: bn, mean, sem: fin(b.sem), sd: fin(b.sd), fit: fin(b.fit) });
+  }
+  // Buckets are drawn from SWEET_SPOT_MIN_NIGHTS_CHART nights up, and must account for every night.
+  if ((n >= SWEET_SPOT_MIN_NIGHTS_CHART) !== (buckets.length > 0)) return null;
+  if (buckets.length > 0 && nights !== n) return null;
+  if (buckets.length > SWEET_SPOT_MAX_BUCKETS) return null;
+
+  let adj: SweetSpotBakedAdjusted = { status: "unavailable", n: 0, buckets: [], fit: null };
+  if (isObj(v.adj)) {
+    const an = count(v.adj.n) ?? 0;
+    if (v.adj.status === "too_few") adj = { status: "too_few", n: an, buckets: [], fit: null };
+    if (v.adj.status === "ok" && Array.isArray(v.adj.buckets) && v.adj.buckets.length === buckets.length) {
+      const afit = parseBakedFit(v.adj.fit);
+      const ab: SweetSpotBakedAdjusted["buckets"] = [];
+      let ok = afit !== null;
+      for (const b of v.adj.buckets) {
+        const bn = isObj(b) ? count(b.n) : null;
+        const mean = isObj(b) ? fin(b.mean) : null;
+        if (!isObj(b) || bn === null || (bn > 0) !== (mean !== null)) {
+          ok = false;
+          break;
+        }
+        ab.push({ n: bn, mean, sem: fin(b.sem), raw: fin(b.raw), fit: fin(b.fit) });
+      }
+      // A malformed adjusted block only costs the adjusted view, never the plain chart.
+      if (ok) adj = { status: "ok", n: an, buckets: ab, fit: afit };
+    }
+  }
+  return { n, size, buckets, fit, adj };
+}
+
+/**
+ * The pipeline row's result_json -> a validated SweetSpotBaked, or null when it cannot be used
+ * at all (no row, another payload version, or thresholds that differ from this file's).
+ * A payload with status "failed" is returned with no pairs, so the panel can say so.
+ * Pairs are kept only when their input was built from the same column, transform and bucket
+ * width as SWEET_SPOT_X; anything else is dropped and computed in the browser.
+ */
+export function parseSweetSpotBaked(json: unknown, computedAt?: unknown): SweetSpotBaked | null {
+  if (!isObj(json) || json.version !== SWEET_SPOT_BAKED_VERSION) return null;
+  const base = {
+    computedAt: typeof computedAt === "string" ? computedAt : null,
+    through: typeof json.through === "string" ? json.through : null,
+  };
+  if (json.status === "failed") return { status: "failed", ...base, pairs: {}, inputs: {} };
+  if (json.status !== "ok" && json.status !== "partial") return null;
+  const th = isObj(json.thresholds) ? json.thresholds : {};
+  if (
+    th.chart !== SWEET_SPOT_MIN_NIGHTS_CHART || th.fit !== SWEET_SPOT_MIN_NIGHTS_FIT ||
+    th.curvature_t !== SWEET_SPOT_MIN_CURVATURE_T || th.max_buckets !== SWEET_SPOT_MAX_BUCKETS ||
+    th.adjusted !== SWEET_SPOT_MIN_NIGHTS_ADJUSTED
+  ) return null;
+
+  const rawInputs = isObj(json.inputs) ? json.inputs : {};
+  const inputs: SweetSpotBaked["inputs"] = {};
+  for (const k of SWEET_SPOT_X_KEYS) {
+    const meta = SWEET_SPOT_X[k];
+    const inp = rawInputs[k];
+    // in_matrix false = the pipeline's matrix had no such column, so its "0 nights" says nothing.
+    if (!isObj(inp) || inp.in_matrix !== true || inp.column !== meta.column ||
+        inp.transform !== meta.transform || inp.bucket_size !== meta.bucketSize) continue;
+    const labels = Array.isArray(inp.confounder_labels) ? inp.confounder_labels : [];
+    inputs[k] = {
+      zeroNights: count(inp.zero_nights) ?? 0,
+      confounders: labels.filter((l): l is string => typeof l === "string" && l.length > 0 && l.length <= 80).slice(0, 20),
+    };
+  }
+
+  const pairs: Record<string, SweetSpotBakedPair> = {};
+  for (const p of Array.isArray(json.pairs) ? json.pairs : []) {
+    if (!isObj(p) || "error" in p) continue;
+    const xKey = SWEET_SPOT_X_KEYS.find((k) => k === p.x);
+    const yKey = SWEET_SPOT_Y_KEYS.find((k) => k === p.y);
+    if (!xKey || !yKey || !inputs[xKey]) continue;
+    const pair = parseBakedPair(p);
+    if (pair) pairs[sweetSpotPairKey(xKey, yKey)] = pair;
+  }
+  return { status: json.status, ...base, pairs, inputs };
+}
+
+/** True when the pipeline row covers every (input, outcome) pair, so the nightly rows are not needed. */
+export function sweetSpotBakedIsComplete(baked: SweetSpotBaked | null): boolean {
+  if (!baked || baked.status !== "ok") return false;
+  return SWEET_SPOT_X_KEYS.every((x) => SWEET_SPOT_Y_KEYS.every((y) => sweetSpotPairKey(x, y) in baked.pairs));
+}
+
+// ---------------------------------------------------------------------------
+// One view for the panel, whichever source produced it
+// ---------------------------------------------------------------------------
+
+export interface SweetSpotViewBucket {
+  start: number;
+  end: number;
+  n: number;
+  /** null for a bucket with no nights. */
+  meanY: number | null;
+  sem: number | null;
+  /** Unadjusted views only. */
+  sd: number | null;
+  /** The fitted curve at the middle of the bucket. */
+  fit: number | null;
+  /** Adjusted views only: the plain mean of the same nights. */
+  rawMeanY: number | null;
+}
+
+export interface SweetSpotViewFit {
+  n: number;
+  status: QuadraticFitStatus;
+  hasCurve: boolean;
+  r2: number | null;
+  curvatureT: number | null;
+  /** Where the parabola turns (may lie outside the data); null without a curve or a bend. */
+  vertexX: number | null;
+  peak: SweetSpotPoint | null;
+  xMin: number | null;
+  xMax: number | null;
+}
+
+export interface SweetSpotView {
+  source: "pipeline" | "browser";
+  adjusted: boolean;
+  /** Nights behind this view (for an adjusted view: nights with every confounder). */
+  n: number;
+  size: number;
+  /** Empty when there are too few nights to draw the chart. */
+  buckets: SweetSpotViewBucket[];
+  fit: SweetSpotViewFit;
+}
+
+function vertexOf(a: number | null, b: number | null): number | null {
+  if (a === null || b === null || a === 0) return null;
+  const v = -b / (2 * a);
+  return Number.isFinite(v) ? v : null;
+}
+
+/** The fallback: the chart computed here from the nightly rows (always unadjusted). */
+export function sweetSpotViewFromRows(
+  rows: ReadonlyArray<SweetSpotRow>,
+  xKey: SweetSpotXKey,
+  yKey: SweetSpotYKey,
+): SweetSpotView {
+  const points = sweetSpotPoints(rows, xKey, yKey);
+  const fit = fitQuadratic(points);
+  const viewFit: SweetSpotViewFit = {
+    n: fit.n,
+    status: fit.status,
+    hasCurve: fit.curve !== null,
+    r2: fit.curve?.r2 ?? null,
+    curvatureT: fit.curve?.curvatureT ?? null,
+    vertexX: fit.curve ? vertexOf(fit.curve.a, fit.curve.b) : null,
+    peak: fit.peak,
+    xMin: fit.xMin,
+    xMax: fit.xMax,
+  };
+  const base = { source: "browser" as const, adjusted: false, n: points.length, fit: viewFit };
+  const size = SWEET_SPOT_X[xKey].bucketSize;
+  if (points.length < SWEET_SPOT_MIN_NIGHTS_CHART) return { ...base, size, buckets: [] };
+  const grid = bucketSweetSpot(points, size);
+  return {
+    ...base,
+    size: grid.size,
+    buckets: grid.buckets.map((b) => ({
+      start: b.start, end: b.end, n: b.n, meanY: b.meanY, sem: b.sem, sd: b.sd,
+      fit: fit.curve ? predictQuadratic(fit.curve, b.mid) : null,
+      rawMeanY: null,
+    })),
+  };
+}
+
+function bakedFitView(f: SweetSpotBakedFit): SweetSpotViewFit {
+  return {
+    n: f.n, status: f.status, hasCurve: f.a !== null && f.b !== null, r2: f.r2, curvatureT: f.t,
+    vertexX: vertexOf(f.a, f.b), peak: f.peak, xMin: f.xMin, xMax: f.xMax,
+  };
+}
+
+/**
+ * The pipeline's result for one pair. `adjusted` asks for the confounder-adjusted version;
+ * when the pair has none the unadjusted view is returned (check `view.adjusted`).
+ */
+export function sweetSpotViewFromBaked(pair: SweetSpotBakedPair, adjusted: boolean): SweetSpotView {
+  if (adjusted && pair.adj.status === "ok" && pair.adj.fit) {
+    return {
+      source: "pipeline", adjusted: true, n: pair.adj.n, size: pair.size, fit: bakedFitView(pair.adj.fit),
+      buckets: pair.buckets.map((b, i) => {
+        const a = pair.adj.buckets[i];
+        return { start: b.start, end: b.start + pair.size, n: a.n, meanY: a.mean, sem: a.sem, sd: null, fit: a.fit, rawMeanY: a.raw };
+      }),
+    };
+  }
+  return {
+    source: "pipeline", adjusted: false, n: pair.n, size: pair.size, fit: bakedFitView(pair.fit),
+    buckets: pair.buckets.map((b) => ({
+      start: b.start, end: b.start + pair.size, n: b.n, meanY: b.mean, sem: b.sem, sd: b.sd, fit: b.fit, rawMeanY: null,
+    })),
+  };
+}
+
+/**
+ * The view the panel draws: the pipeline's result for the pair when it has one, otherwise the
+ * browser computation on `rows`.
+ */
+export function sweetSpotView(
+  rows: ReadonlyArray<SweetSpotRow>,
+  baked: SweetSpotBaked | null,
+  xKey: SweetSpotXKey,
+  yKey: SweetSpotYKey,
+  adjusted: boolean,
+): SweetSpotView {
+  const pair = baked?.pairs[sweetSpotPairKey(xKey, yKey)];
+  return pair ? sweetSpotViewFromBaked(pair, adjusted) : sweetSpotViewFromRows(rows, xKey, yKey);
+}
+
+/** Nights for one pair from the same source the view would use (shown on the input selector). */
+export function sweetSpotNights(
+  rows: ReadonlyArray<SweetSpotRow>,
+  baked: SweetSpotBaked | null,
+  xKey: SweetSpotXKey,
+  yKey: SweetSpotYKey,
+): number {
+  const pair = baked?.pairs[sweetSpotPairKey(xKey, yKey)];
+  return pair ? pair.n : sweetSpotPoints(rows, xKey, yKey).length;
 }

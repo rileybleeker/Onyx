@@ -23,7 +23,10 @@
 
 import { supabase } from "@/lib/supabase";
 import { getWorkoutSleepGap, type WorkoutSleepGap } from "@/lib/queries";
-import { SWEET_SPOT_COLUMNS, shapeSweetSpotRows, type SweetSpotRow } from "@/lib/sweet-spot";
+import {
+  SWEET_SPOT_COLUMNS, parseSweetSpotBaked, shapeSweetSpotRows, sweetSpotBakedIsComplete,
+  type SweetSpotBaked, type SweetSpotRow,
+} from "@/lib/sweet-spot";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -151,6 +154,8 @@ export const HRV_ANALYSIS_PANELS: readonly (readonly [string, string?])[] = [
   ["feature_importance", "shap_habit"], ["causal", "binary_treatments"],
   ["causal", "continuous_treatments"], ["causal", "dag"],
   ["causal", "meta"], ["causal", "dropped_low_n"], ["model_diagnostics", "xgboost"],
+  // Environment Sweet Spot, pre-baked by hrv_analysis.py (lib/sweet-spot.ts SWEET_SPOT_RESULT).
+  ["dose_response_continuous", "sweet_spot"],
 ];
 
 export async function getHrvAnalysisBatch() {
@@ -159,7 +164,7 @@ export async function getHrvAnalysisBatch() {
   const filter = exactPanels.map(([type, key]) =>
     `and(result_type.eq.${type},result_key.eq.${key})`).join(",");
   // The existing unique (result_type, result_key) constraint bounds this to
-  // 15 rows. Type-only selectors retain their LIMIT 1 queries, so future keys
+  // 16 rows. Type-only selectors retain their LIMIT 1 queries, so future keys
   // cannot turn one rendered panel into an unbounded download of JSON blobs.
   const [exact, journal, habits] = await Promise.all([
     supabase.from("hrv_analysis_results")
@@ -240,6 +245,28 @@ export async function getEnvDoseResponseData(): Promise<SweetSpotRow[]> {
   }
   // Compact rows (short keys, nulls dropped): about 420 nights ride in the ISR payload.
   return shapeSweetSpotRows(rows);
+}
+
+// Environment Sweet Spot data: the pipeline's pre-baked result when the last retrain wrote
+// one, and the nightly matview rows only when the panel still needs to compute something
+// itself (no row yet, a failed or partial run, or a row built from other columns / bucket
+// widths / thresholds than lib/sweet-spot.ts; parseSweetSpotBaked decides). `row` is the
+// dose_response_continuous / sweet_spot row from the analysis batch, or null.
+// A PostgREST error in the fallback read still rejects (ISR prefetch contract); an unreadable
+// result_json does not: it is the same as no row.
+export async function loadSweetSpot(
+  row: { result_json: unknown; computed_at?: unknown } | null,
+): Promise<{ baked: SweetSpotBaked | null; rows: SweetSpotRow[] }> {
+  let baked: SweetSpotBaked | null = null;
+  if (row?.result_json) {
+    try {
+      baked = parseSweetSpotBaked(parseJsonb(row.result_json), row.computed_at);
+    } catch {
+      baked = null;
+    }
+  }
+  const rows = sweetSpotBakedIsComplete(baked) ? [] : await getEnvDoseResponseData();
+  return { baked, rows };
 }
 
 export async function getHrvResiduals() {
@@ -359,7 +386,10 @@ export interface HrvDashboardData extends HrvRangeDependent {
   causalDag: any | null;
   causalMeta: any | null;
   causalDropped: any[];
+  /** Nightly rows for the Sweet Spot browser fallback; empty when `envBaked` covers every pair. */
   envMatrix: SweetSpotRow[];
+  /** The pipeline's pre-baked Sweet Spot result (validated), or null when there is none. */
+  envBaked: SweetSpotBaked | null;
   xgbDiagnostics: any | null;
 }
 
@@ -390,7 +420,7 @@ async function loadHrvStatic(): Promise<Omit<HrvDashboardData, keyof HrvRangeDep
   const [
     tomorrow, m, corr, ji, fi, res, prophet, jCorr, jShap, sarimax,
     suppImp, suppDose, nutImp, hi, hCorr, hShap,
-    cBin, cCont, cDag, cMeta, cDrop, envM, xgbDiag,
+    cBin, cCont, cDag, cMeta, cDrop, xgbDiag, sweetSpot,
   ] = await Promise.all([
     getTomorrowPrediction(),
     getHrvModelMetrics(),
@@ -413,8 +443,9 @@ async function loadHrvStatic(): Promise<Omit<HrvDashboardData, keyof HrvRangeDep
     panel("causal", "dag"),
     panel("causal", "meta"),
     panel("causal", "dropped_low_n"),
-    getEnvDoseResponseData(),
     panel("model_diagnostics", "xgboost"),
+    // Pipeline result first; the matview read runs only when the panel needs the fallback.
+    panel("dose_response_continuous", "sweet_spot").then(loadSweetSpot),
   ]);
   return {
     tomorrowPred: tomorrow,
@@ -450,7 +481,8 @@ async function loadHrvStatic(): Promise<Omit<HrvDashboardData, keyof HrvRangeDep
       n_treated: d.n_treated,
       n_control: d.n_control,
     })),
-    envMatrix: envM,
+    envMatrix: sweetSpot.rows,
+    envBaked: sweetSpot.baked,
     // model_diagnostics/xgboost row carries feature_condition_number +
     // shap_unstable from the latest train_xgboost run; the banner above
     // Prediction Drivers reads it to flag SHAP attributions as unreliable
