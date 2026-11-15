@@ -1,6 +1,7 @@
 import { GARMIN_WEARABLE_FILTER, garminNoWearMessage, ingestionHeartbeatStatus } from "@/lib/status-freshness";
 import { NextResponse } from "next/server";
 import { getNycScoutFreshness } from "@/lib/nyc";
+import { swrCache } from "@/lib/swr-cache";
 import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
 import { SIMPLEFIN_THRESHOLDS, financeLedgerCard } from "@/lib/finance-status";
@@ -230,20 +231,41 @@ function enrichmentSource({
   };
 }
 
+// The NYC Scout card's freshness is a Notion query (0.3-0.6 s, the slowest read here). The scout runs once a day,
+// so a shared cached answer (lib/swr-cache.ts: refreshed in the background once it is 5 minutes old, never more
+// than 6 hours old) keeps Notion off the request path. A failed Notion read is not cached: the card turns red as before.
+const nycScoutFreshness = swrCache("status-nyc-scout-freshness-v1", () => getNycScoutFreshness(), {
+  revalidateSeconds: 300,
+  maxAgeMs: 6 * 60 * 60 * 1000,
+});
+
 export async function GET() {
   try {
+    // Every read below is independent, so they are all sent at once (one round trip, not six in a row).
+    // Supabase query builders are lazy: .then() sends each one now; the awaits further down only collect them.
+    //
     // Fetch last 100 sync_log rows (enough to cover all sources with history).
     // matrix_mat and perf_mats each refresh 2x/hour (~48 heartbeat rows/day
     // apiece) and would flood this window, drowning every other source's
     // history — each gets a dedicated limit-1 fetch below instead.
-    const { data: syncRows, error: syncErr } = await supabase
+    const syncRowsPromise = supabase
       .from("sync_log")
       .select("*")
       .not("source", "in", '("matrix_mat","perf_mats")')
       .order("sync_start", { ascending: false })
-      .limit(100);
-
-    if (syncErr) throw syncErr;
+      .limit(100)
+      .then((res) => res);
+    // Procurement subscription tracker (/procurement): hand-typed, so data age says nothing. The card reports whether saving is set up (table answers) and how many are tracked.
+    const procurementPromise = supabase.from("procurement_subscriptions").select("updated_at", { count: "exact" }).eq("is_active", true).order("updated_at", { ascending: false }).limit(1).then((res) => res);
+    // Renewal cards (sms-reminders Worker -> /api/procurement/renewals/claim): heartbeat age, own limit-1
+    // query so a Worker that stops polling reads red instead of dropping out of the shared window.
+    const renewalRemindersPromise = supabase.from("sync_log").select("status,sync_start,records_synced,duration_seconds,error_message")
+      .eq("source", "procurement_renewals").eq("data_type", "prompt").order("sync_start", { ascending: false }).limit(1).then((res) => res);
+    // Cash forecast snapshot (cash-forecast-snapshot.yml, weekly): heartbeat age, own limit-1 query.
+    const cashForecastPromise = supabase.from("sync_log").select("status,sync_start,records_synced,duration_seconds,error_message")
+      .eq("source", "finance_forecast").eq("data_type", "snapshot").order("sync_start", { ascending: false }).limit(1).then((res) => res);
+    // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
+    const urgentEmailCardPromise = getUrgentEmailStatusCard(supabase);
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
@@ -259,7 +281,7 @@ export async function GET() {
     // nyc-scout agent upserts every run), not in sync_log. Started here so the
     // one Notion call overlaps the Supabase reads; a Notion failure turns the
     // card red but never breaks /status.
-    const nycPromise = getNycScoutFreshness().then(
+    const nycPromise = nycScoutFreshness().then(
       (v) => ({ ok: true as const, ...v }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
@@ -412,6 +434,9 @@ export async function GET() {
       supabase.from("ci_tokens").select("token_data").eq("service", "spotify").limit(1),
     ]);
 
+    const { data: syncRows, error: syncErr } = await syncRowsPromise;
+    if (syncErr) throw syncErr;
+
     // Find the latest sync entry per (source, data_type) key
     const latestBySrcType: Record<string, Record<string, unknown>> = {};
     for (const row of (syncRows ?? [])) {
@@ -494,19 +519,12 @@ export async function GET() {
     const nyc = await nycPromise;
     const nycDate = nyc.ok ? nyc.lastVerified : null;
     const nycLag = daysLag(nycDate, spineMaxDate);
-    // Procurement subscription tracker (/procurement): hand-typed, so data age says nothing. The card reports whether saving is set up (table answers) and how many are tracked.
-    const procurementRes = await supabase.from("procurement_subscriptions").select("updated_at", { count: "exact" }).eq("is_active", true).order("updated_at", { ascending: false }).limit(1);
+    const procurementRes = await procurementPromise;
     const procurementPending = procurementRes.error?.code === "PGRST205" || procurementRes.error?.code === "42P01";
     const procurementLast = (procurementRes.data?.[0]?.updated_at as string | undefined) ?? null;
-    // Renewal cards (sms-reminders Worker -> /api/procurement/renewals/claim): heartbeat age, own limit-1
-    // query so a Worker that stops polling reads red instead of dropping out of the shared window.
-    const renewalRemindersRes = await supabase.from("sync_log").select("status,sync_start,records_synced,duration_seconds,error_message")
-      .eq("source", "procurement_renewals").eq("data_type", "prompt").order("sync_start", { ascending: false }).limit(1);
-    // Cash forecast snapshot (cash-forecast-snapshot.yml, weekly): heartbeat age, own limit-1 query.
-    const cashForecastRes = await supabase.from("sync_log").select("status,sync_start,records_synced,duration_seconds,error_message")
-      .eq("source", "finance_forecast").eq("data_type", "snapshot").order("sync_start", { ascending: false }).limit(1);
-    // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
-    const urgentEmailCard = await getUrgentEmailStatusCard(supabase);
+    const renewalRemindersRes = await renewalRemindersPromise;
+    const cashForecastRes = await cashForecastPromise;
+    const urgentEmailCard = await urgentEmailCardPromise;
 
     const sources: Record<string, SourceStatus> = {
       garmin: {

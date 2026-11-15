@@ -252,48 +252,52 @@ export async function listBooks(supabase: Supa): Promise<Book[]> {
   return (data ?? []) as Book[];
 }
 
+/**
+ * One book with every row the overview needs, in ONE PostgREST request (embedded resources over the foreign keys
+ * book_id and highlight_id), sent in parallel with behavioral today. Same rows and order as separate queries:
+ * sessions newest first, unarchived highlights newest first with their reviews, quizzes newest first, chapters by
+ * position. (2026-11-14: was four round trips in a row.)
+ */
+const OVERVIEW_SELECT =
+  "*, reading_sessions(*), book_highlights(*, reading_reviews(review_id,highlight_id,review_date,grade)), reading_quizzes(*), book_chapters(chapter,start_position,end_position,start_page,end_page)";
+
+type OverviewRow = Book & {
+  reading_sessions?: ReadingSession[] | null;
+  book_highlights?: (Highlight & { reading_reviews?: Review[] | null })[] | null;
+  reading_quizzes?: Quiz[] | null;
+  book_chapters?: ChapterSpan[] | null;
+};
+
 export async function getOverview(supabase: Supa, slug?: string | null): Promise<ReadingOverview | null> {
-  const book = await getBook(supabase, slug);
-  if (!book) return null;
-  const today = await behavioralToday(supabase);
+  let q = supabase.from("books").select(OVERVIEW_SELECT);
+  if (slug) q = q.eq("slug", slug);
+  else q = q.eq("status", "reading");
+  const bookQuery = q
+    .eq("book_highlights.archived", false)
+    .order("session_date", { referencedTable: "reading_sessions", ascending: false })
+    .order("session_id", { referencedTable: "reading_sessions", ascending: false })
+    .order("created_at", { referencedTable: "book_highlights", ascending: false })
+    .order("highlight_id", { referencedTable: "book_highlights", ascending: false })
+    .order("taken_at", { referencedTable: "reading_quizzes", ascending: false })
+    .order("start_position", { referencedTable: "book_chapters" })
+    .order("created_at", { ascending: false })
+    .limit(1);
+  const [{ data, error }, today] = await Promise.all([bookQuery, behavioralToday(supabase)]);
+  if (error) throw new Error(error.message);
+  const row = (data?.[0] as OverviewRow | undefined) ?? null;
+  if (!row) return null;
 
-  const [sessionsRes, highlightsRes, quizzesRes, chaptersRes] = await Promise.all([
-    supabase
-      .from("reading_sessions")
-      .select("*")
-      .eq("book_id", book.book_id)
-      .order("session_date", { ascending: false })
-      .order("session_id", { ascending: false }),
-    supabase
-      .from("book_highlights")
-      .select("*")
-      .eq("book_id", book.book_id)
-      .eq("archived", false)
-      .order("created_at", { ascending: false })
-      .order("highlight_id", { ascending: false }),
-    supabase.from("reading_quizzes").select("*").eq("book_id", book.book_id).order("taken_at", { ascending: false }),
-    supabase.from("book_chapters").select("chapter,start_position,end_position,start_page,end_page").eq("book_id", book.book_id).order("start_position"),
-  ]);
-  for (const r of [sessionsRes, highlightsRes, quizzesRes, chaptersRes]) {
-    if (r.error) throw new Error(r.error.message);
-  }
-  const sessions = (sessionsRes.data ?? []) as ReadingSession[];
-  const highlights = ((highlightsRes.data ?? []) as Highlight[]).map((h) => ({ ...h, ease: Number(h.ease) }));
-  const quizzes = (quizzesRes.data ?? []) as Quiz[];
-  const chapters = (chaptersRes.data ?? []) as ChapterSpan[];
+  const { reading_sessions, book_highlights, reading_quizzes, book_chapters, ...book } = row;
+  const sessions = reading_sessions ?? [];
+  const reviews: Review[] = [];
+  const highlights = (book_highlights ?? []).map(({ reading_reviews, ...h }) => {
+    for (const r of reading_reviews ?? []) reviews.push(r);
+    return { ...h, ease: Number(h.ease) } as Highlight;
+  });
+  const quizzes = reading_quizzes ?? [];
+  const chapters = book_chapters ?? [];
 
-  const highlightIds = highlights.map((h) => h.highlight_id);
-  let reviews: Review[] = [];
-  if (highlightIds.length) {
-    const { data, error } = await supabase
-      .from("reading_reviews")
-      .select("review_id,highlight_id,review_date,grade")
-      .in("highlight_id", highlightIds);
-    if (error) throw new Error(error.message);
-    reviews = (data ?? []) as Review[];
-  }
-
-  return computeOverview({ book, today, sessions, highlights, reviews, quizzes, chapters });
+  return computeOverview({ book: book as Book, today, sessions, highlights, reviews, quizzes, chapters });
 }
 
 /* ------------------------------------------------------------------ */
