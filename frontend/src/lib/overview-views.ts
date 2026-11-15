@@ -239,7 +239,7 @@ const nutrition: View = ([nutritionRows, weight, caffeineRows], now) => {
   const lastAt = hourLabel(num(lastCaf?.last_caffeine_hour));
   return {
     metrics: [
-      { label: "Calories", value: round(num(lastNut?.calories)), unit: lastNut ? "kcal" : undefined, sub: lastNut ? `${dayLabel(str(lastNut.calendar_date), today)} · ${source === "uber_eats" ? "Uber Eats estimate" : source === "mfp" ? "MyFitnessPal" : "Cronometer"}` : "Nothing logged this week" },
+      { label: "Calories", value: round(num(lastNut?.calories)), unit: lastNut ? "kcal" : undefined, sub: lastNut ? `${dayLabel(str(lastNut.calendar_date), today)} · ${source === "uber_eats" ? "Uber Eats estimate" : source === "photo" ? "Photo estimate" : source === "uber_eats+photo" ? "Uber Eats + photo estimate" : source === "mfp" ? "MyFitnessPal" : "Cronometer"}` : "Nothing logged this week" },
       { label: "Weight", value: kg === null ? DASH : (kg / 0.45359237).toFixed(1), unit: kg === null ? undefined : "lb", sub: lastWeight ? dayLabel(str(lastWeight.log_date), today) : "No weigh-in in 90 days" },
       { label: "Caffeine", value: round(mg), unit: mg === null ? undefined : "mg", sub: lastCaf ? `${dayLabel(str(lastCaf.calendar_date), today)}${lastAt ? ` · last ${lastAt}` : ""}` : "None this week" },
     ],

@@ -55,9 +55,13 @@ type HeaderGetter = { get(name: string): string | null };
  * Request-shape checks for the PATCH route, before the body is read. Returns null when the request may
  * proceed, else the status + message to answer with. The route is session-only (middleware); this adds a
  * same-origin check (a browser always sends Origin on a PATCH, so a missing one is refused), a JSON
- * content type, and a small declared size.
+ * content type, and a small declared size (`maxBytes`; the photo-meal routes pass their own cap).
  */
-export function checkPortionRequest(headers: HeaderGetter, requestOrigin: string): { status: number; error: string } | null {
+export function checkPortionRequest(
+  headers: HeaderGetter,
+  requestOrigin: string,
+  maxBytes: number = MAX_PORTION_BODY_BYTES,
+): { status: number; error: string } | null {
   const origin = headers.get("origin");
   if (!origin) return { status: 403, error: "missing Origin" };
   let o: URL;
@@ -77,7 +81,7 @@ export function checkPortionRequest(headers: HeaderGetter, requestOrigin: string
   if (type !== "application/json") return { status: 415, error: "Content-Type must be application/json" };
 
   const len = headers.get("content-length");
-  if (len != null && (!/^[0-9]+$/.test(len) || Number(len) > MAX_PORTION_BODY_BYTES)) {
+  if (len != null && (!/^[0-9]+$/.test(len) || Number(len) > maxBytes)) {
     return { status: 413, error: "body too large" };
   }
   return null;
@@ -124,6 +128,8 @@ export interface DeliveryEstimateDay {
   est_protein_g: number | string | null;
   est_carbs_g: number | string | null;
   est_fat_g: number | string | null;
+  /** Provenance tag for the merged row; absent = "uber_eats". combineEstimateDays (lib/photo-meal.ts) sets it. */
+  nutrition_source?: string;
 }
 
 /**
@@ -145,7 +151,7 @@ export function mergeDeliveryEstimates<T extends { calendar_date: string }>(
     seen.add(e.behavioral_date);
     rows.push({
       calendar_date: e.behavioral_date,
-      nutrition_source: "uber_eats",
+      nutrition_source: e.nutrition_source ?? "uber_eats",
       calories: e.est_kcal,
       protein_g: e.est_protein_g,
       carbs_g: e.est_carbs_g,
