@@ -67,7 +67,7 @@ export default function Sidebar() {
   return (
     <aside className="fixed inset-y-0 left-0 z-50 w-[220px] bg-surface-sunken border-r border-border-subtle flex flex-col max-md:hidden">
       <div className="shrink-0 px-5 py-5 border-b border-border-subtle">
-        <h1 className="flex items-center gap-2 text-[20px] font-bold lowercase leading-none tracking-[0.01em] text-text-primary"><img src="/icons/logo-mark-64.png?v=3" width={22} height={22} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
+        <h1 className="flex items-center gap-2 text-[20px] font-bold lowercase leading-none tracking-[0.01em] text-text-primary"><img src="/icons/logo-mark-64.png?v=4" width={30} height={30} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
         <p className="text-[11px] text-text-tertiary mt-1.5 font-mono">Personal Data Scientist</p>
       </div>
 
