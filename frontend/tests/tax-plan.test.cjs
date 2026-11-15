@@ -108,7 +108,7 @@ test("what-if levers: parsed from the URL, applied to the profile, extra cash it
   const params = S.parseScenarioParams((k) => ({ bonusPct: "50", bonusShiftMonths: "2", moveDate: "2031-05-01", rentChange: "1500", movingCosts: "6000", spendChange: "-200", payoffCard: "card1", payoffAmount: "10000", payoffDate: "2031-02-01", junk: "x", preTax: "999999" })[k] ?? null);
   assert.equal(params.preTax, undefined); // out of range
   assert.equal(params.bonusPct, 50);
-  const p2 = S.applyToProfile(base, params);
+  const p2 = S.applyToProfile(base, params, "2030-12-01");
   assert.equal(p2.oneOffs[0].grossCents, 3_000_000);
   assert.equal(p2.oneOffs[0].date, "2031-03-31");
   assert.equal(p2.moveDate, "2031-05-01");
@@ -134,7 +134,7 @@ test("every year's bonus: generated each January, an explicit one wins, raises g
   const items = T.taxCashItems(p, [T.computeTaxYear(p, 2031, "2030-12-01")], "2030-12-01");
   assert.ok(items.some((i) => i.id.startsWith("pay:2032-01") && i.amountCents > 0), "future bonus reaches the cash forecast");
   const S = loadTs("lib/cash-forecast-scenario.ts");
-  assert.equal(S.applyToProfile(p, { bonusPct: 50 }).annualBonus.amountCents, 2_500_000);
+  assert.equal(S.applyToProfile(p, { bonusPct: 50 }, "2030-12-01").annualBonus.amountCents, 2_500_000);
 });
 
 test("tax rules are configurable: bracket indexing for unpublished years, state rates, employer withholding", () => {
@@ -146,4 +146,71 @@ test("tax rules are configurable: bracket indexing for unpublished years, state 
   assert.equal(T.tablesFor({ ...p, gaRatePct: 4.99 }, 2026).ga.rate, 4.99);
   const none = T.computeTaxYear({ ...p, employerStateWithholding: "none" }, 2026, "2026-03-01");
   assert.equal(none.jurisdictions.find((j) => j.jur === "NC").withheldCents, 0);
+});
+
+test("tax years by cash date: last year stays in after New Year until its lines are settled", () => {
+  // Synthetic horizon: two years ahead, as the loader uses.
+  assert.deepEqual(T.taxYearsFor("2030-12-31", "2032-12-30"), [2030, 2031, 2032]);
+  assert.deepEqual(T.taxYearsFor("2031-01-01", "2032-12-31"), [2030, 2031, 2032], "the 2030 January estimate and April refund are still ahead");
+  assert.deepEqual(T.taxYearsFor("2031-05-31", "2033-05-30"), [2030, 2031, 2032, 2033], "within the late-match window after the 2030 refund date");
+  assert.deepEqual(T.taxYearsFor("2031-06-01", "2033-05-31"), [2031, 2032, 2033], "past the window: 2030 is done");
+  assert.equal(T.taxYearLastCashDate(2030), "2031-04-30");
+});
+
+test("the prior year's January estimate and refund survive Dec 31 -> Jan 1 (real computeTaxYear / taxCashItems)", () => {
+  const p = { ...base, employmentStart: "2030-01-01", oneOffs: [] };
+  const lines = (today) => T.taxCashItems(p, T.taxYearsFor(today, "2032-12-30").map((y) => T.computeTaxYear(p, y, today)), today).filter((i) => i.id.startsWith("tax:2030:"));
+  const dec31 = lines("2030-12-31");
+  const jan1 = lines("2031-01-01");
+  assert.ok(dec31.some((i) => i.id === "tax:2030:GA:2031-01-15" && i.amountCents < 0), "a Georgia payment is due on Jan 15");
+  assert.ok(dec31.some((i) => i.id === "tax:2030:NC:2031-04-30" && i.amountCents > 0), "the NC withholding comes back");
+  assert.deepEqual(jan1, dec31, "New Year changes nothing: nothing was paid or received");
+  // After Jan 15 with nothing recorded, the Georgia balance is still owed: with the return on April 15.
+  const jan20 = lines("2031-01-20");
+  const ga = jan20.find((i) => i.id.startsWith("tax:2030:GA:"));
+  assert.equal(ga.date, "2031-04-15");
+  assert.equal(ga.amountCents, dec31.find((i) => i.id === "tax:2030:GA:2031-01-15").amountCents);
+  // Recording the payment settles it.
+  const paid = { ...p, estimatesPaid: [{ year: 2030, jur: "GA", date: "2031-01-15", cents: -ga.amountCents }] };
+  const settled = T.taxCashItems(paid, [T.computeTaxYear(paid, 2030, "2031-01-20")], "2031-01-20");
+  assert.ok(!settled.some((i) => i.id.startsWith("tax:2030:GA:")));
+  // A line whose date passed is kept for the late-match window (the forecast settles it), then dropped.
+  const keep = (today) => T.taxCashItems(p, [T.computeTaxYear(p, 2030, today)], today).map((i) => i.id);
+  assert.ok(keep("2031-05-10").includes("tax:2030:NC:2031-04-30"));
+  assert.ok(keep("2031-05-10").includes("tax:2030:GA:2031-04-15"));
+  assert.ok(!keep("2031-06-01").includes("tax:2030:NC:2031-04-30"));
+});
+
+test("other income what-if: dated receipts, taxed in the year received, nothing for income the profile already has", () => {
+  const today = "2030-11-14";
+  // Default start: next month; one twelfth at each month end.
+  const ch = S.otherIncomeChange({ otherIncome: 12_000 }, 0, today);
+  assert.deepEqual(ch, { annualCents: 1_200_000, from: "2030-12-01" });
+  assert.deepEqual(T.otherIncomeReceiptDates(ch.from, 2030), ["2030-12-31"]);
+  assert.equal(T.otherIncomeReceiptDates(ch.from, 2031).length, 12);
+  assert.deepEqual(S.otherIncomeChange({ otherIncome: 12_000, otherIncomeStart: "2031-03-10" }, 0, today).from, "2031-03-10");
+  assert.equal(S.otherIncomeChange({ otherIncome: 12_000, otherIncomeStart: "2030-01-01" }, 0, today).from, "2030-12-01", "a past start counts from next month");
+  assert.equal(S.otherIncomeChange({ otherIncome: 5_000 }, 500_000, today), null, "the same figure as the profile: no change");
+  assert.equal(S.otherIncomeChange({}, 0, today), null);
+
+  const sp = S.applyToProfile(base, { otherIncome: 12_000 }, today);
+  assert.equal(sp.otherIncomeAnnualCents, 0, "the profile's own figure is kept");
+  assert.equal(T.otherIncomeFor(sp, 2030), 100_000, "one December receipt is taxed in 2030");
+  assert.equal(T.otherIncomeFor(sp, 2031), 1_200_000);
+  const items = S.scenarioItems({ otherIncome: 12_000 }, sp, today).filter((i) => i.id.startsWith("wi:other:"));
+  assert.equal(items.length, 26);
+  assert.ok(items.every((i) => i.amountCents === 100_000 && i.date > today));
+  for (const y of [2030, 2031]) assert.equal(items.filter((i) => i.date.startsWith(`${y}-`)).reduce((s, i) => s + i.amountCents, 0), T.otherIncomeFor(sp, y), `cash and tax agree for ${y}`);
+  // The profile already has $5k a year (in the history): $12k adds only $7k of receipts and $7k of income.
+  const withBase = { ...base, otherIncomeAnnualCents: 500_000 };
+  const sp2 = S.applyToProfile(withBase, { otherIncome: 12_000 }, today);
+  const items2 = S.scenarioItems({ otherIncome: 12_000 }, sp2, today).filter((i) => i.id.startsWith("wi:other:"));
+  assert.equal(items2[0].amountCents, Math.round(700_000 / 12));
+  assert.equal(T.otherIncomeFor(sp2, 2031), 500_000 + 12 * Math.round(700_000 / 12));
+  // Less than the profile: the receipts are negative and the income goes down.
+  const less = S.scenarioItems({ otherIncome: 2_000 }, S.applyToProfile(withBase, { otherIncome: 2_000 }, today), today).filter((i) => i.id.startsWith("wi:other:"));
+  assert.ok(less.length > 0 && less.every((i) => i.amountCents === -25_000 && /less other income/.test(i.label)));
+  // Parsed from the URL; the start only travels with an amount.
+  assert.deepEqual(S.parseScenarioParams((k) => ({ otherIncome: "12000", otherIncomeStart: "2031-03-10" })[k] ?? null), { otherIncome: 12_000, otherIncomeStart: "2031-03-10" });
+  assert.deepEqual(S.parseScenarioParams((k) => ({ otherIncomeStart: "2031-03-10" })[k] ?? null), {});
 });

@@ -8,7 +8,8 @@ import { moveItems, parseMovePlan, type MovePlan } from "@/lib/finance-plan";
 import { forecastCash, poolBalanceAt, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
 import { driversToInputs, itemRowToPlanned, type DriverRow, type ItemInput, type ItemRow } from "@/lib/cash-forecast-store";
 import { applyToProfile, hasLevers, scenarioCardPayments, scenarioItems, type ScenarioParams } from "@/lib/cash-forecast-scenario";
-import { computeTaxYear, federalMarginalRate, parseTaxProfile, salaryFor, taxCashItems, type TaxProfile, type TaxYearResult } from "@/lib/tax-plan";
+import { computeTaxYear, federalMarginalRate, parseTaxProfile, salaryFor, taxCashItems, taxYearsFor, type TaxProfile, type TaxYearResult } from "@/lib/tax-plan";
+import { addDays } from "@/lib/procurement-recurring";
 
 /**
  * Server-side reads and writes for the cash forecast (/financials/forecast). SERVICE ROLE ONLY: the finance
@@ -18,6 +19,8 @@ import { computeTaxYear, federalMarginalRate, parseTaxProfile, salaryFor, taxCas
 
 const TXN_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
 const HISTORY_DAYS = 450;
+/** The forecast runs two years ahead; the tax years are picked from the same window. */
+const HORIZON_DAYS = 730;
 const MAX_PAGES = 40;
 
 export interface PlanItemView {
@@ -132,17 +135,20 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const drivers = ((driversRes.data ?? []) as DriverRow[]).filter((d) => d && typeof d.key === "string" && d.value && typeof d.value === "object");
     const { settings, cardTerms, growth, adjustments: savedAdjust } = driversToInputs(drivers);
 
-    // Tax plan for this year and next; its payments, refunds and after-tax bonus become planned cash lines.
+    // Tax plan; its payments, refunds and after-tax bonus become planned cash lines.
     // The move plan (driver "move") is the single source of the move date: it also sets the tax residency change.
     const move = parseMovePlan(drivers.find((d) => d.key === "move")?.value);
     const rawProfile = parseTaxProfile(drivers.find((d) => d.key === "tax")?.value);
     const profile = rawProfile && move ? { ...rawProfile, moveDate: move.date } : rawProfile;
     const year = Number(today.slice(0, 4));
-    // Three tax years: this one, next (the move), and the one after (the next January bonus as a NY/NYC resident).
-    const taxFor = (p: TaxProfile | null) => (p ? [0, 1, 2].map((k) => computeTaxYear(p, year + k, today)) : []);
+    // Tax years by cash date (taxYearsFor): every year with a line inside the forecast window, including LAST year
+    // until its January estimate, April balance and refund are settled (they fall after New Year), through the year
+    // the horizon ends in (this one, the move, the next January bonus as a NY/NYC resident).
+    const taxYears = taxYearsFor(today, addDays(today, HORIZON_DAYS));
+    const taxFor = (p: TaxProfile | null) => (p ? taxYears.map((y) => computeTaxYear(p, y, today)) : []);
     const tax = taxFor(profile);
     const manual = itemRows.map(itemRowToPlanned);
-    const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings: { ...settings, horizonDays: 730 } };
+    const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings: { ...settings, horizonDays: HORIZON_DAYS } };
     const basePlanned = [...manual, ...(move ? moveItems(move) : []), ...(profile ? taxCashItems(profile, tax, today) : [])];
     let result = forecastCash({ ...baseInput, planned: basePlanned, adjustments: savedAdjust });
     // Annual raise: the paycheck stream grows each January (net pay scaled with gross; a planning approximation).
@@ -158,7 +164,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     // What-if: the same history with the levers applied (computed here, so the browser never gets the ledger).
     let scenario: { params: ScenarioParams; result: ForecastResult; tax: TaxYearResult[] } | null = null;
     if (hasLevers(levers)) {
-      const sp = profile ? applyToProfile(profile, levers) : null;
+      const sp = profile ? applyToProfile(profile, levers, today) : null;
       const sTax = taxFor(sp);
       const adjustments: { streamId: string; from: string; amountCents?: number; stop?: boolean }[] = [...raiseAdjust(sp, result), ...savedAdjust];
       const pay = result.streams.filter((x) => x.kind === "income").sort((a, b) => b.typicalCents - a.typicalCents)[0];
@@ -167,7 +173,8 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
         const keep = 1 - (federalMarginalRate(profile, year) + 5) / 100;
         adjustments.push({ streamId: pay.id, from: today, amountCents: pay.typicalCents - Math.round((delta / 12) * keep) });
       }
-      const extra = scenarioItems(levers, sp ?? ({ moveDate: null } as TaxProfile), today);
+      // The levers' own cash lines, including the receipts of a change in other income (its tax is in sTax).
+      const extra = scenarioItems(levers, sp ?? ({ moveDate: null, otherIncomeAnnualCents: 0 } as TaxProfile), today);
       const sResult = forecastCash({
         ...baseInput,
         planned: [
@@ -179,6 +186,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
         adjustments,
         extraCardPayments: scenarioCardPayments(levers, today),
       });
+      if (!sp && extra.some((i) => i.id.startsWith("wi:other:"))) sResult.warnings.push("No tax profile yet: the other income is counted before tax.");
       scenario = { params: levers, result: sResult, tax: sTax };
     }
     // Forecast vs actual: snapshots of past weeks against the balance rebuilt from the ledger.

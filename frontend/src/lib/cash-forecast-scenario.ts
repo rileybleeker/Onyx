@@ -5,7 +5,7 @@
  */
 import { addDays, addMonths } from "./procurement-recurring";
 import type { PlannedItem } from "./cash-forecast";
-import type { TaxProfile } from "./tax-plan";
+import { otherIncomeReceiptCents, otherIncomeReceiptDates, type TaxProfile } from "./tax-plan";
 
 export interface ScenarioParams {
   /** Bonus as a % of plan (100 = as planned). Applies to supplemental pay labelled "bonus". */
@@ -24,8 +24,14 @@ export interface ScenarioParams {
   payoffCard?: string;
   payoffAmount?: number;
   payoffDate?: string;
-  /** Other (1099) income for the year, dollars. */
+  /**
+   * Other (1099) income per year, dollars, from otherIncomeStart on (default: the first day of next month). The
+   * change against the tax profile's own figure is received as one twelfth at each month end and taxed in the year
+   * it is received; the profile's own other income is taken as already in the history, so it adds no receipts.
+   */
   otherIncome?: number;
+  /** The day the other income above starts (YYYY-MM-DD); a past date counts from next month. */
+  otherIncomeStart?: string;
   /** Pre-tax 401(k) / HSA contributions per year, dollars. */
   preTax?: number;
 }
@@ -59,6 +65,8 @@ export function parseScenarioParams(get: (k: string) => string | null | undefine
   if (card && /^[A-Za-z0-9_-]{1,64}$/.test(card)) out.payoffCard = card;
   const pd = get("payoffDate");
   if (isDay(pd)) out.payoffDate = pd;
+  const os = get("otherIncomeStart");
+  if (isDay(os) && out.otherIncome !== undefined) out.otherIncomeStart = os;
   return out;
 }
 export function scenarioToQuery(p: ScenarioParams): string {
@@ -68,8 +76,25 @@ export function scenarioToQuery(p: ScenarioParams): string {
 }
 export const hasLevers = (p: ScenarioParams): boolean => Object.keys(p).length > 0;
 
+/** The first day of the month after `today`. */
+const nextMonthStart = (today: string): string => {
+  const y = Number(today.slice(0, 4));
+  const m = Number(today.slice(5, 7));
+  return m === 12 ? `${y + 1}-01-01` : `${y}-${String(m + 1).padStart(2, "0")}-01`;
+};
+/**
+ * The change in other income the lever makes against `baseAnnualCents` (the tax profile's figure), and the day it
+ * starts (never in the past: a start on or before today counts from the first day of next month). Null = no change.
+ */
+export function otherIncomeChange(p: ScenarioParams, baseAnnualCents: number, today: string): { annualCents: number; from: string } | null {
+  if (p.otherIncome === undefined) return null;
+  const annualCents = Math.round(p.otherIncome * 100) - Math.max(0, baseAnnualCents);
+  if (!annualCents) return null;
+  return { annualCents, from: p.otherIncomeStart && p.otherIncomeStart > today ? p.otherIncomeStart : nextMonthStart(today) };
+}
+
 /** The tax profile under the scenario (bonus size / timing, move date, other income, pre-tax savings). */
-export function applyToProfile(profile: TaxProfile, p: ScenarioParams): TaxProfile {
+export function applyToProfile(profile: TaxProfile, p: ScenarioParams, today: string): TaxProfile {
   const next: TaxProfile = { ...profile, oneOffs: profile.oneOffs.map((o) => ({ ...o })), annualBonus: profile.annualBonus ? { ...profile.annualBonus } : profile.annualBonus };
   if (p.bonusPct !== undefined && next.annualBonus) next.annualBonus.amountCents = Math.round((next.annualBonus.amountCents * p.bonusPct) / 100);
   if (p.bonusPct !== undefined || p.bonusShiftMonths) {
@@ -80,12 +105,19 @@ export function applyToProfile(profile: TaxProfile, p: ScenarioParams): TaxProfi
     );
   }
   if (p.moveDate !== undefined) next.moveDate = p.moveDate === "none" ? null : p.moveDate;
-  if (p.otherIncome !== undefined) next.otherIncomeAnnualCents = Math.round(p.otherIncome * 100);
+  // Other income: the change from its start date (taxed in the years it is received), not a new figure for every year.
+  next.otherIncomeChange = otherIncomeChange(p, profile.otherIncomeAnnualCents, today);
   if (p.preTax !== undefined) next.preTaxAnnualCents = Math.round(p.preTax * 100);
   return next;
 }
 
-/** Extra planned items the levers add (rent change, moving costs, spending change, card payoff). */
+/** Months of other-income receipts a what-if lists (past the 24-month forecast window, so it is always covered). */
+const OTHER_INCOME_MONTHS = 26;
+
+/**
+ * Extra planned items the levers add (rent change, moving costs, spending change, card payoff, the receipts of a
+ * change in other income). `profile` is the scenario's tax profile (applyToProfile); its other income is the base.
+ */
 export function scenarioItems(p: ScenarioParams, profile: TaxProfile, today: string): PlannedItem[] {
   const items: PlannedItem[] = [];
   const move = p.moveDate === "none" ? null : (p.moveDate ?? profile.moveDate);
@@ -95,6 +127,14 @@ export function scenarioItems(p: ScenarioParams, profile: TaxProfile, today: str
   if (move && p.movingCosts) items.push({ id: "wi:moving", label: "What-if: moving costs", date: move, amountCents: -Math.round(p.movingCosts * 100), certainty: "likely" });
   if (p.spendChange) {
     items.push({ id: "wi:spend", label: "What-if: everyday spending change", date: addDays(today, 30), amountCents: -Math.round(p.spendChange * 100), certainty: "likely", repeat: { unit: "month", every: 1, count: 24 } });
+  }
+  const other = otherIncomeChange(p, profile.otherIncomeAnnualCents ?? 0, today);
+  if (other) {
+    const cents = otherIncomeReceiptCents(other.annualCents);
+    const label = other.annualCents > 0 ? "What-if: other income" : "What-if: less other income";
+    const dates: string[] = [];
+    for (let y = Number(other.from.slice(0, 4)); dates.length < OTHER_INCOME_MONTHS; y++) dates.push(...otherIncomeReceiptDates(other.from, y));
+    for (const date of dates.slice(0, OTHER_INCOME_MONTHS)) items.push({ id: `wi:other:${date}`, label, date, amountCents: cents, certainty: "likely" });
   }
   if (p.payoffCard && p.payoffAmount && p.payoffAmount > 0) {
     items.push({ id: "wi:payoff", label: "What-if: extra card payment", date: p.payoffDate && p.payoffDate > today ? p.payoffDate : addDays(today, 1), amountCents: -Math.round(p.payoffAmount * 100), certainty: "confirmed" });

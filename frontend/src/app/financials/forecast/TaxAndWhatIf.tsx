@@ -49,6 +49,7 @@ export function WhatIfPanel({ params, accounts, saved, busy, run }: { params: Sc
     payoffAmount: p.payoffAmount?.toString() ?? "",
     payoffDate: p.payoffDate ?? "",
     otherIncome: p.otherIncome?.toString() ?? "",
+    otherIncomeStart: p.otherIncomeStart ?? "",
     preTax: p.preTax?.toString() ?? "",
   });
   const [name, setName] = useState("");
@@ -70,6 +71,7 @@ export function WhatIfPanel({ params, accounts, saved, busy, run }: { params: Sc
     if (f.moveDate) out.moveDate = f.moveDate;
     if (f.payoffCard && out.payoffAmount) out.payoffCard = f.payoffCard;
     if (f.payoffDate && out.payoffAmount) out.payoffDate = f.payoffDate;
+    if (f.otherIncomeStart && out.otherIncome !== undefined) out.otherIncomeStart = f.otherIncomeStart;
     return out;
   };
   const apply = () => {
@@ -95,6 +97,7 @@ export function WhatIfPanel({ params, accounts, saved, busy, run }: { params: Sc
         {field("Moving costs ($)", "movingCosts", "e.g. 6000")}
         {field("Spending change ($/mo)", "spendChange", "+ or -")}
         {field("Other / 1099 income ($/yr)", "otherIncome", "0")}
+        {field("Starting (default next month)", "otherIncomeStart", "", "date", "w-36")}
         {field("401(k) / pre-tax ($/yr)", "preTax", "0")}
         <label className="flex flex-col gap-1 text-[12px] text-text-secondary">
           Extra card payment
