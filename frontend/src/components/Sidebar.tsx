@@ -10,6 +10,7 @@ import { goHint } from "@/lib/go-shortcuts";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 import { InstallAppButton, ReloadAppButton, usePaletteShortcutLabel } from "./DesktopApp";
 import { useActiveRoute, useRevealActiveNavItem } from "./FeedContext";
+import PersonalizeButton from "./personalize/PersonalizeButton";
 
 const SIDEBAR_LIST_SELECTOR = 'nav[data-nav-list="sidebar"]';
 
@@ -103,6 +104,7 @@ export default function Sidebar() {
       <div className="shrink-0 px-2 py-3 border-t border-border-subtle">
         <InstallAppButton />
         <ReloadAppButton />
+        <PersonalizeButton className="flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full focus:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:text-accent disabled:hover:bg-transparent" />
         <button
           onClick={handleSignOut}
           className="flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"

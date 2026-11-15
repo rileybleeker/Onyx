@@ -10,6 +10,7 @@ import {
 import AirQualityPanel from "@/components/AirQualityPanel";
 import ChartCard from "@/components/ChartCard";
 import DeferredMount from "@/components/DeferredMount";
+import { Part, PartGrid, usePartOrder } from "@/components/personalize/PartGrid";
 import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import KpiTile from "@/components/KpiTile";
@@ -226,6 +227,27 @@ const SECTIONS = [
   { id: "environment", label: "Environment" },
   { id: "methods", label: "Methods & Eval" },
 ] as const;
+
+const SECTION_IDS: string[] = SECTIONS.map((s) => s.id);
+const SECTION_LABELS = new Map<string, string>(SECTIONS.map((s) => [s.id, s.label] as [string, string]));
+
+/** The right-rail "On this page" links, in the personalized section order, without hidden sections. */
+function SectionNav() {
+  const ids = usePartOrder("/analytics/hrv", SECTION_IDS);
+  return (
+    <>
+      {ids.map((id) => (
+        <a
+          key={id}
+          href={`#${id}`}
+          className="block px-2 py-1 text-[12px] text-text-tertiary hover:text-text-primary rounded-[3px] hover:bg-white/[0.03] transition-colors"
+        >
+          {SECTION_LABELS.get(id) ?? id}
+        </a>
+      ))}
+    </>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Page Component
@@ -651,6 +673,8 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         </div>
       </div>
 
+      <PartGrid page="/analytics/hrv" title="HRV Deep Analysis">
+      <Part id="kpis" title="Forecast tiles">
       {/* ── Row 1: Hero KPI tiles (horizontal scroll-snap on mobile) ── */}
       <div className="flex gap-3 overflow-x-auto snap-x snap-mandatory pb-1 -mx-1 px-1 [scrollbar-width:none] sm:mx-0 sm:px-0 sm:grid sm:grid-cols-3 sm:gap-4 sm:overflow-visible">
         <div className="min-w-[78%] snap-start sm:min-w-0 relative bg-surface-card border border-border-subtle rounded-card shadow-card px-4 py-4 flex flex-col items-center">
@@ -713,7 +737,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
           meta={[{ text: "XGBOOST · SHAP" }]}
         />
       </div>
+      </Part>
 
+      <Part id="forecast" title="Forecast & Drivers">
       <SectionHeader id="forecast" tick="forecast" title="Forecast & Drivers" kicker="What tonight's sleep should bring, and why" />
       {/* ── Forward-looking: what's predicted and why (today) ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -899,6 +925,8 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
           SectionHeader anchors stay OUTSIDE the wrappers so #fragment nav
           finds its targets before the section content mounts. minHeight
           approximates each section's rendered height to limit scroll shift. */}
+      </Part>
+      <Part id="accuracy" title="Model Accuracy">
       <SectionHeader id="accuracy" tick="calibration" title="Model Accuracy" kicker="Backtested next-day prediction error" />
       {/* ── How well does the model actually predict? ── */}
       <DeferredMount minHeight={420}>
@@ -984,7 +1012,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         </ChartCard>
       </div>
       </DeferredMount>
+      </Part>
 
+      <Part id="trend" title="HRV Trend">
       <SectionHeader id="trend" tick="descriptive" title="HRV Trend" />
       {/* ── Where is HRV trending overall? ── */}
       <DeferredMount minHeight={420}>
@@ -1019,7 +1049,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         )}
       </ChartCard>
       </DeferredMount>
+      </Part>
 
+      <Part id="associations" title="Associations">
       <SectionHeader id="associations" tick="descriptive" title="Associations" kicker="What historically moves with your HRV" />
       {/* ── What's associated with your HRV ── */}
       <DeferredMount minHeight={1400}>
@@ -1134,7 +1166,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         </ChartCard>
       </div>
       </DeferredMount>
+      </Part>
 
+      <Part id="impact" title="Behavior Impact">
       <SectionHeader id="impact" tick="descriptive" title="Behavior Impact" kicker="Mean HRV difference on the night after the behavior (Welch's t-test)" />
       {/* ── Behavior t-tests: Journal + Habit Impact ── */}
       <DeferredMount minHeight={480}>
@@ -1281,7 +1315,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         </ChartCard>
       </div>
       </DeferredMount>
+      </Part>
 
+      <Part id="supplements" title="Supplements">
       <SectionHeader id="supplements" tick="descriptive" title="Supplements" />
       {/* ── Supplements: Yes/No impact + Dose-Response ── */}
       <DeferredMount minHeight={460}>
@@ -1427,7 +1463,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         )}
       </div>
       </DeferredMount>
+      </Part>
 
+      <Part id="lifestyle" title="Lifestyle">
       <SectionHeader id="lifestyle" tick="descriptive" title="Lifestyle" />
       {/* ── Lifestyle: Nutrition + Workout-to-Bed Gap ── */}
       <DeferredMount minHeight={440}>
@@ -1574,7 +1612,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         </ChartCard>
       </div>
       </DeferredMount>
+      </Part>
 
+      <Part id="causal" title="Causal Inference">
       <SectionHeader id="causal" tick="causal" title="Causal Inference" kicker="Adjusted effects — from association to causation" />
       {/* ── Causal Inference: from association to causation ── */}
       {/*
@@ -2341,7 +2381,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         </ChartCard>
       </div>
       </DeferredMount>
+      </Part>
 
+      <Part id="environment" title="Environment Sweet Spot">
       <SectionHeader id="environment" tick="descriptive" title="Environment" />
       {/* ── Environment Sweet Spot: descriptive dose-response for day-D inputs ── */}
       {/*
@@ -2357,17 +2399,23 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
       <DeferredMount minHeight={900}>
         <SweetSpotPanel rows={envMatrix} />
       </DeferredMount>
+      </Part>
 
+      <Part id="air-quality" title="PM2.5 air quality">
       {/* PM2.5 panel: fetches /api/air-quality itself (service-role table, not in the ISR prefetch). */}
       <DeferredMount minHeight={420}>
         <AirQualityPanel />
       </DeferredMount>
+      </Part>
 
+      <Part id="weather" title="Weather">
       {/* Weather panel: same pattern, fetches /api/weather itself (pds.weather_daily, service-role table). */}
       <DeferredMount minHeight={500}>
         <WeatherPanel />
       </DeferredMount>
+      </Part>
 
+      <Part id="methods" title="Methods & Evaluation">
       <SectionHeader id="methods" tick="calibration" title="Methods & Evaluation" />
       {/* ── Models & Methods ── */}
       {/* Both methods/eval cards render collapsed by default (just their
@@ -2744,19 +2792,13 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         )}
       </div>
       </DeferredMount>
+      </Part>
+      </PartGrid>
     </div>
     <aside className="hidden xl:block w-[170px] shrink-0">
       <nav className="sticky top-[88px] space-y-0.5" aria-label="On this page">
         <p className="text-[10px] font-medium uppercase tracking-[0.12em] text-text-tertiary/70 px-2 pb-1">On this page</p>
-        {SECTIONS.map((s) => (
-          <a
-            key={s.id}
-            href={`#${s.id}`}
-            className="block px-2 py-1 text-[12px] text-text-tertiary hover:text-text-primary rounded-[3px] hover:bg-white/[0.03] transition-colors"
-          >
-            {s.label}
-          </a>
-        ))}
+        <SectionNav />
       </nav>
     </aside>
     </div>

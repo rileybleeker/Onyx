@@ -132,3 +132,206 @@
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(236, 235, 230, 0.2);
 }
+
+/* ── Personalize (components/personalize/*): part grid, normal mode ─────────────────────────────────────
+   Every part spans the full row on a phone. Half = two side by side from 1024 px; third = three from 1024 px,
+   two from 768 px. Parts in one row stretch to the same height, like the grids they replaced. */
+.pz-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: var(--pz-gap, 24px);
+}
+.pz-grid > * {
+  grid-column: span 12 / span 12;
+  min-width: 0;
+}
+@media (min-width: 768px) {
+  .pz-grid > [data-w="third"] { grid-column: span 6 / span 6; }
+}
+@media (min-width: 1024px) {
+  .pz-grid > [data-w="half"] { grid-column: span 6 / span 6; }
+  .pz-grid > [data-w="third"] { grid-column: span 4 / span 4; }
+}
+.pz-part {
+  display: flex;
+  flex-direction: column;
+}
+/* A tile zone (e.g. the /status source cards): its own columns, one tile per cell, no widths. */
+.pz-grid.pz-tiles {
+  grid-template-columns: repeat(1, minmax(0, 1fr));
+}
+.pz-grid.pz-tiles > * {
+  grid-column: auto;
+}
+@media (min-width: 640px) {
+  .pz-grid.pz-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 1024px) {
+  .pz-grid.pz-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (min-width: 1280px) {
+  .pz-grid.pz-tiles { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+}
+.pz-body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+}
+.pz-body > :last-child {
+  flex: 1 1 auto;
+}
+/* Freeze pane of a personalized table. */
+.pz-frozen {
+  background: var(--color-surface-card);
+}
+.pz-frozen-edge {
+  box-shadow: inset -1px 0 0 var(--color-border-default);
+}
+
+/* ── Personalize mode (only while the banner is open) ─────────────────────────────────────────────────── */
+body.pz-editing {
+  padding-top: var(--pz-banner-h, 0px);
+}
+.pz-banner {
+  position: fixed;
+  z-index: 45;
+  left: 0;
+  right: 0;
+  top: calc(env(safe-area-inset-top) + 3rem);
+  background: var(--color-surface-raised);
+  border-bottom: 1px solid var(--color-border-emphasis);
+  box-shadow: var(--shadow-elevated);
+}
+@media (min-width: 768px) {
+  .pz-banner { top: 0; left: 220px; }
+}
+.pz-grid[data-pz-editing] {
+  position: relative;
+}
+.pz-grid[data-pz-editing] > .pz-part {
+  position: relative;
+  border-radius: var(--radius-card);
+  outline: 1px dashed var(--color-border-hover);
+  outline-offset: 4px;
+}
+.pz-grid[data-pz-editing] > .pz-part:hover,
+.pz-grid[data-pz-editing] > .pz-part:focus-within {
+  outline: 2px solid var(--color-accent);
+}
+.pz-cover {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  cursor: grab;
+  border-radius: var(--radius-card);
+}
+.pz-toolbar {
+  position: absolute;
+  z-index: 4;
+  top: 6px;
+  left: 6px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 2px;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--color-surface-raised) 94%, transparent);
+  box-shadow: var(--shadow-elevated);
+}
+.pz-handle {
+  cursor: grab;
+  touch-action: none;
+}
+/* A part that holds its own tiles: its toolbar sits above them instead of over them. */
+.pz-grid[data-pz-editing] > .pz-part[data-nested] > .pz-toolbar {
+  position: relative;
+  top: 0;
+  left: 0;
+  right: 0;
+  order: -1;
+  margin-bottom: 12px;
+}
+/* Controls inside a part (table column tools) stay usable above the drag surface. */
+.pz-grid[data-pz-editing] .pz-tools {
+  position: relative;
+  z-index: 3;
+}
+.pz-grid[data-pz-dragging] > .pz-part {
+  transition: transform 120ms ease;
+}
+.pz-grid[data-pz-dragging] .pz-cover,
+.pz-grid[data-pz-dragging] .pz-handle {
+  cursor: grabbing;
+}
+.pz-part.pz-lifted {
+  opacity: 0.4;
+}
+.pz-part.pz-here {
+  outline: 2px solid var(--color-accent);
+  box-shadow: 0 0 0 6px var(--color-accent-muted);
+}
+/* The drop indicator: where the part will land. */
+.pz-indicator {
+  position: absolute;
+  z-index: 6;
+  pointer-events: none;
+  border-radius: 9999px;
+  background: var(--color-accent);
+  box-shadow: 0 0 0 3px var(--color-accent-muted);
+}
+.pz-indicator-label {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  max-width: 240px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+.pz-indicator[data-axis="v"] .pz-indicator-label {
+  top: 0;
+  left: 50%;
+  transform: translate(-50%, -100%);
+}
+.pz-ghost {
+  position: fixed;
+  z-index: 80;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  max-width: 260px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  padding: 6px 10px;
+  border: 1px solid var(--color-border-emphasis);
+  border-radius: var(--radius-control);
+  background: var(--color-surface-raised);
+  color: var(--color-text-primary);
+  font-size: 12px;
+  font-weight: 500;
+  box-shadow: var(--shadow-floating);
+}
+.pz-hidden-part {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 8px 12px;
+  border: 1px dashed var(--color-border-hover);
+  border-radius: var(--radius-card);
+  background: repeating-linear-gradient(135deg, transparent 0 8px, rgba(236, 235, 230, 0.04) 8px 16px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .pz-grid[data-pz-dragging] > .pz-part { transition: none; }
+}
