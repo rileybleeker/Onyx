@@ -58,6 +58,13 @@ async function bounded<T>(promise: Promise<T>): Promise<T> {
 }
 // The email label sync runs hourly; older than this and Today says newer labels may be missing.
 const LABEL_SYNC_STALE_MS = 3 * 3_600_000;
+// While Today stays on screen it checks again this often (the app is often left open on the desktop).
+const VISIBLE_REFRESH_MS = 5 * 60_000;
+// The three "Keep life moving" checks that show a panel only when something is due. Their state is tracked so
+// "nothing due" (checked) never looks the same as "not checked" (Codex #191 UI 3).
+type LifeCheck = { state: "checking" | "ok" | "failed"; at: number | null };
+type LifeChecks = { orders: LifeCheck; renewals: LifeCheck; money: LifeCheck };
+const NOT_CHECKED: LifeCheck = { state: "checking", at: null };
 const URGENT_SHOWN = 5;
 // Calendar panel: today and tomorrow, at most this many events listed per day.
 const CALENDAR_SHOWN = 6;
@@ -157,6 +164,13 @@ export default function TodayClient() {
   // The one follow-up read after an `updating` (older, being recomputed) answer.
   const moneyRecheck = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
+  const [lifeChecks, setLifeChecks] = useState<LifeChecks>({ orders: NOT_CHECKED, renewals: NOT_CHECKED, money: NOT_CHECKED });
+  const markCheck = useCallback((key: keyof LifeChecks, ok: boolean) => {
+    setLifeChecks((previous) => {
+      const next: LifeCheck = ok ? { state: "ok", at: Date.now() } : { state: "failed", at: previous[key].at };
+      return { ...previous, [key]: next };
+    });
+  }, []);
   const sequence = useRef(0);
   const inFlight = useRef(false);
   const lastStarted = useRef(0);
@@ -210,15 +224,20 @@ export default function TodayClient() {
       if (sequence.current === current) setUrgent(fresh(value));
     }).catch(() => { if (sequence.current === current) setUrgent((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
     const ordersRequest = request(ORDERS_URL, parseOrders).then((value) => {
-      if (sequence.current === current) setOrders((previous) => sameJson(previous, value) ? previous : value);
-    }).catch(() => { /* keep the last summary; /orders has the details */ });
+      if (sequence.current !== current) return;
+      setOrders((previous) => sameJson(previous, value) ? previous : value);
+      markCheck("orders", true);
+    }).catch(() => { if (sequence.current === current) markCheck("orders", false); /* keep the last summary, marked */ });
     const renewalsRequest = request(RENEWALS_URL, parseRenewals).then((value) => {
-      if (sequence.current === current) setRenewals((previous) => sameJson(previous, value) ? previous : value);
-    }).catch(() => { /* keep the last summary; /procurement has the details */ });
+      if (sequence.current !== current) return;
+      setRenewals((previous) => sameJson(previous, value) ? previous : value);
+      markCheck("renewals", true);
+    }).catch(() => { if (sequence.current === current) markCheck("renewals", false); /* keep the last summary, marked */ });
     const keepMarked = (previous: MoneyView | null): MoneyView | null => previous && !previous.refreshFailed ? { ...previous, refreshFailed: true } : previous;
     const moneyRequest = request(MONEY_URL, parseMoneyAnswer).then((value) => {
       if (sequence.current !== current) return;
       setMoney((previous) => sameJson(previous, value) ? previous : value);
+      markCheck("money", true);
       if (!value.updating) return;
       // An older stored answer, recomputed on the server after it answered: ask once more for the current one
       // (?fresh=1 computes it if the background refresh has not landed). A newer load cancels this.
@@ -234,7 +253,7 @@ export default function TodayClient() {
           if (sequence.current === current) setMoney((previous) => sameJson(previous, next) ? previous : next);
         }).catch(() => { if (sequence.current === current) setMoney(keepMarked); });
       }, MONEY_RECHECK_MS);
-    }).catch(() => { if (sequence.current === current) setMoney(keepMarked); });
+    }).catch(() => { if (sequence.current === current) { setMoney(keepMarked); markCheck("money", false); } });
     const experimentRequest = request(EXPERIMENT_URL, parseExperiment).then((value) => {
       if (sequence.current === current) setExperiment(fresh(value));
     }).catch(() => { if (sequence.current === current) setExperiment((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
@@ -244,7 +263,7 @@ export default function TodayClient() {
     void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest, renewalsRequest, moneyRequest, experimentRequest, calendarRequest]).then(() => {
       if (sequence.current === current) { inFlight.current = false; setRefreshing(false); }
     });
-  }, []);
+  }, [markCheck]);
   // Reopening the app: fill empty panels from the copy kept on this device (IndexedDB) while the network
   // answers. Finance, procurement and experiment answers are never on the device, so they wait for the network.
   useEffect(() => {
@@ -268,6 +287,10 @@ export default function TodayClient() {
     load();
     const visible = () => { if (document.visibilityState === "visible" && Date.now() - lastStarted.current > 60000) load(); };
     document.addEventListener("visibilitychange", visible);
+    // Left open and visible: check again every few minutes (load() skips while a check is in flight).
+    const tick = setInterval(() => {
+      if (document.visibilityState === "visible" && Date.now() - lastStarted.current > VISIBLE_REFRESH_MS) load();
+    }, 60_000);
     return () => {
       // Invalidate asynchronous work, not a DOM ref. Also supports Strict Mode remount.
       // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -275,6 +298,7 @@ export default function TodayClient() {
       inFlight.current = false;
       if (moneyRecheck.current) { clearTimeout(moneyRecheck.current); moneyRecheck.current = null; }
       document.removeEventListener("visibilitychange", visible);
+      clearInterval(tick);
     };
   }, [load]);
 
@@ -339,7 +363,8 @@ export default function TodayClient() {
   const emailCards = cards.filter((item) => isEmailCard(item.card));
   const requests = cards.filter((item) => !isEmailCard(item.card));
   const pending = refreshing || inbox.state === "loading" || reading.state === "loading" || urgent.state === "loading" || calendar.state === "loading";
-  const unavailable = inbox.state === "error" || reading.state === "error" || urgent.state === "error" || (inbox.state === "ready" && inbox.stale) || (reading.state === "ready" && reading.stale) || (urgent.state === "ready" && urgent.stale) || experiment.state === "error" || (experiment.state === "ready" && experiment.stale) || calendar.state === "error" || (calendar.state === "ready" && calendar.stale);
+  const unavailable = inbox.state === "error" || reading.state === "error" || urgent.state === "error" || (inbox.state === "ready" && inbox.stale) || (reading.state === "ready" && reading.stale) || (urgent.state === "ready" && urgent.stale) || experiment.state === "error" || (experiment.state === "ready" && experiment.stale) || calendar.state === "error" || (calendar.state === "ready" && calendar.stale)
+    || lifeChecks.orders.state === "failed" || lifeChecks.renewals.state === "failed" || lifeChecks.money.state === "failed";
   // "none" (no trial registered, the usual case) and "not_connected" render nothing at all.
   const trial = experiment.state === "ready" && experiment.value.status !== "none" && experiment.value.status !== "not_connected" ? experiment.value : null;
   const email = urgent.state === "ready" && urgent.value.status === "ready" ? urgent.value : null;
@@ -361,6 +386,35 @@ export default function TodayClient() {
   const calendarSync = agenda ? syncHealth(agenda.lastSync, now.getTime()) : "never";
   const renewing = renewals?.status === "ready" && renewals.count > 0 ? renewals : null;
   const moneyStatus = money ? moneyNote(money, now) : null;
+  const moneyPanel = !!money && showMoneyPanel(money);
+  // "Also checked": one line per check that has no panel, saying what it found, or that it is still checking or
+  // could not check. A panel that is shown carries its own "couldn't refresh" note instead.
+  const clock = (t: number | null) => t ? new Date(t).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : null;
+  type CheckLine = { key: string; label: string; href: string; text: string; warn: boolean; when: string };
+  function checkLine(key: keyof LifeChecks, label: string, href: string, hasValue: boolean, found: string): CheckLine {
+    const c = lifeChecks[key];
+    const at = clock(c.at);
+    if (!hasValue) {
+      return { key, label, href, text: c.state === "failed" ? "Couldn't check. Try refreshing." : "Checking...", warn: c.state === "failed", when: "" };
+    }
+    if (c.state === "failed") return { key, label, href, text: `${found} Couldn't refresh; this is from ${at ? `the check at ${at}` : "an earlier visit"}.`, warn: true, when: "" };
+    return { key, label, href, text: found, warn: false, when: c.state === "checking" && !at ? "from an earlier visit; checking..." : at ? `checked ${at}` : "" };
+  }
+  const checkLines: CheckLine[] = [];
+  if (!packages) {
+    checkLines.push(checkLine("orders", "Packages", "/orders", !!orders, orders?.status === "not_connected"
+      ? "Package tracking isn't connected yet."
+      : `Nothing needs attention or arrives today${orders?.status === "ready" && orders.onTheWay > 0 ? `; ${orders.onTheWay} on the way` : ""}.`));
+  }
+  if (!renewing) {
+    checkLines.push(checkLine("renewals", "Renewals", "/procurement", !!renewals, renewals?.status === "ready"
+      ? `Nothing renews in the next ${renewals.withinDays} days.`
+      : "No subscriptions found in your ledger."));
+  }
+  if (!moneyPanel) {
+    checkLines.push(checkLine("money", "Money", "/financials/budgets", !!money, moneyStatus ? `No alerts to act on. ${moneyStatus.text}` : "No alerts to act on."));
+  }
+  const lifeFailed = (key: keyof LifeChecks) => lifeChecks[key].state === "failed";
   return (
     <div className={styles.today}>
       <header className={styles.header}>
@@ -527,6 +581,15 @@ export default function TodayClient() {
       </div>
       <div className={styles.sectionLabel}><span>03</span><h2>Keep life moving</h2></div>
       <div className={styles.lifeGrid}>
+      {checkLines.length > 0 && <section className={panelStyle} aria-labelledby="checks-heading">
+        <h2 id="checks-heading" className="text-lg font-medium text-text-primary">Also checked</h2>
+        <ul className="mt-3 divide-y divide-border-subtle" aria-label="Checks with nothing due">
+          {checkLines.map((line) => <li key={line.key} className="py-3">
+            <p className="text-xs text-text-secondary"><Link href={line.href} className="text-text-primary hover:underline">{line.label}</Link>{line.when ? ` · ${line.when}` : ""}</p>
+            <p className={`mt-0.5 break-words text-sm ${line.warn ? "text-mid" : "text-text-secondary"}`}>{line.text}</p>
+          </li>)}
+        </ul>
+      </section>}
       {packages && <section className={panelStyle} aria-labelledby="packages-heading">
         <div className="flex items-center gap-2"><Package aria-hidden="true" className="h-5 w-5 text-accent" />
           <h2 id="packages-heading" className="text-lg font-medium text-text-primary">Packages</h2></div>
@@ -537,9 +600,10 @@ export default function TodayClient() {
         {packages.top.length > 0 && <ul className="mt-2 space-y-2" aria-label="Packages that need attention">
           {packages.top.map((t, i) => <li key={i} className="text-xs text-text-secondary"><span className="text-text-primary">{t.merchant}: {t.label}.</span> {t.reason}</li>)}
         </ul>}
+        {lifeFailed("orders") && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh packages. Showing {clock(lifeChecks.orders.at) ? `the check at ${clock(lifeChecks.orders.at)}` : "an earlier check"}; it may have changed.</p>}
         <Link href="/orders" className={`${linkStyle} mt-4 inline-block`}>Open orders</Link>
       </section>}
-      {money && showMoneyPanel(money) && <section className={panelStyle} aria-labelledby="money-heading" aria-busy={money.updating && !money.refreshFailed}>
+      {money && moneyPanel && <section className={panelStyle} aria-labelledby="money-heading" aria-busy={money.updating && !money.refreshFailed}>
         <div className="flex items-center gap-2"><Wallet aria-hidden="true" className="h-5 w-5 text-accent" />
           <h2 id="money-heading" className="text-lg font-medium text-text-primary">Money</h2></div>
         {money.alerts.length > 0 && <ul className="mt-3 space-y-2" aria-label="Money alerts">
@@ -548,7 +612,7 @@ export default function TodayClient() {
             <p className="text-xs text-text-secondary">{a.detail}</p>
           </li>)}
         </ul>}
-        {moneyStatus && <p className={`mt-3 text-sm ${moneyStatus.tone === "warn" ? "text-amber-300" : "text-text-secondary"}`}>{moneyStatus.text}</p>}
+        {moneyStatus && <p className={`mt-3 text-sm ${moneyStatus.tone === "warn" ? "text-mid" : "text-text-secondary"}`}>{moneyStatus.text}</p>}
         <p className="mt-2 text-xs text-text-secondary">From your forecast and budgets. Onyx never moves money.</p>
         <Link href="/financials/budgets" className={`${linkStyle} mt-4 inline-block`}>Open budgets</Link>
       </section>}
@@ -561,6 +625,7 @@ export default function TodayClient() {
         </ul>
         {renewing.count > renewing.soon.length && <p className="mt-1 text-xs text-text-secondary">And {renewing.count - renewing.soon.length} more.</p>}
         <p className="mt-2 text-xs text-text-secondary">Estimated from past charges in your ledger. Onyx never pays or cancels anything.</p>
+        {lifeFailed("renewals") && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh renewals. Showing {clock(lifeChecks.renewals.at) ? `the check at ${clock(lifeChecks.renewals.at)}` : "an earlier check"}; it may have changed.</p>}
         <Link href="/procurement" className={`${linkStyle} mt-4 inline-block`}>Open procurement</Link>
       </section>}
       <section className={panelStyle} aria-labelledby="reading-heading" aria-busy={reading.state === "loading"}>
