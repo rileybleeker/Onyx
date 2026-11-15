@@ -9,7 +9,7 @@ import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
-import { Part, PartGrid } from "@/components/personalize/PartGrid";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import { useInFeed } from "@/components/FeedContext";
 import { chartTooltip, axisTick, gridStyle, axisLabel, sourceColors, chartColors as C } from "@/lib/chart-theme";
 import { mergeDailySteps, stepsSourceLabel } from "@/lib/steps";
@@ -749,14 +749,17 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
       </div>
 
       <PartGrid page="/activities" title="Activities">
-      <Part id="summary" title="Steps, heart rate & stress tiles">
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+      {/* Sections have no heading on screen; Personalize shows their names. */}
+      <PartGroup id="section-summary" title="Summary tiles">
+        <Part id="tile-steps" title="Steps (tile)" width="quarter">
         <StatCard
           label="Steps"
           value={latestSteps ? latestSteps.steps.toLocaleString() : null}
           sublabel={latestSteps ? `${latestSteps.day}${latestSteps.partial ? " so far" : ""}` : undefined}
           source={latestSteps?.source}
         />
+        </Part>
+        <Part id="tile-avg-hr" title="Avg HR (WHOOP)" width="quarter">
         <StatCard
           label="Avg HR"
           value={avgCycleHr != null ? avgCycleHr.toFixed(0) : null}
@@ -764,12 +767,19 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
           sublabel={rangeNote}
           source="WHOOP"
         />
+        </Part>
+        <Part id="tile-max-hr" title="Max HR (Garmin)" width="quarter">
         <StatCard label="Max HR" value={avgMaxHr != null ? avgMaxHr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
+        </Part>
+        <Part id="tile-min-hr" title="Min HR (Garmin)" width="quarter">
         <StatCard label="Min HR" value={avgMinHr != null ? avgMinHr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
+        </Part>
+        <Part id="tile-stress" title="Stress Level (tile)" width="quarter">
         <StatCard label="Stress Level" value={avgStress != null ? avgStress.toFixed(0) : null} sublabel={rangeNote} source="GARMIN" />
-      </div>
-      </Part>
+        </Part>
+      </PartGroup>
 
+      <PartGroup id="section-trends" title="Steps, heart rate & stress charts" gap={24}>
         <Part id="daily-steps" title="Daily Steps" width="half">
         <ChartCard title="Daily Steps" subtitle={rangeLabel(shownRange)} source={stepsSource}>
           <ResponsiveContainer width="100%" height={220}>
@@ -854,7 +864,9 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
           </ResponsiveContainer>
         </ChartCard>
         </Part>
+      </PartGroup>
 
+      <PartGroup id="section-sessions" title="Sessions">
       <Part id="activity-list" title="Activity list">
       {rows.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-center">
@@ -1184,6 +1196,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
         </div>
       )}
       </Part>
+      </PartGroup>
       </PartGrid>
     </>
   );
