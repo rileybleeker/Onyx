@@ -19,7 +19,7 @@ const NO_STORE = { "Cache-Control": "no-store" };
 // Logs a code only (inside the loaders), never a merchant or an amount.
 export async function GET(req: NextRequest) {
   // A same-origin GET carries no Origin header; Sec-Fetch-Site says which site caused it.
-  const site = req.headers.get("sec-fetch-site");
+  const site = req.headers.get("Sec-Fetch-Site"); // Headers.get is case-insensitive
   if (site && site !== "same-origin") return NextResponse.json({ error: "cross_origin" }, { status: 403, headers: NO_STORE });
   try {
     const [detected, reorder] = await Promise.all([loadDetectedSubscriptions(), loadReorderSuggestions()]);

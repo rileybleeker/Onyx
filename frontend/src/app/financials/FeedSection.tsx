@@ -2,7 +2,7 @@
 
 import { useMemo } from "react";
 import InfoHint from "@/components/InfoHint";
-import type { LedgerLoad } from "@/lib/finance-ledger-server";
+import type { LedgerLoad } from "@/lib/finance-ledger-types";
 import FinancialsClient from "./FinancialsClient";
 import LedgerView, { FreshnessLine } from "./LedgerView";
 import { FeedSkeleton, RetryButton, StaleNote, useFinancePageData } from "./feed-data";

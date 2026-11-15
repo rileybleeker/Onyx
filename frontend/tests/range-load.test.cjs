@@ -78,6 +78,8 @@ function mountSleep() {
       "@/components/ChartCard": { __esModule: true, default: () => null },
       "@/components/DeferredMount": { __esModule: true, default: () => null },
       "@/components/RangeFilter": { __esModule: true, default: (p) => { picker.current = p; return null; } },
+      // Personalize layout (#230) is not under test here: parts render their children in place.
+      "@/components/personalize/PartGrid": { Part: ({ children }) => children ?? null, PartGrid: ({ children }) => children ?? null },
     },
   });
   const last = (days) => loads.get(days).at(-1);

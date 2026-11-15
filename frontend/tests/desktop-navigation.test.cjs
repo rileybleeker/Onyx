@@ -60,7 +60,8 @@ const Sidebar = load('src/components/Sidebar.tsx', {
   },
 }).default;
 const render = () => renderToStaticMarkup(React.createElement(Sidebar));
-const hrefs = (html) => [...html.matchAll(/href="([^"]+)"/g)].map((m) => m[1]);
+// Links only: React 19 also emits <link rel="preload" href> for the sidebar's logo <img> (#231).
+const hrefs = (html) => [...html.matchAll(/<a [^>]*?href="([^"]+)"/g)].map((m) => m[1]);
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // Sidebar's element tree, captured inside a real render so its hooks run in React (calling it bare would not).
 function sidebarTree() {

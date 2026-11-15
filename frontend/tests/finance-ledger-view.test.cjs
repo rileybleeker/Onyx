@@ -159,6 +159,8 @@ test("empty month, no balances, warnings", () => {
 function pageFor(load) {
   return loadTs("app/financials/page.tsx", {
     "@/lib/finance-ledger-server": { loadLedger: async () => load },
+    // No request scope offline: no saved Personalize layout cookie (page.tsx reads it since #230).
+    "next/headers": { cookies: async () => ({ get: () => undefined }) },
     "./FinancialsClient": { __esModule: true, default: ({ embedded }) => h("div", { "data-csv": String(!!embedded) }) },
     "./LedgerView": { __esModule: true, default: () => h("div", { "data-ledger": "yes" }), FreshnessLine: View.FreshnessLine },
   });

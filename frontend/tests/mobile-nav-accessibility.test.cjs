@@ -11,6 +11,10 @@ const source = fs.readFileSync(path.join(__dirname, '../src/components/MobileNav
 const tabsJs = ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/lib/mobile-tabs.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 const mobileTabs = { exports: {} };
 vm.runInNewContext(tabsJs, { module: mobileTabs, exports: mobileTabs.exports });
+// Personalize (#235, #240): the real saved-order module (no storage here = default order).
+const navAreasJs = ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/lib/nav-areas.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+const navAreas = { exports: {} };
+vm.runInNewContext(navAreasJs, { module: navAreas, exports: navAreas.exports });
 const icon = () => null;
 const NAV = [
   { title: 'Home', items: [{ href: '/today', label: 'Today', icon }] },
@@ -34,6 +38,9 @@ function render(drawerOpen = false, logOpen = false, unread = 0, pathname = '/to
     if (id === '@/lib/warmup') return { navIntentProps: () => ({}) };
     if (id === './CommandPalette') return { OPEN_COMMAND_PALETTE: 'open-command-palette' };
     if (id === './FeedContext') return { useActiveRoute: () => (pathname === '/' ? '/today' : pathname) };
+    if (id === './personalize/PersonalizeButton') return { __esModule: true, default: (props) => React.createElement('button', props, 'Personalize') };
+    if (id === '@/lib/nav-areas') return navAreas.exports;
+    if (id === '@/lib/personalize-registry') return { currentEditingKey: () => null, editorRef: () => null, subscribeTargets: () => () => {} };
     throw new Error(`Unexpected dependency: ${id}`);
   };
   const js = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
