@@ -608,7 +608,9 @@ test.describe("/nyc apartment search", () => {
 test("/check-in lists today's habit questions", async ({ page }) => {
   await gotoAuthed(page, "/check-in");
   await settle(page);
-  await expect(page.getByText("Check-in", { exact: true }).first()).toBeVisible({ timeout: LOAD_TIMEOUT });
+  // Scoped to <main> (2026-11-15): the sidebar/mobile nav also carries a "Check-in" label, and a hidden copy of it
+  // matched first, so the page heading was never looked at.
+  await expect(page.locator("main").getByRole("heading", { name: "Check-in", exact: true }).first()).toBeVisible({ timeout: LOAD_TIMEOUT });
   await expect(page.getByText(/Couldn't load|Couldn't reach Onyx/)).toHaveCount(0);
   const yesButtons = page.getByRole("button", { name: /: yes$/ });
   await expect(yesButtons.first()).toBeVisible({ timeout: LOAD_TIMEOUT });
