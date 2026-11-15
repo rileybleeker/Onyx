@@ -52,7 +52,10 @@ test("driver bodies: keys, accounts and value fields are checked", () => {
 
 test("rows map to engine inputs", () => {
   const p = S.itemRowToPlanned({ id: "i1", label: "Demo", item_date: "2031-01-29", amount_cents: "5000", certainty: "likely", repeat_unit: "month", repeat_every: 2, repeat_count: 3, note: null });
-  assert.deepEqual(p, { id: "i1", label: "Demo", date: "2031-01-29", amountCents: 5000, certainty: "likely", repeat: { unit: "month", every: 2, count: 3 } });
+  assert.deepEqual(p, { id: "i1", label: "Demo", date: "2031-01-29", amountCents: 5000, certainty: "likely", repeat: { unit: "month", every: 2, count: 3 }, account: undefined });
+  assert.equal(S.itemRowToPlanned({ id: "i2", label: "To brokerage", item_date: "2031-02-01", amount_cents: -100, certainty: "confirmed", repeat_unit: null, repeat_every: null, repeat_count: null, note: null, account_key: "inv1" }).account, "inv1");
+  assert.equal(S.parseItemBody({ label: "x", date: "2031-03-01", amountCents: -1, accountKey: "inv1" }).item.account_key, "inv1");
+  assert.equal(S.parseItemBody({ label: "x", date: "2031-03-01", amountCents: -1, accountKey: "../x" }).ok, false);
   const d = S.driversToInputs([
     { key: "settings", value: { bufferCents: 50000 } },
     { key: "card:a", value: { promoEnds: "2031-06-17", promoNote: "estimated" } },

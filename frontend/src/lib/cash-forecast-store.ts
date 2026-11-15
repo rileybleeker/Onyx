@@ -44,8 +44,9 @@ export interface ItemInput {
   repeat_every: number | null;
   repeat_count: number | null;
   note: string | null;
+  account_key: string | null;
 }
-const ITEM_KEYS = new Set(["label", "date", "amountCents", "certainty", "repeatUnit", "repeatEvery", "repeatCount", "note"]);
+const ITEM_KEYS = new Set(["label", "date", "amountCents", "certainty", "repeatUnit", "repeatEvery", "repeatCount", "note", "accountKey"]);
 
 /** Body {label, date, amountCents (money in +, out -), certainty?, repeatUnit?, repeatEvery?, repeatCount?, note?}. */
 export function parseItemBody(body: unknown): { ok: true; item: ItemInput } | { ok: false; error: string } {
@@ -72,7 +73,12 @@ export function parseItemBody(body: unknown): { ok: true; item: ItemInput } | { 
     if (!Number.isInteger(count) || count < 1 || count > 120) return { ok: false, error: "repeatCount must be 1 to 120" };
   }
   const note = typeof b.note === "string" && b.note.trim() ? b.note.trim().slice(0, 300) : null;
-  return { ok: true, item: { label, item_date: b.date, amount_cents: b.amountCents, certainty: certainty as Certainty, repeat_unit: unit, repeat_every: every, repeat_count: count, note } };
+  let account_key: string | null = null;
+  if (b.accountKey !== undefined && b.accountKey !== null && b.accountKey !== "") {
+    if (typeof b.accountKey !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(b.accountKey)) return { ok: false, error: "bad accountKey" };
+    account_key = b.accountKey;
+  }
+  return { ok: true, item: { label, item_date: b.date, amount_cents: b.amountCents, certainty: certainty as Certainty, repeat_unit: unit, repeat_every: every, repeat_count: count, note, account_key } };
 }
 
 export const isUuid = (s: unknown): s is string => typeof s === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
@@ -88,6 +94,7 @@ export function itemRowToPlanned(r: ItemRow): PlannedItem {
     amountCents: Number(r.amount_cents),
     certainty: r.certainty,
     repeat: r.repeat_unit && r.repeat_count ? { unit: r.repeat_unit, every: r.repeat_every ?? 1, count: r.repeat_count } : undefined,
+    account: r.account_key ?? undefined,
   };
 }
 

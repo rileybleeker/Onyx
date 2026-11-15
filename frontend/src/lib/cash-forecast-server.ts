@@ -21,6 +21,7 @@ const HISTORY_DAYS = 450;
 const MAX_PAGES = 40;
 
 export interface PlanItemView {
+  account: string | null;
   id: string;
   label: string;
   date: string;
@@ -89,7 +90,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const fixesRead = started(loadCategoryFixes(db));
     const planRead = started(
       Promise.all([
-        db.from("finance_plan_items").select("id,label,item_date,amount_cents,certainty,repeat_unit,repeat_every,repeat_count,note").is("removed_at", null).order("item_date", { ascending: true }),
+        db.from("finance_plan_items").select("id,label,item_date,amount_cents,certainty,repeat_unit,repeat_every,repeat_count,note,account_key").is("removed_at", null).order("item_date", { ascending: true }),
         db.from("finance_plan_drivers").select("key,value"),
       ]),
     );
@@ -225,12 +226,17 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
       .filter((d) => d.key.startsWith("scenario:"))
       .map((d) => ({ slug: d.key.slice(9), name: String((d.value as { name?: unknown }).name ?? d.key.slice(9)), params: ((d.value as { params?: ScenarioParams }).params ?? {}) as ScenarioParams }));
     if (bal.truncated || txn.truncated) result.warnings.push("Part of the history was not read (page limit), so the forecast may be off.");
+    const accountLabelsByKey = new Map<string, string>([
+      ...parsedAccounts.map((a) => [a.account_key, accountLabel(a)] as [string, string]),
+      ...drivers.filter((d) => d.key.startsWith("growth:virtual-")).map((d) => [d.key.slice(7), String((d.value as { label?: unknown }).label ?? d.key.slice(7))] as [string, string]),
+    ]);
     const items: PlanItemView[] = itemRows.map((r) => ({
       id: r.id,
       label: r.label,
       date: r.item_date,
       amountCents: r.amount_cents,
       certainty: r.certainty,
+      account: r.account_key ? (accountLabelsByKey.get(r.account_key) ?? r.account_key) : null,
       repeat: r.repeat_unit && r.repeat_count ? `${r.repeat_count} times, every ${r.repeat_every ?? 1} ${r.repeat_unit}${(r.repeat_every ?? 1) > 1 ? "s" : ""}` : null,
       note: r.note,
     }));
