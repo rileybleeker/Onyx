@@ -651,6 +651,56 @@ test.describe("Today home", () => {
   });
 });
 
+// /today (2026-11-15): the routed Today page (the test above opens "/"). Its request, urgent-email and calendar
+// panels each read their own source; a failed read shows the panel's "Couldn't check ..." line. Those syncs run
+// daily, so a failed-read line is a real break. Stale "Couldn't refresh ..." lines (slow network) and the number of
+// requests, emails or events (legitimately zero some days) are not asserted.
+test("/today renders without the panel-level failed-check states", async ({ page }) => {
+  await gotoAuthed(page, "/today");
+  await settle(page);
+  await expect(
+    pageHeading(page, page.locator("main").getByRole("heading", { name: "Today", exact: true })),
+    "/today did not render its Today heading"
+  ).toBeVisible({ timeout: LOAD_TIMEOUT });
+  // Each panel settles from its loading line into ready or error; wait for that before checking the error lines.
+  for (const loading of ["Checking agent requests...", "Checking email...", "Checking your calendar..."]) {
+    await expect(page.getByText(loading, { exact: true }), `a Today panel did not settle: "${loading}"`).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+  }
+  for (const failed of [
+    "Couldn't check requests. Open your inbox or try refreshing.",
+    "Couldn't check urgent email. Try refreshing.",
+    "Couldn't check the calendar. Try refreshing.",
+  ]) {
+    await expect(page.getByText(failed, { exact: true }), `Today panel failed to load: "${failed}"`).toHaveCount(0);
+  }
+  await expectNoClientCrash(page);
+});
+
+// /analytics/travel (2026-11-15): the Flights table is filled by the Delta email ETL (every 3 hours) and holds
+// every parsed segment, so it is never legitimately empty. The tripwire: the Flights card renders table rows and
+// its empty-state line is absent. Never reads or compares a flight, date, route or confirmation number.
+test("/analytics/travel lists flights in the Flights card", async ({ page }) => {
+  await gotoAuthed(page, "/analytics/travel");
+  await settle(page);
+  await expect(
+    pageHeading(page, page.locator("main").getByRole("heading", { name: "Travel Analysis", exact: true })),
+    "/analytics/travel did not render its Travel Analysis heading"
+  ).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(
+    page.getByText("No flights parsed yet", { exact: false }),
+    "Flights card shows its empty state"
+  ).toHaveCount(0);
+  const flightsCard = page
+    .locator("main div.bg-surface-card")
+    .filter({ has: page.getByRole("heading", { name: "Flights", exact: true }) })
+    .last();
+  await expect(flightsCard, "Flights card did not render").toBeVisible({ timeout: LOAD_TIMEOUT });
+  const rows = flightsCard.locator("table tbody tr");
+  await expect(rows.first(), "Flights table rendered no rows").toBeVisible({ timeout: LOAD_TIMEOUT });
+  expect(await rows.count(), "Flights table rendered no rows").toBeGreaterThan(0);
+  await expectNoClientCrash(page);
+});
+
 // /procurement (2026-11-11; renewal estimates 2026-11-13): read-only advice. It talks to no
 // merchant, so the tripwire is: the page renders behind the login, the ledger read behind the
 // detected-subscriptions card and the order-history read behind the purchase suggestions did
