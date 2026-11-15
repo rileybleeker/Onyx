@@ -18,7 +18,9 @@ PR to merge in about a minute.
 
 `scheduled-tests.yml` runs the rest of the suite against master every 30 minutes: `frontend-types` (all `frontend/tests/*.test.cjs` and `scripts/test-*.mjs`, `tsc`, a compile-only `next build`, the Today browser regressions), `lint` (`npm run lint`, which the Vercel build skips), `stats-tests` (`tests/run_offline_tests.py`, no secrets) and `focus-policy`. A commit that already passed is skipped in seconds. A failure never blocks a merge or a deploy: the run goes red, the cloud watchdog raises it (`scheduled-tests-failed`), and the fix ships as a normal PR. `focus-ios`, `kindle-harvester-test` and `rocketmoney-harvester-test` run after merge (push to master, path-filtered), not per PR. Run the suite by hand: Actions > Scheduled tests > Run workflow (`force` re-tests a commit that passed).
 
-## What the train will not merge (the owner does)
+## Merge ownership and exclusions
+
+Branches under `builder/` belong exclusively to the local feature worker in `personal-agents/local/feature_worker.py`. The train skips them even when ready and green: it never selects them for an update, CI dispatch or merge. Only the worker has the exact-head review and type-check receipt, and its merge uses `--match-head-commit`. Marking a PR ready does not pin its head; letting the train independently merge a later head would bypass that receipt. Land this exclusion before activating the worker's exact-head guard. If the worker is unavailable, the PR waits for worker recovery or an explicit owner decision; the train does not take over. Ordinary feature branches and `rollback/` retain their existing rules.
 
 Drafts, forks, PRs from anyone but the owner login, PRs with the `hold` label, conflicts, any red or running check (the Vercel Preview Comments check is ignored), more than 100 files, and any PR touching a protected path: `.github/**`, the train itself, auth/login/token/session code, `middleware.ts`, RLS/owner-read SQL, `.env*`, `vercel.json`, `CODEOWNERS`.
 
