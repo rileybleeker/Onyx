@@ -30,6 +30,10 @@ component = component.replace(/require\("@\/lib\/money-alerts-view"\)/g, `requir
 // tests (frontend/tests/overview-cards.test.cjs); here they render nothing, so this file keeps checking Today's
 // own panels and exactly the requests those panels make.
 component = component.replace(/require\("@\/components\/overview\/TodayOverview"\)/g, '({__esModule:true,default:()=>null})');
+// Personalize (components/personalize/PartGrid, tested in frontend/tests/personalize.test.cjs): here the grid
+// renders its parts in the default order, as the server does, so this file keeps checking the panels themselves.
+component = component.replace(/require\("@\/components\/personalize\/PartGrid"\)/g,
+  '({__esModule:true,Part:({children})=>React.createElement(React.Fragment,null,children),PartGrid:({children})=>React.createElement("div",{className:"pz-grid"},children)})');
 // GET /api/experiments/today answers (synthetic). "none" is the usual case: no trial registered.
 const experimentFixtures = {
     none: { status: 'none' },
