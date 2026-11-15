@@ -101,6 +101,10 @@ function mountPage(t, { onPost, onDelete, today = () => ({ date: TODAY, intakes:
       "@/components/StackEditorModal": none,
       "@/components/CustomSupplementFlow": none,
       "@/components/ChartCard": { __esModule: true, default: passthrough },
+      // /supplements is a personalized page since #267; the grid and table use React context, which this hook
+      // shim does not provide. Same passthrough as tests/range-load.test.cjs; no assertion reads the totals table.
+      "@/components/personalize/PartGrid": { PartGrid: ({ children }) => children, PartGroup: ({ children }) => children, Part: ({ children }) => children },
+      "@/components/personalize/PersonalTable": none,
     },
   });
   t.after(() => h.unmount());
