@@ -256,3 +256,28 @@ test("amazon import: an undated delivery (same-day) is dated to the order day, n
   const e = A.eventsFor(amz({ status: "delivered", status_on: null, expected_on: null, ordered_on: "2026-10-23" }), "2026-11-13T03:50:00.000Z");
   assert.equal(e[1].received_at, "2026-10-23T21:00:00+00:00");
 });
+
+// ─── the page's section of the continuous scroll (app/orders/FeedSection.tsx) ─
+
+test("feed: /api/orders/page-data answers what the page renders; GET only, same-origin, no-store, code-only logs", async () => {
+  const fakeNext = { NextResponse: { json: (body, init = {}) => ({ status: init.status ?? 200, body, headers: init.headers ?? {} }) } };
+  const load = (impl) => loadTs("app/api/orders/page-data/route.ts", { "next/server": fakeNext, "@/lib/online-orders-server": { loadOrders: impl } });
+  const data = { state: "ready", orders: [], marks: [], lastSync: null };
+  const route = load(async () => data);
+  assert.deepEqual(Object.keys(route).filter((k) => typeof route[k] === "function"), ["GET"]);
+  const req = (site) => ({ headers: new Headers(site ? { "sec-fetch-site": site } : {}) });
+  const ok = await route.GET(req("same-origin"));
+  assert.deepEqual([ok.status, ok.body, ok.headers["Cache-Control"]], [200, data, "no-store"]);
+  assert.equal((await route.GET(req(null))).status, 200);
+  assert.equal((await route.GET(req("cross-site"))).status, 403);
+  const original = console.error;
+  const logged = [];
+  console.error = (...args) => logged.push(args.join(" "));
+  try {
+    const failed = await load(async () => { throw new Error("Example Store order 1001"); }).GET(req("same-origin"));
+    assert.deepEqual([failed.status, failed.headers["Cache-Control"]], [500, "no-store"]);
+  } finally {
+    console.error = original;
+  }
+  assert.doesNotMatch(logged.join("\n"), /Example Store|1001/);
+});

@@ -27,7 +27,12 @@ function ago(iso: string, now: Date): string {
   return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`;
 }
 
-export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIso: string }) {
+/**
+ * The /orders screen. `feed`: drawn as this page's section of the continuous scroll (app/orders/FeedSection.tsx):
+ * the heading carries the feed's test id and the section ids get a prefix, so they never clash with the routed page.
+ */
+export default function OrdersClient({ data, nowIso, feed = false }: { data: OrdersLoad; nowIso: string; feed?: boolean }) {
+  const idPrefix = feed ? "feed-orders-" : "";
   const [now, setNow] = useState(() => new Date(nowIso));
   const [marks, setMarks] = useState<OrderMark[]>(data.state === "ready" ? data.marks : []);
   const [saving, setSaving] = useState<Set<string>>(new Set());
@@ -119,9 +124,9 @@ export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIs
   function section(id: string, title: string, icon: ReactNode, list: ClassifiedOrder[], hint?: string) {
     if (!list.length) return null;
     return (
-      <section className={panel} aria-labelledby={id}>
+      <section className={panel} aria-labelledby={idPrefix + id}>
         <div className="flex items-center gap-2">{icon}
-          <h2 id={id} className="text-lg font-medium text-text-primary">{title} <span className="text-text-secondary">({list.length})</span></h2>
+          <h2 id={idPrefix + id} className="text-lg font-medium text-text-primary">{title} <span className="text-text-secondary">({list.length})</span></h2>
         </div>
         {hint && <p className="mt-1 text-xs text-text-secondary">{hint}</p>}
         <ul className="mt-2 divide-y divide-border-subtle">
@@ -136,7 +141,7 @@ export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIs
     <div className="mx-auto max-w-2xl space-y-5">
       <header>
         <div className="flex items-center gap-2">
-          <h1 data-testid="page-heading" className="text-[30px] font-medium text-text-primary">Orders</h1>
+          <h1 data-testid={feed ? "feed-page-heading" : "page-heading"} className="text-[30px] font-medium text-text-primary">Orders</h1>
           <InfoHint label="Orders">
             <p>Online orders from shipping and delivery emails (both Gmail accounts) and your Amazon order history, checked every 3 hours.</p>
             <p>Got it and Hide only change this page. Onyx never replies to, labels or marks these emails.</p>
@@ -176,9 +181,9 @@ export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIs
         "These stores don't email on delivery. Tap Got it once it's here.")}
 
       {groups.recent.length > 0 && (
-        <section className={panel} aria-labelledby="recent-heading">
+        <section className={panel} aria-labelledby={`${idPrefix}recent-heading`}>
           <div className="flex items-center gap-2"><CheckCircle2 aria-hidden="true" className="h-5 w-5 text-emerald-400" />
-            <h2 id="recent-heading" className="text-lg font-medium text-text-primary">Delivered, last 30 days <span className="text-text-secondary">({groups.recent.length})</span></h2>
+            <h2 id={`${idPrefix}recent-heading`} className="text-lg font-medium text-text-primary">Delivered, last 30 days <span className="text-text-secondary">({groups.recent.length})</span></h2>
           </div>
           <ul className="mt-2 divide-y divide-border-subtle">
             {groups.recent.map((c) => row(c, c.markedReceived ? "undo" : "none"))}

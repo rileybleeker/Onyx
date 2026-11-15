@@ -259,3 +259,75 @@ test("a failed last sync is called out, and ?days= reaches the reader clamped", 
   assert.match(r.html, /aria-current="page"[^>]*>90d</);
   assert.equal((await renderPage({ kind: "empty", windowDays: 180, sync: null }, { days: "9999" })).asked, 180);
 });
+
+// ── The page's section of the continuous scroll (FeedSection.tsx) ──────────────────────────────
+const V = loadTs("lib/screen-time-view.ts");
+const fakeNext = { NextResponse: { json: (body, init = {}) => ({ status: init.status ?? 200, body, headers: init.headers ?? {} }) } };
+
+test("feed: the view data is what the screen shows, never the day rows", () => {
+  const days = S.shapeScreenRows([row("2030-01-10"), row("2030-01-11"), row("2030-01-12", PARTIAL)]);
+  const v = V.screenTimeViewData({ kind: "ok", windowDays: 30, days, skippedRows: 1, sync: null });
+  assert.equal(v.kind, "ok");
+  assert.ok(!("days" in v));
+  assert.equal(v.skippedRows, 1);
+  assert.deepEqual(v.summary, S.summarize(days));
+  assert.deepEqual(v.points, S.chartPoints(days));
+  assert.deepEqual(v.topApps, S.topEntries(days, "byApp"));
+  assert.deepEqual(v.topCategories, S.topEntries(days, "byCategory"));
+  const empty = { kind: "empty", windowDays: 14, sync: null };
+  assert.deepEqual(V.screenTimeViewData(empty), empty);
+  const roundTrip = JSON.parse(JSON.stringify(v));
+  assert.deepEqual(V.readScreenTimeViewData(roundTrip), roundTrip);
+  for (const bad of [null, [], {}, { kind: "ok" }, { kind: "empty" }, { kind: "error" }, { kind: "other", hint: "x" }]) {
+    assert.throws(() => V.readScreenTimeViewData(bad));
+  }
+  // Memory only in the client cache, like the page's own payload.
+  assert.equal(loadTs("lib/client-cache.ts").isSensitiveKey("/api/screen-time/page-data?days=30"), true);
+});
+
+test("feed: /api/screen-time/page-data answers the page's view data for ?days=; GET only, same-origin, no-store", async () => {
+  let asked = null;
+  const route = loadTs("app/api/screen-time/page-data/route.ts", {
+    "next/server": fakeNext,
+    "@/lib/screen-time-server": {
+      loadScreenTime: async (d) => {
+        asked = d;
+        return { kind: "empty", windowDays: d, sync: null };
+      },
+    },
+  });
+  assert.deepEqual(Object.keys(route).filter((k) => typeof route[k] === "function"), ["GET"]);
+  const req = (qs, site = "same-origin") => ({
+    headers: new Headers({ "sec-fetch-site": site }),
+    nextUrl: new URL(`https://onyx.example/api/screen-time/page-data${qs}`),
+  });
+  const res = await route.GET(req("?days=90"));
+  assert.deepEqual([res.status, res.body, res.headers["Cache-Control"]], [200, { kind: "empty", windowDays: 90, sync: null }, "no-store"]);
+  await route.GET(req("?days=9999"));
+  assert.equal(asked, 180);
+  await route.GET(req(""));
+  assert.equal(asked, 30);
+  assert.equal((await route.GET(req("", "cross-site"))).status, 403);
+  // Session only: not in middleware's CI-token carve-out.
+  assert.ok(!fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8").includes("/api/screen-time/page-data"));
+});
+
+test("feed: the scroll section draws the same screen, with window buttons and the feed heading", () => {
+  const View = loadTs("app/screen-time/ScreenTimeView.tsx", {
+    "next/link": { __esModule: true, default: ({ href, children, ...rest }) => React.createElement("a", { href, ...rest }, children) },
+    "./ScreenTimeCharts": { __esModule: true, default: ({ points }) => React.createElement("div", { "data-charts": points.length }) },
+  }).default;
+  const draw = (props) => renderToStaticMarkup(React.createElement(View, { feed: true, onWindow: () => {}, ...props }));
+  const empty = draw({ data: { kind: "empty", windowDays: 14, sync: null }, windowDays: 14 });
+  assert.ok(empty.startsWith("<section"));
+  assert.ok(empty.includes('data-testid="feed-page-heading"') && !empty.includes('data-testid="page-heading"'));
+  assert.ok(empty.includes(`>${EMPTY}<`));
+  assert.match(empty, /aria-pressed="true"[^>]*>14d</);
+  assert.doesNotMatch(empty, /href="\/screen-time\?days=/);
+  const days = S.shapeScreenRows([row("2030-01-10"), row("2030-01-11")]);
+  const ok = draw({ data: V.screenTimeViewData({ kind: "ok", windowDays: 30, days, skippedRows: 0, sync: null }), windowDays: 30 });
+  assert.ok(ok.includes('data-charts="2"') && ok.includes("App One") && ok.includes("2 complete days"));
+  const loading = draw({ data: null, windowDays: 30 });
+  assert.ok(loading.includes("Loading Screen Time") && loading.includes('aria-busy="true"'));
+  assert.ok(!loading.includes(FAILED) && !loading.includes(EMPTY));
+});

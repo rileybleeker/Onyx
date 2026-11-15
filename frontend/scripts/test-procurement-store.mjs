@@ -166,7 +166,7 @@ assert.ok(fetches.length > 0 && fetches.every(f => f === 'SUBSCRIPTIONS_API' || 
 // The other files of the page: the detected-subscriptions card may call ONE thing, the PATCH that
 // remembers a dismissed flag; nothing else makes a request, and none has an order button.
 const pageFiles = fs.readdirSync(new URL('src/app/procurement/', root)).filter(f => /\.tsx?$/.test(f)).sort();
-assert.deepEqual(pageFiles, ['DetectedSubscriptions.tsx', 'ProcurementClient.tsx', 'ReorderSuggestions.tsx', 'loading.tsx', 'page.tsx']);   // loading.tsx = the #192 skeleton
+assert.deepEqual(pageFiles, ['DetectedSubscriptions.tsx', 'FeedSection.tsx', 'ProcurementClient.tsx', 'ReorderSuggestions.tsx', 'loading.tsx', 'page.tsx']);   // loading.tsx = the #192 skeleton; FeedSection.tsx = this page in the continuous scroll
 for (const file of pageFiles.filter(f => f !== 'ProcurementClient.tsx')) {
   const src = read('src/app/procurement/' + file);
   const calls = [...src.matchAll(/\bfetch\(([^,)]+)/g)].map(m => m[1].trim());
@@ -182,7 +182,10 @@ const routeFiles = [];
 // The tracker routes, the read-only renewals summary Today reads (GET only; tests/procurement-renewals.test.cjs)
 // and the flag-dismissal route (PATCH only; tests/procurement-flags.test.cjs).
 // The renewal claim (POST only; tests/procurement-renewal-claim.test.cjs) is the Worker's poll for /agents cards.
-assert.deepEqual(routeFiles.sort(), ['src/app/api/procurement/flags/route.ts', 'src/app/api/procurement/renewals/claim/route.ts', 'src/app/api/procurement/renewals/summary/route.ts', 'src/app/api/procurement/subscriptions/[id]/route.ts', 'src/app/api/procurement/subscriptions/route.ts'], 'only the tracker routes, the renewals summary, the renewal claim and the flag dismissal exist under /api/procurement');
+// page-data (GET only) answers what the page renders, for its section of the continuous scroll.
+assert.deepEqual(routeFiles.sort(), ['src/app/api/procurement/flags/route.ts', 'src/app/api/procurement/page-data/route.ts', 'src/app/api/procurement/renewals/claim/route.ts', 'src/app/api/procurement/renewals/summary/route.ts', 'src/app/api/procurement/subscriptions/[id]/route.ts', 'src/app/api/procurement/subscriptions/route.ts'], 'only the tracker routes, the page data, the renewals summary, the renewal claim and the flag dismissal exist under /api/procurement');
+assert.deepEqual([...read('src/app/api/procurement/page-data/route.ts').matchAll(/export async function (\w+)/g)].map(m => m[1]), ['GET'], 'the page data is read-only');
+assert.match(read('src/app/api/procurement/page-data/route.ts'), /"Cache-Control": "no-store"/, 'the page data is never cached by the browser or CDN');
 assert.deepEqual([...read('src/app/api/procurement/renewals/claim/route.ts').matchAll(/export async function (\w+)/g)].map(m => m[1]), ['POST'], 'the renewal claim is one POST');
 assert.deepEqual([...read('src/app/api/procurement/renewals/summary/route.ts').matchAll(/export async function (\w+)/g)].map(m => m[1]), ['GET'], 'the renewals summary is read-only');
 assert.deepEqual([...read('src/app/api/procurement/flags/route.ts').matchAll(/export async function (\w+)/g)].map(m => m[1]), ['PATCH'], 'the flags route only records a dismissal');
