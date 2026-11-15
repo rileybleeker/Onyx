@@ -28,7 +28,8 @@ import {
   type PageLayout,
   type StoredLayout,
 } from "./personalize-layout";
-import { setEditingKey } from "./personalize-registry";
+import { setEditingKey, setEditorRef } from "./personalize-registry";
+import { AREAS_KEY, LAYOUT_EVENT } from "./nav-areas";
 
 export const PULL_EVERY_MS = 15 * 60_000;
 
@@ -94,27 +95,39 @@ export function adoptPending(key: string, page: string) {
 
 // ---- Personalize session ----------------------------------------------------------------------------------
 
-interface Session {
-  key: string;
-  page: string;
-  title: string;
+interface Draft {
   draft: PageLayout;
   base: PageLayout;
   /** Riley has changed something in this session. */
   touched: boolean;
 }
 
+interface Session {
+  /** The page being personalized (its layout key), or AREAS_KEY for the app-wide arrangement. */
+  key: string;
+  page: string;
+  title: string;
+  /** Drafts by layout key: the page's own, plus layout.areas once the side panel is rearranged. */
+  drafts: Record<string, Draft>;
+}
+
 let session: Session | null = null;
 let editor: unknown = null;
 
-/** What a grid shows: the draft while its page is being personalized, else the saved layout. */
+/** What a grid shows: the draft while it is being personalized, else the saved layout. */
 export function layoutSnapshot(key: string): PageLayout {
-  if (session && session.key === key) return session.draft;
-  return savedLayout(key);
+  const d = session?.drafts[key];
+  return d ? d.draft : savedLayout(key);
 }
 
+/** The page (key) of the open Personalize session is this one. */
 export function isEditing(key: string): boolean {
   return session !== null && session.key === key;
+}
+
+/** A Personalize session is open (any page): the side panel can be rearranged. */
+export function isPersonalizing(): boolean {
+  return session !== null;
 }
 
 export function editingSession(): Readonly<Session> | null {
@@ -129,6 +142,7 @@ export function editorSnapshot(): unknown {
 export function setEditorModule(mod: unknown) {
   if (editor === mod) return;
   editor = mod;
+  setEditorRef(mod);
   emit();
 }
 
@@ -136,38 +150,53 @@ export function beginEdit(key: string, page: string, title: string) {
   if (session?.key === key) return;
   if (session) endEdit(true);
   const base = savedLayout(key);
-  session = { key, page, title, draft: base, base, touched: false };
+  session = { key, page, title, drafts: { [key]: { draft: base, base, touched: false } } };
   pagesByKey.set(key, page);
   setEditingKey(key);
   emit();
-  // Edit the newest copy: another device may have changed this page since it was last checked.
+  // Edit the newest copies: another device may have changed this page or the area order since last checked.
   void pull(key, true);
+  if (key !== AREAS_KEY) void pull(AREAS_KEY, true);
 }
 
-export function updateDraft(fn: (layout: PageLayout) => PageLayout) {
+/** Change the draft of `key` (default: the session's page). The draft is created from the saved layout. */
+export function updateDraftFor(key: string, fn: (layout: PageLayout) => PageLayout) {
   if (!session) return;
-  const draft = fn(session.draft);
-  if (draft === session.draft) return;
-  session = { ...session, draft, touched: true };
+  const cur = session.drafts[key] ?? { draft: savedLayout(key), base: savedLayout(key), touched: false };
+  const draft = fn(cur.draft);
+  if (draft === cur.draft) return;
+  session = { ...session, drafts: { ...session.drafts, [key]: { ...cur, draft, touched: true } } };
   emit();
 }
 
-/** End Personalize mode: Done (save = true) keeps the draft, Cancel throws it away. */
+export function updateDraft(fn: (layout: PageLayout) => PageLayout) {
+  if (session) updateDraftFor(session.key, fn);
+}
+
+function commitTouched(s: Session, skip?: string) {
+  for (const [key, d] of Object.entries(s.drafts)) {
+    if (key === skip) continue;
+    if (d.touched && JSON.stringify(d.draft) !== JSON.stringify(d.base)) commit(key, d.draft);
+  }
+}
+
+/** End Personalize mode: Done (save = true) keeps the drafts, Cancel throws them away. */
 export function endEdit(save: boolean) {
   const s = session;
   if (!s) return;
   session = null;
   setEditingKey(null);
-  if (save && s.touched && JSON.stringify(s.draft) !== JSON.stringify(s.base)) commit(s.key, s.draft);
+  if (save) commitTouched(s);
   emit();
 }
 
-/** "Clear personalization": the page goes back to its default layout, here and on the other devices. */
+/** "Clear personalization": this page goes back to its default layout, here and on the other devices. */
 export function clearAndEnd() {
   const s = session;
   if (!s) return;
   session = null;
   setEditingKey(null);
+  commitTouched(s, s.key);
   commit(s.key, EMPTY_LAYOUT);
   emit();
 }
@@ -178,7 +207,13 @@ function commit(key: string, layout: PageLayout) {
   write(key, { layout: clean, updatedAt: prev?.updatedAt ?? null, savedAt: Date.now(), dirty: true, checkedAt: prev?.checkedAt ?? 0 });
   pending.delete(key);
   writeCookie(pagesByKey.get(key), clean);
+  announceLayout(key);
   void push(key);
+}
+
+/** The sidebar and the continuous scroll re-read this device's copy (other tabs get a storage event). */
+function announceLayout(key: string) {
+  try { window.dispatchEvent(new CustomEvent(LAYOUT_EVENT, { detail: key })); } catch { /* ignore */ }
 }
 
 // ---- server copy ------------------------------------------------------------------------------------------
@@ -248,17 +283,22 @@ async function pull(key: string, applyNow: boolean) {
   const rec: StoredLayout = { layout: sanitizeLayout(pref.value), updatedAt: pref.updatedAt, savedAt: local?.savedAt ?? null, dirty: false, checkedAt: now };
   try { window.localStorage.setItem(storageKey(key), serializeStored(rec)); } catch { /* ignore */ }
   writeCookie(pagesByKey.get(key), rec.layout);
-  if (applyNow && session?.key === key && !session.touched) {
+  const d = session?.drafts[key];
+  if (session && d) {
     records.set(key, rec);
-    session = { ...session, draft: rec.layout, base: rec.layout };
+    // Not changed yet in this session: edit the newest copy. Already changed: keep the draft (Done overwrites).
+    const next: Draft = d.touched ? { ...d, base: rec.layout } : { draft: rec.layout, base: rec.layout, touched: false };
+    session = { ...session, drafts: { ...session.drafts, [key]: next } };
     emit();
-  } else if (session?.key === key) {
-    // Riley is already editing: keep the draft, the server copy is overwritten on Done.
+  } else if (applyNow || key === AREAS_KEY) {
+    // The area order drives the side panel (pre-painted from this copy) and the scroll below the fold.
     records.set(key, rec);
-    session = { ...session, base: rec.layout };
+    pending.delete(key);
+    emit();
   } else {
     pending.set(key, rec);
   }
+  announceLayout(key);
 }
 
 /** A grid mounted (normal mode): in an idle slot after the page has loaded, sync this page with the server. */

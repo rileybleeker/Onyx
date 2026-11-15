@@ -41,8 +41,12 @@ import {
   type DropItem,
   type DropTarget,
 } from "@/lib/personalize-ops";
-import { clearAndEnd, editingSession, endEdit, subscribe, updateDraft } from "@/lib/personalize-store";
+import { clearAndEnd, editingSession, endEdit, subscribe, updateDraft, updateDraftFor } from "@/lib/personalize-store";
+import { AREAS_KEY } from "@/lib/nav-areas";
 import type { GridApi } from "./PartGrid";
+import { announce, setSpeaker } from "./editor-shared";
+
+export { SidebarArranger, DrawerArranger } from "./NavArranger";
 
 /**
  * Personalize mode (loaded only when it starts). Emulates Business Central's personalization:
@@ -65,11 +69,20 @@ const GAP_SHIFT = 8;
 
 // ---- shared bits ------------------------------------------------------------------------------------------
 
-let say: (text: string) => void = () => {};
+// ---- the grids on screen (the banner lists their hidden parts) ------------------------------------------
 
-/** Screen-reader announcement (the banner owns the live region). */
-function announce(text: string) {
-  say(text);
+const gridApis = new Map<string, GridApi>();
+const gridListeners = new Set<() => void>();
+let gridVersion = 0;
+
+function gridsChanged() {
+  gridVersion++;
+  for (const fn of Array.from(gridListeners)) fn();
+}
+
+function subscribeGrids(fn: () => void): () => void {
+  gridListeners.add(fn);
+  return () => { gridListeners.delete(fn); };
 }
 
 function useMedia(query: string): boolean {
@@ -543,6 +556,15 @@ export function GridEditor({ api }: { api: GridApi }) {
   latest.current = api;
 
   useEffect(() => {
+    gridApis.set(k, api);
+    gridsChanged();
+  });
+  useEffect(() => () => {
+    gridApis.delete(k);
+    gridsChanged();
+  }, [k]);
+
+  useEffect(() => {
     let c = controllers.get(k);
     if (!c) {
       c = new Controller(latest.current);
@@ -718,21 +740,22 @@ function useSession() {
   return useSyncExternalStore(subscribe, editingSession, () => null);
 }
 
-export function Banner({ api }: { api: GridApi }) {
+export function Banner() {
   const session = useSession();
   const ref = useRef<HTMLDivElement>(null);
   const [confirming, setConfirming] = useState(false);
   const [message, setMessage] = useState("");
-  const hidden = api.parts.filter((p) => p.hidden);
+  useSyncExternalStore(subscribeGrids, () => gridVersion, () => 0);
+  const pageGrids = Array.from(gridApis.values()).filter((g) => session !== null && g.key === session.key);
+  const hidden = pageGrids.flatMap((g) => g.parts.filter((p) => p.hidden).map((p) => ({ grid: g, part: p })));
+  const app = session?.key === AREAS_KEY && pageGrids.length === 0;
 
   useEffect(() => {
-    say = (text: string) => {
+    setSpeaker((text: string) => {
       setMessage("");
       requestAnimationFrame(() => setMessage(text));
-    };
-    return () => {
-      say = () => {};
-    };
+    });
+    return () => setSpeaker(null);
   }, []);
 
   // Room for the banner above the page, as long as it is open.
@@ -751,14 +774,15 @@ export function Banner({ api }: { api: GridApi }) {
     };
   }, []);
 
-  const pageTitle = session?.title ?? api.title;
+  if (!session) return null;
+  const pageTitle = session.title;
 
   const addItems = (): MenuItem[] =>
-    hidden.map((p) => ({
+    hidden.map(({ grid, part: p }) => ({
       label: p.title,
       icon: <Plus className="h-3.5 w-3.5" />,
       onSelect: () => {
-        updateDraft((l) => setPartHidden(l, api.zone, api.defs, p.id, false));
+        updateDraftFor(grid.key, (l) => setPartHidden(l, grid.zone, grid.defs, p.id, false));
         announce(`${p.title} added.`);
         focusLater(`[data-part="${cssId(p.id)}"] [data-pz-handle]`);
       },
@@ -772,12 +796,17 @@ export function Banner({ api }: { api: GridApi }) {
           <p className="min-w-0 truncate text-[13px] text-text-primary">
             <span className="font-semibold">Personalizing</span> <span className="text-text-secondary">{pageTitle}</span>
           </p>
-          <p className="hidden text-[11px] text-text-tertiary lg:block">Drag a part to move it · ⋯ for more</p>
+          <p className="hidden text-[11px] text-text-tertiary lg:block">
+            {app ? "Drag pages or section names in the side panel to reorder them" : "Drag a part to move it · ⋯ for more · the side panel can be rearranged too"}
+          </p>
+          {app && <p className="text-[11px] text-text-tertiary md:hidden">Open More to reorder pages</p>}
         </div>
         {confirming ? (
           <div className="flex w-full flex-wrap items-center gap-2 md:w-auto" role="alertdialog" aria-label="Clear personalization">
             <p className="min-w-0 flex-1 text-[12px] text-text-secondary">
-              Put every part and column of this page back in its default place and size? This can&apos;t be undone.
+              {app
+                ? "Put the side panel and the scroll back in their default order? This can't be undone."
+                : "Put every part and column of this page back in its default place and size? This can't be undone."}
             </p>
             <button type="button" className={btn} onClick={() => setConfirming(false)} autoFocus>
               Keep my layout

@@ -16,6 +16,7 @@ export interface PersonalizeTarget {
 
 let targets: PersonalizeTarget[] = [];
 let editingKey: string | null = null;
+let editorMod: unknown = null;
 const listeners = new Set<() => void>();
 
 function emit() {
@@ -55,7 +56,21 @@ export function currentEditingKey(): string | null {
   return editingKey;
 }
 
-/** Fired by the command palette / menu entries; same as clicking "Personalize". */
+/** The loaded editor module (opaque; set by components/personalize/editor-loader.ts), so the shell can draw it. */
+export function setEditorRef(mod: unknown) {
+  if (editorMod === mod) return;
+  editorMod = mod;
+  emit();
+}
+
+export function editorRef(): unknown {
+  return editorMod;
+}
+
+/**
+ * Personalize the page on screen. Returns false when the page has no parts of its own: the caller then opens the
+ * app-wide arrangement (components/personalize/start.ts).
+ */
 export function startPersonalize(): boolean {
   const t = currentTarget();
   if (!t) return false;

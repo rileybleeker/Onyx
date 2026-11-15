@@ -2,31 +2,28 @@
 
 import { useSyncExternalStore } from "react";
 import { Settings2 } from "lucide-react";
-import { currentEditingKey, currentTarget, subscribeTargets } from "@/lib/personalize-registry";
+import { currentEditingKey, subscribeTargets } from "@/lib/personalize-registry";
+import { personalizeNow, preloadPersonalize } from "./start";
 
 const none = () => null;
 
 /**
- * "Personalize" in the sidebar footer and the phone's More drawer (BC: Settings ⚙ → Personalize). Shown only on
- * a page that has personalizable parts. Hover / focus starts loading the editor so the banner opens at once.
+ * "Personalize" in the sidebar footer and the phone's More drawer (BC: Settings ⚙ → Personalize), on every page.
+ * A page with parts personalizes its parts (and the side panel); any other page opens the side panel arrangement.
+ * Hover / focus starts loading the editor so the banner opens at once.
  */
-export default function PersonalizeButton({ className, onStart }: { className?: string; onStart?: () => void }) {
-  const target = useSyncExternalStore(subscribeTargets, currentTarget, none);
+export default function PersonalizeButton({ className, onStart }: { className?: string; onStart?: (kind: "page" | "app") => void }) {
   const editing = useSyncExternalStore(subscribeTargets, currentEditingKey, none);
-  if (!target) return null;
-  const active = editing === target.key;
+  const active = editing !== null;
   return (
     <button
       type="button"
-      onClick={() => {
-        onStart?.();
-        target.start();
-      }}
-      onPointerEnter={target.preload}
-      onFocus={target.preload}
+      onClick={() => onStart?.(personalizeNow())}
+      onPointerEnter={preloadPersonalize}
+      onFocus={preloadPersonalize}
       disabled={active}
       aria-pressed={active}
-      title={active ? "Personalizing this page" : "Move, hide, resize and collapse the parts of this page"}
+      title={active ? "Personalizing" : "Move, hide, resize and collapse the parts of this page, and rearrange the side panel"}
       className={className}
     >
       <Settings2 className="w-[17px] h-[17px] shrink-0" strokeWidth={1.75} aria-hidden />

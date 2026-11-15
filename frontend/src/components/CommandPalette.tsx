@@ -1,13 +1,13 @@
 "use client";
 
-import { useState, useEffect, useRef, useMemo, useCallback, useSyncExternalStore } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Search, CornerDownLeft, Settings2 } from "lucide-react";
 import { NAV_ITEMS, type NavItem } from "@/lib/nav";
 import { warmRoute } from "@/lib/warmup";
 import { createGoShortcuts, goHint } from "@/lib/go-shortcuts";
 import { useActiveRoute } from "./FeedContext";
-import { currentTarget, startPersonalize, subscribeTargets } from "@/lib/personalize-registry";
+import { personalizeNow } from "./personalize/start";
 
 /** Fire this to open the palette from a button: window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE)) */
 export const OPEN_COMMAND_PALETTE = "onyx:open-command-palette";
@@ -21,7 +21,6 @@ const PERSONALIZE_ITEM: NavItem = {
   icon: Settings2,
   keywords: ["customize", "layout", "arrange", "move", "hide", "columns", "parts", "edit"],
 };
-const noTarget = () => null;
 
 function matches(item: NavItem, q: string): boolean {
   if (!q) return true;
@@ -50,13 +49,12 @@ export default function CommandPalette() {
   // Ignore hover refreshes caused by rows scrolling under a stationary mouse.
   const lastPointer = useRef<string | null>(null);
 
-  const target = useSyncExternalStore(subscribeTargets, currentTarget, noTarget);
   const results = useMemo(() => {
     const pages = NAV_ITEMS.filter((i) => matches(i, query));
-    if (!target || !matches(PERSONALIZE_ITEM, query)) return pages;
+    if (!matches(PERSONALIZE_ITEM, query)) return pages;
     // Typed for: first. Otherwise last, so Enter on an empty palette still opens the first page.
     return query.trim() ? [PERSONALIZE_ITEM, ...pages] : [...pages, PERSONALIZE_ITEM];
-  }, [query, target]);
+  }, [query]);
 
   const close = useCallback(() => {
     pointerSelect.current = false;
@@ -70,7 +68,7 @@ export default function CommandPalette() {
       if (!item) return;
       close();
       if (item.href === PERSONALIZE_HREF) {
-        startPersonalize();
+        personalizeNow();
         return;
       }
       router.push(item.href);
