@@ -75,9 +75,27 @@ const DATA: Record<string, () => DataWarmer[]> = {
   "/status": () => [json("/api/status")],
 };
 
+// The `dynamic(..., { ssr: false })` client chunks the router prefetch does not load (measured on production
+// 2026-11-15: HRV fetched three chunks on click and drew its charts ~0.8 s later). Same modules as the
+// pages' own dynamic imports, so webpack serves the page from the chunk loaded here.
+const CODE: Record<string, () => Promise<unknown>> = {
+  "/activities": () => import("@/app/activities/ActivitiesClient"),
+  "/analytics/hrv": () => import("@/app/analytics/hrv/HrvAnalysisClient"),
+  "/bland-altman": () => import("@/app/bland-altman/BlandAltmanClient"),
+  "/caffeine": () => import("@/app/caffeine/CaffeineClient"),
+  "/habits": () => import("@/app/habits/HabitsClient"),
+  "/health/records": () => import("@/app/health/records/LabTrendChart"),
+  "/nutrition": () => import("@/app/nutrition/NutritionClient"),
+  "/nyc": () => import("@/app/nyc/NycClient"),
+  "/reading": () => import("@/app/reading/BurnupChart"),
+  "/sleep": () => import("@/app/sleep/SleepClient"),
+  "/spotify": () => import("@/app/spotify/SpotifyClient"),
+  "/supplements": () => import("@/app/supplements/SupplementsClient"),
+};
+
 export function warmTargets(): WarmTarget[] {
   const hrefs = [...PINNED, ...NAV_ITEMS.map((i) => i.href).filter((h) => !PINNED.includes(h))];
-  return hrefs.map((href) => ({ href, prefetch: (AUTO_ONLY.has(href) ? "auto" : "full") as PrefetchMode, data: DATA[href] }));
+  return hrefs.map((href) => ({ href, prefetch: (AUTO_ONLY.has(href) ? "auto" : "full") as PrefetchMode, data: DATA[href], code: CODE[href] }));
 }
 
 let fetchObserved = false;
