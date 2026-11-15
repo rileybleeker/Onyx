@@ -8,12 +8,14 @@ const supabase = createClient(
   { db: { schema: "pds" } },
 );
 
-// One day's intakes (product names embedded: one round trip) and its compound rollup.
+// One day's intakes (product names embedded: one round trip), its compound rollup and the day's stack reminders
+// (pds.supplement_stack_reminder: which stacks got a Log it / Skip card in /agents and how it was answered; /log
+// offers Skip only for a card still open).
 function readDay(today: string) {
   return Promise.all([
     supabase
       .from("supplement_intake")
-      .select("intake_id,intake_date,intake_time,product_id,doses,notes,supplement_products(brand_name,full_name)")
+      .select("intake_id,intake_date,intake_time,product_id,doses,notes,stack_id,supplement_products(brand_name,full_name)")
       .eq("intake_date", today)
       .order("intake_time", { ascending: false, nullsFirst: false }),
     supabase
@@ -21,6 +23,10 @@ function readDay(today: string) {
       .select("compound_key,ingredient_group,ingredient_names,unii_code,categories,unit_class,unit,source_units,total_amount,total_doses,source_product_count")
       .eq("calendar_date", today)
       .order("ingredient_group"),
+    supabase
+      .from("supplement_stack_reminder")
+      .select("stack_id,status")
+      .eq("behavioral_date", today),
   ]);
 }
 
@@ -54,7 +60,7 @@ export async function GET() {
   const today = (behavioralToday as string | null)
     ?? new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
 
-  const [intakesRes, compoundsRes] = today === guess ? await speculative : await readDay(today);
+  const [intakesRes, compoundsRes, remindersRes] = today === guess ? await speculative : await readDay(today);
 
   if (intakesRes.error) return NextResponse.json({ error: intakesRes.error.message }, { status: 500 });
   if (compoundsRes.error) return NextResponse.json({ error: compoundsRes.error.message }, { status: 500 });
@@ -75,9 +81,16 @@ export async function GET() {
     ingredient_name: Array.isArray(c.ingredient_names) ? (c.ingredient_names[0] ?? null) : (c.ingredient_names ?? null),
   }));
 
+  // A failed reminder read never fails the page: null = "not known" (no Skip offered), [] = no card today.
+  if (remindersRes.error) console.error("supplement reminders read failed:", remindersRes.error.code);
+  const reminders = remindersRes.error
+    ? null
+    : (remindersRes.data ?? []).map((r) => ({ stack_id: Number(r.stack_id), status: String(r.status) }));
+
   return NextResponse.json({
     date: today,
     intakes: decoratedIntakes,
     compounds,
+    reminders,
   });
 }
