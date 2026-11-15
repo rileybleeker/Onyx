@@ -27,8 +27,8 @@ const NAV = [
   { title: 'Health', items: [{ href: '/health', label: 'Health & appointments', icon }] },
   { title: 'Tools', items: [{ href: '/analytics/hrv', label: 'HRV Analysis', icon }, { href: '/agents', label: 'Agents', icon }, { href: '/chat', label: 'Onyx Chat', icon }] },
 ];
-function render(drawerOpen = false, unread = 0, pathname = '/today') {
-  const states = [drawerOpen, unread];
+function render(drawerOpen = false, logOpen = false, unread = 0, pathname = '/today') {
+  const states = [drawerOpen, logOpen, unread];
   const module = { exports: {} };
   const mockRequire = (id) => {
     if (id === 'react') return { ...React, useState: () => [states.shift(), () => {}], useEffect: () => {}, useRef: () => ({ current: null }) };
@@ -59,7 +59,7 @@ function button(html, label) {
   return found;
 }
 test('mobile search and dismiss buttons expose 44px targets and descriptive names', () => {
-  for (const [html, label] of [[render(), 'Search'], [render(true), 'Close navigation']]) {
+  for (const [html, label] of [[render(), 'Search'], [render(false, true), 'Close quick log'], [render(true), 'Close navigation']]) {
     const markup = button(html, label);
     assert.match(markup, /\bw-11\b/);
     assert.match(markup, /\bh-11\b/);
@@ -67,17 +67,17 @@ test('mobile search and dismiss buttons expose 44px targets and descriptive name
 });
 test('openers announce dialogs and reference only mounted panels', () => {
   assert.doesNotMatch(render(), /aria-controls=/);
-  for (const [html, id] of [[render(true), 'mobile-navigation']]) {
+  for (const [html, id] of [[render(false, true), 'mobile-quick-log'], [render(true), 'mobile-navigation']]) {
     assert.ok(html.includes(`aria-controls="${id}"`));
     assert.ok(html.includes(`id="${id}"`));
     assert.match(html, /aria-expanded="true" aria-haspopup="dialog"/);
   }
 });
-test('Log opens the Log screen (every entry on one page); there is no quick-log sheet any more', () => {
-  const html = render();
-  assert.match(html, /<a[^>]*href="\/log"[^>]*>(?:(?!<\/a>)[\s\S])*?<span>Log<\/span><\/a>/);
-  assert.ok(!html.includes('mobile-quick-log'), 'no sheet');
-  assert.ok(!html.includes('Quick log'), 'no sheet');
+test('all quick capture destinations remain available and check-in remains first', () => {
+  const html = render(false, true);
+  const links = [...html.matchAll(/href="([^"]+)"/g)].map(m => m[1]);
+  const checkin = links.indexOf('/check-in');
+  assert.deepEqual(links.slice(checkin, checkin + 4), ['/check-in', '/supplements', '/habits', '/nutrition?log=weight']);
 });
 test('drawer navigation and search/sign-out have minimum 44px height', () => {
   const html = render(true);
@@ -97,22 +97,22 @@ function tabBar(html) {
 test('bottom bar: Today, Agents, Log (centre), Chat, More; every label is where it goes', () => {
   const tabs = tabBar(render());
   assert.deepEqual(tabs.map((t) => t.label), ['Today', 'Agents', 'Log', 'Chat', 'More']);
-  assert.deepEqual(tabs.map((t) => t.href), ['/today', '/agents', '/log', '/chat', null]);
+  assert.deepEqual(tabs.map((t) => t.href), ['/today', '/agents', null, '/chat', null]);
   assert.ok(!tabs.some((t) => t.label === 'Trends'), 'Trends lives in More and on Today');
-  const log = render().match(/<a[^>]*href="\/log"[^>]*>(?:(?!<\/a>)[\s\S])*?<span>Log<\/span><\/a>/)[0];
+  const log = render().match(/<button[^>]*>(?:(?!<\/button>)[\s\S])*?<span>Log<\/span><\/button>/)[0];
   assert.match(log, /bg-accent/, 'Log is the visually primary action');
 });
 test('bottom bar: the active tab follows the page, and Agents carries the unread count', () => {
-  for (const [path, label] of [['/today', 'Today'], ['/', 'Today'], ['/agents', 'Agents'], ['/agents?t=devops', 'Agents'], ['/chat', 'Chat'], ['/log', 'Log']]) {
-    const current = tabBar(render(false, 0, path.split('?')[0])).filter((t) => t.current).map((t) => t.label);
+  for (const [path, label] of [['/today', 'Today'], ['/', 'Today'], ['/agents', 'Agents'], ['/agents?t=devops', 'Agents'], ['/chat', 'Chat']]) {
+    const current = tabBar(render(false, false, 0, path.split('?')[0])).filter((t) => t.current).map((t) => t.label);
     assert.deepEqual(current, [label], path);
   }
-  assert.deepEqual(tabBar(render(false, 0, '/sleep')).filter((t) => t.current), []);
-  const agents = tabBar(render(false, 3)).find((t) => t.href === '/agents');
+  assert.deepEqual(tabBar(render(false, false, 0, '/sleep')).filter((t) => t.current), []);
+  const agents = tabBar(render(false, false, 3)).find((t) => t.href === '/agents');
   assert.match(agents.text, /3/);
   assert.match(agents.text, /3 unread/);
   assert.ok(!/unread/.test(tabBar(render()).find((t) => t.href === '/agents').text), 'no badge at zero');
-  assert.match(tabBar(render(false, 12)).find((t) => t.href === '/agents').text, /9\+/);
+  assert.match(tabBar(render(false, false, 12)).find((t) => t.href === '/agents').text, /9\+/);
 });
 test('bottom bar keeps 44px-plus targets and the safe-area padding', () => {
   const html = render();

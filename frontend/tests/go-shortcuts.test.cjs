@@ -17,7 +17,6 @@ test('every nav item has a shortcut, and no two share one', () => {
   assert.equal(by['/agents'], 'G');
   assert.equal(by['/check-in'], 'K');
   assert.deepEqual([by['/health'], by['/health/records'], by['/financials/budgets'], by['/financials/forecast']], ['Z', 'X', 'Q', '4']);
-  assert.equal(by['/log'], '1', 'Log: the one screen for every entry');
 });
 
 test('hint reads "G <key>"', () => {

@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Plus, Menu, X, LogOut, Search, ChevronDown, ChevronRight } from "lucide-react";
+import { Plus, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck, Camera, ChevronDown, ChevronRight } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS } from "@/lib/nav";
 import { CACHE_KEYS, clientCache, wipeClientData } from "@/lib/client-cache";
@@ -22,8 +22,13 @@ const none = () => null;
 // Hides the bottom-bar slots Riley changed until React renders them (a full page load paints the default bar first).
 const TABS_BOOT = tabsBootScript(DEFAULT_TAB_SLOTS.map((h) => (h === MORE_SLOT ? MORE_SLOT : areaId(h))));
 
-// The centre tab: the Log screen, where every daily entry is (it replaced the quick-log sheet, 2026-11-15).
-const LOG_HREF = "/log";
+const LOG_ACTIONS = [
+  { label: "Check-in", href: "/check-in", icon: ClipboardCheck },
+  { label: "Supplement", href: "/supplements", icon: Pill },
+  { label: "Habit", href: "/habits", icon: CircleCheck },
+  { label: "Weight", href: "/nutrition?log=weight", icon: Scale }, // opens the weight quick-log first, field focused
+  { label: "Meal photo", href: "/nutrition?log=photo", icon: Camera }, // opens the plate-photo logger first
+];
 
 /**
  * The Agents unread count the app already has: the cached inbox (Today, the Agents inbox and the warm-up
@@ -57,7 +62,9 @@ export default function MobileNav() {
   const arranged = arrangeNav(NAV_SECTIONS, prefs);
   const arranging = useSyncExternalStore(subscribeTargets, currentEditingKey, none) !== null;
   const editor = useSyncExternalStore(subscribeTargets, editorRef, none) as EditorModule | null;
+  const [logOpen, setLogOpen] = useState(false);
   const drawerRef = useRef<HTMLElement>(null);
+  const logRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
   // The page in view (follows the continuous scroll); `pathname` stays the routed page for closing overlays.
   const current = useActiveRoute();
@@ -67,16 +74,17 @@ export default function MobileNav() {
     if (prefs !== null) dropTabsBootStyle();
   }, [prefs]);
 
-  // Close the drawer on route change.
+  // Close every overlay on route change.
   useEffect(() => {
     setDrawerOpen(false);
+    setLogOpen(false);
   }, [pathname]);
 
   // Treat each overlay as a modal: contain keyboard focus and return it to
   // the opener. Preserve any scroll lock owned by another surface.
   useEffect(() => {
-    if (!drawerOpen) return;
-    const overlay = drawerRef.current;
+    if (!drawerOpen && !logOpen) return;
+    const overlay = drawerOpen ? drawerRef.current : logRef.current;
     if (!overlay) return;
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const previousOverflow = document.body.style.overflow;
@@ -87,6 +95,7 @@ export default function MobileNav() {
     focusable()[0]?.focus();
     function closeOverlays() {
       setDrawerOpen(false);
+      setLogOpen(false);
     }
     function onKeyDown(event: KeyboardEvent) {
       // Yield focus ownership when the global command palette opens.
@@ -95,6 +104,7 @@ export default function MobileNav() {
       } else if (event.key === "Escape") {
         event.preventDefault();
         setDrawerOpen(false);
+        setLogOpen(false);
       } else if (event.key === "Tab") {
         const elements = focusable();
         const first = elements[0];
@@ -112,7 +122,7 @@ export default function MobileNav() {
     // A hidden mobile overlay must not leave desktop scrolling locked.
     const desktop = window.matchMedia("(min-width: 768px)");
     function onViewportChange() {
-      if (desktop.matches) setDrawerOpen(false);
+      if (desktop.matches) { setDrawerOpen(false); setLogOpen(false); }
     }
     document.addEventListener("keydown", onKeyDown);
     window.addEventListener(OPEN_COMMAND_PALETTE, closeOverlays);
@@ -127,7 +137,7 @@ export default function MobileNav() {
         opener.focus();
       }
     };
-  }, [drawerOpen]);
+  }, [drawerOpen, logOpen]);
 
   async function handleSignOut() {
     const supabase = createSupabaseBrowser();
@@ -138,7 +148,7 @@ export default function MobileNav() {
     window.location.assign("/login");
   }
 
-  // [slot, slot, Log, slot, slot]: Log (the Log screen, /log) in the centre; the four slots are pages or More (the
+  // [slot, slot, Log, slot, slot]: Log (the quick-log sheet) in the centre; the four slots are pages or More (the
   // drawer), by default Today, Agents | Log | Chat, More, chosen in Personalize (lib/mobile-tabs.ts). Each page
   // tab's label is the page it opens; Trends lives in More and on Today.
   const navItems = new Map(NAV_SECTIONS.flatMap((section) => section.items).map((item) => [item.href, item] as const));
@@ -237,29 +247,58 @@ export default function MobileNav() {
                 </Link>
               );
             }
-            if (tab.kind === "log") {
-              const active = isTabActive(LOG_HREF, current);
-              return (
-                <Link key="log" href={LOG_HREF} {...navIntentProps(LOG_HREF)} className={`${cell} ${active ? "text-accent" : "text-text-primary"}`} aria-current={active ? "page" : undefined}>
-                  {/* The primary action: an accent disc (the only filled control on the bar). */}
+            const isLog = tab.kind === "log";
+            const open = isLog ? logOpen : drawerOpen;
+            return (
+              <button key={tab.kind} type="button" data-tab-slot={tab.kind === "more" ? tab.slot : undefined} onClick={() => (isLog ? setLogOpen(true) : setDrawerOpen(true))}
+                className={`${cell} ${!isLog && open ? "text-accent" : isLog ? "text-text-primary" : "text-text-tertiary hover:text-text-secondary"}`}
+                aria-expanded={open} aria-haspopup="dialog" aria-controls={open ? (isLog ? "mobile-quick-log" : "mobile-navigation") : undefined}>
+                {isLog ? (
+                  // The primary action: an accent disc (the only filled control on the bar).
                   <span className="w-9 h-9 -mt-1 rounded-full bg-accent text-on-accent flex items-center justify-center shadow-card">
                     <Plus className="w-[20px] h-[20px]" strokeWidth={2.25} />
                   </span>
-                  <span>Log</span>
-                </Link>
-              );
-            }
-            return (
-              <button key={tab.kind} type="button" data-tab-slot={tab.slot} onClick={() => setDrawerOpen(true)}
-                className={`${cell} ${drawerOpen ? "text-accent" : "text-text-tertiary hover:text-text-secondary"}`}
-                aria-expanded={drawerOpen} aria-haspopup="dialog" aria-controls={drawerOpen ? "mobile-navigation" : undefined}>
-                <Menu className="w-[20px] h-[20px]" strokeWidth={1.75} />
-                <span>More</span>
+                ) : (
+                  <Menu className="w-[20px] h-[20px]" strokeWidth={1.75} />
+                )}
+                <span>{isLog ? "Log" : "More"}</span>
               </button>
             );
           })}
         </div>
       </nav>
+
+      {/* Log sheet — quick entry to all logging surfaces. */}
+      {logOpen && (
+        <div id="mobile-quick-log" ref={logRef} className="md:hidden fixed inset-0 z-50 flex flex-col justify-end" role="dialog" aria-modal="true" aria-label="Quick log">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setLogOpen(false)} />
+          <div className="relative bg-surface-raised border-t border-border-default rounded-t-[12px] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] animate-fade-in-up">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-[13px] font-semibold uppercase tracking-[0.07em] text-text-secondary">Quick log</h2>
+              <button onClick={() => setLogOpen(false)} className="w-11 h-11 shrink-0 flex items-center justify-center text-text-tertiary hover:text-text-primary" aria-label="Close quick log">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {LOG_ACTIONS.map((a) => {
+                const Icon = a.icon;
+                return (
+                  <Link
+                    key={a.label}
+                    href={a.href}
+                    {...navIntentProps(a.href)}
+                    onClick={() => setLogOpen(false)}
+                    className={`${a.href === "/check-in" ? "col-span-2 " : ""}flex items-center gap-2.5 px-3 py-3 rounded-control bg-surface-card border border-border-subtle text-[14px] text-text-primary hover:border-border-hover transition-colors`}
+                  >
+                    <Icon className="w-[18px] h-[18px] text-accent shrink-0" strokeWidth={1.75} />
+                    {a.label}
+                  </Link>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Drawer (full nav) — opened by the "More" tab. */}
       {drawerOpen && (
