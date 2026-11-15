@@ -6,6 +6,7 @@ import MobileNav from "./MobileNav";
 import CommandPalette from "./CommandPalette";
 import { DesktopLaunchHandler } from "./DesktopApp";
 import AppData, { SignedOutWipe } from "./AppData";
+import UpdateChecker from "./UpdateChecker";
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -27,6 +28,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         {children}
         <CommandPalette />
         <DesktopLaunchHandler />
+        <UpdateChecker />
       </>
     );
   }
@@ -46,6 +48,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <MobileNav />
       <CommandPalette />
       <DesktopLaunchHandler />
+      <UpdateChecker />
     </>
   );
 }
