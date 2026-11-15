@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
+import { cookies } from "next/headers";
 import { loadLedger } from "@/lib/finance-ledger-server";
 import { parseLedgerQuery } from "@/lib/finance-ledger";
+import { layoutCookieName, layoutFromCookie } from "@/lib/personalize-layout";
 import InfoHint from "@/components/InfoHint";
 import FinancialsClient from "./FinancialsClient";
 import LedgerView, { FreshnessLine } from "./LedgerView";
@@ -22,6 +24,8 @@ export default async function FinancialsPage({
 }) {
   const now = new Date();
   const load = await loadLedger(parseLedgerQuery(await searchParams), now);
+  // Personalize: the saved layout rides in a cookie scoped to this page, so the server renders it as is.
+  const layout = layoutFromCookie((await cookies()).get(layoutCookieName("/financials"))?.value);
 
   return (
     <main className="mx-auto max-w-6xl space-y-6 p-4 md:p-8">
@@ -63,7 +67,7 @@ export default async function FinancialsPage({
         </section>
       )}
 
-      {load.kind === "ok" && <LedgerView data={load.data} now={now} />}
+      {load.kind === "ok" && <LedgerView data={load.data} now={now} layout={layout} />}
 
       <details className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
         <summary className="cursor-pointer text-[13px] font-medium">Preview a CSV</summary>

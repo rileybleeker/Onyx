@@ -23,6 +23,7 @@ import {
 import { formatDate, kgToLb, lbToKg, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { Part, PartGrid } from "@/components/personalize/PartGrid";
 import InfoHint from "@/components/InfoHint";
 import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
@@ -545,6 +546,8 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
           (manual meal_events logging removed 2026-05-31). Per-meal log shows in
           "Today's Meals" below; meal-timing drivers show on /analytics/hrv. */}
 
+      <PartGrid page="/nutrition" title="Nutrition">
+      <Part id="macros" title="Daily macros">
       {/* ─── Daily Macros (Cronometer; MFP fills pre-cutover history) ──────── */}
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Daily Macros</p>
       {estDays > 0 && (
@@ -705,7 +708,9 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
         </>
       )}
 
-      <div className="border-t border-border-subtle my-10" />
+      </Part>
+      <Part id="vitamins" title="Vitamins & Minerals">
+      <div className="border-t border-border-subtle mb-8" />
 
       {/* ─── Vitamins & Minerals (Cronometer dietary + Onyx supplement) ─────── */}
       <div className="flex items-baseline justify-between mb-3">
@@ -760,7 +765,9 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
         );
       })()}
 
-      <div className="border-t border-border-subtle my-10" />
+      </Part>
+      <Part id="meals" title="Meals">
+      <div className="border-t border-border-subtle mb-8" />
 
       {/* ─── Today's meals (Cronometer per-entry log) ──────────────────────── */}
       <div className="flex items-baseline justify-between mb-3">
@@ -841,7 +848,9 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
         </>
       )}
 
-      <div className="border-t border-border-subtle my-10" />
+      </Part>
+      <Part id="all-nutrients" title="All tracked nutrients">
+      <div className="border-t border-border-subtle mb-8" />
 
       {/* ─── All tracked nutrients (Cronometer dietary; latest day + 7d avg) ── */}
       <details className="group">
@@ -878,7 +887,9 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
         })()}
       </details>
 
-      <div className="border-t border-border-subtle my-10" />
+      </Part>
+      <Part id="weight" title="Body weight">
+      <div className="border-t border-border-subtle mb-8" />
 
       {/* ─── Body Weight ───────────────────────────────────────────────────── */}
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Body Weight</p>
@@ -911,7 +922,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
         />
       </div>
 
-      <div className="space-y-6 mb-10">
+      <div className="space-y-6">
         {/* Quick-log card (moved to the top of the page when opened from a Log weight shortcut) */}
         {!logWeightFirst && weightLogCard}
 
@@ -990,6 +1001,8 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
         )}
       </div>
 
+      </Part>
+      </PartGrid>
     </>
   );
 }

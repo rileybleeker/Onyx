@@ -16,6 +16,7 @@ import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import DeferredMount from "@/components/DeferredMount";
+import { Part, PartGrid } from "@/components/personalize/PartGrid";
 import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
@@ -406,9 +407,11 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
         </div>
       </div>
 
+      <PartGrid page="/sleep" title="Sleep & Recovery">
       {/* ── WHOOP Recovery ──────────────────────────────────────────────────── */}
+      <Part id="whoop-recovery" title="WHOOP recovery tiles">
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Recovery</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6 items-stretch">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 items-stretch">
         <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Recovery"
@@ -433,8 +436,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
         <StatCard label="HRV" value={avgWhoopHrv != null ? avgWhoopHrv.toFixed(0) : null} unit="ms" sublabel={rangeNote} source="WHOOP" />
         <StatCard label="Resting HR" value={avgWhoopRhr != null ? avgWhoopRhr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="WHOOP" />
       </div>
+      </Part>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
+        <Part id="recovery-score" title="Recovery Score" width="half">
         <ChartCard title="Recovery Score" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={recoveryData}>
@@ -452,7 +456,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="daily-strain" title="Daily Strain" width="half">
         <ChartCard title="Daily Strain" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={strainData}>
@@ -470,7 +476,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="whoop-vitals" title="SpO2, Skin Temp & Resp Rate" width="half">
         <ChartCard title="SpO2, Skin Temp & Resp Rate" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={recoveryData}>
@@ -487,11 +495,12 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
-      </div>
+        </Part>
 
       {/* ── WHOOP Sleep ─────────────────────────────────────────────────────── */}
+      <Part id="whoop-sleep" title="WHOOP sleep tiles">
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Sleep</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard
           label="Duration"
           value={avgInBedMs != null ? formatDurationMs(avgInBedMs + avgWhoopNapMs) : null}
@@ -508,8 +517,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
         <StatCard label="Deep Sleep" value={avgDeepMs != null ? formatDurationMs(avgDeepMs) : null} sublabel={rangeNote} source="WHOOP" />
         <StatCard label="REM Sleep" value={avgRemMs != null ? formatDurationMs(avgRemMs) : null} sublabel={rangeNote} source="WHOOP" />
       </div>
+      </Part>
 
-      <div className="mb-6">
+        <Part id="time-in-bed" title="Time in Bed">
         <DeferredMount minHeight={345}>
           <ChartCard title="Time in Bed" source="WHOOP">
             <ResponsiveContainer width="100%" height={280}>
@@ -523,9 +533,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
-      </div>
+        </Part>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+        <Part id="sleep-debt" title="Sleep Debt" width="third">
         <DeferredMount minHeight={345}>
           <ChartCard title="Sleep Debt" source="WHOOP">
             <ResponsiveContainer width="100%" height={280}>
@@ -543,7 +553,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="hours-vs-needed" title="Hours vs Needed" width="third">
         <DeferredMount minHeight={345}>
           <ChartCard title="Hours vs Needed" source="WHOOP">
             <ResponsiveContainer width="100%" height={280}>
@@ -562,7 +574,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="sleep-consistency" title="Sleep Consistency" width="third">
         <DeferredMount minHeight={345}>
           <ChartCard title="Sleep Consistency" source="WHOOP">
             <ResponsiveContainer width="100%" height={280}>
@@ -580,9 +594,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
-      </div>
+        </Part>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-10">
+        <Part id="whoop-stages" title="Sleep Stages (WHOOP)" width="third">
         <DeferredMount minHeight={325}>
           <ChartCard title="Sleep Stages" source="WHOOP">
             <ResponsiveContainer width="100%" height={260}>
@@ -604,7 +618,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="whoop-scores" title="Sleep Scores (WHOOP)" width="third">
         <DeferredMount minHeight={325}>
           <ChartCard title="Sleep Scores" source="WHOOP">
             <ResponsiveContainer width="100%" height={260}>
@@ -640,7 +656,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="whoop-heart" title="Resting HR, HRV & Respiratory Rate" width="third">
         <DeferredMount minHeight={325}>
           <ChartCard title="Resting HR, HRV & Respiratory Rate" source="WHOOP">
             <ResponsiveContainer width="100%" height={260}>
@@ -668,10 +686,10 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
-      </div>
+        </Part>
 
       {/* ── Behaviors ───────────────────────────────────────────────────────── */}
-      {journal.length > 0 && <DeferredMount minHeight={1100}>{(() => {
+      {journal.length > 0 && <Part id="behaviors" title="Behaviors"><DeferredMount minHeight={1100}>{(() => {
         // `behaviors_date` is the calendar day the journal answer describes
         // (the day the user was awake leading into bedtime). Computed at the
         // DB layer via trigger from each cycle's start_time − 6h in local TZ;
@@ -754,21 +772,22 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ChartCard>
           </>
         );
-      })()}</DeferredMount>}
-
-      <div className="border-t border-border-subtle mb-8" />
+      })()}</DeferredMount></Part>}
 
       {/* ── Garmin Cardiac ──────────────────────────────────────────────────── */}
+      <Part id="garmin-cardiac" title="Garmin cardiac tiles">
+      <div className="border-t border-border-subtle mb-8" />
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">GARMIN · Cardiac</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-10">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard label="Avg RHR" value={avgGarminRhr != null ? avgGarminRhr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
       </div>
-
-      <div className="border-t border-border-subtle mb-8" />
+      </Part>
 
       {/* ── Eight Sleep ─────────────────────────────────────────────────────── */}
+      <Part id="eight-sleep" title="Eight Sleep tiles">
+      <div className="border-t border-border-subtle mb-8" />
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Eight Sleep</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard label="Sleep Score" value={avgEightSleep != null ? avgEightSleep.toFixed(0) : null} sublabel={rangeNote} source="8SLP" />
         <StatCard
           label="Duration"
@@ -783,8 +802,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
         <StatCard label="HRV" value={avgEightHrv != null ? avgEightHrv.toFixed(0) : null} unit="ms" sublabel={rangeNote} source="8SLP" />
         <StatCard label="Sleep Latency" value={avgEightLatency != null ? (avgEightLatency / 60).toFixed(0) : null} unit="min" sublabel={rangeNote} source="8SLP" />
       </div>
+      </Part>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
+        <Part id="eight-scores" title="Sleep Scores (Eight Sleep)" width="half">
         <DeferredMount minHeight={325}>
           <ChartCard title="Sleep Scores" source="8SLP">
             <ResponsiveContainer width="100%" height={260}>
@@ -800,7 +820,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="eight-stages" title="Sleep Stages (Eight Sleep)" width="half">
         <DeferredMount minHeight={325}>
           <ChartCard title="Sleep Stages" source="8SLP">
             <ResponsiveContainer width="100%" height={260}>
@@ -822,7 +844,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="eight-biometrics" title="Heart Rate, HRV & Resp Rate (Eight Sleep)" width="half">
         <DeferredMount minHeight={325}>
           <ChartCard title="Heart Rate, HRV & Resp Rate" source="8SLP">
             <ResponsiveContainer width="100%" height={260}>
@@ -841,7 +865,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="eight-temperature" title="Bed & Room Temperature" width="half">
         <DeferredMount minHeight={325}>
           <ChartCard title="Bed & Room Temperature" source="8SLP">
             <ResponsiveContainer width="100%" height={260}>
@@ -859,7 +885,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="snoring" title="Snoring" width="half">
         <DeferredMount minHeight={340}>
           <ChartCard
             title="Snoring"
@@ -883,7 +911,9 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="sleep-latency" title="Time to Fall Asleep" width="half">
         <DeferredMount minHeight={340}>
           <ChartCard
             title="Time to Fall Asleep"
@@ -906,7 +936,8 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
-      </div>
+        </Part>
+      </PartGrid>
     </>
   );
 }

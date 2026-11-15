@@ -5,6 +5,8 @@ import { useEffect, useState, useCallback, useRef, type RefObject } from "react"
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
+import { Part, PartGrid } from "@/components/personalize/PartGrid";
+import PersonalTable, { type TableColumn } from "@/components/personalize/PersonalTable";
 import { sameJson } from "@/lib/format";
 import { clientCache } from "@/lib/client-cache";
 import SpotifyReconnect from "@/components/SpotifyReconnect";
@@ -174,6 +176,19 @@ function formatSyncTime(isoStr: string | null): string {
   const d = new Date(isoStr);
   return d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
 }
+
+const HISTORY_TH = "text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4";
+const HISTORY_TH_RIGHT = "text-right text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4";
+
+/** Sync History columns (personalizable: Personalize -> Columns, or the menu on each header). */
+const HISTORY_COLUMNS: TableColumn[] = [
+  { id: "source", label: "Source", locked: true, th: HISTORY_TH, td: "py-2 pr-4 font-mono font-medium text-text-secondary" },
+  { id: "type", label: "Type", th: HISTORY_TH, td: "py-2 pr-4 text-text-tertiary" },
+  { id: "time", label: "Time", th: HISTORY_TH, td: "py-2 pr-4 text-text-tertiary whitespace-nowrap" },
+  { id: "status", label: "Status", th: HISTORY_TH, td: "py-2 pr-4" },
+  { id: "records", label: "Records", th: HISTORY_TH_RIGHT, td: "py-2 pr-4 text-right font-mono text-text-secondary tabular-nums" },
+  { id: "duration", label: "Duration", th: HISTORY_TH_RIGHT, td: "py-2 pr-4 text-right font-mono text-text-tertiary tabular-nums" },
+];
 
 function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus }) {
   const badge = SOURCE_BADGE[sourceKey] ?? sourceKey.toUpperCase();
@@ -557,8 +572,10 @@ export default function StatusPage() {
         </div>
       )}
 
+      <PartGrid page="/status" title="System Status">
+      <Part id="kpis" title="Status tiles">
       {/* KPI row */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Sources Online"
@@ -587,75 +604,68 @@ export default function StatusPage() {
         />
       </div>
 
-      {/* Source cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4 mb-8">
-        {sourceList.map(({ key, info }) => (
-          <SourceCard key={key} sourceKey={key} info={info} />
-        ))}
-      </div>
+      </Part>
+
+      {/* Source cards: a tile zone of their own, so single cards can be moved and hidden */}
+      <Part id="sources" title="Source cards" nested>
+        <PartGrid page="/status" zone="sources" title="System Status" className="pz-tiles" gap={16}>
+          {sourceList.map(({ key, info }) => (
+            <Part key={key} id={key} title={info.label}>
+              <SourceCard sourceKey={key} info={info} />
+            </Part>
+          ))}
+        </PartGrid>
+      </Part>
 
       {/* Sync history */}
       {history.length > 0 && (
+        <Part id="sync-history" title="Sync History">
         <ChartCard title="Sync History" subtitle="Last 20 pipeline runs">
           <div className="overflow-x-auto">
-            <table className="w-full text-[12px]">
-              <thead>
-                <tr className="border-b border-white/5">
-                  <th className="text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4">Source</th>
-                  <th className="text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4">Type</th>
-                  <th className="text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4">Time</th>
-                  <th className="text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4">Status</th>
-                  <th className="text-right text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4">Records</th>
-                  <th className="text-right text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2">Duration</th>
-                </tr>
-              </thead>
-              <tbody>
-                {history.map((row: any, i: number) => {
-                  const isSuccess = row.status === "success";
-                  const isPartial = row.status === "partial";
-                  return (
-                    <tr key={i} className="border-b border-white/[0.03] hover:bg-white/[0.02]">
-                      <td className="py-2 pr-4 font-mono font-medium text-text-secondary">
-                        {HISTORY_SOURCE_LABELS[row.source] ?? row.source}
-                      </td>
-                      <td className="py-2 pr-4 text-text-tertiary">
-                        {HISTORY_TYPE_LABELS[row.data_type] ?? row.data_type}
-                      </td>
-                      <td className="py-2 pr-4 text-text-tertiary whitespace-nowrap">
-                        {formatSyncTime(row.sync_start)}
-                      </td>
-                      <td className="py-2 pr-4">
+            <PersonalTable
+              id="sync-history"
+              className="w-full text-[12px]"
+              headRowClassName="border-b border-white/5"
+              columns={HISTORY_COLUMNS}
+              rows={history.map((row: any, i: number) => {
+                const isSuccess = row.status === "success";
+                const isPartial = row.status === "partial";
+                return {
+                  key: String(i),
+                  className: "border-b border-white/[0.03] hover:bg-white/[0.02]",
+                  cells: {
+                    source: HISTORY_SOURCE_LABELS[row.source] ?? row.source,
+                    type: HISTORY_TYPE_LABELS[row.data_type] ?? row.data_type,
+                    time: formatSyncTime(row.sync_start),
+                    status: (
+                      <span
+                        className={`inline-flex items-center gap-1 text-[10px] font-medium font-mono px-1.5 py-0.5 rounded-[3px] ${
+                          isSuccess
+                            ? "bg-green-500/10 text-green-400"
+                            : isPartial
+                            ? "bg-yellow-500/10 text-yellow-400"
+                            : "bg-red-500/10 text-red-400"
+                        }`}
+                      >
                         <span
-                          className={`inline-flex items-center gap-1 text-[10px] font-medium font-mono px-1.5 py-0.5 rounded-[3px] ${
-                            isSuccess
-                              ? "bg-green-500/10 text-green-400"
-                              : isPartial
-                              ? "bg-yellow-500/10 text-yellow-400"
-                              : "bg-red-500/10 text-red-400"
+                          className={`w-1.5 h-1.5 rounded-full ${
+                            isSuccess ? "bg-green-400" : isPartial ? "bg-yellow-400" : "bg-red-400"
                           }`}
-                        >
-                          <span
-                            className={`w-1.5 h-1.5 rounded-full ${
-                              isSuccess ? "bg-green-400" : isPartial ? "bg-yellow-400" : "bg-red-400"
-                            }`}
-                          />
-                          {row.status}
-                        </span>
-                      </td>
-                      <td className="py-2 pr-4 text-right font-mono text-text-secondary tabular-nums">
-                        {row.records_synced > 0 ? row.records_synced.toLocaleString() : "—"}
-                      </td>
-                      <td className="py-2 text-right font-mono text-text-tertiary tabular-nums">
-                        {row.duration_seconds != null ? `${(row.duration_seconds as number).toFixed(1)}s` : "—"}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                        />
+                        {row.status}
+                      </span>
+                    ),
+                    records: row.records_synced > 0 ? row.records_synced.toLocaleString() : "—",
+                    duration: row.duration_seconds != null ? `${(row.duration_seconds as number).toFixed(1)}s` : "—",
+                  },
+                };
+              })}
+            />
           </div>
         </ChartCard>
+        </Part>
       )}
+      </PartGrid>
     </>
   );
 }

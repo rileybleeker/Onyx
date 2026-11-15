@@ -9,6 +9,7 @@ import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { Part, PartGrid } from "@/components/personalize/PartGrid";
 import { chartTooltip, axisTick, gridStyle, axisLabel, sourceColors, chartColors as C } from "@/lib/chart-theme";
 import { mergeDailySteps, stepsSourceLabel } from "@/lib/steps";
 import {
@@ -743,7 +744,9 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
         </div>
       </div>
 
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+      <PartGrid page="/activities" title="Activities">
+      <Part id="summary" title="Steps, heart rate & stress tiles">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
         <StatCard
           label="Steps"
           value={latestSteps ? latestSteps.steps.toLocaleString() : null}
@@ -761,8 +764,9 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
         <StatCard label="Min HR" value={avgMinHr != null ? avgMinHr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
         <StatCard label="Stress Level" value={avgStress != null ? avgStress.toFixed(0) : null} sublabel={rangeNote} source="GARMIN" />
       </div>
+      </Part>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+        <Part id="daily-steps" title="Daily Steps" width="half">
         <ChartCard title="Daily Steps" subtitle={rangeLabel(shownRange)} source={stepsSource}>
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={stepsData}>
@@ -779,7 +783,9 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="avg-heart-rate" title="Avg Heart Rate" width="half">
         <ChartCard title="Avg Heart Rate" subtitle={rangeLabel(shownRange)} source="WHOOP">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={cycleHrData}>
@@ -797,7 +803,9 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="heart-rate-range" title="Heart Rate Range" width="half">
         <ChartCard title="Heart Rate Range" source="GARMIN">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={hrData}>
@@ -821,7 +829,9 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="stress" title="Stress Level" width="half">
         <ChartCard title="Stress Level" source="GARMIN">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={stressData}>
@@ -839,8 +849,9 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
-      </div>
+        </Part>
 
+      <Part id="activity-list" title="Activity list">
       {rows.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-center">
           <svg className="w-10 h-10 text-text-tertiary mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -1168,6 +1179,8 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
           })}
         </div>
       )}
+      </Part>
+      </PartGrid>
     </>
   );
 }

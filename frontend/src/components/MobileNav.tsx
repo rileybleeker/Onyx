@@ -12,6 +12,7 @@ import { badgeText, isTabActive, mobileTabs, tabLabel } from "@/lib/mobile-tabs"
 import { navIntentProps } from "@/lib/warmup";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 import { useActiveRoute } from "./FeedContext";
+import PersonalizeButton from "./personalize/PersonalizeButton";
 
 const LOG_ACTIONS = [
   { label: "Check-in", href: "/check-in", icon: ClipboardCheck },
@@ -314,6 +315,10 @@ export default function MobileNav() {
         </nav>
 
         <div className="px-2 py-3 border-t border-border-subtle pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+          <PersonalizeButton
+            onStart={() => setDrawerOpen(false)}
+            className="min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full disabled:text-accent"
+          />
           <button
             onClick={handleSignOut}
             className="min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full"
