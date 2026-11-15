@@ -61,7 +61,7 @@ test("reads Personalize's local record and a bare layout; garbage is nothing", (
   assert.equal(N.parseAreaIds(JSON.stringify({ v: 1 })), null);
 });
 
-test('the pre-paint script writes the same order React renders', () => {
+test('the pre-paint script writes the same panel React renders', () => {
   const saved = ['today', 'analytics.hrv', 'sleep', 'financials.budgets', 'nutrition'];
   const appended = [];
   const env = {
@@ -73,12 +73,40 @@ test('the pre-paint script writes the same order React renders', () => {
   assert.equal(appended[0].id, N.NAV_BOOT_STYLE_ID);
   const css = appended[0].textContent;
   const rank = N.rankAreas(N.navDefaultIds(SECTIONS), saved);
-  for (const [id, r] of rank) assert.ok(css.includes(`[data-nav-area="${id}"]{order:${r}}`), id);
-  // Sections ordered by their first item, exactly like orderNav().
-  const sectionOrder = (i) => Number(new RegExp(`\\[data-nav-section="${i}"\\]\\{order:(\\d+)\\}`).exec(css)[1]);
-  const reactOrder = N.orderNav(SECTIONS, saved).map((s) => s.index);
-  const cssOrder = [0, 1, 2, 3].sort((a, b) => sectionOrder(a) - sectionOrder(b));
+  // The default pins (Today, Check-in) sit in Quick access, so their section copies are off.
+  const pinned = ['today', 'check-in'];
+  for (const [id, r] of rank) {
+    if (pinned.includes(id)) assert.ok(css.includes(`[data-nav-area="${id}"]{display:none!important}`), id);
+    else assert.ok(css.includes(`[data-nav-area="${id}"]{display:flex!important;order:${r}}`), id);
+  }
+  pinned.forEach((id, i) => assert.ok(css.includes(`[data-nav-quick="${id}"]{display:flex!important;order:${i}}`), id));
+  // Sections ordered by their first item, exactly like orderNav(); Home (only Today) is empty and hidden.
+  assert.ok(css.includes('[data-nav-section="0"]{display:none!important}'));
+  const sectionOrder = (i) => {
+    const m = new RegExp(`\\[data-nav-section="${i}"\\]\\{display:block!important;order:(\\d+)\\}`).exec(css);
+    return m ? Number(m[1]) : null;
+  };
+  const reactOrder = N.arrangeNav(SECTIONS, N.areaPrefsOf({ v: 1, grids: { main: { order: saved } } })).sections.map((s) => s.index);
+  const cssOrder = [0, 1, 2, 3].filter((i) => sectionOrder(i) !== null).sort((a, b) => sectionOrder(a) - sectionOrder(b));
   assert.deepEqual(cssOrder, reactOrder);
+});
+
+test('the pre-paint script shows saved pins and hides hidden pages, like arrangeNav()', () => {
+  const layout = { v: 1, grids: { quick: { order: ['sleep'], hide: { sleep: false, 'check-in': true } }, nav: { hide: { activities: true } } } };
+  const appended = [];
+  new Function('localStorage', 'document', N.navBootScript(SECTIONS))(
+    { getItem: () => JSON.stringify({ l: layout }) },
+    { createElement: () => ({}), head: { appendChild: (el) => appended.push(el) } },
+  );
+  const css = appended[0].textContent;
+  const arranged = N.arrangeNav(SECTIONS, N.areaPrefsOf(layout));
+  assert.deepEqual(arranged.pinned.map((i) => i.href), ['/sleep', '/today']);
+  assert.ok(css.includes('[data-nav-quick="sleep"]{display:flex!important;order:0}'));
+  assert.ok(css.includes('[data-nav-quick="today"]{display:flex!important;order:1}'));
+  assert.ok(css.includes('[data-nav-quick="check-in"]{display:none!important}'));
+  assert.ok(css.includes('[data-nav-area="check-in"]{display:flex!important;'), 'an unpinned default is back in its section');
+  assert.ok(css.includes('[data-nav-area="activities"]{display:none!important}'), 'a hidden page is off');
+  assert.deepEqual(arranged.hidden.map((i) => i.href), ['/activities']);
 });
 
 test('the pre-paint script does nothing without a saved order or on bad data', () => {
@@ -117,4 +145,60 @@ test('moving a section moves its pages as a block; the scroll order is the flatt
   l = A.moveNavSectionBy(l, SECTIONS, 3, 1); // and to the end: the default again
   assert.deepEqual(flat(N.orderNav(SECTIONS, l.grids?.main?.order ?? null)).map((x) => x.split(':')[0]), ['Home', 'Logging', 'Insights', 'Tools']);
   assert.deepEqual(l, { v: 1 });
+});
+
+test('pin, unpin and hide: Quick access and hidden pages are stored in layout.areas', () => {
+  let l = { v: 1 };
+  assert.deepEqual(A.pinnedOf(l, SECTIONS), ['/today', '/check-in'], 'default pins');
+  l = A.setPinned(l, SECTIONS, '/sleep', true);
+  assert.deepEqual(A.pinnedOf(l, SECTIONS), ['/today', '/check-in', '/sleep']);
+  const a = N.arrangeNav(SECTIONS, N.areaPrefsOf(l));
+  assert.deepEqual(a.sections.map((s) => s.title), ['Logging', 'Insights', 'Tools'], 'Home holds only Today, pinned');
+  assert.deepEqual(a.sections[1].items.map((i) => i.href), ['/analytics/hrv']);
+  // Hiding unpins; the page is listed as hidden.
+  l = A.setNavHidden(l, SECTIONS, '/check-in', true);
+  assert.deepEqual(A.pinnedOf(l, SECTIONS), ['/today', '/sleep']);
+  assert.deepEqual(N.arrangeNav(SECTIONS, N.areaPrefsOf(l)).hidden.map((i) => i.href), ['/check-in']);
+  // Pinning a hidden page shows it again, here before Today.
+  l = A.setPinned(l, SECTIONS, '/check-in', true, '/today');
+  assert.deepEqual(A.pinnedOf(l, SECTIONS), ['/check-in', '/today', '/sleep']);
+  assert.deepEqual(N.areaPrefsOf(l).navHidden, []);
+  l = A.movePinnedBy(l, SECTIONS, '/check-in', 1);
+  assert.deepEqual(A.pinnedOf(l, SECTIONS), ['/today', '/check-in', '/sleep']);
+  // The default pins store nothing.
+  l = A.setPinned(l, SECTIONS, '/sleep', false);
+  assert.equal(l.grids && l.grids.quick, undefined);
+  // Unpin everything: stored as flags, not as "default".
+  l = A.setPinnedList({ v: 1 }, SECTIONS, []);
+  assert.deepEqual(A.pinnedOf(l, SECTIONS), []);
+});
+
+test('hide from scroll is separate from hide from navigation', () => {
+  let l = A.setScrollHidden({ v: 1 }, SECTIONS, '/sleep', true);
+  assert.deepEqual(N.areaPrefsOf(l).scrollHidden, ['sleep']);
+  assert.deepEqual(N.areaPrefsOf(l).navHidden, []);
+  l = A.setNavHidden(l, SECTIONS, '/nutrition', true);
+  assert.deepEqual(N.areaPrefsOf(l).scrollHidden, ['sleep']);
+  assert.deepEqual(N.areaPrefsOf(l).navHidden, ['nutrition']);
+  l = A.setScrollHidden(l, SECTIONS, '/sleep', false);
+  assert.deepEqual(N.areaPrefsOf(l).scrollHidden, []);
+});
+
+test('bottom-bar slots are stored as area ids; the default bar stores nothing', () => {
+  const D = ['/today', '/agents', '/chat', 'more'];
+  const l = A.setTabSlots({ v: 1 }, ['/sleep', '/agents', '/chat', 'more'], D);
+  assert.deepEqual(l.grids.tabs.order, ['sleep', 'agents', 'chat', 'more']);
+  assert.deepEqual(N.areaPrefsOf(l).tabs, ['sleep', 'agents', 'chat', 'more']);
+  assert.deepEqual(A.setTabSlots(l, D, D), { v: 1 });
+});
+
+test('the bottom-bar pre-paint script hides only the slots that differ from the default', () => {
+  const appended = [];
+  const rec = { l: { v: 1, grids: { tabs: { order: ['sleep', 'agents', 'chat', 'nutrition'] } } } };
+  new Function('localStorage', 'document', N.tabsBootScript(['today', 'agents', 'chat', 'more']))(
+    { getItem: () => JSON.stringify(rec) },
+    { createElement: () => ({}), head: { appendChild: (el) => appended.push(el) } },
+  );
+  assert.equal(appended[0].id, N.TABS_BOOT_STYLE_ID);
+  assert.equal(appended[0].textContent, '[data-tab-slot="0"]{visibility:hidden}[data-tab-slot="3"]{visibility:hidden}');
 });

@@ -61,7 +61,12 @@ const Sidebar = load('src/components/Sidebar.tsx', {
 }).default;
 const render = () => renderToStaticMarkup(React.createElement(Sidebar));
 // Link destinations only: React 19's server render also emits <link rel="preload" href> for the sidebar logo.
-const hrefs = (html) => [...html.matchAll(/<a\b[^>]*?\shref="([^"]+)"/g)].map((m) => m[1]);
+// Every page is rendered in Quick access AND in its section (for the pre-paint script); the copy that is not shown
+// carries data-off="true" and is display:none, so it is not counted.
+const hrefs = (html) => [...html.matchAll(/<a\b[^>]*>/g)].map((m) => m[0])
+  .filter((tag) => !/\sdata-off="true"/.test(tag))
+  .map((tag) => (tag.match(/\shref="([^"]+)"/) || [])[1])
+  .filter(Boolean);
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // Sidebar's element tree, captured inside a real render so its hooks run in React (calling it bare would not).
 function sidebarTree() {
@@ -144,7 +149,7 @@ test('real Tailwind layout keeps quick access fixed while library scrolls', { sk
     for (const height of [768, 600, 400]) {
       await page.setViewportSize({ width: 1280, height });
       await page.setContent(`<style>${result.css}</style>${render()}`);
-      const today = page.locator('a[href="/today"]');
+      const today = page.locator('a[href="/today"]:not([data-off])');
       const before = await today.boundingBox();
       const library = page.getByRole('navigation', { name: 'All sections', exact: true });
       const libraryBox = await library.boundingBox();

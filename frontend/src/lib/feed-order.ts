@@ -40,7 +40,15 @@ export function isFeedExcluded(route: string): boolean {
 export interface AreaOrder {
   order: string[];
   hidden: string[];
+  /**
+   * The side panel's Quick access pages (hrefs, in their order), which lead the scroll. Only read from a
+   * Personalize layout: its `grids.quick` (lib/nav-areas.ts), else the default pins.
+   */
+  pinned?: string[];
 }
+
+/** The default Quick access pages. Keep equal to QUICK_ACCESS in lib/nav-areas.ts (both files are import-free). */
+export const DEFAULT_PINNED: readonly string[] = ["/today", "/check-in"];
 
 /** Ways an area can be named in a stored value: "/analytics/hrv", "analytics/hrv", "analytics.hrv", "analytics-hrv". */
 export function areaIdsOf(href: string): string[] {
@@ -101,8 +109,9 @@ export function parseAreaOrder(raw: unknown, known: readonly string[] = []): Are
     for (const h of Array.from(hide)) if (!hidden.includes(h)) hidden.push(h);
     return order.length || hidden.length ? { order, hidden } : null;
   }
-  const grid = (r.grids as Record<string, unknown> | undefined)?.main as { order?: unknown; hide?: unknown } | undefined;
-  if (grid && typeof grid === "object") {
+  const grids = r.grids && typeof r.grids === "object" && !Array.isArray(r.grids) ? (r.grids as Record<string, unknown>) : null;
+  if (grids) {
+    const grid = (grids.main && typeof grids.main === "object" ? grids.main : {}) as { order?: unknown; hide?: unknown };
     const hideMap = grid.hide && typeof grid.hide === "object" ? (grid.hide as Record<string, unknown>) : {};
     const hiddenHrefs = new Set<string>();
     for (const [id, v] of Object.entries(hideMap)) {
@@ -114,13 +123,43 @@ export function parseAreaOrder(raw: unknown, known: readonly string[] = []): Are
       add(id, !!href && hiddenHrefs.has(href));
     }
     for (const h of Array.from(hiddenHrefs)) if (!hidden.includes(h)) hidden.push(h);
-    return order.length || hidden.length ? { order, hidden } : null;
+    const quick = grids.quick && typeof grids.quick === "object" ? (grids.quick as { order?: unknown; hide?: unknown }) : null;
+    const navHide = (grids.nav as { hide?: unknown } | undefined)?.hide;
+    if (!order.length && !hidden.length && !quick) return null;
+    return { order, hidden, pinned: pinnedOf(quick, navHide, known) };
   }
   return null;
 }
 
 /**
- * The full area order: Riley's saved order of the known pages, then any page the saved order does not name
+ * The Quick access pages of a Personalize area layout, as hrefs in order: `quick.order` first, then the default
+ * pins, then the other known pages; `quick.hide[id]` true takes a default pin out, false pins another page; a page
+ * hidden from the side panel (`nav.hide`) is never pinned. Same rule as resolvePinned() in lib/nav-areas.ts.
+ */
+function pinnedOf(quick: { order?: unknown; hide?: unknown } | null, navHide: unknown, known: readonly string[]): string[] {
+  const flags = (v: unknown): Map<string, boolean> => {
+    const m = new Map<string, boolean>();
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      for (const [id, x] of Object.entries(v as Record<string, unknown>)) {
+        const href = hrefFor(id, known);
+        if (href && typeof x === "boolean") m.set(href, x);
+      }
+    }
+    return m;
+  };
+  const hide = flags(quick?.hide);
+  const off = flags(navHide);
+  const defaults = DEFAULT_PINNED.filter((h) => known.length === 0 || known.includes(h));
+  const member = (h: string) => off.get(h) !== true && (hide.has(h) ? !hide.get(h) : defaults.includes(h));
+  const out: string[] = [];
+  const cand = [...idList(quick?.order).map((id) => hrefFor(id, known)), ...defaults, ...known];
+  for (const h of cand) if (h && member(h) && !out.includes(h)) out.push(h);
+  return out;
+}
+
+/**
+ * The full area order: the Quick access (pinned) pages first, then Riley's saved order of the known pages, then any
+ * page the saved order does not name
  * (a page added later) after its nearest predecessor in the default order. Default = `navHrefs` with Today
  * first. Excluded routes never appear.
  */
@@ -130,10 +169,18 @@ export function areaOrder(navHrefs: readonly string[], saved: AreaOrder | null):
     const r = feedRouteOf(h);
     if (!isFeedExcluded(r) && !base.includes(r)) base.push(r);
   }
-  if (!saved || saved.order.length === 0) return base;
+  if (!saved) return base;
+  const ordered = savedOrder(base, saved.order);
+  // Quick access (pinned) pages lead, in their own order.
+  const pins = (saved.pinned ?? []).filter((h) => ordered.includes(h));
+  return pins.length ? [...pins, ...ordered.filter((h) => !pins.includes(h))] : ordered;
+}
+
+function savedOrder(base: readonly string[], saved: readonly string[]): string[] {
+  if (saved.length === 0) return base.slice();
   const known = new Set(base);
   const out: string[] = [];
-  for (const h of saved.order) if (known.has(h) && !out.includes(h)) out.push(h);
+  for (const h of saved) if (known.has(h) && !out.includes(h)) out.push(h);
   for (let i = 0; i < base.length; i++) {
     const h = base[i];
     if (out.includes(h)) continue;

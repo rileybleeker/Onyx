@@ -1,7 +1,8 @@
 /**
- * The phone's bottom tab bar: [tab, tab, Log, tab, More]. Log (the quick-log sheet) sits in the centre and
- * More (the drawer) is always last; the three other tabs are pages from lib/nav.ts. Each tab's label is the
- * name of the page it opens. Import-free (tests/mobile-tabs.test.cjs).
+ * The phone's bottom tab bar: [slot, slot, Log, slot, slot]. Log (the quick-log sheet) sits in the centre; the four
+ * slots around it are pages from lib/nav.ts or More (the drawer), by default Today, Agents | Log | Chat, More, and
+ * Riley can choose them in Personalize (phone drawer). Each tab's label is the name of the page it opens.
+ * Import-free (tests/mobile-tabs.test.cjs).
  */
 
 /** Today, Agents and Chat (Onyx Chat, /chat) around Log; More is always the last tab. */
@@ -47,6 +48,43 @@ export function mobileTabs(saved: string[] | undefined | null, exists: (href: st
     if (exists(h) && !out.includes(h)) out.push(h);
   }
   return out;
+}
+
+// ---- the four slots around Log (Personalize, phone drawer; saved in layout.areas, grids.tabs) ------------------
+
+/** The More menu (the drawer) as a slot value; same text as MORE_TAB in lib/nav-areas.ts. */
+export const MORE_SLOT = "more";
+export const TAB_SLOT_COUNT = 4;
+/** [slot 1, slot 2] Log [slot 3, slot 4]: Today, Agents | Log | Chat, More. */
+export const DEFAULT_TAB_SLOTS: readonly string[] = [...DEFAULT_MOBILE_TABS, MORE_SLOT];
+
+/**
+ * The four slots: the saved choice per slot (a page that exists or More, no repeats), an empty or invalid slot
+ * filled with its default, else the first default not used yet.
+ */
+export function tabSlots(saved: readonly (string | null | undefined)[] | null | undefined, exists: (href: string) => boolean): string[] {
+  const ok = (h: unknown): h is string => typeof h === "string" && (h === MORE_SLOT || exists(h));
+  const out: (string | null)[] = [];
+  for (let i = 0; i < TAB_SLOT_COUNT; i++) {
+    const h = saved?.[i];
+    out.push(ok(h) && !out.includes(h) ? h : null);
+  }
+  for (let i = 0; i < TAB_SLOT_COUNT; i++) {
+    if (out[i] !== null) continue;
+    const d = DEFAULT_TAB_SLOTS[i];
+    out[i] = ok(d) && !out.includes(d) ? d : DEFAULT_TAB_SLOTS.find((x) => ok(x) && !out.includes(x)) ?? null;
+  }
+  return out.filter((x): x is string => x !== null);
+}
+
+/** `value` put in `slot`; when it already sits in another slot the two swap, so nothing repeats or drops out. */
+export function chooseTab(slots: readonly string[], slot: number, value: string): string[] {
+  const next = slots.slice();
+  if (slot < 0 || slot >= next.length || next[slot] === value) return next;
+  const was = next.indexOf(value);
+  if (was !== -1) next[was] = next[slot];
+  next[slot] = value;
+  return next;
 }
 
 /** "9+" past nine; nothing for zero. */
