@@ -11,8 +11,9 @@ import { LogCard } from "./ui";
  * /log "Say it" box (AGENTS.md "Log screen"). Riley types or dictates a few sentences (the keyboard's own
  * microphone) and taps Fill:
  *   - the words go to the embedded Check-in as {checkin: {text}}, which runs its own read-only fill (daytime
- *     answers, last night's sleep, a journal draft of the words) at once, and
- *   - POST /api/log/voice (one model call, read-only) returns drafts for Supplements, Uber Eats, Weight and Reading.
+ *     answers, last night's sleep) at once, and
+ *   - POST /api/log/voice (one model call, read-only) returns drafts for Journal (the words verbatim, when they are
+ *     a reflection or start with "journal:"), Supplements, Uber Eats, Weight and Reading.
  * Every draft is a suggestion marked FROM_WHAT_YOU_SAID in its section; nothing is stored until Riley taps that
  * section's own Save. Nothing is sent on page open or on scroll: only the Fill tap sends.
  *
@@ -31,7 +32,7 @@ type Shown =
 let keptText = "";
 let keptShown: Shown | null = null;
 
-const SECTION_NAMES: Record<string, string> = { supplements: "Supplements", ubereats: "Uber Eats", weight: "Weight", reading: "Reading" };
+const SECTION_NAMES: Record<string, string> = { journal: "Journal", supplements: "Supplements", ubereats: "Uber Eats", weight: "Weight", reading: "Reading" };
 
 export default function SayItSection() {
   const [text, setText] = useState(keptText);
@@ -70,11 +71,12 @@ export default function SayItSection() {
       });
       const json = (await res.json().catch(() => null)) as (LogVoiceResult & { unavailable?: string[]; failed?: boolean; error?: string }) | null;
       if (!res.ok || !json || json.failed || !Array.isArray(json.supplements) || !Array.isArray(json.ubereats)) {
-        show({ kind: "error", message: !res.ok && json?.error ? `Couldn't read that: ${json.error}` : "Couldn't read that for supplements, Uber Eats, weight and reading. Try again." });
+        show({ kind: "error", message: !res.ok && json?.error ? `Couldn't read that: ${json.error}` : "Couldn't read that for the journal, supplements, Uber Eats, weight and reading. Try again." });
         return;
       }
       // Only sections the words filled get a draft: an empty answer leaves a section's earlier suggestion alone.
       const drafts: { [S in keyof LogDraftMap]?: LogDraftMap[S] } = {};
+      if (json.journal) drafts.journal = json.journal;
       if (json.supplements.length) drafts.supplements = json.supplements;
       if (json.ubereats.length) drafts.ubereats = json.ubereats;
       if (json.weight) drafts.weight = json.weight;
@@ -99,8 +101,9 @@ export default function SayItSection() {
       action={
         <InfoHint label="Say it">
           Type, or use your keyboard&apos;s microphone. Fill reads it once and suggests answers in the check-in,
-          supplements, Uber Eats, weight and reading below, marked &ldquo;{FROM_WHAT_YOU_SAID}&rdquo;. Nothing is saved
-          until you press each section&apos;s Save. The words go to Anthropic for that one read and are not stored.
+          journal, supplements, Uber Eats, weight and reading below, marked &ldquo;{FROM_WHAT_YOU_SAID}&rdquo;. Start
+          with &ldquo;journal:&rdquo; to make the rest a journal entry. Nothing is saved until you press each
+          section&apos;s Save. The words go to Anthropic for that read and are not stored.
         </InfoHint>
       }
     >
@@ -154,6 +157,7 @@ function Filled({ result }: { result: LogVoiceResult & { unavailable?: string[] 
   const { summary } = result;
   const rows: Array<{ name: string; lines: string[] }> = [
     { name: "Check-in", lines: ["Filling the questions below"] },
+    { name: "Journal", lines: summary.journal ?? [] },
     { name: "Supplements", lines: summary.supplements },
     { name: "Uber Eats", lines: summary.ubereats },
     { name: "Weight", lines: summary.weight },

@@ -4,10 +4,14 @@
 // its existing write route.
 //
 // The check-in part is not here: the box hands the words to the embedded check-in ({checkin: {text}}), which runs
-// its own read-only fill (POST /api/habits/checkin/voice: daytime answers, last night's sleep, journal labels).
+// its own read-only fill (POST /api/habits/checkin/voice: daytime answers, last night's sleep). The journal draft
+// IS here (the check-in makes none for these words): lib/journal-file.ts sayItJournalDraft on this call's answer.
 import { shiftYmd } from "./delivery-portion";
 import { formatClock, leftoverQuestions, LEFTOVER_WINDOW_DAYS, type LeftoverRow } from "./delivery-leftovers";
+import { JOURNAL_TOPICS } from "./journal-entry";
+import { sayItJournalDraft, SAY_IT_JOURNAL_RULES, SAY_IT_JOURNAL_SCHEMA } from "./journal-file";
 import type {
+  JournalLogDraft,
   LeftoverAnswer,
   PortionFraction,
   ReadingLogDraft,
@@ -158,6 +162,7 @@ export function modelInput(text: string, lists: VoiceLists, clock: VoiceClock): 
       left_now: d.leftoverOpen ? `${shareWord(d.left)} of the dish` : null,
     })),
     books: lists.books.map((b) => ({ slug: b.slug, title: b.title, author: b.author, chapters: b.total_chapters, chapters_done: b.chapters_done })),
+    known_topics: JOURNAL_TOPICS,
   };
 }
 
@@ -170,6 +175,7 @@ You get:
 - products and stacks: the supplements and supplement stacks the person tracks.
 - dishes: restaurant dishes delivered on the last few days.
 - books: the books being read.
+- known_topics: the journal's existing topic tags.
 
 Fill only what the note clearly says happened. Never guess: leave a list empty, and give a field its "not said" value ("" for text, 0 for a number, none for a choice) when the note does not say it. Plans and intentions ("I should take magnesium", "I'll read later") are not entries.
 
@@ -200,7 +206,9 @@ reading: one reading session with read true, or read false (and the rest "not sa
 
 not_matched: short phrases for supplements, dishes or books the note says were taken, eaten or read that match nothing in the lists. Empty when everything matched.
 
-Habits, workouts, alcohol, sleep, mood and every other part of the note are handled elsewhere: ignore them.`;
+${SAY_IT_JOURNAL_RULES}
+
+Habit questions (workouts, alcohol, screens and the like) and sleep are answered elsewhere: leave them out of every list above.`;
 
 // No union types (anyOf / nullable): the API caps a request at 16 of them. "Not said" is "" for text, 0 for
 // numbers, "none" for an enum and false for `weight.said` / `reading.read`.
@@ -266,8 +274,9 @@ export const LOG_VOICE_SCHEMA = {
       additionalProperties: false,
     },
     not_matched: { type: "array", items: STR },
+    journal: SAY_IT_JOURNAL_SCHEMA,
   },
-  required: ["supplements", "stacks", "dishes", "weight", "reading", "not_matched"],
+  required: ["supplements", "stacks", "dishes", "weight", "reading", "not_matched", "journal"],
   additionalProperties: false,
 };
 
@@ -280,8 +289,10 @@ export interface LogVoiceResult {
   ubereats: UberEatsLogDraft[];
   weight: WeightLogDraft | null;
   reading: ReadingLogDraft | null;
+  /** A journal entry of the words (verbatim), when the note is (or holds) a reflection or starts with "journal:". */
+  journal: JournalLogDraft | null;
   /** One readable line per draft, per section (for the box's "what it filled"). */
-  summary: { supplements: string[]; ubereats: string[]; weight: string[]; reading: string[] };
+  summary: { journal: string[]; supplements: string[]; ubereats: string[]; weight: string[]; reading: string[] };
   not_matched: string[];
 }
 
@@ -384,7 +395,8 @@ export function parseLogVoice(
     ubereats: [],
     weight: null,
     reading: null,
-    summary: { supplements: [], ubereats: [], weight: [], reading: [] },
+    journal: null,
+    summary: { journal: [], supplements: [], ubereats: [], weight: [], reading: [] },
     not_matched: [],
   };
   const notMatched = new Set<string>();
@@ -511,6 +523,14 @@ export function parseLogVoice(
       const parts = [chapters, minutes != null ? `${minutes} min` : null, medium, recall ? "recall note" : null].filter(Boolean);
       result.summary.reading.push(`${target.title}${parts.length ? `: ${parts.join(", ")}` : ""}${shortDay(date)}`);
     }
+  }
+
+  // Journal: the words themselves (a "journal:" prefix, an exact quote of the reflective part, or the whole note).
+  const journal = sayItJournalDraft(text, out.journal);
+  if (journal) {
+    result.journal = journal;
+    const words = journal.body.split(/\s+/).length;
+    result.summary.journal.push(`${journal.title ? `"${journal.title}"` : "Entry"}, ${words} word${words === 1 ? "" : "s"} of yours`);
   }
 
   for (const phrase of arr(out.not_matched)) {
