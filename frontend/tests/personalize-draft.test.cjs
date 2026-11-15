@@ -35,6 +35,8 @@ const S = loadTs('lib/personalize-store.ts', {
 const N = loadTs('lib/nav-areas.ts');
 
 const LAYOUT = { v: 1, grids: { main: { order: ['sleep', 'today', 'log'] } } };
+// Differs from LAYOUT, which an earlier test saved: a draft equal to the saved layout is no change (nothing touched).
+const LAYOUT2 = { v: 1, grids: { main: { order: ['log', 'today', 'sleep'] } } };
 const drafts = () => events.filter((e) => e.type === N.LAYOUT_DRAFT_EVENT);
 
 test('each change to the side panel draft is announced; page-only changes are not', () => {
@@ -74,9 +76,9 @@ test('a scroll that starts listening mid-session gets the current draft; none wh
   S.beginEdit('layout.sleep', '/sleep', 'Sleep');
   window.dispatchEvent(new CustomEvent(N.LAYOUT_DRAFT_REQUEST_EVENT));
   assert.equal(drafts().length, 0, 'session, side panel untouched');
-  S.updateDraftFor(N.AREAS_KEY, () => LAYOUT);
+  S.updateDraftFor(N.AREAS_KEY, () => LAYOUT2);
   events.length = 0;
   window.dispatchEvent(new CustomEvent(N.LAYOUT_DRAFT_REQUEST_EVENT));
-  assert.deepEqual(drafts(), [{ type: N.LAYOUT_DRAFT_EVENT, detail: { key: N.AREAS_KEY, layout: LAYOUT } }]);
+  assert.deepEqual(drafts(), [{ type: N.LAYOUT_DRAFT_EVENT, detail: { key: N.AREAS_KEY, layout: LAYOUT2 } }]);
   S.endEdit(false);
 });
