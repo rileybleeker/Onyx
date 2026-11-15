@@ -6,16 +6,20 @@
 What one run does, per registered trial:
 
   no trial registered        nothing. A healthy no-op: one read of pds.experiments, a success
-                             heartbeat with 0 records. This is the usual case.
-  before the first day       nothing to count yet (one line in the log).
+                             heartbeat with 0 records. This is the usual case. Notion is not called.
+  before the first day       nothing to count yet; the Notion page is created (or kept up to date)
+                             from the protocol, Status Registered.
   while the trial runs       PROGRESS ONLY: days elapsed, nights that have an outcome, missing
                              share, adherence. Counts, never an effect. In this mode the job does
-                             not even load an HRV value: it asks which days HAVE one.
+                             not even load an HRV value: it asks which days HAVE one. The counts
+                             go to the Notion page's properties.
   at the pre-registered end  the FINAL report, once: the registered analysis
                              (experiment_analysis.analyze_trial, which itself refuses before the
-                             end), written to pds.experiment_reports, and the trial is marked
+                             end), written to pds.experiment_reports, mirrored to the Notion page
+                             (effect fields + the "Report (auto)" section), and the trial is marked
                              complete. A trial Riley stopped early gets its final report the same
-                             way, labelled stopped_early.
+                             way, labelled stopped_early. An A/A check (protocol kind: aa) also gets
+                             its pass / fail verdict (docs/experiment-framework.md 12.2).
 
 The effect is analysed only at the pre-registered end (Riley's decision 1, doc section 13).
 There is deliberately no --as-of / --force option: the only clock is the database's behavioral
@@ -24,22 +28,25 @@ today, so nobody, including a later agent, can ask this job for an early look.
 The final report waits FINAL_SETTLE_DAYS after the last day, so the last night's HRV, its Screen
 Time sync and a next-morning check-in answer are in, and up to FINAL_MAX_WAIT_DAYS if that last
 night's HRV has still not arrived. Once written it is never recomputed (a later run would use a
-different re-draw seed).
+different re-draw seed); later runs only retry a Notion mirror that has not succeeded yet
+(notion_synced_at is still empty).
 
-pds.experiment_reports is the source of truth. The Notion mirror ("Onyx Experiments", doc 10.1)
-is the next build step and reads from that table; this job does not talk to Notion.
+pds.experiment_reports is the source of truth. The Notion mirror ("Onyx Experiments", doc 10.1,
+experiment_notion.py) is best-effort: it needs NOTION_API_KEY, and a failed or skipped mirror
+never loses the Supabase row; it turns the heartbeat partial.
 
 Guards (heartbeat `failed`, message starts with "GUARD <name>:", AGENTS.md):
   GUARD experiment_alignment  hrv_alignment.ALIGNMENT_VERSION differs from the registered one
   GUARD experiment_schedule   the stored schedule is not what the committed seed generates
 
-Heartbeat: pds.sync_log experiments|report on EVERY run, success and failure. `partial` = 3 or
-more nights in a row without an outcome, or adherence below a threshold the protocol registered
-(adherence.min_pct).
+Heartbeat: pds.sync_log experiments|report on EVERY run, success and failure. `partial` = the
+Notion mirror failed or is not configured, 3 or more nights in a row without an outcome,
+adherence below a threshold the protocol registered (adherence.min_pct), or an A/A check that did
+not pass.
 
 The Actions logs of this repository are public. This script prints the experiment id, dates and
 which report was written. It never prints a seed, an arm, an HRV value, an adherence figure or
-an estimate; those go to the service-role-only table only.
+an estimate; those go to the service-role-only table and to Riley's Notion page only.
 """
 from __future__ import annotations
 
@@ -57,6 +64,7 @@ import experiment_adherence as adherence
 import experiment_admin as admin
 import experiment_analysis as analysis
 import experiment_design as design
+import experiment_notion as notion
 
 SOURCE, DATA_TYPE = "experiments", "report"
 REPORTS_SQL = admin.REPORTS_SQL
@@ -66,6 +74,7 @@ TAIL_MISSING_ALERT = 3       # nights in a row without an outcome that turn the 
 MIN_DAYS_FOR_ADHERENCE_ALERT = 7
 COVARIATE_MIN_NIGHTS = 3     # nights needed inside the previous 7 for the 7-day mean covariate
 ACTIVE = ("registered", "running", "paused")
+AA_MIN_ANSWER_PCT = 90.0     # Phase 2 is done when adherence is captured on 90% or more of days (doc 12)
 EXCLUSION_RULE = ("whole blocks are left out when any of their days is a flight day "
                   "(pds.flight_day_unified.flew = 1), a time-zone transition day (onyx_is_transition_day) "
                   "or a pause declared before the block started")
@@ -108,7 +117,7 @@ class Store(admin.Store):
 
     def final_report(self, experiment_id: str) -> dict | None:
         try:
-            rows = self._t("experiment_reports").select("as_of_date,payload").eq(
+            rows = self._t("experiment_reports").select("as_of_date,payload,notion_synced_at").eq(
                 "experiment_id", experiment_id).eq("report_kind", "final").limit(1).execute().data
         except Exception as exc:  # noqa: BLE001
             if _is_missing_table(exc):
@@ -125,6 +134,17 @@ class Store(admin.Store):
             if _is_missing_table(exc):
                 raise ReportsTableMissing() from None
             raise
+
+    def mark_mirrored(self, experiment_id: str, kind: str, as_of: date) -> None:
+        """Stamp a report row as mirrored to Notion (the only change a final row accepts)."""
+        self._t("experiment_reports").update({"notion_synced_at": datetime.now(adherence.ET).isoformat()}).eq(
+            "experiment_id", experiment_id).eq("report_kind", kind).eq("as_of_date", as_of.isoformat()).execute()
+
+    def revealed_days(self, experiment_id: str) -> set[str]:
+        """The behavioral days whose arm Today has shown (first_revealed_at is set). Dates only."""
+        rows = self._paged(lambda lo, hi: self._t("experiment_schedule").select("behavioral_date").eq(
+            "experiment_id", experiment_id).not_.is_("first_revealed_at", "null").order("day_index").range(lo, hi))
+        return {str(r["behavioral_date"])[:10] for r in rows}
 
     def outcome_days(self, first: date, last: date) -> set[str]:
         """The behavioral days in the range that HAVE a WHOOP HRV. The values are not selected."""
@@ -157,6 +177,10 @@ class Store(admin.Store):
 
     def set_status(self, experiment_id: str, status: str) -> None:
         self._t("experiments").update({"status": status}).eq("experiment_id", experiment_id).execute()
+
+    def set_notion_page(self, experiment_id: str, page_id: str) -> None:
+        """One of the fields the protocol lock leaves open (experiments_guard)."""
+        self._t("experiments").update({"notion_page_id": page_id}).eq("experiment_id", experiment_id).execute()
 
 
 def get_store() -> Store:
@@ -311,6 +335,90 @@ def unrecognised_sensitivity(exp: dict[str, Any]) -> list[str]:
     return out
 
 
+def aa_check(exp: dict[str, Any], report: dict[str, Any], n_done: int, revealed: set[str],
+             answered: int) -> dict[str, Any] | None:
+    """The verdict of an A/A check (protocol kind: aa), None for a treatment trial.
+
+    Both arms carried the same instruction, so a significant difference can only be a false one.
+    The other two items are the rest of Phase 2's "done when" (doc 12): every trial day was revealed
+    on Today, and 90% or more of the days have a check-in answer. Report re-runs being idempotent is
+    shown by the tests and by the final report being written once.
+    """
+    if design.trial_kind(exp.get("protocol")) != design.KIND_AA:
+        return None
+    start = _day(exp["start_date"])
+    days = [(start + timedelta(days=i)).isoformat() for i in range(n_done)]
+    days_revealed = sum(1 for d in days if d in revealed)
+    p_value = report.get("p_value")
+    analysed = isinstance(p_value, (int, float)) and not isinstance(p_value, bool) and not report.get("not_analysable")
+    false_effect = bool(p_value < float(exp["alpha"])) if analysed else None
+    answer_pct = round(100.0 * answered / n_done, 1) if n_done else None
+    done = {
+        "no_false_effect": false_effect is False,
+        "every_day_revealed": n_done > 0 and days_revealed == n_done,
+        "answers_on_90pct_of_days": answer_pct is not None and answer_pct >= AA_MIN_ANSWER_PCT,
+    }
+    return {
+        "expected": "no difference: both arms carried the same instruction",
+        "false_effect": false_effect,
+        "days": n_done,
+        "days_revealed": days_revealed,
+        "days_answered": answered,
+        "answer_pct": answer_pct,
+        "phase2_done": done,
+        "passed": all(done.values()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The Notion mirror, best-effort (doc 10.3)
+# ---------------------------------------------------------------------------
+
+class Mirror:
+    """Wraps experiment_notion so a Notion failure becomes a sentence for the heartbeat, never a
+    crash, and never costs the Supabase row (which is always written first)."""
+
+    def __init__(self, pages: notion.ExperimentPages | None = None, *, dry_run: bool = False):
+        self._pages, self._resolved, self.dry_run = pages, pages is not None, dry_run
+
+    def _get(self) -> notion.ExperimentPages | None:
+        if not self._resolved:
+            transport = notion.transport_from_env()
+            self._pages, self._resolved = (notion.ExperimentPages(transport) if transport else None), True
+        return self._pages
+
+    def sync(self, store: Store, exp: dict[str, Any], out: "Outcome", *, kind: str | None = None,
+             as_of: date | None = None, payload: dict[str, Any] | None = None) -> bool:
+        """Write the experiment's page: the protocol fields (kind None), plus the counts (progress)
+        or everything (final). A mirrored report row gets its notion_synced_at stamp."""
+        if self.dry_run:
+            return False
+        experiment_id = exp["experiment_id"]
+        pages = self._get()
+        if pages is None:
+            out.problems.append(f"{experiment_id}: the Notion mirror was skipped (NOTION_API_KEY is not set)")
+            return False
+        try:
+            if kind == "final":
+                page_id, created = pages.write_final(exp, payload or {})
+            else:
+                page_id, created = pages.write_progress(exp, payload if kind == "progress" else None)
+        except notion.NotionError as exc:
+            out.problems.append(f"{experiment_id}: the Notion mirror failed ({exc})")
+            return False
+        except Exception as exc:  # noqa: BLE001 - the mirror must never fail the run
+            out.problems.append(f"{experiment_id}: the Notion mirror failed ({type(exc).__name__})")
+            return False
+        if page_id and page_id != exp.get("notion_page_id"):
+            store.set_notion_page(experiment_id, page_id)
+            exp["notion_page_id"] = page_id
+        if kind and as_of is not None:
+            store.mark_mirrored(experiment_id, kind, as_of)
+        if created:
+            out.lines.append(f"{experiment_id}: Notion page created in Onyx Experiments.")
+        return True
+
+
 # ---------------------------------------------------------------------------
 # One experiment
 # ---------------------------------------------------------------------------
@@ -414,18 +522,29 @@ def _final(store: Store, exp: dict[str, Any], today: date, arms: list[str], seed
         report = analysis.analyze_trial(spec, data, today)
     except ValueError as exc:
         # Too few nights to fit the model (a trial stopped in its first days). Still a final report.
-        return _clean({**base, "decision": None, "not_analysable": str(exc)})
-    return _clean({**report, **base})
+        report = {"decision": None, "not_analysable": str(exc)}
+    merged = {**report, **base}
+    if design.trial_kind(exp.get("protocol")) == design.KIND_AA:
+        answered = sum(1 for d in days if d.self_report is not None)
+        merged["aa_check"] = aa_check(exp, merged, n_done, store.revealed_days(experiment_id), answered)
+    return _clean(merged)
 
 
-def process(store: Store, exp: dict[str, Any], today: date, dry_run: bool, alignment_version: str, out: Outcome) -> None:
+def process(store: Store, exp: dict[str, Any], today: date, dry_run: bool, alignment_version: str, out: Outcome,
+            mirror: Mirror | None = None) -> None:
     experiment_id = exp["experiment_id"]
+    mirror = mirror or Mirror(dry_run=dry_run)
     existing = store.final_report(experiment_id)
     if existing:
         if exp["status"] == "running" and not dry_run:
             store.set_status(experiment_id, "complete")
             exp["status"] = "complete"
         out.lines.append(f"{experiment_id}: the final report was written on {str(existing['as_of_date'])[:10]}; nothing to recompute.")
+        if not existing.get("notion_synced_at") and not dry_run:
+            # The page missed the final report (Notion was down, or the key was missing): retry it
+            # from the stored payload, never from a new analysis.
+            if mirror.sync(store, exp, out, kind="final", as_of=_day(existing["as_of_date"]), payload=existing["payload"]):
+                out.lines.append(f"{experiment_id}: the final report is now on its Notion page.")
         return
 
     check_alignment(exp, alignment_version)
@@ -434,6 +553,7 @@ def process(store: Store, exp: dict[str, Any], today: date, dry_run: bool, align
     start, last_day = _day(exp["start_date"]), last_trial_day(exp)
     if today <= start and exp["status"] in ACTIVE:
         out.lines.append(f"{experiment_id}: registered; the first day is {start}. No nights to count yet.")
+        mirror.sync(store, exp, out)
         return
 
     # Finished behavioral days: before today, and not past the last trial day.
@@ -455,8 +575,15 @@ def process(store: Store, exp: dict[str, Any], today: date, dry_run: bool, align
         elif exp["status"] in ("registered", "paused"):
             out.problems.append(f"{experiment_id}: the final report is written but the trial is still {exp['status']}; "
                                 "its status can only be closed with experiment_admin.py stop")
+        check = report.get("aa_check")
+        if check and not check.get("passed"):
+            # Which item failed is named; no number about Riley is (the log and the heartbeat are public).
+            failed = [name for name, ok in (check.get("phase2_done") or {}).items() if not ok]
+            out.problems.append(f"{experiment_id}: the A/A check did not pass ({', '.join(failed)}); "
+                                "see the final report before registering a real trial")
         out.lines.append(f"{experiment_id}: FINAL report written ({'stopped early' if exp.get('stopped_on') else 'pre-registered end'} "
-                         f"{last_day}). The result is in pds.experiment_reports, not in this log.")
+                         f"{last_day}). The result is in pds.experiment_reports and on the Notion page, not in this log.")
+        mirror.sync(store, exp, out, kind="final", as_of=today, payload=report)
         return
 
     days = resolve_adherence(exp, arms, n_done, day_rows, screen_rows)
@@ -477,11 +604,16 @@ def process(store: Store, exp: dict[str, Any], today: date, dry_run: bool, align
         + ("computed (dry run: nothing written) " if dry_run else "written ")
         + ("(the trial has ended; the final report follows once the last night has settled)." if awaiting
            else f"(no effect is computed before {last_day})."))
+    # The row is stored first; the mirror can only add a problem, never lose it.
+    mirror.sync(store, exp, out, kind="progress", as_of=today, payload=progress)
 
 
 def run(store: Store, *, today: date | None = None, dry_run: bool = False,
-        alignment_version: str | None = None) -> Outcome:
+        alignment_version: str | None = None, pages: notion.ExperimentPages | None = None) -> Outcome:
+    """`pages` is the Notion writer; None builds one from NOTION_API_KEY on first use (never when no
+    trial is registered)."""
     out = Outcome()
+    mirror = Mirror(pages, dry_run=dry_run)
     experiments = store.locked_experiments()
     if not experiments:
         out.lines.append("No trial is registered. Nothing to report.")
@@ -491,7 +623,7 @@ def run(store: Store, *, today: date | None = None, dry_run: bool = False,
         import hrv_alignment
         alignment_version = hrv_alignment.ALIGNMENT_VERSION
     for exp in experiments:
-        process(store, exp, today, dry_run, alignment_version, out)
+        process(store, exp, today, dry_run, alignment_version, out, mirror)
         out.records += 1
     if out.problems:
         out.status = "partial"
@@ -502,7 +634,8 @@ def run(store: Store, *, today: date | None = None, dry_run: bool = False,
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main(argv: list[str] | None = None, store: Store | None = None, today: date | None = None) -> int:
+def main(argv: list[str] | None = None, store: Store | None = None, today: date | None = None,
+         pages: notion.ExperimentPages | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true", help="read and compute, write nothing")
     args = ap.parse_args(argv)
@@ -511,7 +644,7 @@ def main(argv: list[str] | None = None, store: Store | None = None, today: date 
     store = store or get_store()
     status, records, error, code = "success", 0, None, 0
     try:
-        out = run(store, today=today, dry_run=args.dry_run)
+        out = run(store, today=today, dry_run=args.dry_run, pages=pages)
         status, records, error = out.status, out.records, out.error
         print("\n".join(out.lines))
         if out.problems:

@@ -13,7 +13,13 @@ Covers
       - a trial stopped early, and one with too few nights, still get a final report;
       - GUARD experiment_alignment / experiment_schedule, a missing report table and an unexpected
         error each leave a failed heartbeat;
-      - there is no way to ask for an early analysis, and the job does not talk to Notion yet;
+      - there is no way to ask for an early analysis;
+  * the Notion mirror (experiment_notion.py through experiment_report.Mirror): the page from
+    registration on, counts while running, the effect only from the final report; a failed or
+    unconfigured mirror turns the heartbeat partial and never costs the Supabase row; a final
+    report that missed Notion is retried from the stored payload;
+  * the A/A check (protocol kind: aa, docs/experiments/EXP-900.md): its verdict, end to end, and
+    the false-positive rate of the registered analysis on identical arms of EXP-900's shape;
   * sql/experiment_adherence_reports_schema.sql is additive and service-role only, and its two
     check-in functions answer only for today / yesterday of a running trial whose arm was shown;
   * the scheduled workflow, once Riley has added it (.github/ is a protected path for agents).
@@ -49,7 +55,7 @@ END = START + timedelta(days=N_DAYS - 1)
 ALIGNMENT = "same_night_v1"
 EFFECT = 25.0
 EFFECT_KEYS = {"estimate", "ci_low", "ci_high", "p_value", "carryover", "two_night_total", "decision",
-               "sensitivity", "secondary_outcomes", "allocation"}
+               "sensitivity", "secondary_outcomes", "allocation", "aa_check"}
 RULE = {"source": ad.SCREEN_SOURCE, "max": 5, "arm": "A"}
 SQL_FILE = ROOT / admin.REPORTS_SQL
 
@@ -83,31 +89,38 @@ class FakeStore:
     """In-memory stand-in for experiment_report.Store. It enforces the two report guards of
     the SQL file so a job that broke them would fail here too."""
 
-    def __init__(self, today, status="running", missing=(), planted=EFFECT):
+    def __init__(self, today, status="running", missing=(), planted=EFFECT, n_blocks=N_BLOCKS, kind=None):
         self.supa = FakeSupa()
         self.today = today
         self.calls = []
-        self.arms = ed.generate_schedule(SEED, N_BLOCKS)
+        self.n_days = n_blocks * 4
+        self.end = START + timedelta(days=self.n_days - 1)
+        self.arms = ed.generate_schedule(SEED, n_blocks)
+        aa = kind == ed.KIND_AA
         self.exp = {
             "experiment_id": "EXP-901", "title": "A synthetic evening routine", "status": status,
             "question": "Does the synthetic routine change the synthetic outcome?",
-            "arm_a_instruction": "Synthetic instruction for arm A.", "arm_b_instruction": "Synthetic instruction for arm B.",
+            "arm_a_instruction": "Synthetic instruction for arm A." if not aa else "Synthetic usual day.",
+            "arm_b_instruction": "Synthetic instruction for arm B." if not aa else "Synthetic usual day.",
             "control_arm": "B", "outcome_primary": "synthetic HRV", "alignment_version": ALIGNMENT, "mid_ms": 8,
-            "design_type": ed.DESIGN_DAILY_BLOCKS, "block_len": 4, "n_a_per_block": 2, "n_blocks": N_BLOCKS,
-            "n_days": N_DAYS, "start_date": START.isoformat(), "planned_end": END.isoformat(), "alpha": 0.05,
-            "n_redraws": 999, "adherence": {"objective": dict(RULE)},
+            "design_type": ed.DESIGN_DAILY_BLOCKS, "block_len": 4, "n_a_per_block": 2, "n_blocks": n_blocks,
+            "n_days": self.n_days, "start_date": START.isoformat(), "planned_end": self.end.isoformat(), "alpha": 0.05,
+            "n_redraws": 999, "adherence": {} if aa else {"objective": dict(RULE)},
             "protocol": {"analysis": {"sensitivity": ["ln HRV", "per-protocol", "plus hrv_lag1 covariate",
                                                        "excluding travel blocks", "a synthetic unbuilt analysis"]}},
             "protocol_path": "docs/experiments/EXP-901.md", "protocol_sha256": "a" * 64, "git_commit": "c0ffee",
             "seed_sha256": ed.seed_commitment(SEED), "stopped_on": None, "stop_reason": None, "notion_page_id": None,
         }
+        if kind:
+            self.exp["protocol"]["kind"] = kind
         self.exps = [self.exp]
         self.seed = SEED.hex()
         self.sched = [{"day_index": i, "behavioral_date": _day(i).isoformat(), "arm": arm} for i, arm in enumerate(self.arms)]
+        self.revealed = None                      # None = every scheduled day was revealed on Today
         rng = np.random.default_rng(7)
         self.rows = {}
-        for i in range(-7, N_DAYS + 1):
-            arm_a = 0 <= i < N_DAYS and self.arms[i] == "A"
+        for i in range(-7, self.n_days + 1):
+            arm_a = 0 <= i < self.n_days and self.arms[i] == "A"
             hrv = 70 + rng.normal(0, 5) + (planted if arm_a else 0.0)
             self.rows[_day(i).isoformat()] = {
                 "calendar_date": _day(i).isoformat(), "whoop_hrv_rmssd": None if i in missing else round(float(hrv), 2),
@@ -158,6 +171,12 @@ class FakeStore:
         self.calls.append("screen_rows")
         return [dict(r) for r in self.screens if first.isoformat() <= r["behavioral_date"] <= last.isoformat()]
 
+    def revealed_days(self, _id):
+        self.calls.append("revealed_days")
+        if self.revealed is None:
+            return {_day(i).isoformat() for i in range(self.n_days)}
+        return {_day(i).isoformat() for i in self.revealed}
+
     # -- writes -------------------------------------------------------------------------
     def upsert_report(self, experiment_id, kind, as_of, payload):
         self.calls.append(f"upsert_report:{kind}")
@@ -174,12 +193,21 @@ class FakeStore:
         key = (experiment_id, kind, as_of.isoformat())
         old = self.reports.get(key)
         assert not (old and kind == "final" and old["payload"] != payload), "a final report never changes"
-        self.reports[key] = {"as_of_date": as_of.isoformat(), "payload": payload}
+        # An upsert sets the columns it sends; an earlier notion_synced_at stays (as in Postgres).
+        self.reports[key] = {**(old or {}), "as_of_date": as_of.isoformat(), "payload": payload}
 
     def set_status(self, _id, status):
         self.calls.append(f"set_status:{status}")
         assert (self.exp["status"], status) == ("running", "complete"), "the only status this job moves"
         self.exp["status"] = status
+
+    def set_notion_page(self, _id, page_id):
+        self.calls.append("set_notion_page")
+        self.exp["notion_page_id"] = page_id
+
+    def mark_mirrored(self, experiment_id, kind, as_of):
+        self.calls.append(f"mark_mirrored:{kind}")
+        self.reports[(experiment_id, kind, as_of.isoformat())]["notion_synced_at"] = "2030-01-01T00:00:00+00:00"
 
     # -- helpers for the tests ----------------------------------------------------------
     def final(self):
@@ -197,10 +225,37 @@ class FakeStore:
                              "synced_at": synced.isoformat(), "minutes_last_hour_before_sleep_est": minutes})
 
 
-def _run_main(store, argv=()):
+class FakePages:
+    """Stands in for experiment_notion.ExperimentPages: records what the job sends; can fail."""
+
+    def __init__(self, fail=None):
+        self.writes = []                 # (kind, experiment_id, status, payload)
+        self.fail = fail
+
+    def _write(self, kind, exp, payload):
+        if self.fail is not None:
+            raise self.fail
+        self.writes.append((kind, exp["experiment_id"], exp["status"], dict(payload or {})))
+        return "page-" + exp["experiment_id"].lower(), exp.get("notion_page_id") is None
+
+    def write_progress(self, exp, progress=None):
+        return self._write("progress" if progress else "protocol", exp, progress)
+
+    def write_final(self, exp, report):
+        return self._write("final", exp, report)
+
+    def kinds(self):
+        return [w[0] for w in self.writes]
+
+
+def _run(store, pages=None, **kw):
+    return er.run(store, alignment_version=ALIGNMENT, pages=pages if pages is not None else FakePages(), **kw)
+
+
+def _run_main(store, argv=(), pages=None):
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
-        code = er.main(list(argv), store=store)
+        code = er.main(list(argv), store=store, pages=pages if pages is not None else FakePages())
     return code, out.getvalue() + err.getvalue()
 
 
@@ -306,7 +361,7 @@ def test_no_trial_is_a_healthy_no_op():
 
 def test_before_the_first_day_nothing_is_counted():
     store = FakeStore(START - timedelta(days=2), status="registered")
-    out = er.run(store, alignment_version=ALIGNMENT)
+    out = _run(store)
     assert out.status == "success" and out.records == 1 and store.reports == {}
     assert "outcome_days" not in store.calls and "matrix" not in store.calls
     assert "No nights to count yet" in out.lines[0]
@@ -356,11 +411,11 @@ def test_adherence_floor_from_the_protocol_turns_the_heartbeat_partial():
     store.exp["adherence"] = {"objective": dict(RULE), "min_pct": 80}
     for n, i in enumerate(i for i in range(20) if store.arms[i] == "A"):
         store.add_screen(i, 2.0 if n < 4 else 40.0)
-    out = er.run(store, alignment_version=ALIGNMENT)
+    out = _run(store)
     assert out.status == "partial" and "adherence is below the threshold the protocol registered" in out.error
     assert "%" not in out.error and not re.search(r"\d\d\.\d", out.error), "the heartbeat carries no adherence figure"
     store.exp["adherence"]["min_pct"] = 30
-    assert er.run(store, alignment_version=ALIGNMENT).status == "success"
+    assert _run(store).status == "success"
 
 
 def test_final_report_waits_for_the_end_to_settle():
@@ -370,17 +425,17 @@ def test_final_report_waits_for_the_end_to_settle():
     assert er.final_is_due(END + timedelta(days=4), END, False)
 
     store = FakeStore(END + timedelta(days=1))
-    out = er.run(store, alignment_version=ALIGNMENT)
+    out = _run(store)
     assert out.status == "success" and store.final() is None and "matrix" not in store.calls
     progress = store.progress(END + timedelta(days=1))
     assert progress["days_elapsed"] == N_DAYS and progress["awaiting_final"] is True
     assert "the final report follows" in out.lines[0]
 
     late = FakeStore(END + timedelta(days=3), missing={N_DAYS - 1})
-    er.run(late, alignment_version=ALIGNMENT)
+    _run(late)
     assert late.final() is None, "the last night's HRV may still arrive"
     late.today = END + timedelta(days=4)
-    er.run(late, alignment_version=ALIGNMENT)
+    _run(late)
     assert late.final() is not None and late.final()["nights_with_outcome"] == N_DAYS - 1
 
 
@@ -450,7 +505,7 @@ def test_final_report_at_the_end_is_written_once():
     again = FakeStore(today, missing={11})
     again.screens, again.flights, again.days = store.screens, store.flights, store.days
     again.rows[_day(22).isoformat()]["onyx_is_transition_day"] = True
-    er.run(again, alignment_version=ALIGNMENT)
+    _run(again)
     assert json.dumps(again.final(), sort_keys=True) == json.dumps(report, sort_keys=True)
 
 
@@ -458,10 +513,10 @@ def test_stopped_early_and_too_few_nights_still_get_a_final_report():
     stop = _day(47)
     store = FakeStore(stop + timedelta(days=1), status="stopped_early")
     store.exp.update(stopped_on=stop.isoformat(), stop_reason="synthetic reason")
-    er.run(store, alignment_version=ALIGNMENT)
+    _run(store)
     assert store.final() is None, "the stop day's night has not settled"
     store.today = stop + timedelta(days=2)
-    er.run(store, alignment_version=ALIGNMENT)
+    _run(store)
     report = store.final()
     assert report["stopped_early"] is True and report["last_day_analysed"] == stop.isoformat()
     assert report["days_elapsed"] == 48 and report["n_nights"] == 48 and report["stop_reason"] == "synthetic reason"
@@ -470,7 +525,7 @@ def test_stopped_early_and_too_few_nights_still_get_a_final_report():
     # Stopped on day 6: the model cannot be fitted. The final report says so and carries no estimate.
     tiny = FakeStore(_day(8), status="stopped_early")
     tiny.exp.update(stopped_on=_day(5).isoformat(), stop_reason="synthetic")
-    out = er.run(tiny, alignment_version=ALIGNMENT)
+    out = _run(tiny)
     report = tiny.final()
     assert out.status == "success" and report["decision"] is None and "too few" in report["not_analysable"]
     assert "estimate" not in report and report["allocation"]["seed_hex"] == SEED.hex()
@@ -478,7 +533,7 @@ def test_stopped_early_and_too_few_nights_still_get_a_final_report():
     # Stopped before the first day: nothing to count, still closed with a report.
     never = FakeStore(START + timedelta(days=1), status="stopped_early")
     never.exp.update(stopped_on=(START - timedelta(days=1)).isoformat(), stop_reason="synthetic")
-    er.run(never, alignment_version=ALIGNMENT)
+    _run(never)
     assert never.final()["days_elapsed"] == 0 and never.final()["decision"] is None
 
 
@@ -533,11 +588,14 @@ def test_every_failure_leaves_a_heartbeat():
 
 
 def test_dry_run_writes_nothing():
-    for today in (_day(12), END + timedelta(days=2)):
-        store = FakeStore(today)
-        code, text = _run_main(store, argv=["--dry-run"])
+    for today in (START - timedelta(days=1), _day(12), END + timedelta(days=2)):
+        store, pages = FakeStore(today, status="registered" if today < START else "running"), FakePages()
+        code, text = _run_main(store, argv=["--dry-run"], pages=pages)
         assert code == 0 and store.reports == {} and store.supa.heartbeats == []
-        assert store.exp["status"] == "running" and not any(c.startswith(("upsert", "set_")) for c in store.calls)
+        assert pages.writes == [], "a dry run writes nothing to Notion either"
+        if today < START:
+            continue
+        assert store.exp["status"] == "running" and not any(c.startswith(("upsert", "set_", "mark_")) for c in store.calls)
         _no_leak(text, store)
         assert "dry run: nothing written" in text
 
@@ -564,11 +622,208 @@ def test_there_is_no_way_to_ask_for_an_early_analysis():
     assert "matrix" not in store.calls, "it refuses before reading any outcome"
 
 
-def test_the_report_job_does_not_talk_to_notion_yet():
-    # The Notion mirror is the next build step (docs/experiment-framework.md 12.1); until it exists the
-    # job must not half-write a page or need NOTION_API_KEY.
-    source = (ROOT / "experiment_report.py").read_text(encoding="utf-8")
-    assert not re.search(r"(?m)^\s*import experiment_notion|NOTION_API_KEY|api\.notion\.com", source)
+# ---------------------------------------------------------------------------
+# The Notion mirror (docs/experiment-framework.md 10.2 and 10.3)
+# ---------------------------------------------------------------------------
+
+def test_the_notion_page_follows_the_trial_and_never_shows_an_early_effect():
+    store, pages = FakeStore(START - timedelta(days=2), status="registered"), FakePages()
+    out = _run(store, pages=pages)
+    assert out.status == "success" and pages.kinds() == ["protocol"], "the page exists from registration on"
+    assert pages.writes[0][2] == "registered" and store.exp["notion_page_id"] == "page-exp-901"
+    assert store.reports == {} and not any(c.startswith("mark_mirrored") for c in store.calls)
+
+    store.exp["status"] = "running"
+    store.today = _day(30)
+    out = _run(store, pages=pages)
+    assert out.status == "success" and pages.kinds() == ["protocol", "progress"]
+    sent = pages.writes[-1][3]
+    assert not EFFECT_KEYS & set(sent) and sent["days_elapsed"] == 30, "progress counts only"
+    assert store.reports[("EXP-901", "progress", _day(30).isoformat())]["notion_synced_at"], "the mirrored row is stamped"
+    assert store.calls.count("set_notion_page") == 1, "the page id is stored once"
+
+    store.today = END + timedelta(days=2)
+    code, text = _run_main(store, pages=pages)
+    assert code == 0 and pages.kinds()[-1] == "final"
+    final = pages.writes[-1]
+    assert final[2] == "complete", "the page is written after the trial is closed"
+    assert final[3] == store.final() and "estimate" in final[3]
+    assert store.reports[("EXP-901", "final", store.today.isoformat())]["notion_synced_at"]
+    assert store.supa.heartbeats[-1]["status"] == "success"
+    _no_leak(text, store, store.final())
+
+    # Once mirrored, later runs neither recompute nor rewrite.
+    store.today += timedelta(days=3)
+    writes = len(pages.writes)
+    assert _run(store, pages=pages).status == "success" and len(pages.writes) == writes
+
+
+def test_a_failed_or_missing_mirror_turns_the_heartbeat_partial_and_never_costs_the_report():
+    store = FakeStore(_day(20))
+    failing = FakePages(fail=er.notion.NotionError("Notion PATCH pages failed (HTTP 502, no code)"))
+    code, _ = _run_main(store, pages=failing)
+    beat = store.supa.heartbeats[-1]
+    assert code == 0 and beat["status"] == "partial" and "the Notion mirror failed (Notion PATCH pages failed (HTTP 502" in beat["error_message"]
+    row = store.reports[("EXP-901", "progress", _day(20).isoformat())]
+    assert row["payload"]["days_elapsed"] == 20 and not row.get("notion_synced_at"), "the row is kept, unstamped"
+
+    store = FakeStore(_day(20))
+    out = _run(store, pages=FakePages(fail=KeyError("a field that must not be printed")))
+    assert out.status == "partial" and "the Notion mirror failed (KeyError)" in out.error
+    assert "must not be printed" not in out.error
+
+    # Without NOTION_API_KEY the mirror is skipped, visibly; with no trial it is not needed at all.
+    import os
+    saved = os.environ.pop("NOTION_API_KEY", None)
+    try:
+        out = er.run(FakeStore(_day(20)), alignment_version=ALIGNMENT)
+        assert out.status == "partial" and "the Notion mirror was skipped (NOTION_API_KEY is not set)" in out.error
+        empty = FakeStore(_day(20))
+        empty.exps = []
+        assert er.run(empty, alignment_version=ALIGNMENT).status == "success"
+    finally:
+        if saved is not None:
+            os.environ["NOTION_API_KEY"] = saved
+
+    # A final report whose mirror failed is retried from the STORED payload on later runs.
+    today = END + timedelta(days=2)
+    store = FakeStore(today)
+    out = _run(store, pages=FakePages(fail=er.notion.NotionError("Notion POST pages failed (HTTP 503, no code)")))
+    stored = store.final()
+    assert out.status == "partial" and stored is not None and store.exp["status"] == "complete"
+    assert not store.reports[("EXP-901", "final", today.isoformat())].get("notion_synced_at")
+    store.today = today + timedelta(days=1)
+    pages = FakePages()
+    out = _run(store, pages=pages)
+    assert out.status == "success" and pages.kinds() == ["final"] and pages.writes[0][3] == stored
+    assert store.calls.count("matrix") == 1, "the retry does not analyse again"
+    assert store.reports[("EXP-901", "final", today.isoformat())]["notion_synced_at"]
+    assert any("now on its Notion page" in line for line in out.lines)
+    store.today += timedelta(days=1)
+    assert _run(store, pages=pages).status == "success" and len(pages.writes) == 1
+
+
+def test_the_real_writer_end_to_end_against_an_in_memory_notion():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_experiment_notion import FakeNotion
+    import experiment_notion as en
+
+    api = FakeNotion()
+    pages = en.ExperimentPages(api)
+    store = FakeStore(START - timedelta(days=1), status="registered")
+    _run(store, pages=pages)
+    store.exp["status"] = "running"
+    for i in (5, 6):
+        store.today = _day(i)
+        _run(store, pages=pages)
+    assert len(api.pages) == 1, "one page per experiment, however many runs"
+    before_final = [r for r in api.log if r[0] == "PATCH" and r[1].startswith("/pages/")]
+    for _method, _path, body in before_final:
+        assert not set(en.EFFECT_PROPERTIES) & set(body["properties"]), "no effect field before the end"
+
+    store.today = END + timedelta(days=2)
+    assert _run(store, pages=pages).status == "success"
+    page = next(iter(api.pages.values()))
+    assert page["properties"]["Status"]["status"]["name"] == "Complete"
+    assert page["properties"]["Estimate (ms)"]["number"] == round(store.final()["estimate"], 2)
+    assert page["properties"]["Decision"]["select"]["name"] == "Adopt A"
+    heading = [b for b in api.children[page["id"]] if b["type"] == "heading_2"]
+    assert len(heading) == 1 and api.children[heading[0]["id"]], "the report body sits under one heading"
+    assert store.exp["notion_page_id"] == page["id"]
+
+
+# ---------------------------------------------------------------------------
+# The A/A check (docs/experiment-framework.md 12.2, docs/experiments/EXP-900.md)
+# ---------------------------------------------------------------------------
+
+AA_BLOCKS = 7
+AA_END = START + timedelta(days=AA_BLOCKS * 4 - 1)
+
+
+def _aa_store(planted=0.0, answered=None, revealed=None):
+    store = FakeStore(AA_END + timedelta(days=2), n_blocks=AA_BLOCKS, kind=ed.KIND_AA, planted=planted)
+    days = range(AA_BLOCKS * 4) if answered is None else answered
+    store.days = [{"behavioral_date": _day(i).isoformat(), "self_report": "yes", "excluded": False} for i in days]
+    store.revealed = revealed
+    return store
+
+
+def test_aa_check_verdict_rules():
+    exp = FakeStore(AA_END, n_blocks=AA_BLOCKS, kind=ed.KIND_AA).exp
+    revealed = {_day(i).isoformat() for i in range(28)}
+    ok = er.aa_check(exp, {"p_value": 0.41}, 28, revealed, 28)
+    assert ok["passed"] is True and ok["false_effect"] is False and ok["answer_pct"] == 100.0
+    assert ok["phase2_done"] == {"no_false_effect": True, "every_day_revealed": True, "answers_on_90pct_of_days": True}
+    bad = er.aa_check(exp, {"p_value": 0.01}, 28, revealed, 28)
+    assert bad["passed"] is False and bad["false_effect"] is True
+    assert er.aa_check(exp, {"p_value": 0.41}, 28, revealed - {_day(3).isoformat()}, 28)["phase2_done"]["every_day_revealed"] is False
+    assert er.aa_check(exp, {"p_value": 0.41}, 28, revealed, 26)["passed"] is True, "26 of 28 = 92.9% clears 90%"
+    assert er.aa_check(exp, {"p_value": 0.41}, 28, revealed, 25)["phase2_done"]["answers_on_90pct_of_days"] is False, \
+        "25 of 28 = 89.3% is under 90%"
+    none = er.aa_check(exp, {"decision": None, "not_analysable": "only 9 nights"}, 28, revealed, 28)
+    assert none["false_effect"] is None and none["passed"] is False, "no result is not a pass"
+    treatment = FakeStore(AA_END).exp
+    assert er.aa_check(treatment, {"p_value": 0.01}, 28, revealed, 28) is None, "only an A/A protocol gets the check"
+
+
+def test_aa_trial_end_to_end_reports_its_verdict():
+    store, pages = _aa_store(), FakePages()
+    code, text = _run_main(store, pages=pages)
+    report = store.final()
+    assert code == 0 and report is not None and report["days_scheduled"] == 28
+    check = report["aa_check"]
+    assert check["days"] == 28 and check["days_revealed"] == 28 and check["days_answered"] == 28
+    assert check["false_effect"] == (report["p_value"] < 0.05) and check["passed"] == (not check["false_effect"])
+    assert store.supa.heartbeats[-1]["status"] == ("success" if check["passed"] else "partial")
+    assert pages.writes[-1][3]["aa_check"] == check, "the verdict goes to the Notion page with the report"
+    _no_leak(text, store, report)
+
+    # A pipeline that leaked the arm into the outcome would show an effect between identical arms.
+    broken = _aa_store(planted=25.0)
+    code, _ = _run_main(broken)
+    check = broken.final()["aa_check"]
+    assert code == 0 and check["false_effect"] is True and check["passed"] is False
+    beat = broken.supa.heartbeats[-1]
+    assert beat["status"] == "partial" and "the A/A check did not pass (no_false_effect)" in beat["error_message"]
+
+    # Days never revealed and missing check-in answers are named too, without a number about Riley.
+    sloppy = _aa_store(answered=range(20), revealed=range(27))
+    _run_main(sloppy)
+    check = sloppy.final()["aa_check"]
+    assert check["phase2_done"]["every_day_revealed"] is False and check["phase2_done"]["answers_on_90pct_of_days"] is False
+    message = sloppy.supa.heartbeats[-1]["error_message"]
+    assert "every_day_revealed" in message and "answers_on_90pct_of_days" in message and "%" not in message
+
+
+def test_aa_trials_rarely_report_a_false_effect():
+    # Many synthetic A/A trials of EXP-900's shape (7 blocks of 4 days) on AR(1) noise at the live
+    # SD and lag-1 correlation with 19% missing nights: the registered analysis must call a
+    # difference between identical arms significant about 5% of the time, not more.
+    from experiment_analysis import TrialData, TrialSpec, analyze_trial
+
+    rng = np.random.default_rng(20261114)
+    spec = TrialSpec(experiment_id="EXP-900", start=START, planned_end=AA_END, mid_ms=8.0, n_redraws=199)
+    sigma, rho, n = 21.4, 0.476, 28
+    significant = adopted = analysed = 0
+    for _ in range(300):
+        e = np.empty(n)
+        e[0] = rng.normal(0, sigma)
+        for i in range(1, n):
+            e[i] = rho * e[i - 1] + rng.normal(0, sigma * np.sqrt(1 - rho ** 2))
+        y = 70 + e
+        y[rng.random(n) < 0.189] = np.nan
+        arms = ed.generate_schedule(rng.bytes(32), AA_BLOCKS)
+        try:
+            report = analyze_trial(spec, TrialData(arms=arms, outcome=y), AA_END + timedelta(days=2))
+        except ValueError:
+            continue
+        analysed += 1
+        significant += report["p_value"] < 0.05
+        adopted += report["decision"] == "adopt_A"
+    assert analysed >= 290
+    rate = significant / analysed
+    assert 0.01 <= rate <= 0.09, f"false-positive rate {rate:.3f} on identical arms"
+    assert adopted <= significant, "adopt_A needs a significant result"
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +880,10 @@ def test_workflow_runs_the_job_daily_from_master_only():
     assert "if: github.ref == 'refs/heads/master'" in text
     assert "python experiment_report.py" in text and "persist-credentials: false" in text
     assert "--as-of" not in text and "--force" not in text
+    # The Notion mirror uses the same secret as the other Notion jobs (journal-sync.yml, habits-sync.yml).
+    assert "NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}" in text and "httpx" in text
+    watchdog = (ROOT / "tools" / "watchdog_cloud.py").read_text(encoding="utf-8")
+    assert "'experiment-report.yml': Sched(" in watchdog, "a scheduled workflow is watched (tools/watchdog_cloud.py)"
 
 
 if __name__ == "__main__":
