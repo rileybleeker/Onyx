@@ -25,6 +25,11 @@ export interface WarmTarget {
   prefetch: PrefetchMode;
   /** GET reads the page's client makes on mount. Called when the step runs, so keys can carry today's date. */
   data?: () => DataWarmer[];
+  /**
+   * The page's client code that the router prefetch does not load: a `dynamic(..., { ssr: false })` chunk.
+   * Loading it here means a click renders at once instead of fetching JS first.
+   */
+  code?: () => Promise<unknown>;
 }
 
 export interface WarmCache {
@@ -148,6 +153,11 @@ export function runWarmup(targets: WarmTarget[], deps: WarmupDeps, current: stri
       if (cancelled) return;
       if (pathOnly(target.href) === here) continue;
       try { deps.prefetchRoute(target.href, target.prefetch); } catch { /* a failed prefetch costs only speed */ }
+      if (target.code) {
+        await deps.idle();
+        if (cancelled) return;
+        await target.code().catch(() => {});
+      }
       let warmers: DataWarmer[] = [];
       try { warmers = target.data?.() ?? []; } catch { warmers = []; }
       await warmData(deps, warmers, false, alive);
@@ -172,6 +182,7 @@ export function warmRoute(href: string): void {
   const { deps, targets } = active;
   const target = targets.get(routeOf(href));
   try { deps.prefetchRoute(href, target?.prefetch ?? "auto"); } catch { /* ignore */ }
+  if (target?.code) void target.code().catch(() => {});
   if (!target?.data) return;
   let warmers: DataWarmer[] = [];
   try { warmers = target.data(); } catch { return; }

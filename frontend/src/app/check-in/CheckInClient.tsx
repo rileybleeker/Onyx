@@ -185,13 +185,16 @@ export default function CheckInClient() {
 
   useEffect(() => {
     // Show the cached copy at once while the GET runs, but only when it is for the current behavioral day and
-    // no unsaved tap is waiting: a draft is always judged against a fresh answer. The POST's `today` guard and
+    // no unsaved tap is waiting for one of its days or nights: such a draft is always judged against a fresh answer. The POST's `today` guard and
     // the drafts' stored-answer check still protect a tap made on the cached copy.
     let alive = true;
     answeredRef.current = false;
     const seed = (cached: CheckinPayload | undefined) => {
       if (!alive || !cached || answeredRef.current || !Array.isArray(cached.items)) return;
-      if (cached.today !== fallbackBehavioralToday(new Date()) || drafts.hasPending()) return;
+      if (cached.today !== fallbackBehavioralToday(new Date())) return;
+      // Only drafts for the day and nights this copy shows matter (an old held draft for another date does not).
+      const parts = [dayDraftKey(cached.date), ...(cached.nights ?? []).map((n) => nightDraftKey(n.date))];
+      if (parts.some((key) => Object.keys(drafts.read(key)).length > 0)) return;
       show(cached);
     };
     const hit = clientCache.peek<CheckinPayload>(checkinUrl(requested));

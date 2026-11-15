@@ -121,3 +121,16 @@ test('the app warm-up list: no experiment reveal, write-coupled server pages war
   for (const href of ['/health', '/health/records', '/orders', '/procurement']) assert.ok(autoOnly.includes(`"${href}"`), href);
   for (const nav of ['Sidebar.tsx', 'MobileNav.tsx']) assert.match(src('components', nav), /navIntentProps\(/, nav);
 });
+
+test('a page\'s client chunk (dynamic ssr:false) is loaded in its own idle step and on intent', async () => {
+  const { deps, log } = harness();
+  let loads = 0;
+  const targets = [{ href: '/analytics/hrv', prefetch: 'full', code: async () => { loads++; log.push('code /analytics/hrv'); } }, { href: '/sleep', prefetch: 'full', code: async () => { throw new Error('synthetic chunk failure'); } }, { href: '/status', prefetch: 'full' }];
+  await runWarmup(targets, deps, '/today').done;
+  assert.deepEqual(log, ['route /analytics/hrv full', 'code /analytics/hrv', 'route /sleep full', 'route /status full'], 'a failed chunk does not stop the run');
+  configureWarmup(deps, targets);
+  warmRoute('/analytics/hrv');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(loads, 2);
+  configureWarmup(null);
+});
