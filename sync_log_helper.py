@@ -52,7 +52,9 @@ def log_sync(
     sync_end is captured at write time. duration_seconds is computed from both.
     """
     end_dt = datetime.now(timezone.utc)
-    start_dt = _to_dt(started_at)
+    # No start given = an instantaneous event: use ONE clock reading for both ends
+    # (a second now() would put sync_start a few microseconds after sync_end).
+    start_dt = end_dt if started_at is None else _to_dt(started_at)
     duration = max(0, int((end_dt - start_dt).total_seconds()))
     row = {
         "source": source,

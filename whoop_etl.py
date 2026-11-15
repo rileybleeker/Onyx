@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 from retry_helper import retry_http
+from sync_log_helper import log_sync as _shared_log_sync
 
 # ---------------------------------------------------------------------------
 # Config
@@ -325,23 +326,15 @@ def upsert_to_supabase(sb: Client, table: str, rows: list[dict],
 def log_sync(sb: Client, source: str, data_type: str, status: str,
              records: int = 0, date_start=None, date_end=None,
              error: str = None, duration: float = None):
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(seconds=duration) if duration is not None else end
-    try:
-        sb.schema("pds").table("sync_log").insert({
-            "source": source,
-            "data_type": data_type,
-            "status": status,
-            "records_synced": records,
-            "date_range_start": date_start.isoformat() if date_start else None,
-            "date_range_end": date_end.isoformat() if date_end else None,
-            "error_message": error,
-            "duration_seconds": duration,
-            "sync_start": start.isoformat(),
-            "sync_end": end.isoformat(),
-        }).execute()
-    except Exception as e:
-        log.warning(f"Failed to write sync log: {e}")
+    """Sync_log heartbeat. Delegates to sync_log_helper (the one writer) so
+    sync_start, sync_end and duration_seconds are filled the same way as every
+    other ETL. `duration` is how long the run took; the helper wants the moment
+    it started, so that is derived here. A failed insert is logged, never raised.
+    """
+    started_at = time.time() - duration if duration is not None else None
+    _shared_log_sync(sb, source=source, data_type=data_type, status=status,
+                     records=records, started_at=started_at, error=error,
+                     date_range_start=date_start, date_range_end=date_end)
 
 
 def safe_get(data: dict, *keys, default=None):
@@ -710,7 +703,8 @@ def main():
         log.warning(f"  whoop_tz_backfill skipped: {e}")
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Command-line entry point: main() plus the failure heartbeat."""
     # Belt-and-suspenders top-level heartbeat: any uncaught exception inside
     # main() (e.g. token refresh failure before the per-endpoint try/except
     # blocks, or import/config errors) gets a sync_log row so /status sees
@@ -732,3 +726,7 @@ if __name__ == "__main__":
             except Exception as log_exc:  # noqa: BLE001
                 log.error(f"Could not write failure sync_log row: {log_exc}")
         raise
+
+
+if __name__ == "__main__":
+    cli()

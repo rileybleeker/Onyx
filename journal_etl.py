@@ -13,6 +13,14 @@ Each entry gets:
 The Notion `last_edited_time` is the skip-if-unchanged guard — pages whose
 edit time hasn't advanced since the last sync are not re-fetched or re-embedded.
 
+Images: a Notion-hosted image is stored as `![caption](notion-image:<block id>)`,
+never as its download URL (that URL is signed and dies after about an hour). The
+embedding text carries only `[image: caption]`. See image_markdown().
+
+Upserts: every bulk upsert carries ONE key set (uniform_batches) — a row sent
+without `embedding` next to a row that has one would get its stored embedding
+overwritten with NULL.
+
 Usage:
     python journal_etl.py             # Incremental sync (default)
     python journal_etl.py --full      # Ignore edit-time guard, re-fetch every page
@@ -20,6 +28,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -139,6 +148,63 @@ def _rich_text(rt: list[dict] | None) -> str:
     return "".join(t.get("plain_text", "") for t in rt)
 
 
+# A Notion-hosted image has no permanent address: the API hands out a signed
+# download URL that stops working after about an hour (audit etl/gemini/F-006).
+# Storing it would leave a dead link in content_md and put a random signature in
+# the embedding text. The block id is permanent, so that is what gets stored;
+# anything that wants the picture later can ask Notion for the block again.
+NOTION_IMAGE_SCHEME = "notion-image:"
+
+# ![caption](target) as written by image_markdown().
+_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)\s]*\)")
+
+
+def image_markdown(block: dict) -> str:
+    """Markdown for one Notion image block, with a target that never expires.
+
+    external image  -> ![caption](<the URL the user pasted>)   (not signed, stable)
+    Notion-hosted   -> ![caption](notion-image:<block id>)     (signed URL dropped)
+    """
+    img = block.get("image") or {}
+    # Keep the caption on one line and free of square brackets so the
+    # ![...](...) form stays parseable.
+    cap = " ".join(_rich_text(img.get("caption")).split())
+    cap = cap.replace("[", "(").replace("]", ")")
+    external_url = (img.get("external") or {}).get("url", "")
+    if external_url and not img.get("file"):
+        return f"![{cap}]({external_url})"
+    return f"![{cap}]({NOTION_IMAGE_SCHEME}{block.get('id', '')})"
+
+
+def embedding_text(title: str | None, content_md: str | None) -> str:
+    """What gets embedded for an entry: the title plus the body, with every image
+    reduced to its caption — no URL and no block id in the vector."""
+    def _caption_only(m: re.Match) -> str:
+        cap = m.group(1).strip()
+        return f"[image: {cap}]" if cap else "[image]"
+
+    return (title or "") + "\n\n" + _MD_IMAGE.sub(_caption_only, content_md or "")
+
+
+def uniform_batches(rows: list[dict], size: int):
+    """Yield chunks of rows in which every row has the same keys.
+
+    supabase-py sends a bulk upsert with `columns=` set to the UNION of all keys
+    in the batch, and PostgREST writes NULL for a key a row does not have. Rows
+    that were not re-embedded this run carry no `embedding` / `embedding_model`
+    key, so one edited page in the same batch wiped the stored embedding of every
+    unchanged page next to it — which then looked "model changed" and was
+    re-embedded on the following run, wiping the others in turn (found live
+    2026-11-13: 24 of 45 entries without an embedding, flipping every hour).
+    """
+    groups: dict[frozenset, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(frozenset(row), []).append(row)
+    for group in groups.values():
+        for i in range(0, len(group), size):
+            yield group[i:i + size]
+
+
 def _block_to_md(block: dict, list_index: int | None = None, depth: int = 0) -> str:
     btype = block.get("type", "")
     data = block.get(btype, {}) if btype else {}
@@ -175,10 +241,7 @@ def _block_to_md(block: dict, list_index: int | None = None, depth: int = 0) -> 
     elif btype == "toggle":
         out = f"{indent}▸ {text}" if text else ""
     elif btype == "image":
-        img = data
-        url = (img.get("file") or img.get("external") or {}).get("url", "")
-        cap = _rich_text(img.get("caption"))
-        out = f"![{cap}]({url})" if url else ""
+        out = image_markdown(block)
     else:
         out = f"[unsupported: {btype}]"
 
@@ -397,8 +460,13 @@ def main(full: bool, reembed: bool) -> int:
             )
             if needs_embed and meta.get("content_md"):
                 idx = len(rows_to_upsert) - 1
-                head = (meta["title"] or "") + "\n\n" + meta["content_md"]
-                rows_needing_embed.append((idx, head))
+                rows_needing_embed.append(
+                    (idx, embedding_text(meta["title"], meta["content_md"])))
+            elif edited_changed and stored is not None:
+                # The body was emptied in Notion: there is nothing to embed, and the
+                # stored vector describes text that no longer exists. Clear it.
+                meta["embedding"] = None
+                meta["embedding_model"] = None
 
         # 4. Embed in small batches, paced for Voyage's reduced rate limits
         # (3 RPM / 10K TPM without a payment method — a 45-doc batch 429s
@@ -433,10 +501,11 @@ def main(full: bool, reembed: bool) -> int:
 
     # 5. Upsert in chunks of 25 (vectors are large). Skip rows whose embedding failed this
     #    run so their notion_edited_at stays stale in the DB and they retry next run.
+    #    Rows with and without a fresh embedding go in SEPARATE requests (uniform_batches):
+    #    mixed in one request, the rows without one would have theirs set to NULL.
     upsertable = [r for i, r in enumerate(rows_to_upsert) if i not in embed_failed_idx]
     CHUNK = 25
-    for i in range(0, len(upsertable), CHUNK):
-        chunk = upsertable[i:i + CHUNK]
+    for chunk in uniform_batches(upsertable, CHUNK):
         # supabase-py serializes lists fine; pgvector accepts JSON arrays.
         sb.schema("pds").table("journal_entries").upsert(
             chunk, on_conflict="notion_page_id"
@@ -465,13 +534,14 @@ def main(full: bool, reembed: bool) -> int:
     return 0
 
 
-if __name__ == "__main__":
+def cli(argv: list[str] | None = None) -> None:
+    """Command-line entry point: parse flags, run main(), exit with its code."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--full", action="store_true",
                         help="Ignore edit-time guard, re-fetch every page")
     parser.add_argument("--reembed", action="store_true",
                         help="Regenerate every embedding, even if content unchanged")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     # Re-audit 2026-06-07 (etl/deepseek/F-001): top-level failure heartbeat so an
     # uncaught exception surfaces on /status instead of silently going stale.
     _t_main_start = time.time()
@@ -486,3 +556,7 @@ if __name__ == "__main__":
         except Exception as log_exc:  # noqa: BLE001
             log.error(f"Could not write failure sync_log row: {log_exc}")
         raise
+
+
+if __name__ == "__main__":
+    cli()
