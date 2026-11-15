@@ -45,69 +45,41 @@ function buildItemRows(
 export async function GET(req: NextRequest) {
   const includeArchived = req.nextUrl.searchParams.get("include_archived") === "1";
 
+  // Speed (2026-11-15): stacks, their items and the items' products in ONE query (PostgREST embedding over the
+  // FKs supplement_stack_item.stack_id and .product_id) instead of three round trips in a row.
   let sq = supabase
     .from("supplement_stack")
-    .select("stack_id,name,description,remind_time,is_active,sort_order,created_at,updated_at");
+    .select(
+      "stack_id,name,description,remind_time,is_active,sort_order,created_at,updated_at," +
+        "supplement_stack_item(item_id,product_id,doses,sort_order,supplement_products(brand_name,full_name,serving_size,serving_unit,ingredients,is_active))",
+    );
   if (!includeArchived) sq = sq.eq("is_active", true);
   const { data: stacks, error: stacksErr } = await sq
     .order("sort_order", { ascending: true })
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .order("sort_order", { referencedTable: "supplement_stack_item", ascending: true });
   if (stacksErr) return NextResponse.json({ error: stacksErr.message }, { status: 500 });
 
-  const stackIds = (stacks ?? []).map((s) => s.stack_id);
-  if (stackIds.length === 0) return NextResponse.json({ stacks: [] });
+  type Product = { brand_name: string | null; full_name: string | null; serving_size: number | null; serving_unit: string | null; ingredients: unknown; is_active: boolean };
+  type Item = { item_id: number; product_id: string; doses: number; sort_order: number; supplement_products: Product | Product[] | null };
+  type Stack = { stack_id: number; supplement_stack_item: Item[] | null } & Record<string, unknown>;
 
-  const { data: items, error: itemsErr } = await supabase
-    .from("supplement_stack_item")
-    .select("item_id,stack_id,product_id,doses,sort_order")
-    .in("stack_id", stackIds)
-    .order("sort_order", { ascending: true });
-  if (itemsErr) return NextResponse.json({ error: itemsErr.message }, { status: 500 });
-
-  // Decorate items with product names + ingredient counts.
-  const productIds = Array.from(new Set((items ?? []).map((i) => i.product_id)));
-  let products: Record<string, { brand_name: string | null; full_name: string | null; serving_size: number | null; serving_unit: string | null; ingredient_count: number; is_active: boolean }> = {};
-  if (productIds.length > 0) {
-    const { data: prods } = await supabase
-      .from("supplement_products")
-      .select("product_id,brand_name,full_name,serving_size,serving_unit,ingredients,is_active")
-      .in("product_id", productIds);
-    products = Object.fromEntries(
-      (prods ?? []).map((p) => [
-        p.product_id,
-        {
-          brand_name: p.brand_name,
-          full_name: p.full_name,
-          serving_size: p.serving_size,
-          serving_unit: p.serving_unit,
-          ingredient_count: Array.isArray(p.ingredients) ? p.ingredients.length : 0,
-          is_active: p.is_active,
-        },
-      ]),
-    );
-  }
-
-  const itemsByStack = new Map<number, unknown[]>();
-  for (const it of items ?? []) {
-    const decorated = {
-      item_id: it.item_id,
-      product_id: it.product_id,
-      doses: Number(it.doses),
-      sort_order: it.sort_order,
-      brand_name: products[it.product_id]?.brand_name ?? null,
-      full_name: products[it.product_id]?.full_name ?? null,
-      serving_size: products[it.product_id]?.serving_size ?? null,
-      serving_unit: products[it.product_id]?.serving_unit ?? null,
-      ingredient_count: products[it.product_id]?.ingredient_count ?? 0,
-      product_active: products[it.product_id]?.is_active ?? true,
-    };
-    const arr = itemsByStack.get(it.stack_id) ?? [];
-    arr.push(decorated);
-    itemsByStack.set(it.stack_id, arr);
-  }
-
-  const decorated = (stacks ?? []).map((s) => {
-    const its = (itemsByStack.get(s.stack_id) ?? []) as { doses: number }[];
+  const decorated = ((stacks ?? []) as unknown as Stack[]).map(({ supplement_stack_item, ...s }) => {
+    const its = (supplement_stack_item ?? []).map((it) => {
+      const p = Array.isArray(it.supplement_products) ? it.supplement_products[0] : it.supplement_products;
+      return {
+        item_id: it.item_id,
+        product_id: it.product_id,
+        doses: Number(it.doses),
+        sort_order: it.sort_order,
+        brand_name: p?.brand_name ?? null,
+        full_name: p?.full_name ?? null,
+        serving_size: p?.serving_size ?? null,
+        serving_unit: p?.serving_unit ?? null,
+        ingredient_count: Array.isArray(p?.ingredients) ? (p?.ingredients as unknown[]).length : 0,
+        product_active: p?.is_active ?? true,
+      };
+    });
     return {
       ...s,
       items: its,

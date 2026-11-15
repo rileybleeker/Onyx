@@ -24,9 +24,10 @@ export async function GET(req: NextRequest) {
   since.setDate(since.getDate() - days);
   const sinceStr = since.toISOString().split("T")[0];
 
+  // Product names ride along in the same query (FK supplement_intake.product_id): one round trip, not two.
   const { data, error, count } = await supabase
     .from("supplement_intake")
-    .select("intake_id,intake_date,intake_time,product_id,doses,notes", { count: "exact" })
+    .select("intake_id,intake_date,intake_time,product_id,doses,notes,supplement_products(brand_name,full_name)", { count: "exact" })
     .gte("intake_date", sinceStr)
     .order("intake_date", { ascending: false })
     .order("intake_time", { ascending: false, nullsFirst: false })
@@ -34,24 +35,12 @@ export async function GET(req: NextRequest) {
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
-  const intakes = data ?? [];
-  const productIds = Array.from(new Set(intakes.map((i) => i.product_id)));
-  let names: Record<string, { brand_name: string | null; full_name: string | null }> = {};
-  if (productIds.length > 0) {
-    const { data: prods } = await supabase
-      .from("supplement_products")
-      .select("product_id,brand_name,full_name")
-      .in("product_id", productIds);
-    names = Object.fromEntries(
-      (prods ?? []).map((p) => [p.product_id, { brand_name: p.brand_name, full_name: p.full_name }]),
-    );
-  }
-
-  const rows = intakes.map((i) => ({
-    ...i,
-    brand_name: names[i.product_id]?.brand_name ?? null,
-    full_name: names[i.product_id]?.full_name ?? null,
-  }));
+  type Embedded = { brand_name: string | null; full_name: string | null } | { brand_name: string | null; full_name: string | null }[] | null;
+  const rows = (data ?? []).map((row) => {
+    const { supplement_products: embedded, ...i } = row as typeof row & { supplement_products: Embedded };
+    const p = Array.isArray(embedded) ? embedded[0] : embedded;
+    return { ...i, brand_name: p?.brand_name ?? null, full_name: p?.full_name ?? null };
+  });
 
   return NextResponse.json({ rows, totalCount: count ?? 0 });
 }
