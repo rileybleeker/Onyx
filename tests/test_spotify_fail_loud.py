@@ -57,7 +57,9 @@ STORED = {"access_token": "old-access", "refresh_token": "stored-refresh", "expi
 # ---------------------------------------------------------------------------
 
 class FakeSupabase:
-    """Records inserts / upserts; answers the one select ci_token_helper makes."""
+    """Records inserts / upserts; answers the one select `download spotify` makes, and the
+    save_spotify_token RPC `upload spotify` writes through (applied with the offline model,
+    spotify_upload_decision; a written token is recorded as a ci_tokens write)."""
 
     def __init__(self, stored_token_data: str | None = None):
         self.writes: list[tuple[str, str, dict]] = []   # (table, op, row)
@@ -68,6 +70,16 @@ class FakeSupabase:
 
     def table(self, name):
         return _FakeTable(self, name)
+
+    def rpc(self, name, params):
+        assert name == "save_spotify_token", name
+        action, reason = ci_token_helper.spotify_upload_decision(params["p_token_data"], self.stored_token_data)
+        if action == "upload":
+            self.stored_token_data = params["p_token_data"]
+            self.writes.append(("ci_tokens", "rpc", {"service": "spotify", "token_data": params["p_token_data"]}))
+        outcome = {"upload": "written", "invalid": "invalid"}.get(action) or (
+            "same" if reason == ci_token_helper.SPOTIFY_SAVE_OUTCOMES["same"] else "older_refresh")
+        return SimpleNamespace(execute=lambda: SimpleNamespace(data=outcome))
 
     # helpers for assertions
     def heartbeats(self) -> list[tuple[str, str]]:

@@ -360,8 +360,9 @@ function epoch(value: unknown): number {
 /**
  * Newer-wins: may `candidate` replace `stored` in pds.ci_tokens? A later authorization always wins;
  * within one authorization the later refresh wins. Mirrors spotify_upload_decision in
- * ci_token_helper.py. Used by the refresh path so a blob loaded before a reconnect is never written
- * back over the reconnect's token.
+ * ci_token_helper.py and pds.spotify_token_decision (sql/spotify_token_atomic_save.sql), which is
+ * what the refresh path's write actually runs, atomically, so a blob loaded before a reconnect is
+ * never written back over the reconnect's token. Kept here as the offline model the tests use.
  */
 export function isNewerBlob(candidate: { authorized_at?: unknown; obtained_at?: unknown }, stored: { authorized_at?: unknown; obtained_at?: unknown }): boolean {
   const ca = epoch(candidate.authorized_at);
@@ -376,6 +377,8 @@ export function isNewerBlob(candidate: { authorized_at?: unknown; obtained_at?: 
  * candidate is not newer (isNewerBlob), and false when the same authorization's refresh token was
  * rotated elsewhere (stored token differs from the one this call loaded) and Spotify returned no new
  * one (candidate still carries the loaded token): writing would put the old token over the rotated one.
+ * The write itself runs this rule inside pds.save_spotify_token (with p_loaded_refresh_token), under
+ * the row lock; this function is its offline model.
  */
 export function shouldWriteBack(
   candidate: { authorized_at?: unknown; obtained_at?: unknown; refresh_token?: unknown },

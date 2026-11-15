@@ -15,7 +15,7 @@
  */
 
 import { createClient } from "@supabase/supabase-js";
-import { SPOTIFY_REDIRECT_URI, isNewerBlob, shouldWriteBack, serializeTokenBlob, type SpotifyTokenBlob } from "@/lib/spotify-reconnect";
+import { SPOTIFY_REDIRECT_URI, serializeTokenBlob, type SpotifyTokenBlob } from "@/lib/spotify-reconnect";
 
 const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
 const SPOTIFY_API = "https://api.spotify.com/v1";
@@ -52,44 +52,30 @@ async function loadTokens(): Promise<SpotifyTokenBlob> {
   return JSON.parse(data.token_data as string) as SpotifyTokenBlob;
 }
 
+/** What pds.save_spotify_token answers: an outcome code, never a token. */
+type SaveOutcome = "written" | "same" | "older_signin" | "older_refresh" | "rotated" | "invalid";
+
 /**
- * Refresh path write-back. Newer-wins: the row is re-read first, and a blob that is not newer than
- * the stored one (an earlier authorization, or the same authorization with an older refresh) is
- * dropped. Without this, a call that loaded the old blob just before a reconnect would write the
- * old refresh token back over the new one.
+ * Refresh path write-back, newer-wins and atomic: pds.save_spotify_token (sql/spotify_token_atomic_save.sql)
+ * locks the stored row, compares, and writes only a newer blob, in one transaction. A reconnect
+ * that lands while this call is in flight is therefore never overwritten: it either committed
+ * before the lock (this blob is then older and is not written) or waits for it and writes after.
+ * The rules are isNewerBlob / shouldWriteBack in lib/spotify-reconnect.ts; loadedRefreshToken lets
+ * the function skip a blob whose refresh token was rotated elsewhere meanwhile.
  */
 async function saveTokens(tokens: SpotifyTokenBlob, loadedRefreshToken: string): Promise<void> {
-  const sb = supabaseAdmin();
-  const { data: rows, error: readErr } = await sb.from("ci_tokens").select("token_data").eq("service", "spotify").limit(1);
-  if (readErr) {
-    console.error("Spotify token write-back skipped: could not read the stored row:", readErr.code);
+  const { data, error } = await supabaseAdmin().rpc("save_spotify_token", {
+    p_token_data: serializeTokenBlob(tokens),
+    p_loaded_refresh_token: loadedRefreshToken,
+  });
+  if (error) {
+    console.error("Failed to save refreshed Spotify tokens:", error.code || "unknown");
+    // Non-fatal: the refresh token is unchanged in the common case, so the next call refreshes again.
     return;
   }
-  const storedText = rows?.[0]?.token_data;
-  if (typeof storedText === "string") {
-    try {
-      const stored = JSON.parse(storedText) as Partial<SpotifyTokenBlob> | null;
-      if (stored && typeof stored === "object" && !shouldWriteBack(tokens, loadedRefreshToken, stored)) {
-        if (isNewerBlob(tokens, stored)) {
-          console.error("Spotify token write-back skipped: refresh token rotated elsewhere");
-        }
-        return;
-      }
-    } catch {
-      // unreadable stored row: fall through and replace it
-    }
-  }
-  const { error } = await sb
-    .from("ci_tokens")
-    .upsert({
-      service: "spotify",
-      token_data: serializeTokenBlob(tokens),
-      updated_at: new Date().toISOString(),
-    });
-  if (error) {
-    console.error("Failed to save refreshed Spotify tokens:", error.code);
-    // Non-fatal: the refresh token is unchanged in the common case, so the next call refreshes again.
-  }
+  const outcome = data as SaveOutcome;
+  if (outcome === "rotated") console.error("Spotify token write-back skipped: refresh token rotated elsewhere");
+  else if (outcome === "invalid") console.error("Spotify token write-back refused: not a token blob");
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +147,12 @@ export async function probeRecentlyPlayed(accessToken: string): Promise<"ok" | "
   return resp.status === 401 || resp.status === 403 ? "forbidden" : "unavailable";
 }
 
-/** Strict store for the reconnect: returns false when the row was not written (the caller answers 500). */
+/**
+ * Strict store for the reconnect: returns false when the row was not written (the caller answers 500).
+ * A plain upsert on purpose: this IS the new sign-in, so it must win even over a stored blob whose
+ * authorized_at is somehow later (a clock that was ahead). Its write takes the same row lock as
+ * pds.save_spotify_token, so a refresh in flight compares against it rather than overwriting it.
+ */
 export async function storeSpotifyTokens(tokens: SpotifyTokenBlob): Promise<boolean> {
   const { error } = await supabaseAdmin()
     .from("ci_tokens")
@@ -179,7 +170,7 @@ export async function storeSpotifyTokens(tokens: SpotifyTokenBlob): Promise<bool
 
 /**
  * Returns a valid access token, refreshing on every call. Writes the refreshed blob back to
- * ci_tokens (newer-wins) so the Python ETL stays in sync. Every key of the stored blob is kept,
+ * ci_tokens (newer-wins, atomic: saveTokens) so the Python ETL stays in sync. Every key of the stored blob is kept,
  * including authorized_at.
  */
 export async function getSpotifyAccessToken(): Promise<string> {
