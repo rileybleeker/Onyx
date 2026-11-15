@@ -13,6 +13,11 @@ const ActivitiesClient = dynamic(() => import("./ActivitiesClient"), {
   ),
 });
 
+// Speed (2026-11-15): start loading the page's code as soon as this module runs (with the page's first scripts)
+// instead of after hydration, when the component above first renders; next/dynamic then finds the chunk on its
+// way (one request, webpack shares it). A cold or freshly deployed load waited ~0.8 s for this request.
+if (typeof window !== "undefined") void import("./ActivitiesClient").catch(() => {});
+
 // Shape of the server-prefetched initial data. MUST mirror the FIRST-STAGE
 // Promise.all in ActivitiesClient's mount effect (same 7 functions, same
 // args) — the client seeds its state from this and then silently revalidates
