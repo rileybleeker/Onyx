@@ -26,6 +26,10 @@ const experimentFixtures = {
     upcoming: { status: 'upcoming', experimentId: 'EXP-901', title: 'A synthetic evening routine', startDate: '2030-01-07', nDays: 232 },
     invalid: { status: 'active', experimentId: 'EXP-901', title: 'x', arm: 'C', instruction: 'never shown' },
 };
+// Render the actual route CSS in this synthetic fixture; identity class names
+// replace Next's production hash mapping, not the stylesheet or its rules.
+component = component.replace(/require\("\.\/Today\.module\.css"\)/g,
+  '({__esModule:true,default:new Proxy({},{get:(_,key)=>key})})');
 const script = `const process={env:{NODE_ENV:window.reactEnv||'production'}};const modules={${Object.entries(modules).map(([id, c]) => `${id}:function(module,exports,require){${c}\n}`).join(',')}};const cache={};function require(id){if(cache[id])return cache[id].exports;const m={exports:{}};cache[id]=m;modules[id](m,m.exports,require);return m.exports;}const out={exports:{}};(function(module,exports){${component}\n})(out,out.exports);window.mount=()=>{window.root=require(${dom}).createRoot(document.getElementById('root'));const R=require(${react}),el=R.createElement(out.exports.default);window.root.render(window.strict?R.createElement(R.StrictMode,null,el):el);};window.mount();`;
 const cards = Array.from({ length: 5 }, (_, i) => ({ kind: 'card', thread: 'fixture-agent', messageId: i + 1, card: { code: 'request-' + i, agent: 'Planning assistant', name: ['Review a proposed plan', 'Choose a time for your project', 'Confirm your next step', 'Fourth request', 'Fifth request'][i] } }));
 const fixture = { items: [{ kind: 'message', body: 'FYI should not appear' }, ...cards], threads: [], badge: 6, typing: null };
@@ -47,8 +51,9 @@ const emailCards = [
 ];
 const fixtureWithEmail = { ...fixture, items: [...fixture.items, ...emailCards] };
 // Missing CSS must fail: a script-only pass cannot validate responsive layout.
-const css = fs.readdirSync('frontend/.next/static/css').filter(x => x.endsWith('.css')).map(x => fs.readFileSync('frontend/.next/static/css/' + x, 'utf8')).join('\n');
+let css = fs.readdirSync('frontend/.next/static/css').filter(x => x.endsWith('.css')).map(x => fs.readFileSync('frontend/.next/static/css/' + x, 'utf8')).join('\n');
 assert(css.trim(), 'Compile the frontend before running layout regressions');
+css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8');
 (async () => {
     const browser = await chromium.launch({ headless: true });
     const errors = [];
