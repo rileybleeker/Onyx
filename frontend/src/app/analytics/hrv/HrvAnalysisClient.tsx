@@ -30,7 +30,7 @@ import {
 import {
   SAME_NIGHT_FIRST_PREDICTION_DATE, forecastSource, isSameNightComparable, splitComparable,
 } from "@/lib/hrv-forecast-cutover";
-import type { SweetSpotRow } from "@/lib/sweet-spot";
+import type { SweetSpotBaked, SweetSpotRow } from "@/lib/sweet-spot";
 import type { HrvInitial } from "./HrvLoader";
 import SweetSpotPanel from "./SweetSpotPanel";
 
@@ -312,6 +312,7 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
   const [causalMeta, setCausalMeta] = useState<any | null>(initial?.causalMeta ?? null);
   const [causalDropped, setCausalDropped] = useState<any[]>(initial?.causalDropped ?? []);
   const [envMatrix, setEnvMatrix] = useState<SweetSpotRow[]>(initial?.envMatrix ?? []);
+  const [envBaked, setEnvBaked] = useState<SweetSpotBaked | null>(initial?.envBaked ?? null);
   const [xgbDiagnostics, setXgbDiagnostics] = useState<any | null>(initial?.xgbDiagnostics ?? null);
   const [expandedEval, setExpandedEval] = useState(false);
   const [expandedModels, setExpandedModels] = useState(false);
@@ -422,6 +423,7 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         setCausalMeta((prev: any) => sameJson(prev, d.causalMeta) ? prev : d.causalMeta);
         setCausalDropped(prev => sameJson(prev, d.causalDropped) ? prev : d.causalDropped);
         setEnvMatrix(prev => sameJson(prev, d.envMatrix) ? prev : d.envMatrix);
+        setEnvBaked(prev => sameJson(prev, d.envBaked) ? prev : d.envBaked);
         setXgbDiagnostics((prev: any) => sameJson(prev, d.xgbDiagnostics) ? prev : d.xgbDiagnostics);
       })
       .catch(console.error)
@@ -2438,14 +2440,18 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         are bucketed by the selected input (bedroom / bed temperature, last meal
         to bedtime, calories, caffeine) and the mean of the selected outcome of
         that same night is plotted per bucket (±1 SEM), with a least-squares
-        parabola over the nightly points. Logic: lib/sweet-spot.ts; data:
-        getEnvDoseResponseData (matview, no python pipeline dependency).
+        parabola over the nightly points. Logic: lib/sweet-spot.ts. Data:
+        envBaked = the result hrv_analysis.py pre-bakes on every retrain
+        (dose_response_continuous / sweet_spot, with a confounder-adjusted
+        version); envMatrix = the nightly matview rows, fetched only while
+        that result is missing or incomplete, from which the panel computes
+        the same chart itself (loadSweetSpot in lib/queries-hrv.ts).
       */}
       <PartGroup id="environment" title="Environment" gap={24}
         header={<SectionHeader id="environment" tick="descriptive" title="Environment" />}>
       <Part id="sweet-spot" title="Environment Sweet Spot">
-      <DeferredMount minHeight={900}>
-        <SweetSpotPanel rows={envMatrix} />
+      <DeferredMount minHeight={960}>
+        <SweetSpotPanel rows={envMatrix} baked={envBaked} />
       </DeferredMount>
       </Part>
 

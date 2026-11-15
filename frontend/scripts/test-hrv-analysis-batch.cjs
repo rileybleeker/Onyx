@@ -37,15 +37,15 @@ function fixture() {
  const {api} = harness([]);
  return api.HRV_ANALYSIS_PANELS.map(([type,key],i) => ({result_type:type,result_key:key || 'default',result_json:{synthetic:i},computed_at:'2026-11-11T00:00:00Z'}));
 }
-test('same 17 panel results with 3 requests instead of 17', async () => {
+test('same 18 panel results with 3 requests instead of 18', async () => {
  const rows = fixture(); rows.push({result_type:'unrelated',result_key:'large',result_json:'not requested',computed_at:'2030-01-01'});
  const old = harness(rows), next = harness(rows);
  const before = await Promise.all(old.api.HRV_ANALYSIS_PANELS.map(([t,k])=>old.api.getHrvAnalysisResults(t,k)));
  const select = await next.api.getHrvAnalysisBatch();
  const after = next.api.HRV_ANALYSIS_PANELS.map(([t,k])=>select(t,k));
  assert.equal(JSON.stringify(after),JSON.stringify(before));
- assert.equal(old.count(),17); assert.equal(next.count(),3);
- console.log('Synthetic request benchmark: 17 -> 3 analysis requests (82.4% fewer). No real page latency claim.');
+ assert.equal(old.count(),18); assert.equal(next.count(),3);
+ console.log('Synthetic request benchmark: 18 -> 3 analysis requests (83.3% fewer). No real page latency claim.');
 });
 test('newest type-only row, absent panels, and legacy JSON strings survive', async () => {
  const rows = fixture().filter(r=>r.result_key !== 'dag');
@@ -59,7 +59,7 @@ test('type-only selectors remain bounded with more than 1000 keys', async () => 
  const rows = fixture();
  for(let i=0;i<1001;i++) rows.push({result_type:'journal_impact',result_key:`new${i}`,result_json:[],computed_at:'2027-01-01'});
  const h = harness(rows), select = await h.api.getHrvAnalysisBatch();
- assert.equal(h.count(),3); assert.equal(h.returned(),17); assert.equal(select('causal','dag').result_key,'dag');
+ assert.equal(h.count(),3); assert.equal(h.returned(),18); assert.equal(select('causal','dag').result_key,'dag');
 });
 test('failure in any batch member rejects rather than baking empty data into ISR', async () => {
  for(let i=0;i<3;i++) {
@@ -73,5 +73,5 @@ test('every dashboard panel call is included in the bounded batch specification'
  const calls = [...staticLoader.matchAll(/panel\("([^"]+)"(?:, "([^"]+)")?\)/g)].map(m=>[m[1],m[2]]);
  const specs = api.HRV_ANALYSIS_PANELS.map(([type,key])=>[type,key]);
  assert.equal(JSON.stringify(calls),JSON.stringify(specs));
- assert.equal(calls.length,17);
+ assert.equal(calls.length,18);
 });
