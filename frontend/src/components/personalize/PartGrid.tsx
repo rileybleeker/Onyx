@@ -39,6 +39,7 @@ import {
 } from "@/lib/personalize-store";
 import { registerTarget } from "@/lib/personalize-registry";
 import { loadEditor, preloadEditor, type EditorModule } from "./editor-loader";
+import { logFailure } from "./start";
 import { useInFeed } from "../FeedContext";
 
 /**
@@ -193,7 +194,7 @@ export function PartGrid({ page, title, zone = MAIN_ZONE, initial, className, ga
       title: label,
       start: () => {
         beginEdit(key, page, label);
-        void loadEditor().catch(() => {});
+        void loadEditor().catch((e: unknown) => logFailure("editor load", e));
       },
       preload: preloadEditor,
     });
@@ -208,7 +209,7 @@ export function PartGrid({ page, title, zone = MAIN_ZONE, initial, className, ga
   useEffect(() => (main ? scheduleSync(key) : undefined), [main, key]);
 
   useEffect(() => {
-    if (editing && !editor) void loadEditor().catch(() => {});
+    if (editing && !editor) void loadEditor().catch((e: unknown) => logFailure("editor load", e));
   }, [editing, editor]);
 
   const ctx = useMemo<GridContextValue>(() => ({ key, page, initial }), [key, page, initial]);

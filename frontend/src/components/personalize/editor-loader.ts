@@ -1,4 +1,5 @@
 import { editorSnapshot, setEditorModule } from "@/lib/personalize-store";
+import { logFailure } from "./start";
 
 /**
  * The Personalize editor (banner, part frames, drag and drop, menus, column chooser) is a separate chunk,
@@ -25,7 +26,7 @@ export function loadEditor(): Promise<EditorModule> {
 }
 
 export function preloadEditor() {
-  void loadEditor().catch(() => {});
+  void loadEditor().catch((e: unknown) => logFailure("editor load", e));
 }
 
 export function loadedEditor(): EditorModule | null {
