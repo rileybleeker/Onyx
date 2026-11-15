@@ -165,6 +165,62 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
 
     await expectNoClientCrash(page);
   });
+
+  // The Environment part (PartGroup "environment" in HrvAnalysisClient.tsx): the Sweet Spot panel plus the PM2.5
+  // and Weather panels, which fetch /api/air-quality and /api/weather themselves. Both syncs run every 3 h, so an
+  // error or empty note there is always a real break. Asserts presence of UI only, never values.
+  test("HRV Environment: PM2.5 and Weather charts draw; Sweet Spot renders", async ({
+    page,
+  }) => {
+    await gotoAuthed(page, "/analytics/hrv");
+    await settle(page);
+
+    await expect(
+      pageHeading(page, page.getByRole("heading", { name: "HRV Deep Analysis" }))
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    // Sweet Spot: the subtitle renders whenever the panel does. "sweet-spot-not-enough" is not checked: too few
+    // nights for one input/outcome pair can be legitimate.
+    const sweetSpotSubtitle = page.getByTestId("sweet-spot-subtitle");
+    await sweetSpotSubtitle.scrollIntoViewIfNeeded({ timeout: LOAD_TIMEOUT });
+    await expect(
+      sweetSpotSubtitle,
+      "Sweet Spot panel did not render"
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    // ChartCard renders its title as an <h3>. The panels sit in <DeferredMount>, which mounts them without scrolling;
+    // scrollIntoViewIfNeeded waits for the card to attach and brings it into view before the marks check.
+    for (const [title, label] of [
+      ["Air quality (PM2.5)", "PM2.5"],
+      ["Weather", "Weather"],
+    ] as const) {
+      const card = page
+        .locator("div.bg-surface-card")
+        .filter({ has: page.getByRole("heading", { name: title, exact: true }) })
+        .last();
+      await card.scrollIntoViewIfNeeded({ timeout: LOAD_TIMEOUT });
+      await expect(card, `${label} card did not render`).toBeVisible({ timeout: LOAD_TIMEOUT });
+      await expect(
+        card.locator(RECHARTS_MARKS).first(),
+        `${label} chart drew no marks`
+      ).toBeVisible({ timeout: LOAD_TIMEOUT });
+    }
+
+    // The panels' error/empty notes (AirQualityPanel.tsx, WeatherPanel.tsx; the apostrophe renders as a straight ').
+    for (const note of [
+      "Couldn't load air quality",
+      "No air-quality days yet",
+      "Couldn't load weather",
+      "No weather days yet",
+    ]) {
+      await expect(
+        page.getByText(note),
+        `HRV Environment empty-state present: "${note}"`
+      ).toHaveCount(0);
+    }
+
+    await expectNoClientCrash(page);
+  });
 });
 
 test.describe("Nutrition — Cronometer migration tripwire", () => {
