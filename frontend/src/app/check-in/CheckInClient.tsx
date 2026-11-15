@@ -451,7 +451,7 @@ export default function CheckInClient() {
             router.replace("/check-in", { scroll: false });
             load(null);
           }}
-          className="mt-4 px-3 py-1.5 text-[13px] bg-white/5 border border-border-subtle rounded-control">
+          className="mt-4 min-h-11 px-4 text-[13px] bg-white/5 border border-border-subtle rounded-control">
           Go to today
         </button>
       </div>
@@ -489,9 +489,9 @@ export default function CheckInClient() {
 
       {/* SLEEP: nights that already happened. Not tied to the day tabs below. */}
       {nights.length > 0 && (
-        <section className="mb-7 rounded-[8px] border border-indigo-400/25 bg-indigo-500/[0.06] p-3" aria-label="Sleep">
+        <section className="mb-7 rounded-card border border-border-default bg-surface-sunken shadow-card p-3" aria-label="Sleep">
           <div className="flex items-center gap-2">
-            <Moon className="w-4 h-4 text-indigo-300" />
+            <Moon aria-hidden="true" className="w-4 h-4 text-text-secondary" />
             <h3 className="text-[15px] font-medium text-text-primary">Sleep</h3>
           </div>
           <p className="text-[12px] text-text-tertiary mt-0.5 mb-3">Only nights that already happened. Tonight is asked tomorrow.</p>
@@ -513,7 +513,7 @@ export default function CheckInClient() {
 
       {/* DAYTIME: one behavior day per tab */}
       <div className="flex items-center gap-2 mb-2">
-        <Sun className="w-4 h-4 text-amber-300" />
+        <Sun aria-hidden="true" className="w-4 h-4 text-text-secondary" />
         <h3 className="text-[15px] font-medium text-text-primary">
           Daytime{dayName === "Today" || dayName === "Yesterday" ? ` · ${dayName}` : ""}
         </h3>
@@ -532,7 +532,7 @@ export default function CheckInClient() {
               aria-selected={active}
               disabled={saving}
               onClick={() => goTo(d.date)}
-              className={`flex-1 px-3 py-2 rounded-control border text-left transition-colors ${
+              className={`flex-1 min-h-11 px-3 py-2 rounded-control border text-left transition-colors ${
                 active ? "border-accent/60 bg-accent/10" : "border-border-subtle bg-white/[0.02] hover:bg-white/[0.05]"
               }`}
             >
@@ -545,7 +545,7 @@ export default function CheckInClient() {
 
       {/* Say it once: dictated text -> draft Yes/No taps (nothing is saved until Save) */}
       <details className="mb-4 rounded-control border border-border-subtle bg-white/[0.02] px-3 py-2">
-        <summary className="cursor-pointer text-[13px] text-text-secondary">Say it once</summary>
+        <summary className="cursor-pointer py-3 text-[13px] leading-5 text-text-secondary">Say it once</summary>
         <textarea
           value={voiceText}
           onChange={(e) => setVoiceText(e.target.value.slice(0, VOICE_MAX_TEXT_CHARS))}
@@ -559,7 +559,7 @@ export default function CheckInClient() {
           <button
             onClick={fillFromVoice}
             disabled={voiceBusy || saving || !voiceText.trim()}
-            className="px-3 py-1.5 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary disabled:opacity-50"
+            className="min-h-11 px-4 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary disabled:opacity-50"
           >
             {voiceBusy ? "Filling…" : "Fill answers"}
           </button>
@@ -585,7 +585,7 @@ export default function CheckInClient() {
           <div className="mt-3 flex items-center gap-3">
             <button
               onClick={() => apply(null, Object.fromEntries(dayBlanks.map((i) => [i.name, "No" as CheckinAnswer])))}
-              className="px-3 py-1.5 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary transition-colors"
+              className="min-h-11 px-4 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary transition-colors"
             >
               No for the other {dayBlanks.length}
             </button>
@@ -607,7 +607,7 @@ export default function CheckInClient() {
 
       {extras.length > 0 && (
         <section className="mb-6">
-          <button onClick={() => setShowExtras((s) => !s)} className="flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">
+          <button onClick={() => setShowExtras((s) => !s)} aria-expanded={showExtras} className="min-h-11 flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">
             <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showExtras ? "" : "-rotate-90"}`} />
             Also did ({extras.filter((i) => cells[i.name]).length}/{extras.length})
           </button>
@@ -664,17 +664,17 @@ export default function CheckInClient() {
               />
             </div>
           )}
-          {delivery.loadError && <p className="text-[12px] text-red-400 mt-1.5">{delivery.loadError}</p>}
-          {delivery.error && <p className="text-[12px] text-red-400 mt-1.5">{delivery.error}</p>}
+          {delivery.loadError && <p className="text-[12px] text-down mt-1.5">{delivery.loadError}</p>}
+          {delivery.error && <p className="text-[12px] text-down mt-1.5">{delivery.error}</p>}
         </section>
       )}
 
       {/* Save bar: sticks above the mobile tab bar */}
       <div className="sticky bottom-[calc(env(safe-area-inset-bottom)+4.75rem)] md:bottom-4 z-10 mt-8">
-        <div className="rounded-card border border-border-subtle bg-surface-card/95 backdrop-blur px-4 py-3 flex items-center gap-3 shadow-lg">
+        <div className="rounded-card border border-border-subtle bg-surface-card/95 backdrop-blur px-4 py-3 flex items-center gap-3 shadow-elevated">
           <div className="flex-1 min-w-0 text-[13px]">
             {visibleError ? (
-              <span className="text-red-400">{visibleError}</span>
+              <span className="text-down">{visibleError}</span>
             ) : savedAt === data.date && changeCount === 0 ? (
               <span className="text-text-secondary inline-flex items-center gap-1.5">
                 <Check className="w-4 h-4 text-up" /> Saved
@@ -696,7 +696,7 @@ export default function CheckInClient() {
           <button
             onClick={save}
             disabled={saving || changeCount === 0}
-            className="px-4 py-2 rounded-control text-[14px] font-medium bg-accent text-black disabled:opacity-40 transition-opacity"
+            className="min-h-11 px-5 rounded-full text-[14px] font-semibold bg-accent text-on-accent disabled:opacity-40 transition-opacity"
           >
             {saving ? "Saving…" : "Save"}
           </button>
@@ -791,7 +791,7 @@ function NightBlock({
       <div className="flex items-baseline justify-between gap-2 mb-1.5">
         <span className="text-[14px] font-medium text-text-primary">
           {unconfirmed ? `${night.date} → ${addDays(night.date, 1)} morning` : label.span}
-          {!unconfirmed && <span className="ml-2 text-[11px] font-mono font-normal uppercase tracking-wider text-indigo-200/80">{label.title}</span>}
+          {!unconfirmed && <span className="ml-2 text-[11px] font-mono font-normal uppercase tracking-wider text-text-tertiary">{label.title}</span>}
         </span>
         <span className="text-[11px] font-mono text-text-tertiary shrink-0">{catchUp && done === 0 ? "not answered yet" : `${done}/${asked.length}`}</span>
       </div>
@@ -828,9 +828,17 @@ function NightBlock({
   );
 }
 
+// Yes and No are both valid answers: either one, when chosen, uses the accent selection (never red, which
+// would read as "bad"). A data pre-fill is a suggestion until Riley taps: dashed outline, no fill.
+function answerStyle(selected: boolean, suggested: boolean): string {
+  if (!selected) return "border-border-subtle text-text-tertiary hover:text-text-secondary";
+  return suggested ? "border-dashed border-accent/60 text-accent" : "bg-accent/20 border-accent/70 text-accent";
+}
+
 function Row({ item, cell, onTap, fromVoice }: { item: CheckinItem; cell: Cell | undefined; onTap: (name: string, a: CheckinAnswer) => void; fromVoice?: boolean }) {
   const yes = cell?.answer === "Yes";
   const no = cell?.answer === "No";
+  const suggested = cell?.origin === "suggested";
   return (
     <div className="flex items-center gap-3 px-3 py-2.5">
       <div className="flex-1 min-w-0">
@@ -843,9 +851,7 @@ function Row({ item, cell, onTap, fromVoice }: { item: CheckinItem; cell: Cell |
           onClick={() => onTap(item.name, "Yes")}
           aria-pressed={yes}
           aria-label={`${item.name}: yes`}
-          className={`h-9 w-14 rounded-control border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${
-            yes ? "bg-accent/20 border-accent/70 text-accent" : "border-border-subtle text-text-tertiary hover:text-text-secondary"
-          }`}
+          className={`h-11 w-16 rounded-control border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${answerStyle(yes, suggested)}`}
         >
           <Check className="w-3.5 h-3.5" /> Yes
         </button>
@@ -853,9 +859,7 @@ function Row({ item, cell, onTap, fromVoice }: { item: CheckinItem; cell: Cell |
           onClick={() => onTap(item.name, "No")}
           aria-pressed={no}
           aria-label={`${item.name}: no`}
-          className={`h-9 w-14 rounded-control border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${
-            no ? "bg-red-500/15 border-red-400/60 text-red-300" : "border-border-subtle text-text-tertiary hover:text-text-secondary"
-          }`}
+          className={`h-11 w-16 rounded-control border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${answerStyle(no, suggested)}`}
         >
           <X className="w-3.5 h-3.5" /> No
         </button>
