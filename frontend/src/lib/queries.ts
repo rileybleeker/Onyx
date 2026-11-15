@@ -1,9 +1,10 @@
 import { supabase } from "./supabase";
 import { whoopSleepDay, kjToKcal } from "./format";
 import { hoursToMs, msToMinutes, secondsToMs, type Kilocalories, type Kilojoules, type Milliseconds, type Minutes } from "./units";
-import { dishKcal, mergeDeliveryEstimates } from "./delivery-portion";
+import { dishKcal, mergeDeliveryEstimates, shiftYmd } from "./delivery-portion";
 import { combineEstimateDays, isMissingRelation, type PhotoMealItem } from "./photo-meal";
-import type { LeftoverRow } from "./delivery-leftovers";
+import { LEFTOVER_WINDOW_DAYS, type LeftoverRow } from "./delivery-leftovers";
+import type { UberEatsCheck } from "./log-ubereats";
 
 // Re-audit 2026-06-07 (units/deepseek/F-003): promoted the workout→sleep gap
 // window from a function-local literal to a named module-level const. The pairing
@@ -652,6 +653,64 @@ export async function getDeliveryLeftovers(itemIds: number[]): Promise<LeftoverR
     threw_out: !!r.threw_out,
     eaten_time: r.eaten_time == null ? null : String(r.eaten_time).slice(0, 5),
   }));
+}
+
+/** The dish lists' window: the restaurant cart lines of `days` and their leftover rows. */
+export interface DeliveryWindow {
+  rows: DeliveryDish[];
+  stored: LeftoverRow[];
+}
+
+/**
+ * One window for useDeliveryDishes (/nutrition, /check-in, /log). The leftover rows are read in parallel with the
+ * dishes, by eaten day: a leftover of a dish delivered on day D is always dated D+1..D+LEFTOVER_WINDOW_DAYS (the
+ * guard trigger of pds.delivery_item_leftovers), so the rows of these dishes all fall inside that range; rows of
+ * other dishes are dropped. Same answer as getDeliveryLeftovers(ids), one round trip fewer.
+ */
+export async function getDeliveryWindow(days: string[]): Promise<DeliveryWindow> {
+  if (days.length === 0) return { rows: [], stored: [] };
+  const sorted = [...days].sort();
+  const from = shiftYmd(sorted[0], 1);
+  const to = shiftYmd(sorted[sorted.length - 1], LEFTOVER_WINDOW_DAYS);
+  const [rows, leftovers] = await Promise.all([
+    getDeliveryItemsForDays(days),
+    supabase
+      .from("delivery_item_leftovers")
+      .select("item_id, eaten_date, fraction, threw_out, eaten_time")
+      .gte("eaten_date", from)
+      .lte("eaten_date", to)
+      .order("item_id", { ascending: true })
+      .order("eaten_date", { ascending: true }),
+  ]);
+  if (leftovers.error) throw leftovers.error;
+  const ids = new Set(rows.map((r) => r.item_id));
+  const stored: LeftoverRow[] = (leftovers.data ?? [])
+    .filter((r) => ids.has(Number(r.item_id)))
+    .map((r) => ({
+      item_id: Number(r.item_id),
+      eaten_date: String(r.eaten_date),
+      fraction: Number(r.fraction),
+      threw_out: !!r.threw_out,
+      eaten_time: r.eaten_time == null ? null : String(r.eaten_time).slice(0, 5),
+    }));
+  return { rows, stored };
+}
+
+/**
+ * When the PC harvester last read the Uber Eats order history: the newest ubereats|items heartbeat
+ * (time + status only; sync_log is owner-readable). Shown on /log as "Uber Eats checked N min ago".
+ */
+export async function getUberEatsCheck(): Promise<UberEatsCheck> {
+  const { data, error } = await supabase
+    .from("sync_log")
+    .select("sync_start, status")
+    .eq("source", "ubereats")
+    .eq("data_type", "items")
+    .order("sync_start", { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  const row = data?.[0];
+  return { at: row?.sync_start ? String(row.sync_start) : null, status: row?.status ? String(row.status) : null };
 }
 
 // Explicit column lists for the nutrition + journal reads below (re-audit

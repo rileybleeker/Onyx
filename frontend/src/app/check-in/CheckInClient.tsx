@@ -161,7 +161,9 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
     setRecovery(drafts.recovery());
     setStorageFailed(drafts.storageFailed);
   }, [drafts]);
-  const delivery = useDeliveryDishes(data?.date ?? null, { earlierDays: 2 });
+  // Inside /log the Uber Eats section asks these (omitParts): no second read of the same dishes.
+  const deliveryOmitted = omit.has("uber-eats") && omit.has("uber-eats-leftovers");
+  const delivery = useDeliveryDishes(deliveryOmitted ? null : data?.date ?? null, { earlierDays: 2 });
   const [voiceText, setVoiceText] = useState("");
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
