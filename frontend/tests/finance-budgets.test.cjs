@@ -138,3 +138,20 @@ test("review and rules group per-charge codes under one merchant; interest is no
   const views = S.subscriptionViews([{ id: "dddddddddddddddd", merchant: "Interest Charge on Demo Purchases", cadence: "monthly", typicalCents: 100, monthlyCents: 100, lastCharge: "2030-06-01", nextExpected: "2030-07-01", status: "active" }], new Map(), TODAY);
   assert.equal(views.length, 0);
 });
+
+test("move plan: rent change from the first rent after the move, one-offs around it", () => {
+  const P = loadTs("lib/finance-plan.ts");
+  const m = P.parseMovePlan({ date: "2031-03-10", currentRentCents: 200_000, newRentCents: 350_000, movingCostsCents: 300_000, depositCents: 350_000, depositRefundCents: 200_000, livingCostChangeCents: 20_000 });
+  assert.equal(m.months, 24);
+  const items = Object.fromEntries(P.moveItems(m).map((i) => [i.id, i]));
+  assert.equal(items["move:rent"].date, "2031-04-01");
+  assert.equal(items["move:rent"].amountCents, -150_000);
+  assert.equal(items["move:rent"].repeat.count, 24);
+  assert.equal(items["move:costs"].amountCents, -300_000);
+  assert.equal(items["move:deposit"].date, "2031-02-24");
+  assert.equal(items["move:refund"].amountCents, 200_000);
+  assert.equal(items["move:col"].amountCents, -20_000);
+  assert.equal(P.moveItems(m, "2031-06-01").find((i) => i.id === "move:rent").date, "2031-06-01");
+  assert.equal(P.parseMovePlan({ date: "bad" }), null);
+  assert.equal(P.parseMovePlan({ date: "2031-03-10", newRentCents: 1.5 }), null);
+});
