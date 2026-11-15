@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, Moon, Sun, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
 import { sayFromHash, VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
-import { useLogDrafts } from "@/lib/log-drafts";
+import { setLogDraft, useLogDrafts } from "@/lib/log-drafts";
 import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, Q_JOURNALED, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
 import { clientCache } from "@/lib/client-cache";
 import { takeEarlyFetch } from "@/lib/early-fetch";
@@ -126,7 +126,10 @@ function longDate(date: string): string {
  * `embedded`: drawn as the Check-in section of /log (app/log/sections/CheckIn.tsx, always with `feed`): a section
  * heading, and words from the Log screen's "Say it" box (lib/log-drafts.ts, "checkin") fill this check-in exactly
  * like this screen's own Say it once (draft taps only; Save stores them). `omitParts`: parts another /log section
- * covers ("say-it-once", "uber-eats", "uber-eats-leftovers"), left out.
+ * covers ("say-it-once", "journal-draft", "uber-eats", "uber-eats-leftovers"), left out. With "journal-draft" left
+ * out, the journal draft of this check-in's own Say it once goes to the Log screen's Journal section
+ * (lib/log-drafts.ts, "journal"); words handed over by the Log screen's Say it box get none here (that box drafts
+ * its own).
  */
 export default function CheckInClient({ feed = false, embedded = false, omitParts }: { feed?: boolean; embedded?: boolean; omitParts?: readonly string[] } = {}) {
   const router = useRouter();
@@ -468,6 +471,12 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   // The journal draft for these words (the body is the text itself) with the model's labels. Not over an entry
   // being saved, nor over one already saved from the same words.
   const offerJournal = (date: string, text: string, labels: unknown): boolean => {
+    if (omit.has("journal-draft")) {
+      // /log: the Journal section holds journal drafts (same words, verbatim; the model's labels as suggestions).
+      const l = journalDraftFrom(labels);
+      setLogDraft("journal", { body: text, source: "voice", title: l.title || null, mood: l.mood, confidence: l.confidence, topics: l.topics }, text);
+      return true;
+    }
     const cur = journalRef.current;
     if (cur?.status === "saving" || (cur?.status === "saved" && cur.body === text)) return false;
     const l = journalDraftFrom(labels);
@@ -528,7 +537,13 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
           addMarks(`night:${nightDate}`, nightPatch, FROM_VOICE);
         }
       }
-      const journalNote = offerJournal(date, text, json.journal) ? " A journal draft of your words is below." : "";
+      // Words from the Log screen's Say it box (`given` while embedded): that box drafts its own journal entry.
+      const fromLogSayIt = embedded && given !== undefined;
+      const journalNote = fromLogSayIt
+        ? ""
+        : offerJournal(date, text, json.journal)
+          ? omit.has("journal-draft") ? " A journal draft of your words is in Journal." : " A journal draft of your words is below."
+          : "";
       const n = dayN + nightN;
       if (n === 0) {
         setVoiceMsg((changed.size ? "Nothing new to fill: you already answered those." : "Nothing in the text matched a question.") + journalNote);
@@ -784,7 +799,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
       </details>
       </Part>}
 
-      {journal && (
+      {journal && !omit.has("journal-draft") && (
         <Part id="journal-draft" title="Journal entry draft">
         <JournalDraftCard
           form={journal}

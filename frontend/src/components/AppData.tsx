@@ -10,6 +10,7 @@ import {
   CACHE_KEYS, clientCache, fetchJsonValue, reportSessionEnded, sessionEnded, setSessionEndedHandler, wipeClientData, writeInvalidates,
 } from "@/lib/client-cache";
 import { IdbCacheBackend, idbAvailable } from "@/lib/client-cache-idb";
+import { journalTodayUrl } from "@/lib/journal-file";
 import {
   REWARM_AFTER_MS, REWARM_EVERY_MS, VISITS_KEY, browserIdle, configureWarmup, orderTargets, parseVisits, recordVisit, routeOf, runWarmup,
   type DataWarmer, type PrefetchMode, type WarmRun, type WarmTarget, type WarmupDeps,
@@ -59,7 +60,7 @@ const DATA: Record<string, () => DataWarmer[]> = {
   },
   "/check-in": () => [json("/api/habits/checkin")],
   // The Log screen: each section's GET reads (same keys as the section). Section files add theirs here.
-  "/log": () => [json("/api/habits/checkin"), json("/api/weight?days=90"), json("/api/reading")],
+  "/log": () => [json("/api/habits/checkin"), json(journalTodayUrl(new Date())), json("/api/weight?days=90"), json("/api/reading")],
   "/agents": () => {
     const inbox = clientCache.peek<InboxResponse>(CACHE_KEYS.agentsInbox);
     const threads = Array.isArray(inbox?.threads)

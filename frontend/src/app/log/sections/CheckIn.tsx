@@ -3,6 +3,7 @@
 import { Suspense } from "react";
 import { InFeed } from "@/components/FeedContext";
 import CheckInClient from "@/app/check-in/CheckInClient";
+import { REPLACES_CHECKIN_JOURNAL_DRAFT } from "./Journal";
 import { REPLACES_CHECKIN_SAY_IT_ONCE } from "./SayIt";
 import { REPLACES_CHECKIN_UBER_EATS } from "./UberEats";
 import { SectionSkeleton } from "./ui";
@@ -10,6 +11,7 @@ import { SectionSkeleton } from "./ui";
 // Parts of the check-in another /log section now covers (each section's own flag), so nothing is asked twice.
 const OMIT: readonly string[] = [
   ...(REPLACES_CHECKIN_SAY_IT_ONCE ? ["say-it-once"] : []),
+  ...(REPLACES_CHECKIN_JOURNAL_DRAFT ? ["journal-draft"] : []),
   ...(REPLACES_CHECKIN_UBER_EATS ? ["uber-eats", "uber-eats-leftovers"] : []),
 ];
 

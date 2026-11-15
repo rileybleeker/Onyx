@@ -2,7 +2,7 @@
  * The Log screen's draft contract (/log, AGENTS.md "Log screen").
  *
  * The "Say it" box at the top of /log turns what Riley said or typed into SUGGESTIONS for the sections below it
- * (Check-in, Supplements, Uber Eats, Weight, Reading). It writes them here; each section subscribes to its own
+ * (Check-in, Journal, Supplements, Uber Eats, Weight, Reading). It writes them here; each section subscribes to its own
  * key with `useLogDrafts(section)`, shows the suggestion in its own form with the mark FROM_WHAT_YOU_SAID, and
  * stores nothing until Riley taps THAT section's own Save, which goes through the section's existing write route
  * with its existing validation and date rules. A section clears its draft (`clear(draft.id)`) after a successful
@@ -116,9 +116,29 @@ export interface ReadingLogDraft {
   date: string | null;
 }
 
+/**
+ * Journal, one entry for the personal Notion journal. Saved through POST /api/journal/file (Title, Date = today in
+ * New York, Source, Confidence, Mood, Topics all set; AGENTS.md journal rules). `body` is the person's own words
+ * VERBATIM, never a rewrite or summary: the words after a "journal:" prefix, or an exact quote of what was said
+ * (journalPrefixText / verbatimExcerpt in lib/journal-file.ts), or the whole text. The labels are suggestions: the
+ * section sends them only while the words are unchanged, and any left null / empty is filled in at Save.
+ */
+export interface JournalLogDraft {
+  body: string;
+  /** "voice" when the words were spoken or came through the Say it box (the journal's default), else "typed". */
+  source: "voice" | "typed";
+  /** 3-8 specific words, or null. */
+  title: string | null;
+  mood: "low" | "neutral" | "good" | "great" | null;
+  confidence: "high" | "medium" | "low" | null;
+  /** Lowercase tags, the journal's existing ones where one fits; [] = filled in at Save. */
+  topics: string[];
+}
+
 /** Section id -> the draft value it receives. Supplements and Uber Eats take several items at once. */
 export interface LogDraftMap {
   checkin: CheckinLogDraft;
+  journal: JournalLogDraft;
   supplements: SupplementLogDraft[];
   ubereats: UberEatsLogDraft[];
   weight: WeightLogDraft;
@@ -127,7 +147,7 @@ export interface LogDraftMap {
 
 export type LogSectionId = keyof LogDraftMap;
 
-export const LOG_SECTIONS: readonly LogSectionId[] = ["checkin", "supplements", "ubereats", "weight", "reading"];
+export const LOG_SECTIONS: readonly LogSectionId[] = ["checkin", "journal", "supplements", "ubereats", "weight", "reading"];
 
 /** The mark shown next to a value that came from a draft (same words as the check-in's own Say it once). */
 export const FROM_WHAT_YOU_SAID = "from what you said";

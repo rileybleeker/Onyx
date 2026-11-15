@@ -12,6 +12,7 @@ export default function LogSkeleton() {
       <div className="space-y-6">
         <SectionSkeleton section="sayit" />
         <SectionSkeleton section="checkin" />
+        <SectionSkeleton section="journal" />
         <SectionSkeleton section="supplements" />
       </div>
     </div>
