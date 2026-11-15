@@ -116,7 +116,7 @@ test("the screen applies answers as draft taps and marks them 'from what you sai
   const client = fs.readFileSync(path.join(SRC, "app/check-in/CheckInClient.tsx"), "utf8");
   assert.match(client, /\/api\/habits\/checkin\/voice/);
   assert.match(client, /from what you said/);
-  assert.match(client, /apply\(null, patch\)/);
+  assert.match(client, /apply(?:Ref\.current)?\(null, patch\)/); // the newest apply: the answer arrives after a round trip
   assert.match(client, /Filled \$\{n\} answer/);
   assert.match(client, /Nothing in the text matched a question\./);
 });

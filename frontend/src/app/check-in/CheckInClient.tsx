@@ -7,7 +7,7 @@ import { agentsApi } from "@/lib/agents-api";
 import { VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
 import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
 import { clientCache } from "@/lib/client-cache";
-import { buildCells, savePlan, visibleNights, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
+import { buildCells, savePlan, visibleNights, voicePatch, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
 import { CheckinDraftStore, dayDraftKey, nightDraftKey, recoveryTarget, type DatedDraft } from "@/lib/checkin-drafts";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
 
@@ -94,6 +94,12 @@ export default function CheckInClient() {
   const [voiceMarks, setVoiceMarks] = useState<{ date: string; marks: Record<string, CheckinAnswer> }>({ date: "", marks: {} });
   const dataDateRef = useRef<string | null>(null);
   dataDateRef.current = data?.date ?? null;
+  // "Say it once" answers arrive after a round trip. They are merged into the cells as they are THEN, and never
+  // over a daytime row changed meanwhile: every day-tab change bumps `editGen` and stamps the rows it touched.
+  const cellsRef = useRef<Cells>({});
+  cellsRef.current = cells;
+  const editGen = useRef(0);
+  const lastEdit = useRef<Record<string, number>>({});
 
   const lastLoad = useRef(0);
   const savingRef = useRef(false);
@@ -218,6 +224,10 @@ export default function CheckInClient() {
     refreshDrafts();
     setSaveError(null);
     setSavedAt(null);
+    if (scope === null) {
+      const gen = ++editGen.current;
+      for (const name of Object.keys(patch)) lastEdit.current[name] = gen;
+    }
     const update = (prev: Cells): Cells => {
       const next = { ...prev };
       for (const [name, a] of Object.entries(patch)) {
@@ -232,6 +242,10 @@ export default function CheckInClient() {
       setNightCells((prev) => ({ ...prev, [scope]: update(prev[scope] ?? {}) }));
     }
   };
+
+  // The newest apply (it reads the current data), for answers that arrive after a round trip.
+  const applyRef = useRef(apply);
+  applyRef.current = apply;
 
   // Tapping the active answer clears it.
   const tap = (scope: string | null, name: string, answer: CheckinAnswer) => {
@@ -257,6 +271,8 @@ export default function CheckInClient() {
     });
     return { dayItems, sleepItems, core, extras, coreByCategory };
   }, [data]);
+  const dayItemsRef = useRef<CheckinItem[]>([]);
+  dayItemsRef.current = dayItems;
 
   // Last night always; an earlier night while it is incomplete or holds an unsaved tap (lib/checkin-cells.ts).
   const nights = useMemo(() => visibleNights(data?.nights ?? [], sleepItems, nightCells), [data, sleepItems, nightCells]);
@@ -348,10 +364,12 @@ export default function CheckInClient() {
   };
 
   // "Say it once": the server maps the text to Yes/No answers (it writes nothing); they become ordinary draft taps.
-  // Rows already saved or tapped are never overwritten; a data pre-fill is.
+  // Rows saved or tapped by the time the answer arrives, or changed while it was read, are never overwritten
+  // (voicePatch); a data pre-fill is. The answer buttons stay live while it fills.
   const fillFromVoice = async () => {
     if (!data || voiceBusy || !voiceText.trim()) return;
     const date = data.date;
+    const sentAt = editGen.current;
     setVoiceBusy(true);
     setVoiceMsg(null);
     try {
@@ -366,18 +384,14 @@ export default function CheckInClient() {
         setVoiceMsg("Couldn't read that, try again.");
         return;
       }
-      const patch: Patch = {};
-      for (const item of dayItems) {
-        const a = (json.answers as Record<string, unknown>)[item.name];
-        const cur = cells[item.name];
-        if ((a === "Yes" || a === "No") && cur?.origin !== "saved" && cur?.origin !== "tapped") patch[item.name] = a;
-      }
+      const changed = new Set(Object.entries(lastEdit.current).filter(([, gen]) => gen > sentAt).map(([name]) => name));
+      const patch = voicePatch(dayItemsRef.current, json.answers as Record<string, unknown>, cellsRef.current, changed);
       const n = Object.keys(patch).length;
       if (n === 0) {
-        setVoiceMsg("Nothing in the text matched a question.");
+        setVoiceMsg(changed.size ? "Nothing new to fill: you already answered those." : "Nothing in the text matched a question.");
         return;
       }
-      apply(null, patch);
+      applyRef.current(null, patch);
       setVoiceMarks((prev) => ({ date, marks: { ...(prev.date === date ? prev.marks : {}), ...(patch as Record<string, CheckinAnswer>) } }));
       setVoiceMsg(`Filled ${n} answer${n === 1 ? "" : "s"}. Check them, then Save.`);
     } catch {
