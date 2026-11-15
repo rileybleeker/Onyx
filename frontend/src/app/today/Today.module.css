@@ -6,37 +6,33 @@
 .title { font-size: clamp(36px, 5vw, 52px); line-height: 1.1; letter-spacing: -.045em; font-weight: 500; margin-top: 8px; color: var(--color-text-primary); }
 .refresh { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; border: 1px solid var(--color-border-default); padding: 10px 14px; color: var(--color-text-secondary); font-size: 12px; border-radius: var(--radius-control); }
 .refresh[aria-disabled="true"] { opacity: .5; }
-.capture { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(230px, 1fr); border: 1px solid var(--color-border-default); border-radius: var(--radius-card); box-shadow: var(--shadow-card); overflow: hidden; background: var(--color-surface-card); }
-.captureLead { display: grid; grid-template-columns: auto 1fr; gap: 20px; padding: 32px; background: linear-gradient(115deg, color-mix(in srgb, var(--color-accent) 10%, transparent), transparent 75%); }
+/* Start here + quick log: two parts of the Personalize grid (TodayClient), each its own card. */
+.captureLead, .captureOptions { border: 1px solid var(--color-border-default); border-radius: var(--radius-card); box-shadow: var(--shadow-card); background: var(--color-surface-card); }
+.captureLead { display: grid; grid-template-columns: auto 1fr; gap: 20px; padding: 32px; background: linear-gradient(115deg, color-mix(in srgb, var(--color-accent) 10%, transparent), transparent 75%), var(--color-surface-card); }
 .captureIcon { display: grid; place-items: center; width: 48px; height: 48px; border-radius: var(--radius-control); color: var(--color-accent); border: 1px solid color-mix(in srgb, var(--color-accent) 30%, transparent); }
 .primaryAction { grid-column: 2; justify-self: start; display: inline-flex; align-items: center; justify-content: center; gap: 24px; min-height: 48px; border-radius: 9999px; padding: 12px 22px; background: var(--color-accent); color: var(--color-on-accent); font-size: 14px; font-weight: 600; }
-.captureOptions { padding: 28px; border-left: 1px solid var(--color-border-default); }
+.captureOptions { padding: 28px; }
 .captureLink { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-block: 13px; min-height: 56px; color: var(--color-text-primary); font-size: 14px; border-bottom: 1px solid var(--color-border-subtle); }
 .captureLink:last-child { border-bottom: none; padding-bottom: 0; }
 .caption { display: block; font-size: 11px; color: var(--color-text-secondary); margin-top: 3px; }
 .jumpLinks { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
 .jumpLinks a { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 48px; border: 1px solid var(--color-border-subtle); border-radius: var(--radius-control); padding: 12px 16px; font-size: 12px; color: var(--color-text-secondary); }
 .jumpLinks a > :last-child { color: var(--color-text-primary); font-variant-numeric: tabular-nums; }
-.workspace { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); align-items: start; gap: 24px; }
-.attention, .agenda { min-width: 0; display: flex; flex-direction: column; gap: 18px; }
 .sectionLabel { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
 .sectionLabel > span { color: var(--color-text-secondary); font-size: 10px; font-variant-numeric: tabular-nums; border: 1px solid var(--color-border-default); padding: 5px 7px; border-radius: var(--radius); }
 .sectionLabel h2 { font-size: 14px; font-weight: 500; color: var(--color-text-primary); letter-spacing: -.01em; }
 .panel { min-width: 0; box-shadow: var(--shadow-card); }
 .panel h2 { letter-spacing: -.025em; scroll-margin-top: 100px; }
 .panel > div:first-child { flex-wrap: wrap; }
-.lifeGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
 .footer { display: flex; flex-wrap: wrap; gap: 12px 28px; border-top: 1px solid var(--color-border-subtle); padding-block: 20px; }
 .footer a { min-height: 44px; display: inline-flex; align-items: center; }
 .today a:focus-visible, .refresh:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 4px; }
 .captureLink:hover, .jumpLinks a:hover { color: var(--color-accent); }
-@media (max-width: 900px) { .lifeGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .workspace { grid-template-columns: 1fr; } }
 @media (max-width: 600px) {
 .today { gap: 20px; } .header { align-items: end; } .refresh span { display: none; } .refresh { padding: 13px; }
-.capture { grid-template-columns: 1fr; } .captureLead { padding: 24px; gap: 16px; grid-template-columns: 1fr; } .captureIcon { display: none; } .primaryAction { grid-column: 1; justify-self: stretch; }
-.captureOptions { border-left: 0; border-top: 1px solid var(--color-border-default); padding: 18px 20px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.captureLead { padding: 24px; gap: 16px; grid-template-columns: 1fr; } .captureIcon { display: none; } .primaryAction { grid-column: 1; justify-self: stretch; }
+.captureOptions { padding: 18px 20px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .captureOptions > p { grid-column: 1 / -1; } .captureLink { border: 1px solid var(--color-border-default); border-radius: var(--radius-control); padding: 12px 8px; justify-content: center; font-size: 12px; min-height: 48px; }
 .captureLink:last-child { border: 1px solid var(--color-border-default); padding-bottom: 12px; } .captureLink svg, .caption { display: none; }
 .jumpLinks { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; } .jumpLinks a { padding: 12px; }
-.lifeGrid { grid-template-columns: 1fr; } .workspace { gap: 24px; }
 }
