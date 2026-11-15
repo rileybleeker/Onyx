@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
+import { revalidateTag } from "next/cache";
 import { NextResponse } from "next/server";
-import { fetchActiveHabitsCached } from "@/lib/habits-notion";
+import { fetchActiveHabitsCached, HABITS_CACHE_TAG, parseHabitPage, sameHabitDefinitions } from "@/lib/habits-notion";
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_HABITS_DB = process.env.NOTION_HABITS_DB || "29cc936fd5e14ae8b10a4fe5c5f7a6cd";
@@ -230,6 +231,10 @@ export async function POST() {
     }
   }
 
-  await habitsCacheWarm;
-  return NextResponse.json({ synced, renamed, metadataChanged, count: synced.length });
+  // This route just read the definitions fresh. When the cached list (what the check-in and /habits read) defines
+  // other questions, drop it so the next reader loads Notion instead of serving the old list for up to 3 h.
+  const cachedHabits = await habitsCacheWarm;
+  const definitionsChanged = !!cachedHabits && !sameHabitDefinitions(cachedHabits, data.results.map(parseHabitPage));
+  if (definitionsChanged) revalidateTag(HABITS_CACHE_TAG);
+  return NextResponse.json({ synced, renamed, metadataChanged, count: synced.length, definitionsChanged });
 }
