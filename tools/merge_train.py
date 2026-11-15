@@ -435,11 +435,7 @@ def rollback(sha: str, reason: str, halt_only: bool = False) -> int:
     if halt_only:  # failure provenance unknown: halt and diagnose, never revert a change that is not proven bad
         gh("issue", "create", "-R", REPO, "--title", f"Release {short} failed verification: cause unknown, train halted",
            "--label", HALT, "--body",
-           f"Post-merge verification failed for `{sha}` ({subject}).
-
-**Reason:** {reason}
-
-"
+           f"Post-merge verification failed for `{sha}` ({subject}).\n\n**Reason:** {reason}\n\n"
            f"No automatic revert: the deployment history does not show which commit broke the build (a merge "
            f"without a finished build, a canceled or errored deployment, or a deploy that never finished). Open the "
            f"failed deployment's Vercel log, then either revert the commit that broke it or, for a transient Vercel "
