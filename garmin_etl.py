@@ -8,6 +8,7 @@ Usage:
     python garmin_etl.py --backfill 730   # Backfill ~2 years of history
     python garmin_etl.py --backfill 30    # Backfill last 30 days
     python garmin_etl.py --date 2025-06-15  # Sync a specific date
+    python garmin_etl.py --backfill-training-status 930  # Only training readiness + acute/chronic load
 
 Requirements:
     pip install garminconnect supabase python-dotenv
@@ -499,41 +500,122 @@ def sync_stress(garmin: Garmin, sb: Client, target_date: date) -> int:
 # Sync: Training Status
 # ---------------------------------------------------------------------------
 
+# Garmin's acute / chronic training load are in the training-STATUS payload
+# (garmin.get_training_status -> /metrics-service/metrics/trainingstatus/aggregated/<date>),
+# not in the training-readiness payload read for the rest of the row:
+#   mostRecentTrainingStatus.latestTrainingStatusData.<deviceId>.acuteTrainingLoadDTO
+#     .dailyTrainingLoadAcute   -> acute_training_load
+#     .dailyTrainingLoadChronic -> chronic_training_load
+# Both are windows the watch computes, ending on the record's calendarDate. Until
+# 2026-11-14 nothing read this payload, so both columns were NULL in every row and the
+# three causal treatments built on them (acute, chronic, ATL/CTL ratio) had no data.
+TRAINING_LOAD_FIELDS = (
+    ("dailyTrainingLoadAcute", "acute_training_load"),
+    ("dailyTrainingLoadChronic", "chronic_training_load"),
+)
+
+
+def _load_number(value):
+    """A training-load figure as a float, or None (text, booleans, negatives, NaN and inf are rejected)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if 0 <= value < float("inf") else None  # NaN fails both comparisons
+
+
+def training_load_from_status(status, ds: str) -> dict:
+    """Acute / chronic training load for day `ds` from a training-status payload.
+
+    Returns {column: value} for the columns Garmin filled, or {} when it has nothing for
+    that day. Only a device record dated `ds` counts: the endpoint reports the most
+    recent status as of `ds`, so for a day the watch did not sync it can hand back an
+    EARLIER day's record, and storing that would turn "no data" into a stale number. With several devices the primary training device wins.
+    A missing value is left out of the result, never returned as None, so the upsert
+    keeps whatever an earlier run stored.
+    """
+    latest = safe_get(status, "mostRecentTrainingStatus", "latestTrainingStatusData")
+    if not isinstance(latest, dict):
+        return {}
+    records = [r for r in latest.values()
+               if isinstance(r, dict) and str(r.get("calendarDate") or "")[:10] == ds]
+    records.sort(key=lambda r: r.get("primaryTrainingDevice") is not True)
+    for record in records:
+        dto = record.get("acuteTrainingLoadDTO")
+        if not isinstance(dto, dict):
+            continue
+        values = {column: _load_number(dto.get(field)) for field, column in TRAINING_LOAD_FIELDS}
+        values = {column: v for column, v in values.items() if v is not None}
+        if values:
+            return values
+    return {}
+
+
 def sync_training_status(garmin: Garmin, sb: Client, target_date: date) -> int:
-    """Sync one day of training readiness/status data."""
+    """Sync one day of training readiness and training load (acute / chronic).
+
+    Two Garmin endpoints fill the one row: training readiness (score, level, factors,
+    raw_json) and training status (acute / chronic load, training_load_from_status).
+    Either can be missing for a day. The row carries whatever came back, and the
+    columns of a missing endpoint are left out of the upsert rather than written as
+    NULL. A day with neither writes nothing.
+    """
     if _is_future_et(target_date, "training_status"):
         return 0
     ds = target_date.isoformat()
+    row = {"ts": date_to_ts(target_date), "calendar_date": ds}
+
     try:
         tr = garmin.get_training_readiness(ds)
     except Exception as e:
-        log.debug(f"  training_status {ds}: no data ({e})")
-        return 0
-
-    if not tr:
-        return 0
-
+        log.debug(f"  training_readiness {ds}: no data ({e})")
+        tr = None
     # API may return a list; take the first element
     if isinstance(tr, list):
-        if len(tr) == 0:
-            return 0
-        tr = tr[0]
+        tr = tr[0] if tr else None
+    if isinstance(tr, dict) and tr:
+        row.update({
+            "training_readiness_score": tr.get("score"),
+            "training_readiness_level": tr.get("level"),
+            "sleep_score_factor": safe_get(tr, "sleepScoreFactor", "score"),
+            "recovery_time_factor": safe_get(tr, "recoveryTimeFactor", "score"),
+            "hrv_factor": safe_get(tr, "hrvFactor", "score"),
+            "sleep_history_factor": safe_get(tr, "sleepHistoryFactor", "score"),
+            "stress_history_factor": safe_get(tr, "stressHistoryFactor", "score"),
+            "training_load_factor": safe_get(tr, "acuteTrainingLoadFactor", "score"),
+            "raw_json": tr,
+        })
 
-    row = {
-        "ts": date_to_ts(target_date),
-        "calendar_date": ds,
-        "training_readiness_score": tr.get("score"),
-        "training_readiness_level": tr.get("level"),
-        "sleep_score_factor": safe_get(tr, "sleepScoreFactor", "score"),
-        "recovery_time_factor": safe_get(tr, "recoveryTimeFactor", "score"),
-        "hrv_factor": safe_get(tr, "hrvFactor", "score"),
-        "sleep_history_factor": safe_get(tr, "sleepHistoryFactor", "score"),
-        "stress_history_factor": safe_get(tr, "stressHistoryFactor", "score"),
-        "training_load_factor": safe_get(tr, "acuteTrainingLoadFactor", "score"),
-        "raw_json": tr,
-    }
+    try:
+        status = garmin.get_training_status(ds)
+    except Exception as e:
+        log.debug(f"  training_load {ds}: no data ({e})")
+        status = None
+    row.update(training_load_from_status(status, ds))
 
+    if len(row) == 2:  # only ts + calendar_date: neither endpoint had anything
+        return 0
     return upsert_to_supabase(sb, "garmin_training_status", [row], "calendar_date,ts")
+
+
+def backfill_training_status(garmin: Garmin, sb: Client, days: int) -> tuple[int, int, list[date]]:
+    """Re-read training readiness + training load for the last `days` days (ET), and nothing else.
+
+    Two Garmin calls per day instead of the full sync's six, for filling the
+    acute / chronic history (python garmin_etl.py --backfill-training-status 930).
+    Returns (rows written, days that raised, dates covered).
+    """
+    today = _et_local_today()
+    dates = [today - timedelta(days=i) for i in range(max(days, 0), -1, -1)]
+    count, errors = 0, 0
+    for i, d in enumerate(dates):
+        try:
+            count += sync_training_status(garmin, sb, d)
+        except Exception as e:
+            errors += 1
+            log.warning(f"  training_status {d}: {e}")
+        if i < len(dates) - 1:
+            time.sleep(1)  # same pacing as the daily loop
+    return count, errors, dates
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +960,9 @@ def main():
                         help="Backfill laps for all activities missing lap data")
     parser.add_argument("--sync-workouts", action="store_true",
                         help="Sync workout definitions for all activities with workout IDs")
+    parser.add_argument("--backfill-training-status", type=int, default=None, metavar="DAYS",
+                        help="Re-read only training readiness + acute/chronic training load "
+                             "for the last DAYS days (e.g. 930 to fill the history)")
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -929,6 +1014,19 @@ def main():
         log_sync(sb, "garmin", "workout_sync", "success",
                  records=count, duration=duration)
         log.info(f"Workout sync done: {count} definitions | {duration:.1f}s")
+        return
+
+    # Handle standalone training-status backfill mode (acute / chronic load history)
+    if args.backfill_training_status is not None:
+        t0 = time.time()
+        count, bf_errors, bf_dates = backfill_training_status(garmin, sb, args.backfill_training_status)
+        duration = time.time() - t0
+        log_sync(sb, "garmin", "training_status_backfill", "failed" if bf_errors else "success",
+                 records=count, date_start=bf_dates[0], date_end=bf_dates[-1],
+                 error=f"{bf_errors} sync error(s) across {len(bf_dates)} day(s)" if bf_errors else None,
+                 duration=duration)
+        log.info(f"Training-status backfill done: {count} rows over {len(bf_dates)} days, "
+                 f"{bf_errors} error(s) | {duration:.1f}s")
         return
 
     # Determine date range. Audit P0 fix: use ET-local, not UTC. On a UTC
