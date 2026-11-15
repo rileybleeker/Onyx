@@ -29,6 +29,8 @@ const Sidebar = load('src/components/Sidebar.tsx', {
   '@/lib/warmup': { navIntentProps: () => ({}) },
   '@/lib/go-shortcuts': load('src/lib/go-shortcuts.ts'),
   './CommandPalette': { OPEN_COMMAND_PALETTE: 'test-open-palette' },
+  // The page in view (components/FeedContext.tsx): the routed page here, as no continuous scroll runs.
+  './FeedContext': { useActiveRoute: () => (pathname === '/' ? '/today' : pathname), useRevealActiveNavItem: () => {} },
   './DesktopApp': {
     InstallAppButton: () => React.createElement('button', null, 'Install fixture'),
     ReloadAppButton: () => React.createElement('button', null, 'Reload fixture'),

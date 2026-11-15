@@ -1,5 +1,6 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { useEffect, useRef, useState } from "react";
 import {
   AreaChart, Area, BarChart, Bar, LineChart, Line, CartesianGrid,
@@ -37,7 +38,8 @@ function recoveryColor(score: number | null): string {
 
 import type { SleepInitial } from "./SleepLoader";
 
-export default function SleepPage({ initial }: { initial?: SleepInitial | null }) {
+export default function SleepPage({ initial, headingTestId = "page-heading" }: { initial?: SleepInitial | null; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // Server-prefetched initial data (ISR, default 30d range) seeds the charts
   // so they paint immediately; the mount effect still runs as a SILENT
   // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
@@ -81,6 +83,8 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
     ])
       .then(([sAll, r, c, j, e, sum]) => {
         if (cancelled) return;
+        // The default view also seeds this page in the continuous scroll (lib/feed-seed.ts).
+        if (range === "30d") writeFeedSeed("/sleep", { whoopSleepAll: sAll, whoopRecovery: r, whoopCycles: c, journal: j, eightSleep: e, summaries: sum });
         // Deep-equal bail-out (perf round 3): the silent revalidation's
         // refetched data is usually byte-identical to the server-seeded
         // state — returning the previous reference lets React skip the
@@ -393,7 +397,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Sleep &amp; Recovery</h2>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Sleep &amp; Recovery</h2>
           <p className="text-sm text-text-tertiary mt-0.5">Sleep, recovery, and cardiac trends — {rangeLabel(shownRange)}</p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-3">

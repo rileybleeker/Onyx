@@ -1,5 +1,6 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { useEffect, useRef, useState } from "react";
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
@@ -256,7 +257,8 @@ function HiddenCausalNote({ hidden }: { hidden: { row: any; reasons: string[] }[
   );
 }
 
-export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | null }) {
+export default function HrvAnalysisPage({ initial, headingTestId = "page-heading" }: { initial?: HrvInitial | null; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // Server-prefetched initial data (ISR, default 30d range) seeds the charts
   // so they paint immediately; the mount effect still runs as a SILENT
   // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
@@ -356,6 +358,8 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
     loadHrvDashboard(rangeDays(DEFAULT_RANGE))
       .then((d) => {
         if (cancelled) return;
+        // Also seeds this page in the continuous scroll (lib/feed-seed.ts); same call as the server prefetch.
+        writeFeedSeed("/analytics/hrv", d);
         // Every setter uses the sameJson functional bail-out (perf round 3,
         // 2026-06-11): the silent revalidation's refetched data is byte-
         // identical to the server-seeded state in the common case, but fresh
@@ -614,7 +618,7 @@ export default function HrvAnalysisPage({ initial }: { initial?: HrvInitial | nu
       {/* Header */}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">HRV Deep Analysis</h2>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">HRV Deep Analysis</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
             Predictive modeling · Statistical drivers · {rangeLabel(rangeView.shown)} · {historicalHrv.length} days of data
           </p>

@@ -1,7 +1,6 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
 import { LogOut, Search } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS, type NavItem } from "@/lib/nav";
@@ -10,12 +9,16 @@ import { navIntentProps } from "@/lib/warmup";
 import { goHint } from "@/lib/go-shortcuts";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 import { InstallAppButton, ReloadAppButton, usePaletteShortcutLabel } from "./DesktopApp";
+import { useActiveRoute, useRevealActiveNavItem } from "./FeedContext";
+
+const SIDEBAR_LIST_SELECTOR = 'nav[data-nav-list="sidebar"]';
 
 export default function Sidebar() {
-  const pathname = usePathname();
-  // "/" renders Today (the app's start page).
-  const current = pathname === "/" ? "/today" : pathname;
+  // The page in view: the routed page, or the page the continuous scroll has reached ("/" counts as Today).
+  const current = useActiveRoute();
   const paletteKey = usePaletteShortcutLabel();
+  // Keep the active item visible in the scrolling list as the continuous scroll moves through the pages.
+  useRevealActiveNavItem(SIDEBAR_LIST_SELECTOR, current);
 
   // Derive both groups from the shared route catalog; no destination is removed.
   const pinnedHrefs = new Set(["/today", "/check-in"]);
@@ -84,7 +87,7 @@ export default function Sidebar() {
         {pinnedItems.map(renderLink)}
       </nav>
 
-      <nav aria-label="All sections" className="flex-1 min-h-0 px-2 py-3 overflow-y-auto">
+      <nav aria-label="All sections" className="flex-1 min-h-0 px-2 py-3 overflow-y-auto" data-nav-list="sidebar">
         {librarySections.map((section) => (
           <div key={section.title} className="mb-3 last:mb-0">
             <p className="px-3 pb-1 text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">

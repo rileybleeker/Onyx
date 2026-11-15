@@ -173,7 +173,8 @@ const readJournal = () => clientCache.revalidate<JournalEntry[]>(CACHE_KEYS.habi
 const readHistory = () => clientCache.revalidate<HabitMetadataInterval[]>(CACHE_KEYS.habitsHistory, () => getHabitMetadataHistory());
 const keep = <T,>(next: T) => (prev: T) => (sameJson(prev, next) ? prev : next);
 
-export default function HabitsPage() {
+export default function HabitsPage({ headingTestId = "page-heading" }: { headingTestId?: string } = {}) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // Start from the cached copy (instant revisit / reopen), then revalidate; the skeleton shows only when
   // nothing is cached.
   const [habits, setHabits] = useState<NotionHabit[]>(() => clientCache.peek<HabitsList>(LIST_URL)?.habits ?? []);
@@ -521,7 +522,7 @@ export default function HabitsPage() {
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Habits</h2>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Habits</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
             Daily behaviors — {rangeLabel(range)}
             {syncing && <span className="ml-2 text-accent animate-pulse">syncing from Notion...</span>}

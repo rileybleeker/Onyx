@@ -25,6 +25,7 @@ export interface SpotifyInitial {
   drift: SpotifyDailySignatureRow[];
 }
 
-export default function SpotifyLoader({ initial }: { initial: SpotifyInitial | null }) {
-  return <SpotifyClient initial={initial} />;
+// headingTestId: "feed-page-heading" when the continuous scroll renders this page (its FeedSection).
+export default function SpotifyLoader({ initial, headingTestId }: { initial: SpotifyInitial | null; headingTestId?: string }) {
+  return <SpotifyClient initial={initial} headingTestId={headingTestId} />;
 }

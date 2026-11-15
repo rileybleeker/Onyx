@@ -1,5 +1,6 @@
 "use client";
 
+import { usePageHeadingTestId } from "@/components/FeedContext";
 import { useEffect, useState, useMemo, useRef } from "react";
 import { rangeToDays, rangeLabel, type Range } from "@/lib/queries";
 import RangeFilter from "@/components/RangeFilter";
@@ -60,6 +61,8 @@ function titleIsJustDate(title: string | null, entryDate: string): boolean {
 }
 
 export default function JournalPage() {
+  // "feed-page-heading" when this page is shown inside the continuous scroll (components/ContinuousScroll.tsx).
+  const headingTestId = usePageHeadingTestId();
   const [entries, setEntries] = useState<JournalEntryListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -152,7 +155,7 @@ export default function JournalPage() {
     <div className="px-4 md:px-6 pb-4 md:pb-6 max-w-4xl mx-auto">
       <header className="mb-6 flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 data-testid="page-heading" className="text-xl md:text-2xl font-semibold text-text-primary tracking-tight">
+          <h1 data-testid={headingTestId} className="text-xl md:text-2xl font-semibold text-text-primary tracking-tight">
             Journal
           </h1>
           <p className="text-xs md:text-sm text-text-tertiary mt-1">

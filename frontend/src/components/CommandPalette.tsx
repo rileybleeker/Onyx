@@ -6,6 +6,7 @@ import { Search, CornerDownLeft } from "lucide-react";
 import { NAV_ITEMS, type NavItem } from "@/lib/nav";
 import { warmRoute } from "@/lib/warmup";
 import { createGoShortcuts, goHint } from "@/lib/go-shortcuts";
+import { useActiveRoute } from "./FeedContext";
 
 /** Fire this to open the palette from a button: window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE)) */
 export const OPEN_COMMAND_PALETTE = "onyx:open-command-palette";
@@ -26,6 +27,8 @@ function matches(item: NavItem, q: string): boolean {
  */
 export default function CommandPalette() {
   const router = useRouter();
+  // The page in view (follows the continuous scroll): marked in the list.
+  const current = useActiveRoute();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
@@ -178,8 +181,9 @@ export default function CommandPalette() {
           {results.map((item, i) => {
             const Icon = item.icon;
             const isActive = i === active;
+            const isCurrent = item.href === current;
             return (
-              <li key={item.href} role="option" aria-selected={isActive}>
+              <li key={item.href} role="option" aria-selected={isActive} aria-current={isCurrent ? "page" : undefined}>
                 <button
                   type="button"
                   onMouseMove={(e) => {
@@ -196,8 +200,9 @@ export default function CommandPalette() {
                     isActive ? "bg-white/[0.06] text-text-primary" : "text-text-secondary"
                   }`}
                 >
-                  <Icon className="w-4 h-4 shrink-0 text-text-tertiary" />
+                  <Icon className={`w-4 h-4 shrink-0 ${isCurrent ? "text-accent" : "text-text-tertiary"}`} />
                   <span className="flex-1 truncate">{item.label}</span>
+                  {isCurrent && <span className="text-[10px] font-mono uppercase tracking-[0.08em] text-accent">Here</span>}
                   {item.shortcut && <kbd className="hidden lg:inline text-[10px] font-mono text-text-tertiary border border-border-subtle rounded px-1.5 py-0.5" aria-label={`Shortcut G then ${item.shortcut}`}>{goHint(item.shortcut)}</kbd>}
                   <span className="text-[10px] font-mono text-text-tertiary/70">{item.href}</span>
                   {isActive && <CornerDownLeft className="w-3.5 h-3.5 text-text-tertiary" />}

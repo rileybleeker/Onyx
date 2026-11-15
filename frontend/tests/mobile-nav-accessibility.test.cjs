@@ -33,6 +33,7 @@ function render(drawerOpen = false, logOpen = false, unread = 0, pathname = '/to
     if (id === '@/lib/mobile-tabs') return mobileTabs.exports;
     if (id === '@/lib/warmup') return { navIntentProps: () => ({}) };
     if (id === './CommandPalette') return { OPEN_COMMAND_PALETTE: 'open-command-palette' };
+    if (id === './FeedContext') return { useActiveRoute: () => (pathname === '/' ? '/today' : pathname) };
     throw new Error(`Unexpected dependency: ${id}`);
   };
   const js = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;

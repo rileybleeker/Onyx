@@ -7,6 +7,8 @@ import CommandPalette from "./CommandPalette";
 import { DesktopLaunchHandler } from "./DesktopApp";
 import AppData, { SignedOutWipe } from "./AppData";
 import UpdateChecker from "./UpdateChecker";
+import ContinuousScroll from "./ContinuousScroll";
+import { ActiveRouteProvider } from "./FeedContext";
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -22,19 +24,21 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   if (pathname.startsWith("/agents")) {
     // AppData is first in both layouts so moving to and from /agents keeps it mounted.
     return (
-      <>
+      <ActiveRouteProvider>
         <AppData />
         <Sidebar />
         {children}
         <CommandPalette />
         <DesktopLaunchHandler />
         <UpdateChecker />
-      </>
+      </ActiveRouteProvider>
     );
   }
 
+  // The routed page, then the complete next pages in one scroll (components/ContinuousScroll.tsx). The
+  // provider lets the sidebar, tab bar and palette follow the page in view.
   return (
-    <>
+    <ActiveRouteProvider>
       <AppData />
       <Sidebar />
       <main className="md:ml-[220px] min-h-screen">
@@ -42,13 +46,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             bottom padding clears the fixed mobile tab bar (h-14 + safe-area).
             Desktop has neither, so both revert to 2rem. */}
         <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-[calc(env(safe-area-inset-top)+4rem)] md:pt-8 pb-[calc(env(safe-area-inset-bottom)+5rem)] md:pb-8 animate-fade-in">
-          {children}
+          <ContinuousScroll>{children}</ContinuousScroll>
         </div>
       </main>
       <MobileNav />
       <CommandPalette />
       <DesktopLaunchHandler />
       <UpdateChecker />
-    </>
+    </ActiveRouteProvider>
   );
 }

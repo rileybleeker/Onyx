@@ -20,6 +20,7 @@ export interface BlandAltmanInitial {
   data: unknown[];
 }
 
-export default function BlandAltmanLoader({ initial }: { initial: BlandAltmanInitial | null }) {
-  return <BlandAltmanClient initial={initial} />;
+// headingTestId: "feed-page-heading" when the continuous scroll renders this page (its FeedSection).
+export default function BlandAltmanLoader({ initial, headingTestId }: { initial: BlandAltmanInitial | null; headingTestId?: string }) {
+  return <BlandAltmanClient initial={initial} headingTestId={headingTestId} />;
 }
