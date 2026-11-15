@@ -158,7 +158,9 @@ SUPPLEMENT_EXTRA_CONFOUNDERS = (
 # Only treatments whose value aggregates SEVERAL PAST DAYS belong here.
 # total_training_load is NOT one of them (removed 2026-11-13, dot review #5):
 # it is the sum of the Garmin activities of day D alone
-# (hrv_analysis.aggregate_activities), so hrv_lag1 (HRV of the sleep that closed
+# (hrv_analysis.aggregate_activities; 0 on a day the watch was worn with no activity,
+# NaN on a day it was not worn: hrv_analysis.fill_rest_day_training_load, 2026-11-14),
+# so hrv_lag1 (HRV of the sleep that closed
 # day D-1), hrv_7d_mean and whoop_day_strain_lag1 (yesterday's strain) are all
 # fixed before the treatment happens — ordinary pre-treatment confounders, the
 # same as for every other daily treatment. While it was listed here its estimate

@@ -204,7 +204,9 @@ CI_ALPHA = 1.0 - CI_NOMINAL  # 0.20 — pass to statsmodels conf_int()
 # hadn't yet populated baselines. Lower threshold to 2% so we can still feed
 # them to the model with NaN-aware splits (XGBoost handles missingness).
 HIGH_VALUE_SPARSE_FEATURES = {
-    "garmin_acute_training_load", "garmin_chronic_training_load",
+    # acute / chronic load come from the garmin_training_status join under these names
+    # (the matrix view's garmin_acute_/garmin_chronic_ copies are dropped there).
+    "acute_training_load", "chronic_training_load",
     "garmin_training_load_factor", "garmin_training_load_balance",
     "garmin_recovery_time_hours", "garmin_recovery_time_factor",
     "garmin_recovery_hr", "garmin_hrv_factor", "garmin_sleep_score_factor",
@@ -1033,6 +1035,68 @@ def load_all_data() -> dict[str, pd.DataFrame]:
 # ===========================================================================
 # PHASE 1 – FEATURE ENGINEERING
 # ===========================================================================
+
+# Garmin daily-summary columns, by their matrix-view names, that only the worn and synced
+# watch fills. Garmin writes a summary row for every day, worn or not (goals, profile BMR,
+# stress -1/-2), so having a row proves nothing. Same rule as
+# garmin_etl.daily_summary_has_wearable_values (API field names) and GARMIN_WEARABLE_FILTER
+# in frontend/src/lib/status-freshness.ts (table columns): keep the three in step.
+# tests/test_garmin_training_load.py checks this one against the ETL's through the view SQL.
+GARMIN_WORN_STEPS_COL = "total_steps"
+GARMIN_WORN_VALUE_COLS = (
+    "garmin_rhr", "garmin_min_hr", "garmin_max_hr",
+    "body_battery_highest", "garmin_spo2", "avg_waking_respiration",
+)
+
+
+def garmin_worn_days(df: pd.DataFrame) -> pd.Series:
+    """True on rows whose Garmin daily summary carries data from the worn watch:
+    steps > 0, or any heart-rate / body-battery / SpO2 / respiration value."""
+    worn = pd.Series(False, index=df.index)
+    if GARMIN_WORN_STEPS_COL in df.columns:
+        worn |= pd.to_numeric(df[GARMIN_WORN_STEPS_COL], errors="coerce").gt(0)
+    for c in GARMIN_WORN_VALUE_COLS:
+        if c in df.columns:
+            worn |= df[c].notna()
+    return worn
+
+
+def fill_rest_day_training_load(df: pd.DataFrame, no_activity: pd.Series) -> pd.DataFrame:
+    """total_training_load = 0 on a rest day: the watch was worn, but no activity was logged.
+
+    aggregate_activities only has rows for days with a Garmin activity, so before
+    2026-11-14 every other day was NaN and the load treatments compared harder vs easier
+    ACTIVITY days only (rest days were in neither arm). A day the watch was not worn
+    stays NaN: no sync is "unknown", not "no training" (explicit 0 vs not-logged NaN, the
+    same rule as caffeine and supplements). Days with an activity are untouched.
+    """
+    if "total_training_load" not in df.columns:
+        return df
+    rest = no_activity & garmin_worn_days(df) & df["total_training_load"].isna()
+    df.loc[rest, "total_training_load"] = 0.0
+    unknown = int((no_activity & df["total_training_load"].isna()).sum())
+    log.info(f"  Training load: {int(rest.sum())} worn rest day(s) set to 0; "
+             f"{unknown} day(s) without the watch left NaN")
+    return df
+
+
+def add_rolling_training_load(df: pd.DataFrame) -> pd.DataFrame:
+    """rolling_3d / rolling_7d_training_load: total_training_load summed over days D-3..D-1 /
+    D-7..D-1 (causal_inference.ROLLING_WINDOW_DAYS), plus rolling_7d_activity_duration.
+
+    Rest days count as 0 (fill_rest_day_training_load), so a window of worn rest days is
+    0, not NaN. A window in which the watch was never worn stays NaN. min_periods=1: an
+    unworn day inside a window that has other known days adds nothing to the sum.
+    """
+    if "total_training_load" not in df.columns:
+        return df
+    prior = df["total_training_load"].shift(1)
+    df["rolling_3d_training_load"] = prior.rolling(3, min_periods=1).sum()
+    df["rolling_7d_training_load"] = prior.rolling(7, min_periods=1).sum()
+    df["rolling_7d_activity_duration"] = df.get("total_activity_duration_min",
+                                                 pd.Series(dtype=float)).shift(1).rolling(7, min_periods=1).sum()
+    return df
+
 
 def aggregate_activities(acts: pd.DataFrame, laps: pd.DataFrame) -> pd.DataFrame:
     """Aggregate garmin_activities + garmin_activity_laps to daily level."""
@@ -1914,14 +1978,21 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         gts = gts.drop(columns=["training_status", "training_load_balance",
                                   "training_readiness_level"], errors="ignore")
         df = df.merge(gts, on="calendar_date", how="left", suffixes=("", "_gts"))
+        # The matrix view carries the same two values as garmin_acute_/garmin_chronic_
+        # training_load. Keep one copy (the names the causal layer uses), or the driver
+        # ranking would list each twice once garmin_etl stores them (2026-11-14).
+        df = df.drop(columns=[f"garmin_{c}" for c in ("acute_training_load", "chronic_training_load")
+                              if c in gts.columns], errors="ignore")
 
     # --- Join garmin activities (aggregated) ---
     if not data["garmin_acts"].empty:
         act_daily = aggregate_activities(data["garmin_acts"], data["garmin_laps"])
         if not act_daily.empty:
             df = df.merge(act_daily, on="calendar_date", how="left", suffixes=("", "_acts"))
-            df["is_rest_day"] = df["activity_count"].isna().astype(float)
+            no_activity = df["activity_count"].isna()
+            df["is_rest_day"] = no_activity.astype(float)
             df["activity_count"] = df["activity_count"].fillna(0)
+            df = fill_rest_day_training_load(df, no_activity)
 
     # --- Join whoop_cycles extra columns ---
     if not data["whoop_cycles"].empty:
@@ -2391,11 +2462,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         df["atl_ctl_ratio"] = df["acute_training_load"] / df["chronic_training_load"].replace(0, np.nan)
 
     # Rolling activity load
-    if "total_training_load" in df.columns:
-        df["rolling_3d_training_load"] = df["total_training_load"].shift(1).rolling(3, min_periods=1).sum()
-        df["rolling_7d_training_load"] = df["total_training_load"].shift(1).rolling(7, min_periods=1).sum()
-        df["rolling_7d_activity_duration"] = df.get("total_activity_duration_min",
-                                                       pd.Series(dtype=float)).shift(1).rolling(7, min_periods=1).sum()
+    df = add_rolling_training_load(df)
 
     # Days since hard workout (aerobic TE >= 4.0)
     if "max_aerobic_te" in df.columns:
