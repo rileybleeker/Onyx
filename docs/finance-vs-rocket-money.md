@@ -1,6 +1,6 @@
 # Onyx finance vs Rocket Money: feature comparison
 
-Status 2026-11-14. Pages: `/financials` (ledger), `/financials/budgets`, `/financials/forecast`, `/procurement`,
+Status 2026-11-15 (checked against the live tool). Pages: `/financials` (ledger), `/financials/budgets`, `/financials/forecast`, `/procurement`,
 Today's Money panel. Rocket Money features are taken from its public product pages (budgeting, subscriptions,
 net worth, credit score, bill negotiation, Smart Savings, cancellation concierge).
 
@@ -28,6 +28,9 @@ net worth, credit score, bill negotiation, Smart Savings, cancellation concierge
 | Life-event plan (move, rent change, deposits) and account assumptions | Yes | Plan & assumptions on the forecast page: every value editable; the move date also drives the tax residency change. |
 | What-if scenarios | Yes | Bonus size/timing, move date, rent, moving costs, spending, card payoff, 1099 income, 401(k); compare and save. |
 | Forecast accuracy tracking | Yes | Weekly snapshots vs actual; `/status` card. |
+| Every year's income, not just the next paycheck | Yes | Recurring January bonus + profit share (amount, growth, first plan year), annual raise; the tax plan covers this year and the next two. |
+| Planned one-offs and transfers | Yes | Planned items (once / monthly / yearly; confirmed, likely, possible), matched to the real transaction; a transfer can name the investment account it goes into, so net worth counts both sides. |
+| Everything editable | Yes | Detected paycheck / card payments / bills (new amount or stop from a date, reset), forecast settings (low-balance line, inflation, history weeks, card-average months, band), tax rules (bracket indexing, state rates, employer withholding), card terms, account returns and contributions. |
 
 ## Forecast accuracy (backtest, 64 weekly as-of dates over 18 months)
 
@@ -39,6 +42,14 @@ net worth, credit score, bill negotiation, Smart Savings, cancellation concierge
 
 On average the forecast is now unbiased (it was 10-16% pessimistic before paychecks with changing bank references
 were grouped). Deposits with no schedule (transfers in, refunds) are still not forecast until they happen. The history includes a job change (April 2026), which no forecast made before it could know.
+
+## Gaps found after the first version, all fixed (2026-11-14 / 15)
+
+- The paycheck was missing (its bank description changes each month): fixed; the backtest bias went to about zero.
+- Card payments not matched to the card's own account were hidden in everyday spending: modeled per payee.
+- Future bonuses were missing from cash, net worth and taxes: every year's bonus, raises and a third tax year added.
+- One-time transfers into investments counted only as cash leaving: transfers now name the account.
+- Privacy.com charges each looked like a new merchant; interest showed as a subscription: both fixed.
 
 ## Inputs Onyx derived itself (2026-11-14)
 
