@@ -8,6 +8,15 @@ Read by every coding agent (Claude Code, Codex, Cursor, Copilot, Gemini CLI, …
 - **Do type-check frontend changes:** run `npx tsc --noEmit` in `frontend/` before opening the PR (2–15 s). It is the production build's own check, not a test, and nothing else runs it before merge.
 - **Still write tests.** Add or update tests when behavior changes. The "Tests:" lists in the sections below name the tests that cover an area so you know what to update. They are not steps to run.
 
+## Delivery accountability (Riley, 2026-11-15)
+
+- For authorized implementation, use headless Claude Code handoffs with **Codex independently reviewing the actual resulting diff**. Give the builder bounded scope and acceptance criteria; resolve concrete review findings before release. A builder's summary or exit code is not a review.
+- **Launched, code written, reviewed, merged, deployed and verified are distinct states.** Record the task, attempt, exact revisions, evidence and next action. Never mark Done from launch, a model's claim, a merge, or a successful `/login` response alone.
+- The orchestrator owns supervision through verified completion or an explicit blocker, without Riley having to remind it. Persist recovery state before long-running work; use bounded retries and reconcile existing work after restart instead of launching duplicates. Notify Riley of essential blockers and required decisions.
+- Use one writer per task/worktree and one owner per release transition; respect existing locks and branch ownership. A changed head invalidates its review/check receipts. Preserve private receipts and recovery history across chats and restarts; never invent missing evidence.
+- Verify the actual production behavior against acceptance criteria. For relevant UI changes, include the authenticated **Today entry point, desktop and phone widths**, and the affected interaction. Distinguish a deployed revision from observed product acceptance; record unavailable checks as gaps, not passes. The testing policy above still applies.
+- Follow [delivery accountability](docs/delivery-accountability.md). Existing worker mechanics live in [personal-agents feature-worker documentation](https://github.com/rileybleeker/personal-agents/blob/main/docs/feature-worker.md); these requirements do not assert that every supervision or recovery mechanism is already implemented.
+
 Personal health data aggregation and analytics platform.
 Syncs biometric data from Garmin, WHOOP, and Eight Sleep into a unified Supabase Postgres database,
 visualized via a Next.js frontend with AI-powered analysis through Claude.
