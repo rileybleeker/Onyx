@@ -1,9 +1,10 @@
 "use client";
 
 import { usePageHeadingTestId } from "@/components/FeedContext";
-import { useEffect, useState, useMemo, useRef } from "react";
+import { useEffect, useState, useMemo, useRef, useSyncExternalStore } from "react";
 import { rangeToDays, rangeLabel, type Range } from "@/lib/queries";
 import RangeFilter from "@/components/RangeFilter";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 
 interface JournalEntryListItem {
   notion_page_id: string;
@@ -60,9 +61,21 @@ function titleIsJustDate(title: string | null, entryDate: string): boolean {
   return variants.some((v) => t === v);
 }
 
+const noSubscribe = () => () => {};
+
+/**
+ * False while the prerendered HTML hydrates, true afterwards (and at once on a client-side navigation). The parts
+ * render only then, so the saved layout (read from this device's storage) is the first one painted: the static
+ * HTML cannot know it, and hydrating with the default would move parts after paint.
+ */
+function useHydrated(): boolean {
+  return useSyncExternalStore(noSubscribe, () => true, () => false);
+}
+
 export default function JournalPage() {
   // "feed-page-heading" when this page is shown inside the continuous scroll (components/ContinuousScroll.tsx).
   const headingTestId = usePageHeadingTestId();
+  const hydrated = useHydrated();
   const [entries, setEntries] = useState<JournalEntryListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -165,8 +178,15 @@ export default function JournalPage() {
         <RangeFilter value={range} onChange={setRange} />
       </header>
 
+      {/* Personalize: the filter bar and the entry list are parts (no extra heading on screen). */}
+      {!hydrated ? (
+        <div className="text-text-tertiary text-sm">Loading…</div>
+      ) : (
+      <PartGrid page="/journal" title="Journal">
+      <PartGroup id="section-journal" title="Journal entries">
       {/* Filter bar */}
-      <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-3 md:p-4 mb-4 space-y-3">
+      <Part id="filters" title="Mood & topic filters">
+      <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-3 md:p-4 space-y-3">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-[11px] text-text-tertiary uppercase tracking-wider">Mood</span>
           <button
@@ -224,8 +244,10 @@ export default function JournalPage() {
         )}
 
       </div>
+      </Part>
 
       {/* Entry list */}
+      <Part id="entries" title="Entries">
       {loading ? (
         <div className="text-text-tertiary text-sm">Loading…</div>
       ) : error ? (
@@ -307,6 +329,10 @@ export default function JournalPage() {
             );
           })}
         </ul>
+      )}
+      </Part>
+      </PartGroup>
+      </PartGrid>
       )}
     </div>
   );
