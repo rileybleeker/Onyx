@@ -600,7 +600,8 @@ test("/check-in lists today's habit questions", async ({ page }) => {
 // unavailable data must be visible, never mistaken for an all-clear.
 test.describe("Today home", () => {
   test("home opens Today and its independent sections settle", async ({ page }) => {
-    await gotoAuthed(page, "/", /\/today$/);
+    // Since #192 "/" renders Today directly (no redirect to /today), so the URL stays "/".
+    await gotoAuthed(page, "/", /\/(today)?$/);
     await expect(pageHeading(page, page.getByRole("heading", { name: "Today", exact: true }))).toBeVisible();
     await expect(page.getByText("Checking agent requests...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
     await expect(page.getByText("Loading reading progress...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
