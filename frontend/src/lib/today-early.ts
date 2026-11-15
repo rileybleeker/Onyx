@@ -51,8 +51,8 @@ export function todayEarlyScript(supabaseUrl: string | undefined, agentsApi: str
     `go(${JSON.stringify(TODAY_CALENDAR_PATH)}+"?from="+y+"-"+p(mo+1)+"-"+p(dd)+"&to="+new Date(Date.UTC(y,mo,dd+1,12)).toISOString().slice(0,10),o);`;
   const cookie = supabaseUrl ? authCookieName(supabaseUrl) : null;
   const inbox = cookie
-    ? `try{var K=${JSON.stringify(cookie)},c=document.cookie.split("; "),v=null,ch=[],j,k,x;` +
-      `for(i=0;i<c.length;i++){j=c[i].indexOf("=");if(j<0)continue;k=c[i].slice(0,j);x=c[i].slice(j+1);` +
+    ? `try{var K=${JSON.stringify(cookie)},c=document.cookie.split(";"),v=null,ch=[],j,k,x;` +
+      `for(i=0;i<c.length;i++){c[i]=c[i].replace(/^ +/,"");j=c[i].indexOf("=");if(j<0)continue;k=c[i].slice(0,j);x=c[i].slice(j+1);` +
       `try{x=decodeURIComponent(x);}catch(e){}` +
       `if(k===K)v=x;else if(k.indexOf(K+".")===0&&/^(0|[1-9][0-9]*)$/.test(k.slice(K.length+1)))ch[+k.slice(K.length+1)]=x;}` +
       `if(!v&&ch.length){v="";for(i=0;i<ch.length;i++){if(typeof ch[i]!=="string"){v=null;break;}v+=ch[i];}}` +

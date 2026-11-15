@@ -112,6 +112,7 @@ test("Today: the inbox read carries the session's token (base64url cookie, also 
   const calls = withWindow(t);
   for (const cookie of [
     `other=1; ${COOKIE}=${value}`,
+    `other=1;${COOKIE}=${value}`,
     `${COOKIE}.0=${value.slice(0, 20)}; x=y; ${COOKIE}.1=${value.slice(20)}`,
     `${COOKIE}=${encodeURIComponent(session(3600))}`,
   ]) {
