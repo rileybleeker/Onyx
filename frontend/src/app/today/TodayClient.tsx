@@ -19,6 +19,8 @@ import { CACHE_KEYS, clientCache, isGoneStatus } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 // Import-free too: how current the money alerts are (bundled by name in the same test).
 import { MONEY_FRESH_URL, MONEY_RECHECK_MS, MONEY_URL, moneyNote, parseMoneyAnswer, showMoneyPanel, type MoneyView } from "@/lib/money-alerts-view";
+// Import-free too: the first load takes the reads the page's HTML already started (app/today/EarlyReads.tsx).
+import { earlyOr } from "@/lib/early-fetch";
 // One card per area of the app under Today's own panels (loaded as its own chunk; components/overview/).
 import TodayOverview from "@/components/overview/TodayOverview";
 // Personalize: every panel of Today is a part. Today is rendered on the server (static) and hydrates, so the grid
@@ -109,6 +111,7 @@ function parseExperiment(data: unknown): ExperimentToday {
   if (!isExperimentToday(data)) throw new Error("Invalid experiment arm");
   return data;
 }
+// The same URLs are started early by the page's HTML (lib/today-early.ts; tests/early-fetch.test.cjs keeps them equal).
 const READING_URL = "/api/reading";
 const URGENT_URL = "/api/urgent-email";
 const ORDERS_URL = "/api/orders/summary";
@@ -119,9 +122,11 @@ function calendarUrl(): string {
   const firstDay = localDate(new Date());
   return `/api/calendar/events?from=${firstDay}&to=${shiftDate(firstDay, 1)}`;
 }
-// GET a JSON answer. "Gone" (404 / 410 / 204) removes the cached copy instead of keeping it.
-async function getJson(url: string): Promise<unknown> {
-  const res = await fetch(url, { cache: "no-store" });
+// GET a JSON answer. "Gone" (404 / 410 / 204) removes the cached copy instead of keeping it. `early`: the first load
+// of a full page visit, which takes the GET the page's HTML already started for this URL, if any (lib/today-early.ts).
+async function getJson(url: string, early = false): Promise<unknown> {
+  const get = () => fetch(url, { cache: "no-store" });
+  const res = await (early ? earlyOr(url, get) : get());
   if (isGoneStatus(res.status)) { clientCache.remove(url); throw new Error("Gone"); }
   if (!res.ok) throw new Error("Unavailable");
   return res.json();
@@ -208,7 +213,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
     setUrgent((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setCalendar((previous) => previous.state === "ready" ? previous : { state: "loading" });
     if (!feed) setExperiment((previous) => previous.state === "ready" ? previous : { state: "loading" });
-    const inboxRequest = bounded(Promise.resolve().then(() => agentsApi.inbox())).then((data) => {
+    const inboxRequest = bounded(Promise.resolve().then(() => agentsApi.inbox({ early: !feed }))).then((data) => {
       const value = parseInbox(data);
       if (sequence.current !== current) return;
       clientCache.put(CACHE_KEYS.agentsInbox, value);
@@ -217,8 +222,9 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
     }).catch(() => { if (sequence.current === current) setInbox((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
     // Each GET below: check the answer, cache the raw JSON under its URL (shared with the other pages and the
     // warm-up), then show it. Finance, procurement and experiment answers stay in memory only (lib/client-cache.ts).
+    // The routed page's reads take the answers its HTML started (once each); the scroll's copy never does.
     function request<T>(url: string, parse: (data: unknown) => T): Promise<T> {
-      return bounded(getJson(url).then((data) => {
+      return bounded(getJson(url, !feed).then((data) => {
         const value = parse(data);
         clientCache.put(url, data);
         return value;

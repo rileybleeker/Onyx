@@ -1,6 +1,6 @@
 "use client";
 
-import { usePageHeadingTestId } from "@/components/FeedContext";
+import { useInFeed, usePageHeadingTestId } from "@/components/FeedContext";
 import { useEffect, useState, useCallback, useRef, type RefObject } from "react";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
@@ -9,6 +9,7 @@ import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import PersonalTable, { type TableColumn } from "@/components/personalize/PersonalTable";
 import { sameJson } from "@/lib/format";
 import { clientCache } from "@/lib/client-cache";
+import { earlyFetchScript, earlyOr } from "@/lib/early-fetch";
 import SpotifyReconnect from "@/components/SpotifyReconnect";
 import { needsSpotifyReconnect } from "@/lib/spotify-reconnect";
 import type { DriftAlert, SourceStatus, StatusResponse, TzGapRow } from "@/app/api/status/route";
@@ -388,18 +389,39 @@ function RefreshedLabel({ refreshedAtRef }: { refreshedAtRef: RefObject<Date | n
 }
 
 const STATUS_URL = "/api/status";
+// The page's one read starts with the HTML instead of after the JavaScript and hydration (lib/early-fetch.ts; speed
+// budget, 2026-11-15: the cold first visit took 1022 ms in perf-timing run 43676849680). Same request as load()'s
+// own fetch (the browser's default cache mode: /api/status is edge-cached for 30 s). GET only.
+const STATUS_EARLY = earlyFetchScript(STATUS_URL, false, { noStore: false });
 
 export default function StatusPage() {
+  // The script is in the static HTML of the routed page only. React never runs a script it inserts itself, so an
+  // in-app navigation leaves an inert copy and the scroll's copy (FeedSection) renders none.
+  const inFeed = useInFeed();
+  return (
+    <>
+      {!inFeed && <script dangerouslySetInnerHTML={{ __html: STATUS_EARLY }} />}
+      <StatusView early={!inFeed} />
+    </>
+  );
+}
+
+function StatusView({ early }: { early: boolean }) {
   // "feed-page-heading" when this page is shown inside the continuous scroll (components/ContinuousScroll.tsx).
   const headingTestId = usePageHeadingTestId();
   // Start from the cached copy (instant revisit / reopen), then revalidate.
   const [data, setData] = useState<StatusResponse | null>(() => clientCache.peek<StatusResponse>(STATUS_URL) ?? null);
   const [loading, setLoading] = useState(() => data === null);
   const refreshedAtRef = useRef<Date | null>(null);
+  // The first load of a full page visit takes the GET the HTML started (once); later polls fetch for themselves.
+  const firstLoad = useRef(early);
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch(STATUS_URL);
+      const get = () => fetch(STATUS_URL);
+      const takeEarly = firstLoad.current;
+      firstLoad.current = false;
+      const res = await (takeEarly ? earlyOr(STATUS_URL, get) : get());
       if (res.ok) {
         const fresh: StatusResponse = await res.json();
         clientCache.put(STATUS_URL, fresh);
