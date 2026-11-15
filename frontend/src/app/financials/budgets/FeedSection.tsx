@@ -4,14 +4,14 @@ import Link from "next/link";
 import InfoHint from "@/components/InfoHint";
 import type { BudgetsLoad } from "@/lib/finance-budgets-server";
 import BudgetsView from "./BudgetsView";
-import { FeedSkeleton, StaleNote, useFinancePageData } from "../feed-data";
+import { FeedSkeleton, RetryButton, StaleNote, useFinancePageData } from "../feed-data";
 
 /**
  * /financials/budgets as a section of the continuous scroll: the same content as page.tsx, rendered in the
  * browser from GET /api/finance/page-data?page=budgets.
  */
 export default function BudgetsFeedSection() {
-  const { rootRef, data, failed, refresh } = useFinancePageData<BudgetsLoad>("budgets");
+  const { rootRef, data, failed, refresh, retry } = useFinancePageData<BudgetsLoad>("budgets");
   const load = data?.load ?? null;
   const code = failed?.load?.kind === "error" ? failed.load.code : "unavailable";
 
@@ -43,6 +43,7 @@ export default function BudgetsFeedSection() {
         <section role="alert" className="rounded-card border border-down/30 bg-down/5 p-4">
           <h3 className="font-semibold text-down">Budgets could not be loaded</h3>
           <p className="mt-1 text-[13px] text-text-secondary">Error code {code}. This is a failed query, not an empty ledger.</p>
+          <RetryButton onClick={retry} />
         </section>
       )}
 

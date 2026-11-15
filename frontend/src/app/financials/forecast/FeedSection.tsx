@@ -4,7 +4,7 @@ import Link from "next/link";
 import InfoHint from "@/components/InfoHint";
 import type { ForecastLoad } from "@/lib/cash-forecast-server";
 import ForecastView from "./ForecastView";
-import { FeedSkeleton, StaleNote, useFinancePageData } from "../feed-data";
+import { FeedSkeleton, RetryButton, StaleNote, useFinancePageData } from "../feed-data";
 
 /**
  * /financials/forecast as a section of the continuous scroll: the same content as page.tsx without what-if
@@ -12,7 +12,7 @@ import { FeedSkeleton, StaleNote, useFinancePageData } from "../feed-data";
  * Showing a what-if opens the routed page, which computes it from the address.
  */
 export default function ForecastFeedSection() {
-  const { rootRef, data, failed, refresh } = useFinancePageData<ForecastLoad>("forecast");
+  const { rootRef, data, failed, refresh, retry } = useFinancePageData<ForecastLoad>("forecast");
   const load = data?.load ?? null;
   const code = failed?.load?.kind === "error" ? failed.load.code : "unavailable";
 
@@ -41,6 +41,7 @@ export default function ForecastFeedSection() {
         <section role="alert" className="rounded-card border border-down/30 bg-down/5 p-4">
           <h3 className="font-semibold text-down">The forecast could not be loaded</h3>
           <p className="mt-1 text-[13px] text-text-secondary">Error code {code}. This is a failed query, not an empty ledger.</p>
+          <RetryButton onClick={retry} />
         </section>
       )}
 

@@ -5,7 +5,7 @@ import InfoHint from "@/components/InfoHint";
 import type { LedgerLoad } from "@/lib/finance-ledger-server";
 import FinancialsClient from "./FinancialsClient";
 import LedgerView, { FreshnessLine } from "./LedgerView";
-import { FeedSkeleton, StaleNote, useFinancePageData } from "./feed-data";
+import { FeedSkeleton, RetryButton, StaleNote, useFinancePageData } from "./feed-data";
 
 /**
  * /financials as a section of the continuous scroll: the same content as page.tsx (its default view: newest
@@ -13,7 +13,7 @@ import { FeedSkeleton, StaleNote, useFinancePageData } from "./feed-data";
  * Filters and paging open the routed page, which reads them from the address.
  */
 export default function FinancialsFeedSection() {
-  const { rootRef, data, failed, refresh } = useFinancePageData<LedgerLoad>("financials");
+  const { rootRef, data, failed, refresh, retry } = useFinancePageData<LedgerLoad>("financials");
   const now = useMemo(() => (data ? new Date(data.now) : null), [data]);
   const load = data?.load ?? null;
   const failedLoad = failed?.load?.kind === "error" ? failed.load : null;
@@ -45,6 +45,7 @@ export default function FinancialsFeedSection() {
           <h3 className="font-semibold text-red-300">{failedLoad?.message ?? "Couldn't load the ledger."}</h3>
           <p className="mt-1 text-[13px] text-text-secondary">{failedLoad?.hint ?? "The server did not answer. Try again in a moment."}</p>
           <p className="mt-1 text-[12px] text-text-tertiary">This is a failed query, not an empty ledger.</p>
+          <RetryButton onClick={retry} />
         </section>
       )}
 

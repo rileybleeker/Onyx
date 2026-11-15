@@ -127,7 +127,13 @@ export function useFinancePageData<L>(page: FinanceFeedPage) {
     };
   }, [url, page, adopt, refresh]);
 
-  return { rootRef, data, failed, refresh };
+  /** Try again after a failed first read: back to the skeleton while it loads. */
+  const retry = useCallback(() => {
+    setFailed(null);
+    refresh();
+  }, [refresh]);
+
+  return { rootRef, data, failed, refresh, retry };
 }
 
 /** Shown under the heading until the first answer: roughly the page's layout, theme tokens, no animation. */
@@ -160,6 +166,14 @@ export function FeedSkeleton({ label, tiles, blocks, list = 0 }: { label: string
         ))}
       </div>
     </div>
+  );
+}
+
+export function RetryButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button type="button" onClick={onClick} className="mt-3 min-h-11 rounded-control border border-border-subtle bg-white/5 px-4 text-[13px]">
+      Try again
+    </button>
   );
 }
 
