@@ -12,7 +12,7 @@ import {
 import { hasFeedSection, loadFeedSection, loadedFeedSection } from "@/lib/feed-registry";
 import { GONE, clientCache, fetchJsonValue } from "@/lib/client-cache";
 import { parseUiPref, uiPrefUrl } from "@/lib/ui-preferences";
-import { LAYOUT_EVENT } from "@/lib/nav-areas";
+import { LAYOUT_EVENT, QUICK_ACCESS } from "@/lib/nav-areas";
 import { browserIdle } from "@/lib/warmup";
 import PageSkeleton from "./PageSkeleton";
 import { InFeed, useSetActiveRoute } from "./FeedContext";
@@ -38,7 +38,12 @@ import { InFeed, useSetActiveRoute } from "./FeedContext";
  *   its checks are about the routed page alone).
  */
 
-const NAV_HREFS = NAV_ITEMS.map((i) => i.href);
+// The scroll follows the sidebar as Riley sees it: the Quick access pages (Today, Check-in) first, then the sections
+// (Riley 2026-11-15: "scroll from Today -> Check-in -> Activities"). Personalize's saved order still wins over this.
+const NAV_HREFS = [
+  ...QUICK_ACCESS.filter((h) => NAV_ITEMS.some((i) => i.href === h)),
+  ...NAV_ITEMS.map((i) => i.href).filter((h) => !QUICK_ACCESS.includes(h)),
+];
 const KNOWN = areaOrder(NAV_HREFS, null);
 const LABELS = new Map(NAV_ITEMS.map((i) => [i.href, i.label] as const));
 const PREF_URL = uiPrefUrl(AREAS_PREF_KEY);
