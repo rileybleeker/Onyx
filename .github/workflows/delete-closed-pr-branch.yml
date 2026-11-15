@@ -2,8 +2,13 @@ name: Delete closed PR branch
 # Riley 2026-11-14: a closed PR's branch is removed immediately, merged or not. GitHub's "Automatically delete head
 # branches" setting only covers merges, so this covers PRs closed without merging. The branch can be brought back
 # with "Restore branch" on the PR page (GitHub keeps the PR's commits). Never checks out or runs PR code; the branch
-# name only reaches the shell through an environment variable. Local copies on RileyPC are removed by the hourly
+# name only reaches the script through an environment variable. Local copies on RileyPC are removed by the hourly
 # Branch Cleanup task (personal-agents local/branch_cleanup.py).
+#
+# The branch is removed only while it still points at the commit the PR closed with (Codex review 2026-11-14): the
+# delete is one compare-and-delete (GraphQL updateRefs with beforeOid = that commit), so a branch that was pushed to
+# or reused after the close is kept for a later cleanup pass. Every outcome is a receipt in the job summary; a
+# failure that is not "the branch is confirmed gone" or "the branch moved" turns the run red.
 on:
   pull_request_target:
     types: [closed]
@@ -18,17 +23,73 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
-      - name: Delete the head branch unless another open PR uses it
+      - name: Delete the head branch if it still points at the closed PR's head
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           NUMBER: ${{ github.event.pull_request.number }}
+          REPO_ID: ${{ github.event.repository.node_id }}
         run: |
-          others=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json number --jq 'length')
-          if [ "$others" != "0" ]; then echo "PR #$NUMBER closed; another open PR uses its branch, kept"; exit 0; fi
-          ref=$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["BRANCH"], safe="/"))')
-          if gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$ref" --silent 2>/dev/null; then
-            echo "PR #$NUMBER closed: deleted its branch"
-          else
-            echo "PR #$NUMBER closed: branch already gone (merged and auto-deleted, or deleted by hand)"
-          fi
+          python3 - <<'PY'
+          import json, os, subprocess, sys, urllib.parse
+
+          repo, branch, head = os.environ["GITHUB_REPOSITORY"], os.environ["BRANCH"], os.environ["HEAD_SHA"]
+          number = os.environ["NUMBER"]
+          ref_path = f"repos/{repo}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}"
+
+          def gh(*args):
+              p = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
+              return p.returncode, p.stdout, (p.stderr or p.stdout).strip()[:300]
+
+          def receipt(outcome, detail, ok=True):
+              line = f"PR #{number} closed: {outcome}: {detail}"
+              print(line)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+                  fh.write(line + "\n")
+              sys.exit(0 if ok else 1)
+
+          def tip():
+              """-> ('present', sha) | ('absent', None) | ('unknown', error). Only a 404 counts as gone."""
+              code, out, err = gh("api", ref_path, "--jq", ".object.sha")
+              if code == 0 and out.strip():
+                  return "present", out.strip()
+              if "HTTP 404" in err or "Not Found" in err:
+                  return "absent", None
+              return "unknown", err
+
+          code, out, err = gh("pr", "list", "-R", repo, "--head", branch, "--state", "open", "--json", "number")
+          if code:
+              receipt("FAILED", f"could not list open PRs for the branch ({err}); branch kept", ok=False)
+          if json.loads(out or "[]"):
+              receipt("kept", "another open PR uses this branch")
+
+          state, value = tip()
+          if state == "absent":
+              receipt("already gone", "confirmed absent before deleting (merged and auto-deleted, or deleted by hand)")
+          if state == "unknown":
+              receipt("FAILED", f"could not read the branch ({value}); nothing deleted", ok=False)
+          if value != head:
+              receipt("kept", f"branch moved to {value[:7]} after the PR closed at {head[:7]}; left for a later cleanup")
+
+          mutation = ("mutation($rid:ID!,$name:GitRefname!,$before:GitObjectID!){updateRefs(input:{repositoryId:$rid,"
+                      "refUpdates:[{name:$name,beforeOid:$before,afterOid:\"0000000000000000000000000000000000000000\"}]})"
+                      "{clientMutationId}}")
+          code, _, err = gh("api", "graphql", "-f", f"query={mutation}", "-f", f"rid={os.environ['REPO_ID']}",
+                            "-f", f"name=refs/heads/{branch}", "-f", f"before={head}")
+          state, value = tip()  # postcondition, whatever the mutation said
+          how = "compare-and-delete"
+          if code and state == "present" and value == head:
+              # The tip was just re-read and still matches: fall back to the plain delete (a window of milliseconds,
+              # not the old minutes between the close event and the delete) and say so in the receipt.
+              how = f"plain delete after compare-and-delete failed ({err})"
+              code, _, err = gh("api", "-X", "DELETE", ref_path.replace("/git/ref/", "/git/refs/"), "--silent")
+              state, value = tip()
+          if state == "absent":
+              receipt("deleted", f"branch removed at {head[:7]} by {how}; verified absent afterwards")
+          if state == "present" and value != head:
+              receipt("kept", f"branch moved to {value[:7]} while it was being removed; left for a later cleanup")
+          detail = f"delete {'returned success' if code == 0 else 'failed: ' + err}, but the branch "
+          detail += f"still points at {head[:7]}" if state == "present" else f"could not be re-read ({value})"
+          receipt("FAILED", detail, ok=False)
+          PY

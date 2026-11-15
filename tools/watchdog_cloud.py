@@ -7,8 +7,8 @@ Deterministic (no AI), stdlib only, GITHUB_TOKEN only, talks to GitHub through t
 What it looks at:
   1. PRs that are ready to merge but nobody merged them (the PC merger is down).
   2. PRs that are red, pending too long, in conflict or behind master.
-  3. Master health: Autonomous CI, Production Smoke Test, Live checks, train-halt,
-     rollback PRs.
+  3. Master health: Autonomous CI, Production Smoke Test, Live checks, the post-deploy
+     suites (Scheduled tests, speed budget), train-halt, rollback PRs.
   4. Scheduled workflows that missed their window or were disabled (bounded
      recovery: dispatch or re-enable, from a fixed allow-list, at most once per 6 h).
   5. The PC runner heartbeat (issue labelled `runner-heartbeat`).
@@ -681,6 +681,18 @@ CONCLUSIVE = ('success', 'failure', 'timed_out', 'startup_failure')
 BAD = ('failure', 'timed_out', 'startup_failure')
 
 
+# Suites that run after deployment instead of in front of it (Riley 2026-11-14). key, title, what to do.
+POST_DEPLOY_SUITES: dict[str, tuple[str, str, str]] = {
+    'scheduled-tests.yml': (
+        'scheduled-tests-failed', 'Scheduled tests are failing on master',
+        'Open the run, find the failing job (frontend-types, lint, stats-tests or focus-policy) and fix forward '
+        'with a normal PR. This never reverts or halts the train by itself.'),
+    'perf-timing.yml': (
+        'speed-budget-broken', 'Speed budget broken on production (something took a second)',
+        'Read the "Speed budget" step of the run for the slow page or call and fix it in the next PR.'),
+}
+
+
 def conclusive_runs(ctx: Ctx, workflow: str, count: int) -> list[dict]:
     runs = ctx.runs(workflow, extra='&status=completed', per_page=15)
     runs = [r for r in runs if r.get('conclusion') in CONCLUSIVE]     # cancelled/skipped say nothing
@@ -721,6 +733,18 @@ def check_master(ctx: Ctx) -> list[Finding]:
                 'live-checks-failed', f'{LIVE_CHECKS_NAME} failed',
                 f'Latest completed run ended {r["conclusion"]}: {r.get("html_url", "")}',
                 'Open the run and fix what the live check found (or the check itself).',
+                since=parse_ts(r['updated_at']) if r.get('updated_at') else None))
+
+    # Post-deploy suites (docs/ci-cd.md): a red run never reverts or halts anything, so this finding is the alert.
+    # Fixed forward by devops with a normal PR. A run that deferred or skipped its tests reports success, which
+    # clears the finding only until the next run tests the commit again.
+    for file, (key, title, fix) in POST_DEPLOY_SUITES.items():
+        latest = conclusive_runs(ctx, file, 1)
+        if latest and latest[0]['conclusion'] in BAD:
+            r = latest[0]
+            out.append(Finding(
+                key, title, f'Latest completed run on {ctx.default_branch} ended {r["conclusion"]} at '
+                f'{r.get("updated_at", "?")}: {r.get("html_url", "")}', fix,
                 since=parse_ts(r['updated_at']) if r.get('updated_at') else None))
 
     for issue in open_train_halts(ctx):

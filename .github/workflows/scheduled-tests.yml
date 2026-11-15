@@ -47,8 +47,8 @@ jobs:
           passed=0
           runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SHA&per_page=100" --jq '.workflow_runs[] | select((.path == ".github/workflows/scheduled-tests.yml" or .path == ".github/workflows/post-merge.yml") and (.event == "push" or .event == "schedule")) | .id')
           for run in $runs; do
-            count=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?per_page=100" --jq '[.jobs[] | select(((.name | split(" / ") | last) == "frontend-types" or (.name | split(" / ") | last) == "stats-tests" or (.name | split(" / ") | last) == "focus-policy") and .conclusion == "success")] | length')
-            if [ "$count" = 3 ]; then passed=1; break; fi
+            count=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?per_page=100" --jq '[.jobs[] | select(((.name | split(" / ") | last) == "frontend-types" or (.name | split(" / ") | last) == "lint" or (.name | split(" / ") | last) == "stats-tests" or (.name | split(" / ") | last) == "focus-policy") and .conclusion == "success")] | length')
+            if [ "$count" = 4 ]; then passed=1; break; fi
           done
           if [ "$FORCE" = true ] || [ "$passed" = 0 ]; then echo 'run=true' >> "$GITHUB_OUTPUT"
           else echo 'run=false' >> "$GITHUB_OUTPUT"; fi
@@ -89,6 +89,31 @@ jobs:
       - name: Run synthetic Today component regressions (no credentials or backend)
         working-directory: .
         run: node tests/today-regression.cjs
+
+  lint:
+    # The Vercel build skips ESLint (frontend/next.config.ts, 2026-11-14), so it runs here, after deploy.
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: ESLint (next lint, frontend/.eslintrc.json)
+        run: npm run lint
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
 
   stats-tests:
     needs: gate

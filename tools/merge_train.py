@@ -6,8 +6,9 @@ the API and never checks out or executes PR code. GitHub branch protection (requ
 enforced for admins) stays the final gate: this script only does the clicking a human or agent used to do.
 
     train [--dry-run]            merge what is green, bring the next PR up to date, one in flight at a time
-    post-merge --sha SHA         wait for the Production deploy + master CI of SHA, print result=ok|fail|skipped
-    rollback --sha SHA --reason  halt the train, open a revert PR for SHA (needs the Actions PR-creation setting)
+    post-merge --sha SHA         wait for the Production deploy of SHA, print result=ok|fail|halt|skipped
+    rollback --sha SHA --reason  halt the train, open a revert PR for SHA (needs the Actions PR-creation setting);
+             [--halt-only]       with --halt-only (failure provenance unknown) halt and file the issue, no revert
     ensure-labels                create the hold / rollback / train-halt labels
 """
 from __future__ import annotations
@@ -332,20 +333,52 @@ def moved_on_verdict(result: str, why: str, sha: str, head: str) -> tuple[str, s
     return result, why
 
 
-def culprit_of(chain: list[tuple[str, list[str]]]) -> str:
-    """Pure: chain = [(sha, production states)] from the failing merge back through its parents. The commit to revert
-    is the oldest one in the unbroken run of failed builds: reverting a later commit would drop a good change and
-    leave the build broken (likely now that tsc runs on the schedule, not per PR, and merges land back to back)."""
+def build_state(states: list[str]) -> str:
+    """Pure: what a commit's Production deployment statuses prove about its build.
+
+    good    = a deployment succeeded.
+    failed  = every deployment ended `failure`, which is what Vercel posts when the build fails
+              ("Deployment has failed").
+    unknown = anything else: no deployment at all (Vercel skips a commit superseded by a newer push, e.g. #187),
+              `inactive` (Vercel posts it for a deployment canceled from its dashboard, so it never built), still
+              pending, `error` (an infrastructure error, not evidence against the source) or a mix."""
+    if "success" in states:
+        return "good"
+    if states and all(s == "failure" for s in states):
+        return "failed"
+    return "unknown"
+
+
+def culprit_of(chain: list[tuple[str, list[str]]]) -> str | None:
+    """Pure: chain = [(sha, production states)] from the failing merge back through its parents. Returns the commit
+    to revert, or None when the evidence does not name one (Codex review 2026-11-14).
+
+    The culprit is the oldest commit of the unbroken run of failed builds, and only when that run ends at a good
+    build: reverting a later commit would drop a good change and leave the build broken. A commit with no build
+    result (skipped, canceled, errored, pending) inside the run, a failing merge that itself has no failed build (a
+    deploy timeout), or no good build within the commits read means the breaking commit is not known: if A broke the
+    build, B was never built and C failed, the walk cannot tell A from B, and stopping at B would revert C, an
+    unrelated change. Then nothing is reverted and the train halts for a diagnosis."""
+    if not chain or build_state(chain[0][1]) != "failed":
+        return None
     culprit = chain[0][0]
     for commit, states in chain[1:]:
-        if states and all(s in ("failure", "error") for s in states):
-            culprit = commit
-        else:
-            break
-    return culprit
+        state = build_state(states)
+        if state == "good":
+            return culprit
+        if state == "unknown":
+            return None
+        culprit = commit
+    return None
 
 
-def first_broken(sha: str, depth: int = 8) -> str:
+def describe_chain(chain: list[tuple[str, list[str]]]) -> str:
+    """Pure: one line of evidence for the halt issue, newest first, e.g. `c3cf45d failure, 769fe65 no deployment`."""
+    return ", ".join(f"{c[:7]} {'/'.join(s) if s else 'no deployment'}" for c, s in chain)
+
+
+def build_chain(sha: str, depth: int = 8) -> list[tuple[str, list[str]]]:
+    """[(sha, states)] from sha back through first parents, stopping after the first good build."""
     chain, cur = [], sha
     for _ in range(depth):
         deps = api_items(f"repos/{REPO}/deployments?sha={cur}&environment=Production&per_page=5", ".[]|{id}")
@@ -354,11 +387,13 @@ def first_broken(sha: str, depth: int = 8) -> str:
             st = api_items(f"repos/{REPO}/deployments/{d['id']}/statuses?per_page=1", ".[]|{state}")
             states.append(st[0]["state"] if st else "pending")
         chain.append((cur, states))
+        if build_state(states) == "good":
+            break
         parent = gh("api", f"repos/{REPO}/commits/{cur}", "--jq", ".parents[0].sha", check=False).strip()
         if not parent:
             break
         cur = parent
-    return culprit_of(chain)
+    return chain
 
 
 def post_merge(sha: str, drill: bool) -> int:
@@ -378,8 +413,13 @@ def post_merge(sha: str, drill: bool) -> int:
         return 0
     result, why = wait_production(sha)  # deploys do not wait for tests (scheduled-tests.yml runs them)
     if result == "fail":
-        culprit = first_broken(sha)
-        if culprit != sha:
+        chain = build_chain(sha)
+        culprit = culprit_of(chain)
+        if culprit is None:
+            result = "halt"
+            why += (f"; the commit that broke it is not known ({describe_chain(chain)}), so nothing is reverted: "
+                    "the train halts until someone reads the deployment logs")
+        elif culprit != sha:
             why += f"; the build was already broken by {culprit[:7]}, which is reverted instead"
             sha = culprit
     result, why = moved_on_verdict(result, why, sha, master_sha())
@@ -388,10 +428,24 @@ def post_merge(sha: str, drill: bool) -> int:
 
 
 # ---------- rollback ----------
-def rollback(sha: str, reason: str) -> int:
+def rollback(sha: str, reason: str, halt_only: bool = False) -> int:
     ensure_labels()
     short = sha[:7]
     subject = subprocess.run(["git", "log", "-1", "--format=%s", sha], capture_output=True, text=True).stdout.strip()
+    if halt_only:  # failure provenance unknown: halt and diagnose, never revert a change that is not proven bad
+        gh("issue", "create", "-R", REPO, "--title", f"Release {short} failed verification: cause unknown, train halted",
+           "--label", HALT, "--body",
+           f"Post-merge verification failed for `{sha}` ({subject}).
+
+**Reason:** {reason}
+
+"
+           f"No automatic revert: the deployment history does not show which commit broke the build (a merge "
+           f"without a finished build, a canceled or errored deployment, or a deploy that never finished). Open the "
+           f"failed deployment's Vercel log, then either revert the commit that broke it or, for a transient Vercel "
+           f"error, redeploy. Close this issue to resume the merge train.", check=False)
+        note(f"HALTED train without a revert for {short}: failure provenance unknown")
+        return 1
     if halted() or subject.startswith("Revert"):  # never revert a revert or stack rollbacks: a person decides
         gh("issue", "create", "-R", REPO, "--title", f"Release {short} failed verification while halted or after a revert",
            "--label", HALT, "--body", f"`{sha}` ({subject}) failed verification: {reason}\n\nNo automatic revert was "
@@ -456,6 +510,7 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("rollback")
     r.add_argument("--sha", required=True)
     r.add_argument("--reason", required=True)
+    r.add_argument("--halt-only", action="store_true", help="halt the train and file the issue, no revert")
     sub.add_parser("ensure-labels")
     a = ap.parse_args(argv)
     if a.cmd == "train":
@@ -463,7 +518,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "post-merge":
         return post_merge(a.sha, a.drill)
     if a.cmd == "rollback":
-        return rollback(a.sha, a.reason)
+        return rollback(a.sha, a.reason, a.halt_only)
     ensure_labels()
     return 0
 
