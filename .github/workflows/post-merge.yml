@@ -1,7 +1,10 @@
 name: Post-merge verify
 # After every merge to master: wait for the Production deploy (not for tests: those run on a schedule in
 # scheduled-tests.yml), run the production smoke test (one retry for flakiness), and if either fails halt the merge
-# train and open a revert PR. A failed build is reverted at the commit that broke it, not at a later merge.
+# train and open a revert PR. A failed build is reverted at the commit that broke it, not at a later merge; when the
+# deployment history cannot name that commit (result=halt) the train halts with an issue and nothing is reverted.
+# The offline suite below is reported, never a rollback or halt condition: a red offline-tests job (or a red
+# scheduled-tests run) is raised by the cloud watchdog and fixed forward with a normal PR (docs/ci-cd.md).
 # `drill: true` injects a failure so the rollback path can be exercised on a harmless commit.
 on:
   push:
@@ -60,7 +63,7 @@ jobs:
     secrets: inherit
   rollback:
     needs: [verify, smoke, smoke-retry]
-    if: always() && (needs.verify.outputs.result == 'fail' || needs.smoke-retry.result == 'failure')
+    if: always() && (needs.verify.outputs.result == 'fail' || needs.verify.outputs.result == 'halt' || needs.smoke-retry.result == 'failure')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -73,8 +76,9 @@ jobs:
         with:
           fetch-depth: 0
       - name: Halt the train and open the revert
-        run: python3 tools/merge_train.py rollback --sha "$SHA" --reason "$REASON"
+        run: python3 tools/merge_train.py rollback --sha "$SHA" --reason "$REASON" $HALT_ONLY
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ needs.verify.outputs.sha || github.event.inputs.sha || github.sha }}
-          REASON: ${{ needs.verify.outputs.result == 'fail' && needs.verify.outputs.detail || 'production smoke test failed twice' }}
+          REASON: ${{ (needs.verify.outputs.result == 'fail' || needs.verify.outputs.result == 'halt') && needs.verify.outputs.detail || 'production smoke test failed twice' }}
+          HALT_ONLY: ${{ needs.verify.outputs.result == 'halt' && '--halt-only' || '' }}

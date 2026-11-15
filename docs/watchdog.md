@@ -64,6 +64,8 @@ protected paths); the watchdog does not care which of them is late.
 | `pr-behind:pr-N` | green but BEHIND for more than 3 h (the train updates one behind PR at a time) | first seen by the watchdog |
 | `master-ci-failed` | newest conclusive `Autonomous CI` run on master failed (cancelled and skipped runs are ignored) | run time |
 | `smoke-failed-twice` | the two newest conclusive `Production Smoke Test` runs on master both failed | older failure |
+| `scheduled-tests-failed` | newest conclusive `Scheduled tests` run on master failed (the post-deploy suite: tests, types, lint; never a rollback or halt, so this is its alert) | run time |
+| `speed-budget-broken` | newest conclusive `Production Performance Timing` run failed its speed budget (something took 1 s, or a page was not measured) | run time |
 | `live-checks-failed` | newest conclusive `Live DB Checks` run (`live-checks.yml`) failed (ignored if the workflow is absent or disabled) | run time |
 | `train-halt:issue-N` | an open issue labelled `train-halt` (opened by a failed release; merging is paused) | issue creation |
 | `rollback-pr:pr-N` | an open same-repo PR whose head branch starts with `rollback/` (master was reverted or is about to be) | PR creation |
