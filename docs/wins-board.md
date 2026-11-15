@@ -24,6 +24,14 @@ Live on the site comes from the public GitHub Deployments API (`environment=Prod
 
 Older highlights missing from the latest 100 updated PRs use individual hourly-cached lookups. Cache revalidation can retain older snapshots; the board does not promise a maximum age. The source timestamp comes from the oldest upstream Date header used, not render time. Entries are curated in display order within each stage, not automatically ranked. At most about 40 GitHub requests per hour in total (12 list, 12 deployment, up to 15 hourly fallbacks), under the unauthenticated limit of 60.
 
+## Reading the board
+
+The overview separates live website changes, merged work, and proposals/drafts. Closed and unavailable counts remain visible when present. All, Delivered, and In progress filters show their counts; they keep the same stage rules and never count unknown statuses as delivered.
+
+On wide desktop windows, each stage's explanation sits beside its list of improvements. On smaller screens it sits above the list. Each card keeps its area, title, change, benefit, merge date, deployment caveat, and evidence link visible. Change and benefit sit side by side when there is room, then stack on phones. Filter buttons, evidence links, and footer navigation have a minimum 44px target height. Loading uses the same overview/list outline with a screen-reader status message.
+
 ## Verification
+
+The synthetic component/layout regression is `node --test tests/wins-board.test.cjs` from `frontend`; opt into the headless browser checks with `RUN_WINS_LAYOUT=1`. It uses invented fixtures and blocks network access. This checks responsive geometry and keyboard/filter behavior, not real-device Safari, installed Windows PWA behavior, or production data.
 
 From `frontend`: `node --test tests/wins.test.cjs`, `npx tsc --noEmit`, and legacy-config lint with `ESLINT_USE_FLAT_CONFIG=false npx eslint src/app/wins src/lib/wins.ts src/lib/wins-server.ts src/lib/nav.ts`. The tests run in the required frontend CI job and include stage separation (live, merged, proposed, draft never mix). Exercise All / Delivered / In progress filters, keyboard focus, mobile widths, GitHub failures, and the owner-auth boundary before reporting deployment verified.
