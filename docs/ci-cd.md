@@ -6,7 +6,7 @@ PR to merge in about a minute.
 
 ## Flow
 
-1. **PR opens** (any agent, same repo, owner identity, not draft). `Autonomous CI` runs the single required check `offline-checks` (about 10 s: Python parses, the HRV clock-boundary tests, the merge-guard and merge-train tests). Nothing else runs per PR; Vercel builds `master` only.
+1. **PR opens** (any agent, same repo, owner identity, not draft). `Autonomous CI` runs the single required check `offline-checks` (Python syntax validation only; no behavioral tests). Nothing else runs per PR; Vercel builds `master` only.
 2. **Merge train** (`.github/workflows/merge-train.yml`, `tools/merge_train.py`) runs on PR events, on CI completion, and every 15 min. Per pass it:
    - merges every PR whose required check is green on its exact head, oldest first (squash, pinned to that head SHA; GitHub still enforces branch protection, there is no admin bypass);
    - merges a PR that is behind master as it is: protection is not strict, so there is no rebase-and-retest round. Two PRs that each pass but break together are caught by the Production build and the scheduled tests.
@@ -31,3 +31,9 @@ Drafts, forks, PRs from anyone but the owner login, PRs with the `hold` label, c
 ## Security notes
 
 Uses only the workflow `GITHUB_TOKEN` (no PAT, no stored secrets in the train). `pull_request_target` is safe here because nothing from the PR is checked out or executed; fork PRs are ignored. Opening the revert PR needs Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests"; until enabled, a failed release halts the train, pushes the revert branch and files an issue with the one-click compare link.
+
+## Postdeployment-only automated tests (Riley, 2026-11-15)
+
+The existing required `offline-checks` status now parses Python only; it is not a test pass. Branch protection and security settings are unchanged. Vercel compilation, authentication, signing and permission controls remain. Behavioral/offline tests run after evidence of a successful Production deployment for the exact revision. Post-merge verification starts the credential-free suite; the 30-minute schedule retries deployed revisions. A skipped/deferred run is not evidence of a passing test. Production smoke remains after deployment, and existing live write tests stay manual opt-in only. No automated tests were run before deploying this policy change, per Riley's instruction; independent source review is the validation before publication.
+
+The live HRV matrix check remains daily/manual, not every UI release, to avoid additional production database load. Model-retraining data-integrity checks and iOS entitlement/signing checks are separate safety/build workflows and are unchanged.

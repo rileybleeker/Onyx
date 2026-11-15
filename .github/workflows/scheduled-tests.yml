@@ -1,17 +1,15 @@
 name: Scheduled tests
-# The full offline test suite, run against master on a schedule instead of on every PR (Riley 2026-11-14: one user,
-# move fast; testing and deploying are independent). The per-PR gate is only `offline-checks` in autonomous-ci.yml.
-#
-# A failure here never blocks a merge or a deploy. It turns this run red; the cloud watchdog (SCHEDULED in
-# tools/watchdog_cloud.py) and devops pick it up, and the fix ships as an ordinary PR. A master commit that already
-# passed is not tested again: the gate job exits in seconds. A commit that failed is tested again on every run, so
-# the red stays visible (and a flaky test shows up as a later green on the same commit).
-#
-# Jobs keep their old names (frontend-types, stats-tests) so history, docs and tests that name them still match.
-# No job here holds a secret: stats-tests sets no SUPABASE_* variables (live tests are in live-checks.yml).
+# Credential-free behavioral suite, after a confirmed exact-revision Production deployment.
+# Called from post-merge verification and retried on schedule. Failures do not block deployment.
+# Deferred runs are not counted as test passes. No production credentials are available here.
 on:
   schedule:
     - cron: "7,37 * * * *"   # every 30 minutes
+  workflow_call:
+    inputs:
+      sha:
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       force:
@@ -21,11 +19,18 @@ on:
 permissions:
   contents: read
   actions: read
+  deployments: read
 concurrency:
   group: scheduled-tests
   cancel-in-progress: false
 jobs:
+  deployed:
+    uses: ./.github/workflows/deployed-revision.yml
+    with:
+      sha: ${{ inputs.sha || github.sha }}
   gate:
+    needs: deployed
+    if: needs.deployed.outputs.ready == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -35,14 +40,18 @@ jobs:
         name: Skip a master commit that already passed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ inputs.sha || github.sha }}
           FORCE: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
         run: |
-          passed=$(gh run list -R "$GITHUB_REPOSITORY" --workflow scheduled-tests.yml --commit "$SHA" \
-            --status success --limit 20 --json databaseId --jq length 2>/dev/null || echo 0)
-          # A run whose jobs were all skipped by this gate also ends "success", but only after a real pass existed.
-          if [ "$FORCE" = "true" ] || [ "${passed:-0}" = "0" ]; then echo "run=true" >> "$GITHUB_OUTPUT"
-          else echo "run=false" >> "$GITHUB_OUTPUT"; echo "master ${SHA:0:7} already passed; nothing to test"; fi
+          # A deferred workflow also reports success: require actual successful test jobs.
+          passed=0
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SHA&per_page=100" --jq '.workflow_runs[] | select((.path == ".github/workflows/scheduled-tests.yml" or .path == ".github/workflows/post-merge.yml") and (.event == "push" or .event == "schedule")) | .id')
+          for run in $runs; do
+            count=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?per_page=100" --jq '[.jobs[] | select(((.name | split(" / ") | last) == "frontend-types" or (.name | split(" / ") | last) == "stats-tests" or (.name | split(" / ") | last) == "focus-policy") and .conclusion == "success")] | length')
+            if [ "$count" = 3 ]; then passed=1; break; fi
+          done
+          if [ "$FORCE" = true ] || [ "$passed" = 0 ]; then echo 'run=true' >> "$GITHUB_OUTPUT"
+          else echo 'run=false' >> "$GITHUB_OUTPUT"; fi
 
   frontend-types:
     needs: gate
@@ -55,6 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ inputs.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -88,6 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ inputs.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -100,3 +111,17 @@ jobs:
         run: pip install -r requirements-ci.txt
       - name: Offline tests (all of tests/test_*.py except the live ones, in parallel)
         run: python tests/run_offline_tests.py
+
+  focus-policy:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          persist-credentials: false
+      - name: Test Focus policy with synthetic data
+        working-directory: tools/screentime_ios/FocusCore
+        run: swift test
