@@ -201,7 +201,13 @@ export class Autosaver<T> {
       this.timers.clear(this.timer);
       this.timer = null;
     }
-    while (this.inflight) await this.inflight;
+    let waited = false;
+    while (this.inflight) {
+      waited = true;
+      await this.inflight;
+    }
+    // The save this flush waited on just failed: its retry timer (or Retry) sends again, not this flush at once.
+    if (waited && this.state.status === "error") return;
     const next = this.latest;
     if (!next || this.disposed) return;
     if (this.opts.ready?.(next.value)) return;

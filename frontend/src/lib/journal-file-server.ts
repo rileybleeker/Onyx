@@ -207,7 +207,7 @@ export async function updateJournalPage(
       inferred = await infer(input.body);
       relabeled = true;
     } catch {
-      console.error("[journal-file] relabel failed");
+      // Not logged (this module logs nothing); a failed relabel keeps relabeled = false and the current labels.
     }
   }
   const labels = labelsToWrite({ explicit: input.explicit, inferred, last: input.last, current });

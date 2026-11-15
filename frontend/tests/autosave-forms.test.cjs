@@ -27,7 +27,7 @@ for (const [file, hook, oldButton] of CONVERTED) {
   test(`${file} autosaves and shows the status line`, () => {
     const src = read(file);
     assert.match(src, hook, "saves through the shared autosave");
-    assert.match(src, /<AutosaveStatus /, "shows Saving… / Saved / Not saved + Retry");
+    assert.match(src, /<AutosaveStatus\s/, "shows Saving… / Saved / Not saved + Retry");
     assert.doesNotMatch(src, oldButton, "the old Save button is gone");
   });
 }

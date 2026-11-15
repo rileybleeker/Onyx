@@ -5,7 +5,10 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { loadTs } = require("./helpers/load-ts.cjs");
-const { Autosaver } = loadTs("lib/autosave.ts");
+// Loaded once and passed to the client as "@/lib/autosave": loadTs has no module cache, and a second copy would give
+// the client its own AutosaveRefused class, which the scheduler's instanceof check does not recognise.
+const autosaveLib = loadTs("lib/autosave.ts");
+const { Autosaver } = autosaveLib;
 
 const DAY = "Synthetic daytime question?";
 const SLEEP = "Synthetic sleep question?";
@@ -140,11 +143,12 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
     "./ExperimentAdherence": { __esModule: true, default: () => null },
     // /check-in is a personalized page since #272; the grid uses React context, which this hook shim does not
     // provide. Pass its parts through so the client renders as before.
-    "@/components/personalize/PartGrid": { PartGrid: ({ children }) => children, PartGroup: ({ children }) => children, Part: ({ children }) => children },
+    "@/components/personalize/PartGrid": { PartGrid: ({ children }) => children, PartGroup: ({ header, children }) => [header, children], Part: ({ children }) => children },
     // The /log Say it drafts (only the embedded check-in reads them; covered by tests/log-drafts.test.cjs).
     "@/lib/log-drafts": { useLogDrafts: () => ({ draft: null, clear: () => {} }), setLogDraft: () => {} },
     // The real scheduler on the manual clock; the hook's page-hidden / unmount listeners are lib/use-autosave.ts
     // (h.hide() stands in for "the page was hidden": flush with keepalive).
+    "@/lib/autosave": autosaveLib,
     "@/lib/use-autosave": {
       useAutosave: (_name, opts) => {
         const [state, setState] = hooks.useState({ status: "idle", error: null, retrying: false, savedAt: null });
