@@ -76,7 +76,7 @@ export function SectionSkeleton({ section }: { section: LogSkeletonId }) {
   if (section === "checkin") {
     // Same shape as the check-in's own loading state (heading, then question rows).
     return (
-      <div className="max-w-xl space-y-3" aria-busy="true">
+      <div className="space-y-3" aria-busy="true">
         <h2 className="text-[15px] font-medium text-text-primary">{title}</h2>
         <p role="status" className="sr-only">Loading {title}</p>
         <div aria-hidden="true" className="space-y-3">

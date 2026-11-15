@@ -78,6 +78,18 @@ function checkProducts(d: unknown) {
   if (!d || !Array.isArray((d as { products?: unknown }).products)) throw new Error("bad supplements/products answer");
 }
 
+/** This device's memory copy of a read, if it passes `check` (the persisted copy is read after mount). */
+function peekChecked<T>(url: string, check: (d: unknown) => void, ok: (v: T) => boolean = () => true): T | null {
+  const v = clientCache.peek(url);
+  if (v === undefined) return null;
+  try {
+    check(v);
+  } catch {
+    return null;
+  }
+  return ok(v as T) ? (v as T) : null;
+}
+
 const productLabel = (p: { brand_name: string | null; full_name: string | null }) =>
   p.full_name?.trim() || p.brand_name?.trim() || "Product";
 const norm = (s: string | null | undefined) => (s ?? "").toLowerCase().replace(/[^a-z0-9µ.]+/g, " ").trim();
@@ -171,12 +183,16 @@ const input =
   "min-h-11 rounded-control border border-border-subtle bg-transparent px-3 text-[14px] text-text-primary placeholder:text-text-disabled focus:outline-none focus:border-border-emphasis";
 
 export default function SupplementsSection() {
-  const [today, setToday] = useState<TodayResp | null>(null);
-  const [stacks, setStacks] = useState<Stack[] | null>(null);
-  const [products, setProducts] = useState<Product[] | null>(null);
-  const [todayState, setTodayState] = useState<LoadState>("loading");
-  const [stacksState, setStacksState] = useState<LoadState>("loading");
-  const [productsState, setProductsState] = useState<LoadState>("loading");
+  // Painted from the memory cache on the first render (the warm-up and other screens fill it); same rules as the
+  // seed below: today's copy only when it is for the current behavioral day.
+  const [today, setToday] = useState<TodayResp | null>(() =>
+    peekChecked<TodayResp>(TODAY_URL, checkToday, (t) => t.date === fallbackBehavioralToday(new Date())),
+  );
+  const [stacks, setStacks] = useState<Stack[] | null>(() => peekChecked<{ stacks: Stack[] }>(STACKS_URL, checkStacks)?.stacks ?? null);
+  const [products, setProducts] = useState<Product[] | null>(() => peekChecked<{ products: Product[] }>(PRODUCTS_URL, checkProducts)?.products ?? null);
+  const [todayState, setTodayState] = useState<LoadState>(() => (today ? "ready" : "loading"));
+  const [stacksState, setStacksState] = useState<LoadState>(() => (stacks ? "ready" : "loading"));
+  const [productsState, setProductsState] = useState<LoadState>(() => (products ? "ready" : "loading"));
 
   // Writes since load: rows just written (shown until the next read), rows being removed, stacks just logged.
   const [extraRows, setExtraRows] = useState<LoggedRow[]>([]);

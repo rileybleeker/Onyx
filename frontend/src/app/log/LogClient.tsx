@@ -1,10 +1,13 @@
 "use client";
 
+import { useEffect } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import { Camera } from "lucide-react";
+import { useInFeed } from "@/components/FeedContext";
 import { Part, PartGrid } from "@/components/personalize/PartGrid";
 import { navIntentProps } from "@/lib/warmup";
+import { jumpToLogPart, logAnchorId, partFromHash, type LogPartId } from "./jump";
 import { SectionSkeleton } from "./sections/ui";
 
 /**
@@ -36,9 +39,29 @@ const UberEats = dynamic(() => import("./sections/UberEats"), { ssr: false, load
 const Weight = dynamic(() => import("./sections/Weight"), { ssr: false, loading: () => <SectionSkeleton section="weight" /> });
 const Reading = dynamic(() => import("./sections/Reading"), { ssr: false, loading: () => <SectionSkeleton section="reading" /> });
 
+/**
+ * The top of a part: `/log#log-part-<id>` (Today's quick links) and the Say it box's "go to" buttons land here. Clears
+ * the fixed phone header.
+ */
+function Anchor({ part }: { part: LogPartId }) {
+  return <span id={logAnchorId(part)} aria-hidden="true" className="block h-0 scroll-mt-[calc(env(safe-area-inset-top)+4.25rem)] md:scroll-mt-6" />;
+}
+
 export default function LogClient({ headingTestId = "page-heading" }: { headingTestId?: string }) {
+  const inFeed = useInFeed();
+  // Opened at a section (/log#log-part-supplements): go there and stay while the sections above finish loading.
+  // Only the routed page reads the address (a copy drawn in the scroll belongs to another page's address).
+  useEffect(() => {
+    if (inFeed) return;
+    const part = partFromHash(window.location.hash);
+    if (!part) return;
+    // After this commit's layout (the parts exist now; their contents load in their own chunks).
+    const raf = requestAnimationFrame(() => jumpToLogPart(part, { settle: true }));
+    return () => cancelAnimationFrame(raf);
+  }, [inFeed]);
+
   return (
-    <div className="max-w-3xl">
+    <div className="log-screen max-w-3xl" data-log-root="">
       <header className="mb-5 flex min-h-11 items-end justify-between gap-3">
         <h1 data-testid={headingTestId} className="text-[20px] font-medium text-text-primary tracking-tight">Log</h1>
         <Link
@@ -51,13 +74,13 @@ export default function LogClient({ headingTestId = "page-heading" }: { headingT
         </Link>
       </header>
       <PartGrid page="/log" title="Log">
-        <Part id="say-it" title="Say it"><SayIt /></Part>
-        <Part id="check-in" title="Check-in" nested><CheckIn /></Part>
-        <Part id="journal" title="Journal"><Journal /></Part>
-        <Part id="supplements" title="Supplements"><Supplements /></Part>
-        <Part id="uber-eats" title="Uber Eats"><UberEats /></Part>
-        <Part id="weight" title="Weight" width="half"><Weight /></Part>
-        <Part id="reading" title="Reading" width="half"><Reading /></Part>
+        <Part id="say-it" title="Say it"><Anchor part="say-it" /><SayIt /></Part>
+        <Part id="check-in" title="Check-in" nested><Anchor part="check-in" /><CheckIn /></Part>
+        <Part id="journal" title="Journal"><Anchor part="journal" /><Journal /></Part>
+        <Part id="supplements" title="Supplements"><Anchor part="supplements" /><Supplements /></Part>
+        <Part id="uber-eats" title="Uber Eats"><Anchor part="uber-eats" /><UberEats /></Part>
+        <Part id="weight" title="Weight" width="half"><Anchor part="weight" /><Weight /></Part>
+        <Part id="reading" title="Reading" width="half"><Anchor part="reading" /><Reading /></Part>
       </PartGrid>
     </div>
   );

@@ -117,6 +117,14 @@
   border-radius: var(--radius-control);
 }
 
+/* The Log screen (/log) on a phone: a field under 16 px makes iOS zoom the page in on focus. Every field there
+   (the sections' own and the shared check-in / Uber Eats controls they reuse) reads at 16 px on a touch screen. */
+@media (pointer: coarse) {
+  .log-screen :is(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), select, textarea) {
+    font-size: 16px;
+  }
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;
