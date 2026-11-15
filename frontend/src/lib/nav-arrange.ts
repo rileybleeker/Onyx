@@ -1,14 +1,18 @@
 /**
  * Personalize mode: rearranging the side panel / phone drawer. Items move within their section, sections move as a
  * block; either way the result is stored as the app's single area order (`layout.areas`, `grids.main.order`), the
- * order the continuous scroll follows too. Loaded only with the editor.
+ * order the continuous scroll follows too. Also pins (Quick access), hiding from the side panel or from the scroll,
+ * and the phone bottom bar's tabs, each a grid entry of the same layout. Loaded only with the editor.
  *
  * Pure (tests/nav-areas.test.cjs).
  */
 
-import { areaId, navDefaultIds, orderNav, type NavSectionLike } from "./nav-areas";
-import type { PageLayout, PartDef } from "./personalize-layout";
-import { moveBefore, setGridOrder } from "./personalize-ops";
+import {
+  MORE_TAB, NAV_HIDE_GRID, PIN_GRID, QUICK_ACCESS, TABS_GRID, areaId, areaPrefsOf, arrangeNav, navDefaultIds, orderNav,
+  type NavSectionLike,
+} from "./nav-areas";
+import type { GridOverlay, PageLayout, PartDef } from "./personalize-layout";
+import { moveBefore, normalizeLayout, setGridOrder, setPartHidden } from "./personalize-ops";
 
 function defs(sections: readonly NavSectionLike[]): PartDef[] {
   return navDefaultIds(sections).map((id) => ({ id, title: id, width: "full", hidden: false, collapsed: false }));
@@ -88,4 +92,95 @@ export function moveNavSectionBy(
   const all = ordered.map((s) => s.index);
   const after = all[all.indexOf(list[to]) + 1];
   return moveNavSection(layout, sections, index, after ?? null);
+}
+
+// ---- Quick access (pins), hidden pages, bottom-bar tabs (all in layout.areas, see lib/nav-areas.ts) ----------
+
+const sameIds = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+function withAreaGrid(layout: PageLayout, id: string, grid: GridOverlay | null): PageLayout {
+  const grids = { ...(layout.grids ?? {}) };
+  if (grid && Object.keys(grid).length) grids[id] = grid;
+  else delete grids[id];
+  return normalizeLayout({ ...layout, grids });
+}
+
+/** The pinned pages (hrefs, in Quick access order). */
+export function pinnedOf(layout: PageLayout, sections: readonly NavSectionLike[]): string[] {
+  return arrangeNav(sections, areaPrefsOf(layout)).pinned.map((i) => i.href);
+}
+
+/** Store `hrefs` as the Quick access pages, in that order (the default pins store nothing). */
+export function setPinnedList(layout: PageLayout, sections: readonly NavSectionLike[], hrefs: readonly string[]): PageLayout {
+  const all = navDefaultIds(sections);
+  const defaults = QUICK_ACCESS.map(areaId).filter((id) => all.includes(id));
+  const ids: string[] = [];
+  for (const h of hrefs) {
+    const id = areaId(h);
+    if (all.includes(id) && !ids.includes(id)) ids.push(id);
+  }
+  const hide: Record<string, boolean> = {};
+  for (const id of all) {
+    const d = defaults.includes(id);
+    const p = ids.includes(id);
+    if (d && !p) hide[id] = true;
+    else if (!d && p) hide[id] = false;
+  }
+  if (!Object.keys(hide).length && sameIds(ids, defaults)) return withAreaGrid(layout, PIN_GRID, null);
+  return withAreaGrid(layout, PIN_GRID, { ...(ids.length ? { order: ids } : {}), ...(Object.keys(hide).length ? { hide } : {}) });
+}
+
+/** Pin `href` to Quick access (at the end, or before `beforeHref`), or unpin it. */
+export function setPinned(
+  layout: PageLayout,
+  sections: readonly NavSectionLike[],
+  href: string,
+  pinned: boolean,
+  beforeHref: string | null = null,
+): PageLayout {
+  const cur = pinnedOf(layout, sections).filter((h) => h !== href);
+  if (!pinned) return setPinnedList(layout, sections, cur);
+  // A page hidden from the side panel comes back when it is pinned.
+  const shown = setNavHidden(layout, sections, href, false);
+  const at = beforeHref === null ? -1 : cur.indexOf(beforeHref);
+  const next = at === -1 ? [...cur, href] : [...cur.slice(0, at), href, ...cur.slice(at)];
+  return setPinnedList(shown, sections, next);
+}
+
+/** `href` moved `delta` places within Quick access. */
+export function movePinnedBy(layout: PageLayout, sections: readonly NavSectionLike[], href: string, delta: number): PageLayout {
+  const cur = pinnedOf(layout, sections);
+  const at = cur.indexOf(href);
+  const to = at + delta;
+  if (at === -1 || delta === 0 || to < 0 || to >= cur.length) return layout;
+  const next = cur.slice();
+  next.splice(at, 1);
+  next.splice(to, 0, href);
+  return setPinnedList(layout, sections, next);
+}
+
+/** Hide `href` from the side panel and the phone drawer (it is unpinned too), or show it again. */
+export function setNavHidden(layout: PageLayout, sections: readonly NavSectionLike[], href: string, hidden: boolean): PageLayout {
+  const id = areaId(href);
+  const cur = layout.grids?.[NAV_HIDE_GRID]?.hide ?? {};
+  if ((cur[id] === true) === hidden) return layout;
+  const hide = { ...cur };
+  if (hidden) hide[id] = true;
+  else delete hide[id];
+  const base = hidden ? setPinnedList(layout, sections, pinnedOf(layout, sections).filter((h) => h !== href)) : layout;
+  return withAreaGrid(base, NAV_HIDE_GRID, Object.keys(hide).length ? { hide } : null);
+}
+
+/** Leave `href` out of the continuous scroll (and its card on Today), or put it back. */
+export function setScrollHidden(layout: PageLayout, sections: readonly NavSectionLike[], href: string, hidden: boolean): PageLayout {
+  return setPartHidden(layout, "main", defs(sections), areaId(href), hidden);
+}
+
+/**
+ * Store the phone bottom bar's four slots (hrefs, or MORE_TAB for the More menu) around Log. `defaults` = the
+ * default slots (lib/mobile-tabs.ts); the default bar stores nothing.
+ */
+export function setTabSlots(layout: PageLayout, slots: readonly string[], defaults: readonly string[]): PageLayout {
+  if (sameIds(slots, defaults)) return withAreaGrid(layout, TABS_GRID, null);
+  return withAreaGrid(layout, TABS_GRID, { order: slots.map((h) => (h === MORE_TAB ? MORE_TAB : areaId(h))) });
 }

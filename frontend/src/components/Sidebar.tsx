@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
-import { LogOut, Search } from "lucide-react";
+import { ChevronDown, ChevronRight, LogOut, Search } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
-import { NAV_SECTIONS, type NavItem } from "@/lib/nav";
+import { NAV_ITEMS, NAV_SECTIONS, type NavItem } from "@/lib/nav";
 import { wipeClientData } from "@/lib/client-cache";
 import { navIntentProps } from "@/lib/warmup";
 import { goHint } from "@/lib/go-shortcuts";
@@ -14,14 +14,14 @@ import { useActiveRoute, useRevealActiveNavItem } from "./FeedContext";
 import PersonalizeButton from "./personalize/PersonalizeButton";
 import type { EditorModule } from "./personalize/editor-loader";
 import {
-  QUICK_ACCESS, areaId, dropNavBootStyle, navBootScript, orderNav, savedAreaIds, subscribeAreaIds,
+  areaId, arrangeNav, dropNavBootStyle, navBootScript, orderNav, savedAreaPrefs, subscribeAreaIds,
 } from "@/lib/nav-areas";
 import { currentEditingKey, editorRef, subscribeTargets } from "@/lib/personalize-registry";
 
 const SIDEBAR_LIST_SELECTOR = 'nav[data-nav-list="sidebar"]';
 // Paints Riley's saved order (Personalize, `layout.areas`) before React runs on a full page load.
 const NAV_BOOT = navBootScript(NAV_SECTIONS);
-const noIds = () => null;
+const noPrefs = () => null;
 const none = () => null;
 
 export default function Sidebar() {
@@ -31,48 +31,55 @@ export default function Sidebar() {
   // Keep the active item visible in the scrolling list as the continuous scroll moves through the pages.
   useRevealActiveNavItem(SIDEBAR_LIST_SELECTOR, current);
 
-  // Riley's area order (Personalize; the continuous scroll follows the same order). Server render and hydration
-  // use the default; the inline script below has already painted the saved order, which React then renders.
-  const savedIds = useSyncExternalStore(subscribeAreaIds, savedAreaIds, noIds);
+  // Riley's side panel (Personalize, `layout.areas`: order, Quick access pins, hidden pages; the continuous scroll
+  // follows the same order). Server render and hydration use the default; the inline script below has already
+  // painted the saved panel, which React then renders.
+  const prefs = useSyncExternalStore(subscribeAreaIds, savedAreaPrefs, noPrefs);
   useEffect(() => {
-    if (savedIds !== null) dropNavBootStyle();
-  }, [savedIds]);
+    if (prefs !== null) dropNavBootStyle();
+  }, [prefs]);
   const editing = useSyncExternalStore(subscribeTargets, currentEditingKey, none) !== null;
   const editor = useSyncExternalStore(subscribeTargets, editorRef, none) as EditorModule | null;
+  const [showHidden, setShowHidden] = useState(false);
 
-  // Derive both groups from the shared route catalog; no destination is removed.
-  const pinnedHrefs = new Set(QUICK_ACCESS);
-  const pinnedItems = NAV_SECTIONS.flatMap((section) => section.items).filter((item) => pinnedHrefs.has(item.href));
-  const librarySections = orderNav(NAV_SECTIONS, savedIds).map((section) => ({
-    ...section,
-    items: section.items.filter((item) => !pinnedHrefs.has(item.href)),
-  })).filter((section) => section.items.length > 0);
+  // Every destination is rendered in Quick access AND in its section and shown where Riley put it, so the pre-paint
+  // script can show a saved panel before React runs without moving anything. Off copies carry data-off and
+  // display:none; no destination is removed (hidden pages are listed under "Show hidden").
+  const arranged = arrangeNav(NAV_SECTIONS, prefs);
+  const pinnedHrefs = new Set(arranged.pinned.map((item) => item.href));
+  const hiddenHrefs = new Set(arranged.hidden.map((item) => item.href));
+  const quickItems = [...arranged.pinned, ...NAV_ITEMS.filter((item) => !pinnedHrefs.has(item.href))];
+  const librarySections = orderNav(NAV_SECTIONS, prefs?.order ?? null);
+  const offInSection = (href: string) => pinnedHrefs.has(href) || hiddenHrefs.has(href);
 
-  function renderLink(item: NavItem) {
-    const active = current === item.href;
+  function renderLink(item: NavItem, where: "quick" | "section" | "hidden", off = false) {
+    const active = current === item.href && !off;
     const Icon = item.icon;
+    const id = areaId(item.href);
     // No viewport prefetch: the scheduled warm-up (components/AppData.tsx) loads every page in idle time,
     // and hover / focus / pointer-down warm this one at once.
     return (
       <Link
         key={item.href}
         href={item.href}
-        data-nav-area={areaId(item.href)}
+        data-nav-quick={where === "quick" ? id : undefined}
+        data-nav-area={where === "section" ? id : undefined}
+        data-off={off ? "true" : undefined}
         aria-current={active ? "page" : undefined}
         {...navIntentProps(item.href)}
-        className={`flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium transition-colors relative focus:outline-none focus-visible:ring-1 focus-visible:ring-accent ${
+        className={`${off ? "hidden" : "flex"} items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium transition-colors relative focus:outline-none focus-visible:ring-1 focus-visible:ring-accent ${
           active
             ? "bg-surface-raised text-text-primary"
             : "text-text-secondary hover:text-text-primary hover:bg-white/[0.03]"
         }`}
-                  >
-                    <Icon className={`w-[17px] h-[17px] shrink-0 ${active ? "text-accent" : "text-text-tertiary"}`} strokeWidth={1.75} />
-                    <span className="flex-1 truncate">{item.label}</span>
-                    <kbd className="text-[10px] font-mono text-text-tertiary/60 ml-auto hidden lg:inline" title={`Press G, then ${item.shortcut}`}>
-                      {goHint(item.shortcut)}
-                    </kbd>
-                  </Link>
-                );
+      >
+        <Icon className={`w-[17px] h-[17px] shrink-0 ${active ? "text-accent" : "text-text-tertiary"}`} strokeWidth={1.75} />
+        <span className="flex-1 truncate">{item.label}</span>
+        <kbd className="text-[10px] font-mono text-text-tertiary/60 ml-auto hidden lg:inline" title={`Press G, then ${item.shortcut}`}>
+          {goHint(item.shortcut)}
+        </kbd>
+      </Link>
+    );
   }
 
   async function handleSignOut() {
@@ -110,21 +117,39 @@ export default function Sidebar() {
         <editor.SidebarArranger current={current} />
       ) : (
         <>
-          <nav aria-label="Quick access" className="shrink-0 px-2 py-3 border-b border-border-subtle space-y-0.5">
-            {pinnedItems.map(renderLink)}
+          <nav aria-label="Quick access" className="shrink-0 px-2 py-3 border-b border-border-subtle flex flex-col gap-0.5">
+            {quickItems.map((item) => renderLink(item, "quick", !pinnedHrefs.has(item.href)))}
           </nav>
 
           <nav aria-label="All sections" className="flex-1 min-h-0 px-2 py-3 overflow-y-auto flex flex-col" data-nav-list="sidebar">
-            {librarySections.map((section) => (
-              <div key={section.title} data-nav-section={section.index} className="shrink-0 mb-3 last:mb-0">
-                <p className="px-3 pb-1 text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
-                  {section.title}
-                </p>
-                <div className="flex flex-col gap-0.5">
-                  {section.items.map(renderLink)}
+            {librarySections.map((section) => {
+              const empty = section.items.every((item) => offInSection(item.href));
+              return (
+                <div key={section.title} data-nav-section={section.index} className={`${empty ? "hidden" : "block"} shrink-0 mb-3 last:mb-0`}>
+                  <p className="px-3 pb-1 text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
+                    {section.title}
+                  </p>
+                  <div className="flex flex-col gap-0.5">
+                    {section.items.map((item) => renderLink(item, "section", offInSection(item.href)))}
+                  </div>
                 </div>
+              );
+            })}
+            {arranged.hidden.length > 0 && (
+              // Pages hidden in Personalize stay one click away. Always last (its order beats the pre-paint rules).
+              <div className="shrink-0" style={{ order: 9999 }}>
+                <button
+                  type="button"
+                  onClick={() => setShowHidden((v) => !v)}
+                  aria-expanded={showHidden}
+                  className="w-full flex items-center gap-1.5 px-3 py-1.5 rounded-control text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary hover:text-text-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                >
+                  {showHidden ? <ChevronDown className="w-3 h-3" aria-hidden /> : <ChevronRight className="w-3 h-3" aria-hidden />}
+                  Show hidden ({arranged.hidden.length})
+                </button>
+                {showHidden && <div className="flex flex-col gap-0.5 opacity-80">{arranged.hidden.map((item) => renderLink(item, "hidden"))}</div>}
               </div>
-            ))}
+            )}
           </nav>
         </>
       )}

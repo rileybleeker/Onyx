@@ -4,7 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { loadTs } = require('./helpers/load-ts.cjs');
 
-const { DEFAULT_MOBILE_TABS, mobileTabs, isTabActive, tabLabel, badgeText } = loadTs('lib/mobile-tabs.ts');
+const { DEFAULT_MOBILE_TABS, DEFAULT_TAB_SLOTS, MORE_SLOT, mobileTabs, tabSlots, chooseTab, isTabActive, tabLabel, badgeText } = loadTs('lib/mobile-tabs.ts');
 const { NAV_ITEMS } = loadTs('lib/nav.ts');
 const exists = (h) => NAV_ITEMS.some((i) => i.href === h);
 
@@ -50,4 +50,19 @@ test('unread badge text', () => {
   assert.equal(badgeText(NaN), '');
   assert.equal(badgeText(4), '4');
   assert.equal(badgeText(10), '9+');
+});
+
+test('four slots around Log: defaults Today, Agents | Log | Chat, More; a saved choice per slot', () => {
+  assert.deepEqual(DEFAULT_TAB_SLOTS, ['/today', '/agents', '/chat', MORE_SLOT]);
+  assert.deepEqual(tabSlots(null, exists), ['/today', '/agents', '/chat', 'more']);
+  assert.deepEqual(tabSlots(['/sleep', '/habits', '/nutrition', '/today'], exists), ['/sleep', '/habits', '/nutrition', '/today']);
+  // An unknown or repeated page leaves its slot to its default (or the first unused default).
+  assert.deepEqual(tabSlots(['/gone-page', '/sleep', '/sleep', 'more'], exists), ['/today', '/sleep', '/chat', 'more']);
+});
+
+test('choosing a page that already sits in another slot swaps the two', () => {
+  const slots = ['/today', '/agents', '/chat', 'more'];
+  assert.deepEqual(chooseTab(slots, 0, '/sleep'), ['/sleep', '/agents', '/chat', 'more']);
+  assert.deepEqual(chooseTab(slots, 0, 'more'), ['more', '/agents', '/chat', '/today']);
+  assert.deepEqual(chooseTab(slots, 9, '/sleep'), slots);
 });

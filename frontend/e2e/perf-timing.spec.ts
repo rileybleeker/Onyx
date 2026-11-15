@@ -269,7 +269,8 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
       // "iad1::<request-id>" (CDN) or "iad1::iad1::<request-id>" (function ran): keep the regions only.
       sample.region = vid ? vid.split("::").slice(0, -1).join(">") : null;
     } else {
-      const link = page.locator(`aside a[href="${spec.route}"]`).first();
+      // Shown copy only: every page also has an off (display:none) copy in Quick access or its section.
+      const link = page.locator(`aside a[href="${spec.route}"]:not([data-off])`).first();
       await link.scrollIntoViewIfNeeded({ timeout: 10_000 });
       clickedAt = await page.evaluate((sel) => {
         document.querySelectorAll(sel).forEach((e) => e.setAttribute("data-pf-old", ""));

@@ -3,22 +3,24 @@
 import { useState, useEffect, useRef, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Plus, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck, Camera } from "lucide-react";
+import { Plus, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck, Camera, ChevronDown, ChevronRight } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS } from "@/lib/nav";
 import { CACHE_KEYS, clientCache, wipeClientData } from "@/lib/client-cache";
 import { AGENTS_BADGE_EVENT, lastAgentsBadge } from "@/lib/agents-api";
-import { badgeText, isTabActive, mobileTabs, tabLabel } from "@/lib/mobile-tabs";
+import { DEFAULT_TAB_SLOTS, MORE_SLOT, badgeText, isTabActive, tabLabel, tabSlots } from "@/lib/mobile-tabs";
 import { navIntentProps } from "@/lib/warmup";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 import { useActiveRoute } from "./FeedContext";
 import PersonalizeButton from "./personalize/PersonalizeButton";
 import type { EditorModule } from "./personalize/editor-loader";
-import { orderNav, savedAreaIds, subscribeAreaIds } from "@/lib/nav-areas";
+import { areaId, arrangeNav, dropTabsBootStyle, savedAreaPrefs, subscribeAreaIds, tabsBootScript } from "@/lib/nav-areas";
 import { currentEditingKey, editorRef, subscribeTargets } from "@/lib/personalize-registry";
 
-const noIds = () => null;
+const noPrefs = () => null;
 const none = () => null;
+// Hides the bottom-bar slots Riley changed until React renders them (a full page load paints the default bar first).
+const TABS_BOOT = tabsBootScript(DEFAULT_TAB_SLOTS.map((h) => (h === MORE_SLOT ? MORE_SLOT : areaId(h))));
 
 const LOG_ACTIONS = [
   { label: "Check-in", href: "/check-in", icon: ClipboardCheck },
@@ -54,9 +56,10 @@ function useAgentsBadge(): number {
 
 export default function MobileNav() {
   const [drawerOpen, setDrawerOpen] = useState(false);
-  // Riley's area order (Personalize, `layout.areas`): the drawer lists sections and pages in it, like the sidebar.
-  const savedIds = useSyncExternalStore(subscribeAreaIds, savedAreaIds, noIds);
-  const orderedSections = orderNav(NAV_SECTIONS, savedIds);
+  // Riley's side panel (Personalize, `layout.areas`): the drawer lists Quick access, then sections and pages in the
+  // saved order without pinned or hidden pages, like the sidebar; the bottom bar's four slots come from it too.
+  const prefs = useSyncExternalStore(subscribeAreaIds, savedAreaPrefs, noPrefs);
+  const arranged = arrangeNav(NAV_SECTIONS, prefs);
   const arranging = useSyncExternalStore(subscribeTargets, currentEditingKey, none) !== null;
   const editor = useSyncExternalStore(subscribeTargets, editorRef, none) as EditorModule | null;
   const [logOpen, setLogOpen] = useState(false);
@@ -66,6 +69,10 @@ export default function MobileNav() {
   // The page in view (follows the continuous scroll); `pathname` stays the routed page for closing overlays.
   const current = useActiveRoute();
   const agentsUnread = useAgentsBadge();
+  const [showHidden, setShowHidden] = useState(false);
+  useEffect(() => {
+    if (prefs !== null) dropTabsBootStyle();
+  }, [prefs]);
 
   // Close every overlay on route change.
   useEffect(() => {
@@ -141,17 +148,44 @@ export default function MobileNav() {
     window.location.assign("/login");
   }
 
-  // [page, page, Log, page, More]: Log (the quick-log sheet) in the centre, More (the drawer) last. Each page
-  // tab's label is the page it opens (lib/mobile-tabs.ts); Trends lives in More and on Today.
+  // [slot, slot, Log, slot, slot]: Log (the quick-log sheet) in the centre; the four slots are pages or More (the
+  // drawer), by default Today, Agents | Log | Chat, More, chosen in Personalize (lib/mobile-tabs.ts). Each page
+  // tab's label is the page it opens; Trends lives in More and on Today.
   const navItems = new Map(NAV_SECTIONS.flatMap((section) => section.items).map((item) => [item.href, item] as const));
-  const pages = mobileTabs(null, (href) => navItems.has(href)).map((href) => navItems.get(href)!);
-  type Tab = { kind: "page"; href: string } | { kind: "log" } | { kind: "more" };
+  const hrefOfId = new Map(Array.from(navItems.keys()).map((href) => [areaId(href), href] as const));
+  const savedSlots = prefs?.tabs ? prefs.tabs.map((id) => (id === MORE_SLOT ? MORE_SLOT : hrefOfId.get(id) ?? null)) : null;
+  const slots = tabSlots(savedSlots, (href) => navItems.has(href));
+  type Tab = { kind: "page"; href: string; slot: number } | { kind: "log" } | { kind: "more"; slot: number };
+  const slotTab = (value: string, slot: number): Tab => (value === MORE_SLOT ? { kind: "more", slot } : { kind: "page", href: value, slot });
   const tabs: Tab[] = [
-    ...pages.slice(0, 2).map((item) => ({ kind: "page" as const, href: item.href })),
+    ...slots.slice(0, 2).map((value, i) => slotTab(value, i)),
     { kind: "log" },
-    ...pages.slice(2).map((item) => ({ kind: "page" as const, href: item.href })),
-    { kind: "more" },
+    ...slots.slice(2).map((value, i) => slotTab(value, i + 2)),
   ];
+  // With More off the bar the drawer (every page, Personalize, Sign out) opens from the top bar instead.
+  const moreOnBar = slots.includes(MORE_SLOT);
+
+  function drawerLink(item: (typeof NAV_SECTIONS)[number]["items"][number]) {
+    const active = current === item.href;
+    const Icon = item.icon;
+    return (
+      <Link
+        key={item.href}
+        href={item.href}
+        {...navIntentProps(item.href)}
+        onClick={() => setDrawerOpen(false)}
+        aria-current={active ? "page" : undefined}
+        className={`min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium transition-colors relative ${
+          active
+            ? "bg-surface-raised text-text-primary"
+            : "text-text-secondary hover:text-text-primary hover:bg-white/[0.03]"
+        }`}
+      >
+        <Icon className={`w-[17px] h-[17px] shrink-0 ${active ? "text-accent" : "text-text-tertiary"}`} strokeWidth={1.75} />
+        <span className="flex-1 truncate">{item.label}</span>
+      </Link>
+    );
+  }
 
   return (
     <>
@@ -160,17 +194,33 @@ export default function MobileNav() {
       <header className="md:hidden fixed inset-x-0 top-0 z-40 bg-surface-sunken border-b border-border-subtle pt-[env(safe-area-inset-top)]">
         <div className="h-12 px-3 flex items-center justify-between">
           <span className="flex items-center gap-2 text-[17px] font-bold lowercase tracking-[0.01em] text-text-primary"><img src="/icons/logo-mark-64.png?v=4" width={26} height={26} alt="" aria-hidden="true" className="shrink-0" />Onyx</span>
-          <button
-            onClick={() => window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE))}
-            className="w-11 h-11 -mr-1 flex items-center justify-center rounded-control text-text-secondary hover:text-text-primary transition-colors"
-            aria-label="Search"
-          >
-            <Search className="w-[18px] h-[18px]" />
-          </button>
+          <div className="flex items-center">
+            {!moreOnBar && (
+              <button
+                type="button"
+                onClick={() => setDrawerOpen(true)}
+                className="w-11 h-11 flex items-center justify-center rounded-control text-text-secondary hover:text-text-primary transition-colors"
+                aria-label="More"
+                aria-expanded={drawerOpen}
+                aria-haspopup="dialog"
+                aria-controls={drawerOpen ? "mobile-navigation" : undefined}
+              >
+                <Menu className="w-[18px] h-[18px]" />
+              </button>
+            )}
+            <button
+              onClick={() => window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE))}
+              className="w-11 h-11 -mr-1 flex items-center justify-center rounded-control text-text-secondary hover:text-text-primary transition-colors"
+              aria-label="Search"
+            >
+              <Search className="w-[18px] h-[18px]" />
+            </button>
+          </div>
         </div>
       </header>
 
       {/* Bottom tab bar — primary mobile navigation. */}
+      <script dangerouslySetInnerHTML={{ __html: TABS_BOOT }} />
       <nav
         data-testid="mobile-tab-bar"
         className="md:hidden fixed inset-x-0 bottom-0 z-40 bg-surface-sunken border-t border-border-subtle pb-[env(safe-area-inset-bottom)]"
@@ -185,7 +235,7 @@ export default function MobileNav() {
               const active = isTabActive(item.href, current);
               const count = item.href === "/agents" ? badgeText(agentsUnread) : "";
               return (
-                <Link key={item.href} href={item.href} className={`${cell} ${active ? "text-accent" : "text-text-tertiary hover:text-text-secondary"}`} aria-current={active ? "page" : undefined} {...navIntentProps(item.href)}>
+                <Link key={item.href} href={item.href} data-tab-slot={tab.slot} className={`${cell} ${active ? "text-accent" : "text-text-tertiary hover:text-text-secondary"}`} aria-current={active ? "page" : undefined} {...navIntentProps(item.href)}>
                   <span className="relative">
                     <Icon className="w-[20px] h-[20px]" strokeWidth={1.75} />
                     {count && (
@@ -200,7 +250,7 @@ export default function MobileNav() {
             const isLog = tab.kind === "log";
             const open = isLog ? logOpen : drawerOpen;
             return (
-              <button key={tab.kind} type="button" onClick={() => (isLog ? setLogOpen(true) : setDrawerOpen(true))}
+              <button key={tab.kind} type="button" data-tab-slot={tab.kind === "more" ? tab.slot : undefined} onClick={() => (isLog ? setLogOpen(true) : setDrawerOpen(true))}
                 className={`${cell} ${!isLog && open ? "text-accent" : isLog ? "text-text-primary" : "text-text-tertiary hover:text-text-secondary"}`}
                 aria-expanded={open} aria-haspopup="dialog" aria-controls={open ? (isLog ? "mobile-quick-log" : "mobile-navigation") : undefined}>
                 {isLog ? (
@@ -264,7 +314,7 @@ export default function MobileNav() {
         aria-modal={drawerOpen ? true : undefined}
         aria-label="Navigation"
         inert={!drawerOpen}
-        className={`md:hidden fixed inset-y-0 left-0 z-50 w-[240px] bg-surface-sunken border-r border-border-subtle flex flex-col transition-transform duration-200 ease-in-out ${
+        className={`md:hidden fixed inset-y-0 left-0 z-50 ${arranging && editor ? "w-[min(340px,94vw)]" : "w-[240px]"} bg-surface-sunken border-r border-border-subtle flex flex-col transition-transform duration-200 ease-in-out ${
           drawerOpen ? "translate-x-0" : "-translate-x-full"
         }`}
       >
@@ -298,36 +348,34 @@ export default function MobileNav() {
           <editor.DrawerArranger />
         ) : (
         <nav className="flex-1 px-2 py-3 overflow-y-auto">
-          {orderedSections.map((section) => (
+          {arranged.pinned.length > 0 && (
+            <div className="mb-3">
+              <p className="px-3 pb-1 text-[10px] font-medium uppercase tracking-[0.12em] text-text-tertiary/70">Quick access</p>
+              <div className="space-y-0.5">{arranged.pinned.map(drawerLink)}</div>
+            </div>
+          )}
+          {arranged.sections.map((section) => (
             <div key={section.title} className="mb-3 last:mb-0">
               <p className="px-3 pb-1 text-[10px] font-medium uppercase tracking-[0.12em] text-text-tertiary/70">
                 {section.title}
               </p>
-              <div className="space-y-0.5">
-                {section.items.map((item) => {
-                  const active = current === item.href;
-                  const Icon = item.icon;
-                  return (
-                    <Link
-                      key={item.href}
-                      href={item.href}
-                      {...navIntentProps(item.href)}
-                      onClick={() => setDrawerOpen(false)}
-                      aria-current={active ? "page" : undefined}
-                      className={`min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium transition-colors relative ${
-                        active
-                          ? "bg-surface-raised text-text-primary"
-                          : "text-text-secondary hover:text-text-primary hover:bg-white/[0.03]"
-                      }`}
-                    >
-                      <Icon className={`w-[17px] h-[17px] shrink-0 ${active ? "text-accent" : "text-text-tertiary"}`} strokeWidth={1.75} />
-                      <span className="flex-1 truncate">{item.label}</span>
-                    </Link>
-                  );
-                })}
-              </div>
+              <div className="space-y-0.5">{section.items.map(drawerLink)}</div>
             </div>
           ))}
+          {arranged.hidden.length > 0 && (
+            <div className="mt-3">
+              <button
+                type="button"
+                onClick={() => setShowHidden((v) => !v)}
+                aria-expanded={showHidden}
+                className="min-h-11 w-full flex items-center gap-1.5 px-3 rounded-control text-[10px] font-medium uppercase tracking-[0.12em] text-text-tertiary hover:text-text-secondary"
+              >
+                {showHidden ? <ChevronDown className="w-3 h-3" aria-hidden /> : <ChevronRight className="w-3 h-3" aria-hidden />}
+                Show hidden ({arranged.hidden.length})
+              </button>
+              {showHidden && <div className="space-y-0.5 opacity-80">{arranged.hidden.map(drawerLink)}</div>}
+            </div>
+          )}
         </nav>
         )}
 
