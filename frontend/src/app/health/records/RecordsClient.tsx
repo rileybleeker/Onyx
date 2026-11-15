@@ -5,6 +5,7 @@ import dynamic from 'next/dynamic';
 import { createSupabaseBrowser } from '@/lib/supabase-browser';
 import { todayLocal } from '@/lib/care-planner';
 import type { Section } from '@/lib/medical-records-server';
+import InfoHint from '@/components/InfoHint';
 import {
   DOC_KINDS, DOC_KIND_LABEL, FLAG_LABEL, MAX_DOC_NOTES, MAX_FILE_BYTES, MAX_LAB_BATCH, MAX_LAB_NOTES, MEDICAL_BUCKET,
   compareDocuments, compareNewestFirst, documentMatches, formatBytes, formatRange, formatResult, labFlag, labSeries,
@@ -129,19 +130,16 @@ export default function RecordsClient({ documents, labs }: { documents: Section<
 
   return <div className="mx-auto max-w-5xl space-y-6 p-4 sm:p-8">
     <header>
-      <h1 data-testid="page-heading" className="text-2xl font-semibold">Medical records</h1>
-      <p className="mt-2 text-text-secondary">Lab results you can follow over time, and the documents they came from.</p>
+      <div className="flex items-center gap-2">
+        <h1 data-testid="page-heading" className="text-2xl font-semibold">Medical records</h1>
+        <InfoHint label="Medical records privacy">
+          <p>Records are saved in Onyx&apos;s database and a private file store. Only the Onyx server can read them, and only after you sign in.</p>
+          <p>Onyx Chat and Onyx&apos;s other AI features never read them, and nothing is sent to a provider. A file opens through a link that stops working after a minute.</p>
+          <p>High and Low compare a value with the range you typed in; they are not medical advice.</p>
+        </InfoHint>
+      </div>
       <p className="mt-1 text-sm"><Link href="/health" className="text-accent hover:underline">← Health & appointments</Link></p>
     </header>
-
-    <section className={panel} aria-label="Privacy">
-      <h2 className="font-semibold">Private to you</h2>
-      <p className="mt-2 text-sm text-text-secondary">
-        Records are saved in Onyx&apos;s database and a private file store. Only the Onyx server can read them, and only after you sign in.
-        Onyx Chat and Onyx&apos;s other AI features never read them, and nothing is sent to a provider. A file opens through a link that stops working after a minute.
-        High and Low compare a value with the range you typed in; they are not medical advice.
-      </p>
-    </section>
 
     {notice && <p role={notice.error ? 'alert' : 'status'} className={`text-sm ${notice.error ? 'text-amber-400' : 'text-text-secondary'}`}>{notice.text}</p>}
     {undo && <div className="flex flex-wrap items-center gap-3 text-sm" role="status">
@@ -306,10 +304,15 @@ function LabEntryForm({ today, docs, series, onSaved }: { today: string; docs: M
   if (!open) return <button className={button} onClick={() => setOpen(true)}>Add lab results</button>;
   return <div className={`${panel} space-y-4`}>
     <div className="flex items-center justify-between gap-2">
-      <h3 className="font-semibold">Add lab results</h3>
+      <div className="flex items-center gap-2">
+        <h3 className="font-semibold">Add lab results</h3>
+        <InfoHint label="Adding lab results">
+          <p>One row per test, as printed on the report. A value that is not a number (&quot;Negative&quot;, &quot;&lt;0.5&quot;) is kept as text.</p>
+          <p>Ranges like 70-99, &lt;200 or &gt;40 set High / Low.</p>
+        </InfoHint>
+      </div>
       <button className={small} onClick={() => setOpen(false)}>Close</button>
     </div>
-    <p className="text-sm text-text-secondary">One row per test, as printed on the report. A value that is not a number (&quot;Negative&quot;, &quot;&lt;0.5&quot;) is kept as text. Ranges like 70-99, &lt;200 or &gt;40 set High / Low.</p>
     <div className="grid gap-3 sm:grid-cols-3">
       <label className="grid gap-1 text-sm">Collected on<input type="date" className={field} value={collectedOn || today} onChange={e => setCollectedOn(e.target.value)} /></label>
       <label className="grid gap-1 text-sm">Lab

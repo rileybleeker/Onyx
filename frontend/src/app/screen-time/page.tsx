@@ -12,6 +12,7 @@ import {
   type TopEntry,
 } from "@/lib/screen-time";
 import ScreenTimeCharts from "./ScreenTimeCharts";
+import InfoHint from "@/components/InfoHint";
 
 // Private data (every app used, by day): rendered per request on the server, never ISR, never
 // cached by the CDN, and never fetched from the browser. pds.phone_usage_* is service-role only and
@@ -104,10 +105,12 @@ export default async function ScreenTimePage({
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <p className="text-xs uppercase tracking-widest text-text-tertiary">iPhone, by day</p>
-          <h1 data-testid="page-heading" className="text-2xl font-semibold">Screen Time</h1>
-          <p className="mt-2 text-text-secondary">
-            What the Onyx Screen Time app sends from the iPhone each morning. Days run bedtime to bedtime.
-          </p>
+          <div className="flex items-center gap-2">
+            <h1 data-testid="page-heading" className="text-2xl font-semibold">Screen Time</h1>
+            <InfoHint label="Screen Time">
+              <p>What the Onyx Screen Time app sends from the iPhone each morning. Days run bedtime to bedtime.</p>
+            </InfoHint>
+          </div>
         </div>
         <nav aria-label="Window" className="flex gap-1 text-[12px]">
           {WINDOW_CHOICES.map((d) => (
@@ -201,10 +204,12 @@ export default async function ScreenTimePage({
                   empty="No complete day in this window yet."
                 />
               </div>
-              <p className="text-[12px] text-text-tertiary">
-                Apple reports use in one-hour blocks, so the minutes before and after sleep onset are estimates: an hour
-                that straddles sleep onset is split in proportion to the overlap. Sleep onset is WHOOP&apos;s.
-              </p>
+              <InfoHint variant="disclosure" label="Sleep estimates" summary="About the sleep estimates">
+                <p>
+                  Apple reports use in one-hour blocks, so the minutes before and after sleep onset are estimates: an
+                  hour that straddles sleep onset is split in proportion to the overlap. Sleep onset is WHOOP&apos;s.
+                </p>
+              </InfoHint>
             </>
           );
         })()}

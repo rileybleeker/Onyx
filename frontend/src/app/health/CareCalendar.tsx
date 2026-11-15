@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { type CalendarEntry, type CareItem, type CareStatus, dueSoon, entriesInRange, formatTime, monthBounds, monthGrid } from '@/lib/care-planner';
 import { CALENDAR_SOURCE_LABEL, type CalendarEvent, externalEntries, mergeByDate } from '@/lib/calendar-events';
+import InfoHint from '@/components/InfoHint';
 
 const panel = 'rounded-2xl border border-border-default bg-surface-card p-5';
 const button = 'rounded-lg border border-border-default px-3 py-2 text-sm hover:bg-surface-hover disabled:opacity-50';
@@ -47,7 +48,7 @@ export function DueSoon({ items, today }: { items: CareItem[]; today: string }) 
   const entries = useMemo(() => (today ? dueSoon(items, today, 30) : []), [items, today]);
   return <section className={`${panel} space-y-3`} aria-label="Due soon">
     <h2 className="font-semibold">Due soon</h2>
-    <p className="text-xs text-text-secondary">Overdue items and anything due in the next 30 days.</p>
+    <p className="text-xs text-text-secondary">Overdue and the next 30 days.</p>
     {entries.length === 0
       ? <p className="text-sm text-text-secondary">Nothing due in the next 30 days.</p>
       : <ul className="space-y-2">{entries.map(({ item, status, daysAway }) => <li key={item.id} className="flex flex-wrap items-baseline justify-between gap-x-3 rounded-xl border border-border-default px-4 py-3">
@@ -123,6 +124,10 @@ export function CareCalendar({ items, today, external = NO_EVENTS, onRangeChange
             ? <span className="min-w-0 break-words text-sm text-text-secondary">{entry.date} · {entry.when}{entry.tentative && ' · Tentative'}{entry.location && ` · ${entry.location}`} · <span className={STATUS_TONE.external}>{CALENDAR_SOURCE_LABEL}: {entry.calendar} (read-only)</span></span>
             : <span className="text-sm text-text-secondary">{entry.date}{entry.time ? ` at ${formatTime(entry.time)}` : ''} · <span className={STATUS_TONE[entry.status]}>{STATUS_LABEL[entry.status]}</span>{entry.months > 0 && entry.status !== 'projected' && ` · Every ${entry.months} month${entry.months === 1 ? '' : 's'} after completion`}</span>}
         </li>)}</ul>}
-    <p className="text-xs text-text-secondary">Care item dates come only from what you entered here. Projected dates (italic) assume a repeating item is completed on schedule; repeats count from the day you complete them, so they can move. Entries marked {CALENDAR_SOURCE_LABEL} are read-only copies of events on your calendars, shown in this device&apos;s time zone; they cannot be changed here.</p>
+    <p className="text-xs text-text-secondary"><span className="italic">Italic</span>: projected repeat · {CALENDAR_SOURCE_LABEL}: read-only</p>
+    <InfoHint variant="disclosure" label="Calendar dates" summary="About these dates">
+      <p>Care item dates come only from what you entered here. A projected date assumes a repeating item is completed on schedule; repeats count from the day you complete them, so they can move.</p>
+      <p>Entries marked {CALENDAR_SOURCE_LABEL} are read-only copies of events on your calendars, shown in this device&apos;s time zone; they cannot be changed here.</p>
+    </InfoHint>
   </section>;
 }

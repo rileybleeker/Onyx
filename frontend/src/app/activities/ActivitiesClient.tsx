@@ -1028,7 +1028,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
                   {sug && (
                     <div className="flex flex-wrap items-center gap-2 pt-0.5" data-testid="tag-suggestion">
                       <span className="text-text-tertiary text-[11px]">
-                        Suggested{sug.confidence ? ` (${sug.confidence} confidence)` : ""}. Tap chips to adjust, then accept.
+                        Suggested{sug.confidence ? ` (${sug.confidence} confidence)` : ""}
                       </span>
                       <button
                         onClick={() => acceptSuggestion(act)}

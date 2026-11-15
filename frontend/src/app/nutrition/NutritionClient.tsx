@@ -21,6 +21,7 @@ import {
 import { formatDate, kgToLb, lbToKg, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import InfoHint from "@/components/InfoHint";
 import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
@@ -418,9 +419,14 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Nutrition</h2>
+          <div className="flex items-center gap-2">
+            <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Nutrition</h2>
+            <InfoHint label="Nutrition">
+              Food comes from Cronometer. On days with no Cronometer log, Uber Eats dish estimates fill in.
+            </InfoHint>
+          </div>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Daily macros, micronutrients &amp; body weight — food from Cronometer + Uber Eats — {rangeLabel(rangeView.shown)}
+            Macros, micronutrients &amp; weight — {rangeLabel(rangeView.shown)}
           </p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-3">
@@ -436,10 +442,16 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
       {/* ─── Daily Macros (Cronometer; MFP fills pre-cutover history) ──────── */}
       <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Daily Macros</p>
       {estDays > 0 && (
-        <p className="text-xs text-text-tertiary -mt-2 mb-3">
-          {estDays} of {nutritionData.length} days use Uber Eats estimates (dish names → kcal/macros; no Cronometer log that day).
-          They count what you marked as eaten under Meals below or in the check-in (All unless you change it), and miss anything not delivered.
-        </p>
+        <div className="flex items-center gap-2 -mt-2 mb-3">
+          <p className="text-xs text-text-tertiary">
+            {estDays} of {nutritionData.length} days use Uber Eats estimates.
+          </p>
+          <InfoHint label="Uber Eats estimates">
+            Estimated from dish names (kcal and macros) on days with no Cronometer log. They count what you
+            marked as eaten under Meals below or in the check-in (All unless you change it), and miss anything
+            not delivered.
+          </InfoHint>
+        </div>
       )}
 
       {nutritionLoading ? (
@@ -486,7 +498,8 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <ChartCard
               title="Calorie Trend — Consumed vs Burnt"
-              subtitle="Daily intake (Cronometer; Uber Eats dish estimates on days with no Cronometer log) against WHOOP cycle energy expenditure (kilojoule → kcal). Net = consumed − burnt."
+              subtitle="Intake vs WHOOP energy burnt"
+              hint="Intake is Cronometer, with Uber Eats dish estimates on days with no Cronometer log. Burnt is WHOOP cycle energy expenditure (kilojoule → kcal). Net = consumed − burnt."
               source={`${macroSource} + WHOOP`}
               className="lg:col-span-2"
             >
@@ -529,7 +542,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
 
             <ChartCard
               title="Net Energy Balance"
-              subtitle="Consumed − burnt per day. Above zero = surplus, below = deficit."
+              subtitle="Consumed − burnt · above 0 = surplus"
               source={`${macroSource} + WHOOP`}
               className="lg:col-span-2"
             >
@@ -698,7 +711,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
         <>
           <div className={`flex items-baseline justify-between ${todayServings.length ? "mt-3" : ""} mb-1.5`}>
             <span className="text-[10px] font-mono text-text-tertiary">
-              Tap how much you ate; what you save for later is asked about the next days.
+              Tap how much you ate
             </span>
             <span className="text-[11px] font-mono text-text-secondary">
               {delivery.totalKcal != null ? `Uber Eats ~${Math.round(delivery.totalKcal)} kcal` : ""}
@@ -799,7 +812,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
           subtitle={
             todayWeight && weightDate === etTodayStr()
               ? `Already logged today (${kgToLb(Number(todayWeight.weight_kg))!.toFixed(1)} lb). Saving overwrites.`
-              : "One entry per day. Stored in kg; entered + displayed in pounds."
+              : "One entry per day, in pounds"
           }
         >
           <div className="flex flex-wrap items-center gap-2 mb-3">
@@ -877,7 +890,6 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
         {/* Trend chart */}
         <ChartCard
           title="Weight Trend"
-          subtitle="One row per ET day · displayed in pounds (stored as kg)"
           source={weightTrendSource}
         >
           {weightLoading ? (
@@ -912,7 +924,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
         {weightRows.length > 0 && (
           <ChartCard
             title="Recent entries"
-            subtitle="Newest first · re-log the same date to overwrite · trash to delete"
+            subtitle="Newest first · re-log a date to overwrite"
           >
             <div className="space-y-1">
               {[...weightRows].reverse().slice(0, 10).map((w) => (

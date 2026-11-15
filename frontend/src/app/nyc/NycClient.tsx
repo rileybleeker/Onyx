@@ -205,7 +205,7 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         <h1 className="text-[22px] font-display text-text-primary">NYC Apartment Search</h1>
         <p className="text-[12px] text-text-secondary">{BRIEF}</p>
         <p className="text-[11px] font-mono text-text-tertiary">
-          nyc-scout runs daily at 6:10 AM ET · last checked {lastChecked ? shortDate(lastChecked) : "—"} ·{" "}
+          Last checked {lastChecked ? shortDate(lastChecked) : "—"} ·{" "}
           <a href={NOTION_DB_URL} target="_blank" rel="noreferrer" className="underline hover:text-text-secondary">
             open in Notion
           </a>
@@ -291,7 +291,7 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         </div>
       </ChartCard>
 
-      <ChartCard title="Leads" subtitle="Click a row for details and notes; your choice is saved to Notion for the scout" variant="secondary">
+      <ChartCard title="Leads" subtitle="Tap a row for details and notes" variant="secondary">
         {saveError && <p className="mb-3 text-[12px] text-down">{saveError}</p>}
         {loading ? (
           <p className="py-8 text-center text-[12px] font-mono text-text-tertiary">Loading leads…</p>

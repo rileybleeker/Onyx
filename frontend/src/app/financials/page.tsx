@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { loadLedger } from "@/lib/finance-ledger-server";
 import { parseLedgerQuery } from "@/lib/finance-ledger";
+import InfoHint from "@/components/InfoHint";
 import FinancialsClient from "./FinancialsClient";
 import LedgerView, { FreshnessLine } from "./LedgerView";
 
@@ -25,11 +26,15 @@ export default async function FinancialsPage({
   return (
     <main className="mx-auto max-w-6xl space-y-6 p-4 md:p-8">
       <header>
-        <p className="text-xs uppercase tracking-widest text-text-tertiary">Money, in view</p>
-        <h1 data-testid="page-heading" className="text-2xl font-semibold">Financials</h1>
-        <p className="mt-2 text-text-secondary">
-          Your bank accounts, balances and transactions, imported automatically (SimpleFIN Bridge, every 6 hours; Rocket Money history before 2026-11-14) and shown only to you.
-        </p>
+        <div className="flex items-center gap-2">
+          <h1 data-testid="page-heading" className="text-2xl font-semibold">Financials</h1>
+          <InfoHint label="Financials">
+            <p>
+              Bank accounts, balances and transactions, imported from SimpleFIN Bridge every 6 hours (Rocket Money history before
+              2026-11-14). Shown only to you.
+            </p>
+          </InfoHint>
+        </div>
         <p className="mt-2 text-[13px]">
           <a href="/financials/budgets" className="text-accent hover:underline">Budgets →</a>{" "}
           <a href="/financials/forecast" className="ml-3 text-accent hover:underline">Cash forecast →</a>
@@ -51,9 +56,7 @@ export default async function FinancialsPage({
               ? "No ledger data yet - the harvester has run but imported nothing."
               : "No ledger data yet - the harvester has not run."}
           </p>
-          <p className="mt-2 text-[13px] text-text-secondary">
-            Accounts, balances and transactions appear here after the first SimpleFIN import. No sample or invented numbers are shown.
-          </p>
+          <p className="mt-2 text-[13px] text-text-secondary">They appear after the first SimpleFIN import.</p>
           <div className="mt-3">
             <FreshnessLine freshness={load.freshness} now={now} />
           </div>
@@ -64,9 +67,7 @@ export default async function FinancialsPage({
 
       <details className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
         <summary className="cursor-pointer text-[13px] font-medium">Preview a CSV</summary>
-        <p className="mt-2 text-[12px] text-text-tertiary">
-          A separate, browser-only tool for looking at an exported file. It does not read from or write to the saved ledger above.
-        </p>
+        <p className="mt-2 text-[12px] text-text-tertiary">Browser-only; it does not touch the saved ledger.</p>
         <div className="mt-4">
           <FinancialsClient embedded />
         </div>

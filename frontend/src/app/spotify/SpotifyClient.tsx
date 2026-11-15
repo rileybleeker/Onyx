@@ -7,6 +7,7 @@ import {
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
 import ChartCard from "@/components/ChartCard";
+import InfoHint from "@/components/InfoHint";
 import StatCard from "@/components/StatCard";
 import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel, chartColors as C } from "@/lib/chart-theme";
@@ -369,7 +370,14 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
     <div className="space-y-6">
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 data-testid="page-heading" className="text-[20px] font-medium text-text-primary tracking-tight">Spotify</h1>
+          <div className="flex items-center gap-2">
+            <h1 data-testid="page-heading" className="text-[20px] font-medium text-text-primary tracking-tight">Spotify</h1>
+            <InfoHint label="Spotify coverage">
+              Only plays that Spotify&apos;s servers receive appear here. Offline playback on partner devices
+              (Garmin watches, some car head units, older wearables) is never reported, even after the device
+              reconnects, so workout listening on the Garmin is under-counted.
+            </InfoHint>
+          </div>
           <p className="text-[12px] text-text-tertiary mt-0.5">
             Listening behavior — {rangeLabel(range)}
           </p>
@@ -384,14 +392,6 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
           <RangeFilter value={range} onChange={setRange} accent={spotifyGreen} />
         </div>
       </header>
-
-      <p className="text-[11px] text-text-tertiary leading-relaxed border-l-2 border-source-spotify/30 pl-3">
-        <span className="text-text-secondary">Coverage note:</span> Only plays that Spotify&apos;s
-        backend knows about appear here. Offline playback from Spotify-licensed partner devices
-        (Garmin watches, some car head units, older standalone wearables) isn&apos;t reported to
-        the API and won&apos;t show up — even after the device reconnects. If you listen heavily
-        on Garmin during workouts, this dashboard under-counts that listening.
-      </p>
 
       {modalOpen && (
         <div
@@ -409,9 +409,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                   {topTracks.length} tracks · private · added to your Spotify account
                 </p>
                 <p className="text-[10px] text-amber-300/80 mb-4 leading-relaxed">
-                  Heads up: Spotify Dev-mode apps ignore the private flag — the
-                  playlist may land Public. Toggle to private in the Spotify
-                  app if needed. (Server logs warn when this happens.)
+                  Spotify may make it public anyway; switch it to private in the Spotify app.
                 </p>
                 <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">Name</label>
                 <input
@@ -492,12 +490,10 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
               <>
                 <h2 className="text-[15px] font-medium text-text-primary mb-1">Generate playlist</h2>
                 <p className="text-[11px] text-text-tertiary mb-2">
-                  Free-text prompt + structured constraints. Claude picks tracks and creates the playlist in your Spotify account.
+                  Claude picks the tracks and saves the playlist to your Spotify account.
                 </p>
                 <p className="text-[10px] text-amber-300/80 mb-4 leading-relaxed">
-                  Heads up: Spotify Dev-mode apps ignore the private flag — the
-                  playlist may land Public. Toggle to private in the Spotify
-                  app if needed.
+                  Spotify may make it public anyway; switch it to private in the Spotify app.
                 </p>
 
                 <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
@@ -563,7 +559,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
 
                 <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1.5">
                   Genres <span className="text-text-tertiary/60 normal-case">
-                    (from your top {rangeLabel(range)} — click to bias selection)
+                    (from your top {rangeLabel(range)})
                   </span>
                 </label>
                 <div className="flex gap-2 mb-2 flex-wrap">
@@ -619,11 +615,6 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                     ))}
                   </div>
                 )}
-
-                <p className="text-[10px] text-text-tertiary leading-relaxed border-l-2 border-amber-500/40 pl-2 mb-4">
-                  Playlists are requested private — Spotify&apos;s Dev-mode API may still publish them
-                  as Public; toggle to Private from the Spotify app if needed.
-                </p>
 
                 {genError && (
                   <p className="text-[11px] text-red-400 font-mono mb-3 break-all">{genError}</p>
@@ -797,12 +788,14 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
           {/* Taste evolution — three trend charts */}
           <section className="space-y-4">
             <div className="border-l-2 border-source-spotify/40 pl-3">
-              <h2 className="text-[14px] font-medium text-text-primary">Taste evolution</h2>
-              <p className="text-[11px] text-text-tertiary mt-0.5">
-                How your listening has changed across {rangeLabel(range)}. Each chart is smoothed
-                with a 7-day rolling mean (where the range is long enough) so daily noise doesn&apos;t
-                drown out the trend.
-              </p>
+              <div className="flex items-center gap-2">
+                <h2 className="text-[14px] font-medium text-text-primary">Taste evolution</h2>
+                <InfoHint label="Taste evolution">
+                  Each chart is smoothed with a 7-day rolling mean (where the range is long enough) so daily
+                  noise does not drown out the trend.
+                </InfoHint>
+              </div>
+              <p className="text-[11px] text-text-tertiary mt-0.5">{rangeLabel(range)}</p>
             </div>
 
             {/* Sound evolution — audio feature drift */}
@@ -810,7 +803,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
               title="Sound evolution"
               subtitle={`7 audio features over time — ${rangeLabel(range)}`}
               source="RECCOBEATS"
-              info="Daily mean of each feature, smoothed with a 7-day right-aligned rolling mean. All features are normalized 0–1. Days with no featurized plays are dropped before smoothing so gaps don't pull the line. Rising acousticness + falling energy is the classic 'going introspective' signature; rising danceability + speechiness leans into hip-hop / dance territory."
+              hint="Daily mean of each feature (0–1), smoothed with a 7-day rolling mean. Days with no featurized plays are dropped before smoothing. Rising acousticness with falling energy reads as introspective; rising danceability and speechiness leans hip-hop / dance."
             >
               {drift.length === 0 ? (
                 <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
@@ -850,9 +843,9 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
             {/* Genre rotation — stacked area */}
             <ChartCard
               title="Genre rotation"
-              subtitle={`daily play composition, top ${genreRotation.topGenres.length} genres + other — ${rangeLabel(range)}`}
+              subtitle={`top ${genreRotation.topGenres.length} genres + other — ${rangeLabel(range)}`}
               source="MUSICBRAINZ"
-              info="Stacked area shows how many plays each day came from each top genre. Each artist's full tag set contributes — heavy-rotation artists weight their genres more. Tracks whose artist had no MusicBrainz match fall into 'other'."
+              hint="Plays per day from each top genre. Every genre tag of an artist counts, so heavy-rotation artists weigh more. Artists with no MusicBrainz match fall into 'other'."
             >
               {genreRotation.rows.length === 0 ? (
                 <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
@@ -899,7 +892,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
               title="Discovery rate"
               subtitle={`% of plays that were brand-new tracks — ${rangeLabel(range)}`}
               source="SPOTIFY"
-              info="For each day, the % of plays that were tracks you'd never played before (across all-time history, not just this range). The 7-day rolling mean smooths the daily spikes. Sustained high = exploration mode; sustained low = comfort-zone listening."
+              hint="Share of each day's plays that were tracks never played before (all-time history, not just this range), smoothed with a 7-day rolling mean. High = exploring; low = comfort listening."
             >
               {discovery.length === 0 ? (
                 <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
@@ -927,7 +920,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
             title="Current sonic profile"
             subtitle={`play-weighted mean of 7 audio features — ${rangeLabel(range)}`}
             source="RECCOBEATS"
-            info="All values normalized 0–1. Valence = positivity. Energy = intensity. Danceability = rhythmic regularity. Acousticness = acoustic vs. electronic. Instrumentalness = lack of vocals. Liveness = live-recording probability. Speechiness = spoken-word content. Weighted by play count so heavy rotation moves the shape."
+            hint="All values 0–1, weighted by play count. Valence = positivity. Energy = intensity. Danceability = rhythmic regularity. Acousticness = acoustic vs electronic. Instrumentalness = no vocals. Liveness = live recording. Speechiness = spoken word."
           >
             {sonic ? (
               <ResponsiveContainer width="100%" height={320}>
@@ -982,7 +975,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
               title="Top genres"
               subtitle={`${rangeLabel(range)}, by play count`}
               source="MUSICBRAINZ"
-              info="Each play counts once toward every genre tag MusicBrainz has for that artist, so heavy-rotation artists weight their genres more. Genres come from MusicBrainz (Spotify Dev Mode strips genres post-Feb 2026)."
+              hint="Each play counts once toward every MusicBrainz genre tag of its artist (Spotify no longer returns genres)."
             >
               <ol className="space-y-1.5">
                 {genres.map((g, i) => (
@@ -1054,7 +1047,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
             title="Listening by hour of day"
             subtitle={`ET, ${rangeLabel(range)}`}
             source="SPOTIFY"
-            info="Bars are play counts grouped by hour-of-day (America/New_York). Reveals chronotype patterns — heavy late-night listening shows up here."
+            hint="Plays grouped by hour of day, Eastern time."
           >
             <ResponsiveContainer width="100%" height={220}>
               <BarChart data={hours} margin={{ top: 8, right: 8, left: 4, bottom: 20 }}>
@@ -1072,7 +1065,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
             title="Play ledger"
             subtitle={`every play, newest first · ${rangeLabel(range)}${ledgerTotal > 0 ? ` · ${ledgerTotal.toLocaleString()} plays` : ""}`}
             source="SPOTIFY"
-            info="Every track that registered in Spotify's recently-played feed for the selected range. Spotify's 30-second minimum applies — anything skipped sooner doesn't appear."
+            hint="Every track in Spotify's recently-played feed for this range. Tracks skipped within 30 seconds never appear."
           >
             {ledgerLoading && ledger.length === 0 && (
               <p className="text-[11px] text-text-tertiary font-mono py-8 text-center">Loading…</p>

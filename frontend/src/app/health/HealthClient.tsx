@@ -12,6 +12,7 @@ import type { CalendarStatus } from '@/lib/care-google';
 import { CareCalendar, DueSoon } from './CareCalendar';
 import CalendarConnectionCard from './CalendarConnectionCard';
 import CalendarEventsCard from './CalendarEventsCard';
+import InfoHint from '@/components/InfoHint';
 import { type CalendarRange, useCalendarEvents } from './useCalendarEvents';
 
 const panel = 'rounded-2xl border border-border-default bg-surface-card p-5';
@@ -196,10 +197,15 @@ export default function HealthClient({ initial, calendar }: { initial: CareLoad;
   const zones = [...new Set([form.tz, viewerTz, ...COMMON_ZONES])].filter(validTimeZone);
 
   return <div className="mx-auto max-w-4xl space-y-6 p-4 sm:p-8">
-    <header><h1 data-testid="page-heading" className="text-2xl font-semibold">Health & appointments</h1><p className="mt-2 text-text-secondary">Plan routine care and keep track of what needs booking.</p></header>
+    <header><h1 data-testid="page-heading" className="text-2xl font-semibold">Health & appointments</h1></header>
     <section className={panel} aria-label="Privacy and calendar connection">
-      <h2 className="font-semibold">Private planning, saved in Onyx</h2>
-      <p className="mt-2 text-sm text-text-secondary">Items are saved to your Onyx account and show on any device where you are signed in. Keep labels short; lab results and documents go in <Link href="/health/records" className="text-accent hover:underline">Medical records</Link>. Nothing is sent to a provider or a reminder service, and nothing goes to a calendar unless you connect one below. Dates and repeat intervals are yours to choose, not medical recommendations.</p>
+      <div className="flex items-center gap-2">
+        <h2 className="font-semibold">Private planning, saved in Onyx</h2>
+        <InfoHint label="Private planning">
+          <p>Items are saved to your Onyx account and show on any device where you are signed in. Lab results and documents go in <Link href="/health/records" className="text-accent hover:underline">Medical records</Link>.</p>
+          <p>Nothing is sent to a provider or a reminder service, and nothing goes to a calendar unless you connect one below. Dates and repeat intervals are yours to choose, not medical recommendations.</p>
+        </InfoHint>
+      </div>
       {local.state === 'offer' && <div className="mt-3 rounded-xl border border-border-default p-3 text-sm">
         <p>This browser holds {local.items.length} item{local.items.length === 1 ? '' : 's'} saved by the earlier version of this page.</p>
         <button className={`${button} mt-2`} disabled={copying || load !== 'ready'} onClick={copyLocal}>{copying ? 'Copying…' : `Copy ${local.items.length === 1 ? 'it' : `all ${local.items.length}`} into Onyx`}</button>
@@ -221,11 +227,17 @@ export default function HealthClient({ initial, calendar }: { initial: CareLoad;
       <button className={button} onClick={() => void reload()}>Try again</button>
     </section>}
     {load === 'ready' && <>
-      <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={demo} onChange={event => setDemo(event.target.checked)} />Show sample data in the calendar and due-soon list (invented examples, not saved, not your records)</label>
+      <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={demo} onChange={event => setDemo(event.target.checked)} />Show sample data (invented, not saved)</label>
       <DueSoon items={shown} today={today} />
       <CareCalendar items={shown} today={today} external={events.events} onRangeChange={showRange} />
       <form onSubmit={submit} className={`${panel} space-y-4`}>
-        <h2 className="font-semibold">{form.editing ? 'Edit care item' : 'Add care item'}</h2>
+        <div className="flex items-center gap-2">
+          <h2 className="font-semibold">{form.editing ? 'Edit care item' : 'Add care item'}</h2>
+          <InfoHint label="Care items">
+            <p>Marking complete uses today&apos;s date for the next interval. A repeat becomes due, never automatically booked.</p>
+            <p>The time is the clock time where the appointment is, so it does not shift when clocks change.</p>
+          </InfoHint>
+        </div>
         <div className="grid gap-3 sm:grid-cols-2">
           <label className="flex flex-col gap-1 text-sm">Short label<input className={field} required maxLength={100} value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} placeholder="e.g. Routine checkup" /></label>
           <label className="flex flex-col gap-1 text-sm">Kind<select className={field} value={form.kind} onChange={e => setForm({ ...form, kind: e.target.value as CareKind })}>{CARE_KINDS.map(kind => <option key={kind} value={kind}>{KIND_LABEL[kind]}</option>)}</select></label>
@@ -236,7 +248,6 @@ export default function HealthClient({ initial, calendar }: { initial: CareLoad;
           <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={form.booked} onChange={e => setForm({ ...form, booked: e.target.checked })} />I have already booked this appointment</label>
           <label className="flex flex-col gap-1 text-sm sm:col-span-2">Note (optional)<textarea className={field} rows={2} maxLength={MAX_NOTES} value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} placeholder="e.g. bring the referral form" /></label>
         </div>
-        <p className="text-xs text-text-secondary">Marking complete uses today&apos;s date for the next interval. A repeat becomes due, never automatically booked. The time is the clock time where the appointment is, so it does not shift when clocks change.</p>
         <button className={button} type="submit" disabled={form.editing !== null && busy.has(form.editing)}>{form.editing ? 'Save changes' : 'Add item'}</button>{form.editing && <button className={`${button} ml-2`} type="button" onClick={() => setForm(emptyForm(viewerTz))}>Cancel</button>}
       </form>
       <section className={`${panel} space-y-3`}><h2 className="font-semibold">Upcoming care</h2>

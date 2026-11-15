@@ -3,6 +3,7 @@
 import { ReactNode, useEffect, useState } from "react";
 import clsx from "clsx";
 import MetadataRow, { type MetaItem } from "./MetadataRow";
+import InfoHint from "./InfoHint";
 
 type Variant = "primary" | "secondary" | "compact";
 type TickKey = "forecast" | "descriptive" | "causal" | "calibration";
@@ -24,7 +25,11 @@ interface ChartCardProps {
   title: string;
   subtitle?: string;
   source?: string;
+  /** Always-visible note under the header. Keep it for statistical explanations (how to read a
+   * test or estimate); everyday context belongs in `hint`. */
   info?: string;
+  /** Context behind an "i" button next to the title, closed by default (AGENTS.md "UI copy"). */
+  hint?: ReactNode;
   children: ReactNode;
   className?: string;
   collapsible?: boolean;
@@ -58,6 +63,7 @@ export default function ChartCard({
   subtitle,
   source,
   info,
+  hint,
   children,
   className,
   collapsible,
@@ -112,12 +118,15 @@ export default function ChartCard({
 
   const titleBlock = (
     <div className="min-w-0">
-      <h3 className="flex items-center gap-2 text-[14px] font-semibold text-text-primary">
-        {tickColor && (
-          <span aria-hidden className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: tickColor }} />
-        )}
-        {title}
-      </h3>
+      <div className="flex items-center gap-2">
+        <h3 className="flex items-center gap-2 text-[14px] font-semibold text-text-primary">
+          {tickColor && (
+            <span aria-hidden className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: tickColor }} />
+          )}
+          {title}
+        </h3>
+        {hint && !collapsible && <InfoHint label={title}>{hint}</InfoHint>}
+      </div>
       {subtitle && <p className="text-[11px] text-text-tertiary mt-0.5 normal-case tracking-normal">{subtitle}</p>}
       {hasMeta && <MetadataRow items={metaItems} className="mt-1" />}
     </div>
@@ -158,6 +167,11 @@ export default function ChartCard({
           </button>
         ) : (
           titleBlock
+        )}
+        {hint && collapsible && (
+          <div className="shrink-0 pt-0.5">
+            <InfoHint label={title}>{hint}</InfoHint>
+          </div>
         )}
         {actions && <div className="shrink-0 flex items-center gap-1.5">{actions}</div>}
       </div>

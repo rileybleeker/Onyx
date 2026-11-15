@@ -15,9 +15,9 @@ import { chromium } from '@playwright/test';
 
 const frontend = fileURLToPath(new URL('..', import.meta.url));
 const fixture = await mkdtemp(path.join(tmpdir(), 'onyx-care-ui-'));
-for (const dir of ['src/app/health', 'src/lib']) await mkdir(path.join(fixture, dir), { recursive: true });
+for (const dir of ['src/app/health', 'src/lib', 'src/components']) await mkdir(path.join(fixture, dir), { recursive: true });
 await symlink(path.join(frontend, 'node_modules'), path.join(fixture, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
-for (const file of ['src/lib/care-planner.ts', 'src/lib/care-items.ts', 'src/lib/care-google.ts', 'src/app/health/HealthClient.tsx', 'src/app/health/CareCalendar.tsx', 'src/app/health/CalendarConnectionCard.tsx', 'src/app/health/CalendarEventsCard.tsx', 'src/app/health/useCalendarEvents.ts', 'src/lib/calendar-events.ts', 'src/lib/urgent-email.ts', 'src/app/globals.css']) {
+for (const file of ['src/lib/care-planner.ts', 'src/lib/care-items.ts', 'src/lib/care-google.ts', 'src/app/health/HealthClient.tsx', 'src/app/health/CareCalendar.tsx', 'src/app/health/CalendarConnectionCard.tsx', 'src/app/health/CalendarEventsCard.tsx', 'src/components/InfoHint.tsx', 'src/app/health/useCalendarEvents.ts', 'src/lib/calendar-events.ts', 'src/lib/urgent-email.ts', 'src/app/globals.css']) {
   await copyFile(path.join(frontend, file), path.join(fixture, file));
 }
 await copyFile(path.join(frontend, 'postcss.config.mjs'), path.join(fixture, 'postcss.config.mjs'));
@@ -285,7 +285,7 @@ try {
   await idle();
   await page.getByText('Archived and completed items').click();
   await page.getByRole('button', { name: 'Remove', exact: true }).click();
-  await page.waitForFunction(() => !document.querySelector('details'));
+  await page.waitForFunction(() => ![...document.querySelectorAll('details > summary')].some(s => s.textContent === 'Archived and completed items'));
   assert.equal(last().method, 'DELETE');
   assert.equal(last().path, `/api/care/items/${newId}`);
   assert.equal(last().body, null);

@@ -156,7 +156,7 @@ export default function JournalPage() {
             Journal
           </h1>
           <p className="text-xs md:text-sm text-text-tertiary mt-1">
-            Personal entries synced from Notion — {rangeLabel(range)}. {entries.length} {entries.length === 1 ? "entry" : "entries"}.
+            {rangeLabel(range)} · {entries.length} {entries.length === 1 ? "entry" : "entries"}
           </p>
         </div>
         <RangeFilter value={range} onChange={setRange} />
