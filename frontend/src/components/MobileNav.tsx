@@ -2,10 +2,12 @@
 
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname } from "next/navigation";
 import { House, BarChart3, Plus, MessageSquare, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS } from "@/lib/nav";
+import { wipeClientData } from "@/lib/client-cache";
+import { navIntentProps } from "@/lib/warmup";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 
 const LOG_ACTIONS = [
@@ -21,7 +23,6 @@ export default function MobileNav() {
   const drawerRef = useRef<HTMLElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
-  const router = useRouter();
 
   // Close every overlay on route change.
   useEffect(() => {
@@ -91,11 +92,14 @@ export default function MobileNav() {
   async function handleSignOut() {
     const supabase = createSupabaseBrowser();
     await supabase.auth.signOut();
-    router.push("/login");
+    // Nothing of this session stays on the device: cached data, its IndexedDB store, drafts.
+    await wipeClientData();
+    // A full load, not router.push: it also drops the router's in-memory page cache (prefetched pages).
+    window.location.assign("/login");
   }
 
   const tabs = [
-    { key: "today", label: "Today", icon: House, href: "/today", isActive: pathname === "/today" },
+    { key: "today", label: "Today", icon: House, href: "/today", isActive: pathname === "/today" || pathname === "/" },
     { key: "trends", label: "Trends", icon: BarChart3, href: "/analytics/hrv", isActive: pathname.startsWith("/analytics") },
     { key: "log", label: "Log", icon: Plus, action: () => setLogOpen(true), isActive: logOpen },
     { key: "chat", label: "Chat", icon: MessageSquare, href: "/agents", isActive: pathname.startsWith("/agents") },
@@ -138,7 +142,7 @@ export default function MobileNav() {
               </>
             );
             return tab.href ? (
-              <Link key={tab.key} href={tab.href} className={cls} aria-current={tab.isActive ? "page" : undefined}>
+              <Link key={tab.key} href={tab.href} className={cls} aria-current={tab.isActive ? "page" : undefined} {...navIntentProps(tab.href)}>
                 {inner}
               </Link>
             ) : (
@@ -168,6 +172,7 @@ export default function MobileNav() {
                   <Link
                     key={a.label}
                     href={a.href}
+                    {...navIntentProps(a.href)}
                     onClick={() => setLogOpen(false)}
                     className={`${a.href === "/check-in" ? "col-span-2 " : ""}flex items-center gap-2.5 px-3 py-3 rounded-control bg-surface-card border border-border-subtle text-[14px] text-text-primary hover:border-border-hover transition-colors`}
                   >
@@ -232,12 +237,13 @@ export default function MobileNav() {
               </p>
               <div className="space-y-0.5">
                 {section.items.map((item) => {
-                  const active = pathname === item.href;
+                  const active = (pathname === "/" ? "/today" : pathname) === item.href;
                   const Icon = item.icon;
                   return (
                     <Link
                       key={item.href}
                       href={item.href}
+                      {...navIntentProps(item.href)}
                       onClick={() => setDrawerOpen(false)}
                       aria-current={active ? "page" : undefined}
                       className={`min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium transition-colors relative ${

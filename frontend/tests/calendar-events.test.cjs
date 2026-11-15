@@ -231,11 +231,20 @@ test("the calendar events path only reads: no page sends anything to it, and it 
   }
   assert.ok(!fs.readFileSync(path.join(SRC, "app/health/CalendarEventsCard.tsx"), "utf8").includes("<button"), "nothing to press on the read-only card");
   // Wherever the events route is requested, it is a plain GET.
-  for (const file of ["app/health/useCalendarEvents.ts", "app/today/TodayClient.tsx"]) {
+  {
+    const file = "app/health/useCalendarEvents.ts";
     const src = fs.readFileSync(path.join(SRC, file), "utf8");
     const calls = src.match(/fetch\(`\/api\/calendar\/events[^)]*\)/g) ?? [];
     assert.ok(calls.length === 1, `${file} requests the events route once`);
     assert.ok(!/method|body/.test(calls[0]), `${file} only reads the events route`);
+  }
+  {
+    // Today builds the URL in one place and reads it through its GET helper (shared with the client cache).
+    const src = fs.readFileSync(path.join(SRC, "app/today/TodayClient.tsx"), "utf8");
+    assert.equal((src.match(/`\/api\/calendar\/events\?/g) ?? []).length, 1, "Today builds the events URL once");
+    const getJson = /async function getJson\([^)]*\)[^{]*\{([\s\S]*?)\n\}/.exec(src);
+    assert.ok(getJson, "Today reads through getJson");
+    assert.ok(!/method|body/.test(getJson[1]), "getJson only reads (GET)");
   }
   // The care-item write paths and the care-items -> Google sync never read the synced events.
   for (const file of ["lib/care-items.ts", "lib/care-items-server.ts", "lib/care-google.ts", "lib/care-google-server.ts"]) {

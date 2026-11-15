@@ -19,6 +19,8 @@ function render(drawerOpen = false, logOpen = false) {
     if (id === 'lucide-react') return new Proxy({}, { get: () => () => null });
     if (id === '@/lib/nav') return { NAV_SECTIONS: [{ title: 'Health', items: [{ href: '/health', label: 'Health & appointments', icon: () => null }] }] };
     if (id === '@/lib/supabase-browser') return {};
+    if (id === '@/lib/client-cache') return { wipeClientData: async () => {} };
+    if (id === '@/lib/warmup') return { navIntentProps: () => ({}) };
     if (id === './CommandPalette') return { OPEN_COMMAND_PALETTE: 'open-command-palette' };
     throw new Error(`Unexpected dependency: ${id}`);
   };

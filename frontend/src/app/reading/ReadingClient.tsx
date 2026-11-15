@@ -6,6 +6,8 @@ import Link from "next/link";
 import { BookMarked, Check, ChevronDown, Flame, Headphones, Highlighter, Sparkles, Trophy, X } from "lucide-react";
 import MetricRing from "@/components/MetricRing";
 import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type Medium, type ReadingOverview, type Book } from "@/lib/reading";
+import { clientCache } from "@/lib/client-cache";
+import { sameJson } from "@/lib/format";
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -37,11 +39,20 @@ const SOURCES: Array<{ key: HighlightSource; label: string }> = [
 const fmtDate = (d: string | null | undefined, opts: Intl.DateTimeFormatOptions = { month: "short", day: "numeric" }) =>
   d ? new Date(d + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", ...opts }) : "—";
 
+type ReadingAnswer = { overview: ReadingOverview | null; books?: Book[] };
+const readingUrl = (which: string | null) => `/api/reading${which ? `?book=${encodeURIComponent(which)}` : ""}`;
+function cachedReading(raw: unknown): ReadingAnswer | null {
+  const v = raw as ReadingAnswer | undefined;
+  return v && "overview" in v && (v.overview === null || !!v.overview?.book?.slug) ? v : null;
+}
+
 export default function ReadingClient() {
-  const [overview, setOverview] = useState<ReadingOverview | null>(null);
-  const [books, setBooks] = useState<Book[]>([]);
-  const [slug, setSlug] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Start from the cached answer (Today and the warm-up read the same URL), then revalidate.
+  const [seed] = useState(() => cachedReading(clientCache.peek(readingUrl(null))));
+  const [overview, setOverview] = useState<ReadingOverview | null>(seed?.overview ?? null);
+  const [books, setBooks] = useState<Book[]>(seed?.books ?? []);
+  const [slug, setSlug] = useState<string | null>(seed?.overview?.book.slug ?? null);
+  const [loading, setLoading] = useState(!seed);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast>(null);
 
@@ -55,11 +66,12 @@ export default function ReadingClient() {
       if (!silent) setLoading(true);
       setError(null);
       try {
-        const res = await fetch(`/api/reading${which ? `?book=${encodeURIComponent(which)}` : ""}`, { cache: "no-store" });
+        const res = await fetch(readingUrl(which), { cache: "no-store" });
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
-        setOverview(json.overview);
-        setBooks(json.books ?? []);
+        clientCache.put(readingUrl(which), json);
+        setOverview((prev) => (sameJson(prev, json.overview) ? prev : json.overview));
+        setBooks((prev) => (sameJson(prev, json.books ?? []) ? prev : json.books ?? []));
         if (json.overview && !which) setSlug(json.overview.book.slug);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Couldn't load");
@@ -71,7 +83,8 @@ export default function ReadingClient() {
   );
 
   useEffect(() => {
-    load(null);
+    // With a cached answer on screen the first load is silent (no skeleton).
+    load(null, !!seed);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

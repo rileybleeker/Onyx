@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { CACHE_KEYS, clientCache } from "@/lib/client-cache";
+import { sameJson } from "@/lib/format";
 import Link from "next/link";
 import { ArrowUp, Bell, ChevronLeft, RotateCw } from "lucide-react";
 import {
@@ -12,6 +14,7 @@ import {
   type AgentCard,
   type AgentMessage,
   type CardState,
+  type MessagesResponse,
   type PushState,
 } from "@/lib/agents-api";
 import { agentInfo, Avatar, CardBody, CardButtons, dayLabel, Linkified, parseUtc, settledLabel, timeLabel } from "./agent-ui";
@@ -69,10 +72,18 @@ function TypingBubble() {
   );
 }
 
+function cachedThread(raw: unknown): MessagesResponse | null {
+  const v = raw as MessagesResponse | undefined;
+  return v && Array.isArray(v.messages) ? v : null;
+}
+
 export default function AgentsChat({ thread, reply }: { thread: string; reply?: string | null }) {
   const info = agentInfo(thread);
-  const [messages, setMessages] = useState<AgentMessage[]>([]);
-  const [cardStates, setCardStates] = useState<Record<string, CardState>>({});
+  const cacheKey = CACHE_KEYS.agentsThread(thread);
+  // Start from the cached conversation (shown until the first live answer replaces it). Nothing is marked
+  // read from the cached copy: markRead waits for a live answer (lastIdRef stays 0 until then).
+  const [messages, setMessages] = useState<AgentMessage[]>(() => cachedThread(clientCache.peek(cacheKey))?.messages ?? []);
+  const [cardStates, setCardStates] = useState<Record<string, CardState>>(() => cachedThread(clientCache.peek(cacheKey))?.cardStates ?? {});
   const [pending, setPending] = useState<Pending[]>([]);
   const [typing, setTyping] = useState(false);
   const [input, setInput] = useState("");
@@ -151,9 +162,15 @@ export default function AgentsChat({ thread, reply }: { thread: string; reply?: 
 
   const poll = useCallback(async () => {
     try {
+      const full = !lastIdRef.current;
       const res = await agentsApi.messages({ thread, after: lastIdRef.current || undefined, limit: lastIdRef.current ? 100 : 60 });
-      if (!lastIdRef.current && res.messages.length < 60) setHasOlder(false);
-      merge(res.messages);
+      if (full && res.messages.length < 60) setHasOlder(false);
+      if (full) {
+        // The first answer replaces a cached copy outright: the server is the source of truth.
+        const sorted = [...res.messages].sort((a, b) => a.id - b.id);
+        if (sorted.length) lastIdRef.current = sorted[sorted.length - 1].id;
+        setMessages((prev) => (sameJson(prev, sorted) ? prev : sorted));
+      } else merge(res.messages);
       if (res.cardStates) setCardStates(res.cardStates);
       setTyping(res.typing);
       if (res.typing) activeUntilRef.current = Math.max(activeUntilRef.current, Date.now() + 15_000);
@@ -164,6 +181,24 @@ export default function AgentsChat({ thread, reply }: { thread: string; reply?: 
       setLoaded(true);
     }
   }, [merge, handleError, thread]);
+
+  // Reopening the app: the conversation kept on this device, until the live answer arrives.
+  useEffect(() => {
+    let alive = true;
+    void clientCache.read(cacheKey).then((raw) => {
+      const cached = cachedThread(raw);
+      if (!alive || !cached || lastIdRef.current) return;
+      setMessages((prev) => (prev.length ? prev : cached.messages));
+      setCardStates((prev) => (Object.keys(prev).length ? prev : cached.cardStates ?? {}));
+    });
+    return () => { alive = false; };
+  }, [cacheKey]);
+
+  // Keep the cached copy in step with what the server last said (the newest 60 messages).
+  useEffect(() => {
+    if (!loaded || !lastIdRef.current) return;
+    clientCache.put(cacheKey, { messages: messages.slice(-60), cardStates, lastRead: 0, typing: false } satisfies MessagesResponse);
+  }, [loaded, messages, cardStates, cacheKey]);
 
   // ---- polling loop: fast right after a send, slow when idle, paused in the background ----
   useEffect(() => {
@@ -372,7 +407,7 @@ export default function AgentsChat({ thread, reply }: { thread: string; reply?: 
       {/* Thread */}
       <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto overscroll-contain py-3" role="log" aria-live="polite">
         <div className="max-w-3xl mx-auto flex flex-col gap-[3px]">
-          {!loaded && <p className="text-center text-[13px] text-text-tertiary mt-10">Loading…</p>}
+          {!loaded && messages.length === 0 && <p className="text-center text-[13px] text-text-tertiary mt-10">Loading…</p>}
           {loaded && messages.length === 0 && pending.length === 0 && (
             <div className="text-center mt-16 px-8">
               <p className="text-[15px] text-text-secondary">{thread === "onyx" ? "Ask anything." : `${info.name} will write here.`}</p>

@@ -4,7 +4,8 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { getHabitJournal, getHabitMetadataHistory, rangeDays, rangeLabel, type Range, type HabitMetadataInterval } from "@/lib/queries";
 import { axisTick, gridStyle, chartTooltip, chartColors as C } from "@/lib/chart-theme";
-import { formatDate } from "@/lib/format";
+import { formatDate, sameJson } from "@/lib/format";
+import { CACHE_KEYS, clientCache, fetchJsonValue } from "@/lib/client-cache";
 import { SLEEP_QUESTIONS } from "@/lib/checkin";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
@@ -162,11 +163,23 @@ function calculateStreak(
   return streak;
 }
 
+const LIST_URL = "/api/habits/list";
+type HabitsList = { habits?: NotionHabit[] };
+// Each read goes through the shared cache (one request even when the warm-up asks at the same time).
+// An error answer is never cached (fetchJsonValue throws on it; 404 removes the entry).
+const readList = () => clientCache.revalidate<HabitsList>(LIST_URL, () => fetchJsonValue(LIST_URL) as Promise<HabitsList>);
+const readJournal = () => clientCache.revalidate<JournalEntry[]>(CACHE_KEYS.habitsJournal, () => getHabitJournal(365) as Promise<JournalEntry[]>);
+const readHistory = () => clientCache.revalidate<HabitMetadataInterval[]>(CACHE_KEYS.habitsHistory, () => getHabitMetadataHistory());
+const keep = <T,>(next: T) => (prev: T) => (sameJson(prev, next) ? prev : next);
+
 export default function HabitsPage() {
-  const [habits, setHabits] = useState<NotionHabit[]>([]);
-  const [journal, setJournal] = useState<JournalEntry[]>([]);
-  const [history, setHistory] = useState<HabitMetadataInterval[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Start from the cached copy (instant revisit / reopen), then revalidate; the skeleton shows only when
+  // nothing is cached.
+  const [habits, setHabits] = useState<NotionHabit[]>(() => clientCache.peek<HabitsList>(LIST_URL)?.habits ?? []);
+  const [journal, setJournal] = useState<JournalEntry[]>(() => clientCache.peek<JournalEntry[]>(CACHE_KEYS.habitsJournal) ?? []);
+  const [history, setHistory] = useState<HabitMetadataInterval[]>(() => clientCache.peek<HabitMetadataInterval[]>(CACHE_KEYS.habitsHistory) ?? []);
+  const [loading, setLoading] = useState(() => !(clientCache.peek(LIST_URL) && clientCache.peek(CACHE_KEYS.habitsJournal) && clientCache.peek(CACHE_KEYS.habitsHistory)));
+  const shownRef = useRef(!loading);
   const [syncing, setSyncing] = useState(false);
   const [toggling, setToggling] = useState<Set<string>>(new Set());
   const [range, setRange] = useState<Range>("30d");
@@ -179,16 +192,13 @@ export default function HabitsPage() {
   const answerSeq = useRef(new Map<string, number>());
 
   const load = useCallback(async () => {
-    setLoading(true);
+    if (!shownRef.current) setLoading(true);
     try {
-      const [habitsRes, journalData, historyData] = await Promise.all([
-        fetch("/api/habits/list").then((r) => r.json()),
-        getHabitJournal(365),
-        getHabitMetadataHistory(),
-      ]);
-      setHabits(habitsRes.habits || []);
-      setJournal(journalData);
-      setHistory(historyData);
+      const [habitsRes, journalData, historyData] = await Promise.all([readList(), readJournal(), readHistory()]);
+      setHabits(keep(habitsRes?.habits || []));
+      setJournal(keep(journalData ?? []));
+      setHistory(keep(historyData ?? []));
+      shownRef.current = true;
     } catch (e) {
       console.error(e);
     } finally {
@@ -211,10 +221,11 @@ export default function HabitsPage() {
       if (syncRes.ok) {
         const { count } = await syncRes.json();
         if (count > 0) {
-          const updated = await getHabitJournal(365);
-          setJournal(updated);
+          const updated = await readJournal();
+          setJournal(keep(updated ?? []));
         }
-        setHistory(await getHabitMetadataHistory());
+        const fresh = await readHistory();
+        setHistory(keep(fresh ?? []));
       }
     } catch (e) {
       console.error(e);
@@ -228,6 +239,27 @@ export default function HabitsPage() {
   // locally. Loading on every range switch used to re-run all three fetches
   // and flash the skeleton for zero new data.
   useEffect(() => { load(); }, [load]);
+
+  // Reopening the app: fill from the copy kept on this device while the network answers.
+  useEffect(() => {
+    if (shownRef.current) return;
+    let alive = true;
+    void Promise.all([clientCache.read<HabitsList>(LIST_URL), clientCache.read<JournalEntry[]>(CACHE_KEYS.habitsJournal), clientCache.read<HabitMetadataInterval[]>(CACHE_KEYS.habitsHistory)])
+      .then(([list, j, h]) => {
+        if (!alive || shownRef.current || !list || !j || !h) return;
+        shownRef.current = true;
+        setHabits(list.habits ?? []);
+        setJournal(j);
+        setHistory(h);
+        setLoading(false);
+      });
+    return () => { alive = false; };
+  }, []);
+
+  // Taps update the journal optimistically; keep the cached copy in step so the next visit shows them.
+  useEffect(() => {
+    if (!loading) clientCache.put(CACHE_KEYS.habitsJournal, journal);
+  }, [journal, loading]);
 
   // Tri-state lookup of "habitName|date" → explicit answer. completionSet
   // stays Yes-only on purpose: every KPI, rate, and streak treats explicit

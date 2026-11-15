@@ -1,16 +1,19 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname } from "next/navigation";
 import { LogOut, Search } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS, type NavItem } from "@/lib/nav";
+import { wipeClientData } from "@/lib/client-cache";
+import { navIntentProps } from "@/lib/warmup";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 import { InstallAppButton, ReloadAppButton, usePaletteShortcutLabel } from "./DesktopApp";
 
 export default function Sidebar() {
   const pathname = usePathname();
-  const router = useRouter();
+  // "/" renders Today (the app's start page).
+  const current = pathname === "/" ? "/today" : pathname;
   const paletteKey = usePaletteShortcutLabel();
 
   // Derive both groups from the shared route catalog; no destination is removed.
@@ -22,13 +25,16 @@ export default function Sidebar() {
   })).filter((section) => section.items.length > 0);
 
   function renderLink(item: NavItem) {
-    const active = pathname === item.href;
+    const active = current === item.href;
     const Icon = item.icon;
+    // No viewport prefetch: the scheduled warm-up (components/AppData.tsx) loads every page in idle time,
+    // and hover / focus / pointer-down warm this one at once.
     return (
       <Link
         key={item.href}
         href={item.href}
         aria-current={active ? "page" : undefined}
+        {...navIntentProps(item.href)}
         className={`flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium transition-colors relative focus:outline-none focus-visible:ring-1 focus-visible:ring-accent ${
           active
             ? "bg-surface-raised text-text-primary"
@@ -47,7 +53,10 @@ export default function Sidebar() {
   async function handleSignOut() {
     const supabase = createSupabaseBrowser();
     await supabase.auth.signOut();
-    router.push("/login");
+    // Nothing of this session stays on the device: cached data, its IndexedDB store, drafts.
+    await wipeClientData();
+    // A full load, not router.push: it also drops the router's in-memory page cache (prefetched pages).
+    window.location.assign("/login");
   }
 
   return (

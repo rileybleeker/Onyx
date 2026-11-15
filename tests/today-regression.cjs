@@ -18,6 +18,11 @@ const calendarLib = ids.size; ids.set('frontend/src/lib/calendar-events.ts', cal
 component = component.replace(/require\("@\/lib\/calendar-events"\)/g, `require(${calendarLib})`);
 const clearLib = ids.size; ids.set('frontend/src/lib/today-clear.ts', clearLib); modules[clearLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/today-clear.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/today-clear"\)/g, `require(${clearLib})`);
+// The shared client cache and sameJson (both import-free). No persisted store is attached here: memory only.
+const cacheLib = ids.size; ids.set('frontend/src/lib/client-cache.ts', cacheLib); modules[cacheLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/client-cache.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/client-cache"\)/g, `require(${cacheLib})`);
+const formatLib = ids.size; ids.set('frontend/src/lib/format.ts', formatLib); modules[formatLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/format.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/format"\)/g, `require(${formatLib})`);
 // GET /api/experiments/today answers (synthetic). "none" is the usual case: no trial registered.
 const experimentFixtures = {
     none: { status: 'none' },

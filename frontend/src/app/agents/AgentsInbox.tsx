@@ -19,6 +19,8 @@ import {
   type ThreadSummary,
 } from "@/lib/agents-api";
 import { agentInfo, Avatar, CardBody, CardButtons, listTime, parseUtc, settledLabel } from "./agent-ui";
+import { CACHE_KEYS, clientCache } from "@/lib/client-cache";
+import { sameJson } from "@/lib/format";
 
 // The Agents inbox, like the iPhone Messages list. "Unread" is everything that needs Riley: open cards (with their
 // buttons, so most can be answered right here) and agent messages not read yet, filterable by agent. "All" is one
@@ -134,10 +136,18 @@ function ConversationRow({ t, typing }: { t: ThreadSummary; typing: boolean }) {
   );
 }
 
+function cachedInbox(raw: unknown): InboxResponse | null {
+  const v = raw as InboxResponse | undefined;
+  return v && Array.isArray(v.items) && Array.isArray(v.threads) ? v : null;
+}
+
 export default function AgentsInbox({ initialView }: { initialView: InboxView | null }) {
   const router = useRouter();
-  const [data, setData] = useState<InboxResponse | null>(null);
-  const [view, setView] = useState<InboxView>(initialView ?? "unread");
+  // Start from the cached inbox (Today and the warm-up keep it fresh), then revalidate.
+  const [data, setData] = useState<InboxResponse | null>(() => cachedInbox(clientCache.peek(CACHE_KEYS.agentsInbox)));
+  // With nothing waiting in the cached copy, open on the conversations (the first live answer decides).
+  const autoAllRef = useRef(initialView === null && !!data && data.items.length === 0);
+  const [view, setView] = useState<InboxView>(initialView ?? (autoAllRef.current ? "all" : "unread"));
   const [filter, setFilter] = useState<string | null>(null);
   const [sent, setSent] = useState<Record<string, string>>({}); // card code -> what Riley tapped, until the server agrees
   const [error, setError] = useState<string | null>(null);
@@ -154,7 +164,8 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
   const load = useCallback(async () => {
     try {
       const res = await agentsApi.inbox();
-      setData(res);
+      clientCache.put(CACHE_KEYS.agentsInbox, res);
+      setData((prev) => (prev && sameJson(prev, res) ? prev : res));
       setBadge(res.badge);
       setError(null);
       // Everything the phone notified about is listed here, so the phone's notification list need not keep it.
@@ -163,11 +174,23 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
       if (!viewChosenRef.current) {
         viewChosenRef.current = true;
         if (res.items.length === 0) setView("all");
+        else if (autoAllRef.current) setView("unread");
+        autoAllRef.current = false;
       }
     } catch (e) {
       if (e instanceof AuthError) setAuthExpired(true);
       else setError("Can't reach the agents right now. Retrying…");
     }
+  }, []);
+
+  // Reopening the app: show the inbox kept on this device until the live one answers.
+  useEffect(() => {
+    let alive = true;
+    void clientCache.read(CACHE_KEYS.agentsInbox).then((raw) => {
+      const cached = cachedInbox(raw);
+      if (alive && cached) setData((prev) => prev ?? cached);
+    });
+    return () => { alive = false; };
   }, []);
 
   useEffect(() => {
