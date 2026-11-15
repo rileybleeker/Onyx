@@ -353,6 +353,8 @@ def test_protocol_rules():
     assert "interim looks are not built" in _problems(_protocol_text(**{
         "interim: none ": "interim: at 50% of blocks, O'Brien-Fleming "}))
     assert "front matter" in " ".join(_catch(lambda: ed.parse_protocol(b"# no front matter\n")))
+    assert _validate(_protocol_text(**{"    arm: A\n": "    arm: A\n  min_pct: 80\n"}))["adherence"]["min_pct"] == 80
+    assert "min_pct" in _problems(_protocol_text(**{"    arm: A\n": "    arm: A\n  min_pct: 180\n"}))
 
 
 def _catch(fn):
@@ -419,6 +421,9 @@ class FakeStore:
     def behavioral_today(self):
         return self.today
 
+    def reports_table_ready(self):
+        return getattr(self, "reports_ready", True)
+
     def experiment_active(self):
         return any(r["status"] in ("registered", "running", "paused") for r in self.rows.values())
 
@@ -465,6 +470,11 @@ def test_admin_seed_then_register_then_verify():
         dirty = lambda _p: {**MERGED(_p), "clean": False}  # noqa: E731
         assert "committed" in _refused(lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=dirty))
         assert "must be after today" in _refused(lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=date(2030, 1, 7), git=MERGED))
+        store.reports_ready = False
+        assert "sql/experiment_adherence_reports_schema.sql" in _refused(
+            lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED)), \
+            "a trial cannot be registered before its report table exists"
+        store.reports_ready = True
         assert store.rows["EXP-901"]["status"] == "draft" and store.sched == {}, "a refused registration writes nothing"
 
         out = "\n".join(admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED))

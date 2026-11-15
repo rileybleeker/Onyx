@@ -10,6 +10,7 @@ import { clientCache } from "@/lib/client-cache";
 import { buildCells, savePlan, visibleNights, voicePatch, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
 import { CheckinDraftStore, dayDraftKey, nightDraftKey, recoveryTarget, type DatedDraft } from "@/lib/checkin-drafts";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
+import ExperimentAdherence from "./ExperimentAdherence";
 
 // Daily habit check-in (2026-11-07). Yes / No per question, one Save.
 // - Saved answers load as-is; questions another source can answer start pre-filled and labeled with that
@@ -32,6 +33,9 @@ import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/
 //   asked the next evening). It loads on its own after the questions (never delays them), shows nothing when
 //   there is nothing to ask, and each tap saves immediately through PATCH /api/delivery/items/[itemId]
 //   (not part of the Save bar).
+// - While an N-of-1 trial runs, the day tab of today (or yesterday, answered the next morning) also asks
+//   "Followed today's arm?" (ExperimentAdherence.tsx). It renders nothing when no trial is running, saves
+//   each tap at once through /api/experiments/adherence (not part of the Save bar) and never writes a habit.
 
 const CATEGORY_ORDER = ["health", "fitness", "nutrition", "mindfulness", "productivity", "social", "learning", "general"];
 const withAnswers = (saved: Record<string, CheckinAnswer>, patch: Patch) => {
@@ -603,6 +607,11 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
           </div>
         )}
       </div>
+
+      {/* N-of-1 trial: "Followed today's arm?" Renders nothing unless a trial is running. */}
+      {!refreshFailed && (data.date === data.today || data.date === addDays(data.today, -1)) && (
+        <ExperimentAdherence key={data.date} date={data.date} when={data.date === data.today ? "today" : "yesterday"} />
+      )}
 
       {coreByCategory.map(([category, items]) => (
         <section key={category} className="mb-6">

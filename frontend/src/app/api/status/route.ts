@@ -46,6 +46,9 @@ const CADENCE: Record<string, string> = {
   // unconditional safety-net. Tracked separately because the predict path
   // can stay green while the retrain crashes silently (the model is cached).
   hrv_retrain: "Hourly (cond.) + 12:00 UTC safety-net",
+  // N-of-1 trial report job (experiment_report.py, docs/experiment-framework.md 10.4). With no trial
+  // registered each run is a no-op that still heartbeats.
+  experiments: "Daily 15:00 UTC",
   spotify: "Hourly :50",
   reccobeats: "With Spotify ETL",
   musicbrainz: "With Spotify ETL",
@@ -101,6 +104,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   cronometer:     { method: "automated",      label: "Web export ETL" },
   hrv_analysis:   { method: "automated",      label: "Computed" },
   hrv_retrain:    { method: "automated",      label: "Model retrain" },
+  experiments:    { method: "automated",      label: "Trial report" },
   spotify:        { method: "automated",      label: "API ETL" },
   reccobeats:     { method: "automated",      label: "API ETL" },
   musicbrainz:    { method: "automated",      label: "API ETL" },
@@ -449,6 +453,8 @@ export async function GET() {
         ["google_calendar", "events"],
         // PC activity logger (Riley's PC, hourly upload while signed in).
         ["pc_activity", "usage"],
+        // N-of-1 trial report job: one heartbeat a day.
+        ["experiments", "report"],
         // Pollen ETL (twice a day): a 19 h gap between runs, far outside the shared window.
         ["pollen", "daily"],
       ].map(async ([source, dataType]) => {
@@ -703,6 +709,31 @@ export async function GET() {
           cadence: CADENCE.hrv_retrain,
           integrationMethod: METHOD.hrv_retrain.method,
           methodLabel: METHOD.hrv_retrain.label,
+        };
+      })(),
+      // N-of-1 trial report job (experiment_report.py). Heartbeat only: no report row, arm or result is
+      // read here (this endpoint is CDN-cacheable). Daily at 15:00 UTC, so more than 26 h without a run
+      // is degraded and more than 30 h is an error, like the retrain card. No heartbeat yet = Unknown
+      // with the reason: the scheduled workflow has not run (it is added by hand: .github/ is protected).
+      experiments: (() => {
+        const entry = latestBySrcType["experiments|report"] ?? null;
+        const lastSync = (entry?.sync_start as string) ?? null;
+        const ageHours = hoursSince(lastSync);
+        const status = ingestionHeartbeatStatus("success", entry, 26, 30);
+        return {
+          label: "Experiments",
+          lastSync,
+          status,
+          latestDataDate: null,                            // a job, not a data table
+          daysLag: lastSync ? Math.floor(ageHours / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No run yet - the Experiment Report workflow has not reported."
+              : ageHours > 30 ? `No trial report run for ${ageHours}h (daily at 15:00 UTC).` : null),
+          cadence: CADENCE.experiments,
+          integrationMethod: METHOD.experiments.method,
+          methodLabel: METHOD.experiments.label,
         };
       })(),
       spotify: {
