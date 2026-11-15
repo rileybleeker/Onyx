@@ -62,3 +62,5 @@ When several branches are in flight at once (one git worktree each), CI checks e
 - Dependencies installed by `requirements-ci.txt` come from the lock file, which was last regenerated 2026-04-16 and pins `supabase==2.19.0`. Local development uses newer versions, so a pin bump should be tried through this job first.
 
 The scoped-job dependency inventory and audit limits are in [stats-ci-dependency-inventory.md](stats-ci-dependency-inventory.md).
+
+Postdeployment-only policy (2026-11-15) supersedes the historical PR descriptions above: `offline-checks` only parses Python; behavioral tests require successful exact-revision Production deployment. See `docs/ci-cd.md`.

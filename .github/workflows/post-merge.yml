@@ -42,6 +42,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ github.event.inputs.sha || github.sha }}
           DRILL: ${{ github.event.inputs.drill == 'true' && '--drill' || '' }}
+  offline-tests:
+    needs: verify
+    if: needs.verify.outputs.result == 'ok'
+    uses: ./.github/workflows/scheduled-tests.yml
+    with:
+      sha: ${{ needs.verify.outputs.sha }}
   smoke:
     needs: verify
     if: needs.verify.outputs.result == 'ok'

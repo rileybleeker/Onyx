@@ -1,9 +1,6 @@
 name: Autonomous CI
-# The ONLY per-PR gate (Riley 2026-11-14: one user, move fast; test on a schedule; testing and deploying are
-# independent). offline-checks takes about 10 s: Python parses, the HRV clock-boundary tests and the merge-guard and
-# merge-train decision tests. Everything slower (Node tests, tsc, compile build, browser regressions, the Python stats
-# suite) runs in scheduled-tests.yml against master. A type error cannot reach production anyway: Vercel's
-# `next build` type-checks, a failed Production build deploys nothing, and post-merge verify reverts the merge.
+# Required compatibility check now performs syntax/build validation only, not automated tests.
+# Behavioral tests run after verified Production deployment in scheduled-tests.yml.
 run-name: Autonomous CI ${{ inputs.sha || github.sha }}
 on:
   pull_request:
@@ -40,9 +37,3 @@ jobs:
               with open(path, encoding='utf-8-sig') as stream:
                   ast.parse(stream.read(), filename=path)
           PY
-      - name: HRV behavioral clock boundary tests
-        run: python tests/test_hrv_clock_boundaries.py
-      - name: Autonomous merge guard unit tests (no credentials or network)
-        run: python -m unittest discover -s tests -p test_autonomous_merge.py -v
-      - name: Merge train decision tests (no credentials or network)
-        run: python -m unittest discover -s tests -p test_merge_train.py -v

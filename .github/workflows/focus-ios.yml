@@ -16,9 +16,6 @@ jobs:
         run: |
           NEWEST=$(ls -d /Applications/Xcode*.app | grep -vi beta | sort -V | tail -1)
           sudo xcode-select -s "$NEWEST"
-      - name: Test policy (offline)
-        working-directory: tools/screentime_ios/FocusCore
-        run: swift test
       - name: Generate opt-in focus project
         working-directory: tools/screentime_ios
         run: |

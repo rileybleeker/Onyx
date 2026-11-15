@@ -1,6 +1,6 @@
 name: Live DB Checks
 
-# Tests that need the production Supabase project. They run ONLY after code is on master,
+# Tests that need the production Supabase project. They run ONLY after confirmed deployment,
 # on a daily schedule, or when someone starts them by hand - never on a pull request, so
 # unreviewed PR code never holds the service-role key and PR bursts never load the database.
 # The credential-free tests run in scheduled-tests.yml (stats-tests job). See docs/ci-checks.md.
@@ -11,19 +11,6 @@ name: Live DB Checks
 # The secrets are scoped to the individual steps that need them, not to the workflow or job.
 
 on:
-  push:
-    branches: [master]
-    paths:
-      - "hrv_analysis.py"
-      - "hrv_predict.py"
-      - "hrv_alignment.py"
-      - "causal_inference.py"
-      - "garmin_etl.py"
-      - "whoop_etl.py"
-      - "eight_sleep_etl.py"
-      - "tests/**"
-      - "requirements-analysis*"
-      - ".github/workflows/live-checks.yml"
   schedule:
     # 08:25 UTC daily: a quiet slot between the hourly ETL crons (the 3-hourly :25 flights job
     # does not run at hour 8) and well before the 12:00 UTC retrain, which runs the alignment
@@ -39,6 +26,7 @@ on:
 
 permissions:
   contents: read
+  deployments: read
 
 # One run at a time against the database; never cancel a run that is mid-query.
 concurrency:
@@ -46,12 +34,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  deployed:
+    uses: ./.github/workflows/deployed-revision.yml
+    with:
+      sha: ${{ github.event.workflow_run.head_sha || github.sha }}
   live-checks:
+    needs: deployed
+    if: needs.deployed.outputs.ready == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
