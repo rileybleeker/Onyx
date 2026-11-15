@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CHECK_EVERY_MS, MIN_GAP_MS, isBusy, updateAction } from "@/lib/app-update";
+import { trackUnsavedWork, unsavedWork } from "@/lib/unsaved-work";
 
 const RUNNING = process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA;
 const KEY = "onyx.reloadedFor";
@@ -23,7 +24,8 @@ export default function UpdateChecker() {
       const action = updateAction({
         running: RUNNING,
         live,
-        busy: isBusy(document),
+        // Focus is not enough (Onyx#326): unsaved edits and in-flight saves survive a blur.
+        busy: isBusy(document) || unsavedWork.has(),
         reloadedFor: sessionStorage.getItem(KEY),
       });
       if (action === "reload" && live) {
@@ -35,6 +37,10 @@ export default function UpdateChecker() {
     } catch {
       // offline or signed out: the next check tries again
     }
+  }, []);
+
+  useEffect(() => {
+    trackUnsavedWork(window as unknown as Parameters<typeof trackUnsavedWork>[0]);
   }, []);
 
   useEffect(() => {

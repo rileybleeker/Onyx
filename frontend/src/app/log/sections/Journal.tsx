@@ -10,6 +10,7 @@ import { easternDate, JOURNAL_MAX_BODY_CHARS, JOURNAL_SOURCES, type JournalSourc
 import { journalTodayUrl } from "@/lib/journal-file";
 import { useLogDrafts, type JournalLogDraft } from "@/lib/log-drafts";
 import { logEarlyGet } from "@/lib/log-early";
+import { useUnsavedWork } from "@/lib/use-unsaved-work";
 import { DraftMark, LogCard, LogSaveButton } from "./ui";
 
 /** This section holds /log's journal drafts, so the embedded check-in leaves out its own journal draft card (./CheckIn.tsx). */
@@ -79,6 +80,8 @@ export default function JournalSection() {
   const seenDraft = useRef(0);
   const bodyRef = useRef(body);
   bodyRef.current = body;
+  // Unsaved words (or a save in flight) keep the automatic updater from reloading the page (Onyx#326).
+  useUnsavedWork(body.trim() !== "" || saving, "journal");
 
   // The day rolls over while the screen is open: the list (and the entry's date) follow the New York calendar.
   useEffect(() => {
