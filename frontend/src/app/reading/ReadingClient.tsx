@@ -9,6 +9,7 @@ import InfoHint from "@/components/InfoHint";
 import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type Medium, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -151,32 +152,69 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         )}
       </div>
 
-      <QuestCard o={o} />
+      {/* Personalize: every card, checkpoint tile and list is its own part; sections have no extra heading on screen. */}
+      <PartGrid page="/reading" title="Reading" gap={16}>
+      <PartGroup id="section-quest" title="Quest & pace">
+        <Part id="quest" title="Quest (progress, level, streak)">
+          <QuestCard o={o} />
+        </Part>
 
-      {/* Burn-up */}
-      <section className="mt-4 bg-surface-card border border-border-subtle rounded-card shadow-card px-4 pt-3 pb-1">
-        <div className="flex items-baseline justify-between mb-1">
-          <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Chapters vs pace</h3>
-          <span className="text-[11px] font-mono text-text-tertiary">
-            {fmtDate(o.book.start_date)} → {fmtDate(o.book.target_date)}
-          </span>
-        </div>
-        <BurnupChart data={o.burnup} today={o.today} total={o.totalChapters} />
-      </section>
+        {/* Burn-up */}
+        <Part id="burnup" title="Chapters vs pace">
+          <section className="bg-surface-card border border-border-subtle rounded-card shadow-card px-4 pt-3 pb-1">
+            <div className="flex items-baseline justify-between mb-1">
+              <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Chapters vs pace</h3>
+              <span className="text-[11px] font-mono text-text-tertiary">
+                {fmtDate(o.book.start_date)} → {fmtDate(o.book.target_date)}
+              </span>
+            </div>
+            <BurnupChart data={o.burnup} today={o.today} total={o.totalChapters} />
+          </section>
+        </Part>
+      </PartGroup>
 
-      <Checkpoints o={o} />
+      {/* Checkpoints: one tile each (ids by position, so a layout carries over to the next book), three across like before. */}
+      <PartGroup
+        id="section-checkpoints"
+        title="Checkpoints"
+        gridClassName="grid grid-cols-3 gap-2"
+        header={o.checkpoints.length ? <CheckpointsHeader /> : null}
+      >
+        {o.checkpoints.map((c, i) => (
+          <Part key={c.key} id={`checkpoint-${i + 1}`} title={`Checkpoint ${i + 1} (ch ${c.chapter})`}>
+            <CheckpointTile c={c} />
+          </Part>
+        ))}
+      </PartGroup>
 
-      <ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} />
+      <PartGroup id="section-practice" title="Review & capture">
+        <Part id="review" title="Review">
+          <ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} />
+        </Part>
 
-      <SessionForm o={o} onLogged={(xp, finished) => { showToast({ text: finished ? `Finished! +${xp} XP` : `+${xp} XP`, kind: "xp" }); load(slug, true); }} onError={(m) => showToast({ text: m, kind: "err" })} />
+        <Part id="log-session" title="Log a session">
+          <SessionForm o={o} onLogged={(xp, finished) => { showToast({ text: finished ? `Finished! +${xp} XP` : `+${xp} XP`, kind: "xp" }); load(slug, true); }} onError={(m) => showToast({ text: m, kind: "err" })} />
+        </Part>
 
-      <HighlightForm o={o} onAdded={(n) => { showToast({ text: n === 1 ? "+5 XP · highlight" : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onError={(m) => showToast({ text: m, kind: "err" })} />
+        <Part id="add-highlight" title="Highlight + comment">
+          <HighlightForm o={o} onAdded={(n) => { showToast({ text: n === 1 ? "+5 XP · highlight" : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onError={(m) => showToast({ text: m, kind: "err" })} />
+        </Part>
+      </PartGroup>
 
-      <Badges o={o} />
+      <PartGroup id="section-history" title="Badges & history">
+        <Part id="badges" title="Badges">
+          <Badges o={o} />
+        </Part>
 
-      <HighlightsList o={o} onChanged={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
+        <Part id="highlights" title="Highlights by concept">
+          <HighlightsList o={o} onChanged={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
+        </Part>
 
-      <SessionsList o={o} />
+        <Part id="session-log" title="Session log">
+          <SessionsList o={o} />
+        </Part>
+      </PartGroup>
+      </PartGrid>
 
       {toast && (
         <div className="fixed bottom-[calc(env(safe-area-inset-bottom)+5rem)] md:bottom-6 left-1/2 -translate-x-1/2 z-20">
@@ -283,47 +321,45 @@ function Stat({ icon, label, value, sub, valueClass, subClass }: { icon?: React.
   );
 }
 
-function Checkpoints({ o }: { o: ReadingOverview }) {
-  if (!o.checkpoints.length) return null;
+function CheckpointsHeader() {
   return (
-    <section className="mt-4">
-      <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">Checkpoints</h3>
-      <div className="grid grid-cols-3 gap-2">
-        {o.checkpoints.map((c) => {
-          const state = c.reached ? (c.onTime ? "done" : "late") : c.onTime === false ? "missed" : "upcoming";
-          const border =
-            state === "done" ? "border-accent/60" : state === "late" ? "border-[var(--color-mid)]/60" : state === "missed" ? "border-[var(--color-down)]/60" : "border-border-subtle";
-          return (
-            <div key={c.key} className={`bg-surface-card border ${border} rounded-control px-3 py-2.5`}>
-              <div className="text-[13px] font-medium text-text-primary">Ch {c.chapter}</div>
-              <div className="text-[11px] font-mono text-text-tertiary">by {fmtDate(c.due)}</div>
-              <div className="mt-1.5 text-[11px] font-mono">
-                {state === "done" && <span className="text-up">✓ on time</span>}
-                {state === "late" && <span className="text-[var(--color-mid)]">✓ late</span>}
-                {state === "missed" && <span className="text-[var(--color-down)]">missed</span>}
-                {state === "upcoming" && <span className="text-text-tertiary">upcoming</span>}
-              </div>
-              <div className="mt-1 text-[11px] font-mono text-text-tertiary">
-                {c.quiz ? (
-                  <span className={c.quiz.score / c.quiz.total >= 0.8 ? "text-accent" : "text-text-secondary"}>
-                    quiz {c.quiz.score}/{c.quiz.total}
-                  </span>
-                ) : c.reached ? (
-                  <Link href="/chat" className="text-accent/80 underline underline-offset-2">
-                    quiz me →
-                  </Link>
-                ) : (
-                  "no quiz yet"
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-      <p className="mt-1.5 text-[11px] text-text-tertiary">
+    <div className="mb-2">
+      <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Checkpoints</h3>
+      <p className="mt-0.5 text-[11px] text-text-tertiary">
         Quiz in <Link href="/chat" className="underline underline-offset-2">Health Q&amp;A</Link> (&ldquo;quiz me through chapter 12&rdquo;). 80% passes.
       </p>
-    </section>
+    </div>
+  );
+}
+
+function CheckpointTile({ c }: { c: ReadingOverview["checkpoints"][number] }) {
+  const state = c.reached ? (c.onTime ? "done" : "late") : c.onTime === false ? "missed" : "upcoming";
+  const border =
+    state === "done" ? "border-accent/60" : state === "late" ? "border-[var(--color-mid)]/60" : state === "missed" ? "border-[var(--color-down)]/60" : "border-border-subtle";
+  return (
+    <div className={`bg-surface-card border ${border} rounded-control px-3 py-2.5`}>
+      <div className="text-[13px] font-medium text-text-primary">Ch {c.chapter}</div>
+      <div className="text-[11px] font-mono text-text-tertiary">by {fmtDate(c.due)}</div>
+      <div className="mt-1.5 text-[11px] font-mono">
+        {state === "done" && <span className="text-up">✓ on time</span>}
+        {state === "late" && <span className="text-[var(--color-mid)]">✓ late</span>}
+        {state === "missed" && <span className="text-[var(--color-down)]">missed</span>}
+        {state === "upcoming" && <span className="text-text-tertiary">upcoming</span>}
+      </div>
+      <div className="mt-1 text-[11px] font-mono text-text-tertiary">
+        {c.quiz ? (
+          <span className={c.quiz.score / c.quiz.total >= 0.8 ? "text-accent" : "text-text-secondary"}>
+            quiz {c.quiz.score}/{c.quiz.total}
+          </span>
+        ) : c.reached ? (
+          <Link href="/chat" className="text-accent/80 underline underline-offset-2">
+            quiz me →
+          </Link>
+        ) : (
+          "no quiz yet"
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -360,7 +396,7 @@ function ReviewCard({ o, onGraded }: { o: ReadingOverview; onGraded: (xp: number
   };
 
   return (
-    <section className="mt-4 bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-review">
+    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-review">
       <div className="flex items-baseline justify-between">
         <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Review</h3>
         <span className="text-[11px] font-mono text-text-tertiary">
@@ -440,7 +476,7 @@ function SessionForm({ o, onLogged, onError }: { o: ReadingOverview; onLogged: (
   };
 
   return (
-    <section className="mt-4 bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-session-form">
+    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-session-form">
       <div className="flex items-baseline justify-between">
         <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary flex items-center gap-1.5">
           <BookMarked className="w-3.5 h-3.5" /> Log a session
@@ -562,7 +598,7 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
   };
 
   return (
-    <section className="mt-4 bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-highlight-form">
+    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-highlight-form">
       <div className="flex items-center justify-between">
         <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary flex items-center gap-1.5">
           <Highlighter className="w-3.5 h-3.5" /> Highlight + comment
@@ -648,7 +684,7 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
 
 function Badges({ o }: { o: ReadingOverview }) {
   return (
-    <section className="mt-4">
+    <section>
       <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2 flex items-center gap-1.5">
         <Trophy className="w-3.5 h-3.5" /> Badges
       </h3>
@@ -698,7 +734,7 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
   };
 
   return (
-    <section className="mt-6">
+    <section className="pt-2">
       <button onClick={() => setOpen((s) => !s)} className="flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">
         <ChevronDown className={`w-3.5 h-3.5 transition-transform ${open ? "" : "-rotate-90"}`} />
         Highlights by concept ({o.highlights.length})
@@ -760,7 +796,7 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
 function SessionsList({ o }: { o: ReadingOverview }) {
   const [open, setOpen] = useState(false);
   return (
-    <section className="mt-4">
+    <section>
       <button onClick={() => setOpen((s) => !s)} className="flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">
         <ChevronDown className={`w-3.5 h-3.5 transition-transform ${open ? "" : "-rotate-90"}`} />
         Session log ({o.sessions.length})
