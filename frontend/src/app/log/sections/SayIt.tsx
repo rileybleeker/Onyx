@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import InfoHint from "@/components/InfoHint";
 import { VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
+import { sayItJournalDraft } from "@/lib/journal-file";
 import { FROM_WHAT_YOU_SAID, setLogDraft, setLogDrafts, type LogDraftMap } from "@/lib/log-drafts";
 import type { LogVoiceResult } from "@/lib/log-voice";
 import { LogCard } from "./ui";
@@ -25,7 +26,7 @@ import { LogCard } from "./ui";
 export const REPLACES_CHECKIN_SAY_IT_ONCE = true;
 
 type Shown =
-  | { kind: "filled"; result: LogVoiceResult & { unavailable?: string[] } }
+  | { kind: "filled"; result: LogVoiceResult & { unavailable?: string[]; error?: string } }
   | { kind: "error"; message: string };
 
 // Memory only (see above).
@@ -71,7 +72,9 @@ export default function SayItSection() {
       });
       const json = (await res.json().catch(() => null)) as (LogVoiceResult & { unavailable?: string[]; failed?: boolean; error?: string }) | null;
       if (!res.ok || !json || json.failed || !Array.isArray(json.supplements) || !Array.isArray(json.ubereats)) {
-        show({ kind: "error", message: !res.ok && json?.error ? `Couldn't read that: ${json.error}` : "Couldn't read that for the journal, supplements, Uber Eats, weight and reading. Try again." });
+        const message = !res.ok && json?.error ? `Couldn't read that: ${json.error}` : "Couldn't read that for the journal, supplements, Uber Eats, weight and reading. Try again.";
+        // A "journal:" note needs no model: its entry (the words after the prefix, verbatim) is still offered.
+        if (!offerPrefixedJournal(words, message)) show({ kind: "error", message });
         return;
       }
       // Only sections the words filled get a draft: an empty answer leaves a section's earlier suggestion alone.
@@ -84,10 +87,34 @@ export default function SayItSection() {
       setLogDrafts(drafts, words);
       show({ kind: "filled", result: json });
     } catch {
-      show({ kind: "error", message: "Couldn't reach Onyx. Your words are still here." });
+      const message = "Couldn't reach Onyx. Your words are still here.";
+      if (!offerPrefixedJournal(words, message)) show({ kind: "error", message });
     } finally {
       if (mounted.current) setBusy(false);
     }
+  };
+
+  // The fallback above: true when the words start with "journal:" and the Journal section got them as a draft.
+  const offerPrefixedJournal = (words: string, error: string): boolean => {
+    const journal = sayItJournalDraft(words, null);
+    if (!journal) return false;
+    setLogDrafts({ journal }, words);
+    const n = journal.body.split(/\s+/).length;
+    show({
+      kind: "filled",
+      result: {
+        day: "",
+        supplements: [],
+        ubereats: [],
+        weight: null,
+        reading: null,
+        journal,
+        summary: { journal: [`Entry, ${n} word${n === 1 ? "" : "s"} of yours`], supplements: [], ubereats: [], weight: [], reading: [] },
+        not_matched: [],
+        error,
+      },
+    });
+    return true;
   };
 
   const clear = () => {
@@ -153,7 +180,7 @@ export default function SayItSection() {
 }
 
 /** What one Fill suggested, per section. */
-function Filled({ result }: { result: LogVoiceResult & { unavailable?: string[] } }) {
+function Filled({ result }: { result: LogVoiceResult & { unavailable?: string[]; error?: string } }) {
   const { summary } = result;
   const rows: Array<{ name: string; lines: string[] }> = [
     { name: "Check-in", lines: ["Filling the questions below"] },
@@ -186,9 +213,10 @@ function Filled({ result }: { result: LogVoiceResult & { unavailable?: string[] 
           </div>
         ) : null}
       </dl>
+      {result.error ? <p className="text-[13px] text-down">{result.error}</p> : null}
       {unavailable.length > 0 ? <p className="text-[12px] text-mid">Couldn&apos;t load {unavailable.join(", ")}; not filled.</p> : null}
       <p className="text-[12px] text-text-secondary">
-        {empty.length > 0 ? `Nothing for ${empty.map((n) => (n === "Uber Eats" ? n : n.toLowerCase())).join(", ")}. ` : ""}
+        {!result.error && empty.length > 0 ? `Nothing for ${empty.map((n) => (n === "Uber Eats" ? n : n.toLowerCase())).join(", ")}. ` : ""}
         Check each section, then press its Save.
       </p>
     </div>
