@@ -10,12 +10,12 @@ import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
  * /log Weight. Shows the day's weight with its source (Tanita scale rollup or a manual entry) and takes one pounds
  * entry through POST /api/weight {log_date, weight_kg}, the same route and rules as the /nutrition quick-log:
  * one row per ET calendar day, no day after today, 0 to 1000 lb, and saving a day that already has a row replaces
- * it (a manual entry then owns that day, so the scale rollup stops touching it). Reads GET /api/weight?days=90
- * through the client cache (same key as the Today overview card). A Say it draft (WeightLogDraft) fills the form as
- * a suggestion; nothing is written until Save.
+ * it (a manual entry then owns that day, so the scale rollup stops touching it). Reads GET /api/weight?days=365
+ * through the client cache: a year, so the last weigh-in still shows after a long gap (the table holds at most one
+ * row per day). A Say it draft (WeightLogDraft) fills the form as a suggestion; nothing is written until Save.
  */
 
-const WEIGHT_URL = "/api/weight?days=90";
+const WEIGHT_URL = "/api/weight?days=365";
 
 interface WeightRow {
   log_date: string;
@@ -175,7 +175,7 @@ export default function WeightSection() {
         setData((prev) => {
           const kept = (prev?.rows ?? []).filter((r) => r.log_date !== row.log_date);
           const next = [...kept, row].sort((a, b) => (a.log_date < b.log_date ? -1 : a.log_date > b.log_date ? 1 : 0));
-          return { days: prev?.days ?? 90, rows: next };
+          return { days: prev?.days ?? 365, rows: next };
         });
       }
       setInput("");
