@@ -37,6 +37,8 @@ function isCiRoute(pathname: string): boolean {
     // Onyx Focus iPhone app: read-only "are today's chosen habits done?" (2026-11-13).
     // Exact path - never /api/focus/* (the settings route /api/focus/config stays session-only).
     pathname === "/api/focus/unlock-status" ||
+    // Care calendar catch-up (care-calendar-catch-up.yml, every 6 h): the same Google Calendar sync as Sync now; answers counts and a short code only. Exact path.
+    pathname === "/api/jobs/care-calendar-catch-up" ||
     // Renewal cards for /agents: the sms-reminders Worker claims subscriptions that renew within
     // 3 days (Riley's decision, 2026-11-13). The response carries only an opaque id, the merchant
     // name, the estimated date and the days until it - never an amount. Exact path: every other
