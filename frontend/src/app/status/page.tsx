@@ -5,7 +5,7 @@ import { useEffect, useState, useCallback, useRef, type RefObject } from "react"
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
-import { Part, PartGrid } from "@/components/personalize/PartGrid";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import PersonalTable, { type TableColumn } from "@/components/personalize/PersonalTable";
 import { sameJson } from "@/lib/format";
 import { clientCache } from "@/lib/client-cache";
@@ -201,6 +201,13 @@ const HISTORY_COLUMNS: TableColumn[] = [
   { id: "records", label: "Records", th: HISTORY_TH_RIGHT, td: "py-2 pr-4 text-right font-mono text-text-secondary tabular-nums" },
   { id: "duration", label: "Duration", th: HISTORY_TH_RIGHT, td: "py-2 pr-4 text-right font-mono text-text-tertiary tabular-nums" },
 ];
+
+/**
+ * The source-card section's grid: the dense tile columns (1 / 2 / 3 / 5), one card per cell. Widths chosen in
+ * Personalize still apply here: Full takes the row, Half two cells from 640 px; Third and Quarter stay one cell.
+ */
+const SOURCE_TILES_GRID =
+  "pz-grid pz-tiles [&>[data-w=full]]:col-span-full! sm:[&>[data-w=half]]:col-span-2!";
 
 function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus }) {
   const badge = SOURCE_BADGE[sourceKey] ?? sourceKey.toUpperCase();
@@ -533,11 +540,16 @@ export default function StatusPage() {
         </button>
       </div>
 
+      {/* Personalize: every banner, KPI tile, source card and the history table is its own part; parts move
+          within their section and into any other section of the page. */}
+      <PartGrid page="/status" title="System Status">
+      <PartGroup id="kpis" title="Overview">
       {/* tz_log_gaps banner — per ADR-0001 drastic-TZ-abroad gap #3. WHOOP
           cycles whose offset disagrees with pds.tz_for_instant — Riley
           likely traveled but forgot to add a user_tz_log entry. */}
       {tzGapRanges.length > 0 && (
-        <div className="mb-6 border border-yellow-500/30 bg-yellow-500/10 rounded-control p-4">
+        <Part id="tz-gaps" title="Travel without a log entry">
+        <div className="border border-yellow-500/30 bg-yellow-500/10 rounded-control p-4">
           <div className="flex items-center gap-2 mb-2">
             <span className="w-2 h-2 rounded-full bg-yellow-400" />
             <p className="text-[13px] font-medium text-yellow-300">
@@ -564,11 +576,13 @@ export default function StatusPage() {
             <code className="text-yellow-200/80">{`INSERT INTO pds.user_tz_log(effective_from, tz) VALUES ('${tzGapRanges[0].from}T00:00:00Z', 'Europe/Berlin');`}</code>
           </p>
         </div>
+        </Part>
       )}
 
       {/* Drift alerts banner */}
       {driftAlerts.length > 0 && (
-        <div className="mb-6 border border-red-500/30 bg-red-500/10 rounded-control p-4">
+        <Part id="drift-alerts" title="HRV model drift">
+        <div className="border border-red-500/30 bg-red-500/10 rounded-control p-4">
           <div className="flex items-center gap-2 mb-2">
             <span className="w-2 h-2 rounded-full bg-red-400" />
             <p className="text-[13px] font-medium text-red-300">
@@ -584,12 +598,11 @@ export default function StatusPage() {
             ))}
           </ul>
         </div>
+        </Part>
       )}
 
-      <PartGrid page="/status" title="System Status">
-      <Part id="kpis" title="Status tiles">
-      {/* KPI row */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      {/* KPI tiles */}
+      <Part id="sources-online" title="Sources Online" width="quarter">
         <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Sources Online"
@@ -601,37 +614,42 @@ export default function StatusPage() {
             size={120}
           />
         </div>
+      </Part>
+      <Part id="last-etl-run" title="Last ETL Run" width="quarter">
         <StatCard
           label="Last ETL Run"
           value={mostRecentSync ? formatRelativeTime(mostRecentSync) : "—"}
           sublabel={mostRecentSync ? formatSyncTime(mostRecentSync) : "No data"}
         />
+      </Part>
+      <Part id="records-today" title="Records · Latest Today" width="quarter">
         <StatCard
           label="Records · Latest Today"
           value={recordsLatestToday > 0 ? recordsLatestToday.toLocaleString() : "—"}
           sublabel="latest run per source"
         />
+      </Part>
+      <Part id="active-errors" title="Active Errors" width="quarter">
         <StatCard
           label="Active Errors"
           value={activeErrors}
           sublabel={activeErrors === 0 ? "all sources healthy" : `${activeErrors} source${activeErrors !== 1 ? "s" : ""} need attention`}
         />
-      </div>
-
       </Part>
+      </PartGroup>
 
-      {/* Source cards: a tile zone of their own, so single cards can be moved and hidden */}
-      <Part id="sources" title="Source cards" nested>
-        <PartGrid page="/status" zone="sources" title="System Status" className="pz-tiles" gap={16}>
-          {sourceList.map(({ key, info }) => (
-            <Part key={key} id={key} title={info.label}>
-              <SourceCard sourceKey={key} info={info} />
-            </Part>
-          ))}
-        </PartGrid>
-      </Part>
+      {/* Source cards: one part per source (ids = source keys, kept from the earlier tile zone so saved
+          orders still apply). The group keeps the dense tile columns; Full / Half widen a card in it. */}
+      <PartGroup id="sources" title="Source cards" gridClassName={SOURCE_TILES_GRID}>
+        {sourceList.map(({ key, info }) => (
+          <Part key={key} id={key} title={info.label} width="quarter">
+            <SourceCard sourceKey={key} info={info} />
+          </Part>
+        ))}
+      </PartGroup>
 
       {/* Sync history */}
+      <PartGroup id="history" title="Sync History">
       {history.length > 0 && (
         <Part id="sync-history" title="Sync History">
         <ChartCard title="Sync History" subtitle="Last 20 pipeline runs">
@@ -679,6 +697,7 @@ export default function StatusPage() {
         </ChartCard>
         </Part>
       )}
+      </PartGroup>
       </PartGrid>
     </>
   );
