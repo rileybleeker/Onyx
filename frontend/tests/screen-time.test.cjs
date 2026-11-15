@@ -205,6 +205,10 @@ test("the page is not a token route and is in the nav", () => {
 const React = require("react");
 const { renderToStaticMarkup } = require("react-dom/server");
 
+// The four chart parts (one component each); every stub draws the number of rows it got.
+const chartStub = ({ points }) => React.createElement("div", { "data-charts": points.length });
+const CHARTS_STUB = { __esModule: true, DailyTotalChart: chartStub, LateNightChart: chartStub, PickupsChart: chartStub, SleepOnsetChart: chartStub };
+
 async function renderPage(load, search = {}) {
   let asked = null;
   const page = loadTs("app/screen-time/page.tsx", {
@@ -215,7 +219,8 @@ async function renderPage(load, search = {}) {
       },
     },
     "next/link": { __esModule: true, default: ({ href, children, ...rest }) => React.createElement("a", { href, ...rest }, children) },
-    "./ScreenTimeCharts": { __esModule: true, default: ({ points }) => React.createElement("div", { "data-charts": points.length }) },
+    "next/headers": { cookies: async () => ({ get: () => undefined }) },
+    "./ScreenTimeCharts": CHARTS_STUB,
   });
   const html = renderToStaticMarkup(await page.default({ searchParams: Promise.resolve(search) }));
   return { html, asked };
@@ -315,7 +320,7 @@ test("feed: /api/screen-time/page-data answers the page's view data for ?days=; 
 test("feed: the scroll section draws the same screen, with window buttons and the feed heading", () => {
   const View = loadTs("app/screen-time/ScreenTimeView.tsx", {
     "next/link": { __esModule: true, default: ({ href, children, ...rest }) => React.createElement("a", { href, ...rest }, children) },
-    "./ScreenTimeCharts": { __esModule: true, default: ({ points }) => React.createElement("div", { "data-charts": points.length }) },
+    "./ScreenTimeCharts": CHARTS_STUB,
   }).default;
   const draw = (props) => renderToStaticMarkup(React.createElement(View, { feed: true, onWindow: () => {}, ...props }));
   const empty = draw({ data: { kind: "empty", windowDays: 14, sync: null }, windowDays: 14 });
