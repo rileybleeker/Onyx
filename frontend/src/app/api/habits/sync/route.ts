@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
+import { fetchActiveHabitsCached } from "@/lib/habits-notion";
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_HABITS_DB = process.env.NOTION_HABITS_DB || "29cc936fd5e14ae8b10a4fe5c5f7a6cd";
@@ -26,6 +27,11 @@ export async function POST() {
   if (!NOTION_API_KEY) {
     return NextResponse.json({ error: "NOTION_API_KEY not configured" }, { status: 500 });
   }
+
+  // Keep the shared habit-list cache (lib/habits-notion.ts) warm: this route runs hourly and on every /habits visit,
+  // so the cached list the check-in screen reads is at most about an hour old. Read in parallel; awaited before the
+  // answer so Next refreshes a stale entry in the background (waitUntil).
+  const habitsCacheWarm = fetchActiveHabitsCached().catch(() => null);
 
   // Fetch ALL active habits (not just ones with Last Completed)
   const res = await fetch(`https://api.notion.com/v1/databases/${NOTION_HABITS_DB}/query`, {
@@ -224,5 +230,6 @@ export async function POST() {
     }
   }
 
+  await habitsCacheWarm;
   return NextResponse.json({ synced, renamed, metadataChanged, count: synced.length });
 }
