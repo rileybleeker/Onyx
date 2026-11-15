@@ -2,6 +2,12 @@
 
 Read by every coding agent (Claude Code, Codex, Cursor, Copilot, Gemini CLI, …). This is the only project-instructions file; there is no CLAUDE.md.
 
+## Read this first: testing and checks (Riley, 2026-11-15)
+
+- **Do not run automated tests before merging, not even locally or "just the relevant one".** That means no `node --test`, no `frontend/scripts/test-*.mjs` (above all the `-ui.mjs` browser tests), no pytest and no `tests/run_offline_tests.py`. The scheduled suite runs every test against each deployed revision within 30 minutes, and a red run comes back as a normal fix PR. Running them first only slows you and the other agents on this PC.
+- **Do type-check frontend changes:** run `npx tsc --noEmit` in `frontend/` before opening the PR (2–15 s). It is the production build's own check, not a test, and nothing else runs it before merge.
+- **Still write tests.** Add or update tests when behavior changes. The "Tests:" lists in the sections below name the tests that cover an area so you know what to update. They are not steps to run.
+
 Personal health data aggregation and analytics platform.
 Syncs biometric data from Garmin, WHOOP, and Eight Sleep into a unified Supabase Postgres database,
 visualized via a Next.js frontend with AI-powered analysis through Claude.
