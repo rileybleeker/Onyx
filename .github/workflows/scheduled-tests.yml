@@ -73,10 +73,14 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci --ignore-scripts
       - name: Offline Node tests (auto-discovered - add a test file, not a workflow line; *-ui.mjs needs a browser and is excluded)
+        # Every file runs even after one fails (the step used to stop at the first failure, so one red file hid the
+        # results of every file after it); the step fails at the end and names each failed file.
         run: |
           shopt -s nullglob
-          for f in tests/*.test.cjs; do node --test "$f"; done
-          for f in scripts/test-*.mjs; do case "$f" in *-ui.mjs) continue;; esac; node "$f"; done
+          failed=0
+          for f in tests/*.test.cjs; do node --test "$f" || { echo "::error::$f failed"; failed=1; }; done
+          for f in scripts/test-*.mjs; do case "$f" in *-ui.mjs) continue;; esac; node "$f" || { echo "::error::$f failed"; failed=1; }; done
+          exit "$failed"
       - name: Status freshness regression tests (synthetic, no credentials)
         run: node test-status-freshness.cjs
       - run: npx --no-install tsc --noEmit
