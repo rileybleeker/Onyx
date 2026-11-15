@@ -8,14 +8,36 @@ const ts = require('typescript');
 const React = require('react');
 const { renderToStaticMarkup } = require('react-dom/server');
 let pathname = '/today';
-function load(file, mocks = {}) {
+const SRC = path.resolve('src');
+// Resolve an import the way the app's bundler does: "@/x" is src/x (tsconfig paths), "./x" and "../x" sit next to
+// the importing file, as .ts / .tsx source. Anything else is a real node module (react, lucide-react, ...).
+function resolveSource(name, from) {
+  let base = null;
+  if (name.startsWith('@/')) base = path.join(SRC, name.slice(2));
+  else if (name.startsWith('./') || name.startsWith('../')) base = path.resolve(path.dirname(from), name);
+  if (base === null) return null;
+  for (const ext of ['.ts', '.tsx']) if (fs.existsSync(base + ext)) return base + ext;
+  return null;
+}
+// Real source modules (Sidebar's own imports such as ./personalize/PersonalizeButton, @/lib/nav-areas and
+// @/lib/personalize-registry) are transpiled and loaded too, once per file like the bundle, so the Sidebar and
+// the Personalize button share one registry. Only the mocked browser/auth boundaries are replaced.
+function load(file, mocks = {}, cache = new Map()) {
   const filename = path.resolve(file);
+  if (cache.has(filename)) return cache.get(filename).exports;
   const mod = new Module(filename, module);
+  cache.set(filename, mod);
   mod.paths = module.paths;
   const originalRequire = mod.require.bind(mod);
-  mod.require = (name) => name in mocks ? mocks[name] : originalRequire(name);
+  mod.require = (name) => {
+    if (name in mocks) return mocks[name];
+    const source = resolveSource(name, filename);
+    return source ? load(source, mocks, cache) : originalRequire(name);
+  };
   mod._compile(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true },
+    // fileName keeps .ts files out of the JSX parser; a modern target keeps for...of over a Set or Map working.
+    fileName: path.basename(filename),
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true },
   }).outputText, filename);
   return mod.exports;
 }
@@ -39,6 +61,33 @@ const Sidebar = load('src/components/Sidebar.tsx', {
 }).default;
 const render = () => renderToStaticMarkup(React.createElement(Sidebar));
 const hrefs = (html) => [...html.matchAll(/href="([^"]+)"/g)].map((m) => m[1]);
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Sidebar's element tree, captured inside a real render so its hooks run in React (calling it bare would not).
+function sidebarTree() {
+  let tree;
+  function Capture() { tree = Sidebar(); return tree; }
+  renderToStaticMarkup(React.createElement(Capture));
+  return tree;
+}
+const textOf = (node) => {
+  if (node == null || typeof node === 'boolean') return '';
+  if (typeof node !== 'object') return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join('');
+  return textOf(node.props && node.props.children);
+};
+// The first host element (div, button, ...) in the tree that matches; components are not expanded.
+function findHost(node, match) {
+  if (node == null || typeof node !== 'object') return null;
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = findHost(child, match);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  if (typeof node.type === 'string' && match(node)) return node;
+  return findHost(node.props && node.props.children, match);
+}
 test('every catalog destination appears once without removal or duplication', () => {
   assert.deepEqual(hrefs(render()).sort(), nav.NAV_ITEMS.map((item) => item.href).sort());
 });
@@ -52,15 +101,17 @@ test('Today and Check-in are pinned outside the scrollable library', () => {
 test('current page remains correctly marked for every destination', () => {
   for (const item of nav.NAV_ITEMS) {
     pathname = item.href;
-    assert.equal((render().match(/aria-current="page"/g) || []).length, 1);
-    assert.ok(render().includes(`href="${item.href}" aria-current="page"`));
+    const html = render();
+    assert.equal((html.match(/aria-current="page"/g) || []).length, 1);
+    // The marker sits on this destination's own link (other attributes, e.g. data-nav-area, may come between).
+    assert.match(html, new RegExp(`<a href="${escapeRe(item.href)}"[^>]*\\saria-current="page"`), item.href);
   }
 });
 test('search uses existing palette event and platform shortcut', () => {
   let received;
   global.window = { dispatchEvent: (event) => { received = event.type; } };
-  const tree = Sidebar();
-  const search = tree.props.children[1].props.children;
+  const search = findHost(sidebarTree(), (el) => el.type === 'button' && textOf(el).includes('Search…'));
+  assert.ok(search, 'search button');
   search.props.onClick();
   assert.equal(received, 'test-open-palette');
   assert.ok(render().includes('Ctrl K'));
@@ -74,6 +125,8 @@ test('every item shows its go-to shortcut as "G <key>" (desktop only)', () => {
 test('installed app controls remain present and sidebar remains desktop-only', () => {
   const html = render();
   for (const label of ['Install fixture', 'Reload fixture', 'Sign out']) assert.ok(html.includes(label));
+  // The real Personalize button (components/personalize/PersonalizeButton.tsx), not a fixture.
+  assert.ok(html.includes('>Personalize</button>'), 'Personalize');
   assert.ok(html.includes('max-md:hidden'));
 });
 // CI's offline stage has no browser installed. Opt in after installing Playwright:
