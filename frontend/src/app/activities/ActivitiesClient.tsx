@@ -10,6 +10,7 @@ import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import { Part, PartGrid } from "@/components/personalize/PartGrid";
+import { useInFeed } from "@/components/FeedContext";
 import { chartTooltip, axisTick, gridStyle, axisLabel, sourceColors, chartColors as C } from "@/lib/chart-theme";
 import { mergeDailySteps, stepsSourceLabel } from "@/lib/steps";
 import {
@@ -421,6 +422,9 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
   // any failure. The entry doubles as the draft - toggling a ghost chip edits it in place.
   const [suggestions, setSuggestions] = useState<Record<string, TagSuggestion>>({});
   const suggestStarted = useRef(false);
+  // Inside the continuous scroll this page is only a neighbour, and scrolling never writes: asking for
+  // suggestions calls the model and stores its answer, so it happens only on /activities itself.
+  const inFeed = useInFeed();
   const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
@@ -573,7 +577,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
   // every row and caps the batch at SUGGEST_MAX_ITEMS), and stays silent on any failure - a missing
   // suggestion is just the manual pills as before. No tag is ever written without Accept.
   useEffect(() => {
-    if (loading || suggestStarted.current) return;
+    if (inFeed || loading || suggestStarted.current) return;
     const cutoff = Date.now() - SUGGEST_WINDOW_DAYS * 24 * 60 * 60 * 1000;
     const wanted = rows.filter(
       (r) =>
@@ -609,7 +613,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
         }
       }
     })();
-  }, [loading, rows]);
+  }, [inFeed, loading, rows]);
 
   // Best-effort: tell the server this activity's suggestion is done (dismissed or accepted).
   function resolveSuggestion(act: ActivityRow) {
