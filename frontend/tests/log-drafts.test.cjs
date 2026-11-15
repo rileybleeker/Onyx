@@ -90,7 +90,7 @@ test("the sections are Personalize parts in the default order, each its own file
   assert.deepEqual(ids, ["say-it", "check-in", "journal", "supplements", "uber-eats", "weight", "reading"]);
   assert.match(client, /<PartGrid page="\/log" title="Log">/);
   for (const f of ["SayIt", "CheckIn", "Journal", "Supplements", "UberEats", "Weight", "Reading"]) {
-    assert.match(client, new RegExp(`import\("\./sections/${f}"\)`), f);
+    assert.match(client, new RegExp(`import\\("\\./sections/${f}"\\)`), f);
     assert.ok(fs.existsSync(path.join(SRC, "app/log/sections", `${f}.tsx`)), f);
   }
 });
