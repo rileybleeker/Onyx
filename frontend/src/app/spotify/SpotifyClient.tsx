@@ -10,6 +10,7 @@ import {
 import ChartCard from "@/components/ChartCard";
 import InfoHint from "@/components/InfoHint";
 import StatCard from "@/components/StatCard";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel, chartColors as C } from "@/lib/chart-theme";
 import { sameJson } from "@/lib/format";
@@ -738,21 +739,30 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
       )}
 
       {!loading && hasData && (
-        <>
+        // Personalize: every KPI tile, chart and list is its own part, in four sections; a part moves within its
+        // section or into another. Header, range filter, modals and the loading / empty states stay fixed.
+        <PartGrid page="/spotify" title="Spotify">
           {/* KPI Row */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <PartGroup id="overview" title="Overview">
+            <Part id="plays" title="Plays" width="quarter">
             <StatCard label="Plays" value={kpis!.totalPlays} sublabel={rangeLabel(range)} />
+            </Part>
+            <Part id="listening-hours" title="Listening" width="quarter">
             <StatCard
               label="Listening"
               value={kpis!.totalHours.toFixed(1)}
               unit="hrs"
               sublabel={rangeLabel(range)}
             />
+            </Part>
+            <Part id="unique-tracks" title="Unique Tracks" width="quarter">
             <StatCard
               label="Unique Tracks"
               value={kpis!.uniqueTracks}
               sublabel={`${kpis!.uniqueArtists} artists`}
             />
+            </Part>
+            <Part id="top-track" title="Top Track" width="quarter">
             <StatCard
               label="Top Track"
               value={kpis!.topTrack ? `${kpis!.topTrack.count}×` : "—"}
@@ -762,9 +772,10 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
                   : undefined
               }
             />
-          </div>
+            </Part>
 
           {/* Listening volume over time */}
+          <Part id="listening-volume" title="Listening volume">
           <ChartCard
             title="Listening volume"
             subtitle={`plays per day, ${rangeLabel(range)}`}
@@ -788,10 +799,15 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
               </LineChart>
             </ResponsiveContainer>
           </ChartCard>
+          </Part>
+          </PartGroup>
 
           {/* Taste evolution — three trend charts */}
-          <section className="space-y-4">
-            <div className="border-l-2 border-source-spotify/40 pl-3">
+          <PartGroup
+            id="taste"
+            title="Taste evolution"
+            header={
+            <div className="border-l-2 border-source-spotify/40 pl-3 mb-4">
               <div className="flex items-center gap-2">
                 <h2 className="text-[14px] font-medium text-text-primary">Taste evolution</h2>
                 <InfoHint label="Taste evolution">
@@ -801,8 +817,11 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
               </div>
               <p className="text-[11px] text-text-tertiary mt-0.5">{rangeLabel(range)}</p>
             </div>
+            }
+          >
 
             {/* Sound evolution — audio feature drift */}
+            <Part id="sound-evolution" title="Sound evolution">
             <ChartCard
               title="Sound evolution"
               subtitle={`7 audio features over time — ${rangeLabel(range)}`}
@@ -843,8 +862,10 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
                 </ResponsiveContainer>
               )}
             </ChartCard>
+            </Part>
 
             {/* Genre rotation — stacked area */}
+            <Part id="genre-rotation" title="Genre rotation">
             <ChartCard
               title="Genre rotation"
               subtitle={`top ${genreRotation.topGenres.length} genres + other — ${rangeLabel(range)}`}
@@ -890,8 +911,10 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
                 </ResponsiveContainer>
               )}
             </ChartCard>
+            </Part>
 
             {/* Discovery rate */}
+            <Part id="discovery-rate" title="Discovery rate">
             <ChartCard
               title="Discovery rate"
               subtitle={`% of plays that were brand-new tracks — ${rangeLabel(range)}`}
@@ -917,9 +940,12 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
                 </ResponsiveContainer>
               )}
             </ChartCard>
-          </section>
+            </Part>
+          </PartGroup>
 
           {/* Current sonic profile */}
+          <PartGroup id="favorites" title="Profile & favorites">
+          <Part id="sonic-profile" title="Current sonic profile">
           <ChartCard
             title="Current sonic profile"
             subtitle={`play-weighted mean of 7 audio features — ${rangeLabel(range)}`}
@@ -972,9 +998,10 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
               </p>
             )}
           </ChartCard>
+          </Part>
 
           {/* Top genres + top artists + top tracks side by side */}
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <Part id="top-genres" title="Top genres" width="third">
             <ChartCard
               title="Top genres"
               subtitle={`${rangeLabel(range)}, by play count`}
@@ -998,7 +1025,9 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
                 )}
               </ol>
             </ChartCard>
+            </Part>
 
+            <Part id="top-artists" title="Top artists" width="third">
             <ChartCard title="Top artists" subtitle={`${rangeLabel(range)}, by play count`} source="SPOTIFY">
               <ol className="space-y-1.5">
                 {topArtists.map((a, i) => (
@@ -1017,7 +1046,9 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
                 )}
               </ol>
             </ChartCard>
+            </Part>
 
+            <Part id="top-tracks" title="Top tracks" width="third">
             <ChartCard title="Top tracks" subtitle={`${rangeLabel(range)}, by play count`} source="SPOTIFY">
               <button
                 onClick={() => setModalOpen(true)}
@@ -1044,9 +1075,12 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
                 )}
               </ol>
             </ChartCard>
-          </div>
+            </Part>
+          </PartGroup>
 
           {/* Hour of day */}
+          <PartGroup id="listening-log" title="Listening log">
+          <Part id="by-hour" title="Listening by hour of day">
           <ChartCard
             title="Listening by hour of day"
             subtitle={`ET, ${rangeLabel(range)}`}
@@ -1063,8 +1097,10 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
               </BarChart>
             </ResponsiveContainer>
           </ChartCard>
+          </Part>
 
           {/* Play ledger */}
+          <Part id="play-ledger" title="Play ledger">
           <ChartCard
             title="Play ledger"
             subtitle={`every play, newest first · ${rangeLabel(range)}${ledgerTotal > 0 ? ` · ${ledgerTotal.toLocaleString()} plays` : ""}`}
@@ -1138,7 +1174,9 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
               </>
             )}
           </ChartCard>
-        </>
+          </Part>
+          </PartGroup>
+        </PartGrid>
       )}
     </div>
   );
