@@ -78,17 +78,34 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const today = etDate(now.toISOString());
     const since = new Date(now.getTime() - HISTORY_DAYS * 86_400_000).toISOString().slice(0, 10);
     const balSince = new Date(now.getTime() - 60 * 86_400_000).toISOString();
+    // Every read below is independent, so all of them start now (one round trip instead of five in a row);
+    // each result is awaited where it is used. started() kicks off a lazy query builder and keeps a failure
+    // from becoming an unhandled rejection when an earlier step returns first.
+    const started = <T>(q: PromiseLike<T>): Promise<T> => {
+      const p = Promise.resolve(q);
+      p.catch(() => {});
+      return p;
+    };
+    const fixesRead = started(loadCategoryFixes(db));
+    const planRead = started(
+      Promise.all([
+        db.from("finance_plan_items").select("id,label,item_date,amount_cents,certainty,repeat_unit,repeat_every,repeat_count,note").is("removed_at", null).order("item_date", { ascending: true }),
+        db.from("finance_plan_drivers").select("key,value"),
+      ]),
+    );
+    const snapsRead = started(db.from("finance_forecast_snapshots").select("as_of,week_end,likely_cents,low_cents,high_cents").lt("week_end", today).order("week_end", { ascending: false }).limit(200));
+    const goalsRead = started(db.from("finance_goals").select("id,name,target_cents,target_date,account_key").is("removed_at", null).order("target_date", { ascending: true }));
     const [acc, bal, txn] = await Promise.all([
       db.from("finance_accounts").select("account_key,institution,account_name,account_type,mask"),
-      fetchPaged((f, t) => db.from("finance_balance_snapshots").select("account_key,captured_at,balance_cents,currency,kind", { count: "exact" }).gte("captured_at", balSince).order("captured_at", { ascending: true }).range(f, t), MAX_PAGES),
-      fetchPaged((f, t) => db.from("finance_transactions").select(TXN_COLS, { count: "exact" }).gte("txn_date", since).order("txn_date", { ascending: true }).order("txn_key", { ascending: true }).range(f, t), MAX_PAGES),
+      fetchPaged((f, t, c) => db.from("finance_balance_snapshots").select("account_key,captured_at,balance_cents,currency,kind", c ? { count: "exact" } : undefined).gte("captured_at", balSince).order("captured_at", { ascending: true }).order("account_key", { ascending: true }).range(f, t), MAX_PAGES),
+      fetchPaged((f, t, c) => db.from("finance_transactions").select(TXN_COLS, c ? { count: "exact" } : undefined).gte("txn_date", since).order("txn_date", { ascending: true }).order("txn_key", { ascending: true }).range(f, t), MAX_PAGES),
     ]);
     if (acc.error) return { kind: "error", code: acc.error.code ?? "accounts" };
     const parsedAccounts = (acc.data ?? []).map(parseAccount).filter((a): a is NonNullable<typeof a> => !!a);
     if (!parsedAccounts.length) return { kind: "empty" };
     const accounts: ForecastAccount[] = parsedAccounts.map((a) => ({ account_key: a.account_key, account_type: a.account_type, label: accountLabel(a) }));
     const balances: ForecastBalance[] = bal.rows.map(parseBalance).filter((b): b is NonNullable<typeof b> => !!b);
-    const fixes = await loadCategoryFixes(db);
+    const fixes = await fixesRead;
     const txns: ForecastTxn[] = [];
     for (const raw of txn.rows) {
       const r = raw as Record<string, unknown>;
@@ -108,10 +125,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
 
     // Plan inputs: a missing table (migration not applied) shows the forecast without them.
     let setupPending = false;
-    const [itemsRes, driversRes] = await Promise.all([
-      db.from("finance_plan_items").select("id,label,item_date,amount_cents,certainty,repeat_unit,repeat_every,repeat_count,note").is("removed_at", null).order("item_date", { ascending: true }),
-      db.from("finance_plan_drivers").select("key,value"),
-    ]);
+    const [itemsRes, driversRes] = await planRead;
     if (itemsRes.error || driversRes.error) setupPending = true;
     const itemRows = ((itemsRes.data ?? []) as ItemRow[]).map((r) => ({ ...r, amount_cents: Number(r.amount_cents) }));
     const drivers = ((driversRes.data ?? []) as DriverRow[]).filter((d) => d && typeof d.key === "string" && d.value && typeof d.value === "object");
@@ -168,7 +182,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     }
     // Forecast vs actual: snapshots of past weeks against the balance rebuilt from the ledger.
     const accuracy: AccuracyRow[] = [];
-    const snaps = await db.from("finance_forecast_snapshots").select("as_of,week_end,likely_cents,low_cents,high_cents").lt("week_end", today).order("week_end", { ascending: false }).limit(200);
+    const snaps = await snapsRead;
     if (!snaps.error && snaps.data?.length && result.state === "ok") {
       const poolSet = new Set(result.pool.map((p) => p.account_key));
       const poolTxns = txns.filter((t) => poolSet.has(t.account_key));
@@ -193,7 +207,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     }
     // Savings goals: progress from the latest balances, and the forecast for goals on the cash pool.
     let goals: GoalView[] = [];
-    const goalRes = await db.from("finance_goals").select("id,name,target_cents,target_date,account_key").is("removed_at", null).order("target_date", { ascending: true });
+    const goalRes = await goalsRead;
     if (!goalRes.error && goalRes.data) {
       const latestBal = new Map<string, number>();
       const latestAt = new Map<string, string>();

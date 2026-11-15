@@ -24,7 +24,7 @@ export async function loadBudgetData(now: Date = new Date()): Promise<{ txns: Bu
   // 400 days: budgets use about 7 months, subscription detection needs the year (annual renewals).
   const since = new Date(Date.parse(`${today}T00:00:00Z`) - 400 * 86_400_000).toISOString().slice(0, 10);
   const [rows, fixes, budgetsRes] = await Promise.all([
-    fetchPaged((f, t) => db.from("finance_transactions").select(COLS, { count: "exact" }).gte("txn_date", since).order("txn_date", { ascending: true }).order("txn_key", { ascending: true }).range(f, t), 40),
+    fetchPaged((f, t, c) => db.from("finance_transactions").select(COLS, c ? { count: "exact" } : undefined).gte("txn_date", since).order("txn_date", { ascending: true }).order("txn_key", { ascending: true }).range(f, t), 40),
     loadCategoryFixes(db),
     db.from("finance_budgets").select("category,monthly_cents"),
   ]);
@@ -55,10 +55,13 @@ export async function loadBudgetData(now: Date = new Date()): Promise<{ txns: Bu
 
 export async function loadBudgets(now: Date = new Date()): Promise<BudgetsLoad> {
   try {
+    // The cancel marks are read at the same time as the ledger (one round trip, not two in a row).
+    const marksRead = Promise.resolve(serviceClient().from("finance_cancel_marks").select("sub_id,marked_on"));
+    marksRead.catch(() => {});
     const d = await loadBudgetData(now);
     if (!d.txns.length) return { kind: "empty" };
     const result = computeBudgets(d.txns, d.budgets, d.today);
-    const marksRes = await serviceClient().from("finance_cancel_marks").select("sub_id,marked_on");
+    const marksRes = await marksRead;
     const marks = new Map(((marksRes.data ?? []) as { sub_id: string; marked_on: string }[]).map((m) => [m.sub_id, m.marked_on]));
     const subscriptions = subscriptionViews(detectRecurring(d.txns, d.today), marks, d.today);
     return { kind: "ok", result, categories: categoryOptions(result.categoriesSeen), rules: d.rules.sort((a, b) => a.merchantKey.localeCompare(b.merchantKey)), setupPending: d.setupPending, subscriptions };

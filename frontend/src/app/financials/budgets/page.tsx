@@ -1,14 +1,16 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { loadBudgets } from "@/lib/finance-budgets-server";
+import { cachedBudgets } from "@/lib/finance-result-cache-server";
 import BudgetsView from "./BudgetsView";
 
-// Private financial data: per request on the server, never ISR, never cached; owner-only via middleware.
+// Private financial data: per request on the server, never ISR, never cached by the CDN; owner-only via
+// middleware. The computed budgets are stored server-side (pds.finance_result_cache) and reused until the
+// ledger, the budgets or the category fixes change.
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Budgets - Onyx", robots: { index: false, follow: false } };
 
 export default async function BudgetsPage() {
-  const load = await loadBudgets(new Date());
+  const load = await cachedBudgets(new Date());
   return (
     <main className="mx-auto max-w-6xl space-y-6 p-4 md:p-8">
       <header>
