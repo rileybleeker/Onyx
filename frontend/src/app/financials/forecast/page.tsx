@@ -1,11 +1,14 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { loadForecast } from "@/lib/cash-forecast-server";
-import { parseScenarioParams } from "@/lib/cash-forecast-scenario";
+import { cachedForecast } from "@/lib/finance-result-cache-server";
+import { hasLevers, parseScenarioParams } from "@/lib/cash-forecast-scenario";
 import ForecastView from "./ForecastView";
 
 // Private financial data: rendered per request on the server, never ISR, never cached by the CDN; the
 // finance and plan tables are service-role only and the middleware lets only the owner reach this route.
+// Without what-if levers the computed forecast is stored server-side (pds.finance_result_cache) and reused
+// until the ledger or the plan changes; with levers it is computed for the request.
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = {
   title: "Cash forecast - Onyx",
@@ -15,7 +18,8 @@ export const metadata: Metadata = {
 export default async function ForecastPage({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const sp = await searchParams;
   const levers = parseScenarioParams((k) => (typeof sp[k] === "string" ? (sp[k] as string) : null));
-  const load = await loadForecast(new Date(), levers);
+  const now = new Date();
+  const load = hasLevers(levers) ? await loadForecast(now, levers) : await cachedForecast(now);
   return (
     <main className="mx-auto max-w-6xl space-y-6 p-4 md:p-8">
       <header>

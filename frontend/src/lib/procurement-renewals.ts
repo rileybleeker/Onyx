@@ -95,12 +95,58 @@ export type RenewalSummary =
  * A failed ledger read is the route's business (HTTP 500), never an empty summary.
  */
 export function renewalSummary(load: Exclude<DetectedLoad, { state: "error" }>): RenewalSummary {
+  return summaryFromAhead(renewalsAhead(load), load.state === "ok" ? load.today : "");
+}
+
+/**
+ * The stored form of the Today summary (pds.finance_result_cache, key "renewals"): every alertable
+ * renewal due today or later, as {merchant, date} only (no amounts), soonest first, plus the day it was
+ * computed for. The summary for a LATER day is derived from it without re-reading the ledger
+ * (summaryFromAhead): an estimate that is today or later belongs to an active subscription and does not
+ * move with the date, so the derived summary equals a fresh computation until the ledger changes.
+ */
+export type RenewalsAhead =
+  | { status: "empty" }
+  | { status: "ready"; from: string; upcoming: { merchant: string; date: string }[] };
+
+export function renewalsAhead(load: Exclude<DetectedLoad, { state: "error" }>): RenewalsAhead {
   if (load.state === "empty") return { status: "empty" };
-  const soon = renewalsWithin(load.subs, load.today, RENEWAL_SOON_DAYS);
+  const upcoming = renewalRows(load.subs, load.today)
+    .filter((r) => r.alertable && r.days >= 0)
+    .map((r) => ({ merchant: r.merchant, date: r.date }));
+  return { status: "ready", from: load.today, upcoming };
+}
+
+/** The Today summary on `today` (never earlier than the day the stored form was computed for). */
+export function summaryFromAhead(ahead: RenewalsAhead, today: string): RenewalSummary {
+  if (ahead.status === "empty") return { status: "empty" };
+  const on = today > ahead.from ? today : ahead.from;
+  // The stored order is soonest first, then merchant; every date shifts by the same number of days, so a
+  // stable sort on days keeps it.
+  const soon = ahead.upcoming
+    .map((u) => ({ ...u, days: daysBetween(on, u.date) }))
+    .filter((r) => r.days >= 0 && r.days <= RENEWAL_SOON_DAYS)
+    .sort((a, b) => a.days - b.days);
   return {
     status: "ready",
     count: soon.length,
     soon: soon.slice(0, RENEWAL_SUMMARY_MAX).map((r) => ({ merchant: r.merchant, days: r.days, date: r.date, label: renewalPhrase(r.days) })),
     withinDays: RENEWAL_SOON_DAYS,
   };
+}
+
+/** A stored RenewalsAhead read back from the database, or null when it is not one. */
+export function parseRenewalsAhead(body: unknown): RenewalsAhead | null {
+  if (!body || typeof body !== "object") return null;
+  const b = body as Record<string, unknown>;
+  if (b.status === "empty") return { status: "empty" };
+  const isDay = (v: unknown): v is string => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+  if (b.status !== "ready" || !isDay(b.from) || !Array.isArray(b.upcoming)) return null;
+  const upcoming: { merchant: string; date: string }[] = [];
+  for (const u of b.upcoming) {
+    const r = u as Record<string, unknown> | null;
+    if (!r || typeof r.merchant !== "string" || !isDay(r.date)) return null;
+    upcoming.push({ merchant: r.merchant, date: r.date });
+  }
+  return { status: "ready", from: b.from, upcoming };
 }

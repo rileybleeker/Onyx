@@ -110,26 +110,50 @@ function check<T extends { error: PgErr | null }>(res: T): T {
   return res;
 }
 
+type PageResult = { data: unknown[] | null; error: PgErr | null; count: number | null };
+
 /**
- * Page through a query 1000 rows at a time. The exact row count (asked for on every page) decides
- * when to stop, so a project whose PostgREST max-rows is lower than 1000 still returns every row
- * instead of silently stopping after a short first page. `truncated` is true when the page cap cut
- * the read off before the count was reached.
+ * Read every row of a query in pages. The first page asks for the exact row count; the remaining
+ * pages are then requested all at once (in parallel) and joined in offset order, so the result is
+ * the same as reading them one after another as long as `build` orders by a unique key.
+ *
+ * `withCount` tells `build` whether to ask for the count (only the first page needs it). The page
+ * size is the number of rows the first page actually returned, so a project whose PostgREST
+ * max-rows is lower than 1000 still returns every row instead of leaving gaps between pages.
+ * Without a count (a builder that never asks for one) the pages are read one after another until
+ * a short page. `truncated` is true when the page cap cut the read off before the count.
  */
 export async function fetchPaged(
-  build: (from: number, to: number) => PromiseLike<{ data: unknown[] | null; error: PgErr | null; count: number | null }>,
+  build: (from: number, to: number, withCount: boolean) => PromiseLike<PageResult>,
   maxPages: number,
 ): Promise<{ rows: unknown[]; truncated: boolean }> {
-  const rows: unknown[] = [];
-  for (let i = 0; i < maxPages; i++) {
-    const { data, count } = check(await build(rows.length, rows.length + PAGE - 1));
-    const got = data ?? [];
-    rows.push(...got);
-    if (got.length === 0 || (typeof count === "number" ? rows.length >= count : got.length < PAGE)) {
-      return { rows, truncated: false };
+  const first = check(await build(0, PAGE - 1, true));
+  const rows: unknown[] = [...(first.data ?? [])];
+  const step = rows.length;
+  const total = typeof first.count === "number" ? first.count : null;
+  if (step === 0 || (total !== null ? rows.length >= total : step < PAGE)) return { rows, truncated: false };
+
+  if (total === null) {
+    for (let i = 1; i < maxPages; i++) {
+      const got = check(await build(rows.length, rows.length + PAGE - 1, false)).data ?? [];
+      rows.push(...got);
+      if (got.length < PAGE) return { rows, truncated: false };
     }
+    return { rows, truncated: true };
   }
-  return { rows, truncated: true };
+
+  const needed = Math.ceil(total / step);
+  const starts = Array.from({ length: Math.min(needed, maxPages) - 1 }, (_, i) => (i + 1) * step);
+  const pages = await Promise.all(
+    starts.map(async (from) => {
+      const res = await build(from, from + step - 1, false);
+      // Rows removed since the count: PostgREST answers a range past the end with 416 (PGRST103).
+      if (res.error?.code === "PGRST103") return [];
+      return check(res).data ?? [];
+    }),
+  );
+  for (const got of pages) rows.push(...got);
+  return { rows, truncated: needed > maxPages };
 }
 
 async function dateEdge(db: Db, ascending: boolean): Promise<string | null> {
@@ -182,8 +206,8 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
     return fail(e);
   }
   try {
-    const fixes = await loadCategoryFixes(db);
-    const [accountsRes, minDate, maxDate, txHeartbeat, balHeartbeat] = await Promise.all([
+    const [fixes, accountsRes, minDate, maxDate, txHeartbeat, balHeartbeat] = await Promise.all([
+      loadCategoryFixes(db),
       db.from("finance_accounts").select(ACCOUNT_COLS).order("institution").order("account_name").order("account_key"),
       dateEdge(db, true),
       dateEdge(db, false),
@@ -221,10 +245,10 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
 
     const windowStart = monthStart(trailingMonths(month, TREND_MONTHS)[0]);
     const windowEnd = monthStart(shiftMonth(month, 1)); // exclusive
-    const windowRead = fetchPaged((from, to) => {
+    const windowRead = fetchPaged((from, to, withCount) => {
       let qb = db
         .from("finance_transactions")
-        .select(WINDOW_COLS, { count: "exact" })
+        .select(WINDOW_COLS, withCount ? { count: "exact" } : undefined)
         .gte("txn_date", windowStart)
         .lt("txn_date", windowEnd);
       if (account) qb = qb.eq("account_key", account);

@@ -27,10 +27,10 @@ export async function loadDetectedSubscriptions(now: Date = new Date()): Promise
     const today = etDate(now.toISOString());
     const since = addDays(today, -RECURRING_WINDOW_DAYS);
     const { rows } = await fetchPaged(
-      (from, to) =>
+      (from, to, withCount) =>
         db
           .from("finance_transactions")
-          .select(COLS, { count: "exact" })
+          .select(COLS, withCount ? { count: "exact" } : undefined)
           .gte("txn_date", since)
           .order("txn_date", { ascending: false })
           .order("txn_key", { ascending: true })

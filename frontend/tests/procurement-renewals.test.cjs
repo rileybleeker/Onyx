@@ -92,12 +92,16 @@ test("summary: nothing due is ready with a zero count; an empty ledger is its ow
 });
 
 // ─── the route: ready / empty / failed are distinct, nothing cached ──────────────────────────
+// The route reads the stored detection (lib/finance-result-cache-server.ts, tested in
+// tests/finance-result-cache.test.cjs); here that layer is a pass-through to the stubbed loader.
 function route(load) {
   const stubs = {
     "next/server": {
       NextResponse: { json: (body, init = {}) => ({ body, status: init.status ?? 200, headers: init.headers ?? {} }) },
     },
-    "@/lib/procurement-recurring-server": { loadDetectedSubscriptions: async () => load },
+    "@/lib/finance-result-cache-server": {
+      cachedRenewalsAhead: async () => (load.state === "error" ? null : N.renewalsAhead(load)),
+    },
   };
   return loadTs("app/api/procurement/renewals/summary/route.ts", stubs);
 }
