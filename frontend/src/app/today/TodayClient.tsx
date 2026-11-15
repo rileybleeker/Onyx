@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import styles from "./Today.module.css";
 import { ArrowUpRight, BookOpen, CalendarClock, CalendarDays, ClipboardCheck, FlaskConical, Mail, Package, RefreshCw, Wallet, X } from "lucide-react";
-import type { MoneyAlert } from "@/lib/finance-alerts";
 import { agentsApi, clearDeviceNotifications, setBadge, type InboxResponse, type InboxItem } from "@/lib/agents-api";
 import type { ReadingOverview } from "@/lib/reading";
 import type { UrgentEmailResponse } from "@/lib/urgent-email-query";
@@ -18,6 +17,8 @@ import { type EmailClearMark, MAX_CLEAR_ITEMS, clearedLabel, hiddenEmailKey } fr
 // Import-free too: the shared client cache (Today renders from it at once, then revalidates) and sameJson.
 import { CACHE_KEYS, clientCache, isGoneStatus } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
+// Import-free too: how current the money alerts are (bundled by name in the same test).
+import { MONEY_FRESH_URL, MONEY_RECHECK_MS, MONEY_URL, moneyNote, parseMoneyAnswer, showMoneyPanel, type MoneyView } from "@/lib/money-alerts-view";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -91,11 +92,6 @@ function parseRenewals(data: unknown): RenewalSummary {
   if (!v || (v.status !== "empty" && !(v.status === "ready" && Array.isArray(v.soon) && typeof v.count === "number"))) throw new Error("Invalid renewals");
   return v;
 }
-function parseMoney(data: unknown): MoneyAlert[] {
-  const v = data as { status?: string; alerts?: MoneyAlert[] } | null;
-  if (!v || v.status !== "ready" || !Array.isArray(v.alerts)) throw new Error("Invalid money alerts");
-  return v.alerts;
-}
 function parseExperiment(data: unknown): ExperimentToday {
   if (!isExperimentToday(data)) throw new Error("Invalid experiment arm");
   return data;
@@ -104,7 +100,6 @@ const READING_URL = "/api/reading";
 const URGENT_URL = "/api/urgent-email";
 const ORDERS_URL = "/api/orders/summary";
 const RENEWALS_URL = "/api/procurement/renewals/summary";
-const MONEY_URL = "/api/finance/alerts";
 const EXPERIMENT_URL = "/api/experiments/today";
 // Today and tomorrow in this device's zone; the server pads the range by a day on each side.
 function calendarUrl(): string {
@@ -153,8 +148,12 @@ export default function TodayClient() {
   // Subscription renewals (GET /api/procurement/renewals/summary) follow the same rule: shown only
   // when one is due within 3 days; a failed check hides the panel, /procurement has the details.
   const [renewals, setRenewals] = useState<RenewalSummary | null>(() => cachedValue(RENEWALS_URL, parseRenewals));
-  // Money alerts (GET /api/finance/alerts): shown only when there is something to act on; a failed check keeps the last answer.
-  const [money, setMoney] = useState<MoneyAlert[] | null>(() => cachedValue(MONEY_URL, parseMoney));
+  // Money alerts (GET /api/finance/alerts): shown when there is something to act on, or when "nothing to act on"
+  // is not verified (an older answer that could not be updated, or part of the check missing); every shown answer
+  // says how current it is (lib/money-alerts-view.ts). A failed check keeps the last answer, marked.
+  const [money, setMoney] = useState<MoneyView | null>(() => cachedValue(MONEY_URL, parseMoneyAnswer));
+  // The one follow-up read after an `updating` (older, being recomputed) answer.
+  const moneyRecheck = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
   const sequence = useRef(0);
   const inFlight = useRef(false);
@@ -214,9 +213,26 @@ export default function TodayClient() {
     const renewalsRequest = request(RENEWALS_URL, parseRenewals).then((value) => {
       if (sequence.current === current) setRenewals((previous) => sameJson(previous, value) ? previous : value);
     }).catch(() => { /* keep the last summary; /procurement has the details */ });
-    const moneyRequest = request(MONEY_URL, parseMoney).then((value) => {
-      if (sequence.current === current) setMoney((previous) => sameJson(previous, value) ? previous : value);
-    }).catch(() => { /* keep the last alerts; /financials has the details */ });
+    const keepMarked = (previous: MoneyView | null): MoneyView | null => previous && !previous.refreshFailed ? { ...previous, refreshFailed: true } : previous;
+    const moneyRequest = request(MONEY_URL, parseMoneyAnswer).then((value) => {
+      if (sequence.current !== current) return;
+      setMoney((previous) => sameJson(previous, value) ? previous : value);
+      if (!value.updating) return;
+      // An older stored answer, recomputed on the server after it answered: ask once more for the current one
+      // (?fresh=1 computes it if the background refresh has not landed). A newer load cancels this.
+      if (moneyRecheck.current) clearTimeout(moneyRecheck.current);
+      moneyRecheck.current = setTimeout(() => {
+        moneyRecheck.current = null;
+        if (sequence.current !== current) return;
+        void bounded(getJson(MONEY_FRESH_URL).then((data) => {
+          const next = parseMoneyAnswer(data);
+          clientCache.put(MONEY_URL, data);
+          return next;
+        })).then((next) => {
+          if (sequence.current === current) setMoney((previous) => sameJson(previous, next) ? previous : next);
+        }).catch(() => { if (sequence.current === current) setMoney(keepMarked); });
+      }, MONEY_RECHECK_MS);
+    }).catch(() => { if (sequence.current === current) setMoney(keepMarked); });
     const experimentRequest = request(EXPERIMENT_URL, parseExperiment).then((value) => {
       if (sequence.current === current) setExperiment(fresh(value));
     }).catch(() => { if (sequence.current === current) setExperiment((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
@@ -255,6 +271,7 @@ export default function TodayClient() {
       // eslint-disable-next-line react-hooks/exhaustive-deps
       sequence.current++;
       inFlight.current = false;
+      if (moneyRecheck.current) { clearTimeout(moneyRecheck.current); moneyRecheck.current = null; }
       document.removeEventListener("visibilitychange", visible);
     };
   }, [load]);
@@ -341,6 +358,7 @@ export default function TodayClient() {
   const agendaByDay = agenda ? eventsByDay(agenda.events, calendarDays[0].day, calendarDays[1].day) : null;
   const calendarSync = agenda ? syncHealth(agenda.lastSync, now.getTime()) : "never";
   const renewing = renewals?.status === "ready" && renewals.count > 0 ? renewals : null;
+  const moneyStatus = money ? moneyNote(money, now) : null;
   return (
     <div className={styles.today}>
       <header className={styles.header}>
@@ -519,15 +537,16 @@ export default function TodayClient() {
         </ul>}
         <Link href="/orders" className={`${linkStyle} mt-4 inline-block`}>Open orders</Link>
       </section>}
-      {money && money.length > 0 && <section className={panelStyle} aria-labelledby="money-heading">
+      {money && showMoneyPanel(money) && <section className={panelStyle} aria-labelledby="money-heading" aria-busy={money.updating && !money.refreshFailed}>
         <div className="flex items-center gap-2"><Wallet aria-hidden="true" className="h-5 w-5 text-accent" />
           <h2 id="money-heading" className="text-lg font-medium text-text-primary">Money</h2></div>
-        <ul className="mt-3 space-y-2" aria-label="Money alerts">
-          {money.slice(0, 5).map((a, i) => <li key={i} className="break-words">
+        {money.alerts.length > 0 && <ul className="mt-3 space-y-2" aria-label="Money alerts">
+          {money.alerts.slice(0, 5).map((a, i) => <li key={i} className="break-words">
             <Link href={a.href} className={`text-sm ${a.severity === "high" ? "text-down" : "text-text-primary"} hover:underline`}>{a.title}</Link>
             <p className="text-xs text-text-secondary">{a.detail}</p>
           </li>)}
-        </ul>
+        </ul>}
+        {moneyStatus && <p className={`mt-3 text-sm ${moneyStatus.tone === "warn" ? "text-amber-300" : "text-text-secondary"}`}>{moneyStatus.text}</p>}
         <p className="mt-2 text-xs text-text-secondary">From your forecast and budgets. Onyx never moves money.</p>
         <Link href="/financials/budgets" className={`${linkStyle} mt-4 inline-block`}>Open budgets</Link>
       </section>}
