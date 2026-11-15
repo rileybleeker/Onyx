@@ -597,6 +597,37 @@ def fetch_all(table: str, select: str = "*", filters: list | None = None,
     return pd.DataFrame(rows)
 
 
+# Supplement rollup source (sql/db_perf_2026_11.sql, docs/db-perf-2026-11.md).
+# The live view recomputes its whole JSONB expansion for every 1000-row page
+# (10.6k rows = 11 pages, ~95 ms each, 2026-11-14). The matview copy is refreshed
+# within ~5 minutes of any supplement write. Until Riley applies the SQL the
+# matview does not exist, so the read falls back to the live view unchanged.
+SUPPLEMENT_ROLLUP_MAT = "supplement_intake_by_compound_mat"
+SUPPLEMENT_ROLLUP_VIEW = "supplement_intake_by_compound"
+_MISSING_RELATION_CODES = {"PGRST205", "42P01"}
+
+
+def fetch_supplement_rollup(select: str, fetch=None) -> pd.DataFrame:
+    """Read the per-day supplement rollup from its matview, else from the live view.
+
+    `fetch` defaults to fetch_all (injectable for tests). Any error on the matview
+    falls back to the live view: the two hold the same rows, so the fallback only
+    costs time. A missing matview (not applied yet) logs at info; anything else
+    logs a warning so a broken grant or refresh is visible in the run log.
+    """
+    fetch = fetch or fetch_all
+    try:
+        return fetch(SUPPLEMENT_ROLLUP_MAT, select=select)
+    except Exception as e:  # postgrest APIError, network error, ...
+        code = getattr(e, "code", None)
+        msg = f"  {SUPPLEMENT_ROLLUP_MAT} unavailable ({code or type(e).__name__}); reading {SUPPLEMENT_ROLLUP_VIEW}"
+        if code in _MISSING_RELATION_CODES:
+            log.info(msg)
+        else:
+            log.warning(f"{msg}: {str(e)[:200]}")
+        return fetch(SUPPLEMENT_ROLLUP_VIEW, select=select)
+
+
 def to_date_str(s: pd.Series) -> pd.Series:
     """Coerce a series to 'YYYY-MM-DD' string dates.
 
@@ -862,8 +893,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     )
 
     log.info("  Loading supplement_intake_by_compound…")
-    data["supplements"] = fetch_all(
-        "supplement_intake_by_compound",
+    data["supplements"] = fetch_supplement_rollup(
         select="calendar_date,ingredient_group,categories,unit,total_amount",
     )
     if not data["supplements"].empty:
