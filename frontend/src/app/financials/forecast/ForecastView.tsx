@@ -274,7 +274,7 @@ export default function ForecastView({
       <section className={card} aria-labelledby="fc-acc">
         <h2 id="fc-acc" className="font-semibold">How accurate has the forecast been?</h2>
         {accuracy.length === 0 ? (
-          <p className="mt-1 text-[13px] text-text-secondary">A snapshot is saved every Monday; this fills in as weeks pass. The backtest on 18 months of history: typically off by about 13% of a month&apos;s spending at 4 weeks, with about 80% of outcomes inside the range.</p>
+          <p className="mt-1 text-[13px] text-text-secondary">A snapshot is saved every Monday; this fills in as weeks pass. Backtest on 18 months of history (64 weekly runs): typically off by about 17% of a month&apos;s outflows at 4 weeks and 32% at 13 weeks, with no average bias; about 85% of outcomes landed inside the range.</p>
         ) : (
           <table className="mt-2 w-full text-[13px]">
             <thead className="text-[12px] text-text-tertiary">
