@@ -117,6 +117,34 @@ def test_unknown_times():
     assert out.loc["2026-01-08", "delivery_late_meal"] == 0
 
 
+def test_leftover_meals_count_on_the_day_eaten():
+    # The view (sql/delivery_leftover_time.sql) adds leftover meals: counts per day, and TIMED
+    # ones already folded into late_meal_delivery / the gap to sleep.
+    rows = _delivery().assign(leftover_meal_count=0, untimed_leftover_meal_count=0)
+    extra = pd.DataFrame([
+        # a leftover-only day eaten late, with a time
+        {"behavioral_date": "2026-01-04", "meal_order_count": 0, "untimed_meal_order_count": 0,
+         "late_meal_delivery": True, "last_meal_delivery_to_sleep_minutes": 30.0,
+         "leftover_meal_count": 1, "untimed_leftover_meal_count": 0},
+        # a leftover-only day with no time: counted, late flag unknown
+        {"behavioral_date": "2026-01-09", "meal_order_count": 0, "untimed_meal_order_count": 0,
+         "late_meal_delivery": None, "last_meal_delivery_to_sleep_minutes": None,
+         "leftover_meal_count": 1, "untimed_leftover_meal_count": 1},
+    ])
+    rows.loc[rows["behavioral_date"] == "2026-01-05", "leftover_meal_count"] = 1  # receipt + leftover
+    out = h.merge_delivery_features(_matrix(), pd.concat([rows, extra], ignore_index=True),
+                                    "2026-01-10").set_index("calendar_date")
+    assert out.loc["2026-01-04", "delivery_meal_count"] == 1
+    assert out.loc["2026-01-04", "delivery_any_meal"] == 1
+    assert out.loc["2026-01-04", "delivery_late_meal"] == 1
+    assert out.loc["2026-01-04", "delivery_last_meal_to_sleep_min"] == 30.0
+    assert out.loc["2026-01-05", "delivery_meal_count"] == 3
+    assert out.loc["2026-01-09", "delivery_any_meal"] == 1
+    assert np.isnan(out.loc["2026-01-09", "delivery_late_meal"])
+    # a frame from before the columns existed still merges
+    assert _merged().loc["2026-01-05", "delivery_meal_count"] == 2
+
+
 def test_fail_open():
     m = _matrix()
     assert h.merge_delivery_features(m, None) is m

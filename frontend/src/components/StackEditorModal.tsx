@@ -155,7 +155,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
       onClick={onClose}
     >
       <div
-        className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card p-5 w-full max-w-lg mt-12"
+        className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 w-full max-w-lg mt-12"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-3">
@@ -180,7 +180,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
           onChange={(e) => setName(e.target.value)}
           disabled={saving}
           placeholder="e.g. Morning stack"
-          className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none disabled:opacity-50"
+          className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
         />
 
         <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
@@ -192,7 +192,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
           onChange={(e) => setDescription(e.target.value)}
           disabled={saving}
           placeholder="e.g. taken right after waking"
-          className="w-full mb-4 px-3 py-2 text-[13px] bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none disabled:opacity-50"
+          className="w-full mb-4 px-3 py-2 text-[13px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
         />
 
         <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
@@ -205,7 +205,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
             onChange={(e) => setRemindTime(e.target.value)}
             disabled={saving}
             aria-label="Reminder time"
-            className="px-3 py-2 text-[13px] tabular-nums bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none disabled:opacity-50"
+            className="px-3 py-2 text-[13px] tabular-nums bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
           />
           {remindTime && (
             <button
@@ -231,7 +231,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
         </div>
 
         {items.length === 0 ? (
-          <p className="text-[11px] text-text-tertiary font-mono py-3 text-center border border-dashed border-border-subtle rounded-[4px] mb-3">
+          <p className="text-[11px] text-text-tertiary font-mono py-3 text-center border border-dashed border-border-subtle rounded-control mb-3">
             No products yet — add one below.
           </p>
         ) : (
@@ -241,7 +241,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
               return (
                 <div
                   key={it.product_id}
-                  className="flex items-center gap-2 bg-black/30 border border-border-subtle rounded-[4px] px-3 py-2"
+                  className="flex items-center gap-2 bg-black/30 border border-border-subtle rounded-control px-3 py-2"
                 >
                   <div className="min-w-0 flex-1">
                     <p className="text-[12px] text-text-primary truncate">
@@ -260,7 +260,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
                     value={it.doses}
                     onChange={(e) => setDoses(it.product_id, e.target.value)}
                     disabled={saving}
-                    className="w-[64px] px-2 py-1 text-[13px] tabular-nums bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none disabled:opacity-50"
+                    className="w-[64px] px-2 py-1 text-[13px] tabular-nums bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
                     title="Doses logged for this product"
                   />
                   <span className="text-[10px] text-text-tertiary font-mono shrink-0">dose</span>
@@ -284,7 +284,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
             value={addProductId}
             onChange={(e) => addItem(e.target.value)}
             disabled={saving || available.length === 0}
-            className="flex-1 px-3 py-2 text-[12px] bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-[#1DB954]/50 outline-none disabled:opacity-50"
+            className="flex-1 px-3 py-2 text-[12px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
           >
             <option value="">
               {available.length === 0 ? "All library products added" : "+ Add a product…"}
@@ -322,7 +322,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
             <button
               onClick={save}
               disabled={saving}
-              className="px-4 py-2 text-[12px] font-medium text-text-primary bg-[#1DB954]/20 hover:bg-[#1DB954]/30 disabled:opacity-40 disabled:cursor-not-allowed border border-[#1DB954]/40 rounded-[4px] transition-colors"
+              className="px-4 py-2 text-[12px] font-medium text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed border border-accent rounded-full transition-colors"
             >
               {saving ? "Saving…" : isNew ? "Create stack" : "Save changes"}
             </button>

@@ -4,7 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { Part, PartGrid, PartGroup } from "@/components/personalize/PartGrid";
+import PersonalTable, { type TableColumn } from "@/components/personalize/PersonalTable";
 import RangeFilter from "@/components/RangeFilter";
+import LogLink from "@/components/LogLink";
 // @zxing/browser is ~120 kB of route JS but only needed once the user taps
 // "Scan barcode" — load it lazily on first open instead of on page load.
 const BarcodeScannerModal = dynamic(() => import("@/components/BarcodeScannerModal"), { ssr: false });
@@ -12,6 +15,13 @@ import EditIntakeModal, { type EditableIntake } from "@/components/EditIntakeMod
 import StackEditorModal, { type EditableStack } from "@/components/StackEditorModal";
 import CustomSupplementFlow from "@/components/CustomSupplementFlow";
 import { rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { Check, X } from "lucide-react";
+import { clientCache } from "@/lib/client-cache";
+import { fallbackBehavioralToday } from "@/lib/checkin";
+
+// The page's two data-ready reads, under the client cache's keys (lib/client-cache.ts: one key per GET, the URL).
+const PRODUCTS_URL = "/api/supplements/products";
+const TODAY_URL = "/api/supplements/today";
 
 interface Product {
   product_id: string;
@@ -92,6 +102,14 @@ function categoryColor(c: string | null): string {
   return CATEGORY_COLORS[c.toLowerCase()] ?? "text-text-tertiary";
 }
 
+// Columns of "Today's compound totals" (Personalize: hide / move / freeze columns).
+const COMPOUND_COLUMNS: TableColumn[] = [
+  { id: "category", label: "Category", th: "text-left py-2 px-1 font-normal w-[80px]", td: "py-1.5 px-1" },
+  { id: "compound", label: "Compound", locked: true, th: "text-left py-2 px-1 font-normal", td: "py-1.5 px-1 text-text-primary" },
+  { id: "amount", label: "Amount", th: "text-right py-2 px-1 font-normal w-[100px]", td: "py-1.5 px-1 text-right text-text-secondary tabular-nums" },
+  { id: "sources", label: "Sources", th: "text-right py-2 px-1 font-normal w-[60px]", td: "py-1.5 px-1 text-right text-text-tertiary tabular-nums" },
+];
+
 function formatDoseTime(iso: string | null): string {
   if (!iso) return "—";
   const d = new Date(iso);
@@ -109,13 +127,16 @@ function etTodayStr(): string {
 }
 
 /** Pretty-print a YYYY-MM-DD as "May 20" for inline labels. */
-function formatShortDate(ymd: string): string {
-  // Construct as midday UTC so timezone shifts can't bump the day.
-  const d = new Date(`${ymd}T12:00:00Z`);
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+
+/** GET JSON; a non-OK answer throws, so a failed read never replaces a list with "nothing". */
+async function getJson(url: string) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} answered ${res.status}`);
+  return res.json();
 }
 
-export default function SupplementsPage() {
+export default function SupplementsPage({ headingTestId = "page-heading" }: { headingTestId?: string } = {}) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   const [products, setProducts] = useState<Product[]>([]);
   const [intakes, setIntakes] = useState<Intake[]>([]);
   const [compounds, setCompounds] = useState<CompoundRow[]>([]);
@@ -125,10 +146,9 @@ export default function SupplementsPage() {
   // Supplement stacks (BOM-style recurring lists). Editor holds the stack being
   // created/edited; null = closed.
   const [stacks, setStacks] = useState<Stack[]>([]);
-  const [busyStackId, setBusyStackId] = useState<number | null>(null);
   const [editingStack, setEditingStack] = useState<EditableStack | null>(null);
-  // Most-recent stack-log batch, for one-click "undo all".
-  const [lastBatch, setLastBatch] = useState<{ name: string; ids: number[] } | null>(null);
+  // Single-row deletes the server refused: the row is back on the list, listed here with Retry.
+  const [failedDeletes, setFailedDeletes] = useState<{ intake_id: number; label: string }[]>([]);
 
   // History (older intakes, paginated). Window driven by the global range filter.
   const [history, setHistory] = useState<Intake[]>([]);
@@ -139,28 +159,25 @@ export default function SupplementsPage() {
   // Edit-intake modal
   const [editing, setEditing] = useState<EditableIntake | null>(null);
 
-  // Center-screen "logged 👍" confirmation toast. Fires on every successful
-  // intake write (quick-tap, seed+log, custom-product log). pointer-events-none
-  // so it never blocks rapid tapping; the timer resets on each fire so a burst
-  // of taps keeps it on screen until ~1.5s after the last one.
-  const [toast, setToast] = useState<{ msg: string; id: number } | null>(null);
+  // Center-screen receipt toast. "Saved" only after the server answered OK (seed+log, custom-product log);
+  // "Not deleted" when a delete was refused (the failure also stays in the bar below with Retry).
+  // pointer-events-none so it never blocks a tap; the timer resets on each fire.
+  const [toast, setToast] = useState<{ msg: string; ok: boolean; id: number } | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toastSeq = useRef(0);
-  const showToast = useCallback((msg = "logged 👍") => {
+  const showToast = useCallback((msg = "Saved", ok = true) => {
     toastSeq.current += 1;
-    setToast({ msg, id: toastSeq.current });
+    setToast({ msg, ok, id: toastSeq.current });
     if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 1500);
+    toastTimer.current = setTimeout(() => setToast(null), ok ? 1500 : 2500);
   }, []);
   useEffect(() => () => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
   }, []);
 
-  // Date that quick-tap log buttons attribute the intake to. Default seeded
-  // with ET-clock-today as a synchronous best-guess, then overridden on
-  // mount via /api/behavioral-today which calls pds.behavioral_today_now()
-  // — TZ-aware (travel) and awake-tail-aware (-6h rule). User can still
-  // manually override via the date picker for retroactive entries.
+  // Date the add-product "log a dose now" step attributes the intake to (daily logging is on /log). Seeded
+  // with ET-clock-today as a synchronous best-guess, then overridden on mount via /api/behavioral-today, which
+  // calls pds.behavioral_today_now(): TZ-aware (travel) and awake-tail-aware (-6h rule).
   const [logDate, setLogDate] = useState<string>(etTodayStr());
   const today = etTodayStr();
   useEffect(() => {
@@ -175,24 +192,6 @@ export default function SupplementsPage() {
     // Run once on mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const isLoggingForToday = logDate === today;
-
-  // Time the quick-tap log buttons stamp on intake_time. Default is
-  // empty = "use the current clock instant at the moment of tap" (the
-  // pre-existing behavior). When set, every tap on a product writes
-  // that fixed timestamp until cleared. Use this when you forgot to
-  // log a supplement earlier — e.g. "I took my caffeine at 9 AM but
-  // I'm tapping now at 11 AM." Stored as a datetime-local string
-  // (YYYY-MM-DDTHH:MM); converted to ISO at send time.
-  const [logTimeLocal, setLogTimeLocal] = useState<string>("");
-  const [logTimeOpen, setLogTimeOpen] = useState<boolean>(false);
-
-  // Convert "YYYY-MM-DDTHH:MM" (local clock) → ISO; empty/invalid → null.
-  function logTimeIso(): string | null {
-    if (!logTimeLocal) return null;
-    const d = new Date(logTimeLocal);
-    return Number.isNaN(d.getTime()) ? null : d.toISOString();
-  }
 
   // Add product flow
   const [addOpen, setAddOpen] = useState(false);
@@ -208,23 +207,25 @@ export default function SupplementsPage() {
   // Custom-product fallback (photo → vision extraction → save).
   const [customMode, setCustomMode] = useState(false);
 
+  // Set once the server has answered: a copy from the client cache that arrives later never replaces it.
+  const answeredRef = useRef(false);
+  // Set when this device's cached copy is on screen (the seed effect below): the first load then stays silent.
+  const shownFromCacheRef = useRef(false);
   const loadAll = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
-    if (!silent) setLoading(true);
+    if (!silent && !answeredRef.current && !shownFromCacheRef.current) setLoading(true);
     try {
-      const [pRes, tRes] = await Promise.all([
-        fetch("/api/supplements/products").then((r) => r.json()),
-        fetch("/api/supplements/today").then((r) => r.json()),
-      ]);
+      const [pRes, tRes] = await Promise.all([getJson(PRODUCTS_URL), getJson(TODAY_URL)]);
+      answeredRef.current = true;
+      // Kept for the next visit (shown at once, then revalidated by this same load). A write drops them
+      // (components/AppData.tsx invalidates /api/supplements after any successful write).
+      clientCache.put(PRODUCTS_URL, pRes);
+      clientCache.put(TODAY_URL, tRes);
       setProducts(pRes.products ?? []);
-      // Preserve any still-pending optimistic intake rows (negative intake_id)
-      // so a silent refresh doesn't blow them away mid-POST.
-      const serverIntakes: Intake[] = tRes.intakes ?? [];
-      setIntakes((prev) => {
-        const pending = prev.filter((i) => i.intake_id < 0);
-        return pending.length === 0 ? serverIntakes : [...pending, ...serverIntakes];
-      });
+      // Only server-confirmed rows live in `intakes`; rows still saving are drawn from `writes`.
+      setIntakes(tRes.intakes ?? []);
       setCompounds(tRes.compounds ?? []);
     } catch (e) {
+      // A failed read keeps what is on screen (never an empty "nothing logged").
       console.error("Supplements load:", e);
     } finally {
       if (!silent) setLoading(false);
@@ -234,10 +235,7 @@ export default function SupplementsPage() {
   const loadHistory = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
     if (!silent) setHistoryLoading(true);
     try {
-      const res = await fetch(
-        `/api/supplements/history?days=${historyDays}&perPage=100`,
-      );
-      const json = await res.json();
+      const json = await getJson(`/api/supplements/history?days=${historyDays}&perPage=100`);
       const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
       // Exclude today's rows (already shown in "Today's intakes" above).
       setHistory((json.rows ?? []).filter((r: Intake) => r.intake_date !== todayStr));
@@ -250,12 +248,34 @@ export default function SupplementsPage() {
 
   const loadStacks = useCallback(async () => {
     try {
-      const res = await fetch("/api/supplements/stacks");
-      const json = await res.json();
+      const json = await getJson("/api/supplements/stacks");
       setStacks(json.stacks ?? []);
     } catch (e) {
       console.error("Stacks load:", e);
     }
+  }, []);
+
+  // Speed (2026-11-15): show this device's last copy of the products and today's intakes at once (memory, else
+  // the persisted cache), only when it is for the current behavioral day and the server has not answered yet;
+  // loadAll below always revalidates. Before this, the page waited for both reads on every visit (data-ready
+  // 1.0-1.4 s in perf-timing run 43668835523).
+  useEffect(() => {
+    let alive = true;
+    type TodayCopy = { date?: unknown; intakes?: Intake[]; compounds?: CompoundRow[] };
+    const seed = (p: { products?: Product[] } | undefined, t: TodayCopy | undefined) => {
+      if (!alive || answeredRef.current || !p || !t || !Array.isArray(p.products) || !Array.isArray(t.intakes)) return;
+      if (t.date !== fallbackBehavioralToday(new Date())) return;
+      shownFromCacheRef.current = true;
+      setProducts(p.products);
+      setIntakes(t.intakes);
+      setCompounds(t.compounds ?? []);
+      setLoading(false);
+    };
+    const p = clientCache.peek<{ products?: Product[] }>(PRODUCTS_URL);
+    const t = clientCache.peek<TodayCopy>(TODAY_URL);
+    if (p && t) seed(p, t);
+    else void Promise.all([clientCache.read<{ products?: Product[] }>(PRODUCTS_URL), clientCache.read<TodayCopy>(TODAY_URL)]).then(([a, b]) => seed(a, b)).catch(() => {});
+    return () => { alive = false; };
   }, []);
 
   useEffect(() => {
@@ -276,20 +296,15 @@ export default function SupplementsPage() {
     await Promise.all([loadAll({ silent: true }), loadHistory({ silent: true }), loadStacks()]);
   }, [loadAll, loadHistory, loadStacks]);
 
-  // Debounced silent refresh of /today only — used after rapid log taps so
-  // the compounds-rollup table catches up without re-fetching on every click.
-  // Optimistic intake rows are kept alive by loadAll's pending-merge logic.
+  // Debounced silent refresh of /today only — used after deletes so the
+  // compounds-rollup table catches up without re-fetching on every click.
   const todayRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scheduleSilentTodayRefresh = useCallback(() => {
     if (todayRefreshTimer.current) clearTimeout(todayRefreshTimer.current);
     todayRefreshTimer.current = setTimeout(async () => {
       try {
-        const tRes = await fetch("/api/supplements/today").then((r) => r.json());
-        const serverIntakes: Intake[] = tRes.intakes ?? [];
-        setIntakes((prev) => {
-          const pending = prev.filter((i) => i.intake_id < 0);
-          return pending.length === 0 ? serverIntakes : [...pending, ...serverIntakes];
-        });
+        const tRes = await getJson("/api/supplements/today");
+        setIntakes(tRes.intakes ?? []);
         setCompounds(tRes.compounds ?? []);
       } catch (e) {
         console.error("Silent today refresh:", e);
@@ -300,132 +315,25 @@ export default function SupplementsPage() {
     if (todayRefreshTimer.current) clearTimeout(todayRefreshTimer.current);
   }, []);
 
-  async function logIntake(product_id: string) {
-    const product = products.find((p) => p.product_id === product_id);
-    if (!product) return;
-
-    // Negative ID marks this row as optimistic / unconfirmed — replaced with
-    // the real intake_id once POST resolves, or removed on error.
-    const tempId = -(Date.now() + Math.floor(Math.random() * 10000));
-    const logDateIsToday = logDate === today;
-    // Backdated logs get NO timestamp unless the user set one explicitly:
-    // stamping "now" on a past intake_date produced retro-log artifacts the
-    // caffeine timing layer had to quarantine (timestamp attributing to a
-    // different behavioral day than claimed). NULL = "took it that day, time
-    // unspecified" — mg totals still count, timing aggregates stay clean.
-    const stampIso = logTimeIso() ?? (logDateIsToday ? new Date().toISOString() : null);
-    const optimistic: Intake = {
-      intake_id: tempId,
-      intake_date: logDate,
-      intake_time: stampIso,
-      product_id,
-      doses: 1,
-      notes: null,
-      brand_name: product.brand_name,
-      full_name: product.full_name,
-    };
-    if (logDateIsToday) {
-      setIntakes((prev) => [optimistic, ...prev]);
-    }
-    // Optimistic confirmation — matches the optimistic row above. A failed POST
-    // rolls the row back below; the brief toast is an acceptable cost.
-    showToast();
-
-    try {
-      const res = await fetch("/api/supplements/log-intake", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          product_id,
-          intake_date: logDate,
-          intake_time: stampIso,
-        }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      const saved = (await res.json()) as { intake_id: number };
-      if (logDateIsToday) {
-        setIntakes((prev) =>
-          prev.map((i) => (i.intake_id === tempId ? { ...i, intake_id: saved.intake_id } : i)),
-        );
-        scheduleSilentTodayRefresh();
-      } else {
-        // Logged to a past date → row shows up in history, not today.
-        void loadHistory({ silent: true });
-      }
-    } catch (e) {
-      // Roll back the optimistic row so the UI matches the server.
-      if (logDateIsToday) {
-        setIntakes((prev) => prev.filter((i) => i.intake_id !== tempId));
-      }
-      console.error("Log intake:", e);
-    }
-  }
-
   async function undoIntake(intake_id: number) {
     // Optimistic remove — keep refs so we can re-insert on failure.
     const removedToday = intakes.find((i) => i.intake_id === intake_id);
     const removedHistory = history.find((i) => i.intake_id === intake_id);
+    const label = (removedToday ?? removedHistory)?.full_name ?? "intake";
+    setFailedDeletes((l) => l.filter((d) => d.intake_id !== intake_id));
     setIntakes((prev) => prev.filter((i) => i.intake_id !== intake_id));
     setHistory((prev) => prev.filter((i) => i.intake_id !== intake_id));
     try {
       const res = await fetch(`/api/supplements/log-intake?intake_id=${intake_id}`, { method: "DELETE" });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw new Error(`refused (${res.status})`);
       scheduleSilentTodayRefresh();
     } catch (e) {
-      if (removedToday) setIntakes((prev) => [removedToday, ...prev]);
-      if (removedHistory) setHistory((prev) => [removedHistory, ...prev]);
+      // The row comes back, and the failure stays listed with Retry.
+      if (removedToday) setIntakes((prev) => (prev.some((i) => i.intake_id === intake_id) ? prev : [removedToday, ...prev]));
+      if (removedHistory) setHistory((prev) => (prev.some((i) => i.intake_id === intake_id) ? prev : [removedHistory, ...prev]));
+      setFailedDeletes((l) => [...l.filter((d) => d.intake_id !== intake_id), { intake_id, label }]);
+      showToast(`Not deleted: ${label}`, false);
       console.error("Undo intake:", e);
-    }
-  }
-
-  // Log an entire stack — writes one intake per item server-side, honoring the
-  // page's logDate / logTime overrides (so a pre-bed stack can attribute to
-  // yesterday). Records the batch for one-click undo.
-  async function logStack(stack: Stack) {
-    setBusyStackId(stack.stack_id);
-    // Same backdate rule as addIntake: no explicit time + past date → null
-    // timestamp (the server passes null through; it no longer coerces to now).
-    const stampIso = logTimeIso() ?? (isLoggingForToday ? new Date().toISOString() : null);
-    showToast(`logged ${stack.name} 👍`);
-    try {
-      const res = await fetch("/api/supplements/stacks/log", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          stack_id: stack.stack_id,
-          intake_date: logDate,
-          intake_time: stampIso,
-        }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      const saved = (await res.json()) as { intake_ids: number[] };
-      setLastBatch({ name: stack.name, ids: saved.intake_ids ?? [] });
-      if (logDate === today) {
-        await loadAll({ silent: true });
-      } else {
-        await loadHistory({ silent: true });
-      }
-    } catch (e) {
-      console.error("Log stack:", e);
-    } finally {
-      setBusyStackId(null);
-    }
-  }
-
-  // Undo the most-recent stack-log batch by deleting every intake it wrote.
-  async function undoLastBatch() {
-    if (!lastBatch) return;
-    const { ids } = lastBatch;
-    setLastBatch(null);
-    try {
-      await Promise.all(
-        ids.map((id) =>
-          fetch(`/api/supplements/log-intake?intake_id=${id}`, { method: "DELETE" }),
-        ),
-      );
-      await Promise.all([loadAll({ silent: true }), loadHistory({ silent: true })]);
-    } catch (e) {
-      console.error("Undo stack batch:", e);
     }
   }
 
@@ -469,9 +377,8 @@ export default function SupplementsPage() {
             product_id: seeded.product_id,
             doses,
             intake_date: logDate,
-            // Same backdate rule as addIntake/logStack: past date + no
-            // explicit time → null timestamp, never a misleading "now".
-            intake_time: logTimeIso() ?? (logDate === today ? new Date().toISOString() : null),
+            // Backdate rule: a past date gets a null timestamp, never a misleading "now".
+            intake_time: logDate === today ? new Date().toISOString() : null,
           }),
         });
         if (!logRes.ok) throw new Error(await logRes.text());
@@ -525,94 +432,84 @@ export default function SupplementsPage() {
     <div className="space-y-6">
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 data-testid="page-heading" className="text-[20px] font-medium text-text-primary tracking-tight">Supplements</h1>
+          <h1 data-testid={headingTestId} className="text-[20px] font-medium text-text-primary tracking-tight">Supplements</h1>
           <p className="text-[12px] text-text-tertiary mt-0.5">
             DSLD-backed library · ingredient-level intake tracking — {rangeLabel(range)}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <RangeFilter value={range} onChange={setRange} />
+          {/* Intakes and stacks are logged on Log (one place to enter data); this page manages the library. */}
+          <LogLink part="supplements">Log supplements on Log</LogLink>
           <button
             onClick={() => setScannerOpen(true)}
-            className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-text-primary bg-accent/15 hover:bg-accent/25 border border-accent/30 rounded-[4px] transition-colors"
+            className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-on-accent font-semibold bg-accent hover:bg-accent/90 border border-accent rounded-full transition-colors"
           >
             Scan barcode
           </button>
           <button
             onClick={() => setAddOpen(true)}
-            className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-text-primary bg-black/30 hover:bg-white/5 border border-border-subtle rounded-[4px] transition-colors"
+            className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-text-primary bg-black/30 hover:bg-white/5 border border-border-subtle rounded-control transition-colors"
           >
             + Add product
           </button>
         </div>
       </header>
 
+      <PartGrid page="/supplements" title="Supplements">
       {/* KPI Row */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <StatCard label="Library" value={products.length} sublabel="products" />
-        <StatCard label="Logged Today" value={intakeCount} sublabel="intake events" />
-        <StatCard label="Distinct Compounds" value={distinctCompounds} sublabel="today" />
-        <StatCard
-          label="Total Doses Today"
-          value={intakes.reduce((s, i) => s + Number(i.doses), 0)}
-          sublabel="servings consumed"
-        />
-      </div>
-
-      {loading && (
-        <p className="text-[12px] text-text-tertiary font-mono">Loading…</p>
-      )}
+      <PartGroup id="summary" title="Summary tiles" gap={12}>
+        <Part id="library" title="Library" width="quarter">
+          <StatCard label="Library" value={products.length} sublabel="products" />
+        </Part>
+        <Part id="logged-today" title="Logged Today" width="quarter">
+          <StatCard label="Logged Today" value={intakeCount} sublabel="intake events" />
+        </Part>
+        <Part id="distinct-compounds" title="Distinct Compounds" width="quarter">
+          <StatCard label="Distinct Compounds" value={distinctCompounds} sublabel="today" />
+        </Part>
+        <Part id="total-doses" title="Total Doses Today" width="quarter">
+          <StatCard
+            label="Total Doses Today"
+            value={intakes.reduce((s, i) => s + Number(i.doses), 0)}
+            sublabel="servings consumed"
+          />
+        </Part>
+      </PartGroup>
 
       {!loading && (
-        <>
-          {/* Stacks — recurring supplement lists (BOM). One tap logs the whole list. */}
+        <PartGroup id="logging" title="Stacks & products" gap={24}>
+          {/* Stacks — recurring supplement lists (BOM), edited here and logged on Log. */}
+          <Part id="stacks" title="Stacks">
           <ChartCard
             title="Stacks"
-            subtitle="Reusable supplement lists — tap Log to record every product in the list at once."
+            subtitle="Reusable supplement lists. Log them on Log; edit them here."
             source="Onyx"
-            info="A stack is a saved list of products + per-product doses, like a bill of materials. Logging a stack writes one ordinary intake event per product (with the stack's doses), attributed to the date/time selected below. Editing a stack never changes anything you've already logged."
+            info="A stack is a saved list of products + per-product doses, like a bill of materials. Logging a stack (on Log) writes one ordinary intake event per product with the stack's doses. Editing a stack never changes anything you've already logged."
           >
             <div className="flex items-center justify-end mb-2">
               <button
                 onClick={() =>
                   setEditingStack({ stack_id: null, name: "", description: null, remind_time: null, items: [] })
                 }
-                className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-text-primary bg-accent/15 hover:bg-accent/25 border border-accent/30 rounded-[4px] transition-colors"
+                className="px-3 py-1.5 text-[11px] font-mono tracking-wide text-on-accent font-semibold bg-accent hover:bg-accent/90 border border-accent rounded-full transition-colors"
               >
                 + New stack
               </button>
             </div>
 
-            {lastBatch && (
-              <div className="flex items-center justify-between gap-2 mb-2 px-3 py-1.5 bg-accent/10 border border-accent/25 rounded-[4px] text-[11px] font-mono">
-                <span className="text-text-secondary truncate">
-                  Logged {lastBatch.name} · {lastBatch.ids.length} products
-                </span>
-                <button
-                  onClick={undoLastBatch}
-                  className="text-text-tertiary hover:text-red-400 underline underline-offset-2 shrink-0"
-                >
-                  undo all
-                </button>
-              </div>
-            )}
-
             {stacks.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
-                No stacks yet. Create one to log your recurring supplements in a single tap.
+                No stacks yet. Create one to log your recurring supplements in a single tap on Log.
               </p>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                 {stacks.map((s) => (
                   <div
                     key={s.stack_id}
-                    className="flex items-center gap-2 bg-black/30 border border-border-subtle rounded-[4px]"
+                    className="flex items-center gap-2 bg-black/30 border border-border-subtle rounded-control"
                   >
-                    <button
-                      onClick={() => logStack(s)}
-                      disabled={busyStackId === s.stack_id || s.item_count === 0}
-                      className="flex-1 flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-white/[0.03] active:bg-white/[0.06] disabled:opacity-50 rounded-l-[4px] transition-colors"
-                    >
+                    <div className="flex-1 min-w-0 px-3 py-2">
                       <div className="min-w-0">
                         <p className="text-[12px] text-text-primary truncate">{s.name}</p>
                         <p className="text-[10px] text-text-tertiary font-mono truncate">
@@ -622,10 +519,7 @@ export default function SupplementsPage() {
                           {s.remind_time ? ` · remind ${s.remind_time}` : ""}
                         </p>
                       </div>
-                      <span className="text-[11px] text-accent/90 font-mono shrink-0">
-                        {busyStackId === s.stack_id ? "…" : "Log"}
-                      </span>
-                    </button>
+                    </div>
                     <button
                       onClick={() =>
                         setEditingStack({
@@ -651,93 +545,15 @@ export default function SupplementsPage() {
               </div>
             )}
           </ChartCard>
+          </Part>
 
-          {/* Log intake — product picker */}
+          {/* Products — the library the Log screen picks from (part id kept: it is the saved layout's key). */}
+          <Part id="log-intake" title="Products">
           <ChartCard
-            title={isLoggingForToday ? "Log intake today" : `Log intake for ${formatShortDate(logDate)}`}
-            subtitle="Tap a product to add one dose. Each click writes a fresh intake event with the current clock timestamp."
+            title="Products"
+            subtitle="Your library. Log a product on Log; ✕ removes it from the list (history is kept)."
             source="DSLD"
           >
-            {/* Manual date override — defaults to today; lets the user
-                attribute a post-midnight pre-bed intake to the day that
-                just ended (behavioral-day convention; see AGENTS.md). */}
-            <div className="flex flex-wrap items-center gap-2 mb-2">
-              <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
-                Intake date
-              </label>
-              <input
-                type="date"
-                value={logDate}
-                max={today}
-                onChange={(e) => setLogDate(e.target.value || today)}
-                className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none"
-              />
-              {!isLoggingForToday && (
-                <>
-                  <span className="text-[10px] font-mono text-amber-400/90">
-                    logging to {formatShortDate(logDate)} — not today
-                    {!logTimeLocal && " · no clock time will be stored (set one below if you know it)"}
-                  </span>
-                  <button
-                    onClick={() => setLogDate(today)}
-                    className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
-                  >
-                    reset to today
-                  </button>
-                </>
-              )}
-            </div>
-
-            {/* Manual time override — defaults to "now at tap"; lets the
-                user attribute an intake to an earlier clock time when
-                they forgot to log right away. Critical for HRV timing
-                analysis (e.g. caffeine at 8 AM, logged at 11 AM). */}
-            <div className="flex flex-wrap items-center gap-2 mb-3 pb-3 border-b border-border-subtle/40">
-              <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
-                Intake time
-              </label>
-              {!logTimeOpen ? (
-                <>
-                  <span className="text-[12px] font-mono text-text-secondary">now</span>
-                  <button
-                    onClick={() => {
-                      // Pre-fill picker with current local clock so the
-                      // user just nudges backwards instead of typing.
-                      const now = new Date();
-                      const pad = (n: number) => String(n).padStart(2, "0");
-                      const local = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
-                      setLogTimeLocal(local);
-                      setLogTimeOpen(true);
-                    }}
-                    className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
-                  >
-                    change time
-                  </button>
-                </>
-              ) : (
-                <>
-                  <input
-                    type="datetime-local"
-                    value={logTimeLocal}
-                    onChange={(e) => setLogTimeLocal(e.target.value)}
-                    className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none"
-                  />
-                  <span className="text-[10px] font-mono text-amber-400/90">
-                    stamping at custom clock time
-                  </span>
-                  <button
-                    onClick={() => {
-                      setLogTimeOpen(false);
-                      setLogTimeLocal("");
-                    }}
-                    className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
-                  >
-                    reset to now
-                  </button>
-                </>
-              )}
-            </div>
-
             {products.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
                 Library is empty. Add a product to get started.
@@ -747,12 +563,9 @@ export default function SupplementsPage() {
                 {products.map((p) => (
                   <div
                     key={p.product_id}
-                    className="flex items-center gap-2 bg-black/30 hover:bg-white/[0.03] border border-border-subtle hover:border-border-hover rounded-[4px] transition-colors"
+                    className="flex items-center gap-2 bg-black/30 border border-border-subtle rounded-control"
                   >
-                    <button
-                      onClick={() => logIntake(p.product_id)}
-                      className="flex-1 flex items-center justify-between gap-3 px-3 py-2 text-left active:bg-white/[0.06] transition-colors"
-                    >
+                    <div className="flex-1 min-w-0 px-3 py-2">
                       <div className="min-w-0">
                         <p className="text-[12px] text-text-primary truncate">{p.full_name ?? "—"}</p>
                         <p className="text-[10px] text-text-tertiary font-mono truncate">
@@ -762,8 +575,7 @@ export default function SupplementsPage() {
                             : ""}
                         </p>
                       </div>
-                      <span className="text-[16px] text-accent/80 font-mono shrink-0">+</span>
-                    </button>
+                    </div>
                     <button
                       onClick={() => archiveProduct(p.product_id, p.full_name)}
                       disabled={busyProductId === p.product_id}
@@ -778,12 +590,18 @@ export default function SupplementsPage() {
               </div>
             )}
           </ChartCard>
+          </Part>
+        </PartGroup>
+      )}
 
-          {/* Today's intakes */}
+      {!loading && (
+        <PartGroup id="today" title="Today" gap={24}>
+          {/* Today's intakes (logged on Log, chat or an agent card): edit and delete stay here for corrections. */}
           {intakes.length > 0 && (
+            <Part id="todays-intakes" title="Today's intakes">
             <ChartCard
               title="Today's intakes"
-              subtitle={`${intakes.length} events · newest first`}
+              subtitle={`${intakes.length} logged · newest first`}
               source="DSLD"
             >
               <div className="space-y-1.5">
@@ -828,9 +646,11 @@ export default function SupplementsPage() {
                 ))}
               </div>
             </ChartCard>
+            </Part>
           )}
 
           {/* Today's compound totals — rolled up by UNII */}
+          <Part id="compound-totals" title="Today's compound totals">
           <ChartCard
             title="Today's compound totals"
             subtitle="Cross-product rollup by UNII code — Vitamin C from a multivitamin and a standalone Vitamin C tablet sum here."
@@ -843,43 +663,42 @@ export default function SupplementsPage() {
               </p>
             ) : (
               <div className="overflow-x-auto">
-                <table className="w-full text-[12px] font-mono">
-                  <thead>
-                    <tr className="text-[10px] uppercase tracking-wide text-text-tertiary border-b border-border-subtle">
-                      <th className="text-left py-2 px-1 font-normal w-[80px]">Category</th>
-                      <th className="text-left py-2 px-1 font-normal">Compound</th>
-                      <th className="text-right py-2 px-1 font-normal w-[100px]">Amount</th>
-                      <th className="text-right py-2 px-1 font-normal w-[60px]">Sources</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {compounds.map((c) => (
-                      <tr
-                        key={c.compound_key}
-                        className="border-b border-border-subtle/50 hover:bg-white/[0.02]"
-                      >
-                        <td className={`py-1.5 px-1 ${categoryColor(c.category)} uppercase text-[10px] tracking-wide`}>
+                <PersonalTable
+                  id="compounds"
+                  className="w-full text-[12px] font-mono"
+                  headRowClassName="text-[10px] uppercase tracking-wide text-text-tertiary border-b border-border-subtle"
+                  rowClassName="border-b border-border-subtle/50 hover:bg-white/[0.02]"
+                  columns={COMPOUND_COLUMNS}
+                  rows={compounds.map((c) => ({
+                    key: c.compound_key,
+                    cells: {
+                      category: (
+                        <span className={`${categoryColor(c.category)} uppercase text-[10px] tracking-wide`}>
                           {c.category ?? "—"}
-                        </td>
-                        <td className="py-1.5 px-1 text-text-primary">
-                          {c.ingredient_group ?? c.ingredient_name ?? c.compound_key}
-                        </td>
-                        <td className="py-1.5 px-1 text-right text-text-secondary tabular-nums">
+                        </span>
+                      ),
+                      compound: c.ingredient_group ?? c.ingredient_name ?? c.compound_key,
+                      amount: (
+                        <>
                           {Number(c.total_amount).toLocaleString(undefined, { maximumFractionDigits: 2 })}{" "}
                           <span className="text-text-tertiary">{c.unit}</span>
-                        </td>
-                        <td className="py-1.5 px-1 text-right text-text-tertiary tabular-nums">
-                          {c.source_product_count}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                        </>
+                      ),
+                      sources: c.source_product_count,
+                    },
+                  }))}
+                />
               </div>
             )}
           </ChartCard>
+          </Part>
+        </PartGroup>
+      )}
 
+      {!loading && (
+        <PartGroup id="history" title="History">
           {/* Recent intakes (prior days) — edit/delete any row */}
+          <Part id="recent-intakes" title="Recent intakes">
           <ChartCard
             title="Recent intakes"
             subtitle={`prior days · ${rangeLabel(range)} · ${history.length} entries`}
@@ -936,7 +755,13 @@ export default function SupplementsPage() {
               </div>
             )}
           </ChartCard>
-        </>
+          </Part>
+        </PartGroup>
+      )}
+      </PartGrid>
+
+      {loading && (
+        <p className="text-[12px] text-text-tertiary font-mono">Loading…</p>
       )}
 
       {/* Edit-intake modal */}
@@ -973,7 +798,7 @@ export default function SupplementsPage() {
           }}
         >
           <div
-            className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card p-5 w-full max-w-lg mt-12"
+            className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 w-full max-w-lg mt-12"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-3">
@@ -1017,12 +842,12 @@ export default function SupplementsPage() {
                 value={searchQ}
                 onChange={(e) => setSearchQ(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && runSearch(searchQ)}
-                className="flex-1 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none"
+                className="flex-1 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
               />
               <button
                 onClick={() => runSearch(searchQ)}
                 disabled={searching || !searchQ.trim()}
-                className="px-3 py-2 text-[11px] font-mono text-text-primary bg-accent/20 hover:bg-accent/30 disabled:opacity-40 border border-accent/40 rounded-[4px] transition-colors"
+                className="px-3 py-2 text-[11px] font-mono text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 border border-accent rounded-full transition-colors"
               >
                 {searching ? "…" : "Search"}
               </button>
@@ -1031,7 +856,7 @@ export default function SupplementsPage() {
                   setAddOpen(false);
                   setScannerOpen(true);
                 }}
-                className="px-3 py-2 text-[11px] font-mono text-text-secondary hover:text-text-primary bg-black/30 hover:bg-white/[0.05] border border-border-subtle rounded-[4px] transition-colors"
+                className="px-3 py-2 text-[11px] font-mono text-text-secondary hover:text-text-primary bg-black/30 hover:bg-white/[0.05] border border-border-subtle rounded-control transition-colors"
                 title="Scan a barcode"
               >
                 📷
@@ -1046,7 +871,7 @@ export default function SupplementsPage() {
               <div className="mb-3 pb-3 border-b border-border-subtle/40">
                 <button
                   onClick={() => setCustomMode(true)}
-                  className="w-full px-3 py-2 text-[11px] font-mono text-text-secondary hover:text-text-primary bg-black/20 hover:bg-white/[0.04] border border-dashed border-border-subtle hover:border-border-hover rounded-[4px] transition-colors text-left"
+                  className="w-full px-3 py-2 text-[11px] font-mono text-text-secondary hover:text-text-primary bg-black/20 hover:bg-white/[0.04] border border-dashed border-border-subtle hover:border-border-hover rounded-control transition-colors text-left"
                 >
                   <span className="text-amber-400/80">Not in DSLD?</span>{" "}
                   <span className="text-text-tertiary">Photograph the supplement facts panel — Claude will read it.</span>{" "}
@@ -1064,7 +889,7 @@ export default function SupplementsPage() {
                       setConfirmHit(h);
                       setConfirmDoses("1");
                     }}
-                    className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left bg-black/30 hover:bg-white/[0.04] border border-border-subtle hover:border-border-hover rounded-[4px] transition-colors"
+                    className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left bg-black/30 hover:bg-white/[0.04] border border-border-subtle hover:border-border-hover rounded-control transition-colors"
                   >
                     <div className="min-w-0">
                       <p className="text-[12px] text-text-primary truncate">{h.full_name ?? "—"}</p>
@@ -1086,7 +911,7 @@ export default function SupplementsPage() {
             )}
 
             {confirmHit && (
-              <div className="bg-black/40 border border-accent/30 rounded-[4px] p-4">
+              <div className="bg-black/40 border border-accent/30 rounded-control p-4">
                 <p className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono mb-2">
                   Confirm + log
                 </p>
@@ -1107,7 +932,7 @@ export default function SupplementsPage() {
                   step="0.5"
                   value={confirmDoses}
                   onChange={(e) => setConfirmDoses(e.target.value)}
-                  className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/50 outline-none"
+                  className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none"
                   autoFocus
                 />
                 <p className="text-[10px] text-text-tertiary mb-3 leading-relaxed">
@@ -1133,7 +958,7 @@ export default function SupplementsPage() {
                       seedAndOptionallyLog(Number(confirmHit.id), doses > 0 ? doses : null);
                     }}
                     disabled={seedingId !== null}
-                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-accent/20 hover:bg-accent/30 disabled:opacity-40 disabled:cursor-not-allowed border border-accent/40 rounded-[4px] transition-colors"
+                    className="px-4 py-2 text-[12px] text-on-accent font-semibold bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed border border-accent rounded-full transition-colors"
                   >
                     {seedingId !== null
                       ? "Saving…"
@@ -1161,16 +986,47 @@ export default function SupplementsPage() {
         />
       )}
 
-      {/* Center-screen "logged" confirmation. z above the add-product modal (z-50)
-          so seed+log / custom-product logs flash over it; pointer-events-none so
+      {/* Deletes the server did not confirm. Fixed above the mobile tab bar so a failure is seen wherever the
+          tap was made; each one can be retried. */}
+      {failedDeletes.length > 0 && (
+        <div
+          role="region"
+          aria-label="Not deleted"
+          className="fixed left-1/2 z-40 w-[min(32rem,calc(100vw-2rem))] -translate-x-1/2 rounded-card border border-down/30 bg-surface-raised shadow-elevated px-3 py-2 bottom-[calc(env(safe-area-inset-bottom)+5.5rem)] md:bottom-6"
+        >
+          <ul className="divide-y divide-border-subtle">
+            {failedDeletes.slice(0, 3).map((d) => (
+              <li key={`del${d.intake_id}`} className="flex items-center gap-2 py-1">
+                <span className="min-w-0 flex-1 truncate text-[12px] text-down">Not deleted: {d.label} (still logged)</span>
+                <button onClick={() => void undoIntake(d.intake_id)} className="min-h-11 px-3 text-[13px] font-medium text-accent shrink-0">
+                  Retry
+                </button>
+                <button
+                  onClick={() => setFailedDeletes((l) => l.filter((x) => x.intake_id !== d.intake_id))}
+                  aria-label={`Dismiss: ${d.label}`}
+                  className="min-h-11 min-w-11 inline-flex items-center justify-center text-text-tertiary hover:text-text-primary shrink-0"
+                >
+                  <X aria-hidden="true" className="w-4 h-4" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Center-screen receipt: "Saved" only after the server answered OK, "Not saved" otherwise. z above the
+          add-product modal (z-50) so seed+log / custom-product logs flash over it; pointer-events-none so
           it never intercepts taps. Keyed by id to re-run the fade on every fire. */}
       {toast && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center pointer-events-none">
+        <div className="fixed inset-0 z-[100] flex items-center justify-center pointer-events-none" role="status" aria-live="polite">
           <div
             key={toast.id}
-            className="animate-fade-in flex items-center gap-2 px-6 py-4 rounded-[10px] bg-surface-raised/95 border border-accent/40 shadow-floating backdrop-blur-sm"
+            className={`animate-fade-in flex items-center gap-2 px-6 py-4 rounded-card bg-surface-raised/95 border shadow-floating backdrop-blur-sm ${
+              toast.ok ? "border-up/40" : "border-down/40"
+            }`}
           >
-            <span className="text-[15px] font-medium text-text-primary tracking-tight">
+            {toast.ok ? <Check aria-hidden="true" className="w-4 h-4 text-up" /> : <X aria-hidden="true" className="w-4 h-4 text-down" />}
+            <span className={`text-[15px] font-medium tracking-tight ${toast.ok ? "text-text-primary" : "text-down"}`}>
               {toast.msg}
             </span>
           </div>

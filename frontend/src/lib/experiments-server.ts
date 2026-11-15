@@ -1,30 +1,72 @@
 import "server-only";
 import { createClient } from "@supabase/supabase-js";
-import { parseExperimentToday, type ExperimentToday } from "@/lib/experiments";
+import {
+  parseAdherenceDay,
+  parseExperimentToday,
+  type AdherenceDay,
+  type AdherenceRequest,
+  type ExperimentToday,
+} from "@/lib/experiments";
 
 /**
- * Server-side read of today's experiment arm. SERVICE ROLE ONLY: the experiment tables
+ * Server-side access to the N-of-1 experiment framework. SERVICE ROLE ONLY: the experiment tables
  * (sql/experiment_framework_schema.sql) have RLS on, no policies and no grants to
  * anon / authenticated, so the browser can never query them, and this module must never be
  * imported from a client component ("server-only" enforces that at build time).
  *
- * It calls ONE database function, pds.experiment_today(), which returns the arm of the current
- * behavioral day and nothing later. This module never selects from the schedule table, so no
- * code path in the app can read a future arm. The function stamps the first time a day's arm was
- * shown (the allocation audit trail); it records nothing about what Riley did.
+ * It calls database FUNCTIONS only and never selects from a table, so no code path in the app can
+ * read a future arm:
+ *   pds.experiment_today()              today's arm for the Today card. It stamps the first time a
+ *                                       day's arm was shown (the allocation audit trail).
+ *   pds.experiment_adherence_day()      the check-in question "Followed today's arm?" for today or
+ *                                       yesterday; only for a day whose arm was already shown, and
+ *                                       it stamps nothing.
+ *   pds.experiment_record_adherence()   saves Riley's answer to that question (the per-day table).
  *
- * Nothing here logs the answer: a failure logs an error code only.
+ * Nothing here logs an answer: a failure logs an error code only.
  */
-export async function loadExperimentToday(): Promise<ExperimentToday> {
-  const client = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
+function serviceClient() {
+  return createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
     db: { schema: "pds" },
     auth: { persistSession: false },
   });
-  const { data, error } = await client.rpc("experiment_today");
+}
+
+// PGRST202: the function is not in the schema cache, i.e. its SQL file was never applied.
+const NOT_APPLIED = "PGRST202";
+
+export async function loadExperimentToday(): Promise<ExperimentToday> {
+  const { data, error } = await serviceClient().rpc("experiment_today");
   if (error) {
-    // PGRST202: the function is not in the schema cache, i.e. the SQL file was never applied.
-    if (error.code === "PGRST202") return { status: "not_connected" };
+    if (error.code === NOT_APPLIED) return { status: "not_connected" };
     throw new Error(`experiment_today failed (${error.code ?? "no code"})`);
   }
   return parseExperimentToday(data);
+}
+
+/** The check-in question for a behavioral day (null = today). Reads only; reveals nothing new. */
+export async function loadAdherenceDay(date: string | null): Promise<AdherenceDay> {
+  const { data, error } = await serviceClient().rpc("experiment_adherence_day", { p_date: date });
+  if (error) {
+    if (error.code === NOT_APPLIED) return { status: "not_connected" };
+    throw new Error(`experiment_adherence_day failed (${error.code ?? "no code"})`);
+  }
+  return parseAdherenceDay(data);
+}
+
+/**
+ * Save the answer. The database decides whether the day is open (running trial, today or yesterday,
+ * arm already shown); when it is not, nothing is written and its state comes back instead.
+ */
+export async function recordAdherence({ date, answer, note }: AdherenceRequest): Promise<AdherenceDay> {
+  const { data, error } = await serviceClient().rpc("experiment_record_adherence", {
+    p_date: date,
+    p_answer: answer,
+    p_note: note,
+  });
+  if (error) {
+    if (error.code === NOT_APPLIED) return { status: "not_connected" };
+    throw new Error(`experiment_record_adherence failed (${error.code ?? "no code"})`);
+  }
+  return parseAdherenceDay(data);
 }

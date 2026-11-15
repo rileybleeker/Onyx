@@ -121,7 +121,7 @@ function expectedFlows(month, account) {
 test("an empty ledger is its own state, with the heartbeat if one exists", async () => {
   const none = await load(makeDb({})).loadLedger(q(), NOW);
   assert.deepEqual(none, { kind: "empty", freshness: null });
-  const ran = await load(makeDb({ beats: [{ source: "rocketmoney", data_type: "transactions", status: "failed", sync_start: hoursAgo(1), records_synced: 0, duration_seconds: 1, error_message: "Login required" }] })).loadLedger(q(), NOW);
+  const ran = await load(makeDb({ beats: [{ source: "simplefin", data_type: "transactions", status: "failed", sync_start: hoursAgo(1), records_synced: 0, duration_seconds: 1, error_message: "Login required" }] })).loadLedger(q(), NOW);
   assert.equal(ran.kind, "empty");
   assert.equal(ran.freshness.status, "failed");
   assert.equal(ran.freshness.errorMessage, "Login required");
@@ -144,7 +144,7 @@ test("default month is the newest with data; flows, trend and month list match a
   assert.equal(d.months[d.months.length - 1], "2029-02", "oldest month with data");
   assert.equal(d.windowTruncated, false);
   assert.equal(d.skippedRows, 0);
-  const windowReads = db.calls.filter((c) => c.table === "finance_transactions" && c.cols === "account_key,txn_date,amount_cents,currency,category,ignored_from");
+  const windowReads = db.calls.filter((c) => c.table === "finance_transactions" && c.cols === "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from");
   assert.ok(windowReads.length >= 3, "the window was read in several capped pages");
 });
 

@@ -5,17 +5,18 @@ import {
   AreaChart, Area, BarChart, Bar, LineChart, Line,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
-import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getBehaviorLog, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getBehaviorLog, rangeDays, rangeLabel } from "@/lib/queries";
 import { formatDate, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
+import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
+const legendStyle = { fontSize: 11, fontFamily: "var(--font-mono)" };
 
 function recoveryColor(score: number | null): string {
   if (!score) return C.neutral;
@@ -37,7 +38,8 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
   const [sleep, setSleep] = useState<any[]>(initial?.sleep ?? []);
   const [journal, setJournal] = useState<any[]>(initial?.journal ?? []);
   const [loading, setLoading] = useState(!initial);
-  const [range, setRange] = useState<Range>("30d");
+  // Requested vs shown range (components/RangeLoadStatus.tsx, Codex #191 UI 4): labels use the shown one.
+  const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange } = useRangeLoad("30d");
   const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
@@ -48,6 +50,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
     const silent = firstRunWithInitial.current;
     firstRunWithInitial.current = false;
     if (!silent) setLoading(true);
+    const seq = beginRange(range, silent);
     const days = rangeDays(range);
     Promise.all([getWhoopRecovery(days), getWhoopCycles(days), getWhoopSleep(days), getBehaviorLog(days)])
       .then(([r, c, s, j]) => {
@@ -59,13 +62,18 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
         setCycles((prev) => (sameJson(prev, c) ? prev : c));
         setSleep((prev) => (sameJson(prev, s) ? prev : s));
         setJournal((prev) => (sameJson(prev, j) ? prev : j));
+        finishRange(seq, range, true);
       })
-      .catch(console.error)
+      .catch((e) => {
+        console.error(e);
+        // The charts keep the shown range's rows and labels; the status line offers Retry.
+        if (!cancelled) finishRange(seq, range, false);
+      })
       .finally(() => {
         if (!cancelled && !silent) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [range]);
+  }, [range, attempt, beginRange, finishRange]);
 
   if (loading) {
     return (
@@ -73,7 +81,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
         <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
               <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
               <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
             </div>
@@ -121,14 +129,17 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">WHOOP</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">Recovery, strain, and sleep analytics — {rangeLabel(range)}</p>
+          <p className="text-sm text-text-tertiary mt-0.5">Recovery, strain, and sleep analytics — {rangeLabel(rangeView.shown)}</p>
         </div>
-        <RangeFilter value={range} onChange={setRange} />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <RangeLoadStatus view={rangeView} onRetry={retryRange} />
+          <RangeFilter value={selectedRange} onChange={selectRange} />
+        </div>
       </div>
 
       {/* Ring-led hero — WHOOP recovery / strain / sleep triad */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8 items-stretch">
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Recovery"
             value={latestRecovery?.recovery_score ?? NaN}
@@ -139,7 +150,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
               : undefined}
           />
         </div>
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Day Strain"
             value={latestCycle?.strain ?? NaN}
@@ -149,7 +160,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
             sublabel="of 21"
           />
         </div>
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Sleep"
             value={latestSleep?.sleep_performance_percentage ?? NaN}
@@ -292,7 +303,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
             {/* Category summary cards */}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
               {[...categoryMap.entries()].map(([cat, qs]) => (
-                <div key={cat} className="bg-surface-card border border-border-subtle rounded-[6px] p-4">
+                <div key={cat} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4">
                   <p className="text-[10px] text-text-tertiary font-mono font-medium uppercase tracking-wider">{cat}</p>
                   <p className="text-lg font-semibold text-text-primary mt-1">{qs.length} behavior{qs.length !== 1 ? "s" : ""}</p>
                   <p className="text-xs text-text-tertiary mt-1">{qs.slice(0, 3).join(", ")}{qs.length > 3 ? "\u2026" : ""}</p>

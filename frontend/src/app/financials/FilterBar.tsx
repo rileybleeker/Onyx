@@ -16,7 +16,7 @@ interface Props {
 }
 
 const field =
-  "rounded-[4px] border border-border-subtle bg-surface-card px-2 py-1.5 text-[13px] text-text-primary";
+  "rounded-control border border-border-subtle bg-surface-card px-2 py-1.5 text-[13px] text-text-primary";
 
 /**
  * Month / account / search controls for /financials. A plain GET form: the server page reads the

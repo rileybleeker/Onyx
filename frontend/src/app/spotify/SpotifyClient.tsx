@@ -1,5 +1,6 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { useEffect, useRef, useState } from "react";
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
@@ -7,10 +8,13 @@ import {
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
 import ChartCard from "@/components/ChartCard";
+import InfoHint from "@/components/InfoHint";
 import StatCard from "@/components/StatCard";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel, chartColors as C } from "@/lib/chart-theme";
 import { sameJson } from "@/lib/format";
+import { msToSeconds, type Milliseconds } from "@/lib/units";
 import {
   getSpotifyDashboard,
   getSpotifyDailyVolume,
@@ -62,7 +66,7 @@ function applyRollingMean<T extends object>(
   });
 }
 
-const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
+const legendStyle = { fontSize: 11, fontFamily: "var(--font-mono)" };
 
 const spotifyGreen = C.source.spotify;
 
@@ -116,7 +120,7 @@ interface GenLogEntry {
 
 function chipClass(active: boolean, disabled = false): string {
   const base =
-    "px-2.5 py-1 text-[11px] font-mono rounded-[4px] border transition-colors whitespace-nowrap";
+    "px-2.5 py-1 text-[11px] font-mono rounded-control border transition-colors whitespace-nowrap";
   if (disabled) return `${base} opacity-40 cursor-not-allowed border-border-subtle text-text-tertiary`;
   if (active) return `${base} bg-source-spotify/25 border-source-spotify/50 text-text-primary`;
   return `${base} bg-black/20 border-border-subtle text-text-secondary hover:border-source-spotify/40 hover:text-text-primary`;
@@ -124,7 +128,8 @@ function chipClass(active: boolean, disabled = false): string {
 
 import type { SpotifyInitial } from "./SpotifyLoader";
 
-export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | null }) {
+export default function SpotifyPage({ initial, headingTestId = "page-heading" }: { initial?: SpotifyInitial | null; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // Server-prefetched initial data (ISR, default 30d range) seeds the charts
   // so they paint immediately; the mount effect still runs as a SILENT
   // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
@@ -329,6 +334,8 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
     ])
       .then(([dash, v, d]) => {
         if (cancelled) return;
+        // The default view also seeds this page in the continuous scroll (lib/feed-seed.ts, memory only).
+        if (range === "30d") writeFeedSeed("/spotify", { dashboard: dash, volume: v, drift: d });
         // sameJson bail-out: the silent revalidation's data is usually
         // byte-identical to the server-seeded state — returning the previous
         // reference lets React skip the commit (and a full chart re-render).
@@ -369,7 +376,14 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
     <div className="space-y-6">
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 data-testid="page-heading" className="text-[20px] font-medium text-text-primary tracking-tight">Spotify</h1>
+          <div className="flex items-center gap-2">
+            <h1 data-testid={headingTestId} className="text-[20px] font-medium text-text-primary tracking-tight">Spotify</h1>
+            <InfoHint label="Spotify coverage">
+              Only plays that Spotify&apos;s servers receive appear here. Offline playback on partner devices
+              (Garmin watches, some car head units, older wearables) is never reported, even after the device
+              reconnects, so workout listening on the Garmin is under-counted.
+            </InfoHint>
+          </div>
           <p className="text-[12px] text-text-tertiary mt-0.5">
             Listening behavior — {rangeLabel(range)}
           </p>
@@ -377,7 +391,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
         <div className="flex items-center gap-2 flex-wrap">
           <button
             onClick={() => setGenOpen(true)}
-            className="px-3 py-1.5 text-[11px] font-mono font-medium tracking-wide text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-[4px] transition-colors whitespace-nowrap"
+            className="px-3 py-1.5 text-[11px] font-mono font-medium tracking-wide text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-control transition-colors whitespace-nowrap"
           >
             Generate playlist
           </button>
@@ -385,21 +399,13 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
         </div>
       </header>
 
-      <p className="text-[11px] text-text-tertiary leading-relaxed border-l-2 border-source-spotify/30 pl-3">
-        <span className="text-text-secondary">Coverage note:</span> Only plays that Spotify&apos;s
-        backend knows about appear here. Offline playback from Spotify-licensed partner devices
-        (Garmin watches, some car head units, older standalone wearables) isn&apos;t reported to
-        the API and won&apos;t show up — even after the device reconnects. If you listen heavily
-        on Garmin during workouts, this dashboard under-counts that listening.
-      </p>
-
       {modalOpen && (
         <div
           className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
           onClick={closeModal}
         >
           <div
-            className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card p-5 w-full max-w-md"
+            className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 w-full max-w-md"
             onClick={(e) => e.stopPropagation()}
           >
             {!createResult && (
@@ -409,16 +415,14 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                   {topTracks.length} tracks · private · added to your Spotify account
                 </p>
                 <p className="text-[10px] text-amber-300/80 mb-4 leading-relaxed">
-                  Heads up: Spotify Dev-mode apps ignore the private flag — the
-                  playlist may land Public. Toggle to private in the Spotify
-                  app if needed. (Server logs warn when this happens.)
+                  Spotify may make it public anyway; switch it to private in the Spotify app.
                 </p>
                 <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">Name</label>
                 <input
                   type="text"
                   value={playlistName}
                   onChange={(e) => setPlaylistName(e.target.value)}
-                  className="w-full mb-3 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors"
+                  className="w-full mb-3 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-source-spotify/50 outline-none transition-colors"
                   disabled={creating}
                 />
                 <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">Description</label>
@@ -426,7 +430,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                   value={playlistDesc}
                   onChange={(e) => setPlaylistDesc(e.target.value)}
                   rows={3}
-                  className="w-full mb-3 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors resize-none"
+                  className="w-full mb-3 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-source-spotify/50 outline-none transition-colors resize-none"
                   disabled={creating}
                 />
                 {createError && (
@@ -443,7 +447,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                   <button
                     onClick={submitCreatePlaylist}
                     disabled={creating || !playlistName.trim()}
-                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/40 rounded-[4px] transition-colors"
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/40 rounded-control transition-colors"
                   >
                     {creating ? "Creating…" : "Create"}
                   </button>
@@ -468,7 +472,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                     href={createResult.spotify_url}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-[4px] transition-colors"
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-control transition-colors"
                   >
                     Open in Spotify
                   </a>
@@ -485,19 +489,17 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
           onClick={closeGen}
         >
           <div
-            className="bg-surface-card border border-border-subtle rounded-[6px] shadow-card p-5 w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+            className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 w-full max-w-2xl max-h-[90vh] overflow-y-auto"
             onClick={(e) => e.stopPropagation()}
           >
             {!genResult && (
               <>
                 <h2 className="text-[15px] font-medium text-text-primary mb-1">Generate playlist</h2>
                 <p className="text-[11px] text-text-tertiary mb-2">
-                  Free-text prompt + structured constraints. Claude picks tracks and creates the playlist in your Spotify account.
+                  Claude picks the tracks and saves the playlist to your Spotify account.
                 </p>
                 <p className="text-[10px] text-amber-300/80 mb-4 leading-relaxed">
-                  Heads up: Spotify Dev-mode apps ignore the private flag — the
-                  playlist may land Public. Toggle to private in the Spotify
-                  app if needed.
+                  Spotify may make it public anyway; switch it to private in the Spotify app.
                 </p>
 
                 <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1">
@@ -508,7 +510,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                   onChange={(e) => setGenPrompt(e.target.value)}
                   rows={3}
                   placeholder="e.g. Late-night drive through the rain, heavy on synths and slow burn. Mostly instrumental."
-                  className="w-full mb-4 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors resize-none"
+                  className="w-full mb-4 px-3 py-2 text-[13px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-source-spotify/50 outline-none transition-colors resize-none"
                   disabled={genRunning}
                 />
 
@@ -563,7 +565,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
 
                 <label className="block text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-1.5">
                   Genres <span className="text-text-tertiary/60 normal-case">
-                    (from your top {rangeLabel(range)} — click to bias selection)
+                    (from your top {rangeLabel(range)})
                   </span>
                 </label>
                 <div className="flex gap-2 mb-2 flex-wrap">
@@ -594,12 +596,12 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                     }}
                     placeholder="Add custom genre (e.g. ambient)"
                     disabled={genRunning}
-                    className="flex-1 px-3 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-source-spotify/50 outline-none transition-colors"
+                    className="flex-1 px-3 py-1.5 text-[12px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-source-spotify/50 outline-none transition-colors"
                   />
                   <button
                     onClick={addCustomGenre}
                     disabled={genRunning || !genCustomGenre.trim()}
-                    className="px-3 py-1.5 text-[11px] font-mono text-text-secondary hover:text-text-primary border border-border-subtle rounded-[4px] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                    className="px-3 py-1.5 text-[11px] font-mono text-text-secondary hover:text-text-primary border border-border-subtle rounded-control disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                   >
                     Add
                   </button>
@@ -620,11 +622,6 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                   </div>
                 )}
 
-                <p className="text-[10px] text-text-tertiary leading-relaxed border-l-2 border-amber-500/40 pl-2 mb-4">
-                  Playlists are requested private — Spotify&apos;s Dev-mode API may still publish them
-                  as Public; toggle to Private from the Spotify app if needed.
-                </p>
-
                 {genError && (
                   <p className="text-[11px] text-red-400 font-mono mb-3 break-all">{genError}</p>
                 )}
@@ -643,7 +640,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                       genRunning ||
                       (!genPrompt.trim() && genVibes.length === 0 && genGenres.length === 0)
                     }
-                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/40 rounded-[4px] transition-colors"
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/40 rounded-control transition-colors"
                   >
                     {genRunning ? "Generating…" : "Generate"}
                   </button>
@@ -654,7 +651,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                     <p className="text-[10px] font-mono uppercase tracking-wide text-text-tertiary mb-2">
                       Progress
                     </p>
-                    <div className="bg-black/30 border border-border-subtle rounded-[4px] p-2.5 max-h-40 overflow-y-auto space-y-1">
+                    <div className="bg-black/30 border border-border-subtle rounded-control p-2.5 max-h-40 overflow-y-auto space-y-1">
                       {genLog.map((entry, i) => (
                         <div
                           key={i}
@@ -689,7 +686,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                   {genResult.track_count} tracks
                 </p>
                 {genLog.length > 0 && (
-                  <div className="mb-4 bg-black/30 border border-border-subtle rounded-[4px] p-2.5 max-h-32 overflow-y-auto space-y-1">
+                  <div className="mb-4 bg-black/30 border border-border-subtle rounded-control p-2.5 max-h-32 overflow-y-auto space-y-1">
                     {genLog
                       .filter((e) => e.kind === "message" || e.kind === "tool_result")
                       .map((entry, i) => (
@@ -715,7 +712,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                     href={genResult.spotify_url}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-[4px] transition-colors"
+                    className="px-4 py-2 text-[12px] font-medium text-text-primary bg-source-spotify/20 hover:bg-source-spotify/30 border border-source-spotify/40 rounded-control transition-colors"
                   >
                     Open in Spotify
                   </a>
@@ -731,7 +728,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
       )}
 
       {!loading && !hasData && (
-        <div className="bg-surface-card border border-border-subtle rounded-[6px] p-8 text-center">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-8 text-center">
           <p className="text-[13px] text-text-secondary">No Spotify plays in the database yet.</p>
           <p className="text-[11px] text-text-tertiary mt-2 font-mono">
             Run the OAuth bootstrap: <code>python spotify_etl.py --auth</code>
@@ -743,21 +740,30 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
       )}
 
       {!loading && hasData && (
-        <>
+        // Personalize: every KPI tile, chart and list is its own part, in four sections; a part moves within its
+        // section or into another. Header, range filter, modals and the loading / empty states stay fixed.
+        <PartGrid page="/spotify" title="Spotify">
           {/* KPI Row */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <PartGroup id="overview" title="Overview">
+            <Part id="plays" title="Plays" width="quarter">
             <StatCard label="Plays" value={kpis!.totalPlays} sublabel={rangeLabel(range)} />
+            </Part>
+            <Part id="listening-hours" title="Listening" width="quarter">
             <StatCard
               label="Listening"
               value={kpis!.totalHours.toFixed(1)}
               unit="hrs"
               sublabel={rangeLabel(range)}
             />
+            </Part>
+            <Part id="unique-tracks" title="Unique Tracks" width="quarter">
             <StatCard
               label="Unique Tracks"
               value={kpis!.uniqueTracks}
               sublabel={`${kpis!.uniqueArtists} artists`}
             />
+            </Part>
+            <Part id="top-track" title="Top Track" width="quarter">
             <StatCard
               label="Top Track"
               value={kpis!.topTrack ? `${kpis!.topTrack.count}×` : "—"}
@@ -767,9 +773,10 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                   : undefined
               }
             />
-          </div>
+            </Part>
 
           {/* Listening volume over time */}
+          <Part id="listening-volume" title="Listening volume">
           <ChartCard
             title="Listening volume"
             subtitle={`plays per day, ${rangeLabel(range)}`}
@@ -793,24 +800,34 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
               </LineChart>
             </ResponsiveContainer>
           </ChartCard>
+          </Part>
+          </PartGroup>
 
           {/* Taste evolution — three trend charts */}
-          <section className="space-y-4">
-            <div className="border-l-2 border-source-spotify/40 pl-3">
-              <h2 className="text-[14px] font-medium text-text-primary">Taste evolution</h2>
-              <p className="text-[11px] text-text-tertiary mt-0.5">
-                How your listening has changed across {rangeLabel(range)}. Each chart is smoothed
-                with a 7-day rolling mean (where the range is long enough) so daily noise doesn&apos;t
-                drown out the trend.
-              </p>
+          <PartGroup
+            id="taste"
+            title="Taste evolution"
+            header={
+            <div className="border-l-2 border-source-spotify/40 pl-3 mb-4">
+              <div className="flex items-center gap-2">
+                <h2 className="text-[14px] font-medium text-text-primary">Taste evolution</h2>
+                <InfoHint label="Taste evolution">
+                  Each chart is smoothed with a 7-day rolling mean (where the range is long enough) so daily
+                  noise does not drown out the trend.
+                </InfoHint>
+              </div>
+              <p className="text-[11px] text-text-tertiary mt-0.5">{rangeLabel(range)}</p>
             </div>
+            }
+          >
 
             {/* Sound evolution — audio feature drift */}
+            <Part id="sound-evolution" title="Sound evolution">
             <ChartCard
               title="Sound evolution"
               subtitle={`7 audio features over time — ${rangeLabel(range)}`}
               source="RECCOBEATS"
-              info="Daily mean of each feature, smoothed with a 7-day right-aligned rolling mean. All features are normalized 0–1. Days with no featurized plays are dropped before smoothing so gaps don't pull the line. Rising acousticness + falling energy is the classic 'going introspective' signature; rising danceability + speechiness leans into hip-hop / dance territory."
+              hint="Daily mean of each feature (0–1), smoothed with a 7-day rolling mean. Days with no featurized plays are dropped before smoothing. Rising acousticness with falling energy reads as introspective; rising danceability and speechiness leans hip-hop / dance."
             >
               {drift.length === 0 ? (
                 <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
@@ -846,13 +863,15 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                 </ResponsiveContainer>
               )}
             </ChartCard>
+            </Part>
 
             {/* Genre rotation — stacked area */}
+            <Part id="genre-rotation" title="Genre rotation">
             <ChartCard
               title="Genre rotation"
-              subtitle={`daily play composition, top ${genreRotation.topGenres.length} genres + other — ${rangeLabel(range)}`}
+              subtitle={`top ${genreRotation.topGenres.length} genres + other — ${rangeLabel(range)}`}
               source="MUSICBRAINZ"
-              info="Stacked area shows how many plays each day came from each top genre. Each artist's full tag set contributes — heavy-rotation artists weight their genres more. Tracks whose artist had no MusicBrainz match fall into 'other'."
+              hint="Plays per day from each top genre. Every genre tag of an artist counts, so heavy-rotation artists weigh more. Artists with no MusicBrainz match fall into 'other'."
             >
               {genreRotation.rows.length === 0 ? (
                 <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
@@ -893,13 +912,15 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                 </ResponsiveContainer>
               )}
             </ChartCard>
+            </Part>
 
             {/* Discovery rate */}
+            <Part id="discovery-rate" title="Discovery rate">
             <ChartCard
               title="Discovery rate"
               subtitle={`% of plays that were brand-new tracks — ${rangeLabel(range)}`}
               source="SPOTIFY"
-              info="For each day, the % of plays that were tracks you'd never played before (across all-time history, not just this range). The 7-day rolling mean smooths the daily spikes. Sustained high = exploration mode; sustained low = comfort-zone listening."
+              hint="Share of each day's plays that were tracks never played before (all-time history, not just this range), smoothed with a 7-day rolling mean. High = exploring; low = comfort listening."
             >
               {discovery.length === 0 ? (
                 <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
@@ -920,14 +941,17 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                 </ResponsiveContainer>
               )}
             </ChartCard>
-          </section>
+            </Part>
+          </PartGroup>
 
           {/* Current sonic profile */}
+          <PartGroup id="favorites" title="Profile & favorites">
+          <Part id="sonic-profile" title="Current sonic profile">
           <ChartCard
             title="Current sonic profile"
             subtitle={`play-weighted mean of 7 audio features — ${rangeLabel(range)}`}
             source="RECCOBEATS"
-            info="All values normalized 0–1. Valence = positivity. Energy = intensity. Danceability = rhythmic regularity. Acousticness = acoustic vs. electronic. Instrumentalness = lack of vocals. Liveness = live-recording probability. Speechiness = spoken-word content. Weighted by play count so heavy rotation moves the shape."
+            hint="All values 0–1, weighted by play count. Valence = positivity. Energy = intensity. Danceability = rhythmic regularity. Acousticness = acoustic vs electronic. Instrumentalness = no vocals. Liveness = live recording. Speechiness = spoken word."
           >
             {sonic ? (
               <ResponsiveContainer width="100%" height={320}>
@@ -975,14 +999,15 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
               </p>
             )}
           </ChartCard>
+          </Part>
 
           {/* Top genres + top artists + top tracks side by side */}
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <Part id="top-genres" title="Top genres" width="third">
             <ChartCard
               title="Top genres"
               subtitle={`${rangeLabel(range)}, by play count`}
               source="MUSICBRAINZ"
-              info="Each play counts once toward every genre tag MusicBrainz has for that artist, so heavy-rotation artists weight their genres more. Genres come from MusicBrainz (Spotify Dev Mode strips genres post-Feb 2026)."
+              hint="Each play counts once toward every MusicBrainz genre tag of its artist (Spotify no longer returns genres)."
             >
               <ol className="space-y-1.5">
                 {genres.map((g, i) => (
@@ -1001,7 +1026,9 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                 )}
               </ol>
             </ChartCard>
+            </Part>
 
+            <Part id="top-artists" title="Top artists" width="third">
             <ChartCard title="Top artists" subtitle={`${rangeLabel(range)}, by play count`} source="SPOTIFY">
               <ol className="space-y-1.5">
                 {topArtists.map((a, i) => (
@@ -1020,12 +1047,14 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                 )}
               </ol>
             </ChartCard>
+            </Part>
 
+            <Part id="top-tracks" title="Top tracks" width="third">
             <ChartCard title="Top tracks" subtitle={`${rangeLabel(range)}, by play count`} source="SPOTIFY">
               <button
                 onClick={() => setModalOpen(true)}
                 disabled={topTracks.length === 0}
-                className="mb-3 w-full px-3 py-2 text-[11px] font-mono font-medium tracking-wide text-text-primary bg-source-spotify/15 hover:bg-source-spotify/25 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/30 rounded-[4px] transition-colors"
+                className="mb-3 w-full px-3 py-2 text-[11px] font-mono font-medium tracking-wide text-text-primary bg-source-spotify/15 hover:bg-source-spotify/25 disabled:opacity-40 disabled:cursor-not-allowed border border-source-spotify/30 rounded-control transition-colors"
               >
                 Create private Spotify playlist from these {topTracks.length} tracks
               </button>
@@ -1047,14 +1076,17 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                 )}
               </ol>
             </ChartCard>
-          </div>
+            </Part>
+          </PartGroup>
 
           {/* Hour of day */}
+          <PartGroup id="listening-log" title="Listening log">
+          <Part id="by-hour" title="Listening by hour of day">
           <ChartCard
             title="Listening by hour of day"
             subtitle={`ET, ${rangeLabel(range)}`}
             source="SPOTIFY"
-            info="Bars are play counts grouped by hour-of-day (America/New_York). Reveals chronotype patterns — heavy late-night listening shows up here."
+            hint="Plays grouped by hour of day, Eastern time."
           >
             <ResponsiveContainer width="100%" height={220}>
               <BarChart data={hours} margin={{ top: 8, right: 8, left: 4, bottom: 20 }}>
@@ -1066,13 +1098,15 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
               </BarChart>
             </ResponsiveContainer>
           </ChartCard>
+          </Part>
 
           {/* Play ledger */}
+          <Part id="play-ledger" title="Play ledger">
           <ChartCard
             title="Play ledger"
             subtitle={`every play, newest first · ${rangeLabel(range)}${ledgerTotal > 0 ? ` · ${ledgerTotal.toLocaleString()} plays` : ""}`}
             source="SPOTIFY"
-            info="Every track that registered in Spotify's recently-played feed for the selected range. Spotify's 30-second minimum applies — anything skipped sooner doesn't appear."
+            hint="Every track in Spotify's recently-played feed for this range. Tracks skipped within 30 seconds never appear."
           >
             {ledgerLoading && ledger.length === 0 && (
               <p className="text-[11px] text-text-tertiary font-mono py-8 text-center">Loading…</p>
@@ -1110,7 +1144,7 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                             {r.artist_name ?? "—"}
                           </td>
                           <td className="py-1.5 px-1 text-right text-text-tertiary tabular-nums">
-                            {formatDuration(r.duration_ms)}
+                            {formatTrackLengthMs(r.duration_ms)}
                           </td>
                         </tr>
                       ))}
@@ -1125,14 +1159,14 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
                     <button
                       onClick={() => setLedgerPage((p) => Math.max(0, p - 1))}
                       disabled={ledgerPage === 0 || ledgerLoading}
-                      className="px-2.5 py-1 text-[11px] text-text-secondary hover:text-text-primary disabled:opacity-30 disabled:cursor-not-allowed border border-border-subtle rounded-[4px] transition-colors"
+                      className="px-2.5 py-1 text-[11px] text-text-secondary hover:text-text-primary disabled:opacity-30 disabled:cursor-not-allowed border border-border-subtle rounded-control transition-colors"
                     >
                       ← Prev
                     </button>
                     <button
                       onClick={() => setLedgerPage((p) => p + 1)}
                       disabled={(ledgerPage + 1) * LEDGER_PER_PAGE >= ledgerTotal || ledgerLoading}
-                      className="px-2.5 py-1 text-[11px] text-text-secondary hover:text-text-primary disabled:opacity-30 disabled:cursor-not-allowed border border-border-subtle rounded-[4px] transition-colors"
+                      className="px-2.5 py-1 text-[11px] text-text-secondary hover:text-text-primary disabled:opacity-30 disabled:cursor-not-allowed border border-border-subtle rounded-control transition-colors"
                     >
                       Next →
                     </button>
@@ -1141,7 +1175,9 @@ export default function SpotifyPage({ initial }: { initial?: SpotifyInitial | nu
               </>
             )}
           </ChartCard>
-        </>
+          </Part>
+          </PartGroup>
+        </PartGrid>
       )}
     </div>
   );
@@ -1160,9 +1196,12 @@ function formatPlayedAt(iso: string): string {
   return playedAtFmt.format(new Date(iso));
 }
 
-function formatDuration(ms: number | null): string {
+// Track length as m:ss from Spotify's duration_ms. Named apart from format.ts's
+// formatDuration (seconds -> "1h 2m") and formatDurationMs (ms -> "1h 2m") so
+// it cannot be mistaken for, or shadow, either one (units/gpt-5/F-005).
+function formatTrackLengthMs(ms: Milliseconds | null): string {
   if (ms == null) return "—";
-  const totalSec = Math.round(ms / 1000);
+  const totalSec = Math.round(msToSeconds(ms));
   const m = Math.floor(totalSec / 60);
   const s = totalSec % 60;
   return `${m}:${s.toString().padStart(2, "0")}`;

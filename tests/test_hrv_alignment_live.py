@@ -11,7 +11,8 @@ behaviour was scored one night late. This one reads live data and fails if:
      and timed Cronometer servings dated D start after the sleep dated D-1 and before the
      sleep dated D);
   3. a re-keyed column (WHOOP strain, Eight Sleep, Garmin HRV) stops lining up best with
-     the same row after hrv_alignment.realign_matrix;
+     the same row after hrv_alignment.realign_matrix; the same for WHOOP steps
+     (pds.whoop_cycles.step_count, re-keyed in pandas) against Garmin steps;
   4. the descriptive outcome, the forecast target (prepare_ml_data) or the causal outcome
      stops being row D's own HRV;
   5. anyone re-introduces a negative shift of the HRV target in the pipeline sources;
@@ -76,7 +77,7 @@ def fetch(table: str, select: str, filters: list | None = None) -> pd.DataFrame:
 
 MATRIX_COLS = ("calendar_date,whoop_hrv_rmssd,whoop_day_strain,whoop_kilojoule,"
                "whoop_cycle_avg_hr,whoop_cycle_max_hr,whoop_workout_strain,"
-               "eight_sleep_hrv,garmin_hrv_last_night")
+               "eight_sleep_hrv,garmin_hrv_last_night,total_steps")
 
 
 def load():
@@ -86,7 +87,7 @@ def load():
         if c != "calendar_date":
             m[c] = pd.to_numeric(m[c], errors="coerce")
     m = m.sort_values("calendar_date").reset_index(drop=True)
-    cycles = fetch("whoop_cycles", "cycle_id,start_time,end_time,onyx_behavioral_date")
+    cycles = fetch("whoop_cycles", "cycle_id,start_time,end_time,timezone_offset,onyx_behavioral_date,step_count")
     rec = fetch("whoop_recovery", "cycle_id,hrv_rmssd_milli,score_state")
     sleep = fetch("whoop_sleep", "cycle_id,start_time,is_nap,score_state",
                   [("is_nap", "eq", False)])
@@ -136,6 +137,22 @@ def test_rekeyed_columns_line_up_with_the_same_row(m):
     problems = al.check_rekey_directions(realigned)
     assert not problems, problems
     print("PASS: after realign_matrix, strain / Eight Sleep / Garmin HRV match the same row best")
+
+
+def test_whoop_steps_sit_on_the_waking_day(m, cycles):
+    """WHOOP steps are merged in pandas (not a matrix column), keyed cycle date + 1. Garmin
+    steps (clock day) are the reference: the same day counted by a second device."""
+    import hrv_analysis as ha
+
+    df = ha.merge_whoop_steps_features(al.realign_matrix(m), cycles)
+    assert "whoop_steps" in df.columns, "merge_whoop_steps_features produced no column"
+    same, n = al._corr(df["whoop_steps"], df["total_steps"])
+    assert n >= 30, f"only {n} days with both WHOOP and Garmin steps - cannot check"
+    problems = [p for p in al.check_rekey_directions(df) if "whoop_steps" in p]
+    assert not problems, problems
+    assert same >= 0.7, f"WHOOP vs Garmin steps on the same row: r={same:.2f} (n={n})"
+    print(f"PASS: WHOOP steps (cycle date + 1) match Garmin steps on the same row best "
+          f"(r={same:.2f}, n={n})")
 
 
 def test_every_layer_scores_against_row_d(m):
@@ -217,6 +234,7 @@ def main() -> int:
         lambda: test_row_hrv_is_the_cycle_dated_to_the_row(m, cycles, rec),
         lambda: test_day_d_events_precede_the_sleep_dated_d(cycles, sleep),
         lambda: test_rekeyed_columns_line_up_with_the_same_row(m),
+        lambda: test_whoop_steps_sit_on_the_waking_day(m, cycles),
         lambda: test_every_layer_scores_against_row_d(m),
         test_no_negative_shift_of_the_target_in_the_pipeline,
         test_alcohol_canary,

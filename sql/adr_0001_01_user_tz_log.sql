@@ -1,5 +1,8 @@
 -- =============================================================================
 -- ADR-0001 Phase 1, step 1 — pds.user_tz_log + derivation helpers
+-- NOTE 2026-11-14: pds.derive_onyx_dates (tier 3+5 labelled by pds.tz_log_resolve) is
+-- redefined in sql/tz_derivation_edge_cases.sql (pending Riley's apply). Once applied,
+-- that file holds the current definition; do not re-run the copy below.
 -- =============================================================================
 -- Per docs/adr/0001-timezone-and-behavioral-day-handling.md (D3 hybrid TZ
 -- detection, tier 3). Hand-maintained table of "Riley was in IANA TZ X

@@ -1,3 +1,9 @@
+// Type-only import: format.ts stays import-free at runtime, because
+// tests/today-regression.cjs bundles it on its own without resolving imports.
+import type {
+  Kilocalories, Kilograms, Kilojoules, Meters, Milliseconds, Pounds, Seconds,
+} from "./units";
+
 export function formatDate(dateStr: string): string {
   const d = new Date(dateStr + "T00:00:00");
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
@@ -66,9 +72,10 @@ export function whoopSleepDay(startTime: string | null | undefined): string {
  *   - Garmin + Eight Sleep store durations in SECONDS — pass directly.
  *   - WHOOP stores durations in MILLISECONDS — use `formatDurationMs` or
  *     divide by 1000 first. Passing raw WHOOP `_milli` values here renders
- *     durations 1000× too large.
+ *     durations 1000× too large. The `Seconds` / `Milliseconds` types in
+ *     units.ts make that mistake a compile error once a value is tagged.
  */
-export function formatDuration(seconds: number | null | undefined): string {
+export function formatDuration(seconds: Seconds | null | undefined): string {
   // Explicit null/NaN guard rather than `!seconds` so a legitimate 0-second
   // duration (e.g. a logged "rest" or "warm-up only") renders as "0m" instead
   // of being swallowed as "—".
@@ -87,14 +94,14 @@ export function formatDuration(seconds: number | null | undefined): string {
  * to seconds and delegates — exists so WHOOP `_milli` fields can be passed
  * directly without each caller risking the off-by-1000 bug.
  */
-export function formatDurationMs(ms: number | null): string {
+export function formatDurationMs(ms: Milliseconds | null): string {
   if (ms == null || Number.isNaN(ms)) return "—";
   return formatDuration(Math.round(ms / 1000));
 }
 
 // Second-precision duration for short events (lap times, intervals). Format:
 // <60s → "30s"; <1h → "8:09"; ≥1h → "1:02:42".
-export function formatShortDuration(seconds: number | null): string {
+export function formatShortDuration(seconds: Seconds | null): string {
   if (seconds == null || Number.isNaN(seconds)) return "—";
   const s = Math.round(seconds);
   if (s < 60) return `${s}s`;
@@ -106,7 +113,7 @@ export function formatShortDuration(seconds: number | null): string {
   return `${m}:${pad(sec)}`;
 }
 
-export function formatDistance(meters: number | null | undefined): string {
+export function formatDistance(meters: Meters | null | undefined): string {
   if (meters == null || Number.isNaN(meters)) return "—";
   const miles = meters / METERS_PER_MILE;
   if (miles >= 0.5) return `${miles.toFixed(1)} mi`;
@@ -123,10 +130,10 @@ export const KJ_PER_KCAL = 4.184;
 export const KG_PER_LB = 0.45359237;
 export const LB_PER_KG = 1 / KG_PER_LB;
 
-export const kjToKcal = (kj: number): number => kj / KJ_PER_KCAL;
-export const kgToLb = (kg: number | null | undefined): number | null =>
+export const kjToKcal = (kj: Kilojoules): Kilocalories => kj / KJ_PER_KCAL;
+export const kgToLb = (kg: Kilograms | null | undefined): Pounds | null =>
   kg == null ? null : kg * LB_PER_KG;
-export const lbToKg = (lb: number): number => lb * KG_PER_LB;
+export const lbToKg = (lb: Pounds): Kilograms => lb * KG_PER_LB;
 
 /**
  * Format a kJ value as kcal for display. Rounds to the integer at the
@@ -137,7 +144,7 @@ export const lbToKg = (lb: number): number => lb * KG_PER_LB;
  * `formatKjAsKcal`. Input is kJ, not kcal — the old name suggested an
  * already-kcal value, inviting an accidental second /4.184 division.
  */
-export function formatKjAsKcal(kj: number | null | undefined): string {
+export function formatKjAsKcal(kj: Kilojoules | null | undefined): string {
   if (kj == null || Number.isNaN(kj)) return "—";
   return `${Math.round(kjToKcal(kj))} kcal`;
 }

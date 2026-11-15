@@ -2,6 +2,7 @@ import { revalidatePath } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { MAX_PORTION_BODY_BYTES, checkPortionRequest, parseItemId, parsePortionBody } from "@/lib/delivery-portion";
+import { leftoverConflictMessage } from "@/lib/delivery-leftovers";
 
 // PATCH /api/delivery/items/[itemId]   body {eaten_fraction: number | null}
 // How much of one delivered Uber Eats cart line Riley ate (1, 0.75, 0.5, 0.25, 0; null = back to "all",
@@ -46,6 +47,10 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ it
     .eq("item_id", id)
     .select("item_id, eaten_fraction");
   if (error) {
+    // The leftover guard (sql/delivery_item_leftovers.sql) refuses a delivery-day portion that would no
+    // longer leave room for leftovers already saved on a later day.
+    const conflict = leftoverConflictMessage(error.code, "portion");
+    if (conflict) return NextResponse.json({ error: conflict }, { status: 409 });
     console.error("delivery portion update failed:", error.code);
     return NextResponse.json({ error: "could not save" }, { status: 500 });
   }

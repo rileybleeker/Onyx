@@ -16,7 +16,7 @@ Run: python tests/test_air_quality.py
 """
 import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -37,15 +37,22 @@ NOW = datetime(2026, 11, 11, 14, 30, tzinfo=etl.ET)   # 14:30 ET: hours up to 14
 
 
 def _payload(hours):
-    """hours: list of (local 'YYYY-MM-DDTHH:00', pm2_5, us_aqi)."""
+    """hours: list of (UTC 'YYYY-MM-DDTHH:00', pm2_5, us_aqi), as the API returns them with timezone=GMT."""
     return {"hourly": {"time": [t for t, _, _ in hours],
                        "pm2_5": [p for _, p, _ in hours],
                        "us_aqi": [a for _, _, a in hours]}}
 
 
+def _utc(day, hr):
+    """The UTC API timestamp of ET wall-clock hour `hr` on ET day `day`."""
+    local = datetime.fromisoformat(f"{day}T{hr:02d}:00").replace(tzinfo=etl.ET)
+    return local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+
+
 def _day(day, pm_values, aqi_values=None):
+    """Hours 00:00, 01:00, ... of ET day `day`, stamped in UTC."""
     aqi_values = aqi_values or [None] * len(pm_values)
-    return [(f"{day}T{hr:02d}:00", p, a) for hr, (p, a) in enumerate(zip(pm_values, aqi_values))]
+    return [(_utc(day, hr), p, a) for hr, (p, a) in enumerate(zip(pm_values, aqi_values))]
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +70,57 @@ def test_aggregate_groups_by_et_day_and_drops_future_hours():
     assert yesterday["us_aqi_mean"] == 50.0 and yesterday["us_aqi_max"] == 60.0
     assert now_row["n_hours"] == 15, "hours 00..14 only; the forecast hours are never stored"
     assert (yesterday["latitude"], yesterday["longitude"], yesterday["source"]) == (LAT, LON, "open-meteo-cams")
+
+
+def test_et_day_is_built_from_utc_not_from_the_api_offset():
+    # July: ET is UTC-4. 03:00Z on July 1 is 23:00 ET on June 30; 04:00Z is midnight ET July 1.
+    july = [("2026-07-01T03:00", 30.0, None), ("2026-07-01T04:00", 2.0, None),
+            ("2026-07-02T03:00", 4.0, None), ("2026-07-02T04:00", 40.0, None)]
+    by = {r["calendar_date"]: r for r in etl.aggregate_daily(_payload(july), NOW, LAT, LON)}
+    assert set(by) == {"2026-06-30", "2026-07-01", "2026-07-02"}
+    assert by["2026-06-30"]["pm25_max"] == 30.0
+    assert (by["2026-07-01"]["n_hours"], by["2026-07-01"]["pm25_mean"], by["2026-07-01"]["pm25_max"]) == (2, 3.0, 4.0)
+    assert by["2026-07-02"]["pm25_max"] == 40.0
+    # January: ET is UTC-5. 04:00Z on Jan 15 is 23:00 ET on Jan 14; 05:00Z is midnight ET Jan 15.
+    january = [("2026-01-15T04:00", 30.0, None), ("2026-01-15T05:00", 2.0, None),
+               ("2026-01-16T04:00", 4.0, None), ("2026-01-16T05:00", 40.0, None)]
+    by = {r["calendar_date"]: r for r in etl.aggregate_daily(_payload(january), NOW, LAT, LON)}
+    assert set(by) == {"2026-01-14", "2026-01-15", "2026-01-16"}
+    assert (by["2026-01-15"]["n_hours"], by["2026-01-15"]["pm25_mean"], by["2026-01-15"]["pm25_max"]) == (2, 3.0, 4.0)
+
+
+def test_dst_days_have_23_and_25_hours():
+    def utc_range(start, n):
+        t0 = datetime.fromisoformat(start)
+        return [((t0 + timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M"), 5.0, None) for i in range(n)]
+    spring = {r["calendar_date"]: r for r in etl.aggregate_daily(_payload(utc_range("2026-03-07T05:00", 71)), NOW, LAT, LON)}
+    assert [spring[d]["n_hours"] for d in ("2026-03-07", "2026-03-08", "2026-03-09")] == [24, 23, 24]
+    fall = {r["calendar_date"]: r for r in etl.aggregate_daily(_payload(utc_range("2026-10-31T04:00", 73)), NOW, LAT, LON)}
+    assert [fall[d]["n_hours"] for d in ("2026-10-31", "2026-11-01", "2026-11-02")] == [24, 25, 24]
+
+
+def test_fetch_asks_for_utc_hours_and_covers_the_last_et_day():
+    seen = {}
+
+    class Client:
+        def get(self, url, params):
+            seen.update(params)
+
+            class R:
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {"hourly": {"time": [], "pm2_5": []}}
+            return R()
+
+    etl.fetch_hourly(Client(), LAT, LON, date(2026, 7, 1), date(2026, 7, 2))
+    assert seen["timezone"] == "GMT"
+    now_utc = datetime(2026, 11, 12, 2, 0, tzinfo=timezone.utc)   # 21:00 ET on Nov 11
+    assert etl.api_range(date(2026, 11, 1), date(2026, 11, 11), now_utc) == (date(2026, 11, 1), date(2026, 11, 12))
+    assert etl.api_range(date(2026, 7, 1), date(2026, 9, 28), now_utc) == (date(2026, 7, 1), date(2026, 9, 29))
+    early = datetime(2026, 11, 11, 15, 0, tzinfo=timezone.utc)
+    assert etl.api_range(date(2026, 11, 1), date(2026, 11, 11), early)[1] == date(2026, 11, 11)
 
 
 def test_aggregate_skips_nulls_and_empty_days():
@@ -220,12 +278,14 @@ def test_missing_table_error_names_the_sql_file():
 def test_routine_run_window_and_empty_table_bootstrap():
     today = datetime.now(etl.ET).date()
     empty_payload = _payload(_day("2026-11-10", [None]))
+    # The API is asked for UTC dates: one extra date at the end completes the last ET day (never past UTC today).
+    last = min(today + timedelta(days=1), datetime.now(timezone.utc).date())
     _, calls = _run(FakeSupabase(existing=True), empty_payload)
-    assert calls == [(today - timedelta(days=etl.DEFAULT_DAYS), today)]
+    assert calls == [(today - timedelta(days=etl.DEFAULT_DAYS), last)]
     _, calls = _run(FakeSupabase(existing=False), empty_payload)
-    assert calls[0][0] == etl.BOOTSTRAP_START and calls[-1][1] == today and len(calls) > 5
+    assert calls[0][0] == etl.BOOTSTRAP_START and calls[-1][1] == last and len(calls) > 5
     _, calls = _run(FakeSupabase(existing=False), empty_payload, days=30)
-    assert calls == [(today - timedelta(days=30), today)], "an explicit window never bootstraps"
+    assert calls == [(today - timedelta(days=30), last)], "an explicit window never bootstraps"
 
 
 # ---------------------------------------------------------------------------

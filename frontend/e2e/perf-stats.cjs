@@ -128,7 +128,7 @@ function summarizePage(samples) {
   const timing = {};
   for (const k of TIMING_KEYS) {
     const xs = warm.map((s) => s[k]);
-    timing[k] = { p50: percentile(xs, 50), p95: percentile(xs, 95), min: percentile(xs, 0), max: percentile(xs, 100), n: xs.filter(finite).length };
+    timing[k] = { p50: percentile(xs, 50), p95: percentile(xs, 95), min: percentile(xs, 0), max: percentile(xs, 100), n: xs.filter(finite).length, values: xs.filter(finite) };
   }
 
   const requests = {};
@@ -155,6 +155,9 @@ function summarizePage(samples) {
     const first = per.find(Boolean);
     const callMs = [];
     for (const e of per) if (e && e.n > 0) callMs.push(e.ms / e.n);
+    // The slowest single call in each warm view: the budget is about any one call, so a 1500 ms call next to a
+    // 100 ms one must not average to 800 ms (Codex review 2026-11-14).
+    const maxPerView = per.filter((e) => e && e.n > 0).map((e) => (finite(e.maxMs) ? e.maxMs : e.ms / e.n));
     endpoints.push({
       cls: first.cls,
       key: first.key,
@@ -162,9 +165,19 @@ function summarizePage(samples) {
       msPerView: median(per.map((e) => (e ? e.ms : 0))),
       callMsP50: percentile(callMs, 50),
       callMsP95: percentile(callMs, 95),
+      callMsMax: percentile(maxPerView, 100),
+      callMaxP95: percentile(maxPerView, 95),
+      maxPerView,
       bytesPerView: median(per.map((e) => (e ? e.bytes : 0))),
       seenIn: per.filter(Boolean).length,
     });
+  }
+  // The cold (first) navigation's calls, kept separately: a first visit is something Riley waits for too.
+  const coldEndpoints = [];
+  if (cold && cold.ok) {
+    for (const e of Object.values(cold.endpoints || {})) {
+      if (e && e.n > 0) coldEndpoints.push({ cls: e.cls, key: e.key, maxMs: finite(e.maxMs) ? e.maxMs : e.ms / e.n });
+    }
   }
   endpoints.sort((a, b) => b.msPerView - a.msPerView || b.callsPerView - a.callsPerView);
 
@@ -182,6 +195,7 @@ function summarizePage(samples) {
     emptyState: samples.filter((s) => s.emptyState).length,
     quietTimedOut: samples.filter((s) => s.quietTimedOut).length,
     cold: cold && cold.ok ? pickCold(cold) : null,
+    coldEndpoints,
     timing,
     requests,
     total_: total,
@@ -250,13 +264,13 @@ function requestsTable(pages) {
 
 function endpointTable(pages, perPage = 5) {
   const out = [];
-  out.push("| Page | Endpoint (class, path) | calls / view | summed ms / view | per-call p50 / p95 ms | KB / view |");
-  out.push("|---|---|---|---|---|---|");
+  out.push("| Page | Endpoint (class, path) | calls / view | summed ms / view | per-call p50 / p95 ms | slowest call (max / p95 of views) ms | KB / view |");
+  out.push("|---|---|---|---|---|---|---|");
   for (const p of pages) {
     const rows = p.summary.endpoints.filter((e) => e.cls === "rest" || e.cls === "api" || e.cls === "worker").slice(0, perPage);
     for (const e of rows) {
       out.push(
-        `| ${p.label} | ${e.cls} ${e.key} | ${num(e.callsPerView)} | ${ms(e.msPerView)} | ${ms(e.callMsP50)} / ${ms(e.callMsP95)} | ${kb(e.bytesPerView)} |`
+        `| ${p.label} | ${e.cls} ${e.key} | ${num(e.callsPerView)} | ${ms(e.msPerView)} | ${ms(e.callMsP50)} / ${ms(e.callMsP95)} | ${ms(e.callMsMax)} / ${ms(e.callMaxP95)} | ${kb(e.bytesPerView)} |`
       );
     }
   }
@@ -302,7 +316,58 @@ function stabilityTable(runs) {
   return out.join("\n");
 }
 
+/**
+ * Speed budget (Riley 2026-11-14: nothing may take a full second). Pure: `pages` are summarizePage() results with
+ * their slug, label and `expected` navigation count. Tightened after the Codex review of 2026-11-14 (D4):
+ *   - any single API / database / Worker call (warm or the cold first visit) that takes `ms` or more breaks it: the
+ *     slowest call per view is compared, not a per-view mean;
+ *   - a page's data taking `ms` or more in any warm view, or in the cold first visit, breaks it;
+ *   - an incomplete page breaks it: a navigation that never reached data-ready (its data took at least 30 s, or the
+ *     page is broken), fewer navigations than planned, or no warm view at all. A missing number is never a pass.
+ * Each line says whether the breach is repeatable (slow in two or more warm views) or isolated (one slow view), with
+ * the warm p95 beside it, so a persistent regression can be told from a single slow request. Returns one line per breach; empty = within budget.
+ */
+const SPEED_BUDGET_MS = 1000;
+const BUDGET_CLASSES = new Set(["rest", "api", "worker", "supabase-auth"]);
+function budgetViolations(pages, ms = SPEED_BUDGET_MS) {
+  const out = [];
+  const r = (v) => Math.round(v);
+  // Repeatable = slow in two or more warm views; with the hourly 3 warm views a p95 is close to the max, so the count
+  // tells a persistent regression from one slow request, and the p95 is reported beside it.
+  const kind = (p95, slowViews, views) =>
+    `${slowViews >= 2 ? "repeatable" : "isolated"}: ${slowViews} of ${views} warm views${finite(p95) ? `, warm p95 ${r(p95)} ms` : ""}`;
+  for (const p of pages) {
+    const s = p.summary || {};
+    const name = p.label || p.slug;
+    const total = s.total ?? 0;
+    const expected = finite(p.expected) ? p.expected : total;
+    if (total < expected) out.push(`${name}: only ${total} of ${expected} navigations were measured`);
+    if (s.failed > 0) out.push(`${name}: ${s.failed} of ${total} navigations never reached data-ready (counts as over ${ms} ms)`);
+    const ready = s.timing?.ready || {};
+    if (expected >= 2 && !(ready.n > 0)) out.push(`${name}: no warm navigation reached data-ready`);
+    if (s.cold && finite(s.cold.ready) && s.cold.ready >= ms) out.push(`${name}: data ready ${r(s.cold.ready)} ms on the cold first visit`);
+    if (finite(ready.max) && ready.max >= ms) {
+      const slow = (ready.values || []).filter((v) => v >= ms).length || 1;
+      out.push(`${name}: data ready ${r(ready.max)} ms in the slowest warm view (${kind(ready.p95, slow, ready.n || 1)})`);
+    }
+    for (const e of s.endpoints || []) {
+      if (!BUDGET_CLASSES.has(e.cls)) continue;
+      const max = finite(e.callMsMax) ? e.callMsMax : e.callMsP50;
+      if (!(finite(max) && max >= ms)) continue;
+      const per = Array.isArray(e.maxPerView) ? e.maxPerView : [];
+      const slow = per.filter((v) => v >= ms).length || 1;
+      out.push(`${name}: ${e.key} took ${r(max)} ms (${kind(e.callMaxP95, slow, per.length || 1)})`);
+    }
+    for (const e of s.coldEndpoints || []) {
+      if (BUDGET_CLASSES.has(e.cls) && finite(e.maxMs) && e.maxMs >= ms) out.push(`${name}: ${e.key} took ${r(e.maxMs)} ms on the cold first visit`);
+    }
+  }
+  return out;
+}
+
 module.exports = {
+  SPEED_BUDGET_MS,
+  budgetViolations,
   REQUEST_CLASSES,
   percentile,
   median,

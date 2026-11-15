@@ -45,6 +45,21 @@ GENERATOR = f"numpy PCG64 raw stream + SeedSequence, rejection-sampled (numpy {n
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 # Objective adherence sources pds.experiment_day_status knows how to read (sql/experiment_framework_schema.sql).
 OBJECTIVE_SOURCES = ("pds.phone_usage_daily.minutes_last_hour_before_sleep_est",)
+# Protocol field `kind` (optional, default treatment). An A/A check (docs/experiment-framework.md 12.2)
+# runs the whole pipeline with both arms carrying the same instruction, so a significant result
+# can only be a false one. docs/experiments/EXP-900.md is the first.
+KIND_TREATMENT, KIND_AA = "treatment", "aa"
+TRIAL_KINDS = (KIND_TREATMENT, KIND_AA)
+
+
+def trial_kind(protocol: Any) -> str:
+    """The protocol's kind; anything other than an explicit `kind: aa` is a treatment trial."""
+    kind = protocol.get("kind") if isinstance(protocol, dict) else None
+    return KIND_AA if str(kind or "").strip().lower() == KIND_AA else KIND_TREATMENT
+
+
+def _same_instruction(a: Any, b: Any) -> bool:
+    return " ".join(str(a).split()).lower() == " ".join(str(b).split()).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +239,20 @@ def validate_protocol(p: dict[str, Any], *, today: date, alignment_version: str,
     if control not in ARMS:
         problems.append("control_arm must be A or B")
 
+    # kind: treatment (default) or aa. An A/A check must have two identical arms, and a treatment
+    # trial two different ones, so neither can be registered as the other by mistake.
+    kind_raw = p.get("kind", KIND_TREATMENT)
+    if str(kind_raw).strip().lower() not in TRIAL_KINDS:
+        problems.append("kind must be treatment or aa (an A/A check: both arms the same instruction)")
+    kind = trial_kind(p)
+    if arm_a and arm_b:
+        same = _same_instruction(arm_a, arm_b)
+        if kind == KIND_AA and not same:
+            problems.append("kind: aa (an A/A check) needs arms.A and arms.B to be the same instruction")
+        if kind == KIND_TREATMENT and same:
+            problems.append("arms.A and arms.B are the same instruction: a treatment trial needs two different arms "
+                            "(an A/A check says kind: aa)")
+
     outcome = need(p, "outcome", "") or {}
     primary = need(outcome, "primary", "outcome.")
     registered_alignment = need(outcome, "alignment_version", "outcome.")
@@ -273,11 +302,19 @@ def validate_protocol(p: dict[str, Any], *, today: date, alignment_version: str,
         problems.append("allocation.seed_sha256 does not match the seed stored for this experiment")
 
     objective = (p.get("adherence") or {}).get("objective") if isinstance(p.get("adherence"), dict) else None
-    if objective is not None:
+    if objective is not None and kind == KIND_AA:
+        problems.append("an A/A check has no adherence.objective rule: both arms are the same, so a device "
+                        "check on one arm would make them differ")
+    elif objective is not None:
         if not isinstance(objective, dict) or objective.get("source") not in OBJECTIVE_SOURCES:
             problems.append("adherence.objective.source must be one of: " + ", ".join(OBJECTIVE_SOURCES))
         elif not isinstance(objective.get("max"), (int, float)) or isinstance(objective.get("max"), bool)                 or objective.get("arm") not in ARMS:
             problems.append("adherence.objective needs a numeric max and arm A or B")
+
+    # Optional: the adherence share below which the daily report job warns (experiment_report.py).
+    min_pct = p["adherence"].get("min_pct") if isinstance(p.get("adherence"), dict) else None
+    if min_pct is not None and (isinstance(min_pct, bool) or not isinstance(min_pct, (int, float)) or not 0 < min_pct <= 100):
+        problems.append("adherence.min_pct must be a number above 0 and at most 100")
 
     stopping = p.get("stopping") if isinstance(p.get("stopping"), dict) else {}
     if str(stopping.get("interim", "none")).strip().lower() != "none":

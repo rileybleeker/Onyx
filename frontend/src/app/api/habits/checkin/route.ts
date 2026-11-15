@@ -1,13 +1,13 @@
 import { createClient } from "@supabase/supabase-js";
 import { after, NextRequest, NextResponse } from "next/server";
-import { fetchActiveHabits, NotionHabitsError, type NotionHabit } from "@/lib/habits-notion";
+import { fetchActiveHabits, fetchActiveHabitsCached, NotionHabitsError, type NotionHabit } from "@/lib/habits-notion";
+import { behavioralToday, dateError, isDate, loadChannels, loadItems, toItems, WHOOP_JOURNAL_FROZEN_THROUGH } from "@/lib/checkin-server";
 import {
   addDays,
   APP_HABITS,
   appHabitSuggestions,
   CHECKIN_MAX_DAYS_BACK,
   fallbackBehavioralToday,
-  groupFor,
   journaledSuggestion,
   Q_JOURNALED,
   Q_SAME_BED,
@@ -46,10 +46,12 @@ import { CHECKIN_SCREEN_COLUMNS, settledLastHourMinutes } from "@/lib/checkin-sc
  * days before are accepted; older days stay unlogged (the HRV pipeline treats them as unknown).
  *
  * Auth: under /api/habits/*, so middleware requires a Supabase session (or the CI token).
+ *
+ * Speed (2026-11-14): the question list comes from the shared Notion cache (lib/habits-notion.ts), and the GET starts
+ * the day's reads before behavioral today is known (see GET), so a load is one round of parallel reads.
  */
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
-const WHOOP_JOURNAL_FROZEN_THROUGH = "2026-06-08";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -62,44 +64,7 @@ const Q_REST = "Took a rest day?";
 // WHOOP sports that don't make a day "not a rest day" on their own (yoga, auto-detected activity, sauna, ...).
 const LIGHT_SPORTS = new Set(["yoga", "activity", "other", "walking", "sauna", "meditation", "stretching", "breathwork"]);
 
-const isDate = (s: unknown): s is string => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
-
-async function behavioralToday(): Promise<string> {
-  try {
-    const { data } = await supabase.rpc("behavioral_today_now");
-    if (data) return data as string;
-  } catch {
-    /* fall through */
-  }
-  return fallbackBehavioralToday(new Date());
-}
-
-function dateError(date: string, today: string): string | null {
-  if (date > today) return "That day hasn't happened yet.";
-  if (date < addDays(today, -CHECKIN_MAX_DAYS_BACK)) return `The check-in only covers today and the ${CHECKIN_MAX_DAYS_BACK} days before.`;
-  if (date <= WHOOP_JOURNAL_FROZEN_THROUGH) return "That day is in the frozen WHOOP era.";
-  return null;
-}
-
-async function loadItems(): Promise<{ items: CheckinItem[]; habits: NotionHabit[] }> {
-  const [habits, { data: map }] = await Promise.all([fetchActiveHabits(), supabase.from("habit_name_map").select("habit_name, channel")]);
-  const channel = new Map((map ?? []).map((r: { habit_name: string; channel: string }) => [r.habit_name, r.channel]));
-  const items = habits
-    .filter((h) => h.name)
-    .map((h): CheckinItem => {
-      const ch = channel.get(h.name) === "whoop" ? "whoop" : "habit";
-      return {
-        name: h.name,
-        notionPageId: h.id,
-        category: h.category,
-        frequency: h.frequency,
-        channel: ch,
-        group: groupFor(h.name, ch, h.frequency),
-        sleep: SLEEP_QUESTIONS.has(h.name),
-      };
-    });
-  return { items, habits };
-}
+// behavioralToday, dateError, isDate and loadItems are shared with the voice route (lib/checkin-server.ts).
 
 /** Pre-fills from other sources. Each one is only offered when the data is clear; otherwise the question stays blank. */
 async function suggestionsFor(date: string, today: string, names: Set<string>): Promise<Record<string, CheckinSuggestion>> {
@@ -168,7 +133,11 @@ async function suggestionsFor(date: string, today: string, names: Set<string>): 
  * Pre-fills for one finished night. `night` = the behavior day that night closes (its answers are stored on that
  * day). Same contract as suggestionsFor: only when the data is clear, never written here.
  */
-async function sleepSuggestionsFor(night: string, names: Set<string>): Promise<Record<string, CheckinSuggestion>> {
+async function sleepSuggestionsFor(
+  night: string,
+  names: Set<string>,
+  newestBed: PromiseLike<{ data: unknown[] | null; error: unknown }> | null
+): Promise<Record<string, CheckinSuggestion>> {
   const out: Record<string, CheckinSuggestion> = {};
   const tasks: Promise<void>[] = [];
 
@@ -186,12 +155,12 @@ async function sleepSuggestionsFor(night: string, names: Set<string>): Promise<R
   }
 
   // Eight Sleep: was that night spent in the usual bed? (Eight Sleep keys a night by its wake-up date = night + 1)
-  if (names.has(Q_SAME_BED)) {
+  if (names.has(Q_SAME_BED) && newestBed) {
     tasks.push(
       (async () => {
         const [rowsRes, newest] = await Promise.all([
           supabase.from("eight_sleep_trends").select("time_slept_seconds").eq("calendar_date", addDays(night, 1)).neq("bed_side", "away"),
-          supabase.from("eight_sleep_trends").select("calendar_date").neq("bed_side", "away").order("calendar_date", { ascending: false }).limit(1),
+          newestBed,
         ]);
         if (rowsRes.error || newest.error) return;
         const rows = (rowsRes.data ?? []) as { time_slept_seconds: number | null }[];
@@ -206,62 +175,99 @@ async function sleepSuggestionsFor(night: string, names: Set<string>): Promise<R
   return out;
 }
 
+type Built = { payload: CheckinPayload } | { error: string };
+
+/**
+ * Everything the screen shows for `date`, given behavioral `today`. Read-only: pre-fills are never written here.
+ * Names and sleep flags do not depend on the channel, so the reads start before habit_name_map answers.
+ */
+async function buildPayload(today: string, date: string, habitsP: Promise<NotionHabit[]>, channelsP: Promise<Map<string, string>>): Promise<Built> {
+  const habits = await habitsP;
+  const names = habits.map((h) => h.name).filter((n) => n);
+  const from = addDays(today, -CHECKIN_MAX_DAYS_BACK);
+
+  // Sleep questions are asked per finished NIGHT (sleepNights), never per day tab: the day's own lists leave them out.
+  const sleepNames = new Set(names.filter((n) => SLEEP_QUESTIONS.has(n)));
+  const dayNames = new Set(names.filter((n) => !sleepNames.has(n)));
+  const nightDates = sleepNames.size ? sleepNights(today, WHOOP_JOURNAL_FROZEN_THROUGH) : [];
+  const kitNames = SLEEP_KIT.filter((q) => sleepNames.has(q));
+  // Newest Eight Sleep night: the same answer for every night asked, so it is read once (.then() sends the
+  // lazy query builder now and gives one shared promise; awaiting the builder itself twice would send it twice).
+  const newestBed =
+    sleepNames.has(Q_SAME_BED) && nightDates.length
+      ? supabase.from("eight_sleep_trends").select("calendar_date").neq("bed_side", "away").order("calendar_date", { ascending: false }).limit(1).then((r) => r)
+      : null;
+
+  const [{ data: rows, error }, suggestions, kitRows, nightSuggestions, channel] = await Promise.all([
+    supabase.from("habit_journal").select("cycle_date, question, answer").gte("cycle_date", from).lte("cycle_date", today).in("question", names),
+    suggestionsFor(date, today, dayNames),
+    // Newest answers to the sleep-kit questions before the newest night asked (200 rows = 40 fully answered days).
+    kitNames.length && nightDates.length
+      ? supabase.from("habit_journal").select("cycle_date, question, answer").in("question", kitNames).lt("cycle_date", nightDates[0]).order("cycle_date", { ascending: false }).limit(200)
+      : Promise.resolve({ data: [], error: null }),
+    Promise.all(nightDates.map((n) => sleepSuggestionsFor(n, sleepNames, newestBed))),
+    channelsP,
+  ]);
+  if (error) return { error: error.message };
+  const kitHistory = kitRows.error ? [] : ((kitRows.data ?? []) as { cycle_date: string; question: string; answer: string }[]);
+
+  const items = toItems(habits, channel);
+  const core = new Set(items.filter((i) => i.group === "core").map((i) => i.name));
+  const dayCore = new Set([...core].filter((n) => !sleepNames.has(n)));
+
+  const answers: Record<string, CheckinAnswer> = {};
+  const nightAnswers = new Map<string, Record<string, CheckinAnswer>>(nightDates.map((n) => [n, {}]));
+  const answeredByDay = new Map<string, number>();
+  for (const r of (rows ?? []) as { cycle_date: string; question: string; answer: CheckinAnswer }[]) {
+    if (sleepNames.has(r.question)) {
+      const night = nightAnswers.get(r.cycle_date);
+      if (night) night[r.question] = r.answer;
+      continue;
+    }
+    if (r.cycle_date === date) answers[r.question] = r.answer;
+    if (dayCore.has(r.question)) answeredByDay.set(r.cycle_date, (answeredByDay.get(r.cycle_date) || 0) + 1);
+  }
+  const days = Array.from({ length: CHECKIN_MAX_DAYS_BACK + 1 }, (_, i) => addDays(today, -i))
+    .filter((d) => d > WHOOP_JOURNAL_FROZEN_THROUGH)
+    .map((d) => ({ date: d, answered: answeredByDay.get(d) || 0, total: dayCore.size }));
+  const nights: CheckinNight[] = nightDates.map((n, i) => ({
+    date: n,
+    answers: nightAnswers.get(n) ?? {},
+    suggestions: nightSuggestions[i] ?? {},
+    usualKit: usualKit(kitHistory, n, kitNames),
+  }));
+
+  return { payload: { date, today, items, answers, suggestions, nights, days } };
+}
+
 export async function GET(req: NextRequest) {
   try {
-    const today = await behavioralToday();
-    const date = req.nextUrl.searchParams.get("date") || today;
+    const requested = req.nextUrl.searchParams.get("date") || null;
+    const habitsP = fetchActiveHabitsCached();
+    const channelsP = loadChannels();
+    // Handled here so a failure nobody awaits (a dropped guess below) is not an unhandled rejection;
+    // every await of these promises still throws.
+    habitsP.catch(() => {});
+    channelsP.catch(() => {});
+    const todayP = behavioralToday();
+
+    // Behavioral today is TZ-aware (pds.behavioral_today_now(), travel via user_tz_log), but at home it equals the
+    // Eastern rule (fallbackBehavioralToday). Start the day's reads with that guess while the RPC answers: they are
+    // used only when the RPC agrees, otherwise dropped and read again for the real day (read-only, so harmless).
+    const guess = fallbackBehavioralToday(new Date());
+    const guessDate = requested ?? guess;
+    const speculative = isDate(guessDate) && !dateError(guessDate, guess) ? buildPayload(guess, guessDate, habitsP, channelsP) : null;
+    speculative?.catch(() => {});
+
+    const today = await todayP;
+    const date = requested || today;
     if (!isDate(date)) return NextResponse.json({ error: "date must be YYYY-MM-DD" }, { status: 400 });
     const bad = dateError(date, today);
     if (bad) return NextResponse.json({ error: bad, today }, { status: 400 });
 
-    const { items } = await loadItems();
-    const names = items.map((i) => i.name);
-    const core = new Set(items.filter((i) => i.group === "core").map((i) => i.name));
-    const from = addDays(today, -CHECKIN_MAX_DAYS_BACK);
-
-    // Sleep questions are asked per finished NIGHT (sleepNights), never per day tab: the day's own lists leave them out.
-    const sleepNames = new Set(items.filter((i) => i.sleep).map((i) => i.name));
-    const dayCore = new Set([...core].filter((n) => !sleepNames.has(n)));
-    const dayNames = new Set(names.filter((n) => !sleepNames.has(n)));
-    const nightDates = sleepNames.size ? sleepNights(today, WHOOP_JOURNAL_FROZEN_THROUGH) : [];
-    const kitNames = SLEEP_KIT.filter((q) => sleepNames.has(q));
-
-    const [{ data: rows, error }, suggestions, kitRows, nightSuggestions] = await Promise.all([
-      supabase.from("habit_journal").select("cycle_date, question, answer").gte("cycle_date", from).lte("cycle_date", today).in("question", names),
-      suggestionsFor(date, today, dayNames),
-      // Newest answers to the sleep-kit questions before the newest night asked (200 rows = 40 fully answered days).
-      kitNames.length && nightDates.length
-        ? supabase.from("habit_journal").select("cycle_date, question, answer").in("question", kitNames).lt("cycle_date", nightDates[0]).order("cycle_date", { ascending: false }).limit(200)
-        : Promise.resolve({ data: [], error: null }),
-      Promise.all(nightDates.map((n) => sleepSuggestionsFor(n, sleepNames))),
-    ]);
-    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
-    const kitHistory = kitRows.error ? [] : ((kitRows.data ?? []) as { cycle_date: string; question: string; answer: string }[]);
-
-    const answers: Record<string, CheckinAnswer> = {};
-    const nightAnswers = new Map<string, Record<string, CheckinAnswer>>(nightDates.map((n) => [n, {}]));
-    const answeredByDay = new Map<string, number>();
-    for (const r of (rows ?? []) as { cycle_date: string; question: string; answer: CheckinAnswer }[]) {
-      if (sleepNames.has(r.question)) {
-        const night = nightAnswers.get(r.cycle_date);
-        if (night) night[r.question] = r.answer;
-        continue;
-      }
-      if (r.cycle_date === date) answers[r.question] = r.answer;
-      if (dayCore.has(r.question)) answeredByDay.set(r.cycle_date, (answeredByDay.get(r.cycle_date) || 0) + 1);
-    }
-    const days = Array.from({ length: CHECKIN_MAX_DAYS_BACK + 1 }, (_, i) => addDays(today, -i))
-      .filter((d) => d > WHOOP_JOURNAL_FROZEN_THROUGH)
-      .map((d) => ({ date: d, answered: answeredByDay.get(d) || 0, total: dayCore.size }));
-    const nights: CheckinNight[] = nightDates.map((n, i) => ({
-      date: n,
-      answers: nightAnswers.get(n) ?? {},
-      suggestions: nightSuggestions[i] ?? {},
-      usualKit: usualKit(kitHistory, n, kitNames),
-    }));
-
-    const payload: CheckinPayload = { date, today, items, answers, suggestions, nights, days };
-    return NextResponse.json(payload, { headers: { "Cache-Control": "no-store" } });
+    const built = speculative && today === guess ? await speculative : await buildPayload(today, date, habitsP, channelsP);
+    if ("error" in built) return NextResponse.json({ error: built.error }, { status: 500 });
+    return NextResponse.json(built.payload, { headers: { "Cache-Control": "no-store" } });
   } catch (e) {
     if (e instanceof NotionHabitsError) return NextResponse.json({ error: e.message }, { status: 502 });
     throw e;
@@ -270,6 +276,8 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as { date?: unknown; answers?: unknown; today?: unknown };
+  const itemsP = loadItems(); // in parallel with behavioral today; its errors are answered below, after the date checks
+  itemsP.catch(() => {});
   const today = await behavioralToday();
   // The screen sends the `today` it was drawn with. If the day has rolled over since (a page left open
   // overnight), its "Last night" is now the night before: refuse, and the screen reloads. Optional field.
@@ -283,9 +291,8 @@ export async function POST(req: NextRequest) {
   if (!body.answers || typeof body.answers !== "object") return NextResponse.json({ error: "answers is required" }, { status: 400 });
 
   let items: CheckinItem[];
-  let habits: NotionHabit[];
   try {
-    ({ items, habits } = await loadItems());
+    ({ items } = await itemsP);
   } catch (e) {
     if (e instanceof NotionHabitsError) return NextResponse.json({ error: e.message }, { status: 502 });
     throw e;
@@ -314,7 +321,19 @@ export async function POST(req: NextRequest) {
     if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  if (NOTION_API_KEY) after(() => mirrorLastCompleted(date, upserts, clears, habits, byName));
+  // The mirror decides from Notion's CURRENT "Last Completed", so it reads Notion fresh (never the cached list).
+  if (NOTION_API_KEY && (upserts.length || clears.length)) {
+    after(async () => {
+      let habits: NotionHabit[];
+      try {
+        habits = await fetchActiveHabits();
+      } catch (e) {
+        console.error("[checkin] Notion read for Last Completed failed (Supabase already saved):", e instanceof Error ? e.message : e);
+        return;
+      }
+      await mirrorLastCompleted(date, upserts, clears, habits, byName);
+    });
+  }
 
   return NextResponse.json({ success: true, date, saved: upserts.length, cleared: clears.length });
 }

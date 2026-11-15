@@ -301,6 +301,29 @@ test("stale or missing heartbeats say what is wrong in words", () => {
   assert.equal(card(beat(1, { status: "running" }), beat(1)).status, "partial");
 });
 
+test("keep-alive heartbeat: a failing visit newer than the imports drags the card down with its own text; it never makes the card fresher", () => {
+  const K = (h, over) => beat(h, { status: "success", records_synced: 0, ...over });
+  const fail1 = K(1, { status: "partial", error_message: "keep-alive visit failed (1 in a row): the Net Worth data did not load within 45 s" });
+  const fail2 = K(1, { status: "failed", error_message: "keep-alive visit failed (2 in a row): could not read the app" });
+  // newer than both imports and failing: partial on the first miss, red from the second, with the visit's own words
+  assert.equal(S.financeLedgerCard(beat(5), beat(5), NOW.getTime(), fail1).status, "partial");
+  assert.match(S.financeLedgerCard(beat(5), beat(5), NOW.getTime(), fail1).errorMessage, /^keep-alive visit failed \(1 in a row\)/);
+  assert.equal(S.financeLedgerCard(beat(5), beat(5), NOW.getTime(), fail2).status, "failed");
+  // a successful keep-alive changes nothing, and never refreshes stale imports
+  assert.equal(S.financeLedgerCard(beat(5), beat(5), NOW.getTime(), K(1)).status, "success");
+  assert.equal(S.financeLedgerCard(beat(40), beat(40), NOW.getTime(), K(1)).status, "partial");
+  assert.equal(S.financeLedgerCard(beat(5), beat(5), NOW.getTime(), K(1)).lastSync, hoursAgo(5));
+  // an import after the failed visit is the newer truth
+  assert.equal(S.financeLedgerCard(beat(1), beat(1), NOW.getTime(), K(3, { status: "failed", error_message: "x" })).status, "success");
+  // an import failure keeps its own text first
+  const login = S.financeLedgerCard(beat(5, { status: "failed", error_message: "login required: run node harvest.mjs --login" }), beat(5), NOW.getTime(), fail2);
+  assert.equal(login.errorMessage, "login required: run node harvest.mjs --login");
+  // no import heartbeat at all: still unknown, a keep-alive alone says nothing about the ledger
+  assert.equal(S.financeLedgerCard(null, null, NOW.getTime(), fail2).status, "unknown");
+  // the records count is the imports' only
+  assert.equal(S.financeLedgerCard(beat(5, { records_synced: 3 }), beat(5, { records_synced: 4 }), NOW.getTime(), K(1, { records_synced: 99 })).recordsSynced, 7);
+});
+
 test("card totals and newest sync", () => {
   const c = card(beat(5, { records_synced: 120 }), beat(2, { records_synced: 7, duration_seconds: 1.2 }));
   assert.equal(c.recordsSynced, 127);
@@ -324,7 +347,7 @@ function fakeSupabase(beats) {
       then(resolve, reject) {
         reads.push(q);
         let data = [];
-        if (table === "sync_log" && q.eq.source === "rocketmoney") data = beats[q.eq.data_type] ? [beats[q.eq.data_type]] : [];
+        if (table === "sync_log" && q.eq.source === "simplefin") data = beats[q.eq.data_type] ? [beats[q.eq.data_type]] : [];
         return Promise.resolve({ data, error: null }).then(resolve, reject);
       },
     };
@@ -346,40 +369,46 @@ async function statusBody(beats) {
   return { body: res.body, reads: fake.reads };
 }
 
-test("/status has a Rocket Money card: automated, daily, worst-of-two heartbeats, heartbeats only", async () => {
+test("/status has a SimpleFIN card: automated, every 6h, worst-of-two heartbeats, heartbeats only", async () => {
   // The route reads the real clock, so these heartbeats are timed against it (not the fixed NOW above).
-  const fresh = (h, over) => ({ source: "rocketmoney", status: "success", sync_start: new Date(Date.now() - h * 3_600_000).toISOString(), records_synced: 10, duration_seconds: 4.5, error_message: null, ...over });
+  const fresh = (h, over) => ({ source: "simplefin", status: "success", sync_start: new Date(Date.now() - h * 3_600_000).toISOString(), records_synced: 10, duration_seconds: 4.5, error_message: null, ...over });
   const ok = await statusBody({ transactions: fresh(2), balances: fresh(3) });
-  const c = ok.body.sources.rocket_money;
-  assert.equal(c.label, "Rocket Money");
+  const c = ok.body.sources.simplefin;
+  assert.equal(c.label, "SimpleFIN");
   assert.equal(c.status, "success");
   assert.equal(c.integrationMethod, "automated");
   assert.ok(c.cadence && c.methodLabel);
   assert.equal(c.recordsSynced, 20);
-  const dedicated = ok.reads.filter((q) => q.table === "sync_log" && q.eq.source === "rocketmoney").map((q) => q.eq.data_type).sort();
+  assert.equal(ok.body.sources.rocket_money, undefined, "the retired Rocket Money card is gone");
+  const dedicated = ok.reads.filter((q) => q.table === "sync_log" && q.eq.source === "simplefin").map((q) => q.eq.data_type).sort();
   assert.deepEqual(dedicated, ["balances", "transactions"], "each heartbeat has its own limit-1 read");
   assert.equal(ok.reads.some((q) => q.table.startsWith("finance_")), false, "the cacheable status endpoint never reads ledger rows");
 
-  const login = await statusBody({ transactions: fresh(1), balances: fresh(1, { status: "failed", error_message: "Login required" }) });
-  assert.equal(login.body.sources.rocket_money.status, "failed");
-  assert.equal(login.body.sources.rocket_money.errorMessage, "Login required");
+  const revoked = await statusBody({ transactions: fresh(1, { status: "failed", error_message: "SimpleFIN refused the Access URL" }), balances: fresh(1) });
+  assert.equal(revoked.body.sources.simplefin.status, "failed");
+  assert.equal(revoked.body.sources.simplefin.errorMessage, "SimpleFIN refused the Access URL");
+  const reconnect = await statusBody({ transactions: fresh(1, { status: "partial", error_message: "SimpleFIN: Reconnect Demo Bank" }), balances: fresh(1) });
+  assert.equal(reconnect.body.sources.simplefin.status, "partial");
 
-  const stale = await statusBody({ transactions: fresh(40), balances: fresh(40) });
-  assert.equal(stale.body.sources.rocket_money.status, "partial");
-  const dead = await statusBody({ transactions: fresh(80), balances: fresh(80) });
-  assert.equal(dead.body.sources.rocket_money.status, "failed");
+  assert.equal((await statusBody({ transactions: fresh(13), balances: fresh(13) })).body.sources.simplefin.status, "success");
+  assert.equal((await statusBody({ transactions: fresh(15), balances: fresh(1) })).body.sources.simplefin.status, "partial");
+  assert.equal((await statusBody({ transactions: fresh(31), balances: fresh(31) })).body.sources.simplefin.status, "failed");
+  // An old Rocket Money heartbeat no longer counts for anything.
   const never = await statusBody({});
-  assert.equal(never.body.sources.rocket_money.status, "unknown");
+  assert.equal(never.body.sources.simplefin.status, "unknown");
 });
 
 test("the status page lists the card and labels its history", () => {
   const page = fs.readFileSync(path.join(SRC, "app/status/page.tsx"), "utf8");
-  assert.match(page, /rocket_money: "ROCKET MONEY"/);
-  assert.match(page, /rocket_money: "text-/);
-  assert.match(page, /SOURCE_ORDER = \[[^\]]*"rocket_money"/s);
-  assert.match(page, /rocketmoney: "Rocket Money"/);
+  assert.match(page, /simplefin: "SIMPLEFIN"/);
+  assert.match(page, /simplefin: "text-/);
+  assert.match(page, /SOURCE_ORDER = \[[^\]]*"simplefin"/s);
+  assert.doesNotMatch(page, /SOURCE_ORDER = \[[^\]]*"rocket_money"/s);
+  assert.match(page, /simplefin: "SimpleFIN"/);
+  assert.match(page, /rocketmoney: "Rocket Money"/, "old Rocket Money history rows keep their label");
   assert.match(page, /transactions: "Transactions"/);
   assert.match(page, /balances: "Balances"/);
+  assert.match(page, /keepalive: "Keep-alive"/);
 });
 
 // ─── privacy and architecture guards ─────────────────────────────────────────

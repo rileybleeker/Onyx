@@ -1,5 +1,6 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
 import { ExternalLink } from "lucide-react";
@@ -7,7 +8,9 @@ import type { NycLead, RileyDecision } from "@/lib/nyc";
 import { sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import NycMap, { markerColor } from "./NycMap";
+import { usePageHeadingTestId } from "@/components/FeedContext";
 
 const NOTION_DB_URL = "https://www.notion.so/967fdf52d6ee4aab9a5854298e564b43";
 const BRIEF =
@@ -25,7 +28,7 @@ const VIEWS: Array<{ key: View; label: string }> = [
 const PRICE_CAPS = [null, 3000, 3500, 4000] as const;
 const DECISIONS: Array<{ key: RileyDecision; label: string; on: string }> = [
   { key: "Interested", label: "Interested", on: "bg-accent-muted text-accent border-accent/40" },
-  { key: "Toured", label: "Toured", on: "bg-[#9A7BFA]/15 text-[#B9A4FC] border-[#9A7BFA]/40" },
+  { key: "Toured", label: "Toured", on: "bg-[#9085E9]/15 text-[#B3ACF2] border-[#9085E9]/40" },
   { key: "Passed", label: "Pass", on: "bg-down/10 text-down border-down/40" },
 ];
 
@@ -52,6 +55,8 @@ function median(xs: number[]): number | null {
 }
 
 export default function NycClient({ initial }: { initial: NycLead[] | null }) {
+  // "page-heading" on /nyc itself, "feed-page-heading" inside the continuous scroll.
+  const headingTestId = usePageHeadingTestId();
   const [leads, setLeads] = useState<NycLead[]>(initial ?? []);
   const [loading, setLoading] = useState(!initial);
   const [error, setError] = useState<string | null>(null);
@@ -78,6 +83,8 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
       })
       .then((next) => {
         if (cancelled) return;
+        // Also seeds this page in the continuous scroll (lib/feed-seed.ts).
+        writeFeedSeed("/nyc", next);
         setError(null);
         setLeads((prev) => (sameJson(prev, next) ? prev : next));
       })
@@ -202,10 +209,10 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
   return (
     <div className="space-y-6">
       <header className="space-y-1">
-        <h1 className="text-[22px] font-display text-text-primary">NYC Apartment Search</h1>
+        <h1 data-testid={headingTestId} className="text-[22px] font-display text-text-primary">NYC Apartment Search</h1>
         <p className="text-[12px] text-text-secondary">{BRIEF}</p>
         <p className="text-[11px] font-mono text-text-tertiary">
-          nyc-scout runs daily at 6:10 AM ET · last checked {lastChecked ? shortDate(lastChecked) : "—"} ·{" "}
+          Last checked {lastChecked ? shortDate(lastChecked) : "—"} ·{" "}
           <a href={NOTION_DB_URL} target="_blank" rel="noreferrer" className="underline hover:text-text-secondary">
             open in Notion
           </a>
@@ -213,20 +220,38 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
       </header>
 
       {error && (
-        <div className="border border-down/40 bg-down/10 rounded-[4px] px-4 py-3 text-[12px] text-down">
+        <div className="border border-down/40 bg-down/10 rounded-control px-4 py-3 text-[12px] text-down">
           Couldn&apos;t load leads: {error}
         </div>
       )}
 
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        <StatCard label="Active leads" value={active.length} sublabel="not gone, not passed" />
-        <StatCard label="Fit the brief" value={fits.length} sublabel="full fit or meets numbers" />
-        <StatCard label="Interested" value={interested.length} sublabel="incl. toured" />
-        <StatCard label="New this week" value={newThisWeek.length} />
-        <StatCard label="Median ask" value={medianAsk == null ? null : money(medianAsk)} sublabel="active leads" />
-      </div>
+      {/* Personalize: each KPI tile is its own part (Overview); the map and the leads table are parts of "Map & leads",
+          whose header keeps the view / neighborhood / price filters. A part moves within its section or into the other. */}
+      <PartGrid page="/nyc" title="NYC Apartment Search">
+      <PartGroup id="overview" title="Overview">
+        <Part id="active-leads" title="Active leads" width="quarter">
+          <StatCard label="Active leads" value={active.length} sublabel="not gone, not passed" />
+        </Part>
+        <Part id="fit-brief" title="Fit the brief" width="quarter">
+          <StatCard label="Fit the brief" value={fits.length} sublabel="full fit or meets numbers" />
+        </Part>
+        <Part id="interested" title="Interested" width="quarter">
+          <StatCard label="Interested" value={interested.length} sublabel="incl. toured" />
+        </Part>
+        <Part id="new-this-week" title="New this week" width="quarter">
+          <StatCard label="New this week" value={newThisWeek.length} />
+        </Part>
+        <Part id="median-ask" title="Median ask" width="quarter">
+          <StatCard label="Median ask" value={medianAsk == null ? null : money(medianAsk)} sublabel="active leads" />
+        </Part>
+      </PartGroup>
 
-      <div className="flex flex-wrap items-center gap-2">
+      <PartGroup
+        id="leads"
+        title="Map & leads"
+        gap={24}
+        header={
+      <div className="mb-4 flex flex-wrap items-center gap-2">
         {VIEWS.map((v) => (
           <button
             key={v.key}
@@ -245,7 +270,7 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         <select
           value={hood}
           onChange={(e) => setHood(e.target.value)}
-          className="bg-surface-card border border-border-default rounded-[4px] px-2 py-1 text-[12px] text-text-secondary"
+          className="bg-surface-card border border-border-default rounded-control px-2 py-1 text-[12px] text-text-secondary"
           aria-label="Neighborhood"
         >
           {neighborhoods.map((n) => (
@@ -255,7 +280,7 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         <select
           value={priceCap ?? ""}
           onChange={(e) => setPriceCap(e.target.value ? Number(e.target.value) : null)}
-          className="bg-surface-card border border-border-default rounded-[4px] px-2 py-1 text-[12px] text-text-secondary"
+          className="bg-surface-card border border-border-default rounded-control px-2 py-1 text-[12px] text-text-secondary"
           aria-label="Maximum price"
         >
           {PRICE_CAPS.map((p) => (
@@ -267,7 +292,10 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
           Fits the brief only
         </label>
       </div>
+        }
+      >
 
+      <Part id="map" title="Map">
       <ChartCard
         title="Map"
         subtitle={`${visible.length - unmapped} of ${visible.length} shown${unmapped ? ` · ${unmapped} without a location` : ""}`}
@@ -276,12 +304,12 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         <NycMap leads={visible} selectedId={selectedId} onSelect={(id) => select(id, true)} />
         <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-text-tertiary">
           {[
-            ["Interested", "#16E07A"],
-            ["Toured", "#9A7BFA"],
-            ["Full fit, not judged", "#F5A623"],
-            ["Meets numbers", "#FFD23F"],
-            ["Partial", "#9AA0A6"],
-            ["Passed", "#5F6368"],
+            ["Interested", "#5BC46E"],
+            ["Toured", "#9085E9"],
+            ["Full fit, not judged", "#FF6A1A"],
+            ["Meets numbers", "#F4C84E"],
+            ["Partial", "#B0AEA6"],
+            ["Passed", "#706E67"],
           ].map(([label, color]) => (
             <span key={label} className="flex items-center gap-1.5">
               <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: color }} />
@@ -290,8 +318,10 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
           ))}
         </div>
       </ChartCard>
+      </Part>
 
-      <ChartCard title="Leads" subtitle="Click a row for details and notes; your choice is saved to Notion for the scout" variant="secondary">
+      <Part id="leads-table" title="Leads">
+      <ChartCard title="Leads" subtitle="Tap a row for details and notes" variant="secondary">
         {saveError && <p className="mb-3 text-[12px] text-down">{saveError}</p>}
         {loading ? (
           <p className="py-8 text-center text-[12px] font-mono text-text-tertiary">Loading leads…</p>
@@ -432,13 +462,13 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
                                   onChange={(e) => setNoteDraft(e.target.value)}
                                   rows={3}
                                   maxLength={2000}
-                                  className="w-full bg-surface-card border border-border-default rounded-[4px] px-2 py-1.5 text-text-primary"
+                                  className="w-full bg-surface-card border border-border-default rounded-control px-2 py-1.5 text-text-primary"
                                   placeholder="e.g. ask about the second room; skip if no laundry"
                                 />
                                 <button
                                   onClick={() => save(l, { rileyNote: noteDraft })}
                                   disabled={noteDraft.trim() === l.rileyNote}
-                                  className="px-3 py-1 rounded-[4px] border border-accent/50 text-accent text-[12px] disabled:opacity-40"
+                                  className="px-3 py-1 rounded-control border border-accent/50 text-accent text-[12px] disabled:opacity-40"
                                 >
                                   Save note
                                 </button>
@@ -455,6 +485,9 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
           </div>
         )}
       </ChartCard>
+      </Part>
+      </PartGroup>
+      </PartGrid>
     </div>
   );
 }

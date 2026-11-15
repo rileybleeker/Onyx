@@ -32,6 +32,20 @@ const RECHARTS_MARKS = "svg.recharts-surface path";
 // the data fetch. Give them room.
 const LOAD_TIMEOUT = 30_000;
 
+// The continuous scroll (components/ContinuousScroll.tsx) draws the neighbouring pages above and below the routed
+// one. Every check in this file is about the routed page alone (a neighbour's chart must not stand in for a broken
+// one, and a neighbour's text must not double a locator), so the scroll is switched off in each test's tab
+// (sessionStorage "onyx.feed" = "off", FEED_OFF_SESSION_KEY in lib/feed-order.ts) before any page script runs.
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => {
+    try {
+      window.sessionStorage.setItem("onyx.feed", "off");
+    } catch {
+      /* storage blocked: the page still loads */
+    }
+  });
+});
+
 /**
  * Best-effort "data settled" wait. Client data fetches (Supabase queries fired
  * in useEffect) are normal network requests, so once they go quiet the page has
@@ -146,6 +160,62 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
       await expect(
         page.getByText(fallback),
         `HRV empty-state present: "${fallback}"`
+      ).toHaveCount(0);
+    }
+
+    await expectNoClientCrash(page);
+  });
+
+  // The Environment part (PartGroup "environment" in HrvAnalysisClient.tsx): the Sweet Spot panel plus the PM2.5
+  // and Weather panels, which fetch /api/air-quality and /api/weather themselves. Both syncs run every 3 h, so an
+  // error or empty note there is always a real break. Asserts presence of UI only, never values.
+  test("HRV Environment: PM2.5 and Weather charts draw; Sweet Spot renders", async ({
+    page,
+  }) => {
+    await gotoAuthed(page, "/analytics/hrv");
+    await settle(page);
+
+    await expect(
+      pageHeading(page, page.getByRole("heading", { name: "HRV Deep Analysis" }))
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    // Sweet Spot: the subtitle renders whenever the panel does. "sweet-spot-not-enough" is not checked: too few
+    // nights for one input/outcome pair can be legitimate.
+    const sweetSpotSubtitle = page.getByTestId("sweet-spot-subtitle");
+    await sweetSpotSubtitle.scrollIntoViewIfNeeded({ timeout: LOAD_TIMEOUT });
+    await expect(
+      sweetSpotSubtitle,
+      "Sweet Spot panel did not render"
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    // ChartCard renders its title as an <h3>. The panels sit in <DeferredMount>, which mounts them without scrolling;
+    // scrollIntoViewIfNeeded waits for the card to attach and brings it into view before the marks check.
+    for (const [title, label] of [
+      ["Air quality (PM2.5)", "PM2.5"],
+      ["Weather", "Weather"],
+    ] as const) {
+      const card = page
+        .locator("div.bg-surface-card")
+        .filter({ has: page.getByRole("heading", { name: title, exact: true }) })
+        .last();
+      await card.scrollIntoViewIfNeeded({ timeout: LOAD_TIMEOUT });
+      await expect(card, `${label} card did not render`).toBeVisible({ timeout: LOAD_TIMEOUT });
+      await expect(
+        card.locator(RECHARTS_MARKS).first(),
+        `${label} chart drew no marks`
+      ).toBeVisible({ timeout: LOAD_TIMEOUT });
+    }
+
+    // The panels' error/empty notes (AirQualityPanel.tsx, WeatherPanel.tsx; the apostrophe renders as a straight ').
+    for (const note of [
+      "Couldn't load air quality",
+      "No air-quality days yet",
+      "Couldn't load weather",
+      "No weather days yet",
+    ]) {
+      await expect(
+        page.getByText(note),
+        `HRV Environment empty-state present: "${note}"`
       ).toHaveCount(0);
     }
 
@@ -362,6 +432,24 @@ const PAGES: SmokePage[] = [
     legitimateEmpty: "No ledger data yet - the harvester has not run.",
   },
   {
+    // Budgets (2026-11-14): server-rendered over pds.finance_* + budgets / category rules, service-role only.
+    // Page-loads check; the failed-load state is a hard fail; no transactions SKIPS. No amounts asserted.
+    route: "/financials/budgets",
+    heading: "Budgets",
+    signal: "page-loads",
+    hardEmpty: ["Budgets could not be loaded"],
+    legitimateEmpty: "No transactions in the last six months yet.",
+  },
+  {
+    // Cash forecast (2026-11-14): server-rendered over pds.finance_* + pds.finance_plan_*, service-role only.
+    // Must render the chart; the failed-load state is a hard fail; an empty ledger SKIPS. No amounts asserted.
+    route: "/financials/forecast",
+    heading: "Cash forecast",
+    signal: "charts",
+    hardEmpty: ["The forecast could not be loaded"],
+    legitimateEmpty: "No ledger data yet.",
+  },
+  {
     // iPhone Screen Time (pds.phone_usage_daily, service-role only, server-rendered). The app
     // syncs once a day and the default window is 30 days, so a month without a sync legitimately
     // shows the empty state: SKIP, like /caffeine. The failed-query state is a hard fail. It never
@@ -371,6 +459,16 @@ const PAGES: SmokePage[] = [
     signal: "charts",
     hardEmpty: ["Couldn't load Screen Time."],
     legitimateEmpty: "No Screen Time days in this window.",
+  },
+  {
+    // Medical records (pds.medical_documents + pds.lab_results, service-role only, server-rendered).
+    // No lab results yet is a legitimate state: SKIP, like /caffeine. A failed query is a hard
+    // fail. It never asserts on a test name, a value or a document title.
+    route: "/health/records",
+    heading: "Medical records",
+    signal: "page-loads",
+    hardEmpty: ["Couldn't load lab results.", "Couldn't load documents."],
+    legitimateEmpty: "No lab results yet. Add the values from a lab report below.",
   },
   {
     route: "/journal",
@@ -419,7 +517,9 @@ for (const p of PAGES) {
     await gotoAuthed(page, p.route, p.finalUrl);
     await settle(page);
     await expect(
-      pageHeading(page, page.getByText(p.heading, { exact: true })),
+      // The copy fallback is looked up inside <main>: since #281 the sidebar keeps nav labels ("Journal",
+      // "Caffeine", ...) in hidden rows that come first in the page, and .first() would pick one of those.
+      pageHeading(page, page.locator("main").getByText(p.heading, { exact: true })),
       `${p.route} did not render its "${p.heading}" heading`
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
@@ -464,7 +564,7 @@ test.describe("Caffeine — renders real historical rows", () => {
     await gotoAuthed(page, "/caffeine?days=720", /\/caffeine\?days=720/);
     await settle(page);
     await expect(
-      page.getByText("Caffeine", { exact: true }).first()
+      pageHeading(page, page.locator("main").getByText("Caffeine", { exact: true }))
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
 
     // Wait for the non-silent fetch to land (the ISR seed is discarded for a
@@ -510,13 +610,17 @@ test.describe("Mobile chrome — bottom tab bar", () => {
       tabBar,
       "bottom tab bar not visible on a mobile viewport"
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
-    // The five primary tabs.
-    for (const label of ["Today", "Trends", "Log", "Chat", "More"]) {
+    // The five primary tabs: Today, Agents, Log (centre), Chat (/chat, Onyx Chat), More.
+    for (const label of ["Today", "Agents", "Log", "Chat", "More"]) {
       await expect(
         tabBar.getByText(label, { exact: true }),
         `tab "${label}" missing from the bottom tab bar`
       ).toBeVisible();
     }
+
+    // A tab's name is where it goes: Chat is Onyx Chat, Agents is the agents inbox.
+    await expect(tabBar.getByRole("link", { name: /^Chat$/ })).toHaveAttribute("href", "/chat");
+    await expect(tabBar.getByRole("link", { name: /^Agents/ })).toHaveAttribute("href", "/agents");
 
     // On a desktop viewport the same element is display:none (md:hidden).
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -560,7 +664,9 @@ test.describe("/nyc apartment search", () => {
 test("/check-in lists today's habit questions", async ({ page }) => {
   await gotoAuthed(page, "/check-in");
   await settle(page);
-  await expect(page.getByText("Check-in", { exact: true }).first()).toBeVisible({ timeout: LOAD_TIMEOUT });
+  // Scoped to <main> (2026-11-15): the sidebar/mobile nav also carries a "Check-in" label, and a hidden copy of it
+  // matched first, so the page heading was never looked at.
+  await expect(page.locator("main").getByRole("heading", { name: "Check-in", exact: true }).first()).toBeVisible({ timeout: LOAD_TIMEOUT });
   await expect(page.getByText(/Couldn't load|Couldn't reach Onyx/)).toHaveCount(0);
   const yesButtons = page.getByRole("button", { name: /: yes$/ });
   await expect(yesButtons.first()).toBeVisible({ timeout: LOAD_TIMEOUT });
@@ -568,20 +674,87 @@ test("/check-in lists today's habit questions", async ({ page }) => {
   await expectNoClientCrash(page);
 });
 
+// /log (2026-11-15): every daily entry on one screen. The tripwire: the frame renders behind the login and its
+// Check-in section (the real check-in) loads today's questions. Read-only: never taps or saves.
+test("/log shows the check-in questions inside the Log screen", async ({ page }) => {
+  await gotoAuthed(page, "/log");
+  await settle(page);
+  await expect(page.locator('[data-testid="page-heading"]', { hasText: "Log" })).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(page.getByText(/Couldn't load|Couldn't reach Onyx/)).toHaveCount(0);
+  const yesButtons = page.getByRole("button", { name: /: yes$/ });
+  await expect(yesButtons.first()).toBeVisible({ timeout: LOAD_TIMEOUT });
+  expect(await yesButtons.count(), "expected the core check-in questions on /log").toBeGreaterThanOrEqual(10);
+  await expectNoClientCrash(page);
+});
+
 // Today is a read-only entry point. A legitimate empty inbox/book is allowed;
 // unavailable data must be visible, never mistaken for an all-clear.
 test.describe("Today home", () => {
   test("home opens Today and its independent sections settle", async ({ page }) => {
-    await gotoAuthed(page, "/", /\/today$/);
+    // Since #192 "/" renders Today directly (no redirect to /today), so the URL stays "/".
+    await gotoAuthed(page, "/", /\/(today)?$/);
     await expect(pageHeading(page, page.getByRole("heading", { name: "Today", exact: true }))).toBeVisible();
     await expect(page.getByText("Checking agent requests...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
     await expect(page.getByText("Loading reading progress...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
     await expect(page.getByText("Couldn't check requests.", { exact: false })).toHaveCount(0);
     await expect(page.getByText("Reading progress is unavailable right now.")).toHaveCount(0);
-    await expect(page.getByRole("link", { name: "Open check-in", exact: true })).toHaveAttribute("href", "/check-in");
+    // Calendar panel (2026-11-13): "isn't connected yet" and an empty day are legitimate; a failed read is not.
+    await expect(page.getByText("Checking your calendar...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+    await expect(page.getByText("Couldn't check the calendar.", { exact: false })).toHaveCount(0);
+    await expect(page.getByRole("link", { name: "Open check-in", exact: true })).toHaveAttribute("href", "/log#log-part-check-in");
     await expect(page.getByRole("link", { name: "System status", exact: true })).toHaveAttribute("href", "/status");
     await expectNoClientCrash(page);
   });
+});
+
+// /today (2026-11-15): the routed Today page (the test above opens "/"). Its request, urgent-email and calendar
+// panels each read their own source; a failed read shows the panel's "Couldn't check ..." line. Those syncs run
+// daily, so a failed-read line is a real break. Stale "Couldn't refresh ..." lines (slow network) and the number of
+// requests, emails or events (legitimately zero some days) are not asserted.
+test("/today renders without the panel-level failed-check states", async ({ page }) => {
+  await gotoAuthed(page, "/today");
+  await settle(page);
+  await expect(
+    pageHeading(page, page.locator("main").getByRole("heading", { name: "Today", exact: true })),
+    "/today did not render its Today heading"
+  ).toBeVisible({ timeout: LOAD_TIMEOUT });
+  // Each panel settles from its loading line into ready or error; wait for that before checking the error lines.
+  for (const loading of ["Checking agent requests...", "Checking email...", "Checking your calendar..."]) {
+    await expect(page.getByText(loading, { exact: true }), `a Today panel did not settle: "${loading}"`).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+  }
+  for (const failed of [
+    "Couldn't check requests. Open your inbox or try refreshing.",
+    "Couldn't check urgent email. Try refreshing.",
+    "Couldn't check the calendar. Try refreshing.",
+  ]) {
+    await expect(page.getByText(failed, { exact: true }), `Today panel failed to load: "${failed}"`).toHaveCount(0);
+  }
+  await expectNoClientCrash(page);
+});
+
+// /analytics/travel (2026-11-15): the Flights table is filled by the Delta email ETL (every 3 hours) and holds
+// every parsed segment, so it is never legitimately empty. The tripwire: the Flights card renders table rows and
+// its empty-state line is absent. Never reads or compares a flight, date, route or confirmation number.
+test("/analytics/travel lists flights in the Flights card", async ({ page }) => {
+  await gotoAuthed(page, "/analytics/travel");
+  await settle(page);
+  await expect(
+    pageHeading(page, page.locator("main").getByRole("heading", { name: "Travel Analysis", exact: true })),
+    "/analytics/travel did not render its Travel Analysis heading"
+  ).toBeVisible({ timeout: LOAD_TIMEOUT });
+  await expect(
+    page.getByText("No flights parsed yet", { exact: false }),
+    "Flights card shows its empty state"
+  ).toHaveCount(0);
+  const flightsCard = page
+    .locator("main div.bg-surface-card")
+    .filter({ has: page.getByRole("heading", { name: "Flights", exact: true }) })
+    .last();
+  await expect(flightsCard, "Flights card did not render").toBeVisible({ timeout: LOAD_TIMEOUT });
+  const rows = flightsCard.locator("table tbody tr");
+  await expect(rows.first(), "Flights table rendered no rows").toBeVisible({ timeout: LOAD_TIMEOUT });
+  expect(await rows.count(), "Flights table rendered no rows").toBeGreaterThan(0);
+  await expectNoClientCrash(page);
 });
 
 // /procurement (2026-11-11; renewal estimates 2026-11-13): read-only advice. It talks to no
@@ -621,6 +794,12 @@ test("/wins renders the Wins board", async ({ page }) => {
 // rendered; an empty list is legitimate), sample data is NOT on by default, and the calendar card
 // shows one of its two real states. Read-only: never types, adds, toggles, copies, connects or
 // syncs anything, and never asserts on an item's label or date.
+// Calendar events (2026-11-13): the page also shows read-only copies of the events on Riley's
+// calendars (google_calendar_etl.py, hourly) with a "Google Calendar: connected" card (renamed from "Your calendar events" 2026-11-14; the care-items card became "Copy care items to Google Calendar: off|on"). That card being
+// "not synced yet", late or failing (the /status card's job) and a month with no events are all
+// legitimate, so the only tripwire is that Onyx could read its own copy: the card settles and is
+// not in the "couldn't be checked" state (= /api/calendar/events is broken). Both lines hold
+// before the first sync run and after it. Never asserts on an event.
 test("/health renders the care planner with sample data off and a calendar state", async ({ page }) => {
   await gotoAuthed(page, "/health");
   await expect(pageHeading(page, page.getByRole("heading", { name: "Health & appointments", exact: true }))).toBeVisible({ timeout: LOAD_TIMEOUT });
@@ -629,7 +808,9 @@ test("/health renders the care planner with sample data off and a calendar state
   await expect(page.getByText(/Loading your care items/)).toHaveCount(0, { timeout: LOAD_TIMEOUT });
   await expect(page.getByRole("heading", { name: "Add care item", exact: true })).toBeVisible();
   await expect(page.getByLabel(/Show sample data/), "sample data must be opt-in").not.toBeChecked();
-  await expect(page.getByRole("heading", { name: /^Google Calendar: (not connected|connected)$/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /^Copy care items to Google Calendar: (off|on)$/ })).toBeVisible();
+  await expect(page.getByText("Checking the calendar events sync.")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
+  await expect(page.getByRole("heading", { name: /^Google Calendar: couldn't be checked$/i }), "Onyx could not read its copy of the calendar events").toHaveCount(0);
   await expectNoClientCrash(page);
 });
 

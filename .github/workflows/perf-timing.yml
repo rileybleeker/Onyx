@@ -1,17 +1,20 @@
 name: Production Performance Timing
 
-# MANUAL ONLY. Measures authenticated page loads against PRODUCTION from a GitHub-hosted
-# runner: per key page, N full navigations (first = cold browser cache), recording TTFB, FCP,
-# LCP, time to the page's data, and every Supabase /rest/v1 + /api + Worker request (path,
-# duration, bytes - no query strings, no bodies, no cookies). Results go to the job summary
-# and to a JSON artifact. See docs/perf-evidence-2026-11-12.md for method and caveats.
-#
-# Start it with:  gh workflow run perf-timing.yml   (GitHub only dispatches a workflow file that is
-# already on the default branch; --ref <branch> then runs that branch's copy of it.)
-# It has no schedule and no pull_request trigger on purpose: it signs in to production and
-# loads every key page 15 times, which is a load nobody should get by opening a PR.
-
+# The speed budget, checked AFTER deployment (Riley 2026-11-14: nothing may take a full second; testing never slows a
+# deploy). Every hour it signs in to production from a GitHub-hosted runner, loads each key page a few times and
+# records TTFB, FCP, LCP, time to the page's data and every Supabase /rest/v1 + /api + Worker request (path, duration,
+# bytes - no query strings, no bodies, no cookies), then opens the app at / and clicks through the sidebar to time
+# in-app navigations. The run turns red (`perf-report.cjs --budget`, `budgetViolations` in e2e/perf-stats.cjs) when
+# any single call takes 1 s or more, when a page's data does in any warm view or on the cold first visit, or when a
+# page was not measured completely (a missing navigation is never a pass). Each breach says whether it is repeatable
+# (slow in two or more warm views) or isolated, with the warm p95. A red run is devops's to fix with a normal PR; the cloud watchdog raises it as
+# `speed-budget-broken`. Coverage: Today (every panel), Log (every section), Check-in, HRV, Sleep, Nutrition, Supplements, Agents, Status,
+# Caffeine, Financials, Budgets, Cash forecast. It samples production hourly; it is not tied to one deployment.
+# The runner is often served from a far-away edge, so its numbers are pessimistic; a pass here means fast at home.
+# Manual deep run:  gh workflow run perf-timing.yml -f navigations=15
 on:
+  schedule:
+    - cron: "23 * * * *"   # hourly, 4 navigations per page
   workflow_dispatch:
     inputs:
       navigations:
@@ -59,7 +62,7 @@ jobs:
           SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
           SMOKE_TEST_EMAIL: ${{ secrets.SMOKE_TEST_EMAIL }}
           SMOKE_TEST_PASSWORD: ${{ secrets.SMOKE_TEST_PASSWORD }}
-          PERF_NAVIGATIONS: ${{ inputs.navigations }}
+          PERF_NAVIGATIONS: ${{ inputs.navigations || '4' }}
         run: npx --no-install playwright test -c e2e/perf.config.ts
 
       - name: Summarize (job summary)
@@ -71,6 +74,13 @@ jobs:
           else
             echo "No timing results were written (the sign-in or the first page failed)." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Speed budget (red when anything takes a second, or a page was not measured)
+        run: |
+          if node e2e/perf-report.cjs perf-results --budget --md /dev/null > budget.txt 2>&1; then code=0; else code=$?; fi
+          cat budget.txt
+          { echo "### Speed budget"; echo; sed 's/^/    /' budget.txt; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
 
       - name: Upload results
         if: always()

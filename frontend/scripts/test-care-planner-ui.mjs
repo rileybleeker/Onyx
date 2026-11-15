@@ -15,9 +15,9 @@ import { chromium } from '@playwright/test';
 
 const frontend = fileURLToPath(new URL('..', import.meta.url));
 const fixture = await mkdtemp(path.join(tmpdir(), 'onyx-care-ui-'));
-for (const dir of ['src/app/health', 'src/lib']) await mkdir(path.join(fixture, dir), { recursive: true });
+for (const dir of ['src/app/health', 'src/lib', 'src/components']) await mkdir(path.join(fixture, dir), { recursive: true });
 await symlink(path.join(frontend, 'node_modules'), path.join(fixture, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
-for (const file of ['src/lib/care-planner.ts', 'src/lib/care-items.ts', 'src/lib/care-google.ts', 'src/app/health/HealthClient.tsx', 'src/app/health/CareCalendar.tsx', 'src/app/health/CalendarConnectionCard.tsx', 'src/app/globals.css']) {
+for (const file of ['src/lib/care-planner.ts', 'src/lib/care-items.ts', 'src/lib/care-google.ts', 'src/app/health/HealthClient.tsx', 'src/app/health/CareCalendar.tsx', 'src/app/health/CalendarConnectionCard.tsx', 'src/app/health/CalendarEventsCard.tsx', 'src/components/InfoHint.tsx', 'src/app/health/useCalendarEvents.ts', 'src/lib/calendar-events.ts', 'src/lib/urgent-email.ts', 'src/app/globals.css']) {
   await copyFile(path.join(frontend, file), path.join(fixture, file));
 }
 await copyFile(path.join(frontend, 'postcss.config.mjs'), path.join(fixture, 'postcss.config.mjs'));
@@ -75,13 +75,29 @@ try {
   const removed = new Map(), importKeys = new Set();
   // The one outside address the page may leave for. It is answered here; the real Google is never contacted.
   const CONSENT_STUB = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=fixture';
-  const calls = [], googleCalls = [], left = [];
+  const calls = [], googleCalls = [], left = [], eventCalls = [];
+  // Synced calendar events for the current month (the page's zone is America/New_York): one
+  // all-day and one timed event today, both invented.
+  let eventsMode = 'ready';
+  const nyToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+  const nyOffset = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', timeZoneName: 'longOffset' }).formatToParts(new Date()).find(p => p.type === 'timeZoneName').value.replace('GMT', '') || '+00:00';
+  const syntheticEvents = () => [
+    { key: 'ev-timed', title: 'Synthetic calendar meeting', allDay: false, startAt: new Date(`${nyToday}T09:00:00${nyOffset}`).toISOString(), endAt: new Date(`${nyToday}T10:00:00${nyOffset}`).toISOString(), startDate: nyToday, endDate: nyToday, calendar: 'main', account: 'acct one', location: 'Synthetic room', status: 'confirmed', recurring: false },
+    { key: 'ev-day', title: 'Synthetic all-day event', allDay: true, startAt: null, endAt: null, startDate: nyToday, endDate: nyToday, calendar: 'main', account: 'acct one', location: null, status: 'confirmed', recurring: false },
+  ];
   let failNext = false, startUrl = CONSENT_STUB;
   const answer = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
   await page.route('**/*', route => {
     const request = route.request(), target = new URL(request.url());
     if (request.url() === CONSENT_STUB) { left.push(request.url()); return route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>Consent page stand-in</h1>' }); }
     if (target.origin !== new URL(url).origin) { blocked.push(request.url()); return route.abort(); }
+    if (target.pathname === '/api/calendar/events') {
+      eventCalls.push(`${request.method()} ${target.search}`);
+      if (eventsMode === 'error') return answer(route, { error: 'calendar unavailable' }, 500);
+      if (eventsMode === 'not_connected') return answer(route, { status: 'not_connected', lastSync: null });
+      return answer(route, { status: 'ready', truncated: false, events: syntheticEvents(), lastSync: { at: new Date(Date.now() - 20 * 60000).toISOString(), status: 'success', error: null },
+        calendars: [{ account: 'acct one', calendar: 'main', events: 2 }] });
+    }
     if (!target.pathname.startsWith('/api/care/')) return route.continue();
     if (target.pathname.startsWith('/api/care/google/')) {
       googleCalls.push(`${request.method()} ${target.pathname} origin=${request.headers().origin === url}`);
@@ -143,6 +159,38 @@ try {
   assert.equal(await page.getByRole('heading', { name: "Couldn't load your care items" }).count(), 0);
   assert.equal(await page.getByText(/This browser holds/).count(), 0, 'no copy offer without a browser-saved planner');
   assert.deepEqual(calls, [], 'rendering and sample data make no API call');
+
+  // ---- synced calendar events: read-only, next to the care items, never one of them ----
+  const eventsCard = page.locator('[aria-label="Calendar events sync"]');
+  await eventsCard.getByRole('heading', { name: 'Google Calendar: connected', exact: true }).waitFor();
+  assert.match(await eventsCard.innerText(), /main \(acct one\)\s*2 events/);
+  assert.match(await eventsCard.innerText(), /Last sync 20 min ago\./);
+  assert.equal(await eventsCard.locator('button').count(), 0, 'the read-only card has nothing to press');
+  const calendarBox = page.locator('section[aria-label="Care calendar"]');
+  const todayCell = calendarBox.locator('td', { has: page.locator('span.sr-only', { hasText: '(today)' }) });
+  assert.deepEqual(await todayCell.locator('li').evaluateAll(list => list.map(li => li.firstChild.textContent)), ['Synthetic all-day event', 'Synthetic calendar meeting'], 'all-day first, then by time');
+  assert.match(await todayCell.locator('li').nth(1).getAttribute('title'), /^Synthetic calendar meeting: 9:00 AM - 10:00 AM, Synthetic room, Google Calendar: main \(read-only\)$/);
+  await calendarBox.getByRole('button', { name: 'Agenda', exact: true }).click();
+  assert.match(await calendarBox.locator('li', { hasText: 'Synthetic calendar meeting' }).innerText(), new RegExp(`${nyToday} · 9:00 AM - 10:00 AM · Synthetic room · Google Calendar: main \\(read-only\\)`));
+  assert.match(await calendarBox.locator('li', { hasText: 'Synthetic all-day event' }).innerText(), /All day · Google Calendar: main \(read-only\)/);
+  await calendarBox.getByRole('button', { name: 'Month', exact: true }).click();
+  assert.equal(await upcoming.getByText(/Synthetic (calendar meeting|all-day event)/).count(), 0, 'calendar events are never in the editable care list');
+  assert.equal(await page.locator('section[aria-label="Due soon"]').getByText(/Synthetic (calendar meeting|all-day event)/).count(), 0, 'nor in Due soon');
+  assert.ok(eventCalls.length >= 1 && eventCalls.every(c => /^GET \?from=\d{4}-\d{2}-\d{2}&to=\d{4}-\d{2}-\d{2}&summary=1$/.test(c)), 'the events route is only ever read');
+  assert.deepEqual(calls, [], 'showing calendar events sends nothing to the care-item routes');
+  assert.deepEqual(googleCalls, [], 'and nothing to the care-items -> Google routes');
+  // A failed read and a missing table are their own states; the care items are unaffected by either.
+  for (const [mode, heading] of [['error', "Google Calendar: couldn't be checked"], ['not_connected', 'Google Calendar: not synced yet']]) {
+    eventsMode = mode;
+    await page.goto(url);
+    await eventsCard.getByRole('heading', { name: heading, exact: true }).waitFor();
+    await card('Synthetic yearly visit').waitFor();
+    assert.equal(await calendarBox.getByText(/Synthetic (calendar meeting|all-day event)/).count(), 0);
+  }
+  eventsMode = 'ready';
+  await page.goto(url);
+  await eventsCard.getByRole('heading', { name: 'Google Calendar: connected', exact: true }).waitFor();
+  eventCalls.length = 0;
 
   // ---- add: shown at once, POSTed same-origin as JSON with every field ----
   await page.getByLabel('Short label').fill('Synthetic new visit');
@@ -237,7 +285,7 @@ try {
   await idle();
   await page.getByText('Archived and completed items').click();
   await page.getByRole('button', { name: 'Remove', exact: true }).click();
-  await page.waitForFunction(() => !document.querySelector('details'));
+  await page.waitForFunction(() => ![...document.querySelectorAll('details > summary')].some(s => s.textContent === 'Archived and completed items'));
   assert.equal(last().method, 'DELETE');
   assert.equal(last().path, `/api/care/items/${newId}`);
   assert.equal(last().body, null);
@@ -321,7 +369,7 @@ try {
   const cardAlert = cardBox.locator('p[role="alert"]');
   for (const variant of ['', '/?cal=none']) {
     await page.goto(url + variant);
-    await page.getByRole('heading', { name: 'Google Calendar: not connected', exact: true }).waitFor();
+    await page.getByRole('heading', { name: 'Copy care items to Google Calendar: off', exact: true }).waitFor();
     assert.equal(await page.getByRole('button', { name: 'Connect Google Calendar', exact: true }).isDisabled(), true);
     await cardBox.getByText(/Not set up yet: Onyx has no Google credentials/).waitFor();
     await cardBox.getByText('Never requested', { exact: true }).waitFor();
@@ -342,7 +390,7 @@ try {
   assert.deepEqual(googleCalls.splice(0), ['POST /api/care/google/start origin=true', 'POST /api/care/google/start origin=true']);
   // Back from Google: the result is shown once and removed from the address bar.
   await page.goto(url + '/?cal=on&calendar=connected');
-  await page.getByRole('heading', { name: 'Google Calendar: connected', exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Copy care items to Google Calendar: on', exact: true }).waitFor();
   await cardBox.getByText(/Google Calendar is connected\. The first sync runs in the background/).waitFor();
   await page.waitForFunction(() => !location.search.includes('calendar='));
   assert.equal(new URL(page.url()).search, '?cal=on');
@@ -354,7 +402,7 @@ try {
   await page.getByRole('button', { name: 'Sync now' }).click();
   await cardAlert.filter({ hasText: "Couldn't run the sync." }).waitFor();
   await page.getByRole('button', { name: 'Disconnect' }).click();
-  await page.getByRole('heading', { name: 'Google Calendar: not connected', exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Copy care items to Google Calendar: off', exact: true }).waitFor();
   await cardBox.getByText(/Disconnected\. The "Onyx care" calendar and its events are still in Google Calendar/).waitFor();
   assert.deepEqual(googleCalls.splice(0), ['POST /api/care/google/sync origin=true', 'POST /api/care/google/sync origin=true', 'POST /api/care/google/disconnect origin=true']);
   await page.goto(url + '/?cal=ready&calendar=error&reason=wrong_scope');
@@ -363,8 +411,10 @@ try {
   await cardBox.getByText('The Google sign-in was cancelled. Nothing was connected.', { exact: true }).waitFor();
   assert.deepEqual(googleCalls, []);
 
+  assert.ok(calls.every(c => !JSON.stringify(c.body ?? '').includes('Synthetic calendar meeting') && !JSON.stringify(c.body ?? '').includes('Synthetic all-day event')), 'no care-item request ever carried a calendar event');
+  assert.ok(eventCalls.every(c => c.startsWith('GET ')), 'the events route was only ever read');
   assert.deepEqual(errors, []); assert.deepEqual(blocked, []);
-  console.log('Care planner UI regression passed (optimistic saves, reverts, undo, load states, one-time copy, calendar card). Screenshots: ' + fixture);
+  console.log('Care planner UI regression passed (optimistic saves, reverts, undo, load states, one-time copy, calendar card, read-only calendar events). Screenshots: ' + fixture);
 } finally {
   await browser?.close();
   server.kill();

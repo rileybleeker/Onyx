@@ -3,6 +3,7 @@ import {
   House,
   Sparkles,
   CalendarDays,
+  FileHeart,
   ShoppingCart,
   Package,
   Wallet,
@@ -24,6 +25,7 @@ import {
   Building2,
   BookMarked,
   Smartphone,
+  NotebookPen,
 } from "lucide-react";
 
 /**
@@ -37,7 +39,11 @@ import {
 export interface NavItem {
   href: string;
   label: string;
-  /** Single-letter desktop shortcut hint (display only). */
+  /**
+   * Desktop "go to" key: press G, then this key (components/CommandPalette.tsx listens, lib/go-shortcuts.ts).
+   * Unique per item (tests/go-shortcuts.test.cjs). All 26 letters are in use, so Cash forecast is "4" ("4cast") and
+   * Log is "1" (the one screen for every entry).
+   */
   shortcut: string;
   icon: LucideIcon;
   /** Extra search terms for the command palette. */
@@ -54,6 +60,7 @@ export const NAV_SECTIONS: NavSection[] = [
   {
     title: "Logging",
     items: [
+      { href: "/log", label: "Log", shortcut: "1", icon: NotebookPen, keywords: ["entries", "enter", "record", "say it", "dictate", "one screen", "check-in", "supplement", "weight", "uber eats", "portion", "leftovers", "reading"] },
       { href: "/activities", label: "Activities", shortcut: "A", icon: Activity, keywords: ["workout", "run", "strength", "lifting", "training", "sauna"] },
       { href: "/nutrition", label: "Nutrition", shortcut: "N", icon: Utensils, keywords: ["food", "macros", "calories", "cronometer", "vitamins", "weight", "meal"] },
       { href: "/supplements", label: "Supplements", shortcut: "P", icon: Pill, keywords: ["stack", "pills", "compound", "dose", "intake", "log"] },
@@ -79,11 +86,14 @@ export const NAV_SECTIONS: NavSection[] = [
     title: "Tools",
     items: [
       { href: "/wins", label: "Wins", shortcut: "E", icon: Sparkles, keywords: ["accomplishments", "celebrate", "progress", "board", "claude", "dot"] },
-      { href: "/health", label: "Health & appointments", shortcut: "", icon: CalendarDays, keywords: ["care", "recurring", "doctor", "dentist", "calendar", "due"] },
+      { href: "/health", label: "Health & appointments", shortcut: "Z", icon: CalendarDays, keywords: ["care", "recurring", "doctor", "dentist", "calendar", "due"] },
+      { href: "/health/records", label: "Medical records", shortcut: "X", icon: FileHeart, keywords: ["labs", "lab results", "blood work", "documents", "pdf", "doctor", "visit", "cholesterol", "test results"] },
       { href: "/orders", label: "Orders", shortcut: "D", icon: Package, keywords: ["packages", "deliveries", "shipping", "tracking", "amazon", "ups", "fedex", "usps", "arriving", "delivered", "overdue", "missing"] },
       { href: "/procurement", label: "Procurement", shortcut: "O", icon: ShoppingCart, keywords: ["buy", "orders", "subscriptions", "shopping"] },
       { href: "/agents", label: "Agents", shortcut: "G", icon: Bot, keywords: ["chat", "messages", "briefing", "approvals", "leads", "reminders", "inbox", "notifications"] },
       { href: "/financials", label: "Financials", shortcut: "W", icon: Wallet, keywords: ["money", "finance", "rocket money", "spending", "transactions", "budget", "net worth", "balances", "accounts", "ledger", "cashflow"] },
+      { href: "/financials/budgets", label: "Budgets", shortcut: "Q", icon: Wallet, keywords: ["budget", "spending", "categories", "categorize", "merchants", "overspending", "left to spend", "rules"] },
+      { href: "/financials/forecast", label: "Cash forecast", shortcut: "4", icon: Wallet, keywords: ["forecast", "cash flow", "projection", "bonus", "taxes", "0%", "promo", "balance transfer", "what if", "safe to move"] },
       { href: "/nyc", label: "NYC Search", shortcut: "Y", icon: Building2, keywords: ["apartment", "move", "new york", "listings", "leads", "rent", "scout", "manhattan"] },
       { href: "/chat", label: "Onyx Chat", shortcut: "C", icon: MessageSquare, keywords: ["ask", "claude", "assistant", "query", "chat", "health", "writing", "planning"] },
       { href: "/status", label: "Status", shortcut: "U", icon: ShieldCheck, keywords: ["system", "sync", "etl", "health", "freshness"] },

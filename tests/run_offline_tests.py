@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run every OFFLINE test in tests/ in parallel, with no credentials.
 
-This is what the pull-request job (.github/workflows/stats-pr-check.yml) runs, and
+This is what the stats-tests job of .github/workflows/scheduled-tests.yml runs, and
 you can run it locally the same way:
 
     python tests/run_offline_tests.py              # all offline tests, one process per CPU

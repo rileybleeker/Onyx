@@ -92,12 +92,16 @@ test("summary: nothing due is ready with a zero count; an empty ledger is its ow
 });
 
 // ─── the route: ready / empty / failed are distinct, nothing cached ──────────────────────────
+// The route reads the stored detection (lib/finance-result-cache-server.ts, tested in
+// tests/finance-result-cache.test.cjs); here that layer is a pass-through to the stubbed loader.
 function route(load) {
   const stubs = {
     "next/server": {
       NextResponse: { json: (body, init = {}) => ({ body, status: init.status ?? 200, headers: init.headers ?? {} }) },
     },
-    "@/lib/procurement-recurring-server": { loadDetectedSubscriptions: async () => load },
+    "@/lib/finance-result-cache-server": {
+      cachedRenewalsAhead: async () => (load.state === "error" ? null : N.renewalsAhead(load)),
+    },
   };
   return loadTs("app/api/procurement/renewals/summary/route.ts", stubs);
 }
@@ -125,5 +129,9 @@ test("route source: read-only GET, session-only, no write or outbound call", () 
   const src = fs.readFileSync(path.join(SRC, "app/api/procurement/renewals/summary/route.ts"), "utf8");
   assert.deepEqual([...src.matchAll(/export async function (\w+)/g)].map((m) => m[1]), ["GET"]);
   assert.doesNotMatch(src, /\.(insert|update|upsert|delete|rpc)\(/);
-  assert.doesNotMatch(fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8"), /api\/procurement/);
+  // Session-only: the one procurement path that takes the CI token is the renewal claim (Riley,
+  // 2026-11-13; scripts/test-procurement-store.mjs holds that exception). Never this route.
+  const middleware = fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8");
+  assert.doesNotMatch(middleware, /api\/procurement\/renewals\/summary/);
+  assert.deepEqual([...middleware.matchAll(/["'`](\/api\/procurement[^"'`]*)["'`]/g)].map((m) => m[1]), ["/api/procurement/renewals/claim"]);
 });

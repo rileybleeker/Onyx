@@ -6,7 +6,7 @@ on:
     # nothing downstream is time-critical; the /status card tolerates a 12h gap
     # before going red. :40 keeps clear of the hourly ETL (:00), retrain check
     # (:20), flights (:25), journal (:35), habits (:45) and Spotify (:50).
-    - cron: '40 */3 * * *'
+    - cron: '*/15 * * * *'   # every 15 min (Riley 2026-11-15: the receipt should be in Onyx right after delivery)
   workflow_dispatch:
     inputs:
       days:

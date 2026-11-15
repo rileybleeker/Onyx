@@ -13,6 +13,11 @@ const BlandAltmanClient = dynamic(() => import("./BlandAltmanClient"), {
   ),
 });
 
+// Speed (2026-11-15): start loading the page's code as soon as this module runs (with the page's first scripts)
+// instead of after hydration, when the component above first renders; next/dynamic then finds the chunk on its
+// way (one request, webpack shares it). A cold or freshly deployed load waited ~0.8 s for this request.
+if (typeof window !== "undefined") void import("./BlandAltmanClient").catch(() => {});
+
 // Shape of the server-prefetched initial data. MUST mirror the query in
 // BlandAltmanClient's mount effect (same function, same args) — the client
 // seeds its state from this and then silently revalidates on mount.
@@ -20,6 +25,7 @@ export interface BlandAltmanInitial {
   data: unknown[];
 }
 
-export default function BlandAltmanLoader({ initial }: { initial: BlandAltmanInitial | null }) {
-  return <BlandAltmanClient initial={initial} />;
+// headingTestId: "feed-page-heading" when the continuous scroll renders this page (its FeedSection).
+export default function BlandAltmanLoader({ initial, headingTestId }: { initial: BlandAltmanInitial | null; headingTestId?: string }) {
+  return <BlandAltmanClient initial={initial} headingTestId={headingTestId} />;
 }

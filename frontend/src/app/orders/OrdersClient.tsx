@@ -12,6 +12,9 @@ import {
   type OrderMark,
 } from "@/lib/online-orders";
 import type { OrdersLoad } from "@/lib/online-orders-server";
+import InfoHint from "@/components/InfoHint";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
+import type { PageLayout } from "@/lib/personalize-layout";
 
 const panel = "rounded-2xl border border-border-default bg-surface-card p-5 sm:p-6";
 const link = "text-xs text-accent underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-accent";
@@ -26,7 +29,26 @@ function ago(iso: string, now: Date): string {
   return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`;
 }
 
-export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIso: string }) {
+/**
+ * The /orders screen. `feed`: drawn as this page's section of the continuous scroll (app/orders/FeedSection.tsx):
+ * the heading carries the feed's test id and the section ids get a prefix, so they never clash with the routed page.
+ *
+ * Personalize: each list panel is its own part, in two sections (Open orders, Delivered); a panel moves within its
+ * section or into the other one. `layout` (routed page only) is the saved layout from the page's cookie, so the
+ * server renders the saved arrangement and nothing moves after hydration.
+ */
+export default function OrdersClient({
+  data,
+  nowIso,
+  feed = false,
+  layout,
+}: {
+  data: OrdersLoad;
+  nowIso: string;
+  feed?: boolean;
+  layout?: PageLayout;
+}) {
+  const idPrefix = feed ? "feed-orders-" : "";
   const [now, setNow] = useState(() => new Date(nowIso));
   const [marks, setMarks] = useState<OrderMark[]>(data.state === "ready" ? data.marks : []);
   const [saving, setSaving] = useState<Set<string>>(new Set());
@@ -118,9 +140,9 @@ export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIs
   function section(id: string, title: string, icon: ReactNode, list: ClassifiedOrder[], hint?: string) {
     if (!list.length) return null;
     return (
-      <section className={panel} aria-labelledby={id}>
+      <section className={panel} aria-labelledby={idPrefix + id}>
         <div className="flex items-center gap-2">{icon}
-          <h2 id={id} className="text-lg font-medium text-text-primary">{title} <span className="text-text-secondary">({list.length})</span></h2>
+          <h2 id={idPrefix + id} className="text-lg font-medium text-text-primary">{title} <span className="text-text-secondary">({list.length})</span></h2>
         </div>
         {hint && <p className="mt-1 text-xs text-text-secondary">{hint}</p>}
         <ul className="mt-2 divide-y divide-border-subtle">
@@ -134,10 +156,13 @@ export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIs
   return (
     <div className="mx-auto max-w-2xl space-y-5">
       <header>
-        <h1 data-testid="page-heading" className="text-[30px] font-medium text-text-primary">Orders</h1>
-        <p className="mt-1 text-sm text-text-secondary">
-          Online orders from shipping and delivery emails (both Gmail accounts) and your Amazon order history, checked every 3 hours.
-        </p>
+        <div className="flex items-center gap-2">
+          <h1 data-testid={feed ? "feed-page-heading" : "page-heading"} className="text-[30px] font-medium text-text-primary">Orders</h1>
+          <InfoHint label="Orders">
+            <p>Online orders from shipping and delivery emails (both Gmail accounts) and your Amazon order history, checked every 3 hours.</p>
+            <p>Got it and Hide only change this page. Onyx never replies to, labels or marks these emails.</p>
+          </InfoHint>
+        </div>
         {sync && (
           <p className={`mt-2 text-xs ${syncStale ? "text-amber-300" : "text-text-secondary"}`}>
             Emails last checked {ago(sync.at, now)}{sync.status !== "success" ? ` (that run: ${sync.status})` : ""}
@@ -164,26 +189,47 @@ export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIs
         <section className={panel}><p className="text-sm text-text-secondary">Nothing on the way right now.</p></section>
       )}
 
-      {section("attention-heading", "Needs attention", <AlertTriangle aria-hidden="true" className="h-5 w-5 text-amber-300" />, groups.attention,
-        "Past its date with no delivery email, a reported delivery problem, or ordered a week ago and not shipped. If it arrived, tap Got it.")}
-      {section("arriving-heading", "On the way", <Truck aria-hidden="true" className="h-5 w-5 text-accent" />, groups.arriving)}
-      {section("processing-heading", "Ordered, not shipped yet", <Clock aria-hidden="true" className="h-5 w-5 text-accent" />, groups.processing)}
-      {section("unconfirmed-heading", "No delivery email", <Package aria-hidden="true" className="h-5 w-5 text-text-secondary" />, groups.unconfirmed,
-        "These stores don't usually email when a package arrives, so Onyx can't tell. Tap Got it once it's here.")}
+      <PartGrid page="/orders" title="Orders" initial={layout} gap={20}>
+        <PartGroup id="open" title="Open orders" gap={20}>
+          {groups.attention.length > 0 && (
+            <Part id="attention" title="Needs attention">
+              {section("attention-heading", "Needs attention", <AlertTriangle aria-hidden="true" className="h-5 w-5 text-amber-300" />, groups.attention,
+                "Late, a delivery problem, or not shipped after a week. If it arrived, tap Got it.")}
+            </Part>
+          )}
+          {groups.arriving.length > 0 && (
+            <Part id="arriving" title="On the way">
+              {section("arriving-heading", "On the way", <Truck aria-hidden="true" className="h-5 w-5 text-accent" />, groups.arriving)}
+            </Part>
+          )}
+          {groups.processing.length > 0 && (
+            <Part id="processing" title="Ordered, not shipped yet">
+              {section("processing-heading", "Ordered, not shipped yet", <Clock aria-hidden="true" className="h-5 w-5 text-accent" />, groups.processing)}
+            </Part>
+          )}
+          {groups.unconfirmed.length > 0 && (
+            <Part id="unconfirmed" title="No delivery email">
+              {section("unconfirmed-heading", "No delivery email", <Package aria-hidden="true" className="h-5 w-5 text-text-secondary" />, groups.unconfirmed,
+                "These stores don't email on delivery. Tap Got it once it's here.")}
+            </Part>
+          )}
+        </PartGroup>
 
-      {groups.recent.length > 0 && (
-        <section className={panel} aria-labelledby="recent-heading">
-          <div className="flex items-center gap-2"><CheckCircle2 aria-hidden="true" className="h-5 w-5 text-emerald-400" />
-            <h2 id="recent-heading" className="text-lg font-medium text-text-primary">Delivered, last 30 days <span className="text-text-secondary">({groups.recent.length})</span></h2>
-          </div>
-          <ul className="mt-2 divide-y divide-border-subtle">
-            {groups.recent.map((c) => row(c, c.markedReceived ? "undo" : "none"))}
-          </ul>
-        </section>
-      )}
-      <p className="pb-4 text-xs text-text-secondary">
-        Got it and Hide only change this page. Onyx never replies to, labels or marks these emails.
-      </p>
+        <PartGroup id="delivered" title="Delivered" gap={20}>
+          {groups.recent.length > 0 && (
+            <Part id="recent" title="Delivered, last 30 days">
+              <section className={panel} aria-labelledby={`${idPrefix}recent-heading`}>
+                <div className="flex items-center gap-2"><CheckCircle2 aria-hidden="true" className="h-5 w-5 text-emerald-400" />
+                  <h2 id={`${idPrefix}recent-heading`} className="text-lg font-medium text-text-primary">Delivered, last 30 days <span className="text-text-secondary">({groups.recent.length})</span></h2>
+                </div>
+                <ul className="mt-2 divide-y divide-border-subtle">
+                  {groups.recent.map((c) => row(c, c.markedReceived ? "undo" : "none"))}
+                </ul>
+              </section>
+            </Part>
+          )}
+        </PartGroup>
+      </PartGrid>
     </div>
   );
 }

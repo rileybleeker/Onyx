@@ -10,15 +10,19 @@ A pull request can edit `tests/*.py` or the workflow files themselves, so any se
 
 | Check | Workflow | Runs on | Secrets | Touches production |
 |---|---|---|---|---|
-| `offline-checks`, `frontend-types` | `autonomous-ci.yml` | every PR, push to master | none | no |
-| `stats-tests` (Stats Tests, PR check) | `stats-pr-check.yml` | PRs that change Python, `tests/`, `frontend/src/`, requirements, or the workflow | none | no |
+| `offline-checks` (the only required check) | `autonomous-ci.yml` | every PR | none | no |
+| `frontend-types`, `stats-tests` | `scheduled-tests.yml` | master every 30 min (a commit that passed is skipped), manual | none | no |
 | Live DB Checks | `live-checks.yml` | push to master (pipeline and test paths), daily 08:25 UTC, manual | step-scoped Supabase service-role key | read-only; one run at a time |
 | HRV alignment before each retrain | `hrv-retrain-on-backfill.yml` | hourly (conditional) and daily 12:00 UTC | job-level | read-only, writes a failure heartbeat |
 | Production smoke | `smoke-test.yml` | every 6 hours | smoke login | read-only |
 
+Since 2026-11-14 `stats-tests` runs on master in `scheduled-tests.yml` and always runs the full suite (the TDEE source guard is part of it). The frontend-only scope in `tools/stats_ci_scope.py` (2026-11-14, #171) only applied to `pull_request` events and is no longer used by any workflow; its dependency fingerprint and inventory are kept as the audit record.
+
+This reduces redundant runner work; it does not guarantee a shorter release when the parallel frontend job is already slower. Measure actual Actions durations before claiming a wall-clock improvement.
+
 `stats-tests` has no `SUPABASE_*` variables at all. Its single install step is `pip install -r requirements-ci.txt` (the pinned `requirements-analysis.lock` plus the one extra package the ETL modules import). Pip downloads are cached on the hash of those two files.
 
-## PR job: `tests/run_offline_tests.py`
+## Offline Python suite: `tests/run_offline_tests.py` (scheduled, since 2026-11-14)
 
 The job runs `python tests/run_offline_tests.py`. It finds every `tests/test_*.py` except the live ones, runs each in its own process (the same `python tests/test_x.py` the file's docstring documents), one process per CPU, and exits non-zero if any file fails. Secret-looking environment variables are stripped from the child processes, so even a developer machine with a loaded `.env` runs the same way CI does.
 
@@ -56,3 +60,7 @@ When several branches are in flight at once (one git worktree each), CI checks e
 
 - `autonomous-ci.yml` (including its `offline-checks` and `frontend-types` jobs, the required checks) is unchanged.
 - Dependencies installed by `requirements-ci.txt` come from the lock file, which was last regenerated 2026-04-16 and pins `supabase==2.19.0`. Local development uses newer versions, so a pin bump should be tried through this job first.
+
+The scoped-job dependency inventory and audit limits are in [stats-ci-dependency-inventory.md](stats-ci-dependency-inventory.md).
+
+Postdeployment-only policy (2026-11-15) supersedes the historical PR descriptions above: `offline-checks` only parses Python; behavioral tests require successful exact-revision Production deployment. See `docs/ci-cd.md`.

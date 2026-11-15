@@ -1,4 +1,5 @@
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
+import { takeEarlyFetch } from "@/lib/early-fetch";
 
 /**
  * Client for the Agents chat. The backend is the sms-reminders Cloudflare Worker (Riley's personal-agents
@@ -86,6 +87,20 @@ async function call<T>(path: string, init: RequestInit = {}, retried = false): P
   return (await res.json()) as T;
 }
 
+/**
+ * The inbox GET Today's HTML already started with the session's token (lib/today-early.ts), when it answered OK;
+ * anything else (none started, 401 for a token that just expired, a network error) asks as usual, refreshing the
+ * token if needed.
+ */
+async function earlyInbox(): Promise<InboxResponse> {
+  const p = takeEarlyFetch(`${AGENTS_API}/onyx/inbox`);
+  const res = p ? await p.catch(() => null) : null;
+  if (res && res.ok) {
+    try { return (await res.json()) as InboxResponse; } catch { /* ask again below */ }
+  }
+  return call<InboxResponse>("/onyx/inbox");
+}
+
 export const agentsApi = {
   messages: (q: { after?: number; before?: number; limit?: number; thread?: string } = {}) => {
     const p = new URLSearchParams();
@@ -95,7 +110,8 @@ export const agentsApi = {
     if (q.limit) p.set("limit", String(q.limit));
     return call<MessagesResponse>(`/onyx/messages?${p}`);
   },
-  inbox: () => call<InboxResponse>("/onyx/inbox"),
+  /** `early`: the first load of a full Today visit (takes the GET its HTML started, if any). */
+  inbox: (opts: { early?: boolean } = {}) => (opts.early ? earlyInbox() : call<InboxResponse>("/onyx/inbox")),
   send: (text: string, thread?: string) => call<{ message: AgentMessage }>("/onyx/send", { method: "POST", body: JSON.stringify({ text, thread }) }),
   /** Mark one conversation read up to `id`; `all` marks every conversation. Returns the new unread count. */
   read: (id: number, opts: { thread?: string; all?: boolean } = {}) =>
@@ -188,4 +204,15 @@ export async function clearDeviceNotifications(): Promise<void> {
 export function setBadge(n: number): void {
   const nav = navigator as unknown as { setAppBadge?: (n: number) => Promise<void>; clearAppBadge?: () => Promise<void> };
   (n > 0 ? nav.setAppBadge?.(n) : nav.clearAppBadge?.())?.catch(() => {});
+  // The phone's Agents tab shows the same count (components/MobileNav.tsx).
+  lastBadge = n;
+  try { window.dispatchEvent(new CustomEvent(AGENTS_BADGE_EVENT, { detail: n })); } catch { /* no window */ }
+}
+
+/** Fired by setBadge() with the new unread count. */
+export const AGENTS_BADGE_EVENT = "onyx:agents-badge";
+let lastBadge: number | null = null;
+/** The last count passed to setBadge() in this tab, or null. */
+export function lastAgentsBadge(): number | null {
+  return lastBadge;
 }

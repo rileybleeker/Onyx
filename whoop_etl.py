@@ -15,6 +15,7 @@ Requirements:
 import os
 import sys
 import json
+import math
 import time
 import argparse
 import logging
@@ -267,14 +268,29 @@ class WhoopClient:
         )
         return all_records
 
+    def _get_v2_or_v1(self, suffix: str) -> dict:
+        """GET a singleton from /v2, falling back to /v1 only if /v2 says the path does
+        not exist (404 / 410). WHOOP's API reference lists these two endpoints under /v2
+        only and calls v1 "no longer supported"; the fallback is there so the move can
+        never take the whole run down with the profile check."""
+        try:
+            return self.get(f"/v2{suffix}")
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in (404, 410):
+                raise
+            log.warning(f"/v2{suffix} returned {exc.response.status_code}; falling back to /v1{suffix}")
+            return self.get(f"/v1{suffix}")
+
     def get_profile(self) -> dict:
-        return self.get("/v1/user/profile/basic")
+        return self._get_v2_or_v1("/user/profile/basic")
 
     def get_body_measurement(self) -> dict:
-        return self.get("/v1/user/measurement/body")
+        return self._get_v2_or_v1("/user/measurement/body")
 
     def get_cycles(self, start: str, end: str) -> list:
-        return self.get_paginated("/v1/cycle", start=start, end=end)
+        # /v2/cycle (moved from /v1/cycle 2026-11-13): same integer cycle id and the same
+        # score fields, plus step_count on each cycle (WHOOP added it 2026-09-23).
+        return self.get_paginated("/v2/cycle", start=start, end=end)
 
     def get_recovery(self, start: str, end: str) -> list:
         return self.get_paginated("/v2/recovery", start=start, end=end)
@@ -335,30 +351,57 @@ def safe_get(data: dict, *keys, default=None):
 # Sync functions
 # ---------------------------------------------------------------------------
 
+def parse_step_count(value):
+    """WHOOP's step_count as a non-negative int, or None.
+
+    The API sends null (never 0) when it has no step data for the cycle, e.g. the strap
+    was not worn; None here keeps "unknown" apart from a real zero. Anything that is not a
+    whole non-negative number (a bool, text, a negative, NaN) is treated as missing."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0 or number != int(number):
+        return None
+    return int(number)
+
+
+def cycle_row(c: dict) -> dict:
+    """One pds.whoop_cycles row from a WHOOP cycle record (v2 shape; a v1 record, which
+    has no step_count key, gives the same row with step_count None)."""
+    score = c.get("score") or {}
+    return {
+        "cycle_id": c["id"],
+        "user_id": c.get("user_id"),
+        "created_at": c.get("created_at"),
+        "updated_at": c.get("updated_at"),
+        "start_time": c["start"],
+        "end_time": c.get("end"),
+        "timezone_offset": c.get("timezone_offset"),
+        "score_state": c.get("score_state"),
+        "strain": score.get("strain"),
+        "kilojoule": score.get("kilojoule"),
+        "average_heart_rate": score.get("average_heart_rate"),
+        "max_heart_rate": score.get("max_heart_rate"),
+        # Top-level on the cycle, not inside score. Counts over the WHOOP cycle (sleep
+        # onset to the next sleep onset), not a midnight day; the open cycle holds the
+        # steps so far and is overwritten on every run until the cycle closes.
+        "step_count": parse_step_count(c.get("step_count")),
+        "raw_json": c,
+    }
+
+
 def sync_cycles(whoop: WhoopClient, sb: Client, start: str, end: str) -> int:
-    """Sync WHOOP cycles."""
+    """Sync WHOOP cycles (strain, energy, heart rate and step count)."""
     cycles = whoop.get_cycles(start, end)
     if not cycles:
         return 0
 
-    rows = []
-    for c in cycles:
-        score = c.get("score") or {}
-        rows.append({
-            "cycle_id": c["id"],
-            "user_id": c.get("user_id"),
-            "created_at": c.get("created_at"),
-            "updated_at": c.get("updated_at"),
-            "start_time": c["start"],
-            "end_time": c.get("end"),
-            "timezone_offset": c.get("timezone_offset"),
-            "score_state": c.get("score_state"),
-            "strain": score.get("strain"),
-            "kilojoule": score.get("kilojoule"),
-            "average_heart_rate": score.get("average_heart_rate"),
-            "max_heart_rate": score.get("max_heart_rate"),
-            "raw_json": c,
-        })
+    rows = [cycle_row(c) for c in cycles]
+    with_steps = sum(1 for r in rows if r["step_count"] is not None)
+    log.info(f"  cycles: {with_steps} of {len(rows)} carry a step count")
 
     return upsert_to_supabase(sb, "whoop_cycles", rows, "cycle_id")
 
@@ -523,6 +566,10 @@ def main():
                         help="Number of days to backfill (e.g., 730 for ~2 years)")
     parser.add_argument("--days", type=int, default=30,
                         help="Number of recent days to sync (default: 30)")
+    parser.add_argument("--cycles-only", action="store_true",
+                        help="Sync only cycles (strain, energy, step count) and skip the "
+                             "time-zone pass. For deep history re-reads, e.g. filling "
+                             "step_count for old cycles: --days 800 --cycles-only")
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -552,6 +599,10 @@ def main():
 
     log.info(f"Syncing {days} days: {start_dt.date()} — {now.date()}")
 
+    # --cycles-only: a deep re-read of one endpoint. Its heartbeats have their own data_type
+    # so they can never stand in for (or mask) the hourly whoop|full_sync on /status.
+    heartbeat_type = "cycles_backfill" if args.cycles_only else "full_sync"
+
     # Profile check
     profile_started = time.time()
     try:
@@ -564,7 +615,7 @@ def main():
         msg = f"WHOOP profile check failed: {e}"
         log.error(msg)
         log_sync(
-            sb, "whoop", "full_sync", "failed",
+            sb, "whoop", heartbeat_type, "failed",
             records=0, error=msg,
             duration=time.time() - profile_started,
         )
@@ -584,6 +635,8 @@ def main():
         ("workouts", lambda: sync_workouts(whoop, sb, start_iso, end_iso)),
         ("body_measurement", lambda: sync_body_measurement(whoop, sb)),
     ]
+    if args.cycles_only:
+        sync_tasks = sync_tasks[:1]
 
     for name, sync_fn in sync_tasks:
         try:
@@ -608,7 +661,11 @@ def main():
 
     duration = time.time() - t0
 
-    log_sync(sb, "whoop", "full_sync", "success" if errors == 0 else "partial",
+    # --cycles-only has one endpoint, so an error there means the backfill did nothing:
+    # failed + a red run, not a green "partial".
+    backfill_failed = args.cycles_only and errors > 0
+    log_sync(sb, "whoop", heartbeat_type,
+             "failed" if backfill_failed else ("success" if errors == 0 else "partial"),
              records=total_records, date_start=start_dt.date(), date_end=now.date(),
              duration=duration,
              error=f"{errors} endpoint(s) failed" if errors else None)
@@ -624,6 +681,16 @@ def main():
     # most reliable trip-detector we have. IANA is history-inferred since
     # WHOOP gives offset not IANA; manual entries always win and are never
     # overridden. Silently skips if anything goes wrong (ETL still succeeds).
+    #
+    # Not run for --cycles-only: a deep cycle re-read must not rewrite time-zone history.
+    # (Until 2026-11-14 the pass also proposed rows over wide windows for old trips the log
+    # already covered: a full-history dry run on 2026-11-13 proposed 23. It now checks each
+    # cycle against the log at that cycle's own instant.)
+    if args.cycles_only:
+        log.info("Skipping whoop_tz_backfill (--cycles-only)")
+        if backfill_failed:
+            sys.exit(1)
+        return
     try:
         import subprocess
         since_iso = start_dt.date().isoformat()

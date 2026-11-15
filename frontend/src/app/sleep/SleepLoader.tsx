@@ -13,6 +13,11 @@ const SleepClient = dynamic(() => import("./SleepClient"), {
   ),
 });
 
+// Speed (2026-11-15): start loading the page's code as soon as this module runs (with the page's first scripts)
+// instead of after hydration, when the component above first renders; next/dynamic then finds the chunk on its
+// way (one request, webpack shares it). A cold or freshly deployed load waited ~0.8 s for this request.
+if (typeof window !== "undefined") void import("./SleepClient").catch(() => {});
+
 // Shape of the server-prefetched initial data. MUST mirror the Promise.all in
 // SleepClient's mount effect (same functions, same args) — the client seeds
 // its state from this and then silently revalidates on mount. The main-only
@@ -27,6 +32,7 @@ export interface SleepInitial {
   summaries: unknown[];
 }
 
-export default function SleepLoader({ initial }: { initial: SleepInitial | null }) {
-  return <SleepClient initial={initial} />;
+// headingTestId: "feed-page-heading" when the continuous scroll renders this page (its FeedSection).
+export default function SleepLoader({ initial, headingTestId }: { initial: SleepInitial | null; headingTestId?: string }) {
+  return <SleepClient initial={initial} headingTestId={headingTestId} />;
 }

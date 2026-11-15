@@ -1,38 +1,82 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useSyncExternalStore } from "react";
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
-import { House, BarChart3, Plus, MessageSquare, Menu, X, LogOut, Search, Pill, CircleCheck, Scale } from "lucide-react";
+import { usePathname } from "next/navigation";
+import { Plus, Menu, X, LogOut, Search, ChevronDown, ChevronRight } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS } from "@/lib/nav";
+import { CACHE_KEYS, clientCache, wipeClientData } from "@/lib/client-cache";
+import { AGENTS_BADGE_EVENT, lastAgentsBadge } from "@/lib/agents-api";
+import { DEFAULT_TAB_SLOTS, MORE_SLOT, badgeText, isTabActive, tabLabel, tabSlots } from "@/lib/mobile-tabs";
+import { navIntentProps } from "@/lib/warmup";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
+import { useActiveRoute } from "./FeedContext";
+import PersonalizeButton from "./personalize/PersonalizeButton";
+import type { EditorModule } from "./personalize/editor-loader";
+import { areaId, arrangeNav, dropTabsBootStyle, savedAreaPrefs, subscribeAreaIds, tabsBootScript } from "@/lib/nav-areas";
+import { currentEditingKey, editorRef, subscribeTargets } from "@/lib/personalize-registry";
 
-const LOG_ACTIONS = [
-  { label: "Supplement", href: "/supplements", icon: Pill },
-  { label: "Habit", href: "/habits", icon: CircleCheck },
-  { label: "Weight", href: "/nutrition", icon: Scale },
-];
+const noPrefs = () => null;
+const none = () => null;
+// Hides the bottom-bar slots Riley changed until React renders them (a full page load paints the default bar first).
+const TABS_BOOT = tabsBootScript(DEFAULT_TAB_SLOTS.map((h) => (h === MORE_SLOT ? MORE_SLOT : areaId(h))));
+
+// The centre tab: the Log screen, where every daily entry is (it replaced the quick-log sheet, 2026-11-15).
+const LOG_HREF = "/log";
+
+/**
+ * The Agents unread count the app already has: the cached inbox (Today, the Agents inbox and the warm-up
+ * keep it fresh) and every setBadge() call (marking read in a conversation). No polling of its own.
+ */
+function useAgentsBadge(): number {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const fromInbox = (v: unknown) => {
+      const badge = (v as { badge?: unknown } | undefined)?.badge;
+      if (typeof badge === "number") setN(badge);
+    };
+    const last = lastAgentsBadge();
+    if (last !== null) setN(last);
+    else fromInbox(clientCache.peek(CACHE_KEYS.agentsInbox));
+    let alive = true;
+    void clientCache.read(CACHE_KEYS.agentsInbox).then((v) => { if (alive && lastAgentsBadge() === null) fromInbox(v); });
+    const off = clientCache.subscribe(CACHE_KEYS.agentsInbox, fromInbox);
+    const onBadge = (e: Event) => { const d = (e as CustomEvent<number>).detail; if (typeof d === "number") setN(d); };
+    window.addEventListener(AGENTS_BADGE_EVENT, onBadge);
+    return () => { alive = false; off(); window.removeEventListener(AGENTS_BADGE_EVENT, onBadge); };
+  }, []);
+  return n;
+}
 
 export default function MobileNav() {
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [logOpen, setLogOpen] = useState(false);
+  // Riley's side panel (Personalize, `layout.areas`): the drawer lists Quick access, then sections and pages in the
+  // saved order without pinned or hidden pages, like the sidebar; the bottom bar's four slots come from it too.
+  const prefs = useSyncExternalStore(subscribeAreaIds, savedAreaPrefs, noPrefs);
+  const arranged = arrangeNav(NAV_SECTIONS, prefs);
+  const arranging = useSyncExternalStore(subscribeTargets, currentEditingKey, none) !== null;
+  const editor = useSyncExternalStore(subscribeTargets, editorRef, none) as EditorModule | null;
   const drawerRef = useRef<HTMLElement>(null);
-  const logRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
-  const router = useRouter();
+  // The page in view (follows the continuous scroll); `pathname` stays the routed page for closing overlays.
+  const current = useActiveRoute();
+  const agentsUnread = useAgentsBadge();
+  const [showHidden, setShowHidden] = useState(false);
+  useEffect(() => {
+    if (prefs !== null) dropTabsBootStyle();
+  }, [prefs]);
 
-  // Close every overlay on route change.
+  // Close the drawer on route change.
   useEffect(() => {
     setDrawerOpen(false);
-    setLogOpen(false);
   }, [pathname]);
 
   // Treat each overlay as a modal: contain keyboard focus and return it to
   // the opener. Preserve any scroll lock owned by another surface.
   useEffect(() => {
-    if (!drawerOpen && !logOpen) return;
-    const overlay = drawerOpen ? drawerRef.current : logRef.current;
+    if (!drawerOpen) return;
+    const overlay = drawerRef.current;
     if (!overlay) return;
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const previousOverflow = document.body.style.overflow;
@@ -43,7 +87,6 @@ export default function MobileNav() {
     focusable()[0]?.focus();
     function closeOverlays() {
       setDrawerOpen(false);
-      setLogOpen(false);
     }
     function onKeyDown(event: KeyboardEvent) {
       // Yield focus ownership when the global command palette opens.
@@ -52,7 +95,6 @@ export default function MobileNav() {
       } else if (event.key === "Escape") {
         event.preventDefault();
         setDrawerOpen(false);
-        setLogOpen(false);
       } else if (event.key === "Tab") {
         const elements = focusable();
         const first = elements[0];
@@ -70,7 +112,7 @@ export default function MobileNav() {
     // A hidden mobile overlay must not leave desktop scrolling locked.
     const desktop = window.matchMedia("(min-width: 768px)");
     function onViewportChange() {
-      if (desktop.matches) { setDrawerOpen(false); setLogOpen(false); }
+      if (desktop.matches) setDrawerOpen(false);
     }
     document.addEventListener("keydown", onKeyDown);
     window.addEventListener(OPEN_COMMAND_PALETTE, closeOverlays);
@@ -85,100 +127,139 @@ export default function MobileNav() {
         opener.focus();
       }
     };
-  }, [drawerOpen, logOpen]);
+  }, [drawerOpen]);
 
   async function handleSignOut() {
     const supabase = createSupabaseBrowser();
     await supabase.auth.signOut();
-    router.push("/login");
+    // Nothing of this session stays on the device: cached data, its IndexedDB store, drafts.
+    await wipeClientData();
+    // A full load, not router.push: it also drops the router's in-memory page cache (prefetched pages).
+    window.location.assign("/login");
   }
 
-  const tabs = [
-    { key: "today", label: "Today", icon: House, href: "/today", isActive: pathname === "/today" },
-    { key: "trends", label: "Trends", icon: BarChart3, href: "/analytics/hrv", isActive: pathname.startsWith("/analytics") },
-    { key: "log", label: "Log", icon: Plus, action: () => setLogOpen(true), isActive: logOpen },
-    { key: "chat", label: "Chat", icon: MessageSquare, href: "/agents", isActive: pathname.startsWith("/agents") },
-    { key: "more", label: "More", icon: Menu, action: () => setDrawerOpen(true), isActive: drawerOpen },
+  // [slot, slot, Log, slot, slot]: Log (the Log screen, /log) in the centre; the four slots are pages or More (the
+  // drawer), by default Today, Agents | Log | Chat, More, chosen in Personalize (lib/mobile-tabs.ts). Each page
+  // tab's label is the page it opens; Trends lives in More and on Today.
+  const navItems = new Map(NAV_SECTIONS.flatMap((section) => section.items).map((item) => [item.href, item] as const));
+  const hrefOfId = new Map(Array.from(navItems.keys()).map((href) => [areaId(href), href] as const));
+  const savedSlots = prefs?.tabs ? prefs.tabs.map((id) => (id === MORE_SLOT ? MORE_SLOT : hrefOfId.get(id) ?? null)) : null;
+  const slots = tabSlots(savedSlots, (href) => navItems.has(href));
+  type Tab = { kind: "page"; href: string; slot: number } | { kind: "log" } | { kind: "more"; slot: number };
+  const slotTab = (value: string, slot: number): Tab => (value === MORE_SLOT ? { kind: "more", slot } : { kind: "page", href: value, slot });
+  const tabs: Tab[] = [
+    ...slots.slice(0, 2).map((value, i) => slotTab(value, i)),
+    { kind: "log" },
+    ...slots.slice(2).map((value, i) => slotTab(value, i + 2)),
   ];
+  // With More off the bar the drawer (every page, Personalize, Sign out) opens from the top bar instead.
+  const moreOnBar = slots.includes(MORE_SLOT);
+
+  function drawerLink(item: (typeof NAV_SECTIONS)[number]["items"][number]) {
+    const active = current === item.href;
+    const Icon = item.icon;
+    return (
+      <Link
+        key={item.href}
+        href={item.href}
+        {...navIntentProps(item.href)}
+        onClick={() => setDrawerOpen(false)}
+        aria-current={active ? "page" : undefined}
+        className={`min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium transition-colors relative ${
+          active
+            ? "bg-surface-raised text-text-primary"
+            : "text-text-secondary hover:text-text-primary hover:bg-white/[0.03]"
+        }`}
+      >
+        <Icon className={`w-[17px] h-[17px] shrink-0 ${active ? "text-accent" : "text-text-tertiary"}`} strokeWidth={1.75} />
+        <span className="flex-1 truncate">{item.label}</span>
+      </Link>
+    );
+  }
 
   return (
     <>
       {/* Slim top bar — wordmark + search. Fills the safe-area inset so scrolled
           content can't bleed under the iOS status bar. Mobile only. */}
-      <header className="md:hidden fixed inset-x-0 top-0 z-40 bg-surface-card border-b border-border-subtle pt-[env(safe-area-inset-top)]">
+      <header className="md:hidden fixed inset-x-0 top-0 z-40 bg-surface-sunken border-b border-border-subtle pt-[env(safe-area-inset-top)]">
         <div className="h-12 px-3 flex items-center justify-between">
-          <span className="text-[15px] font-semibold text-text-primary tracking-tight">Onyx</span>
-          <button
-            onClick={() => window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE))}
-            className="w-9 h-9 -mr-1 flex items-center justify-center rounded-[6px] text-text-secondary hover:text-text-primary transition-colors"
-            aria-label="Search"
-          >
-            <Search className="w-[18px] h-[18px]" />
-          </button>
+          <span className="flex items-center gap-2 text-[17px] font-bold lowercase tracking-[0.01em] text-text-primary"><img src="/icons/logo-mark-64.png?v=4" width={26} height={26} alt="" aria-hidden="true" className="shrink-0" />Onyx</span>
+          <div className="flex items-center">
+            {!moreOnBar && (
+              <button
+                type="button"
+                onClick={() => setDrawerOpen(true)}
+                className="w-11 h-11 flex items-center justify-center rounded-control text-text-secondary hover:text-text-primary transition-colors"
+                aria-label="More"
+                aria-expanded={drawerOpen}
+                aria-haspopup="dialog"
+                aria-controls={drawerOpen ? "mobile-navigation" : undefined}
+              >
+                <Menu className="w-[18px] h-[18px]" />
+              </button>
+            )}
+            <button
+              onClick={() => window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE))}
+              className="w-11 h-11 -mr-1 flex items-center justify-center rounded-control text-text-secondary hover:text-text-primary transition-colors"
+              aria-label="Search"
+            >
+              <Search className="w-[18px] h-[18px]" />
+            </button>
+          </div>
         </div>
       </header>
 
       {/* Bottom tab bar — primary mobile navigation. */}
+      <script dangerouslySetInnerHTML={{ __html: TABS_BOOT }} />
       <nav
         data-testid="mobile-tab-bar"
-        className="md:hidden fixed inset-x-0 bottom-0 z-40 bg-surface-card border-t border-border-subtle pb-[env(safe-area-inset-bottom)]"
+        className="md:hidden fixed inset-x-0 bottom-0 z-40 bg-surface-sunken border-t border-border-subtle pb-[env(safe-area-inset-bottom)]"
         aria-label="Primary"
       >
         <div className="grid grid-cols-5 h-14">
           {tabs.map((tab) => {
-            const Icon = tab.icon;
-            const cls = `flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium transition-colors ${
-              tab.isActive ? "text-accent" : "text-text-tertiary hover:text-text-secondary"
-            }`;
-            const inner = (
-              <>
-                <Icon className="w-[20px] h-[20px]" strokeWidth={1.75} />
-                <span>{tab.label}</span>
-              </>
-            );
-            return tab.href ? (
-              <Link key={tab.key} href={tab.href} className={cls} aria-current={tab.isActive ? "page" : undefined}>
-                {inner}
-              </Link>
-            ) : (
-              <button key={tab.key} type="button" onClick={tab.action} className={cls} aria-expanded={tab.isActive}>
-                {inner}
+            const cell = "flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium transition-colors";
+            if (tab.kind === "page") {
+              const item = navItems.get(tab.href)!;
+              const Icon = item.icon;
+              const active = isTabActive(item.href, current);
+              const count = item.href === "/agents" ? badgeText(agentsUnread) : "";
+              return (
+                <Link key={item.href} href={item.href} data-tab-slot={tab.slot} className={`${cell} ${active ? "text-accent" : "text-text-tertiary hover:text-text-secondary"}`} aria-current={active ? "page" : undefined} {...navIntentProps(item.href)}>
+                  <span className="relative">
+                    <Icon className="w-[20px] h-[20px]" strokeWidth={1.75} />
+                    {count && (
+                      <span aria-hidden="true" className="absolute -top-1.5 -right-2.5 min-w-[16px] h-4 px-1 rounded-full bg-accent text-on-accent text-[10px] font-mono leading-4 text-center">{count}</span>
+                    )}
+                  </span>
+                  <span>{tabLabel(item)}</span>
+                  {count && <span className="sr-only">, {agentsUnread} unread</span>}
+                </Link>
+              );
+            }
+            if (tab.kind === "log") {
+              const active = isTabActive(LOG_HREF, current);
+              return (
+                <Link key="log" href={LOG_HREF} {...navIntentProps(LOG_HREF)} className={`${cell} ${active ? "text-accent" : "text-text-primary"}`} aria-current={active ? "page" : undefined}>
+                  {/* The primary action: an accent disc (the only filled control on the bar). */}
+                  <span className="w-9 h-9 -mt-1 rounded-full bg-accent text-on-accent flex items-center justify-center shadow-card">
+                    <Plus className="w-[20px] h-[20px]" strokeWidth={2.25} />
+                  </span>
+                  <span>Log</span>
+                </Link>
+              );
+            }
+            return (
+              <button key={tab.kind} type="button" data-tab-slot={tab.slot} onClick={() => setDrawerOpen(true)}
+                className={`${cell} ${drawerOpen ? "text-accent" : "text-text-tertiary hover:text-text-secondary"}`}
+                aria-expanded={drawerOpen} aria-haspopup="dialog" aria-controls={drawerOpen ? "mobile-navigation" : undefined}>
+                <Menu className="w-[20px] h-[20px]" strokeWidth={1.75} />
+                <span>More</span>
               </button>
             );
           })}
         </div>
       </nav>
-
-      {/* Log sheet — quick entry to the three logging surfaces. */}
-      {logOpen && (
-        <div ref={logRef} className="md:hidden fixed inset-0 z-50 flex flex-col justify-end" role="dialog" aria-modal="true" aria-label="Quick log">
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setLogOpen(false)} />
-          <div className="relative bg-surface-raised border-t border-border-default rounded-t-[12px] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] animate-fade-in-up">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-[13px] font-semibold uppercase tracking-[0.07em] text-text-secondary">Quick log</h2>
-              <button onClick={() => setLogOpen(false)} className="w-7 h-7 flex items-center justify-center text-text-tertiary hover:text-text-primary" aria-label="Close">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              {LOG_ACTIONS.map((a) => {
-                const Icon = a.icon;
-                return (
-                  <Link
-                    key={a.label}
-                    href={a.href}
-                    onClick={() => setLogOpen(false)}
-                    className="flex items-center gap-2.5 px-3 py-3 rounded-[6px] bg-surface-card border border-border-subtle text-[14px] text-text-primary hover:border-border-hover transition-colors"
-                  >
-                    <Icon className="w-[18px] h-[18px] text-accent shrink-0" strokeWidth={1.75} />
-                    {a.label}
-                  </Link>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Drawer (full nav) — opened by the "More" tab. */}
       {drawerOpen && (
@@ -188,23 +269,24 @@ export default function MobileNav() {
         />
       )}
       <aside
+        id="mobile-navigation"
         ref={drawerRef}
         role={drawerOpen ? "dialog" : undefined}
         aria-modal={drawerOpen ? true : undefined}
         aria-label="Navigation"
         inert={!drawerOpen}
-        className={`md:hidden fixed inset-y-0 left-0 z-50 w-[240px] bg-surface-card border-r border-border-subtle flex flex-col transition-transform duration-200 ease-in-out ${
+        className={`md:hidden fixed inset-y-0 left-0 z-50 ${arranging && editor ? "w-[min(340px,94vw)]" : "w-[240px]"} bg-surface-sunken border-r border-border-subtle flex flex-col transition-transform duration-200 ease-in-out ${
           drawerOpen ? "translate-x-0" : "-translate-x-full"
         }`}
       >
         <div className="px-5 py-5 border-b border-border-subtle flex items-center justify-between pt-[max(1.25rem,env(safe-area-inset-top))]">
           <div>
-            <h1 className="text-base font-semibold text-text-primary tracking-tight">Onyx</h1>
-            <p className="text-[11px] text-text-tertiary mt-0.5 font-mono">Personal Data Scientist</p>
+            <h1 className="flex items-center gap-2 text-base font-semibold text-text-primary tracking-tight"><img src="/icons/logo-mark-64.png?v=4" width={26} height={26} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
+            <p className="text-[11px] text-text-tertiary mt-0.5 font-mono">Personal OS</p>
           </div>
           <button
             onClick={() => setDrawerOpen(false)}
-            className="w-7 h-7 flex items-center justify-center text-text-tertiary hover:text-text-primary transition-colors"
+            className="w-11 h-11 shrink-0 flex items-center justify-center text-text-tertiary hover:text-text-primary transition-colors"
             aria-label="Close navigation"
           >
             <X className="w-4 h-4" />
@@ -215,49 +297,57 @@ export default function MobileNav() {
           <button
             type="button"
             onClick={() => { setDrawerOpen(false); window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE)); }}
-            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-[4px] text-[13px] text-text-tertiary bg-white/[0.02] border border-border-subtle hover:border-border-hover transition-colors"
+            className="w-full min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] text-text-tertiary bg-white/[0.02] border border-border-subtle hover:border-border-hover transition-colors"
           >
             <Search className="w-[15px] h-[15px] shrink-0" />
             <span className="flex-1 text-left">Search…</span>
           </button>
         </div>
 
+        {arranging && editor ? (
+          // Personalize mode: up / down buttons for pages and sections (components/personalize/NavArranger.tsx).
+          <editor.DrawerArranger />
+        ) : (
         <nav className="flex-1 px-2 py-3 overflow-y-auto">
-          {NAV_SECTIONS.map((section) => (
+          {arranged.pinned.length > 0 && (
+            <div className="mb-3">
+              <p className="px-3 pb-1 text-[10px] font-medium uppercase tracking-[0.12em] text-text-tertiary/70">Quick access</p>
+              <div className="space-y-0.5">{arranged.pinned.map(drawerLink)}</div>
+            </div>
+          )}
+          {arranged.sections.map((section) => (
             <div key={section.title} className="mb-3 last:mb-0">
               <p className="px-3 pb-1 text-[10px] font-medium uppercase tracking-[0.12em] text-text-tertiary/70">
                 {section.title}
               </p>
-              <div className="space-y-0.5">
-                {section.items.map((item) => {
-                  const active = pathname === item.href;
-                  const Icon = item.icon;
-                  return (
-                    <Link
-                      key={item.href}
-                      href={item.href}
-                      onClick={() => setDrawerOpen(false)}
-                      aria-current={active ? "page" : undefined}
-                      className={`flex items-center gap-2.5 px-3 py-2 rounded-[4px] text-[13px] font-medium transition-colors relative ${
-                        active
-                          ? "bg-white/5 text-text-primary before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-[2px] before:bg-accent before:rounded-full"
-                          : "text-text-secondary hover:text-text-primary hover:bg-white/[0.03]"
-                      }`}
-                    >
-                      <Icon className="w-[17px] h-[17px] shrink-0" strokeWidth={1.75} />
-                      <span className="flex-1 truncate">{item.label}</span>
-                    </Link>
-                  );
-                })}
-              </div>
+              <div className="space-y-0.5">{section.items.map(drawerLink)}</div>
             </div>
           ))}
+          {arranged.hidden.length > 0 && (
+            <div className="mt-3">
+              <button
+                type="button"
+                onClick={() => setShowHidden((v) => !v)}
+                aria-expanded={showHidden}
+                className="min-h-11 w-full flex items-center gap-1.5 px-3 rounded-control text-[10px] font-medium uppercase tracking-[0.12em] text-text-tertiary hover:text-text-secondary"
+              >
+                {showHidden ? <ChevronDown className="w-3 h-3" aria-hidden /> : <ChevronRight className="w-3 h-3" aria-hidden />}
+                Show hidden ({arranged.hidden.length})
+              </button>
+              {showHidden && <div className="space-y-0.5 opacity-80">{arranged.hidden.map(drawerLink)}</div>}
+            </div>
+          )}
         </nav>
+        )}
 
         <div className="px-2 py-3 border-t border-border-subtle pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+          <PersonalizeButton
+            onStart={(kind) => { if (kind === "page") setDrawerOpen(false); }}
+            className="min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full disabled:text-accent"
+          />
           <button
             onClick={handleSignOut}
-            className="flex items-center gap-2.5 px-3 py-2 rounded-[4px] text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full"
+            className="min-h-11 flex items-center gap-2.5 px-3 py-2 rounded-control text-[13px] font-medium text-text-secondary hover:text-text-primary hover:bg-white/[0.03] transition-colors w-full"
           >
             <LogOut className="w-[17px] h-[17px] shrink-0" strokeWidth={1.75} />
             Sign out

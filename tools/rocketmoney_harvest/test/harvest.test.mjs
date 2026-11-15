@@ -245,16 +245,23 @@ test("run: success writes balances.json to a fresh scratch folder, recycles it, 
   }
 });
 
-test("run: refuses a second run within 20 hours unless forced", async () => {
+test("run: within 20 hours of the last import a run is only a keep-alive visit (no import; only a keepalive heartbeat) unless forced", async () => {
   const r = rig({ state: { lastAttemptAt: "2026-11-12T03:00:00.000Z" } });
   try {
-    let called = 0;
-    const capture = async () => { called++; return { status: "ok", networth: NETWORTH, accounts: ACCOUNTS, transactions: TRANSACTIONS }; };
+    const calls = [];
+    const capture = async (opts) => {
+      calls.push(opts.full);
+      return opts.full ? { status: "ok", networth: NETWORTH, accounts: ACCOUNTS, transactions: TRANSACTIONS } : { status: "ok", keepalive: true };
+    };
     assert.equal(await r.run({ capture }), 0);
-    assert.equal(called, 0);
-    assert.equal(r.store.heartbeats.length, 0);
+    assert.deepEqual(calls, [false]); // the app was opened, but only to keep the session alive
+    assert.deepEqual(r.store.heartbeats.map((h) => [h.data_type, h.status, h.records_synced, h.error_message]), [["keepalive", "success", 0, null]]);
+    assert.deepEqual(r.store.writes, { accounts: 0, transactions: 0, snapshots: 0, heartbeats: 1 }); // nothing in the ledger tables
+    assert.equal(r.recycled.length, 0);
+    assert.equal(JSON.parse(readFileSync(r.paths.statePath, "utf8")).lastAttemptAt, "2026-11-12T03:00:00.000Z"); // the 20-hour clock is untouched
+    assert.ok(r.logs.includes("keep-alive visit ok; last import attempt 9 h ago (next import at 20 h)"));
     assert.equal(await r.run({ capture, force: true }), 0);
-    assert.equal(called, 1);
+    assert.deepEqual(calls, [false, true]);
   } finally {
     r.done();
   }
@@ -270,7 +277,11 @@ test("run: not signed in -> failed 'login required' heartbeat, exit 2, and the n
       assert.equal(hb.status, "failed");
       assert.match(hb.error_message, /^login required/);
     }
-    assert.equal(JSON.parse(readFileSync(r.paths.statePath, "utf8")).lastAttemptAt, "2026-11-10T00:00:00.000Z");
+    // Signed out is remembered, and the 20-hour clock is cleared so the first signed-in visit imports at once.
+    const state = JSON.parse(readFileSync(r.paths.statePath, "utf8"));
+    assert.equal(state.lastAttemptAt, null);
+    assert.equal(state.signedOutSince, "2026-11-12T12:00:00.000Z");
+    assert.equal(state.lastSignedOutCheckAt, "2026-11-12T12:00:00.000Z");
   } finally {
     r.done();
   }
@@ -411,12 +422,23 @@ test("run: a failed transactions read fails only the transactions heartbeat; bal
   }
 });
 
-test("run: the session expiring during the transactions read is 'login required' (exit 2) and the next run is not held back", async () => {
-  const r = rig({ capture: okCapture({ transactions: { ok: false, error: "the transactions request was refused", login: true } }), state: { lastAttemptAt: "2026-11-10T00:00:00.000Z" } });
+test("run: a refused transactions read after a signed-in landing is a transactions failure, not 'signed out': keep-alive visits go on", async () => {
+  const r = rig({ capture: okCapture({ transactions: { ok: false, error: "the transactions request was refused (HTTP 401)", login: true } }), state: { lastAttemptAt: "2026-11-10T00:00:00.000Z" } });
   try {
-    assert.equal(await r.run(), 2);
-    assert.match(r.store.heartbeats[0].error_message, /^login required/);
-    assert.equal(JSON.parse(readFileSync(r.paths.statePath, "utf8")).lastAttemptAt, "2026-11-10T00:00:00.000Z");
+    assert.equal(await r.run(), 1);
+    assert.deepEqual(r.store.heartbeats.map((h) => [h.data_type, h.status]), [["transactions", "failed"]]);
+    assert.match(r.store.heartbeats[0].error_message, /^the transactions read was refused although the app was signed in \(the transactions request was refused \(HTTP 401\)\); the next visit checks the sign-in/);
+    const state = readState(r);
+    assert.equal(state.signedOutSince, null, "the landing proved the session alive");
+    assert.equal(state.lastSignedInAt, "2026-11-12T12:00:00.000Z");
+    // Two hours later the run is a keep-alive visit that really opens the app (the old code skipped it for 20 h).
+    const calls = [];
+    const later = await r.run({
+      now: new Date("2026-11-12T14:00:00.000Z"),
+      capture: async (opts) => { calls.push(opts.full); return { status: "ok", keepalive: true, session: SESSION }; },
+    });
+    assert.equal(later, 0);
+    assert.deepEqual(calls, [false]);
   } finally {
     r.done();
   }
@@ -482,5 +504,173 @@ test("run: a capture that returns no transactions result at all is a failure, no
     assert.match(r.store.heartbeats.find((h) => h.data_type === "transactions").error_message, /were not read/);
   } finally {
     r.done();
+  }
+});
+
+// --- keeping the sign-in: keep-alive visits, signed-out back-off, what a failure says ------------------------------
+const SESSION = { app: { name: "tb.auth0.sid", sessionOnly: false, minutesLeft: 228, guessed: false }, signIn: { name: "auth0", sessionOnly: false, minutesLeft: 4320 }, browserSessionOnly: 6 };
+const SEEN_SIGNED_OUT = {
+  endedAt: "auth.rocketaccount.com/u/login",
+  hops: 6,
+  silentTried: true,
+  silentError: "login_required",
+  silentRenewed: false,
+  path: "app.rocketmoney.com/net-worth > client-api.rocketmoney.com/auth0/auth/oidc/login > auth.rocketaccount.com/authorize > client-api.rocketmoney.com/auth0/auth/oidc/callback (login_required) > auth.rocketaccount.com/u/login",
+};
+const readState = (r) => JSON.parse(readFileSync(r.paths.statePath, "utf8"));
+
+test("run: a signed-in visit records when, for how long, and which kind of cookies hold the sign-in (never a value)", async () => {
+  const r = rig({ capture: okCapture({ session: SESSION, seen: { silentTried: false, silentRenewed: false, path: "app.rocketmoney.com/net-worth" } }) });
+  try {
+    assert.equal(await r.run(), 0);
+    const state = readState(r);
+    assert.equal(state.lastSignedInAt, "2026-11-12T12:00:00.000Z");
+    assert.equal(state.signedInSince, "2026-11-12T12:00:00.000Z");
+    assert.equal(state.visitsSinceSignIn, 1);
+    assert.equal(state.signedOutSince, null);
+    assert.deepEqual(state.lastSession, SESSION);
+    assert.ok(r.logs.includes("session cookies: app tb.auth0.sid: 228 min left; sign-in service auth0: 4320 min left; 6 browser-session cookie(s), gone when Chrome closes"));
+    assert.ok(r.logs.includes("signed in: the app session was still alive (visit 1 since 2026-11-12T12:00:00.000Z)"));
+    assert.equal(r.logs.some((l) => l.startsWith("WARNING")), false); // 228 min is enough for a 2-hour schedule
+  } finally {
+    r.done();
+  }
+});
+
+test("run: keep-alive visits count up, keep the first-seen time, and say when the session was renewed without a sign-in", async () => {
+  const r = rig({
+    state: { lastAttemptAt: "2026-11-12T03:00:00.000Z", signedInSince: "2026-11-11T05:00:00.000Z", lastSignedInAt: "2026-11-12T10:00:00.000Z", visitsSinceSignIn: 7, silentRenewals: 1 },
+    capture: async () => ({ status: "ok", keepalive: true, session: SESSION, seen: { silentTried: true, silentError: null, silentRenewed: true, path: "app.rocketmoney.com/net-worth > auth.rocketaccount.com/authorize > app.rocketmoney.com/net-worth" } }),
+  });
+  try {
+    assert.equal(await r.run(), 0);
+    const state = readState(r);
+    assert.equal(state.signedInSince, "2026-11-11T05:00:00.000Z");
+    assert.equal(state.visitsSinceSignIn, 8);
+    assert.equal(state.silentRenewals, 2);
+    assert.equal(state.lastAttemptAt, "2026-11-12T03:00:00.000Z");
+    assert.ok(r.logs.includes("signed in: the app session had lapsed and was renewed without a sign-in (visit 8 since 2026-11-11T05:00:00.000Z)"));
+    assert.ok(r.logs.some((l) => l.startsWith("sign-in round trip: app.rocketmoney.com/net-worth > auth.rocketaccount.com/authorize")));
+    assert.deepEqual(r.store.heartbeats.map((h) => `${h.data_type}:${h.status}`), ["keepalive:success"]);
+  } finally {
+    r.done();
+  }
+});
+
+test("run: an app session too short for the 2-hour schedule is called out in the log", async () => {
+  const r = rig({ capture: okCapture({ session: { ...SESSION, app: { ...SESSION.app, minutesLeft: 58 } } }) });
+  try {
+    assert.equal(await r.run(), 0);
+    assert.ok(r.logs.some((l) => l.startsWith("WARNING: the app session has 58 min left, less than the 2-hour schedule needs (135 min)")));
+  } finally {
+    r.done();
+  }
+});
+
+test("run: a keep-alive visit that finds the sign-in gone reports it at once, with what was seen and how long the sign-in lasted", async () => {
+  const r = rig({
+    state: { lastAttemptAt: "2026-11-12T03:00:00.000Z", signedInSince: "2026-11-11T04:00:00.000Z", lastSignedInAt: "2026-11-12T02:00:00.000Z", visitsSinceSignIn: 9, lastSession: SESSION },
+    capture: async () => ({ status: "login_required", seen: SEEN_SIGNED_OUT }),
+  });
+  try {
+    assert.equal(await r.run(), 2);
+    assert.deepEqual(r.store.heartbeats.map((h) => `${h.data_type}:${h.status}`).sort(), ["balances:failed", "transactions:failed"]);
+    const reason = r.store.heartbeats[0].error_message;
+    assert.equal(
+      reason,
+      "login required: run node harvest.mjs --login; at auth.rocketaccount.com/u/login; silent renewal: login_required; last signed in 10 h ago; sign-in lasted 22 h; sign-in cookie had 72 h left",
+    );
+    assert.ok(reason.length <= 200);
+    assert.ok(r.logs.includes(`sign-in round trip: ${SEEN_SIGNED_OUT.path}`));
+    const state = readState(r);
+    assert.equal(state.signedOutSince, "2026-11-12T12:00:00.000Z");
+    assert.equal(state.lastAttemptAt, null);
+    assert.equal(state.lastSignedInAt, "2026-11-12T02:00:00.000Z"); // what was known stays for the next message
+  } finally {
+    r.done();
+  }
+});
+
+test("run: while signed out the sign-in page is not opened again for 20 hours, unless the profile was used or --force", async () => {
+  const signedOut = { signedOutSince: "2026-11-12T08:00:00.000Z", lastSignedOutCheckAt: "2026-11-12T08:00:00.000Z", lastVisitEndedAt: "2026-11-12T08:00:10.000Z", lastAttemptAt: null };
+  const r = rig({ state: signedOut });
+  try {
+    let called = 0;
+    const capture = async () => { called++; return { status: "login_required", seen: SEEN_SIGNED_OUT }; };
+    // 4 hours after the last check, nobody touched the profile: nothing is opened, nothing is written
+    assert.equal(await r.run({ capture, profileChangedAt: () => Date.parse("2026-11-12T08:00:05.000Z") }), 2);
+    assert.equal(called, 0);
+    assert.equal(r.store.heartbeats.length, 0);
+    assert.ok(r.logs.some((l) => l.startsWith("signed out since 2026-11-12T08:00:00.000Z; checked 4 h ago. Not opening the sign-in page again")));
+    // --force looks anyway
+    assert.equal(await r.run({ capture, force: true }), 2);
+    assert.equal(called, 1);
+  } finally {
+    r.done();
+  }
+});
+
+test("run: a sign-in done by hand in the profile is noticed on the next visit, which imports straight away", async () => {
+  const r = rig({
+    state: { signedOutSince: "2026-11-12T08:00:00.000Z", lastSignedOutCheckAt: "2026-11-12T08:00:00.000Z", lastVisitEndedAt: "2026-11-12T08:00:10.000Z", lastAttemptAt: null, lastSignedInAt: "2026-11-11T20:00:00.000Z", signedInSince: "2026-11-11T04:00:00.000Z", visitsSinceSignIn: 9 },
+  });
+  try {
+    const calls = [];
+    const capture = async (opts) => { calls.push(opts.full); return { status: "ok", networth: NETWORTH, accounts: ACCOUNTS, transactions: TRANSACTIONS, session: SESSION }; };
+    // the cookie file changed at 11:30, long after the harvester's own last visit ended at 08:00:10
+    assert.equal(await r.run({ capture, profileChangedAt: () => Date.parse("2026-11-12T11:30:00.000Z") }), 0);
+    assert.deepEqual(calls, [true]);
+    assert.equal(r.store.heartbeats.filter((h) => h.status === "success").length, 1); // transactions (balances has its own importer)
+    const state = readState(r);
+    assert.equal(state.signedOutSince, null);
+    assert.equal(state.signedInSince, "2026-11-12T12:00:00.000Z"); // a new sign-in, counted from its first sighting
+    assert.equal(state.visitsSinceSignIn, 1);
+    assert.equal(state.lastAttemptAt, "2026-11-12T12:00:00.000Z");
+  } finally {
+    r.done();
+  }
+});
+
+test("run: a keep-alive visit that fails for another reason is not an import failure, but /status sees it: partial at once, failed from the second in a row", async () => {
+  for (const capture of [
+    async () => { throw new Error("browserType.launchPersistentContext: profile in use"); },
+    async () => ({ status: "failed", error: "the Net Worth data did not load within 45 s" }),
+  ]) {
+    const r = rig({ state: { lastAttemptAt: "2026-11-12T03:00:00.000Z" }, capture });
+    try {
+      assert.equal(await r.run(), 1);
+      assert.deepEqual(r.store.heartbeats.map((h) => `${h.data_type}:${h.status}`), ["keepalive:partial"]);
+      assert.match(r.store.heartbeats[0].error_message, /^keep-alive visit failed \(1 in a row\): /);
+      assert.ok(r.logs.some((l) => l.startsWith("keep-alive visit failed (1 in a row): ")));
+      assert.equal(readState(r).lastAttemptAt, "2026-11-12T03:00:00.000Z");
+      assert.equal(readState(r).keepaliveFailures, 1);
+      // The second miss in a row: the app session (about 3 h 48 min) has probably lapsed -> failed.
+      assert.equal(await r.run({ now: new Date("2026-11-12T14:00:00.000Z") }), 1);
+      assert.deepEqual(r.store.heartbeats.map((h) => `${h.data_type}:${h.status}`), ["keepalive:partial", "keepalive:failed"]);
+      assert.match(r.store.heartbeats[1].error_message, /^keep-alive visit failed \(2 in a row\): /);
+      // A visit that gets in again ends the run of failures.
+      assert.equal(await r.run({ now: new Date("2026-11-12T16:00:00.000Z"), capture: async () => ({ status: "ok", keepalive: true, session: SESSION }) }), 0);
+      assert.equal(readState(r).keepaliveFailures, 0);
+      assert.equal(r.store.heartbeats.at(-1).status, "success");
+      assert.equal(r.store.heartbeats.some((h) => h.data_type !== "keepalive"), false, "no import heartbeat from keep-alive visits");
+    } finally {
+      r.done();
+    }
+  }
+});
+
+test("run: a dry run always reads in full and leaves the state file alone, signed in or not", async () => {
+  const state = { lastAttemptAt: "2026-11-12T03:00:00.000Z" };
+  for (const [capture, code] of [[okCapture({ session: SESSION }), 0], [async () => ({ status: "login_required", seen: SEEN_SIGNED_OUT }), 2]]) {
+    const r = rig({ state, capture });
+    try {
+      const calls = [];
+      assert.equal(await r.run({ dryRun: true, capture: async (opts) => { calls.push(opts.full); return capture(opts); } }), code);
+      assert.deepEqual(calls, [true]);
+      assert.deepEqual(readState(r), state);
+      assert.equal(r.store.heartbeats.length, 0);
+    } finally {
+      r.done();
+    }
   }
 });

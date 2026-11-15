@@ -4,7 +4,8 @@
 #
 # Same settings as the Kindle harvester's task (see tools/kindle_harvest/register-task.ps1 for why):
 # hidden launcher, runs on battery, catches up after sleep, 20-minute limit, never wakes the laptop.
-# Every 6 hours: an order's items do not change after delivery, so there is no rush.
+# Every 10 minutes (Riley 2026-11-15: a meal must be loggable right after it arrives). A run with nothing new reads
+# one page of order history and stops, so frequent runs are cheap.
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $name = 'Onyx Uber Eats Harvest'
@@ -12,7 +13,7 @@ $name = 'Onyx Uber Eats Harvest'
 $action = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\wscript.exe" `
   -Argument "//B //Nologo //E:JScript `"$here\run-hidden.js`"" -WorkingDirectory $here
 $trigger = New-ScheduledTaskTrigger -Once -At ([datetime]::Today.AddHours(9).AddMinutes(40)) `
-  -RepetitionInterval (New-TimeSpan -Hours 6)
+  -RepetitionInterval (New-TimeSpan -Minutes 10)
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
   -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited

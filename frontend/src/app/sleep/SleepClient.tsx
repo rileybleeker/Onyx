@@ -1,5 +1,6 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { useEffect, useRef, useState } from "react";
 import {
   AreaChart, Area, BarChart, Bar, LineChart, Line, CartesianGrid,
@@ -8,19 +9,34 @@ import {
 import {
   getWhoopSleepAll, getWhoopRecovery, getWhoopCycles, getBehaviorLog,
   getEightSleepTrends, getDailySummaries,
-  rangeDays, rangeLabel, type Range,
+  rangeDays, rangeLabel,
 } from "@/lib/queries";
 import { formatDate, formatDuration, formatDurationMs, etDate, sameJson } from "@/lib/format";
+import { hoursToSeconds, minutesToSeconds, type Milliseconds, type Seconds } from "@/lib/units";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import DeferredMount from "@/components/DeferredMount";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import RangeFilter from "@/components/RangeFilter";
+import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
+const legendStyle = { fontSize: 11, fontFamily: "var(--font-mono)" };
+
+// A section heading of the page (the header of its Personalize group). `divider`: the rule above it.
+function SectionLabel({ children, divider = false }: { children: string; divider?: boolean }) {
+  return (
+    <>
+      {divider ? <div className="border-t border-border-subtle mb-8" /> : null}
+      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">{children}</p>
+    </>
+  );
+}
+
+const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "other";
 
 // Temps come from the Eight Sleep / WHOOP APIs in °C. Convert to °F at the
 // display layer for the US-based reader. Returns null for null/undefined input.
@@ -36,7 +52,8 @@ function recoveryColor(score: number | null): string {
 
 import type { SleepInitial } from "./SleepLoader";
 
-export default function SleepPage({ initial }: { initial?: SleepInitial | null }) {
+export default function SleepPage({ initial, headingTestId = "page-heading" }: { initial?: SleepInitial | null; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // Server-prefetched initial data (ISR, default 30d range) seeds the charts
   // so they paint immediately; the mount effect still runs as a SILENT
   // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
@@ -49,13 +66,13 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
   const [eightSleep, setEightSleep]     = useState<any[]>(initial?.eightSleep ?? []);
   const [summaries, setSummaries]       = useState<any[]>(initial?.summaries ?? []);
   // `loading` only gates the no-initial COLD path (skeleton until the first
-  // fetch resolves — same behavior as pre-ISR). Range changes flip the narrow
-  // `rangeLoading` flag instead (perf round 3): the stale charts stay visible
-  // and re-render in place when the new window lands, with a small
-  // "updating…" hint next to the RangeFilter rather than a page-wide skeleton.
+  // fetch resolves — same behavior as pre-ISR). Range changes keep the charts
+  // visible (perf round 3) and re-render them in place when the new window
+  // lands. The labels follow the range of the rows ON SCREEN (`rangeView.shown`),
+  // never the one still loading; a failed load says so with Retry
+  // (components/RangeLoadStatus.tsx, Codex #191 UI 4).
   const [loading, setLoading]           = useState(!initial);
-  const [rangeLoading, setRangeLoading] = useState(false);
-  const [range, setRange]               = useState<Range>("30d");
+  const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange } = useRangeLoad("30d");
   const firstRun = useRef(true);
   const firstRunWithInitial = useRef(!!initial);
 
@@ -68,7 +85,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
     firstRun.current = false;
     const silent = isFirst && firstRunWithInitial.current;
     firstRunWithInitial.current = false;
-    if (!isFirst) setRangeLoading(true);
+    const seq = beginRange(range, silent);
     const days = rangeDays(range);
     Promise.all([
       getWhoopSleepAll(days),
@@ -80,6 +97,8 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
     ])
       .then(([sAll, r, c, j, e, sum]) => {
         if (cancelled) return;
+        // The default view also seeds this page in the continuous scroll (lib/feed-seed.ts).
+        if (range === "30d") writeFeedSeed("/sleep", { whoopSleepAll: sAll, whoopRecovery: r, whoopCycles: c, journal: j, eightSleep: e, summaries: sum });
         // Deep-equal bail-out (perf round 3): the silent revalidation's
         // refetched data is usually byte-identical to the server-seeded
         // state — returning the previous reference lets React skip the
@@ -92,21 +111,25 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
         setJournal((prev) => (sameJson(prev, j) ? prev : j));
         setEightSleep((prev) => (sameJson(prev, e) ? prev : e));
         setSummaries((prev) => (sameJson(prev, sum) ? prev : sum));
+        finishRange(seq, range, true);
       })
-      .catch(console.error)
+      .catch((e) => {
+        console.error(e);
+        // The rows on screen keep their own range's labels; the status line offers Retry.
+        if (!cancelled) finishRange(seq, range, false);
+      })
       .finally(() => {
         if (cancelled) return;
-        // Clear BOTH flags unconditionally (no-op setState bails when the
-        // value is unchanged). Gating setLoading on `isFirst` left a hole
-        // under dev StrictMode: the doubled mount consumed the firstRun ref
-        // on the cancelled first invocation, so the second run never reached
-        // the only setLoading(false) site and a cold (initial=null) load
-        // showed the skeleton forever.
-        setRangeLoading(false);
+        // Clear the flag unconditionally (no-op setState bails when the value
+        // is unchanged). Gating setLoading on `isFirst` left a hole under dev
+        // StrictMode: the doubled mount consumed the firstRun ref on the
+        // cancelled first invocation, so the second run never reached the
+        // only setLoading(false) site and a cold (initial=null) load showed
+        // the skeleton forever.
         setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [range]);
+  }, [range, attempt, beginRange, finishRange]);
 
   if (loading) {
     return (
@@ -114,7 +137,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
         <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
               <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
               <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
             </div>
@@ -132,7 +155,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
       .map(Number);
     return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
   };
-  const rangeNote = range === "1d" ? "today" : `${rangeLabel(range)} avg`;
+  // Labels describe the rows on screen, which stay the previous range's until a new range has loaded.
+  const shownRange = rangeView.shown;
+  const rangeNote = shownRange === "1d" ? "today" : `${rangeLabel(shownRange)} avg`;
 
   // ── WHOOP ────────────────────────────────────────────────────────────────────
   // Main-only sleep rows derived from the nap-inclusive set (perf round 3):
@@ -212,7 +237,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
       nap_awake: nap ? +nap.awake.toFixed(2) : 0,
     };
   });
-  const avgWhoopNapMs = whoopNapsByDate.size
+  const avgWhoopNapMs: Milliseconds = whoopNapsByDate.size
     ? Array.from(whoopNapsByDate.values()).reduce((a, b) => a + b.inBedMs, 0) / whoopSleep.length
     : 0;
 
@@ -286,16 +311,19 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
 
   // ── Eight Sleep ───────────────────────────────────────────────────────────────
   const avgEightSleep    = avg(eightSleep, "sleep_score");
-  const avgEightDuration = avg(eightSleep, "time_slept_seconds");
+  const avgEightDuration: Seconds | null = avg(eightSleep, "time_slept_seconds");
   const avgEightHrv      = avg(eightSleep, "avg_hrv");
-  const avgEightLatency  = avg(eightSleep, "latency_asleep_seconds");
+  const avgEightLatency: Seconds | null = avg(eightSleep, "latency_asleep_seconds");
 
   // ── WHOOP Sleep aggregates ───────────────────────────────────────────────────
-  const avgInBedMs       = avg(whoopSleep, "total_in_bed_time_milli");
+  // WHOOP durations are milliseconds and Eight Sleep's are seconds, both on this
+  // page. The unit tags (lib/units.ts) turn formatDuration(avgInBedMs) into a
+  // compile error instead of a label 1000 times too long.
+  const avgInBedMs: Milliseconds | null = avg(whoopSleep, "total_in_bed_time_milli");
   const avgSleepPerf     = avg(whoopSleep, "sleep_performance_percentage");
   const avgSleepEff      = avg(whoopSleep, "sleep_efficiency_percentage");
-  const avgDeepMs        = avg(whoopSleep, "total_slow_wave_sleep_time_milli");
-  const avgRemMs         = avg(whoopSleep, "total_rem_sleep_time_milli");
+  const avgDeepMs: Milliseconds | null = avg(whoopSleep, "total_slow_wave_sleep_time_milli");
+  const avgRemMs: Milliseconds | null = avg(whoopSleep, "total_rem_sleep_time_milli");
   const hoursVsNeededVals = whoopSleep.map(hoursVsNeeded).filter((v): v is number => v != null);
   const avgHoursVsNeeded = hoursVsNeededVals.length
     ? hoursVsNeededVals.reduce((a, b) => a + b, 0) / hoursVsNeededVals.length
@@ -334,8 +362,8 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
   // Range averages: main sleep duration + average nap duration across the range
   // (nap-less days contribute 0, so this is a per-day average that adds back to
   // avgEightDuration when both are summed).
-  const avgEightMainSec = avg(eightSleep, "time_slept_main_session_seconds");
-  const avgEightNapSec  = avgEightDuration != null && avgEightMainSec != null
+  const avgEightMainSec: Seconds | null = avg(eightSleep, "time_slept_main_session_seconds");
+  const avgEightNapSec: Seconds | null = avgEightDuration != null && avgEightMainSec != null
     ? Math.max(0, avgEightDuration - avgEightMainSec)
     : null;
 
@@ -382,25 +410,50 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
     ? eightSleep.reduce((a, d) => a + (d.snore_duration_seconds ?? 0), 0) / snoreNightsTracked / 60
     : null;
 
+  // ── Behaviors (journal heatmap) ──────────────────────────────────────────────
+  // `behaviors_date` is the calendar day the journal answer describes
+  // (the day the user was awake leading into bedtime). Computed at the
+  // DB layer via trigger from each cycle's start_time − 6h in local TZ;
+  // falls back to cycle_date for rows without a matching cycle.
+  const journalDate = (j: any) => j.behaviors_date ?? j.cycle_date;
+  const behaviors = [...new Set(journal.map((j: any) => j.question))].sort();
+  const dates     = [...new Set(journal.map(journalDate))].sort();
+  const journalMap = new Map<string, string>();
+  journal.forEach((j: any) => {
+    journalMap.set(`${journalDate(j)}|${j.question}`, j.answer);
+  });
+  const categoryMap = new Map<string, string[]>();
+  journal.forEach((j: any) => {
+    const cat = j.category || "Other";
+    if (!categoryMap.has(cat)) categoryMap.set(cat, []);
+    const list = categoryMap.get(cat)!;
+    if (!list.includes(j.question)) list.push(j.question);
+  });
+  const behaviorCategories = [...categoryMap.entries()];
+  const isPositive = (answer: string | undefined) => {
+    if (!answer) return false;
+    const a = answer.toLowerCase();
+    return a === "yes" || a === "true" || (parseFloat(a) > 0 && !isNaN(parseFloat(a)));
+  };
+
   return (
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Sleep &amp; Recovery</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">Sleep, recovery, and cardiac trends — {rangeLabel(range)}</p>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Sleep &amp; Recovery</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">Sleep, recovery, and cardiac trends — {rangeLabel(shownRange)}</p>
         </div>
-        <div className="flex items-center gap-3">
-          {rangeLoading && (
-            <span className="text-[11px] font-mono text-text-tertiary animate-pulse">updating…</span>
-          )}
-          <RangeFilter value={range} onChange={setRange} />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <RangeLoadStatus view={rangeView} onRetry={retryRange} />
+          <RangeFilter value={selectedRange} onChange={selectRange} />
         </div>
       </div>
 
+      <PartGrid page="/sleep" title="Sleep & Recovery">
       {/* ── WHOOP Recovery ──────────────────────────────────────────────────── */}
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Recovery</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6 items-stretch">
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+      <PartGroup id="section-whoop-recovery" title="WHOOP · Recovery" header={<SectionLabel>WHOOP · Recovery</SectionLabel>}>
+        <Part id="tile-recovery" title="Recovery (ring)" width="quarter">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Recovery"
             value={avgRecoveryScore ?? NaN}
@@ -411,7 +464,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
               : rangeNote}
           />
         </div>
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+        </Part>
+        <Part id="tile-day-strain" title="Day Strain (ring)" width="quarter">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Day Strain"
             value={avgStrain ?? NaN}
@@ -421,11 +476,15 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             sublabel="of 21"
           />
         </div>
+        </Part>
+        <Part id="tile-whoop-hrv" title="HRV (WHOOP)" width="quarter">
         <StatCard label="HRV" value={avgWhoopHrv != null ? avgWhoopHrv.toFixed(0) : null} unit="ms" sublabel={rangeNote} source="WHOOP" />
+        </Part>
+        <Part id="tile-whoop-rhr" title="Resting HR (WHOOP)" width="quarter">
         <StatCard label="Resting HR" value={avgWhoopRhr != null ? avgWhoopRhr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="WHOOP" />
-      </div>
+        </Part>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
+        <Part id="recovery-score" title="Recovery Score" width="half">
         <ChartCard title="Recovery Score" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={recoveryData}>
@@ -443,7 +502,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="daily-strain" title="Daily Strain" width="half">
         <ChartCard title="Daily Strain" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={strainData}>
@@ -461,7 +522,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="whoop-vitals" title="SpO2, Skin Temp & Resp Rate" width="half">
         <ChartCard title="SpO2, Skin Temp & Resp Rate" source="WHOOP">
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={recoveryData}>
@@ -478,11 +541,12 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
-      </div>
+        </Part>
+      </PartGroup>
 
       {/* ── WHOOP Sleep ─────────────────────────────────────────────────────── */}
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Sleep</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <PartGroup id="section-whoop-sleep" title="WHOOP · Sleep" header={<SectionLabel>WHOOP · Sleep</SectionLabel>}>
+        <Part id="tile-whoop-duration" title="Duration (WHOOP)" width="quarter">
         <StatCard
           label="Duration"
           value={avgInBedMs != null ? formatDurationMs(avgInBedMs + avgWhoopNapMs) : null}
@@ -493,14 +557,24 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
           }
           source="WHOOP"
         />
+        </Part>
+        <Part id="tile-hours-vs-needed" title="Hours vs Needed (tile)" width="quarter">
         <StatCard label="Hours vs Needed" value={avgHoursVsNeeded != null ? `${avgHoursVsNeeded.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
+        </Part>
+        <Part id="tile-sleep-performance" title="Sleep Performance" width="quarter">
         <StatCard label="Sleep Performance" value={avgSleepPerf != null ? `${avgSleepPerf.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
+        </Part>
+        <Part id="tile-sleep-efficiency" title="Sleep Efficiency" width="quarter">
         <StatCard label="Sleep Efficiency" value={avgSleepEff != null ? `${avgSleepEff.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
+        </Part>
+        <Part id="tile-deep-sleep" title="Deep Sleep" width="quarter">
         <StatCard label="Deep Sleep" value={avgDeepMs != null ? formatDurationMs(avgDeepMs) : null} sublabel={rangeNote} source="WHOOP" />
+        </Part>
+        <Part id="tile-rem-sleep" title="REM Sleep" width="quarter">
         <StatCard label="REM Sleep" value={avgRemMs != null ? formatDurationMs(avgRemMs) : null} sublabel={rangeNote} source="WHOOP" />
-      </div>
+        </Part>
 
-      <div className="mb-6">
+        <Part id="time-in-bed" title="Time in Bed">
         <DeferredMount minHeight={345}>
           <ChartCard title="Time in Bed" source="WHOOP">
             <ResponsiveContainer width="100%" height={280}>
@@ -514,9 +588,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
-      </div>
+        </Part>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+        <Part id="sleep-debt" title="Sleep Debt" width="third">
         <DeferredMount minHeight={345}>
           <ChartCard title="Sleep Debt" source="WHOOP">
             <ResponsiveContainer width="100%" height={280}>
@@ -534,7 +608,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="hours-vs-needed" title="Hours vs Needed" width="third">
         <DeferredMount minHeight={345}>
           <ChartCard title="Hours vs Needed" source="WHOOP">
             <ResponsiveContainer width="100%" height={280}>
@@ -553,7 +629,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="sleep-consistency" title="Sleep Consistency" width="third">
         <DeferredMount minHeight={345}>
           <ChartCard title="Sleep Consistency" source="WHOOP">
             <ResponsiveContainer width="100%" height={280}>
@@ -571,9 +649,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
-      </div>
+        </Part>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-10">
+        <Part id="whoop-stages" title="Sleep Stages (WHOOP)" width="third">
         <DeferredMount minHeight={325}>
           <ChartCard title="Sleep Stages" source="WHOOP">
             <ResponsiveContainer width="100%" height={260}>
@@ -581,7 +659,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
                 <CartesianGrid {...gridStyle} />
                 <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
                 <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
-                <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
+                <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(hoursToSeconds(Number(v))), name]} />
                 <Legend wrapperStyle={legendStyle} />
                 <Bar isAnimationActive={false} dataKey="deep"  stackId="a" fill={C.source.garmin} name="Deep" />
                 <Bar isAnimationActive={false} dataKey="light" stackId="a" fill={C.categorical[6]} name="Light" />
@@ -595,7 +673,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="whoop-scores" title="Sleep Scores (WHOOP)" width="third">
         <DeferredMount minHeight={325}>
           <ChartCard title="Sleep Scores" source="WHOOP">
             <ResponsiveContainer width="100%" height={260}>
@@ -631,7 +711,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="whoop-heart" title="Resting HR, HRV & Respiratory Rate" width="third">
         <DeferredMount minHeight={325}>
           <ChartCard title="Resting HR, HRV & Respiratory Rate" source="WHOOP">
             <ResponsiveContainer width="100%" height={260}>
@@ -659,108 +741,80 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
-      </div>
+        </Part>
+      </PartGroup>
 
       {/* ── Behaviors ───────────────────────────────────────────────────────── */}
-      {journal.length > 0 && <DeferredMount minHeight={1100}>{(() => {
-        // `behaviors_date` is the calendar day the journal answer describes
-        // (the day the user was awake leading into bedtime). Computed at the
-        // DB layer via trigger from each cycle's start_time − 6h in local TZ;
-        // falls back to cycle_date for rows without a matching cycle.
-        const journalDate = (j: any) => j.behaviors_date ?? j.cycle_date;
-
-        const behaviors = [...new Set(journal.map((j: any) => j.question))].sort();
-        const dates     = [...new Set(journal.map(journalDate))].sort();
-        const journalMap = new Map<string, string>();
-        journal.forEach((j: any) => {
-          journalMap.set(`${journalDate(j)}|${j.question}`, j.answer);
-        });
-
-        const categoryMap = new Map<string, string[]>();
-        journal.forEach((j: any) => {
-          const cat = j.category || "Other";
-          if (!categoryMap.has(cat)) categoryMap.set(cat, []);
-          const list = categoryMap.get(cat)!;
-          if (!list.includes(j.question)) list.push(j.question);
-        });
-
-        const isPositive = (answer: string | undefined) => {
-          if (!answer) return false;
-          const a = answer.toLowerCase();
-          return a === "yes" || a === "true" || (parseFloat(a) > 0 && !isNaN(parseFloat(a)));
-        };
-
-        return (
-          <>
-            <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-4">Behaviors</p>
-
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-              {[...categoryMap.entries()].map(([cat, qs]) => (
-                <div key={cat} className="bg-surface-card border border-border-subtle rounded-[6px] p-4">
-                  <p className="text-[10px] text-text-tertiary font-mono font-medium uppercase tracking-wider">{cat}</p>
-                  <p className="text-lg font-semibold text-text-primary mt-1">{qs.length} behavior{qs.length !== 1 ? "s" : ""}</p>
-                  <p className="text-xs text-text-tertiary mt-1">{qs.slice(0, 3).join(", ")}{qs.length > 3 ? "…" : ""}</p>
-                </div>
-              ))}
+      {journal.length > 0 && (
+      <PartGroup id="section-behaviors" title="Behaviors" header={<SectionLabel>Behaviors</SectionLabel>}>
+        {behaviorCategories.map(([cat, qs]) => (
+          <Part key={cat} id={`behavior-category-${slug(cat)}`} title={`Behaviors: ${cat}`} width="quarter">
+            <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4">
+              <p className="text-[10px] text-text-tertiary font-mono font-medium uppercase tracking-wider">{cat}</p>
+              <p className="text-lg font-semibold text-text-primary mt-1">{qs.length} behavior{qs.length !== 1 ? "s" : ""}</p>
+              <p className="text-xs text-text-tertiary mt-1">{qs.slice(0, 3).join(", ")}{qs.length > 3 ? "…" : ""}</p>
             </div>
-
-            <ChartCard title="Behavior Heatmap">
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr>
-                      <th className="text-left align-bottom bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal pr-3 pb-2 sticky left-0 bg-surface-card min-w-[140px]">Behavior</th>
-                      {dates.map((d) => (
-                        <th key={d} className="align-bottom bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal px-0.5 min-w-[36px]">
-                          <div className="h-14 flex items-end justify-center">
-                            <span className="rotate-[-45deg] origin-bottom-left whitespace-nowrap translate-x-2">
-                              {formatDate(d)}
-                            </span>
-                          </div>
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {behaviors.map((b) => (
-                      <tr key={b} className="border-b border-white/5 hover:bg-white/[0.02]">
-                        <td className="text-text-secondary pr-3 py-1 sticky left-0 bg-surface-card truncate max-w-[160px]" title={b}>{b}</td>
-                        {dates.map((d) => {
-                          const answer = journalMap.get(`${d}|${b}`);
-                          const active = isPositive(answer);
-                          return (
-                            <td key={d} className="px-0.5 py-1 text-center">
-                              <div
-                                className={`w-5 h-5 rounded-sm mx-auto ${active ? "bg-green-500/80" : "bg-white/5"}`}
-                                title={answer ? `${b}: ${answer}` : `${b}: —`}
-                              />
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </ChartCard>
-          </>
-        );
-      })()}</DeferredMount>}
-
-      <div className="border-t border-border-subtle mb-8" />
+          </Part>
+        ))}
+        <Part id="behavior-heatmap" title="Behavior Heatmap">
+        <DeferredMount minHeight={980}>
+        <ChartCard title="Behavior Heatmap">
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr>
+                  <th className="text-left align-bottom bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal pr-3 pb-2 sticky left-0 bg-surface-card min-w-[140px]">Behavior</th>
+                  {dates.map((d) => (
+                    <th key={d} className="align-bottom bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal px-0.5 min-w-[36px]">
+                      <div className="h-14 flex items-end justify-center">
+                        <span className="rotate-[-45deg] origin-bottom-left whitespace-nowrap translate-x-2">
+                          {formatDate(d)}
+                        </span>
+                      </div>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {behaviors.map((b) => (
+                  <tr key={b} className="border-b border-white/5 hover:bg-white/[0.02]">
+                    <td className="text-text-secondary pr-3 py-1 sticky left-0 bg-surface-card truncate max-w-[160px]" title={b}>{b}</td>
+                    {dates.map((d) => {
+                      const answer = journalMap.get(`${d}|${b}`);
+                      const active = isPositive(answer);
+                      return (
+                        <td key={d} className="px-0.5 py-1 text-center">
+                          <div
+                            className={`w-5 h-5 rounded-sm mx-auto ${active ? "bg-green-500/80" : "bg-white/5"}`}
+                            title={answer ? `${b}: ${answer}` : `${b}: —`}
+                          />
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </ChartCard>
+        </DeferredMount>
+        </Part>
+      </PartGroup>
+      )}
 
       {/* ── Garmin Cardiac ──────────────────────────────────────────────────── */}
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">GARMIN · Cardiac</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-10">
+      <PartGroup id="section-garmin-cardiac" title="Garmin · Cardiac" header={<SectionLabel divider>GARMIN · Cardiac</SectionLabel>}>
+        <Part id="tile-garmin-rhr" title="Avg RHR (Garmin)" width="quarter">
         <StatCard label="Avg RHR" value={avgGarminRhr != null ? avgGarminRhr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
-      </div>
-
-      <div className="border-t border-border-subtle mb-8" />
+        </Part>
+      </PartGroup>
 
       {/* ── Eight Sleep ─────────────────────────────────────────────────────── */}
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Eight Sleep</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <PartGroup id="section-eight-sleep" title="Eight Sleep" header={<SectionLabel divider>Eight Sleep</SectionLabel>}>
+        <Part id="tile-eight-score" title="Sleep Score (Eight Sleep)" width="quarter">
         <StatCard label="Sleep Score" value={avgEightSleep != null ? avgEightSleep.toFixed(0) : null} sublabel={rangeNote} source="8SLP" />
+        </Part>
+        <Part id="tile-eight-duration" title="Duration (Eight Sleep)" width="quarter">
         <StatCard
           label="Duration"
           value={avgEightDuration != null ? formatDuration(Math.round(avgEightDuration)) : null}
@@ -771,11 +825,15 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
           }
           source="8SLP"
         />
+        </Part>
+        <Part id="tile-eight-hrv" title="HRV (Eight Sleep)" width="quarter">
         <StatCard label="HRV" value={avgEightHrv != null ? avgEightHrv.toFixed(0) : null} unit="ms" sublabel={rangeNote} source="8SLP" />
+        </Part>
+        <Part id="tile-eight-latency" title="Sleep Latency (tile)" width="quarter">
         <StatCard label="Sleep Latency" value={avgEightLatency != null ? (avgEightLatency / 60).toFixed(0) : null} unit="min" sublabel={rangeNote} source="8SLP" />
-      </div>
+        </Part>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
+        <Part id="eight-scores" title="Sleep Scores (Eight Sleep)" width="half">
         <DeferredMount minHeight={325}>
           <ChartCard title="Sleep Scores" source="8SLP">
             <ResponsiveContainer width="100%" height={260}>
@@ -791,7 +849,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="eight-stages" title="Sleep Stages (Eight Sleep)" width="half">
         <DeferredMount minHeight={325}>
           <ChartCard title="Sleep Stages" source="8SLP">
             <ResponsiveContainer width="100%" height={260}>
@@ -799,7 +859,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
                 <CartesianGrid {...gridStyle} />
                 <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
                 <YAxis tick={axisTick} width={50} label={axisLabel("hours", "y")} />
-                <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(Math.round(Number(v) * 3600)), name]} />
+                <Tooltip {...chartTooltip} formatter={(v: any, name: any) => [formatDuration(hoursToSeconds(Number(v))), name]} />
                 <Legend wrapperStyle={legendStyle} />
                 <Bar isAnimationActive={false} dataKey="deep"  stackId="a" fill={C.source.garmin} name="Deep" />
                 <Bar isAnimationActive={false} dataKey="light" stackId="a" fill={C.categorical[6]} name="Light" />
@@ -813,7 +873,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="eight-biometrics" title="Heart Rate, HRV & Resp Rate (Eight Sleep)" width="half">
         <DeferredMount minHeight={325}>
           <ChartCard title="Heart Rate, HRV & Resp Rate" source="8SLP">
             <ResponsiveContainer width="100%" height={260}>
@@ -832,7 +894,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="eight-temperature" title="Bed & Room Temperature" width="half">
         <DeferredMount minHeight={325}>
           <ChartCard title="Bed & Room Temperature" source="8SLP">
             <ResponsiveContainer width="100%" height={260}>
@@ -850,7 +914,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="snoring" title="Snoring" width="half">
         <DeferredMount minHeight={340}>
           <ChartCard
             title="Snoring"
@@ -874,7 +940,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
+        </Part>
 
+        <Part id="sleep-latency" title="Time to Fall Asleep" width="half">
         <DeferredMount minHeight={340}>
           <ChartCard
             title="Time to Fall Asleep"
@@ -886,7 +954,7 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
                 <CartesianGrid {...gridStyle} />
                 <XAxis dataKey="date" tick={{ ...axisTick, angle: -45, textAnchor: "end" }} interval={0} height={60} />
                 <YAxis tick={axisTick} width={45} label={axisLabel("minutes", "y")} />
-                <Tooltip {...chartTooltip} formatter={(v: any) => [formatDuration(Math.round(Number(v) * 60)), "Latency"]} />
+                <Tooltip {...chartTooltip} formatter={(v: any) => [formatDuration(minutesToSeconds(Number(v))), "Latency"]} />
                 <ReferenceLine y={15} stroke={C.up} strokeDasharray="3 3" strokeOpacity={0.5} label={{ value: "15 min", position: "right", fill: C.up, fontSize: 10 }} />
                 <Bar isAnimationActive={false} dataKey="minutes" name="Latency" radius={[3, 3, 0, 0]}>
                   {eightLatencyData.map((d, i) => (
@@ -897,7 +965,9 @@ export default function SleepPage({ initial }: { initial?: SleepInitial | null }
             </ResponsiveContainer>
           </ChartCard>
         </DeferredMount>
-      </div>
+        </Part>
+      </PartGroup>
+      </PartGrid>
     </>
   );
 }

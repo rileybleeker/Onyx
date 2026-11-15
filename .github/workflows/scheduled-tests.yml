@@ -1,0 +1,156 @@
+name: Scheduled tests
+# Credential-free behavioral suite, after a confirmed exact-revision Production deployment.
+# Called from post-merge verification and retried on schedule. Failures do not block deployment.
+# Deferred runs are not counted as test passes. No production credentials are available here.
+on:
+  schedule:
+    - cron: "7,37 * * * *"   # every 30 minutes
+  workflow_call:
+    inputs:
+      sha:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Test even if this master commit already passed
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+concurrency:
+  group: scheduled-tests
+  cancel-in-progress: false
+jobs:
+  deployed:
+    uses: ./.github/workflows/deployed-revision.yml
+    with:
+      sha: ${{ inputs.sha || github.sha }}
+  gate:
+    needs: deployed
+    if: needs.deployed.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+    steps:
+      - id: g
+        name: Skip a master commit that already passed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ inputs.sha || github.sha }}
+          FORCE: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
+        run: |
+          # A deferred workflow also reports success: require actual successful test jobs.
+          passed=0
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SHA&per_page=100" --jq '.workflow_runs[] | select((.path == ".github/workflows/scheduled-tests.yml" or .path == ".github/workflows/post-merge.yml") and (.event == "push" or .event == "schedule")) | .id')
+          for run in $runs; do
+            count=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?per_page=100" --jq '[.jobs[] | select(((.name | split(" / ") | last) == "frontend-types" or (.name | split(" / ") | last) == "lint" or (.name | split(" / ") | last) == "stats-tests" or (.name | split(" / ") | last) == "focus-policy") and .conclusion == "success")] | length')
+            if [ "$count" = 4 ]; then passed=1; break; fi
+          done
+          if [ "$FORCE" = true ] || [ "$passed" = 0 ]; then echo 'run=true' >> "$GITHUB_OUTPUT"
+          else echo 'run=false' >> "$GITHUB_OUTPUT"; fi
+
+  frontend-types:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Offline Node tests (auto-discovered - add a test file, not a workflow line; *-ui.mjs needs a browser and is excluded)
+        # Every file runs even after one fails (the step used to stop at the first failure, so one red file hid the
+        # results of every file after it); the step fails at the end and names each failed file.
+        run: |
+          shopt -s nullglob
+          failed=0
+          for f in tests/*.test.cjs; do node --test "$f" || { echo "::error::$f failed"; failed=1; }; done
+          for f in scripts/test-*.mjs; do case "$f" in *-ui.mjs) continue;; esac; node "$f" || { echo "::error::$f failed"; failed=1; }; done
+          exit "$failed"
+      - name: Status freshness regression tests (synthetic, no credentials)
+        run: node test-status-freshness.cjs
+      - run: npx --no-install tsc --noEmit
+      - name: Compile production bundles without prerendering or production credentials
+        run: npx --no-install next build --experimental-build-mode compile
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+      - name: Install isolated regression browser
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Run synthetic Today component regressions (no credentials or backend)
+        working-directory: .
+        run: node tests/today-regression.cjs
+
+  lint:
+    # The Vercel build skips ESLint (frontend/next.config.ts, 2026-11-14), so it runs here, after deploy.
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: ESLint (next lint, frontend/.eslintrc.json)
+        run: npm run lint
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+
+  stats-tests:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-ci.txt
+            requirements-analysis.lock
+      - name: Install (pinned analysis lock + the few extras the ETL modules import)
+        run: pip install -r requirements-ci.txt
+      - name: Offline tests (all of tests/test_*.py except the live ones, in parallel)
+        run: python tests/run_offline_tests.py
+
+  focus-policy:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          persist-credentials: false
+      - name: Test Focus policy with synthetic data
+        working-directory: tools/screentime_ios/FocusCore
+        run: swift test

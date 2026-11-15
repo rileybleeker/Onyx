@@ -15,6 +15,11 @@ Audio features: Spotify deprecated /v1/audio-features for apps registered
 after 2024-11-27. This app is post-cutoff, so we use ReccoBeats (accepts
 Spotify track IDs) as the features source. `features_source` records provenance.
 
+Sign-in: Spotify expires a refresh token 180 days after the sign-in, however often
+it is refreshed. The normal way to renew it is the Reconnect control on the Spotify
+card of the Onyx /status page (no secret on the PC, nothing to run); --auth and
+--exchange-code below are the other routes. See AGENTS.md, Token recovery (Spotify).
+
 Usage:
     python spotify_etl.py --auth        # OAuth sign-in (local; needs the client id + secret in .env)
     python spotify_etl.py --exchange-code <code or callback URL>
@@ -35,8 +40,9 @@ import logging
 import secrets
 import urllib.parse
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
@@ -206,15 +212,58 @@ def exchange_authorization_code(code: str) -> dict:
             "single-use and short-lived: open the authorize URL again for a new one."
         )
         sys.exit(1)
-    tokens = resp.json()
-    if not tokens.get("refresh_token"):
-        log.error("Spotify's answer carried no refresh token; nothing saved.")
+    try:
+        answer = resp.json()
+    except ValueError:
+        answer = None
+    tokens = token_blob_from_response(answer, time.time())
+    if tokens is None:
+        log.error("Spotify's answer carried no access or refresh token; nothing saved.")
         sys.exit(1)
-    now = int(time.time())
-    tokens["obtained_at"] = now
-    tokens["authorized_at"] = now
+    if not has_required_scopes(tokens["scope"]):
+        log.error(
+            "Spotify did not grant both permissions Onyx needs "
+            f"({SPOTIFY_SCOPES}); nothing saved. Sign in again and approve them."
+        )
+        sys.exit(1)
     save_tokens(tokens)
     return tokens
+
+
+def has_required_scopes(scope) -> bool:
+    """True when every scope in SPOTIFY_SCOPES was granted (Spotify picks the order).
+    Mirrors hasRequiredScopes in frontend/src/lib/spotify-reconnect.ts."""
+    if not isinstance(scope, str):
+        return False
+    return set(SPOTIFY_SCOPES.split()) <= set(scope.split())
+
+
+def token_blob_from_response(answer, now: float) -> dict | None:
+    """The token blob stored in pds.ci_tokens, built from Spotify's authorization_code
+    answer. Exactly these keys, in this order, whichever route made the sign-in (this
+    one for `--auth` and the workflow's auth_code input, buildTokenBlob in
+    frontend/src/lib/spotify-reconnect.ts for Reconnect on /status), so every route
+    stores the same shape. None when the answer has no access or refresh token."""
+    if not isinstance(answer, dict):
+        return None
+    access, refresh = answer.get("access_token"), answer.get("refresh_token")
+    if not isinstance(access, str) or not access or not isinstance(refresh, str) or not refresh:
+        return None
+    token_type = answer.get("token_type")
+    expires = answer.get("expires_in")
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)) or expires <= 0:
+        expires = 3600
+    scope = answer.get("scope")
+    at = int(now)
+    return {
+        "access_token": access,
+        "token_type": token_type if isinstance(token_type, str) and token_type else "Bearer",
+        "expires_in": int(expires),
+        "refresh_token": refresh,
+        "scope": scope if isinstance(scope, str) else "",
+        "obtained_at": at,
+        "authorized_at": at,
+    }
 
 
 def _auth_code_from_github_event() -> str:
@@ -272,8 +321,14 @@ class SpotifyAuthError(Exception):
     """
 
 
+# Every failed or expiring-soon heartbeat ends with this, and /status shows it on the
+# Spotify card next to its Reconnect control. The control appears when the card's error
+# contains "refresh token rejected", "sign-in expires" or "no refresh token" /
+# "No Spotify tokens" (needsSpotifyReconnect in frontend/src/lib/spotify-reconnect.ts):
+# keep those phrases.
 REAUTH_HOWTO = (
-    "Sign in again (AGENTS.md, Token recovery (Spotify)): `python spotify_etl.py --auth` "
+    "Sign in again: open the Onyx /status page and use Reconnect on the Spotify card. "
+    "Other routes (AGENTS.md, Token recovery (Spotify)): `python spotify_etl.py --auth` "
     "then `python ci_token_helper.py upload spotify`."
 )
 REAUTH_INSTRUCTIONS = f"Spotify refresh token rejected. {REAUTH_HOWTO}"
@@ -345,15 +400,28 @@ def reauth_warning(tokens: dict, now: float | None = None) -> str | None:
     if not isinstance(authorized_at, (int, float)) or isinstance(authorized_at, bool):
         return None
     expires = float(authorized_at) + REFRESH_TOKEN_LIFETIME_DAYS * 86400
-    left = (expires - (time.time() if now is None else now)) / 86400
+    now = time.time() if now is None else now
+    left = (expires - now) / 86400
     if left > REAUTH_WARNING_DAYS:
         return None
-    day = datetime.fromtimestamp(expires, tz=timezone.utc).strftime("%Y-%m-%d")
-    when = f"in {int(left)} days" if left >= 1 else ("today" if left >= 0 else "already")
-    return (
-        f"Spotify sign-in expires {when} ({day} UTC, {REFRESH_TOKEN_LIFETIME_DAYS} days "
-        f"after it was made). {REAUTH_HOWTO}"
-    )
+    # One date, the same one the /status card prints (reconnectByDate in
+    # frontend/src/lib/spotify-reconnect.ts): the last full Eastern-time day before
+    # the day the token expires. Calendar-day arithmetic, not "minus 24 hours".
+    eastern = ZoneInfo("America/New_York")
+    expiry_day = datetime.fromtimestamp(expires, tz=eastern).date()
+    reconnect_by = expiry_day - timedelta(days=1)
+    lifetime = f"{REFRESH_TOKEN_LIFETIME_DAYS} days after it was made"
+    if left < 0:
+        return (
+            f"Spotify sign-in expires {lifetime} and that day has already passed "
+            f"({expiry_day}, Eastern time). {REAUTH_HOWTO}"
+        )
+    when = f"in {int(left)} days" if left >= 1 else "today"
+    if reconnect_by >= datetime.fromtimestamp(now, tz=eastern).date():
+        act = f"reconnect by {reconnect_by} (Eastern time)"
+    else:
+        act = "reconnect now"
+    return f"Spotify sign-in expires {when}, {lifetime}: {act}. {REAUTH_HOWTO}"
 
 
 # ---------------------------------------------------------------------------

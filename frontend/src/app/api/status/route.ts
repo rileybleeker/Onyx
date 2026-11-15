@@ -1,9 +1,12 @@
 import { GARMIN_WEARABLE_FILTER, garminNoWearMessage, ingestionHeartbeatStatus } from "@/lib/status-freshness";
 import { NextResponse } from "next/server";
 import { getNycScoutFreshness } from "@/lib/nyc";
+import { staleCheckNote, swrCacheTimed } from "@/lib/swr-cache";
 import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
-import { financeLedgerCard } from "@/lib/finance-status";
+import { SIMPLEFIN_THRESHOLDS, financeLedgerCard } from "@/lib/finance-status";
+import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
+import { CARE_CALENDAR_SYNC_COLUMNS, careCalendarCard, careCalendarConfigured, type CareCalendarSyncRow } from "@/lib/care-calendar-status";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -25,6 +28,8 @@ export interface SourceStatus {
   cadence: string;
   integrationMethod: IntegrationMethod;
   methodLabel: string;
+  /** Spotify card only, from day 165 after the authorization: the date (YYYY-MM-DD, ET) to reconnect by. */
+  reconnectBy?: string | null;
 }
 
 // Human-readable sync cadence per source. "Manual" means user-triggered;
@@ -41,13 +46,17 @@ const CADENCE: Record<string, string> = {
   // unconditional safety-net. Tracked separately because the predict path
   // can stay green while the retrain crashes silently (the model is cached).
   hrv_retrain: "Hourly (cond.) + 12:00 UTC safety-net",
-  spotify: "Every 2h :50",
+  // N-of-1 trial report job (experiment_report.py, docs/experiment-framework.md 10.4). With no trial
+  // registered each run is a no-op that still heartbeats.
+  experiments: "Daily 15:00 UTC",
+  spotify: "Hourly :50",
   reccobeats: "With Spotify ETL",
   musicbrainz: "With Spotify ETL",
   supplements: "Manual",
   reading: "Manual",
   procurement: "Manual",
-  kindle: "Every 3h (Riley's PC, while logged on)",
+  photo_meals: "Manual (a plate photo on /nutrition)",
+  kindle:"Every 3h (Riley's PC, while logged on)",
   amazon_orders: "Every 3h with the Kindle harvest (Riley's PC)",
   screen_usage: "Daily (iPhone Shortcuts automation)",
   notion_journal: "Hourly :35",
@@ -56,11 +65,19 @@ const CADENCE: Record<string, string> = {
   delivery: "Every 3h :40",
   online_orders: "Every 3h :05 (both Gmail accounts)",
   air_quality: "Every 3h :12",
+  weather: "Every 3h :32",
+  pollen: "Twice daily, 16:20 + 21:20 UTC",
   supplement_reminders: "Worker poll (heartbeat ~hourly); cards at each stack's reminder time",
+  renewal_reminders: "Worker poll, hourly; a card up to 3 days before a renewal",
+  cash_forecast: "Weekly, Monday 12:30 UTC (forecast snapshot)",
   urgent_email: "Hourly :15 (both Gmail accounts)",
+  google_calendar: "Hourly :55",
+  care_calendar: "After each /health change + every 6h :20 catch-up",
   ubereats: "Every 6h (Riley's PC, while logged on)",
+  pc_activity: "Hourly (Riley's PC, while signed in)",
+  ai_usage: "Every 3h (Riley's PC, while signed in)",
   nyc_scout: "Daily 6:10am ET",
-  rocket_money: "Daily (harvester)",
+  simplefin: "Every 6h :30 (GitHub Actions); banks refresh about daily, Apple Card monthly",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
   // the frontend matrix reads hit since 2026-06-11). The heartbeat also
   // carries the schema-drift tripwire — a 'failed' here can mean the view
@@ -88,12 +105,14 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   cronometer:     { method: "automated",      label: "Web export ETL" },
   hrv_analysis:   { method: "automated",      label: "Computed" },
   hrv_retrain:    { method: "automated",      label: "Model retrain" },
+  experiments:    { method: "automated",      label: "Trial report" },
   spotify:        { method: "automated",      label: "API ETL" },
   reccobeats:     { method: "automated",      label: "API ETL" },
   musicbrainz:    { method: "automated",      label: "API ETL" },
   supplements:    { method: "manual",         label: "Manual entry" },
   reading:        { method: "manual",         label: "Manual entry" },
   procurement:    { method: "manual",         label: "Manual entry" },
+  photo_meals:    { method: "manual",         label: "Photo + Claude estimate" },
   kindle:         { method: "automated",      label: "Local Chrome harvest" },
   amazon_orders:  { method: "automated",      label: "Local Chrome harvest" },
   screen_usage:   { method: "automated",      label: "iPhone app export" },
@@ -103,11 +122,19 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   delivery:       { method: "automated",      label: "IMAP email parser" },
   online_orders:  { method: "automated",      label: "IMAP email parser" },
   air_quality:    { method: "automated",      label: "API ETL" },
+  weather:        { method: "automated",      label: "API ETL" },
+  pollen:         { method: "automated",      label: "Web page ETL" },
   supplement_reminders: { method: "automated", label: "Worker push cards" },
+  renewal_reminders: { method: "automated", label: "Worker push cards" },
+  cash_forecast:  { method: "automated",      label: "Snapshot job" },
   urgent_email:   { method: "automated",      label: "IMAP label reader" },
+  google_calendar: { method: "automated",     label: "iCal feed ETL" },
+  care_calendar:  { method: "automated",      label: "Calendar API (Onyx → Google)" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
+  pc_activity:    { method: "automated",      label: "Local PC logger" },
+  ai_usage:       { method: "automated",      label: "Local log harvest" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
-  rocket_money:   { method: "automated",      label: "Harvester import" },
+  simplefin:      { method: "automated",      label: "Bank feed API" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
   perf_mats:      { method: "automated",      label: "Matview refresh" },
 };
@@ -219,20 +246,59 @@ function enrichmentSource({
   };
 }
 
+// The NYC Scout card's freshness is a Notion query (0.3-0.6 s, the slowest read here). The scout runs once a day,
+// so a shared cached answer (lib/swr-cache.ts: refreshed in the background once it is 5 minutes old, never more
+// than 6 hours old) keeps Notion off the request path. A failed Notion read with nothing cached turns the card red as
+// before. A failed background refresh keeps the older answer, so an answer older than NYC_CHECK_STALE_MS (three
+// refresh intervals) is shown as Degraded with its age, never as current health (Codex review 2026-11-14).
+const nycScoutFreshness = swrCacheTimed("status-nyc-scout-freshness-v1", () => getNycScoutFreshness(), {
+  revalidateSeconds: 300,
+  maxAgeMs: 6 * 60 * 60 * 1000,
+});
+const NYC_CHECK_STALE_MS = 15 * 60 * 1000;
+
+// The sync_log fields this route and its helpers (deriveStatus, enrichmentSource, ingestionHeartbeatStatus,
+// financeLedgerCard, recentHistory) read, listed instead of select("*") (units/gpt-5/F-004). Checked against
+// information_schema 2026-11-14; id, sync_end, date_range_* and created_at are not read from these rows.
+const SYNC_LOG_COLS = "source, data_type, sync_start, status, records_synced, duration_seconds, error_message";
+
 export async function GET() {
   try {
+    // Every read below is independent, so they are all sent at once (one round trip, not six in a row).
+    // Supabase query builders are lazy: .then() sends each one now; the awaits further down only collect them.
+    //
     // Fetch last 100 sync_log rows (enough to cover all sources with history).
     // matrix_mat and perf_mats each refresh 2x/hour (~48 heartbeat rows/day
     // apiece) and would flood this window, drowning every other source's
     // history — each gets a dedicated limit-1 fetch below instead.
-    const { data: syncRows, error: syncErr } = await supabase
+    const syncRowsPromise = supabase
       .from("sync_log")
-      .select("*")
+      .select(SYNC_LOG_COLS)
       .not("source", "in", '("matrix_mat","perf_mats")')
       .order("sync_start", { ascending: false })
-      .limit(100);
-
-    if (syncErr) throw syncErr;
+      .limit(100)
+      .then((res) => res);
+    // Procurement subscription tracker (/procurement): hand-typed, so data age says nothing. The card reports whether saving is set up (table answers) and how many are tracked.
+    const procurementPromise = supabase.from("procurement_subscriptions").select("updated_at", { count: "exact" }).eq("is_active", true).order("updated_at", { ascending: false }).limit(1).then((res) => res);
+    // Meal photos (/nutrition, pds.photo_meals): logged only when Riley takes one, so a quiet week is not stale.
+    // Same shape as Procurement: "unknown" until sql/photo_meals.sql is applied, green once the table answers.
+    const photoMealsPromise = supabase.from("photo_meals").select("eaten_date,created_at", { count: "exact" }).order("created_at", { ascending: false }).limit(1).then((res) => res);
+    // Renewal cards (sms-reminders Worker -> /api/procurement/renewals/claim): heartbeat age, own limit-1
+    // query so a Worker that stops polling reads red instead of dropping out of the shared window.
+    const renewalRemindersPromise = supabase.from("sync_log").select("status,sync_start,records_synced,duration_seconds,error_message")
+      .eq("source", "procurement_renewals").eq("data_type", "prompt").order("sync_start", { ascending: false }).limit(1).then((res) => res);
+    // Cash forecast snapshot (cash-forecast-snapshot.yml, weekly): heartbeat age, own limit-1 query.
+    const cashForecastPromise = supabase.from("sync_log").select("status,sync_start,records_synced,duration_seconds,error_message")
+      .eq("source", "finance_forecast").eq("data_type", "snapshot").order("sync_start", { ascending: false }).limit(1).then((res) => res);
+    // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
+    const urgentEmailCardPromise = getUrgentEmailStatusCard(supabase);
+    // Google Calendar WRITE side (care items -> the "Onyx care" calendar): the one sync-state row,
+    // which holds timestamps, counts and a short code only (never pds.ci_tokens, never an item).
+    // Inert until set up: without the two Google variables nothing is read, as in care-google-server.ts.
+    const careCalendarIsSetUp = careCalendarConfigured(process.env);
+    const careCalendarPromise = careCalendarIsSetUp
+      ? supabase.from("care_calendar_sync").select(CARE_CALENDAR_SYNC_COLUMNS).eq("id", 1).limit(1).then((res) => res)
+      : Promise.resolve(null);
 
     // Fetch latest data dates per source + drift alerts (last 7 days) in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
@@ -243,16 +309,21 @@ export async function GET() {
     const garminWornPromise = supabase.from("garmin_daily_summary").select("calendar_date")
       .or(GARMIN_WEARABLE_FILTER).order("calendar_date", { ascending: false }).limit(1)
       .then((res) => res);
+    // Pollen (pollen_etl.py): newest published count in pds.pollen_daily. A missing table
+    // (sql/pollen_schema.sql not applied yet) comes back as an error and is shown on the card.
+    const pollenLatestPromise = supabase.from("pollen_daily").select("count_date")
+      .order("count_date", { ascending: false }).limit(1)
+      .then((res) => res);
 
     // NYC scout freshness lives in Notion (the "NYC Leads" database the
     // nyc-scout agent upserts every run), not in sync_log. Started here so the
     // one Notion call overlaps the Supabase reads; a Notion failure turns the
     // card red but never breaks /status.
-    const nycPromise = getNycScoutFreshness().then(
-      (v) => ({ ok: true as const, ...v }),
+    const nycPromise = nycScoutFreshness().then(
+      ({ value, checkedAt }) => ({ ok: true as const, ...value, stale: staleCheckNote(checkedAt, Date.now(), NYC_CHECK_STALE_MS, "Notion") }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -279,7 +350,7 @@ export async function GET() {
       // reads Healthy off data-lag alone until the lag itself crosses 1d.
       supabase
         .from("sync_log")
-        .select("*")
+        .select(SYNC_LOG_COLS)
         .eq("source", "tanita")
         .eq("data_type", "weight")
         .order("sync_start", { ascending: false })
@@ -324,7 +395,7 @@ export async function GET() {
       // Matview refresh heartbeat (excluded from the main window above).
       supabase
         .from("sync_log")
-        .select("*")
+        .select(SYNC_LOG_COLS)
         .eq("source", "matrix_mat")
         .eq("data_type", "refresh")
         .order("sync_start", { ascending: false })
@@ -333,7 +404,7 @@ export async function GET() {
       // (see CADENCE comment above); also excluded from the main window.
       supabase
         .from("sync_log")
-        .select("*")
+        .select(SYNC_LOG_COLS)
         .eq("source", "perf_mats")
         .eq("data_type", "refresh")
         .order("sync_start", { ascending: false })
@@ -344,26 +415,31 @@ export async function GET() {
       // (the 3-hourly run can fall out of the 100-row window above when hourly sources are busy).
       // A missing table (SQL not applied yet) shows its error text on the card instead of breaking /status.
       supabase.from("air_quality_daily").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
-      supabase.from("sync_log").select("*").eq("source", "air_quality").eq("data_type", "daily")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "air_quality").eq("data_type", "daily")
+        .order("sync_start", { ascending: false }).limit(1),
+      // Weather: same shape as air quality (newest ET day in pds.weather_daily + a dedicated
+      // limit-1 heartbeat fetch for the 3-hourly run; a missing table shows its error on the card).
+      supabase.from("weather_daily").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "weather").eq("data_type", "daily")
         .order("sync_start", { ascending: false }).limit(1),
       // The two PC harvesters heartbeat hours apart (and not at all while the PC is off), so their
       // newest row regularly falls out of the 100-row window above (~13 h of history). Without a
       // dedicated fetch a stalled harvester reads "Unknown" instead of going amber, then red.
-      supabase.from("sync_log").select("*").eq("source", "ubereats").eq("data_type", "items")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "ubereats").eq("data_type", "items")
         .order("sync_start", { ascending: false }).limit(1),
-      supabase.from("sync_log").select("*").eq("source", "kindle").eq("data_type", "highlights")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "kindle").eq("data_type", "highlights")
         .order("sync_start", { ascending: false }).limit(1),
       // Onyx Screen Time iPhone app: one heartbeat a day, so it also needs its own fetch.
-      supabase.from("sync_log").select("*").eq("source", "screen_time").eq("data_type", "usage")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "screen_time").eq("data_type", "usage")
         .order("sync_start", { ascending: false }).limit(1),
       // HRV retrain: daily safety net + conditional hourly runs, so its newest heartbeat (incl. a
       // failed "GUARD …" row from the alignment check) can fall out of the 100-row window.
-      supabase.from("sync_log").select("*").eq("source", "hrv_analysis").eq("data_type", "retrain")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "hrv_analysis").eq("data_type", "retrain")
         .order("sync_start", { ascending: false }).limit(1),
       // Supplement stack reminders: the sms-reminders Worker polls /api/supplements/reminders/claim
       // and each poll (throttled to ~1/h when nothing is due) writes a heartbeat. Dedicated fetch so
       // a Worker that stops polling reads red instead of "unknown" once the row leaves the window.
-      supabase.from("sync_log").select("*").eq("source", "supplement_reminders").eq("data_type", "prompt")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "supplement_reminders").eq("data_type", "prompt")
         .order("sync_start", { ascending: false }).limit(1),
       // Scheduled ingestion must retain its latest heartbeat even when the shared
       // history window is full of newer jobs. In particular, daily Eight Sleep and
@@ -371,22 +447,41 @@ export async function GET() {
       Promise.all([
         ["garmin", "full_sync"], ["whoop", "full_sync"],
         ["eight_sleep", "trends"], ["cronometer", "daily"],
-        // Finance ledger: the harvester + importers heartbeat once a day (transactions and
-        // balances separately), so the pair needs its own limit-1 reads. Heartbeats only:
-        // this endpoint is CDN-cacheable, so no ledger rows or amounts are read here.
-        ["rocketmoney", "transactions"], ["rocketmoney", "balances"],
+        // Finance ledger: simplefin_etl.py heartbeats every 6h (transactions and balances
+        // separately), so the pair needs its own limit-1 reads. Heartbeats only: this
+        // endpoint is CDN-cacheable, so no ledger rows or amounts are read here.
+        ["simplefin", "transactions"], ["simplefin", "balances"],
         // Online orders (every 3h): its own read so the shared 100-row window cannot push it out.
         ["online_orders", "email"],
         // Personal Amazon order list (Kindle harvester pass on Riley's PC, every 3h).
         ["amazon", "orders"],
+        // Google Calendar (hourly): 24 rows a day would otherwise push it, or the daily jobs,
+        // out of the shared 100-row window.
+        ["google_calendar", "events"],
+        // PC activity logger (Riley's PC, hourly upload while signed in).
+        ["pc_activity", "usage"],
+        // AI tool usage harvester (Riley's PC, every 3h while signed in).
+        ["ai_usage", "sessions"],
+        // N-of-1 trial report job: one heartbeat a day.
+        ["experiments", "report"],
+        // Pollen ETL (twice a day): a 19 h gap between runs, far outside the shared window.
+        ["pollen", "daily"],
       ].map(async ([source, dataType]) => {
-        const { data, error } = await supabase.from("sync_log").select("*")
+        const { data, error } = await supabase.from("sync_log").select(SYNC_LOG_COLS)
           .eq("source", source).eq("data_type", dataType)
           .order("sync_start", { ascending: false }).limit(1);
         if (error) throw error;
         return { key: `${source}|${dataType}`, entry: data?.[0] ?? null };
       })),
+      // Spotify authorization age. Spotify expires a refresh token 180 days after the authorization,
+      // so the card warns from day 165. The token text is read here and ONLY the derived
+      // reconnect-by date leaves this function (this response is CDN-cacheable): never the blob,
+      // a token or authorized_at itself. A failed read just means no warning.
+      supabase.from("ci_tokens").select("token_data").eq("service", "spotify").limit(1),
     ]);
+
+    const { data: syncRows, error: syncErr } = await syncRowsPromise;
+    if (syncErr) throw syncErr;
 
     // Find the latest sync entry per (source, data_type) key
     const latestBySrcType: Record<string, Record<string, unknown>> = {};
@@ -396,6 +491,8 @@ export async function GET() {
         latestBySrcType[key] = row as Record<string, unknown>;
       }
     }
+
+    const spotifyReconnectDate = spotifyReconnectBy(spotifyTokenRes?.data?.[0]?.token_data, Date.now());
 
     for (const { key, entry } of ingestionHeartbeats) {
       if (entry) latestBySrcType[key] = entry as Record<string, unknown>;
@@ -468,12 +565,19 @@ export async function GET() {
     const nyc = await nycPromise;
     const nycDate = nyc.ok ? nyc.lastVerified : null;
     const nycLag = daysLag(nycDate, spineMaxDate);
-    // Procurement subscription tracker (/procurement): hand-typed, so data age says nothing. The card reports whether saving is set up (table answers) and how many are tracked.
-    const procurementRes = await supabase.from("procurement_subscriptions").select("updated_at", { count: "exact" }).eq("is_active", true).order("updated_at", { ascending: false }).limit(1);
+    const procurementRes = await procurementPromise;
     const procurementPending = procurementRes.error?.code === "PGRST205" || procurementRes.error?.code === "42P01";
     const procurementLast = (procurementRes.data?.[0]?.updated_at as string | undefined) ?? null;
-    // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
-    const urgentEmailCard = await getUrgentEmailStatusCard(supabase);
+    const photoMealsRes = await photoMealsPromise;
+    const photoMealsPending = photoMealsRes.error?.code === "PGRST205" || photoMealsRes.error?.code === "42P01";
+    const photoMealsLast = (photoMealsRes.data?.[0]?.created_at as string | undefined) ?? null;
+    const renewalRemindersRes = await renewalRemindersPromise;
+    const cashForecastRes = await cashForecastPromise;
+    const urgentEmailCard = await urgentEmailCardPromise;
+    const pollenRes = await pollenLatestPromise;
+    const pollenPending = pollenRes.error?.code === "PGRST205" || pollenRes.error?.code === "42P01";
+    const pollenLatest = (pollenRes.data?.[0]?.count_date as string | undefined) ?? null;
+    const careCalendarRes = await careCalendarPromise;
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -616,10 +720,37 @@ export async function GET() {
           methodLabel: METHOD.hrv_retrain.label,
         };
       })(),
+      // N-of-1 trial report job (experiment_report.py). Heartbeat only: no report row, arm or result is
+      // read here (this endpoint is CDN-cacheable). Daily at 15:00 UTC, so more than 26 h without a run
+      // is degraded and more than 30 h is an error, like the retrain card. No heartbeat yet = Unknown
+      // with the reason: the scheduled workflow has not run (it is added by hand: .github/ is protected).
+      experiments: (() => {
+        const entry = latestBySrcType["experiments|report"] ?? null;
+        const lastSync = (entry?.sync_start as string) ?? null;
+        const ageHours = hoursSince(lastSync);
+        const status = ingestionHeartbeatStatus("success", entry, 26, 30);
+        return {
+          label: "Experiments",
+          lastSync,
+          status,
+          latestDataDate: null,                            // a job, not a data table
+          daysLag: lastSync ? Math.floor(ageHours / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No run yet - the Experiment Report workflow has not reported."
+              : ageHours > 30 ? `No trial report run for ${ageHours}h (daily at 15:00 UTC).` : null),
+          cadence: CADENCE.experiments,
+          integrationMethod: METHOD.experiments.method,
+          methodLabel: METHOD.experiments.label,
+        };
+      })(),
       spotify: {
         label: "Spotify",
         lastSync: (spotifyEntry?.sync_start as string) ?? null,
-        status: deriveStatus(spotifyEntry, spotifyLag),
+        // From day 165 of the 180-day authorization a healthy card reads Degraded, so the
+        // reconnect is done before the sync stops rather than after.
+        status: ((s) => (spotifyReconnectDate && s === "success" ? "partial" : s))(deriveStatus(spotifyEntry, spotifyLag)),
         latestDataDate: spotifyDate,
         daysLag: spotifyLag,
         recordsSynced: (spotifyEntry?.records_synced as number) ?? 0,
@@ -628,6 +759,7 @@ export async function GET() {
         cadence: CADENCE.spotify,
         integrationMethod: METHOD.spotify.method,
         methodLabel: METHOD.spotify.label,
+        reconnectBy: spotifyReconnectDate,
       },
       reccobeats: {
         ...enrichmentSource({ label: "ReccoBeats", entry: reccobeatsEntry }),
@@ -674,6 +806,51 @@ export async function GET() {
         integrationMethod: METHOD.reading.method,
         methodLabel: METHOD.reading.label,
       },
+      // Renewal cards (2026-11-13): the Worker claims subscriptions renewing within 3 days and posts a
+      // card to /agents. Freshness = heartbeat age, because a week with nothing renewing is healthy.
+      // Hourly poll, quiet 23:30-07:00: >3h with no poll = degraded, >9h or a failed heartbeat = red;
+      // "unknown" until the Worker's first call. records_synced = renewals claimed by that call. The
+      // heartbeat text is an error code at most - never a merchant or an amount.
+      renewal_reminders: (() => {
+        const entry = latestBySrcType["procurement_renewals|prompt"]
+          ?? (renewalRemindersRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        return {
+          label: "Renewal Reminders",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status: ingestionHeartbeatStatus("success", entry, 3, 9),
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (entry && ageH > 9 ? `No claim call for ${Math.floor(ageH)}h - check the sms-reminders Worker's renewal poll.` : null),
+          cadence: CADENCE.renewal_reminders,
+          integrationMethod: METHOD.renewal_reminders.method,
+          methodLabel: METHOD.renewal_reminders.label,
+        };
+      })(),
+      // Cash forecast snapshot (2026-11-14): a weekly job saves the forecast so /financials/forecast can show
+      // forecast vs actual. Weekly: >8 days without a run = degraded, >15 days or a failed run = red. The
+      // heartbeat text is an error code at most - never an amount.
+      cash_forecast: (() => {
+        const entry = latestBySrcType["finance_forecast|snapshot"] ?? (cashForecastRes.data?.[0] as Record<string, unknown> | undefined) ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        return {
+          label: "Cash Forecast",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status: ingestionHeartbeatStatus("success", entry, 8 * 24, 15 * 24),
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string) ?? (entry && ageH > 15 * 24 ? `No forecast snapshot for ${Math.floor(ageH / 24)} days - check cash-forecast-snapshot.yml.` : null),
+          cadence: CADENCE.cash_forecast,
+          integrationMethod: METHOD.cash_forecast.method,
+          methodLabel: METHOD.cash_forecast.label,
+        };
+      })(),
       // Procurement subscription tracker (/procurement, 2026-11-11): typed by hand, never connected to a provider.
       // "unknown" (not red) until sql/procurement_schema.sql is applied; green once the table answers.
       procurement: {
@@ -688,6 +865,20 @@ export async function GET() {
         cadence: CADENCE.procurement,
         integrationMethod: METHOD.procurement.method,
         methodLabel: METHOD.procurement.label,
+      },
+      // Food by photo (/nutrition, 2026-11-14): Claude vision estimate, confirmed by Riley, saved to pds.photo_meals.
+      photo_meals: {
+        label: photoMealsPending ? "Meal photos (saving not set up)" : "Meal photos",
+        lastSync: photoMealsLast,
+        status: photoMealsPending ? "unknown" : photoMealsRes.error ? "failed" : "success",
+        latestDataDate: (photoMealsRes.data?.[0]?.eaten_date as string | undefined) ?? null,
+        daysLag: 0,
+        recordsSynced: photoMealsRes.count ?? 0,
+        durationSeconds: null,
+        errorMessage: photoMealsRes.error && !photoMealsPending ? photoMealsRes.error.message : null,
+        cadence: CADENCE.photo_meals,
+        integrationMethod: METHOD.photo_meals.method,
+        methodLabel: METHOD.photo_meals.label,
       },
       // Kindle Notebook harvester (tools/kindle_harvest): a Task Scheduler job on
       // Riley's PC scrapes read.amazon.com/notebook in a signed-in Chrome and posts
@@ -907,6 +1098,76 @@ export async function GET() {
           methodLabel: METHOD.air_quality.label,
         };
       })(),
+      // Weather (weather_etl.py): hourly outdoor weather from the keyless Open-Meteo archive
+      // API, aggregated per ET day into pds.weather_daily for the HRV pipeline (wx_* features)
+      // and the Weather panel on /analytics/hrv. Freshness = heartbeat age, same thresholds as
+      // Air Quality: cron every 3h -> >4h partial, >12h or a failed row = red. A 'partial'
+      // heartbeat means the API returned no temperature values, or the optional UV index
+      // request failed (the error text says which).
+      weather: (() => {
+        const entry = latestBySrcType["weather|daily"]
+          ?? (weatherSyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || entry.status === "error" || ageH > 12
+            ? "failed"
+            : entry.status === "partial" || ageH > 4
+              ? "partial"
+              : "success";
+        return {
+          label: "Weather",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: (weatherRes.data?.[0]?.calendar_date as string | undefined) ?? null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (entry ? null : weatherRes.error?.message ?? weatherSyncRes.error?.message ?? null),
+          cadence: CADENCE.weather,
+          integrationMethod: METHOD.weather.method,
+          methodLabel: METHOD.weather.label,
+        };
+      })(),
+      // Pollen (pollen_etl.py): the daily Atlanta count from atlantaallergy.com (one page request
+      // per run) into pds.pollen_daily. Freshness = heartbeat age: two runs a day, 19 h apart at
+      // most -> >21h partial, >27h or a failed row red. The station skips weekends and holidays,
+      // so a count 2-4 days old is normal; more than 4 days behind the spine reads partial. A
+      // 'partial' heartbeat means the page was read but part of it was not recognised.
+      pollen: (() => {
+        const entry = latestBySrcType["pollen|daily"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const countLag = pollenLatest ? daysLag(pollenLatest, spineMaxDate) : 999;
+        const countStale = entry !== null && pollenLatest !== null && countLag > 4;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || entry.status === "error" || ageH > 27
+            ? "failed"
+            : entry.status === "partial" || ageH > 21 || countStale
+              ? "partial"
+              : "success";
+        return {
+          label: "Pollen",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: pollenLatest,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (countStale ? `No new count since ${pollenLatest} (${countLag} days). The station skips weekends and holidays.` : null)
+            ?? (entry ? null
+              : pollenPending
+                ? "pds.pollen_daily is missing - apply sql/pollen_schema.sql, then add the Pollen ETL workflow (YAML in the roadmap row)."
+                : pollenRes.error?.message
+                  ?? "No run yet - add .github/workflows/pollen-etl.yml (YAML in the roadmap row)."),
+          cadence: CADENCE.pollen,
+          integrationMethod: METHOD.pollen.method,
+          methodLabel: METHOD.pollen.label,
+        };
+      })(),
       // Supplement stack reminders (sms-reminders Worker -> /api/supplements/reminders/*):
       // the Worker claims due stacks on a schedule and posts Log it / Skip cards to /agents.
       // Freshness = heartbeat age, because a day with nothing due (stacks logged early, reminders
@@ -965,6 +1226,65 @@ export async function GET() {
           methodLabel: METHOD.ubereats.label,
         };
       })(),
+      // PC activity logger (tools/pc_activity_logger on Riley's PC): active / idle time per
+      // hour + the foreground program's name, upserted hourly to pds.pc_activity_hours/apps with
+      // a pc_activity|usage heartbeat per upload. It only runs while Riley is signed in to the PC,
+      // so a weekend away is normal: >26h degraded, >72h or a failed row red.
+      pc_activity: (() => {
+        const entry = latestBySrcType["pc_activity|usage"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 72
+            ? "failed"
+            : entry.status === "partial" || ageH > 26
+              ? "partial"
+              : "success";
+        return {
+          label: "PC Activity",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No upload yet - apply sql/pc_activity_schema.sql, then run tools/pc_activity_logger/register-task.ps1 on the PC." : null),
+          cadence: CADENCE.pc_activity,
+          integrationMethod: METHOD.pc_activity.method,
+          methodLabel: METHOD.pc_activity.label,
+        };
+      })(),
+      // AI tool usage harvester (tools/ai_usage_harvest on Riley's PC): Claude Code + Codex session
+      // METADATA (times, token counts, prompt / tool-call counts, project folder name; never content),
+      // upserted every 3h to pds.ai_tool_usage_daily with an ai_usage|sessions heartbeat per run.
+      // Same PC-off allowance as PC Activity: >26h degraded, >72h or a failed row red; 'partial' =
+      // some log files could not be read (their days stay open for the next run).
+      ai_usage: (() => {
+        const entry = latestBySrcType["ai_usage|sessions"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 72
+            ? "failed"
+            : entry.status === "partial" || ageH > 26
+              ? "partial"
+              : "success";
+        return {
+          label: "AI Tool Usage",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No upload yet - apply sql/ai_tool_usage_schema.sql, then run tools/ai_usage_harvest/register-task.ps1 on the PC." : null),
+          cadence: CADENCE.ai_usage,
+          integrationMethod: METHOD.ai_usage.method,
+          methodLabel: METHOD.ai_usage.label,
+        };
+      })(),
       // Body weight via Tanita Health Planet (tanita_etl.py): scale → phone
       // app → Health Planet cloud → twice-daily ETL → tanita_measurements,
       // rolled up into weight_log (source='tanita'). This card REPLACED the
@@ -993,12 +1313,12 @@ export async function GET() {
       nyc_scout: {
         label: "NYC Scout",
         lastSync: nycDate,
-        status: nyc.ok ? deriveStatus(null, nycLag) : "failed",
+        status: !nyc.ok ? "failed" : nyc.stale && deriveStatus(null, nycLag) === "success" ? "partial" : deriveStatus(null, nycLag),
         latestDataDate: nycDate,
         daysLag: nycLag,
         recordsSynced: nyc.ok ? nyc.liveCount : 0,
         durationSeconds: null,
-        errorMessage: nyc.ok ? null : nyc.error,
+        errorMessage: nyc.ok ? nyc.stale : nyc.error,
         cadence: CADENCE.nyc_scout,
         integrationMethod: METHOD.nyc_scout.method,
         methodLabel: METHOD.nyc_scout.label,
@@ -1065,18 +1385,22 @@ export async function GET() {
           methodLabel: METHOD.perf_mats.label,
         };
       })(),
-      // Rocket Money ledger (pds.finance_*, read by /financials): the daily harvester and the
-      // transactions + balances importers each write a rocketmoney heartbeat on every run.
-      // Status is the worse of the two (>36h degraded, >72h or a failed/error row = red, a
-      // "login required" failure shows the importer's own text). Heartbeat-only by design:
-      // no amounts or row contents ever reach this cacheable endpoint.
-      rocket_money: (() => {
+      // Finance ledger (pds.finance_*, read by /financials), fed by SimpleFIN Bridge since 2026-11-14
+      // (simplefin_etl.py; the Rocket Money harvester it replaced is retired). Each run writes a
+      // simplefin|transactions and a simplefin|balances heartbeat. Status is the worse of the two
+      // (>14h degraded, >30h or a failed row red; 'partial' = SimpleFIN reported a connection problem
+      // or an account could not be matched, with that text). Heartbeat-only by design: no amounts or
+      // row contents ever reach this cacheable endpoint.
+      simplefin: (() => {
         const card = financeLedgerCard(
-          latestBySrcType["rocketmoney|transactions"],
-          latestBySrcType["rocketmoney|balances"],
+          latestBySrcType["simplefin|transactions"],
+          latestBySrcType["simplefin|balances"],
+          Date.now(),
+          null,
+          SIMPLEFIN_THRESHOLDS,
         );
         return {
-          label: "Rocket Money",
+          label: "SimpleFIN",
           lastSync: card.lastSync,
           status: card.status,
           latestDataDate: card.latestDataDate,
@@ -1084,11 +1408,58 @@ export async function GET() {
           recordsSynced: card.recordsSynced,
           durationSeconds: card.durationSeconds,
           errorMessage: card.errorMessage,
-          cadence: CADENCE.rocket_money,
-          integrationMethod: METHOD.rocket_money.method,
-          methodLabel: METHOD.rocket_money.label,
+          cadence: CADENCE.simplefin,
+          integrationMethod: METHOD.simplefin.method,
+          methodLabel: METHOD.simplefin.label,
         };
       })(),
+      // Google Calendar (google_calendar_etl.py): the calendars' iCal feeds copied hourly into
+      // pds.calendar_events for /health and Today (read-only, calendar -> Onyx). Freshness =
+      // heartbeat age (an hour without a new event is healthy): hourly cron -> >3h partial, >8h or
+      // a failed run red. 'partial' = one feed failed, or a malformed event or series was skipped.
+      // Heartbeat only: this endpoint is CDN-cacheable, so no event row is read here.
+      google_calendar: (() => {
+        const entry = latestBySrcType["google_calendar|events"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || entry.status === "error" || ageH > 8
+            ? "failed"
+            : entry.status === "partial" || ageH > 3
+              ? "partial"
+              : "success";
+        return {
+          label: "Google Calendar",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No run yet - the Google Calendar ETL workflow has not reported." : ageH > 8 ? `No run for ${Math.floor(ageH)}h - check the Google Calendar ETL workflow.` : null),
+          cadence: CADENCE.google_calendar,
+          integrationMethod: METHOD.google_calendar.method,
+          methodLabel: METHOD.google_calendar.label,
+        };
+      })(),
+      // Care Calendar (the other direction: care items on /health -> the "Onyx care" calendar,
+      // lib/care-google-server.ts). No sync_log rows: the heartbeat is care_calendar_sync.last_sync_at,
+      // moved by every sync (after each /health change, Sync now, and the 6-hourly catch-up at
+      // /api/jobs/care-calendar-catch-up). "unknown" while not set up or not connected; once connected
+      // a failed sync is red, and a good one is degraded after 14 h and red after 30 h without a sync.
+      // Thresholds and messages: lib/care-calendar-status.ts.
+      care_calendar: {
+        ...careCalendarCard({
+          configured: careCalendarIsSetUp,
+          row: (careCalendarRes?.data?.[0] as CareCalendarSyncRow | undefined) ?? null,
+          readError: careCalendarRes?.error ?? null,
+          nowMs: Date.now(),
+        }),
+        cadence: CADENCE.care_calendar,
+        integrationMethod: METHOD.care_calendar.method,
+        methodLabel: METHOD.care_calendar.label,
+      },
       // Urgent email for Today: inbox-triage's Agent/Action + Agent/Deadline labels read
       // over IMAP (read-only) into pds.inbox_emails. Thresholds in getUrgentEmailStatusCard.
       urgent_email: {

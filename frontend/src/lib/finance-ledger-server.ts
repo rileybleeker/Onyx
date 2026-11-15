@@ -21,16 +21,14 @@ import {
   toCents,
   trailingMonths,
   classifyTxn,
-  type FlowSummary,
   type LedgerAccount,
   type LedgerBalance,
   type LedgerQuery,
   type LedgerTxn,
-  type NetWorth,
-  type TrendPoint,
-  type TxnClass,
 } from "@/lib/finance-ledger";
-import { financeLedgerCard, type FinanceCard } from "@/lib/finance-status";
+import { FINANCE_SOURCE, SIMPLEFIN_THRESHOLDS, financeLedgerCard } from "@/lib/finance-status";
+import { NO_FIXES, applyFixes, fixedCategory, type CategoryFixes } from "@/lib/finance-categories";
+import { merchantKey } from "@/lib/procurement-recurring";
 
 /**
  * Server-side reads of the finance ledger. SERVICE ROLE ONLY: pds.finance_* has RLS on, no
@@ -45,42 +43,17 @@ import { financeLedgerCard, type FinanceCard } from "@/lib/finance-status";
 const ACCOUNT_COLS = "account_key,institution,account_name,account_type,mask";
 const BALANCE_COLS = "account_key,captured_at,balance_cents,currency,kind";
 // The 12-month window needs only what the arithmetic uses.
-const WINDOW_COLS = "account_key,txn_date,amount_cents,currency,category,ignored_from";
+// txn_key + names are read too, for the category fixes (merchant rules / one-off overrides).
+const WINDOW_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
 const LIST_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
 const HEARTBEAT_COLS = "status,sync_start,records_synced,duration_seconds,error_message";
 const PAGE = 1000; // PostgREST's default max rows per request
 const MAX_WINDOW_PAGES = 40; // 40k rows of window; beyond that the page says so
 
-export interface ListRow {
-  txn_key: string;
-  account_key: string;
-  txn_date: string;
-  title: string;
-  amount_cents: number;
-  currency: string;
-  category: string | null;
-  excluded: Exclude<TxnClass, "counted"> | null;
-}
-export interface LedgerData {
-  query: LedgerQuery & { month: string };
-  accounts: LedgerAccount[];
-  accountLabels: Record<string, string>;
-  months: string[];
-  netWorth: NetWorth;
-  flows: FlowSummary;
-  trend: TrendPoint[];
-  list: { rows: ListRow[]; total: number; page: number; pageCount: number; pageSize: number };
-  freshness: FinanceCard | null;
-  /** Rows that could not be read, and whether the 12-month window was cut off. */
-  skippedRows: number;
-  windowTruncated: boolean;
-  /** The page asked for is past the end; page 1 is shown instead. */
-  pageClamped: boolean;
-}
-export type LedgerLoad =
-  | { kind: "error"; message: string; hint: string | null }
-  | { kind: "empty"; freshness: FinanceCard | null }
-  | { kind: "ok"; data: LedgerData };
+// The shapes this module returns live in finance-ledger-types.ts (types only), so client code can name them
+// without importing this server module.
+export type { LedgerData, LedgerLoad, ListRow } from "@/lib/finance-ledger-types";
+import type { LedgerData, LedgerLoad, ListRow } from "@/lib/finance-ledger-types";
 
 interface PgErr {
   code?: string;
@@ -105,26 +78,50 @@ function check<T extends { error: PgErr | null }>(res: T): T {
   return res;
 }
 
+type PageResult = { data: unknown[] | null; error: PgErr | null; count: number | null };
+
 /**
- * Page through a query 1000 rows at a time. The exact row count (asked for on every page) decides
- * when to stop, so a project whose PostgREST max-rows is lower than 1000 still returns every row
- * instead of silently stopping after a short first page. `truncated` is true when the page cap cut
- * the read off before the count was reached.
+ * Read every row of a query in pages. The first page asks for the exact row count; the remaining
+ * pages are then requested all at once (in parallel) and joined in offset order, so the result is
+ * the same as reading them one after another as long as `build` orders by a unique key.
+ *
+ * `withCount` tells `build` whether to ask for the count (only the first page needs it). The page
+ * size is the number of rows the first page actually returned, so a project whose PostgREST
+ * max-rows is lower than 1000 still returns every row instead of leaving gaps between pages.
+ * Without a count (a builder that never asks for one) the pages are read one after another until
+ * a short page. `truncated` is true when the page cap cut the read off before the count.
  */
 export async function fetchPaged(
-  build: (from: number, to: number) => PromiseLike<{ data: unknown[] | null; error: PgErr | null; count: number | null }>,
+  build: (from: number, to: number, withCount: boolean) => PromiseLike<PageResult>,
   maxPages: number,
 ): Promise<{ rows: unknown[]; truncated: boolean }> {
-  const rows: unknown[] = [];
-  for (let i = 0; i < maxPages; i++) {
-    const { data, count } = check(await build(rows.length, rows.length + PAGE - 1));
-    const got = data ?? [];
-    rows.push(...got);
-    if (got.length === 0 || (typeof count === "number" ? rows.length >= count : got.length < PAGE)) {
-      return { rows, truncated: false };
+  const first = check(await build(0, PAGE - 1, true));
+  const rows: unknown[] = [...(first.data ?? [])];
+  const step = rows.length;
+  const total = typeof first.count === "number" ? first.count : null;
+  if (step === 0 || (total !== null ? rows.length >= total : step < PAGE)) return { rows, truncated: false };
+
+  if (total === null) {
+    for (let i = 1; i < maxPages; i++) {
+      const got = check(await build(rows.length, rows.length + PAGE - 1, false)).data ?? [];
+      rows.push(...got);
+      if (got.length < PAGE) return { rows, truncated: false };
     }
+    return { rows, truncated: true };
   }
-  return { rows, truncated: true };
+
+  const needed = Math.ceil(total / step);
+  const starts = Array.from({ length: Math.min(needed, maxPages) - 1 }, (_, i) => (i + 1) * step);
+  const pages = await Promise.all(
+    starts.map(async (from) => {
+      const res = await build(from, from + step - 1, false);
+      // Rows removed since the count: PostgREST answers a range past the end with 416 (PGRST103).
+      if (res.error?.code === "PGRST103") return [];
+      return check(res).data ?? [];
+    }),
+  );
+  for (const got of pages) rows.push(...got);
+  return { rows, truncated: needed > maxPages };
 }
 
 async function dateEdge(db: Db, ascending: boolean): Promise<string | null> {
@@ -139,12 +136,34 @@ async function heartbeat(db: Db, dataType: string): Promise<Record<string, unkno
   const { data, error } = await db
     .from("sync_log")
     .select(HEARTBEAT_COLS)
-    .eq("source", "rocketmoney")
+    .eq("source", FINANCE_SOURCE)
     .eq("data_type", dataType)
     .order("sync_start", { ascending: false })
     .limit(1);
   // The freshness line is context, not the ledger: a failed read just omits it.
   return error ? null : ((data?.[0] as Record<string, unknown> | undefined) ?? null);
+}
+
+/**
+ * Category fixes Riley made (merchant rules, one-off overrides). Fail-open: a missing table or a failed read
+ * shows the source categories, never an error page.
+ */
+export async function loadCategoryFixes(db: Db): Promise<CategoryFixes> {
+  let rules: { data: unknown[] | null; error: unknown };
+  let overrides: { data: unknown[] | null; error: unknown };
+  try {
+    [rules, overrides] = await Promise.all([
+      db.from("finance_category_rules").select("merchant_key,category"),
+      db.from("finance_txn_categories").select("txn_key,category"),
+    ]);
+  } catch {
+    return NO_FIXES;
+  }
+  if (rules.error && overrides.error) return NO_FIXES;
+  return {
+    rules: new Map(((rules.data ?? []) as { merchant_key: string; category: string }[]).map((r) => [r.merchant_key, r.category])),
+    overrides: new Map(((overrides.data ?? []) as { txn_key: string; category: string }[]).map((r) => [r.txn_key, r.category])),
+  };
 }
 
 export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Promise<LedgerLoad> {
@@ -155,7 +174,8 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
     return fail(e);
   }
   try {
-    const [accountsRes, minDate, maxDate, txHeartbeat, balHeartbeat] = await Promise.all([
+    const [fixes, accountsRes, minDate, maxDate, txHeartbeat, balHeartbeat] = await Promise.all([
+      loadCategoryFixes(db),
       db.from("finance_accounts").select(ACCOUNT_COLS).order("institution").order("account_name").order("account_key"),
       dateEdge(db, true),
       dateEdge(db, false),
@@ -166,7 +186,7 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
       .map(parseAccount)
       .filter((a): a is LedgerAccount => a !== null);
     const freshness =
-      txHeartbeat || balHeartbeat ? financeLedgerCard(txHeartbeat, balHeartbeat, now.getTime()) : null;
+      txHeartbeat || balHeartbeat ? financeLedgerCard(txHeartbeat, balHeartbeat, now.getTime(), null, SIMPLEFIN_THRESHOLDS) : null;
 
     if (accounts.length === 0 && maxDate === null) return { kind: "empty", freshness };
 
@@ -193,23 +213,23 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
 
     const windowStart = monthStart(trailingMonths(month, TREND_MONTHS)[0]);
     const windowEnd = monthStart(shiftMonth(month, 1)); // exclusive
-    const windowRead = fetchPaged((from, to) => {
+    const windowRead = fetchPaged((from, to, withCount) => {
       let qb = db
         .from("finance_transactions")
-        .select(WINDOW_COLS, { count: "exact" })
+        .select(WINDOW_COLS, withCount ? { count: "exact" } : undefined)
         .gte("txn_date", windowStart)
         .lt("txn_date", windowEnd);
       if (account) qb = qb.eq("account_key", account);
       return qb.order("txn_date", { ascending: false }).order("txn_key", { ascending: true }).range(from, to);
     }, MAX_WINDOW_PAGES);
 
-    const listRead = readList(db, { ...query, month, account }, accounts);
+    const listRead = readList(db, { ...query, month, account }, accounts, fixes);
     const [balanceReadRows, windowRaw, list] = await Promise.all([Promise.all(balanceReads), windowRead, listRead]);
     const balanceRows = balanceReadRows.flatMap((r) => (r.balance ? [r.balance] : []));
 
     const windowRows: LedgerTxn[] = [];
     let skipped = 0;
-    for (const raw of windowRaw.rows) {
+    for (const raw of applyFixes(windowRaw.rows as Record<string, unknown>[], fixes)) {
       const t = parseTxn(raw);
       if (t) windowRows.push(t);
       else skipped++;
@@ -244,6 +264,7 @@ async function readList(
   db: Db,
   q: LedgerQuery & { month: string },
   accounts: readonly LedgerAccount[],
+  fixes: CategoryFixes = NO_FIXES,
 ): Promise<{ list: LedgerData["list"]; skipped: number; clamped: boolean }> {
   const filter = buildSearchFilter(q.q);
   const run = async (page: number) => {
@@ -268,7 +289,8 @@ async function readList(
   const rows: ListRow[] = [];
   let skipped = 0;
   for (const raw of data ?? []) {
-    const r = raw as Record<string, unknown>;
+    const r0 = raw as Record<string, unknown>;
+    const r: Record<string, unknown> = { ...r0, category: fixedCategory(r0, fixes) };
     const t = parseTxn(r);
     const key = typeof r.txn_key === "string" ? r.txn_key : null;
     const name = typeof r.name === "string" ? r.name : "";
@@ -287,6 +309,7 @@ async function readList(
       currency: t.currency,
       category: t.category,
       excluded: cls === "counted" ? null : cls,
+      merchant_key: merchantKey({ name, custom_name: custom || null }),
     });
   }
   const total = typeof count === "number" ? count : rows.length;

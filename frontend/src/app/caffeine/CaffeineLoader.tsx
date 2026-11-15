@@ -14,6 +14,11 @@ const CaffeineClient = dynamic(() => import("./CaffeineClient"), {
   ),
 });
 
+// Speed (2026-11-15): start loading the page's code as soon as this module runs (with the page's first scripts)
+// instead of after hydration, when the component above first renders; next/dynamic then finds the chunk on its
+// way (one request, webpack shares it). A cold or freshly deployed load waited ~0.8 s for this request.
+if (typeof window !== "undefined") void import("./CaffeineClient").catch(() => {});
+
 // Shape of the server-prefetched initial data. MUST mirror the Promise.all in
 // CaffeineClient's mount effect (same functions, same args: getCaffeineDaily(60),
 // getCaffeineHrvPairs(90), getCaffeineDataQuality(45)) — the client seeds its
@@ -24,6 +29,7 @@ export interface CaffeineInitial {
   quality: CaffeineQualityFlag[];
 }
 
-export default function CaffeineLoader({ initial }: { initial: CaffeineInitial | null }) {
-  return <CaffeineClient initial={initial} />;
+// headingTestId: "feed-page-heading" when the continuous scroll renders this page (its FeedSection).
+export default function CaffeineLoader({ initial, headingTestId }: { initial: CaffeineInitial | null; headingTestId?: string }) {
+  return <CaffeineClient initial={initial} headingTestId={headingTestId} />;
 }

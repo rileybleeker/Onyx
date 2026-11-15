@@ -7,8 +7,8 @@ Deterministic (no AI), stdlib only, GITHUB_TOKEN only, talks to GitHub through t
 What it looks at:
   1. PRs that are ready to merge but nobody merged them (the PC merger is down).
   2. PRs that are red, pending too long, in conflict or behind master.
-  3. Master health: Autonomous CI, Production Smoke Test, Live checks, train-halt,
-     rollback PRs.
+  3. Master health: Autonomous CI, Production Smoke Test, Live checks, the post-deploy
+     suites (Scheduled tests, speed budget), train-halt, rollback PRs.
   4. Scheduled workflows that missed their window or were disabled (bounded
      recovery: dispatch or re-enable, from a fixed allow-list, at most once per 6 h).
   5. The PC runner heartbeat (issue labelled `runner-heartbeat`).
@@ -40,7 +40,7 @@ WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / '.github' / 'workflows'
 # ---------------------------------------------------------------------------
 # Thresholds (all in one place so docs/watchdog.md and the tests can quote them)
 # ---------------------------------------------------------------------------
-REQUIRED_CHECKS = ('offline-checks', 'frontend-types')
+REQUIRED_CHECKS = ('offline-checks',)  # the rest runs in scheduled-tests.yml (2026-11-14)
 ACTIONS_APP_ID = 15368                       # GitHub Actions; branch protection pins it
 MERGE_STALL_AFTER = dt.timedelta(minutes=20)
 RED_AFTER = dt.timedelta(hours=6)
@@ -101,19 +101,39 @@ SCHEDULED: dict[str, Sched] = {
         'a manual dispatch forces an unconditional full retrain, and the 12:00 UTC safety net already covers it'),
     'hrv-prediction.yml': Sched('HRV Prediction', _h(26), True, 'daily crons plus a run after every hourly ETL'),
     'flights-email.yml': Sched('Flights Email ETL', _h(4), True, 'every 3h; routinely 3h19 in practice'),
-    'delivery-email.yml': Sched('Delivery Email ETL', _h(4), True, 'every 3h; worst seen 3h08'),
+    'delivery-email.yml': Sched(
+        'Delivery Email ETL', _m(90), True, 'every 15 min since #286 (2026-11-15); was every 3h, worst seen 3h08'),
     'air-quality-etl.yml': Sched(
         'Air Quality ETL', _h(4), True, 'every 3h at :12; new 2026-11-11, same cadence as the email ETLs'),
+    'weather-etl.yml': Sched(
+        'Weather ETL', _h(4), True, 'every 3h at :32; new 2026-11-13, same cadence as the air-quality ETL'),
+    'pollen-etl.yml': Sched(
+        'Pollen ETL', _h(21), True, '16:20 and 21:20 UTC (19h gap); new 2026-11-14, no run history yet'),
     'orders-email.yml': Sched(
         'Online Orders Email', _h(4), True, 'every 3h at :05; new 2026-11-12, same cadence as the email ETLs'),
     'urgent-email.yml': Sched(
         'Urgent Email Labels', _m(150), False, 'hourly :15; new 2026-11-11, no run history yet',
         'every run fails until sql/inbox_emails_schema.sql is applied, so a re-run cannot help; Riley decides'),
+    'google-calendar-etl.yml': Sched(
+        'Google Calendar ETL', _m(150), True, 'hourly at :55; new 2026-11-13, no run history yet'),
+    'simplefin-etl.yml': Sched(
+        'SimpleFIN ETL', _h(8), True, 'every 6h at :30; new 2026-11-14, no run history yet'),
+    'care-calendar-catch-up.yml': Sched(
+        'Care Calendar Catch-up', _h(8), True, 'every 6h at :20; new 2026-11-14, no run history yet'),
     'cronometer-etl.yml': Sched(
         'Cronometer ETL', _h(15), True, '02:30 and 16:00 UTC (13h30 gap); 14h would fire on normal delay'),
     'tanita-etl.yml': Sched('Tanita ETL', _h(26), True, '14:00 and 17:30 UTC (20h30 gap); worst seen 21h19'),
     'eight-sleep-etl.yml': Sched('Eight Sleep ETL', _h(28), True, 'daily; worst seen 26h46'),
+    'experiment-report.yml': Sched(
+        'Experiment Report', _h(28), True,
+        'daily 15:00 UTC; new 2026-11-14, no run history yet; a re-run is safe (progress upserts, final written once)'),
     'smoke-test.yml': Sched('Production Smoke Test', _h(8), True, 'every 6h; worst seen 7h18'),
+    'perf-timing.yml': Sched(
+        'Production Performance Timing', _m(150), True, 'hourly at :23; speed budget, new 2026-11-14'),
+    'scheduled-tests.yml': Sched(
+        'Scheduled tests', _m(90), True, 'every 30 min at :07/:37; new 2026-11-14 (replaced the per-PR test jobs)'),
+    'cash-forecast-snapshot.yml': Sched(
+        'Cash Forecast Snapshot', _h(8 * 24), True, 'weekly Monday 12:30 UTC; new 2026-11-14, no run history yet'),
     'merge-train.yml': Sched(
         'Merge train', _m(90), True, '*/15 plus PR and CI events; the cron alone can be delayed by half an hour'),
     'live-checks.yml': Sched(
@@ -669,6 +689,18 @@ CONCLUSIVE = ('success', 'failure', 'timed_out', 'startup_failure')
 BAD = ('failure', 'timed_out', 'startup_failure')
 
 
+# Suites that run after deployment instead of in front of it (Riley 2026-11-14). key, title, what to do.
+POST_DEPLOY_SUITES: dict[str, tuple[str, str, str]] = {
+    'scheduled-tests.yml': (
+        'scheduled-tests-failed', 'Scheduled tests are failing on master',
+        'Open the run, find the failing job (frontend-types, lint, stats-tests or focus-policy) and fix forward '
+        'with a normal PR. This never reverts or halts the train by itself.'),
+    'perf-timing.yml': (
+        'speed-budget-broken', 'Speed budget broken on production (something took a second)',
+        'Read the "Speed budget" step of the run for the slow page or call and fix it in the next PR.'),
+}
+
+
 def conclusive_runs(ctx: Ctx, workflow: str, count: int) -> list[dict]:
     runs = ctx.runs(workflow, extra='&status=completed', per_page=15)
     runs = [r for r in runs if r.get('conclusion') in CONCLUSIVE]     # cancelled/skipped say nothing
@@ -709,6 +741,18 @@ def check_master(ctx: Ctx) -> list[Finding]:
                 'live-checks-failed', f'{LIVE_CHECKS_NAME} failed',
                 f'Latest completed run ended {r["conclusion"]}: {r.get("html_url", "")}',
                 'Open the run and fix what the live check found (or the check itself).',
+                since=parse_ts(r['updated_at']) if r.get('updated_at') else None))
+
+    # Post-deploy suites (docs/ci-cd.md): a red run never reverts or halts anything, so this finding is the alert.
+    # Fixed forward by devops with a normal PR. A run that deferred or skipped its tests reports success, which
+    # clears the finding only until the next run tests the commit again.
+    for file, (key, title, fix) in POST_DEPLOY_SUITES.items():
+        latest = conclusive_runs(ctx, file, 1)
+        if latest and latest[0]['conclusion'] in BAD:
+            r = latest[0]
+            out.append(Finding(
+                key, title, f'Latest completed run on {ctx.default_branch} ended {r["conclusion"]} at '
+                f'{r.get("updated_at", "?")}: {r.get("html_url", "")}', fix,
                 since=parse_ts(r['updated_at']) if r.get('updated_at') else None))
 
     for issue in open_train_halts(ctx):

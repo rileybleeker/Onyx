@@ -40,9 +40,14 @@ export function draftWith(draft: Draft, patch: Patch, saved: Record<string, Chec
 }
 
 /** The draft after a save: what was sent and is still unchanged goes; a tap made mid-save stays. */
-export function draftSettled(draft: Draft, posted: Patch): Draft {
+export function draftSettled(draft: Draft, posted: Patch, sent: Draft = draft): Draft {
   const next = { ...draft };
-  for (const [name, a] of Object.entries(posted)) if (next[name] && next[name].a === a) delete next[name];
+  for (const [name, a] of Object.entries(posted)) {
+    if (!next[name]) continue;
+    if (next[name] === sent[name] && next[name].a === a) delete next[name];
+    // A newer tap was made against the old server value. Keep it against the value just saved.
+    else next[name] = { ...next[name], base: a };
+  }
   return next;
 }
 
@@ -133,4 +138,21 @@ export function savePlan(args: {
     .map(({ date, changes }) => ({ date, changes }));
   const changeCount = Object.keys(dayPatch).length + nightPatches.reduce((sum, n) => sum + Object.keys(n.changes).length, 0);
   return { dayPatch, nightPatches, changeCount };
+}
+
+/**
+ * "Say it once": which of the text's answers become taps. Only Yes / No, only for `items` (the daytime
+ * questions). Never over a row that is saved or was tapped by the time the answer arrives (`cells` must be the
+ * CURRENT cells, not the ones from when the text was sent), and never over a row Riley changed while it was
+ * being read (`changedSince`), even one he cleared. A data pre-fill is replaced.
+ */
+export function voicePatch(items: CheckinItem[], answers: Record<string, unknown>, cells: Cells, changedSince: ReadonlySet<string>): Patch {
+  const patch: Patch = {};
+  for (const item of items) {
+    const a = answers[item.name];
+    const cur = cells[item.name];
+    if (!isAnswer(a) || changedSince.has(item.name) || cur?.origin === "saved" || cur?.origin === "tapped") continue;
+    patch[item.name] = a;
+  }
+  return patch;
 }

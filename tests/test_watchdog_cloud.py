@@ -401,11 +401,11 @@ class PrCheckTests(unittest.TestCase):
 
     def test_pending_more_than_45_minutes(self):
         self.fake.prs = [pr(1, 'BLOCKED')]
-        self.checks_for([check_run('offline-checks', completed=50, run_id=1),
-                         check_run('frontend-types', status='in_progress', started=ts(minutes_ago=50), run_id=2)])
+        self.checks_for([check_run('offline-checks', status='in_progress', started=ts(minutes_ago=50), run_id=1),
+                         check_run('frontend-types', completed=50, run_id=2)])  # no longer required (2026-11-14)
         found, _ = self.run_check()
         self.assertEqual(keys(found), ['pr-pending:pr-1'])
-        self.assertIn('frontend-types (pending)', found[0].detail)
+        self.assertIn('offline-checks (pending)', found[0].detail)
 
     def test_pending_under_45_minutes_is_quiet(self):
         self.fake.prs = [pr(1, 'BLOCKED')]
@@ -496,6 +496,8 @@ class MasterHealthTests(unittest.TestCase):
     def setUp(self):
         self.fake = FakeGH()
         self.fake.on(f'repos/{REPO}/actions/workflows?', [])
+        for file in w.POST_DEPLOY_SUITES:
+            self.runs(file, [])
 
     def runs(self, workflow, runs):
         self.fake.on(f'repos/{REPO}/actions/workflows/{workflow}/runs', {'workflow_runs': runs})
@@ -532,6 +534,17 @@ class MasterHealthTests(unittest.TestCase):
         self.runs('smoke-test.yml', [run_obj('failure', 30, 2, 'schedule'), run_obj('success', 400, 1, 'schedule')])
         self.assertEqual(w.check_master(make_ctx(self.fake)), [])
         self.runs('smoke-test.yml', [run_obj('failure', 30, 2, 'schedule')])
+        self.assertEqual(w.check_master(make_ctx(self.fake)), [])
+
+    def test_post_deploy_suites_alert_on_their_latest_conclusive_run(self):
+        # Codex 2026-11-14: a red post-deploy suite is never a rollback, so the watchdog must raise it.
+        self.runs('autonomous-ci.yml', [])
+        self.runs('smoke-test.yml', [])
+        self.runs('scheduled-tests.yml', [run_obj('cancelled', 5, 3, 'schedule'), run_obj('failure', 20, 2, 'schedule')])
+        self.runs('perf-timing.yml', [run_obj('failure', 30, 4, 'schedule')])
+        self.assertEqual(sorted(keys(w.check_master(make_ctx(self.fake)))), ['scheduled-tests-failed', 'speed-budget-broken'])
+        self.runs('scheduled-tests.yml', [run_obj('success', 5, 3, 'schedule'), run_obj('failure', 20, 2, 'schedule')])
+        self.runs('perf-timing.yml', [run_obj('success', 10, 5, 'schedule')])
         self.assertEqual(w.check_master(make_ctx(self.fake)), [])
 
     def test_live_db_checks_found_by_real_name_or_file(self):

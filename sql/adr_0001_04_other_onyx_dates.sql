@@ -1,5 +1,9 @@
 -- =============================================================================
 -- ADR-0001 Phase 1, step 4 — onyx_* columns on remaining tables
+-- NOTE 2026-11-14: the habit_journal, whoop_journal, journal_entries, meal_events and
+-- supplement_intake trigger functions are redefined in sql/tz_derivation_edge_cases.sql
+-- (pending Riley's apply). Once applied, that file holds the current definitions; do not
+-- re-run the copies below.
 -- =============================================================================
 -- Per docs/adr/0001-timezone-and-behavioral-day-handling.md (D4).
 --

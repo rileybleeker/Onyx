@@ -5,11 +5,12 @@ import {
   AreaChart, Area, LineChart, Line, CartesianGrid,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
 } from "recharts";
-import { getWhoopRecovery, getWhoopCycles, getHeartRateData, getDailySummaries, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { getWhoopRecovery, getWhoopCycles, getHeartRateData, getDailySummaries, rangeDays, rangeLabel } from "@/lib/queries";
 import { formatDate, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
+import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import { chartColors as C, chartTooltip, axisTick, gridStyle, axisLabel } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -27,7 +28,8 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
   const [hr, setHr] = useState<any[]>(initial?.hr ?? []);
   const [summaries, setSummaries] = useState<any[]>(initial?.summaries ?? []);
   const [loading, setLoading] = useState(!initial);
-  const [range, setRange] = useState<Range>("30d");
+  // Requested vs shown range (components/RangeLoadStatus.tsx, Codex #191 UI 4): labels use the shown one.
+  const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange } = useRangeLoad("30d");
   const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
@@ -38,6 +40,7 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
     const silent = firstRunWithInitial.current;
     firstRunWithInitial.current = false;
     if (!silent) setLoading(true);
+    const seq = beginRange(range, silent);
     const days = rangeDays(range);
     Promise.all([getWhoopRecovery(days), getWhoopCycles(days), getHeartRateData(days), getDailySummaries(days)])
       .then(([rec, cyc, h, s]) => {
@@ -49,13 +52,18 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
         setCycles((prev) => (sameJson(prev, cyc) ? prev : cyc));
         setHr((prev) => (sameJson(prev, h) ? prev : h));
         setSummaries((prev) => (sameJson(prev, s) ? prev : s));
+        finishRange(seq, range, true);
       })
-      .catch(console.error)
+      .catch((e) => {
+        console.error(e);
+        // The charts keep the shown range's rows and labels; the status line offers Retry.
+        if (!cancelled) finishRange(seq, range, false);
+      })
       .finally(() => {
         if (!cancelled && !silent) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [range]);
+  }, [range, attempt, beginRange, finishRange]);
 
   if (loading) {
     return (
@@ -63,7 +71,7 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
         <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
               <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
               <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
             </div>
@@ -101,9 +109,12 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Heart & HRV</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">Heart rate and variability trends — {rangeLabel(range)}</p>
+          <p className="text-sm text-text-tertiary mt-0.5">Heart rate and variability trends — {rangeLabel(rangeView.shown)}</p>
         </div>
-        <RangeFilter value={range} onChange={setRange} />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <RangeLoadStatus view={rangeView} onRetry={retryRange} />
+          <RangeFilter value={selectedRange} onChange={selectRange} />
+        </div>
       </div>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
@@ -131,7 +142,7 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} label={axisLabel("bpm", "y")} />
               <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
+              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-mono)" }} />
               <Area type="monotone" dataKey="max" stroke={C.down} fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max" isAnimationActive={false} />
               <Area type="monotone" dataKey="min" stroke={C.up} fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min" isAnimationActive={false} />
             </AreaChart>
@@ -146,7 +157,7 @@ export default function HeartPage({ initial }: { initial?: HeartInitial | null }
               <YAxis yAxisId="rhr" tick={axisTick} width={40} />
               <YAxis yAxisId="hrv" orientation="right" tick={axisTick} width={40} />
               <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
+              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-mono)" }} />
               <Line yAxisId="rhr" type="monotone" dataKey="rhr" stroke={C.source.garmin} strokeWidth={2} dot={false} name="RHR (bpm)" isAnimationActive={false} />
               <Line yAxisId="hrv" type="monotone" dataKey="hrv" stroke={C.source.eightsleep} strokeWidth={2} dot={false} name="HRV RMSSD (ms)" isAnimationActive={false} />
             </LineChart>

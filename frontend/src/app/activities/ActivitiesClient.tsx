@@ -1,13 +1,18 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { useEffect, useRef, useState } from "react";
 import { AreaChart, Area, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
-import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, getRunningRecoveryContext, getActivityLaps, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, getRunningRecoveryContext, getActivityLaps, rangeDays, rangeLabel } from "@/lib/queries";
 import { formatDuration, formatShortDuration, formatDistance, formatPace, formatDate, sameJson } from "@/lib/format";
 import RangeFilter from "@/components/RangeFilter";
+import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
-import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel, chartColors as C } from "@/lib/chart-theme";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
+import { useInFeed } from "@/components/FeedContext";
+import { chartTooltip, axisTick, gridStyle, axisLabel, sourceColors, chartColors as C } from "@/lib/chart-theme";
+import { mergeDailySteps, stepsSourceLabel } from "@/lib/steps";
 import {
   SPLIT_LABELS, MUSCLE_GROUPS, SUGGEST_MAX_ITEMS, SUGGEST_WINDOW_DAYS, deriveActivityCategory,
   type ActivityCategory, type MuscleGroup, type SplitLabel, type SuggestionConfidence,
@@ -384,7 +389,8 @@ function buildWorkoutRows(segments: SegmentTarget[], laps: Lap[]): WorkoutRow[] 
 
 import type { ActivitiesInitial } from "./ActivitiesLoader";
 
-export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitial | null }) {
+export default function ActivitiesPage({ initial, headingTestId = "page-heading" }: { initial?: ActivitiesInitial | null; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // Server-prefetched initial data (ISR, default 30d range) seeds the page so
   // it paints immediately; the mount effect still runs as a SILENT
   // revalidation (no skeleton) because the ISR snapshot can be up to ~1h
@@ -408,13 +414,17 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
   const [lapsByActivity, setLapsByActivity] = useState<Record<number, Lap[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(!initial);
-  const [range, setRange] = useState<Range>("30d");
+  // Requested vs shown range (components/RangeLoadStatus.tsx, Codex #191 UI 4): labels use the shown one.
+  const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange } = useRangeLoad("30d");
   const [deletingId, setDeletingId] = useState<string | null>(null);
   // LLM-proposed tags for untagged strength rows, keyed by row id ("whoop:<id>"). Never part of the
   // ISR prefetch: they load after the list has painted (effect below) and degrade to nothing on
   // any failure. The entry doubles as the draft - toggling a ghost chip edits it in place.
   const [suggestions, setSuggestions] = useState<Record<string, TagSuggestion>>({});
   const suggestStarted = useRef(false);
+  // Inside the continuous scroll this page is only a neighbour, and scrolling never writes: asking for
+  // suggestions calls the model and stores its answer, so it happens only on /activities itself.
+  const inFeed = useInFeed();
   const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
@@ -429,10 +439,13 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     firstRunWithInitial.current = false;
     if (!silent) setLoading(true);
     setExpanded(new Set());
+    const seq = beginRange(range, silent);
     const days = rangeDays(range);
     Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts(), getDailySummaries(days), getWhoopCycles(days), getHeartRateData(days), getRunningRecoveryContext(days)])
       .then(([garmin, whoop, wkts, sums, cycles, h, recCtx]) => {
         if (cancelled) return;
+        // The default view also seeds this page in the continuous scroll (lib/feed-seed.ts).
+        if (range === "30d") writeFeedSeed("/activities", { garmin, whoop, workouts: wkts, summaries: sums, cycles, hr: h, recoveryContext: recCtx });
         // sameJson bail-out: the silent revalidation's data is usually
         // byte-identical to the server-seeded state — returning the previous
         // reference lets React skip the commit (and a full chart re-render).
@@ -447,6 +460,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
         setHr((prev) => (sameJson(prev, h) ? prev : h));
         const nextRecoveryMap = buildRecoveryMap(recCtx);
         setRecoveryMap((prev) => (sameJson(prev, nextRecoveryMap) ? prev : nextRecoveryMap));
+        finishRange(seq, range, true);
 
         // Batch-fetch laps for every Garmin running activity with a multi-segment plan
         const multiSegIds = recCtx
@@ -475,12 +489,16 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
           }).catch(console.error);
         }
       })
-      .catch(console.error)
+      .catch((e) => {
+        console.error(e);
+        // The list and charts keep the shown range's rows and labels; the status line offers Retry.
+        if (!cancelled) finishRange(seq, range, false);
+      })
       .finally(() => {
         if (!cancelled && !silent) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [range]);
+  }, [range, attempt, beginRange, finishRange]);
 
   function toggleExpanded(id: string) {
     setExpanded((prev) => {
@@ -559,7 +577,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
   // every row and caps the batch at SUGGEST_MAX_ITEMS), and stays silent on any failure - a missing
   // suggestion is just the manual pills as before. No tag is ever written without Accept.
   useEffect(() => {
-    if (loading || suggestStarted.current) return;
+    if (inFeed || loading || suggestStarted.current) return;
     const cutoff = Date.now() - SUGGEST_WINDOW_DAYS * 24 * 60 * 60 * 1000;
     const wanted = rows.filter(
       (r) =>
@@ -595,7 +613,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
         }
       }
     })();
-  }, [loading, rows]);
+  }, [inFeed, loading, rows]);
 
   // Best-effort: tell the server this activity's suggestion is done (dismissed or accepted).
   function resolveSuggestion(act: ActivityRow) {
@@ -660,10 +678,17 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     saveTags(act, { is_sauna: !act.is_sauna });
   }
 
-  const latestSummary = summaries[summaries.length - 1];
-  const stepsData = summaries.map((d) => ({
-    date: formatDate(d.calendar_date),
-    steps: d.total_steps,
+  // Steps: one count per day, the larger of Garmin's and WHOOP's (whoop_cycles.step_count,
+  // dated to the waking day each cycle counts): a watch worn for part of the day is not a
+  // low-step day. One device per day, never summed; each bar and the stat tile name their
+  // device (lib/steps.ts).
+  const dailySteps = mergeDailySteps(summaries, whoopCycles);
+  const latestSteps = dailySteps[dailySteps.length - 1];
+  const stepsSource = stepsSourceLabel(dailySteps);
+  const stepsData = dailySteps.map((d) => ({
+    date: formatDate(d.day),
+    garmin: d.source === "GARMIN" ? d.steps : null,
+    whoop: d.source === "WHOOP" ? d.steps : null,
   }));
 
   // WHOOP day-wide cycle avg HR (one value per cycle = behavioral day).
@@ -694,7 +719,8 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     date:    formatDate(d.calendar_date),
     overall: d.avg_stress_level,
   }));
-  const rangeNote = range === "1d" ? "today" : `${rangeLabel(range)} avg`;
+  const shownRange = rangeView.shown; // labels describe the rows on screen
+  const rangeNote = shownRange === "1d" ? "today" : `${rangeLabel(shownRange)} avg`;
 
   if (loading) {
     return (
@@ -702,7 +728,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
         <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
         <div className="space-y-3">
           {[...Array(6)].map((_, i) => (
-            <div key={i} className="h-20 bg-white/5 animate-pulse rounded-[6px]" />
+            <div key={i} className="h-20 bg-white/5 animate-pulse rounded-control" />
           ))}
         </div>
       </div>
@@ -713,45 +739,68 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Activities</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">Training — {rangeLabel(range)}</p>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Activities</h2>
+          <p className="text-sm text-text-tertiary mt-0.5">Training — {rangeLabel(shownRange)}</p>
         </div>
-        <RangeFilter value={range} onChange={setRange} />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <RangeLoadStatus view={rangeView} onRetry={retryRange} />
+          <RangeFilter value={selectedRange} onChange={selectRange} />
+        </div>
       </div>
 
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+      <PartGrid page="/activities" title="Activities">
+      {/* Sections have no heading on screen; Personalize shows their names. */}
+      <PartGroup id="section-summary" title="Summary tiles">
+        <Part id="tile-steps" title="Steps (tile)" width="quarter">
         <StatCard
           label="Steps"
-          value={latestSummary?.total_steps?.toLocaleString()}
-          sublabel={latestSummary?.calendar_date}
-          source="GARMIN"
+          value={latestSteps ? latestSteps.steps.toLocaleString() : null}
+          sublabel={latestSteps ? `${latestSteps.day}${latestSteps.partial ? " so far" : ""}` : undefined}
+          source={latestSteps?.source}
         />
+        </Part>
+        <Part id="tile-avg-hr" title="Avg HR (WHOOP)" width="quarter">
         <StatCard
           label="Avg HR"
           value={avgCycleHr != null ? avgCycleHr.toFixed(0) : null}
           unit="bpm"
-          sublabel={range === "1d" ? "today" : `${rangeLabel(range)} avg`}
+          sublabel={rangeNote}
           source="WHOOP"
         />
+        </Part>
+        <Part id="tile-max-hr" title="Max HR (Garmin)" width="quarter">
         <StatCard label="Max HR" value={avgMaxHr != null ? avgMaxHr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
+        </Part>
+        <Part id="tile-min-hr" title="Min HR (Garmin)" width="quarter">
         <StatCard label="Min HR" value={avgMinHr != null ? avgMinHr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
+        </Part>
+        <Part id="tile-stress" title="Stress Level (tile)" width="quarter">
         <StatCard label="Stress Level" value={avgStress != null ? avgStress.toFixed(0) : null} sublabel={rangeNote} source="GARMIN" />
-      </div>
+        </Part>
+      </PartGroup>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-        <ChartCard title="Daily Steps" subtitle={rangeLabel(range)} source="GARMIN">
+      <PartGroup id="section-trends" title="Steps, heart rate & stress charts" gap={24}>
+        <Part id="daily-steps" title="Daily Steps" width="half">
+        <ChartCard title="Daily Steps" subtitle={rangeLabel(shownRange)} source={stepsSource}>
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={stepsData}>
               <CartesianGrid {...gridStyle} />
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} label={axisLabel("steps", "y")} />
               <Tooltip {...chartTooltip} />
-              <Bar dataKey="steps" fill={accentColor} radius={[2, 2, 0, 0]} fillOpacity={0.85} isAnimationActive={false} />
+              {stepsSource === "GARMIN + WHOOP" && (
+                <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-mono)" }} />
+              )}
+              {/* One bar per day: a day has either a Garmin or a WHOOP value, so the stack never adds them. */}
+              <Bar dataKey="garmin" stackId="steps" name="Garmin" fill={sourceColors.garmin} radius={[2, 2, 0, 0]} fillOpacity={0.85} isAnimationActive={false} />
+              <Bar dataKey="whoop" stackId="steps" name="WHOOP" fill={sourceColors.whoop} radius={[2, 2, 0, 0]} fillOpacity={0.85} isAnimationActive={false} />
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
-        <ChartCard title="Avg Heart Rate" subtitle={rangeLabel(range)} source="WHOOP">
+        <Part id="avg-heart-rate" title="Avg Heart Rate" width="half">
+        <ChartCard title="Avg Heart Rate" subtitle={rangeLabel(shownRange)} source="WHOOP">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={cycleHrData}>
               <defs>
@@ -768,7 +817,9 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="heart-rate-range" title="Heart Rate Range" width="half">
         <ChartCard title="Heart Rate Range" source="GARMIN">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={hrData}>
@@ -786,13 +837,15 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
               <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
               <YAxis tick={axisTick} width={55} label={axisLabel("bpm", "y")} />
               <Tooltip {...chartTooltip} />
-              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" }} />
+              <Legend wrapperStyle={{ fontSize: 11, fontFamily: "var(--font-mono)" }} />
               <Area type="monotone" dataKey="max" stroke={C.down} fill="url(#heartMaxGrad)" strokeWidth={1.5} name="Max HR" isAnimationActive={false} />
               <Area type="monotone" dataKey="min" stroke={C.up} fill="url(#heartMinGrad)" strokeWidth={1.5} name="Min HR" isAnimationActive={false} />
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
 
+        <Part id="stress" title="Stress Level" width="half">
         <ChartCard title="Stress Level" source="GARMIN">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={stressData}>
@@ -810,8 +863,11 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
-      </div>
+        </Part>
+      </PartGroup>
 
+      <PartGroup id="section-sessions" title="Sessions">
+      <Part id="activity-list" title="Activity list">
       {rows.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-center">
           <svg className="w-10 h-10 text-text-tertiary mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -855,7 +911,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
               : null;
 
             return (
-            <div key={act.id} className="bg-surface-card border border-border-subtle rounded-[6px] hover:border-border-hover transition-colors">
+            <div key={act.id} className="bg-surface-card border border-border-subtle rounded-control hover:border-border-hover transition-colors">
               <div
                 className={`p-4 flex flex-col sm:flex-row sm:items-center gap-3 ${canExpand ? "cursor-pointer" : ""}`}
                 onClick={canExpand ? () => toggleExpanded(act.id) : undefined}
@@ -1003,7 +1059,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
                   {sug && (
                     <div className="flex flex-wrap items-center gap-2 pt-0.5" data-testid="tag-suggestion">
                       <span className="text-text-tertiary text-[11px]">
-                        Suggested{sug.confidence ? ` (${sug.confidence} confidence)` : ""}. Tap chips to adjust, then accept.
+                        Suggested{sug.confidence ? ` (${sug.confidence} confidence)` : ""}
                       </span>
                       <button
                         onClick={() => acceptSuggestion(act)}
@@ -1139,6 +1195,9 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
           })}
         </div>
       )}
+      </Part>
+      </PartGroup>
+      </PartGrid>
     </>
   );
 }

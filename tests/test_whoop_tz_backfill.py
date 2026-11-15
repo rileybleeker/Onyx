@@ -39,7 +39,7 @@ def test_infer_proposed_inserts_builds_notes_without_nameerror() -> None:
     }
     history_map = {"-06:00": "America/Chicago"}
 
-    with patch.object(wtb, "tz_for_instant_via_pg", return_value="America/New_York"):
+    with patch.object(wtb, "fetch_tz_log", return_value=[]):
         proposals = wtb.infer_proposed_inserts([cycle], history_map)
 
     assert len(proposals) == 1, f"expected 1 proposal, got {len(proposals)}"
@@ -63,7 +63,7 @@ def test_dst_artifact_cycle_is_skipped() -> None:
         "end_time": "2026-03-02T05:00:00+00:00",
         "timezone_offset": "-05:00",  # matches NY EST at start
     }
-    with patch.object(wtb, "tz_for_instant_via_pg", return_value="America/New_York"):
+    with patch.object(wtb, "fetch_tz_log", return_value=[]):
         proposals = wtb.infer_proposed_inserts([cycle], history_map={})
     assert proposals == []
 
@@ -86,7 +86,7 @@ def test_unknown_offset_skips_instead_of_proposing_etc_utc() -> None:
         "test premise broken: +05:45 is now in the generic map; pick a new "
         "obscure offset for this test."
     )
-    with patch.object(wtb, "tz_for_instant_via_pg", return_value="America/New_York"):
+    with patch.object(wtb, "fetch_tz_log", return_value=[]):
         proposals = wtb.infer_proposed_inserts([cycle], history_map={})
     assert proposals == [], (
         f"expected skip on unknown offset; got proposal: {proposals}"
@@ -96,8 +96,88 @@ def test_unknown_offset_skips_instead_of_proposing_etc_utc() -> None:
     assert iana is None, f"expected None, got {iana!r} ({reason})"
 
 
+def _cycle(cycle_id: int, start: str, end: str, offset: str) -> dict:
+    return {"cycle_id": cycle_id, "start_time": start, "end_time": end,
+            "timezone_offset": offset}
+
+
+def _ts(iso: str):
+    return wtb._parse_ts(iso)
+
+
+def test_wide_window_skips_trips_the_log_already_covers() -> None:
+    """2026-11-14 roadmap bug: over a wide --since window the pass read the log
+    only at the first cycle, so later trips that already had manual rows (at
+    other instants than the cycle starts) were proposed again. Each cycle must
+    be checked against the log at its own instant.
+
+    Synthetic log: a Chicago trip (Jan 2025) and a Paris trip (Jul 2025), both
+    with outbound and return rows. A Los Angeles trip (Feb 2025) has no rows,
+    so only its two legs should be proposed."""
+    tz_log = [
+        (_ts("2025-01-10T20:00:00+00:00"), "America/Chicago"),
+        (_ts("2025-01-14T22:00:00+00:00"), "America/New_York"),
+        (_ts("2025-07-01T10:00:00+00:00"), "Europe/Paris"),
+        (_ts("2025-07-08T20:00:00+00:00"), "America/New_York"),
+    ]
+    cycles = [
+        _cycle(1, "2025-01-05T04:00:00+00:00", "2025-01-05T12:00:00+00:00", "-05:00"),
+        _cycle(2, "2025-01-11T05:00:00+00:00", "2025-01-11T13:00:00+00:00", "-06:00"),
+        _cycle(3, "2025-01-12T05:00:00+00:00", "2025-01-12T13:00:00+00:00", "-06:00"),
+        _cycle(4, "2025-01-15T04:00:00+00:00", "2025-01-15T12:00:00+00:00", "-05:00"),
+        # Uncovered trip: Los Angeles, no log rows.
+        _cycle(5, "2025-02-20T07:00:00+00:00", "2025-02-20T15:00:00+00:00", "-08:00"),
+        _cycle(6, "2025-02-21T07:00:00+00:00", "2025-02-21T15:00:00+00:00", "-08:00"),
+        _cycle(7, "2025-02-23T04:00:00+00:00", "2025-02-23T12:00:00+00:00", "-05:00"),
+        _cycle(8, "2025-06-30T03:00:00+00:00", "2025-06-30T11:00:00+00:00", "-04:00"),
+        _cycle(9, "2025-07-02T21:00:00+00:00", "2025-07-03T05:00:00+00:00", "+02:00"),
+        _cycle(10, "2025-07-03T21:00:00+00:00", "2025-07-04T05:00:00+00:00", "+02:00"),
+        _cycle(11, "2025-07-09T03:00:00+00:00", "2025-07-09T11:00:00+00:00", "-04:00"),
+    ]
+    history_map = {
+        "-08:00": "America/Los_Angeles",
+        "-06:00": "America/Chicago",
+        "-05:00": "America/New_York",
+        "-04:00": "America/New_York",
+        "+02:00": "Europe/Paris",
+    }
+    with patch.object(wtb, "fetch_tz_log", return_value=list(tz_log)):
+        proposals = wtb.infer_proposed_inserts(cycles, history_map)
+
+    got = [(p["effective_from"], p["tz"]) for p in proposals]
+    assert got == [
+        ("2025-02-20T07:00:00+00:00", "America/Los_Angeles"),
+        ("2025-02-23T04:00:00+00:00", "America/New_York"),
+    ], f"expected only the uncovered LA trip's two legs, got: {got}"
+
+    # The same window with the LA trip logged too proposes nothing.
+    full_log = tz_log + [
+        (_ts("2025-02-19T23:00:00+00:00"), "America/Los_Angeles"),
+        (_ts("2025-02-22T23:00:00+00:00"), "America/New_York"),
+    ]
+    with patch.object(wtb, "fetch_tz_log", return_value=sorted(full_log)):
+        proposals = wtb.infer_proposed_inserts(cycles, history_map)
+    assert proposals == [], f"log covers every trip; got: {proposals}"
+
+
+def test_tz_at_matches_tz_for_instant_rule() -> None:
+    """tz_at mirrors pds.tz_for_instant: latest row at or before the instant,
+    America/New_York before the first row."""
+    tz_log = [
+        (_ts("2025-01-10T20:00:00+00:00"), "America/Chicago"),
+        (_ts("2025-01-14T22:00:00+00:00"), "America/New_York"),
+    ]
+    assert wtb.tz_at(tz_log, _ts("2025-01-01T00:00:00+00:00")) == "America/New_York"
+    assert wtb.tz_at(tz_log, _ts("2025-01-10T20:00:00+00:00")) == "America/Chicago"
+    assert wtb.tz_at(tz_log, _ts("2025-01-12T00:00:00+00:00")) == "America/Chicago"
+    assert wtb.tz_at(tz_log, _ts("2025-01-20T00:00:00+00:00")) == "America/New_York"
+    assert wtb.tz_at([], _ts("2025-01-20T00:00:00+00:00")) == "America/New_York"
+
+
 if __name__ == "__main__":
     test_infer_proposed_inserts_builds_notes_without_nameerror()
     test_dst_artifact_cycle_is_skipped()
     test_unknown_offset_skips_instead_of_proposing_etc_utc()
+    test_wide_window_skips_trips_the_log_already_covers()
+    test_tz_at_matches_tz_for_instant_rule()
     print("OK — whoop_tz_backfill regression tests passed.")

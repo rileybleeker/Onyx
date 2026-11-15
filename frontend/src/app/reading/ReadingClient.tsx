@@ -3,9 +3,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
-import { BookMarked, Check, ChevronDown, Flame, Headphones, Highlighter, Sparkles, Trophy, X } from "lucide-react";
+import { Check, ChevronDown, Flame, Highlighter, Sparkles, Trophy, X } from "lucide-react";
 import MetricRing from "@/components/MetricRing";
-import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type Medium, type ReadingOverview, type Book } from "@/lib/reading";
+import InfoHint from "@/components/InfoHint";
+import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
+import { clientCache } from "@/lib/client-cache";
+import { sameJson } from "@/lib/format";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
+import LogLink from "@/components/LogLink";
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -14,19 +19,14 @@ const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading
  *
  * One book at a time: progress ring + pace against the target date, session
  * streak, XP / level, badges, three checkpoints, a burn-up chart, today's
- * spaced-repetition review, and the two capture forms (session with a from-
- * memory recall note; highlight with a comment, or a pasted Kindle export).
+ * spaced-repetition review, and the highlight capture form (a comment, or a
+ * pasted Kindle export). Sessions are logged on /log (one place to enter data).
  * Writes go to /api/reading/*; each write mirrors to the book's Notion
  * reading-log page server-side. All numbers are derived in lib/reading.ts.
  */
 
 type Toast = { text: string; kind: "xp" | "ok" | "err" } | null;
 
-const MEDIA: Array<{ key: Medium; label: string }> = [
-  { key: "audio", label: "Audio" },
-  { key: "kindle", label: "Kindle" },
-  { key: "paper", label: "Paper" },
-];
 const SOURCES: Array<{ key: HighlightSource; label: string }> = [
   { key: "kindle", label: "Kindle" },
   { key: "audible", label: "Audible clip" },
@@ -37,11 +37,22 @@ const SOURCES: Array<{ key: HighlightSource; label: string }> = [
 const fmtDate = (d: string | null | undefined, opts: Intl.DateTimeFormatOptions = { month: "short", day: "numeric" }) =>
   d ? new Date(d + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", ...opts }) : "—";
 
-export default function ReadingClient() {
-  const [overview, setOverview] = useState<ReadingOverview | null>(null);
-  const [books, setBooks] = useState<Book[]>([]);
-  const [slug, setSlug] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+type ReadingAnswer = { overview: ReadingOverview | null; books?: Book[] };
+const readingUrl = (which: string | null) => `/api/reading${which ? `?book=${encodeURIComponent(which)}` : ""}`;
+function cachedReading(raw: unknown): ReadingAnswer | null {
+  const v = raw as ReadingAnswer | undefined;
+  return v && "overview" in v && (v.overview === null || !!v.overview?.book?.slug) ? v : null;
+}
+
+/** `feed`: drawn inside the continuous scroll (FeedSection.tsx); the heading is then marked feed-page-heading. */
+export default function ReadingClient({ feed = false }: { feed?: boolean } = {}) {
+  const headingTestId = feed ? "feed-page-heading" : "page-heading";
+  // Start from the cached answer (Today and the warm-up read the same URL), then revalidate.
+  const [seed] = useState(() => cachedReading(clientCache.peek(readingUrl(null))));
+  const [overview, setOverview] = useState<ReadingOverview | null>(seed?.overview ?? null);
+  const [books, setBooks] = useState<Book[]>(seed?.books ?? []);
+  const [slug, setSlug] = useState<string | null>(seed?.overview?.book.slug ?? null);
+  const [loading, setLoading] = useState(!seed);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast>(null);
 
@@ -55,11 +66,12 @@ export default function ReadingClient() {
       if (!silent) setLoading(true);
       setError(null);
       try {
-        const res = await fetch(`/api/reading${which ? `?book=${encodeURIComponent(which)}` : ""}`, { cache: "no-store" });
+        const res = await fetch(readingUrl(which), { cache: "no-store" });
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
-        setOverview(json.overview);
-        setBooks(json.books ?? []);
+        clientCache.put(readingUrl(which), json);
+        setOverview((prev) => (sameJson(prev, json.overview) ? prev : json.overview));
+        setBooks((prev) => (sameJson(prev, json.books ?? []) ? prev : json.books ?? []));
         if (json.overview && !which) setSlug(json.overview.book.slug);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Couldn't load");
@@ -71,7 +83,8 @@ export default function ReadingClient() {
   );
 
   useEffect(() => {
-    load(null);
+    // With a cached answer on screen the first load is silent (no skeleton).
+    load(null, !!seed);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -79,8 +92,8 @@ export default function ReadingClient() {
     return (
       <div className="max-w-3xl space-y-3">
         <div className="h-8 w-40 bg-white/5 animate-pulse rounded" />
-        <div className="h-44 bg-white/[0.03] animate-pulse rounded-[6px]" />
-        <div className="h-28 bg-white/[0.03] animate-pulse rounded-[6px]" />
+        <div className="h-44 bg-white/[0.03] animate-pulse rounded-control" />
+        <div className="h-28 bg-white/[0.03] animate-pulse rounded-control" />
       </div>
     );
   }
@@ -88,7 +101,7 @@ export default function ReadingClient() {
   if (error && !overview) {
     return (
       <div className="max-w-3xl">
-        <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Reading</h2>
+        <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Reading</h2>
         <p className="mt-3 text-sm text-red-400">{error}</p>
         <p className="mt-1 text-[12px] text-text-tertiary">If this is a fresh deploy, apply sql/reading_schema.sql in Supabase first.</p>
       </div>
@@ -98,7 +111,7 @@ export default function ReadingClient() {
   if (!overview) {
     return (
       <div className="max-w-3xl">
-        <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Reading</h2>
+        <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Reading</h2>
         <p className="mt-3 text-sm text-text-secondary">No book in progress. Add one with POST /api/reading/books or the chat.</p>
       </div>
     );
@@ -111,7 +124,7 @@ export default function ReadingClient() {
       {/* Header */}
       <div className="mb-5 flex items-start justify-between gap-3">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Reading</h2>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Reading</h2>
           <p className="text-sm text-text-secondary mt-0.5">
             <span className="text-text-primary">{o.book.title}</span>
             {o.book.author && <span className="text-text-tertiary"> · {o.book.author}</span>}
@@ -124,7 +137,7 @@ export default function ReadingClient() {
               setSlug(e.target.value);
               load(e.target.value);
             }}
-            className="bg-surface-card border border-border-subtle rounded-[6px] text-[12px] px-2 py-1.5 text-text-secondary"
+            className="bg-surface-card border border-border-subtle rounded-control text-[12px] px-2 py-1.5 text-text-secondary"
           >
             {books.map((b) => (
               <option key={b.slug} value={b.slug}>
@@ -135,32 +148,72 @@ export default function ReadingClient() {
         )}
       </div>
 
-      <QuestCard o={o} />
+      {/* Personalize: every card, checkpoint tile and list is its own part; sections have no extra heading on screen. */}
+      <PartGrid page="/reading" title="Reading" gap={16}>
+      <PartGroup id="section-quest" title="Quest & pace">
+        <Part id="quest" title="Quest (progress, level, streak)">
+          <QuestCard o={o} />
+        </Part>
 
-      {/* Burn-up */}
-      <section className="mt-4 bg-surface-card border border-border-subtle rounded-[6px] px-4 pt-3 pb-1">
-        <div className="flex items-baseline justify-between mb-1">
-          <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Chapters vs pace</h3>
-          <span className="text-[11px] font-mono text-text-tertiary">
-            {fmtDate(o.book.start_date)} → {fmtDate(o.book.target_date)}
-          </span>
-        </div>
-        <BurnupChart data={o.burnup} today={o.today} total={o.totalChapters} />
-      </section>
+        {/* Burn-up */}
+        <Part id="burnup" title="Chapters vs pace">
+          <section className="bg-surface-card border border-border-subtle rounded-card shadow-card px-4 pt-3 pb-1">
+            <div className="flex items-baseline justify-between mb-1">
+              <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Chapters vs pace</h3>
+              <span className="text-[11px] font-mono text-text-tertiary">
+                {fmtDate(o.book.start_date)} → {fmtDate(o.book.target_date)}
+              </span>
+            </div>
+            <BurnupChart data={o.burnup} today={o.today} total={o.totalChapters} />
+          </section>
+        </Part>
+      </PartGroup>
 
-      <Checkpoints o={o} />
+      {/* Checkpoints: one tile each (ids by position, so a layout carries over to the next book), three across like before. */}
+      <PartGroup
+        id="section-checkpoints"
+        title="Checkpoints"
+        gridClassName="grid grid-cols-3 gap-2"
+        header={o.checkpoints.length ? <CheckpointsHeader /> : null}
+      >
+        {o.checkpoints.map((c, i) => (
+          <Part key={c.key} id={`checkpoint-${i + 1}`} title={`Checkpoint ${i + 1} (ch ${c.chapter})`}>
+            <CheckpointTile c={c} />
+          </Part>
+        ))}
+      </PartGroup>
 
-      <ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} />
+      <PartGroup id="section-practice" title="Review & capture">
+        <Part id="review" title="Review">
+          <ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} />
+        </Part>
 
-      <SessionForm o={o} onLogged={(xp, finished) => { showToast({ text: finished ? `Finished! +${xp} XP` : `+${xp} XP`, kind: "xp" }); load(slug, true); }} onError={(m) => showToast({ text: m, kind: "err" })} />
+        {/* Sessions are logged on Log (one place to enter data); the Session log below lists them. */}
+        <Part id="log-session" title="Log a session">
+          <div className="flex justify-end">
+            <LogLink part="reading">Log a reading session on Log</LogLink>
+          </div>
+        </Part>
 
-      <HighlightForm o={o} onAdded={(n) => { showToast({ text: n === 1 ? "+5 XP · highlight" : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onError={(m) => showToast({ text: m, kind: "err" })} />
+        <Part id="add-highlight" title="Highlight + comment">
+          <HighlightForm o={o} onAdded={(n) => { showToast({ text: n === 1 ? "+5 XP · highlight" : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onError={(m) => showToast({ text: m, kind: "err" })} />
+        </Part>
+      </PartGroup>
 
-      <Badges o={o} />
+      <PartGroup id="section-history" title="Badges & history">
+        <Part id="badges" title="Badges">
+          <Badges o={o} />
+        </Part>
 
-      <HighlightsList o={o} onChanged={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
+        <Part id="highlights" title="Highlights by concept">
+          <HighlightsList o={o} onChanged={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
+        </Part>
 
-      <SessionsList o={o} />
+        <Part id="session-log" title="Session log">
+          <SessionsList o={o} />
+        </Part>
+      </PartGroup>
+      </PartGrid>
 
       {toast && (
         <div className="fixed bottom-[calc(env(safe-area-inset-bottom)+5rem)] md:bottom-6 left-1/2 -translate-x-1/2 z-20">
@@ -190,10 +243,10 @@ function QuestCard({ o }: { o: ReadingOverview }) {
         : pace.aheadBy > 0
           ? `${pace.aheadBy} chapter${pace.aheadBy === 1 ? "" : "s"} ahead`
           : `${-pace.aheadBy} chapter${pace.aheadBy === -1 ? "" : "s"} behind`;
-  const paceColor = o.book.status === "finished" || pace.aheadBy >= 0 ? "text-accent" : pace.aheadBy >= -2 ? "text-[var(--color-mid)]" : "text-[var(--color-down)]";
+  const paceColor = o.book.status === "finished" || pace.aheadBy >= 0 ? "text-up" : pace.aheadBy >= -2 ? "text-[var(--color-mid)]" : "text-[var(--color-down)]";
 
   return (
-    <section className="bg-surface-card border border-border-subtle rounded-[6px] p-4" data-testid="reading-quest">
+    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-quest">
       <div className="flex gap-4 items-center">
         <MetricRing
           value={o.chaptersDone}
@@ -267,47 +320,45 @@ function Stat({ icon, label, value, sub, valueClass, subClass }: { icon?: React.
   );
 }
 
-function Checkpoints({ o }: { o: ReadingOverview }) {
-  if (!o.checkpoints.length) return null;
+function CheckpointsHeader() {
   return (
-    <section className="mt-4">
-      <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">Checkpoints</h3>
-      <div className="grid grid-cols-3 gap-2">
-        {o.checkpoints.map((c) => {
-          const state = c.reached ? (c.onTime ? "done" : "late") : c.onTime === false ? "missed" : "upcoming";
-          const border =
-            state === "done" ? "border-accent/60" : state === "late" ? "border-[var(--color-mid)]/60" : state === "missed" ? "border-[var(--color-down)]/60" : "border-border-subtle";
-          return (
-            <div key={c.key} className={`bg-surface-card border ${border} rounded-[6px] px-3 py-2.5`}>
-              <div className="text-[13px] font-medium text-text-primary">Ch {c.chapter}</div>
-              <div className="text-[11px] font-mono text-text-tertiary">by {fmtDate(c.due)}</div>
-              <div className="mt-1.5 text-[11px] font-mono">
-                {state === "done" && <span className="text-accent">✓ on time</span>}
-                {state === "late" && <span className="text-[var(--color-mid)]">✓ late</span>}
-                {state === "missed" && <span className="text-[var(--color-down)]">missed</span>}
-                {state === "upcoming" && <span className="text-text-tertiary">upcoming</span>}
-              </div>
-              <div className="mt-1 text-[11px] font-mono text-text-tertiary">
-                {c.quiz ? (
-                  <span className={c.quiz.score / c.quiz.total >= 0.8 ? "text-accent" : "text-text-secondary"}>
-                    quiz {c.quiz.score}/{c.quiz.total}
-                  </span>
-                ) : c.reached ? (
-                  <Link href="/chat" className="text-accent/80 underline underline-offset-2">
-                    quiz me →
-                  </Link>
-                ) : (
-                  "no quiz yet"
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-      <p className="mt-1.5 text-[11px] text-text-tertiary">
-        Quizzes run in <Link href="/chat" className="underline underline-offset-2">Health Q&amp;A</Link>: &ldquo;quiz me on The Goal through chapter 12&rdquo;. The result is recorded here. 80% passes.
+    <div className="mb-2">
+      <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Checkpoints</h3>
+      <p className="mt-0.5 text-[11px] text-text-tertiary">
+        Quiz in <Link href="/chat" className="underline underline-offset-2">Health Q&amp;A</Link> (&ldquo;quiz me through chapter 12&rdquo;). 80% passes.
       </p>
-    </section>
+    </div>
+  );
+}
+
+function CheckpointTile({ c }: { c: ReadingOverview["checkpoints"][number] }) {
+  const state = c.reached ? (c.onTime ? "done" : "late") : c.onTime === false ? "missed" : "upcoming";
+  const border =
+    state === "done" ? "border-accent/60" : state === "late" ? "border-[var(--color-mid)]/60" : state === "missed" ? "border-[var(--color-down)]/60" : "border-border-subtle";
+  return (
+    <div className={`bg-surface-card border ${border} rounded-control px-3 py-2.5`}>
+      <div className="text-[13px] font-medium text-text-primary">Ch {c.chapter}</div>
+      <div className="text-[11px] font-mono text-text-tertiary">by {fmtDate(c.due)}</div>
+      <div className="mt-1.5 text-[11px] font-mono">
+        {state === "done" && <span className="text-up">✓ on time</span>}
+        {state === "late" && <span className="text-[var(--color-mid)]">✓ late</span>}
+        {state === "missed" && <span className="text-[var(--color-down)]">missed</span>}
+        {state === "upcoming" && <span className="text-text-tertiary">upcoming</span>}
+      </div>
+      <div className="mt-1 text-[11px] font-mono text-text-tertiary">
+        {c.quiz ? (
+          <span className={c.quiz.score / c.quiz.total >= 0.8 ? "text-accent" : "text-text-secondary"}>
+            quiz {c.quiz.score}/{c.quiz.total}
+          </span>
+        ) : c.reached ? (
+          <Link href="/chat" className="text-accent/80 underline underline-offset-2">
+            quiz me →
+          </Link>
+        ) : (
+          "no quiz yet"
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -344,7 +395,7 @@ function ReviewCard({ o, onGraded }: { o: ReadingOverview; onGraded: (xp: number
   };
 
   return (
-    <section className="mt-4 bg-surface-card border border-border-subtle rounded-[6px] p-4" data-testid="reading-review">
+    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-review">
       <div className="flex items-baseline justify-between">
         <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Review</h3>
         <span className="text-[11px] font-mono text-text-tertiary">
@@ -358,7 +409,7 @@ function ReviewCard({ o, onGraded }: { o: ReadingOverview; onGraded: (xp: number
             {cur.chapter != null ? `ch ${cur.chapter}` : ""} {cur.concept ? `· ${cur.concept}` : ""}
           </div>
           {!revealed ? (
-            <button onClick={() => setRevealed(true)} className="mt-3 px-3 py-1.5 text-[13px] rounded-[6px] border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-text-secondary">
+            <button onClick={() => setRevealed(true)} className="mt-3 px-3 py-1.5 text-[13px] rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-text-secondary">
               Say what this means, then reveal your note
             </button>
           ) : (
@@ -381,101 +432,10 @@ function ReviewCard({ o, onGraded }: { o: ReadingOverview; onGraded: (xp: number
 
 function GradeBtn({ label, sub, onClick, disabled, className }: { label: string; sub: string; onClick: () => void; disabled: boolean; className: string }) {
   return (
-    <button onClick={onClick} disabled={disabled} className={`flex-1 h-11 rounded-[6px] border bg-white/[0.02] disabled:opacity-40 ${className}`}>
+    <button onClick={onClick} disabled={disabled} className={`flex-1 h-11 rounded-control border bg-white/[0.02] disabled:opacity-40 ${className}`}>
       <div className="text-[13px] font-medium leading-none">{label}</div>
       <div className="text-[10px] font-mono opacity-70 mt-1">{sub}</div>
     </button>
-  );
-}
-
-function SessionForm({ o, onLogged, onError }: { o: ReadingOverview; onLogged: (xp: number, finished: boolean) => void; onError: (m: string) => void }) {
-  const suggested = Math.min(o.totalChapters || 9999, o.chaptersDone + 2);
-  const [through, setThrough] = useState<string>(String(suggested));
-  const [minutes, setMinutes] = useState<string>("");
-  const [medium, setMedium] = useState<Medium>("audio");
-  const [recall, setRecall] = useState("");
-  const [question, setQuestion] = useState("");
-  const [date, setDate] = useState(o.today);
-  const [saving, setSaving] = useState(false);
-  useEffect(() => setThrough(String(Math.min(o.totalChapters || 9999, o.chaptersDone + 2))), [o.chaptersDone, o.totalChapters]);
-  useEffect(() => setDate(o.today), [o.today]);
-
-  const recallOk = recall.trim().length >= 40;
-  const submit = async () => {
-    if (saving) return;
-    setSaving(true);
-    try {
-      const res = await fetch("/api/reading/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ book: o.book.slug, date, chapter_through: Number(through), minutes: minutes ? Number(minutes) : null, medium, recall, question }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "failed");
-      setRecall("");
-      setQuestion("");
-      setMinutes("");
-      onLogged(json.xp_gained ?? 0, !!json.finished);
-    } catch (e) {
-      onError(e instanceof Error ? e.message : "Couldn't log the session");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <section className="mt-4 bg-surface-card border border-border-subtle rounded-[6px] p-4" data-testid="reading-session-form">
-      <div className="flex items-baseline justify-between">
-        <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary flex items-center gap-1.5">
-          <BookMarked className="w-3.5 h-3.5" /> Log a session
-        </h3>
-        <span className="text-[11px] font-mono text-text-tertiary">10 XP / chapter · 20 XP for a recall note</span>
-      </div>
-      <div className="mt-3 grid grid-cols-3 gap-2">
-        <label className="block">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Through ch.</span>
-          <input type="number" inputMode="numeric" min={0} max={o.totalChapters || undefined} value={through} onChange={(e) => setThrough(e.target.value)} className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-2 text-[15px] font-mono text-text-primary" />
-        </label>
-        <label className="block">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Minutes</span>
-          <input type="number" inputMode="numeric" min={0} value={minutes} onChange={(e) => setMinutes(e.target.value)} placeholder="31" className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-2 text-[15px] font-mono text-text-primary" />
-        </label>
-        <label className="block">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Day</span>
-          <input type="date" value={date} max={o.today} onChange={(e) => setDate(e.target.value)} className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-2 text-[13px] font-mono text-text-primary" />
-        </label>
-      </div>
-      <div className="mt-2 flex gap-1.5">
-        {MEDIA.map((m) => (
-          <button key={m.key} onClick={() => setMedium(m.key)} aria-pressed={medium === m.key} className={`px-3 h-8 rounded-[6px] border text-[12px] inline-flex items-center gap-1 ${medium === m.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}>
-            {m.key === "audio" && <Headphones className="w-3.5 h-3.5" />}
-            {m.label}
-          </button>
-        ))}
-      </div>
-      <label className="block mt-3">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">
-          Recall, from memory <span className={recallOk ? "text-accent" : ""}>{recallOk ? "· +20 XP" : "· 3 sentences"}</span>
-        </span>
-        <textarea
-          value={recall}
-          onChange={(e) => setRecall(e.target.value)}
-          rows={4}
-          placeholder="What happened, what principle it showed, where it shows up in a BC implementation. Dictate it; don't open the book."
-          className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[14px] text-text-primary leading-relaxed"
-        />
-      </label>
-      <label className="block mt-2">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">One question for a plant manager</span>
-        <input value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Optional" className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[14px] text-text-primary" />
-      </label>
-      <div className="mt-3 flex items-center justify-between">
-        <span className="text-[11px] text-text-tertiary">Also marks the &ldquo;{o.book.habit_name ?? "reading"}&rdquo; habit for {fmtDate(date)}.</span>
-        <button onClick={submit} disabled={saving || through === ""} className="px-4 py-2 rounded-[6px] text-[14px] font-medium bg-accent text-black disabled:opacity-40">
-          {saving ? "Saving…" : "Log session"}
-        </button>
-      </div>
-    </section>
   );
 }
 
@@ -546,16 +506,16 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
   };
 
   return (
-    <section className="mt-4 bg-surface-card border border-border-subtle rounded-[6px] p-4" data-testid="reading-highlight-form">
+    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-highlight-form">
       <div className="flex items-center justify-between">
         <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary flex items-center gap-1.5">
           <Highlighter className="w-3.5 h-3.5" /> Highlight + comment
         </h3>
         <div className="flex gap-1 text-[11px] font-mono">
-          <button onClick={() => setMode("one")} className={`px-2 py-1 rounded-[4px] ${mode === "one" ? "bg-white/[0.08] text-text-primary" : "text-text-tertiary"}`}>
+          <button onClick={() => setMode("one")} className={`px-2 py-1 rounded-control ${mode === "one" ? "bg-white/[0.08] text-text-primary" : "text-text-tertiary"}`}>
             one
           </button>
-          <button onClick={() => setMode("import")} className={`px-2 py-1 rounded-[4px] ${mode === "import" ? "bg-white/[0.08] text-text-primary" : "text-text-tertiary"}`}>
+          <button onClick={() => setMode("import")} className={`px-2 py-1 rounded-control ${mode === "import" ? "bg-white/[0.08] text-text-primary" : "text-text-tertiary"}`}>
             paste Kindle export
           </button>
         </div>
@@ -563,11 +523,11 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
 
       {mode === "one" ? (
         <>
-          <textarea value={passage} onChange={(e) => setPassage(e.target.value)} rows={3} placeholder="The passage, as written." className="mt-3 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[14px] text-text-primary leading-relaxed" />
-          <textarea value={comment} onChange={(e) => setComment(e.target.value)} rows={2} placeholder="Your comment. Why it matters, or where it shows up in BC." className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[14px] text-text-primary italic" />
+          <textarea value={passage} onChange={(e) => setPassage(e.target.value)} rows={3} placeholder="The passage, as written." className="mt-3 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary leading-relaxed" />
+          <textarea value={comment} onChange={(e) => setComment(e.target.value)} rows={2} placeholder="Your comment. Why it matters, or where it shows up in BC." className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary italic" />
           <div className="mt-2 grid grid-cols-[88px_1fr] gap-2">
-            <input type="number" inputMode="numeric" min={0} value={chapter} onChange={(e) => setChapter(e.target.value)} placeholder="ch." className="bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-2 text-[13px] font-mono text-text-primary" />
-            <select value={concept} onChange={(e) => setConcept(e.target.value)} className="bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-2 text-[13px] text-text-primary">
+            <input type="number" inputMode="numeric" min={0} value={chapter} onChange={(e) => setChapter(e.target.value)} placeholder="ch." className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary" />
+            <select value={concept} onChange={(e) => setConcept(e.target.value)} className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary">
               <option value="">Concept (optional)</option>
               {CONCEPTS.map((c) => (
                 <option key={c} value={c}>
@@ -577,23 +537,30 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
               <option value="__custom">Other…</option>
             </select>
           </div>
-          {concept === "__custom" && <input value={customConcept} onChange={(e) => setCustomConcept(e.target.value)} placeholder="Concept name" className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[13px] text-text-primary" />}
+          {concept === "__custom" && <input value={customConcept} onChange={(e) => setCustomConcept(e.target.value)} placeholder="Concept name" className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[13px] text-text-primary" />}
           <div className="mt-2 flex flex-wrap gap-1.5">
             {SOURCES.map((s) => (
-              <button key={s.key} onClick={() => setSource(s.key)} aria-pressed={source === s.key} className={`px-2.5 h-7 rounded-[6px] border text-[11px] ${source === s.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}>
+              <button key={s.key} onClick={() => setSource(s.key)} aria-pressed={source === s.key} className={`px-2.5 h-7 rounded-control border text-[11px] ${source === s.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}>
                 {s.label}
               </button>
             ))}
-            <button onClick={addOne} disabled={saving || !passage.trim()} className="ml-auto px-4 h-8 rounded-[6px] text-[13px] font-medium bg-accent text-black disabled:opacity-40">
+            <button onClick={addOne} disabled={saving || !passage.trim()} className="ml-auto px-4 h-8 rounded-control text-[13px] font-medium bg-accent text-black disabled:opacity-40">
               {saving ? "Saving…" : "Add highlight"}
             </button>
           </div>
         </>
       ) : (
         <>
-          <p className="mt-2 text-[12px] text-text-tertiary">
-            Kindle app → notebook → share → <span className="text-text-secondary">Export notebook</span>, then paste the email body here. My Clippings.txt from a Kindle device works too, as does a plain list separated by blank lines (a line starting with &ldquo;&gt;&rdquo; under a passage becomes its comment). Re-pasting the same export is safe.
-          </p>
+          <div className="mt-2 flex items-center gap-2">
+            <p className="text-[12px] text-text-tertiary">Paste a Kindle notebook export, My Clippings.txt or a plain list.</p>
+            <InfoHint label="Importing highlights">
+              <p>
+                Kindle app → notebook → share → <span className="text-text-primary">Export notebook</span>, then paste the
+                email body. In a plain list, separate passages with blank lines; a line starting with &ldquo;&gt;&rdquo; under a
+                passage becomes its comment. Re-pasting the same export is safe.
+              </p>
+            </InfoHint>
+          </div>
           <textarea
             value={importText}
             onChange={(e) => {
@@ -602,7 +569,7 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
             }}
             rows={6}
             placeholder="Paste here"
-            className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-[6px] px-3 py-2 text-[12px] font-mono text-text-primary"
+            className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[12px] font-mono text-text-primary"
           />
           <div className="mt-2 flex items-center gap-2">
             {preview && (
@@ -610,10 +577,10 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
                 {preview.count} highlight{preview.count === 1 ? "" : "s"} · {preview.format}
               </span>
             )}
-            <button onClick={doPreview} disabled={saving || !importText.trim()} className="ml-auto px-3 h-8 rounded-[6px] text-[13px] border border-border-subtle text-text-secondary disabled:opacity-40">
+            <button onClick={doPreview} disabled={saving || !importText.trim()} className="ml-auto px-3 h-8 rounded-control text-[13px] border border-border-subtle text-text-secondary disabled:opacity-40">
               Preview
             </button>
-            <button onClick={doImport} disabled={saving || !preview || preview.count === 0} className="px-4 h-8 rounded-[6px] text-[13px] font-medium bg-accent text-black disabled:opacity-40">
+            <button onClick={doImport} disabled={saving || !preview || preview.count === 0} className="px-4 h-8 rounded-control text-[13px] font-medium bg-accent text-black disabled:opacity-40">
               Import
             </button>
           </div>
@@ -625,13 +592,13 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
 
 function Badges({ o }: { o: ReadingOverview }) {
   return (
-    <section className="mt-4">
+    <section>
       <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2 flex items-center gap-1.5">
         <Trophy className="w-3.5 h-3.5" /> Badges
       </h3>
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
         {o.badges.map((b) => (
-          <div key={b.key} title={b.description} className={`rounded-[6px] border px-3 py-2 ${b.earned ? "bg-accent/10 border-accent/50" : "bg-surface-card border-border-subtle opacity-60"}`}>
+          <div key={b.key} title={b.description} className={`rounded-control border px-3 py-2 ${b.earned ? "bg-accent/10 border-accent/50" : "bg-surface-card border-border-subtle opacity-60"}`}>
             <div className={`text-[12px] font-medium ${b.earned ? "text-accent" : "text-text-secondary"}`}>{b.label}</div>
             <div className="text-[10px] text-text-tertiary leading-snug mt-0.5">{b.description}</div>
           </div>
@@ -675,7 +642,7 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
   };
 
   return (
-    <section className="mt-6">
+    <section className="pt-2">
       <button onClick={() => setOpen((s) => !s)} className="flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">
         <ChevronDown className={`w-3.5 h-3.5 transition-transform ${open ? "" : "-rotate-90"}`} />
         Highlights by concept ({o.highlights.length})
@@ -689,17 +656,17 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
               <div className="text-[12px] text-text-secondary mb-1.5">
                 {concept} <span className="font-mono text-text-tertiary">· {items.length}</span>
               </div>
-              <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
+              <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
                 {items.map((h) => (
                   <div key={h.highlight_id} className="px-3 py-2.5">
                     <p className="text-[13px] text-text-primary leading-relaxed">&ldquo;{h.passage}&rdquo;</p>
                     {editing === h.highlight_id ? (
                       <div className="mt-1.5 flex gap-2">
-                        <input autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} className="flex-1 bg-white/[0.03] border border-border-subtle rounded-[6px] px-2 py-1 text-[13px] italic text-text-primary" />
-                        <button onClick={() => saveComment(h)} className="h-8 w-8 rounded-[6px] border border-accent/60 text-accent inline-flex items-center justify-center">
+                        <input autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} className="flex-1 bg-white/[0.03] border border-border-subtle rounded-control px-2 py-1 text-[13px] italic text-text-primary" />
+                        <button onClick={() => saveComment(h)} className="h-8 w-8 rounded-control border border-accent/60 text-accent inline-flex items-center justify-center">
                           <Check className="w-3.5 h-3.5" />
                         </button>
-                        <button onClick={() => setEditing(null)} className="h-8 w-8 rounded-[6px] border border-border-subtle text-text-tertiary inline-flex items-center justify-center">
+                        <button onClick={() => setEditing(null)} className="h-8 w-8 rounded-control border border-border-subtle text-text-tertiary inline-flex items-center justify-center">
                           <X className="w-3.5 h-3.5" />
                         </button>
                       </div>
@@ -719,7 +686,7 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
                       {h.location && <span>{h.location}</span>}
                       <span className="uppercase">{h.source}</span>
                       {h.next_review && <span>review {h.next_review <= o.today ? "due" : fmtDate(h.next_review)}</span>}
-                      <span className={h.notion_block_id ? "text-accent/70" : ""}>{h.notion_block_id ? "notion ✓" : "notion …"}</span>
+                      <span className={h.notion_block_id ? "text-up/70" : ""}>{h.notion_block_id ? "notion ✓" : "notion …"}</span>
                       <button onClick={() => archive(h)} className="ml-auto hover:text-[var(--color-down)]">
                         archive
                       </button>
@@ -737,7 +704,7 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
 function SessionsList({ o }: { o: ReadingOverview }) {
   const [open, setOpen] = useState(false);
   return (
-    <section className="mt-4">
+    <section>
       <button onClick={() => setOpen((s) => !s)} className="flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">
         <ChevronDown className={`w-3.5 h-3.5 transition-transform ${open ? "" : "-rotate-90"}`} />
         Session log ({o.sessions.length})
@@ -746,7 +713,7 @@ function SessionsList({ o }: { o: ReadingOverview }) {
         (o.sessions.length === 0 ? (
           <p className="text-[13px] text-text-tertiary">No sessions yet.</p>
         ) : (
-          <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
+          <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
             {o.sessions.map((s) => (
               <div key={s.session_id} className="px-3 py-2.5">
                 <div className="flex items-center gap-2 text-[12px] font-mono text-text-secondary">
@@ -759,7 +726,7 @@ function SessionsList({ o }: { o: ReadingOverview }) {
                       kindle · auto{s.highlight_count ? ` · ${s.highlight_count} hl` : ""}
                     </span>
                   )}
-                  <span className={`ml-auto text-[10px] ${s.notion_block_id ? "text-accent/70" : "text-text-tertiary"}`}>{s.notion_block_id ? "notion ✓" : ""}</span>
+                  <span className={`ml-auto text-[10px] ${s.notion_block_id ? "text-up/70" : "text-text-tertiary"}`}>{s.notion_block_id ? "notion ✓" : ""}</span>
                 </div>
                 {s.recall && <p className="mt-1 text-[13px] text-text-primary leading-relaxed">{s.recall}</p>}
                 {s.question && <p className="mt-1 text-[12px] text-text-secondary italic">Q: {s.question}</p>}

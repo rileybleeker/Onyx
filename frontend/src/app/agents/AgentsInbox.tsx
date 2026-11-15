@@ -19,6 +19,9 @@ import {
   type ThreadSummary,
 } from "@/lib/agents-api";
 import { agentInfo, Avatar, CardBody, CardButtons, listTime, parseUtc, settledLabel } from "./agent-ui";
+import { CACHE_KEYS, clientCache } from "@/lib/client-cache";
+import { sameJson } from "@/lib/format";
+import InfoHint from "@/components/InfoHint";
 
 // The Agents inbox, like the iPhone Messages list. "Unread" is everything that needs Riley: open cards (with their
 // buttons, so most can be answered right here) and agent messages not read yet, filterable by agent. "All" is one
@@ -134,10 +137,18 @@ function ConversationRow({ t, typing }: { t: ThreadSummary; typing: boolean }) {
   );
 }
 
+function cachedInbox(raw: unknown): InboxResponse | null {
+  const v = raw as InboxResponse | undefined;
+  return v && Array.isArray(v.items) && Array.isArray(v.threads) ? v : null;
+}
+
 export default function AgentsInbox({ initialView }: { initialView: InboxView | null }) {
   const router = useRouter();
-  const [data, setData] = useState<InboxResponse | null>(null);
-  const [view, setView] = useState<InboxView>(initialView ?? "unread");
+  // Start from the cached inbox (Today and the warm-up keep it fresh), then revalidate.
+  const [data, setData] = useState<InboxResponse | null>(() => cachedInbox(clientCache.peek(CACHE_KEYS.agentsInbox)));
+  // With nothing waiting in the cached copy, open on the conversations (the first live answer decides).
+  const autoAllRef = useRef(initialView === null && !!data && data.items.length === 0);
+  const [view, setView] = useState<InboxView>(initialView ?? (autoAllRef.current ? "all" : "unread"));
   const [filter, setFilter] = useState<string | null>(null);
   const [sent, setSent] = useState<Record<string, string>>({}); // card code -> what Riley tapped, until the server agrees
   const [error, setError] = useState<string | null>(null);
@@ -151,10 +162,16 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
   const [hiddenTick, setHiddenTick] = useState(0);
   const [cleared, setCleared] = useState<{ codes: string[]; text: string } | null>(null);
 
+  // The first load of a full page visit takes the inbox GET the page's HTML started (app/agents/EarlyInbox.tsx).
+  const firstLoadRef = useRef(true);
+
   const load = useCallback(async () => {
     try {
-      const res = await agentsApi.inbox();
-      setData(res);
+      const early = firstLoadRef.current;
+      firstLoadRef.current = false;
+      const res = await agentsApi.inbox({ early });
+      clientCache.put(CACHE_KEYS.agentsInbox, res);
+      setData((prev) => (prev && sameJson(prev, res) ? prev : res));
       setBadge(res.badge);
       setError(null);
       // Everything the phone notified about is listed here, so the phone's notification list need not keep it.
@@ -163,11 +180,23 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
       if (!viewChosenRef.current) {
         viewChosenRef.current = true;
         if (res.items.length === 0) setView("all");
+        else if (autoAllRef.current) setView("unread");
+        autoAllRef.current = false;
       }
     } catch (e) {
       if (e instanceof AuthError) setAuthExpired(true);
       else setError("Can't reach the agents right now. Retrying…");
     }
+  }, []);
+
+  // Reopening the app: show the inbox kept on this device until the live one answers.
+  useEffect(() => {
+    let alive = true;
+    void clientCache.read(CACHE_KEYS.agentsInbox).then((raw) => {
+      const cached = cachedInbox(raw);
+      if (alive && cached) setData((prev) => prev ?? cached);
+    });
+    return () => { alive = false; };
   }, []);
 
   useEffect(() => {
@@ -378,7 +407,7 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
 
           {data && view === "unread" && shown.length === 0 && (
             <div className="text-center mt-20 px-8">
-              <CheckCheck className="w-10 h-10 text-accent mx-auto" />
+              <CheckCheck className="w-10 h-10 text-up mx-auto" />
               <p className="mt-3 text-[17px] font-semibold text-text-primary">You&apos;re all caught up</p>
               <p className="mt-1 text-[14px] text-text-tertiary">Nothing from your agents needs you right now.</p>
               <button type="button" onClick={() => choose("all")} className="mt-5 text-[15px] text-accent font-medium">
@@ -408,9 +437,11 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
           )}
 
           {view === "unread" && items.some((i) => i.kind === "card") && (
-            <p className="text-center text-[12px] text-text-tertiary mt-4 px-6">
-              Clearing a card only tidies this list and your notifications. The agent still waits for an answer; you can reply in its conversation.
-            </p>
+            <div className="mt-4 flex justify-center px-6">
+              <InfoHint variant="disclosure" label="Clearing cards" summary="About clearing">
+                <p>Clearing a card only tidies this list and your notifications. The agent still waits for an answer; you can reply in its conversation.</p>
+              </InfoHint>
+            </div>
           )}
 
           {(error || authExpired) && (

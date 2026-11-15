@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import InfoHint from "./InfoHint";
 import {
   describeStatus,
   FOCUS_RULES,
@@ -142,14 +143,16 @@ export default function FocusUnlockSettings() {
   }
 
   return (
-    <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 space-y-4" data-testid="focus-unlock-settings">
+    <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-6 space-y-4" data-testid="focus-unlock-settings">
       <div>
-        <h2 className="text-base font-medium text-text-primary">Focus: unlock with habits</h2>
-        <p className="text-text-tertiary text-xs mt-1">
-          Pick the habits that unlock the blocked apps on the iPhone. A habit counts once it is answered Yes for the
-          day in Onyx. With nothing picked, the phone unlocks at its unlock time, as before. The unlock time, the
-          blocked apps and the LinkedIn exception stay on the phone.
-        </p>
+        <div className="flex items-center gap-2">
+          <h2 className="text-base font-medium text-text-primary">Focus: unlock with habits</h2>
+          <InfoHint label="Focus: unlock with habits">
+            <p>A habit counts once it is answered Yes for the day in Onyx. With nothing picked, the phone unlocks at its unlock time, as before. The unlock time, the blocked apps and the LinkedIn exception stay on the phone.</p>
+            <p>If the phone&apos;s check fails (offline, for example) it uses the unlock time alone. Before 6 AM Onyx still counts the previous day, so habits start counting at 6 AM.</p>
+          </InfoHint>
+        </div>
+        <p className="text-text-tertiary text-xs mt-1">Pick the habits that unlock the blocked apps on the iPhone.</p>
       </div>
 
       {load === "loading" && <p className="text-text-tertiary text-sm">Loading…</p>}
@@ -196,7 +199,7 @@ export default function FocusUnlockSettings() {
                 onChange={(e) => setFilter(e.target.value)}
                 placeholder="Filter"
                 aria-label="Filter habits"
-                className="w-32 bg-surface border border-border-subtle rounded-[4px] px-2 py-1 text-xs text-text-primary"
+                className="w-32 bg-surface border border-border-subtle rounded-control px-2 py-1 text-xs text-text-primary"
               />
             </div>
             {listError && (
@@ -204,7 +207,7 @@ export default function FocusUnlockSettings() {
                 Couldn&apos;t load the habit list from Notion. You can still untick a chosen habit or change the rule.
               </p>
             )}
-            <ul className="max-h-64 overflow-y-auto border border-border-subtle rounded-[4px] divide-y divide-border-subtle">
+            <ul className="max-h-64 overflow-y-auto border border-border-subtle rounded-control divide-y divide-border-subtle">
               {visible.length === 0 && <li className="px-3 py-2 text-text-tertiary text-xs">No habits match.</li>}
               {visible.map((o) => {
                 const checked = selected.includes(o.id);
@@ -238,7 +241,7 @@ export default function FocusUnlockSettings() {
               type="button"
               onClick={save}
               disabled={!dirty || saving}
-              className="block w-full text-center bg-accent hover:bg-accent/90 disabled:opacity-50 text-white font-medium py-2.5 rounded-[4px] text-sm transition-colors"
+              className="block w-full text-center bg-accent hover:bg-accent/90 disabled:opacity-50 text-on-accent font-medium py-2.5 rounded-full text-sm transition-colors"
             >
               {saving ? "Saving…" : dirty ? "Save" : "Saved"}
             </button>
@@ -268,10 +271,8 @@ export default function FocusUnlockSettings() {
           </>
         )}
         <p className="text-text-tertiary text-xs">
-          The phone only checks when the Onyx Screen Time app is opened (or its “Check Onyx Focus habits” shortcut
-          runs), so open the app after finishing the habits; under AND the block stays after the unlock time until
-          you do. If that check fails (offline, for example) the phone uses the unlock time alone. Before 6 AM Onyx
-          still counts the previous day, so habits start counting at 6 AM.
+          Open the Onyx Screen Time app after finishing the habits: the phone only checks then (or when its “Check
+          Onyx Focus habits” shortcut runs). Under AND the block stays after the unlock time until you do.
         </p>
       </div>
     </div>

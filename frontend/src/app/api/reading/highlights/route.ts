@@ -1,6 +1,6 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { addHighlight, getBook, type HighlightSource } from "@/lib/reading";
+import { HIGHLIGHT_COLS, addHighlight, getBook, type HighlightSource } from "@/lib/reading";
 import { mirrorHighlight } from "@/lib/reading-notion";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
@@ -11,7 +11,7 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
 export async function GET(req: NextRequest) {
   const book = await getBook(supabase, req.nextUrl.searchParams.get("book"));
   if (!book) return NextResponse.json({ error: "No active book" }, { status: 404 });
-  let q = supabase.from("book_highlights").select("*").eq("book_id", book.book_id).order("created_at", { ascending: false });
+  let q = supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("book_id", book.book_id).order("created_at", { ascending: false });
   if (!req.nextUrl.searchParams.get("include_archived")) q = q.eq("archived", false);
   const { data, error } = await q;
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });

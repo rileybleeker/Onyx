@@ -5,11 +5,11 @@ import type { DetectedLoad, DetectedSubscription, IrregularCharge } from '@/lib/
 import { RENEWAL_LIST_DAYS, estimateNote, renewalPhrase, renewalRows, type RenewalRow } from '@/lib/procurement-renewals';
 import { dismissalKey, usageLine, type AdviceLoad, type SubscriptionAdvice, type WasteFlag } from '@/lib/procurement-flags';
 
-// Subscriptions detected in the Rocket Money ledger, with renewal estimates and waste flags.
+// Subscriptions detected in the finance ledger, with renewal estimates and waste flags.
 // Read-only advice: every number comes from the server-rendered props. The only request this
 // component makes is the PATCH that remembers a dismissed flag; nothing here pays or cancels.
 const FLAGS_API = '/api/procurement/flags';
-const card = 'rounded-xl border border-border-subtle bg-surface-card p-5 space-y-4';
+const card = 'rounded-card shadow-card border border-border-subtle bg-surface-card p-5 space-y-4';
 const smallButton = 'rounded border border-border-subtle px-2 py-1 text-xs hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed';
 const cadenceWord = { weekly: 'week', monthly: 'month', quarterly: 'quarter', annual: 'year' } as const;
 const dayNum = (iso: string) => Math.round(Date.parse(`${iso}T00:00:00Z`) / 86400000);
@@ -88,9 +88,8 @@ export default function DetectedSubscriptions({ detected, advice }: { detected: 
   const dismissedFlags = flagged.filter(x => isDismissed(x.sub.id, x.flag));
   return <section className={card} aria-label="Detected subscriptions" data-testid="procurement-detected" data-state={detected.state}>
     <h2 className="text-xl font-semibold">Detected subscriptions</h2>
-    <p className="text-sm text-text-secondary">Recurring charges found in your Rocket Money ledger over the last 400 days, with an estimate of when each one renews and rule-based flags worth a look. Read-only: Onyx never cancels or pays anything.</p>
     {detected.state === 'error' && <p role="alert" className="text-red-400">Couldn&apos;t read the ledger (code {detected.code}), so no subscriptions are shown. This is a failed query, not an empty ledger.</p>}
-    {detected.state === 'empty' && <p>No ledger data yet. Subscriptions appear here after the daily Rocket Money import; nothing is invented in the meantime.</p>}
+    {detected.state === 'empty' && <p>No ledger data yet. Subscriptions appear here after the bank import; nothing is invented in the meantime.</p>}
     {ok && (ok.subs.length === 0 && irregular.length === 0
       ? <p>The ledger was read but no recurring charges were found in it.</p>
       : <div className="space-y-4">
@@ -100,13 +99,12 @@ export default function DetectedSubscriptions({ detected, advice }: { detected: 
           {soon.length === 0
             ? <p className="text-sm text-text-secondary">Nothing is expected to renew in the next {RENEWAL_LIST_DAYS} days.</p>
             : <ul className="mt-1 space-y-1">{soon.map(r => <SoonRow key={subKey(r)} row={r} />)}</ul>}
-          <p className="mt-1 text-xs text-text-secondary">Dates are estimates from past charge dates; a charge can post a day or two either side. Today shows a renewal 3 days ahead when the estimate is high or medium confidence.</p>
         </div>
         {advice && <div data-testid="procurement-flags" data-open={openCount}>
           <h3 className="font-semibold">Worth a look</h3>
           <p className="text-sm text-text-secondary">{openCount === 0
             ? 'No open flags on your active subscriptions.'
-            : `${openCount} open flag${openCount === 1 ? '' : 's'}, shown under the subscription ${openCount === 1 ? 'it belongs' : 'they belong'} to.`} Flags: a price increase (last charge 5% and $0.50 or more above the usual amount), a possible duplicate (two active subscriptions in one service category), and no recent use on your iPhone (under 10 minutes in 30 days of Screen Time, only where an app or site could be matched; otherwise usage is unknown).</p>
+            : `${openCount} open flag${openCount === 1 ? '' : 's'}, shown under the subscription ${openCount === 1 ? 'it belongs' : 'they belong'} to.`}</p>
           {!advice.usageAvailable && <p className="text-sm text-text-secondary">Screen Time data could not be read, so usage is unknown for every subscription and no &quot;no recent use&quot; flag is raised.</p>}
           {!advice.canDismiss && <p className="text-sm text-text-secondary">Dismissing flags is not available right now (the dismissals table could not be read), so every flag is shown.</p>}
           {flagError && <p role="alert" className="text-sm text-red-400">{flagError}</p>}
@@ -119,5 +117,6 @@ export default function DetectedSubscriptions({ detected, advice }: { detected: 
         {lapsed.length > 0 && <details><summary className="cursor-pointer text-sm">{lapsed.length} lapsed (no recent charge)</summary><ul className="space-y-3 mt-3">{lapsed.map(s => <DetectedRow key={subKey(s)} sub={s} today={today} actions={actions} />)}</ul></details>}
         {irregular.length > 0 && <details data-testid="procurement-irregular"><summary className="cursor-pointer text-sm">{irregular.length} repeating charge{irregular.length === 1 ? '' : 's'} without a regular schedule (no date estimated)</summary><ul className="space-y-3 mt-3">{irregular.map(i => <IrregularRow key={i.id} item={i} />)}</ul></details>}
       </div>)}
+    <details className="group text-[12px] text-text-tertiary"><summary className="inline-flex min-h-11 cursor-pointer list-none items-center gap-1.5 rounded-control pr-2 hover:text-text-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-accent [&::-webkit-details-marker]:hidden">About this<span aria-hidden className="text-text-disabled transition-transform group-open:rotate-90">›</span></summary><div className="mb-2 space-y-2 leading-relaxed text-text-secondary"><p>Recurring charges found in your finance ledger over the last 400 days, with an estimate of when each one renews. Read-only: Onyx never cancels or pays anything.</p><p>Dates are estimates from past charge dates; a charge can post a day or two either side. Today shows a renewal 3 days ahead when the estimate is high or medium confidence.</p><p>Flags: a price increase (last charge 5% and $0.50 or more above the usual amount), a possible duplicate (two active subscriptions in one service category), and no recent use on your iPhone (under 10 minutes in 30 days of Screen Time, only where an app or site could be matched; otherwise usage is unknown).</p></div></details>
   </section>;
 }

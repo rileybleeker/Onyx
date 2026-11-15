@@ -2,11 +2,25 @@
 
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { Search, CornerDownLeft } from "lucide-react";
+import { Search, CornerDownLeft, Settings2 } from "lucide-react";
 import { NAV_ITEMS, type NavItem } from "@/lib/nav";
+import { warmRoute } from "@/lib/warmup";
+import { createGoShortcuts, goHint } from "@/lib/go-shortcuts";
+import { useActiveRoute } from "./FeedContext";
+import { personalizeNow } from "./personalize/start";
 
 /** Fire this to open the palette from a button: window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE)) */
 export const OPEN_COMMAND_PALETTE = "onyx:open-command-palette";
+
+/** The palette's one action: Personalize the page on screen (listed when the page has personalizable parts). */
+const PERSONALIZE_HREF = "#personalize";
+const PERSONALIZE_ITEM: NavItem = {
+  href: PERSONALIZE_HREF,
+  label: "Personalize this page",
+  shortcut: "",
+  icon: Settings2,
+  keywords: ["customize", "layout", "arrange", "move", "hide", "columns", "parts", "edit"],
+};
 
 function matches(item: NavItem, q: string): boolean {
   if (!q) return true;
@@ -24,6 +38,8 @@ function matches(item: NavItem, q: string): boolean {
  */
 export default function CommandPalette() {
   const router = useRouter();
+  // The page in view (follows the continuous scroll): marked in the list.
+  const current = useActiveRoute();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
@@ -33,7 +49,12 @@ export default function CommandPalette() {
   // Ignore hover refreshes caused by rows scrolling under a stationary mouse.
   const lastPointer = useRef<string | null>(null);
 
-  const results = useMemo(() => NAV_ITEMS.filter((i) => matches(i, query)), [query]);
+  const results = useMemo(() => {
+    const pages = NAV_ITEMS.filter((i) => matches(i, query));
+    if (!matches(PERSONALIZE_ITEM, query)) return pages;
+    // Typed for: first. Otherwise last, so Enter on an empty palette still opens the first page.
+    return query.trim() ? [PERSONALIZE_ITEM, ...pages] : [...pages, PERSONALIZE_ITEM];
+  }, [query]);
 
   const close = useCallback(() => {
     pointerSelect.current = false;
@@ -46,6 +67,10 @@ export default function CommandPalette() {
     (item: NavItem | undefined) => {
       if (!item) return;
       close();
+      if (item.href === PERSONALIZE_HREF) {
+        personalizeNow();
+        return;
+      }
       router.push(item.href);
     },
     [close, router],
@@ -70,6 +95,21 @@ export default function CommandPalette() {
     };
   }, []);
 
+  // "Go to" shortcuts: G, then a page's key (lib/nav.ts), within 1.5 s. Client-side navigation onto the
+  // warmed page. Ignored while typing or with a modifier held, so Ctrl/Cmd + K stays the palette's.
+  useEffect(() => {
+    const keys = createGoShortcuts(NAV_ITEMS);
+    function onKey(e: KeyboardEvent) {
+      const href = keys.onKey(e);
+      if (!href) return;
+      e.preventDefault();
+      warmRoute(href);
+      router.push(href);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [router]);
+
   // Focus input + reset selection on open.
   useEffect(() => {
     if (open) {
@@ -80,6 +120,14 @@ export default function CommandPalette() {
       return () => clearTimeout(t);
     }
   }, [open]);
+
+  // Warm the highlighted page so Enter lands on loaded data (the warm-up usually has it already).
+  const highlighted = open ? results[active]?.href : undefined;
+  useEffect(() => {
+    if (!highlighted || highlighted.startsWith("#")) return;
+    const t = setTimeout(() => warmRoute(highlighted), 120);
+    return () => clearTimeout(t);
+  }, [highlighted]);
 
   // Keep the active index within the (changing) result set.
   useEffect(() => {
@@ -126,7 +174,7 @@ export default function CommandPalette() {
       aria-label="Command palette"
     >
       <div
-        className="w-full max-w-lg bg-surface-raised border border-border-default rounded-[6px] shadow-floating overflow-hidden"
+        className="w-full max-w-lg bg-surface-raised border border-border-default rounded-control shadow-floating overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-2.5 px-3.5 border-b border-border-subtle">
@@ -153,8 +201,9 @@ export default function CommandPalette() {
           {results.map((item, i) => {
             const Icon = item.icon;
             const isActive = i === active;
+            const isCurrent = item.href === current;
             return (
-              <li key={item.href} role="option" aria-selected={isActive}>
+              <li key={item.href} role="option" aria-selected={isActive} aria-current={isCurrent ? "page" : undefined}>
                 <button
                   type="button"
                   onMouseMove={(e) => {
@@ -171,9 +220,11 @@ export default function CommandPalette() {
                     isActive ? "bg-white/[0.06] text-text-primary" : "text-text-secondary"
                   }`}
                 >
-                  <Icon className="w-4 h-4 shrink-0 text-text-tertiary" />
+                  <Icon className={`w-4 h-4 shrink-0 ${isCurrent ? "text-accent" : "text-text-tertiary"}`} />
                   <span className="flex-1 truncate">{item.label}</span>
-                  <span className="text-[10px] font-mono text-text-tertiary/70">{item.href}</span>
+                  {isCurrent && <span className="text-[10px] font-mono uppercase tracking-[0.08em] text-accent">Here</span>}
+                  {item.shortcut && <kbd className="hidden lg:inline text-[10px] font-mono text-text-tertiary border border-border-subtle rounded px-1.5 py-0.5" aria-label={`Shortcut G then ${item.shortcut}`}>{goHint(item.shortcut)}</kbd>}
+                  <span className="text-[10px] font-mono text-text-tertiary/70">{item.href === PERSONALIZE_HREF ? "action" : item.href}</span>
                   {isActive && <CornerDownLeft className="w-3.5 h-3.5 text-text-tertiary" />}
                 </button>
               </li>

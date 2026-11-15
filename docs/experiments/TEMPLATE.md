@@ -4,6 +4,7 @@
 # seed_sha256 below, merge to master, then run the register step (AGENTS.md, "Experiments").
 # EXP-000 is the template id and can never be registered. Every date here is a placeholder.
 id: EXP-000
+kind: treatment                 # or aa: an A/A check, both arms the same instruction (see EXP-900.md)
 title: Phone off in the last hour before bed
 status: draft
 question: Does no phone use in the 60 min before sleep raise same-night HRV?
@@ -17,6 +18,7 @@ adherence:
     source: pds.phone_usage_daily.minutes_last_hour_before_sleep_est
     max: 5                      # minutes
     arm: A
+  # min_pct: 80                 # optional: the daily report heartbeat turns partial below this adherence %
 outcome:
   primary: whoop_hrv_rmssd of the sleep that closes the behavioral day (hrv_alignment.outcome_series h=1)
   alignment_version: same_night_v1

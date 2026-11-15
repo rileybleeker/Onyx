@@ -1,5 +1,6 @@
 import clsx from "clsx";
 import type { ReactNode } from "react";
+import InfoHint from "./InfoHint";
 
 type TickKey = "forecast" | "descriptive" | "causal" | "calibration";
 
@@ -17,6 +18,8 @@ interface SectionHeaderProps {
   tick?: TickKey | string;
   /** One-line description / kicker under the title. */
   kicker?: string;
+  /** Context behind an "i" button next to the title, closed by default (AGENTS.md "UI copy"). */
+  hint?: ReactNode;
   /** Right-aligned controls (RangeFilter, toggles, links). */
   actions?: ReactNode;
   /** Anchor id for the in-page TOC. */
@@ -34,6 +37,7 @@ export default function SectionHeader({
   title,
   tick,
   kicker,
+  hint,
   actions,
   id,
   className,
@@ -59,9 +63,12 @@ export default function SectionHeader({
           style={{ backgroundColor: tickColor }}
         />
         <div className="min-w-0">
-          <h2 className="text-[18px] font-semibold tracking-[-0.01em] text-text-primary leading-tight truncate">
-            {title}
-          </h2>
+          <div className="flex min-w-0 items-center gap-2">
+            <h2 className="text-[18px] font-semibold tracking-[-0.01em] text-text-primary leading-tight truncate">
+              {title}
+            </h2>
+            {hint && <InfoHint label={title}>{hint}</InfoHint>}
+          </div>
           {kicker && <p className="text-[12px] text-text-tertiary mt-0.5">{kicker}</p>}
         </div>
       </div>

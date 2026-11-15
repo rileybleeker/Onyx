@@ -6,8 +6,9 @@ the API and never checks out or executes PR code. GitHub branch protection (requ
 enforced for admins) stays the final gate: this script only does the clicking a human or agent used to do.
 
     train [--dry-run]            merge what is green, bring the next PR up to date, one in flight at a time
-    post-merge --sha SHA         wait for the Production deploy + master CI of SHA, print result=ok|fail|skipped
-    rollback --sha SHA --reason  halt the train, open a revert PR for SHA (needs the Actions PR-creation setting)
+    post-merge --sha SHA         wait for the Production deploy of SHA, print result=ok|fail|halt|skipped
+    rollback --sha SHA --reason  halt the train, open a revert PR for SHA (needs the Actions PR-creation setting);
+             [--halt-only]       with --halt-only (failure provenance unknown) halt and file the issue, no revert
     ensure-labels                create the hold / rollback / train-halt labels
 """
 from __future__ import annotations
@@ -24,7 +25,7 @@ REPO = os.environ.get("GITHUB_REPOSITORY", "rileybleeker/Onyx")
 BASE = "master"
 CI_WORKFLOW = "autonomous-ci.yml"
 POST_MERGE_WORKFLOW = "post-merge.yml"
-REQUIRED = ("offline-checks", "frontend-types")  # mirrors branch protection; GitHub still enforces it
+REQUIRED = ("offline-checks",)  # mirrors branch protection; the rest of the suite runs in scheduled-tests.yml
 OWNER_LOGINS = {"rileybleeker"}  # every agent PR is opened with the owner's identity
 BOT_LOGINS = {"github-actions[bot]", "app/github-actions", "github-actions"}
 HOLD, ROLLBACK, HALT = "hold", "rollback", "train-halt"
@@ -39,7 +40,8 @@ PROTECTED = [re.compile(p, re.I) for p in (
     r"^frontend/src/(app/)?(api/)?(auth|login)(/|$)", r"^sql/.*(rls|polic|owner)", r"(^|/)\.env",
     r"(^|/)CODEOWNERS$", r"^vercel\.json$", r"^frontend/vercel\.json$")]
 BAD = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
-MERGEABLE_STATES = {"CLEAN", "UNSTABLE", "HAS_HOOKS"}
+# BEHIND merges as it is (branch protection is not strict): no rebase-and-retest round per PR (Riley 2026-11-14).
+MERGEABLE_STATES = {"CLEAN", "UNSTABLE", "HAS_HOOKS", "BEHIND"}
 
 
 def ignored(name: str) -> bool:
@@ -50,8 +52,8 @@ def ignored(name: str) -> bool:
 # The train's own job shows up as a check on the PR head; waiting on it would wait on itself.
 OWN_CHECKS = {"train"}
 OWN_WORKFLOWS = {"Merge train", "Post-merge verify"}
-# Vercel's preview build status: it queues behind other builds on Vercel and repeats what frontend-types already
-# compiles, so a pending preview does not hold a merge. A failed preview still blocks.
+# Vercel's preview build status: it queues behind other builds on Vercel and repeats what the Production build
+# checks, so a pending preview does not hold a merge. A failed preview still blocks.
 PREVIEW_STATUS = "Vercel"
 
 
@@ -110,8 +112,6 @@ def judge(pr: dict, files: list[str] | None, runs: list[dict], statuses: list[di
     for s in statuses:
         if s["state"] in ("failure", "error") and not ignored(s["context"]):
             return "skip", f"status {s['context']} {s['state']}"
-    if pr["mergeStateStatus"] == "BEHIND":
-        return "update", "behind " + BASE
     pending = active_runs > 0 or any(r["status"] != "completed" for r in latest.values()) or \
         any(s["state"] == "pending" and not ignored(s["context"]) and s["context"] != PREVIEW_STATUS for s in statuses)
     if pending:
@@ -249,6 +249,29 @@ def merge(pr: dict, why: str) -> str | None:
     return None
 
 
+def rollback_target(body: str) -> str | None:
+    """Pure: the commit a rollback PR reverts, from the body rollback() writes ("Automatic rollback of `<sha>`")."""
+    m = re.search(r"Automatic rollback of `([0-9a-f]{40})`", body or "")
+    return m.group(1) if m else None
+
+
+def retire_fixed_rollback(pr: dict) -> bool:
+    """Close, unmerged, a rollback PR whose target's failed build a newer merge has since fixed and deployed, and
+    close its halt issue. -> True when closed. Merging it would take a working change off the site (#296)."""
+    body = gh("api", f"repos/{REPO}/pulls/{pr['number']}", "--jq", ".body // \"\"", check=False)
+    target = rollback_target(body)
+    fixer = already_fixed(target) if target else None
+    if not fixer:
+        return False
+    msg = (f"Not merged: the failed build of `{target[:7]}` is already fixed by `{fixer[:7]}`, which contains it and "
+           f"deployed to Production successfully. Reverting now would take a working change off the site.")
+    gh("pr", "close", str(pr["number"]), "-R", REPO, "--comment", msg, "--delete-branch", check=False)
+    for n in re.findall(r"Closes #(\d+)", body):
+        gh("issue", "close", n, "-R", REPO, "--comment", f"{msg} Train resumes.", check=False)
+    note(f"CLOSED stale rollback #{pr['number']}: {target[:7]} already fixed by {fixer[:7]}")
+    return True
+
+
 def update(pr: dict) -> None:
     gh("api", "-X", "PUT", f"repos/{REPO}/pulls/{pr['number']}/update-branch", "-f",
        f"expected_head_sha={pr['headRefOid']}")
@@ -275,6 +298,8 @@ def run_train(dry: bool) -> int:
         note(f"plan: {move}" + (f" #{pr['number']} ({why})" if pr else ""))
         if dry or move in ("idle", "wait"):
             return 0
+        if move == "merge" and is_rollback(pr) and retire_fixed_rollback(pr):
+            continue
         if move == "merge":
             sha = merge(pr, why)
             if not sha:
@@ -321,51 +346,8 @@ def wait_production(sha: str, timeout: int = 900) -> tuple[str, str]:
     return "fail", f"no successful Production deployment within {timeout // 60} min"
 
 
-def master_ci_verdict(runs: list[dict], master_moved: bool) -> tuple[str, str] | None:
-    """Pure: verdict on the merge commit's Autonomous CI runs, or None while still waiting.
-
-    Autonomous CI cancels an in-progress master run when the next merge lands (concurrency per ref). A run that was
-    only cancelled because master moved on is superseded, not failed: the newer merge's own verification covers it.
-    """
-    done = [r for r in runs if r["status"] == "completed"]
-    if done and any(r["conclusion"] == "success" for r in done):
-        return "ok", "master CI green"
-    if done and all(r["conclusion"] in BAD for r in done) and len(done) == len(runs):
-        if master_moved and all(r["conclusion"] == "cancelled" for r in done):
-            return "skipped", "master CI cancelled because master moved on; that merge's own verification covers this one"
-        return "fail", "master CI " + done[0]["conclusion"]
-    return None
-
-
-def wait_master_ci(sha: str, timeout: int = 600) -> tuple[str, str]:
-    """Autonomous CI on the merge commit. A token-made merge may start no push run, so dispatch one if none exists."""
-    def runs():
-        return api_items(f"repos/{REPO}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={sha}&per_page=10",
-                         ".workflow_runs[]|{id,status,conclusion}")
-    time.sleep(45)
-    if not runs():
-        gh("workflow", "run", CI_WORKFLOW, "-R", REPO, "--ref", BASE)
-    end = time.time() + timeout
-    while time.time() < end:
-        current = runs()
-        verdict = master_ci_verdict(current, master_sha() != sha)
-        if verdict:
-            return verdict
-        time.sleep(20)
-    return ci_timeout_verdict(timeout)
-
-
-def ci_timeout_verdict(timeout: int) -> tuple[str, str]:
-    """Master CI still queued or running when the wait ends is not a failure. Back-to-back merges queue the runs
-    (2026-11-12: #74 and #83 were reverted for exactly this, with green PR checks and a green deploy). The same checks
-    passed on the PR head before the merge, so the production smoke test that runs next is the gate; a real CI failure
-    is still caught by master_ci_verdict whenever it finishes in time."""
-    return "ok", "master CI still queued or running after %d min (PR checks were green); production smoke decides" % (
-        timeout // 60)
-
-
 def moved_on_verdict(result: str, why: str, sha: str, head: str) -> tuple[str, str]:
-    """Pure: an `ok` verdict turns `skipped` when master moved on while we waited for the deploy and CI.
+    """Pure: an `ok` verdict turns `skipped` when master moved on while we waited for the deploy.
 
     The smoke test that runs next checks out THIS commit's tests but loads PRODUCTION, which by then serves the newer
     merge. Old tests against newer pages fail on copy the newer merge changed (2026-11-14: #113's run failed on
@@ -374,6 +356,105 @@ def moved_on_verdict(result: str, why: str, sha: str, head: str) -> tuple[str, s
     if result == "ok" and head != sha:
         return "skipped", f"master moved on to {head[:7]} while this merge was verified; that merge's own verification covers this one"
     return result, why
+
+
+def build_state(states: list[str]) -> str:
+    """Pure: what a commit's Production deployment statuses prove about its build.
+
+    good    = a deployment succeeded.
+    failed  = every deployment ended `failure`, which is what Vercel posts when the build fails
+              ("Deployment has failed").
+    unknown = anything else: no deployment at all (Vercel skips a commit superseded by a newer push, e.g. #187),
+              `inactive` (Vercel posts it for a deployment canceled from its dashboard, so it never built), still
+              pending, `error` (an infrastructure error, not evidence against the source) or a mix."""
+    if "success" in states:
+        return "good"
+    if states and all(s == "failure" for s in states):
+        return "failed"
+    return "unknown"
+
+
+def culprit_of(chain: list[tuple[str, list[str]]]) -> str | None:
+    """Pure: chain = [(sha, production states)] from the failing merge back through its parents. Returns the commit
+    to revert, or None when the evidence does not name one (Codex review 2026-11-14).
+
+    The culprit is the oldest commit of the unbroken run of failed builds, and only when that run ends at a good
+    build: reverting a later commit would drop a good change and leave the build broken. A commit with no build
+    result (skipped, canceled, errored, pending) inside the run, a failing merge that itself has no failed build (a
+    deploy timeout), or no good build within the commits read means the breaking commit is not known: if A broke the
+    build, B was never built and C failed, the walk cannot tell A from B, and stopping at B would revert C, an
+    unrelated change. Then nothing is reverted and the train halts for a diagnosis."""
+    if not chain or build_state(chain[0][1]) != "failed":
+        return None
+    culprit = chain[0][0]
+    for commit, states in chain[1:]:
+        state = build_state(states)
+        if state == "good":
+            return culprit
+        if state == "unknown":
+            return None
+        culprit = commit
+    return None
+
+
+def fixed_later(own_states: list[str], later: list[tuple[str, list[str]]]) -> str | None:
+    """Pure: a failed build is already fixed when a newer master commit that contains it built successfully.
+
+    later = [(sha, production states)] from master head back through first parents, down to (not including) the
+    commit itself, so every entry contains it. Returns the newest good commit, or None. Only a build failure can be
+    fixed this way: a smoke failure on a commit whose own build succeeded is not disproved by a later good build.
+    (2026-11-15: #294's build failed, #297 fixed it and deployed, and the rollback of #294 still merged as #296,
+    taking a working /log off the site.)"""
+    if build_state(own_states) != "failed":
+        return None
+    return next((c for c, s in later if build_state(s) == "good"), None)
+
+
+def production_states(sha: str) -> list[str]:
+    states = []
+    for d in api_items(f"repos/{REPO}/deployments?sha={sha}&environment=Production&per_page=5", ".[]|{id}"):
+        st = api_items(f"repos/{REPO}/deployments/{d['id']}/statuses?per_page=1", ".[]|{state}")
+        states.append(st[0]["state"] if st else "pending")
+    return states
+
+
+def later_chain(sha: str, depth: int = 20) -> list[tuple[str, list[str]]]:
+    """[(commit, states)] from master head back through first parents down to sha (excluded). Empty when sha is
+    master head or is not on that path within depth (then nothing is known to contain it)."""
+    chain, cur = [], master_sha()
+    for _ in range(depth):
+        if cur == sha:
+            return chain
+        chain.append((cur, production_states(cur)))
+        cur = gh("api", f"repos/{REPO}/commits/{cur}", "--jq", ".parents[0].sha", check=False).strip()
+        if not cur:
+            break
+    return []
+
+
+def already_fixed(sha: str) -> str | None:
+    """I/O wrapper of fixed_later: the newer master commit whose good build shows sha's failed build is fixed."""
+    return fixed_later(production_states(sha), later_chain(sha))
+
+
+def describe_chain(chain: list[tuple[str, list[str]]]) -> str:
+    """Pure: one line of evidence for the halt issue, newest first, e.g. `c3cf45d failure, 769fe65 no deployment`."""
+    return ", ".join(f"{c[:7]} {'/'.join(s) if s else 'no deployment'}" for c, s in chain)
+
+
+def build_chain(sha: str, depth: int = 8) -> list[tuple[str, list[str]]]:
+    """[(sha, states)] from sha back through first parents, stopping after the first good build."""
+    chain, cur = [], sha
+    for _ in range(depth):
+        states = production_states(cur)
+        chain.append((cur, states))
+        if build_state(states) == "good":
+            break
+        parent = gh("api", f"repos/{REPO}/commits/{cur}", "--jq", ".parents[0].sha", check=False).strip()
+        if not parent:
+            break
+        cur = parent
+    return chain
 
 
 def post_merge(sha: str, drill: bool) -> int:
@@ -391,20 +472,47 @@ def post_merge(sha: str, drill: bool) -> int:
     if head != sha:
         emit("skipped", f"master moved on to {head[:7]}; that merge's own verification covers this one")
         return 0
-    result, why = wait_production(sha)
-    if result == "ok":
-        result, why2 = wait_master_ci(sha)
-        why = why + "; " + why2
+    result, why = wait_production(sha)  # deploys do not wait for tests (scheduled-tests.yml runs them)
+    if result == "fail":
+        chain = build_chain(sha)
+        culprit = culprit_of(chain)
+        if culprit is None:
+            result = "halt"
+            why += (f"; the commit that broke it is not known ({describe_chain(chain)}), so nothing is reverted: "
+                    "the train halts until someone reads the deployment logs")
+        else:
+            if culprit != sha:
+                why += f"; the build was already broken by {culprit[:7]}, which is reverted instead"
+                sha = culprit
+            fixer = already_fixed(sha)
+            if fixer:
+                result = "skipped"
+                why = (f"the build of {sha[:7]} failed, but {fixer[:7]}, which contains it, deployed to Production "
+                       f"successfully: already fixed, nothing to revert")
     result, why = moved_on_verdict(result, why, sha, master_sha())
     emit(result, why)
     return 0
 
 
 # ---------- rollback ----------
-def rollback(sha: str, reason: str) -> int:
+def rollback(sha: str, reason: str, halt_only: bool = False) -> int:
     ensure_labels()
     short = sha[:7]
     subject = subprocess.run(["git", "log", "-1", "--format=%s", sha], capture_output=True, text=True).stdout.strip()
+    if halt_only:  # failure provenance unknown: halt and diagnose, never revert a change that is not proven bad
+        gh("issue", "create", "-R", REPO, "--title", f"Release {short} failed verification: cause unknown, train halted",
+           "--label", HALT, "--body",
+           f"Post-merge verification failed for `{sha}` ({subject}).\n\n**Reason:** {reason}\n\n"
+           f"No automatic revert: the deployment history does not show which commit broke the build (a merge "
+           f"without a finished build, a canceled or errored deployment, or a deploy that never finished). Open the "
+           f"failed deployment's Vercel log, then either revert the commit that broke it or, for a transient Vercel "
+           f"error, redeploy. Close this issue to resume the merge train.", check=False)
+        note(f"HALTED train without a revert for {short}: failure provenance unknown")
+        return 1
+    fixer = already_fixed(sha)  # the verify job can finish before a fix lands; this job runs later
+    if fixer:
+        note(f"no rollback for {short}: its failed build is fixed by {fixer[:7]}, which deployed successfully")
+        return 0
     if halted() or subject.startswith("Revert"):  # never revert a revert or stack rollbacks: a person decides
         gh("issue", "create", "-R", REPO, "--title", f"Release {short} failed verification while halted or after a revert",
            "--label", HALT, "--body", f"`{sha}` ({subject}) failed verification: {reason}\n\nNo automatic revert was "
@@ -469,6 +577,7 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("rollback")
     r.add_argument("--sha", required=True)
     r.add_argument("--reason", required=True)
+    r.add_argument("--halt-only", action="store_true", help="halt the train and file the issue, no revert")
     sub.add_parser("ensure-labels")
     a = ap.parse_args(argv)
     if a.cmd == "train":
@@ -476,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "post-merge":
         return post_merge(a.sha, a.drill)
     if a.cmd == "rollback":
-        return rollback(a.sha, a.reason)
+        return rollback(a.sha, a.reason, a.halt_only)
     ensure_labels()
     return 0
 

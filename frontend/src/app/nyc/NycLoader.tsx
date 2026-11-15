@@ -13,6 +13,11 @@ const NycClient = dynamic(() => import("./NycClient"), {
   ),
 });
 
+// Speed (2026-11-15): start loading the page's code as soon as this module runs (with the page's first scripts)
+// instead of after hydration, when the component above first renders; next/dynamic then finds the chunk on its
+// way (one request, webpack shares it). A cold or freshly deployed load waited ~0.8 s for this request.
+if (typeof window !== "undefined") void import("./NycClient").catch(() => {});
+
 export default function NycLoader({ initial }: { initial: NycLead[] | null }) {
   return <NycClient initial={initial} />;
 }

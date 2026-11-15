@@ -128,7 +128,10 @@ test("the route never writes a pre-fill: habit_journal is only written in POST",
   assert.equal(/\.(upsert|insert|update|delete)\(/.test(get), false);
   const suggestions = route.slice(route.indexOf("async function suggestionsFor"), route.indexOf("export async function GET"));
   assert.equal(/\.(upsert|insert|update|delete)\(/.test(suggestions), false);
-  assert.match(route, /groupFor\(h\.name, ch, h\.frequency\)/);
+  // loadItems moved to lib/checkin-server.ts (shared with the voice route)
+  const server = fs.readFileSync(path.join(SRC, "lib/checkin-server.ts"), "utf8");
+  assert.match(server, /groupFor\(h\.name, ch, h\.frequency\)/);
+  assert.match(route, /loadItems\(\)/);
 });
 
 // ─── sleep is asked for finished nights only ─────────────────────────────────
@@ -300,9 +303,10 @@ test("the screen wires the save plan: day under its date with the card settle, n
   const dayBranch = save.slice(save.indexOf("if (Object.keys(dayPatch).length)"), save.indexOf("for (const n of nightPatches)"));
   assert.match(dayBranch, /agentsApi\.checkinDone\(data\.date\)/); // only when the day was sent
   assert.equal((save.match(/checkinDone/g) || []).length, 1);
-  // a refused stale page drops its unsaved taps before redrawing
+  // A refused stale page preserves unfinished drafts for dated review before redrawing.
   const stale = save.slice(save.indexOf("e instanceof StaleDayError"));
-  assert.ok(stale.indexOf("settleDraft(dayDraftKey(data.date), dayPatch)") < stale.indexOf("await load(requested)"));
+  assert.ok(stale.indexOf("drafts.holdAll()") < stale.indexOf("await load(null, true)"));
+  assert.doesNotMatch(stale, /drafts\.(settle|discard)\(/);
 });
 
 test("other write paths keep sleep answers off today", () => {
@@ -314,8 +318,16 @@ test("other write paths keep sleep answers off today", () => {
   assert.match(complete, /sleepDateError\(habit, completionDate, today, answer\)/);
   const checkin = fs.readFileSync(path.join(SRC, "app/api/habits/checkin/route.ts"), "utf8");
   assert.match(checkin, /sleepDateError\(name, date, today, raw\)/);
+  // /habits has no "Today's Habits" checklist any more (one place to enter data: Log's check-in); its heatmap
+  // corrections go through /api/habits/complete, whose sleepDateError guard is asserted above.
   const habits = fs.readFileSync(path.join(SRC, "app/habits/HabitsClient.tsx"), "utf8");
-  assert.match(habits, /habits\.filter\(\(h\) => !SLEEP_QUESTIONS\.has\(h\.name\)\)\.map/);
+  assert.equal(/today-checklist|function HabitRow/.test(habits), false);
+  assert.match(habits, /<LogLink part="check-in">/);
+  // The hourly Notion sync never turns a "Last Completed" date into a sleep answer: a date cannot say which night.
+  const sync = fs.readFileSync(path.join(SRC, "app/api/habits/sync/route.ts"), "utf8");
+  assert.match(sync, /if \(lastCompleted && !SLEEP_QUESTIONS\.has\(name\)\) \{/);
+  assert.equal((sync.match(/\.from\("habit_journal"\)\s*\.upsert\(/g) || []).length, 1);
+  assert.ok(sync.indexOf("!SLEEP_QUESTIONS.has(name)") < sync.search(/\.from\("habit_journal"\)\s*\.upsert\(/));
 });
 
 test("the route builds nights from sleepNights and keeps sleep answers out of the day", () => {

@@ -1,10 +1,17 @@
 "use client";
 
+import { useInFeed, usePageHeadingTestId } from "@/components/FeedContext";
 import { useEffect, useState, useCallback, useRef, type RefObject } from "react";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
+import PersonalTable, { type TableColumn } from "@/components/personalize/PersonalTable";
 import { sameJson } from "@/lib/format";
+import { clientCache } from "@/lib/client-cache";
+import { earlyFetchScript, earlyOr } from "@/lib/early-fetch";
+import SpotifyReconnect from "@/components/SpotifyReconnect";
+import { needsSpotifyReconnect } from "@/lib/spotify-reconnect";
 import type { DriftAlert, SourceStatus, StatusResponse, TzGapRow } from "@/app/api/status/route";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -18,12 +25,14 @@ const SOURCE_BADGE: Record<string, string> = {
   cronometer: "CRON",
   hrv_analysis: "ML",
   hrv_retrain: "ML",
+  experiments: "N-OF-1",
   spotify: "SPOTIFY",
   reccobeats: "RECCOBEATS",
   musicbrainz: "MUSICBRAINZ",
   supplements: "DSLD",
   reading: "BOOK",
   procurement: "SUBS",
+  photo_meals: "PHOTO",
   kindle: "KINDLE",
   amazon_orders: "AMAZON",
   screen_usage: "IPHONE",
@@ -32,11 +41,19 @@ const SOURCE_BADGE: Record<string, string> = {
   delivery: "UBER EATS",
   online_orders: "GMAIL",
   air_quality: "OPEN-METEO",
+  weather: "OPEN-METEO",
+  pollen: "ATL ALLERGY",
   supplement_reminders: "AGENTS",
+  renewal_reminders: "AGENTS",
+  cash_forecast: "FORECAST",
   urgent_email: "GMAIL",
+  google_calendar: "GOOGLE",
+  care_calendar: "GOOGLE",
   ubereats: "UBER EATS",
+  pc_activity: "PC",
+  ai_usage: "PC",
   nyc_scout: "AGENT",
-  rocket_money: "ROCKET MONEY",
+  simplefin: "SIMPLEFIN",
   matrix_mat: "DB",
   perf_mats: "DB",
 };
@@ -50,13 +67,15 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   cronometer: "text-text-tertiary",
   hrv_analysis: "text-blue-400",
   hrv_retrain: "text-blue-400/70",
+  experiments: "text-violet-300",
   spotify: "text-source-spotify",
   reccobeats: "text-source-spotify/70",
   musicbrainz: "text-source-spotify/70",
   supplements: "text-amber-400",
   reading: "text-amber-300",
   procurement: "text-amber-300",
-  kindle: "text-amber-300/70",
+  photo_meals: "text-emerald-300",
+  kindle:"text-amber-300/70",
   amazon_orders: "text-orange-300",
   screen_usage: "text-fuchsia-400/70",
   tanita: "text-amber-500",
@@ -64,11 +83,19 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   delivery: "text-emerald-400",
   online_orders: "text-orange-300",
   air_quality: "text-teal-400",
+  weather: "text-sky-400",
+  pollen: "text-yellow-300",
   supplement_reminders: "text-amber-400/70",
+  renewal_reminders: "text-amber-300/70",
+  cash_forecast: "text-amber-300/70",
   urgent_email: "text-rose-400",
+  google_calendar: "text-blue-300",
+  care_calendar: "text-blue-300/70",
   ubereats: "text-emerald-400/70",
+  pc_activity: "text-slate-300",
+  ai_usage: "text-violet-300",
   nyc_scout: "text-sky-400",
-  rocket_money: "text-lime-400",
+  simplefin: "text-lime-400",
   matrix_mat: "text-cyan-400/70",
   perf_mats: "text-cyan-400/70",
 };
@@ -113,12 +140,14 @@ const SOURCE_ORDER = [
   "cronometer",
   "hrv_analysis",
   "hrv_retrain",
+  "experiments",
   "spotify",
   "reccobeats",
   "musicbrainz",
   "supplements",
   "reading",
   "procurement",
+  "photo_meals",
   "kindle",
   "amazon_orders",
   "screen_usage",
@@ -127,11 +156,19 @@ const SOURCE_ORDER = [
   "delivery",
   "online_orders",
   "air_quality",
+  "weather",
+  "pollen",
   "supplement_reminders",
+  "renewal_reminders",
+  "cash_forecast",
   "urgent_email",
+  "google_calendar",
+  "care_calendar",
   "ubereats",
+  "pc_activity",
+  "ai_usage",
   "nyc_scout",
-  "rocket_money",
+  "simplefin",
   "matrix_mat",
   "perf_mats",
 ];
@@ -159,6 +196,26 @@ function formatSyncTime(isoStr: string | null): string {
   return d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
 }
 
+const HISTORY_TH = "text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4";
+const HISTORY_TH_RIGHT = "text-right text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4";
+
+/** Sync History columns (personalizable: Personalize -> Columns, or the menu on each header). */
+const HISTORY_COLUMNS: TableColumn[] = [
+  { id: "source", label: "Source", locked: true, th: HISTORY_TH, td: "py-2 pr-4 font-mono font-medium text-text-secondary" },
+  { id: "type", label: "Type", th: HISTORY_TH, td: "py-2 pr-4 text-text-tertiary" },
+  { id: "time", label: "Time", th: HISTORY_TH, td: "py-2 pr-4 text-text-tertiary whitespace-nowrap" },
+  { id: "status", label: "Status", th: HISTORY_TH, td: "py-2 pr-4" },
+  { id: "records", label: "Records", th: HISTORY_TH_RIGHT, td: "py-2 pr-4 text-right font-mono text-text-secondary tabular-nums" },
+  { id: "duration", label: "Duration", th: HISTORY_TH_RIGHT, td: "py-2 pr-4 text-right font-mono text-text-tertiary tabular-nums" },
+];
+
+/**
+ * The source-card section's grid: the dense tile columns (1 / 2 / 3 / 5), one card per cell. Widths chosen in
+ * Personalize still apply here: Full takes the row, Half two cells from 640 px; Third and Quarter stay one cell.
+ */
+const SOURCE_TILES_GRID =
+  "pz-grid pz-tiles [&>[data-w=full]]:col-span-full! sm:[&>[data-w=half]]:col-span-2!";
+
 function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus }) {
   const badge = SOURCE_BADGE[sourceKey] ?? sourceKey.toUpperCase();
   const badgeColor = SOURCE_BADGE_COLOR[sourceKey] ?? "text-text-tertiary";
@@ -167,7 +224,7 @@ function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus
   const statusLabel = STATUS_LABEL[info.status];
 
   return (
-    <div className="bg-surface-card border border-border-subtle rounded-[6px] p-5 shadow-card transition-colors hover:border-border-hover">
+    <div className="bg-surface-card border border-border-subtle rounded-card p-5 shadow-card transition-colors hover:border-border-hover">
       {/* Header */}
       <div className="flex items-start justify-between mb-4">
         <div>
@@ -206,9 +263,15 @@ function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus
 
       {/* Error box */}
       {info.errorMessage && (
-        <div className="mt-3 px-3 py-2 bg-red-500/10 border border-red-500/20 rounded-[4px]">
+        <div className="mt-3 px-3 py-2 bg-red-500/10 border border-red-500/20 rounded-control">
           <p className="text-[11px] text-red-400 font-mono break-all">{info.errorMessage}</p>
         </div>
+      )}
+
+      {/* Spotify: the refresh token dies 180 days after authorization. Offer the reconnect when the
+          sync error says so, and from day 165 (reconnectBy) before it happens. */}
+      {sourceKey === "spotify" && (needsSpotifyReconnect(info.errorMessage) || info.reconnectBy) && (
+        <SpotifyReconnect reconnectBy={info.reconnectBy} />
       )}
     </div>
   );
@@ -249,6 +312,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   musicbrainz: "MusicBrainz",
   notion_journal: "Notion Journal",
   hrv_analysis: "HRV Retrain",
+  experiments: "Experiments",
   tanita: "Tanita",
   kindle: "Kindle",
   amazon: "Amazon Orders",
@@ -257,16 +321,25 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   delivery: "Delivery",
   online_orders: "Online Orders",
   air_quality: "Air Quality",
+  weather: "Weather",
+  pollen: "Pollen",
   supplement_reminders: "Supplement Reminders",
+  procurement_renewals: "Renewal Reminders",
+  finance_forecast: "Cash Forecast",
   urgent_email: "Urgent Email",
+  google_calendar: "Google Calendar",
   ubereats: "Uber Eats Items",
+  pc_activity: "PC Activity",
+  ai_usage: "AI Tool Usage",
   rocketmoney: "Rocket Money",
+  simplefin: "SimpleFIN",
   matrix_mat: "Matrix Matview",
   perf_mats: "Perf Matviews",
 };
 
 const HISTORY_TYPE_LABELS: Record<string, string> = {
   full_sync: "Full Sync",
+  cycles_backfill: "Cycles Backfill",
   trends: "Trends",
   temp_selfheal: "Temp Self-Heal",
   journal_email: "Journal Email",
@@ -278,16 +351,22 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   artist_tags: "Artist Tags",
   entries: "Entries",
   usage: "Usage",
+  sessions: "Sessions",
   retrain: "Retrain",
+  report: "Trial Report",
+  admin: "Trial Admin",
   weight: "Weight",
   highlights: "Highlights",
   items: "Order Items",
   email: "Email Parse",
   labels: "Labels",
+  events: "Events",
   refresh: "Refresh",
   prompt: "Reminder Poll",
   transactions: "Transactions",
   balances: "Balances",
+  keepalive: "Keep-alive",
+  snapshot: "Snapshot",
 };
 
 // "refreshed Xm ago" label, isolated from the page render cycle (perf round
@@ -309,16 +388,43 @@ function RefreshedLabel({ refreshedAtRef }: { refreshedAtRef: RefObject<Date | n
   );
 }
 
+const STATUS_URL = "/api/status";
+// The page's one read starts with the HTML instead of after the JavaScript and hydration (lib/early-fetch.ts; speed
+// budget, 2026-11-15: the cold first visit took 1022 ms in perf-timing run 43676849680). Same request as load()'s
+// own fetch (the browser's default cache mode: /api/status is edge-cached for 30 s). GET only.
+const STATUS_EARLY = earlyFetchScript(STATUS_URL, false, { noStore: false });
+
 export default function StatusPage() {
-  const [data, setData] = useState<StatusResponse | null>(null);
-  const [loading, setLoading] = useState(true);
+  // The script is in the static HTML of the routed page only. React never runs a script it inserts itself, so an
+  // in-app navigation leaves an inert copy and the scroll's copy (FeedSection) renders none.
+  const inFeed = useInFeed();
+  return (
+    <>
+      {!inFeed && <script dangerouslySetInnerHTML={{ __html: STATUS_EARLY }} />}
+      <StatusView early={!inFeed} />
+    </>
+  );
+}
+
+function StatusView({ early }: { early: boolean }) {
+  // "feed-page-heading" when this page is shown inside the continuous scroll (components/ContinuousScroll.tsx).
+  const headingTestId = usePageHeadingTestId();
+  // Start from the cached copy (instant revisit / reopen), then revalidate.
+  const [data, setData] = useState<StatusResponse | null>(() => clientCache.peek<StatusResponse>(STATUS_URL) ?? null);
+  const [loading, setLoading] = useState(() => data === null);
   const refreshedAtRef = useRef<Date | null>(null);
+  // The first load of a full page visit takes the GET the HTML started (once); later polls fetch for themselves.
+  const firstLoad = useRef(early);
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch("/api/status");
+      const get = () => fetch(STATUS_URL);
+      const takeEarly = firstLoad.current;
+      firstLoad.current = false;
+      const res = await (takeEarly ? earlyOr(STATUS_URL, get) : get());
       if (res.ok) {
         const fresh: StatusResponse = await res.json();
+        clientCache.put(STATUS_URL, fresh);
         // Bail out of the commit when the poll returned the same payload
         // (perf round 3): fetchedAt is volatile — the server stamps it on
         // every response — so compare everything EXCEPT it, or the guard
@@ -336,6 +442,17 @@ export default function StatusPage() {
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  // Reopening the app: the copy kept on this device until the live answer arrives.
+  useEffect(() => {
+    let alive = true;
+    void clientCache.read<StatusResponse>(STATUS_URL).then((cached) => {
+      if (!alive || !cached) return;
+      setData((prev) => prev ?? cached);
+      setLoading(false);
+    });
+    return () => { alive = false; };
   }, []);
 
   useEffect(() => {
@@ -363,7 +480,7 @@ export default function StatusPage() {
         <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
               <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
               <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
             </div>
@@ -371,7 +488,7 @@ export default function StatusPage() {
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-5 space-y-4 h-40">
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-5 space-y-4 h-40">
               <div className="h-4 w-28 bg-white/5 animate-pulse rounded" />
               <div className="space-y-2">
                 {[...Array(3)].map((_, j) => (
@@ -442,7 +559,7 @@ export default function StatusPage() {
       {/* Page header */}
       <div className="flex items-baseline justify-between mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">System Status</h2>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">System Status</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
             ETL pipeline health and data freshness
             <RefreshedLabel refreshedAtRef={refreshedAtRef} />
@@ -450,17 +567,22 @@ export default function StatusPage() {
         </div>
         <button
           onClick={load}
-          className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-[6px] hover:bg-white/10 transition-colors"
+          className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-control hover:bg-white/10 transition-colors"
         >
           Refresh
         </button>
       </div>
 
+      {/* Personalize: every banner, KPI tile, source card and the history table is its own part; parts move
+          within their section and into any other section of the page. */}
+      <PartGrid page="/status" title="System Status">
+      <PartGroup id="kpis" title="Overview">
       {/* tz_log_gaps banner — per ADR-0001 drastic-TZ-abroad gap #3. WHOOP
           cycles whose offset disagrees with pds.tz_for_instant — Riley
           likely traveled but forgot to add a user_tz_log entry. */}
       {tzGapRanges.length > 0 && (
-        <div className="mb-6 border border-yellow-500/30 bg-yellow-500/10 rounded-[6px] p-4">
+        <Part id="tz-gaps" title="Travel without a log entry">
+        <div className="border border-yellow-500/30 bg-yellow-500/10 rounded-control p-4">
           <div className="flex items-center gap-2 mb-2">
             <span className="w-2 h-2 rounded-full bg-yellow-400" />
             <p className="text-[13px] font-medium text-yellow-300">
@@ -487,11 +609,13 @@ export default function StatusPage() {
             <code className="text-yellow-200/80">{`INSERT INTO pds.user_tz_log(effective_from, tz) VALUES ('${tzGapRanges[0].from}T00:00:00Z', 'Europe/Berlin');`}</code>
           </p>
         </div>
+        </Part>
       )}
 
       {/* Drift alerts banner */}
       {driftAlerts.length > 0 && (
-        <div className="mb-6 border border-red-500/30 bg-red-500/10 rounded-[6px] p-4">
+        <Part id="drift-alerts" title="HRV model drift">
+        <div className="border border-red-500/30 bg-red-500/10 rounded-control p-4">
           <div className="flex items-center gap-2 mb-2">
             <span className="w-2 h-2 rounded-full bg-red-400" />
             <p className="text-[13px] font-medium text-red-300">
@@ -507,11 +631,12 @@ export default function StatusPage() {
             ))}
           </ul>
         </div>
+        </Part>
       )}
 
-      {/* KPI row */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+      {/* KPI tiles */}
+      <Part id="sources-online" title="Sources Online" width="quarter">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Sources Online"
             value={sourcesOnline}
@@ -522,92 +647,91 @@ export default function StatusPage() {
             size={120}
           />
         </div>
+      </Part>
+      <Part id="last-etl-run" title="Last ETL Run" width="quarter">
         <StatCard
           label="Last ETL Run"
           value={mostRecentSync ? formatRelativeTime(mostRecentSync) : "—"}
           sublabel={mostRecentSync ? formatSyncTime(mostRecentSync) : "No data"}
         />
+      </Part>
+      <Part id="records-today" title="Records · Latest Today" width="quarter">
         <StatCard
           label="Records · Latest Today"
           value={recordsLatestToday > 0 ? recordsLatestToday.toLocaleString() : "—"}
-          sublabel="sum across each source's most-recent run today"
+          sublabel="latest run per source"
         />
+      </Part>
+      <Part id="active-errors" title="Active Errors" width="quarter">
         <StatCard
           label="Active Errors"
           value={activeErrors}
           sublabel={activeErrors === 0 ? "all sources healthy" : `${activeErrors} source${activeErrors !== 1 ? "s" : ""} need attention`}
         />
-      </div>
+      </Part>
+      </PartGroup>
 
-      {/* Source cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4 mb-8">
+      {/* Source cards: one part per source (ids = source keys, kept from the earlier tile zone so saved
+          orders still apply). The group keeps the dense tile columns; Full / Half widen a card in it. */}
+      <PartGroup id="sources" title="Source cards" gridClassName={SOURCE_TILES_GRID}>
         {sourceList.map(({ key, info }) => (
-          <SourceCard key={key} sourceKey={key} info={info} />
+          <Part key={key} id={key} title={info.label} width="quarter">
+            <SourceCard sourceKey={key} info={info} />
+          </Part>
         ))}
-      </div>
+      </PartGroup>
 
       {/* Sync history */}
+      <PartGroup id="history" title="Sync History">
       {history.length > 0 && (
+        <Part id="sync-history" title="Sync History">
         <ChartCard title="Sync History" subtitle="Last 20 pipeline runs">
           <div className="overflow-x-auto">
-            <table className="w-full text-[12px]">
-              <thead>
-                <tr className="border-b border-white/5">
-                  <th className="text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4">Source</th>
-                  <th className="text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4">Type</th>
-                  <th className="text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4">Time</th>
-                  <th className="text-left text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4">Status</th>
-                  <th className="text-right text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2 pr-4">Records</th>
-                  <th className="text-right text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal py-2">Duration</th>
-                </tr>
-              </thead>
-              <tbody>
-                {history.map((row: any, i: number) => {
-                  const isSuccess = row.status === "success";
-                  const isPartial = row.status === "partial";
-                  return (
-                    <tr key={i} className="border-b border-white/[0.03] hover:bg-white/[0.02]">
-                      <td className="py-2 pr-4 font-mono font-medium text-text-secondary">
-                        {HISTORY_SOURCE_LABELS[row.source] ?? row.source}
-                      </td>
-                      <td className="py-2 pr-4 text-text-tertiary">
-                        {HISTORY_TYPE_LABELS[row.data_type] ?? row.data_type}
-                      </td>
-                      <td className="py-2 pr-4 text-text-tertiary whitespace-nowrap">
-                        {formatSyncTime(row.sync_start)}
-                      </td>
-                      <td className="py-2 pr-4">
+            <PersonalTable
+              id="sync-history"
+              className="w-full text-[12px]"
+              headRowClassName="border-b border-white/5"
+              columns={HISTORY_COLUMNS}
+              rows={history.map((row: any, i: number) => {
+                const isSuccess = row.status === "success";
+                const isPartial = row.status === "partial";
+                return {
+                  key: String(i),
+                  className: "border-b border-white/[0.03] hover:bg-white/[0.02]",
+                  cells: {
+                    source: HISTORY_SOURCE_LABELS[row.source] ?? row.source,
+                    type: HISTORY_TYPE_LABELS[row.data_type] ?? row.data_type,
+                    time: formatSyncTime(row.sync_start),
+                    status: (
+                      <span
+                        className={`inline-flex items-center gap-1 text-[10px] font-medium font-mono px-1.5 py-0.5 rounded-[3px] ${
+                          isSuccess
+                            ? "bg-green-500/10 text-green-400"
+                            : isPartial
+                            ? "bg-yellow-500/10 text-yellow-400"
+                            : "bg-red-500/10 text-red-400"
+                        }`}
+                      >
                         <span
-                          className={`inline-flex items-center gap-1 text-[10px] font-medium font-mono px-1.5 py-0.5 rounded-[3px] ${
-                            isSuccess
-                              ? "bg-green-500/10 text-green-400"
-                              : isPartial
-                              ? "bg-yellow-500/10 text-yellow-400"
-                              : "bg-red-500/10 text-red-400"
+                          className={`w-1.5 h-1.5 rounded-full ${
+                            isSuccess ? "bg-green-400" : isPartial ? "bg-yellow-400" : "bg-red-400"
                           }`}
-                        >
-                          <span
-                            className={`w-1.5 h-1.5 rounded-full ${
-                              isSuccess ? "bg-green-400" : isPartial ? "bg-yellow-400" : "bg-red-400"
-                            }`}
-                          />
-                          {row.status}
-                        </span>
-                      </td>
-                      <td className="py-2 pr-4 text-right font-mono text-text-secondary tabular-nums">
-                        {row.records_synced > 0 ? row.records_synced.toLocaleString() : "—"}
-                      </td>
-                      <td className="py-2 text-right font-mono text-text-tertiary tabular-nums">
-                        {row.duration_seconds != null ? `${(row.duration_seconds as number).toFixed(1)}s` : "—"}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                        />
+                        {row.status}
+                      </span>
+                    ),
+                    records: row.records_synced > 0 ? row.records_synced.toLocaleString() : "—",
+                    duration: row.duration_seconds != null ? `${(row.duration_seconds as number).toFixed(1)}s` : "—",
+                  },
+                };
+              })}
+            />
           </div>
         </ChartCard>
+        </Part>
       )}
+      </PartGroup>
+      </PartGrid>
     </>
   );
 }

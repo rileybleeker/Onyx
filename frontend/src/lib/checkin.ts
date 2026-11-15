@@ -85,7 +85,7 @@ export const Q_READ_IN_BED = "Read (non-screened device) while in bed?";
  * night (sleepNights) and stores each night's answers on the day it closes. A sleep question that is also
  * OCCASIONAL (read in bed) is an optional row in the night block: blank = not logged.
  * Other write paths follow the same rule: the chat tool stores a sleep answer with no date on yesterday
- * (sleepAnswerDate), and the /habits "Today's Habits" checklist leaves these questions out.
+ * (sleepAnswerDate), and the /habits heatmap writes through /api/habits/complete, whose sleepDateError refuses tonight.
  */
 export const SLEEP_QUESTIONS: ReadonlySet<string> = new Set([...SLEEP_KIT, Q_SAME_BED, Q_SCREEN_IN_BED, Q_READ_IN_BED]);
 

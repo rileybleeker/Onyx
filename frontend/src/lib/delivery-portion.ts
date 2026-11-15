@@ -55,9 +55,13 @@ type HeaderGetter = { get(name: string): string | null };
  * Request-shape checks for the PATCH route, before the body is read. Returns null when the request may
  * proceed, else the status + message to answer with. The route is session-only (middleware); this adds a
  * same-origin check (a browser always sends Origin on a PATCH, so a missing one is refused), a JSON
- * content type, and a small declared size.
+ * content type, and a small declared size (`maxBytes`; the photo-meal routes pass their own cap).
  */
-export function checkPortionRequest(headers: HeaderGetter, requestOrigin: string): { status: number; error: string } | null {
+export function checkPortionRequest(
+  headers: HeaderGetter,
+  requestOrigin: string,
+  maxBytes: number = MAX_PORTION_BODY_BYTES,
+): { status: number; error: string } | null {
   const origin = headers.get("origin");
   if (!origin) return { status: 403, error: "missing Origin" };
   let o: URL;
@@ -77,7 +81,7 @@ export function checkPortionRequest(headers: HeaderGetter, requestOrigin: string
   if (type !== "application/json") return { status: 415, error: "Content-Type must be application/json" };
 
   const len = headers.get("content-length");
-  if (len != null && (!/^[0-9]+$/.test(len) || Number(len) > MAX_PORTION_BODY_BYTES)) {
+  if (len != null && (!/^[0-9]+$/.test(len) || Number(len) > maxBytes)) {
     return { status: 413, error: "body too large" };
   }
   return null;
@@ -124,6 +128,8 @@ export interface DeliveryEstimateDay {
   est_protein_g: number | string | null;
   est_carbs_g: number | string | null;
   est_fat_g: number | string | null;
+  /** Provenance tag for the merged row; absent = "uber_eats". combineEstimateDays (lib/photo-meal.ts) sets it. */
+  nutrition_source?: string;
 }
 
 /**
@@ -145,7 +151,7 @@ export function mergeDeliveryEstimates<T extends { calendar_date: string }>(
     seen.add(e.behavioral_date);
     rows.push({
       calendar_date: e.behavioral_date,
-      nutrition_source: "uber_eats",
+      nutrition_source: e.nutrition_source ?? "uber_eats",
       calories: e.est_kcal,
       protein_g: e.est_protein_g,
       carbs_g: e.est_carbs_g,
@@ -194,13 +200,17 @@ export function groupDishesByDay<T extends { behavioral_date: string }>(
 
 export type PortionSendResult = { ok: true } | { ok: false; error: string };
 
-export interface PortionSaverOptions {
+/**
+ * K = what one serialized slot is keyed by (a dish's item_id; for leftovers "itemId|date"), V = the value
+ * it holds (a fraction; for leftovers a LeftoverToken string). Values are compared with ===.
+ */
+export interface PortionSaverOptions<K = number, V = number | null> {
   /** Write one dish's fraction (PATCH /api/delivery/items/[itemId]). A throw counts as a network error. */
-  send(itemId: number, fraction: number | null): Promise<PortionSendResult>;
+  send(itemId: K, fraction: V): Promise<PortionSendResult>;
   /** Show a value for the dish (the optimistic tap, or the stored value after a failed save). */
-  apply(itemId: number, fraction: number | null): void;
-  onError(itemId: number, message: string): void;
-  onSaved(itemId: number, fraction: number | null): void;
+  apply(itemId: K, fraction: V): void;
+  onError(itemId: K, message: string): void;
+  onSaved(itemId: K, fraction: V): void;
 }
 
 /**
@@ -209,11 +219,11 @@ export interface PortionSaverOptions {
  * the taps in order, and a failed save goes back to the last value the server CONFIRMED (the loaded one,
  * or the last successful write), never to an earlier optimistic tap that was not saved.
  */
-export function createPortionSaver(o: PortionSaverOptions) {
-  type Dish = { confirmed: number | null; shown: number | null; inflight: boolean; pending: { v: number | null } | null };
-  const dishes = new Map<number, Dish>();
+export function createPortionSaver<K = number, V = number | null>(o: PortionSaverOptions<K, V>) {
+  type Dish = { confirmed: V; shown: V; inflight: boolean; pending: { v: V } | null };
+  const dishes = new Map<K, Dish>();
 
-  async function run(id: number, d: Dish, f: number | null): Promise<void> {
+  async function run(id: K, d: Dish, f: V): Promise<void> {
     d.inflight = true;
     let r: PortionSendResult;
     try {
@@ -242,7 +252,7 @@ export function createPortionSaver(o: PortionSaverOptions) {
      * Record the stored value of a freshly loaded dish. Returns the value to display: the stored one,
      * or (while a save for that dish is still in flight) the value on screen.
      */
-    seed(itemId: number, stored: number | null): number | null {
+    seed(itemId: K, stored: V): V {
       const d = dishes.get(itemId);
       if (!d) {
         dishes.set(itemId, { confirmed: stored, shown: stored, inflight: false, pending: null });
@@ -254,10 +264,10 @@ export function createPortionSaver(o: PortionSaverOptions) {
       return stored;
     },
     /** A tap. Resolves when this tap's write (or the queued write that supersedes it) has settled. */
-    set(itemId: number, fraction: number | null): Promise<void> {
+    set(itemId: K, fraction: V): Promise<void> {
       let d = dishes.get(itemId);
       if (!d) {
-        d = { confirmed: null, shown: null, inflight: false, pending: null };
+        d = { confirmed: null as V, shown: null as V, inflight: false, pending: null };
         dishes.set(itemId, d);
       }
       if (d.shown === fraction) return Promise.resolve();
@@ -269,10 +279,10 @@ export function createPortionSaver(o: PortionSaverOptions) {
       }
       return run(itemId, d, fraction);
     },
-    shown(itemId: number): number | null | undefined {
+    shown(itemId: K): V | undefined {
       return dishes.get(itemId)?.shown;
     },
-    confirmed(itemId: number): number | null | undefined {
+    confirmed(itemId: K): V | undefined {
       return dishes.get(itemId)?.confirmed;
     },
   };

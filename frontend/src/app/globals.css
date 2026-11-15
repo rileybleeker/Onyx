@@ -1,70 +1,83 @@
 @import "tailwindcss";
 
 /*
- * Onyx design tokens — Direction A ("Terminal").
- * Dark-only. Bloomberg-meets-Linear: deep cool-slate surfaces, a single rationed
- * cyan accent, consistent HRV-direction encoding (up=green / down=red), and a
- * mono+sans split (JetBrains Mono for numerics, Geist Sans for prose).
+ * Onyx design tokens — Direction D ("Instrument"), adopted 2026-11-14.
+ * Dark-only. Warm graphite hardware: matte surfaces a step apart, one signal-orange
+ * accent rationed to controls and highlights, WHOOP-style status colors
+ * (green / yellow / red) that only ever mean state, Archivo for text and DM Mono
+ * for numerics and small labels, rounded cards with a soft lift, round dials.
+ *
+ * Rules that keep it consistent (also in AGENTS.md, "Theme"):
+ * - Colors come from these tokens (classes like bg-surface-card, text-accent) or
+ *   from lib/chart-theme.ts for charts. No new hex literals in components.
+ * - Orange (accent) = controls, selection, focus, the primary action. Success,
+ *   "saved", "on time" use text-up, never the accent.
+ * - Cards: rounded-card shadow-card. Buttons, inputs, nav items: rounded-control.
+ *   The primary action: bg-accent text-on-accent rounded-full.
  */
 @theme {
-  /* Surfaces — Surface 0 (page) → Surface 3 (hover / row stripe) */
-  --color-surface: #08090B;        /* Surface 0 — page background */
-  --color-surface-card: #0E1014;   /* Surface 1 — card body */
-  --color-surface-raised: #15181E; /* Surface 2 — tooltip / popover / sticky header */
-  --color-surface-hover: #1A1E26;  /* Surface 3 — hover / row stripe */
+  /* Surfaces — page → card → raised (popover, tooltip) → hover; sunken = side rails */
+  --color-surface: #1A1A18;
+  --color-surface-sunken: #151513;
+  --color-surface-card: #232321;
+  --color-surface-raised: #2C2C29;
+  --color-surface-hover: #34342F;
 
   /* Borders */
-  --color-border-subtle: rgba(255, 255, 255, 0.05);
-  --color-border-default: rgba(255, 255, 255, 0.08);
-  --color-border-hover: rgba(255, 255, 255, 0.08);   /* legacy name, mapped to default */
-  --color-border-emphasis: rgba(22, 224, 122, 0.30); /* active row / selected */
+  --color-border-subtle: rgba(236, 235, 230, 0.07);
+  --color-border-default: rgba(236, 235, 230, 0.10);
+  --color-border-hover: rgba(236, 235, 230, 0.16);
+  --color-border-emphasis: rgba(255, 106, 26, 0.45); /* active row / selected */
 
-  /* Accent — WHOOP recovery green (active nav, focus ring, selected row, primary CTA) */
-  --color-accent: #16E07A;
-  --color-accent-muted: rgba(22, 224, 122, 0.15);
+  /* Accent — signal orange (active nav, focus ring, selection, primary action) */
+  --color-accent: #FF6A1A;
+  --color-accent-muted: rgba(255, 106, 26, 0.15);
+  --color-on-accent: #1A0E05;      /* text on a solid accent fill */
 
-  /* Text */
-  --color-text-primary: #E8EAED;
-  --color-text-secondary: #9AA0A6;
-  --color-text-tertiary: #5F6368;
-  --color-text-disabled: #3C4043;
+  /* Text (tertiary passes 4.5:1 on cards; the old Terminal grey did not) */
+  --color-text-primary: #ECEBE6;
+  --color-text-secondary: #B0AEA6;
+  --color-text-tertiary: #97958D;
+  --color-text-disabled: #5E5C56;
 
-  /* Semantic — WHOOP zone encoding (green/yellow/red) used consistently everywhere */
-  --color-up: #16E07A;        /* good / high recovery (WHOOP green) */
-  --color-down: #FF4159;      /* bad / low recovery (WHOOP red) */
-  --color-mid: #FFD23F;       /* caution / mid recovery (WHOOP yellow) */
-  --color-neutral: #9AA0A6;   /* no direction */
-  --color-low-conf: rgba(154, 160, 166, 0.45); /* dimmed / low-confidence */
-  /* Strain — WHOOP's blue 0–21 scale (kept distinct from the recovery zones) */
-  --color-strain: #0093E7;
-  --color-strain-bright: #33B5F5;
+  /* Semantic — WHOOP zone encoding, always shown with an icon or a word */
+  --color-up: #5BC46E;        /* good / high recovery */
+  --color-down: #F0584E;      /* bad / low recovery */
+  --color-mid: #F4C84E;       /* caution / mid recovery */
+  --color-neutral: #B0AEA6;   /* no direction */
+  --color-low-conf: rgba(176, 174, 166, 0.45);
+  /* Strain — blue, kept apart from the recovery zones */
+  --color-strain: #6FA8DC;
+  --color-strain-bright: #8DBDE8;
 
-  /* Source colors (desaturated ~15% from the prior palette) */
-  --color-source-garmin: #5B8DF6;
-  --color-source-whoop: #F5A623;
-  --color-source-eightsleep: #9A7BFA;
-  --color-source-cronometer: #22D3A6;
+  /* Device colors (identity; Garmin / WHOOP / Eight Sleep separate for every
+     color-vision type when charted together) */
+  --color-source-garmin: #3987E5;
+  --color-source-whoop: #C98500;
+  --color-source-eightsleep: #199E70;
+  --color-source-cronometer: #9085E9;
   --color-source-spotify: #1ED760;
 
-  /* Section-tick colors (colored left-edge ticks keyed to section function) */
-  --color-tick-forecast: #0093E7;     /* forecast / prediction (strain blue) */
-  --color-tick-descriptive: #9AA0A6;  /* descriptive stats */
-  --color-tick-causal: #F5A623;       /* causal inference */
-  --color-tick-calibration: #16E07A;  /* calibration / accuracy (recovery green) */
+  /* Section-tick colors keyed to section function */
+  --color-tick-forecast: #6FA8DC;
+  --color-tick-descriptive: #B0AEA6;
+  --color-tick-causal: #C98500;
+  --color-tick-calibration: #5BC46E;
 
-  /* Shadows — Direction A cards are nearly flat (border-only, no float) */
-  --shadow-card: none;
-  --shadow-elevated: 0 4px 16px rgba(0, 0, 0, 0.45);
-  --shadow-floating: 0 8px 30px rgba(0, 0, 0, 0.6);
+  /* Shape */
+  --radius: 6px;           /* bare `rounded` (chips, small badges) */
+  --radius-card: 14px;     /* rounded-card */
+  --radius-control: 10px;  /* rounded-control: buttons, inputs, nav items */
 
-  /* Fonts — CSS vars set by next/font.
-     Mono is JetBrains Mono (Direction A numerics); ui-monospace is the system
-     fallback. (Geist Mono was removed 2026-06-11: it sat behind the
-     always-loaded JetBrains Mono in both stacks, so its font files downloaded
-     on every page without ever rendering a glyph.) */
-  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
-  --font-mono: var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, monospace;
-  --font-display: var(--font-jetbrains-mono), ui-monospace, monospace;
+  /* Shadows — cards sit slightly raised: a top highlight plus a soft drop */
+  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 4px 14px rgba(0, 0, 0, 0.28);
+  --shadow-elevated: 0 6px 20px rgba(0, 0, 0, 0.45);
+  --shadow-floating: 0 12px 36px rgba(0, 0, 0, 0.55);
+
+  /* Fonts — CSS vars set by next/font (vendored WOFF2 in app/fonts). */
+  --font-sans: var(--font-archivo), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-dm-mono), ui-monospace, SFMono-Regular, monospace;
+  --font-display: var(--font-dm-mono), ui-monospace, monospace;
 
   /* Animation */
   --animate-fade-in: fade-in 150ms ease-out both;
@@ -85,42 +98,12 @@
   to { opacity: 1; transform: translateY(0); }
 }
 
-/* JetBrains Mono display numerics get the ss01 stylistic set (slashed zero etc.) */
+/* DM Mono display numerics: tabular figures. */
 .font-display {
   font-family: var(--font-display);
-  font-feature-settings: "ss01", "tnum";
+  font-feature-settings: "tnum";
   font-variant-numeric: tabular-nums;
-}
-
-/* Ambient gradient backdrop — Eight Sleep Pod aesthetic with a little personality.
-   A fixed multi-hue aurora mesh (indigo · cyan · a faint WHOOP-green core · violet ·
-   warm magenta) painted behind the app on the deep base surface, drifting very
-   slowly so it feels alive rather than static. Oversized via negative inset so the
-   drift never exposes a viewport edge; opaque cards sit on top, so it reads through
-   the page background, gaps, and margins. pointer-events:none keeps it decorative. */
-body::before {
-  content: "";
-  position: fixed;
-  inset: -20%;
-  z-index: -1;
-  pointer-events: none;
-  background:
-    radial-gradient(60% 50% at 18% 4%,  rgba(82, 96, 255, 0.16), transparent 60%),   /* indigo, top-left */
-    radial-gradient(55% 45% at 92% 10%, rgba(56, 189, 248, 0.10), transparent 58%),  /* cyan, top-right */
-    radial-gradient(52% 46% at 50% 42%, rgba(22, 224, 122, 0.06), transparent 62%),  /* faint WHOOP-green core */
-    radial-gradient(60% 55% at 86% 96%, rgba(124, 92, 250, 0.13), transparent 60%),  /* violet, bottom-right */
-    radial-gradient(55% 50% at 10% 98%, rgba(236, 72, 153, 0.07), transparent 60%);  /* warm magenta, bottom-left */
-  animation: aura-drift 34s ease-in-out infinite alternate;
-}
-
-@keyframes aura-drift {
-  from { transform: translate3d(-1.5%, -1%, 0) scale(1.02); }
-  to   { transform: translate3d(1.5%, 1.5%, 0) scale(1.06); }
-}
-
-/* Respect reduced-motion: keep the aura, drop the drift. */
-@media (prefers-reduced-motion: reduce) {
-  body::before { animation: none; }
+  letter-spacing: -0.01em;
 }
 
 /* Chart tooltip override */
@@ -130,8 +113,16 @@ body::before {
 
 /* Skeleton loader base */
 .skeleton {
-  background: rgba(255, 255, 255, 0.05);
-  border-radius: 4px;
+  background: rgba(236, 235, 230, 0.06);
+  border-radius: var(--radius-control);
+}
+
+/* The Log screen (/log) on a phone: a field under 16 px makes iOS zoom the page in on focus. Every field there
+   (the sections' own and the shared check-in / Uber Eats controls they reuse) reads at 16 px on a touch screen. */
+@media (pointer: coarse) {
+  .log-screen :is(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), select, textarea) {
+    font-size: 16px;
+  }
 }
 
 /* Scrollbar styling */
@@ -143,9 +134,226 @@ body::before {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(236, 235, 230, 0.12);
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(236, 235, 230, 0.2);
+}
+
+/* ── Personalize (components/personalize/*): part grid, normal mode ─────────────────────────────────────
+   Every part spans the full row on a phone. Half = two side by side from 1024 px; third = three from 1024 px,
+   two from 768 px. Parts in one row stretch to the same height, like the grids they replaced. */
+.pz-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: var(--pz-gap, 24px);
+}
+.pz-grid > * {
+  grid-column: span 12 / span 12;
+  min-width: 0;
+}
+.pz-grid > [data-w="quarter"] { grid-column: span 6 / span 6; }
+@media (min-width: 768px) {
+  .pz-grid > [data-w="third"] { grid-column: span 6 / span 6; }
+}
+@media (min-width: 1024px) {
+  .pz-grid > [data-w="half"] { grid-column: span 6 / span 6; }
+  .pz-grid > [data-w="third"] { grid-column: span 4 / span 4; }
+  .pz-grid > [data-w="quarter"] { grid-column: span 3 / span 3; }
+}
+.pz-part {
+  display: flex;
+  flex-direction: column;
+}
+/* A tile zone (e.g. the /status source cards): its own columns, one tile per cell, no widths. */
+.pz-grid.pz-tiles {
+  grid-template-columns: repeat(1, minmax(0, 1fr));
+}
+.pz-grid.pz-tiles > * {
+  grid-column: auto;
+}
+@media (min-width: 640px) {
+  .pz-grid.pz-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 1024px) {
+  .pz-grid.pz-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (min-width: 1280px) {
+  .pz-grid.pz-tiles { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+}
+.pz-body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+}
+.pz-body > :last-child {
+  flex: 1 1 auto;
+}
+/* Freeze pane of a personalized table. */
+.pz-frozen {
+  background: var(--color-surface-card);
+}
+.pz-frozen-edge {
+  box-shadow: inset -1px 0 0 var(--color-border-default);
+}
+
+/* ── Personalize mode (only while the banner is open) ─────────────────────────────────────────────────── */
+body.pz-editing {
+  padding-top: var(--pz-banner-h, 0px);
+}
+.pz-banner {
+  position: fixed;
+  z-index: 45;
+  left: 0;
+  right: 0;
+  top: calc(env(safe-area-inset-top) + 3rem);
+  background: var(--color-surface-raised);
+  border-bottom: 1px solid var(--color-border-emphasis);
+  box-shadow: var(--shadow-elevated);
+}
+@media (min-width: 768px) {
+  .pz-banner { top: 0; left: 220px; }
+}
+[data-pz-zone][data-pz-editing] {
+  position: relative;
+}
+[data-pz-editing] > .pz-part {
+  position: relative;
+  border-radius: var(--radius-card);
+  outline: 1px dashed var(--color-border-hover);
+  outline-offset: 4px;
+}
+[data-pz-editing] > .pz-part:hover,
+[data-pz-editing] > .pz-part:focus-within {
+  outline: 2px solid var(--color-accent);
+}
+.pz-cover {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  cursor: grab;
+  border-radius: var(--radius-card);
+}
+.pz-toolbar {
+  position: absolute;
+  z-index: 4;
+  top: 6px;
+  left: 6px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 2px;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--color-surface-raised) 94%, transparent);
+  box-shadow: var(--shadow-elevated);
+}
+.pz-handle {
+  cursor: grab;
+  touch-action: none;
+}
+/* A part that holds its own tiles: its toolbar sits above them instead of over them. */
+[data-pz-editing] > .pz-part[data-nested] > .pz-toolbar {
+  position: relative;
+  top: 0;
+  left: 0;
+  right: 0;
+  order: -1;
+  margin-bottom: 12px;
+}
+/* Controls inside a part (table column tools) stay usable above the drag surface. */
+[data-pz-editing] .pz-tools {
+  position: relative;
+  z-index: 3;
+}
+[data-pz-dragging] .pz-part {
+  transition: transform 120ms ease;
+}
+[data-pz-dragging] .pz-cover,
+[data-pz-dragging] .pz-handle {
+  cursor: grabbing;
+}
+.pz-part.pz-lifted {
+  opacity: 0.4;
+}
+.pz-part.pz-here {
+  outline: 2px solid var(--color-accent);
+  box-shadow: 0 0 0 6px var(--color-accent-muted);
+}
+/* The drop indicator: where the part will land. */
+.pz-indicator {
+  position: absolute;
+  z-index: 6;
+  pointer-events: none;
+  border-radius: 9999px;
+  background: var(--color-accent);
+  box-shadow: 0 0 0 3px var(--color-accent-muted);
+}
+.pz-indicator-label {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  max-width: 240px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+.pz-indicator[data-axis="v"] .pz-indicator-label {
+  top: 0;
+  left: 50%;
+  transform: translate(-50%, -100%);
+}
+.pz-ghost {
+  position: fixed;
+  z-index: 80;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  max-width: 260px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  padding: 6px 10px;
+  border: 1px solid var(--color-border-emphasis);
+  border-radius: var(--radius-control);
+  background: var(--color-surface-raised);
+  color: var(--color-text-primary);
+  font-size: 12px;
+  font-weight: 500;
+  box-shadow: var(--shadow-floating);
+}
+/* An empty group while personalizing: a slot to drop parts into. */
+.pz-empty-group {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 72px;
+  border: 1px dashed var(--color-border-emphasis);
+  border-radius: var(--radius-card);
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+}
+.pz-hidden-part {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 8px 12px;
+  border: 1px dashed var(--color-border-hover);
+  border-radius: var(--radius-card);
+  background: repeating-linear-gradient(135deg, transparent 0 8px, rgba(236, 235, 230, 0.04) 8px 16px);
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-pz-dragging] .pz-part { transition: none; }
 }

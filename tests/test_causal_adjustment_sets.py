@@ -101,7 +101,8 @@ def make_rolling_frame(seed: int = 0, n: int = 700) -> pd.DataFrame:
     """Frame where every unit of training load in the last 7 days lowers tonight's
     HRV by the same amount ("load is load"), activities happen on ~60% of days
     independently of everything else (so nothing confounds the 3-day load), and
-    rest days are NaN like the live matrix."""
+    days without an activity are NaN (the live matrix had NaN rest days until
+    2026-11-14; since then a worn rest day is 0 and only an unworn day is NaN)."""
     rng = np.random.default_rng(seed)
     dates = pd.date_range("2025-01-01", periods=n, freq="D")
     dow = dates.dayofweek.to_numpy()
@@ -217,15 +218,40 @@ def test_window_containment_rule() -> None:
 
 
 def test_declared_windows_match_the_feature_builder() -> None:
-    """ROLLING_WINDOW_DAYS restates hrv_analysis.build_feature_matrix; fail if they drift.
-    Reads the source text only (importing hrv_analysis needs credentials)."""
-    src = (ROOT / "hrv_analysis.py").read_text(encoding="utf-8")
+    """ROLLING_WINDOW_DAYS restates the windows hrv_analysis builds; fail if they drift.
+
+    Runs the real builder (hrv_analysis.add_rolling_training_load, the one
+    build_feature_matrix calls since 2026-11-14) on a synthetic daily load and checks
+    every declared column against an independent sum over its declared days D+first..
+    D+last, skipping days with no value and NaN when none has one (min_periods=1).
+    Until 2026-11-14 this matched one source line, which broke when the formula moved
+    into the helper with the window unchanged. The stub credentials above are enough
+    to import hrv_analysis (no network call at import)."""
+    import inspect
+
+    import hrv_analysis as ha
+
+    assert "add_rolling_training_load(df)" in inspect.getsource(ha.build_feature_matrix), \
+        "build_feature_matrix no longer builds the rolling loads with add_rolling_training_load"
+    rng = np.random.default_rng(3)
+    n = 40
+    load = rng.integers(0, 300, n).astype(float)
+    load[[2, 9]] = 0.0                       # worn rest days count as 0
+    load[[14, 15, 16, 17, 18, 19, 20, 30]] = np.nan   # a week without the watch + one day
+    df = pd.DataFrame({"calendar_date": pd.date_range("2026-01-01", periods=n, freq="D")
+                       .strftime("%Y-%m-%d"), "total_training_load": load})
+    out = ha.add_rolling_training_load(df.copy())
     for col, (first, last) in ci.ROLLING_WINDOW_DAYS.items():
         assert last == -1, (col, last)
-        line = (f'df["{col}"] = df["total_training_load"].shift(1)'
-                f'.rolling({-first}, min_periods=1).sum()')
-        assert line in src, f"hrv_analysis.py no longer builds {col} as {line}"
-    print("  declared windows match hrv_analysis.build_feature_matrix")
+        assert col in out.columns, f"hrv_analysis.add_rolling_training_load no longer builds {col}"
+        for d in range(n):
+            days = [d + k for k in range(first, last + 1) if 0 <= d + k < n]
+            known = [load[i] for i in days if not np.isnan(load[i])]
+            want = float(sum(known)) if known else np.nan
+            got = float(out[col].iloc[d])
+            assert (np.isnan(want) and np.isnan(got)) or np.isclose(got, want), \
+                f"{col} on day {d}: built {got}, declared days {first}..{last} give {want}"
+    print("  declared windows match hrv_analysis.add_rolling_training_load")
 
 
 def test_prepare_treatment_builds_x_from_the_adjustment_set() -> None:

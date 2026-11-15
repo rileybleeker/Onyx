@@ -4,14 +4,35 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, Moon, Sun, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
-import { kitSummary, nightLabel, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
-import { buildCells, draftSettled, draftWith, parseDraft, savePlan, visibleNights, type Cell, type Cells, type Draft, type Patch } from "@/lib/checkin-cells";
-import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortions";
+import { sayFromHash, VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
+import { reportCheckinFill, setLogDraft, useLogDrafts } from "@/lib/log-drafts";
+import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, Q_JOURNALED, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
+import { clientCache } from "@/lib/client-cache";
+import { earlyOr } from "@/lib/early-fetch";
+import { buildCells, savePlan, visibleNights, voicePatch, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
+import { CheckinDraftStore, dayDraftKey, nightDraftKey, recoveryTarget, type DatedDraft } from "@/lib/checkin-drafts";
+import {
+  easternDate,
+  journalDraftFrom,
+  JOURNAL_CONFIDENCES,
+  JOURNAL_MAX_BODY_CHARS,
+  JOURNAL_MAX_TITLE_CHARS,
+  JOURNAL_MAX_TOPICS,
+  JOURNAL_MOODS,
+  JOURNAL_SOURCES,
+  JOURNAL_TOPICS,
+  type JournalConfidence,
+  type JournalMood,
+  type JournalSource,
+} from "@/lib/journal-entry";
+import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
+import ExperimentAdherence from "./ExperimentAdherence";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 
 // Daily habit check-in (2026-11-07). Yes / No per question, one Save.
 // - Saved answers load as-is; questions another source can answer start pre-filled and labeled with that
 //   source; everything else starts blank. Blank on save = not logged (never a "No").
-// - Taps are kept as a local draft, so leaving the page (or the app being killed) loses nothing.
+// - Taps are kept as dated local drafts. Reopened drafts require review; storage failures are surfaced.
 // - Two parts (2026-11-13, rules in lib/checkin.ts):
 //     SLEEP   one block per night that already happened ("Last night", and the night before while it is
 //             unanswered). It does not follow the day tabs and never asks about tonight. A night's answers
@@ -29,32 +50,44 @@ import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortio
 //   asked the next evening). It loads on its own after the questions (never delays them), shows nothing when
 //   there is nothing to ask, and each tap saves immediately through PATCH /api/delivery/items/[itemId]
 //   (not part of the Save bar).
+// - "Say it once" (2026-11-14): one dictated or typed note fills the day tab's questions AND last night's sleep
+//   block as ordinary draft taps, and drafts a journal entry of the same words (the body verbatim, the model's
+//   title / mood / confidence / topics) that Riley reviews and saves on its own with "Save to journal". The
+//   iPhone Shortcut opens /check-in#say=<words>: the words land in the box and Fill runs once (writes nothing).
+
+const FROM_VOICE = "from what you said";
+const FROM_JOURNAL = "from the journal entry you saved";
+
+/** The journal draft under the box: these words, labels Riley can change, saved only by "Save to journal". */
+type JournalForm = {
+  date: string;
+  title: string;
+  mood: JournalMood | null;
+  confidence: JournalConfidence;
+  topics: string[];
+  source: JournalSource;
+  body: string;
+  status: "draft" | "saving" | "saved";
+  url: string | null;
+  existing: boolean;
+  error: string | null;
+};
+
+/** Rows filled by the box (or the saved journal entry), per part: "day:<date>" or "night:<date>". */
+type Marks = Record<string, Record<string, { answer: CheckinAnswer; label: string }>>;
+// - While an N-of-1 trial runs, the day tab of today (or yesterday, answered the next morning) also asks
+//   "Followed today's arm?" (ExperimentAdherence.tsx). It renders nothing when no trial is running, saves
+//   each tap at once through /api/experiments/adherence (not part of the Save bar) and never writes a habit.
 
 const CATEGORY_ORDER = ["health", "fitness", "nutrition", "mindfulness", "productivity", "social", "learning", "general"];
-const dayDraftKey = (date: string) => `onyx:checkin:${date}`;
-const nightDraftKey = (night: string) => `onyx:checkin:night:${night}`;
-
-// Drafts live in localStorage; the rules (baseline, settle, build) are pure functions in lib/checkin-cells.ts.
-function readDraft(key: string): Draft {
-  try {
-    return parseDraft(JSON.parse(localStorage.getItem(key) || "{}"));
-  } catch {
-    return {};
+const withAnswers = (saved: Record<string, CheckinAnswer>, patch: Patch) => {
+  const next = { ...saved };
+  for (const [name, answer] of Object.entries(patch)) {
+    if (answer === null) delete next[name];
+    else next[name] = answer;
   }
-}
-
-function storeDraft(key: string, draft: Draft) {
-  try {
-    if (Object.keys(draft).length) localStorage.setItem(key, JSON.stringify(draft));
-    else localStorage.removeItem(key);
-  } catch {
-    /* storage unavailable: the in-memory state still works */
-  }
-}
-
-const writeDraft = (key: string, patch: Patch, saved: Record<string, CheckinAnswer>) => storeDraft(key, draftWith(readDraft(key), patch, saved));
-/** After a save: drop what was sent and is still unchanged, so a tap made mid-save survives. */
-const settleDraft = (key: string, posted: Patch) => storeDraft(key, draftSettled(readDraft(key), posted));
+  return next;
+};
 
 /** The server refused because the day rolled over since the page loaded: reload, don't keep the stale labels. */
 class StaleDayError extends Error {}
@@ -63,6 +96,13 @@ class StaleDayError extends Error {}
 const isNightItem = (i: CheckinItem) => i.sleep;
 /** Reload when the app comes back after this long: "Last night" must never be a day old. */
 const RELOAD_AFTER_MS = 60_000;
+// The GET this screen makes; its answer is cached under this URL (shared with the warm-up).
+const checkinUrl = (date: string | null) => `/api/habits/checkin${date ? `?date=${date}` : ""}`;
+
+/** Personalize id of a question category's part ("health" -> "cat-health"); stable per category name. */
+function categoryPartId(category: string): string {
+  return `cat-${category.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "general"}`;
+}
 
 function dayLabel(date: string, today: string): string {
   const d = new Date(date + "T12:00:00Z");
@@ -77,60 +117,187 @@ function longDate(date: string): string {
   return new Date(date + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" });
 }
 
-export default function CheckInClient() {
+/**
+ * `feed`: drawn inside another page instead of on /check-in itself (the /log Check-in section, which the
+ * continuous scroll shows; /check-in has no FeedSection of its own). The day tabs then keep the chosen day in this
+ * component instead of the address (a router.replace would leave that page for /check-in), and the heading is
+ * marked feed-page-heading unless `embedded`.
+ *
+ * `embedded`: drawn as the Check-in section of /log (app/log/sections/CheckIn.tsx, always with `feed`): a section
+ * heading, and words from the Log screen's "Say it" box (lib/log-drafts.ts, "checkin") fill this check-in exactly
+ * like this screen's own Say it once (draft taps only; Save stores them). `omitParts`: parts another /log section
+ * covers ("say-it-once", "journal-draft", "uber-eats", "uber-eats-leftovers"), left out. With "journal-draft" left
+ * out, the journal draft of this check-in's own Say it once goes to the Log screen's Journal section
+ * (lib/log-drafts.ts, "journal"); words handed over by the Log screen's Say it box get none here (that box drafts
+ * its own).
+ *
+ * `earlyRead`: with `feed`, the first load still takes the GET the page's HTML started (lib/early-fetch.ts): the
+ * /log section on the routed /log page (lib/log-early.ts), never a copy drawn in the continuous scroll.
+ */
+export default function CheckInClient({ feed = false, embedded = false, omitParts, earlyRead = false }: { feed?: boolean; embedded?: boolean; omitParts?: readonly string[]; earlyRead?: boolean } = {}) {
   const router = useRouter();
   const params = useSearchParams();
-  const requested = params.get("date");
+  const [feedDate, setFeedDate] = useState<string | null>(null);
+  const requested = feed ? feedDate : params.get("date");
+  // Switch the day being checked in (null = the server's today).
+  const showDate = useCallback((date: string | null) => {
+    if (feed) setFeedDate(date);
+    else router.replace(date ? `/check-in?date=${date}` : "/check-in", { scroll: false });
+  }, [feed, router]);
+  const headingTestId = feed && !embedded ? "feed-page-heading" : undefined;
+  const headingClass = embedded ? "text-[15px] font-medium text-text-primary" : "text-[28px] font-medium text-text-primary";
+  const omit = new Set(omitParts ?? []);
+  // On /log the check-in lines up with the other sections (full width); on its own page it keeps its column.
+  const wrapClass = embedded ? "" : "max-w-xl";
 
   const [data, setData] = useState<CheckinPayload | null>(null);
   const [cells, setCells] = useState<Cells>({}); // the day tab's questions
   const [nightCells, setNightCells] = useState<Record<string, Cells>>({}); // sleep questions, per night
   const [error, setError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [refreshFailed, setRefreshFailed] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [showExtras, setShowExtras] = useState(false);
-  const delivery = useDeliveryDishes(data?.date ?? null, { earlierDays: 2 });
+  const [drafts] = useState(() => new CheckinDraftStore(() => localStorage));
+  const [recovery, setRecovery] = useState<DatedDraft[]>([]);
+  const [storageFailed, setStorageFailed] = useState(false);
+  const refreshDrafts = useCallback(() => {
+    setRecovery(drafts.recovery());
+    setStorageFailed(drafts.storageFailed);
+  }, [drafts]);
+  // Inside /log the Uber Eats section asks these (omitParts): no second read of the same dishes.
+  const deliveryOmitted = omit.has("uber-eats") && omit.has("uber-eats-leftovers");
+  const delivery = useDeliveryDishes(deliveryOmitted ? null : data?.date ?? null, { earlierDays: 2 });
+  const [voiceText, setVoiceText] = useState("");
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
+  const [voiceOpen, setVoiceOpen] = useState(false);
+  const [marks, setMarks] = useState<Marks>({});
+  const [journal, setJournal] = useState<JournalForm | null>(null);
+  const journalRef = useRef<JournalForm | null>(null);
+  journalRef.current = journal;
+  // Words handed over by the iPhone Shortcut (#say=), waiting for the check-in to load.
+  const [handoff, setHandoff] = useState<string | null>(null);
+  const dataRef = useRef<CheckinPayload | null>(null);
+  dataRef.current = data;
+  const dataDateRef = useRef<string | null>(null);
+  dataDateRef.current = data?.date ?? null;
+  // "Say it once" answers arrive after a round trip. They are merged into the cells as they are THEN, and never
+  // over a row changed meanwhile: every change bumps `editGen` and stamps the rows it touched, per part
+  // ("day", or the night's date).
+  const cellsRef = useRef<Cells>({});
+  cellsRef.current = cells;
+  const nightCellsRef = useRef<Record<string, Cells>>({});
+  nightCellsRef.current = nightCells;
+  const editGen = useRef(0);
+  const lastEdit = useRef<Record<string, Record<string, number>>>({});
+  const changedSince = (part: string, since: number) =>
+    new Set(Object.entries(lastEdit.current[part] ?? {}).filter(([, gen]) => gen > since).map(([name]) => name));
 
   const lastLoad = useRef(0);
   const savingRef = useRef(false);
+  const deferredLoad = useRef<{ date: string | null } | null>(null);
 
   const loadSeq = useRef(0);
+  // Set once a GET answered: a cached copy is shown only before that.
+  const answeredRef = useRef(false);
 
-  const load = useCallback(async (date: string | null) => {
+  // Draw the screen from a check-in answer (fresh, or the cached copy shown while the fresh one loads).
+  const show = useCallback((payload: CheckinPayload) => {
+    drafts.prepare(payload);
+    const day = buildCells(
+      payload.items.filter((i) => !isNightItem(i)),
+      payload.answers,
+      payload.suggestions,
+      drafts.active(dayDraftKey(payload.date))
+    );
+    const sleepItems = payload.items.filter(isNightItem);
+    const nights: Record<string, Cells> = {};
+    for (const n of payload.nights ?? []) nights[n.date] = buildCells(sleepItems, n.answers, n.suggestions, drafts.active(nightDraftKey(n.date)));
+    setData(payload);
+    setRefreshFailed(false);
+    setCells(day);
+    setNightCells(nights);
+    // Open "Also did" when it holds a saved or pre-filled answer, so nothing is saved out of sight.
+    setShowExtras(payload.items.some((i) => i.group === "extra" && day[i.name]));
+  }, [drafts]);
+
+  const load = useCallback(async (date: string | null, afterSave = false) => {
+    // Back/forward can change the URL even while the tabs are disabled. Finish the dated save first.
+    if (savingRef.current && !afterSave) {
+      deferredLoad.current = { date };
+      return;
+    }
     lastLoad.current = Date.now();
     const seq = ++loadSeq.current; // a newer load (tab switch, resume) makes this one's result irrelevant
     setError(null);
     setSavedAt(null);
     try {
-      const res = await fetch(`/api/habits/checkin${date ? `?date=${date}` : ""}`, { cache: "no-store" });
-      const json = await res.json();
+      const url = checkinUrl(date);
+      // The first load of a full page visit takes the GET the page's HTML already started (lib/early-fetch.ts):
+      // /check-in itself, or the /log section on the routed /log page (`earlyRead`).
+      // A 401, a redirect to sign-in or a network error is fetched again, so session-end handling still sees it.
+      const get = () => fetch(url, { cache: "no-store" });
+      const res = await ((feed && !earlyRead) || afterSave ? get() : earlyOr(url, get));
+      const json = await res.json().catch(() => ({}));
       if (seq !== loadSeq.current) return;
       if (!res.ok) {
+        // A rejected date/session is unusable. A transient outage leaves the last loaded form editable,
+        // still on its original dates; POST's `today` guard remains the authority on rollover.
+        if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+          drafts.holdAll();
+          setData(null);
+          clientCache.remove(url); // the server refused it: never show that cached copy again
+        }
+        setRefreshFailed(true);
         setError(json.error || `Couldn't load the check-in (${res.status}).`);
-        setData(null);
         return;
       }
       const payload = json as CheckinPayload;
-      const day = buildCells(
-        payload.items.filter((i) => !isNightItem(i)),
-        payload.answers,
-        payload.suggestions,
-        readDraft(dayDraftKey(payload.date))
-      );
-      const sleepItems = payload.items.filter(isNightItem);
-      const nights: Record<string, Cells> = {};
-      for (const n of payload.nights ?? []) nights[n.date] = buildCells(sleepItems, n.answers, n.suggestions, readDraft(nightDraftKey(n.date)));
-      setData(payload);
-      setCells(day);
-      setNightCells(nights);
-      // Open "Also did" when it holds a saved or pre-filled answer, so nothing is saved out of sight.
-      setShowExtras(payload.items.some((i) => i.group === "extra" && day[i.name]));
+      answeredRef.current = true;
+      clientCache.put(url, payload);
+      show(payload);
     } catch {
-      if (seq === loadSeq.current) setError("Couldn't reach Onyx. Check your connection and try again.");
+      if (seq === loadSeq.current) {
+        setRefreshFailed(true);
+        setError("Couldn't reach Onyx. Check your connection and try again.");
+      }
     }
-  }, []);
+    finally { if (seq === loadSeq.current) refreshDrafts(); }
+  }, [drafts, refreshDrafts, show, feed, earlyRead]);
 
   useEffect(() => {
+    // Discover recovery records even if the requested date has expired or the GET cannot load.
+    drafts.scan();
+    refreshDrafts();
+    const leaving = (event: BeforeUnloadEvent) => {
+      if (drafts.storageFailed && drafts.hasPending()) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
+    };
+    window.addEventListener("beforeunload", leaving);
+    return () => window.removeEventListener("beforeunload", leaving);
+  }, [drafts, refreshDrafts]);
+
+  useEffect(() => {
+    // Show the cached copy at once while the GET runs, but only when it is for the current behavioral day and
+    // no unsaved tap is waiting for one of its days or nights: such a draft is always judged against a fresh answer. The POST's `today` guard and
+    // the drafts' stored-answer check still protect a tap made on the cached copy.
+    let alive = true;
+    answeredRef.current = false;
+    const seed = (cached: CheckinPayload | undefined) => {
+      if (!alive || !cached || answeredRef.current || !Array.isArray(cached.items)) return;
+      if (cached.today !== fallbackBehavioralToday(new Date())) return;
+      // Only drafts for the day and nights this copy shows matter (an old held draft for another date does not).
+      const parts = [dayDraftKey(cached.date), ...(cached.nights ?? []).map((n) => nightDraftKey(n.date))];
+      if (parts.some((key) => Object.keys(drafts.read(key)).length > 0)) return;
+      show(cached);
+    };
+    const hit = clientCache.peek<CheckinPayload>(checkinUrl(requested));
+    if (hit) seed(hit);
+    else void clientCache.read<CheckinPayload>(checkinUrl(requested)).then(seed);
     load(requested);
     // A page left open (or an installed app resumed) keeps the `today` it loaded with, so after the day rolls
     // over its "Last night" would be the night before. Reload on return; unsaved taps come back from the drafts.
@@ -140,15 +307,27 @@ export default function CheckInClient() {
     document.addEventListener("visibilitychange", back);
     window.addEventListener("pageshow", back);
     return () => {
+      alive = false;
       document.removeEventListener("visibilitychange", back);
       window.removeEventListener("pageshow", back);
     };
-  }, [load, requested]);
+  }, [load, requested, drafts, show]);
 
   // One or several answers at once. scope = null for the day tab, or the night's date for a sleep block.
   const apply = (scope: string | null, patch: Patch) => {
     if (!data || !Object.keys(patch).length) return;
+    const key = scope === null ? dayDraftKey(data.date) : nightDraftKey(scope);
+    const saved = scope === null ? data.answers : data.nights?.find((n) => n.date === scope)?.answers ?? {};
+    if (!drafts.write(key, patch, saved)) {
+      setError("Review or discard the preserved draft for this date before changing its answers.");
+      return;
+    }
+    refreshDrafts();
+    setSaveError(null);
     setSavedAt(null);
+    const gen = ++editGen.current;
+    const stamps = (lastEdit.current[scope ?? "day"] ??= {});
+    for (const name of Object.keys(patch)) stamps[name] = gen;
     const update = (prev: Cells): Cells => {
       const next = { ...prev };
       for (const [name, a] of Object.entries(patch)) {
@@ -159,12 +338,14 @@ export default function CheckInClient() {
     };
     if (scope === null) {
       setCells(update);
-      writeDraft(dayDraftKey(data.date), patch, data.answers);
     } else {
       setNightCells((prev) => ({ ...prev, [scope]: update(prev[scope] ?? {}) }));
-      writeDraft(nightDraftKey(scope), patch, data.nights?.find((n) => n.date === scope)?.answers ?? {});
     }
   };
+
+  // The newest apply (it reads the current data), for answers that arrive after a round trip.
+  const applyRef = useRef(apply);
+  applyRef.current = apply;
 
   // Tapping the active answer clears it.
   const tap = (scope: string | null, name: string, answer: CheckinAnswer) => {
@@ -190,6 +371,10 @@ export default function CheckInClient() {
     });
     return { dayItems, sleepItems, core, extras, coreByCategory };
   }, [data]);
+  const dayItemsRef = useRef<CheckinItem[]>([]);
+  dayItemsRef.current = dayItems;
+  const sleepItemsRef = useRef<CheckinItem[]>([]);
+  sleepItemsRef.current = sleepItems;
 
   // Last night always; an earlier night while it is incomplete or holds an unsaved tap (lib/checkin-cells.ts).
   const nights = useMemo(() => visibleNights(data?.nights ?? [], sleepItems, nightCells), [data, sleepItems, nightCells]);
@@ -205,10 +390,31 @@ export default function CheckInClient() {
   );
 
   const save = async () => {
-    if (!data || saving || changeCount === 0) return;
+    if (!data || savingRef.current || changeCount === 0) return;
     setSaving(true);
     savingRef.current = true;
+    ++loadSeq.current; // an older in-flight GET must not replace a just-saved baseline
     setError(null);
+    setSaveError(null);
+    const sentDrafts = new Map([
+      [dayDraftKey(data.date), drafts.read(dayDraftKey(data.date))],
+      ...nightPatches.map((n) => [nightDraftKey(n.date), drafts.read(nightDraftKey(n.date))] as const),
+    ]);
+    const settled = (date: string, patch: Patch, night: boolean) => {
+      const key = night ? nightDraftKey(date) : dayDraftKey(date);
+      drafts.settle(key, patch, sentDrafts.get(key) ?? {});
+      // Settle each successful part immediately, even if the next request or the final reload fails.
+      setData((prev) => !prev ? prev : night
+        ? { ...prev, nights: prev.nights.map((n) => n.date === date ? { ...n, answers: withAnswers(n.answers, patch) } : n) }
+        : prev.date === date ? { ...prev, answers: withAnswers(prev.answers, patch) } : prev);
+      if (night) {
+        const n = data.nights.find((n) => n.date === date)!;
+        setNightCells((prev) => ({ ...prev, [date]: buildCells(sleepItems, withAnswers(n.answers, patch), n.suggestions, drafts.active(key)) }));
+      } else {
+        setCells(buildCells(dayItems, withAnswers(data.answers, patch), data.suggestions, drafts.active(key)));
+      }
+      refreshDrafts();
+    };
     const post = async (date: string, answers: Patch) => {
       const res = await fetch("/api/habits/checkin", {
         method: "POST",
@@ -222,54 +428,265 @@ export default function CheckInClient() {
       }
     };
     try {
-      // The day, then each night under ITS date. A part that saved is not lost if a later part fails: its
-      // answers stay on screen and saving again just writes the same rows.
+      // The day, then each night under ITS date. Only successful requests settle their draft snapshots.
       if (Object.keys(dayPatch).length) {
         await post(data.date, dayPatch);
-        settleDraft(dayDraftKey(data.date), dayPatch);
+        settled(data.date, dayPatch, false);
         // Settle the Agents card; best-effort (the card also expires on its own). Only when the day was saved.
         agentsApi.checkinDone(data.date).catch(() => {});
       }
       for (const n of nightPatches) {
         await post(n.date, n.changes);
-        settleDraft(nightDraftKey(n.date), n.changes);
+        settled(n.date, n.changes, true);
       }
       const date = data.date;
-      await load(date);
+      await load(date, true);
       setSavedAt(date);
     } catch (e) {
       if (e instanceof StaleDayError) {
-        // These taps were made on a page whose "last night" and "today" were a day old, so they may be meant for
-        // other nights: drop them all (not only the refused request), redraw with the new day, and say why.
-        settleDraft(dayDraftKey(data.date), dayPatch);
-        for (const n of nightPatches) settleDraft(nightDraftKey(n.date), n.changes);
-        await load(requested);
-        setError("A new day started since this page loaded, so the unsaved answers were cleared. Please answer again.");
+        // Keep every unfinished tap under its original date, outside Save until explicitly reviewed.
+        drafts.holdAll();
+        refreshDrafts();
+        setData(null);
+        showDate(null);
+        await load(null, true);
+        setSaveError("A new day started. Unsaved answers are preserved under their original dates. Review them below before using them.");
       } else {
-        setError(e instanceof TypeError ? "Couldn't reach Onyx. Your answers are still here." : e instanceof Error ? e.message : "Save failed. Your answers are still here.");
+        setSaveError(e instanceof TypeError ? "Couldn't reach Onyx. Your answers are still here." : e instanceof Error ? e.message : "Save failed. Your answers are still here.");
       }
     } finally {
       savingRef.current = false;
       setSaving(false);
+      if (deferredLoad.current) {
+        const { date } = deferredLoad.current;
+        deferredLoad.current = null;
+        void load(date);
+      }
     }
   };
 
-  const goTo = (date: string) => {
-    router.replace(`/check-in?date=${date}`, { scroll: false });
+  const addMarks = (part: string, patch: Patch, label: string) =>
+    setMarks((prev) => {
+      const next = { ...(prev[part] ?? {}) };
+      for (const [name, a] of Object.entries(patch)) if (a) next[name] = { answer: a, label };
+      return { ...prev, [part]: next };
+    });
+  // The note stays while the row still holds the answer it was filled with; any change by Riley removes it.
+  const noteFor = (part: string, name: string, cell: Cell | undefined) => {
+    const m = marks[part]?.[name];
+    return m && cell && cell.answer === m.answer ? m.label : undefined;
   };
 
-  if (error && !data) {
+  // The journal draft for these words (the body is the text itself) with the model's labels. Not over an entry
+  // being saved, nor over one already saved from the same words.
+  const offerJournal = (date: string, text: string, labels: unknown): boolean => {
+    if (omit.has("journal-draft")) {
+      // /log: the Journal section holds journal drafts (same words, verbatim; the model's labels as suggestions).
+      const l = journalDraftFrom(labels);
+      setLogDraft("journal", { body: text, source: "voice", title: l.title || null, mood: l.mood, confidence: l.confidence, topics: l.topics }, text);
+      return true;
+    }
+    const cur = journalRef.current;
+    if (cur?.status === "saving" || (cur?.status === "saved" && cur.body === text)) return false;
+    const l = journalDraftFrom(labels);
+    setJournal({ date, title: l.title, mood: l.mood, confidence: l.confidence, topics: l.topics, source: "voice", body: text, status: "draft", url: null, existing: false, error: null });
+    return true;
+  };
+
+  // "Say it once": the server maps the text to Yes/No answers for the day tab and for last night (it writes
+  // nothing); they become ordinary draft taps. Rows saved or tapped by the time the answer arrives, or changed while
+  // it was read, are never overwritten (voicePatch); a data pre-fill is. The answer buttons stay live while it fills.
+  // Sleep answers go only into the night block on screen with the date the server named, a night already over.
+  const fillFromVoice = async (given?: string) => {
+    const page = dataRef.current;
+    const text = (given ?? voiceText).trim();
+    if (!page || voiceBusy || !text) return;
+    const date = page.date;
+    const sentAt = editGen.current;
+    setVoiceBusy(true);
+    setVoiceMsg(null);
+    try {
+      const res = await fetch("/api/habits/checkin/voice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date, text, today: page.today }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (date !== dataDateRef.current) return; // switched day meanwhile: drop it
+      if (res.status === 409 && json.stale) {
+        // The day rolled over since the page was drawn: "last night" moved. Reload today, then fill again.
+        setVoiceMsg("A new day started since this page loaded. It has reloaded; press Fill answers again.");
+        if (requested) showDate(null);
+        else void load(null);
+        return;
+      }
+      if (!res.ok || json.failed || !json.answers || typeof json.answers !== "object") {
+        setVoiceMsg("Couldn't read that, try again.");
+        return;
+      }
+      const now = dataRef.current ?? page;
+      const changed = changedSince("day", sentAt);
+      const patch = voicePatch(dayItemsRef.current, json.answers as Record<string, unknown>, cellsRef.current, changed);
+      const dayN = Object.keys(patch).length;
+      if (dayN) {
+        applyRef.current(null, patch);
+        addMarks(`day:${date}`, patch, FROM_VOICE);
+      }
+      let nightN = 0;
+      const night = json.night as { date?: unknown; answers?: unknown } | null | undefined;
+      if (
+        night && typeof night.date === "string" && night.answers && typeof night.answers === "object" &&
+        night.date < now.today && now.nights.some((n) => n.date === night.date)
+      ) {
+        const nightDate = night.date;
+        const nightPatch = voicePatch(sleepItemsRef.current, night.answers as Record<string, unknown>, nightCellsRef.current[nightDate] ?? {}, changedSince(nightDate, sentAt));
+        nightN = Object.keys(nightPatch).length;
+        if (nightN) {
+          applyRef.current(nightDate, nightPatch);
+          addMarks(`night:${nightDate}`, nightPatch, FROM_VOICE);
+        }
+      }
+      // Words from the Log screen's Say it box (`given` while embedded): that box drafts its own journal entry.
+      const fromLogSayIt = embedded && given !== undefined;
+      const journalNote = fromLogSayIt
+        ? ""
+        : offerJournal(date, text, json.journal)
+          ? omit.has("journal-draft") ? " A journal draft of your words is in Journal." : " A journal draft of your words is below."
+          : "";
+      const n = dayN + nightN;
+      if (n === 0) {
+        setVoiceMsg((changed.size ? "Nothing new to fill: you already answered those." : "Nothing in the text matched a question.") + journalNote);
+        return;
+      }
+      setVoiceMsg(`Filled ${n} answer${n === 1 ? "" : "s"}${nightN ? ` (${nightN} for last night)` : ""}. Check them, then Save.${journalNote}`);
+    } catch {
+      setVoiceMsg("Couldn't read that, try again.");
+    } finally {
+      setVoiceBusy(false);
+    }
+  };
+
+  // iPhone Shortcut hand-off: /check-in#say=<URL-encoded words>. The words go in the box and Fill runs once the
+  // check-in has loaded fresh (Fill writes nothing). The hash is removed at once, so a reload doesn't fill again
+  // and the words don't stay in the address bar. Not in the continuous scroll (it doesn't own the address).
+  useEffect(() => {
+    if (feed) return;
+    const words = sayFromHash(window.location?.hash ?? "");
+    if (words === null) return;
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    setVoiceText(words);
+    setVoiceOpen(true);
+    setHandoff(words);
+  }, [feed]);
+  const fillRef = useRef(fillFromVoice);
+  fillRef.current = fillFromVoice;
+  useEffect(() => {
+    if (handoff === null || !data || refreshFailed || !answeredRef.current) return; // not on a cached copy
+    setHandoff(null);
+    void fillRef.current(handoff);
+  }, [handoff, data, refreshFailed]);
+  // /log: the Log screen's Say it box hands its words over the same way (taken once, then cleared).
+  const { draft: logDraft, clear: clearLogDraft } = useLogDrafts("checkin");
+  // Set once this check-in took words from the Log Say it box (a remount after that leaves the box's result alone).
+  const tookLogWords = useRef(false);
+  useEffect(() => {
+    if (!embedded || !logDraft) return;
+    clearLogDraft(logDraft.id);
+    const words = logDraft.value.text.trim().slice(0, VOICE_MAX_TEXT_CHARS);
+    if (!words) return;
+    tookLogWords.current = true;
+    setVoiceMsg(null);
+    setVoiceText(words);
+    setVoiceOpen(true);
+    setHandoff(words);
+  }, [embedded, logDraft, clearLogDraft]);
+  // /log leaves out this screen's Say it once box, where the fill's result is written: the Log Say it box shows it.
+  useEffect(() => {
+    if (!embedded || !tookLogWords.current) return;
+    // Words waiting for a check-in that could not load fresh are never filled into a stale copy: say so.
+    if (handoff !== null && !voiceBusy && refreshFailed) {
+      reportCheckinFill({ pending: false, message: "Not filled yet: the check-in couldn't load. It fills once the check-in loads." });
+      return;
+    }
+    reportCheckinFill({ pending: voiceBusy || handoff !== null, message: voiceMsg });
+  }, [embedded, voiceBusy, handoff, voiceMsg, refreshFailed]);
+
+  // "Journaled your thoughts?" once the entry for the day on screen is saved: a draft Yes like any other tap,
+  // never over a saved or tapped answer.
+  const markJournaled = (date: string) => {
+    if (dataRef.current?.date !== date) return;
+    const patch = voicePatch(dayItemsRef.current.filter((i) => i.name === Q_JOURNALED), { [Q_JOURNALED]: "Yes" }, cellsRef.current, new Set());
+    if (!Object.keys(patch).length) return;
+    applyRef.current(null, patch);
+    addMarks(`day:${date}`, patch, FROM_JOURNAL);
+  };
+
+  // "Save to journal": the only write of the journal draft (POST /api/journal/entry creates the Notion entry).
+  const saveJournal = async () => {
+    const j = journalRef.current;
+    if (!j || j.status !== "draft") return;
+    setJournal({ ...j, status: "saving", error: null });
+    try {
+      const res = await fetch("/api/journal/entry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date: j.date, title: j.title, mood: j.mood, confidence: j.confidence, source: j.source, topics: j.topics, body: j.body }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json || typeof json !== "object" || !("url" in json)) {
+        setJournal((cur) => cur && { ...cur, status: "draft", error: json?.error || `Couldn't save the journal entry (${res.status}). It is still here.` });
+        return;
+      }
+      setJournal((cur) => cur && { ...cur, status: "saved", url: typeof json.url === "string" ? json.url : null, existing: !!json.existing });
+      markJournaled(j.date);
+    } catch {
+      setJournal((cur) => cur && { ...cur, status: "draft", error: "Couldn't reach Onyx. The entry is still here." });
+    }
+  };
+
+  const goTo = (date: string) => showDate(date);
+
+  const reviewDraft = (entry: DatedDraft) => {
+    if (!data || savingRef.current || !drafts.recover(entry.key, data)) return;
+    setError(null);
+    setSaveError(null);
+    setSavedAt(null);
+    if (entry.night) {
+      const n = data.nights.find((n) => n.date === entry.date)!;
+      setNightCells((prev) => ({ ...prev, [n.date]: buildCells(sleepItems, n.answers, n.suggestions, drafts.active(entry.key)) }));
+    } else {
+      const next = buildCells(dayItems, data.answers, data.suggestions, drafts.active(entry.key));
+      setCells(next);
+      setShowExtras(dayItems.some((i) => i.group === "extra" && next[i.name]));
+    }
+    refreshDrafts();
+  };
+
+  const draftRecovery = (
+    <>
+      {storageFailed && <p role="alert" className="my-4 text-sm text-mid">Some drafts could not be read or stored in this browser. Answers entered here are kept in this open page, but may be lost if you close or refresh it. Keep it open until saved, or copy the answers.</p>}
+      <DraftRecovery entries={recovery} page={data} saving={saving} onReview={reviewDraft} onGo={goTo} onDiscard={(entry) => {
+        if (savingRef.current) return;
+        drafts.discard(entry.key, entry.draft);
+        refreshDrafts();
+      }} />
+    </>
+  );
+
+  const visibleError = [saveError, error].filter(Boolean).join(" ");
+  if (visibleError && !data) {
     return (
-      <div className="max-w-xl">
-        <h2 className="text-[28px] font-medium text-text-primary">Check-in</h2>
-        <p className="mt-4 text-sm text-text-secondary">{error}</p>
+      <div className={wrapClass}>
+        <h2 data-testid={headingTestId} className={headingClass}>Check-in</h2>
+        <p className="mt-4 text-sm text-text-secondary">{visibleError}</p>
+        {draftRecovery}
         <button
           onClick={() => {
             // No date: the server decides which day it is (before 06:00 the clock date is a day ahead).
-            router.replace("/check-in", { scroll: false });
+            showDate(null);
             load(null);
           }}
-          className="mt-4 px-3 py-1.5 text-[13px] bg-white/5 border border-border-subtle rounded-[6px]">
+          className="mt-4 min-h-11 px-4 text-[13px] bg-white/5 border border-border-subtle rounded-control">
           Go to today
         </button>
       </div>
@@ -278,34 +695,43 @@ export default function CheckInClient() {
 
   if (!data) {
     return (
-      <div className="max-w-xl space-y-3">
+      <div className={`${wrapClass} space-y-3`}>
+        {embedded && <h2 className={headingClass}>Check-in</h2>}
+        {draftRecovery}
         <div className="h-8 w-40 bg-white/5 animate-pulse rounded" />
         {[...Array(8)].map((_, i) => (
-          <div key={i} className="h-12 bg-white/[0.03] animate-pulse rounded-[6px]" />
+          <div key={i} className="h-12 bg-white/[0.03] animate-pulse rounded-control" />
         ))}
       </div>
     );
   }
 
   const catchUp = data.days.find((d) => d.date !== data.date && d.date !== data.today && d.answered === 0);
-  const dayName = dayLabel(data.date, data.today);
+  const labelDay = (date: string) => refreshFailed ? date : dayLabel(date, data.today);
+  const dayName = labelDay(data.date);
 
   return (
-    <div className="max-w-xl">
+    <div className={wrapClass}>
       <div className="mb-5">
-        <h2 className="text-[28px] font-medium text-text-primary">Check-in</h2>
+        <h2 data-testid={headingTestId} className={headingClass}>Check-in</h2>
         <p className="text-sm text-text-tertiary mt-0.5">
-          {nights.length > 0
+          {refreshFailed ? `Showing the last loaded check-in for daytime ${data.date}. Dates are unchanged; refresh could not confirm today's date.` : nights.length > 0
             ? `Two parts. Sleep: ${nightLabel(nights[0].date, data.today).span}. Daytime: ${dayName === "Today" || dayName === "Yesterday" ? `${dayName.toLowerCase()}, ` : ""}${longDate(data.date)}.`
             : `Daytime: ${longDate(data.date)}. Skip anything you're unsure of.`}
         </p>
       </div>
 
+      {draftRecovery}
+
+      {/* Personalize: every block is its own part; sections get no extra heading on screen. The Save bar stays fixed. */}
+      <PartGrid page="/check-in" title="Check-in">
+      <PartGroup id="section-sleep" title="Sleep">
       {/* SLEEP: nights that already happened. Not tied to the day tabs below. */}
       {nights.length > 0 && (
-        <section className="mb-7 rounded-[8px] border border-indigo-400/25 bg-indigo-500/[0.06] p-3" aria-label="Sleep">
+        <Part id="sleep-nights" title="Sleep (nights that happened)">
+        <section className="rounded-card border border-border-default bg-surface-sunken shadow-card p-3" aria-label="Sleep">
           <div className="flex items-center gap-2">
-            <Moon className="w-4 h-4 text-indigo-300" />
+            <Moon aria-hidden="true" className="w-4 h-4 text-text-secondary" />
             <h3 className="text-[15px] font-medium text-text-primary">Sleep</h3>
           </div>
           <p className="text-[12px] text-text-tertiary mt-0.5 mb-3">Only nights that already happened. Tonight is asked tomorrow.</p>
@@ -314,23 +740,28 @@ export default function CheckInClient() {
               key={n.date}
               night={n}
               today={data.today}
+              unconfirmed={refreshFailed}
               catchUp={i > 0}
               items={sleepItems}
               cells={nightCells[n.date] ?? {}}
+              noteFor={(name, cell) => noteFor(`night:${n.date}`, name, cell)}
               onTap={(name, a) => tap(n.date, name, a)}
               onKit={(kit) => apply(n.date, kit)}
             />
           ))}
         </section>
+        </Part>
       )}
+      </PartGroup>
 
-      {/* DAYTIME: one behavior day per tab */}
+      {/* DAYTIME: one behavior day per tab. The heading and the day tabs are the section's header. */}
+      <PartGroup id="section-daytime" title="Daytime" gap={24} header={<>
       <div className="flex items-center gap-2 mb-2">
-        <Sun className="w-4 h-4 text-amber-300" />
+        <Sun aria-hidden="true" className="w-4 h-4 text-text-secondary" />
         <h3 className="text-[15px] font-medium text-text-primary">
           Daytime{dayName === "Today" || dayName === "Yesterday" ? ` · ${dayName}` : ""}
         </h3>
-        <span className="text-[13px] text-text-secondary">{longDate(data.date)}</span>
+        <span className="text-[13px] text-text-secondary">{refreshFailed ? data.date : longDate(data.date)}</span>
       </div>
 
       {/* Day tabs: today and the two days before, with progress */}
@@ -345,19 +776,68 @@ export default function CheckInClient() {
               aria-selected={active}
               disabled={saving}
               onClick={() => goTo(d.date)}
-              className={`flex-1 px-3 py-2 rounded-[6px] border text-left transition-colors ${
+              className={`flex-1 min-h-11 px-3 py-2 rounded-control border text-left transition-colors ${
                 active ? "border-accent/60 bg-accent/10" : "border-border-subtle bg-white/[0.02] hover:bg-white/[0.05]"
               }`}
             >
-              <div className={`text-[13px] font-medium ${active ? "text-text-primary" : "text-text-secondary"}`}>{dayLabel(d.date, data.today)}</div>
+              <div className={`text-[13px] font-medium ${active ? "text-text-primary" : "text-text-secondary"}`}>{labelDay(d.date)}</div>
               <div className="text-[11px] font-mono text-text-tertiary">{complete ? "done" : d.answered ? `${d.answered}/${d.total}` : "not started"}</div>
             </button>
           );
         })}
       </div>
+      </>}>
+
+      {/* Say it once: dictated text -> draft Yes/No taps for the day and last night, and a journal draft (nothing is saved until Save / Save to journal) */}
+      {!omit.has("say-it-once") && <Part id="say-it-once" title="Say it once">
+      <details
+        open={voiceOpen}
+        onToggle={(e) => setVoiceOpen(e.currentTarget.open)}
+        className="rounded-control border border-border-subtle bg-white/[0.02] px-3 py-2"
+      >
+        <summary className="cursor-pointer py-3 text-[13px] leading-5 text-text-secondary">Say it once</summary>
+        <textarea
+          value={voiceText}
+          onChange={(e) => setVoiceText(e.target.value.slice(0, VOICE_MAX_TEXT_CHARS))}
+          maxLength={VOICE_MAX_TEXT_CHARS}
+          rows={4}
+          aria-label="Say it once"
+          className="mt-2 w-full rounded-control border border-border-subtle bg-transparent p-2 text-[14px] text-text-primary"
+        />
+        <p className="text-[11px] text-text-tertiary mt-1">
+          Type or use the keyboard microphone: the day, and last night&apos;s sleep. It fills answers and drafts a journal entry of your words. Nothing is saved until you press Save (or Save to journal).
+        </p>
+        <div className="mt-2 flex items-center gap-3">
+          <button
+            onClick={() => fillFromVoice()}
+            disabled={voiceBusy || saving || !voiceText.trim()}
+            className="min-h-11 px-4 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary disabled:opacity-50"
+          >
+            {voiceBusy ? "Filling…" : "Fill answers"}
+          </button>
+          <span className="text-[11px] font-mono text-text-tertiary">
+            {voiceText.length}/{VOICE_MAX_TEXT_CHARS}
+          </span>
+        </div>
+        {voiceMsg && <p className="text-[12px] text-text-secondary mt-2">{voiceMsg}</p>}
+      </details>
+      </Part>}
+
+      {journal && !omit.has("journal-draft") && (
+        <Part id="journal-draft" title="Journal entry draft">
+        <JournalDraftCard
+          form={journal}
+          maxDate={easternDate(new Date())}
+          onChange={(change) => setJournal((cur) => (cur && cur.status === "draft" ? { ...cur, ...change, error: null } : cur))}
+          onSave={() => saveJournal()}
+          onDiscard={() => setJournal((cur) => (cur?.status === "saving" ? cur : null))}
+        />
+        </Part>
+      )}
 
       {/* Progress */}
-      <div className="mb-6">
+      <Part id="progress" title="Progress, No for the rest, trial question">
+      <div>
         <div className="flex justify-between text-[12px] font-mono text-text-tertiary mb-1.5">
           <span>
             {coreDone} of {core.length} answered
@@ -371,7 +851,7 @@ export default function CheckInClient() {
           <div className="mt-3 flex items-center gap-3">
             <button
               onClick={() => apply(null, Object.fromEntries(dayBlanks.map((i) => [i.name, "No" as CheckinAnswer])))}
-              className="px-3 py-1.5 rounded-[6px] border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary transition-colors"
+              className="min-h-11 px-4 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary transition-colors"
             >
               No for the other {dayBlanks.length}
             </button>
@@ -379,39 +859,53 @@ export default function CheckInClient() {
           </div>
         )}
       </div>
+      {/* N-of-1 trial: "Followed today's arm?" Renders nothing unless a trial is running, so it rides in this part
+          (an empty part of its own would still take a grid gap). The wrapper collapses when it renders nothing. */}
+      {!refreshFailed && (data.date === data.today || data.date === addDays(data.today, -1)) && (
+        <div className="mt-6 empty:hidden [&>section]:mb-0">
+          <ExperimentAdherence key={data.date} date={data.date} when={data.date === data.today ? "today" : "yesterday"} />
+        </div>
+      )}
+      </Part>
 
+      {/* One part per question category (the id follows the category name, so its saved place sticks). */}
       {coreByCategory.map(([category, items]) => (
-        <section key={category} className="mb-6">
+        <Part key={category} id={categoryPartId(category)} title={`${category.charAt(0).toUpperCase()}${category.slice(1)} questions`}>
+        <section>
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">{category}</h3>
-          <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
+          <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
             {items.map((item) => (
-              <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} />
+              <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} note={noteFor(`day:${data.date}`, item.name, cells[item.name])} />
             ))}
           </div>
         </section>
+        </Part>
       ))}
 
       {extras.length > 0 && (
-        <section className="mb-6">
-          <button onClick={() => setShowExtras((s) => !s)} className="flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">
+        <Part id="also-did" title="Also did">
+        <section>
+          <button onClick={() => setShowExtras((s) => !s)} aria-expanded={showExtras} className="min-h-11 flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">
             <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showExtras ? "" : "-rotate-90"}`} />
             Also did ({extras.filter((i) => cells[i.name]).length}/{extras.length})
           </button>
           {showExtras && (
             <>
               <p className="text-[12px] text-text-tertiary mb-2">Weekly and rarely-Yes questions. Leave blank unless you did (or deliberately skipped) one {dayName === "Today" ? "today" : "that day"}.</p>
-              <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
+              <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
                 {extras.map((item) => (
-                  <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} />
+                  <Row key={item.name} item={item} cell={cells[item.name]} onTap={(name, a) => tap(null, name, a)} note={noteFor(`day:${data.date}`, item.name, cells[item.name])} />
                 ))}
               </div>
             </>
           )}
         </section>
+        </Part>
       )}
 
-      {(delivery.groups.length > 0 || delivery.loadError) && (
-        <section className="mb-6">
+      {!omit.has("uber-eats") && (delivery.groups.length > 0 || delivery.loadError) && (
+        <Part id="uber-eats" title="Uber Eats: how much did you eat?">
+        <section>
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">Uber Eats: how much did you eat?</h3>
           {delivery.groups.length > 0 && (
             <p className="text-[12px] text-text-tertiary mb-2">Saved as you tap. Left as All unless you change it; tap All to confirm.</p>
@@ -420,7 +914,7 @@ export default function CheckInClient() {
             <div key={g.date} className="mb-3">
               <div className="flex items-baseline justify-between mb-1">
                 <span className="text-[11px] font-mono text-text-secondary">
-                  {g.date === data.date ? dayLabel(g.date, data.today) : `${dayLabel(g.date, data.today)} · not answered yet`}
+                  {g.date === data.date ? labelDay(g.date) : `${labelDay(g.date)} · not answered yet`}
                 </span>
                 {g.totalKcal != null && (
                   <span className="text-[11px] font-mono text-text-tertiary">~{Math.round(g.totalKcal)} kcal counted</span>
@@ -429,23 +923,55 @@ export default function CheckInClient() {
               <DeliveryDishList items={g.items} onPick={delivery.setFraction} />
             </div>
           ))}
-          {delivery.loadError && <p className="text-[12px] text-red-400 mt-1.5">{delivery.loadError}</p>}
-          {delivery.error && <p className="text-[12px] text-red-400 mt-1.5">{delivery.error}</p>}
+          {delivery.loadError && <p className="text-[12px] text-down mt-1.5">{delivery.loadError}</p>}
+          {delivery.error && <p className="text-[12px] text-down mt-1.5">{delivery.error}</p>}
         </section>
+        </Part>
       )}
+
+      {!omit.has("uber-eats-leftovers") && delivery.leftovers.length > 0 && (
+        <Part id="uber-eats-leftovers" title="Uber Eats leftovers">
+        <section>
+          <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">Uber Eats: leftovers</h3>
+            <div>
+              <div className="flex items-baseline justify-between mb-1">
+                <span className="text-[11px] font-mono text-text-secondary">
+                  Leftovers · {labelDay(data.date)}
+                </span>
+                {delivery.leftoverKcal != null && (
+                  <span className="text-[11px] font-mono text-text-tertiary">~{Math.round(delivery.leftoverKcal)} kcal counted</span>
+                )}
+              </div>
+              <p className="text-[12px] text-text-tertiary mb-2">
+                Share of what was left. Add the time so it counts for meal timing. Unanswered counts as thrown out.
+              </p>
+              <LeftoverList
+                questions={delivery.leftovers}
+                onPick={delivery.setLeftover}
+                onTime={delivery.setLeftoverTime}
+                showNow={data.date === data.today}
+              />
+            </div>
+          {/* A failed tap shows here when the dishes part is not on screen. */}
+          {delivery.error && !(delivery.groups.length > 0 || delivery.loadError) && <p className="text-[12px] text-down mt-1.5">{delivery.error}</p>}
+        </section>
+        </Part>
+      )}
+      </PartGroup>
+      </PartGrid>
 
       {/* Save bar: sticks above the mobile tab bar */}
       <div className="sticky bottom-[calc(env(safe-area-inset-bottom)+4.75rem)] md:bottom-4 z-10 mt-8">
-        <div className="rounded-[8px] border border-border-subtle bg-surface-card/95 backdrop-blur px-4 py-3 flex items-center gap-3 shadow-lg">
+        <div className="rounded-card border border-border-subtle bg-surface-card/95 backdrop-blur px-4 py-3 flex items-center gap-3 shadow-elevated">
           <div className="flex-1 min-w-0 text-[13px]">
-            {error ? (
-              <span className="text-red-400">{error}</span>
+            {visibleError ? (
+              <span className="text-down">{visibleError}</span>
             ) : savedAt === data.date && changeCount === 0 ? (
               <span className="text-text-secondary inline-flex items-center gap-1.5">
-                <Check className="w-4 h-4 text-accent" /> Saved
+                <Check className="w-4 h-4 text-up" /> Saved
                 {catchUp && (
                   <button onClick={() => goTo(catchUp.date)} className="ml-2 text-accent underline underline-offset-2">
-                    Catch up {dayLabel(catchUp.date, data.today).toLowerCase()}
+                    Catch up {labelDay(catchUp.date).toLowerCase()}
                   </button>
                 )}
               </span>
@@ -461,7 +987,7 @@ export default function CheckInClient() {
           <button
             onClick={save}
             disabled={saving || changeCount === 0}
-            className="px-4 py-2 rounded-[6px] text-[14px] font-medium bg-accent text-black disabled:opacity-40 transition-opacity"
+            className="min-h-11 px-5 rounded-full text-[14px] font-semibold bg-accent text-on-accent disabled:opacity-40 transition-opacity"
           >
             {saving ? "Saving…" : "Save"}
           </button>
@@ -471,21 +997,71 @@ export default function CheckInClient() {
   );
 }
 
+/** Review is local only. Restoring fills the original dated form; a separate Save is still required. */
+function DraftRecovery({ entries, page, saving, onReview, onDiscard, onGo }: {
+  entries: DatedDraft[];
+  page: CheckinPayload | null;
+  saving: boolean;
+  onReview: (entry: DatedDraft) => void;
+  onDiscard: (entry: DatedDraft) => void;
+  onGo: (date: string) => void;
+}) {
+  const [discardDraft, setDiscardDraft] = useState<DatedDraft | null>(null);
+  if (!entries.length) return null;
+  return (
+    <section aria-label="Preserved check-in drafts" className="my-4 rounded-card border border-border-subtle bg-surface-card p-3">
+      <h3 className="text-sm font-medium text-text-primary">Review preserved answers</h3>
+      <p className="mt-1 text-xs text-text-secondary">These answers are excluded from Save until you review their original dates. Using them fills that dated form; then press Save. You can also select and copy the text.</p>
+      {entries.map((entry) => {
+        const label = entry.night ? `Night ${entry.date} → ${addDays(entry.date, 1)} morning` : `Daytime ${entry.date}`;
+        const target = recoveryTarget(entry, page);
+        const selectableDay = !entry.night && page?.days.some((d) => d.date === entry.date);
+        return (
+          <details key={entry.key} className="mt-3 text-sm">
+            <summary className="cursor-pointer text-text-primary">{label} · {Object.keys(entry.draft).length} answers</summary>
+            <ul className="mt-2 space-y-1 text-text-secondary">
+              {Object.entries(entry.draft).map(([name, e]) => <li key={name}>{name}: <strong>{e.a ?? "Clear answer"}</strong>{e.base !== undefined && <span className="text-text-tertiary"> (saved when tapped: {e.base ?? "not logged"})</span>}</li>)}
+            </ul>
+            {target ? (
+              <button disabled={saving} onClick={() => onReview(entry)} className="mt-2 rounded-control border border-border-subtle px-3 py-2 text-accent disabled:opacity-50">Use answers for {label}</button>
+            ) : selectableDay && page?.date !== entry.date ? (
+              <button disabled={saving} onClick={() => onGo(entry.date)} className="mt-2 rounded-control border border-border-subtle px-3 py-2 text-accent disabled:opacity-50">Open {entry.date} to review</button>
+            ) : (
+              <p className="mt-2 text-xs text-text-tertiary">This date or a question is no longer offered in check-in. The draft stays here for review and copying; it will not be moved to another date.</p>
+            )}
+            <div className="mt-2">
+              {discardDraft?.key === entry.key ? <>
+                <span className="text-xs text-text-secondary">Discard these unsaved answers for {label}?</span>
+                <button disabled={saving} onClick={() => { onDiscard(discardDraft); setDiscardDraft(null); }} className="ml-2 rounded-control border border-border-subtle px-3 py-2 text-down">Discard these answers</button>
+                <button onClick={() => setDiscardDraft(null)} className="ml-2 rounded-control px-3 py-2 text-text-secondary">Keep draft</button>
+              </> : <button disabled={saving} onClick={() => setDiscardDraft(entry)} className="rounded-control border border-border-subtle px-3 py-2 text-text-secondary">Discard draft…</button>}
+            </div>
+          </details>
+        );
+      })}
+    </section>
+  );
+}
+
 /** One finished night: which night it is, the one-tap usual kit, then the sleep questions. */
 function NightBlock({
   night,
   today,
+  unconfirmed,
   catchUp,
   items,
   cells,
+  noteFor,
   onTap,
   onKit,
 }: {
   night: CheckinNight;
   today: string;
+  unconfirmed: boolean;
   catchUp: boolean;
   items: CheckinItem[];
   cells: Cells;
+  noteFor: (name: string, cell: Cell | undefined) => string | undefined;
   onTap: (name: string, a: CheckinAnswer) => void;
   onKit: (kit: Record<string, CheckinAnswer>) => void;
 }) {
@@ -507,8 +1083,8 @@ function NightBlock({
       {/* The weekday span is the main label: it names the night at any hour ("Last night" alone can be misread before 6 AM). */}
       <div className="flex items-baseline justify-between gap-2 mb-1.5">
         <span className="text-[14px] font-medium text-text-primary">
-          {label.span}
-          <span className="ml-2 text-[11px] font-mono font-normal uppercase tracking-wider text-indigo-200/80">{label.title}</span>
+          {unconfirmed ? `${night.date} → ${addDays(night.date, 1)} morning` : label.span}
+          {!unconfirmed && <span className="ml-2 text-[11px] font-mono font-normal uppercase tracking-wider text-text-tertiary">{label.title}</span>}
         </span>
         <span className="text-[11px] font-mono text-text-tertiary shrink-0">{catchUp && done === 0 ? "not answered yet" : `${done}/${asked.length}`}</span>
       </div>
@@ -516,7 +1092,7 @@ function NightBlock({
         <button
           onClick={() => onKit(kit)}
           disabled={kitApplied}
-          className={`w-full mb-2 px-3 py-2.5 rounded-[6px] border text-left transition-colors ${
+          className={`w-full mb-2 px-3 py-2.5 rounded-control border text-left transition-colors ${
             kitApplied ? "border-accent/40 bg-accent/10" : "border-border-subtle bg-white/[0.03] hover:bg-white/[0.06]"
           }`}
         >
@@ -526,17 +1102,17 @@ function NightBlock({
           <span className="block text-[12px] text-text-tertiary mt-0.5">{kitSummary(kit)}</span>
         </button>
       )}
-      <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card">
+      <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
         {asked.map((item) => (
-          <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} />
+          <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} note={noteFor(item.name, cells[item.name])} />
         ))}
       </div>
       {optional.length > 0 && (
         <>
           <p className="text-[11px] text-text-tertiary mt-2 mb-1">Optional. Leave blank unless it happened.</p>
-          <div className="rounded-[6px] border border-border-subtle divide-y divide-border-subtle bg-surface-card/60">
+          <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card/60">
             {optional.map((item) => (
-              <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} />
+              <Row key={item.name} item={item} cell={cells[item.name]} onTap={onTap} note={noteFor(item.name, cells[item.name])} />
             ))}
           </div>
         </>
@@ -545,13 +1121,168 @@ function NightBlock({
   );
 }
 
-function Row({ item, cell, onTap }: { item: CheckinItem; cell: Cell | undefined; onTap: (name: string, a: CheckinAnswer) => void }) {
+// Yes and No are both valid answers: either one, when chosen, uses the accent selection (never red, which
+// would read as "bad"). A data pre-fill is a suggestion until Riley taps: dashed outline, no fill.
+function answerStyle(selected: boolean, suggested: boolean): string {
+  if (!selected) return "border-border-subtle text-text-tertiary hover:text-text-secondary";
+  return suggested ? "border-dashed border-accent/60 text-accent" : "bg-accent/20 border-accent/70 text-accent";
+}
+
+/** The journal draft: the words as written (editable), the labels the journal requires, one explicit save. */
+function JournalDraftCard({
+  form,
+  maxDate,
+  onChange,
+  onSave,
+  onDiscard,
+}: {
+  form: JournalForm;
+  maxDate: string;
+  onChange: (change: Partial<Pick<JournalForm, "date" | "title" | "mood" | "confidence" | "topics" | "source" | "body">>) => void;
+  onSave: () => void | Promise<void>;
+  onDiscard: () => void;
+}) {
+  const busy = form.status === "saving";
+  const ready = !!form.title.trim() && !!form.mood && form.topics.length > 0 && !!form.body.trim();
+  const missing = [!form.title.trim() && "a title", !form.mood && "a mood", !form.topics.length && "a topic"].filter(Boolean).join(", ");
+  const addable = JOURNAL_TOPICS.filter((t) => !form.topics.includes(t));
+  const field = "mt-1 w-full rounded-control border border-border-subtle bg-transparent p-2 text-[14px] text-text-primary disabled:opacity-60";
+  const label = "block text-[11px] font-mono uppercase tracking-wider text-text-tertiary";
+
+  if (form.status === "saved") {
+    return (
+      <section aria-label="Journal entry" className="rounded-card border border-border-subtle bg-surface-card p-3">
+        <p className="text-[13px] text-text-secondary inline-flex flex-wrap items-center gap-1.5">
+          <Check className="w-4 h-4 text-up" />
+          {form.existing ? "Already in your journal (same date and title)." : "Saved to your journal."} It shows on Journal after the hourly sync.
+          {form.url && (
+            <a href={form.url} target="_blank" rel="noreferrer" className="text-accent underline underline-offset-2">
+              Open in Notion
+            </a>
+          )}
+        </p>
+      </section>
+    );
+  }
+
+  return (
+    <section aria-label="Journal entry" className="rounded-card border border-border-subtle bg-surface-card p-3">
+      <div className="flex items-baseline justify-between gap-2">
+        <h3 className="text-[14px] font-medium text-text-primary">Journal entry</h3>
+        <span className="text-[11px] font-mono text-text-tertiary">draft · not saved</span>
+      </div>
+      <p className="mt-0.5 text-[12px] text-text-tertiary">Your words as written. Check the title and labels, then save it to the journal, or discard it.</p>
+
+      <label className={`${label} mt-3`}>
+        Title
+        <input value={form.title} maxLength={JOURNAL_MAX_TITLE_CHARS} disabled={busy} onChange={(e) => onChange({ title: e.target.value })} className={field} />
+      </label>
+      <label className={`${label} mt-3`}>
+        Date
+        <input type="date" value={form.date} max={maxDate} disabled={busy} onChange={(e) => e.target.value && onChange({ date: e.target.value })} className={field} />
+      </label>
+      <Choice label="Mood" options={JOURNAL_MOODS} value={form.mood} disabled={busy} onPick={(mood) => onChange({ mood })} />
+      <Choice label="How sure" options={JOURNAL_CONFIDENCES} value={form.confidence} disabled={busy} onPick={(confidence) => onChange({ confidence })} />
+
+      <div className="mt-3" role="group" aria-label="Topics">
+        <div className={label}>Topics</div>
+        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+          {form.topics.map((t) => (
+            <button
+              key={t}
+              type="button"
+              disabled={busy}
+              onClick={() => onChange({ topics: form.topics.filter((x) => x !== t) })}
+              aria-label={`Remove topic ${t}`}
+              className="min-h-11 px-3 rounded-control border border-accent/60 bg-accent/10 text-[13px] text-accent inline-flex items-center gap-1"
+            >
+              {t} <X className="w-3.5 h-3.5" />
+            </button>
+          ))}
+          {form.topics.length < JOURNAL_MAX_TOPICS && addable.length > 0 && (
+            <select
+              value=""
+              disabled={busy}
+              aria-label="Add topic"
+              onChange={(e) => e.target.value && onChange({ topics: [...form.topics, e.target.value] })}
+              className="min-h-11 px-2 rounded-control border border-border-subtle bg-transparent text-[13px] text-text-secondary"
+            >
+              <option value="">Add topic…</option>
+              {addable.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      </div>
+
+      <Choice label="Captured by" options={JOURNAL_SOURCES} value={form.source} disabled={busy} onPick={(source) => onChange({ source })} />
+
+      <label className={`${label} mt-3`}>
+        Entry
+        <textarea
+          value={form.body}
+          rows={5}
+          maxLength={JOURNAL_MAX_BODY_CHARS}
+          disabled={busy}
+          onChange={(e) => onChange({ body: e.target.value })}
+          className={field}
+        />
+      </label>
+
+      {form.error && <p role="alert" className="mt-2 text-[12px] text-down">{form.error}</p>}
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          onClick={onSave}
+          disabled={busy || !ready}
+          className="min-h-11 px-4 rounded-full text-[13px] font-semibold bg-accent text-on-accent disabled:opacity-40 transition-opacity"
+        >
+          {busy ? "Saving…" : "Save to journal"}
+        </button>
+        <button type="button" onClick={onDiscard} disabled={busy} className="min-h-11 px-3 rounded-control text-[13px] text-text-secondary disabled:opacity-50">
+          Discard
+        </button>
+        {!ready && missing && <span className="text-[12px] text-text-tertiary">Add {missing} first.</span>}
+      </div>
+    </section>
+  );
+}
+
+/** One choice out of a few (mood, how sure, captured by): the same accent selection as the Yes / No buttons. */
+function Choice<T extends string>({ label, options, value, disabled, onPick }: { label: string; options: readonly T[]; value: T | null; disabled?: boolean; onPick: (v: T) => void }) {
+  return (
+    <div className="mt-3" role="group" aria-label={label}>
+      <div className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">{label}</div>
+      <div className="mt-1 flex flex-wrap gap-1.5">
+        {options.map((o) => (
+          <button
+            key={o}
+            type="button"
+            aria-pressed={value === o}
+            disabled={disabled}
+            onClick={() => onPick(o)}
+            className={`min-h-11 px-3 rounded-control border text-[13px] font-medium transition-colors ${answerStyle(value === o, false)}`}
+          >
+            {o}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Row({ item, cell, onTap, note }: { item: CheckinItem; cell: Cell | undefined; onTap: (name: string, a: CheckinAnswer) => void; note?: string }) {
   const yes = cell?.answer === "Yes";
   const no = cell?.answer === "No";
+  const suggested = cell?.origin === "suggested";
   return (
     <div className="flex items-center gap-3 px-3 py-2.5">
       <div className="flex-1 min-w-0">
         <p className="text-[14px] text-text-primary leading-snug">{item.name}</p>
+        {note && <p className="text-[11px] font-mono text-accent/80 mt-0.5">{note}</p>}
         {cell?.origin === "suggested" && cell.source && <p className="text-[11px] font-mono text-accent/80 mt-0.5">from {cell.source} · tap to change</p>}
       </div>
       <div className="flex gap-1.5 shrink-0">
@@ -559,9 +1290,7 @@ function Row({ item, cell, onTap }: { item: CheckinItem; cell: Cell | undefined;
           onClick={() => onTap(item.name, "Yes")}
           aria-pressed={yes}
           aria-label={`${item.name}: yes`}
-          className={`h-9 w-14 rounded-[6px] border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${
-            yes ? "bg-accent/20 border-accent/70 text-accent" : "border-border-subtle text-text-tertiary hover:text-text-secondary"
-          }`}
+          className={`h-11 w-16 rounded-control border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${answerStyle(yes, suggested)}`}
         >
           <Check className="w-3.5 h-3.5" /> Yes
         </button>
@@ -569,9 +1298,7 @@ function Row({ item, cell, onTap }: { item: CheckinItem; cell: Cell | undefined;
           onClick={() => onTap(item.name, "No")}
           aria-pressed={no}
           aria-label={`${item.name}: no`}
-          className={`h-9 w-14 rounded-[6px] border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${
-            no ? "bg-red-500/15 border-red-400/60 text-red-300" : "border-border-subtle text-text-tertiary hover:text-text-secondary"
-          }`}
+          className={`h-11 w-16 rounded-control border text-[13px] font-medium inline-flex items-center justify-center gap-1 transition-colors ${answerStyle(no, suggested)}`}
         >
           <X className="w-3.5 h-3.5" /> No
         </button>

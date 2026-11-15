@@ -138,6 +138,18 @@ function cleanLabel(raw: string): string {
 export function normalizeMerchant(raw: string): string {
   return cleanLabel(raw).toLowerCase();
 }
+/** A row's display label: its custom name, else its name. */
+export function rowLabel(t: { name: string | null; custom_name: string | null }): string {
+  return (t.custom_name ?? "").trim() || (t.name ?? "").trim();
+}
+/** The grouping key the detectors use for a row: its normalized merchant label ("" when unnamed). */
+export function merchantKey(t: { name: string | null; custom_name: string | null }): string {
+  return normalizeMerchant(rowLabel(t));
+}
+/** A merchant label for display: store / reference numbers stripped. */
+export function displayMerchant(raw: string): string {
+  return cleanLabel(raw) || raw.trim();
+}
 
 /** Parse one PostgREST row into a detector input; a malformed row is dropped (null). */
 export function parseRecurringInput(raw: unknown): RecurringInput | null {
@@ -320,8 +332,8 @@ function groupCharges(txns: readonly RecurringInput[]): Map<string, Charge[]> {
     if (!(t.amount_cents > 0)) continue;
     if ((t.currency ?? "").trim().toUpperCase() !== "USD") continue;
     if (!isDay(t.txn_date)) continue;
-    const label = (t.custom_name ?? "").trim() || (t.name ?? "").trim();
-    const key = normalizeMerchant(label);
+    const label = rowLabel(t);
+    const key = merchantKey(t);
     if (!key) continue;
     const list = groups.get(key);
     const charge = { date: t.txn_date, cents: t.amount_cents, label };

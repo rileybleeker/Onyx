@@ -57,7 +57,9 @@ STORED = {"access_token": "old-access", "refresh_token": "stored-refresh", "expi
 # ---------------------------------------------------------------------------
 
 class FakeSupabase:
-    """Records inserts / upserts; answers the one select ci_token_helper makes."""
+    """Records inserts / upserts; answers the one select `download spotify` makes, and the
+    save_spotify_token RPC `upload spotify` writes through (applied with the offline model,
+    spotify_upload_decision; a written token is recorded as a ci_tokens write)."""
 
     def __init__(self, stored_token_data: str | None = None):
         self.writes: list[tuple[str, str, dict]] = []   # (table, op, row)
@@ -68,6 +70,16 @@ class FakeSupabase:
 
     def table(self, name):
         return _FakeTable(self, name)
+
+    def rpc(self, name, params):
+        assert name == "save_spotify_token", name
+        action, reason = ci_token_helper.spotify_upload_decision(params["p_token_data"], self.stored_token_data)
+        if action == "upload":
+            self.stored_token_data = params["p_token_data"]
+            self.writes.append(("ci_tokens", "rpc", {"service": "spotify", "token_data": params["p_token_data"]}))
+        outcome = {"upload": "written", "invalid": "invalid"}.get(action) or (
+            "same" if reason == ci_token_helper.SPOTIFY_SAVE_OUTCOMES["same"] else "older_refresh")
+        return SimpleNamespace(execute=lambda: SimpleNamespace(data=outcome))
 
     # helpers for assertions
     def heartbeats(self) -> list[tuple[str, str]]:
@@ -374,7 +386,7 @@ def test_parse_auth_code_accepts_code_or_callback_url() -> None:
 
 def test_exchange_code_saves_tokens_with_authorized_at() -> None:
     issued = FakeResponse(200, {"access_token": "acc", "refresh_token": "fresh-refresh",
-                                "expires_in": 3600, "scope": "user-read-recently-played"})
+                                "expires_in": 3600, "scope": spotify_etl.SPOTIFY_SCOPES})
     t0 = int(time.time())
     r = run(token_response=issued, stored=None,
             argv=["--exchange-code", "http://127.0.0.1:8888/callback?code=AQD-synthetic_code"])
@@ -390,7 +402,8 @@ def test_exchange_code_saves_tokens_with_authorized_at() -> None:
 
 
 def test_exchange_code_reads_the_workflow_input_from_the_event_file() -> None:
-    issued = FakeResponse(200, {"access_token": "acc", "refresh_token": "fresh-refresh"})
+    issued = FakeResponse(200, {"access_token": "acc", "refresh_token": "fresh-refresh",
+                                "scope": spotify_etl.SPOTIFY_SCOPES})
     with tempfile.TemporaryDirectory() as tmp:
         event = os.path.join(tmp, "event.json")
         Path(event).write_text(json.dumps({"inputs": {"auth_code": "AQD-from-event"}}))
@@ -415,6 +428,13 @@ def test_refused_code_saves_nothing_and_keeps_the_old_file() -> None:
 
     no_refresh = FakeResponse(200, {"access_token": "acc"})
     r = run(token_response=no_refresh, argv=["--exchange-code", "AQD-synthetic_code"])
+    assert r.code == 1 and r.after == r.before
+
+    # A sign-in that did not grant both scopes would break the sync or the playlist tools
+    # later; it is refused here, as the /status Reconnect refuses it (missing_scope).
+    one_scope = FakeResponse(200, {"access_token": "acc", "refresh_token": "fresh-refresh",
+                                   "scope": "user-read-recently-played"})
+    r = run(token_response=one_scope, argv=["--exchange-code", "AQD-synthetic_code"])
     assert r.code == 1 and r.after == r.before
 
 

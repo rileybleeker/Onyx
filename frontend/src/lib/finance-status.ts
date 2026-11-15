@@ -1,16 +1,29 @@
 import { ingestionHeartbeatStatus, type HealthStatus } from "@/lib/status-freshness";
 
 /**
- * Rocket Money ledger health, from the two sync_log heartbeats the importers write on EVERY run:
- * source 'rocketmoney', data_type 'transactions' and 'balances'. Used by the /status card and
+ * Finance ledger health, from the two sync_log heartbeats the feed writes on every run (data_type
+ * 'transactions' and 'balances'). Since 2026-11-14 the feed is SimpleFIN Bridge (simplefin_etl.py,
+ * source 'simplefin', every 6 h, thresholds SIMPLEFIN_*_HOURS); before that it was the Rocket Money
+ * harvester (source 'rocketmoney', daily, the FINANCE_*_HOURS defaults). Used by the /status card and
  * by the freshness line at the top of /financials, so both always agree.
  *
  * Thresholds: a heartbeat older than 36 h is degraded, older than 72 h is failed; a failed or
  * 'error' heartbeat is failed immediately and its own error text (for example a "login required"
  * message from the harvester) is shown as is. Pure: no network, no clock unless passed.
+ *
+ * Keep-alive visits (the harvester opens the app every 2 hours between imports to hold the sign-in)
+ * write a third heartbeat, data_type 'keepalive': success, partial on the first failed visit in a
+ * row, failed from the second. It never makes the card fresher (the import heartbeats alone set the
+ * age), but when it is newer than both import heartbeats and not a success it drags the card down
+ * with its own text, so a keep-alive that keeps failing is seen before the sign-in lapses.
  */
 export const FINANCE_WARN_HOURS = 36;
 export const FINANCE_FAIL_HOURS = 72;
+/** SimpleFIN runs every 6 h: two missed runs is degraded, a day and more without one is red. */
+export const SIMPLEFIN_WARN_HOURS = 14;
+export const SIMPLEFIN_FAIL_HOURS = 30;
+export const FINANCE_SOURCE = "simplefin";
+export const SIMPLEFIN_THRESHOLDS = { warnHours: SIMPLEFIN_WARN_HOURS, failHours: SIMPLEFIN_FAIL_HOURS } as const;
 
 type Entry = Record<string, unknown> | null | undefined;
 export interface FinanceCard {
@@ -29,20 +42,42 @@ const ageHours = (e: Entry, now: number): number => {
   return Number.isFinite(t) ? (now - t) / 3_600_000 : Infinity;
 };
 
-export function financeLedgerCard(transactions: Entry, balances: Entry, now = Date.now()): FinanceCard {
+const startedAt = (e: Entry): number => (typeof e?.sync_start === "string" ? Date.parse(e.sync_start) : NaN);
+
+/** The keep-alive heartbeat's status when it should count (newest, not a success), else null. */
+function keepaliveStatus(keepalive: Entry, imports: Entry[]): HealthStatus | null {
+  if (!keepalive) return null;
+  const at = startedAt(keepalive);
+  if (!Number.isFinite(at)) return null;
+  if (imports.some((e) => e && !(startedAt(e) < at))) return null;
+  if (keepalive.status === "failed" || keepalive.status === "error") return "failed";
+  if (keepalive.status === "partial") return "partial";
+  return null;
+}
+
+export function financeLedgerCard(
+  transactions: Entry,
+  balances: Entry,
+  now = Date.now(),
+  keepalive: Entry = null,
+  thresholds: { warnHours: number; failHours: number } = { warnHours: FINANCE_WARN_HOURS, failHours: FINANCE_FAIL_HOURS },
+): FinanceCard {
+  const { warnHours, failHours } = thresholds;
   const parts = [
     { name: "transactions", entry: transactions ?? null },
     { name: "balances", entry: balances ?? null },
   ].map((p) => ({
     ...p,
-    status: p.entry ? ingestionHeartbeatStatus("success", p.entry, FINANCE_WARN_HOURS, FINANCE_FAIL_HOURS, now) : ("unknown" as HealthStatus),
+    status: p.entry ? ingestionHeartbeatStatus("success", p.entry, warnHours, failHours, now) : ("unknown" as HealthStatus),
   }));
   const present = parts.filter((p) => p.entry);
+  const keep = present.length ? keepaliveStatus(keepalive, present.map((p) => p.entry)) : null;
+  const ranked = keep ? [...parts, { name: "keep-alive", entry: keepalive ?? null, status: keep }] : parts;
 
   let status: HealthStatus;
   if (present.length === 0) status = "unknown";
-  else if (parts.some((p) => p.status === "failed")) status = "failed";
-  else if (parts.some((p) => p.status === "partial")) status = "partial";
+  else if (ranked.some((p) => p.status === "failed")) status = "failed";
+  else if (ranked.some((p) => p.status === "partial")) status = "partial";
   // One kind never reported, or a heartbeat we cannot read: half the pipeline is not
   // checking in, so the card must not look healthy.
   else if (parts.some((p) => p.status === "unknown")) status = "partial";
@@ -51,7 +86,7 @@ export function financeLedgerCard(transactions: Entry, balances: Entry, now = Da
   // Words for the card: the importer's own error text wins; otherwise say what is wrong.
   let errorMessage: string | null = null;
   for (const wantStatus of ["failed", "partial"] as const) {
-    for (const p of parts) {
+    for (const p of ranked) {
       if (p.status === wantStatus && p.entry) errorMessage ??= text(p.entry.error_message);
     }
   }
@@ -65,7 +100,7 @@ export function financeLedgerCard(transactions: Entry, balances: Entry, now = Da
       else {
         const h = ageHours(p.entry, now);
         errorMessage = Number.isFinite(h)
-          ? `Last ${p.name} import was ${Math.floor(h)}h ago (degraded after ${FINANCE_WARN_HOURS}h, failed after ${FINANCE_FAIL_HOURS}h).`
+          ? `Last ${p.name} import was ${Math.floor(h)}h ago (degraded after ${warnHours}h, failed after ${failHours}h).`
           : `The ${p.name} heartbeat could not be read.`;
       }
       break;

@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useState, useMemo, useRef } from "react";
+import { usePageHeadingTestId } from "@/components/FeedContext";
+import { useEffect, useState, useMemo, useRef, useSyncExternalStore } from "react";
 import { rangeToDays, rangeLabel, type Range } from "@/lib/queries";
 import RangeFilter from "@/components/RangeFilter";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 
 interface JournalEntryListItem {
   notion_page_id: string;
@@ -59,7 +61,21 @@ function titleIsJustDate(title: string | null, entryDate: string): boolean {
   return variants.some((v) => t === v);
 }
 
+const noSubscribe = () => () => {};
+
+/**
+ * False while the prerendered HTML hydrates, true afterwards (and at once on a client-side navigation). The parts
+ * render only then, so the saved layout (read from this device's storage) is the first one painted: the static
+ * HTML cannot know it, and hydrating with the default would move parts after paint.
+ */
+function useHydrated(): boolean {
+  return useSyncExternalStore(noSubscribe, () => true, () => false);
+}
+
 export default function JournalPage() {
+  // "feed-page-heading" when this page is shown inside the continuous scroll (components/ContinuousScroll.tsx).
+  const headingTestId = usePageHeadingTestId();
+  const hydrated = useHydrated();
   const [entries, setEntries] = useState<JournalEntryListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -152,18 +168,25 @@ export default function JournalPage() {
     <div className="px-4 md:px-6 pb-4 md:pb-6 max-w-4xl mx-auto">
       <header className="mb-6 flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 data-testid="page-heading" className="text-xl md:text-2xl font-semibold text-text-primary tracking-tight">
+          <h1 data-testid={headingTestId} className="text-xl md:text-2xl font-semibold text-text-primary tracking-tight">
             Journal
           </h1>
           <p className="text-xs md:text-sm text-text-tertiary mt-1">
-            Personal entries synced from Notion — {rangeLabel(range)}. {entries.length} {entries.length === 1 ? "entry" : "entries"}.
+            {rangeLabel(range)} · {entries.length} {entries.length === 1 ? "entry" : "entries"}
           </p>
         </div>
         <RangeFilter value={range} onChange={setRange} />
       </header>
 
+      {/* Personalize: the filter bar and the entry list are parts (no extra heading on screen). */}
+      {!hydrated ? (
+        <div className="text-text-tertiary text-sm">Loading…</div>
+      ) : (
+      <PartGrid page="/journal" title="Journal">
+      <PartGroup id="section-journal" title="Journal entries">
       {/* Filter bar */}
-      <div className="bg-surface-card border border-border-subtle rounded-[6px] p-3 md:p-4 mb-4 space-y-3">
+      <Part id="filters" title="Mood & topic filters">
+      <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-3 md:p-4 space-y-3">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-[11px] text-text-tertiary uppercase tracking-wider">Mood</span>
           <button
@@ -221,8 +244,10 @@ export default function JournalPage() {
         )}
 
       </div>
+      </Part>
 
       {/* Entry list */}
+      <Part id="entries" title="Entries">
       {loading ? (
         <div className="text-text-tertiary text-sm">Loading…</div>
       ) : error ? (
@@ -236,7 +261,7 @@ export default function JournalPage() {
             return (
               <li
                 key={e.notion_page_id}
-                className="bg-surface-card border border-border-subtle rounded-[6px] overflow-hidden"
+                className="bg-surface-card border border-border-subtle rounded-control overflow-hidden"
               >
                 <button
                   onClick={() => toggleExpand(e.notion_page_id)}
@@ -304,6 +329,10 @@ export default function JournalPage() {
             );
           })}
         </ul>
+      )}
+      </Part>
+      </PartGroup>
+      </PartGrid>
       )}
     </div>
   );

@@ -225,9 +225,16 @@ export type CalendarEntry = {
   title: string;
   date: string;
   time: string | null;
-  status: CareStatus | 'projected';
+  // 'external' = a read-only copy of a synced calendar event (lib/calendar-events.ts). It is
+  // never a care item: no item id, never built by this file, never saved, edited or sent.
+  status: CareStatus | 'projected' | 'external';
   sample: boolean;
   months: number;
+  // Only on 'external' entries.
+  when?: string;
+  calendar?: string;
+  location?: string | null;
+  tentative?: boolean;
 };
 
 // Entries to draw between `start` and `end` (inclusive). Each active item shows

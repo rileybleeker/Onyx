@@ -4,40 +4,58 @@ import { usePathname } from "next/navigation";
 import Sidebar from "./Sidebar";
 import MobileNav from "./MobileNav";
 import CommandPalette from "./CommandPalette";
+import { DesktopLaunchHandler } from "./DesktopApp";
+import AppData, { SignedOutWipe } from "./AppData";
+import UpdateChecker from "./UpdateChecker";
+import PersonalizeHost from "./personalize/PersonalizeHost";
+import ContinuousScroll from "./ContinuousScroll";
+import { ActiveRouteProvider } from "./FeedContext";
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const isAuth = pathname.startsWith("/login") || pathname.startsWith("/auth");
 
   if (isAuth) {
-    return <>{children}</>;
+    // On /login there is no session: clear whatever a previous session left on this device.
+    return <>{pathname.startsWith("/login") && <SignedOutWipe />}{children}</>;
   }
 
   // The Agents chat is a full-screen conversation (like a thread in Messages): its own header and composer,
   // no mobile top bar or tab bar. The desktop sidebar stays.
   if (pathname.startsWith("/agents")) {
+    // AppData is first in both layouts so moving to and from /agents keeps it mounted.
     return (
-      <>
+      <ActiveRouteProvider>
+        <AppData />
         <Sidebar />
         {children}
         <CommandPalette />
-      </>
+        <DesktopLaunchHandler />
+        <UpdateChecker />
+        <PersonalizeHost />
+      </ActiveRouteProvider>
     );
   }
 
+  // The routed page, then the complete next pages in one scroll (components/ContinuousScroll.tsx). The
+  // provider lets the sidebar, tab bar and palette follow the page in view.
   return (
-    <>
+    <ActiveRouteProvider>
+      <AppData />
       <Sidebar />
       <main className="md:ml-[220px] min-h-screen">
         {/* Top padding clears the fixed mobile header (safe-area inset + bar);
             bottom padding clears the fixed mobile tab bar (h-14 + safe-area).
             Desktop has neither, so both revert to 2rem. */}
         <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-[calc(env(safe-area-inset-top)+4rem)] md:pt-8 pb-[calc(env(safe-area-inset-bottom)+5rem)] md:pb-8 animate-fade-in">
-          {children}
+          <ContinuousScroll>{children}</ContinuousScroll>
         </div>
       </main>
       <MobileNav />
       <CommandPalette />
-    </>
+      <DesktopLaunchHandler />
+      <UpdateChecker />
+      <PersonalizeHost />
+    </ActiveRouteProvider>
   );
 }

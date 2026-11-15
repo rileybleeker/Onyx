@@ -1,11 +1,15 @@
 import { supabase } from "./supabase";
 import { whoopSleepDay, kjToKcal } from "./format";
-import { dishKcal, mergeDeliveryEstimates } from "./delivery-portion";
+import { hoursToMs, msToMinutes, secondsToMs, type Kilocalories, type Kilojoules, type Milliseconds, type Minutes } from "./units";
+import { dishKcal, mergeDeliveryEstimates, shiftYmd } from "./delivery-portion";
+import { combineEstimateDays, isMissingRelation, type PhotoMealItem } from "./photo-meal";
+import { LEFTOVER_WINDOW_DAYS, type LeftoverRow } from "./delivery-leftovers";
+import type { UberEatsCheck } from "./log-ubereats";
 
 // Re-audit 2026-06-07 (units/deepseek/F-003): promoted the workout→sleep gap
 // window from a function-local literal to a named module-level const. The pairing
 // only considers a workout "before" a sleep if it ended within this many ms.
-const WORKOUT_SLEEP_GAP_MAX_MS = 18 * 60 * 60 * 1000; // 18 hours
+const WORKOUT_SLEEP_GAP_MAX_MS: Milliseconds = hoursToMs(18);
 
 /**
  * Duration unit convention across this module:
@@ -23,7 +27,10 @@ const WORKOUT_SLEEP_GAP_MAX_MS = 18 * 60 * 60 * 1000; // 18 hours
  * The asymmetry comes from the upstream APIs (WHOOP's v2 API returns ms,
  * everyone else returns seconds). We preserve the unit in the field name
  * rather than normalizing at the query layer so the units stay obvious in
- * every consumer.
+ * every consumer. units.ts adds compile-time tags (`Seconds`, `Milliseconds`,
+ * `Minutes`, `Kilojoules`, ...): tag a value with its unit and the format.ts
+ * formatters reject it in a slot of the wrong unit. Convert with the units.ts
+ * helpers instead of inline `* 1000` / `/ 60000` math.
  */
 
 // Explicit column lists = every scalar column EXCEPT the raw jsonb blobs
@@ -195,7 +202,7 @@ export async function getTrainingStatus(days: number = 30) {
 // minimal per-consumer list so future chart additions don't silently get
 // undefined; if the ETL adds a new scalar column, append it here too.
 const WHOOP_CYCLE_COLS =
-  "cycle_id, user_id, created_at, updated_at, start_time, end_time, timezone_offset, score_state, strain, kilojoule, average_heart_rate, max_heart_rate, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source, onyx_is_transition_day";
+  "cycle_id, user_id, created_at, updated_at, start_time, end_time, timezone_offset, score_state, strain, kilojoule, average_heart_rate, max_heart_rate, step_count, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source, onyx_is_transition_day";
 const WHOOP_RECOVERY_COLS =
   "cycle_id, sleep_id, user_id, created_at, updated_at, score_state, recovery_score, resting_heart_rate, hrv_rmssd_milli, spo2_percentage, skin_temp_celsius, user_calibrating, synced_at";
 const WHOOP_SLEEP_COLS =
@@ -288,7 +295,7 @@ export interface WorkoutSleepGap {
   pred_date: string;
   sleep_onset_utc: string;
   last_workout_end_utc: string | null;
-  gap_minutes: number | null;
+  gap_minutes: Minutes | null;
   whoop_strain: number | null;
   next_morning_hrv: number | null;
 }
@@ -343,7 +350,7 @@ export async function getWorkoutSleepGap(days: number = 60): Promise<WorkoutSlee
   for (const g of gactRes.data ?? []) {
     if (g.start_time_gmt && g.duration_seconds != null) {
       const start = new Date(g.start_time_gmt as string).getTime();
-      const end = start + Number(g.duration_seconds) * 1000;
+      const end = start + secondsToMs(Number(g.duration_seconds));
       workouts.push({ end, whoop_strain: null });
     }
   }
@@ -373,7 +380,7 @@ export async function getWorkoutSleepGap(days: number = 60): Promise<WorkoutSlee
       pred_date: predDate,
       sleep_onset_utc: s.start_time as string,
       last_workout_end_utc: last ? new Date(last.end).toISOString() : null,
-      gap_minutes: last ? (sleepMs - last.end) / 60000 : null,
+      gap_minutes: last ? msToMinutes(sleepMs - last.end) : null,
       whoop_strain: last?.whoop_strain ?? null,
       next_morning_hrv: cycleHrv.get(s.cycle_id as number) ?? null,
     });
@@ -448,43 +455,104 @@ export async function getEightSleepTrends(days: number = 30, side: string = "lef
 export async function getNutrition(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
+  const sinceYmd = since.toISOString().split("T")[0];
 
   // Matview read (15-min refresh): Cronometer data lands via the manual local
   // importer, not in-app writes, so the only staleness case is opening
   // /nutrition within ~15 min of running an import. (The Today's Meals widget
   // reads the LIVE cronometer_servings table and stays instant.)
-  const { data, error } = await supabase
-    .from("daily_health_matrix_behavioral_mat")
-    .select(
-      "calendar_date, nutrition_source, " +
-        "calories:nutrition_calories, protein_g:nutrition_protein_g, " +
-        "carbs_g:nutrition_carbs_g, fat_g:nutrition_fat_g, fiber_g:nutrition_fiber_g, " +
-        "sugar_g:nutrition_sugar_g, sodium_mg:nutrition_sodium_mg, water_ml:nutrition_water_ml"
-    )
-    .gte("calendar_date", since.toISOString().split("T")[0])
-    .not("nutrition_calories", "is", null)
-    .order("calendar_date", { ascending: true });
-
-  if (error) throw error;
-
-  // Uber Eats estimates fill days with no Cronometer/MFP log (Cronometer has
-  // been quiet since 2026-06-29, so delivery orders are often the only food
-  // signal). A logged day always wins — a Cronometer diary usually already
-  // contains the delivered meal, so adding both would double-count.
-  // Estimates are per-dish guesses from the Uber Eats cart (restaurant orders
-  // only, each dish times the eaten portion), tagged nutrition_source='uber_eats'.
-  // est_kcal > 0: a day where every dish was marked "None" has no food signal;
-  // it must not show as a 0 kcal day (mergeDeliveryEstimates skips it too).
-  const { data: est, error: estErr } = await supabase
-    .from("delivery_nutrition_daily")
-    .select("behavioral_date, est_kcal, est_protein_g, est_carbs_g, est_fat_g")
-    .gte("behavioral_date", since.toISOString().split("T")[0])
-    .gt("est_kcal", 0)
-    .order("behavioral_date", { ascending: true });
-  if (estErr) throw estErr;
+  //
+  // Uber Eats estimates and photo-logged meals fill days with no Cronometer/MFP
+  // log (Cronometer has been quiet since 2026-06-29, so they are often the only
+  // food signal). A logged day always wins: a Cronometer diary usually already
+  // contains the meal, so adding both would double-count. On other days the two
+  // estimates add up (different meals; combineEstimateDays in lib/photo-meal.ts),
+  // tagged nutrition_source 'uber_eats' | 'photo' | 'uber_eats+photo'.
+  // Uber Eats: per-dish guesses from the cart (restaurant orders only, each dish
+  // times the eaten portion). est_kcal > 0: a day where every dish was marked
+  // "None" has no food signal; it must not show as a 0 kcal day.
+  // The three reads are independent, so they run in parallel.
+  const [matrix, delivery, photo] = await Promise.all([
+    supabase
+      .from("daily_health_matrix_behavioral_mat")
+      .select(
+        "calendar_date, nutrition_source, " +
+          "calories:nutrition_calories, protein_g:nutrition_protein_g, " +
+          "carbs_g:nutrition_carbs_g, fat_g:nutrition_fat_g, fiber_g:nutrition_fiber_g, " +
+          "sugar_g:nutrition_sugar_g, sodium_mg:nutrition_sodium_mg, water_ml:nutrition_water_ml"
+      )
+      .gte("calendar_date", sinceYmd)
+      .not("nutrition_calories", "is", null)
+      .order("calendar_date", { ascending: true }),
+    supabase
+      .from("delivery_nutrition_daily")
+      .select("behavioral_date, est_kcal, est_protein_g, est_carbs_g, est_fat_g")
+      .gte("behavioral_date", sinceYmd)
+      .gt("est_kcal", 0)
+      .order("behavioral_date", { ascending: true }),
+    supabase
+      .from("photo_meal_daily")
+      .select("behavioral_date, est_kcal, est_protein_g, est_carbs_g, est_fat_g")
+      .gte("behavioral_date", sinceYmd)
+      .gt("est_kcal", 0)
+      .order("behavioral_date", { ascending: true }),
+  ]);
+  if (matrix.error) throw matrix.error;
+  if (delivery.error) throw delivery.error;
+  // Photo meals are an add-on: until sql/photo_meals.sql is applied the view does not exist, and no other
+  // failure there may take the macro charts down with it.
+  if (photo.error && !isMissingRelation(photo.error.code)) console.error("photo_meal_daily:", photo.error.message);
 
   type NutritionRow = Record<string, unknown> & { calendar_date: string };
-  return mergeDeliveryEstimates((data as unknown as NutritionRow[]) ?? [], est ?? []) as NutritionRow[];
+  const estimates = combineEstimateDays(delivery.data ?? [], photo.error ? [] : (photo.data ?? []));
+  return mergeDeliveryEstimates((matrix.data as unknown as NutritionRow[]) ?? [], estimates) as NutritionRow[];
+}
+
+export interface PhotoMeal {
+  meal_id: number;
+  /** Behavioral day. */
+  eaten_date: string;
+  /** "HH:MM" local wall clock as confirmed (before 06:00 = the small hours after eaten_date). */
+  eaten_time: string;
+  eaten_at: string | null;
+  time_source: string;
+  items: PhotoMealItem[];
+  kcal: number;
+  protein_g: number;
+  carbs_g: number;
+  fat_g: number;
+  confidence: string | null;
+}
+
+/**
+ * Photo-logged meals (pds.photo_meals) of the given behavioral days, oldest first. Feeds "Today's Meals"
+ * on /nutrition. [] while sql/photo_meals.sql is not applied (missing table); throws on other errors.
+ */
+export async function getPhotoMealsForDays(dates: string[]): Promise<PhotoMeal[]> {
+  if (dates.length === 0) return [];
+  const { data, error } = await supabase
+    .from("photo_meals")
+    .select("meal_id, eaten_date, eaten_time, eaten_at, time_source, items, kcal, protein_g, carbs_g, fat_g, confidence")
+    .in("eaten_date", dates)
+    .order("eaten_at", { ascending: true })
+    .order("meal_id", { ascending: true });
+  if (error) {
+    if (isMissingRelation(error.code)) return [];
+    throw error;
+  }
+  return (data ?? []).map((r) => ({
+    meal_id: Number(r.meal_id),
+    eaten_date: String(r.eaten_date),
+    eaten_time: String(r.eaten_time).slice(0, 5),
+    eaten_at: r.eaten_at ?? null,
+    time_source: String(r.time_source),
+    items: Array.isArray(r.items) ? (r.items as PhotoMealItem[]) : [],
+    kcal: Number(r.kcal),
+    protein_g: Number(r.protein_g),
+    carbs_g: Number(r.carbs_g),
+    fat_g: Number(r.fat_g),
+    confidence: r.confidence ?? null,
+  }));
 }
 
 export interface DeliveryDish {
@@ -566,6 +634,105 @@ export async function getDeliveryItemsForDays(dates: string[]): Promise<Delivery
 }
 
 /**
+ * Leftover rows (pds.delivery_item_leftovers) of the given Uber Eats cart lines: the share of each
+ * dish eaten on a later behavioral day. Feeds the "Leftovers" questions on /check-in and /nutrition.
+ */
+export async function getDeliveryLeftovers(itemIds: number[]): Promise<LeftoverRow[]> {
+  if (itemIds.length === 0) return [];
+  const { data, error } = await supabase
+    .from("delivery_item_leftovers")
+    .select("item_id, eaten_date, fraction, threw_out, eaten_time")
+    .in("item_id", itemIds)
+    .order("item_id", { ascending: true })
+    .order("eaten_date", { ascending: true });
+  if (error) throw error;
+  return (data ?? []).map((r) => ({
+    item_id: Number(r.item_id),
+    eaten_date: String(r.eaten_date),
+    fraction: Number(r.fraction),
+    threw_out: !!r.threw_out,
+    eaten_time: r.eaten_time == null ? null : String(r.eaten_time).slice(0, 5),
+  }));
+}
+
+/** The dish lists' window: the restaurant cart lines of `days` and their leftover rows. */
+export interface DeliveryWindow {
+  rows: DeliveryDish[];
+  stored: LeftoverRow[];
+}
+
+/**
+ * One window for useDeliveryDishes (/nutrition, /check-in, /log). The leftover rows are read in parallel with the
+ * dishes, by eaten day: a leftover of a dish delivered on day D is always dated D+1..D+LEFTOVER_WINDOW_DAYS (the
+ * guard trigger of pds.delivery_item_leftovers), so the rows of these dishes all fall inside that range; rows of
+ * other dishes are dropped. Same answer as getDeliveryLeftovers(ids), one round trip fewer.
+ */
+export async function getDeliveryWindow(days: string[]): Promise<DeliveryWindow> {
+  if (days.length === 0) return { rows: [], stored: [] };
+  const sorted = [...days].sort();
+  const from = shiftYmd(sorted[0], 1);
+  const to = shiftYmd(sorted[sorted.length - 1], LEFTOVER_WINDOW_DAYS);
+  const [rows, leftovers] = await Promise.all([
+    getDeliveryItemsForDays(days),
+    supabase
+      .from("delivery_item_leftovers")
+      .select("item_id, eaten_date, fraction, threw_out, eaten_time")
+      .gte("eaten_date", from)
+      .lte("eaten_date", to)
+      .order("item_id", { ascending: true })
+      .order("eaten_date", { ascending: true }),
+  ]);
+  if (leftovers.error) throw leftovers.error;
+  const ids = new Set(rows.map((r) => r.item_id));
+  const stored: LeftoverRow[] = (leftovers.data ?? [])
+    .filter((r) => ids.has(Number(r.item_id)))
+    .map((r) => ({
+      item_id: Number(r.item_id),
+      eaten_date: String(r.eaten_date),
+      fraction: Number(r.fraction),
+      threw_out: !!r.threw_out,
+      eaten_time: r.eaten_time == null ? null : String(r.eaten_time).slice(0, 5),
+    }));
+  return { rows, stored };
+}
+
+/**
+ * When the PC harvester last read the Uber Eats order history: the newest ubereats|items heartbeat
+ * (time + status only; sync_log is owner-readable). Shown on /log as "Uber Eats checked N min ago".
+ */
+export async function getUberEatsCheck(): Promise<UberEatsCheck> {
+  const { data, error } = await supabase
+    .from("sync_log")
+    .select("sync_start, status")
+    .eq("source", "ubereats")
+    .eq("data_type", "items")
+    .order("sync_start", { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  const row = data?.[0];
+  return { at: row?.sync_start ? String(row.sync_start) : null, status: row?.status ? String(row.status) : null };
+}
+
+// Explicit column lists for the nutrition + journal reads below (re-audit
+// 2026-06-07, units/gpt-5/F-004: select("*") lets a new, similarly named column
+// flow into consumers unnoticed). Same convention as the Garmin / WHOOP lists at
+// the top: every scalar column of the relation, checked against
+// information_schema on 2026-11-14. If the ETL or the view adds a column a page
+// needs, append it here. The nutrient pages read these rows by computed key
+// (e.g. `${key}_total_${unit}`), so a column missing here reads as undefined
+// and renders as "—".
+// myfitnesspal_nutrition: all scalars plus meals_json; raw_json (the full
+// export row) is left out, like the Garmin raw blobs.
+const MFP_NUTRITION_COLS =
+  "calendar_date, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, water_ml, exercise_kcal, meals_json, synced_at, onyx_et_date, onyx_behavioral_date, onyx_local_date, onyx_tz_source";
+const MICRONUTRIENT_TOTALS_COLS =
+  "onyx_behavioral_date, vit_a_dietary_mcg, vit_a_supplement_mcg, vit_a_total_mcg, vit_c_dietary_mg, vit_c_supplement_mg, vit_c_total_mg, vit_d_dietary_iu, vit_d_supplement_iu, vit_d_total_iu, vit_e_dietary_mg, vit_e_supplement_mg, vit_e_total_mg, vit_k_dietary_mcg, vit_k_supplement_mcg, vit_k_total_mcg, b1_dietary_mg, b1_supplement_mg, b1_total_mg, b2_dietary_mg, b2_supplement_mg, b2_total_mg, b3_dietary_mg, b3_supplement_mg, b3_total_mg, b5_dietary_mg, b5_supplement_mg, b5_total_mg, b6_dietary_mg, b6_supplement_mg, b6_total_mg, b12_dietary_mcg, b12_supplement_mcg, b12_total_mcg, folate_dietary_mcg, folate_supplement_mcg, folate_total_mcg, calcium_dietary_mg, calcium_supplement_mg, calcium_total_mg, iron_dietary_mg, iron_supplement_mg, iron_total_mg, magnesium_dietary_mg, magnesium_supplement_mg, magnesium_total_mg, phosphorus_dietary_mg, phosphorus_supplement_mg, phosphorus_total_mg, potassium_dietary_mg, potassium_supplement_mg, potassium_total_mg, zinc_dietary_mg, zinc_supplement_mg, zinc_total_mg, copper_dietary_mg, copper_supplement_mg, copper_total_mg, manganese_dietary_mg, manganese_supplement_mg, manganese_total_mg, selenium_dietary_mcg, selenium_supplement_mcg, selenium_total_mcg, sodium_dietary_mg, sodium_supplement_mg, sodium_total_mg, omega3_dietary_g, omega3_supplement_g, omega3_total_g, epa_dietary_g, epa_supplement_g, epa_total_g, dha_dietary_g, dha_supplement_g, dha_total_g";
+const CRONOMETER_BEHAVIORAL_DAILY_COLS =
+  "onyx_behavioral_date, calendar_date, completed, calories, alcohol_g, caffeine_mg, oxalate_mg, phytate_mg, water_g, b1_thiamine_mg, b2_riboflavin_mg, b3_niacin_mg, b5_pantothenic_mg, b6_pyridoxine_mg, b12_cobalamin_mcg, folate_mcg, vit_a_rae_mcg, vit_c_mg, vit_d_iu, vit_e_mg, vit_k_mcg, calcium_mg, copper_mg, iron_mg, magnesium_mg, manganese_mg, phosphorus_mg, potassium_mg, selenium_mcg, sodium_mg, zinc_mg, net_carbs_g, carbs_g, fiber_g, insoluble_fiber_g, soluble_fiber_g, starch_g, sugars_g, added_sugars_g, fat_g, cholesterol_mg, monounsaturated_g, polyunsaturated_g, saturated_g, trans_fat_g, omega3_g, ala_g, dha_g, epa_g, omega6_g, aa_g, la_g, cystine_g, histidine_g, isoleucine_g, leucine_g, lysine_g, methionine_g, phenylalanine_g, protein_g, threonine_g, tryptophan_g, tyrosine_g, valine_g, beta_carotene_mcg, b7_biotin_mcg, choline_mg, iodine_mcg, chromium_mcg, molybdenum_mcg, entry_count, timestamped_entries, rollup_source";
+const JOURNAL_COLS =
+  "cycle_date, behaviors_date, question, category, answer, notes, synced_at, source";
+
+/**
  * Raw pre-cutover MFP rows, untouched, for a future "historical archive" view.
  * Reads pds.myfitnesspal_nutrition directly (NOT the COALESCE'd matrix).
  */
@@ -575,7 +742,7 @@ export async function getMfpNutritionHistorical(days: number = 365) {
 
   const { data, error } = await supabase
     .from("myfitnesspal_nutrition")
-    .select("*")
+    .select(MFP_NUTRITION_COLS)
     .gte("calendar_date", since.toISOString().split("T")[0])
     .order("calendar_date", { ascending: true });
 
@@ -624,7 +791,7 @@ export async function getDailyVitamins(days: number = 30) {
 
   const { data, error } = await supabase
     .from("daily_micronutrient_totals")
-    .select("*")
+    .select(MICRONUTRIENT_TOTALS_COLS)
     .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
     .order("onyx_behavioral_date", { ascending: true });
 
@@ -633,7 +800,7 @@ export async function getDailyVitamins(days: number = 30) {
 }
 
 /**
- * The FULL Cronometer daily nutrient set (all ~62 columns incl. amino acids and
+ * The FULL Cronometer daily nutrient set (all ~67 nutrient columns incl. amino acids and
  * fat fractions) for the "All tracked nutrients" table. Dietary-only (no
  * supplement merge) — use getDailyVitamins for the dietary+supplement split.
  * Reads the behavioral-day rollup (servings summed by onyx_behavioral_date) so
@@ -645,7 +812,7 @@ export async function getDailyNutrientsFull(days: number = 30) {
 
   const { data, error } = await supabase
     .from("cronometer_nutrition_behavioral_daily")
-    .select("*")
+    .select(CRONOMETER_BEHAVIORAL_DAILY_COLS)
     .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
     .order("onyx_behavioral_date", { ascending: true });
 
@@ -677,14 +844,14 @@ export async function getWhoopCaloriesBurnt(days: number = 30) {
 
   const byDate = new Map<
     string,
-    { calendar_date: string; kilojoule: number; calories_burnt: number; kcal_exact: number }
+    { calendar_date: string; kilojoule: Kilojoules; calories_burnt: Kilocalories; kcal_exact: Kilocalories }
   >();
   for (const c of data ?? []) {
     if (!c.start_time || c.kilojoule == null) continue;
     const start = new Date(c.start_time);
     const midday = new Date(start.getTime() + 12 * 3600 * 1000);
     const calendar_date = midday.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-    const kj = Number(c.kilojoule);
+    const kj: Kilojoules = Number(c.kilojoule);
     // Re-audit 2026-06-07 (units/deepseek/F-005): the `kilojoule == null` check
     // above doesn't catch a non-numeric string (e.g. ""), which Number() turns
     // into NaN and would poison kcal_exact / averages downstream. Skip it.
@@ -977,7 +1144,7 @@ export async function getJournal(days: number = 30) {
 
   const { data, error } = await supabase
     .from("journal")
-    .select("*")
+    .select(JOURNAL_COLS)
     .gte("cycle_date", since.toISOString().split("T")[0])
     .order("cycle_date", { ascending: true });
 

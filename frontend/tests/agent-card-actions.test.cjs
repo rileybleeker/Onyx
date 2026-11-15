@@ -37,6 +37,11 @@ test('approval, check-in, lead, question and unknown cards keep their buttons', 
   assert.deepEqual(cardActions(card('something-new')).map((a) => a.label), ['Reply']);
 });
 
+test('renewal cards are informational: one fixed link to /procurement, no reply or answer button', () => {
+  assert.deepEqual(cardActions(card('renewal', { code: 'R0123456789abcdef', link: '/procurement' })), [{ label: 'Open procurement', href: '/procurement', primary: true }]);
+  assert.deepEqual(cardActions(card('Renewal', { link: 'https://elsewhere.example/cart' })), [{ label: 'Open procurement', href: '/procurement', primary: true }], 'the link is fixed, whatever the card carries');
+});
+
 test('settled labels: the Worker decisions "logged" and "skipped" read as Logged / Skipped', () => {
   assert.equal(settledLabel(undefined, 'logged'), 'Logged');
   assert.equal(settledLabel(undefined, 'skipped'), 'Skipped');

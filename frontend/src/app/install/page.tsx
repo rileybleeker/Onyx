@@ -42,7 +42,7 @@ function InstallLink({ label, hint, href }: { label: string; hint: string; href:
     <div className="space-y-1.5">
       <a
         href={href}
-        className="block w-full text-center bg-accent hover:bg-accent/90 text-white font-medium py-2.5 rounded-[4px] text-sm transition-colors"
+        className="block w-full text-center bg-accent hover:bg-accent/90 text-on-accent font-medium py-2.5 rounded-full text-sm transition-colors"
       >
         {label}
       </a>
@@ -101,7 +101,7 @@ function CopyTokenButton() {
             setState("failed");
           }
         }}
-        className="block w-full text-center border border-border-subtle hover:bg-surface text-text-primary font-medium py-2.5 rounded-[4px] text-sm transition-colors"
+        className="block w-full text-center border border-border-subtle hover:bg-surface text-text-primary font-medium py-2.5 rounded-control text-sm transition-colors"
       >
         {state === "copied" ? "Token copied — paste it in the app" : "Copy Onyx token"}
       </button>
@@ -110,7 +110,7 @@ function CopyTokenButton() {
           readOnly
           value={shown}
           onFocus={(e) => e.currentTarget.select()}
-          className="w-full bg-surface border border-border-subtle rounded-[4px] px-2 py-1.5 text-xs text-text-secondary font-mono"
+          className="w-full bg-surface border border-border-subtle rounded-control px-2 py-1.5 text-xs text-text-secondary font-mono"
         />
       )}
       {state === "failed" && <p className="text-text-tertiary text-xs">Copy didn&apos;t work — tap the box above, then Copy.</p>}
@@ -155,12 +155,11 @@ function FocusBuildCard() {
   const { build, state, reason, expired } = useBuild("focus");
   const meta = BUILD_VARIANTS.focus;
   return (
-    <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 space-y-4">
+    <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-6 space-y-4">
       <div>
         <h2 className="text-base font-medium text-text-primary">{meta.title}</h2>
         <p className="text-text-tertiary text-xs mt-1">
-          Installs over the Screen Time app (same bundle ID): it upgrades it in place and keeps the Screen Time
-          export. Installing the plain Screen Time build later replaces it again.
+          Upgrades the Screen Time app in place; installing the plain build later replaces it again.
         </p>
       </div>
       {state === "loading" && <p className="text-text-tertiary text-sm">Loading…</p>}
@@ -192,9 +191,7 @@ function FocusBuildCard() {
               <p className="text-text-tertiary text-xs">Links expire {fmt(build.links_expire_at)}.</p>
             </>
           )}
-          <p className="text-text-tertiary text-xs">
-            Keeps opening until its signing certificate and profiles expire: {fmt(build.profile_expires)}.
-          </p>
+          <p className="text-text-tertiary text-xs">Stops opening after {fmt(build.profile_expires)} (signing expires).</p>
         </>
       )}
     </div>
@@ -209,20 +206,20 @@ export default function InstallPage() {
       <div className="max-w-md mx-auto space-y-4">
         <div>
           <h1 className="text-2xl font-semibold text-text-primary mb-1">Onyx Screen Time</h1>
-          <p className="text-text-tertiary text-sm">Install the iPhone app. Open this page in Safari on the iPhone.</p>
+          <p className="text-text-tertiary text-sm">Open this page in Safari on the iPhone.</p>
         </div>
 
         {state === "loading" && <p className="text-text-tertiary text-sm">Loading…</p>}
 
         {state === "none" && (
-          <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6">
+          <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-6">
             <p className="text-text-secondary text-sm">No signed build has been published yet.</p>
             {reason && <p className="text-text-tertiary text-xs mt-2">{reason}</p>}
           </div>
         )}
 
         {state === "error" && (
-          <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6">
+          <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-6">
             <p className="text-down text-sm">Couldn&apos;t load the build.</p>
             {reason && <p className="text-text-tertiary text-xs mt-2">{reason}</p>}
           </div>
@@ -230,7 +227,7 @@ export default function InstallPage() {
 
         {state === "ready" && build && (
           <>
-            <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 space-y-4">
+            <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-6 space-y-4">
               <div>
                 <h2 className="text-base font-medium text-text-primary">
                   Version {build.version} ({build.build}) · build #{build.run_number}
@@ -255,13 +252,10 @@ export default function InstallPage() {
                   <p className="text-text-tertiary text-xs">Links expire {fmt(build.links_expire_at)}.</p>
                 </>
               )}
-              <p className="text-text-tertiary text-xs">
-                The installed app keeps opening until its signing certificate and profile expire:{" "}
-                {fmt(build.profile_expires)}.
-              </p>
+              <p className="text-text-tertiary text-xs">Stops opening after {fmt(build.profile_expires)} (signing expires).</p>
             </div>
 
-            <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 space-y-2">
+            <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-6 space-y-2">
               <h2 className="text-base font-medium text-text-primary">After installing</h2>
               <ol className="list-decimal list-inside text-text-secondary text-sm space-y-1.5">
                 <li>Tap the app icon. iOS says Developer Mode is required.</li>
@@ -276,7 +270,7 @@ export default function InstallPage() {
             </div>
 
             {!expired && (
-              <div className="bg-surface-card border border-border-subtle rounded-[6px] p-6 space-y-2">
+              <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-6 space-y-2">
                 <h2 className="text-base font-medium text-text-primary">USB fallback</h2>
                 <p className="text-text-secondary text-sm">
                   If neither link installs, download the app file on the PC and install it over the cable.

@@ -109,6 +109,20 @@ export interface Quiz {
   quiz_date: string;
 }
 
+// Explicit column lists instead of select("*") (re-audit 2026-06-07,
+// units/gpt-5/F-004: a new, similarly named column should not flow into
+// consumers unnoticed). Every column of each table, checked against
+// information_schema on 2026-11-14: these rows go out whole in /api/reading
+// responses and chat tool results, so nothing is dropped. If the schema adds a
+// column a consumer needs, append it here (and to the interface above).
+export const BOOK_COLS =
+  "book_id, slug, title, author, total_chapters, start_date, target_date, status, finished_on, notion_page_id, habit_name, created_at, updated_at, asin, last_position, last_position_at, total_positions";
+export const SESSION_COLS =
+  "session_id, book_id, session_date, chapter_from, chapter_through, minutes, medium, recall, question, notion_block_id, created_at, source, in_chapter, highlight_count, updated_at";
+export const HIGHLIGHT_COLS =
+  "highlight_id, book_id, chapter, location, passage, comment, concept, source, review_count, ease, interval_days, next_review, last_reviewed, archived, notion_block_id, created_at, updated_at, position, position_end, page, highlighted_at, note_at, behavioral_date";
+const QUIZ_COLS = "quiz_id, book_id, checkpoint, score, total, notes, quiz_date, taken_at";
+
 export interface Checkpoint {
   key: string; // 'ch12'
   chapter: number;
@@ -238,7 +252,7 @@ export async function behavioralToday(supabase: Supa): Promise<string> {
 /* ------------------------------------------------------------------ */
 
 export async function getBook(supabase: Supa, slug?: string | null): Promise<Book | null> {
-  let q = supabase.from("books").select("*");
+  let q = supabase.from("books").select(BOOK_COLS);
   if (slug) q = q.eq("slug", slug);
   else q = q.eq("status", "reading");
   const { data, error } = await q.order("created_at", { ascending: false }).limit(1);
@@ -247,53 +261,57 @@ export async function getBook(supabase: Supa, slug?: string | null): Promise<Boo
 }
 
 export async function listBooks(supabase: Supa): Promise<Book[]> {
-  const { data, error } = await supabase.from("books").select("*").order("created_at", { ascending: false });
+  const { data, error } = await supabase.from("books").select(BOOK_COLS).order("created_at", { ascending: false });
   if (error) throw new Error(error.message);
   return (data ?? []) as Book[];
 }
 
+/**
+ * One book with every row the overview needs, in ONE PostgREST request (embedded resources over the foreign keys
+ * book_id and highlight_id), sent in parallel with behavioral today. Same rows and order as separate queries:
+ * sessions newest first, unarchived highlights newest first with their reviews, quizzes newest first, chapters by
+ * position. (2026-11-14: was four round trips in a row.)
+ */
+const OVERVIEW_SELECT =
+  "*, reading_sessions(*), book_highlights(*, reading_reviews(review_id,highlight_id,review_date,grade)), reading_quizzes(*), book_chapters(chapter,start_position,end_position,start_page,end_page)";
+
+type OverviewRow = Book & {
+  reading_sessions?: ReadingSession[] | null;
+  book_highlights?: (Highlight & { reading_reviews?: Review[] | null })[] | null;
+  reading_quizzes?: Quiz[] | null;
+  book_chapters?: ChapterSpan[] | null;
+};
+
 export async function getOverview(supabase: Supa, slug?: string | null): Promise<ReadingOverview | null> {
-  const book = await getBook(supabase, slug);
-  if (!book) return null;
-  const today = await behavioralToday(supabase);
+  let q = supabase.from("books").select(OVERVIEW_SELECT);
+  if (slug) q = q.eq("slug", slug);
+  else q = q.eq("status", "reading");
+  const bookQuery = q
+    .eq("book_highlights.archived", false)
+    .order("session_date", { referencedTable: "reading_sessions", ascending: false })
+    .order("session_id", { referencedTable: "reading_sessions", ascending: false })
+    .order("created_at", { referencedTable: "book_highlights", ascending: false })
+    .order("highlight_id", { referencedTable: "book_highlights", ascending: false })
+    .order("taken_at", { referencedTable: "reading_quizzes", ascending: false })
+    .order("start_position", { referencedTable: "book_chapters" })
+    .order("created_at", { ascending: false })
+    .limit(1);
+  const [{ data, error }, today] = await Promise.all([bookQuery, behavioralToday(supabase)]);
+  if (error) throw new Error(error.message);
+  const row = (data?.[0] as OverviewRow | undefined) ?? null;
+  if (!row) return null;
 
-  const [sessionsRes, highlightsRes, quizzesRes, chaptersRes] = await Promise.all([
-    supabase
-      .from("reading_sessions")
-      .select("*")
-      .eq("book_id", book.book_id)
-      .order("session_date", { ascending: false })
-      .order("session_id", { ascending: false }),
-    supabase
-      .from("book_highlights")
-      .select("*")
-      .eq("book_id", book.book_id)
-      .eq("archived", false)
-      .order("created_at", { ascending: false })
-      .order("highlight_id", { ascending: false }),
-    supabase.from("reading_quizzes").select("*").eq("book_id", book.book_id).order("taken_at", { ascending: false }),
-    supabase.from("book_chapters").select("chapter,start_position,end_position,start_page,end_page").eq("book_id", book.book_id).order("start_position"),
-  ]);
-  for (const r of [sessionsRes, highlightsRes, quizzesRes, chaptersRes]) {
-    if (r.error) throw new Error(r.error.message);
-  }
-  const sessions = (sessionsRes.data ?? []) as ReadingSession[];
-  const highlights = ((highlightsRes.data ?? []) as Highlight[]).map((h) => ({ ...h, ease: Number(h.ease) }));
-  const quizzes = (quizzesRes.data ?? []) as Quiz[];
-  const chapters = (chaptersRes.data ?? []) as ChapterSpan[];
+  const { reading_sessions, book_highlights, reading_quizzes, book_chapters, ...book } = row;
+  const sessions = reading_sessions ?? [];
+  const reviews: Review[] = [];
+  const highlights = (book_highlights ?? []).map(({ reading_reviews, ...h }) => {
+    for (const r of reading_reviews ?? []) reviews.push(r);
+    return { ...h, ease: Number(h.ease) } as Highlight;
+  });
+  const quizzes = reading_quizzes ?? [];
+  const chapters = book_chapters ?? [];
 
-  const highlightIds = highlights.map((h) => h.highlight_id);
-  let reviews: Review[] = [];
-  if (highlightIds.length) {
-    const { data, error } = await supabase
-      .from("reading_reviews")
-      .select("review_id,highlight_id,review_date,grade")
-      .in("highlight_id", highlightIds);
-    if (error) throw new Error(error.message);
-    reviews = (data ?? []) as Review[];
-  }
-
-  return computeOverview({ book, today, sessions, highlights, reviews, quizzes, chapters });
+  return computeOverview({ book: book as Book, today, sessions, highlights, reviews, quizzes, chapters });
 }
 
 /* ------------------------------------------------------------------ */
@@ -546,7 +564,7 @@ export interface LogSessionResult {
 
 export async function logSession(supabase: Supa, input: LogSessionInput): Promise<LogSessionResult | { ok: false; error: string }> {
   const book = input.book_id
-    ? ((await supabase.from("books").select("*").eq("book_id", input.book_id).maybeSingle()).data as Book | null)
+    ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
     : await getBook(supabase, input.slug ?? null);
   if (!book) return { ok: false, error: "No active book found" };
 
@@ -581,7 +599,7 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
     question: input.question?.trim() || null,
     source: input.source === "chat" ? "chat" : "manual",
   };
-  const { data, error } = await supabase.from("reading_sessions").insert(row).select("*").single();
+  const { data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single();
   if (error) return { ok: false, error: error.message };
   const session = data as ReadingSession;
 
@@ -632,7 +650,7 @@ export async function addHighlight(
   input: AddHighlightInput,
 ): Promise<{ ok: true; book: Book; highlight: Highlight; created: boolean } | { ok: false; error: string }> {
   const book = input.book_id
-    ? ((await supabase.from("books").select("*").eq("book_id", input.book_id).maybeSingle()).data as Book | null)
+    ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
     : await getBook(supabase, input.slug ?? null);
   if (!book) return { ok: false, error: "No active book found" };
   const passage = input.passage?.trim();
@@ -659,7 +677,7 @@ export async function addHighlight(
   // Idempotent on (book_id, passage): a re-import updates comment/chapter/concept/position only when provided.
   const { data: existing } = await supabase
     .from("book_highlights")
-    .select("*")
+    .select(HIGHLIGHT_COLS)
     .eq("book_id", book.book_id)
     .eq("passage", passage)
     .maybeSingle();
@@ -675,14 +693,14 @@ export async function addHighlight(
       if (v != null && v !== ex[k]) patch[k] = v;
     }
     if (Object.keys(patch).length) {
-      const { data, error } = await supabase.from("book_highlights").update(patch).eq("highlight_id", existing.highlight_id).select("*").single();
+      const { data, error } = await supabase.from("book_highlights").update(patch).eq("highlight_id", existing.highlight_id).select(HIGHLIGHT_COLS).single();
       if (error) return { ok: false, error: error.message };
       return { ok: true, book, highlight: data as Highlight, created: false };
     }
     return { ok: true, book, highlight: existing as Highlight, created: false };
   }
 
-  const { data, error } = await supabase.from("book_highlights").insert(row).select("*").single();
+  const { data, error } = await supabase.from("book_highlights").insert(row).select(HIGHLIGHT_COLS).single();
   if (error) return { ok: false, error: error.message };
   return { ok: true, book, highlight: data as Highlight, created: true };
 }
@@ -720,7 +738,7 @@ export async function gradeHighlight(
   date?: string | null,
 ): Promise<{ ok: true; highlight: Highlight; firstReviewToday: boolean } | { ok: false; error: string }> {
   if (!["again", "good", "easy"].includes(grade)) return { ok: false, error: "grade must be again | good | easy" };
-  const { data: h, error } = await supabase.from("book_highlights").select("*").eq("highlight_id", highlight_id).maybeSingle();
+  const { data: h, error } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("highlight_id", highlight_id).maybeSingle();
   if (error) return { ok: false, error: error.message };
   if (!h) return { ok: false, error: "highlight not found" };
   const today = date ?? (await behavioralToday(supabase));
@@ -734,7 +752,7 @@ export async function gradeHighlight(
   const { error: rErr } = await supabase.from("reading_reviews").insert({ highlight_id, review_date: today, grade });
   if (rErr) return { ok: false, error: rErr.message };
   const patch = scheduleAfterGrade(h as Highlight, grade, today);
-  const { data: updated, error: uErr } = await supabase.from("book_highlights").update(patch).eq("highlight_id", highlight_id).select("*").single();
+  const { data: updated, error: uErr } = await supabase.from("book_highlights").update(patch).eq("highlight_id", highlight_id).select(HIGHLIGHT_COLS).single();
   if (uErr) return { ok: false, error: uErr.message };
   return { ok: true, highlight: updated as Highlight, firstReviewToday };
 }
@@ -744,7 +762,7 @@ export async function recordQuiz(
   input: { slug?: string | null; book_id?: number | null; checkpoint: string; score: number; total: number; notes?: string | null; date?: string | null },
 ): Promise<{ ok: true; quiz: Quiz; passed: boolean } | { ok: false; error: string }> {
   const book = input.book_id
-    ? ((await supabase.from("books").select("*").eq("book_id", input.book_id).maybeSingle()).data as Book | null)
+    ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
     : await getBook(supabase, input.slug ?? null);
   if (!book) return { ok: false, error: "No active book found" };
   const score = Math.round(Number(input.score));
@@ -756,7 +774,7 @@ export async function recordQuiz(
   const { data, error } = await supabase
     .from("reading_quizzes")
     .insert({ book_id: book.book_id, checkpoint, score, total, notes: input.notes?.trim() || null, quiz_date })
-    .select("*")
+    .select(QUIZ_COLS)
     .single();
   if (error) return { ok: false, error: error.message };
   return { ok: true, quiz: data as Quiz, passed: score / total >= 0.8 };

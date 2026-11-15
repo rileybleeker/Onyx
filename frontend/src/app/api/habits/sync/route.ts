@@ -1,5 +1,8 @@
 import { createClient } from "@supabase/supabase-js";
+import { revalidateTag } from "next/cache";
 import { NextResponse } from "next/server";
+import { fetchActiveHabitsCached, HABITS_CACHE_TAG, parseHabitPage, sameHabitDefinitions } from "@/lib/habits-notion";
+import { SLEEP_QUESTIONS } from "@/lib/checkin";
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_HABITS_DB = process.env.NOTION_HABITS_DB || "29cc936fd5e14ae8b10a4fe5c5f7a6cd";
@@ -27,6 +30,11 @@ export async function POST() {
     return NextResponse.json({ error: "NOTION_API_KEY not configured" }, { status: 500 });
   }
 
+  // Keep the shared habit-list cache (lib/habits-notion.ts) warm: this route runs hourly and on every /habits visit,
+  // so the cached list the check-in screen reads is at most about an hour old. Read in parallel; awaited before the
+  // answer so Next refreshes a stale entry in the background (waitUntil).
+  const habitsCacheWarm = fetchActiveHabitsCached().catch(() => null);
+
   // Fetch ALL active habits (not just ones with Last Completed)
   const res = await fetch(`https://api.notion.com/v1/databases/${NOTION_HABITS_DB}/query`, {
     method: "POST",
@@ -51,7 +59,7 @@ export async function POST() {
 
   // Load existing name map (channel routes WHOOP-derived habits: their names
   // are frozen pipeline variable identities — see sql/whoop_journal_merge.sql)
-  const { data: nameMap } = await supabase.from("habit_name_map").select("*");
+  const { data: nameMap } = await supabase.from("habit_name_map").select("notion_page_id, habit_name, channel");
   const mapByPageId = new Map<string, { name: string; channel: string }>();
   (nameMap || []).forEach((row: any) =>
     mapByPageId.set(row.notion_page_id, { name: row.habit_name, channel: row.channel || "habit" })
@@ -195,7 +203,11 @@ export async function POST() {
     // retrains), and overwriting an explicit 'No' (tri-state, 2026-06-11)
     // would silently flip a deliberate in-Onyx answer — Notion only carries
     // a completion date, so it can never out-rank a direct answer.
-    if (lastCompleted) {
+    // Sleep questions are never synced from Notion: an answer on day D describes the night that CLOSES day D, and a
+    // Notion date cannot say which night a tick meant (ticked in the morning = last night = D - 1), so sleep is
+    // answered per night on the check-in only. Skipped quietly: the mirror keeps their Last Completed in Notion, and
+    // a reported skip would count as a change on every /habits visit.
+    if (lastCompleted && !SLEEP_QUESTIONS.has(name)) {
       const lcDate = String(lastCompleted).slice(0, 10); // Notion may return a datetime
       if (channel === "whoop" && lcDate <= WHOOP_JOURNAL_FROZEN_THROUGH) {
         synced.push(`${name}: SKIPPED (Last Completed ${lcDate} is inside the frozen historical era)`);
@@ -224,5 +236,10 @@ export async function POST() {
     }
   }
 
-  return NextResponse.json({ synced, renamed, metadataChanged, count: synced.length });
+  // This route just read the definitions fresh. When the cached list (what the check-in and /habits read) defines
+  // other questions, drop it so the next reader loads Notion instead of serving the old list for up to 3 h.
+  const cachedHabits = await habitsCacheWarm;
+  const definitionsChanged = !!cachedHabits && !sameHabitDefinitions(cachedHabits, data.results.map(parseHabitPage));
+  if (definitionsChanged) revalidateTag(HABITS_CACHE_TAG);
+  return NextResponse.json({ synced, renamed, metadataChanged, count: synced.length, definitionsChanged });
 }

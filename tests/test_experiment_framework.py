@@ -353,6 +353,35 @@ def test_protocol_rules():
     assert "interim looks are not built" in _problems(_protocol_text(**{
         "interim: none ": "interim: at 50% of blocks, O'Brien-Fleming "}))
     assert "front matter" in " ".join(_catch(lambda: ed.parse_protocol(b"# no front matter\n")))
+    assert _validate(_protocol_text(**{"    arm: A\n": "    arm: A\n  min_pct: 80\n"}))["adherence"]["min_pct"] == 80
+    assert "min_pct" in _problems(_protocol_text(**{"    arm: A\n": "    arm: A\n  min_pct: 180\n"}))
+
+
+def test_protocol_kind_keeps_an_aa_check_and_a_treatment_trial_apart():
+    assert ed.trial_kind({}) == ed.trial_kind(None) == ed.trial_kind({"kind": "treatment"}) == ed.KIND_TREATMENT
+    assert ed.trial_kind({"kind": "AA"}) == ed.KIND_AA
+    b_line = "  B: Usual evening (control). Use your phone as you normally would.\n"
+    same_b = "  B: No phone in the 60 minutes before you go to sleep.\n"
+    assert "a treatment trial needs two different arms" in _problems(_protocol_text(**{b_line: same_b}))
+    assert "kind must be treatment or aa" in _problems(_protocol_text(**{"kind: treatment ": "kind: sham "}))
+    assert "needs arms.A and arms.B to be the same instruction" in _problems(_protocol_text(**{"kind: treatment ": "kind: aa "}))
+    assert "has no adherence.objective rule" in _problems(_protocol_text(**{"kind: treatment ": "kind: aa ", b_line: same_b}))
+    assert _validate(_protocol_text())["arm_a_instruction"] != _validate(_protocol_text())["arm_b_instruction"]
+
+
+def test_the_aa_check_protocol_file_registers_once_seeded():
+    path = ROOT / "docs" / "experiments" / "EXP-900.md"
+    raw = path.read_text(encoding="utf-8")
+    protocol = ed.parse_protocol(raw.encode())
+    assert protocol["id"] == path.stem == "EXP-900" and ed.trial_kind(protocol) == ed.KIND_AA
+    start = ed._as_date(protocol["start"])
+    assert "seed_sha256" in _problems(raw, today=start - timedelta(days=1)), "not seeded yet: the placeholder is refused"
+    seeded = raw.replace("seed_sha256: paste-the-value-printed-by-the-seed-step", f"seed_sha256: {GOLDEN_COMMITMENT}")
+    fields = _validate(seeded, today=start - timedelta(days=1), seed_sha256=GOLDEN_COMMITMENT)
+    assert (fields["n_blocks"], fields["n_days"], fields["washout_days"]) == (7, 28, 0), "four weeks"
+    assert fields["planned_end"] == (start + timedelta(days=27)).isoformat()
+    assert fields["arm_a_instruction"] == fields["arm_b_instruction"]
+    assert "objective" not in fields["adherence"] and fields["n_redraws"] == 10000 and fields["alpha"] == 0.05
 
 
 def _catch(fn):
@@ -419,6 +448,9 @@ class FakeStore:
     def behavioral_today(self):
         return self.today
 
+    def reports_table_ready(self):
+        return getattr(self, "reports_ready", True)
+
     def experiment_active(self):
         return any(r["status"] in ("registered", "running", "paused") for r in self.rows.values())
 
@@ -465,6 +497,11 @@ def test_admin_seed_then_register_then_verify():
         dirty = lambda _p: {**MERGED(_p), "clean": False}  # noqa: E731
         assert "committed" in _refused(lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=dirty))
         assert "must be after today" in _refused(lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=date(2030, 1, 7), git=MERGED))
+        store.reports_ready = False
+        assert "sql/experiment_adherence_reports_schema.sql" in _refused(
+            lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED)), \
+            "a trial cannot be registered before its report table exists"
+        store.reports_ready = True
         assert store.rows["EXP-901"]["status"] == "draft" and store.sched == {}, "a refused registration writes nothing"
 
         out = "\n".join(admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED))

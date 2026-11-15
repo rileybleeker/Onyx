@@ -390,6 +390,12 @@ export interface TodayUrgentItem {
   atVerb: "Received" | "Posted";
   gmailHref: string | null;
   requestHref: string | null;
+  /**
+   * What a Clear on Today removes: the Agent Inbox card codes merged into this item (dismissed
+   * through the Worker) and the labelled email threads (hidden by /api/urgent-email/clear until a
+   * newer message arrives), including the same message's copy in the other mailbox.
+   */
+  clear: { cards: string[]; emails: { key: string; receivedAt: string }[] };
 }
 
 const URGENT_PREFIX = /^\s*urgent\s*:\s*/i;
@@ -582,6 +588,7 @@ export function mergeUrgent(
     const twin = mid ? byMessageId.get(mid) : undefined;
     if (twin) {   // the same message delivered to both mailboxes
       if (!twin.item.reasons.some((r) => r.startsWith("Also in "))) twin.item.reasons.push(`Also in ${shortAccount(e.account)}`);
+      twin.item.clear.emails.push({ key: e.key, receivedAt: e.receivedAt });
       continue;
     }
     const href = e.href && isGmailHref(e.href) ? e.href : null;
@@ -601,6 +608,7 @@ export function mergeUrgent(
         atVerb: "Received",
         gmailHref: href,
         requestHref: null,
+        clear: { cards: [], emails: [{ key: e.key, receivedAt: e.receivedAt }] },
       },
     };
     entries.push(entry);
@@ -637,6 +645,7 @@ export function mergeUrgent(
       }
     }
     if (match) {
+      match.item.clear.cards.push(code);
       if (!match.item.sources.includes("Agent Inbox")) {
         match.item.sources.push("Agent Inbox");
         match.item.sourceDetail += ` + Agent Inbox (${c.card.agent})`;
@@ -663,6 +672,7 @@ export function mergeUrgent(
         atVerb: "Posted",
         gmailHref: c.card.link && ref ? c.card.link : null,
         requestHref,
+        clear: { cards: [code], emails: [] },
       },
     });
   }

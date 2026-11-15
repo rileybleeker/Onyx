@@ -1,6 +1,8 @@
 "use client";
 
+import { writeFeedSeed } from "@/lib/feed-seed";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   AreaChart, Area,
   BarChart, Bar, Cell,
@@ -15,21 +17,32 @@ import {
   getCronometerServings,
   getDailyVitamins,
   getDailyNutrientsFull,
+  getPhotoMealsForDays,
   rangeDays,
   rangeLabel,
-  type Range,
+  type PhotoMeal,
 } from "@/lib/queries";
-import { formatDate, kgToLb, lbToKg, sameJson } from "@/lib/format";
+import PhotoMealLogger from "@/components/PhotoMealLogger";
+import { daySourceLabel, isEstimateSource, rangeSourceLabel } from "@/lib/photo-meal";
+import { formatClock } from "@/lib/delivery-leftovers";
+import { formatDate, kgToLb, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { Part, PartGrid, PartGroup } from "@/components/personalize/PartGrid";
+import PersonalTable, { type TableColumn } from "@/components/personalize/PersonalTable";
+import InfoHint from "@/components/InfoHint";
 import RangeFilter from "@/components/RangeFilter";
-import { DeliveryDishList, useDeliveryDishes } from "@/components/DeliveryPortions";
+import LogLink from "@/components/LogLink";
+import { useInFeed } from "@/components/FeedContext";
+import { logHref } from "@/app/log/jump";
+import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
+import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
 import { shiftYmd } from "@/lib/delivery-portion";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-const legendStyle = { fontSize: 11, fontFamily: "var(--font-geist-mono), monospace" };
+const legendStyle = { fontSize: 11, fontFamily: "var(--font-mono)" };
 
 // ─── Vitamins & Minerals reference (US RDA/AI for an adult male) ──────────────
 // `tok` is the unit token used in pds.daily_micronutrient_totals column names
@@ -63,7 +76,39 @@ const VITAMIN_DEFS: VitaminDef[] = [
   { key: "dha", label: "DHA", unit: "g", tok: "g", rda: 0.5, group: "Fatty acids" },
   { key: "ala", label: "ALA", unit: "g", tok: "g", rda: 1.6, group: "Fatty acids" },
 ];
-const VITAMIN_GROUPS = ["Fat-soluble", "Water-soluble", "Minerals", "Fatty acids"];
+// One personalizable section per nutrient family; the first keeps the section's old part id ("vitamins").
+const VITAMIN_SECTIONS: { id: string; title: string; group: string }[] = [
+  { id: "vitamins", title: "Vitamins & Minerals: fat-soluble", group: "Fat-soluble" },
+  { id: "vitamins-water", title: "Water-soluble vitamins", group: "Water-soluble" },
+  { id: "minerals", title: "Minerals", group: "Minerals" },
+  { id: "fatty-acids", title: "Fatty acids", group: "Fatty acids" },
+];
+
+const vitNum = (v: any): number | null => (v == null ? null : Number(v));
+const fmtVit = (v: number | null): string =>
+  v == null ? "—" : v >= 100 ? Math.round(v).toString() : v >= 10 ? v.toFixed(0) : v.toFixed(1);
+const fmtNutrient = (v: any): string => (v == null ? "—" : Number(v) >= 10 ? Number(v).toFixed(0) : Number(v).toFixed(2));
+
+const NUTRIENT_TABLE_COLUMNS: TableColumn[] = [
+  { id: "nutrient", label: "Nutrient", locked: true, th: "text-left px-4 py-2", td: "text-left px-4 py-1.5 text-text-secondary font-sans" },
+  { id: "latest", label: "Latest", th: "text-right px-4 py-2", td: "text-right px-4 py-1.5" },
+  { id: "avg7", label: "7d avg", th: "text-right px-4 py-2", td: "text-right px-4 py-1.5 text-text-tertiary" },
+];
+
+/** Placeholder of a KPI tile while the range loads. */
+function TileSkeleton() {
+  return (
+    <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
+      <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
+      <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
+    </div>
+  );
+}
+
+/** Placeholder of a chart card while the range loads. */
+function ChartSkeleton({ height }: { height: number }) {
+  return <div className="bg-surface-card border border-border-subtle rounded-control animate-pulse" style={{ height }} />;
+}
 
 // Remaining Cronometer-only nutrients (no supplement overlap / no RDA tile) shown
 // in the "All tracked nutrients" table — honors the "render everything" choice.
@@ -130,7 +175,8 @@ interface WeightRow {
 
 import type { NutritionInitial } from "./NutritionLoader";
 
-export default function NutritionPage({ initial }: { initial?: NutritionInitial | null }) {
+export default function NutritionPage({ initial, headingTestId = "page-heading" }: { initial?: NutritionInitial | null; headingTestId?: string }) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
   // ─── Nutrition state ───
   // Server-prefetched initial data (ISR, default 30d range) seeds the analytics
   // charts so they paint immediately; the range effect still runs as a SILENT
@@ -144,10 +190,12 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   const [fullNutrients, setFullNutrients] = useState<any[]>(initial?.fullNutrients ?? []);
   const [servingsState, setServingsState] = useState<{ date: string | null; rows: any[]; failed?: boolean }>({ date: null, rows: [] });
   const [nutritionLoading, setNutritionLoading] = useState(!initial);
-  const [range, setRange] = useState<Range>("30d");
+  // Requested vs shown range (components/RangeLoadStatus.tsx, Codex #191 UI 4): labels use the shown one.
+  const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange, shownRef } = useRangeLoad("30d");
   const firstRunWithInitial = useRef(!!initial);
-  // Guards for the silent post-save refresh (refreshNutritionSilently): the range it ran for, a counter the
-  // range effect bumps (a newer range load wins), and a counter per refresh (the newest refresh wins).
+  // Guards for the silent post-save refresh (refreshNutritionSilently): the range it runs for (the one loading,
+  // else the one shown), a counter the range effect bumps (a newer range load wins), and a counter per refresh
+  // (the newest refresh wins).
   const rangeRef = useRef(range);
   const nutritionGen = useRef(0);
   const refreshSeq = useRef(0);
@@ -155,10 +203,15 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   // ─── Weight state ───
   const [weightRows, setWeightRows] = useState<WeightRow[]>([]);
   const [weightLoading, setWeightLoading] = useState(true);
-  const [weightInput, setWeightInput] = useState<string>("");
-  const [weightDate, setWeightDate] = useState<string>("");
-  const [weightNotes, setWeightNotes] = useState<string>("");
-  const [savingWeight, setSavingWeight] = useState(false);
+  // /nutrition?log=photo (Log > Meal photo): the photo logger first.
+  // /nutrition?log=weight (an older shortcut): weight is entered on Log now, so the routed page forwards there.
+  const logParam = useSearchParams().get("log");
+  const logPhotoFirst = logParam === "photo";
+  const router = useRouter();
+  const inFeed = useInFeed();
+  useEffect(() => {
+    if (logParam === "weight" && !inFeed) router.replace(logHref("weight"));
+  }, [logParam, inFeed, router]);
 
   // Behavioral "today" for the Today's Meals widget — seeded with ET-clock-today
   // as a synchronous best-guess, then overridden on mount via /api/behavioral-today
@@ -187,6 +240,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     const silent = firstRunWithInitial.current;
     firstRunWithInitial.current = false;
     if (!silent) setNutritionLoading(true);
+    const seq = beginRange(range, silent);
     Promise.all([
       getNutrition(rangeDays(range)),
       getWhoopCaloriesBurnt(rangeDays(range)),
@@ -195,6 +249,8 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     ])
       .then(([n, b, v, f]) => {
         if (cancelled) return;
+        // The default view also seeds this page in the continuous scroll (lib/feed-seed.ts).
+        if (range === "30d") writeFeedSeed("/nutrition", { nutritionData: n, burntData: b, vitaminsData: v, fullNutrients: f });
         // sameJson bail-out: the silent revalidation's data is usually
         // byte-identical to the server-seeded state — returning the previous
         // reference lets React skip the commit (and a full chart re-render).
@@ -203,13 +259,20 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
         setBurntData((prev) => (sameJson(prev, b) ? prev : b));
         setVitaminsData((prev) => (sameJson(prev, v) ? prev : v));
         setFullNutrients((prev) => (sameJson(prev, f) ? prev : f));
+        finishRange(seq, range, true);
       })
-      .catch(console.error)
+      .catch((e) => {
+        console.error(e);
+        if (cancelled) return;
+        // The charts keep the shown range's rows; a post-save refresh must fetch that range, not the failed one.
+        rangeRef.current = shownRef.current;
+        finishRange(seq, range, false);
+      })
       .finally(() => {
         if (!cancelled && !silent) setNutritionLoading(false);
       });
     return () => { cancelled = true; };
-  }, [range]);
+  }, [range, attempt, beginRange, finishRange, shownRef]);
 
   // ─── Meals log for one behavioral day (today by default; the two days before are one tap away,
   // because a leftover is usually noticed the next morning) ───
@@ -246,11 +309,55 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
       })
       .catch(console.error);
   }, []);
-  const delivery = useDeliveryDishes(mealsDay, { onSaved: refreshNutritionSilently });
+  // Read-only here: the portions and leftovers are answered on /log, which saves them.
+  const delivery = useDeliveryDishes(mealsDay);
   const servingsLoaded = servingsState.date === mealsDay;
   const servingsFailed = servingsLoaded && !!servingsState.failed;
   const todayServings = servingsLoaded ? servingsState.rows : [];
-  const mealsLoading = !servingsLoaded || !delivery.loaded;
+
+  // Photo-logged meals of the shown day (pds.photo_meals); reloaded after a save or a removal.
+  const [photoState, setPhotoState] = useState<{ date: string | null; rows: PhotoMeal[]; failed?: boolean }>({ date: null, rows: [] });
+  const [photoReload, setPhotoReload] = useState(0);
+  const [photoError, setPhotoError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    getPhotoMealsForDays([mealsDay])
+      .then((rows) => {
+        if (!cancelled) setPhotoState((prev) => (prev.date === mealsDay && !prev.failed && sameJson(prev.rows, rows) ? prev : { date: mealsDay, rows }));
+      })
+      .catch((e) => {
+        console.error(e);
+        if (!cancelled) setPhotoState({ date: mealsDay, rows: [], failed: true });
+      });
+    return () => { cancelled = true; };
+  }, [mealsDay, photoReload]);
+  const photoLoaded = photoState.date === mealsDay;
+  const photoMeals = photoLoaded ? photoState.rows : [];
+  const photoKcal = photoMeals.reduce((s, m) => s + m.kcal, 0);
+  const onPhotoSaved = useCallback(() => {
+    setPhotoReload((n) => n + 1);
+    refreshNutritionSilently();
+  }, [refreshNutritionSilently]);
+  async function removePhotoMeal(m: PhotoMeal) {
+    if (!window.confirm(`Remove this meal (${Math.round(m.kcal)} kcal)?`)) return;
+    setPhotoError(null);
+    try {
+      const res = await fetch("/api/nutrition/photo-meals", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ meal_id: m.meal_id }),
+      });
+      if (!res.ok && res.status !== 404) {
+        const j = await res.json().catch(() => null);
+        setPhotoError(`Not removed: ${j?.error ?? res.status}`);
+        return;
+      }
+      onPhotoSaved();
+    } catch {
+      setPhotoError("Network error: the meal was not removed.");
+    }
+  }
+  const mealsLoading = !servingsLoaded || !delivery.loaded || !photoLoaded;
 
   // ─── Weight loader + default date init ───
   const loadWeight = useCallback(async () => {
@@ -267,36 +374,6 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   }, [range]);
 
   useEffect(() => { loadWeight(); }, [loadWeight]);
-  useEffect(() => { setWeightDate(etTodayStr()); }, []);
-
-  async function saveWeight() {
-    const lb = parseFloat(weightInput);
-    if (!Number.isFinite(lb) || lb <= 0 || lb > 1000) {
-      alert("Enter a weight in pounds between 0 and 1000.");
-      return;
-    }
-    setSavingWeight(true);
-    try {
-      const res = await fetch("/api/weight", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          log_date: weightDate || etTodayStr(),
-          weight_kg: lbToKg(lb),
-          notes: weightNotes.trim() || undefined,
-        }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      setWeightInput("");
-      setWeightNotes("");
-      await loadWeight();
-    } catch (e) {
-      console.error("Save weight:", e);
-      alert(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSavingWeight(false);
-    }
-  }
 
   async function deleteWeight(log_date: string) {
     if (!confirm(`Delete weight entry for ${log_date}?`)) return;
@@ -374,7 +451,6 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     if (!baseline) return null;
     return kgToLb(Number(recent.weight_kg) - Number(baseline.weight_kg));
   })();
-  const todayWeight = weightRows.find((w) => w.log_date === etTodayStr());
 
   const macroData = nutritionData.map((d) => ({
     date: formatDate(d.calendar_date),
@@ -396,86 +472,116 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   const avgCarbs = avg(nutritionData, "carbs_g");
   const avgFat = avg(nutritionData, "fat_g");
 
-  // Days without a Cronometer log are filled with Uber Eats estimates
-  // (getNutrition) — label the source honestly.
-  const estDays = nutritionData.filter((d) => d.nutrition_source === "uber_eats").length;
-  const loggedDays = nutritionData.length - estDays;
-  const macroSource =
-    estDays === 0 ? "CRONOMETER" : loggedDays === 0 ? "UBER EATS EST." : "CRONOMETER + UBER EATS EST.";
-  const latestSource = latest?.nutrition_source === "uber_eats" ? "UBER EATS EST." : "CRONOMETER";
+  // Days without a Cronometer log are filled with Uber Eats estimates and
+  // photo-logged meals (getNutrition) — label the source honestly.
+  const estDays = nutritionData.filter((d) => isEstimateSource(d.nutrition_source)).length;
+  const macroSource = rangeSourceLabel(nutritionData.map((d) => d.nutrition_source));
+  const latestSource = daySourceLabel(latest?.nutrition_source);
+
+  // Latest day + trailing week of the micronutrient tiles and the "All tracked nutrients" table.
+  const vitaminLatest = vitaminsData[vitaminsData.length - 1];
+  const vitaminLast7 = vitaminsData.slice(-7);
+  const nutrientLatest = fullNutrients[fullNutrients.length - 1];
+  const nutrientLast7 = fullNutrients.slice(-7);
 
   return (
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Nutrition</h2>
+          <div className="flex items-center gap-2">
+            <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Nutrition</h2>
+            <InfoHint label="Nutrition">
+              Food comes from Cronometer. On days with no Cronometer log, Uber Eats dish estimates and meals
+              logged by photo fill in.
+            </InfoHint>
+          </div>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Daily macros, micronutrients &amp; body weight — food from Cronometer + Uber Eats — {rangeLabel(range)}
+            Macros, micronutrients &amp; weight — {rangeLabel(rangeView.shown)}
           </p>
         </div>
-        <RangeFilter value={range} onChange={setRange} />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <RangeLoadStatus view={rangeView} onRetry={retryRange} />
+          <RangeFilter value={selectedRange} onChange={selectRange} />
+        </div>
       </div>
+
+      {logPhotoFirst && <div className="mb-8"><PhotoMealLogger first onSaved={onPhotoSaved} /></div>}
 
       {/* Meal timing is now automatic from Cronometer Gold per-entry timestamps
           (manual meal_events logging removed 2026-05-31). Per-meal log shows in
           "Today's Meals" below; meal-timing drivers show on /analytics/hrv. */}
 
+      <PartGrid page="/nutrition" title="Nutrition" gap={28}>
       {/* ─── Daily Macros (Cronometer; MFP fills pre-cutover history) ──────── */}
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Daily Macros</p>
-      {estDays > 0 && (
-        <p className="text-xs text-text-tertiary -mt-2 mb-3">
-          {estDays} of {nutritionData.length} days use Uber Eats estimates (dish names → kcal/macros; no Cronometer log that day).
-          They count what you marked as eaten under Meals below or in the check-in (All unless you change it), and miss anything not delivered.
-        </p>
-      )}
-
-      {nutritionLoading ? (
-        <div className="space-y-6">
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-            {[...Array(4)].map((_, i) => (
-              <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
-                <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
-                <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
+      <PartGroup
+        id="macros"
+        title="Daily Macros"
+        header={
+          <div className="mb-3">
+            <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">Daily Macros</p>
+            {estDays > 0 && (
+              <div className="flex items-center gap-2 mt-1">
+                <p className="text-xs text-text-tertiary">
+                  {estDays} of {nutritionData.length} days use estimates.
+                </p>
+                <InfoHint label="Estimates">
+                  On days with no Cronometer log: Uber Eats dishes estimated from their names, counting what you
+                  marked as eaten under Meals below or in the check-in (All unless you change it), plus meals you
+                  logged by photo. Food that was neither delivered nor photographed is missing.
+                </InfoHint>
               </div>
-            ))}
+            )}
           </div>
-          <div className="h-[320px] bg-surface-card border border-border-subtle rounded-[6px] animate-pulse" />
-        </div>
-      ) : (
-        <>
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+        }
+      >
+        <Part id="calories" title="Calories" width="quarter">
+          {nutritionLoading ? <TileSkeleton /> : (
             <StatCard
               label="Calories"
               value={latest?.calories ?? null}
               sublabel={avgCalories > 0 ? `avg ${Math.round(avgCalories)} kcal` : undefined}
               source={latestSource}
             />
+          )}
+        </Part>
+        <Part id="protein" title="Protein" width="quarter">
+          {nutritionLoading ? <TileSkeleton /> : (
             <StatCard
               label="Protein"
               value={latest?.protein_g ? `${Number(latest.protein_g).toFixed(0)}g` : null}
               sublabel={avgProtein > 0 ? `avg ${avgProtein.toFixed(0)}g` : undefined}
               source={latestSource}
             />
+          )}
+        </Part>
+        <Part id="carbs" title="Carbs" width="quarter">
+          {nutritionLoading ? <TileSkeleton /> : (
             <StatCard
               label="Carbs"
               value={latest?.carbs_g ? `${Number(latest.carbs_g).toFixed(0)}g` : null}
               sublabel={avgCarbs > 0 ? `avg ${avgCarbs.toFixed(0)}g` : undefined}
               source={latestSource}
             />
+          )}
+        </Part>
+        <Part id="fat" title="Fat" width="quarter">
+          {nutritionLoading ? <TileSkeleton /> : (
             <StatCard
               label="Fat"
               value={latest?.fat_g ? `${Number(latest.fat_g).toFixed(0)}g` : null}
               sublabel={avgFat > 0 ? `avg ${avgFat.toFixed(0)}g` : undefined}
               source={latestSource}
             />
-          </div>
+          )}
+        </Part>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Part id="calorie-trend" title="Calorie Trend — Consumed vs Burnt">
+          {nutritionLoading ? <ChartSkeleton height={320} /> : (
             <ChartCard
               title="Calorie Trend — Consumed vs Burnt"
-              subtitle="Daily intake (Cronometer; Uber Eats dish estimates on days with no Cronometer log) against WHOOP cycle energy expenditure (kilojoule → kcal). Net = consumed − burnt."
+              subtitle="Intake vs WHOOP energy burnt"
+              hint="Intake is Cronometer, with Uber Eats dish estimates on days with no Cronometer log. Burnt is WHOOP cycle energy expenditure (kilojoule → kcal). Net = consumed − burnt."
               source={`${macroSource} + WHOOP`}
-              className="lg:col-span-2"
             >
               <ResponsiveContainer width="100%" height={280}>
                 <ComposedChart data={calorieData}>
@@ -513,12 +619,15 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                 </ComposedChart>
               </ResponsiveContainer>
             </ChartCard>
+          )}
+        </Part>
 
+        <Part id="net-energy" title="Net Energy Balance">
+          {nutritionLoading ? <ChartSkeleton height={260} /> : (
             <ChartCard
               title="Net Energy Balance"
-              subtitle="Consumed − burnt per day. Above zero = surplus, below = deficit."
+              subtitle="Consumed − burnt · above 0 = surplus"
               source={`${macroSource} + WHOOP`}
-              className="lg:col-span-2"
             >
               <ResponsiveContainer width="100%" height={220}>
                 <BarChart data={calorieData}>
@@ -538,8 +647,12 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                 </BarChart>
               </ResponsiveContainer>
             </ChartCard>
+          )}
+        </Part>
 
-            <ChartCard title="Macro Breakdown (g)" source={macroSource} className="lg:col-span-2">
+        <Part id="macro-breakdown" title="Macro Breakdown (g)">
+          {nutritionLoading ? <ChartSkeleton height={300} /> : (
+            <ChartCard title="Macro Breakdown (g)" source={macroSource}>
               <ResponsiveContainer width="100%" height={260}>
                 <BarChart data={macroData}>
                   <CartesianGrid {...gridStyle} />
@@ -553,8 +666,12 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                 </BarChart>
               </ResponsiveContainer>
             </ChartCard>
+          )}
+        </Part>
 
-            <ChartCard title="Protein, Fat, Fiber & Sugar (g)" source="CRONOMETER" className="lg:col-span-2">
+        <Part id="macro-detail" title="Protein, Fat, Fiber & Sugar (g)">
+          {nutritionLoading ? <ChartSkeleton height={300} /> : (
+            <ChartCard title="Protein, Fat, Fiber & Sugar (g)" source="CRONOMETER">
               <ResponsiveContainer width="100%" height={260}>
                 <LineChart data={detailData}>
                   <CartesianGrid {...gridStyle} />
@@ -569,361 +686,363 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
                 </LineChart>
               </ResponsiveContainer>
             </ChartCard>
-          </div>
-        </>
-      )}
-
-      <div className="border-t border-border-subtle my-10" />
-
-      {/* ─── Vitamins & Minerals (Cronometer dietary + Onyx supplement) ─────── */}
-      <div className="flex items-baseline justify-between mb-3">
-        <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">Vitamins &amp; Minerals</p>
-        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + SUPPLEMENTS · latest day · % of RDA</span>
-      </div>
-      {(() => {
-        const vL = vitaminsData[vitaminsData.length - 1];
-        const last7 = vitaminsData.slice(-7);
-        const num = (v: any) => (v == null ? null : Number(v));
-        const fmtN = (v: number | null) =>
-          v == null ? "—" : v >= 100 ? Math.round(v).toString() : v >= 10 ? v.toFixed(0) : v.toFixed(1);
-        return (
-          <div className="space-y-5">
-            {VITAMIN_GROUPS.map((grp) => (
-              <div key={grp}>
-                <p className="text-[10px] font-mono text-text-tertiary mb-2">{grp}</p>
-                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-                  {VITAMIN_DEFS.filter((d) => d.group === grp).map((d) => {
-                    const total = num(vL?.[`${d.key}_total_${d.tok}`]);
-                    const diet = num(vL?.[`${d.key}_dietary_${d.tok}`]);
-                    const supp = num(vL?.[`${d.key}_supplement_${d.tok}`]);
-                    const avg7 = avg(last7, `${d.key}_total_${d.tok}`);
-                    const pct = total != null && d.rda ? (total / d.rda) * 100 : null;
-                    const barColor = pct == null ? "bg-white/10" : pct >= 100 ? "bg-green-500" : pct >= 50 ? "bg-cyan-500" : "bg-amber-500";
-                    return (
-                      <div key={d.key} className="bg-surface-card border border-border-subtle rounded-[6px] p-3">
-                        <div className="flex justify-between items-baseline">
-                          <span className="text-xs text-text-secondary truncate">{d.label}</span>
-                          <span className="text-[10px] font-mono text-text-tertiary shrink-0 ml-1">{pct == null ? "—" : `${Math.round(pct)}%`}</span>
-                        </div>
-                        <div className="text-base font-mono mt-1">
-                          {fmtN(total)}
-                          <span className="text-[10px] text-text-tertiary ml-1">{d.unit}</span>
-                        </div>
-                        <div className="h-1 bg-white/5 rounded mt-2 overflow-hidden">
-                          <div className={`h-full ${barColor}`} style={{ width: `${pct == null ? 0 : Math.min(pct, 100)}%` }} />
-                        </div>
-                        <div className="text-[10px] font-mono text-text-tertiary mt-1.5 truncate">
-                          food {fmtN(diet)} · supp {fmtN(supp)} · 7d {fmtN(avg7 || null)}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
-            {!vL && (
-              <p className="text-xs text-text-tertiary">No Cronometer micronutrient data yet — import an export to populate.</p>
-            )}
-          </div>
-        );
-      })()}
-
-      <div className="border-t border-border-subtle my-10" />
-
-      {/* ─── Today's meals (Cronometer per-entry log) ──────────────────────── */}
-      <div className="flex items-baseline justify-between mb-3">
-        <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">
-          {mealsDayOffset === 0 ? "Today's Meals" : "Meals"}
-        </p>
-        <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + UBER EATS · {mealsDay}</span>
-      </div>
-      <div className="flex gap-1.5 mb-3" role="tablist" aria-label="Meals day">
-        {[0, 1, 2].map((off) => (
-          <button
-            key={off}
-            role="tab"
-            aria-selected={mealsDayOffset === off}
-            onClick={() => setMealsDayOffset(off)}
-            className={`px-2.5 py-1 rounded-[5px] border text-[11px] font-mono transition-colors ${
-              mealsDayOffset === off
-                ? "border-accent/60 bg-accent/10 text-text-primary"
-                : "border-border-subtle text-text-tertiary hover:text-text-secondary"
-            }`}
-          >
-            {off === 0 ? "Today" : off === 1 ? "Yesterday" : formatShortDate(shiftYmd(behavioralToday, -2))}
-          </button>
-        ))}
-      </div>
-      {mealsLoading ? (
-        <p className="text-xs text-text-tertiary mb-2">Loading…</p>
-      ) : todayServings.length === 0 && delivery.items.length === 0 && !servingsFailed && !delivery.loadError ? (
-        <p className="text-xs text-text-tertiary mb-2">
-          Nothing logged for {mealsDayOffset === 0 ? "today" : "this day"} yet. Cronometer entries and Uber Eats orders appear here once they sync.
-        </p>
-      ) : null}
-      {servingsFailed && <p className="text-xs text-red-400 mb-2">Couldn&apos;t load Cronometer entries.</p>}
-      {delivery.loadError && <p className="text-xs text-red-400 mb-2">{delivery.loadError}</p>}
-      {todayServings.length === 0 ? null : (
-        <div className="bg-surface-card border border-border-subtle rounded-[6px] divide-y divide-border-subtle">
-          {todayServings.map((s) => (
-            <div key={s.serving_id} className="flex items-center gap-3 px-4 py-2.5 text-sm">
-              <span className="text-[11px] font-mono text-text-tertiary w-20 shrink-0">
-                {s.event_time
-                  ? new Date(s.event_time).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })
-                  : (s.meal_group ?? "—")}
-              </span>
-              <span className="flex-1 truncate text-text-secondary">{s.food_name}</span>
-              <span className="text-[11px] font-mono text-text-tertiary shrink-0">{s.amount_raw}</span>
-              <span className="text-[11px] font-mono text-text-tertiary w-16 text-right shrink-0">
-                {s.calories != null ? `${Math.round(Number(s.calories))} kcal` : ""}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-      {delivery.items.length > 0 && (
-        <>
-          <div className={`flex items-baseline justify-between ${todayServings.length ? "mt-3" : ""} mb-1.5`}>
-            <span className="text-[10px] font-mono text-text-tertiary">
-              Tap how much you ate; leftovers count only the part eaten.
-            </span>
-            <span className="text-[11px] font-mono text-text-secondary">
-              {delivery.totalKcal != null ? `Uber Eats ~${Math.round(delivery.totalKcal)} kcal` : ""}
-            </span>
-          </div>
-          <DeliveryDishList items={delivery.items} onPick={delivery.setFraction} />
-          {delivery.error && <p className="text-[11px] text-red-400 mt-1.5">{delivery.error}</p>}
-        </>
-      )}
-
-      <div className="border-t border-border-subtle my-10" />
-
-      {/* ─── All tracked nutrients (Cronometer dietary; latest day + 7d avg) ── */}
-      <details className="group">
-        <summary className="cursor-pointer text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3 list-none flex items-center gap-2">
-          <span className="group-open:rotate-90 transition-transform">▸</span> All Tracked Nutrients
-          <span className="text-text-tertiary/60 normal-case tracking-normal">— amino acids, fat fractions, etc.</span>
-        </summary>
-        {(() => {
-          const fL = fullNutrients[fullNutrients.length - 1];
-          const last7 = fullNutrients.slice(-7);
-          const fmtN = (v: any) => (v == null ? "—" : Number(v) >= 10 ? Number(v).toFixed(0) : Number(v).toFixed(2));
-          return (
-            <div className="bg-surface-card border border-border-subtle rounded-[6px] overflow-hidden">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-[10px] font-mono text-text-tertiary uppercase border-b border-border-subtle">
-                    <th className="text-left px-4 py-2">Nutrient</th>
-                    <th className="text-right px-4 py-2">Latest</th>
-                    <th className="text-right px-4 py-2">7d avg</th>
-                  </tr>
-                </thead>
-                <tbody className="font-mono">
-                  {EXTRA_NUTRIENT_COLS.map((n) => (
-                    <tr key={n.col} className="border-b border-border-subtle/50 last:border-0">
-                      <td className="text-left px-4 py-1.5 text-text-secondary font-sans">{n.label}</td>
-                      <td className="text-right px-4 py-1.5">{fmtN(fL?.[n.col])}<span className="text-text-tertiary text-[10px] ml-1">{n.unit}</span></td>
-                      <td className="text-right px-4 py-1.5 text-text-tertiary">{fmtN(avg(last7, n.col) || null)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          );
-        })()}
-      </details>
-
-      <div className="border-t border-border-subtle my-10" />
-
-      {/* ─── Body Weight ───────────────────────────────────────────────────── */}
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Body Weight</p>
-
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
-        <StatCard
-          label="Latest"
-          value={latestWeightLb !== null ? `${latestWeightLb.toFixed(1)} lb` : "—"}
-          sublabel={latestWeight ? formatShortDate(latestWeight.log_date) : "no entries"}
-          source={latestWeight?.source === "tanita" ? "TANITA" : undefined}
-        />
-        <StatCard
-          label="7d avg"
-          value={sevenDayWeightAvg !== null ? `${sevenDayWeightAvg.toFixed(1)} lb` : "—"}
-          sublabel="trailing 7 days"
-        />
-        <StatCard
-          label="30d delta"
-          value={
-            thirtyDayDelta !== null
-              ? `${thirtyDayDelta >= 0 ? "+" : ""}${thirtyDayDelta.toFixed(1)} lb`
-              : "—"
-          }
-          sublabel="vs ~30 days ago"
-        />
-        <StatCard
-          label="Entries"
-          value={weightRows.length}
-          sublabel="last 90 days"
-        />
-      </div>
-
-      <div className="space-y-6 mb-10">
-        {/* Quick-log card */}
-        <ChartCard
-          title={weightDate === etTodayStr() ? "Log weight — today" : `Log weight for ${formatShortDate(weightDate)}`}
-          subtitle={
-            todayWeight && weightDate === etTodayStr()
-              ? `Already logged today (${kgToLb(Number(todayWeight.weight_kg))!.toFixed(1)} lb). Saving overwrites.`
-              : "One entry per day. Stored in kg; entered + displayed in pounds."
-          }
-        >
-          <div className="flex flex-wrap items-center gap-2 mb-3">
-            <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
-              Date
-            </label>
-            <input
-              type="date"
-              value={weightDate}
-              max={etTodayStr()}
-              onChange={(e) => setWeightDate(e.target.value || etTodayStr())}
-              disabled={savingWeight}
-              className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
-            />
-            {weightDate !== etTodayStr() && (
-              <>
-                <span className="text-[10px] font-mono text-amber-400/90">
-                  logging to {formatShortDate(weightDate)} — not today
-                </span>
-                <button
-                  onClick={() => setWeightDate(etTodayStr())}
-                  className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
-                >
-                  reset to today
-                </button>
-              </>
-            )}
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 mb-3">
-            <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
-              Weight
-            </label>
-            <input
-              type="number"
-              step="0.1"
-              inputMode="decimal"
-              value={weightInput}
-              onChange={(e) => setWeightInput(e.target.value)}
-              placeholder="e.g. 178.4"
-              disabled={savingWeight}
-              className="w-[120px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
-            />
-            <span className="text-[10px] font-mono text-text-tertiary">lb</span>
-            {weightInput && !isNaN(parseFloat(weightInput)) && (
-              <span className="text-[10px] font-mono text-text-tertiary">
-                = {lbToKg(parseFloat(weightInput)).toFixed(2)} kg
-              </span>
-            )}
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 mb-3">
-            <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono shrink-0">
-              Notes
-            </label>
-            <input
-              type="text"
-              value={weightNotes}
-              onChange={(e) => setWeightNotes(e.target.value)}
-              placeholder="optional — e.g. 'morning, post-bathroom', 'after workout'"
-              disabled={savingWeight}
-              className="flex-1 min-w-[200px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-[4px] text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
-            />
-          </div>
-
-          <button
-            onClick={saveWeight}
-            disabled={savingWeight || !weightInput}
-            className="w-full px-4 py-3 text-[13px] font-medium text-text-primary bg-accent/20 hover:bg-accent/30 disabled:opacity-40 disabled:cursor-not-allowed border border-accent/40 rounded-[4px] transition-colors"
-          >
-            {savingWeight ? "Saving…" : "Save weight"}
-          </button>
-        </ChartCard>
-
-        {/* Trend chart */}
-        <ChartCard
-          title="Weight Trend"
-          subtitle="One row per ET day · displayed in pounds (stored as kg)"
-          source={weightTrendSource}
-        >
-          {weightLoading ? (
-            <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">Loading…</p>
-          ) : weightChartData.length === 0 ? (
-            <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
-              No entries yet. Log your first weight above to start the trend.
-            </p>
-          ) : (
-            <ResponsiveContainer width="100%" height={260}>
-              <LineChart data={weightChartData}>
-                <CartesianGrid {...gridStyle} />
-                <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
-                <YAxis tick={axisTick} width={50} domain={["auto", "auto"]} label={axisLabel("lb", "y")} />
-                <Tooltip {...chartTooltip} />
-                <Line
-                  type="monotone"
-                  dataKey="weight_lb"
-                  stroke={C.source.eightsleep}
-                  strokeWidth={2}
-                  dot={{ r: 3, fill: C.source.eightsleep }}
-                  name="Weight (lb)"
-                  connectNulls={false}
-                  isAnimationActive={false}
-                />
-              </LineChart>
-            </ResponsiveContainer>
           )}
-        </ChartCard>
+        </Part>
+      </PartGroup>
 
-        {/* Recent entries (delete-only — edit a row by re-logging the same date) */}
-        {weightRows.length > 0 && (
-          <ChartCard
-            title="Recent entries"
-            subtitle="Newest first · re-log the same date to overwrite · trash to delete"
-          >
-            <div className="space-y-1">
-              {[...weightRows].reverse().slice(0, 10).map((w) => (
-                <div
-                  key={w.log_date}
-                  className="flex items-center justify-between gap-3 py-1.5 border-b border-border-subtle/40 last:border-b-0 text-[12px] font-mono"
-                >
-                  <div className="flex items-baseline gap-2 min-w-0">
-                    <span className="text-text-tertiary tabular-nums shrink-0 w-[80px]">
-                      {formatShortDate(w.log_date)}
-                    </span>
-                    <span className="text-text-primary tabular-nums">
-                      {kgToLb(Number(w.weight_kg))!.toFixed(1)} lb
-                    </span>
-                    <span className="text-text-tertiary tabular-nums">
-                      ({Number(w.weight_kg).toFixed(2)} kg)
-                    </span>
-                    {w.source === "tanita" && (
-                      <span className="text-[9px] text-amber-500/80 tracking-wider shrink-0">TANITA</span>
-                    )}
-                    {w.notes && (
-                      <span className="text-text-tertiary truncate">· {w.notes}</span>
-                    )}
+      {/* ─── Vitamins & Minerals (Cronometer dietary + Onyx supplement) ───────
+          One group per nutrient family; every tile is its own part. The first group carries the section heading
+          and keeps the old "vitamins" id, so a saved hide / position of the section still applies to it. */}
+      {VITAMIN_SECTIONS.map((grp, gi) => (
+        <PartGroup
+          key={grp.id}
+          id={grp.id}
+          title={grp.title}
+          gap={12}
+          header={
+            <div className="mb-2">
+              {gi === 0 && (
+                <div className="flex items-baseline justify-between mb-3">
+                  <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">Vitamins &amp; Minerals</p>
+                  <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + SUPPLEMENTS · latest day · % of RDA</span>
+                </div>
+              )}
+              {gi === 0 && !vitaminLatest && (
+                <p className="text-xs text-text-tertiary mb-3">No Cronometer micronutrient data yet — import an export to populate.</p>
+              )}
+              <p className="text-[10px] font-mono text-text-tertiary">{grp.group}</p>
+            </div>
+          }
+        >
+          {VITAMIN_DEFS.filter((d) => d.group === grp.group).map((d) => {
+            const total = vitNum(vitaminLatest?.[`${d.key}_total_${d.tok}`]);
+            const diet = vitNum(vitaminLatest?.[`${d.key}_dietary_${d.tok}`]);
+            const supp = vitNum(vitaminLatest?.[`${d.key}_supplement_${d.tok}`]);
+            const avg7 = avg(vitaminLast7, `${d.key}_total_${d.tok}`);
+            const pct = total != null && d.rda ? (total / d.rda) * 100 : null;
+            const barColor = pct == null ? "bg-white/10" : pct >= 100 ? "bg-green-500" : pct >= 50 ? "bg-cyan-500" : "bg-amber-500";
+            return (
+              <Part key={d.key} id={`vit-${d.key}`} title={d.label} width="quarter">
+                <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-3">
+                  <div className="flex justify-between items-baseline">
+                    <span className="text-xs text-text-secondary truncate">{d.label}</span>
+                    <span className="text-[10px] font-mono text-text-tertiary shrink-0 ml-1">{pct == null ? "—" : `${Math.round(pct)}%`}</span>
                   </div>
-                  <button
-                    onClick={() => deleteWeight(w.log_date)}
-                    className="text-[10px] text-text-tertiary hover:text-red-400 transition-colors shrink-0"
-                  >
-                    delete
-                  </button>
+                  <div className="text-base font-mono mt-1">
+                    {fmtVit(total)}
+                    <span className="text-[10px] text-text-tertiary ml-1">{d.unit}</span>
+                  </div>
+                  <div className="h-1 bg-white/5 rounded mt-2 overflow-hidden">
+                    <div className={`h-full ${barColor}`} style={{ width: `${pct == null ? 0 : Math.min(pct, 100)}%` }} />
+                  </div>
+                  <div className="text-[10px] font-mono text-text-tertiary mt-1.5 truncate">
+                    food {fmtVit(diet)} · supp {fmtVit(supp)} · 7d {fmtVit(avg7 || null)}
+                  </div>
+                </div>
+              </Part>
+            );
+          })}
+        </PartGroup>
+      ))}
+
+      {/* ─── Meals (Cronometer per-entry log + Uber Eats + photos) ─────────── */}
+      <PartGroup
+        id="meals"
+        title="Meals"
+        gap={12}
+        header={
+          <div className="mb-3">
+            <div className="flex items-baseline justify-between mb-3">
+              <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">
+                {mealsDayOffset === 0 ? "Today's Meals" : "Meals"}
+              </p>
+              <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + UBER EATS + PHOTOS · {mealsDay}</span>
+            </div>
+            <div className="flex gap-1.5" role="tablist" aria-label="Meals day">
+              {[0, 1, 2].map((off) => (
+                <button
+                  key={off}
+                  role="tab"
+                  aria-selected={mealsDayOffset === off}
+                  onClick={() => setMealsDayOffset(off)}
+                  className={`px-2.5 py-1 rounded-control border text-[11px] font-mono transition-colors ${
+                    mealsDayOffset === off
+                      ? "border-accent/60 bg-accent/10 text-text-primary"
+                      : "border-border-subtle text-text-tertiary hover:text-text-secondary"
+                  }`}
+                >
+                  {off === 0 ? "Today" : off === 1 ? "Yesterday" : formatShortDate(shiftYmd(behavioralToday, -2))}
+                </button>
+              ))}
+            </div>
+            {mealsLoading ? (
+              <p className="text-xs text-text-tertiary mt-3">Loading…</p>
+            ) : todayServings.length === 0 && photoMeals.length === 0 && delivery.items.length === 0 && delivery.leftovers.length === 0 && !servingsFailed && !photoState.failed && !delivery.loadError ? (
+              <p className="text-xs text-text-tertiary mt-3">
+                Nothing logged for {mealsDayOffset === 0 ? "today" : "this day"} yet. Cronometer entries and Uber Eats orders appear here once they sync.
+              </p>
+            ) : null}
+            {servingsFailed && <p className="text-xs text-red-400 mt-3">Couldn&apos;t load Cronometer entries.</p>}
+            {delivery.loadError && <p className="text-xs text-red-400 mt-3">{delivery.loadError}</p>}
+            {photoLoaded && photoState.failed && <p className="text-xs text-red-400 mt-3">Couldn&apos;t load photo meals.</p>}
+          </div>
+        }
+      >
+        {!logPhotoFirst && (
+          <Part id="photo-logger" title="Log a meal by photo">
+            <PhotoMealLogger onSaved={onPhotoSaved} />
+          </Part>
+        )}
+        {todayServings.length > 0 && (
+          <Part id="cronometer-entries" title="Cronometer entries">
+            <div className="bg-surface-card border border-border-subtle rounded-control divide-y divide-border-subtle">
+              {todayServings.map((s) => (
+                <div key={s.serving_id} className="flex items-center gap-3 px-4 py-2.5 text-sm">
+                  <span className="text-[11px] font-mono text-text-tertiary w-20 shrink-0">
+                    {s.event_time
+                      ? new Date(s.event_time).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })
+                      : (s.meal_group ?? "—")}
+                  </span>
+                  <span className="flex-1 truncate text-text-secondary">{s.food_name}</span>
+                  <span className="text-[11px] font-mono text-text-tertiary shrink-0">{s.amount_raw}</span>
+                  <span className="text-[11px] font-mono text-text-tertiary w-16 text-right shrink-0">
+                    {s.calories != null ? `${Math.round(Number(s.calories))} kcal` : ""}
+                  </span>
                 </div>
               ))}
             </div>
-          </ChartCard>
+          </Part>
         )}
-      </div>
+        {photoMeals.length > 0 && (
+          <Part id="photo-meals" title="Meals logged by photo">
+            <div>
+              <div className="flex items-baseline justify-between mb-1.5">
+                <span className="text-[10px] font-mono text-text-tertiary">By photo</span>
+                <span className="text-[11px] font-mono text-text-secondary">Photos ~{Math.round(photoKcal)} kcal</span>
+              </div>
+              <div className="bg-surface-card border border-border-subtle rounded-control divide-y divide-border-subtle">
+                {photoMeals.map((m) => (
+                  <div key={m.meal_id} className="flex items-start gap-2 px-4 py-2.5 text-sm">
+                    <span className="text-[11px] font-mono text-text-tertiary w-14 shrink-0 pt-0.5">{formatClock(m.eaten_time)}</span>
+                    <span className="flex-1 min-w-0 text-text-secondary line-clamp-2 break-words">
+                      {m.items.map((i) => i.name).join(", ")}
+                    </span>
+                    <span className="text-[11px] font-mono text-text-tertiary w-16 text-right shrink-0 pt-0.5">~{Math.round(m.kcal)} kcal</span>
+                    <button
+                      onClick={() => removePhotoMeal(m)}
+                      aria-label={`Remove photo meal at ${formatClock(m.eaten_time)}`}
+                      className="w-11 h-11 -my-2.5 -mr-2 shrink-0 flex items-center justify-center text-text-tertiary hover:text-text-primary"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+              {photoError && <p className="text-[11px] text-red-400 mt-1.5">{photoError}</p>}
+            </div>
+          </Part>
+        )}
+        {delivery.items.length > 0 && (
+          <Part id="uber-eats" title="Uber Eats dishes">
+            <div>
+              <div className="flex items-baseline justify-between mb-1.5">
+                <span className="text-[10px] font-mono text-text-tertiary">Uber Eats</span>
+                <span className="text-[11px] font-mono text-text-secondary">
+                  {delivery.totalKcal != null ? `Uber Eats ~${Math.round(delivery.totalKcal)} kcal` : ""}
+                </span>
+              </div>
+              {/* Read-only: portions are answered on Log (one place to enter data). */}
+              <DeliveryDishList items={delivery.items} />
+              <div className="mt-2 flex justify-end">
+                <LogLink part="uber-eats">Set how much you ate on Log</LogLink>
+              </div>
+            </div>
+          </Part>
+        )}
+        {delivery.leftovers.length > 0 && (
+          <Part id="leftovers" title="Leftovers">
+            <div>
+              <div className="flex items-baseline justify-between gap-3 mb-1.5">
+                <span className="text-[10px] font-mono text-text-tertiary">
+                  Leftovers eaten this day. Unanswered counts as thrown out.
+                </span>
+                {delivery.items.length === 0 && delivery.totalKcal != null && (
+                  <span className="text-[11px] font-mono text-text-secondary shrink-0">
+                    Uber Eats ~{Math.round(delivery.totalKcal)} kcal
+                  </span>
+                )}
+              </div>
+              {/* Read-only: leftovers are answered on Log (one place to enter data). */}
+              <LeftoverList questions={delivery.leftovers} />
+              {delivery.items.length === 0 && (
+                <div className="mt-2 flex justify-end">
+                  <LogLink part="uber-eats">Answer leftovers on Log</LogLink>
+                </div>
+              )}
+            </div>
+          </Part>
+        )}
+      </PartGroup>
 
+      {/* ─── All tracked nutrients (Cronometer dietary; latest day + 7d avg) ── */}
+      <PartGroup id="all-nutrients" title="All tracked nutrients">
+        <Part id="nutrients-table" title="All tracked nutrients table">
+          <details className="group">
+            <summary className="cursor-pointer text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3 list-none flex items-center gap-2">
+              <span className="group-open:rotate-90 transition-transform">▸</span> All Tracked Nutrients
+              <span className="text-text-tertiary/60 normal-case tracking-normal">— amino acids, fat fractions, etc.</span>
+            </summary>
+            <div className="bg-surface-card border border-border-subtle rounded-control overflow-hidden">
+              <PersonalTable
+                id="nutrients"
+                className="w-full text-sm"
+                headRowClassName="text-[10px] font-mono text-text-tertiary uppercase border-b border-border-subtle"
+                rowClassName="border-b border-border-subtle/50 last:border-0 font-mono"
+                columns={NUTRIENT_TABLE_COLUMNS}
+                rows={EXTRA_NUTRIENT_COLS.map((n) => ({
+                  key: n.col,
+                  cells: {
+                    nutrient: n.label,
+                    latest: (
+                      <>
+                        {fmtNutrient(nutrientLatest?.[n.col])}
+                        <span className="text-text-tertiary text-[10px] ml-1">{n.unit}</span>
+                      </>
+                    ),
+                    avg7: fmtNutrient(avg(nutrientLast7, n.col) || null),
+                  },
+                }))}
+              />
+            </div>
+          </details>
+        </Part>
+      </PartGroup>
+
+      {/* ─── Body Weight ───────────────────────────────────────────────────── */}
+      <PartGroup
+        id="weight"
+        title="Body Weight"
+        header={<p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Body Weight</p>}
+      >
+        <Part id="weight-latest" title="Latest weight" width="quarter">
+          <StatCard
+            label="Latest"
+            value={latestWeightLb !== null ? `${latestWeightLb.toFixed(1)} lb` : "—"}
+            sublabel={latestWeight ? formatShortDate(latestWeight.log_date) : "no entries"}
+            source={latestWeight?.source === "tanita" ? "TANITA" : undefined}
+          />
+        </Part>
+        <Part id="weight-7d" title="7-day average weight" width="quarter">
+          <StatCard
+            label="7d avg"
+            value={sevenDayWeightAvg !== null ? `${sevenDayWeightAvg.toFixed(1)} lb` : "—"}
+            sublabel="trailing 7 days"
+          />
+        </Part>
+        <Part id="weight-30d" title="30-day weight change" width="quarter">
+          <StatCard
+            label="30d delta"
+            value={
+              thirtyDayDelta !== null
+                ? `${thirtyDayDelta >= 0 ? "+" : ""}${thirtyDayDelta.toFixed(1)} lb`
+                : "—"
+            }
+            sublabel="vs ~30 days ago"
+          />
+        </Part>
+        <Part id="weight-count" title="Weight entries" width="quarter">
+          <StatCard
+            label="Entries"
+            value={weightRows.length}
+            sublabel="last 90 days"
+          />
+        </Part>
+
+        {/* Weight is entered on Log (one place to enter data); a day can still be deleted under Recent entries. */}
+        <Part id="weight-log" title="Log weight">
+          <div className="flex justify-end">
+            <LogLink part="weight">Log today&apos;s weight on Log</LogLink>
+          </div>
+        </Part>
+
+        <Part id="weight-trend" title="Weight Trend">
+          <ChartCard
+            title="Weight Trend"
+            source={weightTrendSource}
+          >
+            {weightLoading ? (
+              <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">Loading…</p>
+            ) : weightChartData.length === 0 ? (
+              <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
+                No entries yet. Log your first weight above to start the trend.
+              </p>
+            ) : (
+              <ResponsiveContainer width="100%" height={260}>
+                <LineChart data={weightChartData}>
+                  <CartesianGrid {...gridStyle} />
+                  <XAxis dataKey="date" tick={axisTick} interval="preserveStartEnd" />
+                  <YAxis tick={axisTick} width={50} domain={["auto", "auto"]} label={axisLabel("lb", "y")} />
+                  <Tooltip {...chartTooltip} />
+                  <Line
+                    type="monotone"
+                    dataKey="weight_lb"
+                    stroke={C.source.eightsleep}
+                    strokeWidth={2}
+                    dot={{ r: 3, fill: C.source.eightsleep }}
+                    name="Weight (lb)"
+                    connectNulls={false}
+                    isAnimationActive={false}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            )}
+          </ChartCard>
+        </Part>
+
+        {/* Recent entries (delete-only — edit a row by re-logging the same date) */}
+        {weightRows.length > 0 && (
+          <Part id="weight-recent" title="Recent weight entries">
+            <ChartCard
+              title="Recent entries"
+              subtitle="Newest first · re-log a date on Log to overwrite"
+            >
+              <div className="space-y-1">
+                {[...weightRows].reverse().slice(0, 10).map((w) => (
+                  <div
+                    key={w.log_date}
+                    className="flex items-center justify-between gap-3 py-1.5 border-b border-border-subtle/40 last:border-b-0 text-[12px] font-mono"
+                  >
+                    <div className="flex items-baseline gap-2 min-w-0">
+                      <span className="text-text-tertiary tabular-nums shrink-0 w-[80px]">
+                        {formatShortDate(w.log_date)}
+                      </span>
+                      <span className="text-text-primary tabular-nums">
+                        {kgToLb(Number(w.weight_kg))!.toFixed(1)} lb
+                      </span>
+                      <span className="text-text-tertiary tabular-nums">
+                        ({Number(w.weight_kg).toFixed(2)} kg)
+                      </span>
+                      {w.source === "tanita" && (
+                        <span className="text-[9px] text-amber-500/80 tracking-wider shrink-0">TANITA</span>
+                      )}
+                      {w.notes && (
+                        <span className="text-text-tertiary truncate">· {w.notes}</span>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => deleteWeight(w.log_date)}
+                      className="text-[10px] text-text-tertiary hover:text-red-400 transition-colors shrink-0"
+                    >
+                      delete
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </ChartCard>
+          </Part>
+        )}
+      </PartGroup>
+      </PartGrid>
     </>
   );
 }

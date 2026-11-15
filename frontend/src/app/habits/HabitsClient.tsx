@@ -4,12 +4,16 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { getHabitJournal, getHabitMetadataHistory, rangeDays, rangeLabel, type Range, type HabitMetadataInterval } from "@/lib/queries";
 import { axisTick, gridStyle, chartTooltip, chartColors as C } from "@/lib/chart-theme";
-import { formatDate } from "@/lib/format";
-import { SLEEP_QUESTIONS } from "@/lib/checkin";
+import { formatDate, sameJson } from "@/lib/format";
+import { CACHE_KEYS, clientCache, fetchJsonValue } from "@/lib/client-cache";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
+import InfoHint from "@/components/InfoHint";
 import RangeFilter from "@/components/RangeFilter";
+import LogLink from "@/components/LogLink";
+import { useInFeed } from "@/components/FeedContext";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -162,33 +166,48 @@ function calculateStreak(
   return streak;
 }
 
-export default function HabitsPage() {
-  const [habits, setHabits] = useState<NotionHabit[]>([]);
-  const [journal, setJournal] = useState<JournalEntry[]>([]);
-  const [history, setHistory] = useState<HabitMetadataInterval[]>([]);
-  const [loading, setLoading] = useState(true);
+const LIST_URL = "/api/habits/list";
+type HabitsList = { habits?: NotionHabit[] };
+// Each read goes through the shared cache (one request even when the warm-up asks at the same time).
+// An error answer is never cached (fetchJsonValue throws on it; 404 removes the entry).
+const readList = () => clientCache.revalidate<HabitsList>(LIST_URL, () => fetchJsonValue(LIST_URL) as Promise<HabitsList>);
+const readJournal = () => clientCache.revalidate<JournalEntry[]>(CACHE_KEYS.habitsJournal, () => getHabitJournal(365) as Promise<JournalEntry[]>);
+const readHistory = () => clientCache.revalidate<HabitMetadataInterval[]>(CACHE_KEYS.habitsHistory, () => getHabitMetadataHistory());
+const keep = <T,>(next: T) => (prev: T) => (sameJson(prev, next) ? prev : next);
+
+export default function HabitsPage({ headingTestId = "page-heading" }: { headingTestId?: string } = {}) {
+  // headingTestId: "feed-page-heading" when shown inside the continuous scroll (components/ContinuousScroll.tsx).
+  // Start from the cached copy (instant revisit / reopen), then revalidate; the skeleton shows only when
+  // nothing is cached.
+  const [habits, setHabits] = useState<NotionHabit[]>(() => clientCache.peek<HabitsList>(LIST_URL)?.habits ?? []);
+  const [journal, setJournal] = useState<JournalEntry[]>(() => clientCache.peek<JournalEntry[]>(CACHE_KEYS.habitsJournal) ?? []);
+  const [history, setHistory] = useState<HabitMetadataInterval[]>(() => clientCache.peek<HabitMetadataInterval[]>(CACHE_KEYS.habitsHistory) ?? []);
+  const [loading, setLoading] = useState(() => !(clientCache.peek(LIST_URL) && clientCache.peek(CACHE_KEYS.habitsJournal) && clientCache.peek(CACHE_KEYS.habitsHistory)));
+  const shownRef = useRef(!loading);
   const [syncing, setSyncing] = useState(false);
   const [toggling, setToggling] = useState<Set<string>>(new Set());
   const [range, setRange] = useState<Range>("30d");
   const [actionError, setActionError] = useState<string | null>(null);
   const [openCell, setOpenCell] = useState<{ habit: NotionHabit; date: string; x: number; y: number } | null>(null);
 
-  const hasSyncedRef = useRef(false);
+  // The Notion sync (POST /api/habits/sync, 1.5-4 s) runs only when /habits is the routed page. Inside the
+  // continuous scroll Habits mounts next to Check-in, Sleep, Caffeine and others, and a background sync there
+  // broke the speed budget on those pages (perf-timing run 43666031043); the hourly habits-sync.yml bounds
+  // staleness, and opening /habits itself still syncs.
+  const inFeed = useInFeed();
+  const hasSyncedRef = useRef(inFeed);
   // Monotonic per-cell sequence so a stale response (rapid re-tap on the same
   // cell) can't revert or clear the in-flight state of a newer optimistic write.
   const answerSeq = useRef(new Map<string, number>());
 
   const load = useCallback(async () => {
-    setLoading(true);
+    if (!shownRef.current) setLoading(true);
     try {
-      const [habitsRes, journalData, historyData] = await Promise.all([
-        fetch("/api/habits/list").then((r) => r.json()),
-        getHabitJournal(365),
-        getHabitMetadataHistory(),
-      ]);
-      setHabits(habitsRes.habits || []);
-      setJournal(journalData);
-      setHistory(historyData);
+      const [habitsRes, journalData, historyData] = await Promise.all([readList(), readJournal(), readHistory()]);
+      setHabits(keep(habitsRes?.habits || []));
+      setJournal(keep(journalData ?? []));
+      setHistory(keep(historyData ?? []));
+      shownRef.current = true;
     } catch (e) {
       console.error(e);
     } finally {
@@ -211,10 +230,11 @@ export default function HabitsPage() {
       if (syncRes.ok) {
         const { count } = await syncRes.json();
         if (count > 0) {
-          const updated = await getHabitJournal(365);
-          setJournal(updated);
+          const updated = await readJournal();
+          setJournal(keep(updated ?? []));
         }
-        setHistory(await getHabitMetadataHistory());
+        const fresh = await readHistory();
+        setHistory(keep(fresh ?? []));
       }
     } catch (e) {
       console.error(e);
@@ -228,6 +248,27 @@ export default function HabitsPage() {
   // locally. Loading on every range switch used to re-run all three fetches
   // and flash the skeleton for zero new data.
   useEffect(() => { load(); }, [load]);
+
+  // Reopening the app: fill from the copy kept on this device while the network answers.
+  useEffect(() => {
+    if (shownRef.current) return;
+    let alive = true;
+    void Promise.all([clientCache.read<HabitsList>(LIST_URL), clientCache.read<JournalEntry[]>(CACHE_KEYS.habitsJournal), clientCache.read<HabitMetadataInterval[]>(CACHE_KEYS.habitsHistory)])
+      .then(([list, j, h]) => {
+        if (!alive || shownRef.current || !list || !j || !h) return;
+        shownRef.current = true;
+        setHabits(list.habits ?? []);
+        setJournal(j);
+        setHistory(h);
+        setLoading(false);
+      });
+    return () => { alive = false; };
+  }, []);
+
+  // Taps update the journal optimistically; keep the cached copy in step so the next visit shows them.
+  useEffect(() => {
+    if (!loading) clientCache.put(CACHE_KEYS.habitsJournal, journal);
+  }, [journal, loading]);
 
   // Tri-state lookup of "habitName|date" → explicit answer. completionSet
   // stays Yes-only on purpose: every KPI, rate, and streak treats explicit
@@ -314,7 +355,7 @@ export default function HabitsPage() {
         <div className="h-8 w-48 bg-white/5 animate-pulse rounded" />
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="bg-surface-card border border-border-subtle rounded-[6px] p-4 space-y-3">
+            <div key={i} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 space-y-3">
               <div className="h-3 w-16 bg-white/5 animate-pulse rounded" />
               <div className="h-8 w-24 bg-white/5 animate-pulse rounded" />
             </div>
@@ -488,19 +529,21 @@ export default function HabitsPage() {
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Habits</h2>
+          <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Habits</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Track daily behaviors and build streaks — {rangeLabel(range)}
+            Daily behaviors — {rangeLabel(range)}
             {syncing && <span className="ml-2 text-accent animate-pulse">syncing from Notion...</span>}
           </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <RangeFilter value={range} onChange={setRange} />
+          {/* Today's answers are entered on Log (its check-in), not here; the heatmap below still corrects a day. */}
+          <LogLink part="check-in">Answer today&apos;s habits on Log</LogLink>
           <a
             href="https://www.notion.so/29cc936fd5e14ae8b10a4fe5c5f7a6cd"
             target="_blank"
             rel="noopener noreferrer"
-            className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-[6px] hover:bg-white/10 transition-colors"
+            className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-control hover:bg-white/10 transition-colors"
           >
             Manage in Notion
           </a>
@@ -508,7 +551,7 @@ export default function HabitsPage() {
       </div>
 
       {actionError && (
-        <div className="mb-6 px-3 py-2.5 rounded-[6px] border border-red-500/30 bg-red-500/[0.06] flex items-start justify-between gap-3">
+        <div className="mb-6 px-3 py-2.5 rounded-control border border-red-500/30 bg-red-500/[0.06] flex items-start justify-between gap-3">
           <p className="text-[12px] text-red-300/90">{actionError}</p>
           <button
             onClick={() => setActionError(null)}
@@ -520,8 +563,12 @@ export default function HabitsPage() {
         </div>
       )}
 
+      {/* Personalize: every tile, card and chart is its own part; sections have no heading on screen. */}
+      <PartGrid page="/habits" title="Habits">
+      <PartGroup id="section-summary" title="Summary tiles">
       {recentChanges.length > 0 && (
-        <div className="mb-6 px-3 py-2.5 rounded-[6px] border border-amber-500/30 bg-amber-500/[0.04]">
+        <Part id="metadata-changes" title="Metadata changed in this range">
+        <div className="px-3 py-2.5 rounded-control border border-amber-500/30 bg-amber-500/[0.04]">
           <p className="text-[11px] font-mono uppercase tracking-wider text-amber-300/80 mb-1.5">
             Metadata changed within this range — rates reflect each day&apos;s in-effect values
           </p>
@@ -538,62 +585,42 @@ export default function HabitsPage() {
             )}
           </ul>
         </div>
+        </Part>
       )}
 
       {/* KPIs */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+      <Part id="tile-today" title="Today (ring)" width="quarter">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing label="Today" value={todayCompleted} max={requiredHabits.length || 1} zone
             centerValue={`${todayCompleted}/${requiredHabits.length}`} sublabel="required habits" size={120} />
         </div>
-        <div className="bg-surface-card border border-border-subtle rounded-[4px] p-4 flex items-center justify-center">
+      </Part>
+      <Part id="tile-7day-rate" title="7-Day Rate (ring)" width="quarter">
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing label="7-Day Rate" value={completionRate} zone centerUnit="%"
             sublabel={`${completedLast7}/${possibleLast7}`} size={120} />
         </div>
+      </Part>
+      <Part id="tile-longest-streak" title="Longest Streak (tile)" width="quarter">
         <StatCard label="Longest Streak" value={longestStreak} unit={longestUnit} sublabel={bestHabit?.name} />
+      </Part>
+      <Part id="tile-vs-prior" title="vs Prior Week (tile)" width="quarter">
         <StatCard
           label="vs Prior Week"
           value={prev7Stats.possible > 0 ? `${deltaVsPrior >= 0 ? "+" : ""}${deltaVsPrior}` : "—"}
           unit={prev7Stats.possible > 0 ? "%" : undefined}
           sublabel={prev7Stats.possible > 0 ? `prior 7d was ${prev7Stats.rate}%` : "no prior data"}
         />
-      </div>
+      </Part>
+      </PartGroup>
 
-      {/* Today's Checklist */}
-      {habits.length > 0 && (
-        <ChartCard title="Today's Habits" subtitle={`${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })} — tap ✓ done or ✕ not done; tap again to clear`}>
-          <div className="space-y-1">
-            {/* Sleep questions are about a finished night and are answered on /check-in ("Last night"), which stores
-                them on the day that night closed. A tap here would write them to today = tonight, so they are left out. */}
-            {habits.filter((h) => !SLEEP_QUESTIONS.has(h.name)).map((h) => {
-              const answer = answerMap.get(`${h.name}|${today}`) ?? null;
-              const isToggling = toggling.has(`${h.name}|${today}`);
-              const streak = calculateStreak(h, completionSet, history);
-              const color = CATEGORY_COLORS[h.category] || CATEGORY_COLORS.general;
-
-              return (
-                <HabitRow
-                  key={h.id}
-                  habit={h}
-                  answer={answer}
-                  isToggling={isToggling}
-                  streak={streak}
-                  color={color}
-                  today={today}
-                  onSetAnswer={(d, a) => setAnswer(h, d, a)}
-                />
-              );
-            })}
-          </div>
-        </ChartCard>
-      )}
-
+      <PartGroup id="section-trends" title="Rates & heatmap" gap={24}>
       {/* Completion-rate trend */}
       {habits.length > 0 && (
+        <Part id="rolling-rate" title="7-Day Rolling Completion Rate">
         <ChartCard
           title="7-Day Rolling Completion Rate"
-          subtitle={`Across ${rangeLabel(range)} — frequency-aware denominator`}
-          className="mt-6"
+          subtitle={rangeLabel(range)}
         >
           <ResponsiveContainer width="100%" height={240}>
             <AreaChart data={trendData}>
@@ -620,14 +647,15 @@ export default function HabitsPage() {
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
       )}
 
       {/* Per-category breakdown */}
       {habits.length > 0 && categoryRates.length > 0 && (
+        <Part id="by-category" title="By Category">
         <ChartCard
           title="By Category"
           subtitle={`Completion rate across ${rangeLabel(range)}`}
-          className="mt-6"
         >
           <div className="space-y-2.5">
             {categoryRates.map(({ category, rate, habitCount, color }) => (
@@ -652,14 +680,15 @@ export default function HabitsPage() {
             ))}
           </div>
         </ChartCard>
+        </Part>
       )}
 
       {/* Heatmap */}
       {habits.length > 0 && (
+        <Part id="heatmap" title="Heatmap">
         <ChartCard
           title={`Heatmap — ${rangeLabel(range)}`}
-          subtitle="Click a cell to set it: filled (yes) / red ✕ (no) / blank (not logged)"
-          className="mt-6"
+          subtitle="Filled = yes · ✕ = no · blank = not logged · click to change"
         >
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
@@ -735,70 +764,15 @@ export default function HabitsPage() {
             </table>
           </div>
         </ChartCard>
+        </Part>
       )}
+      </PartGroup>
 
-      {/* Heatmap cell answer picker — fixed-position popover anchored to the
-          clicked cell, with a transparent backdrop that closes it. */}
-      {openCell && (() => {
-        const current = answerMap.get(`${openCell.habit.name}|${openCell.date}`) ?? null;
-        const pick = (a: HabitAnswer) => {
-          setAnswer(openCell.habit, openCell.date, a);
-          setOpenCell(null);
-        };
-        const clampedX = typeof window !== "undefined"
-          ? Math.min(Math.max(openCell.x, 90), window.innerWidth - 90)
-          : openCell.x;
-        return (
-          <>
-            <div className="fixed inset-0 z-40" onClick={() => setOpenCell(null)} />
-            <div
-              className="fixed z-50 -translate-x-1/2 -translate-y-full pb-1.5"
-              style={{ left: clampedX, top: openCell.y }}
-            >
-              <div className="rounded-[6px] border border-border-subtle bg-surface-card shadow-xl px-2 py-1.5">
-                <p className="text-[10px] font-mono text-text-tertiary mb-1 max-w-[180px] truncate">
-                  {openCell.habit.name} · {openCell.date}
-                </p>
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={() => pick("Yes")}
-                    className={`px-2.5 py-1 text-[12px] font-medium rounded-[4px] transition-colors ${
-                      current === "Yes"
-                        ? "bg-white/15 text-text-primary"
-                        : "text-text-secondary hover:bg-white/10"
-                    }`}
-                  >
-                    ✓ Yes
-                  </button>
-                  <button
-                    onClick={() => pick("No")}
-                    className={`px-2.5 py-1 text-[12px] font-medium rounded-[4px] transition-colors ${
-                      current === "No"
-                        ? "bg-white/15"
-                        : "hover:bg-white/10"
-                    }`}
-                    style={{ color: C.down }}
-                  >
-                    ✕ No
-                  </button>
-                  {current !== null && (
-                    <button
-                      onClick={() => pick(null)}
-                      className="px-2.5 py-1 text-[12px] font-medium rounded-[4px] text-text-tertiary hover:bg-white/10 transition-colors"
-                    >
-                      Clear
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
-          </>
-        );
-      })()}
-
+      <PartGroup id="section-streaks" title="Streaks" gap={24}>
       {/* Streaks */}
       {habits.length > 0 && (
-        <ChartCard title="Current Streaks" className="mt-6">
+        <Part id="current-streaks" title="Current Streaks">
+        <ChartCard title="Current Streaks">
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
             {streaks
               .slice()
@@ -825,7 +799,7 @@ export default function HabitsPage() {
                   label = streak > 0 ? `${streak} ${unitSingular}${streak !== 1 ? "s" : ""}` : "No streak";
                 }
                 return (
-                  <div key={habit.id} className="flex items-center gap-3 px-3 py-2.5 rounded-[4px] bg-white/[0.02]">
+                  <div key={habit.id} className="flex items-center gap-3 px-3 py-2.5 rounded-control bg-white/[0.02]">
                     <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: color }} />
                     <div className="flex-1 min-w-0">
                       <p className="text-sm text-text-primary font-medium truncate">
@@ -853,11 +827,13 @@ export default function HabitsPage() {
               })}
           </div>
         </ChartCard>
+        </Part>
       )}
 
-      {/* Scoring legend */}
+      {/* Scoring rules, closed by default */}
       {habits.length > 0 && (
-        <ChartCard title="How rates & streaks are scored" className="mt-6">
+        <Part id="scoring-rules" title="How rates & streaks are scored">
+        <InfoHint label="How rates and streaks are scored" variant="disclosure" summary="How rates & streaks are scored">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-3 text-[12px] leading-relaxed">
             <div className="flex gap-3">
               <span className="text-text-primary font-mono shrink-0 w-20">daily</span>
@@ -884,13 +860,75 @@ export default function HabitsPage() {
               </span>
             </div>
           </div>
-          <p className="text-[11px] text-text-tertiary/70 mt-4 pt-3 border-t border-border-subtle">
-            Frequency is set per habit in Notion. Longest Streak compares across frequencies by days-equivalent (a weekly streak counts as 7 days per week kept).
-            Each habit/day is tri-state: yes, no, or not logged. An explicit &ldquo;no&rdquo; counts the same as not logged in every rate and streak — it exists to
-            record certainty (you answered) rather than absence (you never said).
+          <p className="text-[11px] text-text-tertiary pt-3 border-t border-border-subtle">
+            Frequency is set per habit in Notion. Longest Streak compares frequencies in days (a kept week counts as 7 days).
+            An explicit &ldquo;no&rdquo; counts the same as not logged in every rate and streak; it records that you answered.
           </p>
-        </ChartCard>
+        </InfoHint>
+        </Part>
       )}
+      </PartGroup>
+      </PartGrid>
+
+      {/* Heatmap cell answer picker — fixed-position popover anchored to the
+          clicked cell, with a transparent backdrop that closes it. */}
+      {openCell && (() => {
+        const current = answerMap.get(`${openCell.habit.name}|${openCell.date}`) ?? null;
+        const pick = (a: HabitAnswer) => {
+          setAnswer(openCell.habit, openCell.date, a);
+          setOpenCell(null);
+        };
+        const clampedX = typeof window !== "undefined"
+          ? Math.min(Math.max(openCell.x, 90), window.innerWidth - 90)
+          : openCell.x;
+        return (
+          <>
+            <div className="fixed inset-0 z-40" onClick={() => setOpenCell(null)} />
+            <div
+              className="fixed z-50 -translate-x-1/2 -translate-y-full pb-1.5"
+              style={{ left: clampedX, top: openCell.y }}
+            >
+              <div className="rounded-control border border-border-subtle bg-surface-card shadow-xl px-2 py-1.5">
+                <p className="text-[10px] font-mono text-text-tertiary mb-1 max-w-[180px] truncate">
+                  {openCell.habit.name} · {openCell.date}
+                </p>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => pick("Yes")}
+                    className={`px-2.5 py-1 text-[12px] font-medium rounded-control transition-colors ${
+                      current === "Yes"
+                        ? "bg-white/15 text-text-primary"
+                        : "text-text-secondary hover:bg-white/10"
+                    }`}
+                  >
+                    ✓ Yes
+                  </button>
+                  <button
+                    onClick={() => pick("No")}
+                    className={`px-2.5 py-1 text-[12px] font-medium rounded-control transition-colors ${
+                      current === "No"
+                        ? "bg-white/15"
+                        : "hover:bg-white/10"
+                    }`}
+                    style={{ color: C.down }}
+                  >
+                    ✕ No
+                  </button>
+                  {current !== null && (
+                    <button
+                      onClick={() => pick(null)}
+                      className="px-2.5 py-1 text-[12px] font-medium rounded-control text-text-tertiary hover:bg-white/10 transition-colors"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          </>
+        );
+      })()}
+
 
       {habits.length === 0 && (
         <div className="text-center py-20">
@@ -906,137 +944,5 @@ export default function HabitsPage() {
         </div>
       )}
     </>
-  );
-}
-
-interface HabitRowProps {
-  habit: NotionHabit;
-  answer: HabitAnswer;
-  isToggling: boolean;
-  streak: number;
-  color: string;
-  today: string;
-  onSetAnswer: (date: string, answer: HabitAnswer) => void;
-}
-
-function HabitRow({ habit, answer, isToggling, streak, color, today, onSetAnswer }: HabitRowProps) {
-  const done = answer === "Yes";
-  const declined = answer === "No";
-  const dateInputRef = useRef<HTMLInputElement>(null);
-
-  function openDatePicker(e: React.MouseEvent) {
-    e.stopPropagation();
-    const input = dateInputRef.current;
-    if (!input) return;
-    if (typeof input.showPicker === "function") {
-      input.showPicker();
-    } else {
-      input.focus();
-      input.click();
-    }
-  }
-
-  function onDateChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const picked = e.target.value;
-    if (picked && picked <= today) onSetAnswer(picked, "Yes");
-    e.target.value = "";
-  }
-
-  return (
-    <div
-      className={`w-full flex items-center gap-3 px-4 py-3 rounded-[4px] transition-all group ${
-        done || declined ? "bg-white/[0.03]" : "hover:bg-white/[0.03]"
-      } ${isToggling ? "opacity-50" : ""}`}
-    >
-      {/* Direct one-tap answers: ✓ sets Yes, ✕ sets No; tapping the active one clears. */}
-      <button
-        onClick={() => onSetAnswer(today, done ? null : "Yes")}
-        className="shrink-0"
-        aria-label={done ? `Clear ${habit.name} for today` : `Mark ${habit.name} done for today`}
-        title={done ? "Yes (click to clear)" : "Mark done"}
-      >
-        <div
-          className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all ${
-            done ? "border-transparent" : "border-white/20 hover:border-white/50"
-          }`}
-          style={done ? { backgroundColor: color } : {}}
-        >
-          {done && (
-            <svg className="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-            </svg>
-          )}
-        </div>
-      </button>
-      <button
-        onClick={() => onSetAnswer(today, declined ? null : "No")}
-        className="shrink-0"
-        aria-label={declined ? `Clear ${habit.name} for today` : `Mark ${habit.name} not done for today`}
-        title={declined ? "No (click to clear)" : "Mark not done"}
-      >
-        <div
-          className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all ${
-            declined ? "" : "border-white/20 hover:border-white/50"
-          }`}
-          style={declined ? { borderColor: `${C.down}99`, backgroundColor: `${C.down}1a` } : {}}
-        >
-          <svg
-            className={`w-3.5 h-3.5 transition-opacity ${declined ? "" : "opacity-25 group-hover:opacity-60"}`}
-            fill="none" viewBox="0 0 24 24" stroke={declined ? C.down : "currentColor"} strokeWidth={3}
-          >
-            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-          </svg>
-        </div>
-      </button>
-
-      <button
-        onClick={() => onSetAnswer(today, done ? null : "Yes")}
-        className="flex-1 text-left min-w-0"
-        aria-label={done ? `Clear ${habit.name} for today` : `Mark ${habit.name} done for today`}
-        title={done ? "Yes (click to clear)" : "Mark done"}
-      >
-        <span className={`text-sm font-medium transition-colors ${done ? "text-text-tertiary line-through" : declined ? "text-text-tertiary" : "text-text-primary"}`}>
-          {habit.name}
-        </span>
-        {declined && (
-          <span className="ml-2 text-[10px] font-mono uppercase tracking-wider" style={{ color: C.down }}>
-            not done
-          </span>
-        )}
-      </button>
-
-      {streak > 0 && (
-        <span
-          className="text-[11px] font-mono font-medium px-2 py-0.5 rounded-full"
-          style={{ backgroundColor: `${color}20`, color }}
-        >
-          {streak}{habit.frequency === "weekly" ? "w" : "d"} streak
-        </span>
-      )}
-
-      <span className="text-[10px] font-mono text-text-tertiary/60 uppercase tracking-wider hidden sm:inline">
-        {habit.category}
-      </span>
-
-      <button
-        onClick={openDatePicker}
-        className="relative p-1.5 rounded-[4px] text-text-tertiary hover:text-text-primary hover:bg-white/5 transition-colors"
-        title="Log a past date as done (use the heatmap for a backdated No)"
-        aria-label={`Backdate ${habit.name}`}
-      >
-        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-        </svg>
-        <input
-          ref={dateInputRef}
-          type="date"
-          max={today}
-          onChange={onDateChange}
-          className="absolute inset-0 opacity-0 pointer-events-none"
-          tabIndex={-1}
-          aria-hidden="true"
-        />
-      </button>
-    </div>
   );
 }
