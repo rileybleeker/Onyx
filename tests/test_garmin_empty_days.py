@@ -31,7 +31,10 @@ sys.path.insert(0, str(ROOT))
 for _name, _attrs in (("dotenv", {"load_dotenv": lambda *a, **k: None}),
                       ("garminconnect", {"Garmin": object}),
                       ("supabase", {"create_client": None, "Client": object})):
-    if importlib.util.find_spec(_name) is None:
+    # A spec with no origin is a namespace package: the repo's own supabase/ folder (migrations, since #336)
+    # shadows a missing supabase-py, so treat it as absent too.
+    _spec = importlib.util.find_spec(_name)
+    if _spec is None or _spec.origin in (None, "namespace"):
         sys.modules[_name] = types.SimpleNamespace(**_attrs)
 
 for _key, _value in (("SUPABASE_URL", "https://stub.invalid"), ("SUPABASE_SERVICE_ROLE_KEY", "stub"),
