@@ -575,7 +575,7 @@ export default function StatusPage() {
         <StatCard
           label="Records · Latest Today"
           value={recordsLatestToday > 0 ? recordsLatestToday.toLocaleString() : "—"}
-          sublabel="sum across each source's most-recent run today"
+          sublabel="latest run per source"
         />
         <StatCard
           label="Active Errors"

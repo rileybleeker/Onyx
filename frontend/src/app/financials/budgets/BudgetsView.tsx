@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { TOTAL_KEY, type BudgetLine, type BudgetsResult } from "@/lib/finance-budgets";
 import { activeMonthly, type SubscriptionView } from "@/lib/finance-subscriptions";
+import InfoHint from "@/components/InfoHint";
 
 const usd = (cents: number | null | undefined) => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -92,7 +93,12 @@ export default function BudgetsView({ result, categories, rules, setupPending, s
 
       <section className={card} aria-labelledby="bd-lines">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 id="bd-lines" className="font-semibold">Budgets by category</h2>
+          <div className="flex items-center gap-2">
+            <h2 id="bd-lines" className="font-semibold">Budgets by category</h2>
+            <InfoHint label="Budgets by category">
+              <p>Suggested = the median of the last 3 months. The grey marker shows where the month is heading at your usual pace; the red one is the budget.</p>
+            </InfoHint>
+          </div>
           <div className="flex flex-wrap gap-2">
             {unbudgeted.length > 0 && (
               <button
@@ -114,7 +120,6 @@ export default function BudgetsView({ result, categories, rules, setupPending, s
             <TotalBudget current={t.budgetCents} busy={busy} run={run} />
           </div>
         </div>
-        <p className="text-[12px] text-text-tertiary">Suggested = the median of the last 3 months. The marker shows where the month is heading at your usual pace.</p>
         <table className="mt-2 w-full text-[13px]">
           <thead className="text-[12px] text-text-tertiary">
             <tr>
@@ -135,9 +140,17 @@ export default function BudgetsView({ result, categories, rules, setupPending, s
       </section>
 
       <section className={card} aria-labelledby="bd-subs">
-        <h2 id="bd-subs" className="font-semibold">Subscriptions</h2>
+        <div className="flex items-center gap-2">
+          <h2 id="bd-subs" className="font-semibold">Subscriptions</h2>
+          <InfoHint label="Subscriptions">
+            <p>
+              Detected from repeat charges. To cancel one, cancel it on the merchant&apos;s site, then press I cancelled it: Onyx checks
+              the ledger and tells you whether the charges actually stopped. Onyx never cancels anything itself.
+            </p>
+          </InfoHint>
+        </div>
         <p className="text-[12px] text-text-tertiary">
-          Detected from repeat charges: {subscriptions.filter((s) => s.state !== "stopped").length} active, about {usd(activeMonthly(subscriptions))} a month. To cancel one, cancel it on the merchant&apos;s site, then mark it here: Onyx checks the ledger and tells you whether the charges actually stopped. Onyx never cancels anything itself.
+          {subscriptions.filter((s) => s.state !== "stopped").length} active, about {usd(activeMonthly(subscriptions))} a month
         </p>
         <table className="mt-2 w-full text-[13px]">
           <tbody>
@@ -190,8 +203,12 @@ export default function BudgetsView({ result, categories, rules, setupPending, s
       </section>
 
       <section className={card} aria-labelledby="bd-review">
-        <h2 id="bd-review" className="font-semibold">To review: uncategorized merchants (last 90 days)</h2>
-        <p className="text-[12px] text-text-tertiary">Pick a category to file every transaction from that merchant, past and future. The bank data itself is not changed.</p>
+        <div className="flex items-center gap-2">
+          <h2 id="bd-review" className="font-semibold">To review: uncategorized merchants (last 90 days)</h2>
+          <InfoHint label="Uncategorized merchants">
+            <p>Always files every transaction from that merchant, past and future, under the category you pick. The bank data itself is not changed.</p>
+          </InfoHint>
+        </div>
         {r.uncategorized.length === 0 ? (
           <p className="mt-2 text-[13px] text-text-secondary">Nothing to review.</p>
         ) : (

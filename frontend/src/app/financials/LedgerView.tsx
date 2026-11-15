@@ -149,7 +149,7 @@ export default function LedgerView({ data, now }: { data: LedgerData; now: Date 
 
       {(data.windowTruncated || data.skippedRows > 0) && (
         <Notice>
-          {data.windowTruncated && "The 12-month window is larger than the page reads (40,000 rows), so the oldest months may be incomplete. "}
+          {data.windowTruncated && "More than 40,000 rows in 12 months, so the oldest months may be incomplete. "}
           {data.skippedRows > 0 && `${data.skippedRows} stored row(s) could not be read and were skipped.`}
         </Notice>
       )}
@@ -175,8 +175,7 @@ export default function LedgerView({ data, now }: { data: LedgerData; now: Date 
         {nw.unclassified.length > 0 && (
           <Notice>
             {nw.unclassified.length} account{nw.unclassified.length === 1 ? " has" : "s have"} no asset or liability label
-            from the source, so {nw.unclassified.length === 1 ? "it is" : "they are"} listed below but not counted in net worth
-            (the account type is not used to guess).
+            from the source (listed under Unclassified).
           </Notice>
         )}
         {nw.nonUsdCount > 0 && (
@@ -186,8 +185,8 @@ export default function LedgerView({ data, now }: { data: LedgerData; now: Date 
         )}
         {nw.staleCount > 0 && (
           <Notice>
-            {nw.staleCount} balance{nw.staleCount === 1 ? " is" : "s are"} older than {STALE_BALANCE_HOURS} hours. The harvester may
-            not be running; check Status.
+            {nw.staleCount} balance{nw.staleCount === 1 ? " is" : "s are"} older than {STALE_BALANCE_HOURS} hours. Check the bank sync
+            on Status.
           </Notice>
         )}
         {nw.noBalance.length > 0 && (
@@ -198,7 +197,7 @@ export default function LedgerView({ data, now }: { data: LedgerData; now: Date 
         )}
         <div className={`${box} space-y-4`}>
           <Group title="Assets" lines={nw.assets} now={now} />
-          <Group title="Liabilities" note="Amount owed; each one reduces net worth." lines={nw.liabilities} now={now} liability />
+          <Group title="Liabilities" lines={nw.liabilities} now={now} liability />
           <Group title="Unclassified" note="Not counted in net worth until the source labels them." lines={nw.unclassified} now={now} />
           {nw.assets.length + nw.liabilities.length + nw.unclassified.length === 0 && (
             <p className="text-[13px] text-text-secondary">No balances captured yet. Transactions below are still shown.</p>
@@ -233,7 +232,7 @@ export default function LedgerView({ data, now }: { data: LedgerData; now: Date 
             ? "No transactions for this month and account."
             : `${flows.counted} transaction${flows.counted === 1 ? "" : "s"} counted. Left out: ${excludedTotal} transfer, card-payment or ignored row${excludedTotal === 1 ? "" : "s"}${
                 flows.foreign > 0 ? `, and ${flows.foreign} non-USD row${flows.foreign === 1 ? "" : "s"} (not converted)` : ""
-              }. Refunds count as money in, not income.`}
+              }.`}
         </p>
       </section>
 
@@ -241,7 +240,7 @@ export default function LedgerView({ data, now }: { data: LedgerData; now: Date 
       <ChartCard
         title="Spending, last 12 months"
         subtitle={`Money out per month, ending ${monthName}${query.account ? " · selected account only" : ""}`}
-        info="Transfers between your own accounts, credit card payments and rows marked ignored are excluded, so paying a card does not count twice."
+        hint="Transfers between your own accounts, card payments and rows marked ignored are left out, so paying a card does not count twice."
       >
         <SpendingTrendChart
           data={data.trend.map((t) => ({ month: t.month, label: t.label, outCents: t.outCents }))}
@@ -298,7 +297,7 @@ export default function LedgerView({ data, now }: { data: LedgerData; now: Date 
         <p className="mt-1 text-[12px] text-text-tertiary" aria-live="polite">
           {list.total === 0
             ? "No matching transactions."
-            : `Showing ${shownFrom}–${shownTo} of ${list.total.toLocaleString("en-US")}. Search does not change the cashflow totals above.`}
+            : `Showing ${shownFrom}–${shownTo} of ${list.total.toLocaleString("en-US")}.`}
           {data.pageClamped && " That page is past the end, so page 1 is shown."}
         </p>
         {list.rows.length > 0 && (

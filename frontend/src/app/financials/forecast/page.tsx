@@ -3,6 +3,7 @@ import Link from "next/link";
 import { loadForecast } from "@/lib/cash-forecast-server";
 import { cachedForecast } from "@/lib/finance-result-cache-server";
 import { hasLevers, parseScenarioParams } from "@/lib/cash-forecast-scenario";
+import InfoHint from "@/components/InfoHint";
 import ForecastView from "./ForecastView";
 
 // Private financial data: rendered per request on the server, never ISR, never cached by the CDN; the
@@ -26,10 +27,15 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
         <p className="text-xs uppercase tracking-widest text-text-tertiary">
           <Link href="/financials" className="hover:text-text-secondary">Financials</Link> / Forecast
         </p>
-        <h1 data-testid="page-heading" className="text-2xl font-semibold">Cash forecast</h1>
-        <p className="mt-2 text-text-secondary">
-          Checking + savings, projected from your own history: paychecks and bills on their schedules, what you actually pay each card, everyday spending, and the items you plan below. Read-only: nothing here moves money.
-        </p>
+        <div className="flex items-center gap-2">
+          <h1 data-testid="page-heading" className="text-2xl font-semibold">Cash forecast</h1>
+          <InfoHint label="Cash forecast">
+            <p>
+              Checking + savings, projected from your own history: paychecks and bills on their schedules, what you actually pay each
+              card, everyday spending, and the items you plan below. Read-only: nothing here moves money.
+            </p>
+          </InfoHint>
+        </div>
       </header>
       {load.kind === "error" && (
         <section role="alert" className="rounded-card border border-down/30 bg-down/5 p-4">

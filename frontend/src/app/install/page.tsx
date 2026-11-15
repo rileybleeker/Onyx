@@ -159,8 +159,7 @@ function FocusBuildCard() {
       <div>
         <h2 className="text-base font-medium text-text-primary">{meta.title}</h2>
         <p className="text-text-tertiary text-xs mt-1">
-          Installs over the Screen Time app (same bundle ID): it upgrades it in place and keeps the Screen Time
-          export. Installing the plain Screen Time build later replaces it again.
+          Upgrades the Screen Time app in place; installing the plain build later replaces it again.
         </p>
       </div>
       {state === "loading" && <p className="text-text-tertiary text-sm">Loading…</p>}
@@ -192,9 +191,7 @@ function FocusBuildCard() {
               <p className="text-text-tertiary text-xs">Links expire {fmt(build.links_expire_at)}.</p>
             </>
           )}
-          <p className="text-text-tertiary text-xs">
-            Keeps opening until its signing certificate and profiles expire: {fmt(build.profile_expires)}.
-          </p>
+          <p className="text-text-tertiary text-xs">Stops opening after {fmt(build.profile_expires)} (signing expires).</p>
         </>
       )}
     </div>
@@ -209,7 +206,7 @@ export default function InstallPage() {
       <div className="max-w-md mx-auto space-y-4">
         <div>
           <h1 className="text-2xl font-semibold text-text-primary mb-1">Onyx Screen Time</h1>
-          <p className="text-text-tertiary text-sm">Install the iPhone app. Open this page in Safari on the iPhone.</p>
+          <p className="text-text-tertiary text-sm">Open this page in Safari on the iPhone.</p>
         </div>
 
         {state === "loading" && <p className="text-text-tertiary text-sm">Loading…</p>}
@@ -255,10 +252,7 @@ export default function InstallPage() {
                   <p className="text-text-tertiary text-xs">Links expire {fmt(build.links_expire_at)}.</p>
                 </>
               )}
-              <p className="text-text-tertiary text-xs">
-                The installed app keeps opening until its signing certificate and profile expire:{" "}
-                {fmt(build.profile_expires)}.
-              </p>
+              <p className="text-text-tertiary text-xs">Stops opening after {fmt(build.profile_expires)} (signing expires).</p>
             </div>
 
             <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-6 space-y-2">

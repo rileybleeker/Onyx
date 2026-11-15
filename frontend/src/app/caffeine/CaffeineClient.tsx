@@ -19,6 +19,7 @@ import {
 import { formatDate, formatDuration, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import InfoHint from "@/components/InfoHint";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-mono)" };
@@ -246,21 +247,18 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
-          <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Caffeine</h2>
+          <div className="flex items-center gap-2">
+            <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Caffeine</h2>
+            <InfoHint label="Caffeine data">
+              Supplement doses (from 2026-05-19) and Cronometer food (from 2026-05-31) are the only sources, so
+              the charts cover that era only. The yes/no caffeine habit is ignored: it proved unreliable.
+            </InfoHint>
+          </div>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Intake, timing windows &amp; next-night HRV — supplements + Cronometer dietary — last {windowDays} days
+            Intake, timing &amp; next-night HRV — last {windowDays} days
           </p>
         </div>
       </div>
-
-      <p className="text-[11px] text-text-tertiary leading-relaxed border-l-2 border-amber-500/30 pl-3 mb-8">
-        <span className="text-text-secondary">Coverage note:</span> Quantitative caffeine tracking
-        began 2026-05-19 (timestamped supplement doses) and 2026-05-31 (Cronometer dietary
-        caffeine), so these charts cover the recent era only. The logged record is the sole
-        caffeine source — the self-reported yes/no caffeine behavior is disregarded by
-        policy (it proved unreliable). The FDA&apos;s 400 mg/day guidance is marked on the
-        intake chart.
-      </p>
 
       {loading ? (
         <div className="space-y-6">
@@ -327,9 +325,9 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
           {/* ─── Daily intake, stacked by channel ────────────────────────── */}
           <ChartCard
             title="Daily Caffeine Intake"
-            subtitle={`mg per behavioral day, dietary (Cronometer) vs supplement (Onyx) stacked · last ${windowDays} days`}
+            subtitle={`dietary vs supplement mg per day · last ${windowDays} days`}
             source="CRONOMETER + SUPPLEMENTS"
-            info="Days with no logged caffeine are omitted (no row in the view). The amber line is the FDA's 400 mg/day guidance for healthy adults."
+            hint="Days with no logged caffeine are left out. The amber line is the FDA's 400 mg/day guidance for healthy adults."
           >
             <ResponsiveContainer width="100%" height={280}>
               <BarChart data={mgData} margin={{ top: 8, right: 8, left: 4, bottom: 0 }}>
@@ -353,9 +351,9 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
           {/* ─── Caffeine window (floating range bars) ───────────────────── */}
           <ChartCard
             title="Caffeine Window"
-            subtitle="first dose → last dose per day (ET hour of day) · trusted-timestamp events only"
+            subtitle="first → last dose, ET · trusted timestamps only"
             source="SUPPLEMENTS + CRONOMETER"
-            info="Each bar spans first to last dose. Single-dose days render a thin tick at the dose time. Bars extending past 12am mark windows that cross midnight (a post-midnight dose still belongs to the previous behavioral day)."
+            hint="Each bar spans first to last dose; a single dose is a thin tick. Bars past 12am cross midnight (a post-midnight dose still belongs to the previous behavioral day)."
           >
             {windowData.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-12 text-center">
@@ -393,9 +391,9 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
           {/* ─── Last dose → bedtime gap ─────────────────────────────────── */}
           <ChartCard
             title="Last Dose → Bedtime Gap"
-            subtitle="minutes between the last trusted-timestamp dose and sleep onset · higher is better"
+            subtitle="last dose to sleep onset · higher is better"
             source="SUPPLEMENTS + CRONOMETER + WHOOP"
-            info="The amber line marks the common 'no caffeine within 6h of bed' guideline (360 min). Gaps require a trusted dose timestamp and a paired sleep onset — days without either are skipped."
+            hint="The amber line is the common 'no caffeine within 6h of bed' guideline (360 min). Days without a trusted dose time or a scored sleep onset are skipped."
           >
             <ResponsiveContainer width="100%" height={260}>
               <LineChart data={gapData} margin={{ top: 8, right: 8, left: 4, bottom: 0 }}>
@@ -428,9 +426,8 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
             <div className="border-l-2 border-accent/40 pl-3">
               <h3 className="text-[14px] font-medium text-text-primary">Caffeine × HRV</h3>
               <p className="text-[11px] text-text-tertiary mt-0.5">
-                Each day&apos;s caffeine paired with the HRV scored from the night that closes it —
-                i.e. the <span className="text-text-secondary">next-night HRV</span> relative to
-                that day&apos;s intake (matrix same-row semantics).
+                Each day&apos;s caffeine is paired with the HRV of the sleep that closes that day: the{" "}
+                <span className="text-text-secondary">next-night HRV</span>.
               </p>
             </div>
 
@@ -502,13 +499,12 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
                 </div>
                 {smallN && (
                   <p className="text-[10px] text-amber-300/80 leading-relaxed mt-3 border-l-2 border-amber-500/40 pl-2">
-                    Small sample — at least one group has n&lt;10, so this comparison is descriptive
-                    only. It firms up as timed caffeine history accumulates.
+                    Small sample: a group has n&lt;10, so this comparison is descriptive only.
                   </p>
                 )}
                 <p className="text-[10px] text-text-tertiary leading-relaxed mt-3">
-                  Days without a trusted last-dose timestamp are excluded. Unadjusted means — for
-                  confounder-adjusted caffeine effects see the causal layer on /analytics/hrv.
+                  Unadjusted means; days without a trusted last-dose time are excluded. Confounder-adjusted
+                  effects are in the causal section of /analytics/hrv.
                 </p>
               </ChartCard>
             </div>
@@ -517,9 +513,9 @@ export default function CaffeinePage({ initial: initialProp }: { initial?: Caffe
           {/* ─── Data quality ─────────────────────────────────────────────── */}
           <ChartCard
             title="Data Quality"
-            subtitle={`retro-logged timestamps + cross-channel double-log checks · last ${qualityDays} days`}
+            subtitle={`retro-logs and double-log checks · last ${qualityDays} days`}
             source="CRONOMETER + SUPPLEMENTS"
-            info="Each flag marks a day worth a second look — resolving them sharpens every chart above and the HRV analysis. Retro-logs keep their mg but their timestamps are quarantined from timing features."
+            hint="Each flag marks a day worth a second look; fixing it sharpens the charts above and the HRV analysis. Retro-logged doses keep their mg, but their times are left out of timing features."
           >
             {quality.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">

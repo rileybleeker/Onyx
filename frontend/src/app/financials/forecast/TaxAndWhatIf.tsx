@@ -6,6 +6,7 @@ import type { ForecastResult } from "@/lib/cash-forecast";
 import { scenarioToQuery, type ScenarioParams } from "@/lib/cash-forecast-scenario";
 import type { ForecastAccountView } from "@/lib/cash-forecast-server";
 import type { Jur, TaxProfile, TaxYearResult } from "@/lib/tax-plan";
+import InfoHint from "@/components/InfoHint";
 
 const usd = (cents: number | null | undefined): string => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -87,8 +88,12 @@ export function WhatIfPanel({ params, accounts, saved, busy, run }: { params: Sc
   );
   return (
     <section className={`${card} ${params ? "border-accent/40" : ""}`} aria-labelledby="fc-whatif">
-      <h2 id="fc-whatif" className="font-semibold">What if</h2>
-      <p className="text-[12px] text-text-tertiary">Change a lever and press Show: the page recomputes cash, net worth and taxes and compares them with the base plan. The base plan is not changed.</p>
+      <div className="flex items-center gap-2">
+        <h2 id="fc-whatif" className="font-semibold">What if</h2>
+        <InfoHint label="What if">
+          <p>Change a lever and press Show: the page recomputes cash, net worth and taxes and compares them with the base plan. The base plan is not changed.</p>
+        </InfoHint>
+      </div>
       <div className="mt-3 flex flex-wrap gap-3">
         {field("Bonus % of plan", "bonusPct", "100", "text", "w-20")}
         {field("Bonus later by (months)", "bonusShiftMonths", "0", "text", "w-20")}
@@ -199,7 +204,7 @@ export function CompareTable({ base, baseTax, scen, scenTax }: { base: ForecastR
           })}
         </tbody>
       </table>
-      <p className="mt-2 text-[12px] text-text-tertiary">For tax and interest rows a lower number is better; the colors follow cash.</p>
+      <p className="mt-2 text-[12px] text-text-tertiary">Colors follow cash; for tax and interest rows lower is better.</p>
     </section>
   );
 }
@@ -209,8 +214,12 @@ export function CompareTable({ base, baseTax, scen, scenTax }: { base: ForecastR
 export function TaxSection({ tax, profile, busy, run }: { tax: TaxYearResult[]; profile: TaxProfile | null; busy: boolean; run: Run }) {
   return (
     <section className={card} aria-labelledby="fc-tax">
-      <h2 id="fc-tax" className="font-semibold">Taxes</h2>
-      <p className="text-[12px] text-text-tertiary">Planning estimates, not a filed return. The payments below are already in the cash forecast.</p>
+      <div className="flex items-center gap-2">
+        <h2 id="fc-tax" className="font-semibold">Taxes</h2>
+        <InfoHint label="Taxes">
+          <p>Planning estimates, not a filed return. The payments below are already in the cash forecast.</p>
+        </InfoHint>
+      </div>
       {!profile && <p className="mt-2 text-[13px] text-mid">No tax profile yet: fill in the form below.</p>}
       {tax.map((t) => (
         <div key={t.year} className="mt-4">

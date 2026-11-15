@@ -5,6 +5,7 @@ import type { DetectedStream, NetWorthMonth } from "@/lib/cash-forecast";
 import type { DriverRow } from "@/lib/cash-forecast-store";
 import type { ForecastAccountView } from "@/lib/cash-forecast-server";
 import type { MovePlan } from "@/lib/finance-plan";
+import InfoHint from "@/components/InfoHint";
 
 const card = "rounded-card shadow-card border border-border-subtle bg-surface-card p-4";
 const input = "rounded-control border border-border-subtle bg-transparent px-2 py-1 text-[13px]";
@@ -27,10 +28,12 @@ const toDollars = (c: number | null | undefined) => (c ? String(Math.round(c / 1
 export function PlanConfig({ move, drivers, accounts, netWorth, busy, run }: { move: MovePlan | null; drivers: DriverRow[]; accounts: ForecastAccountView[]; netWorth: NetWorthMonth[]; busy: boolean; run: Run }) {
   return (
     <section className={card} aria-labelledby="fc-plan">
-      <h2 id="fc-plan" className="font-semibold">Plan &amp; assumptions</h2>
-      <p className="text-[12px] text-text-tertiary">
-        What the forecast cannot see in your bank data. Every value here is editable; saved values replace the defaults on the next load.
-      </p>
+      <div className="flex items-center gap-2">
+        <h2 id="fc-plan" className="font-semibold">Plan &amp; assumptions</h2>
+        <InfoHint label="Plan and assumptions">
+          <p>What the forecast cannot see in your bank data. Every value here is editable; saved values replace the defaults on the next load.</p>
+        </InfoHint>
+      </div>
       <MoveEditor move={move} busy={busy} run={run} />
       <GrowthEditor drivers={drivers} accounts={accounts} netWorth={netWorth} busy={busy} run={run} />
     </section>
@@ -69,7 +72,7 @@ function MoveEditor({ move, busy, run }: { move: MovePlan | null; busy: boolean;
         {field("Living costs change ($/mo)", "col")}
       </div>
       <p className="mt-1 text-[12px] text-text-secondary">
-        {f.date ? `Adds ${change >= 0 ? "+" : "-"}$${Math.abs(Math.round(change / 100)).toLocaleString("en-US")}/mo of rent from the first rent after ${f.date}, the one-off costs around it, and moves your tax residency to New York on that date.` : "No move planned."}
+        {f.date ? `Adds ${change >= 0 ? "+" : "-"}$${Math.abs(Math.round(change / 100)).toLocaleString("en-US")}/mo rent from the first rent after ${f.date}, the one-off costs, and New York tax residency from that date.` : "No move planned."}
       </p>
       <div className="mt-2 flex gap-2">
         <button
@@ -112,8 +115,12 @@ function GrowthEditor({ drivers, accounts, netWorth, busy, run }: { drivers: Dri
   const last = netWorth[netWorth.length - 1]?.byAccount ?? {};
   return (
     <div className="mt-5">
-      <h3 className="text-[13px] font-semibold">Investment accounts: return and contributions</h3>
-      <p className="text-[12px] text-text-tertiary">Counts toward net worth, not cash. Contributions here are money that goes in without passing through checking (employer SEP, payroll 401(k) or HSA).</p>
+      <div className="flex items-center gap-2">
+        <h3 className="text-[13px] font-semibold">Investment accounts: return and contributions</h3>
+        <InfoHint label="Investment accounts">
+          <p>Counts toward net worth, not cash. Contributions here are money that goes in without passing through checking (employer SEP, payroll 401(k) or HSA).</p>
+        </InfoHint>
+      </div>
       <table className="mt-2 w-full text-[13px]">
         <thead className="text-[12px] text-text-tertiary">
           <tr>
@@ -221,7 +228,7 @@ export function ModelSettings({ drivers, busy, run }: { drivers: DriverRow[]; bu
   return (
     <section className={card} aria-labelledby="fc-settings">
       <h2 id="fc-settings" className="font-semibold">Forecast settings</h2>
-      <p className="text-[12px] text-text-tertiary">Blank = the default. These change how the forecast reads your history, not your data.</p>
+      <p className="text-[12px] text-text-tertiary">Blank = the default.</p>
       <div className="mt-2 flex flex-wrap gap-3">
         {field("Low-balance line ($)", "buffer", "0", "Alerts and safe-to-move keep the cautious path above this")}
         {field("Inflation (%/yr)", "inflation", "0", "Grows everyday spending")}

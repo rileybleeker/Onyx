@@ -14,6 +14,7 @@ import { GoalsSection, NetWorthChart, ProjectionBreakdown } from "./ProjectionPa
 import type { GoalView } from "@/lib/finance-goals";
 import type { MovePlan } from "@/lib/finance-plan";
 import { ModelSettings, PlanConfig, StreamEditorList } from "./PlanConfig";
+import InfoHint from "@/components/InfoHint";
 
 const usd = (cents: number | null | undefined): string => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -107,7 +108,7 @@ export default function ForecastView({
 
   return (
     <div className="space-y-6">
-      {setupPending && <p className="text-[13px] text-mid">Planned items could not be read (the forecast tables may not be set up yet); showing the forecast from your history only.</p>}
+      {setupPending && <p className="text-[13px] text-mid">Planned items could not be read; showing the forecast from your history only.</p>}
       {error && <p role="alert" className="text-[13px] text-down">Not saved: {error}</p>}
 
       {/* Headlines */}
@@ -192,9 +193,9 @@ export default function ForecastView({
           </ResponsiveContainer>
         </div>
         <p className="mt-2 text-[12px] text-text-tertiary">
-          Line = likely; shaded = 10th to 90th percentile of 500 resampled paths. Amber lines mark where a 0% promo ends.
-          {scenario && " Dashed blue = the what-if."}
-          {range === "12m" && " Past 13 weeks the forecast is less certain."}
+          Line = likely · shaded = 10th–90th percentile of 500 resampled paths · amber = a 0% promo ends
+          {scenario && " · dashed blue = the what-if"}
+          {range === "12m" && " · less certain past 13 weeks"}
         </p>
       </section>
 
@@ -263,8 +264,12 @@ export default function ForecastView({
 
       {/* Detected */}
       <section className={card} aria-labelledby="fc-detected">
-        <h2 id="fc-detected" className="font-semibold">What the forecast found in your history</h2>
-        <p className="text-[12px] text-text-tertiary">Change any amount from a date (a raise, a new card payment plan) or stop one; Reset goes back to what your history shows.</p>
+        <div className="flex items-center gap-2">
+          <h2 id="fc-detected" className="font-semibold">What the forecast found in your history</h2>
+          <InfoHint label="What the forecast found">
+            <p>Change any amount from a date (a raise, a new card payment plan) or stop one; Reset goes back to what your history shows.</p>
+          </InfoHint>
+        </div>
         <StreamEditorList streams={result.streams} drivers={drivers} today={result.today} busy={busy} run={run} />
         {result.notes.length > 0 && (
           <ul className="mt-3 space-y-1 text-[12px] text-text-tertiary">
@@ -276,9 +281,17 @@ export default function ForecastView({
       </section>
 
       <section className={card} aria-labelledby="fc-acc">
-        <h2 id="fc-acc" className="font-semibold">How accurate has the forecast been?</h2>
+        <div className="flex items-center gap-2">
+          <h2 id="fc-acc" className="font-semibold">How accurate has the forecast been?</h2>
+          <InfoHint label="Forecast accuracy">
+            <p>
+              Backtest on 18 months of history (64 weekly runs): typically off by about 17% of a month&apos;s outflows at 4 weeks and 32%
+              at 13 weeks, with no average bias; about 85% of outcomes landed inside the range.
+            </p>
+          </InfoHint>
+        </div>
         {accuracy.length === 0 ? (
-          <p className="mt-1 text-[13px] text-text-secondary">A snapshot is saved every Monday; this fills in as weeks pass. Backtest on 18 months of history (64 weekly runs): typically off by about 17% of a month&apos;s outflows at 4 weeks and 32% at 13 weeks, with no average bias; about 85% of outcomes landed inside the range.</p>
+          <p className="mt-1 text-[13px] text-text-secondary">A snapshot is saved every Monday; this fills in as weeks pass.</p>
         ) : (
           <table className="mt-2 w-full text-[13px]">
             <thead className="text-[12px] text-text-tertiary">
@@ -347,8 +360,12 @@ function PlannedItems({ items, statuses, busy, run, accountOptions }: { items: P
   };
   return (
     <section className={card} aria-labelledby="fc-planned">
-      <h2 id="fc-planned" className="font-semibold">Planned items</h2>
-      <p className="text-[12px] text-text-tertiary">Bonus, move, trip, tax payment, big purchase. Matched to the real transaction when it happens.</p>
+      <div className="flex items-center gap-2">
+        <h2 id="fc-planned" className="font-semibold">Planned items</h2>
+        <InfoHint label="Planned items">
+          <p>A bonus, move, trip, tax payment or big purchase. Each one is matched to the real transaction when it happens.</p>
+        </InfoHint>
+      </div>
       <table className="mt-2 w-full text-[13px]">
         <tbody>
           {items.map((it) => {
@@ -426,8 +443,15 @@ function Cards({ result, drivers, accounts, busy, run }: { result: ForecastResul
   const extra = accounts.filter((a) => a.type === "card" && !known.has(a.account_key));
   return (
     <section className={card} aria-labelledby="fc-cards">
-      <h2 id="fc-cards" className="font-semibold">Cards</h2>
-      <p className="text-[12px] text-text-tertiary">APR comes from the interest each card actually charged unless you enter it. Promo end dates are read from balance-transfer rows when the bank prints them; enter the rest from your statement.</p>
+      <div className="flex items-center gap-2">
+        <h2 id="fc-cards" className="font-semibold">Cards</h2>
+        <InfoHint label="Cards">
+          <p>
+            APR comes from the interest each card actually charged unless you enter it. Promo end dates are read from balance-transfer
+            rows when the bank prints them; enter the rest from your statement.
+          </p>
+        </InfoHint>
+      </div>
       <div className="mt-2 space-y-3">
         {cards.map((c) => (
           <CardRow key={c.account_key} c={c} driver={drivers.find((d) => d.key === `card:${c.account_key}`)?.value} busy={busy} run={run} />

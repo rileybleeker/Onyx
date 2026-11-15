@@ -6,6 +6,7 @@ import { useState } from "react";
 import type { ForecastResult } from "@/lib/cash-forecast";
 import type { ForecastAccountView } from "@/lib/cash-forecast-server";
 import type { GoalView } from "@/lib/finance-goals";
+import InfoHint from "@/components/InfoHint";
 
 const usd = (cents: number | null | undefined): string => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -47,8 +48,12 @@ export function ProjectionBreakdown({ result, scenario }: { result: ForecastResu
   const endOf = (m: string) => r.days.filter((d) => d.date.slice(0, 7) === m).pop()?.likely;
   return (
     <section className={card} aria-labelledby="fc-breakdown">
-      <h2 id="fc-breakdown" className="font-semibold">What is in the projection, month by month{scenario ? " (what-if)" : ""}</h2>
-      <p className="text-[12px] text-text-tertiary">Every line the cash forecast adds up. A row you expect but do not see is a variable the forecast is missing: add it as a planned item or in the tax profile.</p>
+      <div className="flex items-center gap-2">
+        <h2 id="fc-breakdown" className="font-semibold">What is in the projection, month by month{scenario ? " (what-if)" : ""}</h2>
+        <InfoHint label="What is in the projection">
+          <p>Every line the cash forecast adds up. A row you expect but do not see is a variable the forecast is missing: add it as a planned item or in the tax profile.</p>
+        </InfoHint>
+      </div>
       <div className="mt-2 overflow-x-auto">
         <table className="w-full text-[12px]">
           <thead className="text-text-tertiary">
@@ -115,13 +120,20 @@ export function NetWorthChart({ result, scenario }: { result: ForecastResult; sc
   const accounts = last?.byAccount ? Object.entries(last.byAccount) : [];
   return (
     <section className={card} aria-labelledby="fc-nw">
-      <h2 id="fc-nw" className="font-semibold">Projected net worth</h2>
+      <div className="flex items-center gap-2">
+        <h2 id="fc-nw" className="font-semibold">Projected net worth</h2>
+        <InfoHint label="Projected net worth">
+          <p>
+            Cash from the forecast, investments at their expected return (5% a year unless set otherwise: an assumption, not a promise)
+            plus contributions, and card balances after payments, interest and promo ends.
+          </p>
+        </InfoHint>
+      </div>
       <p className="text-[12px] text-text-secondary">
         {first && last ? (
           <>
             {usd(first.netWorth)} next month → <b>{usd(last.netWorth)}</b> in {result.netWorth.length} months ({last.netWorth - first.netWorth >= 0 ? "+" : ""}
-            {usd(last.netWorth - first.netWorth)}). Cash from the forecast, investments at their expected return plus contributions, card balances after
-            payments, interest and promo ends.
+            {usd(last.netWorth - first.netWorth)}).
           </>
         ) : (
           "Not enough data yet."
@@ -145,7 +157,7 @@ export function NetWorthChart({ result, scenario }: { result: ForecastResult; sc
       </div>
       {accounts.length > 0 && (
         <p className="mt-2 text-[12px] text-text-tertiary">
-          Investments in {result.netWorth.length} months: {accounts.map(([k, v]) => `${k} ${usd(v)}`).join(" · ")}. 5% a year unless set otherwise: an assumption, not a promise.
+          Investments in {result.netWorth.length} months: {accounts.map(([k, v]) => `${k} ${usd(v)}`).join(" · ")}.
         </p>
       )}
     </section>
@@ -172,8 +184,12 @@ export function GoalsSection({ goals, accounts, busy, run }: { goals: GoalView[]
   const options = accounts.filter((a) => a.type === "cash" || a.type === "investment");
   return (
     <section className={card} aria-labelledby="fc-goals">
-      <h2 id="fc-goals" className="font-semibold">Savings goals</h2>
-      <p className="text-[12px] text-text-tertiary">Tracked against your real balances; goals on checking + savings are also checked against the forecast. Onyx never moves money toward a goal.</p>
+      <div className="flex items-center gap-2">
+        <h2 id="fc-goals" className="font-semibold">Savings goals</h2>
+        <InfoHint label="Savings goals">
+          <p>Tracked against your real balances; goals on checking + savings are also checked against the forecast. Onyx never moves money toward a goal.</p>
+        </InfoHint>
+      </div>
       {goals.length > 0 && (
         <ul className="mt-3 space-y-3 text-[13px]">
           {goals.map((g) => (

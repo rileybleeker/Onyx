@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from 'react';
 import { GOOGLE_AUTH_URL, NOT_CONNECTED, type CalendarStatus, type CalendarSyncSummary } from '@/lib/care-google';
+import InfoHint from '@/components/InfoHint';
 
 const button = 'rounded-lg border border-border-default px-3 py-2 text-sm hover:bg-surface-hover disabled:opacity-50';
 
@@ -92,10 +93,16 @@ export default function CalendarConnectionCard({ initial }: { initial?: Calendar
   }
 
   return <div className="mt-4 border-t border-border-default pt-3" aria-label="Google Calendar connection">
-    <h3 className="text-sm font-semibold">Copy care items to Google Calendar: {status.connected ? 'on' : 'off'}</h3>
+    <div className="flex items-center gap-2">
+      <h3 className="text-sm font-semibold">Copy care items to Google Calendar: {status.connected ? 'on' : 'off'}</h3>
+      <InfoHint label="Copy care items to Google Calendar">
+        <p>One way, Onyx to Google: active care items go to a calendar of their own (&quot;{status.calendarName}&quot;) in your Google account. Only the label, date, time and booked state are sent; notes stay in Onyx.</p>
+        <p>Your calendar events above are already connected and do not need this. Marking an item booked only records your confirmation here.</p>
+      </InfoHint>
+    </div>
     {status.connected
-      ? <p className="mt-1 text-sm text-text-secondary">Active care items are copied to the &quot;{status.calendarName}&quot; calendar in your Google account, one way (Onyx to Google). Only the label, date, time and booked state are sent; notes stay in Onyx. Edit items here: changes made in Google Calendar are overwritten.</p>
-      : <p className="mt-1 text-sm text-text-secondary">Optional, and off. Turning it on would put your care items on a calendar of their own in your Google account. Your calendar events above are already connected and do not need this. Nothing on this page writes to a calendar; marking an item booked only records your confirmation here.</p>}
+      ? <p className="mt-1 text-sm text-text-secondary">Edit items here: changes made in Google Calendar are overwritten.</p>
+      : <p className="mt-1 text-sm text-text-secondary">Optional, and off.</p>}
     <p className="mt-2 text-xs font-medium text-text-secondary">{status.connected ? 'The one permission Onyx holds' : 'The one permission a connection asks for'}</p>
     <ul className="mt-1 space-y-1 text-sm">
       <li className="flex flex-wrap justify-between gap-x-3"><span>Create its own calendar (&quot;{status.calendarName}&quot;) and manage the events on it</span><span className={status.connected ? 'text-up' : 'text-text-tertiary'}>{status.connected ? 'Granted' : 'Not granted'}</span></li>
@@ -112,8 +119,8 @@ export default function CalendarConnectionCard({ initial }: { initial?: Calendar
       : <>
         <button className={`${button} mt-3`} disabled={!status.configured || busy !== null} onClick={() => void connect()} aria-describedby="calendar-connect-note">{busy === 'connect' ? 'Opening Google…' : 'Connect Google Calendar'}</button>
         <p id="calendar-connect-note" className="mt-2 text-xs text-text-secondary">{status.configured
-          ? 'Opens Google’s consent page. You approve the one permission above, and Google sends you back here.'
-          : 'Not set up yet: Onyx has no Google credentials, so nothing can be connected and Google is never contacted. The setup steps are in docs/health-google-calendar.md.'}</p>
+          ? 'Opens Google’s consent page for the one permission above.'
+          : 'Not set up yet: Onyx has no Google credentials, so nothing can be connected. Setup steps: docs/health-google-calendar.md.'}</p>
       </>}
   </div>;
 }

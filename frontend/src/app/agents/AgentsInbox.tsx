@@ -21,6 +21,7 @@ import {
 import { agentInfo, Avatar, CardBody, CardButtons, listTime, parseUtc, settledLabel } from "./agent-ui";
 import { CACHE_KEYS, clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
+import InfoHint from "@/components/InfoHint";
 
 // The Agents inbox, like the iPhone Messages list. "Unread" is everything that needs Riley: open cards (with their
 // buttons, so most can be answered right here) and agent messages not read yet, filterable by agent. "All" is one
@@ -431,9 +432,11 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
           )}
 
           {view === "unread" && items.some((i) => i.kind === "card") && (
-            <p className="text-center text-[12px] text-text-tertiary mt-4 px-6">
-              Clearing a card only tidies this list and your notifications. The agent still waits for an answer; you can reply in its conversation.
-            </p>
+            <div className="mt-4 flex justify-center px-6">
+              <InfoHint variant="disclosure" label="Clearing cards" summary="About clearing">
+                <p>Clearing a card only tidies this list and your notifications. The agent still waits for an answer; you can reply in its conversation.</p>
+              </InfoHint>
+            </div>
           )}
 
           {(error || authExpired) && (

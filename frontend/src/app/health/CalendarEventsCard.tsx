@@ -1,6 +1,7 @@
 import { CALENDAR_SOURCE_LABEL, readConnection, type CalendarReadStatus } from '@/lib/calendar-events';
 import { ageLabel } from '@/lib/urgent-email';
 import type { CalendarView } from './useCalendarEvents';
+import InfoHint from '@/components/InfoHint';
 
 // Heading word for each state. "connected" is what Riley looks for: the hourly read sync is the
 // Google Calendar connection; the card below it (copying care items INTO Google) is optional.
@@ -40,10 +41,13 @@ export default function CalendarEventsCard({ calendar }: { calendar: CalendarVie
       {calendars.length > 0
         ? <ul className="mt-2 space-y-1 text-sm" aria-label="Synced calendars">{calendars.map(c => <li key={`${c.account}/${c.calendar}`} className="flex flex-wrap justify-between gap-x-3"><span className="break-words">{c.calendar} <span className="text-text-tertiary">({c.account})</span></span><span className="text-text-secondary">{c.events} event{c.events === 1 ? '' : 's'}</span></li>)}</ul>
         : calendar.calendars && <p className="mt-2 text-sm text-text-secondary">No events are stored yet.</p>}
-      {calendars.length > 1 && <p className="mt-1 text-xs text-text-secondary">{total} events in all, from about 13 months back to 13 months ahead.</p>}
+      {calendars.length > 1 && <p className="mt-1 text-xs text-text-secondary">{total} events in all.</p>}
     </>}
     {calendar.lastSync && <p className={`mt-2 text-xs ${connection.status === 'failing' || connection.status === 'late' ? 'text-amber-300' : 'text-text-secondary'}`}>Last sync {ageLabel(calendar.lastSync.at, now)}{calendar.lastSync.status !== 'success' ? ` (that run: ${calendar.lastSync.status})` : ''}.{calendar.lastSync.error && calendar.lastSync.status !== 'success' ? ` ${calendar.lastSync.error}` : ''}</p>}
     {calendar.truncated && <p className="mt-1 text-xs text-amber-300">This month has more events than one request returns, so some are not shown.</p>}
-    <p className="mt-2 text-xs text-text-secondary">One way only, {CALENDAR_SOURCE_LABEL} to Onyx: Onyx copies each event&apos;s title, time, location and calendar name from your calendars&apos; private iCal addresses about once an hour. It does not copy descriptions, guests or meeting links, and this sync cannot change your calendars or turn a care item into a calendar event.</p>
+    <InfoHint variant="disclosure" label="Calendar events sync" summary="About this sync" className="mt-1">
+      <p>One way only, {CALENDAR_SOURCE_LABEL} to Onyx: about once an hour Onyx copies each event&apos;s title, time, location and calendar name from your calendars&apos; private iCal addresses, from about 13 months back to 13 months ahead.</p>
+      <p>It does not copy descriptions, guests or meeting links, and this sync cannot change your calendars or turn a care item into a calendar event.</p>
+    </InfoHint>
   </div>;
 }

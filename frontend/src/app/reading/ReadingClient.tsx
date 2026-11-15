@@ -5,6 +5,7 @@ import dynamic from "next/dynamic";
 import Link from "next/link";
 import { BookMarked, Check, ChevronDown, Flame, Headphones, Highlighter, Sparkles, Trophy, X } from "lucide-react";
 import MetricRing from "@/components/MetricRing";
+import InfoHint from "@/components/InfoHint";
 import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type Medium, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
@@ -318,7 +319,7 @@ function Checkpoints({ o }: { o: ReadingOverview }) {
         })}
       </div>
       <p className="mt-1.5 text-[11px] text-text-tertiary">
-        Quizzes run in <Link href="/chat" className="underline underline-offset-2">Health Q&amp;A</Link>: &ldquo;quiz me on The Goal through chapter 12&rdquo;. The result is recorded here. 80% passes.
+        Quiz in <Link href="/chat" className="underline underline-offset-2">Health Q&amp;A</Link> (&ldquo;quiz me through chapter 12&rdquo;). 80% passes.
       </p>
     </section>
   );
@@ -604,9 +605,16 @@ function HighlightForm({ o, onAdded, onError }: { o: ReadingOverview; onAdded: (
         </>
       ) : (
         <>
-          <p className="mt-2 text-[12px] text-text-tertiary">
-            Kindle app → notebook → share → <span className="text-text-secondary">Export notebook</span>, then paste the email body here. My Clippings.txt from a Kindle device works too, as does a plain list separated by blank lines (a line starting with &ldquo;&gt;&rdquo; under a passage becomes its comment). Re-pasting the same export is safe.
-          </p>
+          <div className="mt-2 flex items-center gap-2">
+            <p className="text-[12px] text-text-tertiary">Paste a Kindle notebook export, My Clippings.txt or a plain list.</p>
+            <InfoHint label="Importing highlights">
+              <p>
+                Kindle app → notebook → share → <span className="text-text-primary">Export notebook</span>, then paste the
+                email body. In a plain list, separate passages with blank lines; a line starting with &ldquo;&gt;&rdquo; under a
+                passage becomes its comment. Re-pasting the same export is safe.
+              </p>
+            </InfoHint>
+          </div>
           <textarea
             value={importText}
             onChange={(e) => {

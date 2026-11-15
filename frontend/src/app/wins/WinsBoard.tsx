@@ -3,6 +3,7 @@ import { useState } from "react";
 import Link from "next/link";
 import { ArrowUpRight, CircleCheck, Info, Sparkles } from "lucide-react";
 import StatCard from "@/components/StatCard";
+import InfoHint from "@/components/InfoHint";
 import { groupByStage, labels, stageNotes, type Board, type Win, type WinState } from "@/lib/wins";
 
 const filters = ["All", "Delivered", "In progress"] as const;
@@ -64,7 +65,6 @@ export default function WinsBoard({ board }: { board: Board }) {
         <div>
           <div className="mb-2 flex items-center gap-2 text-text-secondary"><Sparkles size={16} aria-hidden="true" /><span className="text-xs font-medium">Small wins. Better Onyx.</span></div>
           <h1 data-testid="page-heading" className="text-3xl font-semibold tracking-tight text-text-primary sm:text-4xl">Worth celebrating</h1>
-          <p className="mt-3 max-w-2xl text-sm leading-relaxed text-text-secondary">A place to see the care going into Onyx. Real improvements, work still taking shape, and the evidence behind each one.</p>
         </div>
         <div role="group" aria-label="Progress overview" className="grid grid-cols-3 gap-2 sm:gap-4">
           <StatCard label="Live on the site" value={live} className="flex flex-col justify-between" />
@@ -72,7 +72,11 @@ export default function WinsBoard({ board }: { board: Board }) {
           <StatCard label="In progress" value={proposed} className="flex flex-col justify-between" />
         </div>
         <div className="space-y-2 text-xs leading-relaxed text-text-secondary">
-          <p>{live + merged === 0 && "Every improvement starts somewhere. "}Each stage is kept apart: proposals and drafts are not merged, and merged is not the same as live on the site.</p>
+          {/* Disclosure, not the popover: it holds no state, so the board still renders to static markup. */}
+          <InfoHint variant="disclosure" label="Worth celebrating" summary="About this board">
+            <p>Real improvements to Onyx, work still taking shape, and the evidence behind each one.</p>
+            <p>Each stage is kept apart: proposals and drafts are not merged, and merged is not the same as live on the site.</p>
+          </InfoHint>
           {(closed > 0 || unknown > 0) && <p>{closed > 0 && `${closed} closed without merging.`}{closed > 0 && unknown > 0 && " "}{unknown > 0 && `${unknown} with status unavailable.`} Included in All.</p>}
         </div>
       </header>

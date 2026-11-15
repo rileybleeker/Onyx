@@ -10,6 +10,7 @@ import { SLEEP_QUESTIONS } from "@/lib/checkin";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
+import InfoHint from "@/components/InfoHint";
 import RangeFilter from "@/components/RangeFilter";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -522,7 +523,7 @@ export default function HabitsPage() {
         <div>
           <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Habits</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Track daily behaviors and build streaks — {rangeLabel(range)}
+            Daily behaviors — {rangeLabel(range)}
             {syncing && <span className="ml-2 text-accent animate-pulse">syncing from Notion...</span>}
           </p>
         </div>
@@ -593,7 +594,11 @@ export default function HabitsPage() {
 
       {/* Today's Checklist */}
       {habits.length > 0 && (
-        <ChartCard title="Today's Habits" subtitle={`${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })} — tap ✓ done or ✕ not done; tap again to clear`}>
+        <ChartCard
+          title="Today's Habits"
+          subtitle={new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}
+          hint="Tap ✓ for done or ✕ for not done; tap the lit one again to clear. Sleep questions are answered on Check-in."
+        >
           <div className="space-y-1">
             {/* Sleep questions are about a finished night and are answered on /check-in ("Last night"), which stores
                 them on the day that night closed. A tap here would write them to today = tonight, so they are left out. */}
@@ -624,7 +629,7 @@ export default function HabitsPage() {
       {habits.length > 0 && (
         <ChartCard
           title="7-Day Rolling Completion Rate"
-          subtitle={`Across ${rangeLabel(range)} — frequency-aware denominator`}
+          subtitle={rangeLabel(range)}
           className="mt-6"
         >
           <ResponsiveContainer width="100%" height={240}>
@@ -690,7 +695,7 @@ export default function HabitsPage() {
       {habits.length > 0 && (
         <ChartCard
           title={`Heatmap — ${rangeLabel(range)}`}
-          subtitle="Click a cell to set it: filled (yes) / red ✕ (no) / blank (not logged)"
+          subtitle="Filled = yes · ✕ = no · blank = not logged · click to change"
           className="mt-6"
         >
           <div className="overflow-x-auto">
@@ -887,9 +892,9 @@ export default function HabitsPage() {
         </ChartCard>
       )}
 
-      {/* Scoring legend */}
+      {/* Scoring rules, closed by default */}
       {habits.length > 0 && (
-        <ChartCard title="How rates & streaks are scored" className="mt-6">
+        <InfoHint label="How rates and streaks are scored" variant="disclosure" summary="How rates & streaks are scored" className="mt-6">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-3 text-[12px] leading-relaxed">
             <div className="flex gap-3">
               <span className="text-text-primary font-mono shrink-0 w-20">daily</span>
@@ -916,12 +921,11 @@ export default function HabitsPage() {
               </span>
             </div>
           </div>
-          <p className="text-[11px] text-text-tertiary/70 mt-4 pt-3 border-t border-border-subtle">
-            Frequency is set per habit in Notion. Longest Streak compares across frequencies by days-equivalent (a weekly streak counts as 7 days per week kept).
-            Each habit/day is tri-state: yes, no, or not logged. An explicit &ldquo;no&rdquo; counts the same as not logged in every rate and streak — it exists to
-            record certainty (you answered) rather than absence (you never said).
+          <p className="text-[11px] text-text-tertiary pt-3 border-t border-border-subtle">
+            Frequency is set per habit in Notion. Longest Streak compares frequencies in days (a kept week counts as 7 days).
+            An explicit &ldquo;no&rdquo; counts the same as not logged in every rate and streak; it records that you answered.
           </p>
-        </ChartCard>
+        </InfoHint>
       )}
 
       {habits.length === 0 && (

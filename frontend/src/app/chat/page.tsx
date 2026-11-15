@@ -85,8 +85,7 @@ export default function ChatPage() {
       <div className="flex items-start justify-between gap-3 mb-5 shrink-0">
         <div>
           <h2 className="text-[28px] font-medium text-text-primary">Chat with Onyx</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">Think, plan, write, or explore your connected data.</p>
-          <p className="text-xs text-text-tertiary mt-2">Conversation stays on this page only. Reloading or leaving clears it. Anything Onyx logs or creates is saved right away and listed under the reply.</p>
+          <p className="text-xs text-text-tertiary mt-1">Reloading or leaving clears this conversation. Anything Onyx logs is saved right away.</p>
         </div>
         <button onClick={newChat} disabled={loading || (!messages.length && !error)} className="shrink-0 text-sm text-text-secondary border border-border-subtle rounded px-3 py-2 disabled:opacity-40">New chat</button>
       </div>
@@ -100,8 +99,7 @@ export default function ChatPage() {
                 <button key={example} onClick={() => { setInput(example); inputRef.current?.focus(); }} className="text-left text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 hover:border-accent">{example}</button>
               ))}
             </div>
-            <p className="text-xs leading-relaxed text-text-tertiary mt-4">Connected tools cover health, habits, supplements, nutrition, journal, reading and Spotify. General help does not require a personal-data lookup.</p>
-            <p className="text-xs leading-relaxed text-text-tertiary mt-2">This chat cannot browse the web, read email or texts, manage your calendar or tasks, or contact agents. For agent messages, open the <Link href="/agents" className="text-accent underline">Agents inbox</Link>.</p>
+            <p className="text-xs leading-relaxed text-text-tertiary mt-4">No web, email, calendar or agents here: for agent messages, open the <Link href="/agents" className="text-accent underline">Agents inbox</Link>.</p>
           </div>
         )}
         {displayed.map((msg, i) => (
@@ -141,7 +139,7 @@ export default function ChatPage() {
           className="flex-1 min-w-0 resize-none bg-surface-card border border-border-subtle rounded px-4 py-3 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent" />
         <button type="submit" disabled={loading || !input.trim()} className="bg-accent hover:bg-accent/90 disabled:opacity-40 text-white px-4 py-3 rounded text-sm font-medium">Send</button>
       </form>
-      <p className="text-xs text-text-tertiary mt-2 shrink-0">Use Send to submit. On a keyboard: Enter sends, Shift+Enter adds a line.</p>
+      <p className="text-xs text-text-tertiary mt-2 shrink-0">On a keyboard: Enter sends, Shift+Enter adds a line.</p>
     </div>
   );
 }

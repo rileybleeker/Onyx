@@ -12,6 +12,7 @@ import {
   type OrderMark,
 } from "@/lib/online-orders";
 import type { OrdersLoad } from "@/lib/online-orders-server";
+import InfoHint from "@/components/InfoHint";
 
 const panel = "rounded-2xl border border-border-default bg-surface-card p-5 sm:p-6";
 const link = "text-xs text-accent underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-accent";
@@ -134,10 +135,13 @@ export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIs
   return (
     <div className="mx-auto max-w-2xl space-y-5">
       <header>
-        <h1 data-testid="page-heading" className="text-[30px] font-medium text-text-primary">Orders</h1>
-        <p className="mt-1 text-sm text-text-secondary">
-          Online orders from shipping and delivery emails (both Gmail accounts) and your Amazon order history, checked every 3 hours.
-        </p>
+        <div className="flex items-center gap-2">
+          <h1 data-testid="page-heading" className="text-[30px] font-medium text-text-primary">Orders</h1>
+          <InfoHint label="Orders">
+            <p>Online orders from shipping and delivery emails (both Gmail accounts) and your Amazon order history, checked every 3 hours.</p>
+            <p>Got it and Hide only change this page. Onyx never replies to, labels or marks these emails.</p>
+          </InfoHint>
+        </div>
         {sync && (
           <p className={`mt-2 text-xs ${syncStale ? "text-amber-300" : "text-text-secondary"}`}>
             Emails last checked {ago(sync.at, now)}{sync.status !== "success" ? ` (that run: ${sync.status})` : ""}
@@ -165,11 +169,11 @@ export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIs
       )}
 
       {section("attention-heading", "Needs attention", <AlertTriangle aria-hidden="true" className="h-5 w-5 text-amber-300" />, groups.attention,
-        "Past its date with no delivery email, a reported delivery problem, or ordered a week ago and not shipped. If it arrived, tap Got it.")}
+        "Late, a delivery problem, or not shipped after a week. If it arrived, tap Got it.")}
       {section("arriving-heading", "On the way", <Truck aria-hidden="true" className="h-5 w-5 text-accent" />, groups.arriving)}
       {section("processing-heading", "Ordered, not shipped yet", <Clock aria-hidden="true" className="h-5 w-5 text-accent" />, groups.processing)}
       {section("unconfirmed-heading", "No delivery email", <Package aria-hidden="true" className="h-5 w-5 text-text-secondary" />, groups.unconfirmed,
-        "These stores don't usually email when a package arrives, so Onyx can't tell. Tap Got it once it's here.")}
+        "These stores don't email on delivery. Tap Got it once it's here.")}
 
       {groups.recent.length > 0 && (
         <section className={panel} aria-labelledby="recent-heading">
@@ -181,9 +185,6 @@ export default function OrdersClient({ data, nowIso }: { data: OrdersLoad; nowIs
           </ul>
         </section>
       )}
-      <p className="pb-4 text-xs text-text-secondary">
-        Got it and Hide only change this page. Onyx never replies to, labels or marks these emails.
-      </p>
     </div>
   );
 }

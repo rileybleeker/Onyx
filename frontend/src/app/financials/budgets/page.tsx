@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { cachedBudgets } from "@/lib/finance-result-cache-server";
+import InfoHint from "@/components/InfoHint";
 import BudgetsView from "./BudgetsView";
 
 // Private financial data: per request on the server, never ISR, never cached by the CDN; owner-only via
@@ -17,9 +18,16 @@ export default async function BudgetsPage() {
         <p className="text-xs uppercase tracking-widest text-text-tertiary">
           <Link href="/financials" className="hover:text-text-secondary">Financials</Link> / Budgets
         </p>
-        <h1 data-testid="page-heading" className="text-2xl font-semibold">Budgets</h1>
-        <p className="mt-2 text-text-secondary">
-          This month&apos;s spending by category against your budgets, where it is heading, and what changed. Card payments and transfers are not spending, so a card purchase counts once.{" "}
+        <div className="flex items-center gap-2">
+          <h1 data-testid="page-heading" className="text-2xl font-semibold">Budgets</h1>
+          <InfoHint label="Budgets">
+            <p>
+              This month&apos;s spending by category against your budgets, where it is heading, and what changed. Card payments and
+              transfers are not spending, so a card purchase counts once.
+            </p>
+          </InfoHint>
+        </div>
+        <p className="mt-2 text-[13px]">
           <Link href="/financials/forecast" className="text-accent hover:underline">Cash forecast →</Link>
         </p>
       </header>
