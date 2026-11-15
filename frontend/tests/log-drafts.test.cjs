@@ -59,7 +59,7 @@ test("memory only: the store never touches storage or the network", () => {
   const src = read("lib/log-drafts.ts");
   assert.ok(!/localStorage|sessionStorage|indexedDB|fetch\(/.test(src.replace(/^\s*(\*|\/\/).*$/gm, "")));
   assert.equal(D.FROM_WHAT_YOU_SAID, "from what you said");
-  assert.deepEqual([...D.LOG_SECTIONS], ["checkin", "supplements", "ubereats", "weight", "reading"]);
+  assert.deepEqual([...D.LOG_SECTIONS], ["checkin", "journal", "supplements", "ubereats", "weight", "reading"]);
 });
 
 test("useLogDrafts renders the section's current draft", () => {
@@ -87,9 +87,9 @@ test("the frame: nav item, Quick access, scroll entry, bottom bar, warm-up", () 
 test("the sections are Personalize parts in the default order, each its own file", () => {
   const client = read("app/log/LogClient.tsx");
   const ids = [...client.matchAll(/<Part id="([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(ids, ["say-it", "check-in", "supplements", "uber-eats", "weight", "reading"]);
+  assert.deepEqual(ids, ["say-it", "check-in", "journal", "supplements", "uber-eats", "weight", "reading"]);
   assert.match(client, /<PartGrid page="\/log" title="Log">/);
-  for (const f of ["SayIt", "CheckIn", "Supplements", "UberEats", "Weight", "Reading"]) {
+  for (const f of ["SayIt", "CheckIn", "Journal", "Supplements", "UberEats", "Weight", "Reading"]) {
     assert.match(client, new RegExp(`import\("\./sections/${f}"\)`), f);
     assert.ok(fs.existsSync(path.join(SRC, "app/log/sections", `${f}.tsx`)), f);
   }
@@ -113,6 +113,23 @@ test("the skeletons stay server-safe (loading.tsx renders them on the server)", 
     assert.ok(!/from "@\/lib\/log-drafts"/.test(text), `${f} must not import lib/log-drafts.ts (hooks)`);
   }
   assert.match(read("app/log/sections/ui.tsx"), /const FROM_WHAT_YOU_SAID = "from what you said";/);
+});
+
+test("journal drafts: the Journal section reads them; the embedded check-in sends its own there, not to a card", () => {
+  D.clearAllLogDrafts();
+  const d = D.setLogDraft("journal", { body: "Synthetic words.", source: "voice", title: null, mood: null, confidence: null, topics: [] }, "Synthetic words.");
+  assert.equal(D.getLogDraft("journal").id, d.id);
+  const section = read("app/log/sections/Journal.tsx");
+  assert.match(section, /useLogDrafts\("journal"\)/);
+  assert.match(section, /export const REPLACES_CHECKIN_JOURNAL_DRAFT = true;/);
+  assert.match(read("app/log/sections/CheckIn.tsx"), /REPLACES_CHECKIN_JOURNAL_DRAFT \? \["journal-draft"\]/);
+  const checkin = read("app/check-in/CheckInClient.tsx");
+  assert.match(checkin, /if \(omit\.has\("journal-draft"\)\) \{[\s\S]{0,400}setLogDraft\("journal"/);
+  assert.match(checkin, /\{journal && !omit\.has\("journal-draft"\) && \(/);
+  // The only write: Save -> POST /api/journal/file.
+  assert.deepEqual([...section.matchAll(/fetch\("([^"]+)"/g)].map((m) => m[1]), ["/api/journal/file"]);
+  assert.match(section, /method: "POST"/);
+  assert.match(read("components/AppData.tsx"), /"\/log": \(\) => \[[^\]]*journalTodayUrl\(new Date\(\)\)/);
 });
 
 test("nothing on /log writes on open: no write in the frame or the placeholders", () => {

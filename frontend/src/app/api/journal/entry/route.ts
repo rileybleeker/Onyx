@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
-import { easternDate, JOURNAL_MAX_REQUEST_BYTES, notionJournalPage, sameEntryQuery, validateJournalEntry } from "@/lib/journal-entry";
+import { easternDate, JOURNAL_MAX_REQUEST_BYTES, sameEntryQuery, validateJournalEntry } from "@/lib/journal-entry";
+import { createJournalPage, notionConfigured, notionPost, notionRefusalMessage, NotionRefused, NOTION_JOURNAL_DB, pageUrl } from "@/lib/journal-file-server";
 
 // POST /api/journal/entry   Body: { date, title, mood, confidence, source, topics, body }
 //
@@ -8,6 +9,7 @@ import { easternDate, JOURNAL_MAX_REQUEST_BYTES, notionJournalPage, sameEntryQue
 // pds.journal_entries hourly at :35). Notion stays the journal's single write surface: this route never writes
 // pds.journal_entries itself, so the entry reaches /journal and the chat's journal search on the next sync.
 // Used by the /check-in journal draft, only when Riley presses "Save to journal" after reviewing it.
+// (The /log Journal section uses POST /api/journal/file, which also fills blank labels; same Notion calls.)
 //
 // Journal rules (AGENTS.md "When creating a journal entry in Notion"): Title, Date, Source, Confidence, Mood and
 // Topics are all required here, and the body is written exactly as sent (paragraphs at blank lines).
@@ -19,30 +21,9 @@ import { easternDate, JOURNAL_MAX_REQUEST_BYTES, notionJournalPage, sameEntryQue
 
 export const maxDuration = 30;
 
-const NOTION_API_KEY = process.env.NOTION_API_KEY;
-const NOTION_JOURNAL_DB = process.env.NOTION_JOURNAL_DB || "96541038264d45aba2a9601d9b175a7e";
-const NOTION_VERSION = "2022-06-28";
-
-const notion = (path: string, body: unknown) =>
-  fetch(`https://api.notion.com/v1/${path}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${NOTION_API_KEY}`, "Notion-Version": NOTION_VERSION, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
-
-const pageUrl = (page: unknown): string | null => {
-  const url = (page as { url?: unknown } | null)?.url;
-  return typeof url === "string" && url.startsWith("https://") ? url : null;
-};
-
 function refusedByNotion(status: number) {
   console.error("[journal-entry] notion", status);
-  const error =
-    status === 401 || status === 403 || status === 404
-      ? "Notion refused: share the Journal database with the Onyx Notion integration, then try again."
-      : `Notion didn't take the entry (${status}). It is still here; try again.`;
-  return NextResponse.json({ error }, { status: 502 });
+  return NextResponse.json({ error: notionRefusalMessage(status) }, { status: 502 });
 }
 
 export async function POST(req: NextRequest) {
@@ -60,19 +41,18 @@ export async function POST(req: NextRequest) {
   }
   const v = validateJournalEntry(parsed, easternDate(new Date()));
   if (!v.ok) return NextResponse.json({ error: v.error }, { status: 400 });
-  if (!NOTION_API_KEY) return NextResponse.json({ error: "NOTION_API_KEY not configured" }, { status: 500 });
+  if (!notionConfigured()) return NextResponse.json({ error: "NOTION_API_KEY not configured" }, { status: 500 });
 
   try {
     // Already saved (a retry after a lost answer, or a second tap)? Return that entry.
-    const found = await notion(`databases/${NOTION_JOURNAL_DB}/query`, sameEntryQuery(v.entry));
+    const found = await notionPost(`databases/${NOTION_JOURNAL_DB}/query`, sameEntryQuery(v.entry));
     if (!found.ok) return refusedByNotion(found.status);
     const existing = ((await found.json()) as { results?: unknown[] }).results?.[0];
     if (existing) return NextResponse.json({ url: pageUrl(existing), existing: true });
 
-    const created = await notion("pages", notionJournalPage(v.entry, NOTION_JOURNAL_DB));
-    if (!created.ok) return refusedByNotion(created.status);
-    return NextResponse.json({ url: pageUrl(await created.json()) });
-  } catch {
+    return NextResponse.json({ url: await createJournalPage(v.entry) });
+  } catch (e) {
+    if (e instanceof NotionRefused) return refusedByNotion(e.status);
     console.error("[journal-entry] unreachable");
     return NextResponse.json({ error: "Couldn't reach Notion. The entry is still here; try again." }, { status: 502 });
   }

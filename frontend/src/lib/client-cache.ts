@@ -33,7 +33,8 @@ export const APP_STORAGE_PREFIXES = ["onyx", "chartCard."];
 
 // Keys whose data never touches the disk. URL keys are the GET path + query; other keys are "<area>:<name>".
 const SENSITIVE: RegExp[] = [
-  /^\/api\/(finance|procurement|medical|screen-time|spotify|focus|experiments)(\/|\?|$)/,
+  // journal: the personal journal's titles, moods and snippets (the /log Journal section's read).
+  /^\/api\/(finance|procurement|medical|screen-time|spotify|focus|experiments|journal)(\/|\?|$)/,
   /^\/(financials|procurement|screen-time|health\/records)(\/|\?|$)/,
   /^(finance|procurement|medical|screen-time|spotify|experiments):/,
   /token|auth|secret|session|password|callback|exchange|credential|install/i,
