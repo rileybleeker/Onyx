@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { AGENTS_API, agentsApi, type InboxResponse } from "@/lib/agents-api";
 import { NAV_ITEMS } from "@/lib/nav";
+import { overviewWarmers } from "@/components/overview/sources";
 import {
   CACHE_KEYS, clientCache, fetchJsonValue, reportSessionEnded, sessionEnded, setSessionEndedHandler, wipeClientData, writeInvalidates,
 } from "@/lib/client-cache";
@@ -52,6 +53,8 @@ const DATA: Record<string, () => DataWarmer[]> = {
       json("/api/orders/summary"),
       json("/api/procurement/renewals/summary"),
       json("/api/finance/alerts"),
+      // The overview cards under Today's panels (shown cards only; memory-only and Today's own keys excluded).
+      ...overviewWarmers(),
     ];
   },
   "/check-in": () => [json("/api/habits/checkin")],

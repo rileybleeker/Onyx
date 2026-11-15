@@ -26,6 +26,10 @@ component = component.replace(/require\("@\/lib\/format"\)/g, `require(${formatL
 // How current the money alerts are (import-free).
 const moneyLib = ids.size; ids.set('frontend/src/lib/money-alerts-view.ts', moneyLib); modules[moneyLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/money-alerts-view.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/money-alerts-view"\)/g, `require(${moneyLib})`);
+// The overview cards under Today's panels (components/overview/) load as their own chunk and have their own
+// tests (frontend/tests/overview-cards.test.cjs); here they render nothing, so this file keeps checking Today's
+// own panels and exactly the requests those panels make.
+component = component.replace(/require\("@\/components\/overview\/TodayOverview"\)/g, '({__esModule:true,default:()=>null})');
 // GET /api/experiments/today answers (synthetic). "none" is the usual case: no trial registered.
 const experimentFixtures = {
     none: { status: 'none' },
