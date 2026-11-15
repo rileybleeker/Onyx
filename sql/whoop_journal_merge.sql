@@ -1,5 +1,8 @@
 -- ============================================================================
 -- WHOOP journal → habit_journal merge (2026-06-11)
+-- NOTE 2026-11-14: pds.set_onyx_dates_habit_journal is redefined in
+-- sql/tz_derivation_edge_cases.sql (pending Riley's apply). Once applied, that file holds
+-- the current definition; do not re-run the copy below.
 -- ============================================================================
 -- Replaces the WHOOP in-app journal (manual CSV export → email ETL) with the
 -- Onyx habits system. ALL behavior data now lives in ONE table:
