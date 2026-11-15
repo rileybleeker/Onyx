@@ -16,7 +16,7 @@ import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import DeferredMount from "@/components/DeferredMount";
-import { Part, PartGrid } from "@/components/personalize/PartGrid";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
@@ -24,6 +24,18 @@ import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-mono)" };
+
+// A section heading of the page (the header of its Personalize group). `divider`: the rule above it.
+function SectionLabel({ children, divider = false }: { children: string; divider?: boolean }) {
+  return (
+    <>
+      {divider ? <div className="border-t border-border-subtle mb-8" /> : null}
+      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">{children}</p>
+    </>
+  );
+}
+
+const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "other";
 
 // Temps come from the Eight Sleep / WHOOP APIs in °C. Convert to °F at the
 // display layer for the US-based reader. Returns null for null/undefined input.
@@ -394,6 +406,32 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
     ? eightSleep.reduce((a, d) => a + (d.snore_duration_seconds ?? 0), 0) / snoreNightsTracked / 60
     : null;
 
+  // ── Behaviors (journal heatmap) ──────────────────────────────────────────────
+  // `behaviors_date` is the calendar day the journal answer describes
+  // (the day the user was awake leading into bedtime). Computed at the
+  // DB layer via trigger from each cycle's start_time − 6h in local TZ;
+  // falls back to cycle_date for rows without a matching cycle.
+  const journalDate = (j: any) => j.behaviors_date ?? j.cycle_date;
+  const behaviors = [...new Set(journal.map((j: any) => j.question))].sort();
+  const dates     = [...new Set(journal.map(journalDate))].sort();
+  const journalMap = new Map<string, string>();
+  journal.forEach((j: any) => {
+    journalMap.set(`${journalDate(j)}|${j.question}`, j.answer);
+  });
+  const categoryMap = new Map<string, string[]>();
+  journal.forEach((j: any) => {
+    const cat = j.category || "Other";
+    if (!categoryMap.has(cat)) categoryMap.set(cat, []);
+    const list = categoryMap.get(cat)!;
+    if (!list.includes(j.question)) list.push(j.question);
+  });
+  const behaviorCategories = [...categoryMap.entries()];
+  const isPositive = (answer: string | undefined) => {
+    if (!answer) return false;
+    const a = answer.toLowerCase();
+    return a === "yes" || a === "true" || (parseFloat(a) > 0 && !isNaN(parseFloat(a)));
+  };
+
   return (
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
@@ -409,9 +447,8 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
 
       <PartGrid page="/sleep" title="Sleep & Recovery">
       {/* ── WHOOP Recovery ──────────────────────────────────────────────────── */}
-      <Part id="whoop-recovery" title="WHOOP recovery tiles">
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Recovery</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 items-stretch">
+      <PartGroup id="section-whoop-recovery" title="WHOOP · Recovery" header={<SectionLabel>WHOOP · Recovery</SectionLabel>}>
+        <Part id="tile-recovery" title="Recovery (ring)" width="quarter">
         <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Recovery"
@@ -423,6 +460,8 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
               : rangeNote}
           />
         </div>
+        </Part>
+        <Part id="tile-day-strain" title="Day Strain (ring)" width="quarter">
         <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing
             label="Day Strain"
@@ -433,10 +472,13 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
             sublabel="of 21"
           />
         </div>
+        </Part>
+        <Part id="tile-whoop-hrv" title="HRV (WHOOP)" width="quarter">
         <StatCard label="HRV" value={avgWhoopHrv != null ? avgWhoopHrv.toFixed(0) : null} unit="ms" sublabel={rangeNote} source="WHOOP" />
+        </Part>
+        <Part id="tile-whoop-rhr" title="Resting HR (WHOOP)" width="quarter">
         <StatCard label="Resting HR" value={avgWhoopRhr != null ? avgWhoopRhr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="WHOOP" />
-      </div>
-      </Part>
+        </Part>
 
         <Part id="recovery-score" title="Recovery Score" width="half">
         <ChartCard title="Recovery Score" source="WHOOP">
@@ -496,11 +538,11 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
           </ResponsiveContainer>
         </ChartCard>
         </Part>
+      </PartGroup>
 
       {/* ── WHOOP Sleep ─────────────────────────────────────────────────────── */}
-      <Part id="whoop-sleep" title="WHOOP sleep tiles">
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">WHOOP · Sleep</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <PartGroup id="section-whoop-sleep" title="WHOOP · Sleep" header={<SectionLabel>WHOOP · Sleep</SectionLabel>}>
+        <Part id="tile-whoop-duration" title="Duration (WHOOP)" width="quarter">
         <StatCard
           label="Duration"
           value={avgInBedMs != null ? formatDurationMs(avgInBedMs + avgWhoopNapMs) : null}
@@ -511,13 +553,22 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
           }
           source="WHOOP"
         />
+        </Part>
+        <Part id="tile-hours-vs-needed" title="Hours vs Needed (tile)" width="quarter">
         <StatCard label="Hours vs Needed" value={avgHoursVsNeeded != null ? `${avgHoursVsNeeded.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
+        </Part>
+        <Part id="tile-sleep-performance" title="Sleep Performance" width="quarter">
         <StatCard label="Sleep Performance" value={avgSleepPerf != null ? `${avgSleepPerf.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
+        </Part>
+        <Part id="tile-sleep-efficiency" title="Sleep Efficiency" width="quarter">
         <StatCard label="Sleep Efficiency" value={avgSleepEff != null ? `${avgSleepEff.toFixed(0)}%` : null} sublabel={rangeNote} source="WHOOP" />
+        </Part>
+        <Part id="tile-deep-sleep" title="Deep Sleep" width="quarter">
         <StatCard label="Deep Sleep" value={avgDeepMs != null ? formatDurationMs(avgDeepMs) : null} sublabel={rangeNote} source="WHOOP" />
+        </Part>
+        <Part id="tile-rem-sleep" title="REM Sleep" width="quarter">
         <StatCard label="REM Sleep" value={avgRemMs != null ? formatDurationMs(avgRemMs) : null} sublabel={rangeNote} source="WHOOP" />
-      </div>
-      </Part>
+        </Part>
 
         <Part id="time-in-bed" title="Time in Bed">
         <DeferredMount minHeight={345}>
@@ -687,108 +738,79 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
           </ChartCard>
         </DeferredMount>
         </Part>
+      </PartGroup>
 
       {/* ── Behaviors ───────────────────────────────────────────────────────── */}
-      {journal.length > 0 && <Part id="behaviors" title="Behaviors"><DeferredMount minHeight={1100}>{(() => {
-        // `behaviors_date` is the calendar day the journal answer describes
-        // (the day the user was awake leading into bedtime). Computed at the
-        // DB layer via trigger from each cycle's start_time − 6h in local TZ;
-        // falls back to cycle_date for rows without a matching cycle.
-        const journalDate = (j: any) => j.behaviors_date ?? j.cycle_date;
-
-        const behaviors = [...new Set(journal.map((j: any) => j.question))].sort();
-        const dates     = [...new Set(journal.map(journalDate))].sort();
-        const journalMap = new Map<string, string>();
-        journal.forEach((j: any) => {
-          journalMap.set(`${journalDate(j)}|${j.question}`, j.answer);
-        });
-
-        const categoryMap = new Map<string, string[]>();
-        journal.forEach((j: any) => {
-          const cat = j.category || "Other";
-          if (!categoryMap.has(cat)) categoryMap.set(cat, []);
-          const list = categoryMap.get(cat)!;
-          if (!list.includes(j.question)) list.push(j.question);
-        });
-
-        const isPositive = (answer: string | undefined) => {
-          if (!answer) return false;
-          const a = answer.toLowerCase();
-          return a === "yes" || a === "true" || (parseFloat(a) > 0 && !isNaN(parseFloat(a)));
-        };
-
-        return (
-          <>
-            <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-4">Behaviors</p>
-
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-              {[...categoryMap.entries()].map(([cat, qs]) => (
-                <div key={cat} className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4">
-                  <p className="text-[10px] text-text-tertiary font-mono font-medium uppercase tracking-wider">{cat}</p>
-                  <p className="text-lg font-semibold text-text-primary mt-1">{qs.length} behavior{qs.length !== 1 ? "s" : ""}</p>
-                  <p className="text-xs text-text-tertiary mt-1">{qs.slice(0, 3).join(", ")}{qs.length > 3 ? "…" : ""}</p>
-                </div>
-              ))}
+      {journal.length > 0 && (
+      <PartGroup id="section-behaviors" title="Behaviors" header={<SectionLabel>Behaviors</SectionLabel>}>
+        {behaviorCategories.map(([cat, qs]) => (
+          <Part key={cat} id={`behavior-category-${slug(cat)}`} title={`Behaviors: ${cat}`} width="quarter">
+            <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4">
+              <p className="text-[10px] text-text-tertiary font-mono font-medium uppercase tracking-wider">{cat}</p>
+              <p className="text-lg font-semibold text-text-primary mt-1">{qs.length} behavior{qs.length !== 1 ? "s" : ""}</p>
+              <p className="text-xs text-text-tertiary mt-1">{qs.slice(0, 3).join(", ")}{qs.length > 3 ? "…" : ""}</p>
             </div>
-
-            <ChartCard title="Behavior Heatmap">
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr>
-                      <th className="text-left align-bottom bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal pr-3 pb-2 sticky left-0 bg-surface-card min-w-[140px]">Behavior</th>
-                      {dates.map((d) => (
-                        <th key={d} className="align-bottom bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal px-0.5 min-w-[36px]">
-                          <div className="h-14 flex items-end justify-center">
-                            <span className="rotate-[-45deg] origin-bottom-left whitespace-nowrap translate-x-2">
-                              {formatDate(d)}
-                            </span>
-                          </div>
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {behaviors.map((b) => (
-                      <tr key={b} className="border-b border-white/5 hover:bg-white/[0.02]">
-                        <td className="text-text-secondary pr-3 py-1 sticky left-0 bg-surface-card truncate max-w-[160px]" title={b}>{b}</td>
-                        {dates.map((d) => {
-                          const answer = journalMap.get(`${d}|${b}`);
-                          const active = isPositive(answer);
-                          return (
-                            <td key={d} className="px-0.5 py-1 text-center">
-                              <div
-                                className={`w-5 h-5 rounded-sm mx-auto ${active ? "bg-green-500/80" : "bg-white/5"}`}
-                                title={answer ? `${b}: ${answer}` : `${b}: —`}
-                              />
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </ChartCard>
-          </>
-        );
-      })()}</DeferredMount></Part>}
+          </Part>
+        ))}
+        <Part id="behavior-heatmap" title="Behavior Heatmap">
+        <DeferredMount minHeight={980}>
+        <ChartCard title="Behavior Heatmap">
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr>
+                  <th className="text-left align-bottom bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal pr-3 pb-2 sticky left-0 bg-surface-card min-w-[140px]">Behavior</th>
+                  {dates.map((d) => (
+                    <th key={d} className="align-bottom bg-surface text-text-tertiary uppercase text-[10px] font-mono tracking-wider font-normal px-0.5 min-w-[36px]">
+                      <div className="h-14 flex items-end justify-center">
+                        <span className="rotate-[-45deg] origin-bottom-left whitespace-nowrap translate-x-2">
+                          {formatDate(d)}
+                        </span>
+                      </div>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {behaviors.map((b) => (
+                  <tr key={b} className="border-b border-white/5 hover:bg-white/[0.02]">
+                    <td className="text-text-secondary pr-3 py-1 sticky left-0 bg-surface-card truncate max-w-[160px]" title={b}>{b}</td>
+                    {dates.map((d) => {
+                      const answer = journalMap.get(`${d}|${b}`);
+                      const active = isPositive(answer);
+                      return (
+                        <td key={d} className="px-0.5 py-1 text-center">
+                          <div
+                            className={`w-5 h-5 rounded-sm mx-auto ${active ? "bg-green-500/80" : "bg-white/5"}`}
+                            title={answer ? `${b}: ${answer}` : `${b}: —`}
+                          />
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </ChartCard>
+        </DeferredMount>
+        </Part>
+      </PartGroup>
+      )}
 
       {/* ── Garmin Cardiac ──────────────────────────────────────────────────── */}
-      <Part id="garmin-cardiac" title="Garmin cardiac tiles">
-      <div className="border-t border-border-subtle mb-8" />
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">GARMIN · Cardiac</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <PartGroup id="section-garmin-cardiac" title="Garmin · Cardiac" header={<SectionLabel divider>GARMIN · Cardiac</SectionLabel>}>
+        <Part id="tile-garmin-rhr" title="Avg RHR (Garmin)" width="quarter">
         <StatCard label="Avg RHR" value={avgGarminRhr != null ? avgGarminRhr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
-      </div>
-      </Part>
+        </Part>
+      </PartGroup>
 
       {/* ── Eight Sleep ─────────────────────────────────────────────────────── */}
-      <Part id="eight-sleep" title="Eight Sleep tiles">
-      <div className="border-t border-border-subtle mb-8" />
-      <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest mb-3">Eight Sleep</p>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <PartGroup id="section-eight-sleep" title="Eight Sleep" header={<SectionLabel divider>Eight Sleep</SectionLabel>}>
+        <Part id="tile-eight-score" title="Sleep Score (Eight Sleep)" width="quarter">
         <StatCard label="Sleep Score" value={avgEightSleep != null ? avgEightSleep.toFixed(0) : null} sublabel={rangeNote} source="8SLP" />
+        </Part>
+        <Part id="tile-eight-duration" title="Duration (Eight Sleep)" width="quarter">
         <StatCard
           label="Duration"
           value={avgEightDuration != null ? formatDuration(Math.round(avgEightDuration)) : null}
@@ -799,10 +821,13 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
           }
           source="8SLP"
         />
+        </Part>
+        <Part id="tile-eight-hrv" title="HRV (Eight Sleep)" width="quarter">
         <StatCard label="HRV" value={avgEightHrv != null ? avgEightHrv.toFixed(0) : null} unit="ms" sublabel={rangeNote} source="8SLP" />
+        </Part>
+        <Part id="tile-eight-latency" title="Sleep Latency (tile)" width="quarter">
         <StatCard label="Sleep Latency" value={avgEightLatency != null ? (avgEightLatency / 60).toFixed(0) : null} unit="min" sublabel={rangeNote} source="8SLP" />
-      </div>
-      </Part>
+        </Part>
 
         <Part id="eight-scores" title="Sleep Scores (Eight Sleep)" width="half">
         <DeferredMount minHeight={325}>
@@ -937,6 +962,7 @@ export default function SleepPage({ initial, headingTestId = "page-heading" }: {
           </ChartCard>
         </DeferredMount>
         </Part>
+      </PartGroup>
       </PartGrid>
     </>
   );
