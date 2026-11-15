@@ -25,6 +25,8 @@ const Sidebar = load('src/components/Sidebar.tsx', {
   'next/navigation': { usePathname: () => pathname, useRouter: () => ({ push() {} }) },
   '@/lib/nav': nav,
   '@/lib/supabase-browser': { createSupabaseBrowser: () => { throw new Error('No auth access in fixture'); } },
+  '@/lib/client-cache': { wipeClientData: async () => {} },
+  '@/lib/warmup': { navIntentProps: () => ({}) },
   './CommandPalette': { OPEN_COMMAND_PALETTE: 'test-open-palette' },
   './DesktopApp': {
     InstallAppButton: () => React.createElement('button', null, 'Install fixture'),

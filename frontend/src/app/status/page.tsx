@@ -5,6 +5,7 @@ import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import { sameJson } from "@/lib/format";
+import { clientCache } from "@/lib/client-cache";
 import SpotifyReconnect from "@/components/SpotifyReconnect";
 import { needsSpotifyReconnect } from "@/lib/spotify-reconnect";
 import type { DriftAlert, SourceStatus, StatusResponse, TzGapRow } from "@/app/api/status/route";
@@ -338,16 +339,20 @@ function RefreshedLabel({ refreshedAtRef }: { refreshedAtRef: RefObject<Date | n
   );
 }
 
+const STATUS_URL = "/api/status";
+
 export default function StatusPage() {
-  const [data, setData] = useState<StatusResponse | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Start from the cached copy (instant revisit / reopen), then revalidate.
+  const [data, setData] = useState<StatusResponse | null>(() => clientCache.peek<StatusResponse>(STATUS_URL) ?? null);
+  const [loading, setLoading] = useState(() => data === null);
   const refreshedAtRef = useRef<Date | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch("/api/status");
+      const res = await fetch(STATUS_URL);
       if (res.ok) {
         const fresh: StatusResponse = await res.json();
+        clientCache.put(STATUS_URL, fresh);
         // Bail out of the commit when the poll returned the same payload
         // (perf round 3): fetchedAt is volatile — the server stamps it on
         // every response — so compare everything EXCEPT it, or the guard
@@ -365,6 +370,17 @@ export default function StatusPage() {
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  // Reopening the app: the copy kept on this device until the live answer arrives.
+  useEffect(() => {
+    let alive = true;
+    void clientCache.read<StatusResponse>(STATUS_URL).then((cached) => {
+      if (!alive || !cached) return;
+      setData((prev) => prev ?? cached);
+      setLoading(false);
+    });
+    return () => { alive = false; };
   }, []);
 
   useEffect(() => {

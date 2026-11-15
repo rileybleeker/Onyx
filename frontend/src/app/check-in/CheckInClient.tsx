@@ -5,7 +5,8 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, Moon, Sun, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
 import { VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
-import { addDays, kitSummary, nightLabel, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
+import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
+import { clientCache } from "@/lib/client-cache";
 import { buildCells, savePlan, visibleNights, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
 import { CheckinDraftStore, dayDraftKey, nightDraftKey, recoveryTarget, type DatedDraft } from "@/lib/checkin-drafts";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
@@ -49,6 +50,8 @@ class StaleDayError extends Error {}
 const isNightItem = (i: CheckinItem) => i.sleep;
 /** Reload when the app comes back after this long: "Last night" must never be a day old. */
 const RELOAD_AFTER_MS = 60_000;
+// The GET this screen makes; its answer is cached under this URL (shared with the warm-up).
+const checkinUrl = (date: string | null) => `/api/habits/checkin${date ? `?date=${date}` : ""}`;
 
 function dayLabel(date: string, today: string): string {
   const d = new Date(date + "T12:00:00Z");
@@ -97,6 +100,28 @@ export default function CheckInClient() {
   const deferredLoad = useRef<{ date: string | null } | null>(null);
 
   const loadSeq = useRef(0);
+  // Set once a GET answered: a cached copy is shown only before that.
+  const answeredRef = useRef(false);
+
+  // Draw the screen from a check-in answer (fresh, or the cached copy shown while the fresh one loads).
+  const show = useCallback((payload: CheckinPayload) => {
+    drafts.prepare(payload);
+    const day = buildCells(
+      payload.items.filter((i) => !isNightItem(i)),
+      payload.answers,
+      payload.suggestions,
+      drafts.active(dayDraftKey(payload.date))
+    );
+    const sleepItems = payload.items.filter(isNightItem);
+    const nights: Record<string, Cells> = {};
+    for (const n of payload.nights ?? []) nights[n.date] = buildCells(sleepItems, n.answers, n.suggestions, drafts.active(nightDraftKey(n.date)));
+    setData(payload);
+    setRefreshFailed(false);
+    setCells(day);
+    setNightCells(nights);
+    // Open "Also did" when it holds a saved or pre-filled answer, so nothing is saved out of sight.
+    setShowExtras(payload.items.some((i) => i.group === "extra" && day[i.name]));
+  }, [drafts]);
 
   const load = useCallback(async (date: string | null, afterSave = false) => {
     // Back/forward can change the URL even while the tabs are disabled. Finish the dated save first.
@@ -109,7 +134,8 @@ export default function CheckInClient() {
     setError(null);
     setSavedAt(null);
     try {
-      const res = await fetch(`/api/habits/checkin${date ? `?date=${date}` : ""}`, { cache: "no-store" });
+      const url = checkinUrl(date);
+      const res = await fetch(url, { cache: "no-store" });
       const json = await res.json().catch(() => ({}));
       if (seq !== loadSeq.current) return;
       if (!res.ok) {
@@ -118,28 +144,16 @@ export default function CheckInClient() {
         if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
           drafts.holdAll();
           setData(null);
+          clientCache.remove(url); // the server refused it: never show that cached copy again
         }
         setRefreshFailed(true);
         setError(json.error || `Couldn't load the check-in (${res.status}).`);
         return;
       }
       const payload = json as CheckinPayload;
-      drafts.prepare(payload);
-      const day = buildCells(
-        payload.items.filter((i) => !isNightItem(i)),
-        payload.answers,
-        payload.suggestions,
-        drafts.active(dayDraftKey(payload.date))
-      );
-      const sleepItems = payload.items.filter(isNightItem);
-      const nights: Record<string, Cells> = {};
-      for (const n of payload.nights ?? []) nights[n.date] = buildCells(sleepItems, n.answers, n.suggestions, drafts.active(nightDraftKey(n.date)));
-      setData(payload);
-      setRefreshFailed(false);
-      setCells(day);
-      setNightCells(nights);
-      // Open "Also did" when it holds a saved or pre-filled answer, so nothing is saved out of sight.
-      setShowExtras(payload.items.some((i) => i.group === "extra" && day[i.name]));
+      answeredRef.current = true;
+      clientCache.put(url, payload);
+      show(payload);
     } catch {
       if (seq === loadSeq.current) {
         setRefreshFailed(true);
@@ -147,7 +161,7 @@ export default function CheckInClient() {
       }
     }
     finally { if (seq === loadSeq.current) refreshDrafts(); }
-  }, [drafts, refreshDrafts]);
+  }, [drafts, refreshDrafts, show]);
 
   useEffect(() => {
     // Discover recovery records even if the requested date has expired or the GET cannot load.
@@ -164,6 +178,19 @@ export default function CheckInClient() {
   }, [drafts, refreshDrafts]);
 
   useEffect(() => {
+    // Show the cached copy at once while the GET runs, but only when it is for the current behavioral day and
+    // no unsaved tap is waiting: a draft is always judged against a fresh answer. The POST's `today` guard and
+    // the drafts' stored-answer check still protect a tap made on the cached copy.
+    let alive = true;
+    answeredRef.current = false;
+    const seed = (cached: CheckinPayload | undefined) => {
+      if (!alive || !cached || answeredRef.current || !Array.isArray(cached.items)) return;
+      if (cached.today !== fallbackBehavioralToday(new Date()) || drafts.hasPending()) return;
+      show(cached);
+    };
+    const hit = clientCache.peek<CheckinPayload>(checkinUrl(requested));
+    if (hit) seed(hit);
+    else void clientCache.read<CheckinPayload>(checkinUrl(requested)).then(seed);
     load(requested);
     // A page left open (or an installed app resumed) keeps the `today` it loaded with, so after the day rolls
     // over its "Last night" would be the night before. Reload on return; unsaved taps come back from the drafts.
@@ -173,10 +200,11 @@ export default function CheckInClient() {
     document.addEventListener("visibilitychange", back);
     window.addEventListener("pageshow", back);
     return () => {
+      alive = false;
       document.removeEventListener("visibilitychange", back);
       window.removeEventListener("pageshow", back);
     };
-  }, [load, requested]);
+  }, [load, requested, drafts, show]);
 
   // One or several answers at once. scope = null for the day tab, or the night's date for a sleep block.
   const apply = (scope: string | null, patch: Patch) => {

@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Search, CornerDownLeft } from "lucide-react";
 import { NAV_ITEMS, type NavItem } from "@/lib/nav";
+import { warmRoute } from "@/lib/warmup";
 
 /** Fire this to open the palette from a button: window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE)) */
 export const OPEN_COMMAND_PALETTE = "onyx:open-command-palette";
@@ -80,6 +81,14 @@ export default function CommandPalette() {
       return () => clearTimeout(t);
     }
   }, [open]);
+
+  // Warm the highlighted page so Enter lands on loaded data (the warm-up usually has it already).
+  const highlighted = open ? results[active]?.href : undefined;
+  useEffect(() => {
+    if (!highlighted) return;
+    const t = setTimeout(() => warmRoute(highlighted), 120);
+    return () => clearTimeout(t);
+  }, [highlighted]);
 
   // Keep the active index within the (changing) result set.
   useEffect(() => {

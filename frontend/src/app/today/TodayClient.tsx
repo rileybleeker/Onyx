@@ -15,6 +15,9 @@ import type { RenewalSummary } from "@/lib/procurement-renewals";
 import { type CalendarEventsResponse, CALENDAR_SOURCE_LABEL, eventTitle, eventsByDay, localDate, readCalendarResponse, shiftDate, syncHealth, timeLabel } from "@/lib/calendar-events";
 // Import-free too (bundled by name in the same test).
 import { type EmailClearMark, MAX_CLEAR_ITEMS, clearedLabel, hiddenEmailKey } from "@/lib/today-clear";
+// Import-free too: the shared client cache (Today renders from it at once, then revalidates) and sameJson.
+import { CACHE_KEYS, clientCache, isGoneStatus } from "@/lib/client-cache";
+import { sameJson } from "@/lib/format";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -62,22 +65,96 @@ function requestHref(item: RequestCard): string {
   return `/agents?${new URLSearchParams({ t: item.thread })}#m${item.messageId}`;
 }
 
+// Each answer is checked before it is shown or cached; a cached copy is checked again before it is used.
+function parseInbox(data: unknown): InboxResponse {
+  const v = data as InboxResponse | null;
+  if (!v || !Array.isArray(v.items) || !Array.isArray(v.threads)) throw new Error("Invalid inbox");
+  return v;
+}
+function parseReading(data: unknown): ReadingOverview | null {
+  const v = data as { overview?: ReadingOverview | null } | null;
+  if (!v || !("overview" in v) || (v.overview !== null && !v.overview?.book?.title)) throw new Error("Invalid reading");
+  return v.overview ?? null;
+}
+function parseUrgent(data: unknown): UrgentEmailResponse {
+  const v = data as UrgentEmailResponse | null;
+  if (!v || (v.status !== "not_connected" && !(v.status === "ready" && Array.isArray(v.items)))) throw new Error("Invalid urgent email");
+  return v;
+}
+function parseOrders(data: unknown): OrdersSummary {
+  const v = data as OrdersSummary | null;
+  if (!v || (v.status !== "not_connected" && !(v.status === "ready" && Array.isArray(v.top)))) throw new Error("Invalid orders");
+  return v;
+}
+function parseRenewals(data: unknown): RenewalSummary {
+  const v = data as RenewalSummary | null;
+  if (!v || (v.status !== "empty" && !(v.status === "ready" && Array.isArray(v.soon) && typeof v.count === "number"))) throw new Error("Invalid renewals");
+  return v;
+}
+function parseMoney(data: unknown): MoneyAlert[] {
+  const v = data as { status?: string; alerts?: MoneyAlert[] } | null;
+  if (!v || v.status !== "ready" || !Array.isArray(v.alerts)) throw new Error("Invalid money alerts");
+  return v.alerts;
+}
+function parseExperiment(data: unknown): ExperimentToday {
+  if (!isExperimentToday(data)) throw new Error("Invalid experiment arm");
+  return data;
+}
+const READING_URL = "/api/reading";
+const URGENT_URL = "/api/urgent-email";
+const ORDERS_URL = "/api/orders/summary";
+const RENEWALS_URL = "/api/procurement/renewals/summary";
+const MONEY_URL = "/api/finance/alerts";
+const EXPERIMENT_URL = "/api/experiments/today";
+// Today and tomorrow in this device's zone; the server pads the range by a day on each side.
+function calendarUrl(): string {
+  const firstDay = localDate(new Date());
+  return `/api/calendar/events?from=${firstDay}&to=${shiftDate(firstDay, 1)}`;
+}
+// GET a JSON answer. "Gone" (404 / 410 / 204) removes the cached copy instead of keeping it.
+async function getJson(url: string): Promise<unknown> {
+  const res = await fetch(url, { cache: "no-store" });
+  if (isGoneStatus(res.status)) { clientCache.remove(url); throw new Error("Gone"); }
+  if (!res.ok) throw new Error("Unavailable");
+  return res.json();
+}
+// The cached copy in memory (an instant revisit), checked like a fresh answer.
+function cachedLoad<T>(key: string, parse: (data: unknown) => T): Load<T> {
+  const raw = clientCache.peek(key);
+  if (raw === undefined) return { state: "loading" };
+  try { return { state: "ready", value: parse(raw) }; } catch { return { state: "loading" }; }
+}
+function cachedValue<T>(key: string, parse: (data: unknown) => T): T | null {
+  const v = cachedLoad(key, parse);
+  return v.state === "ready" ? v.value : null;
+}
+// A fresh answer replaces what is shown; an identical one keeps the same object so React skips the render.
+function fresh<T>(value: T) {
+  return (previous: Load<T>): Load<T> => previous.state === "ready" && !previous.stale && sameJson(previous.value, value) ? previous : { state: "ready", value };
+}
+// A copy read from the device fills a panel that has nothing yet (or only an error); it never replaces a
+// fresher answer.
+function fromDevice<T>(value: T) {
+  return (previous: Load<T>): Load<T> => previous.state === "loading" ? { state: "ready", value } : previous.state === "error" ? { state: "ready", value, stale: true } : previous;
+}
+
 export default function TodayClient() {
-  const [inbox, setInbox] = useState<Load<InboxResponse>>({ state: "loading" });
-  const [reading, setReading] = useState<Load<ReadingOverview | null>>({ state: "loading" });
-  const [urgent, setUrgent] = useState<Load<UrgentEmailResponse>>({ state: "loading" });
+  // Each panel starts from the cached copy when there is one (a revisit is instant), then revalidates.
+  const [inbox, setInbox] = useState<Load<InboxResponse>>(() => cachedLoad(CACHE_KEYS.agentsInbox, parseInbox));
+  const [reading, setReading] = useState<Load<ReadingOverview | null>>(() => cachedLoad(READING_URL, parseReading));
+  const [urgent, setUrgent] = useState<Load<UrgentEmailResponse>>(() => cachedLoad(URGENT_URL, parseUrgent));
   // Packages are shown only when something needs attention or arrives today, and a failed check
   // just hides the panel: /orders is where package status lives.
-  const [orders, setOrders] = useState<OrdersSummary | null>(null);
+  const [orders, setOrders] = useState<OrdersSummary | null>(() => cachedValue(ORDERS_URL, parseOrders));
   // Synced calendar events (read-only copies; see /health). Onyx never writes to the calendar.
-  const [calendar, setCalendar] = useState<Load<CalendarEventsResponse>>({ state: "loading" });
+  const [calendar, setCalendar] = useState<Load<CalendarEventsResponse>>(() => cachedLoad(calendarUrl(), readCalendarResponse));
   // Today's arm of the running N-of-1 trial (GET /api/experiments/today). Usually "none": no card.
-  const [experiment, setExperiment] = useState<Load<ExperimentToday>>({ state: "loading" });
+  const [experiment, setExperiment] = useState<Load<ExperimentToday>>(() => cachedLoad(EXPERIMENT_URL, parseExperiment));
   // Subscription renewals (GET /api/procurement/renewals/summary) follow the same rule: shown only
   // when one is due within 3 days; a failed check hides the panel, /procurement has the details.
-  const [renewals, setRenewals] = useState<RenewalSummary | null>(null);
+  const [renewals, setRenewals] = useState<RenewalSummary | null>(() => cachedValue(RENEWALS_URL, parseRenewals));
   // Money alerts (GET /api/finance/alerts): shown only when there is something to act on; a failed check keeps the last answer.
-  const [money, setMoney] = useState<MoneyAlert[] | null>(null);
+  const [money, setMoney] = useState<MoneyAlert[] | null>(() => cachedValue(MONEY_URL, parseMoney));
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
   const sequence = useRef(0);
   const inFlight = useRef(false);
@@ -109,71 +186,65 @@ export default function TodayClient() {
     setUrgent((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setCalendar((previous) => previous.state === "ready" ? previous : { state: "loading" });
     setExperiment((previous) => previous.state === "ready" ? previous : { state: "loading" });
-    const inboxRequest = bounded(Promise.resolve().then(() => agentsApi.inbox())).then((value) => {
-      if (!Array.isArray(value.items) || !Array.isArray(value.threads)) throw new Error("Invalid inbox");
+    const inboxRequest = bounded(Promise.resolve().then(() => agentsApi.inbox())).then((data) => {
+      const value = parseInbox(data);
       if (sequence.current !== current) return;
-      setInbox({ state: "ready", value });
+      clientCache.put(CACHE_KEYS.agentsInbox, value);
+      setInbox(fresh(value));
       setCheckedAt(new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
     }).catch(() => { if (sequence.current === current) setInbox((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
-    const readingRequest = bounded(fetch("/api/reading", { cache: "no-store" }).then(async (res) => {
-      if (!res.ok) throw new Error("Reading unavailable");
-      const data = await res.json();
-      if (!("overview" in data) || (data.overview !== null && !data.overview?.book?.title)) throw new Error("Invalid reading");
-      return data.overview as ReadingOverview | null;
-    })).then((value) => {
-      if (sequence.current === current) setReading({ state: "ready", value });
+    // Each GET below: check the answer, cache the raw JSON under its URL (shared with the other pages and the
+    // warm-up), then show it. Finance, procurement and experiment answers stay in memory only (lib/client-cache.ts).
+    function request<T>(url: string, parse: (data: unknown) => T): Promise<T> {
+      return bounded(getJson(url).then((data) => {
+        const value = parse(data);
+        clientCache.put(url, data);
+        return value;
+      }));
+    }
+    const readingRequest = request(READING_URL, parseReading).then((value) => {
+      if (sequence.current === current) setReading(fresh(value));
     }).catch(() => { if (sequence.current === current) setReading((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
-    const urgentRequest = bounded(fetch("/api/urgent-email", { cache: "no-store" }).then(async (res) => {
-      if (!res.ok) throw new Error("Urgent email unavailable");
-      const data = await res.json() as UrgentEmailResponse;
-      if (data.status !== "not_connected" && !(data.status === "ready" && Array.isArray(data.items))) throw new Error("Invalid urgent email");
-      return data;
-    })).then((value) => {
-      if (sequence.current === current) setUrgent({ state: "ready", value });
+    const urgentRequest = request(URGENT_URL, parseUrgent).then((value) => {
+      if (sequence.current === current) setUrgent(fresh(value));
     }).catch(() => { if (sequence.current === current) setUrgent((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
-    const ordersRequest = bounded(fetch("/api/orders/summary", { cache: "no-store" }).then(async (res) => {
-      if (!res.ok) throw new Error("Orders unavailable");
-      const data = await res.json() as OrdersSummary;
-      if (data.status !== "not_connected" && !(data.status === "ready" && Array.isArray(data.top))) throw new Error("Invalid orders");
-      return data;
-    })).then((value) => {
-      if (sequence.current === current) setOrders(value);
+    const ordersRequest = request(ORDERS_URL, parseOrders).then((value) => {
+      if (sequence.current === current) setOrders((previous) => sameJson(previous, value) ? previous : value);
     }).catch(() => { /* keep the last summary; /orders has the details */ });
-    const renewalsRequest = bounded(fetch("/api/procurement/renewals/summary", { cache: "no-store" }).then(async (res) => {
-      if (!res.ok) throw new Error("Renewals unavailable");
-      const data = await res.json() as RenewalSummary;
-      if (data.status !== "empty" && !(data.status === "ready" && Array.isArray(data.soon) && typeof data.count === "number")) throw new Error("Invalid renewals");
-      return data;
-    })).then((value) => {
-      if (sequence.current === current) setRenewals(value);
+    const renewalsRequest = request(RENEWALS_URL, parseRenewals).then((value) => {
+      if (sequence.current === current) setRenewals((previous) => sameJson(previous, value) ? previous : value);
     }).catch(() => { /* keep the last summary; /procurement has the details */ });
-    const moneyRequest = bounded(fetch("/api/finance/alerts", { cache: "no-store" }).then(async (res) => {
-      if (!res.ok) throw new Error("Money alerts unavailable");
-      const data = await res.json() as { status?: string; alerts?: MoneyAlert[] };
-      if (data.status !== "ready" || !Array.isArray(data.alerts)) throw new Error("Invalid money alerts");
-      return data.alerts;
-    })).then((value) => {
-      if (sequence.current === current) setMoney(value);
+    const moneyRequest = request(MONEY_URL, parseMoney).then((value) => {
+      if (sequence.current === current) setMoney((previous) => sameJson(previous, value) ? previous : value);
     }).catch(() => { /* keep the last alerts; /financials has the details */ });
-    const experimentRequest = bounded(fetch("/api/experiments/today", { cache: "no-store" }).then(async (res) => {
-      if (!res.ok) throw new Error("Experiment arm unavailable");
-      const data: unknown = await res.json();
-      if (!isExperimentToday(data)) throw new Error("Invalid experiment arm");
-      return data;
-    })).then((value) => {
-      if (sequence.current === current) setExperiment({ state: "ready", value });
+    const experimentRequest = request(EXPERIMENT_URL, parseExperiment).then((value) => {
+      if (sequence.current === current) setExperiment(fresh(value));
     }).catch(() => { if (sequence.current === current) setExperiment((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
-    // Today and tomorrow in this device's zone; the server pads the range by a day on each side.
-    const firstDay = localDate(new Date());
-    const calendarRequest = bounded(fetch(`/api/calendar/events?from=${firstDay}&to=${shiftDate(firstDay, 1)}`, { cache: "no-store" }).then(async (res) => {
-      if (!res.ok) throw new Error("Calendar unavailable");
-      return readCalendarResponse(await res.json());
-    })).then((value) => {
-      if (sequence.current === current) setCalendar({ state: "ready", value });
+    const calendarRequest = request(calendarUrl(), readCalendarResponse).then((value) => {
+      if (sequence.current === current) setCalendar(fresh(value));
     }).catch(() => { if (sequence.current === current) setCalendar((previous) => previous.state === "ready" ? { ...previous, stale: true } : { state: "error" }); });
     void Promise.allSettled([inboxRequest, readingRequest, urgentRequest, ordersRequest, renewalsRequest, moneyRequest, experimentRequest, calendarRequest]).then(() => {
       if (sequence.current === current) { inFlight.current = false; setRefreshing(false); }
     });
+  }, []);
+  // Reopening the app: fill empty panels from the copy kept on this device (IndexedDB) while the network
+  // answers. Finance, procurement and experiment answers are never on the device, so they wait for the network.
+  useEffect(() => {
+    let alive = true;
+    function fill<T>(key: string, parse: (data: unknown) => T, apply: (value: T) => void) {
+      void clientCache.read(key).then((raw) => {
+        if (!alive || raw === undefined) return;
+        let value: T;
+        try { value = parse(raw); } catch { return; }
+        apply(value);
+      });
+    }
+    fill(CACHE_KEYS.agentsInbox, parseInbox, (v) => setInbox(fromDevice(v)));
+    fill(READING_URL, parseReading, (v) => setReading(fromDevice(v)));
+    fill(URGENT_URL, parseUrgent, (v) => setUrgent(fromDevice(v)));
+    fill(calendarUrl(), readCalendarResponse, (v) => setCalendar(fromDevice(v)));
+    fill(ORDERS_URL, parseOrders, (v) => setOrders((previous) => previous ?? v));
+    return () => { alive = false; };
   }, []);
   useEffect(() => {
     load();

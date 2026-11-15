@@ -5,20 +5,24 @@ import Sidebar from "./Sidebar";
 import MobileNav from "./MobileNav";
 import CommandPalette from "./CommandPalette";
 import { DesktopLaunchHandler } from "./DesktopApp";
+import AppData, { SignedOutWipe } from "./AppData";
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const isAuth = pathname.startsWith("/login") || pathname.startsWith("/auth");
 
   if (isAuth) {
-    return <>{children}</>;
+    // On /login there is no session: clear whatever a previous session left on this device.
+    return <>{pathname.startsWith("/login") && <SignedOutWipe />}{children}</>;
   }
 
   // The Agents chat is a full-screen conversation (like a thread in Messages): its own header and composer,
   // no mobile top bar or tab bar. The desktop sidebar stays.
   if (pathname.startsWith("/agents")) {
+    // AppData is first in both layouts so moving to and from /agents keeps it mounted.
     return (
       <>
+        <AppData />
         <Sidebar />
         {children}
         <CommandPalette />
@@ -29,6 +33,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <>
+      <AppData />
       <Sidebar />
       <main className="md:ml-[220px] min-h-screen">
         {/* Top padding clears the fixed mobile header (safe-area inset + bar);
