@@ -18,6 +18,7 @@ import {
   type CaffeineQualityFlag,
 } from "@/lib/queries";
 import { formatDate, formatDuration, sameJson } from "@/lib/format";
+import { minutesToSeconds, type Minutes } from "@/lib/units";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import InfoHint from "@/components/InfoHint";
@@ -181,7 +182,7 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
   )
     .map((d) => num(d.last_caffeine_to_bedtime_minutes))
     .filter((v): v is number => v != null);
-  const avgGapMin = gapVals.length
+  const avgGapMin: Minutes | null = gapVals.length
     ? gapVals.reduce((a, b) => a + b, 0) / gapVals.length
     : null;
 
@@ -311,7 +312,7 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
             <Part id="last-dose-gap" title="Last Dose → Bed" width="quarter">
             <StatCard
               label="Last Dose → Bed"
-              value={avgGapMin != null ? formatDuration(Math.round(avgGapMin) * 60) : "—"}
+              value={avgGapMin != null ? formatDuration(minutesToSeconds(Math.round(avgGapMin))) : "—"}
               sublabel={
                 avgGapMin != null
                   ? `avg of ${gapVals.length} timed days · last 30d`
