@@ -13,6 +13,7 @@ import ChartCard from "@/components/ChartCard";
 import InfoHint from "@/components/InfoHint";
 import RangeFilter from "@/components/RangeFilter";
 import { useInFeed } from "@/components/FeedContext";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -560,8 +561,12 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
         </div>
       )}
 
+      {/* Personalize: every tile, card and chart is its own part; sections have no heading on screen. */}
+      <PartGrid page="/habits" title="Habits">
+      <PartGroup id="section-summary" title="Summary tiles">
       {recentChanges.length > 0 && (
-        <div className="mb-6 px-3 py-2.5 rounded-control border border-amber-500/30 bg-amber-500/[0.04]">
+        <Part id="metadata-changes" title="Metadata changed in this range">
+        <div className="px-3 py-2.5 rounded-control border border-amber-500/30 bg-amber-500/[0.04]">
           <p className="text-[11px] font-mono uppercase tracking-wider text-amber-300/80 mb-1.5">
             Metadata changed within this range — rates reflect each day&apos;s in-effect values
           </p>
@@ -578,29 +583,39 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
             )}
           </ul>
         </div>
+        </Part>
       )}
 
       {/* KPIs */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+      <Part id="tile-today" title="Today (ring)" width="quarter">
         <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing label="Today" value={todayCompleted} max={requiredHabits.length || 1} zone
             centerValue={`${todayCompleted}/${requiredHabits.length}`} sublabel="required habits" size={120} />
         </div>
+      </Part>
+      <Part id="tile-7day-rate" title="7-Day Rate (ring)" width="quarter">
         <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4 flex items-center justify-center">
           <MetricRing label="7-Day Rate" value={completionRate} zone centerUnit="%"
             sublabel={`${completedLast7}/${possibleLast7}`} size={120} />
         </div>
+      </Part>
+      <Part id="tile-longest-streak" title="Longest Streak (tile)" width="quarter">
         <StatCard label="Longest Streak" value={longestStreak} unit={longestUnit} sublabel={bestHabit?.name} />
+      </Part>
+      <Part id="tile-vs-prior" title="vs Prior Week (tile)" width="quarter">
         <StatCard
           label="vs Prior Week"
           value={prev7Stats.possible > 0 ? `${deltaVsPrior >= 0 ? "+" : ""}${deltaVsPrior}` : "—"}
           unit={prev7Stats.possible > 0 ? "%" : undefined}
           sublabel={prev7Stats.possible > 0 ? `prior 7d was ${prev7Stats.rate}%` : "no prior data"}
         />
-      </div>
+      </Part>
+      </PartGroup>
 
+      <PartGroup id="section-today" title="Today's habits">
       {/* Today's Checklist */}
       {habits.length > 0 && (
+        <Part id="today-checklist" title="Today's Habits">
         <ChartCard
           title="Today's Habits"
           subtitle={new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}
@@ -630,14 +645,17 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
             })}
           </div>
         </ChartCard>
+        </Part>
       )}
+      </PartGroup>
 
+      <PartGroup id="section-trends" title="Rates & heatmap" gap={24}>
       {/* Completion-rate trend */}
       {habits.length > 0 && (
+        <Part id="rolling-rate" title="7-Day Rolling Completion Rate">
         <ChartCard
           title="7-Day Rolling Completion Rate"
           subtitle={rangeLabel(range)}
-          className="mt-6"
         >
           <ResponsiveContainer width="100%" height={240}>
             <AreaChart data={trendData}>
@@ -664,14 +682,15 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
             </AreaChart>
           </ResponsiveContainer>
         </ChartCard>
+        </Part>
       )}
 
       {/* Per-category breakdown */}
       {habits.length > 0 && categoryRates.length > 0 && (
+        <Part id="by-category" title="By Category">
         <ChartCard
           title="By Category"
           subtitle={`Completion rate across ${rangeLabel(range)}`}
-          className="mt-6"
         >
           <div className="space-y-2.5">
             {categoryRates.map(({ category, rate, habitCount, color }) => (
@@ -696,14 +715,15 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
             ))}
           </div>
         </ChartCard>
+        </Part>
       )}
 
       {/* Heatmap */}
       {habits.length > 0 && (
+        <Part id="heatmap" title="Heatmap">
         <ChartCard
           title={`Heatmap — ${rangeLabel(range)}`}
           subtitle="Filled = yes · ✕ = no · blank = not logged · click to change"
-          className="mt-6"
         >
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
@@ -779,7 +799,111 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
             </table>
           </div>
         </ChartCard>
+        </Part>
       )}
+      </PartGroup>
+
+      <PartGroup id="section-streaks" title="Streaks" gap={24}>
+      {/* Streaks */}
+      {habits.length > 0 && (
+        <Part id="current-streaks" title="Current Streaks">
+        <ChartCard title="Current Streaks">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+            {streaks
+              .slice()
+              .sort((a, b) => {
+                // Ad hoc habits sort to the bottom, then by recency (more recent first; never = last).
+                if (a.isAdHoc !== b.isAdHoc) return a.isAdHoc ? 1 : -1;
+                if (a.isAdHoc && b.isAdHoc) {
+                  const ax = a.daysSince ?? Infinity;
+                  const bx = b.daysSince ?? Infinity;
+                  return ax - bx;
+                }
+                return b.rankValue - a.rankValue;
+              })
+              .map(({ habit, streak, unit, rankValue, isAdHoc, daysSince }) => {
+                const color = CATEGORY_COLORS[habit.category] || CATEGORY_COLORS.general;
+                const unitSingular = unit === "weeks" ? "week" : "day";
+                let label: string;
+                if (isAdHoc) {
+                  if (daysSince === null) label = "never logged";
+                  else if (daysSince === 0) label = "logged today";
+                  else if (daysSince === 1) label = "1 day ago";
+                  else label = `${daysSince} days ago`;
+                } else {
+                  label = streak > 0 ? `${streak} ${unitSingular}${streak !== 1 ? "s" : ""}` : "No streak";
+                }
+                return (
+                  <div key={habit.id} className="flex items-center gap-3 px-3 py-2.5 rounded-control bg-white/[0.02]">
+                    <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: color }} />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-text-primary font-medium truncate">
+                        {habit.name}
+                        {isAdHoc && (
+                          <span className="ml-1.5 text-[9px] font-mono uppercase tracking-wider text-text-tertiary/70">
+                            ad hoc
+                          </span>
+                        )}
+                      </p>
+                      <p className="text-[11px] font-mono" style={{ color: isAdHoc ? "var(--color-text-tertiary)" : color }}>
+                        {label}
+                      </p>
+                    </div>
+                    {!isAdHoc && (
+                      <div className="w-12 h-2 bg-white/5 rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all"
+                          style={{ width: `${Math.min(100, (rankValue / 30) * 100)}%`, backgroundColor: color }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+          </div>
+        </ChartCard>
+        </Part>
+      )}
+
+      {/* Scoring rules, closed by default */}
+      {habits.length > 0 && (
+        <Part id="scoring-rules" title="How rates & streaks are scored">
+        <InfoHint label="How rates and streaks are scored" variant="disclosure" summary="How rates & streaks are scored">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-3 text-[12px] leading-relaxed">
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">daily</span>
+              <span className="text-text-tertiary">
+                Counts every day. Streak resets if you miss a day (today is grace).
+              </span>
+            </div>
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">weekdays</span>
+              <span className="text-text-tertiary">
+                Counts Mon–Fri only; weekends are skipped. Streak resets if you miss a weekday.
+              </span>
+            </div>
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">weekly</span>
+              <span className="text-text-tertiary">
+                Done at least once in any 7-day window = 100% for that window. Streak resets if you skip a whole week.
+              </span>
+            </div>
+            <div className="flex gap-3">
+              <span className="text-text-primary font-mono shrink-0 w-20">Ad Hoc</span>
+              <span className="text-text-tertiary">
+                Never required. Excluded from every rate. Shown with recency only (&ldquo;3 days ago&rdquo;).
+              </span>
+            </div>
+          </div>
+          <p className="text-[11px] text-text-tertiary pt-3 border-t border-border-subtle">
+            Frequency is set per habit in Notion. Longest Streak compares frequencies in days (a kept week counts as 7 days).
+            An explicit &ldquo;no&rdquo; counts the same as not logged in every rate and streak; it records that you answered.
+          </p>
+        </InfoHint>
+        </Part>
+      )}
+      </PartGroup>
+      </PartGrid>
 
       {/* Heatmap cell answer picker — fixed-position popover anchored to the
           clicked cell, with a transparent backdrop that closes it. */}
@@ -840,100 +964,6 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
         );
       })()}
 
-      {/* Streaks */}
-      {habits.length > 0 && (
-        <ChartCard title="Current Streaks" className="mt-6">
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-            {streaks
-              .slice()
-              .sort((a, b) => {
-                // Ad hoc habits sort to the bottom, then by recency (more recent first; never = last).
-                if (a.isAdHoc !== b.isAdHoc) return a.isAdHoc ? 1 : -1;
-                if (a.isAdHoc && b.isAdHoc) {
-                  const ax = a.daysSince ?? Infinity;
-                  const bx = b.daysSince ?? Infinity;
-                  return ax - bx;
-                }
-                return b.rankValue - a.rankValue;
-              })
-              .map(({ habit, streak, unit, rankValue, isAdHoc, daysSince }) => {
-                const color = CATEGORY_COLORS[habit.category] || CATEGORY_COLORS.general;
-                const unitSingular = unit === "weeks" ? "week" : "day";
-                let label: string;
-                if (isAdHoc) {
-                  if (daysSince === null) label = "never logged";
-                  else if (daysSince === 0) label = "logged today";
-                  else if (daysSince === 1) label = "1 day ago";
-                  else label = `${daysSince} days ago`;
-                } else {
-                  label = streak > 0 ? `${streak} ${unitSingular}${streak !== 1 ? "s" : ""}` : "No streak";
-                }
-                return (
-                  <div key={habit.id} className="flex items-center gap-3 px-3 py-2.5 rounded-control bg-white/[0.02]">
-                    <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: color }} />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm text-text-primary font-medium truncate">
-                        {habit.name}
-                        {isAdHoc && (
-                          <span className="ml-1.5 text-[9px] font-mono uppercase tracking-wider text-text-tertiary/70">
-                            ad hoc
-                          </span>
-                        )}
-                      </p>
-                      <p className="text-[11px] font-mono" style={{ color: isAdHoc ? "var(--color-text-tertiary)" : color }}>
-                        {label}
-                      </p>
-                    </div>
-                    {!isAdHoc && (
-                      <div className="w-12 h-2 bg-white/5 rounded-full overflow-hidden">
-                        <div
-                          className="h-full rounded-full transition-all"
-                          style={{ width: `${Math.min(100, (rankValue / 30) * 100)}%`, backgroundColor: color }}
-                        />
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-          </div>
-        </ChartCard>
-      )}
-
-      {/* Scoring rules, closed by default */}
-      {habits.length > 0 && (
-        <InfoHint label="How rates and streaks are scored" variant="disclosure" summary="How rates & streaks are scored" className="mt-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-3 text-[12px] leading-relaxed">
-            <div className="flex gap-3">
-              <span className="text-text-primary font-mono shrink-0 w-20">daily</span>
-              <span className="text-text-tertiary">
-                Counts every day. Streak resets if you miss a day (today is grace).
-              </span>
-            </div>
-            <div className="flex gap-3">
-              <span className="text-text-primary font-mono shrink-0 w-20">weekdays</span>
-              <span className="text-text-tertiary">
-                Counts Mon–Fri only; weekends are skipped. Streak resets if you miss a weekday.
-              </span>
-            </div>
-            <div className="flex gap-3">
-              <span className="text-text-primary font-mono shrink-0 w-20">weekly</span>
-              <span className="text-text-tertiary">
-                Done at least once in any 7-day window = 100% for that window. Streak resets if you skip a whole week.
-              </span>
-            </div>
-            <div className="flex gap-3">
-              <span className="text-text-primary font-mono shrink-0 w-20">Ad Hoc</span>
-              <span className="text-text-tertiary">
-                Never required. Excluded from every rate. Shown with recency only (&ldquo;3 days ago&rdquo;).
-              </span>
-            </div>
-          </div>
-          <p className="text-[11px] text-text-tertiary pt-3 border-t border-border-subtle">
-            Frequency is set per habit in Notion. Longest Streak compares frequencies in days (a kept week counts as 7 days).
-            An explicit &ldquo;no&rdquo; counts the same as not logged in every rate and streak; it records that you answered.
-          </p>
-        </InfoHint>
-      )}
 
       {habits.length === 0 && (
         <div className="text-center py-20">
