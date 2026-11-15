@@ -14,11 +14,13 @@ export type FeedSectionModule = { default: ComponentType };
 
 export const FEED_SECTIONS: Record<string, () => Promise<FeedSectionModule>> = {
   "/today": () => import("@/app/today/FeedSection"),
+  // /log holds the check-in (its Check-in section), so /check-in has no entry: the scroll never shows it twice.
+  // A visit to /check-in itself (the 21:30 card's link) still renders it as the routed page.
+  "/log": () => import("@/app/log/FeedSection"),
   "/activities": () => import("@/app/activities/FeedSection"),
   "/nutrition": () => import("@/app/nutrition/FeedSection"),
   "/supplements": () => import("@/app/supplements/FeedSection"),
   "/caffeine": () => import("@/app/caffeine/FeedSection"),
-  "/check-in": () => import("@/app/check-in/FeedSection"),
   "/habits": () => import("@/app/habits/FeedSection"),
   "/reading": () => import("@/app/reading/FeedSection"),
   "/sleep": () => import("@/app/sleep/FeedSection"),

@@ -97,10 +97,10 @@ function findHost(node, match) {
 test('every catalog destination appears once without removal or duplication', () => {
   assert.deepEqual(hrefs(render()).sort(), nav.NAV_ITEMS.map((item) => item.href).sort());
 });
-test('Today and Check-in are pinned outside the scrollable library', () => {
+test('Today and Log are pinned outside the scrollable library', () => {
   const html = render();
   const quick = html.match(/<nav aria-label="Quick access"[^>]*>(.*?)<\/nav>/s)[1];
-  assert.deepEqual(hrefs(quick), ['/today', '/check-in']);
+  assert.deepEqual(hrefs(quick), ['/today', '/log']);
   assert.match(html, /aria-label="Quick access" class="shrink-0/);
   assert.match(html, /aria-label="All sections" class="flex-1 min-h-0 [^"]*overflow-y-auto/);
 });
@@ -161,7 +161,7 @@ test('real Tailwind layout keeps quick access fixed while library scrolls', { sk
       await today.focus();
       assert.equal(await page.evaluate(() => document.activeElement.getAttribute('href')), '/today');
       await page.keyboard.press('Tab');
-      assert.equal(await page.evaluate(() => document.activeElement.getAttribute('href')), '/check-in');
+      assert.equal(await page.evaluate(() => document.activeElement.getAttribute('href')), '/log');
     }
     await page.setViewportSize({ width: 390, height: 844 });
     assert.equal(await page.locator('aside').isVisible(), false);
