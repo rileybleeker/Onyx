@@ -22,8 +22,8 @@ const newDoc = (over = {}) => ({
   id: DOC, title: "Sample panel", kind: "lab", date: "2026-03-10", provider: "Example Clinic", notes: "", mime: "application/pdf", size: 2048, ...over,
 });
 const lab = (over = {}) => ({
-  id: LAB, test: "Sample marker", value: 5.4, valueText: "", unit: "mmol/L", refLow: 4, refHigh: 6, refText: "4-6",
-  collectedOn: "2026-03-10", lab: "Example Lab", documentId: null, notes: "", ...over,
+  id: LAB, test: "Sample marker", value: 5.4, valueText: "", unit: "mmol/L", refLow: 4, refHigh: 6, refLowStrict: false, refHighStrict: false,
+  refText: "4-6", collectedOn: "2026-03-10", lab: "Example Lab", documentId: null, notes: "", ...over,
 });
 
 // ---------- body checks ----------
@@ -78,6 +78,12 @@ test("a lab patch checks fields it can check on its own", () => {
   assert.deepEqual(L.parseLabPatch({ value: 6.1 }), { ok: true, patch: { value: 6.1 } });
   assert.equal(L.parseLabPatch({ value: null, valueText: "" }).ok, false);
   assert.equal(L.parseLabPatch({ refLow: 9, refHigh: 2 }).ok, false);
+  assert.equal(L.parseLabPatch({ refLow: 5, refHigh: 5, refHighStrict: true }).ok, false, "an empty range");
+  assert.equal(L.parseLabPatch({ refLowStrict: "yes" }).ok, false);
+  assert.equal(L.parseLabPatch({ refHigh: null, refHighStrict: true }).ok, false, "a strict flag needs its bound");
+  // Clearing a bound clears its strict flag, so the table's CHECK is never hit by the UI.
+  assert.deepEqual(L.parseLabPatch({ refHigh: null }), { ok: true, patch: { refHigh: null, refHighStrict: false } });
+  assert.deepEqual(L.parseLabPatch({ refHighStrict: true }), { ok: true, patch: { refHighStrict: true } });
   assert.equal(L.parseLabPatch({ removed: true }).ok, false);
   assert.equal(L.parseLabPatch({ id: LAB2 }).ok, false);
   assert.equal(L.parseLabPatch({}).ok, false);
@@ -95,15 +101,25 @@ test("values and ranges are read the way a report prints them", () => {
   assert.deepEqual(L.parseLabValue("5.4"), { value: 5.4, valueText: "" });
   assert.deepEqual(L.parseLabValue(" Negative "), { value: null, valueText: "Negative" });
   assert.deepEqual(L.parseLabValue("<0.5"), { value: null, valueText: "<0.5" });
-  assert.deepEqual(L.parseRange("70-99"), { refLow: 70, refHigh: 99, refText: "70-99" });
-  assert.deepEqual(L.parseRange("70 – 99"), { refLow: 70, refHigh: 99, refText: "70 – 99" });
-  assert.deepEqual(L.parseRange("3.5 to 5.0"), { refLow: 3.5, refHigh: 5, refText: "3.5 to 5.0" });
-  assert.deepEqual(L.parseRange("<200"), { refLow: null, refHigh: 200, refText: "<200" });
-  assert.deepEqual(L.parseRange("≤ 5.7"), { refLow: null, refHigh: 5.7, refText: "≤ 5.7" });
-  assert.deepEqual(L.parseRange(">40"), { refLow: 40, refHigh: null, refText: ">40" });
-  assert.deepEqual(L.parseRange("Negative"), { refLow: null, refHigh: null, refText: "Negative" });
-  assert.deepEqual(L.parseRange("99-70"), { refLow: null, refHigh: null, refText: "99-70" });
-  assert.deepEqual(L.parseRange(""), { refLow: null, refHigh: null, refText: "" });
+  const R = (refLow, refHigh, refText, refLowStrict = false, refHighStrict = false) => ({ refLow, refHigh, refLowStrict, refHighStrict, refText });
+  assert.deepEqual(L.parseRange("70-99"), R(70, 99, "70-99"));
+  assert.deepEqual(L.parseRange("70 – 99"), R(70, 99, "70 – 99"));
+  assert.deepEqual(L.parseRange("3.5 to 5.0"), R(3.5, 5, "3.5 to 5.0"));
+  assert.deepEqual(L.parseRange("<200"), R(null, 200, "<200", false, true));
+  assert.deepEqual(L.parseRange("< 200"), R(null, 200, "< 200", false, true));
+  assert.deepEqual(L.parseRange("<=200"), R(null, 200, "<=200"));
+  assert.deepEqual(L.parseRange("<= 200"), R(null, 200, "<= 200"));
+  assert.deepEqual(L.parseRange("≤ 5.7"), R(null, 5.7, "≤ 5.7"));
+  assert.deepEqual(L.parseRange(">40"), R(40, null, ">40", true));
+  assert.deepEqual(L.parseRange(">=60"), R(60, null, ">=60"));
+  assert.deepEqual(L.parseRange(">= 60"), R(60, null, ">= 60"));
+  assert.deepEqual(L.parseRange("≥ 60"), R(60, null, "≥ 60"));
+  assert.deepEqual(L.parseRange("<=-1"), R(null, -1, "<=-1"));
+  assert.deepEqual(L.parseRange("< = 200"), R(null, null, "< = 200"), "a split operator keeps the text only");
+  assert.deepEqual(L.parseRange("=<200"), R(null, null, "=<200"));
+  assert.deepEqual(L.parseRange("Negative"), R(null, null, "Negative"));
+  assert.deepEqual(L.parseRange("99-70"), R(null, null, "99-70"));
+  assert.deepEqual(L.parseRange(""), R(null, null, ""));
 });
 
 test("High / Low compare with the stored range only", () => {
@@ -118,6 +134,54 @@ test("High / Low compare with the stored range only", () => {
   assert.equal(L.formatResult(lab()), "5.4 mmol/L");
   assert.equal(L.formatRange(lab({ refText: "" })), "4-6");
   assert.equal(L.formatRange(lab({ refText: "", refLow: null })), "≤ 6");
+  assert.equal(L.formatRange(lab({ refText: "", refLow: null, refHighStrict: true })), "< 6");
+  assert.equal(L.formatRange(lab({ refText: "", refHigh: null, refLowStrict: true })), "> 4");
+  assert.equal(L.formatRange(lab({ refText: "", refHigh: null })), "≥ 4");
+  assert.equal(L.formatRange(lab({ refText: "", refLowStrict: true })), "> 4 and ≤ 6");
+  // A one-sided range written without its text reads back to the same numbers and strictness.
+  for (const r of [lab({ refText: "", refLow: null, refHighStrict: true }), lab({ refText: "", refHigh: null, refLowStrict: true }), lab({ refText: "" })]) {
+    const back = L.parseRange(L.formatRange(r));
+    assert.deepEqual([back.refLow, back.refHigh, back.refLowStrict, back.refHighStrict], [r.refLow, r.refHigh, r.refLowStrict, r.refHighStrict]);
+  }
+});
+
+test("every range operator flags values below, at and above its bound as printed", () => {
+  // [range as typed, value, expected flag]. "<" / ">" exclude the bound; "<=" "≤" ">=" "≥" and a span include it.
+  const cases = [
+    ["<200", 199, "in-range"], ["<200", 200, "high"], ["<200", 201, "high"],
+    ["< 200", 200, "high"],
+    ["<=200", 199, "in-range"], ["<=200", 200, "in-range"], ["<=200", 201, "high"],
+    ["<= 200", 200, "in-range"],
+    ["≤ 200", 199, "in-range"], ["≤ 200", 200, "in-range"], ["≤ 200", 201, "high"],
+    [">60", 59, "low"], [">60", 60, "low"], [">60", 61, "in-range"],
+    ["> 60", 60, "low"],
+    [">=60", 59, "low"], [">=60", 60, "in-range"], [">=60", 61, "in-range"],
+    [">= 60", 60, "in-range"],
+    ["≥ 60", 59, "low"], ["≥ 60", 60, "in-range"], ["≥ 60", 61, "in-range"],
+    ["70-99", 69, "low"], ["70-99", 70, "in-range"], ["70-99", 99, "in-range"], ["70-99", 100, "high"],
+    ["3.5 to 5.0", 3.4, "low"], ["3.5 to 5.0", 3.5, "in-range"], ["3.5 to 5.0", 5, "in-range"], ["3.5 to 5.0", 5.1, "high"],
+  ];
+  for (const [text, value, want] of cases) {
+    const range = L.parseRange(text);
+    assert.equal(L.labFlag({ value, ...range }), want, `${value} against "${text}"`);
+    // Through the body check, the table columns and back, as the page reads it.
+    const saved = L.parseLabResult(lab({ value, ...range }));
+    assert.equal(saved.ok, true, text);
+    const read = L.rowToLab({ id: LAB, ...L.labColumns(saved.result) });
+    assert.equal(L.labFlag(read), want, `${value} against "${text}" after a round trip`);
+  }
+});
+
+test("strict flags are checked, tied to their bound, and refuse an empty range", () => {
+  assert.equal(L.parseLabResult(lab({ refHighStrict: "true" })).ok, false);
+  assert.equal(L.parseLabResult(lab({ refLow: 5, refHigh: 5 })).ok, true, "5-5 is a one-value range");
+  assert.equal(L.parseLabResult(lab({ refLow: 5, refHigh: 5, refHighStrict: true })).ok, false, "a strict end on equal ends leaves nothing in range");
+  // A strict flag on a missing bound is normalised away rather than stored.
+  const r = L.parseLabResult(lab({ refLow: null, refLowStrict: true }));
+  assert.equal(r.ok, true);
+  assert.equal(r.result.refLowStrict, false);
+  const { refLowStrict: _omit, ...missing } = lab();
+  assert.equal(L.parseLabResult(missing).ok, false, "both flags are required");
 });
 
 test("series group one test in one unit, oldest first, with the newest as latest", () => {
@@ -153,15 +217,18 @@ test("files: accepted types, safe names, and storage paths that carry only the i
 
 test("rows map to the API shape (numeric columns may arrive as text)", () => {
   const row = {
-    id: LAB, test_name: "Sample marker", value_num: "5.4", value_text: "", unit: "mmol/L", ref_low: "4", ref_high: 6, ref_text: "4-6",
-    collected_on: "2026-03-10", lab: "Example Lab", document_id: null, notes: "",
+    id: LAB, test_name: "Sample marker", value_num: "5.4", value_text: "", unit: "mmol/L", ref_low: "4", ref_high: 6,
+    ref_low_strict: false, ref_high_strict: false, ref_text: "4-6", collected_on: "2026-03-10", lab: "Example Lab", document_id: null, notes: "",
   };
   assert.deepEqual(L.rowToLab(row), lab());
   assert.equal(L.rowToLab({ ...row, value_num: null, value_text: "" }), null);
   assert.deepEqual(L.labColumns(lab()), {
-    test_name: "Sample marker", value_num: 5.4, value_text: "", unit: "mmol/L", ref_low: 4, ref_high: 6, ref_text: "4-6",
-    collected_on: "2026-03-10", lab: "Example Lab", document_id: null, notes: "",
+    test_name: "Sample marker", value_num: 5.4, value_text: "", unit: "mmol/L", ref_low: 4, ref_high: 6,
+    ref_low_strict: false, ref_high_strict: false, ref_text: "4-6", collected_on: "2026-03-10", lab: "Example Lab", document_id: null, notes: "",
   });
+  assert.deepEqual(L.rowToLab({ ...row, ref_low: null, ref_high: 200, ref_high_strict: true, ref_text: "<200" }),
+    lab({ refLow: null, refHigh: 200, refHighStrict: true, refText: "<200" }));
+  for (const col of L.LAB_COLUMNS.split(",")) assert.ok(col in row || col === "id", col);
   const docRow = { id: DOC, title: "Sample panel", kind: "lab", doc_date: "2026-03-10", provider: "Example Clinic", notes: "", mime_type: "application/pdf", size_bytes: "2048", uploaded_at: "2026-03-10T12:00:00Z" };
   assert.deepEqual(L.rowToDocument(docRow), { ...newDoc(), uploadedAt: "2026-03-10T12:00:00Z" });
   assert.equal(L.rowToDocument({ ...docRow, mime_type: "text/html" }), null);
