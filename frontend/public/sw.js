@@ -15,8 +15,8 @@ self.addEventListener("push", (event) => {
   const options = {
     body: data.body || "New message",
     tag: data.tag || "onyx-agents",
-    icon: "/icons/icon-192.png?v=3", // new Onyx mark (2026-11-15); the ?v= makes Windows / Android fetch it fresh
-    badge: "/icons/logo-mark-96.png?v=3", // transparent mark: the small monochrome status-bar badge
+    icon: "/icons/icon-192.png?v=4", // new Onyx mark (2026-11-15); the ?v= makes Windows / Android fetch it fresh
+    badge: "/icons/logo-mark-96.png?v=4", // transparent mark: the small monochrome status-bar badge
     data: { url: data.url || "/agents" },
   };
   const badge = typeof data.badge === "number" && self.navigator.setAppBadge ? self.navigator.setAppBadge(data.badge).catch(() => {}) : Promise.resolve();

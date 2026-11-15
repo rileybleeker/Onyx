@@ -64,7 +64,7 @@ export default function LoginPage() {
     <div className="min-h-screen flex items-center justify-center bg-surface px-4">
       <div className="w-full max-w-sm">
         <div className="text-center mb-8">
-          <h1 className="flex items-center justify-center gap-3 text-3xl font-semibold text-text-primary"><img src="/icons/logo-mark-96.png?v=3" width={40} height={40} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
+          <h1 className="flex items-center justify-center gap-3 text-3xl font-semibold text-text-primary"><img src="/icons/logo-mark-96.png?v=4" width={56} height={56} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
           <p className="text-text-tertiary mt-1">Personal Data Scientist</p>
         </div>
 
