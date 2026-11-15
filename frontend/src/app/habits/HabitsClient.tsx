@@ -12,6 +12,7 @@ import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import InfoHint from "@/components/InfoHint";
 import RangeFilter from "@/components/RangeFilter";
+import { useInFeed } from "@/components/FeedContext";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -188,7 +189,12 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
   const [actionError, setActionError] = useState<string | null>(null);
   const [openCell, setOpenCell] = useState<{ habit: NotionHabit; date: string; x: number; y: number } | null>(null);
 
-  const hasSyncedRef = useRef(false);
+  // The Notion sync (POST /api/habits/sync, 1.5-4 s) runs only when /habits is the routed page. Inside the
+  // continuous scroll Habits mounts next to Check-in, Sleep, Caffeine and others, and a background sync there
+  // broke the speed budget on those pages (perf-timing run 43666031043); the hourly habits-sync.yml bounds
+  // staleness, and opening /habits itself still syncs.
+  const inFeed = useInFeed();
+  const hasSyncedRef = useRef(inFeed);
   // Monotonic per-cell sequence so a stale response (rapid re-tap on the same
   // cell) can't revert or clear the in-flight state of a newer optimistic write.
   const answerSeq = useRef(new Map<string, number>());
