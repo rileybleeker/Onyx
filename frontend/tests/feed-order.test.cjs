@@ -6,7 +6,7 @@ const { loadTs } = require('./helpers/load-ts.cjs');
 
 const { areaOrder, feedSequence, feedRouteOf, isFeedExcluded, neighbourOf, parseAreaOrder, feedTitle } = loadTs('lib/feed-order.ts');
 
-const NAV = ['/today', '/activities', '/nutrition', '/check-in', '/sleep', '/analytics/hrv', '/agents', '/financials', '/chat', '/status'];
+const NAV = ['/today', '/activities', '/nutrition', '/log', '/sleep', '/analytics/hrv', '/agents', '/financials', '/chat', '/status'];
 const all = () => true;
 
 test('route keys: "/" is Today, query, hash and trailing slash are dropped', () => {
@@ -26,14 +26,14 @@ test('excluded routes never join the scroll', () => {
 
 test('default: nav order with Today first', () => {
   assert.deepEqual(areaOrder(['/sleep', '/today', '/status'], null), ['/today', '/sleep', '/status']);
-  assert.deepEqual(feedSequence(NAV, null, '/sleep', all), ['/today', '/activities', '/nutrition', '/check-in', '/sleep', '/analytics/hrv', '/financials', '/status']);
+  assert.deepEqual(feedSequence(NAV, null, '/sleep', all), ['/today', '/activities', '/nutrition', '/log', '/sleep', '/analytics/hrv', '/financials', '/status']);
 });
 
 test('pages without a FeedSection are skipped, except the routed page', () => {
-  const has = (r) => r !== '/check-in' && r !== '/financials';
+  const has = (r) => r !== '/log' && r !== '/financials';
   const seq = feedSequence(NAV, null, '/today', has);
-  assert.ok(!seq.includes('/check-in') && !seq.includes('/financials'));
-  assert.ok(feedSequence(NAV, null, '/check-in', has).includes('/check-in'));
+  assert.ok(!seq.includes('/log') && !seq.includes('/financials'));
+  assert.ok(feedSequence(NAV, null, '/log', has).includes('/log'));
 });
 
 test('a saved order: known pages in that order, new pages after their default predecessor, hidden skipped', () => {
@@ -51,7 +51,7 @@ test('a saved order: known pages in that order, new pages after their default pr
 test('accepted shapes: page-layout grid, list with hidden flags, local copy, junk', () => {
   const known = areaOrder(NAV, null);
   // A Personalize layout also names the Quick access pages (the default pins when it has no grids.quick).
-  assert.deepEqual(parseAreaOrder({ v: 1, grids: { main: { order: ['sleep', 'today'], hide: { status: true } } } }, known), { order: ['/sleep', '/today'], hidden: ['/status'], pinned: ['/today', '/check-in'] });
+  assert.deepEqual(parseAreaOrder({ v: 1, grids: { main: { order: ['sleep', 'today'], hide: { status: true } } } }, known), { order: ['/sleep', '/today'], hidden: ['/status'], pinned: ['/today', '/log'] });
   assert.deepEqual(parseAreaOrder([{ href: '/nutrition' }, { href: '/sleep', hidden: true }, '/today', '/nope'], known), { order: ['/nutrition', '/sleep', '/today'], hidden: ['/sleep'] });
   assert.deepEqual(parseAreaOrder({ l: ['analytics-hrv', 'today'] }, known), { order: ['/analytics/hrv', '/today'], hidden: [] });
   assert.equal(parseAreaOrder(null, known), null);
@@ -61,13 +61,13 @@ test('accepted shapes: page-layout grid, list with hidden flags, local copy, jun
 
 test('Quick access (pinned) pages lead the scroll; a page hidden from the side panel is not pinned', () => {
   const known = areaOrder(NAV, null);
-  const layout = { v: 1, grids: { main: { order: ['nutrition', 'sleep', 'today'] }, quick: { order: ['sleep'], hide: { sleep: false, 'check-in': true } } } };
+  const layout = { v: 1, grids: { main: { order: ['nutrition', 'sleep', 'today'] }, quick: { order: ['sleep'], hide: { sleep: false, 'log': true } } } };
   const saved = parseAreaOrder(layout, known);
   assert.deepEqual(saved.pinned, ['/sleep', '/today']);
   assert.deepEqual(areaOrder(NAV, saved).slice(0, 3), ['/sleep', '/today', '/nutrition']);
   assert.deepEqual(feedSequence(NAV, saved, '/nutrition', all).slice(0, 3), ['/sleep', '/today', '/nutrition']);
   const off = parseAreaOrder({ v: 1, grids: { quick: { order: ['sleep'], hide: { sleep: false } }, nav: { hide: { sleep: true } } } }, known);
-  assert.deepEqual(off.pinned, ['/today', '/check-in']);
+  assert.deepEqual(off.pinned, ['/today', '/log']);
   // A layout with only the bottom bar or hidden-from-navigation says nothing about the scroll.
   assert.equal(parseAreaOrder({ v: 1, grids: { tabs: { order: ['sleep'] } } }, known), null);
 });

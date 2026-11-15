@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Check, ChevronDown, Moon, Sun, X } from "lucide-react";
 import { agentsApi } from "@/lib/agents-api";
 import { sayFromHash, VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
+import { useLogDrafts } from "@/lib/log-drafts";
 import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, Q_JOURNALED, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
 import { clientCache } from "@/lib/client-cache";
 import { buildCells, savePlan, visibleNights, voicePatch, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
@@ -116,11 +117,17 @@ function longDate(date: string): string {
 }
 
 /**
- * `feed`: drawn inside the continuous scroll (FeedSection.tsx) instead of on /check-in itself. The day tabs then
- * keep the chosen day in this component instead of the address (the scroll owns the address bar, and a
- * router.replace would leave the scroll for /check-in), and the heading is marked feed-page-heading.
+ * `feed`: drawn inside another page instead of on /check-in itself (the /log Check-in section, which the
+ * continuous scroll shows; /check-in has no FeedSection of its own). The day tabs then keep the chosen day in this
+ * component instead of the address (a router.replace would leave that page for /check-in), and the heading is
+ * marked feed-page-heading unless `embedded`.
+ *
+ * `embedded`: drawn as the Check-in section of /log (app/log/sections/CheckIn.tsx, always with `feed`): a section
+ * heading, and words from the Log screen's "Say it" box (lib/log-drafts.ts, "checkin") fill this check-in exactly
+ * like this screen's own Say it once (draft taps only; Save stores them). `omitParts`: parts another /log section
+ * covers ("say-it-once", "uber-eats", "uber-eats-leftovers"), left out.
  */
-export default function CheckInClient({ feed = false }: { feed?: boolean } = {}) {
+export default function CheckInClient({ feed = false, embedded = false, omitParts }: { feed?: boolean; embedded?: boolean; omitParts?: readonly string[] } = {}) {
   const router = useRouter();
   const params = useSearchParams();
   const [feedDate, setFeedDate] = useState<string | null>(null);
@@ -130,7 +137,9 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
     if (feed) setFeedDate(date);
     else router.replace(date ? `/check-in?date=${date}` : "/check-in", { scroll: false });
   }, [feed, router]);
-  const headingTestId = feed ? "feed-page-heading" : undefined;
+  const headingTestId = feed && !embedded ? "feed-page-heading" : undefined;
+  const headingClass = embedded ? "text-[15px] font-medium text-text-primary" : "text-[28px] font-medium text-text-primary";
+  const omit = new Set(omitParts ?? []);
 
   const [data, setData] = useState<CheckinPayload | null>(null);
   const [cells, setCells] = useState<Cells>({}); // the day tab's questions
@@ -549,6 +558,17 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
     setHandoff(null);
     void fillRef.current(handoff);
   }, [handoff, data, refreshFailed]);
+  // /log: the Log screen's Say it box hands its words over the same way (taken once, then cleared).
+  const { draft: logDraft, clear: clearLogDraft } = useLogDrafts("checkin");
+  useEffect(() => {
+    if (!embedded || !logDraft) return;
+    clearLogDraft(logDraft.id);
+    const words = logDraft.value.text.trim().slice(0, VOICE_MAX_TEXT_CHARS);
+    if (!words) return;
+    setVoiceText(words);
+    setVoiceOpen(true);
+    setHandoff(words);
+  }, [embedded, logDraft, clearLogDraft]);
 
   // "Journaled your thoughts?" once the entry for the day on screen is saved: a draft Yes like any other tap,
   // never over a saved or tapped answer.
@@ -616,7 +636,7 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
   if (visibleError && !data) {
     return (
       <div className="max-w-xl">
-        <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Check-in</h2>
+        <h2 data-testid={headingTestId} className={headingClass}>Check-in</h2>
         <p className="mt-4 text-sm text-text-secondary">{visibleError}</p>
         {draftRecovery}
         <button
@@ -651,7 +671,7 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
   return (
     <div className="max-w-xl">
       <div className="mb-5">
-        <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Check-in</h2>
+        <h2 data-testid={headingTestId} className={headingClass}>Check-in</h2>
         <p className="text-sm text-text-tertiary mt-0.5">
           {refreshFailed ? `Showing the last loaded check-in for daytime ${data.date}. Dates are unchanged; refresh could not confirm today's date.` : nights.length > 0
             ? `Two parts. Sleep: ${nightLabel(nights[0].date, data.today).span}. Daytime: ${dayName === "Today" || dayName === "Yesterday" ? `${dayName.toLowerCase()}, ` : ""}${longDate(data.date)}.`
@@ -727,7 +747,7 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
       </>}>
 
       {/* Say it once: dictated text -> draft Yes/No taps for the day and last night, and a journal draft (nothing is saved until Save / Save to journal) */}
-      <Part id="say-it-once" title="Say it once">
+      {!omit.has("say-it-once") && <Part id="say-it-once" title="Say it once">
       <details
         open={voiceOpen}
         onToggle={(e) => setVoiceOpen(e.currentTarget.open)}
@@ -759,7 +779,7 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
         </div>
         {voiceMsg && <p className="text-[12px] text-text-secondary mt-2">{voiceMsg}</p>}
       </details>
-      </Part>
+      </Part>}
 
       {journal && (
         <Part id="journal-draft" title="Journal entry draft">
@@ -841,7 +861,7 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
         </Part>
       )}
 
-      {(delivery.groups.length > 0 || delivery.loadError) && (
+      {!omit.has("uber-eats") && (delivery.groups.length > 0 || delivery.loadError) && (
         <Part id="uber-eats" title="Uber Eats: how much did you eat?">
         <section>
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">Uber Eats: how much did you eat?</h3>
@@ -867,7 +887,7 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
         </Part>
       )}
 
-      {delivery.leftovers.length > 0 && (
+      {!omit.has("uber-eats-leftovers") && delivery.leftovers.length > 0 && (
         <Part id="uber-eats-leftovers" title="Uber Eats leftovers">
         <section>
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">Uber Eats: leftovers</h3>
