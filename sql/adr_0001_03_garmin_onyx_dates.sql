@@ -1,5 +1,8 @@
 -- =============================================================================
 -- ADR-0001 Phase 1, step 3 — onyx_* columns + triggers on Garmin tables
+-- NOTE 2026-11-14: pds.set_onyx_dates_garmin_hrv (always Garmin's calendar_date,
+-- 'source_field') is redefined in sql/tz_derivation_edge_cases.sql (pending Riley's
+-- apply). Once applied, that file holds the current definition; do not re-run the copy below.
 -- =============================================================================
 -- Per docs/adr/0001-timezone-and-behavioral-day-handling.md (D3/D4).
 --

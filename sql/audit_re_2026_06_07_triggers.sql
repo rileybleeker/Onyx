@@ -1,5 +1,8 @@
 -- =============================================================================
 -- Re-audit 2026-06-07 — synced_at bump trigger + Cronometer onyx-date triggers
+-- NOTE 2026-11-14: pds.set_onyx_dates_cronometer_servings is redefined in
+-- sql/tz_derivation_edge_cases.sql (pending Riley's apply). Once applied, that file holds
+-- the current definition; do not re-run the copy below.
 -- =============================================================================
 -- These objects were applied DIRECTLY to prod via Supabase migrations during
 -- the 2026-06-07 session (recorded in the Supabase migration history) but the
