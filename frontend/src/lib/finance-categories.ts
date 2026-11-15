@@ -3,7 +3,7 @@
  * overrides (pds.finance_category_rules, pds.finance_txn_categories). PURE: no I/O. Applied when the ledger is
  * read, so the stored rows and the importer stay as they are.
  */
-import { merchantKey } from "./procurement-recurring";
+import { merchantKey, rowLabel } from "./procurement-recurring";
 
 /** Categories offered in the picker: Rocket Money's usual set plus whatever the ledger already uses. */
 export const STANDARD_CATEGORIES: readonly string[] = [
@@ -38,6 +38,20 @@ export const STANDARD_CATEGORIES: readonly string[] = [
   "Travel & Vacation",
 ];
 
+/**
+ * A looser merchant key: the first three words with digits and punctuation removed. Groups charges whose
+ * description carries a per-charge code (Privacy.com virtual cards, payroll references) under one merchant.
+ */
+export function wordKey(t: { name: string | null; custom_name: string | null }): string {
+  return rowLabel(t)
+    .toLowerCase()
+    .replace(/[^a-z\s]+/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 1)
+    .slice(0, 3)
+    .join(" ");
+}
+
 export interface CategoryFixes {
   rules: ReadonlyMap<string, string>; // merchant key -> category
   overrides: ReadonlyMap<string, string>; // txn_key -> category
@@ -59,8 +73,9 @@ export function fixedCategory(
     if (o) return o;
   }
   if (fixes.rules.size) {
-    const m = merchantKey({ name: typeof row.name === "string" ? row.name : "", custom_name: typeof row.custom_name === "string" ? row.custom_name : null });
-    const r = m ? fixes.rules.get(m) : undefined;
+    const t = { name: typeof row.name === "string" ? row.name : "", custom_name: typeof row.custom_name === "string" ? row.custom_name : null };
+    const m = merchantKey(t);
+    const r = (m ? fixes.rules.get(m) : undefined) ?? fixes.rules.get(wordKey(t));
     if (r) return r;
   }
   return typeof row.category === "string" ? row.category : null;

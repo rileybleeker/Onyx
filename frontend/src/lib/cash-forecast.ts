@@ -20,6 +20,7 @@
 import { classifyTxn, isNonSpendingCategory } from "./finance-ledger";
 import { addDays, addMonths, daysBetween, displayMerchant, merchantKey, rowLabel, stableId } from "./procurement-recurring";
 import { FORECAST } from "./cash-forecast-config";
+import { wordKey } from "./finance-categories";
 
 // ─── Types ────────────────────────────────────────────────────────────────────────────────────
 
@@ -536,12 +537,7 @@ function pairRows(pool: Row[], cardRows: Row[]): { internal: Set<number>; cardPa
  * normalized label keeps, which split one paycheck into six one-off deposits (found 2026-11-14).
  */
 export function streamKey(t: { name: string | null; custom_name: string | null }): string {
-  const words = rowLabel(t)
-    .toLowerCase()
-    .replace(/[^a-z\s]+/g, " ")
-    .split(/\s+/)
-    .filter((w) => w.length > 1);
-  return words.slice(0, 3).join(" ");
+  return wordKey(t);
 }
 
 interface StreamPlan {

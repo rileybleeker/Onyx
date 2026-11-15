@@ -6,6 +6,7 @@
  */
 import { classifyTxn, UNCATEGORIZED } from "./finance-ledger";
 import { daysBetween, displayMerchant, merchantKey, rowLabel } from "./procurement-recurring";
+import { wordKey } from "./finance-categories";
 
 export const TOTAL_KEY = "__total__";
 export const REVIEW_DAYS = 90;
@@ -151,10 +152,11 @@ export function computeBudgets(txns: readonly BudgetTxn[], budgets: ReadonlyMap<
     .slice(0, 5);
 
   // Merchants: this month's biggest, and uncategorized ones from the last 90 days (to file with one tap).
-  const group = (rows: BudgetTxn[]): MerchantTotal[] => {
+  const group = (rows: BudgetTxn[], loose = false): MerchantTotal[] => {
     const map = new Map<string, MerchantTotal>();
     for (const t of rows) {
-      const key = merchantKey(t);
+      // Review groups by the looser key, so a rule covers charges with per-charge codes (Privacy.com).
+      const key = loose ? wordKey(t) || merchantKey(t) : merchantKey(t);
       if (!key) continue;
       const cur = map.get(key) ?? { key, label: displayMerchant(rowLabel(t)), category: catOf(t), cents: 0, count: 0, lastDate: t.txn_date };
       cur.cents += t.amount_cents;
@@ -166,7 +168,7 @@ export function computeBudgets(txns: readonly BudgetTxn[], budgets: ReadonlyMap<
   };
   const spendRows = counted.filter((t) => t.amount_cents > 0 && !isIncome(catOf(t)));
   const topMerchants = group(spendRows.filter((t) => monthKey(t.txn_date) === month)).sort((a, b) => b.cents - a.cents).slice(0, 8);
-  const uncategorized = group(counted.filter((t) => catOf(t) === UNCATEGORIZED && daysBetween(t.txn_date, today) <= REVIEW_DAYS))
+  const uncategorized = group(counted.filter((t) => catOf(t) === UNCATEGORIZED && daysBetween(t.txn_date, today) <= REVIEW_DAYS), true)
     .sort((a, b) => Math.abs(b.cents) - Math.abs(a.cents))
     .slice(0, 40);
 
