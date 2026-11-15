@@ -37,6 +37,7 @@ import os
 import sys
 import argparse
 import logging
+from bisect import bisect_right, insort_left
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -156,44 +157,59 @@ def fetch_cycles(since: str | None = None) -> list[dict]:
     return rows
 
 
-def tz_for_instant_via_pg(ts_iso: str) -> str:
-    """Query pds.tz_for_instant for the IANA TZ in effect at ts."""
-    res = supa.schema("pds").rpc("tz_for_instant", {"ts": ts_iso}).execute()
-    return res.data or "America/New_York"
+def _parse_ts(ts_iso: str) -> datetime:
+    return datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+
+
+def fetch_tz_log() -> list[tuple[datetime, str]]:
+    """All pds.user_tz_log rows as (effective_from, tz), oldest first."""
+    rows = (supa.schema("pds").from_("user_tz_log")
+               .select("effective_from,tz")
+               .order("effective_from", desc=False)
+               .execute().data)
+    return sorted(((_parse_ts(r["effective_from"]), r["tz"]) for r in rows),
+                  key=lambda r: r[0])
+
+
+def tz_at(tz_log: list[tuple[datetime, str]], ts: datetime) -> str:
+    """In-memory copy of pds.tz_for_instant: the tz of the latest row with
+    effective_from <= ts, else America/New_York."""
+    i = bisect_right(tz_log, ts, key=lambda r: r[0])
+    return tz_log[i - 1][1] if i else "America/New_York"
 
 
 def infer_proposed_inserts(cycles: list[dict], history_map: dict[str, str]) -> list[dict]:
     """For each cycle, propose a user_tz_log row only if:
-      (a) the WHOOP offset doesn't match the offset of what tz_for_instant
-          currently returns at this instant, AND
+      (a) the WHOOP offset doesn't match the offset of the tz the log gives
+          for this instant, AND
       (b) we haven't already proposed the same IANA for the immediately
           prior cycle (deduplication).
 
-    Audit re-2026-05-26 P1 (gemini tz/F-001): rather than calling
-    ``tz_for_instant`` for every cycle, seed an in-memory ``current_tz`` from
-    one initial DB query and update it whenever this loop generates a
-    proposal. Without that, an outbound flight proposal in run N doesn't
-    surface to subsequent cycles' comparisons during the same run, and the
-    return flight back to ET can be missed entirely because the DB still
-    reports the home tz. Also drops ~N-1 RPC round-trips per run.
+    The log is read once and looked up per cycle in memory (same rule as
+    ``pds.tz_for_instant``), and every proposal made in this run is added to
+    that in-memory copy straight away.
+
+    - Per-cycle lookup (2026-11-14): the previous version read the log once
+      at the first cycle and then only followed its own proposals. Over a
+      wide ``--since`` window it never saw the manual / GPS / flight rows
+      for later trips, so it proposed new rows for trips the log already
+      covered.
+    - Proposals join the copy (audit re-2026-05-26 P1, gemini tz/F-001):
+      an outbound-flight proposal must be visible to the next cycles, or
+      the return flight to ET is missed because the DB still reports the
+      home tz until the proposal is applied.
     """
     proposals: list[dict] = []
     last_proposed_tz: str | None = None
-
-    # Seed current_tz from the DB once. Subsequent updates happen in-memory.
-    current_tz: str | None = None
-    if cycles:
-        current_tz = tz_for_instant_via_pg(cycles[0]["start_time"])
-        log.info(f"  seeded current_tz from DB: {current_tz} "
-                 f"(at {cycles[0]['start_time']})")
+    tz_log = fetch_tz_log() if cycles else []
 
     for c in cycles:
         ts_iso = c["start_time"]
         end_iso = c.get("end_time")
         whoop_offset_str = c["timezone_offset"]
-        log_tz = current_tz or "America/New_York"
         try:
-            ts_aware = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+            ts_aware = _parse_ts(ts_iso)
+            log_tz = tz_at(tz_log, ts_aware)
             log_offset_at_start = format_offset(ts_aware.astimezone(ZoneInfo(log_tz)).utcoffset())
             log_offset_at_end = None
             if end_iso:
@@ -234,11 +250,11 @@ def infer_proposed_inserts(cycles: list[dict], history_map: dict[str, str]) -> l
                       f"{provenance}; log was {log_tz} ({log_offset_at_start})"),
         })
         last_proposed_tz = inferred_iana
-        # Update in-memory state so the next cycle's comparison sees the new
-        # tz (necessary to detect the return-flight half of a round trip on
-        # the first run; without this, the return is masked because the DB
-        # still resolves the home tz until the proposal is actually applied).
-        current_tz = inferred_iana
+        # Add the proposal to the in-memory log so the next cycles see it
+        # (needed to catch the return-flight half of a round trip in the same
+        # run). insort_left keeps an existing row at the same instant in
+        # charge, as the primary key would on insert.
+        insort_left(tz_log, (ts_aware, inferred_iana), key=lambda r: r[0])
     return proposals
 
 

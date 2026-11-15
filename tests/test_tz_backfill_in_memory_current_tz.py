@@ -80,26 +80,26 @@ def test_round_trip_proposes_both_legs_on_single_run() -> None:
         "-06:00": "America/Chicago",
         "-05:00": "America/New_York",
     }
-    # Mock the seed query: log says "America/New_York" only at the first
-    # cycle's start_time. The pre-fix code would call tz_for_instant per cycle
-    # and would never see Chicago — let's verify the mock is called ONCE.
-    pg_calls: list[str] = []
+    # Mock the log read: an empty user_tz_log, so the DB would answer
+    # "America/New_York" at every instant and never see Chicago. The log is
+    # read ONCE per run; the run's own proposals are added to the in-memory
+    # copy (2026-11-14: per-cycle lookups go against that copy, not the DB).
+    log_reads: list[int] = []
 
-    def _pg_mock(ts_iso: str) -> str:
-        pg_calls.append(ts_iso)
-        return "America/New_York"
+    def _log_mock() -> list:
+        log_reads.append(1)
+        return []
 
-    with patch.object(wtb, "tz_for_instant_via_pg", side_effect=_pg_mock):
+    with patch.object(wtb, "fetch_tz_log", side_effect=_log_mock):
         proposals = wtb.infer_proposed_inserts(cycles, history_map)
 
-    print(f"  tz_for_instant_via_pg calls: {len(pg_calls)}")
+    print(f"  fetch_tz_log calls: {len(log_reads)}")
     print(f"  proposals: {[(p['effective_from'], p['tz']) for p in proposals]}")
 
-    # Performance / leakage check: the seeded helper is called exactly once,
-    # not per-row.
-    assert len(pg_calls) == 1, (
-        f"Expected 1 DB seed call; saw {len(pg_calls)}. The fix should keep "
-        f"current_tz in memory rather than re-querying per row."
+    # Performance / leakage check: the log is read exactly once, not per-row.
+    assert len(log_reads) == 1, (
+        f"Expected 1 log read; saw {len(log_reads)}. The log should be read "
+        f"once and looked up in memory rather than re-queried per row."
     )
     # Correctness check: both outbound AND return proposals fire on the
     # same run (under the bug, cycle 1003 would never produce a proposal

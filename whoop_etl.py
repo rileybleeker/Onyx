@@ -689,10 +689,10 @@ def main():
     # WHOOP gives offset not IANA; manual entries always win and are never
     # overridden. Silently skips if anything goes wrong (ETL still succeeds).
     #
-    # Not run for --cycles-only: over a window of months the pass proposes rows for old
-    # trips that the log already covers through manual / GPS / flight entries at other
-    # instants (a dry run over the full history on 2026-11-13 proposed 23 rows, 21 of them
-    # new). A deep cycle re-read must not rewrite time-zone history.
+    # Not run for --cycles-only: a deep cycle re-read must not rewrite time-zone history.
+    # (Until 2026-11-14 the pass also proposed rows over wide windows for old trips the log
+    # already covered: a full-history dry run on 2026-11-13 proposed 23. It now checks each
+    # cycle against the log at that cycle's own instant.)
     if args.cycles_only:
         log.info("Skipping whoop_tz_backfill (--cycles-only)")
         if backfill_failed:
