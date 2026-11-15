@@ -78,6 +78,11 @@ type Opts = {
   cacheKey?: string | null;
   /** Change it to read the same window again. Dishes already on screen stay on screen. */
   reloadKey?: number;
+  /**
+   * A read of this window already started (the /log page's first load, app/log/early-delivery.ts): called once per
+   * load with the window's cache key; a promise is used instead of reading again, null = read as usual.
+   */
+  early?: (key: string) => Promise<DeliveryWindow> | null;
 };
 
 async function failure(res: Response) {
@@ -188,6 +193,8 @@ export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
   useEffect(() => {
     onSavedRef.current = opts.onSaved;
   }, [opts.onSaved]);
+  const earlyRef = useRef(opts.early);
+  earlyRef.current = opts.early;
   // Days currently on screen, and each loaded dish's day: a save error for a dish no longer shown is dropped.
   const shownDays = useRef<Set<string>>(new Set());
   const dishDay = useRef(new Map<number, string>());
@@ -275,6 +282,11 @@ export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
       else setState({ ...EMPTY, key, loadError: "Couldn't load Uber Eats dishes." });
     };
     const load = () => getDeliveryWindow(days);
+    // This load's read: one already started for this window (taken once; read again if it failed), else a new one.
+    const first = () => {
+      const started = earlyRef.current?.(cacheKey ?? key);
+      return started ? started.catch(() => load()) : load();
+    };
 
     if (cacheKey) {
       clientCache.register(cacheKey, load);
@@ -294,7 +306,7 @@ export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
         }
       }
       clientCache
-        .revalidate(cacheKey, load)
+        .revalidate(cacheKey, first)
         .then((v) => {
           if (cancelled) return;
           if (!isWindow(v)) throw new Error("Uber Eats window missing");
@@ -303,7 +315,7 @@ export function useDeliveryDishes(date: string | null, opts: Opts = {}) {
         })
         .catch(fail);
     } else {
-      load()
+      first()
         .then((v) => {
           if (!cancelled) show(v);
         })

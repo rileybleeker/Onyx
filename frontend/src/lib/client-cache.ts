@@ -578,11 +578,13 @@ export function reportSessionEnded() { onSessionEnded(); }
  * GET a JSON endpoint through the cache. `check` throws on a malformed answer, which is then neither cached
  * nor returned. The raw JSON is cached under the URL, so every page reading the URL shares one entry.
  * 404 / 410 / 204 removes the entry (GoneError); 401 or a redirect to /login wipes the client (SessionEndedError).
+ * `get`: how to GET `url` when it differs from a plain no-store fetch (e.g. taking the answer a page's HTML already
+ * started, lib/log-early.ts); same URL, GET only.
  */
-export async function cachedJson<T = unknown>(url: string, options: { check?: (data: unknown) => void; persist?: boolean; cache?: ClientCache } = {}): Promise<T> {
+export async function cachedJson<T = unknown>(url: string, options: { check?: (data: unknown) => void; persist?: boolean; cache?: ClientCache; get?: () => Promise<Response> } = {}): Promise<T> {
   const cache = options.cache ?? clientCache;
   const value = await cache.revalidate<T>(url, async () => {
-    const data = await fetchJsonValue(url);
+    const data = await fetchJsonValue(url, options.get);
     if (data !== GONE) options.check?.(data);
     return data as T | typeof GONE;
   }, { persist: options.persist });
@@ -590,9 +592,12 @@ export async function cachedJson<T = unknown>(url: string, options: { check?: (d
   return value;
 }
 
-/** GET a JSON endpoint: the parsed body, or GONE for 404 / 410 / 204. Throws on a session end or other errors. */
-export async function fetchJsonValue(url: string): Promise<unknown> {
-  const res = await fetch(url, { cache: "no-store" });
+/**
+ * GET a JSON endpoint: the parsed body, or GONE for 404 / 410 / 204. Throws on a session end or other errors.
+ * `get` replaces the plain no-store fetch of `url` (see cachedJson).
+ */
+export async function fetchJsonValue(url: string, get?: () => Promise<Response>): Promise<unknown> {
+  const res = await (get ? get() : fetch(url, { cache: "no-store" }));
   if (sessionEnded(res)) { reportSessionEnded(); throw new SessionEndedError(); }
   if (isGoneStatus(res.status)) return GONE;
   if (!res.ok) throw new Error(`HTTP ${res.status ?? "error"}`);

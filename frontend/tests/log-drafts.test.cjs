@@ -99,7 +99,7 @@ test("the Check-in section is the real check-in, not a copy, and never owns Pers
   const section = read("app/log/sections/CheckIn.tsx");
   assert.match(section, /import CheckInClient from "@\/app\/check-in\/CheckInClient";/);
   assert.match(section, /<InFeed>/);
-  assert.match(section, /<CheckInClient feed embedded omitParts=\{OMIT\} \/>/);
+  assert.match(section, /<CheckInClient feed embedded omitParts=\{OMIT\} earlyRead=\{routed\} \/>/);
   const checkin = read("app/check-in/CheckInClient.tsx");
   assert.match(checkin, /useLogDrafts\("checkin"\)/);
   assert.match(checkin, /if \(!embedded \|\| !logDraft\) return;/, "only the embedded check-in takes Log drafts");
