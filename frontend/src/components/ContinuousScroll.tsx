@@ -281,6 +281,9 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
   const heights = useRef(new Map<string, number>());
   const refFns = useRef(new Map<string, (el: HTMLElement | null) => void>());
   const routedHrefRef = useRef<string>(routerRoute);
+  // The routed page whose reset (the effect below) has run: until then activeRef and routedHrefRef still describe
+  // the previous page, so the address is never written (see syncUrl).
+  const syncedForRef = useRef<string | null>(null);
   const routedTitleRef = useRef<string | null>(null);
   const middle = useRef(new Set<string>());
   const near = useRef(new Set<string>());
@@ -395,6 +398,11 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
     const route = activeRef.current;
     const routed = routedRef.current;
     if (route === routed && !back) return;
+    // A navigation the router has started: its new address is already in the bar while the previous page's
+    // observers and scroll handler can still fire (their cleanup runs after the commit). Writing then would put
+    // the previous page's address back over the new page, and the router would stay on a page whose address
+    // never arrives (perf-timing run 43672153038: /sleep in-app, 3 of 4 clicks never "arrived").
+    if (syncedForRef.current !== routed) return;
     const href = route === routed ? routedHrefRef.current : route;
     try {
       if (window.location.pathname + window.location.search === href) return;
@@ -538,14 +546,16 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
         return;
       }
     } catch { /* ignore */ }
+    syncedForRef.current = routedKey;
     // The routed page first (speed budget, 2026-11-15): its own requests get the network, the server and the
     // database to themselves while it loads, and the neighbouring pages start FEED_START_DELAY_MS later (then in an
     // idle slot), or at once when Riley starts to scroll. Mounting them at the first idle slot sent their 20-40
     // reads out together with the opened page's own and slowed those to over a second (perf-timing run 43668835523).
     let alive = true;
     let started = false;
-    // Gestures only, not "scroll": the router scrolls to the top on a navigation, which is not Riley scrolling.
-    const intents = ["wheel", "touchmove", "keydown", "pointerdown"] as const;
+    // Scrolling gestures only: not "scroll" (the router scrolls to the top on a navigation) and not a pointer press
+    // (a click on a nav link is about to leave this page; starting the scroll then raced the navigation).
+    const intents = ["wheel", "touchmove", "keydown"] as const;
     const start = () => {
       if (!alive || started) return;
       started = true;
