@@ -70,7 +70,8 @@ export const hasLevers = (p: ScenarioParams): boolean => Object.keys(p).length >
 
 /** The tax profile under the scenario (bonus size / timing, move date, other income, pre-tax savings). */
 export function applyToProfile(profile: TaxProfile, p: ScenarioParams): TaxProfile {
-  const next: TaxProfile = { ...profile, oneOffs: profile.oneOffs.map((o) => ({ ...o })) };
+  const next: TaxProfile = { ...profile, oneOffs: profile.oneOffs.map((o) => ({ ...o })), annualBonus: profile.annualBonus ? { ...profile.annualBonus } : profile.annualBonus };
+  if (p.bonusPct !== undefined && next.annualBonus) next.annualBonus.amountCents = Math.round((next.annualBonus.amountCents * p.bonusPct) / 100);
   if (p.bonusPct !== undefined || p.bonusShiftMonths) {
     next.oneOffs = next.oneOffs.map((o) =>
       /bonus/i.test(o.label) && !/signing/i.test(o.label)

@@ -286,6 +286,11 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
     ytdState: $(p?.ytd?.stateCents),
     priorTax: $(p?.priorYear?.federalTaxCents),
     priorAgi: $(p?.priorYear?.agiCents),
+    abAmount: $(p?.annualBonus?.amountCents),
+    abProfit: $(p?.annualBonus?.profitShareCents),
+    abGrowth: p?.annualBonus ? String(p.annualBonus.growthPct) : "0",
+    abFirst: p?.annualBonus ? String(p.annualBonus.firstPlanYear) : "",
+    raise: p?.raisePct ? String(p.raisePct) : "0",
   });
   const [oneOffs, setOneOffs] = useState(p?.oneOffs.map((o) => ({ date: o.date, gross: String(Math.round(o.grossCents / 100)), label: o.label })) ?? []);
   const [est, setEst] = useState({ jur: "GA" as Jur, date: "", amount: "" });
@@ -301,6 +306,10 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
     oneOffs: oneOffs.filter((o) => o.date && (dollars(o.gross) ?? 0) > 0).map((o) => ({ date: o.date, grossCents: cents(o.gross), label: o.label || "Bonus" })),
     ytd: f.ytdAsOf ? { year: Number(f.ytdAsOf.slice(0, 4)), asOf: f.ytdAsOf, federalCents: cents(f.ytdFed), stateCents: cents(f.ytdState) } : null,
     priorYear: dollars(f.priorTax) ? { year: Number((f.start || "2026").slice(0, 4)) - 1, federalTaxCents: cents(f.priorTax), agiCents: cents(f.priorAgi) } : null,
+    annualBonus: f.abFirst && (dollars(f.abAmount) || dollars(f.abProfit))
+      ? { amountCents: cents(f.abAmount), profitShareCents: cents(f.abProfit), growthPct: dollars(f.abGrowth) ?? 0, firstPlanYear: Number(f.abFirst) }
+      : null,
+    raisePct: dollars(f.raise) ?? 0,
     estimatesPaid: [...(p?.estimatesPaid ?? []), ...(extraEstimate ? [{ year: Number(extraEstimate.date.slice(0, 4)) - (extraEstimate.date.slice(5, 7) === "01" ? 1 : 0), ...extraEstimate }] : [])],
   });
   const field = (label: string, k: string, type = "text", w = "w-28", ph = "") => (
@@ -324,8 +333,16 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
         {field("YTD NC withheld ($)", "ytdState")}
         {field("Last year's federal tax ($)", "priorTax")}
         {field("Last year's AGI ($)", "priorAgi")}
+        {field("Raise each January (%)", "raise", "text", "w-20")}
       </div>
-      <p className="mt-3 text-[12px] text-text-secondary">Bonuses and one-off pay (gross):</p>
+      <p className="mt-3 text-[12px] text-text-secondary">Every year&apos;s bonus (paid each January for the year before):</p>
+      <div className="mt-1 flex flex-wrap gap-3">
+        {field("Bonus ($/yr, gross)", "abAmount")}
+        {field("Profit share ($/yr)", "abProfit")}
+        {field("Bonus growth (%/yr)", "abGrowth", "text", "w-20")}
+        {field("First plan year", "abFirst", "text", "w-20")}
+      </div>
+      <p className="mt-3 text-[12px] text-text-secondary">One-off pay (gross; a January &quot;bonus&quot; here replaces that year&apos;s generated bonus):</p>
       {oneOffs.map((o, i) => (
         <div key={i} className="mt-1 flex flex-wrap items-center gap-2">
           <input className={`${input} w-40`} value={o.label} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, label: e.target.value } : x)))} />
