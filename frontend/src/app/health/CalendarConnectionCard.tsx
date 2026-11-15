@@ -92,12 +92,12 @@ export default function CalendarConnectionCard({ initial }: { initial?: Calendar
     }
   }
 
-  return <div className="mt-4 border-t border-border-default pt-3" aria-label="Google Calendar connection">
+  return <section className="h-full rounded-2xl border border-border-default bg-surface-card p-5" aria-label="Google Calendar connection">
     <div className="flex items-center gap-2">
       <h3 className="text-sm font-semibold">Copy care items to Google Calendar: {status.connected ? 'on' : 'off'}</h3>
       <InfoHint label="Copy care items to Google Calendar">
         <p>One way, Onyx to Google: active care items go to a calendar of their own (&quot;{status.calendarName}&quot;) in your Google account. Only the label, date, time and booked state are sent; notes stay in Onyx.</p>
-        <p>Your calendar events above are already connected and do not need this. Marking an item booked only records your confirmation here.</p>
+        <p>Your calendar events (the Google Calendar card) are already connected and do not need this. Marking an item booked only records your confirmation here.</p>
       </InfoHint>
     </div>
     {status.connected
@@ -122,5 +122,5 @@ export default function CalendarConnectionCard({ initial }: { initial?: Calendar
           ? 'Opens Google’s consent page for the one permission above.'
           : 'Not set up yet: Onyx has no Google credentials, so nothing can be connected. Setup steps: docs/health-google-calendar.md.'}</p>
       </>}
-  </div>;
+  </section>;
 }
