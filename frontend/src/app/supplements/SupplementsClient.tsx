@@ -19,6 +19,12 @@ import {
   batchUndoResult, claimedIds, findSavedCopy, newWrite, receiptText, updateWrite,
   type SupplementWrite,
 } from "@/lib/supplement-writes";
+import { clientCache } from "@/lib/client-cache";
+import { fallbackBehavioralToday } from "@/lib/checkin";
+
+// The page's two data-ready reads, under the client cache's keys (lib/client-cache.ts: one key per GET, the URL).
+const PRODUCTS_URL = "/api/supplements/products";
+const TODAY_URL = "/api/supplements/today";
 
 interface Product {
   product_id: string;
@@ -241,10 +247,19 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
   // Custom-product fallback (photo → vision extraction → save).
   const [customMode, setCustomMode] = useState(false);
 
+  // Set once the server has answered: a copy from the client cache that arrives later never replaces it.
+  const answeredRef = useRef(false);
+  // Set when this device's cached copy is on screen (the seed effect below): the first load then stays silent.
+  const shownFromCacheRef = useRef(false);
   const loadAll = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
-    if (!silent) setLoading(true);
+    if (!silent && !answeredRef.current && !shownFromCacheRef.current) setLoading(true);
     try {
-      const [pRes, tRes] = await Promise.all([getJson("/api/supplements/products"), getJson("/api/supplements/today")]);
+      const [pRes, tRes] = await Promise.all([getJson(PRODUCTS_URL), getJson(TODAY_URL)]);
+      answeredRef.current = true;
+      // Kept for the next visit (shown at once, then revalidated by this same load). A write drops them
+      // (components/AppData.tsx invalidates /api/supplements after any successful write).
+      clientCache.put(PRODUCTS_URL, pRes);
+      clientCache.put(TODAY_URL, tRes);
       setProducts(pRes.products ?? []);
       // Only server-confirmed rows live in `intakes`; rows still saving are drawn from `writes`.
       setIntakes(tRes.intakes ?? []);
@@ -279,6 +294,30 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
     } catch (e) {
       console.error("Stacks load:", e);
     }
+  }, []);
+
+  // Speed (2026-11-15): show this device's last copy of the products and today's intakes at once (memory, else
+  // the persisted cache), only when it is for the current behavioral day and the server has not answered yet;
+  // loadAll below always revalidates. Before this, the page waited for both reads on every visit (data-ready
+  // 1.0-1.4 s in perf-timing run 43668835523).
+  useEffect(() => {
+    let alive = true;
+    type TodayCopy = { date?: unknown; intakes?: Intake[]; compounds?: CompoundRow[] };
+    const seed = (p: { products?: Product[] } | undefined, t: TodayCopy | undefined) => {
+      if (!alive || answeredRef.current || !p || !t || !Array.isArray(p.products) || !Array.isArray(t.intakes)) return;
+      if (t.date !== fallbackBehavioralToday(new Date())) return;
+      shownFromCacheRef.current = true;
+      setProducts(p.products);
+      setIntakes(t.intakes);
+      setCompounds(t.compounds ?? []);
+      setListDate(t.date as string);
+      setLoading(false);
+    };
+    const p = clientCache.peek<{ products?: Product[] }>(PRODUCTS_URL);
+    const t = clientCache.peek<TodayCopy>(TODAY_URL);
+    if (p && t) seed(p, t);
+    else void Promise.all([clientCache.read<{ products?: Product[] }>(PRODUCTS_URL), clientCache.read<TodayCopy>(TODAY_URL)]).then(([a, b]) => seed(a, b)).catch(() => {});
+    return () => { alive = false; };
   }, []);
 
   useEffect(() => {
