@@ -19,6 +19,7 @@ const base = {
   ytd: null,
   priorYear: null,
   estimatesPaid: [],
+  bracketIndexPct: 0, // the synthetic years use the built-in tables as they are
 };
 
 test("bracket tax", () => {
@@ -134,4 +135,15 @@ test("every year's bonus: generated each January, an explicit one wins, raises g
   assert.ok(items.some((i) => i.id.startsWith("pay:2032-01") && i.amountCents > 0), "future bonus reaches the cash forecast");
   const S = loadTs("lib/cash-forecast-scenario.ts");
   assert.equal(S.applyToProfile(p, { bonusPct: 50 }).annualBonus.amountCents, 2_500_000);
+});
+
+test("tax rules are configurable: bracket indexing for unpublished years, state rates, employer withholding", () => {
+  const p = { ...base, employmentStart: "2026-01-01", bracketIndexPct: undefined };
+  const t28 = T.tablesFor(p, 2028);
+  assert.equal(t28.federal.standardDeduction, Math.round((16_100 * Math.pow(1.027, 2)) / 50) * 50);
+  assert.match(t28.estimated, /indexed 2\.7%/);
+  assert.equal(T.tablesFor({ ...p, bracketIndexPct: 0 }, 2028).federal.standardDeduction, 16_100);
+  assert.equal(T.tablesFor({ ...p, gaRatePct: 4.99 }, 2026).ga.rate, 4.99);
+  const none = T.computeTaxYear({ ...p, employerStateWithholding: "none" }, 2026, "2026-03-01");
+  assert.equal(none.jurisdictions.find((j) => j.jur === "NC").withheldCents, 0);
 });

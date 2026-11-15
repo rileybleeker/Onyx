@@ -97,6 +97,8 @@ export interface ForecastSettings {
   horizonDays?: number;
   paths?: number;
   seed?: number;
+  /** Months of card payments averaged for each card's monthly total (default 6). */
+  cardMonths?: number;
   /** Backtests only: the pool's opening balance, instead of the latest snapshots. */
   openingOverride?: { cents: number; asOf: string };
 }
@@ -643,6 +645,7 @@ function detectCardStreams(
   today: string,
   horizonEnd: string,
   notes: string[],
+  cardMonths: number = FORECAST.cardMeanPayments,
 ): StreamPlan[] {
   const byCard = new Map<string, Row[]>();
   for (const r of pool) {
@@ -672,14 +675,14 @@ function detectCardStreams(
     }
     const firstMonth = monthIndex(monthKeyOf(occ[0].date));
     const totals: number[] = [];
-    for (let k = 1; k <= FORECAST.cardSamplePayments; k++) {
+    for (let k = 1; k <= Math.max(FORECAST.cardSamplePayments, cardMonths); k++) {
       const mi = thisMonth - k;
       if (mi < firstMonth) break;
       const key = monthFromIndex(mi);
       totals.push(occ.filter((o) => monthKeyOf(o.date) === key).reduce((sum, o) => sum + o.cents, 0));
     }
     if (!totals.length) totals.push(occ.reduce((sum, o) => sum + o.cents, 0));
-    const typical = Math.round(mean(totals.slice(0, FORECAST.cardMeanPayments)));
+    const typical = Math.round(mean(totals.slice(0, cardMonths)));
     if (typical <= 0) continue;
     // Amount-weighted median day of the month over the last 6 months of payments.
     const recent = occ.filter((o) => monthIndex(monthKeyOf(o.date)) >= thisMonth - 6);
@@ -723,7 +726,7 @@ function detectCardStreams(
         next: dates[0] ?? null,
         certainty: monthsPaid >= 3 ? "confirmed" : "likely",
         occurrences: occ.length,
-        method: `monthly total = mean paid in the last ${Math.min(FORECAST.cardMeanPayments, totals.length)} months, around the ${ordinal(day)}${paidThisMonth > 0 ? `; ${fmt(paidThisMonth)} already paid this month` : ""}`,
+        method: `monthly total = mean paid in the last ${Math.min(cardMonths, totals.length)} months, around the ${ordinal(day)}${paidThisMonth > 0 ? `; ${fmt(paidThisMonth)} already paid this month` : ""}`,
       },
       dates,
       amounts,
@@ -741,7 +744,7 @@ function cardPayDay(monthKey: string, day: number): string {
 }
 
 /** Monthly-total card streams for unpaired card payments, one per payee (e.g. "APPLECARD GSBANK PAYMENT"). */
-function detectPayeeCardStreams(rows: Row[], today: string, horizonEnd: string, notes: string[]): StreamPlan[] {
+function detectPayeeCardStreams(rows: Row[], today: string, horizonEnd: string, notes: string[], cardMonths: number = FORECAST.cardMeanPayments): StreamPlan[] {
   const byPayee = new Map<string, Row[]>();
   for (const r of rows) {
     if (r.t.txn_date < addDays(today, -FORECAST.detectWindowDays)) continue;
@@ -764,14 +767,14 @@ function detectPayeeCardStreams(rows: Row[], today: string, horizonEnd: string, 
     }
     const firstMonth = monthIndex(monthKeyOf(occ[0].date));
     const totals: number[] = [];
-    for (let k = 1; k <= FORECAST.cardSamplePayments; k++) {
+    for (let k = 1; k <= Math.max(FORECAST.cardSamplePayments, cardMonths); k++) {
       const mi = thisMonth - k;
       if (mi < firstMonth) break;
       const mk = monthFromIndex(mi);
       totals.push(occ.filter((o) => monthKeyOf(o.date) === mk).reduce((sum, o) => sum + o.cents, 0));
     }
     if (!totals.length) totals.push(occ.reduce((sum, o) => sum + o.cents, 0));
-    const typical = Math.round(mean(totals.slice(0, FORECAST.cardMeanPayments)));
+    const typical = Math.round(mean(totals.slice(0, cardMonths)));
     if (typical <= 0) continue;
     const recent = occ.filter((o) => monthIndex(monthKeyOf(o.date)) >= thisMonth - 6);
     const byDay = [...(recent.length ? recent : occ)].sort((a, b) => dayOfMonth(a.date) - dayOfMonth(b.date));
@@ -812,7 +815,7 @@ function detectPayeeCardStreams(rows: Row[], today: string, horizonEnd: string, 
         next: dates[0] ?? null,
         certainty: totals.slice(0, 3).filter((t) => t > 0).length >= 3 ? "confirmed" : "likely",
         occurrences: occ.length,
-        method: `monthly total = mean paid in the last ${Math.min(FORECAST.cardMeanPayments, totals.length)} months, around the ${ordinal(day)} (no matching rows on the card's own account)`,
+        method: `monthly total = mean paid in the last ${Math.min(cardMonths, totals.length)} months, around the ${ordinal(day)} (no matching rows on the card's own account)`,
       },
       dates,
       amounts,
@@ -942,11 +945,12 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   // Pool payments filed as card payments that could not be paired with a card account's rows (a card whose
   // feed is monthly, or one not connected): modeled per payee as monthly totals, like paired card payments.
   const unpairedCardRows = external.filter((r) => r.delta < 0 && /credit card payment/i.test(r.t.category ?? ""));
-  const unpairedCards = detectPayeeCardStreams(unpairedCardRows, today, horizonEnd, notes);
+  const cardMonths = Math.max(1, Math.min(12, Math.round(settings.cardMonths ?? FORECAST.cardMeanPayments)));
+  const unpairedCards = detectPayeeCardStreams(unpairedCardRows, today, horizonEnd, notes, cardMonths);
   const unpairedClaimed = new Set(unpairedCards.flatMap((p) => p.claimed));
   const streamPlans = [
     ...detectStreams(external.filter((r) => !unpairedClaimed.has(r.i)), today, horizonEnd, notes),
-    ...detectCardStreams(poolRows, cardPay, input.accounts, today, horizonEnd, notes),
+    ...detectCardStreams(poolRows, cardPay, input.accounts, today, horizonEnd, notes, cardMonths),
     ...unpairedCards,
   ];
   const claimed = new Set<number>();

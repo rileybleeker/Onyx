@@ -64,3 +64,16 @@ test("rows map to engine inputs", () => {
   assert.equal(d.cardTerms[0].promoNote, "estimated");
   assert.equal(d.growth[0].returnPct, 4);
 });
+
+test("stream adjustments and model settings are stored and mapped", () => {
+  const known = new Set();
+  assert.deepEqual(S.parseDriverBody({ key: "adjust:0123456789abcdef", value: { from: "2031-01-01", amountCents: -500000 } }, known).value, { from: "2031-01-01", amountCents: -500000 });
+  assert.deepEqual(S.parseDriverBody({ key: "adjust:0123456789abcdef", value: { from: "2031-01-01", stop: true } }, known).value, { from: "2031-01-01", stop: true });
+  assert.equal(S.parseDriverBody({ key: "adjust:nothex", value: { from: "2031-01-01", stop: true } }, known).ok, false);
+  assert.equal(S.parseDriverBody({ key: "settings", value: { lookbackWeeks: 52, cardMonths: 3, lowPercentile: 25 } }, known).ok, true);
+  const d = S.driversToInputs([{ key: "settings", value: { lookbackWeeks: 52, cardMonths: 3, lowPercentile: 25 } }, { key: "adjust:0123456789abcdef", value: { from: "2031-01-01", stop: true } }]);
+  assert.equal(d.settings.lookbackWeeks, 52);
+  assert.equal(d.settings.cardMonths, 3);
+  assert.equal(d.settings.lowPercentile, 0.25);
+  assert.deepEqual(d.adjustments[0], { streamId: "0123456789abcdef", from: "2031-01-01", stop: true, amountCents: undefined });
+});

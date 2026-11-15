@@ -291,6 +291,10 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
     abGrowth: p?.annualBonus ? String(p.annualBonus.growthPct) : "0",
     abFirst: p?.annualBonus ? String(p.annualBonus.firstPlanYear) : "",
     raise: p?.raisePct ? String(p.raisePct) : "0",
+    index: p?.bracketIndexPct !== undefined ? String(p.bracketIndexPct) : "",
+    gaRate: typeof p?.gaRatePct === "number" ? String(p.gaRatePct) : "",
+    ncRate: typeof p?.ncRatePct === "number" ? String(p.ncRatePct) : "",
+    withholds: p?.employerStateWithholding ?? "NC",
   });
   const [oneOffs, setOneOffs] = useState(p?.oneOffs.map((o) => ({ date: o.date, gross: String(Math.round(o.grossCents / 100)), label: o.label })) ?? []);
   const [est, setEst] = useState({ jur: "GA" as Jur, date: "", amount: "" });
@@ -310,6 +314,10 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
       ? { amountCents: cents(f.abAmount), profitShareCents: cents(f.abProfit), growthPct: dollars(f.abGrowth) ?? 0, firstPlanYear: Number(f.abFirst) }
       : null,
     raisePct: dollars(f.raise) ?? 0,
+    ...(f.index.trim() ? { bracketIndexPct: dollars(f.index) ?? 0 } : {}),
+    gaRatePct: f.gaRate.trim() ? (dollars(f.gaRate) ?? null) : null,
+    ncRatePct: f.ncRate.trim() ? (dollars(f.ncRate) ?? null) : null,
+    employerStateWithholding: f.withholds === "none" ? "none" : "NC",
     estimatesPaid: [...(p?.estimatesPaid ?? []), ...(extraEstimate ? [{ year: Number(extraEstimate.date.slice(0, 4)) - (extraEstimate.date.slice(5, 7) === "01" ? 1 : 0), ...extraEstimate }] : [])],
   });
   const field = (label: string, k: string, type = "text", w = "w-28", ph = "") => (
@@ -334,6 +342,19 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
         {field("Last year's federal tax ($)", "priorTax")}
         {field("Last year's AGI ($)", "priorAgi")}
         {field("Raise each January (%)", "raise", "text", "w-20")}
+      </div>
+      <p className="mt-3 text-[12px] text-text-secondary">Tax rules (blank = the built-in tables):</p>
+      <div className="mt-1 flex flex-wrap gap-3">
+        {field("Federal brackets rise (%/yr, unpublished years)", "index", "text", "w-20", "2.7")}
+        {field("Georgia rate (%)", "gaRate", "text", "w-20", "5.09")}
+        {field("NC rate (%)", "ncRate", "text", "w-20", "3.99")}
+        <label className="flex flex-col gap-1 text-[12px] text-text-secondary">
+          Employer withholds state tax for
+          <select className={input} value={f.withholds} onChange={(e) => setF((x) => ({ ...x, withholds: e.target.value }))}>
+            <option value="NC">North Carolina</option>
+            <option value="none">no state</option>
+          </select>
+        </label>
       </div>
       <p className="mt-3 text-[12px] text-text-secondary">Every year&apos;s bonus (paid each January for the year before):</p>
       <div className="mt-1 flex flex-wrap gap-3">

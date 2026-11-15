@@ -7,7 +7,7 @@
  * Not a filed return: no itemizing, credits, AMT or equity; FICA is assumed to be withheld exactly.
  */
 import { lastBusinessDayOfMonth, type PlannedItem } from "./cash-forecast";
-import { bracketTax, marginalRate, taxTables } from "./tax-tables";
+import { bracketTax, marginalRate, taxTables, type YearTables } from "./tax-tables";
 
 export type Jur = "federal" | "GA" | "NC" | "NY" | "NYC";
 export const JUR_LABEL: Record<Jur, string> = { federal: "Federal", GA: "Georgia", NC: "North Carolina", NY: "New York State", NYC: "New York City" };
@@ -40,6 +40,40 @@ export interface TaxProfile {
   annualBonus?: { amountCents: number; profitShareCents: number; growthPct: number; firstPlanYear: number } | null;
   /** Salary raise each January after the start year (percent). */
   raisePct?: number;
+  /** Yearly increase applied to federal brackets, standard deduction and wage base for years without published figures (default 2.7%). */
+  bracketIndexPct?: number;
+  /** Rate overrides (percent), applied to every year. */
+  gaRatePct?: number | null;
+  ncRatePct?: number | null;
+  /** The state your employer withholds ("NC" today; "none" if it withholds no state tax). */
+  employerStateWithholding?: "NC" | "none";
+}
+
+export const DEFAULT_BRACKET_INDEX_PCT = 2.7;
+const LAST_PUBLISHED_FEDERAL_YEAR = 2026;
+/** Tax tables for a year with the profile's overrides: indexed federal figures for unpublished years, state rates. */
+export function tablesFor(profile: TaxProfile, year: number): YearTables {
+  const t = taxTables(year);
+  let out: YearTables = t;
+  const idx = (profile.bracketIndexPct ?? DEFAULT_BRACKET_INDEX_PCT) / 100;
+  const n = year - LAST_PUBLISHED_FEDERAL_YEAR;
+  if (n > 0 && idx !== 0) {
+    const f = Math.pow(1 + idx, n);
+    const r50 = (x: number) => Math.round((x * f) / 50) * 50;
+    out = {
+      ...t,
+      estimated: `${year} federal brackets, standard deduction and wage base = ${LAST_PUBLISHED_FEDERAL_YEAR}'s indexed ${(idx * 100).toFixed(1)}% a year (estimate; edit in the tax profile).`,
+      federal: {
+        ...t.federal,
+        single: t.federal.single.map((b) => ({ ...b, upTo: b.upTo === null ? null : r50(b.upTo) })),
+        standardDeduction: r50(t.federal.standardDeduction),
+        ssWageBase: Math.round((t.federal.ssWageBase * f) / 300) * 300,
+      },
+    };
+  }
+  if (typeof profile.gaRatePct === "number") out = { ...out, ga: { ...out.ga, rate: profile.gaRatePct, note: `Georgia rate ${profile.gaRatePct}% (entered).` } };
+  if (typeof profile.ncRatePct === "number") out = { ...out, nc: { ...out.nc, rate: profile.ncRatePct, supplementalRate: profile.ncRatePct + 0.1 } };
+  return out;
 }
 
 const PROJECT_YEARS = 4;
@@ -130,7 +164,7 @@ export function wagesFor(profile: TaxProfile, year: number): Wage[] {
 /** Net cash of one supplemental payment: federal flat rate, Social Security up to the wage base, Medicare, NC supplemental. */
 export function oneOffNetCents(profile: TaxProfile, oneOff: TaxOneOff): number {
   const year = Number(oneOff.date.slice(0, 4));
-  const t = taxTables(year);
+  const t = tablesFor(profile, year);
   const before = wagesFor(profile, year).filter((w) => w.date < oneOff.date || (w.date === oneOff.date && !w.supplemental)).reduce((s, w) => s + w.cents, 0);
   const g = oneOff.grossCents;
   const ssRoom = Math.max(0, c(t.federal.ssWageBase) - before);
@@ -138,14 +172,14 @@ export function oneOffNetCents(profile: TaxProfile, oneOff: TaxOneOff): number {
   const overAddl = Math.max(0, before + g - c(t.federal.addlMedicareThreshold)) - Math.max(0, before - c(t.federal.addlMedicareThreshold));
   const medicare = g * (t.federal.medicareRate / 100) + Math.max(0, overAddl) * (t.federal.addlMedicareRate / 100);
   const fed = g * (t.federal.supplementalRate / 100);
-  const nc = g * (t.nc.supplementalRate / 100);
+  const nc = profile.employerStateWithholding === "none" ? 0 : g * (t.nc.supplementalRate / 100);
   return Math.round(g - fed - ss - medicare - nc);
 }
 
 const DUE = (year: number) => [`${year}-04-15`, `${year}-06-15`, `${year}-09-15`, `${year + 1}-01-15`];
 
 export function computeTaxYear(profile: TaxProfile, year: number, today: string): TaxYearResult {
-  const t = taxTables(year);
+  const t = tablesFor(profile, year);
   const assumptions: string[] = [];
   if (t.estimated) assumptions.push(t.estimated);
   assumptions.push(t.ga.note, `North Carolina ${t.nc.rate}% (nonresident, on the share of days worked there).`, `New York: ${t.ny.note}`);
@@ -177,7 +211,7 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
     if (ytd && w.date <= ytd.asOf) continue;
     const share = w.cents / (salary / 12 || 1);
     fedWithheld += w.supplemental ? Math.round(w.cents * (t.federal.supplementalRate / 100)) : Math.round(regularFed * share);
-    ncWithheld += w.supplemental ? Math.round(w.cents * (t.nc.supplementalRate / 100)) : Math.round(regularNc * share);
+    if (profile.employerStateWithholding !== "none") ncWithheld += w.supplemental ? Math.round(w.cents * (t.nc.supplementalRate / 100)) : Math.round(regularNc * share);
   }
   assumptions.push(ytd ? `Withholding: pay stub to ${ytd.asOf}, then projected.` : "Withholding is estimated from the salary (no pay stub entered yet).");
 
@@ -278,7 +312,7 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
 
 /** Federal marginal rate on this year's income (used to price a 401(k) change in cash). */
 export function federalMarginalRate(profile: TaxProfile, year: number): number {
-  const t = taxTables(year);
+  const t = tablesFor(profile, year);
   const W = wagesFor(profile, year).reduce((s, w) => s + w.cents, 0);
   return marginalRate(Math.max(0, d(W - profile.preTaxAnnualCents + profile.otherIncomeAnnualCents) - t.federal.standardDeduction), t.federal.single);
 }
@@ -338,6 +372,10 @@ export function parseTaxProfile(raw: unknown): TaxProfile | null {
           }
         : null,
     raisePct: Math.max(0, Math.min(50, num(r.raisePct))),
+    bracketIndexPct: typeof r.bracketIndexPct === "number" && Number.isFinite(r.bracketIndexPct) ? Math.max(0, Math.min(10, r.bracketIndexPct)) : undefined,
+    gaRatePct: typeof r.gaRatePct === "number" && Number.isFinite(r.gaRatePct) ? Math.max(0, Math.min(10, r.gaRatePct)) : null,
+    ncRatePct: typeof r.ncRatePct === "number" && Number.isFinite(r.ncRatePct) ? Math.max(0, Math.min(10, r.ncRatePct)) : null,
+    employerStateWithholding: r.employerStateWithholding === "none" ? "none" : "NC",
     estimatesPaid: Array.isArray(r.estimatesPaid)
       ? (r.estimatesPaid as Record<string, unknown>[])
           .filter((e) => jurs.includes(e?.jur as Jur) && day(e?.date) && num(e?.cents) > 0)

@@ -115,7 +115,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     if (itemsRes.error || driversRes.error) setupPending = true;
     const itemRows = ((itemsRes.data ?? []) as ItemRow[]).map((r) => ({ ...r, amount_cents: Number(r.amount_cents) }));
     const drivers = ((driversRes.data ?? []) as DriverRow[]).filter((d) => d && typeof d.key === "string" && d.value && typeof d.value === "object");
-    const { settings, cardTerms, growth } = driversToInputs(drivers);
+    const { settings, cardTerms, growth, adjustments: savedAdjust } = driversToInputs(drivers);
 
     // Tax plan for this year and next; its payments, refunds and after-tax bonus become planned cash lines.
     // The move plan (driver "move") is the single source of the move date: it also sets the tax residency change.
@@ -129,7 +129,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const manual = itemRows.map(itemRowToPlanned);
     const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings: { ...settings, horizonDays: 730 } };
     const basePlanned = [...manual, ...(move ? moveItems(move) : []), ...(profile ? taxCashItems(profile, tax, today) : [])];
-    let result = forecastCash({ ...baseInput, planned: basePlanned });
+    let result = forecastCash({ ...baseInput, planned: basePlanned, adjustments: savedAdjust });
     // Annual raise: the paycheck stream grows each January (net pay scaled with gross; a planning approximation).
     const raiseAdjust = (p: TaxProfile | null, r: ForecastResult) => {
       const pay = r.streams.filter((x) => x.kind === "income").sort((a, b) => b.typicalCents - a.typicalCents)[0];
@@ -138,14 +138,14 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
       return [1, 2].map((k) => ({ streamId: pay.id, from: `${year + k}-01-01`, amountCents: Math.round((pay.typicalCents * salaryFor(p, year + k)) / base) }));
     };
     const baseAdjust = raiseAdjust(profile, result);
-    if (baseAdjust.length) result = forecastCash({ ...baseInput, planned: basePlanned, adjustments: baseAdjust });
+    if (baseAdjust.length) result = forecastCash({ ...baseInput, planned: basePlanned, adjustments: [...baseAdjust, ...savedAdjust] });
 
     // What-if: the same history with the levers applied (computed here, so the browser never gets the ledger).
     let scenario: { params: ScenarioParams; result: ForecastResult; tax: TaxYearResult[] } | null = null;
     if (hasLevers(levers)) {
       const sp = profile ? applyToProfile(profile, levers) : null;
       const sTax = taxFor(sp);
-      const adjustments: { streamId: string; from: string; amountCents: number }[] = [...raiseAdjust(sp, result)];
+      const adjustments: { streamId: string; from: string; amountCents?: number; stop?: boolean }[] = [...raiseAdjust(sp, result), ...savedAdjust];
       const pay = result.streams.filter((x) => x.kind === "income").sort((a, b) => b.typicalCents - a.typicalCents)[0];
       if (pay && profile && levers.preTax !== undefined) {
         const delta = Math.round(levers.preTax * 100) - profile.preTaxAnnualCents;
