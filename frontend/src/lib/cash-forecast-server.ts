@@ -4,6 +4,7 @@ import { accountLabel, parseAccount, parseBalance, toCents } from "@/lib/finance
 import { fetchPaged, loadCategoryFixes, serviceClient } from "@/lib/finance-ledger-server";
 import { fixedCategory } from "@/lib/finance-categories";
 import { computeGoals, type GoalRow, type GoalView } from "@/lib/finance-goals";
+import { moveItems, parseMovePlan, type MovePlan } from "@/lib/finance-plan";
 import { forecastCash, poolBalanceAt, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
 import { driversToInputs, itemRowToPlanned, type DriverRow, type ItemInput, type ItemRow } from "@/lib/cash-forecast-store";
 import { applyToProfile, hasLevers, scenarioCardPayments, scenarioItems, type ScenarioParams } from "@/lib/cash-forecast-scenario";
@@ -56,6 +57,7 @@ export type ForecastLoad =
       saved: { slug: string; name: string; params: ScenarioParams }[];
       accuracy: AccuracyRow[];
       goals: GoalView[];
+      move: MovePlan | null;
     }
   | { kind: "empty" }
   | { kind: "error"; code: string };
@@ -116,13 +118,16 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const { settings, cardTerms, growth } = driversToInputs(drivers);
 
     // Tax plan for this year and next; its payments, refunds and after-tax bonus become planned cash lines.
-    const profile = parseTaxProfile(drivers.find((d) => d.key === "tax")?.value);
+    // The move plan (driver "move") is the single source of the move date: it also sets the tax residency change.
+    const move = parseMovePlan(drivers.find((d) => d.key === "move")?.value);
+    const rawProfile = parseTaxProfile(drivers.find((d) => d.key === "tax")?.value);
+    const profile = rawProfile && move ? { ...rawProfile, moveDate: move.date } : rawProfile;
     const year = Number(today.slice(0, 4));
     const taxFor = (p: TaxProfile | null) => (p ? [computeTaxYear(p, year, today), computeTaxYear(p, year + 1, today)] : []);
     const tax = taxFor(profile);
     const manual = itemRows.map(itemRowToPlanned);
     const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings: { ...settings, horizonDays: 730 } };
-    const result = forecastCash({ ...baseInput, planned: [...manual, ...(profile ? taxCashItems(profile, tax, today) : [])] });
+    const result = forecastCash({ ...baseInput, planned: [...manual, ...(move ? moveItems(move) : []), ...(profile ? taxCashItems(profile, tax, today) : [])] });
 
     // What-if: the same history with the levers applied (computed here, so the browser never gets the ledger).
     let scenario: { params: ScenarioParams; result: ForecastResult; tax: TaxYearResult[] } | null = null;
@@ -139,7 +144,12 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
       const extra = scenarioItems(levers, sp ?? ({ moveDate: null } as TaxProfile), today);
       const sResult = forecastCash({
         ...baseInput,
-        planned: [...manual, ...(sp ? taxCashItems(sp, sTax, today) : []), ...extra],
+        planned: [
+          ...manual,
+          ...(move && levers.moveDate !== "none" ? moveItems(move, levers.moveDate ?? null) : []),
+          ...(sp ? taxCashItems(sp, sTax, today) : []),
+          ...extra,
+        ],
         adjustments,
         extraCardPayments: scenarioCardPayments(levers, today),
       });
@@ -212,6 +222,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
       saved,
       accuracy,
       goals,
+      move,
     };
   } catch (e) {
     const code = e && typeof e === "object" && "code" in e ? String((e as { code: unknown }).code) : "unknown";

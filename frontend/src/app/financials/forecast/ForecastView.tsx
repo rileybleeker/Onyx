@@ -12,6 +12,8 @@ import type { TaxProfile, TaxYearResult } from "@/lib/tax-plan";
 import { CompareTable, TaxSection, WhatIfPanel } from "./TaxAndWhatIf";
 import { GoalsSection, NetWorthChart, ProjectionBreakdown } from "./ProjectionParts";
 import type { GoalView } from "@/lib/finance-goals";
+import type { MovePlan } from "@/lib/finance-plan";
+import { PlanConfig } from "./PlanConfig";
 
 const usd = (cents: number | null | undefined): string => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -48,6 +50,7 @@ export default function ForecastView({
   saved,
   accuracy,
   goals,
+  move,
 }: {
   result: ForecastResult;
   items: PlanItemView[];
@@ -60,6 +63,7 @@ export default function ForecastView({
   saved: { slug: string; name: string; params: ScenarioParams }[];
   accuracy: AccuracyRow[];
   goals: GoalView[];
+  move: MovePlan | null;
 }) {
   const router = useRouter();
   const [range, setRange] = useState<"13w" | "12m">("13w");
@@ -243,6 +247,7 @@ export default function ForecastView({
         </table>
       </section>
 
+      <PlanConfig move={move} drivers={drivers} accounts={accounts} netWorth={result.netWorth} busy={busy} run={run} />
       <TaxSection tax={tax} profile={profile} busy={busy} run={run} />
       <PlannedItems items={items} statuses={result.planned} busy={busy} run={run} />
       <Cards result={result} drivers={drivers} accounts={accounts} busy={busy} run={run} />

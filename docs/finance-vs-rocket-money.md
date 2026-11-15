@@ -25,6 +25,7 @@ net worth, credit score, bill negotiation, Smart Savings, cancellation concierge
 | Cash flow forecast with a range | Yes | 13 weeks / 12 months, likely line + 10-90% band; backtested (below). |
 | 0% promo deadlines | Yes | Read from balance-transfer rows; milestones on the chart, payment that clears it in time. |
 | Tax planning (federal, GA, NC, NY, NYC) | Yes | Withholding vs liability, safe harbour, estimated payments and refunds as dated cash lines. |
+| Life-event plan (move, rent change, deposits) and account assumptions | Yes | Plan & assumptions on the forecast page: every value editable; the move date also drives the tax residency change. |
 | What-if scenarios | Yes | Bonus size/timing, move date, rent, moving costs, spending, card payoff, 1099 income, 401(k); compare and save. |
 | Forecast accuracy tracking | Yes | Weekly snapshots vs actual; `/status` card. |
 

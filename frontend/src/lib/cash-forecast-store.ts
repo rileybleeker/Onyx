@@ -5,6 +5,7 @@
 import type { CardTerms, Certainty, ForecastSettings, GrowthDriver, PlannedItem } from "./cash-forecast";
 import { parseScenarioParams } from "./cash-forecast-scenario";
 import { parseTaxProfile } from "./tax-plan";
+import { parseMovePlan } from "./finance-plan";
 
 export const MAX_FORECAST_BODY_BYTES = 2048;
 const CERTAINTIES: readonly Certainty[] = ["confirmed", "likely", "possible"];
@@ -103,6 +104,11 @@ export function parseDriverBody(
     if (b.value === null) return { ok: true, key, value: null };
     const profile = parseTaxProfile(b.value);
     return profile ? { ok: true, key, value: profile as unknown as Record<string, unknown> } : { ok: false, error: "tax profile needs salaryAnnualCents and employmentStart" };
+  }
+  if (key === "move") {
+    if (b.value === null) return { ok: true, key, value: null };
+    const plan = parseMovePlan(b.value);
+    return plan ? { ok: true, key, value: plan as unknown as Record<string, unknown> } : { ok: false, error: "move plan needs a date and whole-cent amounts" };
   }
   const sm = /^scenario:([a-z0-9-]{1,40})$/.exec(key);
   if (sm) {
