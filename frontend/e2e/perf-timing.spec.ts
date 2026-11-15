@@ -46,6 +46,14 @@ const OUT_DIR = path.join(__dirname, "..", "perf-results");
 // <aside>, and legend icons are excluded, so neither can fake "chart drawn").
 const CHART = "main svg.recharts-surface path:not(.recharts-legend-icon)";
 
+// The continuous scroll (components/ContinuousScroll.tsx) draws the neighbouring pages above and below the routed
+// one, each in a <section data-feed-route>; the routed page itself sits in a <div data-feed-route>. Only the routed
+// page counts for its own data-ready and chart times (a neighbour's chart or skeleton must not decide them). Their
+// network requests stay in the window: they are part of what opening the page costs.
+const FEED_PAGE = "section[data-feed-route]";
+// Text of the routed page alone (the whole body while the scroll is off or before it existed).
+const ROUTED_TEXT = `((document.querySelector("[data-feed-root] > div[data-feed-route]") || document.body).innerText)`;
+
 // Installed in every page before its scripts run: records the first frame in
 // which a chart mark exists, on the page's own performance.now() clock. An in-app
 // navigation restarts it with window.__pfWatchChart(); marks left over from the
@@ -55,7 +63,7 @@ const INIT_SCRIPT = `(() => {
   window.__pfWatchChart = () => {
     window.__pfChart = null;
     const tick = () => {
-      if (window.__pfChart == null && [...document.querySelectorAll(SEL)].some((e) => !e.closest("[data-pf-old]"))) window.__pfChart = performance.now();
+      if (window.__pfChart == null && [...document.querySelectorAll(SEL)].some((e) => !e.closest("[data-pf-old]") && !e.closest(${JSON.stringify(FEED_PAGE)}))) window.__pfChart = performance.now();
       if (window.__pfChart == null) requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
@@ -63,10 +71,17 @@ const INIT_SCRIPT = `(() => {
   window.__pfWatchChart();
 })();`;
 
-// The route content sits in AppShell's <main><div>; before an in-app click its children are marked old, and the new
-// page counts as shown only once none of them is left (the old page's chart cannot satisfy the new page's check).
-const ROUTE_CONTENT = "main > div > *";
-const OLD_CONTENT = "main > div > [data-pf-old]";
+// The route content sits in AppShell's <main><div>, inside the continuous scroll's routed wrapper
+// ([data-feed-root] > div[data-feed-route]) next to the neighbouring pages' sections. Before an in-app click the
+// routed page's elements and those sections are marked old, and the new page counts as shown only once none of them
+// is left (the old page's chart cannot satisfy the new page's check). The scroll's own wrappers stay across a
+// navigation, so they are never marked.
+const ROUTE_CONTENT = [
+  "main > div > :not([data-feed-root])",
+  "main > div > [data-feed-root] > div[data-feed-route] > *",
+  "main > div > [data-feed-root] > section[data-feed-route]",
+].join(", ");
+const OLD_CONTENT = "main [data-pf-old]";
 
 interface PageSpec {
   slug: string;
@@ -80,22 +95,23 @@ interface PageSpec {
 }
 
 const ready = (cond: string) => `(() => { if (!(${cond})) return false; return performance.now(); })()`;
-const hasChart = `!!document.querySelector(${JSON.stringify(CHART)})`;
+const notFeed = `!e.closest(${JSON.stringify(FEED_PAGE)})`;
+const hasChart = `[...document.querySelectorAll(${JSON.stringify(CHART)})].some(e => ${notFeed})`;
 const h = (text: string, tag = "h1,h2,h3,h4,h5,h6") =>
-  `[...document.querySelectorAll(${JSON.stringify(tag)})].some(e => e.textContent.trim() === ${JSON.stringify(text)})`;
+  `[...document.querySelectorAll(${JSON.stringify(tag)})].some(e => ${notFeed} && e.textContent.trim() === ${JSON.stringify(text)})`;
 const leafText = (text: string) =>
-  `[...document.querySelectorAll("p,div,span")].some(e => e.children.length === 0 && e.textContent.trim() === ${JSON.stringify(text)})`;
+  `[...document.querySelectorAll("p,div,span")].some(e => ${notFeed} && e.children.length === 0 && e.textContent.trim() === ${JSON.stringify(text)})`;
 
 // Today's own panels (not the overview cards, which read only near the screen): every panel settled, none busy, and
 // no "Checking..." left in the Also checked list (Codex review 2026-11-14: readiness covered only three panels).
-const TODAY_PANELS = `[...document.querySelectorAll("main section:not([data-card])")]`;
+const TODAY_PANELS = `[...document.querySelectorAll("main section:not([data-card])")].filter(e => ${notFeed})`;
 const TODAY_PENDING = /checking\.\.\.|checking agent requests|checking email|checking your calendar|loading reading progress/i;
 const todayReady = ready(
   `${h("Today", "h1")} && !${TODAY_PANELS}.some((e) => e.getAttribute("aria-busy") === "true" || ${TODAY_PENDING}.test(e.innerText))`
 );
 // Server-rendered finance pages: the real heading (the loading.tsx skeleton's has no test id) with no skeleton left.
 const serverPageReady = ready(
-  `!!document.querySelector('[data-testid="page-heading"]') && ![...document.querySelectorAll('p[role="status"]')].some((e) => /^Loading /.test(e.textContent))`
+  `!!document.querySelector('[data-testid="page-heading"]') && ![...document.querySelectorAll('p[role="status"]')].some((e) => ${notFeed} && /^Loading /.test(e.textContent))`
 );
 
 const PAGES: PageSpec[] = [
@@ -111,7 +127,7 @@ const PAGES: PageSpec[] = [
     label: "/check-in",
     route: "/check-in",
     // The subtitle with "Daytime:" renders only once the day's questions have loaded (not on the error screen).
-    ready: ready(`${h("Check-in", "h2")} && /Daytime: /.test(document.body.innerText)`),
+    ready: ready(`${h("Check-in", "h2")} && /Daytime: /.test(${ROUTED_TEXT})`),
   },
   {
     slug: "analytics-hrv",
@@ -138,14 +154,14 @@ const PAGES: PageSpec[] = [
     slug: "status",
     label: "/status",
     route: "/status",
-    ready: ready(`(document.body.innerText.match(/last sync/gi) || []).length > 4`),
+    ready: ready(`(${ROUTED_TEXT}.match(/last sync/gi) || []).length > 4`),
   },
   {
     slug: "caffeine",
     label: "/caffeine",
     route: "/caffeine",
     // The default 60-day window is empty during a caffeine logging pause; the empty state then IS the settled page.
-    ready: ready(`${hasChart} || document.body.innerText.toLowerCase().includes("no caffeine days in the database yet.")`),
+    ready: ready(`${hasChart} || ${ROUTED_TEXT}.toLowerCase().includes("no caffeine days in the database yet.")`),
     emptyText: "No caffeine days in the database yet.",
     note: "default 60-day window; the empty state counts as settled",
   },
@@ -293,7 +309,7 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     await Promise.allSettled(sizeJobs);
 
     const m = await page.evaluate(
-      async ({ emptyText }) => {
+      async ({ emptyText, routedSel }) => {
         const nav = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming;
         const fcpEntry = performance.getEntriesByName("first-contentful-paint")[0];
         const lcp = await new Promise<number | null>((resolve) => {
@@ -313,6 +329,8 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
           }, 150);
         });
         const text = document.body.innerText;
+        // The empty state is the routed page's own, not a neighbour's in the continuous scroll.
+        const routedText = (document.querySelector(routedSel) as HTMLElement | null)?.innerText ?? text;
         return {
           ttfb: nav.responseStart,
           serverWait: nav.responseStart - nav.requestStart,
@@ -323,10 +341,10 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
           lcp,
           firstChart: (window as unknown as { __pfChart?: number }).__pfChart ?? null,
           degraded: /Application error|client-side exception/i.test(text),
-          emptyState: emptyText ? text.toLowerCase().includes(emptyText.toLowerCase()) : false,
+          emptyState: emptyText ? routedText.toLowerCase().includes(emptyText.toLowerCase()) : false,
         };
       },
-      { emptyText: spec.emptyText ?? "" }
+      { emptyText: spec.emptyText ?? "", routedSel: "[data-feed-root] > div[data-feed-route]" }
     );
     if (mode === "click") {
       // The document was loaded before the click: its TTFB / FCP / LCP belong to Today, not to this page.

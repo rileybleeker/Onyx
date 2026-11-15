@@ -1,11 +1,12 @@
 "use client";
 
-import { Component, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Component, memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { NAV_ITEMS } from "@/lib/nav";
 import {
-  AREAS_LOCAL_KEY, AREAS_PREF_KEY, areaOrder, feedRouteOf, feedSequence, feedTitle, isFeedExcluded, neighbourOf, parseAreaOrder,
+  AREAS_LOCAL_KEY, AREAS_PREF_KEY, FEED_OFF_SESSION_KEY, areaOrder, feedRouteOf, feedSequence, feedTitle, isFeedExcluded, neighbourOf,
+  parseAreaOrder,
   type AreaOrder,
 } from "@/lib/feed-order";
 import { hasFeedSection, loadFeedSection, loadedFeedSection } from "@/lib/feed-registry";
@@ -30,6 +31,10 @@ import { InFeed, useSetActiveRoute } from "./FeedContext";
  * - The page covering the middle of the screen is the active page: the address bar (history.replaceState,
  *   no navigation), the page title and useActiveRoute() (sidebar, phone tab bar, command palette) follow it.
  *   A nav click still navigates normally and the scroll starts again from that page.
+ * - Mounting a page is a React transition, so rendering a heavy page is split into short slices instead of one
+ *   long main-thread task.
+ * - sessionStorage[FEED_OFF_SESSION_KEY] = "off" turns the scroll off for that tab (the smoke suite does this:
+ *   its checks are about the routed page alone).
  */
 
 const NAV_HREFS = NAV_ITEMS.map((i) => i.href);
@@ -192,10 +197,22 @@ const FeedSlot = memo(function FeedSlot({
 
 // ---- the scroll --------------------------------------------------------------------------------------------
 
+/** Read once per tab, after hydration (the server always renders the scroll's frame). */
+function useFeedSwitchedOff(): boolean {
+  const [off, setOff] = useState(false);
+  useEffect(() => {
+    try {
+      if (window.sessionStorage.getItem(FEED_OFF_SESSION_KEY) === "off") setOff(true);
+    } catch { /* storage blocked: the scroll stays on */ }
+  }, []);
+  return off;
+}
+
 export default function ContinuousScroll({ children }: { children: ReactNode }) {
   const routerRoute = feedRouteOf(usePathname() || "/");
   const setActiveRoute = useSetActiveRoute();
-  const enabled = !isFeedExcluded(routerRoute) && KNOWN.includes(routerRoute);
+  const switchedOff = useFeedSwitchedOff();
+  const enabled = !switchedOff && !isFeedExcluded(routerRoute) && KNOWN.includes(routerRoute);
 
   // Reset to just the routed page whenever the router shows another page (a nav click starts again there).
   const [routedKey, setRoutedKey] = useState(routerRoute);
@@ -241,7 +258,12 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
   const keep = useRef(new Set<string>());
   const queue = useRef<string[]>([]);
   const draining = useRef(false);
-  const anchor = useRef<{ el: Element; docTop: number } | null>(null);
+  /**
+   * The element under the top of the screen and the page (section) holding it, with their document positions.
+   * The page is the fallback when the element itself is replaced (a skeleton swapped for content, a list
+   * re-keyed): the page's wrapper element stays for as long as the page is in the scroll.
+   */
+  const anchor = useRef<{ el: Element; docTop: number; sec: Element | null; secTop: number } | null>(null);
   const observers = useRef<{ middle: IntersectionObserver; near: IntersectionObserver; keep: IntersectionObserver; ro: ResizeObserver } | null>(null);
   const edgeObservers = useRef<{ below: IntersectionObserver; above: IntersectionObserver } | null>(null);
 
@@ -257,7 +279,13 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
       if (y >= window.innerHeight) break;
       const el = document.elementFromPoint(x, y);
       if (el && el !== root && root.contains(el)) {
-        anchor.current = { el, docTop: el.getBoundingClientRect().top + window.scrollY };
+        const sec = el.closest("[data-feed-route]");
+        anchor.current = {
+          el,
+          docTop: el.getBoundingClientRect().top + window.scrollY,
+          sec,
+          secTop: sec ? sec.getBoundingClientRect().top + window.scrollY : 0,
+        };
         return;
       }
     }
@@ -266,11 +294,21 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
 
   const correct = useCallback(() => {
     const a = anchor.current;
-    if (!a || !a.el.isConnected) return;
-    const docTop = a.el.getBoundingClientRect().top + window.scrollY;
-    const d = docTop - a.docTop;
-    a.docTop = docTop;
-    // The two-number form is always instant (no smooth scrolling is set anywhere in the app).
+    if (!a) return;
+    const secTop = a.sec && a.sec.isConnected ? a.sec.getBoundingClientRect().top + window.scrollY : null;
+    let d: number;
+    if (a.el.isConnected) {
+      const docTop = a.el.getBoundingClientRect().top + window.scrollY;
+      d = docTop - a.docTop;
+      a.docTop = docTop;
+    } else if (secTop !== null) {
+      d = secTop - a.secTop;
+    } else {
+      return;
+    }
+    if (secTop !== null) a.secTop = secTop;
+    // The two-number form is always instant (no smooth scrolling is set anywhere in the app). Document
+    // positions do not change with the scroll, so the stored ones stay right after it.
     if (Math.abs(d) >= 1) window.scrollBy(0, d);
   }, []);
 
@@ -345,11 +383,14 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
         if (gen !== genRef.current) return;
         if (mountedRef.current.has(route) || !wanted(route)) continue;
         mountedRef.current.add(route);
-        setMounted((prev) => {
-          if (prev.has(route)) return prev;
-          const next = new Set(prev);
-          next.add(route);
-          return next;
+        // A transition: React renders the page in short slices and keeps the screen responsive meanwhile.
+        startTransition(() => {
+          setMounted((prev) => {
+            if (prev.has(route)) return prev;
+            const next = new Set(prev);
+            next.add(route);
+            return next;
+          });
         });
         await nextFrame();
       }
@@ -547,6 +588,12 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [live, feedOn, routedKey, correct, pickAnchor, showActive, neighbours, schedule, prune, extend]);
+
+  // The router writes its own address back after any update of its tree (a refresh, a server action): show the
+  // page in view again. Runs after every render; a no-op unless another page is in view and the address differs.
+  useEffect(() => {
+    if (live && feedOn) syncUrl(false);
+  });
 
   // After the list grows or shrinks: keep the screen still, then look again at both ends (an observer only
   // reports changes, and an end that is still within reach must keep growing).

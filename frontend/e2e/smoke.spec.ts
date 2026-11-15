@@ -32,6 +32,20 @@ const RECHARTS_MARKS = "svg.recharts-surface path";
 // the data fetch. Give them room.
 const LOAD_TIMEOUT = 30_000;
 
+// The continuous scroll (components/ContinuousScroll.tsx) draws the neighbouring pages above and below the routed
+// one. Every check in this file is about the routed page alone (a neighbour's chart must not stand in for a broken
+// one, and a neighbour's text must not double a locator), so the scroll is switched off in each test's tab
+// (sessionStorage "onyx.feed" = "off", FEED_OFF_SESSION_KEY in lib/feed-order.ts) before any page script runs.
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => {
+    try {
+      window.sessionStorage.setItem("onyx.feed", "off");
+    } catch {
+      /* storage blocked: the page still loads */
+    }
+  });
+});
+
 /**
  * Best-effort "data settled" wait. Client data fetches (Supabase queries fired
  * in useEffect) are normal network requests, so once they go quiet the page has
