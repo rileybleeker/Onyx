@@ -100,7 +100,9 @@ test("page: a refused delete puts the row back and stays listed until Retry succ
   await h.click("Retry"); await h.flush();
   assert.equal(h.calls.deletes.length, 2);
   assert.match(h.calls.deletes[1], /intake_id=9$/);
-  assert.doesNotMatch(h.text(), /Not deleted/);
+  // The bar entry is gone and the row with it; the first failure's toast may still be fading (2.5 s), so match the bar's text.
+  assert.doesNotMatch(h.text(), /\(still logged\)/);
+  assert.match(h.text(), /No intakes logged today yet/);
 });
 
 test("page: a failed refresh keeps the rows already on screen", async (t) => {
