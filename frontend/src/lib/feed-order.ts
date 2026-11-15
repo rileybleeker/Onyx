@@ -14,6 +14,12 @@ export const AREAS_PREF_KEY = "layout.areas";
 /** The same value as this device last saved it (Personalize keeps a local copy; an "onyx" key, wiped on sign-out). */
 export const AREAS_LOCAL_KEY = "onyx.layout.areas";
 
+/**
+ * sessionStorage key: "off" turns the scroll off in that tab (only the routed page is drawn). Set by the smoke
+ * suite (e2e/smoke.spec.ts), whose checks are about the routed page alone; nothing in the app sets it.
+ */
+export const FEED_OFF_SESSION_KEY = "onyx.feed";
+
 /** Routes that never join the scroll and never get one: sign-in, the full-screen chats, account and install. */
 export const FEED_EXCLUDED: readonly string[] = ["/login", "/auth", "/agents", "/chat", "/account", "/install"];
 
