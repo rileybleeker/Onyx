@@ -12,6 +12,8 @@ const { START_URL, launchTarget, paletteShortcutLabel, reloadShortcutLabel, isIn
 
 const manifest = JSON.parse(readFileSync('public/manifest.json', 'utf8'));
 const ORIGIN = 'https://onyx.example';
+// Icon src may carry a cache-busting query (?v=3, #216); the file on disk has no query.
+const iconFile = (src) => path.join('public', src.split('?')[0]);
 
 test('manifest keeps the app identity and is installable', () => {
   // id + start_url "/" = the identity existing installs already have; changing either makes a second app.
@@ -23,7 +25,7 @@ test('manifest keeps the app identity and is installable', () => {
   for (const size of ['192x192', '512x512']) {
     const icon = manifest.icons.find((i) => i.sizes === size && !i.purpose);
     assert.ok(icon, `icon ${size}`);
-    assert.ok(existsSync(path.join('public', icon.src)), icon.src);
+    assert.ok(existsSync(iconFile(icon.src)), icon.src);
   }
 });
 
@@ -46,7 +48,7 @@ test('every jump-list shortcut is a real nav route', () => {
     assert.ok(s.name, 'shortcut name');
     assert.ok(nav.includes(`href: "${s.url}"`), `${s.url} is in NAV_SECTIONS`);
     assert.notEqual(s.url, START_URL, 'a shortcut on the start URL would be read as a plain launch');
-    for (const icon of s.icons || []) assert.ok(existsSync(path.join('public', icon.src)), icon.src);
+    for (const icon of s.icons || []) assert.ok(existsSync(iconFile(icon.src)), icon.src);
   }
 });
 
