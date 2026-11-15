@@ -113,8 +113,6 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
     // /check-in is a personalized page since #272; the grid uses React context, which this hook shim does not
     // provide. Pass its parts through so the client renders as before.
     "@/components/personalize/PartGrid": { PartGrid: ({ children }) => children, PartGroup: ({ children }) => children, Part: ({ children }) => children },
-    // The /log Say it drafts (only the embedded check-in reads them; covered by tests/log-drafts.test.cjs).
-    "@/lib/log-drafts": { useLogDrafts: () => ({ draft: null, clear: () => {} }) },
   }).default;
   function expand(node, id = "root") {
     if (node == null || typeof node === "boolean") return null;

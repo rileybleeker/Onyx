@@ -25,7 +25,6 @@ import {
   Building2,
   BookMarked,
   Smartphone,
-  NotebookPen,
 } from "lucide-react";
 
 /**
@@ -41,8 +40,7 @@ export interface NavItem {
   label: string;
   /**
    * Desktop "go to" key: press G, then this key (components/CommandPalette.tsx listens, lib/go-shortcuts.ts).
-   * Unique per item (tests/go-shortcuts.test.cjs). All 26 letters are in use, so Cash forecast is "4" ("4cast") and
-   * Log is "1" (the one screen for every entry).
+   * Unique per item (tests/go-shortcuts.test.cjs). All 26 letters are in use, so Cash forecast is "4" ("4cast").
    */
   shortcut: string;
   icon: LucideIcon;
@@ -60,7 +58,6 @@ export const NAV_SECTIONS: NavSection[] = [
   {
     title: "Logging",
     items: [
-      { href: "/log", label: "Log", shortcut: "1", icon: NotebookPen, keywords: ["entries", "enter", "record", "say it", "dictate", "one screen", "check-in", "supplement", "weight", "uber eats", "portion", "leftovers", "reading"] },
       { href: "/activities", label: "Activities", shortcut: "A", icon: Activity, keywords: ["workout", "run", "strength", "lifting", "training", "sauna"] },
       { href: "/nutrition", label: "Nutrition", shortcut: "N", icon: Utensils, keywords: ["food", "macros", "calories", "cronometer", "vitamins", "weight", "meal"] },
       { href: "/supplements", label: "Supplements", shortcut: "P", icon: Pill, keywords: ["stack", "pills", "compound", "dose", "intake", "log"] },

@@ -25,7 +25,7 @@ export const AREAS_STORAGE = "onyx.layout.areas";
 export const LAYOUT_EVENT = "onyx:layout";
 export const NAV_BOOT_STYLE_ID = "onyx-nav-boot";
 /** The sidebar's "Quick access" group by default (the side panel's pinned pages). Keep equal to DEFAULT_PINNED in feed-order.ts. */
-export const QUICK_ACCESS: readonly string[] = ["/today", "/log"];
+export const QUICK_ACCESS: readonly string[] = ["/today", "/check-in"];
 /** Grid entries of `layout.areas` (see above). */
 export const PIN_GRID = "quick";
 export const NAV_HIDE_GRID = "nav";

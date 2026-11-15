@@ -24,8 +24,8 @@ import {
  *    after a while, ordered by how often each page is opened.
  */
 
-// Tabs and quick links first (Today, Log: the centre tab), then the pages Log links to, then the rest of the nav.
-const PINNED = ["/today", "/log", "/check-in", "/analytics/hrv", "/agents", "/supplements", "/habits", "/nutrition"];
+// Tabs, quick links and the log sheet first (in that order), then the rest of the nav.
+const PINNED = ["/today", "/check-in", "/analytics/hrv", "/agents", "/supplements", "/habits", "/nutrition"];
 
 // Server-rendered pages whose writes update the screen optimistically without router.refresh(): a full
 // prefetch could later show the pre-write server answer, so only their code and loading skeleton are warmed.
@@ -58,8 +58,6 @@ const DATA: Record<string, () => DataWarmer[]> = {
     ];
   },
   "/check-in": () => [json("/api/habits/checkin")],
-  // The Log screen: each section's GET reads (same keys as the section). Section files add theirs here.
-  "/log": () => [json("/api/habits/checkin")],
   "/agents": () => {
     const inbox = clientCache.peek<InboxResponse>(CACHE_KEYS.agentsInbox);
     const threads = Array.isArray(inbox?.threads)
@@ -89,7 +87,6 @@ const CODE: Record<string, () => Promise<unknown>> = {
   "/bland-altman": () => import("@/app/bland-altman/BlandAltmanClient"),
   "/caffeine": () => import("@/app/caffeine/CaffeineClient"),
   "/habits": () => import("@/app/habits/HabitsClient"),
-  "/log": () => import("@/app/log/LogClient"),
   "/health/records": () => import("@/app/health/records/LabTrendChart"),
   "/nutrition": () => import("@/app/nutrition/NutritionClient"),
   "/nyc": () => import("@/app/nyc/NycClient"),
