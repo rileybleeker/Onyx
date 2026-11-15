@@ -9,9 +9,10 @@
 -- After:
 --   anon           no USAGE on schema pds -> cannot read or call anything in it
 --   authenticated  reads tables only through owner_read (auth.uid() = the one
---                  Onyx account); views/matviews keep their SELECT grant
---                  (they run as their owner, so they are guarded by the
---                  login + the middleware owner pin + sign-ups being off)
+--                  Onyx account). Ordinary browser views also require the
+--                  invoker migration documented in docs/owner-view-access.md.
+--                  Direct matview access remains a separate migration; app
+--                  middleware cannot protect a direct Data API read.
 --   service_role   unchanged (ETLs, API routes, ISR prefetch)
 -- Frontend side: lib/supabase.ts reads with the service role on the server
 -- and with the signed-in session in the browser; middleware.ts only accepts
