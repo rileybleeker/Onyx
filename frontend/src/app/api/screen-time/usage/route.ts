@@ -238,9 +238,17 @@ export async function POST(req: NextRequest) {
   }
 }
 
+// The setup check shows whole daily rows, so this is every column of
+// pds.phone_usage_daily (checked against information_schema 2026-11-14), listed
+// instead of a star select so a new column does not appear here unnoticed.
+const SETUP_CHECK_DAILY_COLUMNS =
+  "behavioral_date,hours_reported,total_minutes,late_night_minutes,after_midnight_minutes,pickups,notifications," +
+  "apps_used,first_pickup,last_active_hour_end,sleep_start,minutes_last_hour_before_sleep_est,minutes_during_sleep_est," +
+  "minutes_by_app,minutes_by_category,synced_at";
+
 export async function GET() {
   const [daily, hours] = await Promise.all([
-    supabase.from("phone_usage_daily").select("*").order("behavioral_date", { ascending: false }).limit(7),
+    supabase.from("phone_usage_daily").select(SETUP_CHECK_DAILY_COLUMNS).order("behavioral_date", { ascending: false }).limit(7),
     supabase
       .from("phone_usage_segments")
       .select("device, segment_start, segment_end, total_seconds, first_pickup, onyx_behavioral_date, synced_at")

@@ -8,7 +8,7 @@ import { buildTravelPageData, hrvSinceDate, todayET, type Flight, type HRVRow, t
 async function getTrips(): Promise<Trip[]> {
   const { data, error } = await supabase
     .from("trips")
-    .select("*")
+    .select("trip_id, start_date, end_date, duration_days, iana_tz, offset_hours, n_cycles")
     .order("start_date", { ascending: false });
   if (error) throw error;
   return (data ?? []) as Trip[];

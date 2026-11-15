@@ -255,6 +255,11 @@ const nycScoutFreshness = swrCacheTimed("status-nyc-scout-freshness-v1", () => g
 });
 const NYC_CHECK_STALE_MS = 15 * 60 * 1000;
 
+// The sync_log fields this route and its helpers (deriveStatus, enrichmentSource, ingestionHeartbeatStatus,
+// financeLedgerCard, recentHistory) read, listed instead of select("*") (units/gpt-5/F-004). Checked against
+// information_schema 2026-11-14; id, sync_end, date_range_* and created_at are not read from these rows.
+const SYNC_LOG_COLS = "source, data_type, sync_start, status, records_synced, duration_seconds, error_message";
+
 export async function GET() {
   try {
     // Every read below is independent, so they are all sent at once (one round trip, not six in a row).
@@ -266,7 +271,7 @@ export async function GET() {
     // history — each gets a dedicated limit-1 fetch below instead.
     const syncRowsPromise = supabase
       .from("sync_log")
-      .select("*")
+      .select(SYNC_LOG_COLS)
       .not("source", "in", '("matrix_mat","perf_mats")')
       .order("sync_start", { ascending: false })
       .limit(100)
@@ -343,7 +348,7 @@ export async function GET() {
       // reads Healthy off data-lag alone until the lag itself crosses 1d.
       supabase
         .from("sync_log")
-        .select("*")
+        .select(SYNC_LOG_COLS)
         .eq("source", "tanita")
         .eq("data_type", "weight")
         .order("sync_start", { ascending: false })
@@ -388,7 +393,7 @@ export async function GET() {
       // Matview refresh heartbeat (excluded from the main window above).
       supabase
         .from("sync_log")
-        .select("*")
+        .select(SYNC_LOG_COLS)
         .eq("source", "matrix_mat")
         .eq("data_type", "refresh")
         .order("sync_start", { ascending: false })
@@ -397,7 +402,7 @@ export async function GET() {
       // (see CADENCE comment above); also excluded from the main window.
       supabase
         .from("sync_log")
-        .select("*")
+        .select(SYNC_LOG_COLS)
         .eq("source", "perf_mats")
         .eq("data_type", "refresh")
         .order("sync_start", { ascending: false })
@@ -408,31 +413,31 @@ export async function GET() {
       // (the 3-hourly run can fall out of the 100-row window above when hourly sources are busy).
       // A missing table (SQL not applied yet) shows its error text on the card instead of breaking /status.
       supabase.from("air_quality_daily").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
-      supabase.from("sync_log").select("*").eq("source", "air_quality").eq("data_type", "daily")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "air_quality").eq("data_type", "daily")
         .order("sync_start", { ascending: false }).limit(1),
       // Weather: same shape as air quality (newest ET day in pds.weather_daily + a dedicated
       // limit-1 heartbeat fetch for the 3-hourly run; a missing table shows its error on the card).
       supabase.from("weather_daily").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
-      supabase.from("sync_log").select("*").eq("source", "weather").eq("data_type", "daily")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "weather").eq("data_type", "daily")
         .order("sync_start", { ascending: false }).limit(1),
       // The two PC harvesters heartbeat hours apart (and not at all while the PC is off), so their
       // newest row regularly falls out of the 100-row window above (~13 h of history). Without a
       // dedicated fetch a stalled harvester reads "Unknown" instead of going amber, then red.
-      supabase.from("sync_log").select("*").eq("source", "ubereats").eq("data_type", "items")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "ubereats").eq("data_type", "items")
         .order("sync_start", { ascending: false }).limit(1),
-      supabase.from("sync_log").select("*").eq("source", "kindle").eq("data_type", "highlights")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "kindle").eq("data_type", "highlights")
         .order("sync_start", { ascending: false }).limit(1),
       // Onyx Screen Time iPhone app: one heartbeat a day, so it also needs its own fetch.
-      supabase.from("sync_log").select("*").eq("source", "screen_time").eq("data_type", "usage")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "screen_time").eq("data_type", "usage")
         .order("sync_start", { ascending: false }).limit(1),
       // HRV retrain: daily safety net + conditional hourly runs, so its newest heartbeat (incl. a
       // failed "GUARD …" row from the alignment check) can fall out of the 100-row window.
-      supabase.from("sync_log").select("*").eq("source", "hrv_analysis").eq("data_type", "retrain")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "hrv_analysis").eq("data_type", "retrain")
         .order("sync_start", { ascending: false }).limit(1),
       // Supplement stack reminders: the sms-reminders Worker polls /api/supplements/reminders/claim
       // and each poll (throttled to ~1/h when nothing is due) writes a heartbeat. Dedicated fetch so
       // a Worker that stops polling reads red instead of "unknown" once the row leaves the window.
-      supabase.from("sync_log").select("*").eq("source", "supplement_reminders").eq("data_type", "prompt")
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "supplement_reminders").eq("data_type", "prompt")
         .order("sync_start", { ascending: false }).limit(1),
       // Scheduled ingestion must retain its latest heartbeat even when the shared
       // history window is full of newer jobs. In particular, daily Eight Sleep and
@@ -458,7 +463,7 @@ export async function GET() {
         // Pollen ETL (twice a day): a 19 h gap between runs, far outside the shared window.
         ["pollen", "daily"],
       ].map(async ([source, dataType]) => {
-        const { data, error } = await supabase.from("sync_log").select("*")
+        const { data, error } = await supabase.from("sync_log").select(SYNC_LOG_COLS)
           .eq("source", source).eq("data_type", dataType)
           .order("sync_start", { ascending: false }).limit(1);
         if (error) throw error;

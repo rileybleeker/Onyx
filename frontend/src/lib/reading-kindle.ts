@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { type Book, type ChapterSpan, type ReadingSession, behavioralToday } from "./reading";
+import { BOOK_COLS, SESSION_COLS, type Book, type ChapterSpan, type ReadingSession, behavioralToday } from "./reading";
 
 /**
  * Automatic reading progress from Kindle (2026-11-08).
@@ -29,6 +29,9 @@ export interface BookChapter extends ChapterSpan {
   book_id: number;
   title: string | null;
 }
+
+// pds.book_chapters: every column (checked against information_schema 2026-11-14), not select("*").
+const CHAPTER_COLS = "book_id, chapter, title, start_position, end_position, start_page, end_page, updated_at";
 
 export interface ChapterInput {
   chapter: number;
@@ -63,7 +66,7 @@ export function chaptersDoneAt(chapters: ChapterSpan[], end: number | null | und
 }
 
 export async function loadChapters(supabase: Supa, book_id: number): Promise<BookChapter[]> {
-  const { data, error } = await supabase.from("book_chapters").select("*").eq("book_id", book_id).order("start_position");
+  const { data, error } = await supabase.from("book_chapters").select(CHAPTER_COLS).eq("book_id", book_id).order("start_position");
   if (error) throw new Error(error.message);
   return (data ?? []) as BookChapter[];
 }
@@ -104,7 +107,7 @@ export async function updateReadingPosition(
     advanced = true;
   }
   if (!Object.keys(patch).length) return { book, advanced };
-  const { data, error } = await supabase.from("books").update(patch).eq("book_id", book.book_id).select("*").single();
+  const { data, error } = await supabase.from("books").update(patch).eq("book_id", book.book_id).select(BOOK_COLS).single();
   if (error) throw new Error(error.message);
   return { book: data as Book, advanced };
 }
@@ -165,7 +168,7 @@ export async function syncKindleSessions(supabase: Supa, bookIn: Book): Promise<
 
   const { data: sessRows, error: sErr } = await supabase
     .from("reading_sessions")
-    .select("*")
+    .select(SESSION_COLS)
     .eq("book_id", book.book_id)
     .order("session_date")
     .order("session_id");
@@ -243,12 +246,12 @@ export async function syncKindleSessions(supabase: Supa, bookIn: Book): Promise<
 
     const existing = autos.get(d);
     if (!existing) {
-      const { data, error } = await supabase.from("reading_sessions").insert(row).select("*").single();
+      const { data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single();
       if (error) throw new Error(error.message);
       created.push(data as ReadingSession);
       habitDays.push(d);
     } else if (sessionDiffers(existing, row)) {
-      const { data, error } = await supabase.from("reading_sessions").update(row).eq("session_id", existing.session_id).select("*").single();
+      const { data, error } = await supabase.from("reading_sessions").update(row).eq("session_id", existing.session_id).select(SESSION_COLS).single();
       if (error) throw new Error(error.message);
       updated.push(data as ReadingSession);
     } else unchanged += 1;

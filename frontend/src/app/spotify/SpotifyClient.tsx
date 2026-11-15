@@ -14,6 +14,7 @@ import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import RangeFilter from "@/components/RangeFilter";
 import { chartTooltip, axisTick, gridStyle, accentColor, axisLabel, chartColors as C } from "@/lib/chart-theme";
 import { sameJson } from "@/lib/format";
+import { msToSeconds, type Milliseconds } from "@/lib/units";
 import {
   getSpotifyDashboard,
   getSpotifyDailyVolume,
@@ -1143,7 +1144,7 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
                             {r.artist_name ?? "—"}
                           </td>
                           <td className="py-1.5 px-1 text-right text-text-tertiary tabular-nums">
-                            {formatDuration(r.duration_ms)}
+                            {formatTrackLengthMs(r.duration_ms)}
                           </td>
                         </tr>
                       ))}
@@ -1195,9 +1196,12 @@ function formatPlayedAt(iso: string): string {
   return playedAtFmt.format(new Date(iso));
 }
 
-function formatDuration(ms: number | null): string {
+// Track length as m:ss from Spotify's duration_ms. Named apart from format.ts's
+// formatDuration (seconds -> "1h 2m") and formatDurationMs (ms -> "1h 2m") so
+// it cannot be mistaken for, or shadow, either one (units/gpt-5/F-005).
+function formatTrackLengthMs(ms: Milliseconds | null): string {
   if (ms == null) return "—";
-  const totalSec = Math.round(ms / 1000);
+  const totalSec = Math.round(msToSeconds(ms));
   const m = Math.floor(totalSec / 60);
   const s = totalSec % 60;
   return `${m}:${s.toString().padStart(2, "0")}`;

@@ -120,9 +120,13 @@ export async function getHrvModelMetrics() {
   // eval_date's rows nondeterministically and (b) defeated the client's
   // sameJson revalidation bailout (identical data, different serialization).
   // model + horizon_days make the ordering fully deterministic.
+  //
+  // Explicit columns (units/gpt-5/F-004): the fields /analytics/hrv reads,
+  // checked against information_schema 2026-11-14. mape, created_at,
+  // input_data_hash and directional_accuracy_legacy are not read anywhere.
   const { data, error } = await supabase
     .from("hrv_model_metrics")
-    .select("*")
+    .select("eval_date, model, horizon_days, mae, rmse, r_squared, directional_accuracy, ci_coverage, ci_avg_width, n_predictions, model_version")
     .order("eval_date", { ascending: false })
     .order("model")
     .order("horizon_days")
