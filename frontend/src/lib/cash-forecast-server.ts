@@ -8,7 +8,7 @@ import { moveItems, parseMovePlan, type MovePlan } from "@/lib/finance-plan";
 import { forecastCash, poolBalanceAt, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
 import { driversToInputs, itemRowToPlanned, type DriverRow, type ItemInput, type ItemRow } from "@/lib/cash-forecast-store";
 import { applyToProfile, hasLevers, scenarioCardPayments, scenarioItems, type ScenarioParams } from "@/lib/cash-forecast-scenario";
-import { computeTaxYear, federalMarginalRate, parseTaxProfile, taxCashItems, type TaxProfile, type TaxYearResult } from "@/lib/tax-plan";
+import { computeTaxYear, federalMarginalRate, parseTaxProfile, salaryFor, taxCashItems, type TaxProfile, type TaxYearResult } from "@/lib/tax-plan";
 
 /**
  * Server-side reads and writes for the cash forecast (/financials/forecast). SERVICE ROLE ONLY: the finance
@@ -123,18 +123,29 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const rawProfile = parseTaxProfile(drivers.find((d) => d.key === "tax")?.value);
     const profile = rawProfile && move ? { ...rawProfile, moveDate: move.date } : rawProfile;
     const year = Number(today.slice(0, 4));
-    const taxFor = (p: TaxProfile | null) => (p ? [computeTaxYear(p, year, today), computeTaxYear(p, year + 1, today)] : []);
+    // Three tax years: this one, next (the move), and the one after (the next January bonus as a NY/NYC resident).
+    const taxFor = (p: TaxProfile | null) => (p ? [0, 1, 2].map((k) => computeTaxYear(p, year + k, today)) : []);
     const tax = taxFor(profile);
     const manual = itemRows.map(itemRowToPlanned);
     const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings: { ...settings, horizonDays: 730 } };
-    const result = forecastCash({ ...baseInput, planned: [...manual, ...(move ? moveItems(move) : []), ...(profile ? taxCashItems(profile, tax, today) : [])] });
+    const basePlanned = [...manual, ...(move ? moveItems(move) : []), ...(profile ? taxCashItems(profile, tax, today) : [])];
+    let result = forecastCash({ ...baseInput, planned: basePlanned });
+    // Annual raise: the paycheck stream grows each January (net pay scaled with gross; a planning approximation).
+    const raiseAdjust = (p: TaxProfile | null, r: ForecastResult) => {
+      const pay = r.streams.filter((x) => x.kind === "income").sort((a, b) => b.typicalCents - a.typicalCents)[0];
+      if (!p || !pay || !(p.raisePct && p.raisePct > 0)) return [];
+      const base = salaryFor(p, year);
+      return [1, 2].map((k) => ({ streamId: pay.id, from: `${year + k}-01-01`, amountCents: Math.round((pay.typicalCents * salaryFor(p, year + k)) / base) }));
+    };
+    const baseAdjust = raiseAdjust(profile, result);
+    if (baseAdjust.length) result = forecastCash({ ...baseInput, planned: basePlanned, adjustments: baseAdjust });
 
     // What-if: the same history with the levers applied (computed here, so the browser never gets the ledger).
     let scenario: { params: ScenarioParams; result: ForecastResult; tax: TaxYearResult[] } | null = null;
     if (hasLevers(levers)) {
       const sp = profile ? applyToProfile(profile, levers) : null;
       const sTax = taxFor(sp);
-      const adjustments: { streamId: string; from: string; amountCents: number }[] = [];
+      const adjustments: { streamId: string; from: string; amountCents: number }[] = [...raiseAdjust(sp, result)];
       const pay = result.streams.filter((x) => x.kind === "income").sort((a, b) => b.typicalCents - a.typicalCents)[0];
       if (pay && profile && levers.preTax !== undefined) {
         const delta = Math.round(levers.preTax * 100) - profile.preTaxAnnualCents;

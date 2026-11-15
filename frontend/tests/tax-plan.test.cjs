@@ -120,3 +120,18 @@ test("what-if levers: parsed from the URL, applied to the profile, extra cash it
   assert.equal(S.hasLevers({}), false);
   assert.match(S.scenarioToQuery({ bonusPct: 50 }), /bonusPct=50/);
 });
+
+test("every year's bonus: generated each January, an explicit one wins, raises grow salary", () => {
+  const p = { ...base, oneOffs: [{ date: "2031-01-31", grossCents: 6_000_000, label: "Annual bonus" }], annualBonus: { amountCents: 5_000_000, profitShareCents: 200_000, growthPct: 10, firstPlanYear: 2030 }, raisePct: 3 };
+  const all = T.allOneOffs(p);
+  // Pay year 2031 keeps the explicit bonus; 2032+ are generated with 10% growth per plan year.
+  assert.equal(all.filter((o) => o.date.startsWith("2031-01") && /bonus/i.test(o.label)).length, 1);
+  const b2032 = all.find((o) => o.date.startsWith("2032-01") && /Annual bonus/.test(o.label));
+  assert.equal(b2032.grossCents, Math.round(5_000_000 * 1.1));
+  assert.ok(all.some((o) => o.date.startsWith("2032-01") && /Profit share/.test(o.label)));
+  assert.equal(T.salaryFor(p, 2032), Math.round(12_000_000 * Math.pow(1.03, 2)));
+  const items = T.taxCashItems(p, [T.computeTaxYear(p, 2031, "2030-12-01")], "2030-12-01");
+  assert.ok(items.some((i) => i.id.startsWith("pay:2032-01") && i.amountCents > 0), "future bonus reaches the cash forecast");
+  const S = loadTs("lib/cash-forecast-scenario.ts");
+  assert.equal(S.applyToProfile(p, { bonusPct: 50 }).annualBonus.amountCents, 2_500_000);
+});

@@ -32,6 +32,40 @@ export interface TaxProfile {
   ytd: { year: number; asOf: string; federalCents: number; stateCents: number } | null;
   priorYear: { year: number; federalTaxCents: number; agiCents: number } | null;
   estimatesPaid: { year: number; jur: Jur; date: string; cents: number }[];
+  /**
+   * The bonus every year, not just the next one: for each plan year from firstPlanYear on, a bonus (and profit
+   * share) paid on the last business day of the following January, growing growthPct a year. A January one-off
+   * labelled "bonus" in oneOffs replaces the generated one for that year.
+   */
+  annualBonus?: { amountCents: number; profitShareCents: number; growthPct: number; firstPlanYear: number } | null;
+  /** Salary raise each January after the start year (percent). */
+  raisePct?: number;
+}
+
+const PROJECT_YEARS = 4;
+/** Salary for a calendar year, with the annual raise from the start year on. */
+export function salaryFor(profile: TaxProfile, year: number): number {
+  const startYear = Number(profile.employmentStart.slice(0, 4));
+  const r = Math.max(0, profile.raisePct ?? 0) / 100;
+  return Math.round(profile.salaryAnnualCents * Math.pow(1 + r, Math.max(0, year - startYear)));
+}
+/** Every supplemental payment: the explicit one-offs plus the generated annual bonuses and profit shares. */
+export function allOneOffs(profile: TaxProfile): TaxOneOff[] {
+  const out = [...profile.oneOffs];
+  const ab = profile.annualBonus;
+  if (ab && (ab.amountCents > 0 || ab.profitShareCents > 0)) {
+    for (let k = 0; k < PROJECT_YEARS; k++) {
+      const plan = ab.firstPlanYear + k;
+      const payYear = plan + 1;
+      const hasExplicit = profile.oneOffs.some((o) => o.date.startsWith(`${payYear}-01`) && /bonus/i.test(o.label));
+      if (hasExplicit) continue;
+      const g = Math.pow(1 + (ab.growthPct ?? 0) / 100, k);
+      const date = lastBusinessDayOfMonth(payYear, 1);
+      if (ab.amountCents > 0) out.push({ date, grossCents: Math.round(ab.amountCents * g), label: `Annual bonus (${plan} plan year)` });
+      if (ab.profitShareCents > 0) out.push({ date, grossCents: Math.round(ab.profitShareCents * g), label: `Profit share (${plan} plan year)` });
+    }
+  }
+  return out.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 }
 
 export interface TaxJurResult {
@@ -79,7 +113,7 @@ interface Wage {
 /** Monthly salary on the last business day (the first month prorated by start day), plus the one-offs. */
 export function wagesFor(profile: TaxProfile, year: number): Wage[] {
   const out: Wage[] = [];
-  const monthly = profile.salaryAnnualCents / 12;
+  const monthly = salaryFor(profile, year) / 12;
   const start = profile.employmentStart;
   for (let m = 1; m <= 12; m++) {
     const pay = lastBusinessDayOfMonth(year, m);
@@ -89,7 +123,7 @@ export function wagesFor(profile: TaxProfile, year: number): Wage[] {
     const share = start > monthStart ? (daysIn(year, m) - Number(start.slice(8, 10)) + 1) / daysIn(year, m) : 1;
     out.push({ date: pay, cents: Math.round(monthly * share), supplemental: false, label: "salary" });
   }
-  for (const o of profile.oneOffs) if (o.date.startsWith(`${year}-`) && o.grossCents > 0) out.push({ date: o.date, cents: o.grossCents, supplemental: true, label: o.label });
+  for (const o of allOneOffs(profile)) if (o.date.startsWith(`${year}-`) && o.grossCents > 0) out.push({ date: o.date, cents: o.grossCents, supplemental: true, label: o.label });
   return out.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 }
 
@@ -133,14 +167,15 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
   if (other > 0) assumptions.push(`Other (1099) income ${usd(other)} adds self-employment tax at ${(seRate * 100).toFixed(1)}%.`);
 
   // Withholding, projected: a pay stub's year-to-date figure plus the paychecks after it, else estimated from the start.
-  const regularFed = Math.round(c(bracketTax(Math.max(0, d(profile.salaryAnnualCents - profile.preTaxAnnualCents) - t.federal.standardDeduction), t.federal.single)) / 12);
-  const regularNc = Math.round((Math.max(0, d(profile.salaryAnnualCents - profile.preTaxAnnualCents) - t.nc.standardDeduction) * t.nc.rate) / 100 * 100 / 12);
+  const salary = salaryFor(profile, year);
+  const regularFed = Math.round(c(bracketTax(Math.max(0, d(salary - profile.preTaxAnnualCents) - t.federal.standardDeduction), t.federal.single)) / 12);
+  const regularNc = Math.round((Math.max(0, d(salary - profile.preTaxAnnualCents) - t.nc.standardDeduction) * t.nc.rate) / 100 * 100 / 12);
   const ytd = profile.ytd && profile.ytd.year === year ? profile.ytd : null;
   let fedWithheld = ytd ? ytd.federalCents : 0;
   let ncWithheld = ytd ? ytd.stateCents : 0;
   for (const w of wages) {
     if (ytd && w.date <= ytd.asOf) continue;
-    const share = w.cents / (profile.salaryAnnualCents / 12 || 1);
+    const share = w.cents / (salary / 12 || 1);
     fedWithheld += w.supplemental ? Math.round(w.cents * (t.federal.supplementalRate / 100)) : Math.round(regularFed * share);
     ncWithheld += w.supplemental ? Math.round(w.cents * (t.nc.supplementalRate / 100)) : Math.round(regularNc * share);
   }
@@ -257,7 +292,7 @@ export function taxCashItems(profile: TaxProfile, results: readonly TaxYearResul
       items.push({ id: `tax:${p.year}:${p.jur}:${p.date}`, label: `${p.label} (calculated)`, date: p.date, amountCents: p.cents, certainty: "likely" });
     }
   }
-  for (const o of profile.oneOffs) {
+  for (const o of allOneOffs(profile)) {
     if (o.date <= today) continue;
     items.push({ id: `pay:${o.date}:${o.label}`, label: `${o.label} (after tax, calculated)`, date: o.date, amountCents: oneOffNetCents(profile, o), certainty: "likely" });
   }
@@ -293,6 +328,16 @@ export function parseTaxProfile(raw: unknown): TaxProfile | null {
     priorYear: r.priorYear && typeof r.priorYear === "object" && num((r.priorYear as Record<string, unknown>).federalTaxCents) > 0
       ? { year: num((r.priorYear as Record<string, unknown>).year), federalTaxCents: Math.round(num((r.priorYear as Record<string, unknown>).federalTaxCents)), agiCents: Math.round(num((r.priorYear as Record<string, unknown>).agiCents)) }
       : null,
+    annualBonus:
+      r.annualBonus && typeof r.annualBonus === "object" && num((r.annualBonus as Record<string, unknown>).firstPlanYear) >= 2000
+        ? {
+            amountCents: Math.max(0, Math.round(num((r.annualBonus as Record<string, unknown>).amountCents))),
+            profitShareCents: Math.max(0, Math.round(num((r.annualBonus as Record<string, unknown>).profitShareCents))),
+            growthPct: Math.max(-50, Math.min(100, num((r.annualBonus as Record<string, unknown>).growthPct))),
+            firstPlanYear: Math.round(num((r.annualBonus as Record<string, unknown>).firstPlanYear)),
+          }
+        : null,
+    raisePct: Math.max(0, Math.min(50, num(r.raisePct))),
     estimatesPaid: Array.isArray(r.estimatesPaid)
       ? (r.estimatesPaid as Record<string, unknown>[])
           .filter((e) => jurs.includes(e?.jur as Jur) && day(e?.date) && num(e?.cents) > 0)
