@@ -3,13 +3,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
-import { BookMarked, Check, ChevronDown, Flame, Headphones, Highlighter, Sparkles, Trophy, X } from "lucide-react";
+import { Check, ChevronDown, Flame, Highlighter, Sparkles, Trophy, X } from "lucide-react";
 import MetricRing from "@/components/MetricRing";
 import InfoHint from "@/components/InfoHint";
-import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type Medium, type ReadingOverview, type Book } from "@/lib/reading";
+import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
+import LogLink from "@/components/LogLink";
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -18,19 +19,14 @@ const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading
  *
  * One book at a time: progress ring + pace against the target date, session
  * streak, XP / level, badges, three checkpoints, a burn-up chart, today's
- * spaced-repetition review, and the two capture forms (session with a from-
- * memory recall note; highlight with a comment, or a pasted Kindle export).
+ * spaced-repetition review, and the highlight capture form (a comment, or a
+ * pasted Kindle export). Sessions are logged on /log (one place to enter data).
  * Writes go to /api/reading/*; each write mirrors to the book's Notion
  * reading-log page server-side. All numbers are derived in lib/reading.ts.
  */
 
 type Toast = { text: string; kind: "xp" | "ok" | "err" } | null;
 
-const MEDIA: Array<{ key: Medium; label: string }> = [
-  { key: "audio", label: "Audio" },
-  { key: "kindle", label: "Kindle" },
-  { key: "paper", label: "Paper" },
-];
 const SOURCES: Array<{ key: HighlightSource; label: string }> = [
   { key: "kindle", label: "Kindle" },
   { key: "audible", label: "Audible clip" },
@@ -192,8 +188,11 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
           <ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} />
         </Part>
 
+        {/* Sessions are logged on Log (one place to enter data); the Session log below lists them. */}
         <Part id="log-session" title="Log a session">
-          <SessionForm o={o} onLogged={(xp, finished) => { showToast({ text: finished ? `Finished! +${xp} XP` : `+${xp} XP`, kind: "xp" }); load(slug, true); }} onError={(m) => showToast({ text: m, kind: "err" })} />
+          <div className="flex justify-end">
+            <LogLink part="reading">Log a reading session on Log</LogLink>
+          </div>
         </Part>
 
         <Part id="add-highlight" title="Highlight + comment">
@@ -437,97 +436,6 @@ function GradeBtn({ label, sub, onClick, disabled, className }: { label: string;
       <div className="text-[13px] font-medium leading-none">{label}</div>
       <div className="text-[10px] font-mono opacity-70 mt-1">{sub}</div>
     </button>
-  );
-}
-
-function SessionForm({ o, onLogged, onError }: { o: ReadingOverview; onLogged: (xp: number, finished: boolean) => void; onError: (m: string) => void }) {
-  const suggested = Math.min(o.totalChapters || 9999, o.chaptersDone + 2);
-  const [through, setThrough] = useState<string>(String(suggested));
-  const [minutes, setMinutes] = useState<string>("");
-  const [medium, setMedium] = useState<Medium>("audio");
-  const [recall, setRecall] = useState("");
-  const [question, setQuestion] = useState("");
-  const [date, setDate] = useState(o.today);
-  const [saving, setSaving] = useState(false);
-  useEffect(() => setThrough(String(Math.min(o.totalChapters || 9999, o.chaptersDone + 2))), [o.chaptersDone, o.totalChapters]);
-  useEffect(() => setDate(o.today), [o.today]);
-
-  const recallOk = recall.trim().length >= 40;
-  const submit = async () => {
-    if (saving) return;
-    setSaving(true);
-    try {
-      const res = await fetch("/api/reading/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ book: o.book.slug, date, chapter_through: Number(through), minutes: minutes ? Number(minutes) : null, medium, recall, question }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "failed");
-      setRecall("");
-      setQuestion("");
-      setMinutes("");
-      onLogged(json.xp_gained ?? 0, !!json.finished);
-    } catch (e) {
-      onError(e instanceof Error ? e.message : "Couldn't log the session");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-session-form">
-      <div className="flex items-baseline justify-between">
-        <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary flex items-center gap-1.5">
-          <BookMarked className="w-3.5 h-3.5" /> Log a session
-        </h3>
-        <span className="text-[11px] font-mono text-text-tertiary">10 XP / chapter · 20 XP for a recall note</span>
-      </div>
-      <div className="mt-3 grid grid-cols-3 gap-2">
-        <label className="block">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Through ch.</span>
-          <input type="number" inputMode="numeric" min={0} max={o.totalChapters || undefined} value={through} onChange={(e) => setThrough(e.target.value)} className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[15px] font-mono text-text-primary" />
-        </label>
-        <label className="block">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Minutes</span>
-          <input type="number" inputMode="numeric" min={0} value={minutes} onChange={(e) => setMinutes(e.target.value)} placeholder="31" className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[15px] font-mono text-text-primary" />
-        </label>
-        <label className="block">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Day</span>
-          <input type="date" value={date} max={o.today} onChange={(e) => setDate(e.target.value)} className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary" />
-        </label>
-      </div>
-      <div className="mt-2 flex gap-1.5">
-        {MEDIA.map((m) => (
-          <button key={m.key} onClick={() => setMedium(m.key)} aria-pressed={medium === m.key} className={`px-3 h-8 rounded-control border text-[12px] inline-flex items-center gap-1 ${medium === m.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}>
-            {m.key === "audio" && <Headphones className="w-3.5 h-3.5" />}
-            {m.label}
-          </button>
-        ))}
-      </div>
-      <label className="block mt-3">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">
-          Recall, from memory <span className={recallOk ? "text-up" : ""}>{recallOk ? "· +20 XP" : "· 3 sentences"}</span>
-        </span>
-        <textarea
-          value={recall}
-          onChange={(e) => setRecall(e.target.value)}
-          rows={4}
-          placeholder="What happened, what principle it showed, where it shows up in a BC implementation. Dictate it; don't open the book."
-          className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary leading-relaxed"
-        />
-      </label>
-      <label className="block mt-2">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">One question for a plant manager</span>
-        <input value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Optional" className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary" />
-      </label>
-      <div className="mt-3 flex items-center justify-between">
-        <span className="text-[11px] text-text-tertiary">Also marks the &ldquo;{o.book.habit_name ?? "reading"}&rdquo; habit for {fmtDate(date)}.</span>
-        <button onClick={submit} disabled={saving || through === ""} className="px-4 py-2 rounded-control text-[14px] font-medium bg-accent text-black disabled:opacity-40">
-          {saving ? "Saving…" : "Log session"}
-        </button>
-      </div>
-    </section>
   );
 }
 

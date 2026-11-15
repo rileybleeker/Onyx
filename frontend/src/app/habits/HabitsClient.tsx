@@ -6,12 +6,12 @@ import { getHabitJournal, getHabitMetadataHistory, rangeDays, rangeLabel, type R
 import { axisTick, gridStyle, chartTooltip, chartColors as C } from "@/lib/chart-theme";
 import { formatDate, sameJson } from "@/lib/format";
 import { CACHE_KEYS, clientCache, fetchJsonValue } from "@/lib/client-cache";
-import { SLEEP_QUESTIONS } from "@/lib/checkin";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import InfoHint from "@/components/InfoHint";
 import RangeFilter from "@/components/RangeFilter";
+import LogLink from "@/components/LogLink";
 import { useInFeed } from "@/components/FeedContext";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 
@@ -535,8 +535,10 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
             {syncing && <span className="ml-2 text-accent animate-pulse">syncing from Notion...</span>}
           </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <RangeFilter value={range} onChange={setRange} />
+          {/* Today's answers are entered on Log (its check-in), not here; the heatmap below still corrects a day. */}
+          <LogLink part="check-in">Answer today&apos;s habits on Log</LogLink>
           <a
             href="https://www.notion.so/29cc936fd5e14ae8b10a4fe5c5f7a6cd"
             target="_blank"
@@ -610,43 +612,6 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
           sublabel={prev7Stats.possible > 0 ? `prior 7d was ${prev7Stats.rate}%` : "no prior data"}
         />
       </Part>
-      </PartGroup>
-
-      <PartGroup id="section-today" title="Today's habits">
-      {/* Today's Checklist */}
-      {habits.length > 0 && (
-        <Part id="today-checklist" title="Today's Habits">
-        <ChartCard
-          title="Today's Habits"
-          subtitle={new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}
-          hint="Tap ✓ for done or ✕ for not done; tap the lit one again to clear. Sleep questions are answered on Check-in."
-        >
-          <div className="space-y-1">
-            {/* Sleep questions are about a finished night and are answered on /check-in ("Last night"), which stores
-                them on the day that night closed. A tap here would write them to today = tonight, so they are left out. */}
-            {habits.filter((h) => !SLEEP_QUESTIONS.has(h.name)).map((h) => {
-              const answer = answerMap.get(`${h.name}|${today}`) ?? null;
-              const isToggling = toggling.has(`${h.name}|${today}`);
-              const streak = calculateStreak(h, completionSet, history);
-              const color = CATEGORY_COLORS[h.category] || CATEGORY_COLORS.general;
-
-              return (
-                <HabitRow
-                  key={h.id}
-                  habit={h}
-                  answer={answer}
-                  isToggling={isToggling}
-                  streak={streak}
-                  color={color}
-                  today={today}
-                  onSetAnswer={(d, a) => setAnswer(h, d, a)}
-                />
-              );
-            })}
-          </div>
-        </ChartCard>
-        </Part>
-      )}
       </PartGroup>
 
       <PartGroup id="section-trends" title="Rates & heatmap" gap={24}>
@@ -979,137 +944,5 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
         </div>
       )}
     </>
-  );
-}
-
-interface HabitRowProps {
-  habit: NotionHabit;
-  answer: HabitAnswer;
-  isToggling: boolean;
-  streak: number;
-  color: string;
-  today: string;
-  onSetAnswer: (date: string, answer: HabitAnswer) => void;
-}
-
-function HabitRow({ habit, answer, isToggling, streak, color, today, onSetAnswer }: HabitRowProps) {
-  const done = answer === "Yes";
-  const declined = answer === "No";
-  const dateInputRef = useRef<HTMLInputElement>(null);
-
-  function openDatePicker(e: React.MouseEvent) {
-    e.stopPropagation();
-    const input = dateInputRef.current;
-    if (!input) return;
-    if (typeof input.showPicker === "function") {
-      input.showPicker();
-    } else {
-      input.focus();
-      input.click();
-    }
-  }
-
-  function onDateChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const picked = e.target.value;
-    if (picked && picked <= today) onSetAnswer(picked, "Yes");
-    e.target.value = "";
-  }
-
-  return (
-    <div
-      className={`w-full flex items-center gap-3 px-4 py-3 rounded-control transition-all group ${
-        done || declined ? "bg-white/[0.03]" : "hover:bg-white/[0.03]"
-      } ${isToggling ? "opacity-50" : ""}`}
-    >
-      {/* Direct one-tap answers: ✓ sets Yes, ✕ sets No; tapping the active one clears. */}
-      <button
-        onClick={() => onSetAnswer(today, done ? null : "Yes")}
-        className="shrink-0"
-        aria-label={done ? `Clear ${habit.name} for today` : `Mark ${habit.name} done for today`}
-        title={done ? "Yes (click to clear)" : "Mark done"}
-      >
-        <div
-          className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all ${
-            done ? "border-transparent" : "border-white/20 hover:border-white/50"
-          }`}
-          style={done ? { backgroundColor: color } : {}}
-        >
-          {done && (
-            <svg className="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-            </svg>
-          )}
-        </div>
-      </button>
-      <button
-        onClick={() => onSetAnswer(today, declined ? null : "No")}
-        className="shrink-0"
-        aria-label={declined ? `Clear ${habit.name} for today` : `Mark ${habit.name} not done for today`}
-        title={declined ? "No (click to clear)" : "Mark not done"}
-      >
-        <div
-          className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all ${
-            declined ? "" : "border-white/20 hover:border-white/50"
-          }`}
-          style={declined ? { borderColor: `${C.down}99`, backgroundColor: `${C.down}1a` } : {}}
-        >
-          <svg
-            className={`w-3.5 h-3.5 transition-opacity ${declined ? "" : "opacity-25 group-hover:opacity-60"}`}
-            fill="none" viewBox="0 0 24 24" stroke={declined ? C.down : "currentColor"} strokeWidth={3}
-          >
-            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-          </svg>
-        </div>
-      </button>
-
-      <button
-        onClick={() => onSetAnswer(today, done ? null : "Yes")}
-        className="flex-1 text-left min-w-0"
-        aria-label={done ? `Clear ${habit.name} for today` : `Mark ${habit.name} done for today`}
-        title={done ? "Yes (click to clear)" : "Mark done"}
-      >
-        <span className={`text-sm font-medium transition-colors ${done ? "text-text-tertiary line-through" : declined ? "text-text-tertiary" : "text-text-primary"}`}>
-          {habit.name}
-        </span>
-        {declined && (
-          <span className="ml-2 text-[10px] font-mono uppercase tracking-wider" style={{ color: C.down }}>
-            not done
-          </span>
-        )}
-      </button>
-
-      {streak > 0 && (
-        <span
-          className="text-[11px] font-mono font-medium px-2 py-0.5 rounded-full"
-          style={{ backgroundColor: `${color}20`, color }}
-        >
-          {streak}{habit.frequency === "weekly" ? "w" : "d"} streak
-        </span>
-      )}
-
-      <span className="text-[10px] font-mono text-text-tertiary/60 uppercase tracking-wider hidden sm:inline">
-        {habit.category}
-      </span>
-
-      <button
-        onClick={openDatePicker}
-        className="relative p-1.5 rounded-control text-text-tertiary hover:text-text-primary hover:bg-white/5 transition-colors"
-        title="Log a past date as done (use the heatmap for a backdated No)"
-        aria-label={`Backdate ${habit.name}`}
-      >
-        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-        </svg>
-        <input
-          ref={dateInputRef}
-          type="date"
-          max={today}
-          onChange={onDateChange}
-          className="absolute inset-0 opacity-0 pointer-events-none"
-          tabIndex={-1}
-          aria-hidden="true"
-        />
-      </button>
-    </div>
   );
 }
