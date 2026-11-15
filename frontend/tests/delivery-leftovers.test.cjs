@@ -546,3 +546,18 @@ test("LeftoverList: the When? row appears once an amount is picked, with Now and
   const past = renderToStaticMarkup(React.createElement(C.LeftoverList, { questions: [timed], onPick: () => {}, onTime: () => {} }));
   assert.ok(!past.includes(">Now<"));
 });
+
+test("read-only lists (no onPick, /nutrition): the answer as text, no buttons, no time field", () => {
+  const C = loadTs("components/DeliveryPortions.tsx", { "@/lib/queries": {} });
+  const dish = (item_id, eaten_fraction) => ({ item_id, behavioral_date: "2030-01-08", completed_at: null, store_name: "Example Pizza Co", title: "Large Test Pie", quantity: 1, unit_kcal: 2000, est_kcal: 1500, est_kind: "food", eaten_fraction });
+  const dishes = renderToStaticMarkup(React.createElement(C.DeliveryDishList, { items: [dish(1, 0.75), dish(2, null)] }));
+  assert.ok(!dishes.includes("<button"));
+  assert.match(dishes, /Ate 3\/4/);
+  assert.match(dishes, /Ate All \(assumed\)/);
+  const q = (option, time) => ({ dish: dish(7, 0.25), left: 0.75, token: option ? "0.375" : null, option, kcal: option ? 750 : null, time });
+  const left = renderToStaticMarkup(React.createElement(C.LeftoverList, { questions: [q("0.5", "19:30"), q(null, null), q("threw_out", null)] }));
+  assert.ok(!left.includes("<button") && !left.includes('type="time"'));
+  assert.match(left, /Ate 1\/2 at 7:30 PM/);
+  assert.match(left, /Not answered \(counts as thrown out\)/);
+  assert.match(left, />Threw out</);
+});

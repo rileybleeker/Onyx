@@ -2,7 +2,7 @@
 
 import { writeFeedSeed } from "@/lib/feed-seed";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   AreaChart, Area,
   BarChart, Bar, Cell,
@@ -25,15 +25,16 @@ import {
 import PhotoMealLogger from "@/components/PhotoMealLogger";
 import { daySourceLabel, isEstimateSource, rangeSourceLabel } from "@/lib/photo-meal";
 import { formatClock } from "@/lib/delivery-leftovers";
-import { formatDate, kgToLb, lbToKg, sameJson } from "@/lib/format";
+import { formatDate, kgToLb, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import { Part, PartGrid, PartGroup } from "@/components/personalize/PartGrid";
 import PersonalTable, { type TableColumn } from "@/components/personalize/PersonalTable";
 import InfoHint from "@/components/InfoHint";
-import { AutosaveStatus } from "@/components/AutosaveStatus";
-import { useWeightAutosave } from "@/lib/weight-entry";
 import RangeFilter from "@/components/RangeFilter";
+import LogLink from "@/components/LogLink";
+import { useInFeed } from "@/components/FeedContext";
+import { logHref } from "@/app/log/jump";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
 import { shiftYmd } from "@/lib/delivery-portion";
@@ -202,25 +203,15 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   // ─── Weight state ───
   const [weightRows, setWeightRows] = useState<WeightRow[]>([]);
   const [weightLoading, setWeightLoading] = useState(true);
-  const [weightInput, setWeightInput] = useState<string>("");
-  const [weightDate, setWeightDate] = useState<string>("");
-  const [weightNotes, setWeightNotes] = useState<string>("");
-  const weightRowsRef = useRef<WeightRow[]>([]);
-  weightRowsRef.current = weightRows;
-  const [weightUndoErr, setWeightUndoErr] = useState<string | null>(null);
-  // /nutrition?log=weight: weight first, pounds field focused (the page's charts stay below it).
   // /nutrition?log=photo (Log > Meal photo): the photo logger first.
+  // /nutrition?log=weight (an older shortcut): weight is entered on Log now, so the routed page forwards there.
   const logParam = useSearchParams().get("log");
-  const logWeightFirst = logParam === "weight";
   const logPhotoFirst = logParam === "photo";
-  const weightInputRef = useRef<HTMLInputElement>(null);
+  const router = useRouter();
+  const inFeed = useInFeed();
   useEffect(() => {
-    if (!logWeightFirst) return;
-    const input = weightInputRef.current;
-    if (!input) return;
-    input.focus({ preventScroll: true });
-    document.getElementById("log-weight")?.scrollIntoView({ block: "start" });
-  }, [logWeightFirst]);
+    if (logParam === "weight" && !inFeed) router.replace(logHref("weight"));
+  }, [logParam, inFeed, router]);
 
   // Behavioral "today" for the Today's Meals widget — seeded with ET-clock-today
   // as a synchronous best-guess, then overridden on mount via /api/behavioral-today
@@ -318,7 +309,8 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
       })
       .catch(console.error);
   }, []);
-  const delivery = useDeliveryDishes(mealsDay, { onSaved: refreshNutritionSilently });
+  // Read-only here: the portions and leftovers are answered on /log, which saves them.
+  const delivery = useDeliveryDishes(mealsDay);
   const servingsLoaded = servingsState.date === mealsDay;
   const servingsFailed = servingsLoaded && !!servingsState.failed;
   const todayServings = servingsLoaded ? servingsState.rows : [];
@@ -382,37 +374,6 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   }, [range]);
 
   useEffect(() => { loadWeight(); }, [loadWeight]);
-  useEffect(() => { setWeightDate(etTodayStr()); }, []);
-
-  // The quick-log saves itself (lib/weight-entry.ts): typing, Enter, leaving a field, moving the Date, Undo.
-  const weightAuto = useWeightAutosave("nutrition-weight", {
-    rows: () => weightRowsRef.current,
-    coversDays: () => (weightLoading ? 0 : Math.max(rangeDays(range), 90)),
-    onRow: (day, row) =>
-      setWeightRows((prev) => {
-        const kept = prev.filter((r) => r.log_date !== day);
-        return row ? [...kept, row].sort((a, b) => (a.log_date < b.log_date ? -1 : a.log_date > b.log_date ? 1 : 0)) : kept;
-      }),
-  });
-  const savingWeight = weightAuto.undoing;
-  const editWeight = (next: { lb?: string; day?: string; notes?: string }) => {
-    setWeightUndoErr(null);
-    weightAuto.edit({
-      day: next.day ?? (weightDate || etTodayStr()),
-      lb: next.lb ?? weightInput,
-      notes: next.notes ?? weightNotes,
-    });
-  };
-  async function undoWeight() {
-    const err = await weightAuto.undo();
-    if (err) {
-      setWeightUndoErr(err);
-      return;
-    }
-    setWeightInput("");
-    setWeightNotes("");
-    setWeightDate(etTodayStr());
-  }
 
   async function deleteWeight(log_date: string) {
     if (!confirm(`Delete weight entry for ${log_date}?`)) return;
@@ -490,7 +451,6 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
     if (!baseline) return null;
     return kgToLb(Number(recent.weight_kg) - Number(baseline.weight_kg));
   })();
-  const todayWeight = weightRows.find((w) => w.log_date === etTodayStr());
 
   const macroData = nutritionData.map((d) => ({
     date: formatDate(d.calendar_date),
@@ -524,132 +484,6 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   const nutrientLatest = fullNutrients[fullNutrients.length - 1];
   const nutrientLast7 = fullNutrients.slice(-7);
 
-  // The weight quick-log. A "Log weight" shortcut (Log sheet, Today) opens /nutrition?log=weight: the card is
-  // then drawn first, right under the header, and its pounds field is focused, instead of sitting below every
-  // nutrition chart (Codex #191 UI 5).
-  const weightLogCard = (
-    <div id="log-weight" className="scroll-mt-24">
-    <ChartCard
-      title={weightDate === etTodayStr() ? "Log weight — today" : `Log weight for ${formatShortDate(weightDate)}`}
-      subtitle={
-        todayWeight && weightDate === etTodayStr()
-          ? `Already logged today (${kgToLb(Number(todayWeight.weight_kg))!.toFixed(1)} lb). Typing a weight replaces it.`
-          : "One entry per day, in pounds"
-      }
-    >
-      <div className="flex flex-wrap items-center gap-2 mb-3">
-        <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
-          Date
-        </label>
-        <input
-          type="date"
-          value={weightDate}
-          max={etTodayStr()}
-          onChange={(e) => {
-            const d = e.target.value || etTodayStr();
-            setWeightDate(d);
-            editWeight({ day: d });
-          }}
-          disabled={savingWeight}
-          className="px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
-        />
-        {weightDate !== etTodayStr() && (
-          <>
-            <span className="text-[10px] font-mono text-amber-400/90">
-              logging to {formatShortDate(weightDate)} — not today
-            </span>
-            <button
-              onClick={() => {
-                setWeightDate(etTodayStr());
-                editWeight({ day: etTodayStr() });
-              }}
-              className="text-[10px] font-mono text-text-tertiary hover:text-text-primary underline underline-offset-2"
-            >
-              reset to today
-            </button>
-          </>
-        )}
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2 mb-3">
-        <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono">
-          Weight
-        </label>
-        <input
-          type="number"
-          step="0.1"
-          inputMode="decimal"
-          ref={weightInputRef}
-          aria-label="Weight in pounds"
-          value={weightInput}
-          onChange={(e) => {
-            setWeightInput(e.target.value);
-            editWeight({ lb: e.target.value });
-          }}
-          onBlur={() => void weightAuto.saver.flush()}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void weightAuto.saver.flush();
-          }}
-          placeholder="e.g. 178.4"
-          disabled={savingWeight}
-          className="w-[140px] min-h-11 px-3 text-[16px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
-        />
-        <span className="text-[10px] font-mono text-text-tertiary">lb</span>
-        {weightInput && !isNaN(parseFloat(weightInput)) && (
-          <span className="text-[10px] font-mono text-text-tertiary">
-            = {lbToKg(parseFloat(weightInput)).toFixed(2)} kg
-          </span>
-        )}
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2 mb-3">
-        <label className="text-[10px] uppercase tracking-wide text-text-tertiary font-mono shrink-0">
-          Notes
-        </label>
-        <input
-          type="text"
-          value={weightNotes}
-          onChange={(e) => {
-            setWeightNotes(e.target.value);
-            editWeight({ notes: e.target.value });
-          }}
-          onBlur={() => void weightAuto.saver.flush()}
-          placeholder="optional — e.g. 'morning, post-bathroom', 'after workout'"
-          disabled={savingWeight}
-          className="flex-1 min-w-[200px] px-2 py-1 text-[12px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40"
-        />
-      </div>
-
-      <div className="flex flex-wrap items-center gap-x-3 min-h-11">
-        <AutosaveStatus
-          state={weightAuto.saver.state}
-          onRetry={() => void weightAuto.saver.retry()}
-          showIncomplete={!!weightInput.trim()}
-          savedText={
-            weightAuto.written
-              ? `Saved ${weightAuto.written.lb.toFixed(1)} lb for ${weightAuto.written.day === etTodayStr() ? "today" : formatShortDate(weightAuto.written.day)}`
-              : "Saved"
-          }
-        />
-        {weightAuto.written && weightAuto.saver.state.status === "saved" && (
-          <button
-            type="button"
-            onClick={() => void undoWeight()}
-            disabled={savingWeight}
-            className="min-h-11 px-1 text-[12px] text-text-tertiary hover:text-text-primary underline underline-offset-2 disabled:opacity-40"
-          >
-            {savingWeight ? "Undoing…" : "Undo"}
-          </button>
-        )}
-        {!weightInput.trim() && weightAuto.saver.state.status === "idle" && (
-          <span className="text-[12px] text-text-tertiary">Saves as you type</span>
-        )}
-      </div>
-      {weightUndoErr && <p role="alert" className="mt-1 text-[13px] text-down">{weightUndoErr}</p>}
-    </ChartCard>
-    </div>
-  );
-
   return (
     <>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
@@ -671,7 +505,6 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
         </div>
       </div>
 
-      {logWeightFirst && <div className="mb-8">{weightLogCard}</div>}
       {logPhotoFirst && <div className="mb-8"><PhotoMealLogger first onSaved={onPhotoSaved} /></div>}
 
       {/* Meal timing is now automatic from Cronometer Gold per-entry timestamps
@@ -1013,15 +846,16 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
           <Part id="uber-eats" title="Uber Eats dishes">
             <div>
               <div className="flex items-baseline justify-between mb-1.5">
-                <span className="text-[10px] font-mono text-text-tertiary">
-                  Tap how much you ate
-                </span>
+                <span className="text-[10px] font-mono text-text-tertiary">Uber Eats</span>
                 <span className="text-[11px] font-mono text-text-secondary">
                   {delivery.totalKcal != null ? `Uber Eats ~${Math.round(delivery.totalKcal)} kcal` : ""}
                 </span>
               </div>
-              <DeliveryDishList items={delivery.items} onPick={delivery.setFraction} />
-              {delivery.error && <p className="text-[11px] text-red-400 mt-1.5">{delivery.error}</p>}
+              {/* Read-only: portions are answered on Log (one place to enter data). */}
+              <DeliveryDishList items={delivery.items} />
+              <div className="mt-2 flex justify-end">
+                <LogLink part="uber-eats">Set how much you ate on Log</LogLink>
+              </div>
             </div>
           </Part>
         )}
@@ -1030,7 +864,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
             <div>
               <div className="flex items-baseline justify-between gap-3 mb-1.5">
                 <span className="text-[10px] font-mono text-text-tertiary">
-                  Leftovers: how much did you eat this day? Unanswered counts as thrown out.
+                  Leftovers eaten this day. Unanswered counts as thrown out.
                 </span>
                 {delivery.items.length === 0 && delivery.totalKcal != null && (
                   <span className="text-[11px] font-mono text-text-secondary shrink-0">
@@ -1038,13 +872,13 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
                   </span>
                 )}
               </div>
-              <LeftoverList
-                questions={delivery.leftovers}
-                onPick={delivery.setLeftover}
-                onTime={delivery.setLeftoverTime}
-                showNow={mealsDayOffset === 0}
-              />
-              {delivery.items.length === 0 && delivery.error && <p className="text-[11px] text-red-400 mt-1.5">{delivery.error}</p>}
+              {/* Read-only: leftovers are answered on Log (one place to enter data). */}
+              <LeftoverList questions={delivery.leftovers} />
+              {delivery.items.length === 0 && (
+                <div className="mt-2 flex justify-end">
+                  <LogLink part="uber-eats">Answer leftovers on Log</LogLink>
+                </div>
+              )}
             </div>
           </Part>
         )}
@@ -1124,12 +958,12 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
           />
         </Part>
 
-        {/* Quick-log card (moved to the top of the page when opened from a Log weight shortcut) */}
-        {!logWeightFirst && (
-          <Part id="weight-log" title="Log weight">
-            {weightLogCard}
-          </Part>
-        )}
+        {/* Weight is entered on Log (one place to enter data); a day can still be deleted under Recent entries. */}
+        <Part id="weight-log" title="Log weight">
+          <div className="flex justify-end">
+            <LogLink part="weight">Log today&apos;s weight on Log</LogLink>
+          </div>
+        </Part>
 
         <Part id="weight-trend" title="Weight Trend">
           <ChartCard
@@ -1170,7 +1004,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
           <Part id="weight-recent" title="Recent weight entries">
             <ChartCard
               title="Recent entries"
-              subtitle="Newest first · re-log a date to overwrite"
+              subtitle="Newest first · re-log a date on Log to overwrite"
             >
               <div className="space-y-1">
                 {[...weightRows].reverse().slice(0, 10).map((w) => (

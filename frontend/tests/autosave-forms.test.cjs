@@ -73,14 +73,14 @@ test("forms that keep a button keep it on purpose", () => {
   assert.match(read("app/financials/forecast/PlanConfig.tsx"), /Stop from then/);
 });
 
-// ---- /log Weight, /nutrition weight, /log Supplements + Uber Eats Say it suggestions (2026-11-15) ----
+// ---- /log Weight, /log Supplements + Uber Eats Say it suggestions (2026-11-15) ----
 
 const { execFileSync } = require("node:child_process");
 const { mkdtempSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 
-test("weight entry: both weight forms save through the shared hook, no Save button", () => {
-  for (const f of ["app/log/sections/Weight.tsx", "app/nutrition/NutritionClient.tsx"]) {
+test("weight entry: the Log weight form saves through the shared hook, no Save button", () => {
+  for (const f of ["app/log/sections/Weight.tsx"]) {
     const src = read(f);
     assert.match(src, /useWeightAutosave\(/, f);
     assert.match(src, /<AutosaveStatus/, f);

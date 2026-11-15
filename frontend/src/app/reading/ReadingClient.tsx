@@ -3,17 +3,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
-import { BookMarked, Check, ChevronDown, Flame, Headphones, Highlighter, Sparkles, Trophy, X } from "lucide-react";
+import { Check, ChevronDown, Flame, Highlighter, Sparkles, Trophy, X } from "lucide-react";
 import MetricRing from "@/components/MetricRing";
 import InfoHint from "@/components/InfoHint";
-import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type Medium, type ReadingOverview, type Book } from "@/lib/reading";
+import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { AutosaveRefused, saveRequest } from "@/lib/autosave";
-import { highlightValue, isBlankSession, readingSaveTarget, sameReadingValue, sessionValue, type HighlightValue, type SessionValue } from "@/lib/reading-autosave";
+import { highlightValue, sameReadingValue, type HighlightValue } from "@/lib/reading-autosave";
 import { useAutosave } from "@/lib/use-autosave";
 import { sameJson } from "@/lib/format";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
+import LogLink from "@/components/LogLink";
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -22,21 +23,16 @@ const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading
  *
  * One book at a time: progress ring + pace against the target date, session
  * streak, XP / level, badges, three checkpoints, a burn-up chart, today's
- * spaced-repetition review, and the two capture forms (session with a from-
- * memory recall note; highlight with a comment, or a pasted Kindle export).
- * Both forms save as they are entered (lib/autosave.ts): created on the first
- * valid entry, then edited in place.
+ * spaced-repetition review, and the highlight capture form (a comment, or a
+ * pasted Kindle export), which saves as it is entered (lib/autosave.ts): created on
+ * the first non-empty passage, then edited in place. Sessions are logged on /log
+ * (one place to enter data).
  * Writes go to /api/reading/*; each write mirrors to the book's Notion
  * reading-log page server-side. All numbers are derived in lib/reading.ts.
  */
 
 type Toast = { text: string; kind: "xp" | "ok" | "err" } | null;
 
-const MEDIA: Array<{ key: Medium; label: string }> = [
-  { key: "audio", label: "Audio" },
-  { key: "kindle", label: "Kindle" },
-  { key: "paper", label: "Paper" },
-];
 const SOURCES: Array<{ key: HighlightSource; label: string }> = [
   { key: "kindle", label: "Kindle" },
   { key: "audible", label: "Audible clip" },
@@ -198,8 +194,11 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
           <ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} />
         </Part>
 
+        {/* Sessions are logged on Log (one place to enter data); the Session log below lists them. */}
         <Part id="log-session" title="Log a session">
-          <SessionForm key={o.book.slug} o={o} onLogged={(xp, finished) => { showToast({ text: finished ? `Finished! +${xp} XP` : `+${xp} XP`, kind: "xp" }); load(slug, true); }} onSaved={() => load(slug, true)} />
+          <div className="flex justify-end">
+            <LogLink part="reading">Log a reading session on Log</LogLink>
+          </div>
         </Part>
 
         <Part id="add-highlight" title="Highlight + comment">
@@ -443,294 +442,6 @@ function GradeBtn({ label, sub, onClick, disabled, className }: { label: string;
       <div className="text-[13px] font-medium leading-none">{label}</div>
       <div className="text-[10px] font-mono opacity-70 mt-1">{sub}</div>
     </button>
-  );
-}
-
-/**
- * "Log a session", saved as it is entered (lib/autosave.ts, 2026-11-15): the first valid entry creates the session
- * (POST /api/reading/sessions) once Riley pauses or leaves a field, every later edit updates that same session
- * (PATCH /api/reading/sessions/[id]). The day is sent only when changed (the server takes behavioral today).
- * Nothing is saved until "Through ch." is set.
- * "New session" starts the next one; "Remove this session" deletes the one just made.
- */
-function SessionForm({ o, onLogged, onSaved }: { o: ReadingOverview; onLogged: (xp: number, finished: boolean) => void; onSaved: () => void }) {
-  // "Through" starts blank (the next chapters are one tap away): a guessed chapter must never be saved by a tap
-  // on something else.
-  const [through, setThroughState] = useState<string>("");
-  const [minutes, setMinutes] = useState<string>("");
-  const [medium, setMedium] = useState<Medium>("audio");
-  const [recall, setRecall] = useState("");
-  const [question, setQuestion] = useState("");
-  const [date, setDate] = useState(o.today);
-  const [sessionId, setSessionIdState] = useState<number | null>(null);
-  const [saved, setSaved] = useState<{ xp: number; finished: boolean } | null>(null);
-  const [removing, setRemoving] = useState(false);
-  const [removeError, setRemoveError] = useState<string | null>(null);
-  const sessionRef = useRef<number | null>(null);
-  const touched = useRef({ date: false });
-  const fields = useRef({ through, minutes, medium, recall, question, date });
-  const oRef = useRef(o);
-  oRef.current = o;
-  const alive = useRef(true);
-  useEffect(() => {
-    alive.current = true;
-    return () => {
-      alive.current = false;
-    };
-  }, []);
-  const setSessionId = (id: number | null) => {
-    sessionRef.current = id;
-    setSessionIdState(id);
-  };
-
-  const autosave = useAutosave<SessionValue>("reading-session", {
-    delayMs: 1500,
-    ready: (v) => v.reason,
-    same: sameReadingValue,
-    save: async (v, { keepalive }) => {
-      if (!v.body) return;
-      const id = sessionRef.current;
-      const target = readingSaveTarget("sessions", id);
-      let json: Record<string, unknown>;
-      try {
-        json = await saveRequest(target.url, { method: target.method, body: v.body, keepalive });
-      } catch (e) {
-        if (id !== null && e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
-          if (sessionRef.current === id) setSessionId(null);
-          throw new AutosaveRefused("That session was removed elsewhere. Retry logs it again.");
-        }
-        throw e;
-      }
-      const s = json.session as { session_id?: number } | undefined;
-      const xp = Number(json.xp_gained) || 0;
-      if (alive.current) setSaved({ xp, finished: !!json.finished });
-      if (id === null && s?.session_id && sessionRef.current === null) {
-        setSessionId(s.session_id);
-        onLogged(xp, !!json.finished);
-      } else onSaved();
-    },
-  });
-
-  // Not an entry: an unchanged day follows behavioral today.
-  useEffect(() => {
-    if (touched.current.date) return;
-    fields.current.date = o.today;
-    setDate(o.today);
-  }, [o.today]);
-
-  const commit = (patch: Partial<typeof fields.current>) => {
-    const f = { ...fields.current, ...patch };
-    fields.current = f;
-    setRemoveError(null);
-    const ov = oRef.current;
-    const entry = { from: "", through: f.through, minutes: f.minutes, recall: f.recall, question: f.question, medium: f.medium };
-    if (sessionRef.current === null && !touched.current.date && isBlankSession(entry, { medium: "audio" })) {
-      autosave.reset(); // back to nothing entered: nothing to save, nothing unsaved
-      return;
-    }
-    autosave.change(
-      sessionValue(
-        { from: "", through: f.through, minutes: f.minutes, recall: f.recall, question: f.question, medium: f.medium },
-        { book: ov.book.slug, chosenDay: touched.current.date ? f.date : null, today: ov.today, total: ov.totalChapters || null },
-      ),
-    );
-  };
-
-  const startNew = () => {
-    setSessionId(null);
-    setSaved(null);
-    setRemoveError(null);
-    touched.current = { date: false };
-    autosave.reset();
-    const ov = oRef.current;
-    fields.current = { through: "", minutes: "", medium: "audio", recall: "", question: "", date: ov.today };
-    setThroughState("");
-    setMinutes("");
-    setMedium("audio");
-    setRecall("");
-    setQuestion("");
-    setDate(ov.today);
-  };
-
-  const removeSession = async () => {
-    const id = sessionRef.current;
-    if (id === null || removing) return;
-    autosave.reset();
-    setRemoving(true);
-    setRemoveError(null);
-    try {
-      const res = await fetch(`/api/reading/sessions/${id}`, { method: "DELETE" });
-      const json = (await res.json().catch(() => ({}))) as { error?: string };
-      if (!res.ok && res.status !== 404) throw new Error(json.error || `HTTP ${res.status}`);
-      if (!alive.current) return;
-      startNew();
-      onSaved();
-    } catch (e) {
-      if (alive.current) setRemoveError(`Couldn't remove the session: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      if (alive.current) setRemoving(false);
-    }
-  };
-
-  const recallOk = recall.trim().length >= 40;
-  const nextChapter = o.totalChapters ? Math.min(o.totalChapters, o.chaptersDone + 1) : o.chaptersDone + 1;
-  const chips = [nextChapter, nextChapter + 1].filter((n, i, all) => (!o.totalChapters || n <= o.totalChapters) && all.indexOf(n) === i);
-  const anyEntered = !!(through || minutes || recall || question || touched.current.date || medium !== "audio");
-  const st = autosave.state.status;
-  const busy = st === "saving" || removing;
-  const savedText = `Saved${saved?.finished ? " · book finished" : ""}${saved?.xp ? ` · +${saved.xp} XP` : ""}`;
-
-  return (
-    <section
-      className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4"
-      data-testid="reading-session-form"
-      onBlur={() => void autosave.flush()}
-    >
-      <div className="flex items-baseline justify-between">
-        <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary flex items-center gap-1.5">
-          <BookMarked className="w-3.5 h-3.5" /> {sessionId !== null ? "This session" : "Log a session"}
-        </h3>
-        <span className="text-[11px] font-mono text-text-tertiary">10 XP / chapter · 20 XP for a recall note</span>
-      </div>
-      <div className="mt-3 grid grid-cols-3 gap-2">
-        <label className="block">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Through ch.</span>
-          <input
-            type="number"
-            inputMode="numeric"
-            min={0}
-            max={o.totalChapters || undefined}
-            value={through}
-            onChange={(e) => {
-              setThroughState(e.target.value);
-              commit({ through: e.target.value });
-            }}
-            placeholder={String(Math.min(o.totalChapters || 9999, o.chaptersDone + 1))}
-            className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[15px] font-mono text-text-primary"
-          />
-        </label>
-        <label className="block">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Minutes</span>
-          <input
-            type="number"
-            inputMode="numeric"
-            min={0}
-            value={minutes}
-            onChange={(e) => {
-              setMinutes(e.target.value);
-              commit({ minutes: e.target.value });
-            }}
-            placeholder="31"
-            className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[15px] font-mono text-text-primary"
-          />
-        </label>
-        <label className="block">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">Day</span>
-          <input
-            type="date"
-            value={date}
-            max={o.today}
-            onChange={(e) => {
-              touched.current.date = true;
-              const d = e.target.value || o.today;
-              setDate(d);
-              commit({ date: d });
-            }}
-            className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary"
-          />
-        </label>
-      </div>
-      {chips.length > 0 && (
-        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-          <span className="text-[11px] text-text-tertiary">Through</span>
-          {chips.map((n) => (
-            <button
-              key={n}
-              type="button"
-              onClick={() => {
-                setThroughState(String(n));
-                commit({ through: String(n) });
-              }}
-              aria-pressed={through === String(n)}
-              className={`px-2.5 h-8 rounded-control border font-mono text-[12px] ${through === String(n) ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-secondary"}`}
-            >
-              ch {n}
-            </button>
-          ))}
-        </div>
-      )}
-      <div className="mt-2 flex gap-1.5">
-        {MEDIA.map((m) => (
-          <button
-            key={m.key}
-            type="button"
-            onClick={() => {
-              setMedium(m.key);
-              commit({ medium: m.key });
-            }}
-            aria-pressed={medium === m.key}
-            className={`px-3 h-8 rounded-control border text-[12px] inline-flex items-center gap-1 ${medium === m.key ? "bg-accent/15 border-accent/60 text-accent" : "border-border-subtle text-text-tertiary"}`}
-          >
-            {m.key === "audio" && <Headphones className="w-3.5 h-3.5" />}
-            {m.label}
-          </button>
-        ))}
-      </div>
-      <label className="block mt-3">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">
-          Recall, from memory <span className={recallOk ? "text-up" : ""}>{recallOk ? "· +20 XP" : "· 3 sentences"}</span>
-        </span>
-        <textarea
-          value={recall}
-          onChange={(e) => {
-            setRecall(e.target.value);
-            commit({ recall: e.target.value });
-          }}
-          rows={4}
-          placeholder="What happened, what principle it showed, where it shows up in a BC implementation. Dictate it; don't open the book."
-          className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary leading-relaxed"
-        />
-      </label>
-      <label className="block mt-2">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">One question for a plant manager</span>
-        <input
-          value={question}
-          onChange={(e) => {
-            setQuestion(e.target.value);
-            commit({ question: e.target.value });
-          }}
-          placeholder="Optional"
-          className="mt-1 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary"
-        />
-      </label>
-      <div className="mt-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
-        <span className="text-[11px] text-text-tertiary">
-          Also marks the &ldquo;{o.book.habit_name ?? "reading"}&rdquo; habit for {fmtDate(date)}.{" "}
-          <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} savedText={savedText} showIncomplete={anyEntered} />
-        </span>
-        {sessionId !== null && (
-          <span className="flex items-center gap-1">
-            <button
-              type="button"
-              onClick={() => void removeSession()}
-              disabled={busy}
-              className="px-2 h-8 text-[12px] text-text-tertiary hover:text-[var(--color-down)] underline underline-offset-2 disabled:opacity-40"
-            >
-              {removing ? "Removing…" : "Remove this session"}
-            </button>
-            <button
-              type="button"
-              onClick={() => void autosave.flush().then(() => { if (alive.current) startNew(); })}
-              disabled={busy || st === "error"}
-              className="px-4 py-2 rounded-control text-[13px] font-medium border border-border-subtle text-text-secondary hover:text-text-primary disabled:opacity-40"
-            >
-              New session
-            </button>
-          </span>
-        )}
-      </div>
-      {removeError && <p role="alert" className="mt-2 text-[12px] text-[var(--color-down)]">{removeError}</p>}
-    </section>
   );
 }
 

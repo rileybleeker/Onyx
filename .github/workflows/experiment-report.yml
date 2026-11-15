@@ -1,0 +1,44 @@
+name: Experiment Report
+
+# Daily N-of-1 trial report (experiment_report.py; docs/experiment-framework.md 10, AGENTS.md
+# "Experiments"). With no trial registered it is a no-op with a success heartbeat and never calls
+# Notion. While a trial runs it writes progress counts only; the final analysis runs once, from
+# the planned end + 2 days. 15:00 UTC is after last night's WHOOP recovery has arrived through
+# the hourly ETL. The Notion mirror ("Onyx Experiments") uses NOTION_API_KEY, the same secret as
+# journal-sync.yml; without it the heartbeat turns partial and the Supabase row is still written.
+#
+# The logs of this repository are public: the script never prints a seed, an arm, an HRV value,
+# an adherence figure or an estimate, and it has no option to ask for an early analysis.
+#
+# Merge AFTER applying sql/experiment_adherence_reports_schema.sql (pds.experiment_reports).
+
+on:
+  schedule:
+    - cron: '0 15 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: experiment-report
+  cancel-in-progress: false
+
+jobs:
+  experiment-report:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install numpy==2.4.4 pandas==3.0.2 scipy==1.17.1 PyYAML==6.0.3 supabase==2.19.0 realtime==2.19.0 supabase-functions==2.19.0 storage3==2.19.0 supabase-auth==2.19.0 postgrest==2.19.0 httpx==0.28.1
+      - run: python experiment_report.py

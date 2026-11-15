@@ -1,0 +1,22 @@
+name: Care Calendar Catch-up
+on:
+  schedule:
+    - cron: '20 */6 * * *'
+  workflow_dispatch:
+concurrency:
+  group: care-calendar-catch-up
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  catch-up:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Run the care calendar sync
+        env:
+          ONYX_CI_TOKEN: ${{ secrets.ONYX_CI_TOKEN }}
+        run: |
+          code=$(curl -sS -o body.json -w '%{http_code}' -X POST -H "x-onyx-ci-token: $ONYX_CI_TOKEN" --max-time 90 https://frontend-six-alpha-69.vercel.app/api/jobs/care-calendar-catch-up)
+          cat body.json; echo
+          if [ "$code" != "200" ]; then echo "Care calendar catch-up answered HTTP $code"; exit 1; fi

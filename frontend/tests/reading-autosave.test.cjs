@@ -216,7 +216,8 @@ test("source pins: no Save button on the reading forms; the edit route is owner-
   assert.match(log, /useAutosave/);
   const page = read("app/reading/ReadingClient.tsx");
   assert.doesNotMatch(page, /"Log session"|>\s*Add highlight\s*</);
-  assert.match(page, /useAutosave<SessionValue>/);
+  // Sessions are entered on /log only (#331); /reading keeps the self-saving highlight form.
+  assert.doesNotMatch(page, /function SessionForm/);
   assert.match(page, /useAutosave<HighlightValue>/);
   const route = read("app/api/reading/sessions/[id]/route.ts");
   assert.match(route, /export async function PATCH/);

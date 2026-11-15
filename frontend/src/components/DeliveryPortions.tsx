@@ -474,6 +474,23 @@ export function PortionControl({
   );
 }
 
+/** "Ate 3/4"; "Ate All (assumed)" while the portion was never set (counted as All). */
+export function portionText(fraction: number | null): string {
+  if (fraction == null) return "Ate All (assumed)";
+  const v = Number(fraction);
+  const label = PORTION_OPTIONS.find((o) => o.value === v)?.label ?? `${Math.round(v * 100)}%`;
+  return `Ate ${label}`;
+}
+
+/** "Ate 1/2 at 7:30 PM", "Threw out"; null answer = "Not answered (counts as thrown out)". */
+export function leftoverText(q: Pick<LeftoverQuestion, "option" | "time">): string {
+  if (q.option == null) return "Not answered (counts as thrown out)";
+  const o = LEFTOVER_OPTIONS.find((x) => x.key === q.option);
+  const label = o?.label ?? q.option;
+  const amount = o?.share != null && o.share > 0 ? `Ate ${label}` : label;
+  return q.time ? `${amount} at ${formatClock(q.time)}` : amount;
+}
+
 export function DeliveryDishList({
   items,
   onPick,
@@ -481,7 +498,8 @@ export function DeliveryDishList({
   className = "",
 }: {
   items: DeliveryDish[];
-  onPick: (dish: DeliveryDish, fraction: number) => void;
+  /** Without it the list is read-only: the answer is shown as text (/nutrition; the answer is entered on /log). */
+  onPick?: (dish: DeliveryDish, fraction: number) => void;
   /** item_id -> suggested portion (the /log Say it box), shown "from what you said" until saved. */
   suggestions?: ReadonlyMap<number, number>;
   className?: string;
@@ -506,7 +524,11 @@ export function DeliveryDishList({
             </span>
           </div>
           <div className="mt-1.5 flex justify-end">
-            <PortionControl dish={d} onPick={(f) => onPick(d, f)} suggested={suggestions?.get(d.item_id)} />
+            {onPick ? (
+              <PortionControl dish={d} onPick={(f) => onPick(d, f)} suggested={suggestions?.get(d.item_id)} />
+            ) : (
+              <span className="text-[11px] font-mono text-text-tertiary">{portionText(d.eaten_fraction)}</span>
+            )}
           </div>
           {suggestions?.has(d.item_id) && suggestions.get(d.item_id) !== d.eaten_fraction && (
             <SuggestionNote text={`ate ${PORTION_OPTIONS.find((o) => o.value === suggestions.get(d.item_id))?.label ?? ""}`} />
@@ -539,7 +561,8 @@ export function LeftoverList({
   questions: LeftoverQuestion[];
   /** item_id -> suggested answer (the /log Say it box), shown "from what you said" until saved. */
   suggestions?: ReadonlyMap<number, { option: string; time: string | null }>;
-  onPick: (q: LeftoverQuestion, optionKey: string) => void;
+  /** Without it the list is read-only: the answer is shown as text (/nutrition; the answer is entered on /log). */
+  onPick?: (q: LeftoverQuestion, optionKey: string) => void;
   /** Set ("HH:MM") or clear (null) when it was eaten. Without it no time row is shown. */
   onTime?: (q: LeftoverQuestion, time: string | null) => void;
   /** The list is for the current behavioral day: offer "Now". */
@@ -567,6 +590,11 @@ export function LeftoverList({
               {q.kcal != null ? `~${Math.round(q.kcal)} kcal` : "—"}
             </span>
           </div>
+          {!onPick ? (
+            <div className="mt-1.5 flex justify-end">
+              <span className="text-[11px] font-mono text-text-tertiary">{leftoverText(q)}</span>
+            </div>
+          ) : (
           <div className="mt-1.5 flex flex-wrap justify-end gap-1" role="group" aria-label={`How much of the leftover ${q.dish.title} you ate`}>
             <span className="text-[10px] font-mono text-text-tertiary mr-0.5 self-center">Ate</span>
             {LEFTOVER_OPTIONS.map((o) => {
@@ -600,7 +628,8 @@ export function LeftoverList({
               );
             })}
           </div>
-          {onTime && fractionOfToken(q.token) > 0 && (
+          )}
+          {onPick && onTime && fractionOfToken(q.token) > 0 && (
             <div className="mt-1.5 flex flex-wrap items-center justify-end gap-1">
               <span className="text-[10px] font-mono text-text-tertiary mr-0.5">{q.time ? "At" : "When? (for meal timing)"}</span>
               <input

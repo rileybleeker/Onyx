@@ -335,8 +335,11 @@ test("other write paths keep sleep answers off today", () => {
   assert.match(complete, /sleepDateError\(habit, completionDate, today, answer\)/);
   const checkin = fs.readFileSync(path.join(SRC, "app/api/habits/checkin/route.ts"), "utf8");
   assert.match(checkin, /sleepDateError\(name, date, today, raw\)/);
+  // /habits has no "Today's Habits" checklist any more (one place to enter data: Log's check-in); its heatmap
+  // corrections go through /api/habits/complete, whose sleepDateError guard is asserted above.
   const habits = fs.readFileSync(path.join(SRC, "app/habits/HabitsClient.tsx"), "utf8");
-  assert.match(habits, /habits\.filter\(\(h\) => !SLEEP_QUESTIONS\.has\(h\.name\)\)\.map/);
+  assert.equal(/today-checklist|function HabitRow/.test(habits), false);
+  assert.match(habits, /<LogLink part="check-in">/);
   // The hourly Notion sync never turns a "Last Completed" date into a sleep answer: a date cannot say which night.
   const sync = fs.readFileSync(path.join(SRC, "app/api/habits/sync/route.ts"), "utf8");
   assert.match(sync, /if \(lastCompleted && !SLEEP_QUESTIONS\.has\(name\)\) \{/);

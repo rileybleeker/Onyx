@@ -9,7 +9,7 @@ import { etToday, parseLb, weightDelayMs, weightNotReady, type WeightEntry } fro
 export { etToday, parseLb, weightDelayMs, weightNotReady, type WeightEntry };
 
 /**
- * Weight entry that saves itself (2026-11-15), shared by the /log Weight section and the /nutrition quick-log.
+ * Weight entry that saves itself (2026-11-15), used by the /log Weight section (the one weight form since #331).
  * Same route and rules as before: POST /api/weight upserts one row per ET calendar day (a manual entry then owns
  * the day), 0 to 1000 lb, no day after today.
  *  - Typing saves 1 s after the last keystroke, or 4 s when the number is far (over 30 %) from the last weigh-in
