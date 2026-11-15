@@ -90,7 +90,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         async function settled(page) { await page.waitForFunction(() => document.querySelector('[aria-label="Refresh Today"]')?.getAttribute('aria-disabled') === 'false'); }
         let page = await setup();
         await settled(page);
-        assert.equal(await page.locator('section').first().locator('li').count(), 3);
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3);
         assert(await page.getByText('Showing 3 of 5 requests returned, in inbox order.').isVisible());
         assert.equal(await page.getByText('FYI should not appear').count(), 0);
         assert.equal(await page.getByRole('link', { name: 'See the rest in your inbox' }).getAttribute('href'), '/agents?view=unread');
@@ -106,7 +106,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         await settled(page);
         assert(await page.getByText(/Couldn't refresh requests/).isVisible());
         assert(await page.getByText(/Couldn't refresh reading/).isVisible());
-        assert.equal(await page.locator('section').first().locator('li').count(), 3);
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3);
         assert(await page.evaluate(() => document.activeElement.textContent.includes('Review a proposed plan')));
         assert((await page.evaluate(() => window.calls)).every(c => c.method === 'GET'));
         await page.evaluate(() => window.mode = 'healthy');
@@ -131,7 +131,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
                 else
                     assert(await page.getByText('A book for steady progress').isVisible());
                 if (mode === 'reading-error')
-                    assert.equal(await page.locator('section').first().locator('li').count(), 3);
+                    assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3);
                 assert.equal(await page.getByText(/last check returned no open requests/).count(), 0);
             }
             await close(page);
@@ -160,7 +160,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         });
         await settled(page);
         await page.evaluate(async () => { window.resolveLate(); await new Promise(resolve => setTimeout(resolve, 100)); });
-        assert.equal(await page.locator('section').first().locator('li').count(), 3);
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3);
         assert(await page.getByText('A book for steady progress').isVisible());
         await close(page);
         console.log('PASS duplicate-refresh suppression and Strict Mode superseded completions');
@@ -172,14 +172,14 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         await page.evaluate(() => window.mode = 'healthy');
         await page.getByRole('button', { name: 'Refresh Today' }).click();
         await settled(page);
-        assert.equal(await page.locator('section').first().locator('li').count(), 3);
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3);
         await page.evaluate(async () => {
             for (const pending of window.pending) pending.resolve(pending.kind === 'inbox'
                 ? {...window.fixture, items:[]}
                 : {ok:true, json:async () => ({overview:null})});
             await new Promise(resolve => setTimeout(resolve, 100));
         });
-        assert.equal(await page.locator('section').first().locator('li').count(), 3);
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3);
         assert(await page.getByText('A book for steady progress').isVisible());
         await close(page);
         console.log('PASS bounded timeout is unavailable, not empty; retry recovers and rejects late data');
@@ -217,14 +217,14 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert.equal(await urgentPanel.getByText('A synthetic sign-in check').count(), 1);
         assert(await page.getByText('Showing 3 of 5 requests returned, in inbox order.').isVisible());
         assert(await page.getByText('2 email requests are listed under Urgent email instead.').isVisible());
-        assert.equal(await page.locator('section').first().getByText(/synthetic sign-in check|synthetic ballot/).count(), 0, 'email requests are shown once, under Urgent email');
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').getByText(/synthetic sign-in check|synthetic ballot/).count(), 0, 'email requests are shown once, under Urgent email');
         assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
         await page.evaluate(() => window.urgentMode = 'error');
         await page.getByRole('button', { name: 'Refresh Today' }).click();
         await settled(page);
         assert(await urgentPanel.getByText(/Couldn't refresh the email labels/).isVisible());
         assert.equal(await urgentPanel.locator('li').count(), 4, 'a failed refresh keeps the last list');
-        assert.equal(await page.locator('section').first().locator('li').count(), 3, 'agent requests stay independent of email');
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3, 'agent requests stay independent of email');
         assert((await page.evaluate(() => window.calls)).every(c => c.method === 'GET'));
         await close(page);
         page = await setup('healthy', 390, false, 'error');
@@ -233,7 +233,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert(await urgentPanel.getByText("Couldn't check urgent email. Try refreshing.").isVisible());
         assert.equal(await urgentPanel.getByText('Nothing urgent right now.').count(), 0, 'an error is not empty');
         assert.equal(await urgentPanel.getByText(/isn't connected yet/).count(), 0, 'an error is not the not-connected state');
-        assert.equal(await page.locator('section').first().locator('li').count(), 3);
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3);
         assert(await page.getByText('A book for steady progress').isVisible());
         await close(page);
         page = await setup('email-cards', 390, false, 'error');
@@ -355,7 +355,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert(await armCard().getByText('EXP-901: A synthetic evening routine. Day 12 of 232 (Fri, Jan 18).').isVisible());
         assert(await armCard().getByText(/Opening Today does not record whether you followed it/).isVisible());
         assert.equal(await armCard().locator('a, button, input').count(), 0, 'the arm card is read-only: nothing to tap');
-        assert.equal(await page.locator('section').first().locator('li').count(), 3, 'the other panels are unchanged');
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3, 'the other panels are unchanged');
         assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
         await page.evaluate(() => window.experimentMode = 'error');
         await page.getByRole('button', { name: 'Refresh Today' }).click();
@@ -373,7 +373,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         await settled(page);
         assert(await page.getByText("Couldn't check today's experiment arm. Try refreshing.").isVisible(), 'a failed check is not "no experiment"');
         assert.equal(await armCard().count(), 0);
-        assert.equal(await page.locator('section').first().locator('li').count(), 3, 'agent requests stay independent of the experiment check');
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3, 'agent requests stay independent of the experiment check');
         await close(page);
         page = await setup('healthy', 390, false, 'not_connected', 'invalid');
         await settled(page);
@@ -386,7 +386,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         page = await setup();
         await settled(page);
         let calendarPanel = page.locator('section[aria-labelledby="calendar-heading"]');
-        assert.equal(await page.locator('section').first().getAttribute('aria-labelledby'), 'requests-heading', 'Needs your input stays the first panel');
+        assert.equal(await page.locator('section[aria-labelledby]').first().getAttribute('aria-labelledby'), 'requests-heading', 'Needs your input stays the first panel after Quick capture');
         assert(await calendarPanel.getByText("The calendar sync isn't connected yet.").isVisible());
         assert.equal(await calendarPanel.locator('li').count(), 0);
         assert.equal(await calendarPanel.getByText('Nothing on the calendar.').count(), 0, 'not connected is not an empty day');
@@ -413,7 +413,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         await refresh(page, 'error');
         assert(await calendarPanel.getByText(/Couldn't refresh the calendar/).isVisible());
         assert.equal(await calendarPanel.locator('li').count(), 4, 'a failed refresh keeps the last list');
-        assert.equal(await page.locator('section').first().locator('li').count(), 3, 'agent requests stay independent of the calendar');
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3, 'agent requests stay independent of the calendar');
         assert(await page.getByText('A book for steady progress').isVisible());
         assert((await page.evaluate(() => window.calendarCalls)).every(u => u.startsWith('/api/calendar/events?from=')));
         assert((await page.evaluate(() => window.calls)).every(c => c.method === 'GET'));
@@ -424,7 +424,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert(await calendarPanel.getByText("Couldn't check the calendar. Try refreshing.").isVisible());
         assert.equal(await calendarPanel.getByText('Nothing on the calendar.').count(), 0, 'an error is not empty');
         assert.equal(await calendarPanel.getByText(/isn't connected yet/).count(), 0, 'an error is not the not-connected state');
-        assert.equal(await page.locator('section').first().locator('li').count(), 3);
+        assert.equal(await page.locator('section[aria-labelledby="requests-heading"]').locator('li').count(), 3);
         await close(page);
         page = await setup('healthy', 390, false, 'not_connected', 'none', 'stale_sync');
         await settled(page);
