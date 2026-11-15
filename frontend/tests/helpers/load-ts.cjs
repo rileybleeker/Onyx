@@ -14,7 +14,9 @@ function resolveTs(rel) {
 }
 
 function loadTs(relPath, stubs = {}) {
+  // fileName keeps .ts files out of the JSX parser (a generic arrow `<T>(x: T) =>` is not JSX there).
   const { outputText } = ts.transpileModule(fs.readFileSync(path.join(SRC, relPath), "utf8"), {
+    fileName: path.basename(relPath),
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true, jsx: ts.JsxEmit.ReactJSX },
   });
   const mod = { exports: {} };

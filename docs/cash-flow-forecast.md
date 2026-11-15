@@ -223,7 +223,9 @@ Shown on Today as a panel when one is true; an `/agents` card only if D3 says so
 
 ### 7.1 What it computes
 
-For the current tax year and the next:
+For every tax year with a cash line inside the forecast window (`taxYearsFor`, by cash date: a year's January
+estimate, April balance and refund fall in the next calendar year, so last year stays in after New Year until those
+lines are settled or more than 31 days past):
 
 1. **Projected income:** pay to date (pay stub) + remaining paychecks (forecast) + bonuses and other planned income
    + other income drivers (consulting, interest, dividends, capital gains), minus pre-tax deductions (401(k), HSA,
@@ -280,6 +282,10 @@ preparer files the return (D6).
 - **Quick what-if:** sliders and toggles over the main drivers (bonus % of target, bonus month, move month, NYC rent,
   401(k) %, extra withholding per check, consulting income, one big purchase). Nothing is saved; the headlines and
   chart update in the browser as they move.
+- **Other income** (built 2026-11-14): the lever is income per year from a start date (default next month), counted
+  against the tax profile's own figure. The change is received as one twelfth at each month end and taxed in the year
+  it is received, so the what-if gains the income and pays its tax; the profile's own other income adds no receipts
+  (it is taken to be in the history already).
 - **Saved scenarios:** "Save as scenario" stores the overrides under a name. The base plan is never edited by a
   scenario.
 - **Compare:** up to three scenarios side by side: lowest cash point and date, safe to move, cash at 13 weeks and 12

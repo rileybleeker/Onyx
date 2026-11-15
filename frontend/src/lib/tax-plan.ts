@@ -7,6 +7,7 @@
  * Not a filed return: no itemizing, credits, AMT or equity; FICA is assumed to be withheld exactly.
  */
 import { lastBusinessDayOfMonth, type PlannedItem } from "./cash-forecast";
+import { FORECAST } from "./cash-forecast-config";
 import { bracketTax, marginalRate, taxTables, type YearTables } from "./tax-tables";
 
 export type Jur = "federal" | "GA" | "NC" | "NY" | "NYC";
@@ -28,6 +29,12 @@ export interface TaxProfile {
   ncWorkSharePct: number;
   preTaxAnnualCents: number;
   otherIncomeAnnualCents: number;
+  /**
+   * What-if only (lib/cash-forecast-scenario.ts; never stored, never read from the driver): other income changes by
+   * annualCents a year from `from` on, received as one twelfth at each month end (otherIncomeReceiptDates). Each
+   * year's tax counts exactly the receipts dated in that year, so the tax and the cash lines of a what-if agree.
+   */
+  otherIncomeChange?: { annualCents: number; from: string } | null;
   /** Year-to-date withholding from a pay stub. */
   ytd: { year: number; asOf: string; federalCents: number; stateCents: number } | null;
   priorYear: { year: number; federalTaxCents: number; agiCents: number } | null;
@@ -77,6 +84,43 @@ export function tablesFor(profile: TaxProfile, year: number): YearTables {
 }
 
 const PROJECT_YEARS = 4;
+
+/** The last cash line a tax year can make: its refund, after the April 15 return of the next year. */
+export const taxYearLastCashDate = (year: number): string => `${year + 1}-04-30`;
+const shiftDay = (iso: string, days: number): string => new Date(Date.parse(`${iso}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+/**
+ * The tax years the cash forecast needs, picked by cash date rather than calendar year. A tax year makes cash lines
+ * from its April 15 estimate to the January estimate, the April balance and the refund of the NEXT year, so it stays
+ * in after New Year: until its last line is more than the late-match window (FORECAST.lateMatchDays) behind `today`,
+ * which gives the forecast time to match the payment or refund (or to keep counting an unpaid balance). The last
+ * year is the one `horizonEnd` falls in.
+ */
+export function taxYearsFor(today: string, horizonEnd: string, keepDays: number = FORECAST.lateMatchDays): number[] {
+  const keepFrom = shiftDay(today, -keepDays);
+  const last = Number(horizonEnd.slice(0, 4));
+  const years: number[] = [];
+  for (let y = Number(today.slice(0, 4)) - 2; y <= last; y++) if (taxYearLastCashDate(y) >= keepFrom) years.push(y);
+  return years;
+}
+
+/** Month ends (last business day) on which a what-if change in other income is received, from `from`, in `year`. */
+export function otherIncomeReceiptDates(from: string, year: number): string[] {
+  const out: string[] = [];
+  if (year < Number(from.slice(0, 4))) return out;
+  for (let m = 1; m <= 12; m++) {
+    const date = lastBusinessDayOfMonth(year, m);
+    if (date >= from) out.push(date);
+  }
+  return out;
+}
+/** One receipt of a what-if change in other income (the same rounding for the cash lines and the tax). */
+export const otherIncomeReceiptCents = (annualCents: number): number => Math.round(annualCents / 12);
+/** Other income counted in a tax year: the profile's yearly figure plus the receipts of a what-if change dated that year. */
+export function otherIncomeFor(profile: TaxProfile, year: number): number {
+  const ch = profile.otherIncomeChange;
+  const extra = ch && ch.annualCents ? otherIncomeReceiptCents(ch.annualCents) * otherIncomeReceiptDates(ch.from, year).length : 0;
+  return Math.max(0, profile.otherIncomeAnnualCents + extra);
+}
 /** Salary for a calendar year, with the annual raise from the start year on. */
 export function salaryFor(profile: TaxProfile, year: number): number {
   const startYear = Number(profile.employmentStart.slice(0, 4));
@@ -186,7 +230,7 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
   const wages = wagesFor(profile, year);
   const W = wages.reduce((s, w) => s + w.cents, 0);
   const preTax = Math.min(profile.preTaxAnnualCents, W);
-  const other = profile.otherIncomeAnnualCents;
+  const other = otherIncomeFor(profile, year);
   const agi = Math.max(0, W - preTax + other);
   const isNY = (date: string) => !!profile.moveDate && date >= profile.moveDate;
   const nyMonths = profile.moveDate && profile.moveDate.startsWith(`${year}-`) ? 12 - Number(profile.moveDate.slice(5, 7)) + 1 : profile.moveDate && profile.moveDate < `${year}-01-01` ? 12 : 0;
@@ -314,15 +358,21 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
 export function federalMarginalRate(profile: TaxProfile, year: number): number {
   const t = tablesFor(profile, year);
   const W = wagesFor(profile, year).reduce((s, w) => s + w.cents, 0);
-  return marginalRate(Math.max(0, d(W - profile.preTaxAnnualCents + profile.otherIncomeAnnualCents) - t.federal.standardDeduction), t.federal.single);
+  return marginalRate(Math.max(0, d(W - profile.preTaxAnnualCents + otherIncomeFor(profile, year)) - t.federal.standardDeduction), t.federal.single);
 }
 
-/** Cash lines for the forecast: tax payments and refunds, and the net of each future supplemental payment. */
-export function taxCashItems(profile: TaxProfile, results: readonly TaxYearResult[], today: string): PlannedItem[] {
+/**
+ * Cash lines for the forecast: tax payments and refunds, and the net of each future supplemental payment. A tax line
+ * whose date passed less than the late-match window ago is kept: the forecast matches it to the payment or refund
+ * that happened, keeps counting a payment that was not made (as of tomorrow) and drops a late refund after its match
+ * window (lib/cash-forecast.ts). Recording an estimated payment in the tax profile settles it.
+ */
+export function taxCashItems(profile: TaxProfile, results: readonly TaxYearResult[], today: string, keepDays: number = FORECAST.lateMatchDays): PlannedItem[] {
   const items: PlannedItem[] = [];
+  const keepFrom = shiftDay(today, -keepDays);
   for (const r of results) {
     for (const p of r.payments) {
-      if (p.date <= today) continue;
+      if (p.date < keepFrom) continue;
       items.push({ id: `tax:${p.year}:${p.jur}:${p.date}`, label: `${p.label} (calculated)`, date: p.date, amountCents: p.cents, certainty: "likely" });
     }
   }
