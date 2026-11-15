@@ -21,6 +21,7 @@ import { formatDate, formatDuration, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import InfoHint from "@/components/InfoHint";
+import { Part, PartGrid, PartGroup } from "@/components/personalize/PartGrid";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 const legendStyle = { fontSize: 11, fontFamily: "var(--font-mono)" };
@@ -284,9 +285,10 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
           </p>
         </div>
       ) : (
-        <div className="space-y-6">
-          {/* ─── KPI row ─────────────────────────────────────────────────── */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <PartGrid page="/caffeine" title="Caffeine">
+          {/* ─── KPI row + intake / timing charts ───────────────────────── */}
+          <PartGroup id="intake" title="Intake & timing">
+            <Part id="latest-day" title="Latest Day" width="quarter">
             <StatCard
               label="Latest Day"
               value={latestTotal != null ? Math.round(latestTotal) : null}
@@ -297,12 +299,16 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
                   : undefined
               }
             />
+            </Part>
+            <Part id="seven-day-avg" title="7d Avg" width="quarter">
             <StatCard
               label="7d Avg"
               value={Math.round(sevenDayAvg)}
               unit="mg"
               sublabel="per day · caffeine-free days count as 0"
             />
+            </Part>
+            <Part id="last-dose-gap" title="Last Dose → Bed" width="quarter">
             <StatCard
               label="Last Dose → Bed"
               value={avgGapMin != null ? formatDuration(Math.round(avgGapMin) * 60) : "—"}
@@ -312,6 +318,8 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
                   : "no trusted-timestamp days · last 30d"
               }
             />
+            </Part>
+            <Part id="at-bedtime" title="At Bedtime" width="quarter">
             <StatCard
               label="At Bedtime"
               value={latestAtBedtime != null ? Math.round(latestAtBedtime) : "—"}
@@ -324,9 +332,10 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
                     : "needs trusted timestamps on every dose"
               }
             />
-          </div>
+            </Part>
 
           {/* ─── Daily intake, stacked by channel ────────────────────────── */}
+          <Part id="daily-intake" title="Daily Caffeine Intake">
           <ChartCard
             title="Daily Caffeine Intake"
             subtitle={`dietary vs supplement mg per day · last ${windowDays} days`}
@@ -351,8 +360,10 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
               </BarChart>
             </ResponsiveContainer>
           </ChartCard>
+          </Part>
 
           {/* ─── Caffeine window (floating range bars) ───────────────────── */}
+          <Part id="caffeine-window" title="Caffeine Window">
           <ChartCard
             title="Caffeine Window"
             subtitle="first → last dose, ET · trusted timestamps only"
@@ -391,8 +402,10 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
               </ResponsiveContainer>
             )}
           </ChartCard>
+          </Part>
 
           {/* ─── Last dose → bedtime gap ─────────────────────────────────── */}
+          <Part id="bedtime-gap" title="Last Dose → Bedtime Gap">
           <ChartCard
             title="Last Dose → Bedtime Gap"
             subtitle="last dose to sleep onset · higher is better"
@@ -424,18 +437,25 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
               </LineChart>
             </ResponsiveContainer>
           </ChartCard>
+          </Part>
+          </PartGroup>
 
           {/* ─── Caffeine × HRV ──────────────────────────────────────────── */}
-          <section className="space-y-4">
-            <div className="border-l-2 border-accent/40 pl-3">
-              <h3 className="text-[14px] font-medium text-text-primary">Caffeine × HRV</h3>
-              <p className="text-[11px] text-text-tertiary mt-0.5">
-                Each day&apos;s caffeine is paired with the HRV of the sleep that closes that day: the{" "}
-                <span className="text-text-secondary">next-night HRV</span>.
-              </p>
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <PartGroup
+            id="caffeine-hrv"
+            title="Caffeine × HRV"
+            gap={24}
+            header={
+              <div className="border-l-2 border-accent/40 pl-3 mb-4">
+                <h3 className="text-[14px] font-medium text-text-primary">Caffeine × HRV</h3>
+                <p className="text-[11px] text-text-tertiary mt-0.5">
+                  Each day&apos;s caffeine is paired with the HRV of the sleep that closes that day: the{" "}
+                  <span className="text-text-secondary">next-night HRV</span>.
+                </p>
+              </div>
+            }
+          >
+              <Part id="hrv-scatter" title="Total Caffeine vs Next-Night HRV" width="half">
               <ChartCard
                 title="Total Caffeine vs Next-Night HRV"
                 subtitle={`one point per day · last ${hrvDays} days`}
@@ -473,7 +493,9 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
                   </ResponsiveContainer>
                 )}
               </ChartCard>
+              </Part>
 
+              <Part id="late-vs-early" title="Late vs Early Last Dose" width="half">
               <ChartCard
                 title="Late vs Early Last Dose"
                 subtitle={`mean next-night HRV by last-dose→bedtime gap · last ${hrvDays} days`}
@@ -511,10 +533,12 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
                   effects are in the causal section of /analytics/hrv.
                 </p>
               </ChartCard>
-            </div>
-          </section>
+              </Part>
+          </PartGroup>
 
           {/* ─── Data quality ─────────────────────────────────────────────── */}
+          <PartGroup id="quality" title="Data Quality">
+          <Part id="data-quality" title="Data Quality">
           <ChartCard
             title="Data Quality"
             subtitle={`retro-logs and double-log checks · last ${qualityDays} days`}
@@ -545,7 +569,9 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
               </ul>
             )}
           </ChartCard>
-        </div>
+          </Part>
+          </PartGroup>
+        </PartGrid>
       )}
     </>
   );
