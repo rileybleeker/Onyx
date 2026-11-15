@@ -96,7 +96,13 @@ export class CheckinDraftStore {
     for (const key of saved.keys()) this.read(key);
     for (const [key, draft] of this.memory) {
       const answers = saved.get(key);
-      if (Object.keys(draft).length && (!answers || Object.entries(draft).some(([name, e]) => e.base !== undefined && e.base !== (answers[name] ?? null)))) this.held.add(key);
+      // A confirmed saved Yes/No already satisfies this intent. Do this only on a load, not on a tap:
+      // while an opposite answer is being saved, a tap back to the old value must remain pending.
+      // Nulls stay: even without a saved answer they may deliberately suppress a suggestion.
+      const pending = answers ? Object.fromEntries(Object.entries(draft).filter(([name, e]) => e.a === null || e.a !== answers[name])) : draft;
+      if (Object.keys(pending).length !== Object.keys(draft).length) this.store(key, pending);
+      if (!Object.keys(pending).length) this.held.delete(key);
+      else if (!answers || Object.entries(pending).some(([name, e]) => e.base !== undefined && e.base !== (answers[name] ?? null))) this.held.add(key);
     }
   }
 
@@ -131,9 +137,14 @@ export class CheckinDraftStore {
     return true;
   }
 
-  discard(key: string) {
-    this.store(key, {});
-    this.held.delete(key);
+  discard(key: string, reviewed: Draft) {
+    const pending = { ...this.read(key) };
+    // Discard only what the user actually reviewed. Another tab may have added or changed answers
+    // while the confirmation was open; read() preserves identity only for unchanged entries.
+    for (const [name, entry] of Object.entries(reviewed)) if (pending[name] === entry) delete pending[name];
+    this.store(key, pending);
+    if (Object.keys(pending).length) this.held.add(key);
+    else this.held.delete(key);
   }
 
   recovery(): DatedDraft[] {

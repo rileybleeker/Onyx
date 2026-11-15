@@ -247,18 +247,110 @@ test("baseline conflicts are held until review, which adopts the latest baseline
   assert.deepEqual(savePlan(store, current).dayPatch, { [DAY]: "Yes" });
 });
 
+test("reopening a day or night draft equal to confirmed saved answers does not block fresh taps", () => {
+  for (const isNight of [false, true]) {
+    const disk = storage();
+    const current = page();
+    const key = isNight ? nightDraftKey(current.nights[0].date) : dayDraftKey(current.date);
+    const name = isNight ? SLEEP : DAY;
+    const answers = { [name]: "Yes" };
+    if (isNight) current.nights[0].answers = answers;
+    else current.answers = answers;
+    const first = new CheckinDraftStore(() => disk);
+    first.prepare(current);
+    first.write(key, { [name]: "No" }, answers);
+    first.write(key, { [name]: "Yes" }, answers);
+
+    const reopened = new CheckinDraftStore(() => disk);
+    reopened.prepare(current);
+    assert.deepEqual(reopened.recovery(), []);
+    assert.deepEqual(reopened.read(key), {});
+    assert.equal(disk.entries.has(key), false);
+    assert.equal(reopened.write(key, { [name]: "No" }, answers), true);
+    assert.equal(reopened.needsReview(key), false);
+  }
+});
+
+test("a same-as-baseline newer tap survives an opposite in-flight save", () => {
+  const disk = storage();
+  const current = page();
+  current.answers = { [DAY]: "Yes" };
+  const key = dayDraftKey(current.date);
+  const store = new CheckinDraftStore(() => disk);
+  store.prepare(current);
+  store.write(key, { [DAY]: "No" }, current.answers);
+  const sent = store.read(key);
+  store.write(key, { [DAY]: "Yes" }, current.answers);
+  store.settle(key, { [DAY]: "No" }, sent);
+  current.answers = { [DAY]: "No" };
+  store.prepare(current);
+  assert.deepEqual(store.read(key), { [DAY]: { a: "Yes", base: "No" } });
+  assert.deepEqual(savePlan(store, current).dayPatch, { [DAY]: "Yes" });
+});
+
+test("pruning an already-saved answer retains a null that suppresses a suggestion", () => {
+  const current = page();
+  const key = dayDraftKey(current.date);
+  current.answers = { [DAY]: "Yes" };
+  current.suggestions = { [SECOND]: { answer: "Yes", source: "synthetic" } };
+  const disk = storage({ [key]: { [DAY]: { a: "Yes", base: "Yes" }, [SECOND]: { a: null, base: null } } });
+  const store = new CheckinDraftStore(() => disk);
+  store.prepare(current);
+  assert.deepEqual(store.read(key), { [SECOND]: { a: null, base: null } });
+  assert.equal(store.needsReview(key), true);
+  assert.equal(store.recover(key, current), true);
+  store.write(key, { [DAY]: "No" }, current.answers);
+  assert.deepEqual(savePlan(store, current).dayPatch, { [DAY]: "No" }, "the suppressed suggestion must not ride along with the new tap");
+});
+
 test("explicit discard removes only that draft and leaves the other original date intact", () => {
   const dayKey = dayDraftKey("2031-03-05");
   const nightKey = nightDraftKey("2031-03-04");
   const disk = storage({ [dayKey]: { [DAY]: "Yes" }, [nightKey]: { [SLEEP]: "No" } });
   const store = new CheckinDraftStore(() => disk);
   store.prepare(page());
-  store.discard(dayKey);
+  store.discard(dayKey, store.recovery().find((entry) => entry.key === dayKey).draft);
   assert.deepEqual(store.read(dayKey), {});
   assert.equal(disk.entries.has(dayKey), false);
   assert.equal(store.read(nightKey)[SLEEP].a, "No");
   assert.deepEqual(store.recovery().map((entry) => entry.key), [nightKey]);
   assert.equal(store.hasPending(), true);
+});
+
+test("discard removes only reviewed entries, preserving another tab's new or changed answers", () => {
+  for (const changeReviewed of [false, true]) {
+    const current = page();
+    const key = dayDraftKey(current.date);
+    const disk = storage({ [key]: { [DAY]: { a: "Yes", base: null } } });
+    const first = new CheckinDraftStore(() => disk);
+    first.prepare(current);
+    const reviewed = first.recovery()[0].draft;
+    const second = new CheckinDraftStore(() => disk);
+    second.prepare(current);
+    second.recover(key, current);
+    second.write(key, { ...(changeReviewed ? { [DAY]: "No" } : {}), [SECOND]: "Yes" }, {});
+
+    first.discard(key, reviewed);
+    const expected = { ...(changeReviewed ? { [DAY]: { a: "No", base: null } } : {}), [SECOND]: { a: "Yes", base: null } };
+    assert.deepEqual(first.read(key), expected);
+    assert.deepEqual(JSON.parse(disk.entries.get(key)), expected);
+    assert.equal(first.needsReview(key), true, "unseen retained answers still need their own explicit review");
+  }
+});
+
+test("discard preserves a newer local tap even when it returns to the reviewed value", () => {
+  const current = page();
+  const key = dayDraftKey(current.date);
+  const disk = storage({ [key]: { [DAY]: { a: "Yes", base: null } } });
+  const store = new CheckinDraftStore(() => disk);
+  store.prepare(current);
+  const reviewed = store.recovery()[0].draft;
+  store.recover(key, current);
+  store.write(key, { [DAY]: "No" }, {});
+  store.write(key, { [DAY]: "Yes" }, {});
+  store.discard(key, reviewed);
+  assert.deepEqual(store.read(key), { [DAY]: { a: "Yes", base: null } });
+  assert.equal(store.needsReview(key), true);
 });
 
 test("blank today to yesterday to today navigation does not quarantine fresh taps", () => {
@@ -377,7 +469,7 @@ test("a failed initial read never overwrites or removes previously unread stored
     assert.equal(store.write(key, { [DAY]: "Yes" }, {}), true, "new taps still work in memory");
     assert.deepEqual(store.read(key), { [DAY]: { a: "Yes", base: null } });
     assert.equal(disk.entries.get(key), unread, "a working write cannot overwrite the unread record");
-    store.discard(key);
+    store.discard(key, store.read(key));
     assert.deepEqual(store.read(key), {});
     assert.equal(disk.entries.get(key), unread, "discard of the new in-memory draft cannot delete unread information");
     assert.equal(store.storageFailed, true);
@@ -397,7 +489,7 @@ test("failed removal cannot resurrect acknowledged or explicitly discarded draft
     if (action === "settle") {
       store.settle(key, { [DAY]: "Yes" }, sent);
       current.answers = { [DAY]: "Yes" };
-    } else store.discard(key);
+    } else store.discard(key, sent);
     store.prepare(current);
     assert.equal(disk.entries.has(key), true, "the fake disk still contains the stale value");
     assert.deepEqual(store.read(key), {}, action);
