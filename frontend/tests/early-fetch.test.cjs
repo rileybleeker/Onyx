@@ -183,5 +183,5 @@ test("/agents: the inbox read starts on the inbox view only, never for a convers
   assert.match(src("app/agents/page.tsx"), /<EarlyInbox \/>/);
   assert.match(src("app/agents/AgentsInbox.tsx"), /agentsApi\.inbox\(\{ early \}\)/);
   // The same rule AgentsApp uses to open a conversation instead of the inbox.
-  assert.ok(src("app/agents/AgentsApp.tsx").includes("/^[\w][\w.-]{0,39}$/.test(thread)"));
+  assert.ok(src("app/agents/AgentsApp.tsx").includes(String.raw`/^[\w][\w.-]{0,39}$/.test(thread)`));
 });
