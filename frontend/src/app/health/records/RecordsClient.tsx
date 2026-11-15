@@ -49,7 +49,8 @@ function FlagChip({ result }: { result: LabResult }) {
   return <span className={`rounded-full px-2 py-0.5 text-xs ${out ? 'bg-amber-400/15 text-amber-300' : 'bg-accent-muted text-text-secondary'}`}>{FLAG_LABEL[flag]}</span>;
 }
 
-export default function RecordsClient({ documents, labs }: { documents: Section<MedicalDocument>; labs: Section<LabResult> }) {
+// headingTestId: "feed-page-heading" when rendered as a section of the continuous scroll (FeedSection.tsx).
+export default function RecordsClient({ documents, labs, headingTestId = 'page-heading' }: { documents: Section<MedicalDocument>; labs: Section<LabResult>; headingTestId?: string }) {
   const [docs, setDocs] = useState<MedicalDocument[]>(documents.state === 'ready' ? documents.items : []);
   const [docsLoad, setDocsLoad] = useState<Load>(documents.state === 'ready' ? 'ready' : 'failed');
   const [results, setResults] = useState<LabResult[]>(labs.state === 'ready' ? labs.items : []);
@@ -131,7 +132,7 @@ export default function RecordsClient({ documents, labs }: { documents: Section<
   return <div className="mx-auto max-w-5xl space-y-6 p-4 sm:p-8">
     <header>
       <div className="flex items-center gap-2">
-        <h1 data-testid="page-heading" className="text-2xl font-semibold">Medical records</h1>
+        <h1 data-testid={headingTestId} className="text-2xl font-semibold">Medical records</h1>
         <InfoHint label="Medical records privacy">
           <p>Records are saved in Onyx&apos;s database and a private file store. Only the Onyx server can read them, and only after you sign in.</p>
           <p>Onyx Chat and Onyx&apos;s other AI features never read them, and nothing is sent to a provider. A file opens through a link that stops working after a minute.</p>
@@ -196,11 +197,11 @@ export default function RecordsClient({ documents, labs }: { documents: Section<
 }
 
 /** What the API sent back, checked before it goes on screen (the API speaks the camelCase shape). */
-function rowFromApiLab(raw: unknown): LabResult | null {
+export function rowFromApiLab(raw: unknown): LabResult | null {
   const parsed = parseLabResult(raw);
   return parsed.ok ? parsed.result : null;
 }
-function rowFromApiDoc(raw: unknown): MedicalDocument | null {
+export function rowFromApiDoc(raw: unknown): MedicalDocument | null {
   if (!raw || typeof raw !== 'object') return null;
   const d = raw as Record<string, unknown>;
   // Map back to row column names so rowToDocument applies the same checks the server does.
