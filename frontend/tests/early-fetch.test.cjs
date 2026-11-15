@@ -164,3 +164,24 @@ test("Today's early URLs are the ones TodayClient reads (so each answer is taken
   for (const f of ["app/page.tsx", "app/today/page.tsx"]) assert.match(read(f), /<EarlyReads \/>/, f);
   assert.match(read("app/status/page.tsx"), /earlyFetchScript\(STATUS_URL/);
 });
+
+test("/agents: the inbox read starts on the inbox view only, never for a conversation (?t=<agent>)", (t) => {
+  const value = "base64-" + b64url(session(3600));
+  const calls = withWindow(t, { cookie: `${COOKIE}=${value}` });
+  for (const [search, expected] of [["", true], ["?view=unread", true], ["?t=nyc-scout", false], ["?t=bad%20name", true]]) {
+    calls.length = 0;
+    delete global[E.EARLY_FETCH_KEY];
+    global.location = { search };
+    new Function(T.agentsEarlyScript(SUPABASE, WORKER))();
+    assert.equal(calls.some((c) => c.url === WORKER + T.AGENTS_INBOX_PATH), expected, search || "(none)");
+    assert.ok(calls.every((c) => c.url === WORKER + T.AGENTS_INBOX_PATH), "nothing else");
+  }
+  assert.equal(T.agentsEarlyScript(undefined, WORKER), "", "no Supabase URL: no script");
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = (f) => fs.readFileSync(path.join(__dirname, "..", "src", f), "utf8");
+  assert.match(src("app/agents/page.tsx"), /<EarlyInbox \/>/);
+  assert.match(src("app/agents/AgentsInbox.tsx"), /agentsApi\.inbox\(\{ early \}\)/);
+  // The same rule AgentsApp uses to open a conversation instead of the inbox.
+  assert.ok(src("app/agents/AgentsApp.tsx").includes("/^[\w][\w.-]{0,39}$/.test(thread)"));
+});
