@@ -220,6 +220,31 @@ class MovedOnVerdict(unittest.TestCase):
         self.assertEqual(mt.moved_on_verdict("fail", "deploy failure", "a" * 40, "b" * 40)[0], "fail")
 
 
+class AlreadyFixed(unittest.TestCase):
+    """2026-11-15: #294's build failed, #297 fixed it and deployed, and the rollback of #294 still merged (#296)."""
+    A, B, C = "a" * 40, "b" * 40, "c" * 40
+
+    def test_failed_build_fixed_by_a_newer_good_build(self):
+        self.assertEqual(mt.fixed_later(["failure"], [(self.C, ["success"]), (self.B, ["success"])]), self.C)
+        self.assertEqual(mt.fixed_later(["failure"], [(self.C, []), (self.B, ["success"])]), self.B)
+
+    def test_no_newer_good_build_is_not_fixed(self):
+        self.assertIsNone(mt.fixed_later(["failure"], []))
+        self.assertIsNone(mt.fixed_later(["failure"], [(self.C, ["failure"]), (self.B, ["inactive"])]))
+
+    def test_only_a_build_failure_can_be_fixed_by_a_later_build(self):
+        # a smoke failure on a commit whose own build succeeded is not disproved by a later good build
+        self.assertIsNone(mt.fixed_later(["success"], [(self.C, ["success"])]))
+        self.assertIsNone(mt.fixed_later([], [(self.C, ["success"])]))
+        self.assertIsNone(mt.fixed_later(["error"], [(self.C, ["success"])]))
+
+    def test_rollback_target_reads_the_body_rollback_writes(self):
+        body = f"Automatic rollback of `{self.A}`.\n\nReason: Production deployment failure\n\nCloses #295"
+        self.assertEqual(mt.rollback_target(body), self.A)
+        self.assertIsNone(mt.rollback_target("Revert something by hand"))
+        self.assertIsNone(mt.rollback_target(None))
+
+
 class SelfAndPreview(unittest.TestCase):
     def test_own_running_job_does_not_block(self):
         runs = GREEN + [dict(id=7, name="train", status="in_progress", conclusion=None)]

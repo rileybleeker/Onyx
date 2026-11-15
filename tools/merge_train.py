@@ -249,6 +249,29 @@ def merge(pr: dict, why: str) -> str | None:
     return None
 
 
+def rollback_target(body: str) -> str | None:
+    """Pure: the commit a rollback PR reverts, from the body rollback() writes ("Automatic rollback of `<sha>`")."""
+    m = re.search(r"Automatic rollback of `([0-9a-f]{40})`", body or "")
+    return m.group(1) if m else None
+
+
+def retire_fixed_rollback(pr: dict) -> bool:
+    """Close, unmerged, a rollback PR whose target's failed build a newer merge has since fixed and deployed, and
+    close its halt issue. -> True when closed. Merging it would take a working change off the site (#296)."""
+    body = gh("api", f"repos/{REPO}/pulls/{pr['number']}", "--jq", ".body // \"\"", check=False)
+    target = rollback_target(body)
+    fixer = already_fixed(target) if target else None
+    if not fixer:
+        return False
+    msg = (f"Not merged: the failed build of `{target[:7]}` is already fixed by `{fixer[:7]}`, which contains it and "
+           f"deployed to Production successfully. Reverting now would take a working change off the site.")
+    gh("pr", "close", str(pr["number"]), "-R", REPO, "--comment", msg, "--delete-branch", check=False)
+    for n in re.findall(r"Closes #(\d+)", body):
+        gh("issue", "close", n, "-R", REPO, "--comment", f"{msg} Train resumes.", check=False)
+    note(f"CLOSED stale rollback #{pr['number']}: {target[:7]} already fixed by {fixer[:7]}")
+    return True
+
+
 def update(pr: dict) -> None:
     gh("api", "-X", "PUT", f"repos/{REPO}/pulls/{pr['number']}/update-branch", "-f",
        f"expected_head_sha={pr['headRefOid']}")
@@ -275,6 +298,8 @@ def run_train(dry: bool) -> int:
         note(f"plan: {move}" + (f" #{pr['number']} ({why})" if pr else ""))
         if dry or move in ("idle", "wait"):
             return 0
+        if move == "merge" and is_rollback(pr) and retire_fixed_rollback(pr):
+            continue
         if move == "merge":
             sha = merge(pr, why)
             if not sha:
@@ -372,6 +397,46 @@ def culprit_of(chain: list[tuple[str, list[str]]]) -> str | None:
     return None
 
 
+def fixed_later(own_states: list[str], later: list[tuple[str, list[str]]]) -> str | None:
+    """Pure: a failed build is already fixed when a newer master commit that contains it built successfully.
+
+    later = [(sha, production states)] from master head back through first parents, down to (not including) the
+    commit itself, so every entry contains it. Returns the newest good commit, or None. Only a build failure can be
+    fixed this way: a smoke failure on a commit whose own build succeeded is not disproved by a later good build.
+    (2026-11-15: #294's build failed, #297 fixed it and deployed, and the rollback of #294 still merged as #296,
+    taking a working /log off the site.)"""
+    if build_state(own_states) != "failed":
+        return None
+    return next((c for c, s in later if build_state(s) == "good"), None)
+
+
+def production_states(sha: str) -> list[str]:
+    states = []
+    for d in api_items(f"repos/{REPO}/deployments?sha={sha}&environment=Production&per_page=5", ".[]|{id}"):
+        st = api_items(f"repos/{REPO}/deployments/{d['id']}/statuses?per_page=1", ".[]|{state}")
+        states.append(st[0]["state"] if st else "pending")
+    return states
+
+
+def later_chain(sha: str, depth: int = 20) -> list[tuple[str, list[str]]]:
+    """[(commit, states)] from master head back through first parents down to sha (excluded). Empty when sha is
+    master head or is not on that path within depth (then nothing is known to contain it)."""
+    chain, cur = [], master_sha()
+    for _ in range(depth):
+        if cur == sha:
+            return chain
+        chain.append((cur, production_states(cur)))
+        cur = gh("api", f"repos/{REPO}/commits/{cur}", "--jq", ".parents[0].sha", check=False).strip()
+        if not cur:
+            break
+    return []
+
+
+def already_fixed(sha: str) -> str | None:
+    """I/O wrapper of fixed_later: the newer master commit whose good build shows sha's failed build is fixed."""
+    return fixed_later(production_states(sha), later_chain(sha))
+
+
 def describe_chain(chain: list[tuple[str, list[str]]]) -> str:
     """Pure: one line of evidence for the halt issue, newest first, e.g. `c3cf45d failure, 769fe65 no deployment`."""
     return ", ".join(f"{c[:7]} {'/'.join(s) if s else 'no deployment'}" for c, s in chain)
@@ -381,11 +446,7 @@ def build_chain(sha: str, depth: int = 8) -> list[tuple[str, list[str]]]:
     """[(sha, states)] from sha back through first parents, stopping after the first good build."""
     chain, cur = [], sha
     for _ in range(depth):
-        deps = api_items(f"repos/{REPO}/deployments?sha={cur}&environment=Production&per_page=5", ".[]|{id}")
-        states = []
-        for d in deps:
-            st = api_items(f"repos/{REPO}/deployments/{d['id']}/statuses?per_page=1", ".[]|{state}")
-            states.append(st[0]["state"] if st else "pending")
+        states = production_states(cur)
         chain.append((cur, states))
         if build_state(states) == "good":
             break
@@ -419,9 +480,15 @@ def post_merge(sha: str, drill: bool) -> int:
             result = "halt"
             why += (f"; the commit that broke it is not known ({describe_chain(chain)}), so nothing is reverted: "
                     "the train halts until someone reads the deployment logs")
-        elif culprit != sha:
-            why += f"; the build was already broken by {culprit[:7]}, which is reverted instead"
-            sha = culprit
+        else:
+            if culprit != sha:
+                why += f"; the build was already broken by {culprit[:7]}, which is reverted instead"
+                sha = culprit
+            fixer = already_fixed(sha)
+            if fixer:
+                result = "skipped"
+                why = (f"the build of {sha[:7]} failed, but {fixer[:7]}, which contains it, deployed to Production "
+                       f"successfully: already fixed, nothing to revert")
     result, why = moved_on_verdict(result, why, sha, master_sha())
     emit(result, why)
     return 0
@@ -442,6 +509,10 @@ def rollback(sha: str, reason: str, halt_only: bool = False) -> int:
            f"error, redeploy. Close this issue to resume the merge train.", check=False)
         note(f"HALTED train without a revert for {short}: failure provenance unknown")
         return 1
+    fixer = already_fixed(sha)  # the verify job can finish before a fix lands; this job runs later
+    if fixer:
+        note(f"no rollback for {short}: its failed build is fixed by {fixer[:7]}, which deployed successfully")
+        return 0
     if halted() or subject.startswith("Revert"):  # never revert a revert or stack rollbacks: a person decides
         gh("issue", "create", "-R", REPO, "--title", f"Release {short} failed verification while halted or after a revert",
            "--label", HALT, "--body", f"`{sha}` ({subject}) failed verification: {reason}\n\nNo automatic revert was "
