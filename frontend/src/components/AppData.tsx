@@ -213,9 +213,11 @@ export default function AppData() {
       if (sessionOver) return;
       run = runWarmup(orderTargets(targets, readVisits(), PINNED, Date.now()), deps, pathRef.current);
     };
-    // Let the opened page finish its own requests first.
+    // Let the opened page finish its own requests first. 2.5 s after load (was 1.2 s until 2026-11-15): on a first
+    // visit the page's data can still be on its way at 1.2 s, and the warm-up's two dozen route prefetches then
+    // compete with it for the server and the database (perf-timing run 43668835523: /check-in cold 2.7 s).
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const afterLoad = () => { timer = setTimeout(() => { void browserIdle().then(start); }, 1200); };
+    const afterLoad = () => { timer = setTimeout(() => { void browserIdle().then(start); }, 2500); };
     if (document.readyState === "complete") afterLoad();
     else window.addEventListener("load", afterLoad, { once: true });
     const onVisibility = () => {

@@ -57,6 +57,8 @@ const KEEP_MARGIN = "300% 0px 300% 0px";
 const MIDDLE_MARGIN = "-50% 0px -50% 0px";
 /** Between two pages of the scroll. */
 const SEPARATOR = "mt-12 border-t border-border-subtle pt-8";
+/** How long the routed page has the network to itself before the neighbouring pages start (unless Riley scrolls). */
+const FEED_START_DELAY_MS = 2000;
 
 interface FeedHistoryState {
   doc: string;
@@ -536,9 +538,28 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
         return;
       }
     } catch { /* ignore */ }
+    // The routed page first (speed budget, 2026-11-15): its own requests get the network, the server and the
+    // database to themselves while it loads, and the neighbouring pages start FEED_START_DELAY_MS later (then in an
+    // idle slot), or at once when Riley starts to scroll. Mounting them at the first idle slot sent their 20-40
+    // reads out together with the opened page's own and slowed those to over a second (perf-timing run 43668835523).
     let alive = true;
-    void browserIdle().then(() => { if (alive) setLive(true); });
-    return () => { alive = false; };
+    let started = false;
+    // Gestures only, not "scroll": the router scrolls to the top on a navigation, which is not Riley scrolling.
+    const intents = ["wheel", "touchmove", "keydown", "pointerdown"] as const;
+    const start = () => {
+      if (!alive || started) return;
+      started = true;
+      for (const t of intents) window.removeEventListener(t, onIntent);
+      setLive(true);
+    };
+    const onIntent = () => start();
+    for (const t of intents) window.addEventListener(t, onIntent, { passive: true });
+    const timer = window.setTimeout(() => { void browserIdle().then(start); }, FEED_START_DELAY_MS);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+      for (const t of intents) window.removeEventListener(t, onIntent);
+    };
   }, [routedKey, setActiveRoute]);
 
   // Leaving the scroll altogether (e.g. to the Agents chat): nothing stays highlighted.
