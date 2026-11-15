@@ -132,6 +132,16 @@ function isContiguous(list: readonly string[], sequence: readonly string[]): boo
   return true;
 }
 
+function docTopOf(el: Element): number {
+  return el.getBoundingClientRect().top + window.scrollY;
+}
+
+/** The page after `sec` in the scroll (null for the last one: after it comes the bottom edge marker). */
+function nextPageOf(sec: Element | null): Element | null {
+  const n = sec ? sec.nextElementSibling : null;
+  return n && n.hasAttribute("data-feed-route") ? n : null;
+}
+
 function nextFrame(): Promise<void> {
   return new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
 }
@@ -275,7 +285,10 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
    * The page is the fallback when the element itself is replaced (a skeleton swapped for content, a list
    * re-keyed): the page's wrapper element stays for as long as the page is in the scroll.
    */
-  const anchor = useRef<{ el: Element; docTop: number; sec: Element | null; secTop: number } | null>(null);
+  const anchor = useRef<{ el: Element; docTop: number; sec: Element | null; secTop: number; next: Element | null; nextTop: number } | null>(null);
+  /** The reader's last scroll direction (the scroll's own corrections do not count) and where it left the page. */
+  const dir = useRef<1 | -1>(1);
+  const lastY = useRef(0);
   const observers = useRef<{ middle: IntersectionObserver; near: IntersectionObserver; keep: IntersectionObserver; ro: ResizeObserver } | null>(null);
   const edgeObservers = useRef<{ below: IntersectionObserver; above: IntersectionObserver } | null>(null);
 
@@ -292,12 +305,8 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
       const el = document.elementFromPoint(x, y);
       if (el && el !== root && root.contains(el)) {
         const sec = el.closest("[data-feed-route]");
-        anchor.current = {
-          el,
-          docTop: el.getBoundingClientRect().top + window.scrollY,
-          sec,
-          secTop: sec ? sec.getBoundingClientRect().top + window.scrollY : 0,
-        };
+        const next = nextPageOf(sec);
+        anchor.current = { el, docTop: docTopOf(el), sec, secTop: sec ? docTopOf(sec) : 0, next, nextTop: next ? docTopOf(next) : 0 };
         return;
       }
     }
@@ -308,7 +317,8 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
       const r = sec.getBoundingClientRect();
       if (r.bottom > 0) {
         const top = r.top + window.scrollY;
-        anchor.current = { el: sec, docTop: top, sec, secTop: top };
+        const next = nextPageOf(sec);
+        anchor.current = { el: sec, docTop: top, sec, secTop: top, next, nextTop: next ? docTopOf(next) : 0 };
         return;
       }
     }
@@ -318,21 +328,31 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
   const correct = useCallback(() => {
     const a = anchor.current;
     if (!a) return;
-    const secTop = a.sec && a.sec.isConnected ? a.sec.getBoundingClientRect().top + window.scrollY : null;
+    const secTop = a.sec && a.sec.isConnected ? docTopOf(a.sec) : null;
+    const nextTop = a.next && a.next.isConnected ? docTopOf(a.next) : null;
     let d: number;
     if (a.el.isConnected) {
-      const docTop = a.el.getBoundingClientRect().top + window.scrollY;
+      const docTop = docTopOf(a.el);
       d = docTop - a.docTop;
       a.docTop = docTop;
+    } else if (dir.current < 0 && nextTop !== null) {
+      // The element was replaced (a skeleton swapped for the page) while the reader scrolls up into that page:
+      // hold the page below it, so the page grows upward and its end is what comes into view.
+      d = nextTop - a.nextTop;
     } else if (secTop !== null) {
+      // Scrolling down into it: hold its top, so it grows downward from where the reader is.
       d = secTop - a.secTop;
+    } else if (nextTop !== null) {
+      d = nextTop - a.nextTop;
     } else {
       return;
     }
     if (secTop !== null) a.secTop = secTop;
+    if (nextTop !== null) a.nextTop = nextTop;
     // The two-number form is always instant (no smooth scrolling is set anywhere in the app). Document
     // positions do not change with the scroll, so the stored ones stay right after it.
     if (Math.abs(d) >= 1) window.scrollBy(0, d);
+    lastY.current = window.scrollY;
   }, []);
 
   // ---- address bar, title and the active page ----
@@ -589,6 +609,12 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
       if (raf) return;
       raf = requestAnimationFrame(() => {
         raf = 0;
+        // The reader's direction, before any correction of ours (corrections move lastY with them).
+        const y = window.scrollY;
+        if (y !== lastY.current) {
+          dir.current = y < lastY.current ? -1 : 1;
+          lastY.current = y;
+        }
         correct();
         pickAnchor();
         // The router rewrites the address after its own updates (e.g. a refresh): put the page in view back.
@@ -596,6 +622,8 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
       });
     };
     window.addEventListener("scroll", onScroll, { passive: true });
+    dir.current = 1;
+    lastY.current = window.scrollY;
     pickAnchor();
     return () => {
       window.removeEventListener("scroll", onScroll);
