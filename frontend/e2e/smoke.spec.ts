@@ -538,13 +538,17 @@ test.describe("Mobile chrome — bottom tab bar", () => {
       tabBar,
       "bottom tab bar not visible on a mobile viewport"
     ).toBeVisible({ timeout: LOAD_TIMEOUT });
-    // The five primary tabs.
-    for (const label of ["Today", "Trends", "Log", "Chat", "More"]) {
+    // The five primary tabs: Today, Agents, Log (centre), Chat (/chat, Onyx Chat), More.
+    for (const label of ["Today", "Agents", "Log", "Chat", "More"]) {
       await expect(
         tabBar.getByText(label, { exact: true }),
         `tab "${label}" missing from the bottom tab bar`
       ).toBeVisible();
     }
+
+    // A tab's name is where it goes: Chat is Onyx Chat, Agents is the agents inbox.
+    await expect(tabBar.getByRole("link", { name: /^Chat$/ })).toHaveAttribute("href", "/chat");
+    await expect(tabBar.getByRole("link", { name: /^Agents/ })).toHaveAttribute("href", "/agents");
 
     // On a desktop viewport the same element is display:none (md:hidden).
     await page.setViewportSize({ width: 1280, height: 900 });

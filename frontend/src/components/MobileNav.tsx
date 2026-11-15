@@ -3,10 +3,12 @@
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { House, BarChart3, Plus, MessageSquare, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck } from "lucide-react";
+import { Plus, Menu, X, LogOut, Search, Pill, CircleCheck, Scale, ClipboardCheck } from "lucide-react";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
 import { NAV_SECTIONS } from "@/lib/nav";
-import { wipeClientData } from "@/lib/client-cache";
+import { CACHE_KEYS, clientCache, wipeClientData } from "@/lib/client-cache";
+import { AGENTS_BADGE_EVENT, lastAgentsBadge } from "@/lib/agents-api";
+import { badgeText, isTabActive, mobileTabs, tabLabel } from "@/lib/mobile-tabs";
 import { navIntentProps } from "@/lib/warmup";
 import { OPEN_COMMAND_PALETTE } from "./CommandPalette";
 
@@ -17,12 +19,37 @@ const LOG_ACTIONS = [
   { label: "Weight", href: "/nutrition", icon: Scale },
 ];
 
+/**
+ * The Agents unread count the app already has: the cached inbox (Today, the Agents inbox and the warm-up
+ * keep it fresh) and every setBadge() call (marking read in a conversation). No polling of its own.
+ */
+function useAgentsBadge(): number {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const fromInbox = (v: unknown) => {
+      const badge = (v as { badge?: unknown } | undefined)?.badge;
+      if (typeof badge === "number") setN(badge);
+    };
+    const last = lastAgentsBadge();
+    if (last !== null) setN(last);
+    else fromInbox(clientCache.peek(CACHE_KEYS.agentsInbox));
+    let alive = true;
+    void clientCache.read(CACHE_KEYS.agentsInbox).then((v) => { if (alive && lastAgentsBadge() === null) fromInbox(v); });
+    const off = clientCache.subscribe(CACHE_KEYS.agentsInbox, fromInbox);
+    const onBadge = (e: Event) => { const d = (e as CustomEvent<number>).detail; if (typeof d === "number") setN(d); };
+    window.addEventListener(AGENTS_BADGE_EVENT, onBadge);
+    return () => { alive = false; off(); window.removeEventListener(AGENTS_BADGE_EVENT, onBadge); };
+  }, []);
+  return n;
+}
+
 export default function MobileNav() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
   const drawerRef = useRef<HTMLElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
+  const agentsUnread = useAgentsBadge();
 
   // Close every overlay on route change.
   useEffect(() => {
@@ -98,12 +125,16 @@ export default function MobileNav() {
     window.location.assign("/login");
   }
 
-  const tabs = [
-    { key: "today", label: "Today", icon: House, href: "/today", isActive: pathname === "/today" || pathname === "/" },
-    { key: "trends", label: "Trends", icon: BarChart3, href: "/analytics/hrv", isActive: pathname.startsWith("/analytics") },
-    { key: "log", label: "Log", icon: Plus, action: () => setLogOpen(true), isActive: logOpen },
-    { key: "chat", label: "Chat", icon: MessageSquare, href: "/agents", isActive: pathname.startsWith("/agents") },
-    { key: "more", label: "More", icon: Menu, action: () => setDrawerOpen(true), isActive: drawerOpen },
+  // [page, page, Log, page, More]: Log (the quick-log sheet) in the centre, More (the drawer) last. Each page
+  // tab's label is the page it opens (lib/mobile-tabs.ts); Trends lives in More and on Today.
+  const navItems = new Map(NAV_SECTIONS.flatMap((section) => section.items).map((item) => [item.href, item] as const));
+  const pages = mobileTabs(null, (href) => navItems.has(href)).map((href) => navItems.get(href)!);
+  type Tab = { kind: "page"; href: string } | { kind: "log" } | { kind: "more" };
+  const tabs: Tab[] = [
+    ...pages.slice(0, 2).map((item) => ({ kind: "page" as const, href: item.href })),
+    { kind: "log" },
+    ...pages.slice(2).map((item) => ({ kind: "page" as const, href: item.href })),
+    { kind: "more" },
   ];
 
   return (
@@ -131,23 +162,40 @@ export default function MobileNav() {
       >
         <div className="grid grid-cols-5 h-14">
           {tabs.map((tab) => {
-            const Icon = tab.icon;
-            const cls = `flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium transition-colors ${
-              tab.isActive ? "text-accent" : "text-text-tertiary hover:text-text-secondary"
-            }`;
-            const inner = (
-              <>
-                <Icon className="w-[20px] h-[20px]" strokeWidth={1.75} />
-                <span>{tab.label}</span>
-              </>
-            );
-            return tab.href ? (
-              <Link key={tab.key} href={tab.href} className={cls} aria-current={tab.isActive ? "page" : undefined} {...navIntentProps(tab.href)}>
-                {inner}
-              </Link>
-            ) : (
-              <button key={tab.key} type="button" onClick={tab.action} className={cls} aria-expanded={tab.isActive} aria-haspopup="dialog" aria-controls={tab.isActive ? (tab.key === "log" ? "mobile-quick-log" : "mobile-navigation") : undefined}>
-                {inner}
+            const cell = "flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium transition-colors";
+            if (tab.kind === "page") {
+              const item = navItems.get(tab.href)!;
+              const Icon = item.icon;
+              const active = isTabActive(item.href, pathname);
+              const count = item.href === "/agents" ? badgeText(agentsUnread) : "";
+              return (
+                <Link key={item.href} href={item.href} className={`${cell} ${active ? "text-accent" : "text-text-tertiary hover:text-text-secondary"}`} aria-current={active ? "page" : undefined} {...navIntentProps(item.href)}>
+                  <span className="relative">
+                    <Icon className="w-[20px] h-[20px]" strokeWidth={1.75} />
+                    {count && (
+                      <span aria-hidden="true" className="absolute -top-1.5 -right-2.5 min-w-[16px] h-4 px-1 rounded-full bg-accent text-on-accent text-[10px] font-mono leading-4 text-center">{count}</span>
+                    )}
+                  </span>
+                  <span>{tabLabel(item)}</span>
+                  {count && <span className="sr-only">, {agentsUnread} unread</span>}
+                </Link>
+              );
+            }
+            const isLog = tab.kind === "log";
+            const open = isLog ? logOpen : drawerOpen;
+            return (
+              <button key={tab.kind} type="button" onClick={() => (isLog ? setLogOpen(true) : setDrawerOpen(true))}
+                className={`${cell} ${!isLog && open ? "text-accent" : isLog ? "text-text-primary" : "text-text-tertiary hover:text-text-secondary"}`}
+                aria-expanded={open} aria-haspopup="dialog" aria-controls={open ? (isLog ? "mobile-quick-log" : "mobile-navigation") : undefined}>
+                {isLog ? (
+                  // The primary action: an accent disc (the only filled control on the bar).
+                  <span className="w-9 h-9 -mt-1 rounded-full bg-accent text-on-accent flex items-center justify-center shadow-card">
+                    <Plus className="w-[20px] h-[20px]" strokeWidth={2.25} />
+                  </span>
+                ) : (
+                  <Menu className="w-[20px] h-[20px]" strokeWidth={1.75} />
+                )}
+                <span>{isLog ? "Log" : "More"}</span>
               </button>
             );
           })}

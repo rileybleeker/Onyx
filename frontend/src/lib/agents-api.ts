@@ -188,4 +188,15 @@ export async function clearDeviceNotifications(): Promise<void> {
 export function setBadge(n: number): void {
   const nav = navigator as unknown as { setAppBadge?: (n: number) => Promise<void>; clearAppBadge?: () => Promise<void> };
   (n > 0 ? nav.setAppBadge?.(n) : nav.clearAppBadge?.())?.catch(() => {});
+  // The phone's Agents tab shows the same count (components/MobileNav.tsx).
+  lastBadge = n;
+  try { window.dispatchEvent(new CustomEvent(AGENTS_BADGE_EVENT, { detail: n })); } catch { /* no window */ }
+}
+
+/** Fired by setBadge() with the new unread count. */
+export const AGENTS_BADGE_EVENT = "onyx:agents-badge";
+let lastBadge: number | null = null;
+/** The last count passed to setBadge() in this tab, or null. */
+export function lastAgentsBadge(): number | null {
+  return lastBadge;
 }
