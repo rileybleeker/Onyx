@@ -25,6 +25,7 @@ import {
 } from "@/lib/journal-entry";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
 import ExperimentAdherence from "./ExperimentAdherence";
+import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 
 // Daily habit check-in (2026-11-07). Yes / No per question, one Save.
 // - Saved answers load as-is; questions another source can answer start pre-filled and labeled with that
@@ -95,6 +96,11 @@ const isNightItem = (i: CheckinItem) => i.sleep;
 const RELOAD_AFTER_MS = 60_000;
 // The GET this screen makes; its answer is cached under this URL (shared with the warm-up).
 const checkinUrl = (date: string | null) => `/api/habits/checkin${date ? `?date=${date}` : ""}`;
+
+/** Personalize id of a question category's part ("health" -> "cat-health"); stable per category name. */
+function categoryPartId(category: string): string {
+  return `cat-${category.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "general"}`;
+}
 
 function dayLabel(date: string, today: string): string {
   const d = new Date(date + "T12:00:00Z");
@@ -655,9 +661,13 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
 
       {draftRecovery}
 
+      {/* Personalize: every block is its own part; sections get no extra heading on screen. The Save bar stays fixed. */}
+      <PartGrid page="/check-in" title="Check-in">
+      <PartGroup id="section-sleep" title="Sleep">
       {/* SLEEP: nights that already happened. Not tied to the day tabs below. */}
       {nights.length > 0 && (
-        <section className="mb-7 rounded-card border border-border-default bg-surface-sunken shadow-card p-3" aria-label="Sleep">
+        <Part id="sleep-nights" title="Sleep (nights that happened)">
+        <section className="rounded-card border border-border-default bg-surface-sunken shadow-card p-3" aria-label="Sleep">
           <div className="flex items-center gap-2">
             <Moon aria-hidden="true" className="w-4 h-4 text-text-secondary" />
             <h3 className="text-[15px] font-medium text-text-primary">Sleep</h3>
@@ -678,9 +688,12 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
             />
           ))}
         </section>
+        </Part>
       )}
+      </PartGroup>
 
-      {/* DAYTIME: one behavior day per tab */}
+      {/* DAYTIME: one behavior day per tab. The heading and the day tabs are the section's header. */}
+      <PartGroup id="section-daytime" title="Daytime" gap={24} header={<>
       <div className="flex items-center gap-2 mb-2">
         <Sun aria-hidden="true" className="w-4 h-4 text-text-secondary" />
         <h3 className="text-[15px] font-medium text-text-primary">
@@ -711,12 +724,14 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
           );
         })}
       </div>
+      </>}>
 
       {/* Say it once: dictated text -> draft Yes/No taps for the day and last night, and a journal draft (nothing is saved until Save / Save to journal) */}
+      <Part id="say-it-once" title="Say it once">
       <details
         open={voiceOpen}
         onToggle={(e) => setVoiceOpen(e.currentTarget.open)}
-        className="mb-4 rounded-control border border-border-subtle bg-white/[0.02] px-3 py-2"
+        className="rounded-control border border-border-subtle bg-white/[0.02] px-3 py-2"
       >
         <summary className="cursor-pointer py-3 text-[13px] leading-5 text-text-secondary">Say it once</summary>
         <textarea
@@ -744,8 +759,10 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
         </div>
         {voiceMsg && <p className="text-[12px] text-text-secondary mt-2">{voiceMsg}</p>}
       </details>
+      </Part>
 
       {journal && (
+        <Part id="journal-draft" title="Journal entry draft">
         <JournalDraftCard
           form={journal}
           maxDate={easternDate(new Date())}
@@ -753,10 +770,12 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
           onSave={() => saveJournal()}
           onDiscard={() => setJournal((cur) => (cur?.status === "saving" ? cur : null))}
         />
+        </Part>
       )}
 
       {/* Progress */}
-      <div className="mb-6">
+      <Part id="progress" title="Progress, No for the rest, trial question">
+      <div>
         <div className="flex justify-between text-[12px] font-mono text-text-tertiary mb-1.5">
           <span>
             {coreDone} of {core.length} answered
@@ -778,14 +797,19 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
           </div>
         )}
       </div>
-
-      {/* N-of-1 trial: "Followed today's arm?" Renders nothing unless a trial is running. */}
+      {/* N-of-1 trial: "Followed today's arm?" Renders nothing unless a trial is running, so it rides in this part
+          (an empty part of its own would still take a grid gap). The wrapper collapses when it renders nothing. */}
       {!refreshFailed && (data.date === data.today || data.date === addDays(data.today, -1)) && (
-        <ExperimentAdherence key={data.date} date={data.date} when={data.date === data.today ? "today" : "yesterday"} />
+        <div className="mt-6 empty:hidden [&>section]:mb-0">
+          <ExperimentAdherence key={data.date} date={data.date} when={data.date === data.today ? "today" : "yesterday"} />
+        </div>
       )}
+      </Part>
 
+      {/* One part per question category (the id follows the category name, so its saved place sticks). */}
       {coreByCategory.map(([category, items]) => (
-        <section key={category} className="mb-6">
+        <Part key={category} id={categoryPartId(category)} title={`${category.charAt(0).toUpperCase()}${category.slice(1)} questions`}>
+        <section>
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-2">{category}</h3>
           <div className="rounded-control border border-border-subtle divide-y divide-border-subtle bg-surface-card">
             {items.map((item) => (
@@ -793,10 +817,12 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
             ))}
           </div>
         </section>
+        </Part>
       ))}
 
       {extras.length > 0 && (
-        <section className="mb-6">
+        <Part id="also-did" title="Also did">
+        <section>
           <button onClick={() => setShowExtras((s) => !s)} aria-expanded={showExtras} className="min-h-11 flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">
             <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showExtras ? "" : "-rotate-90"}`} />
             Also did ({extras.filter((i) => cells[i.name]).length}/{extras.length})
@@ -812,10 +838,12 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
             </>
           )}
         </section>
+        </Part>
       )}
 
-      {(delivery.groups.length > 0 || delivery.leftovers.length > 0 || delivery.loadError) && (
-        <section className="mb-6">
+      {(delivery.groups.length > 0 || delivery.loadError) && (
+        <Part id="uber-eats" title="Uber Eats: how much did you eat?">
+        <section>
           <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">Uber Eats: how much did you eat?</h3>
           {delivery.groups.length > 0 && (
             <p className="text-[12px] text-text-tertiary mb-2">Saved as you tap. Left as All unless you change it; tap All to confirm.</p>
@@ -833,8 +861,17 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
               <DeliveryDishList items={g.items} onPick={delivery.setFraction} />
             </div>
           ))}
-          {delivery.leftovers.length > 0 && (
-            <div className="mb-3">
+          {delivery.loadError && <p className="text-[12px] text-down mt-1.5">{delivery.loadError}</p>}
+          {delivery.error && <p className="text-[12px] text-down mt-1.5">{delivery.error}</p>}
+        </section>
+        </Part>
+      )}
+
+      {delivery.leftovers.length > 0 && (
+        <Part id="uber-eats-leftovers" title="Uber Eats leftovers">
+        <section>
+          <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary mb-1">Uber Eats: leftovers</h3>
+            <div>
               <div className="flex items-baseline justify-between mb-1">
                 <span className="text-[11px] font-mono text-text-secondary">
                   Leftovers · {labelDay(data.date)}
@@ -853,11 +890,13 @@ export default function CheckInClient({ feed = false }: { feed?: boolean } = {})
                 showNow={data.date === data.today}
               />
             </div>
-          )}
-          {delivery.loadError && <p className="text-[12px] text-down mt-1.5">{delivery.loadError}</p>}
-          {delivery.error && <p className="text-[12px] text-down mt-1.5">{delivery.error}</p>}
+          {/* A failed tap shows here when the dishes part is not on screen. */}
+          {delivery.error && !(delivery.groups.length > 0 || delivery.loadError) && <p className="text-[12px] text-down mt-1.5">{delivery.error}</p>}
         </section>
+        </Part>
       )}
+      </PartGroup>
+      </PartGrid>
 
       {/* Save bar: sticks above the mobile tab bar */}
       <div className="sticky bottom-[calc(env(safe-area-inset-bottom)+4.75rem)] md:bottom-4 z-10 mt-8">
@@ -1050,7 +1089,7 @@ function JournalDraftCard({
 
   if (form.status === "saved") {
     return (
-      <section aria-label="Journal entry" className="mb-4 rounded-card border border-border-subtle bg-surface-card p-3">
+      <section aria-label="Journal entry" className="rounded-card border border-border-subtle bg-surface-card p-3">
         <p className="text-[13px] text-text-secondary inline-flex flex-wrap items-center gap-1.5">
           <Check className="w-4 h-4 text-up" />
           {form.existing ? "Already in your journal (same date and title)." : "Saved to your journal."} It shows on Journal after the hourly sync.
@@ -1065,7 +1104,7 @@ function JournalDraftCard({
   }
 
   return (
-    <section aria-label="Journal entry" className="mb-4 rounded-card border border-border-subtle bg-surface-card p-3">
+    <section aria-label="Journal entry" className="rounded-card border border-border-subtle bg-surface-card p-3">
       <div className="flex items-baseline justify-between gap-2">
         <h3 className="text-[14px] font-medium text-text-primary">Journal entry</h3>
         <span className="text-[11px] font-mono text-text-tertiary">draft · not saved</span>
