@@ -413,7 +413,7 @@ export function visibleOrder(ids: readonly string[], layout: PageLayout, zone = 
  * Client-rendered pages (the ISR dashboards render their parts with ssr:false) read localStorage on their first
  * render instead and need no cookie.
  */
-export const SSR_LAYOUT_PAGES: readonly string[] = ["/financials", "/financials/budgets", "/financials/forecast", "/screen-time", "/orders"];
+export const SSR_LAYOUT_PAGES: readonly string[] = ["/financials", "/financials/budgets", "/financials/forecast", "/screen-time", "/orders", "/procurement"];
 /** Encoded cookie values longer than this are not written (the page then personalizes after hydration). */
 export const MAX_LAYOUT_COOKIE = 3500;
 
