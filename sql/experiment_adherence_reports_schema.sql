@@ -15,8 +15,9 @@
 --                  stop): the registered analysis. Guard 2a refuses it earlier, so the rule
 --                  "analyse only at the pre-registered end" (section 13, decision 1) also holds at
 --                  the database, whatever a script does. A stored final report never changes; only
---                  the Notion mirror stamp (notion_synced_at, set by the Notion writer, the next
---                  build step) does.
+--                  the Notion mirror stamp (notion_synced_at, set by experiment_report.py once
+--                  experiment_notion.py has written the page) does. An A/A check's verdict
+--                  (aa_check) counts as an effect field: it exists in a final report only.
 --   2. pds.experiment_adherence_day(date) and pds.experiment_record_adherence(date, text, text):
 --      the only way the app reads or writes the "Followed today's arm?" answer in
 --      pds.experiment_days. Both work on the behavioral today or the day before (an answer given
@@ -58,7 +59,7 @@ DECLARE
     e pds.experiments%ROWTYPE;
     last_day date;
     effect_keys text[] := ARRAY['estimate', 'ci_low', 'ci_high', 'p_value', 'carryover', 'two_night_total',
-                                'decision', 'sensitivity', 'secondary_outcomes', 'allocation'];
+                                'decision', 'sensitivity', 'secondary_outcomes', 'allocation', 'aa_check'];
 BEGIN
     NEW.updated_at := now();
     IF (NEW.payload ->> 'report_kind') IS DISTINCT FROM NEW.report_kind THEN
