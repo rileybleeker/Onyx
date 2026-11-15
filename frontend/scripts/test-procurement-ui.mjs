@@ -13,8 +13,18 @@ await symlink(path.join(frontend, 'node_modules'), path.join(fixture, 'node_modu
 await copyFile(path.join(frontend, 'src/lib/procurement.ts'), path.join(fixture, 'lib/procurement.ts'));
 const client = await readFile(path.join(frontend, 'src/app/procurement/ProcurementClient.tsx'), 'utf8');
 // The type-only import of the detector is erased at compile time; point it at a relative path anyway.
-const relative = source => source.replace(/'@\/lib\/(procurement[a-z-]*)'/g, "'../lib/$1'");
+const relative = source => source.replace(/'@\/lib\/(procurement[a-z-]*)'/g, "'../lib/$1'")
+  // Personalize parts: the fixture renders them as plain children (the grid itself is not under test here).
+  .replace(/'@\/components\/personalize\/PartGrid'/g, "'./PartGrid'")
+  .replace(/^import type \{ PageLayout \} from '@\/lib\/personalize-layout';$/m, 'type PageLayout = unknown;');
 await writeFile(path.join(fixture, 'app/ProcurementClient.tsx'), relative(client));
+await writeFile(path.join(fixture, 'app/PartGrid.tsx'), [
+  'import type { ReactNode } from "react";',
+  'type P = { children?: ReactNode; header?: ReactNode; [k: string]: unknown };',
+  'export function PartGrid({ children }: P) { return <>{children}</>; }',
+  'export function PartGroup({ children, header }: P) { return <>{header}{children}</>; }',
+  'export function Part({ children }: P) { return <>{children}</>; }',
+].join('\n'));
 // The detected-subscriptions card (renewal estimates) is its own component next to the client.
 await writeFile(path.join(fixture, 'app/DetectedSubscriptions.tsx'), relative(await readFile(path.join(frontend, 'src/app/procurement/DetectedSubscriptions.tsx'), 'utf8')));
 await copyFile(path.join(frontend, 'src/lib/procurement-recurring.ts'), path.join(fixture, 'lib/procurement-recurring.ts'));

@@ -17,6 +17,7 @@ adherence:
     source: pds.phone_usage_daily.minutes_last_hour_before_sleep_est
     max: 5                      # minutes
     arm: A
+  # min_pct: 80                 # optional: the daily report heartbeat turns partial below this adherence %
 outcome:
   primary: whoop_hrv_rmssd of the sleep that closes the behavioral day (hrv_alignment.outcome_series h=1)
   alignment_version: same_night_v1

@@ -108,6 +108,8 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
     "lucide-react": Object.fromEntries(["Check", "ChevronDown", "Moon", "Sun", "X"].map((name) => [name, () => null])),
     "@/lib/agents-api": { agentsApi: { checkinDone: async (date) => { done.push(date); } } },
     "@/components/DeliveryPortions": { useDeliveryDishes: () => ({ groups: [], leftovers: [] }), DeliveryDishList: () => null, LeftoverList: () => null },
+    // The trial question loads on its own (its own route, covered by tests/experiments.test.cjs).
+    "./ExperimentAdherence": { __esModule: true, default: () => null },
   }).default;
   function expand(node, id = "root") {
     if (node == null || typeof node === "boolean") return null;

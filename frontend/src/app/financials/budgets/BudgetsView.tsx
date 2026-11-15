@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import { TOTAL_KEY, type BudgetLine, type BudgetsResult } from "@/lib/finance-budgets";
 import { activeMonthly, type SubscriptionView } from "@/lib/finance-subscriptions";
 import InfoHint from "@/components/InfoHint";
+import { Part, PartGrid, PartGroup } from "@/components/personalize/PartGrid";
+import type { PageLayout } from "@/lib/personalize-layout";
 
 const usd = (cents: number | null | undefined) => {
   if (cents === null || cents === undefined || !Number.isFinite(cents)) return "-";
@@ -39,6 +41,7 @@ export default function BudgetsView({
   setupPending,
   subscriptions,
   onChanged,
+  layout,
 }: {
   result: BudgetsResult;
   categories: string[];
@@ -47,6 +50,8 @@ export default function BudgetsView({
   subscriptions: SubscriptionView[];
   /** Re-read the data after a save (the scroll section); without it the server page refreshes. */
   onChanged?: () => void;
+  /** The saved Personalize layout read from the page's cookie (the routed page only). */
+  layout?: PageLayout;
 }) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
@@ -71,190 +76,216 @@ export default function BudgetsView({
       {setupPending && <p className="text-[13px] text-mid">Budgets could not be read; showing spending only.</p>}
       {error && <p role="alert" className="text-[13px] text-down">Not saved: {error}</p>}
 
-      <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <div className={card}>
-          <p className="text-[12px] text-text-tertiary">Spent in {monthName} (day {r.dayOfMonth} of {r.daysInMonth})</p>
-          <p className="text-xl font-semibold">{usd(t.spentCents)}</p>
-          <p className="text-[12px] text-text-secondary">usual by now {usd(t.sameDaysAvgCents)} · last month {usd(t.lastMonthCents)}</p>
-        </div>
-        <div className={card}>
-          <p className="text-[12px] text-text-tertiary">Left to spend this month</p>
-          <p className={`text-xl font-semibold ${left !== null && left < 0 ? "text-down" : ""}`}>{left === null ? "set a budget" : usd(left)}</p>
-          <p className="text-[12px] text-text-secondary">budget {usd(t.budgetCents)}</p>
-        </div>
-        <div className={card}>
-          <p className="text-[12px] text-text-tertiary">Heading for, by month end</p>
-          <p className={`text-xl font-semibold ${STATUS[t.status].cls}`}>{usd(t.projectedCents)}</p>
-          <p className="text-[12px] text-text-secondary">{STATUS[t.status].text} · 3-month average {usd(t.avg3Cents)}</p>
-        </div>
-        <div className={card}>
-          <p className="text-[12px] text-text-tertiary">Income this month</p>
-          <p className="text-xl font-semibold">{usd(r.incomeCents)}</p>
-          <p className="text-[12px] text-text-secondary">3-month average {usd(r.incomeAvg3Cents)} · net {usd(r.incomeCents - t.spentCents)}</p>
-        </div>
-      </section>
+      {/* Personalize: every tile and card is its own part; parts move within and between the sections below. */}
+      <PartGrid page="/financials/budgets" title="Budgets" initial={layout}>
+        <PartGroup id="section-month" title="This month">
+          <Part id="spent" title="Spent this month" width="quarter">
+            <div className={card}>
+              <p className="text-[12px] text-text-tertiary">Spent in {monthName} (day {r.dayOfMonth} of {r.daysInMonth})</p>
+              <p className="text-xl font-semibold">{usd(t.spentCents)}</p>
+              <p className="text-[12px] text-text-secondary">usual by now {usd(t.sameDaysAvgCents)} · last month {usd(t.lastMonthCents)}</p>
+            </div>
+          </Part>
+          <Part id="left" title="Left to spend" width="quarter">
+            <div className={card}>
+              <p className="text-[12px] text-text-tertiary">Left to spend this month</p>
+              <p className={`text-xl font-semibold ${left !== null && left < 0 ? "text-down" : ""}`}>{left === null ? "set a budget" : usd(left)}</p>
+              <p className="text-[12px] text-text-secondary">budget {usd(t.budgetCents)}</p>
+            </div>
+          </Part>
+          <Part id="heading-for" title="Heading for, by month end" width="quarter">
+            <div className={card}>
+              <p className="text-[12px] text-text-tertiary">Heading for, by month end</p>
+              <p className={`text-xl font-semibold ${STATUS[t.status].cls}`}>{usd(t.projectedCents)}</p>
+              <p className="text-[12px] text-text-secondary">{STATUS[t.status].text} · 3-month average {usd(t.avg3Cents)}</p>
+            </div>
+          </Part>
+          <Part id="income" title="Income this month" width="quarter">
+            <div className={card}>
+              <p className="text-[12px] text-text-tertiary">Income this month</p>
+              <p className="text-xl font-semibold">{usd(r.incomeCents)}</p>
+              <p className="text-[12px] text-text-secondary">3-month average {usd(r.incomeAvg3Cents)} · net {usd(r.incomeCents - t.spentCents)}</p>
+            </div>
+          </Part>
+          {r.increases.length > 0 && (
+            <Part id="increases" title="Spending more than usual">
+              <section className={card} aria-labelledby="bd-up">
+                <h2 id="bd-up" className="font-semibold">Spending more than usual</h2>
+                <ul className="mt-2 space-y-1 text-[13px]">
+                  {r.increases.map((x) => (
+                    <li key={x.category}>
+                      <b>{x.category}</b>: {usd(x.cents)} so far, against {usd(x.usualCents)} by this day in a usual month ({usd(x.cents - x.usualCents)} more).
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            </Part>
+          )}
+        </PartGroup>
 
-      {r.increases.length > 0 && (
-        <section className={card} aria-labelledby="bd-up">
-          <h2 id="bd-up" className="font-semibold">Spending more than usual</h2>
-          <ul className="mt-2 space-y-1 text-[13px]">
-            {r.increases.map((x) => (
-              <li key={x.category}>
-                <b>{x.category}</b>: {usd(x.cents)} so far, against {usd(x.usualCents)} by this day in a usual month ({usd(x.cents - x.usualCents)} more).
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-
-      <section className={card} aria-labelledby="bd-lines">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <h2 id="bd-lines" className="font-semibold">Budgets by category</h2>
-            <InfoHint label="Budgets by category">
-              <p>Suggested = the median of the last 3 months. The grey marker shows where the month is heading at your usual pace; the red one is the budget.</p>
-            </InfoHint>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {unbudgeted.length > 0 && (
-              <button
-                className={button}
-                disabled={busy}
-                onClick={() =>
-                  run(async () => {
-                    for (const l of unbudgeted) {
-                      const e = await put("/api/finance/budgets", { category: l.category, monthlyCents: l.suggestedCents });
-                      if (e) return e;
-                    }
-                    return null;
-                  })
-                }
-              >
-                Use suggested for {unbudgeted.length} categories
-              </button>
-            )}
-            <TotalBudget current={t.budgetCents} busy={busy} run={run} />
-          </div>
-        </div>
-        <table className="mt-2 w-full text-[13px]">
-          <thead className="text-[12px] text-text-tertiary">
-            <tr>
-              <th className="text-left font-normal">Category</th>
-              <th className="w-1/3 text-left font-normal">This month</th>
-              <th className="text-right font-normal">Spent</th>
-              <th className="text-right font-normal">Heading for</th>
-              <th className="text-right font-normal">Budget</th>
-              <th className="text-left font-normal"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {r.lines.map((l) => (
-              <BudgetRow key={l.category} l={l} busy={busy} run={run} />
-            ))}
-          </tbody>
-        </table>
-      </section>
-
-      <section className={card} aria-labelledby="bd-subs">
-        <div className="flex items-center gap-2">
-          <h2 id="bd-subs" className="font-semibold">Subscriptions</h2>
-          <InfoHint label="Subscriptions">
-            <p>
-              Detected from repeat charges. To cancel one, cancel it on the merchant&apos;s site, then press I cancelled it: Onyx checks
-              the ledger and tells you whether the charges actually stopped. Onyx never cancels anything itself.
-            </p>
-          </InfoHint>
-        </div>
-        <p className="text-[12px] text-text-tertiary">
-          {subscriptions.filter((s) => s.state !== "stopped").length} active, about {usd(activeMonthly(subscriptions))} a month
-        </p>
-        <table className="mt-2 w-full text-[13px]">
-          <tbody>
-            {subscriptions.map((s) => (
-              <tr key={s.id} className="border-t border-border-subtle align-top">
-                <td className="py-1 pr-2">
-                  <b>{s.merchant}</b>
-                  <div className="text-[12px] text-text-tertiary">
-                    {s.cadence} · {usd(s.typicalCents)} · next about {s.nextExpected}
-                  </div>
-                  {s.stateText && <div className={`text-[12px] ${s.state === "still-charging" ? "text-down" : s.state === "stopped" ? "text-up" : "text-mid"}`}>{s.stateText}</div>}
-                </td>
-                <td className="py-1 pr-2 text-right">{usd(s.monthlyCents)}/mo</td>
-                <td className="whitespace-nowrap py-1 text-right">
-                  {s.markedOn ? (
-                    <button className={button} disabled={busy} onClick={() => run(() => put("/api/finance/subscriptions", { subId: s.id, cancelling: false }))}>
-                      Undo
+        <PartGroup id="section-budgets" title="Budgets by category">
+          <Part id="lines" title="Budgets by category">
+            <section className={card} aria-labelledby="bd-lines">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <h2 id="bd-lines" className="font-semibold">Budgets by category</h2>
+                  <InfoHint label="Budgets by category">
+                    <p>Suggested = the median of the last 3 months. The grey marker shows where the month is heading at your usual pace; the red one is the budget.</p>
+                  </InfoHint>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {unbudgeted.length > 0 && (
+                    <button
+                      className={button}
+                      disabled={busy}
+                      onClick={() =>
+                        run(async () => {
+                          for (const l of unbudgeted) {
+                            const e = await put("/api/finance/budgets", { category: l.category, monthlyCents: l.suggestedCents });
+                            if (e) return e;
+                          }
+                          return null;
+                        })
+                      }
+                    >
+                      Use suggested for {unbudgeted.length} categories
                     </button>
-                  ) : (
-                    <>
-                      <a className="mr-2 text-[12px] text-accent hover:underline" href={s.cancelSearchUrl} target="_blank" rel="noopener noreferrer">
-                        How to cancel
-                      </a>
-                      <button className={button} disabled={busy} onClick={() => run(() => put("/api/finance/subscriptions", { subId: s.id, cancelling: true }))}>
-                        I cancelled it
-                      </button>
-                    </>
                   )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
+                  <TotalBudget current={t.budgetCents} busy={busy} run={run} />
+                </div>
+              </div>
+              <table className="mt-2 w-full text-[13px]">
+                <thead className="text-[12px] text-text-tertiary">
+                  <tr>
+                    <th className="text-left font-normal">Category</th>
+                    <th className="w-1/3 text-left font-normal">This month</th>
+                    <th className="text-right font-normal">Spent</th>
+                    <th className="text-right font-normal">Heading for</th>
+                    <th className="text-right font-normal">Budget</th>
+                    <th className="text-left font-normal"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {r.lines.map((l) => (
+                    <BudgetRow key={l.category} l={l} busy={busy} run={run} />
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          </Part>
+        </PartGroup>
 
-      <section className={card} aria-labelledby="bd-top">
-        <h2 id="bd-top" className="font-semibold">Biggest merchants this month</h2>
-        <table className="mt-2 w-full text-[13px]">
-          <tbody>
-            {r.topMerchants.map((m) => (
-              <tr key={m.key} className="border-t border-border-subtle">
-                <td className="py-1">{m.label}</td>
-                <td className="py-1 text-text-tertiary">{m.category}</td>
-                <td className="py-1 text-right">{usd(m.cents)}</td>
-                <td className="py-1 text-right text-text-tertiary">{m.count}×</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
+        <PartGroup id="section-merchants" title="Subscriptions and merchants">
+          <Part id="subscriptions" title="Subscriptions">
+            <section className={card} aria-labelledby="bd-subs">
+              <div className="flex items-center gap-2">
+                <h2 id="bd-subs" className="font-semibold">Subscriptions</h2>
+                <InfoHint label="Subscriptions">
+                  <p>
+                    Detected from repeat charges. To cancel one, cancel it on the merchant&apos;s site, then press I cancelled it: Onyx checks
+                    the ledger and tells you whether the charges actually stopped. Onyx never cancels anything itself.
+                  </p>
+                </InfoHint>
+              </div>
+              <p className="text-[12px] text-text-tertiary">
+                {subscriptions.filter((s) => s.state !== "stopped").length} active, about {usd(activeMonthly(subscriptions))} a month
+              </p>
+              <table className="mt-2 w-full text-[13px]">
+                <tbody>
+                  {subscriptions.map((s) => (
+                    <tr key={s.id} className="border-t border-border-subtle align-top">
+                      <td className="py-1 pr-2">
+                        <b>{s.merchant}</b>
+                        <div className="text-[12px] text-text-tertiary">
+                          {s.cadence} · {usd(s.typicalCents)} · next about {s.nextExpected}
+                        </div>
+                        {s.stateText && <div className={`text-[12px] ${s.state === "still-charging" ? "text-down" : s.state === "stopped" ? "text-up" : "text-mid"}`}>{s.stateText}</div>}
+                      </td>
+                      <td className="py-1 pr-2 text-right">{usd(s.monthlyCents)}/mo</td>
+                      <td className="whitespace-nowrap py-1 text-right">
+                        {s.markedOn ? (
+                          <button className={button} disabled={busy} onClick={() => run(() => put("/api/finance/subscriptions", { subId: s.id, cancelling: false }))}>
+                            Undo
+                          </button>
+                        ) : (
+                          <>
+                            <a className="mr-2 text-[12px] text-accent hover:underline" href={s.cancelSearchUrl} target="_blank" rel="noopener noreferrer">
+                              How to cancel
+                            </a>
+                            <button className={button} disabled={busy} onClick={() => run(() => put("/api/finance/subscriptions", { subId: s.id, cancelling: true }))}>
+                              I cancelled it
+                            </button>
+                          </>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          </Part>
+          <Part id="top-merchants" title="Biggest merchants this month">
+            <section className={card} aria-labelledby="bd-top">
+              <h2 id="bd-top" className="font-semibold">Biggest merchants this month</h2>
+              <table className="mt-2 w-full text-[13px]">
+                <tbody>
+                  {r.topMerchants.map((m) => (
+                    <tr key={m.key} className="border-t border-border-subtle">
+                      <td className="py-1">{m.label}</td>
+                      <td className="py-1 text-text-tertiary">{m.category}</td>
+                      <td className="py-1 text-right">{usd(m.cents)}</td>
+                      <td className="py-1 text-right text-text-tertiary">{m.count}×</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          </Part>
+        </PartGroup>
 
-      <section className={card} aria-labelledby="bd-review">
-        <div className="flex items-center gap-2">
-          <h2 id="bd-review" className="font-semibold">To review: uncategorized merchants (last 90 days)</h2>
-          <InfoHint label="Uncategorized merchants">
-            <p>Always files every transaction from that merchant, past and future, under the category you pick. The bank data itself is not changed.</p>
-          </InfoHint>
-        </div>
-        {r.uncategorized.length === 0 ? (
-          <p className="mt-2 text-[13px] text-text-secondary">Nothing to review.</p>
-        ) : (
-          <table className="mt-2 w-full text-[13px]">
-            <tbody>
-              {r.uncategorized.map((m) => (
-                <ReviewRow key={m.key} m={m} categories={categories} busy={busy} run={run} />
-              ))}
-            </tbody>
-          </table>
-        )}
-      </section>
-
-      <section className={card} aria-labelledby="bd-rules">
-        <h2 id="bd-rules" className="font-semibold">Merchant rules</h2>
-        {rules.length === 0 ? (
-          <p className="mt-1 text-[13px] text-text-secondary">None yet.</p>
-        ) : (
-          <ul className="mt-2 space-y-1 text-[13px]">
-            {rules.map((x) => (
-              <li key={x.merchantKey} className="flex items-center gap-2">
-                <span className="text-text-secondary">{x.merchantKey}</span> → <b>{x.category}</b>
-                <button className="text-[12px] text-text-tertiary hover:text-down" disabled={busy} onClick={() => run(() => put("/api/finance/categories", { merchantKey: x.merchantKey, category: null }))}>
-                  remove
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+        <PartGroup id="section-categorize" title="Categorizing">
+          <Part id="review" title="Uncategorized merchants">
+            <section className={card} aria-labelledby="bd-review">
+              <div className="flex items-center gap-2">
+                <h2 id="bd-review" className="font-semibold">To review: uncategorized merchants (last 90 days)</h2>
+                <InfoHint label="Uncategorized merchants">
+                  <p>Always files every transaction from that merchant, past and future, under the category you pick. The bank data itself is not changed.</p>
+                </InfoHint>
+              </div>
+              {r.uncategorized.length === 0 ? (
+                <p className="mt-2 text-[13px] text-text-secondary">Nothing to review.</p>
+              ) : (
+                <table className="mt-2 w-full text-[13px]">
+                  <tbody>
+                    {r.uncategorized.map((m) => (
+                      <ReviewRow key={m.key} m={m} categories={categories} busy={busy} run={run} />
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </section>
+          </Part>
+          <Part id="rules" title="Merchant rules">
+            <section className={card} aria-labelledby="bd-rules">
+              <h2 id="bd-rules" className="font-semibold">Merchant rules</h2>
+              {rules.length === 0 ? (
+                <p className="mt-1 text-[13px] text-text-secondary">None yet.</p>
+              ) : (
+                <ul className="mt-2 space-y-1 text-[13px]">
+                  {rules.map((x) => (
+                    <li key={x.merchantKey} className="flex items-center gap-2">
+                      <span className="text-text-secondary">{x.merchantKey}</span> → <b>{x.category}</b>
+                      <button className="text-[12px] text-text-tertiary hover:text-down" disabled={busy} onClick={() => run(() => put("/api/finance/categories", { merchantKey: x.merchantKey, category: null }))}>
+                        remove
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          </Part>
+        </PartGroup>
+      </PartGrid>
     </div>
   );
 }

@@ -137,7 +137,7 @@ export default function WeatherPanel() {
   }
 
   return (
-    <ChartCard title="Weather" subtitle="Daily outdoor weather, last 90 days" tick="descriptive" className="mt-4">
+    <ChartCard title="Weather" subtitle="Daily outdoor weather, last 90 days" tick="descriptive">
       {body}
       <p className="text-[11px] text-text-tertiary mt-3">
         Model data (Open-Meteo) for the fixed home location, not a sensor at home and not where you were on a trip.

@@ -262,3 +262,48 @@ test("a good upload still logs success", async () => {
   assert.equal(beats[0].status, "success");
   assert.equal(beats[0].records_synced, 2);
 });
+
+// ------------------------------------------- Care Calendar (Google write side)
+
+test("Care Calendar card: nothing is read until Google is set up, then only the sync-state row", async () => {
+  const saved = [process.env.GOOGLE_CALENDAR_CLIENT_ID, process.env.GOOGLE_CALENDAR_CLIENT_SECRET];
+  try {
+    delete process.env.GOOGLE_CALENDAR_CLIENT_ID;
+    delete process.env.GOOGLE_CALENDAR_CLIENT_SECRET;
+    current = fakeSupabase({});
+    let res = await statusRoute.GET();
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    let card = res.body.sources.care_calendar;
+    assert.deepEqual({ status: card.status, label: card.label, method: card.integrationMethod }, { status: "unknown", label: "Care Calendar (not set up)", method: "automated" });
+    assert.ok(card.cadence && card.methodLabel);
+    assert.match(card.errorMessage, /^Not set up/);
+    assert.ok(!current.calls.reads.some((q) => q.table === "care_calendar_sync"), "not set up: no read");
+
+    process.env.GOOGLE_CALENDAR_CLIENT_ID = "client-fixture";
+    process.env.GOOGLE_CALENDAR_CLIENT_SECRET = "secret-fixture";
+    const row = {
+      calendar_id: "calendar-fixture-1", connected_at: minutesAgo(48 * 60), last_sync_at: minutesAgo(30), last_sync_ok: true,
+      last_sync_counts: { created: 1, updated: 2, removed: 0, unchanged: 5, failed: 0 }, last_error: null,
+    };
+    current = fakeSupabase({ read: (q) => ({ data: q.table === "care_calendar_sync" && q.eq.id === 1 ? [row] : [], error: null }) });
+    res = await statusRoute.GET();
+    card = res.body.sources.care_calendar;
+    assert.deepEqual({ status: card.status, label: card.label, lastSync: card.lastSync, recordsSynced: card.recordsSynced, errorMessage: card.errorMessage },
+      { status: "success", label: "Care Calendar", lastSync: row.last_sync_at, recordsSynced: 3, errorMessage: null });
+    assert.equal(current.calls.reads.filter((q) => q.table === "care_calendar_sync").length, 1);
+    assert.ok(!current.calls.reads.some((q) => q.table === "ci_tokens" && q.eq.service === "google_calendar"), "the stored sign-in is never read here");
+    assert.ok(!current.calls.reads.some((q) => q.table === "care_items" || q.table === "care_calendar_links"), "no care item or link row either");
+    assert.ok(!JSON.stringify(res.body).includes("secret-fixture"));
+
+    current = fakeSupabase({ read: (q) => ({ data: q.table === "care_calendar_sync" ? [{ ...row, last_sync_ok: false, last_error: "google_auth", last_sync_counts: {} }] : [], error: null }) });
+    card = (await statusRoute.GET()).body.sources.care_calendar;
+    assert.equal(card.status, "failed");
+    assert.match(card.errorMessage, /google_auth/);
+
+    current = fakeSupabase({ read: (q) => ({ data: q.table === "care_calendar_sync" ? [{ ...row, last_sync_at: minutesAgo(31 * 60) }] : [], error: null }) });
+    assert.equal((await statusRoute.GET()).body.sources.care_calendar.status, "failed", "no sync for 31 h: the catch-up is not running");
+  } finally {
+    if (saved[0] === undefined) delete process.env.GOOGLE_CALENDAR_CLIENT_ID; else process.env.GOOGLE_CALENDAR_CLIENT_ID = saved[0];
+    if (saved[1] === undefined) delete process.env.GOOGLE_CALENDAR_CLIENT_SECRET; else process.env.GOOGLE_CALENDAR_CLIENT_SECRET = saved[1];
+  }
+});

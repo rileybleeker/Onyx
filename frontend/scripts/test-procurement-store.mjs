@@ -193,7 +193,8 @@ for (const file of routeFiles) {
   const src = read(file);
   const methods = [...src.matchAll(/export async function (\w+)/g)].map(m => m[1]);
   assert.ok(methods.length > 0 && methods.every(m => ['GET', 'POST', 'PATCH', 'DELETE'].includes(m)), file + ': ' + methods);
-  assert.doesNotMatch(src, /\b(fetch|axios|https?:\/\/)/, file + ' must not call any merchant or provider');
+  // A call, not the word: page-data reads the browser's Sec-Fetch-Site header to refuse cross-site reads.
+  assert.doesNotMatch(src, /\bfetch\s*\(|\baxios\b|https?:\/\//, file + ' must not call any merchant or provider');
 }
 // Session-protected, with ONE deliberate exception. Riley decided on 2026-11-13 that the
 // sms-reminders Worker may raise a card in /agents before a renewal, so exactly one exact path,

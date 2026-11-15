@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
+import { Part, PartGrid, PartGroup } from "@/components/personalize/PartGrid";
+import PersonalTable, { type TableColumn } from "@/components/personalize/PersonalTable";
 import RangeFilter from "@/components/RangeFilter";
 // @zxing/browser is ~120 kB of route JS but only needed once the user taps
 // "Scan barcode" — load it lazily on first open instead of on page load.
@@ -96,6 +98,14 @@ function categoryColor(c: string | null): string {
   if (!c) return "text-text-tertiary";
   return CATEGORY_COLORS[c.toLowerCase()] ?? "text-text-tertiary";
 }
+
+// Columns of "Today's compound totals" (Personalize: hide / move / freeze columns).
+const COMPOUND_COLUMNS: TableColumn[] = [
+  { id: "category", label: "Category", th: "text-left py-2 px-1 font-normal w-[80px]", td: "py-1.5 px-1" },
+  { id: "compound", label: "Compound", locked: true, th: "text-left py-2 px-1 font-normal", td: "py-1.5 px-1 text-text-primary" },
+  { id: "amount", label: "Amount", th: "text-right py-2 px-1 font-normal w-[100px]", td: "py-1.5 px-1 text-right text-text-secondary tabular-nums" },
+  { id: "sources", label: "Sources", th: "text-right py-2 px-1 font-normal w-[60px]", td: "py-1.5 px-1 text-right text-text-tertiary tabular-nums" },
+];
 
 function formatDoseTime(iso: string | null): string {
   if (!iso) return "—";
@@ -601,25 +611,31 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
         </div>
       </header>
 
+      <PartGrid page="/supplements" title="Supplements">
       {/* KPI Row */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <StatCard label="Library" value={products.length} sublabel="products" />
-        <StatCard label="Logged Today" value={intakeCount} sublabel="intake events" />
-        <StatCard label="Distinct Compounds" value={distinctCompounds} sublabel="today" />
-        <StatCard
-          label="Total Doses Today"
-          value={intakes.reduce((s, i) => s + Number(i.doses), 0)}
-          sublabel="servings consumed"
-        />
-      </div>
-
-      {loading && (
-        <p className="text-[12px] text-text-tertiary font-mono">Loading…</p>
-      )}
+      <PartGroup id="summary" title="Summary tiles" gap={12}>
+        <Part id="library" title="Library" width="quarter">
+          <StatCard label="Library" value={products.length} sublabel="products" />
+        </Part>
+        <Part id="logged-today" title="Logged Today" width="quarter">
+          <StatCard label="Logged Today" value={intakeCount} sublabel="intake events" />
+        </Part>
+        <Part id="distinct-compounds" title="Distinct Compounds" width="quarter">
+          <StatCard label="Distinct Compounds" value={distinctCompounds} sublabel="today" />
+        </Part>
+        <Part id="total-doses" title="Total Doses Today" width="quarter">
+          <StatCard
+            label="Total Doses Today"
+            value={intakes.reduce((s, i) => s + Number(i.doses), 0)}
+            sublabel="servings consumed"
+          />
+        </Part>
+      </PartGroup>
 
       {!loading && (
-        <>
+        <PartGroup id="logging" title="Stacks & logging" gap={24}>
           {/* Stacks — recurring supplement lists (BOM). One tap logs the whole list. */}
+          <Part id="stacks" title="Stacks">
           <ChartCard
             title="Stacks"
             subtitle="Reusable supplement lists — tap Log to record every product in the list at once."
@@ -722,8 +738,10 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
               </div>
             )}
           </ChartCard>
+          </Part>
 
           {/* Log intake — product picker */}
+          <Part id="log-intake" title="Log intake">
           <ChartCard
             title={isLoggingForToday ? "Log intake today" : `Log intake for ${formatShortDate(logDate)}`}
             subtitle="Tap a product to add one dose. Each click writes a fresh intake event with the current clock timestamp."
@@ -849,9 +867,15 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
               </div>
             )}
           </ChartCard>
+          </Part>
+        </PartGroup>
+      )}
 
+      {!loading && (
+        <PartGroup id="today" title="Today" gap={24}>
           {/* Today's intakes: rows still saving first (no edit/delete until the server has them), then saved rows */}
           {(intakes.length > 0 || savingToday.length > 0) && (
+            <Part id="todays-intakes" title="Today's intakes">
             <ChartCard
               title="Today's intakes"
               subtitle={`${intakes.length} saved${savingToday.length ? ` · ${savingToday.length} saving` : ""} · newest first`}
@@ -911,9 +935,11 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
                 ))}
               </div>
             </ChartCard>
+            </Part>
           )}
 
           {/* Today's compound totals — rolled up by UNII */}
+          <Part id="compound-totals" title="Today's compound totals">
           <ChartCard
             title="Today's compound totals"
             subtitle="Cross-product rollup by UNII code — Vitamin C from a multivitamin and a standalone Vitamin C tablet sum here."
@@ -926,43 +952,42 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
               </p>
             ) : (
               <div className="overflow-x-auto">
-                <table className="w-full text-[12px] font-mono">
-                  <thead>
-                    <tr className="text-[10px] uppercase tracking-wide text-text-tertiary border-b border-border-subtle">
-                      <th className="text-left py-2 px-1 font-normal w-[80px]">Category</th>
-                      <th className="text-left py-2 px-1 font-normal">Compound</th>
-                      <th className="text-right py-2 px-1 font-normal w-[100px]">Amount</th>
-                      <th className="text-right py-2 px-1 font-normal w-[60px]">Sources</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {compounds.map((c) => (
-                      <tr
-                        key={c.compound_key}
-                        className="border-b border-border-subtle/50 hover:bg-white/[0.02]"
-                      >
-                        <td className={`py-1.5 px-1 ${categoryColor(c.category)} uppercase text-[10px] tracking-wide`}>
+                <PersonalTable
+                  id="compounds"
+                  className="w-full text-[12px] font-mono"
+                  headRowClassName="text-[10px] uppercase tracking-wide text-text-tertiary border-b border-border-subtle"
+                  rowClassName="border-b border-border-subtle/50 hover:bg-white/[0.02]"
+                  columns={COMPOUND_COLUMNS}
+                  rows={compounds.map((c) => ({
+                    key: c.compound_key,
+                    cells: {
+                      category: (
+                        <span className={`${categoryColor(c.category)} uppercase text-[10px] tracking-wide`}>
                           {c.category ?? "—"}
-                        </td>
-                        <td className="py-1.5 px-1 text-text-primary">
-                          {c.ingredient_group ?? c.ingredient_name ?? c.compound_key}
-                        </td>
-                        <td className="py-1.5 px-1 text-right text-text-secondary tabular-nums">
+                        </span>
+                      ),
+                      compound: c.ingredient_group ?? c.ingredient_name ?? c.compound_key,
+                      amount: (
+                        <>
                           {Number(c.total_amount).toLocaleString(undefined, { maximumFractionDigits: 2 })}{" "}
                           <span className="text-text-tertiary">{c.unit}</span>
-                        </td>
-                        <td className="py-1.5 px-1 text-right text-text-tertiary tabular-nums">
-                          {c.source_product_count}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                        </>
+                      ),
+                      sources: c.source_product_count,
+                    },
+                  }))}
+                />
               </div>
             )}
           </ChartCard>
+          </Part>
+        </PartGroup>
+      )}
 
+      {!loading && (
+        <PartGroup id="history" title="History">
           {/* Recent intakes (prior days) — edit/delete any row */}
+          <Part id="recent-intakes" title="Recent intakes">
           <ChartCard
             title="Recent intakes"
             subtitle={`prior days · ${rangeLabel(range)} · ${history.length} entries`}
@@ -1019,7 +1044,13 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
               </div>
             )}
           </ChartCard>
-        </>
+          </Part>
+        </PartGroup>
+      )}
+      </PartGrid>
+
+      {loading && (
+        <p className="text-[12px] text-text-tertiary font-mono">Loading…</p>
       )}
 
       {/* Edit-intake modal */}

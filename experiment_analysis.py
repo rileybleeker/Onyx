@@ -62,6 +62,9 @@ class TrialData:
     outcome: np.ndarray                               # HRV of the sleep closing the day; NaN = no outcome
     excluded_blocks: set[int] = field(default_factory=set)   # whole blocks left out (flight / declared pause)
     adherent: np.ndarray | None = None                # optional bool per day, for the per-protocol estimate
+    # Optional pre-registered extras, one array per scheduled day each (NaN = not available):
+    covariates: dict[str, np.ndarray] | None = None          # pre-treatment covariates, one sensitivity fit each
+    secondary_outcomes: dict[str, np.ndarray] | None = None  # other outcomes, same model, never part of the decision
 
 
 def assert_reportable(spec: TrialSpec, as_of: date) -> date:
@@ -340,6 +343,13 @@ def decide(estimate: float, ci_low: float, ci_high: float, p_value: float, mid_m
     return "inconclusive"
 
 
+def _per_day(values: Any, n_days: int, name: str) -> np.ndarray:
+    out = np.asarray(values, dtype=float)
+    if out.shape != (n_days,):
+        raise ValueError(f"{name} must have one value per scheduled day")
+    return out
+
+
 def analyze_trial(spec: TrialSpec, data: TrialData, as_of: date) -> dict[str, Any]:
     """The end-of-trial report. Raises AnalysisNotAllowed before the pre-registered end."""
     last_day = assert_reportable(spec, as_of)
@@ -381,6 +391,27 @@ def analyze_trial(spec: TrialSpec, data: TrialData, as_of: date) -> dict[str, An
             }
         except ValueError as exc:
             sensitivity["per_protocol"] = {"estimate": None, "note": str(exc)}
+    # Doc 8: the primary model plus one pre-treatment covariate at a time. A night whose covariate
+    # is missing is left out, so these fits can use fewer nights than the primary one.
+    for name, values in (data.covariates or {}).items():
+        try:
+            fit = randomization_analysis(t, y, dow, **common, covariates=_per_day(values, n_sched, name))
+            sensitivity[f"covariate_{name}"] = {key: fit[key] for key in ("estimate", "ci_low", "ci_high", "p_value", "n_nights")}
+        except ValueError as exc:
+            sensitivity[f"covariate_{name}"] = {"estimate": None, "note": str(exc)}
+
+    # Doc 6.1 "outcome.secondary": the same model on another series (a second sensor, resting HR).
+    # Reported next to the primary result; the decision rule never reads them.
+    secondary: dict[str, Any] = {}
+    for name, values in (data.secondary_outcomes or {}).items():
+        y2 = _per_day(values, n_sched, name).copy()
+        if used_days < n_sched:
+            y2[used_days:] = np.nan
+        try:
+            fit = randomization_analysis(t, y2, dow, **common)
+            secondary[name] = {key: fit[key] for key in ("estimate", "carryover", "ci_low", "ci_high", "p_value", "n_nights")}
+        except ValueError as exc:
+            secondary[name] = {"estimate": None, "note": str(exc)}
 
     report = {
         "experiment_id": spec.experiment_id,
@@ -399,6 +430,7 @@ def analyze_trial(spec: TrialSpec, data: TrialData, as_of: date) -> dict[str, An
         "carryover_exceeds_half_mid": abs(primary["carryover"]) > spec.mid_ms / 2,
         "missingness": missingness_check(t[in_scope], np.isnan(y[in_scope])),
         "sensitivity": sensitivity,
+        "secondary_outcomes": secondary,
         "redraw_seed": str(seed),
         "generator": design.GENERATOR,
     }

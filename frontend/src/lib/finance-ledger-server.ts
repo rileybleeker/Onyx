@@ -21,16 +21,12 @@ import {
   toCents,
   trailingMonths,
   classifyTxn,
-  type FlowSummary,
   type LedgerAccount,
   type LedgerBalance,
   type LedgerQuery,
   type LedgerTxn,
-  type NetWorth,
-  type TrendPoint,
-  type TxnClass,
 } from "@/lib/finance-ledger";
-import { FINANCE_SOURCE, SIMPLEFIN_THRESHOLDS, financeLedgerCard, type FinanceCard } from "@/lib/finance-status";
+import { FINANCE_SOURCE, SIMPLEFIN_THRESHOLDS, financeLedgerCard } from "@/lib/finance-status";
 import { NO_FIXES, applyFixes, fixedCategory, type CategoryFixes } from "@/lib/finance-categories";
 import { merchantKey } from "@/lib/procurement-recurring";
 
@@ -54,38 +50,10 @@ const HEARTBEAT_COLS = "status,sync_start,records_synced,duration_seconds,error_
 const PAGE = 1000; // PostgREST's default max rows per request
 const MAX_WINDOW_PAGES = 40; // 40k rows of window; beyond that the page says so
 
-export interface ListRow {
-  txn_key: string;
-  account_key: string;
-  txn_date: string;
-  title: string;
-  amount_cents: number;
-  currency: string;
-  category: string | null;
-  excluded: Exclude<TxnClass, "counted"> | null;
-  /** Normalized merchant label, the key a category rule uses. */
-  merchant_key: string;
-}
-export interface LedgerData {
-  query: LedgerQuery & { month: string };
-  accounts: LedgerAccount[];
-  accountLabels: Record<string, string>;
-  months: string[];
-  netWorth: NetWorth;
-  flows: FlowSummary;
-  trend: TrendPoint[];
-  list: { rows: ListRow[]; total: number; page: number; pageCount: number; pageSize: number };
-  freshness: FinanceCard | null;
-  /** Rows that could not be read, and whether the 12-month window was cut off. */
-  skippedRows: number;
-  windowTruncated: boolean;
-  /** The page asked for is past the end; page 1 is shown instead. */
-  pageClamped: boolean;
-}
-export type LedgerLoad =
-  | { kind: "error"; message: string; hint: string | null }
-  | { kind: "empty"; freshness: FinanceCard | null }
-  | { kind: "ok"; data: LedgerData };
+// The shapes this module returns live in finance-ledger-types.ts (types only), so client code can name them
+// without importing this server module.
+export type { LedgerData, LedgerLoad, ListRow } from "@/lib/finance-ledger-types";
+import type { LedgerData, LedgerLoad, ListRow } from "@/lib/finance-ledger-types";
 
 interface PgErr {
   code?: string;

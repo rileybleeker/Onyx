@@ -279,6 +279,11 @@ def validate_protocol(p: dict[str, Any], *, today: date, alignment_version: str,
         elif not isinstance(objective.get("max"), (int, float)) or isinstance(objective.get("max"), bool)                 or objective.get("arm") not in ARMS:
             problems.append("adherence.objective needs a numeric max and arm A or B")
 
+    # Optional: the adherence share below which the daily report job warns (experiment_report.py).
+    min_pct = p["adherence"].get("min_pct") if isinstance(p.get("adherence"), dict) else None
+    if min_pct is not None and (isinstance(min_pct, bool) or not isinstance(min_pct, (int, float)) or not 0 < min_pct <= 100):
+        problems.append("adherence.min_pct must be a number above 0 and at most 100")
+
     stopping = p.get("stopping") if isinstance(p.get("stopping"), dict) else {}
     if str(stopping.get("interim", "none")).strip().lower() != "none":
         problems.append("stopping.interim must be 'none': interim looks are not built yet, and the effect is "

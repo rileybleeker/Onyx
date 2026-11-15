@@ -42,6 +42,8 @@ import experiment_design as design
 ET = ZoneInfo("America/New_York")
 ROOT = Path(__file__).resolve().parent
 PROTOCOL_DIR = "docs/experiments"
+# The report table and the check-in adherence functions (not part of the first schema file).
+REPORTS_SQL = "sql/experiment_adherence_reports_schema.sql"
 
 
 class AdminError(RuntimeError):
@@ -111,6 +113,17 @@ class Store:
 
     def behavioral_today(self) -> date:
         return date.fromisoformat(str(self.supa.schema("pds").rpc("behavioral_today_now", {}).execute().data))
+
+    def reports_table_ready(self) -> bool:
+        """Does pds.experiment_reports exist (REPORTS_SQL applied)? That file also adds the check-in
+        adherence functions, so a trial is never registered before its answers can be stored."""
+        try:
+            self._t("experiment_reports").select("experiment_id").limit(1).execute()
+        except Exception as exc:  # noqa: BLE001
+            if str(getattr(exc, "code", "")) in ("PGRST205", "42P01"):
+                return False
+            raise
+        return True
 
     def stop(self, experiment_id: str, stopped_on: date, reason: str) -> None:
         self._t("experiments").update(
@@ -202,6 +215,10 @@ def cmd_register(store: Store, protocol_path: str, confirm: str, *, root: Path =
         raise AdminError(f"{experiment_id} has no draft; run the seed step first")
     if existing["status"] != "draft":
         raise AdminError(f"{experiment_id} is already {existing['status']} and cannot be registered again")
+
+    if not store.reports_table_ready():
+        raise AdminError(f"pds.experiment_reports does not exist: apply {REPORTS_SQL} first, or the trial's "
+                         "check-in answers and daily reports cannot be stored")
 
     facts = git(rel)
     if not (facts["tracked"] and facts["clean"]):

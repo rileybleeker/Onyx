@@ -12,7 +12,7 @@ Status: built, **not connected**. Nothing in Onyx contacts Google until the two 
   - Not booked yet: an all-day (or timed) event titled "Book: <label>" that does not block your calendar. A due date is never shown as if it were an appointment.
 - Archiving, completing a one-off, or removing an item takes its event off the calendar. Completing a repeating item moves its event to the new due date.
 - Repeats are not sent as recurring events, because a repeat counts from the day you complete the item. Only the current due date is on the calendar.
-- A sync runs in the background after every change on `/health`, and when you press **Sync now**. The card shows the last result (counts only).
+- A sync runs in the background after every change on `/health`, when you press **Sync now**, and every 6 hours as a catch-up (see "Scheduled catch-up" below). The card shows the last result (counts only), and so does the **Care Calendar** card on `/status`.
 
 ## The one permission
 
@@ -53,11 +53,20 @@ Add two variables, then redeploy (Deployments > the latest > Redeploy):
 | `GOOGLE_CALENDAR_CLIENT_ID` | the Client ID from step 1.4 |
 | `GOOGLE_CALENDAR_CLIENT_SECRET` | the Client secret from step 1.4 |
 
-Nothing else is needed: no GitHub secret, no local file, no database step (the tables already exist).
+Nothing else is needed for the sync itself: no GitHub secret, no local file, no database step (the tables already exist). The scheduled catch-up needs two small protected-file changes of its own (below).
 
 ### 3. The one consent click
 
 Open `/health`, press **Connect Google Calendar**. On Google's page choose your account; on the "Google hasn't verified this app" page press **Advanced**, then **Go to Onyx**; then **Continue**. You land back on `/health`, which now says "Google Calendar: connected", and the "Onyx care" calendar appears in Google Calendar within a minute.
+
+### 4. The scheduled catch-up (two protected files, so Riley adds them)
+
+A sync that fails after a change (Google down, a timeout) is retried at the next change and by **Sync now**. The catch-up also retries it on a schedule, every 6 hours, and keeps the `/status` card's "last sync" fresh in a quiet week. It is built (`POST /api/jobs/care-calendar-catch-up`, which runs the same sync as Sync now) but not reachable yet, because both remaining pieces are protected paths that agents do not edit:
+
+- `frontend/src/middleware.ts`: one exact path, `pathname === "/api/jobs/care-calendar-catch-up"`, added to `isCiRoute()`, so the schedule can reach the route with the `x-onyx-ci-token` header. The route checks that token itself too.
+- `.github/workflows/care-calendar-catch-up.yml`: a 6-hourly (`20 */6 * * *`) `curl -X POST` with the existing `ONYX_CI_TOKEN` secret, failing unless the answer is HTTP 200.
+
+The exact text of both is in the Notes of the roadmap row "Build health and recurring appointments calendar". Order does not matter: before Google is connected the route answers `{"ran": false, "reason": "not_set_up"}` (or `"not_connected"`) with HTTP 200 and calls nothing.
 
 ## Turning it off
 
@@ -73,6 +82,8 @@ Open `/health`, press **Connect Google Calendar**. On Google's page choose your 
 | Credentials, stored sign-in, calls to Google, the sync run (server only) | `frontend/src/lib/care-google-server.ts` |
 | Routes (owner session only; never reachable with the CI token) | `/api/care/google/status` (GET), `/start` (POST), `/callback` (GET), `/sync` (POST), `/disconnect` (POST) |
 | Card on the page | `frontend/src/app/health/CalendarConnectionCard.tsx` |
+| Scheduled catch-up (CI token only, checked in the route too; counts and a short code only) | `POST /api/jobs/care-calendar-catch-up`: 200 `{ran: false, reason}` when not set up or not connected, 200 `{ran: true, sync}` after a good run, 502 after a failed one, 401 without the token |
+| `/status` card "Care Calendar" (pure, reads only the `pds.care_calendar_sync` row; nothing at all until the two variables exist) | `frontend/src/lib/care-calendar-status.ts`, wired in `frontend/src/app/api/status/route.ts` |
 | Tables (service-role only, `sql/care_calendar_sync_schema.sql`) | `pds.care_calendar_sync` (one row: calendar id, connected-at, last result), `pds.care_calendar_links` (item to event id + a digest of what was written) |
 | Stored sign-in | `pds.ci_tokens`, `service = 'google_calendar'` (the refresh token only; access tokens are never stored) |
 
@@ -84,12 +95,13 @@ Errors, stored results and logs carry short codes only (for example `google_auth
 
 ## Verification
 
-- `cd frontend; node --test tests/care-google.test.cjs`: the consent URL (one scope, state, PKCE test vector), the event mapping, the sync against a fake Google (create, no-op, rewrite, take off, foreign events never touched, events removed in Google, partial failure, lost access), and the routes with a fake database and fake Google endpoints (not set up: no call anywhere; set up but not connected: no call; state mismatch refused before any call; wrong scope revoked and not stored; disconnect; logs carry no token or label).
+- `cd frontend; node --test tests/care-google.test.cjs`: the consent URL (one scope, state, PKCE test vector), the event mapping, the sync against a fake Google (create, no-op, rewrite, take off, foreign events never touched, events removed in Google, partial failure, lost access), and the routes with a fake database and fake Google endpoints (not set up: no call anywhere; set up but not connected: no call; state mismatch refused before any call; wrong scope revoked and not stored; disconnect; logs carry no token or label). Also the catch-up (CI token only; not set up / not connected: no Google call; it writes what a failed save left behind; a failed run is a 502) and every state of the `/status` card.
+- `cd frontend; node --test tests/status-heartbeats.test.cjs`: `/api/status` reads nothing for the card until the variables exist, then only the sync-state row (never `ci_tokens`, never an item).
 - `cd frontend; node scripts/test-care-planner-ui.mjs` (local, needs a browser): the card's states and buttons.
 
 ## Not proven, and what remains
 
 - **No real Google account has been used.** The first real connection is the first end-to-end run. The endpoints, the scope and the event fields follow Google's published Calendar API reference (checked 2026-11-13), but "works against the fake" is all the tests show. Things to look at on the first connection: the calendar appears, a timed item lands at the right local time, archiving an item removes its event.
-- A `/status` card for the sync is not added: the feature is inert until connected, and the card on `/health` shows the last result. Add one (heartbeat age of `pds.care_calendar_sync.last_sync_at`) once it is connected and in use.
-- There is no scheduled catch-up sync. A sync that fails is retried at the next change or with **Sync now**.
+- The `/status` card "Care Calendar" (2026-11-14) reads the age and result of `pds.care_calendar_sync.last_sync_at` (the sync writes no `sync_log` rows). Not set up, or set up but not connected: Unknown, with the next step. Connected: a failed last sync is Error, with what to do (`google_auth` or `calendar_missing`: Disconnect, then Connect again on `/health`); a good one is Healthy, Degraded after 14 hours and Error after 30 hours without any sync, which means the catch-up is not running. It has only been run against synthetic rows.
+- The scheduled catch-up (2026-11-14) is built and tested against the fake Google, but nothing calls it until the middleware line and the workflow from step 4 exist.
 - Reading Google Calendar into Onyx (for example to warn about a clash) is deliberately not built; it would need a broader permission.
