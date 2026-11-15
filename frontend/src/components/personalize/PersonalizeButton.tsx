@@ -18,7 +18,12 @@ export default function PersonalizeButton({ className, onStart }: { className?: 
   return (
     <button
       type="button"
-      onClick={() => onStart?.(personalizeNow())}
+      onClick={() => {
+        // Start first, then tell the caller. (`onStart?.(personalizeNow())` skipped personalizeNow() whenever no
+        // onStart was passed, which is the desktop sidebar: optional chaining does not evaluate the arguments.)
+        const kind = personalizeNow();
+        if (onStart) onStart(kind);
+      }}
       onPointerEnter={preloadPersonalize}
       onFocus={preloadPersonalize}
       disabled={active}

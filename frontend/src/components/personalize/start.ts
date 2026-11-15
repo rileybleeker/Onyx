@@ -7,11 +7,17 @@ import { startPersonalize } from "@/lib/personalize-registry";
  */
 export function personalizeNow(): "page" | "app" {
   if (startPersonalize()) return "page";
-  void import("./app-session").then((m) => m.startAppSession()).catch(() => {});
+  void import("./app-session").then((m) => m.startAppSession()).catch((e: unknown) => logFailure("start", e));
   return "app";
 }
 
 /** Start loading the editor early (hover / focus on an entry). */
 export function preloadPersonalize() {
-  void import("./editor-loader").then((m) => m.preloadEditor()).catch(() => {});
+  void import("./editor-loader").then((m) => m.preloadEditor()).catch((e: unknown) => logFailure("preload", e));
+}
+
+/** A failure is logged with a code (never page content), so it is not silent. */
+export function logFailure(step: string, e: unknown) {
+  const name = e && typeof e === "object" && "name" in e ? String((e as { name: unknown }).name) : "error";
+  console.error(`[personalize] ${step} failed: ${name}`);
 }
