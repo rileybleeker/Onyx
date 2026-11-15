@@ -27,6 +27,7 @@ const Sidebar = load('src/components/Sidebar.tsx', {
   '@/lib/supabase-browser': { createSupabaseBrowser: () => { throw new Error('No auth access in fixture'); } },
   '@/lib/client-cache': { wipeClientData: async () => {} },
   '@/lib/warmup': { navIntentProps: () => ({}) },
+  '@/lib/go-shortcuts': load('src/lib/go-shortcuts.ts'),
   './CommandPalette': { OPEN_COMMAND_PALETTE: 'test-open-palette' },
   './DesktopApp': {
     InstallAppButton: () => React.createElement('button', null, 'Install fixture'),
@@ -62,6 +63,11 @@ test('search uses existing palette event and platform shortcut', () => {
   assert.equal(received, 'test-open-palette');
   assert.ok(render().includes('Ctrl K'));
   delete global.window;
+});
+test('every item shows its go-to shortcut as "G <key>" (desktop only)', () => {
+  const html = render();
+  for (const item of nav.NAV_ITEMS) assert.ok(html.includes(`>G ${item.shortcut}</kbd>`), item.label);
+  assert.match(html, /<kbd class="[^"]*hidden lg:inline/);
 });
 test('installed app controls remain present and sidebar remains desktop-only', () => {
   const html = render();
