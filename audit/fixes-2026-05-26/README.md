@@ -1,3 +1,5 @@
+> Historical source snapshot. Private context and generated evidence have been removed from public distribution; this is not a complete reviewer input bundle. See `docs/audit-evidence-privacy.md` in the repository root.
+
 # Audit Fixes — 2026-05-26 Session Record
 
 Internal record of the 2026-05-26 audit-closure session. Captures what shipped,
@@ -14,9 +16,7 @@ post-fix code + the same finding-category prompts the original audit used.
 
 - **14 audit tickets closed** across 9 commits + 8 Supabase migrations
 - **Audit open count: 32 → 0** P0/P1 over a single day
-- **All fixes validated** by an end-to-end `python hrv_analysis.py` run
-  (exit 0, no errors, no shift-contract warnings, XGBoost CI coverage now
-  87-92% across horizons vs. systematic under-coverage pre-fix)
+Historical validation evidence is retained privately; public documentation records the methodology rather than personal model outcomes.
 
 ## File map
 

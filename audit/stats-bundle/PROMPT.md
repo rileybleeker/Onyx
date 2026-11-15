@@ -1,3 +1,5 @@
+> Historical source snapshot. Private context and generated evidence have been removed from public distribution; this is not a complete reviewer input bundle. See `docs/audit-evidence-privacy.md` in the repository root.
+
 # Audit Prompt — Onyx Statistics Pipeline (Domain 5)
 
 ## Role
@@ -58,7 +60,7 @@ Provide a one-sentence rationale per score.
 3. **Multicollinearity at N=568 with ~250 features.** Is regularization sufficient? Is VIF computed? Are correlated features causing instability?
 4. **Mediator-exclusion completeness in the DAG.** Are there confounders being conditioned on that secretly close mediating paths? Specifically: training-load lags, sleep-debt aggregates, journal-lag confounders for supplements.
 5. **Prediction interval calibration.** PIs use training-set residual std. Empirical coverage logged in `hrv_model_metrics.ci_coverage`. Does it match nominal 80%?
-6. **Stationarity for SARIMAX / Prophet.** Differencing applied? Tested? What happens during transition days (~3% of the spine)?
+Review timezone-transition days explicitly; do not assume their frequency.
 7. **Target leakage via lag features.** `hrv_z_28d` and similar rolling Z-scores — does the window exclude the target row?
 
 ### Lower priority but in scope

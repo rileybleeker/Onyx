@@ -1,3 +1,5 @@
+> Historical source snapshot. Private context and generated evidence have been removed from public distribution; this is not a complete reviewer input bundle. See `docs/audit-evidence-privacy.md` in the repository root.
+
 # Onyx TZ-Bundle Audit
 
 Self-contained bundle for an independent review of the ADR-0001 timezone implementation (Domain 2).

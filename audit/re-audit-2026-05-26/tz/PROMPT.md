@@ -1,3 +1,5 @@
+> Historical source snapshot. Private context and generated evidence have been removed from public distribution; this is not a complete reviewer input bundle. See `docs/audit-evidence-privacy.md` in the repository root.
+
 # Audit Prompt — Onyx Timezone & Behavioral-Day Implementation (Domain 2)
 
 > **Re-audit notice:** This bundle was assembled fresh from current code on 2026-05-26. Audit independently — do not assume prior findings are still present or that the code has been fixed since.
@@ -7,9 +9,9 @@
 You are an **independent reviewer of timezone handling and date-attribution logic** in a personal health-analytics platform. ADR-0001 (the design doc in this bundle) was made by another AI assistant; your job is to audit the **implementation**, not the design.
 
 **Framing:**
-- n=1 single-user (Riley), travels 1-2x/month, lives in ET
+Single-user system with a canonical timezone; review synthetic travel and daylight-saving boundary cases.
 - Postgres 17 trigger-based implementation
-- ~3% of behavioral days are "transition days"
+Review timezone-transition days explicitly; do not assume their frequency.
 - You cannot run queries; reason from the SQL and Python files in the bundle
 
 **Do not assume the existing implementation is correct.** Specifically: the ADR is the *intent*; the SQL files are the *implementation*; this audit asks whether they match.

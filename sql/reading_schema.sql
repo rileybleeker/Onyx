@@ -18,7 +18,7 @@
 
 CREATE TABLE IF NOT EXISTS pds.books (
     book_id        BIGSERIAL PRIMARY KEY,
-    slug           TEXT        NOT NULL UNIQUE,            -- 'the-goal'
+    slug text NOT NULL UNIQUE, -- stable book key, for example synthetic-book
     title          TEXT        NOT NULL,
     author         TEXT,
     total_chapters INTEGER     CHECK (total_chapters IS NULL OR total_chapters > 0),
@@ -133,20 +133,8 @@ GRANT ALL    ON pds.books, pds.reading_sessions, pds.book_highlights, pds.readin
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA pds TO service_role;
 
 -- -----------------------------------------------------------
--- Seed: The Goal (Goldratt), 40 chapters, Nov 8 -> Nov 30 2026.
--- Habit map row first: habit_journal.question has an FK to
--- habit_name_map.habit_name, and the hourly Notion sync may not have
--- created the 'Read The Goal' row yet.
--- -----------------------------------------------------------
-INSERT INTO pds.habit_name_map (notion_page_id, habit_name, channel)
-VALUES ('412bf5b4-4bf2-81dc-a2f2-c46a56364273', 'Read The Goal', 'habit')
-ON CONFLICT DO NOTHING;
-
-INSERT INTO pds.books (slug, title, author, total_chapters, start_date, target_date, status, notion_page_id, habit_name)
-VALUES ('the-goal', 'The Goal: A Process of Ongoing Improvement', 'Eliyahu M. Goldratt', 40,
-        DATE '2026-11-08', DATE '2026-11-30', 'reading',
-        '412bf5b4-4bf2-81ac-a675-de1ae4ab1021', 'Read The Goal')
-ON CONFLICT (slug) DO NOTHING;
+-- Personal book targets, schedules and mirror references are private configuration.
+-- Create books through the owner-authorized Reading flow; never commit personal seed rows.
 
 -- ---------------------------------------------------------------------------
 -- 2026-11-08 — Automatic progress from Kindle (tools/kindle_harvest + lib/reading.ts:syncKindleSessions)
