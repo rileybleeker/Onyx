@@ -2,9 +2,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import { AreaChart, Area, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
-import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, getRunningRecoveryContext, getActivityLaps, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, getRunningRecoveryContext, getActivityLaps, rangeDays, rangeLabel } from "@/lib/queries";
 import { formatDuration, formatShortDuration, formatDistance, formatPace, formatDate, sameJson } from "@/lib/format";
 import RangeFilter from "@/components/RangeFilter";
+import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import { chartTooltip, axisTick, gridStyle, axisLabel, sourceColors, chartColors as C } from "@/lib/chart-theme";
@@ -409,7 +410,8 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
   const [lapsByActivity, setLapsByActivity] = useState<Record<number, Lap[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(!initial);
-  const [range, setRange] = useState<Range>("30d");
+  // Requested vs shown range (components/RangeLoadStatus.tsx, Codex #191 UI 4): labels use the shown one.
+  const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange } = useRangeLoad("30d");
   const [deletingId, setDeletingId] = useState<string | null>(null);
   // LLM-proposed tags for untagged strength rows, keyed by row id ("whoop:<id>"). Never part of the
   // ISR prefetch: they load after the list has painted (effect below) and degrade to nothing on
@@ -430,6 +432,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     firstRunWithInitial.current = false;
     if (!silent) setLoading(true);
     setExpanded(new Set());
+    const seq = beginRange(range, silent);
     const days = rangeDays(range);
     Promise.all([getActivities(days), getWhoopWorkouts(days), getWorkouts(), getDailySummaries(days), getWhoopCycles(days), getHeartRateData(days), getRunningRecoveryContext(days)])
       .then(([garmin, whoop, wkts, sums, cycles, h, recCtx]) => {
@@ -448,6 +451,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
         setHr((prev) => (sameJson(prev, h) ? prev : h));
         const nextRecoveryMap = buildRecoveryMap(recCtx);
         setRecoveryMap((prev) => (sameJson(prev, nextRecoveryMap) ? prev : nextRecoveryMap));
+        finishRange(seq, range, true);
 
         // Batch-fetch laps for every Garmin running activity with a multi-segment plan
         const multiSegIds = recCtx
@@ -476,12 +480,16 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
           }).catch(console.error);
         }
       })
-      .catch(console.error)
+      .catch((e) => {
+        console.error(e);
+        // The list and charts keep the shown range's rows and labels; the status line offers Retry.
+        if (!cancelled) finishRange(seq, range, false);
+      })
       .finally(() => {
         if (!cancelled && !silent) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [range]);
+  }, [range, attempt, beginRange, finishRange]);
 
   function toggleExpanded(id: string) {
     setExpanded((prev) => {
@@ -702,7 +710,8 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
     date:    formatDate(d.calendar_date),
     overall: d.avg_stress_level,
   }));
-  const rangeNote = range === "1d" ? "today" : `${rangeLabel(range)} avg`;
+  const shownRange = rangeView.shown; // labels describe the rows on screen
+  const rangeNote = shownRange === "1d" ? "today" : `${rangeLabel(shownRange)} avg`;
 
   if (loading) {
     return (
@@ -722,9 +731,12 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Activities</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">Training — {rangeLabel(range)}</p>
+          <p className="text-sm text-text-tertiary mt-0.5">Training — {rangeLabel(shownRange)}</p>
         </div>
-        <RangeFilter value={range} onChange={setRange} />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <RangeLoadStatus view={rangeView} onRetry={retryRange} />
+          <RangeFilter value={selectedRange} onChange={selectRange} />
+        </div>
       </div>
 
       <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
@@ -738,7 +750,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
           label="Avg HR"
           value={avgCycleHr != null ? avgCycleHr.toFixed(0) : null}
           unit="bpm"
-          sublabel={range === "1d" ? "today" : `${rangeLabel(range)} avg`}
+          sublabel={rangeNote}
           source="WHOOP"
         />
         <StatCard label="Max HR" value={avgMaxHr != null ? avgMaxHr.toFixed(0) : null} unit="bpm" sublabel={rangeNote} source="GARMIN" />
@@ -747,7 +759,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-        <ChartCard title="Daily Steps" subtitle={rangeLabel(range)} source={stepsSource}>
+        <ChartCard title="Daily Steps" subtitle={rangeLabel(shownRange)} source={stepsSource}>
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={stepsData}>
               <CartesianGrid {...gridStyle} />
@@ -764,7 +776,7 @@ export default function ActivitiesPage({ initial }: { initial?: ActivitiesInitia
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Avg Heart Rate" subtitle={rangeLabel(range)} source="WHOOP">
+        <ChartCard title="Avg Heart Rate" subtitle={rangeLabel(shownRange)} source="WHOOP">
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={cycleHrData}>
               <defs>

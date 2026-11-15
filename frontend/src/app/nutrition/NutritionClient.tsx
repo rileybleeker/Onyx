@@ -17,12 +17,12 @@ import {
   getDailyNutrientsFull,
   rangeDays,
   rangeLabel,
-  type Range,
 } from "@/lib/queries";
 import { formatDate, kgToLb, lbToKg, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
+import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
 import { shiftYmd } from "@/lib/delivery-portion";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
@@ -144,10 +144,12 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
   const [fullNutrients, setFullNutrients] = useState<any[]>(initial?.fullNutrients ?? []);
   const [servingsState, setServingsState] = useState<{ date: string | null; rows: any[]; failed?: boolean }>({ date: null, rows: [] });
   const [nutritionLoading, setNutritionLoading] = useState(!initial);
-  const [range, setRange] = useState<Range>("30d");
+  // Requested vs shown range (components/RangeLoadStatus.tsx, Codex #191 UI 4): labels use the shown one.
+  const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange, shownRef } = useRangeLoad("30d");
   const firstRunWithInitial = useRef(!!initial);
-  // Guards for the silent post-save refresh (refreshNutritionSilently): the range it ran for, a counter the
-  // range effect bumps (a newer range load wins), and a counter per refresh (the newest refresh wins).
+  // Guards for the silent post-save refresh (refreshNutritionSilently): the range it runs for (the one loading,
+  // else the one shown), a counter the range effect bumps (a newer range load wins), and a counter per refresh
+  // (the newest refresh wins).
   const rangeRef = useRef(range);
   const nutritionGen = useRef(0);
   const refreshSeq = useRef(0);
@@ -187,6 +189,7 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
     const silent = firstRunWithInitial.current;
     firstRunWithInitial.current = false;
     if (!silent) setNutritionLoading(true);
+    const seq = beginRange(range, silent);
     Promise.all([
       getNutrition(rangeDays(range)),
       getWhoopCaloriesBurnt(rangeDays(range)),
@@ -203,13 +206,20 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
         setBurntData((prev) => (sameJson(prev, b) ? prev : b));
         setVitaminsData((prev) => (sameJson(prev, v) ? prev : v));
         setFullNutrients((prev) => (sameJson(prev, f) ? prev : f));
+        finishRange(seq, range, true);
       })
-      .catch(console.error)
+      .catch((e) => {
+        console.error(e);
+        if (cancelled) return;
+        // The charts keep the shown range's rows; a post-save refresh must fetch that range, not the failed one.
+        rangeRef.current = shownRef.current;
+        finishRange(seq, range, false);
+      })
       .finally(() => {
         if (!cancelled && !silent) setNutritionLoading(false);
       });
     return () => { cancelled = true; };
-  }, [range]);
+  }, [range, attempt, beginRange, finishRange, shownRef]);
 
   // ─── Meals log for one behavioral day (today by default; the two days before are one tap away,
   // because a leftover is usually noticed the next morning) ───
@@ -410,10 +420,13 @@ export default function NutritionPage({ initial }: { initial?: NutritionInitial 
         <div>
           <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">Nutrition</h2>
           <p className="text-sm text-text-tertiary mt-0.5">
-            Daily macros, micronutrients &amp; body weight — food from Cronometer + Uber Eats — {rangeLabel(range)}
+            Daily macros, micronutrients &amp; body weight — food from Cronometer + Uber Eats — {rangeLabel(rangeView.shown)}
           </p>
         </div>
-        <RangeFilter value={range} onChange={setRange} />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <RangeLoadStatus view={rangeView} onRetry={retryRange} />
+          <RangeFilter value={selectedRange} onChange={selectRange} />
+        </div>
       </div>
 
       {/* Meal timing is now automatic from Cronometer Gold per-entry timestamps

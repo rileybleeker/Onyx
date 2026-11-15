@@ -5,12 +5,13 @@ import {
   AreaChart, Area, BarChart, Bar, LineChart, Line,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
-import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getBehaviorLog, rangeDays, rangeLabel, type Range } from "@/lib/queries";
+import { getWhoopRecovery, getWhoopCycles, getWhoopSleep, getBehaviorLog, rangeDays, rangeLabel } from "@/lib/queries";
 import { formatDate, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
 import RangeFilter from "@/components/RangeFilter";
+import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import { chartTooltip, axisTick, gridStyle, axisLabel, chartColors as C } from "@/lib/chart-theme";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -37,7 +38,8 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
   const [sleep, setSleep] = useState<any[]>(initial?.sleep ?? []);
   const [journal, setJournal] = useState<any[]>(initial?.journal ?? []);
   const [loading, setLoading] = useState(!initial);
-  const [range, setRange] = useState<Range>("30d");
+  // Requested vs shown range (components/RangeLoadStatus.tsx, Codex #191 UI 4): labels use the shown one.
+  const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange } = useRangeLoad("30d");
   const firstRunWithInitial = useRef(!!initial);
 
   useEffect(() => {
@@ -48,6 +50,7 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
     const silent = firstRunWithInitial.current;
     firstRunWithInitial.current = false;
     if (!silent) setLoading(true);
+    const seq = beginRange(range, silent);
     const days = rangeDays(range);
     Promise.all([getWhoopRecovery(days), getWhoopCycles(days), getWhoopSleep(days), getBehaviorLog(days)])
       .then(([r, c, s, j]) => {
@@ -59,13 +62,18 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
         setCycles((prev) => (sameJson(prev, c) ? prev : c));
         setSleep((prev) => (sameJson(prev, s) ? prev : s));
         setJournal((prev) => (sameJson(prev, j) ? prev : j));
+        finishRange(seq, range, true);
       })
-      .catch(console.error)
+      .catch((e) => {
+        console.error(e);
+        // The charts keep the shown range's rows and labels; the status line offers Retry.
+        if (!cancelled) finishRange(seq, range, false);
+      })
       .finally(() => {
         if (!cancelled && !silent) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [range]);
+  }, [range, attempt, beginRange, finishRange]);
 
   if (loading) {
     return (
@@ -121,9 +129,12 @@ export default function WhoopPage({ initial }: { initial?: WhoopInitial | null }
       <div className="flex flex-wrap items-end justify-between gap-3 mb-8">
         <div>
           <h2 data-testid="page-heading" className="text-[28px] font-medium text-text-primary">WHOOP</h2>
-          <p className="text-sm text-text-tertiary mt-0.5">Recovery, strain, and sleep analytics — {rangeLabel(range)}</p>
+          <p className="text-sm text-text-tertiary mt-0.5">Recovery, strain, and sleep analytics — {rangeLabel(rangeView.shown)}</p>
         </div>
-        <RangeFilter value={range} onChange={setRange} />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <RangeLoadStatus view={rangeView} onRetry={retryRange} />
+          <RangeFilter value={selectedRange} onChange={selectRange} />
+        </div>
       </div>
 
       {/* Ring-led hero — WHOOP recovery / strain / sleep triad */}
