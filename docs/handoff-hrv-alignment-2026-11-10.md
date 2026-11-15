@@ -1,6 +1,6 @@
 # Handoff: fix the one-night misalignment in the HRV analysis
 
-**Status: executed 2026-11-11 — do not run again.** The rule now lives in `hrv_alignment.py` (see the "HRV alignment rule" bullet under Conventions in `AGENTS.md`; the KNOWN ISSUE bullet referred to below was replaced by it). Pre-fix results: `pds.hrv_analysis_results_pre_alignment_20261110`.
+Status: source-contract handoff; personal historical measurements are retained privately.
 
 Written 2026-11-10 for a Claude Code session with no memory of the session that found this. Read the "KNOWN ISSUE (confirmed 2026-11-10 ...)" bullet under Conventions in `AGENTS.md` first; this brief adds what that bullet does not say. The roadmap row is Notion task `414bf5b4-4bf2-81ee-a60a-f7775ae71ec7` (Critical); its Notes hold the raw evidence.
 
@@ -8,38 +8,11 @@ Written 2026-11-10 for a Claude Code session with no memory of the session that 
 
 Row D of `pds.daily_health_matrix_behavioral` holds the HRV of the sleep that CLOSES behavioral day D. The analysis takes the NEXT row's HRV as the outcome. So a day-D behaviour is scored against the sleep that closes day D+1: one night late.
 
-## History (why the old fix and the old test cannot be trusted)
+## Source contract and verification
 
-- 2026-04-04, commit `b0828fa`: introduced `shift(-1)` ("use next-night HRV as target"). Correct then, because the matrix dated the WHOOP cycle by wake day, so a row held the HRV Riley woke up with.
-- 2026-05-25, commits `165b879` and `a04d35e` (ADR-0001): the pipeline switched to the behavioral matrix, which dates the cycle by bedtime minus 6 hours. `shift(-1)` was left in place.
-- 2026-05-27: the re-audit flagged exactly this (gemini F-001, P0). It was marked DISPUTED because it contradicted the docs and `tests/test_phase2_alignment.py`, and it never became a task.
-- That test builds a synthetic, pre-aligned frame in the April layout and never reads the real matrix. It passes and catches nothing.
+The behavioral matrix row for day D contains HRV from the sleep closing D. A forecast for the next behavioral day must use the intended next-day outcome exactly once. Historical agreement between two derived joins does not establish the correct source-day mapping.
 
-This is not the April bug again, and the fix is not the April fix again. For most behaviour features it is the reverse.
-
-## Verified (do not re-derive)
-
-- All 717 matrix rows with HRV equal the recovery of the WHOOP main cycle dated to that row. Example: row 2026-11-06 = 68.7 ms = the cycle starting 2026-11-07 08:47Z (3:47 AM ET).
-- Outcome sites (line numbers approximate):
-
-  | File | What | Line |
-  |---|---|---|
-  | `hrv_analysis.py` | `df["hrv_next"] = df[TARGET].shift(-1)` (descriptive layer) | ~2361 |
-  | `hrv_analysis.py` | `prepare_ml_data`: `hrv_target_t{h} = TARGET.shift(-h)` | ~3106 |
-  | `hrv_analysis.py` | SARIMAX exog `shift(1)` | ~3546 |
-  | `hrv_analysis.py` | Prophet `hrv_target_t1` | ~3752 |
-  | `causal_inference.py` | `OUTCOME_COL`, `_build_outcome_frame` (`shift(-1)`) | ~107, ~974 |
-
-- Two features are already re-keyed to row D-1, so they line up under the current outcome: `merge_delivery_features` (~1322) and `workout_to_sleep_gap` (~2172, `pred_date = calendar_date - 1 day` at ~2215). The latter's docstring still describes wake-day dating, but `cycles.calendar_date` has been `onyx_behavioral_date` since ~722.
-- Effects sit on the same row: drinking days (n=6) -35 ms same-row vs -11.5 next-row; late delivered meal, raw, -7.3 vs -1.3. Small samples: a sanity anchor, not proof.
-- `pds.hrv_analysis_results` is upserted on `(result_type, result_key)` (~4770): every retrain overwrites every finding in place.
-- Live rows in `pds.hrv_predictions` are never regenerated; only `model_version = 'backtest_initial'` rows are rewritten by a retrain.
-
-## Suspected, not verified: check before designing the fix
-
-1. **WHOOP cycle-level columns may belong to the day AFTER the row.** The view takes `whoop_day_strain`, `whoop_kilojoule` and cycle HR from the same main cycle as the recovery (`sql/adr_0001_08_daily_health_matrix_behavioral.sql` ~175, ~247, ~272), and a WHOOP cycle is a sleep followed by the next waking day. If so, strain is correctly aligned today and a blanket switch to same-row HRV would make it reverse-causal.
-2. **The forecast.** `prepare_ml_data` keeps same-row `whoop_hrv_rmssd` as a feature on the assumption that it is "this morning's HRV, known at prediction time" (~3112). Under behavioral dating the newest row's HRV may not exist yet when `hrv_predict.py` predicts (it uses `X.iloc[[-1]]` at ~183 and labels the result `et_today() + 1` at ~217). Find out which sleep a stored prediction actually refers to, and whether the model's main input is NaN at serve time but filled in training.
-3. **Lags, rolling windows and confounders.** `*_lag1`, `hrv_7d_mean`, the training-load windows (~1846 onward) and the causal confounder set were designed for the old dating. Confounders must stay strictly before the treatment; same-sleep variables must stay out (they are mediators).
+Use explicit synthetic source timestamps around midnight and verify private production mappings separately. Keep original provider timestamps, source IDs and behavioral dates distinct; do not apply a second shift when the matrix already owns attribution. Inspect every downstream target, lag, backfill and chart consumer before changing the shared invariant.
 
 ## What to do
 
@@ -50,7 +23,7 @@ This is not the April bug again, and the fix is not the April fix again. For mos
 5. **Snapshot before retraining.** Save the current `pds.hrv_analysis_results` rows (correlation, journal/habit/supplement/nutrition impact, causal) to a file. The retrain overwrites them, so this is the only "before" copy. Baseline retrain: Actions run 42763606230.
 6. **Retrain in GitHub Actions** (`hrv-retrain-on-backfill.yml`; the local machine has no `.env`) and compare before and after: which findings strengthened, vanished or changed sign, and which survive FDR.
 7. **Wording and records.** Update `/analytics/hrv` (`HrvAnalysisClient.tsx` has about 38 "next-night" / "tomorrow" phrases), remove the KNOWN ISSUE bullet from `AGENTS.md` and correct the other passages there that describe the old alignment, set the Notion task to Done with notes, then commit and push.
-8. **Make the alignment a runtime guard, not only a test.** At the start of every retrain, check the assumption the pairing depends on: each matrix row's HRV is the recovery of the WHOOP main cycle whose sleep began at the end of that row's day. If it fails, stop the run and write a `failed` `hrv_analysis|retrain` heartbeat whose `error_message` starts with `GUARD alignment:`. Add a known-answer canary if one has enough data: a behaviour with a known direction should move same-night HRV more than the following night's; on a reversal write a `partial` heartbeat starting `GUARD canary-<name>:`. Alcohol has only 6 drinking days, so check the canary has power before relying on it; if nothing qualifies, ship the structural guard alone and say so. The `GUARD` prefix is a contract: the devops agent matches it (`personal-agents/agents/devops.md`, check 2) and tells Riley instead of re-running.
+3. **Make alignment a runtime guard.** Before retraining, verify the WHOOP main-cycle sleep-to-behavioral-day mapping. Stop on failure and write a failed `hrv_analysis|retrain` heartbeat beginning `GUARD alignment:`. A behavioral canary is optional and requires adequate private support; use `GUARD canary-<name>:` for a partial canary failure. If no canary qualifies, keep the structural guard. Preserve the `GUARD` prefix consumed by the devops agent.
 
 ## Constraints
 

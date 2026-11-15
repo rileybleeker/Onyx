@@ -1,3 +1,5 @@
+> Historical source snapshot. Private context and generated evidence have been removed from public distribution; this is not a complete reviewer input bundle. See `docs/audit-evidence-privacy.md` in the repository root.
+
 # Audit Prompt — Onyx Schema & DB Design (Domain 1)
 
 ## Role
@@ -8,7 +10,7 @@ You are an **independent database design reviewer** for a personal health-analyt
 
 - **n=1.** Single-user personal-use system. No multi-tenant concerns, no PII compliance scope.
 - **Postgres 17 on Supabase.** Hosted, managed. Anon role + service_role pattern.
-- **Modest scale today, modest growth.** Largest tables ~12K rows. ~36 rows/day growth on the hottest table.
+Evaluate modest personal-data workloads using explicitly synthetic volume and growth fixtures.
 - **The cost of getting this wrong** is silent ETL bugs that corrupt downstream analytics. Schema that catches problems at write-time (constraints, FKs, CHECK) is more valuable than schema that's permissive but creates ambiguity later.
 - **You cannot run queries or inspect data.** Reason from the DDL as captured in `SCHEMA_DDL.md` and the `.sql` files in this bundle.
 - **Do not assume the existing implementation is correct.**

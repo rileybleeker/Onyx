@@ -1,15 +1,13 @@
 # Experiment framework (N-of-1 trials): design
 
-Status (2026-11-13): Phase 1 is done and **corrects the trial length** (Section 7.6: 232 days gives 80% power for 8 ms only if HRV stays as calm as the last three months; on 2025-like noise it gives 41 to 53%). The first part of Phase 2 is built (Section 12.1): tables and lock guards, the allocation and analysis libraries, the `/today` arm card and the admin command that registers a trial; on 2026-11-14 the check-in adherence question and the daily report job with its heartbeat and `/status` card followed (their SQL file is not applied yet), then the Notion writer for "Onyx Experiments" and the A/A check protocol `docs/experiments/EXP-900.md` (defined, not seeded or registered; Section 12.2). **No trial is registered; every experiment table is empty.** Not built yet: a way to declare a pause ahead from the app, interim looks and the period design. Riley's decisions are in Section 13. The design numbers come from read-only queries on the live Supabase project on 2026-11-11 (Appendix A) and simulations on those aggregates (Appendix B); Section 7.6 comes from the built analysis run over real nightly HRV on 2026-11-13. No per-day personal rows are stored in this repo.
+Status: design and implementation reference. Personal calibration and empirical results are retained privately.
 
 Roadmap row: "Build experiment framework" (Tasks DB, `Source = "Onyx Roadmap"`).
 
 ## 1. Result first
 
 - An Onyx experiment is a randomized self-trial: each behavioral day gets arm A or arm B by a random schedule made before the trial starts, and the outcome is the HRV of the sleep that closes that day (the `hrv_alignment.py` same-night rule).
-- At today's HRV noise, the recommended design (daily randomization in 4-day blocks) needs about **232 days for an 8 ms effect, 596 days for 5 ms and about 1,650 days for 3 ms** (80% power, two-sided alpha 0.05, 18.9% missing nights). Designs that hold one arm for weeks at a time cost about four times more.
-- So the framework should only test treatments with a plausible effect of 8 ms or more, run one trial at a time, and Riley should wear the WHOOP every night: at 5% missing nights the 8 ms trial drops to about 184 days.
-- It sits next to the observational AIPW layer in `causal_inference.py`, it does not copy it. AIPW screens about 150 variables on history and suggests candidates; a trial answers one pre-registered question with randomization, so it does not depend on the confounder model being right.
+Choose a voluntary, reversible intervention with a prespecified meaningful effect and feasible burden. Estimate the required duration from private data before registration; do not claim a fixed duration is sufficiently powered for every person or treatment.
 
 ## 2. Why this is not the causal layer again
 
@@ -37,14 +35,14 @@ The randomization unit is the behavioral day D defined by ADR-0001 and `hrv_alig
 ### 4.1 Default: daily randomization in 4-day permuted blocks
 
 - Each block of 4 consecutive behavioral days gets one of the 6 orderings of two A days and two B days (AABB, ABAB, ABBA, BAAB, BABA, BBAA), chosen at random.
-- Why 4 days: every block is balanced, the block effect absorbs slow drift (HRV autocorrelation falls to about 0.1 by lag 4 in the current regime, Section 5), and yesterday's arm varies independently enough of today's arm that a carryover term can be estimated. In 2-day pairs the second night always follows the other arm, so a lingering effect cannot be separated and the estimate is biased (Section 7.4).
+- Four-day blocks balance assignment locally and help separate direct treatment effects from previous-day carryover. Two-day pairs can confound those effects; assess the registered estimator with synthetic allocation simulations.
 - Use for treatments that act within a day: evening caffeine cutoff, phone off in the last hour before bed, alcohol yes/no, a pre-bed supplement with a short half-life, evening workout or sauna.
 
 ### 4.2 Period design for slow treatments
 
 - For treatments that build up over days or weeks (creatine loading, an adaptogen, a training-block change): periods of P days per arm, two periods per block in random order (AB or BA), the first w days of every period discarded as washout.
 - Default P = 14 (two whole weeks, so each period has the same weekday mix), w from Section 5.
-- This design is about four times as expensive as 4.1 at equal effect size (Section 7.3). Only use it when the treatment cannot switch daily.
+- Use period assignment when daily switching is unsuitable. Estimate its duration and burden from private calibration before registration.
 
 ### 4.3 Allocation concealment
 
@@ -66,33 +64,24 @@ The whole schedule is generated before the start (the randomization test needs i
 
 - The 21:30 check-in (`/check-in`, `frontend/src/app/check-in/CheckInClient.tsx`, `/api/habits/checkin`) gets one extra question for an active trial: "Followed today's arm?" Yes / Partly / No, plus a note.
 - Stored in a dedicated table (proposed `pds.experiment_days`), **not** in `pds.habit_journal`. `habit_*` columns are auto-enumerated as treatments by `causal_inference.py` and ranked by Spearman, so an adherence habit would leak into the observational layer; a backdated answer would also fire the `habit_journal_backfill_trigger` retrain.
-- Objective adherence where Onyx can see it (Section 9): `pds.phone_usage_daily.minutes_last_hour_before_sleep_est` for a phone-before-bed trial, `pds.caffeine_timing_daily.last_caffeine_hour` for a caffeine cutoff, `pds.supplement_intake.intake_time` for a supplement, WHOOP / Garmin workouts (`is_sauna`, `had_evening_workout`) for exercise. Caffeine and supplements only qualify if logged in real time (today almost nothing is timed, Section 9).
+- Objective adherence can reuse screen-time, caffeine timing, supplement timing and workout sources where their semantics support the protocol. Untimed or retrospective logs do not establish intervention timing.
 
 ## 5. Washout from measured carryover
 
 ### 5.1 How long HRV itself remembers a night
 
-Autocorrelation of nightly WHOOP RMSSD at lag k (pairs of behavioral days k apart, Appendix A, query Q9):
-
-| Lag (days) | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 14 |
-|---|---|---|---|---|---|---|---|---|
-| 2025, stable year (≈355 pairs each) | 0.286 | 0.235 | 0.095 | 0.061 | 0.067 | 0.084 | 0.124 | 0.008 |
-| Last 90 days, current regime (49 to 63 pairs) | 0.476 | 0.344 | 0.206 | 0.114 | 0.089 | 0.129 | 0.039 | 0.277 |
-
-- The correlation falls below about 0.1 by lag 3 (2025) or lag 4 (current regime). The lag-14 value of 0.28 in the last 90 days is the downward drift inside that window (Section 11), not a two-week cycle.
-- Lag 7 is small (0.04 now, 0.12 in 2025), so there is no strong weekly cycle. The day-of-week means (deviation from a centred 15-day mean, last 365 days) range from -4.3 ms (Friday) to +6.3 ms (Sunday), within noise for about 50 nights each but cheap to adjust for, so day of week is a covariate rather than a design constraint.
-- If a treatment's effect travels through HRV's own persistence (an AR(1) state), a shock of b ms on night D would leave roughly rho^k x b on night D+k: with rho = 0.476 that is 48% the next night, 23% two nights later, 11% three nights later. This is an assumption, not a measurement; HRV persistence may come from slow states (fitness, stress, illness) that a single evening does not move.
+Estimate autocorrelation and seasonality from a pinned private baseline. Keep measured values private and report their uncertainty in the protocol. Do not choose washout solely from outcome autocorrelation.
 
 ### 5.2 Measuring a treatment's own carryover
 
-- In the 4-day block design the model includes yesterday's arm: `Y_D = block_D + b0*T_D + b1*T_(D-1) + dow_D + e_D`. Because the arms are randomized, `b1` is identified: it is the treatment's effect on the following night. Simulation (Section 7.4): with a +4 ms carryover this model returns 8.1 for a true 8 ms same-night effect, while 2-day pairs return 6.0.
+Estimate treatment carryover separately from residual outcome autocorrelation, using a prespecified method and an appropriate observation window.
 - From history (hypothesis only): the lag-1 version of a treatment column (`*_lag1`) in the observational layer gives a rough, confounded prior for b1.
 - For slow treatments, use pharmacology first (half-life, loading time) and the period design's discarded days.
 
 ### 5.3 Washout rule
 
 - Daily designs: no washout days; carryover is modelled (b1) and reported. If the pre-registered analysis finds |b1| larger than half the MID, the next trial of that treatment must use the period design.
-- Period designs: w = max(pharmacological washout, smallest lag where the outcome autocorrelation is below 0.1 in the current regime) = at least 3 to 4 days with today's numbers. Recompute at registration with query Q9.
+Choose the washout from treatment carryover uncertainty, biological plausibility and burden; register the rule before revealing outcomes.
 
 ## 6. Pre-registered hypotheses
 
@@ -105,8 +94,8 @@ id: EXP-001
 title: Phone off in the last hour before bed
 status: registered            # draft -> registered -> running -> paused | stopped_early | complete
 registered: 2026-12-01
-start: 2026-12-03             # first behavioral day
-planned_end: 2027-07-22       # start + n_days - 1
+start: "<first-behavioral-day>"
+planned_end: "<start-plus-n_days-minus-one>"
 question: Does no phone use in the 60 min before sleep raise same-night HRV?
 arms:
   A: no phone in the 60 min before sleep onset
@@ -122,13 +111,13 @@ direction: A > B (tested two-sided)
 mid_ms: 8                     # minimal important difference
 design:
   type: daily_4day_permuted_blocks
-  n_blocks: 58
-  n_days: 232
+  n_blocks: "<chosen-before-registration>"
+  n_days: "<four-times-n_blocks>"
   washout_days: 0
-power_inputs:                 # from Appendix A queries on the registration date
-  sigma_ms: 21.4
-  rho_lag1: 0.476
-  missing_rate: 0.189
+power_inputs:                 # placeholders; populate privately before registration
+  sigma_ms: "<private-baseline-estimate>"
+  rho_lag1: "<private-baseline-estimate>"
+  missing_rate: "<private-baseline-estimate>"
 allocation:
   generator: numpy PCG64 (numpy 2.x pinned)
   seed_sha256: <hex>
@@ -160,30 +149,9 @@ The file the code reads is `docs/experiments/TEMPLATE.md` (built 2026-11-13). It
 3. **Notion**: the experiment page carries the same hash (Section 10).
 4. **Amendments**: a new file `EXP-NNN-amend-1.md`, merged before any interim result is seen, listed in the final report. The original never changes.
 
-## 7. Power with live numbers
+## 7. Power and private calibration
 
-### 7.1 Inputs (live, read-only, 2026-11-11)
-
-From `pds.daily_health_matrix_behavioral.whoop_hrv_rmssd` (row D = sleep closing day D). Missing = spine days in the window with no WHOOP HRV.
-
-| Window | HRV nights | Mean (ms) | SD (ms) | Lag-1 r | Lag-7 r | Missing |
-|---|---|---|---|---|---|---|
-| Last 90 days (2026-08-13 to 11-10), **current regime** | 73 | 70.8 | 21.4 | 0.476 | 0.039 | 18.9% |
-| Since 2026-09-01 | 58 | 66.4 | 20.2 | 0.377 | n/a | 18.3% |
-| Last 180 days | 161 | 88.5 | 32.0 | 0.623 | 0.326 | 10.6% |
-| Last 365 days | 340 | 114.4 | 41.1 | 0.585 | 0.494 | 6.8% |
-| 2025 (stable year) | 363 | 123.7 | 32.8 | 0.286 | 0.124 | 0.5% |
-| All (2024-10-27 to 2026-11-10) | 719 | n/a | 36.9 | 0.458 | 0.327 | 3.5% |
-
-Supporting numbers (Appendix A):
-
-- SD of the difference between adjacent nights: 20.9 ms (last 90 days), 21.5 (since Sep 1), 27.8 (last 180), 37.2 (last 365). This is the noise a paired comparison actually faces; it matches the AR(1) prediction `sigma*sqrt(2(1-rho))` = 21.9 ms for the last 90 days.
-- After removing a centred 15-day mean: SD 18.0 ms and lag-1 r 0.20 (last 90 days); 22.4 / 0.22 (last 180). That is roughly what a short block absorbs.
-- Log scale, last 90 days: SD of ln(HRV) 0.329, lag-1 r 0.381.
-- Missing nights in the last 365 days: 25 in 16 gaps, 11 of them single nights, longest 4 nights. Missingness by month: Aug 16.1%, Sep 23.3%, Oct 19.4%, Nov (10 days) 0%.
-
-The power table uses the current regime because that is what a trial starting now will face. Sets B (last 180 days) and C (2025) show how much the answer moves.
-
+Estimate outcome variance, autocorrelation, day-of-week structure, missingness and adherence from an appropriate private baseline. Record the data window and assumptions privately. Public examples must use declared synthetic inputs.
 ### 7.2 Formulas
 
 ```
@@ -202,97 +170,11 @@ sigma = daily SD, rho1 = lag-1 autocorrelation, m = missing-night rate,
 delta = effect in ms, P = period length, w = washout days per period
 ```
 
-The effective-n formula describes contiguous same-arm days: with rho1 = 0.476 each observed night is worth 0.355 independent nights (0.555 in 2025). Daily randomization turns the same autocorrelation into an advantage, because adjacent nights in different arms share the slow part of the noise.
+The effective-n formula describes contiguous same-arm observations. Randomized neighboring assignments can share slow noise while differing in treatment. Estimate the actual precision with the registered allocation and analysis; do not transfer an empirical result from another baseline.
 
-### 7.3 Days needed at 80% power (alpha 0.05, two-sided)
+### 7.3 Planning and simulation
 
-Set A, current regime (sigma 21.4 ms, rho1 0.476, m 18.9%; AR(1) inflation (1+rho)/(1-rho) = 2.82):
-
-| Effect | i.i.d. days per arm (no autocorrelation, no missing) | 14-day periods, 2-day washout (AR(1) effective n) | 2-day pairs (formula, assumes no carryover) | **4-day permuted blocks + carryover term (simulated, recommended)** |
-|---|---|---|---|---|
-| 3 ms (~4% of current mean) | 799 | 6,474 | 1,273 | **~1,650** |
-| 5 ms (~7%) | 288 | 2,331 | 459 | **~596** |
-| 8 ms (~11%) | 112 | 911 | 179 | **~232** |
-
-Total calendar days, both arms, including missing nights and washout. Percentages are of the last-90-day mean (70.8 ms). The 4-day column is the n at which simulated power reached 0.80 (found at 8 ms, scaled by 1/delta^2 for 5 and 3 ms, then re-checked: Section 7.4); it costs about 30% more than pairs because it estimates carryover instead of assuming it away.
-
-Sets B and C, formula columns only:
-
-| Effect | B (last 180 d: sigma 32.0, rho1 0.623, m 10.6%) periods / pairs | C (2025: sigma 32.8, rho1 0.286, m 0.5%) periods / pairs |
-|---|---|---|
-| 3 ms | 20,068 / 1,685 | 7,926 / 2,707 |
-| 5 ms | 7,225 / 607 | 2,853 / 974 |
-| 8 ms | 2,822 / 237 | 1,115 / 381 |
-
-Plain reading: a 3 ms effect cannot be shown in a single N-of-1 trial in any reasonable time. 8 ms is about eight months with the recommended design. In ms terms the 2025 regime was harder (higher SD at a higher HRV level); if effects scale with the HRV level, the log-scale sensitivity analysis is the fairer comparison across regimes.
-
-For context on plausible sizes: the largest same-night difference visible in the data is alcohol, -35 ms (mean 93.7 vs 128.9 ms), from only 6 WHOOP-era "Yes" nights against 300 "No" nights, unadjusted.
-
-### 7.4 Simulation check (Appendix B)
-
-AR(1) noise with the set-A numbers, missing nights at random, analysed exactly as planned:
-
-| Check | Result |
-|---|---|
-| 2-day pairs at the formula's n (3 / 5 / 8 ms) | power 0.783 / 0.793 / 0.785, estimates 2.97 / 5.01 / 8.02 |
-| 14-day periods at the formula's n (5 / 8 ms) | power 0.876 / 0.857: the effective-n formula is conservative by 10 to 15% here |
-| 4-day blocks + carryover term at 232 / 596 / 1,652 days (8 / 5 / 3 ms) | power 0.800 / 0.801 / 0.815, estimates 7.99 / 4.96 / 3.01 |
-| Effect lingers +4 ms into the next night (8 ms design) | pairs: estimate 6.0, power 0.54 (biased); 4-day blocks + carryover term: estimate 8.1, power 0.80 |
-| Effect reverses -4 ms the next night | pairs: estimate 10.0 (biased the other way) |
-| No effect (type I error), 2-day pairs | t-test 0.049, sign-flip randomization test 0.053 |
-| No effect, 4-day blocks | plain OLS t-test 0.061 (slightly liberal: residuals stay autocorrelated inside a block); randomization test 0.043 with power 0.78 at 232 days |
-| Random-walk drift 1.5 ms/day added (pairs, 8 ms) | power 0.781, estimate 8.01: blocks absorb drift |
-| Missing nights 5% / 0% (4-day blocks, 8 ms) | about 184 / 172 days instead of 232 |
-
-Monte-Carlo error: about ±0.006 to ±0.014 on power for 4,000 to 800 replications; on the 300-replication randomization-test runs about ±0.013 on the type I error and ±0.024 on power.
-
-### 7.5 What shortens a trial
-
-1. **Wear the WHOOP every night.** 18.9% missing nights cost about 50 extra days on an 8 ms trial. This is the cheapest lever.
-2. Larger effects: pick treatments with a plausible 8 ms or more.
-3. Covariates measured before the treatment (last night's HRV, 7-day mean) may shrink the residual. Not quantified yet; Phase 1 measures it on real data.
-4. One trial at a time. Two concurrent trials need a factorial design registered up front.
-
-### 7.6 Phase 1: the planned analysis on real history (2026-11-13)
-
-What was run: nightly WHOOP HRV for 2024-12-18 to 2026-11-12 (695 behavioral days, 668 nights) was read once, read-only, into a scratch folder outside the repo. Placebo schedules from `experiment_design.generate_schedule` (random arms that change nothing) were laid over it and analysed by `experiment_analysis.randomization_analysis`, the code a real trial will use (block effects + arm + yesterday's arm + weekday, randomization test with 499 re-draws). A planted effect was added to the real nights to measure power. Only the aggregates below left the scratch folder.
-
-Three non-overlapping 232-day windows (2,000 placebo trials for the error rate, 1,000 for power):
-
-| Window | Nights | Mean / SD (ms) | False-positive rate, randomization test | Same, HAC z-test | Chance SD of the estimate (ms) | Power at +8 ms | Estimate with +8 planted | With +8 and +4 carryover: b0 / b1 |
-|---|---|---|---|---|---|---|---|---|
-| 2024-12-18 to 2025-08-06 | 231 / 232 | 124.7 / 31.7 | 0.045 | 0.037 | 3.73 | 0.53 | 7.91 | 8.20 / 4.39 |
-| 2025-08-07 to 2026-03-26 | 229 / 232 | 128.3 / 35.1 | 0.057 | 0.045 | 4.70 | 0.41 | 7.94 | 8.27 / 4.07 |
-| 2026-03-26 to 2026-11-12 (includes the level shift) | 209 / 232 | 99.9 / 39.5 | 0.046 | 0.029 | 3.77 | 0.51 | 7.94 | 7.76 / 3.09 |
-
-Trailing windows ending 2026-11-12 (1,500 placebo trials each). "Days needed" = window length x (chance SD x 2.8016 / 8)^2, the length at which an 8 ms effect has 80% power if the noise stays like that window:
-
-| Window | Nights | Mean / SD (ms) | Chance SD of the estimate (ms) | Days needed for 8 ms |
-|---|---|---|---|---|
-| Last 92 days (the "current regime" of Section 7.1) | 74 / 92 | 70.9 / 21.2 | 4.10 at 92 days | **190** |
-| Last 120 days | 101 / 120 | 78.9 / 26.3 | 4.11 at 120 days | 249 |
-| Last 180 days | 160 / 180 | 87.3 / 30.2 | 3.63 at 180 days | 291 |
-| Last 232 days | 209 / 232 | 99.9 / 39.5 | 3.87 at 232 days | 425 |
-| For comparison, the two 2025-era windows above | | | 3.73 and 4.70 at 232 days | 396 and 628 |
-
-On the last 92 days alone the false-positive rate was 0.046 and a 92-day trial had power 0.42 for 8 ms.
-
-What this confirms:
-
-- **The test is valid on real HRV.** False-positive rates of 0.045 to 0.057 against a nominal 0.05 (one standard error is 0.005). The HAC z-test is conservative (0.029 to 0.045), so it stays a cross-check only.
-- **The estimate is unbiased, and the carryover term works on real nights**: a planted 8 ms comes back as 7.9, and with a 4 ms carryover as 7.8 to 8.3 with b1 3.1 to 4.4.
-- **The 232-day figure of Section 7.3 matches the calm regime it was planned on**: the last 92 days say about 190 days, the AR(1) simulation said 232. One 92-day window cannot separate those two.
-
-What this corrects:
-
-- **232 days is enough only if HRV stays as calm as it has been since mid-August 2026 (SD about 21 ms).** Over any 232-day stretch of the last two years the same trial would have had 41 to 53% power for 8 ms, not 80%, because nightly SD was 32 to 40 ms; 80% would have needed about 400 to 630 days. Section 7.3's set C already pointed this way (381 days for pairs in 2025); this run measures it with the real analysis.
-- **In relative terms the design is stable.** On the log scale the chance SD at 232 days is 0.033 / 0.037 / 0.040 in the three windows, so 232 days detects a change of about 10 to 12% of the current HRV level in every regime. 8 ms is 11% of today's 71 ms but 6.5% of 2025's 124 ms. If HRV climbs back toward its 2025 level during a trial, a fixed 8 ms effect gets harder to see; if effects scale with the level, the pre-registered ln(HRV) sensitivity analysis is the one that keeps its power.
-- **Covariates are not worth adding to the primary model.** The mean of the previous 7 nights cut the chance SD by 6.1%, 6.7% and 3.3% in the three windows (about 6 to 13% fewer days). Last night's HRV changed it by -1.9%, +3.7% and +4.0% and costs the nights that follow a missing night (196 instead of 209 usable in the latest window). Both stay pre-registered sensitivity analyses (Section 8).
-
-Consequence for the first protocol (Riley's call at registration, Section 13): either register 232 days knowing the 80% holds only while the calm regime lasts, or plan the length from a longer window. `experiment_admin.py power --window N` repeats this check on the latest N days at any time before a trial is registered (it refuses once one is active, because that would be an unregistered look at the outcome).
-
-Not checked here: placebo runs cannot show whether a real treatment's effect is additive in ms or proportional, and three windows are three samples of history, not a forecast of the next eight months.
-
+Use the formulas above for an initial duration estimate, then simulate the actual blocked allocation, missingness, carryover and registered analysis. Examine false-positive rate, interval coverage, power and sensitivity to misspecified carryover. Keep personal calibration inputs and result tables private. Trial duration is chosen before the experiment, not extended until significance appears.
 ## 8. Analysis plan
 
 - **Estimand**: intention-to-treat difference between arms in the HRV of the sleep that closes the day (b0). Secondary: b1 (next night) and b0 + b1.
@@ -306,24 +188,9 @@ Not checked here: placebo runs cannot show whether a real treatment's effect is 
 
 Relation to the observational pipeline: trial days stay in the matrix and keep feeding `hrv_analysis.py` and `causal_inference.py` as ordinary history (randomized variation helps them). The arm indicator is not added to the matrix as a feature, so it never becomes another auto-enumerated treatment. Phase 4 adds one comparison row per finished trial (trial estimate vs the AIPW estimate for the same variable on non-trial days).
 
-## 9. Treatment and adherence data Onyx already has
+## 9. Treatment and adherence sources
 
-Coverage over the last 90 behavioral days (2026-08-13 to 2026-11-10) unless noted (Appendix A, Q10 to Q14):
-
-| Stream | Tables / views | Coverage | As a treatment | As an adherence check |
-|---|---|---|---|---|
-| Outcome: WHOOP HRV | `pds.daily_health_matrix_behavioral.whoop_hrv_rmssd` | 73 / 90 nights | primary outcome | n/a |
-| Second sensor: Eight Sleep HRV | `eight_sleep_hrv` (matrix, re-keyed one day earlier) | covered all 17 nights WHOOP missed; r = 0.81 with WHOOP on the same sleep | secondary outcome only | n/a |
-| Habits / check-in | `pds.habit_journal` via `pds.journal` | 3 days (check-in launched 2026-11-07; nothing logged 2026-07-20 to 11-06) | yes (explicit Yes / No) | self-report only; do not store trial adherence here (Section 4.5) |
-| Supplements | `pds.supplement_intake`, `supplement_intake_by_compound`, `daily_supplement_matrix` | 90 / 90 days, 1,745 intakes, 15 products; 84.8% from stacks, 0.3% with a clock time | yes | only once doses are tapped in real time |
-| Caffeine | `pds.caffeine_events`, `pds.caffeine_timing_daily` | 88 / 90 days with mg > 0 (mean 51 mg/day, all from supplements, no dietary); 1 / 90 days with a timing value | dose yes; a cutoff only once timed | same |
-| Nutrition and meal timing | `pds.cronometer_nutrition_behavioral_daily`, `pds.meal_timing_from_cronometer` | 0 / 90 (last Cronometer day 2026-06-29) | not until logging resumes | no |
-| Screen time | `pds.phone_usage_daily` (Screen Time app, since 2026-10-11) | 31 / 90 days (32 total), 27 with pre-bed minutes | yes | yes, objective |
-| Workouts, sauna | `pds.whoop_workouts`, `pds.garmin_activities` (`is_sauna`), matrix `had_evening_workout` | not counted for this doc | yes | yes, objective |
-| Travel | `pds.flight_day_unified.flew`, matrix `onyx_is_transition_day` | last 365 days: 35 flight days, 14 transition days | exclusion rule | n/a |
-
-Best first candidates with objective adherence today: phone use in the last hour before bed (Screen Time), evening workout or sauna (device-logged). Caffeine and supplement trials need real-time logging first.
-
+Reuse the existing check-in, habits, supplement and screen-time sources where their timestamp and completion semantics support the registered protocol. Missing observations are unknown, not automatic nonadherence. Confirm source coverage privately before enrolling a trial; do not publish personal historical coverage counts.
 ## 10. Auto-report to Notion, heartbeat and /status
 
 ### 10.1 Target
@@ -369,15 +236,15 @@ Per the AGENTS.md three-place rule, in the same commit as the report job:
 
 ## 11. Threats to validity
 
-- **The HRV level shift.** WHOOP HRV by quarter: 2025 Q1 129.6, Q2 126.7, Q3 115.3, Q4 123.6; 2026 Q1 140.1, Q2 124.0, Q3 86.2, Q4 (to Nov 10) 68.1 ms. The independent Eight Sleep sensor moved the same way (2026 Q1 144.2 to Q4 70.9) and WHOOP resting HR rose from 46.9 to 57.3 bpm, so the decline looks physiological rather than a WHOOP-only artefact, as far as these aggregates show. Effects: use current-regime numbers for power; blocks absorb slow drift; a further shift mid-trial keeps the randomization test valid but costs power; if effects scale with the level, the log-scale analysis is the fairer one.
+- **Outcome drift.** Re-estimate power from an appropriate private baseline. Blocks can absorb slow drift, while changes in scale or variability may reduce power; prespecify a log-scale sensitivity analysis when appropriate.
 - **Seasonality.** 2025 quarterly means varied by about 14 ms. Short blocks absorb it; 14-day periods are paired inside 28-day blocks for the same reason.
-- **Travel and time zones.** The behavioral day follows the local TZ (`pds.tz_for_instant`, `pds.user_tz_log`), so the arm and the outcome stay on the same night when travelling. Flight and transition days (35 and 14 in the last year) disturb sleep; blocks containing them are excluded as a whole, decided before looking at HRV. Riley can also declare a travel pause in advance.
+- **Travel and time zones.** Use the local behavioral-day mapping. Prespecify exclusion of whole travel/transition blocks before seeing outcomes, and allow an advance travel pause.
 - **Device changes.** Onyx stores no WHOOP hardware or firmware version (the only device-state field found is `whoop_recovery.user_calibrating`). The protocol records the device in use; a strap or firmware change during a trial is logged in the report and the trial is split at that date in a sensitivity analysis.
-- **Garmin wear gaps.** Garmin HRV nights in the matrix: 64 in 2025 Q1, 8 in 2026 Q2, 1 in Q3, 0 in Q4. Garmin cannot be a backup outcome, and its HRV is a different measurement anyway. Eight Sleep is the only practical second sensor.
+- **Wearable coverage.** Check missingness privately before choosing a secondary sensor. Different devices measure different quantities and must not silently substitute for the registered outcome.
 - **Missing nights that depend on the arm** (for example not wearing the strap after drinking). Checked by the missingness comparison in Section 8.
 - **Carryover.** Modelled in daily designs (b1); washout in period designs (Section 5).
 - **Expectancy and co-interventions.** Open-label arms can change other behaviour (earlier bedtime on the "good" arm). Co-interventions to hold steady are listed in the protocol, and bedtime is a reported secondary variable. Note that changes in sleep caused by the treatment are part of the effect (total effect, as in the causal layer), not bias.
-- **Adherence evidence.** Supplement logs in the last 90 days are 84.8% stack-generated and 0.3% timed, so they show what was planned, not when it was taken. Supplement and caffeine trials need real-time taps.
+- **Adherence evidence.** Planned stack entries and untimed logs do not prove ingestion time. Timing interventions need reliable real-time capture or must be redesigned.
 - **Analysis drift.** A change to `hrv_alignment.py` or the matrix during a trial is caught by the alignment-version guard.
 
 ## 12. Phased rollout
@@ -423,21 +290,12 @@ Before step 1, once: apply `sql/experiment_adherence_reports_schema.sql` (the ch
 
 Built on 2026-11-14: (a) the "Followed today's arm?" question on `/check-in`; (b) the daily report job with `pds.experiment_reports`, the `experiments|report` heartbeat, the `/status` card and the two `GUARD` checks of Section 10.4; (c) the Notion writer for "Onyx Experiments"; (d) exclusions from flight / transition days and declared pauses wired into the final report; (f) the 4-week A/A check, as a protocol and a verdict in the report (Section 12.2; running it is Riley's step). Left for the next PRs: a way to declare a pause ahead from the app (the report already honours `excluded` rows declared before their block); (e) interim looks and the period design, only if a protocol needs them.
 
-### 12.2 The A/A check (EXP-900)
+### 12.2 The A/A check
 
-Phase 2's last item: a 4-week trial whose two arms are the same instruction ("usual day and evening"), so the framework is run end to end with nothing to find. Any significant difference it reports is a false effect.
-
-- **Protocol:** `docs/experiments/EXP-900.md`, `kind: aa`, 7 blocks of 4 days (28 days), self-report adherence only, the registered analysis unchanged (alpha 0.05, 10,000 re-draws). Real trials count up from EXP-001; A/A checks use EXP-900 and up. Dates proposed: 2026-11-30 to 2026-12-27 (move both if it is seeded later; `planned_end` = `start` + 27).
-- **Rules** (`experiment_design.validate_protocol`): `kind` is `treatment` (default) or `aa`; an A/A check must have identical arms and no `adherence.objective` rule (a device check on one arm would make the arms differ); a treatment trial must have two different arms. So neither can be registered as the other by mistake.
-- **Verdict** (`experiment_report.aa_check`, key `aa_check` of the final report, first line of the Notion report): passed when all of Phase 2's "done when" items hold: (1) no false effect: randomization p at least alpha; (2) every trial day was revealed on Today (`first_revealed_at`); (3) 90% or more of the days have a check-in answer (26 of 28). Report re-runs being idempotent is covered by the tests and by the final report being written once. A check that does not pass turns that run's heartbeat `partial`, naming the failed items only (no number about Riley). By chance alone about 1 run in 20 fails item 1 even when everything works, so one failure means "look at the pipeline", not "it is broken". The decision line will normally read Inconclusive: four weeks cannot rule an 8 ms effect in or out, and that is not what the check is for. `aa_check` is one of the effect keys the report table's guard refuses in a progress row.
-- **Evidence (synthetic, not run before merge per AGENTS.md):** `tests/test_experiment_report.py` runs 300 synthetic A/A trials of this shape on AR(1) noise at the live SD 21.4 ms, lag-1 r 0.476 and 19% missing nights and requires a false-positive rate between 1% and 9%; an A/A store with the arm leaked into the outcome must fail the check.
-- **How Riley runs it** (after the SQL file and the schedule PR, Section 12.1): (1) `gh workflow run experiment-admin.yml -f action=seed -f protocol=docs/experiments/EXP-900.md`, paste the printed `seed_sha256` into the file (and move the dates if needed); (2) merge that change at least a day before `start`; (3) `gh workflow run experiment-admin.yml -f action=register -f protocol=docs/experiments/EXP-900.md -f confirm=EXP-900`; (4) for 28 days open Today once a day and answer the check-in question; (5) two days after the last day the report job writes the verdict. One trial is active at a time, so EXP-001 is registered after EXP-900 is complete.
-
-An admin command fails in front of whoever ran it and leaves an `experiments|admin` heartbeat in the sync history. The `/status` card reports the report job's `experiments|report` heartbeat; it reads Unknown until the scheduled workflow has run once.
-
+An A/A protocol checks allocation, concealment, reporting and adherence plumbing without an active treatment difference. It does not validate clinical efficacy or guarantee power. Preserve private run status and results outside the public repository.
 ## 13. Decisions (Riley, 2026-11-11)
 
-1. **Effect size and length.** Only trial treatments with a plausible effect of 8 ms or more, and accept that one trial takes about 8 months (232 days at today's noise and missing-night rate, Section 7). Analyze only at the pre-registered end; interim looks follow the stopping boundary in the protocol, never an ad hoc peek.
+1. **Trial duration:** choose a feasible duration before registration using private calibration and sensitivity analysis. The registered plan controls the end date; do not treat a draft duration as evidence of sufficient power.
 2. **Wear the WHOOP every night during a trial.** Missed nights add about 50 days (about 184 days at 5% missing instead of 232 at 18.9%, Section 1).
 3. **First treatment: phone off in the last hour before bed.** Adherence is verified from Screen Time (`pds.phone_usage_daily.minutes_last_hour_before_sleep_est`, Section 9). Planning input from the observational layer, retrain run 43142943594 (2026-11-12 02:51 UTC), AIPW treatment `journal_viewed_a_screen_device_in_bed` (screen in bed, yes vs no): **AIPW +13.2 ms** (influence-function 95% CI -14.7 to +41.1, block-bootstrap CI -27.0 to +56.5, raw p 0.50, not FDR-significant, 185 treated vs 69 control days), against naive +3.0 ms and PSM +5.9 ms. Positive means higher HRV on nights with a screen in bed, so the sign is the opposite of the trial hypothesis and the interval is wider than the effect. It is a reason to test the treatment, not an estimate of it. The same run flagged 23 of 121 causal rows implausible; this one was not flagged.
 4. **Notion database: created now.** "Onyx Experiments" exists under Project Onyx with the fields in Section 10.1 and no rows (URL and ids in Section 10.1). Rows appear when the first protocol is registered.
@@ -445,13 +303,13 @@ An admin command fails in front of whoever ran it and leaves an `experiments|adm
 
 Still open: the check-in adherence question, the report job and the protocol file for EXP-001 (Section 12.1). None of these decisions changes the design in Sections 4 to 11.
 
-**Open question for decision 1 (raised by Phase 1, 2026-11-13).** "About 8 months" was sized on the last three months of HRV. Section 7.6 shows the same 232 days would have had 41 to 53% power in any earlier stretch. Before EXP-001 is registered Riley should choose: 232 days as decided (cheapest, but a null result would be weak evidence if HRV gets noisier again), or a longer trial sized from a longer window (about 250 to 290 days from the last 120 to 180 days; about 400 or more from a full year).
+**Duration decision.** Before registration, choose a feasible duration using private baseline sensitivity analysis. A short trial may be unable to distinguish a meaningful effect from noise; document that tradeoff before allocation.
 
 ## 14. What this doc does not prove
 
-- The power numbers assume AR(1) noise with the measured SD and lag-1 correlation and missing nights at random. Real HRV has a slow drift component (lag-14 r 0.28 in the last 90 days) and clustered gaps; Phase 1 checks the plan on real history.
+- Power calculations depend on the assumed noise, carryover and missingness process. Examine drift and clustered missingness privately and through synthetic sensitivity simulations.
 - The 3 / 5 / 8 ms effect sizes are planning values, not estimates of any real treatment. The alcohol difference quoted is unadjusted and rests on 6 nights.
-- The "physiological, not device" reading of the 2026 HRV decline rests on two other aggregates (Eight Sleep HRV, WHOOP RHR), not on device logs.
+- Agreement between sensors alone does not identify a physiological cause. Avoid causal or medical interpretations of observational aggregate changes.
 - Built but not proven in production (2026-11-13): no trial has been registered, so `experiment-admin.yml` has never run, the `/today` card has only been tested against synthetic answers, and `pds.experiment_today()` has returned an arm only inside a rolled-back test block. The Notion writer does not exist yet.
 - Built but not proven (2026-11-14): `sql/experiment_adherence_reports_schema.sql` has not been applied, so the check-in question and the report table have never touched a database; `experiment_report.py` has run only against an in-memory store, and the report workflow does not exist until Riley adds it.
 - Built but not proven (2026-11-14, Notion writer and A/A check): `experiment_notion.py` has only written to an in-memory Notion; that the integration behind `NOTION_API_KEY` can write to "Onyx Experiments" is shown only by the first real write (a 403 / 404 says so in the heartbeat). EXP-900 is defined, not seeded or registered, so no A/A result exists. Its tests were written but not run before merge (AGENTS.md "Read this first").
@@ -742,11 +600,4 @@ SELECT
 
 ## Appendix B: simulation method
 
-Run locally on 2026-11-11 with the repo's analysis environment (numpy 2.4, scipy 1.18, statsmodels 0.14) from the aggregate inputs in Section 7.1 only; no rows were downloaded and the scripts are not in the repo.
-
-- Noise: AR(1), `e_D = rho*e_(D-1) + sqrt(1 - rho^2)*sigma*u_D`, with sigma 21.4 ms and rho 0.476 (set A). Optional random-walk drift of 1.5 ms per day.
-- Treatment: `Y_D = e_D + delta*T_D + c*T_(D-1)`, c = carryover (0, +4 or -4 ms).
-- Missing nights: independent, rate 18.9% (also 5% and 0%).
-- Designs: 2-day pairs (random order); 4-day blocks drawn uniformly from the 6 orderings of AABB; 14-day periods in random AB / BA order with the first 2 days of each period discarded.
-- Analysis: pairs, one-sample t-test or sign-flip randomization test (999 flips) on complete pairs; 4-day blocks, OLS with block fixed effects (within-block demeaning) on `T_D` and `T_(D-1)` with a t-test, or a randomization test re-drawing the block orderings (199 draws); periods, mean of kept nights per period, paired by block, one-sample t-test.
-- Replications: 4,000 (formula checks), 2,000 to 800 (4-day calibration at 232 / 596 / 1,652 days), 600 (sign-flip), 300 (block re-draw randomization test).
+Generate synthetic outcomes with explicit variance, autocorrelation, seasonality and carryover assumptions. Apply the registered allocation and estimator across repeated simulations. Vary assumptions and report type-I error and power. Personal calibration and its output belong in private evidence; they must not be embedded in this public method description.

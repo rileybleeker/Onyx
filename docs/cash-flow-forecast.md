@@ -306,25 +306,9 @@ needs a round trip and never reads the raw ledger in the browser.
 - The job writes a `finance_forecast|snapshot` heartbeat on every run, and `/status` gets a Cash Forecast card
   (the "every integration on /status" rule).
 
-### 9.1 Backtest results (2026-11-14, `cash-forecast-backtest.yml`)
+### Private ledger validation
 
-64 weekly as-of dates (about 18 months back to 13 weeks back), 4 cash accounts. Errors are a share of one month
-of the pool's outflows; positive = forecast too high.
-
-| Engine version | Horizon | Median abs. error | Mean error | Actual below low band | Actual above high band |
-|---|---|---|---|---|---|
-| First run | 1 / 4 / 13 weeks | 15% / 18% / 58% | +4% / +15% / +54% | 31% / 38% / 63% | 16% / 2% / 0% |
-| Card payments as monthly totals, large outflows and ignored rows kept | 1 / 4 / 13 weeks | 14% / 13% / 31% | -7% / -8% / -16% | 11% / 9% / 8% | 23% / 11% / 6% |
-| + unpaired card payments per payee, 6-month card window | 1 / 4 / 13 weeks | 16% / 17% / 31% | -6% / -5% / -10% | 14% / 13% / 8% | 20% / 9% / 2% |
-| + paychecks grouped despite changing bank references (live 2026-11-14) | 1 / 4 / 13 weeks | 14% / 17% / 32% | -6% / -1% / +2% | 13% / 16% / 14% | 19% / 6% / 2% |
-
-What changed between the two: (1) card payments are the card's monthly total paid (mean of the last 3 months),
-not one payment a month, because cards are often paid several times a month; (2) only unusually large money IN
-is left out of the everyday baseline, large money out stays in (asymmetric caution); (3) rows the budget marks as
-ignored are counted, because they still moved cash. The bands now cover about 80% of outcomes, as designed. The
-remaining bias is conservative: irregular deposits and transfers in from other accounts are not forecast (13-week
-breakdown: money in 167% forecast vs 233% actual), which is the intended direction. Card payments are still
-under-projected at 13 weeks (162% vs 245%); payments to cards with no card-side rows fall into the baseline.
+Historical backtests and account-coverage measurements belong in private evidence. Run the evaluation procedure above against a pinned window, record calibration and failure cases privately, and publish only synthetic illustrations. Do not interpret the absence of public result tables as a validation result.
 
 ## 10. Architecture (follows the existing finance pattern)
 

@@ -1,7 +1,7 @@
 # Kindle harvester
 
 Turns Kindle reading into Onyx `/reading` data with nothing to type. For each book in
-`books.json` it opens the book in **Kindle for Web** (read.amazon.com) inside a signed-in Chrome
+the private `~/.onyx_kindle_books.json` (or ignored legacy `books.json`) it opens the book in **Kindle for Web** (read.amazon.com) inside a signed-in Chrome
 profile and intercepts what the reader fetches:
 
 | Captured | Used for |
@@ -24,6 +24,12 @@ harvester in `browse-proxy/local/`. It needs a real Chrome with a signed-in Amaz
 which is why it does not run in GitHub Actions.
 
 ## One-time setup
+
+Copy `books.example.json` to `~/.onyx_kindle_books.json`, set your app URL and
+private book mappings there. The home file takes precedence over the ignored
+legacy `books.json`; preserve an existing local config before updating a checkout.
+Never commit reading targets. An invalid private config fails visibly rather
+than falling back to stale targets.
 
 ```powershell
 cd C:\Users\riley\Onyx\tools\kindle_harvest
@@ -52,8 +58,8 @@ run missed during sleep, which left the heartbeat 32 h stale.)
 ## Adding a book
 
 1. Create the `pds.books` row (slug, total_chapters, dates, Notion page, habit name).
-2. Add `{ "slug", "asin", "titleMatch" }` to `books.json`. The ASIN is in the Kindle store URL
-   (`/dp/B0DFD2C9F9`) and is the element id of the book in read.amazon.com/notebook; it is optional
+2. Add `{ "slug", "asin", "titleMatch" }` to `~/.onyx_kindle_books.json`. The ASIN is in the Kindle store URL
+   (`/dp/<ASIN>`) and is the element id of the book in read.amazon.com/notebook; it is optional
    when the title regex matches the Notebook library entry (which only exists once something is
    highlighted).
 3. Only **numbered** TOC entries become chapters (`1`, `Chapter 12`, `12. Title`); front/back

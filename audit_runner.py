@@ -2,7 +2,7 @@
 Onyx Audit Runner
 =================
 Fires the audit at three external reviewer models in parallel and saves
-their JSON responses to audit/responses/:
+their JSON responses to the gitignored analysis_output/audit/responses/:
   - OpenAI GPT-5.5-pro via /v1/responses (reasoning.effort=xhigh)
   - Google Gemini 3.1-pro-preview (thinkingBudget=32768)
   - DeepSeek V4-Pro (thinking mode enabled, reasoning_effort=high)
@@ -49,9 +49,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_BUNDLE_DIR = Path(__file__).parent / "audit" / "stats-bundle"
-RESPONSE_DIR = Path(__file__).parent / "audit" / "responses"
-RESPONSE_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_BUNDLE_DIR = Path(__file__).parent / "analysis_output" / "audit" / "stats-bundle"
+RESPONSE_DIR = Path(__file__).parent / "analysis_output" / "audit" / "responses"
 
 # Read order preference: PROMPT first, then context docs alphabetically, then code.
 # Files not in this list are appended at the end in lexicographic order.
@@ -424,7 +423,8 @@ def validate_response(result: dict) -> list[str]:
 
 
 def save_response(result: dict, output_dir: Path, bundle_name: str) -> Path:
-    """Write to audit/responses/<bundle>-<reviewer>-<commit>-<timestamp>.json"""
+    """Write reviewer output privately; never use a tracked evidence directory."""
+    output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     fname = f"{bundle_name}-{result['reviewer']}-{result['bundle_commit']}-{ts}.json"
     result["bundle"] = bundle_name
@@ -438,6 +438,7 @@ def save_response(result: dict, output_dir: Path, bundle_name: str) -> Path:
 # ---------------------------------------------------------------------------
 
 async def run(args: argparse.Namespace) -> int:
+    RESPONSE_DIR.mkdir(parents=True, exist_ok=True)
     bundle_dir = Path(args.bundle) if args.bundle else DEFAULT_BUNDLE_DIR
     bundle_text, sizes = load_bundle(bundle_dir)
     total_chars = sum(sizes.values())
@@ -506,7 +507,7 @@ def main() -> int:
     parser.add_argument("--fire", action="store_true", help="Actually call the APIs (default is dry-run)")
     parser.add_argument("--dry-run", action="store_true", help="Save the full prompt to disk for inspection")
     parser.add_argument("--bundle", default=None,
-                        help="Path to bundle directory (default: audit/stats-bundle)")
+                        help="Path to a reviewed private bundle (default: analysis_output/audit/stats-bundle)")
     parser.add_argument("--model",
                         choices=["openai", "gemini", "deepseek", "both", "all"],
                         default="all",

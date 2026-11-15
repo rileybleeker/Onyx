@@ -107,5 +107,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: monthly-gh-audit-${{ github.run_id }}
-          path: audit/
+          # Only operational run metadata generated above, never historical
+          # reviewer bundles or production-derived evidence in this directory.
+          path: |
+            audit/all_runs.jsonl
+            audit/summary.json
           retention-days: 90

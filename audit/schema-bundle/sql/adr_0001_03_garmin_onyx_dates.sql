@@ -149,9 +149,7 @@ ALTER TABLE pds.garmin_hrv
 CREATE INDEX IF NOT EXISTS idx_garmin_hrv_behavioral_date
     ON pds.garmin_hrv (onyx_behavioral_date);
 
--- garmin_hrv.start_timestamp is 100% NULL in our history (Garmin doesn't
--- populate it via our ETL). Fall back to calendar_date which is already
--- wake-day attributed by Garmin's backend.
+-- When the provider start timestamp is absent, use its wake-day calendar date with explicit provenance.
 CREATE OR REPLACE FUNCTION pds.set_onyx_dates_garmin_hrv()
 RETURNS TRIGGER AS $$
 DECLARE

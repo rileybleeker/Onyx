@@ -1,3 +1,5 @@
+> Historical source snapshot. Private context and generated evidence have been removed from public distribution; this is not a complete reviewer input bundle. See `docs/audit-evidence-privacy.md` in the repository root.
+
 # Onyx Re-Audit Bundle — 2026-05-26
 
 Five-domain re-audit of the Onyx personal health-analytics platform. Same

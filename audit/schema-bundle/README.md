@@ -1,3 +1,5 @@
+> Historical source snapshot. Private context and generated evidence have been removed from public distribution; this is not a complete reviewer input bundle. See `docs/audit-evidence-privacy.md` in the repository root.
+
 # Onyx Schema-Bundle Audit
 
 Self-contained bundle for an independent review of the Onyx `pds` schema (Domain 1 of 7 in the System Audit).

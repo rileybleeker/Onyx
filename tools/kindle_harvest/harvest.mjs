@@ -30,9 +30,10 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readAmazonOrders } from "./amazon-orders.mjs";
+import { readBookConfig } from "./book-config.mjs";
 
 const HERE = new URL(".", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
-const cfg = JSON.parse(readFileSync(join(HERE, "books.json"), "utf8"));
+const cfg = readBookConfig(HERE);
 const ONYX = (process.env.ONYX_URL || cfg.onyx_url).replace(/\/$/, "");
 const NOTEBOOK = "https://read.amazon.com/notebook";
 const READER = "https://read.amazon.com/";

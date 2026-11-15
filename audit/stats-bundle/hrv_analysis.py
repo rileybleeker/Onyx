@@ -138,10 +138,7 @@ FDR_Q_THRESHOLD = 0.05
 #   cycle_date    = the date bedtime began in WHOOP's local TZ.
 #   behaviors_day = the day the user was awake answering the question about.
 #
-# For pre-midnight bedtimes those agree; for post-midnight bedtimes (Riley's
-# consistent pattern in Atlanta and Spain) cycle_date = behaviors_day + 1.
-# A "Feeling sick = Yes" answer for behaviors on Wed May 13 was stored with
-# cycle_date = 2026-05-14 because Riley went to bed at 00:11 AM May 14 ET.
+# For a post-midnight bedtime, the cycle date can follow the preceding behavioral day. Keep source day and behavioral day distinct.
 #
 # Resolution: `pds.whoop_journal` now carries a `behaviors_date` column
 # (computed by a DB trigger from each cycle's start_time − 6h in local TZ)
@@ -150,9 +147,7 @@ FDR_Q_THRESHOLD = 0.05
 # correct for all bedtime patterns without an in-Python shift.
 
 # Features whose 5%-non-null filter is too strict — these are canonical HRV
-# predictors and their NULLs are concentrated in the early dataset where Garmin
-# hadn't yet populated baselines. Lower threshold to 2% so we can still feed
-# them to the model with NaN-aware splits (XGBoost handles missingness).
+# Provider baselines can be missing; retain the explicit missing-data handling and configured thresholds.
 HIGH_VALUE_SPARSE_FEATURES = {
     "garmin_acute_training_load", "garmin_chronic_training_load",
     "garmin_training_load_factor", "garmin_training_load_balance",
@@ -563,7 +558,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
     )
 
     log.info("  Loading whoop_workouts…")
-    # end_time added for the workout-to-sleep gap feature (true UTC; 100% populated).
+    # The end_time field is a UTC instant used for workout-to-sleep gap features.
     data["whoop_wk"] = fetch_all(
         "whoop_workouts",
         select="workout_id,start_time,end_time,sport_name,strain,kilojoule,average_heart_rate,max_heart_rate,"
@@ -1789,13 +1784,9 @@ def run_statistical_analysis(
     # --- Stage 3: standardized OLS with Cohen's f² (audit finding 2.C) ---
     # For every BH-FDR survivor, fit y ~ all_survivors and y ~ all_survivors\{feat},
     # report standardized beta + f² so we can compare effect sizes on a
-    # comparable scale. Newey-West HAC SEs handle the autocorrelation we know
-    # exists in HRV residuals (audit Phase 2 DW = 2.91 on persistence).
+    # Use autocorrelation-aware standard errors when residuals are serially dependent.
     #
-    # Predictor cap (self-review fix): the audit's own finding 1.A said this
-    # dataset is 5-10× under-powered for OLS without dimensionality reduction.
-    # The previous version capped k=30 anyway, giving ~3 obs/predictor on the
-    # joint-non-null subset (n=98) — severely overfit. Now we enforce the
+    # Limit predictor count for small joint-observation subsets and retain the configured observations-per-predictor floor.
     # 20-obs/predictor floor explicitly, and surface a warning row in the
     # stored JSON so consumers know how reliable the betas are.
     try:
@@ -2602,7 +2593,7 @@ def train_sarimax(df: pd.DataFrame, top_features: list) -> dict:
         # This corrects the causal alignment: behaviors on day N-1 drive HRV on night N.
         # Exclude whoop_hrv_rmssd from exog (it's the endogenous variable itself).
         # Coverage threshold lowered from 0.5 → 0.2 so behavioral features
-        # (journal/mfp/supplement, typically 20-30% coverage) are eligible;
+        # Sparse behavioral features remain eligible under the configured coverage threshold.
         # ffill+bfill on the chosen series still produces a continuous exog.
         # Slot count raised from 5 → 7 so the category-seeded features fit
         # alongside the global SHAP top.
@@ -2757,8 +2748,7 @@ def train_prophet(df: pd.DataFrame, top_features: list) -> dict:
         # Coverage threshold lowered from 0.6 → 0.25 so behavioral features
         # (journal/mfp/supplement) are eligible; ffill+bfill on the chosen
         # series still produces a continuous regressor. Slot count held at 3
-        # — empirically Prophet's holdout MAE degraded ~4ms when widened to
-        # 5 (sparser ffilled regressors weakened the seasonal fit); since
+        # Keep the regressor set compact because sparse carried-forward regressors can weaken model stability.
         # top_features is composed with behavioral seeds first, the first 3
         # slots reliably include the category seeds anyway.
         reg_feats = [f for f in top_features if f in df_p.columns

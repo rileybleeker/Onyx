@@ -1,3 +1,5 @@
+> Historical source snapshot. Private context and generated evidence have been removed from public distribution; this is not a complete reviewer input bundle. See `docs/audit-evidence-privacy.md` in the repository root.
+
 # Onyx ETL-Bundle Audit
 
 Independent review of ETL correctness and idempotency (Domain 4).

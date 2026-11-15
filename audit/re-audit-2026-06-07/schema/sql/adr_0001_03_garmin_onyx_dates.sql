@@ -72,9 +72,7 @@ BEGIN
     -- fallback. Garmin stores start_time_local as wall-clock labeled +00, so
     -- treating it as a true UTC instant silently mis-attributes by the
     -- user's offset. Refusing (option a) leaves onyx_* NULL on degenerate
-    -- rows so they show up as "missing" rather than as wrong dates. Today
-    -- 0/349 rows have NULL start_time_gmt — this is purely defensive against
-    -- future degenerate ingest.
+    -- Leave derived dates missing when the authoritative GMT instant is absent; do not invent an instant from a wall-clock label.
     IF NEW.start_time_gmt IS NULL THEN
         NEW.onyx_et_date         := NULL;
         NEW.onyx_behavioral_date := NULL;
@@ -158,9 +156,7 @@ ALTER TABLE pds.garmin_hrv
 CREATE INDEX IF NOT EXISTS idx_garmin_hrv_behavioral_date
     ON pds.garmin_hrv (onyx_behavioral_date);
 
--- garmin_hrv.start_timestamp is 100% NULL in our history (Garmin doesn't
--- populate it via our ETL). Fall back to calendar_date which is already
--- wake-day attributed by Garmin's backend.
+-- When the provider start timestamp is absent, use its wake-day calendar date with explicit provenance.
 --
 -- Audit re-2026-05-26 P1 fix: the previous fallback set behavioral_date
 -- directly to calendar_date (watch-local) but labelled provenance as

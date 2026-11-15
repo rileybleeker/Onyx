@@ -231,7 +231,7 @@ const tools: Anthropic.Tool[] = [
     input_schema: {
       type: "object" as const,
       properties: {
-        book: { type: "string", description: "Book slug (e.g. 'the-goal'). Omit for the active book." },
+        book: { type: "string", description: "Book slug (e.g. 'synthetic-book'). Omit for the active book." },
       },
       required: [],
     },

@@ -19,6 +19,11 @@ frontend/out/
 # HRV analysis outputs (models, plots - not committed; model cached via GH Actions)
 analysis_output/
 
+# Audit inputs/results may contain private production evidence. Existing reviewed
+# source snapshots stay tracked; new audit files require an explicit privacy review.
+/audit/
+/tools/kindle_harvest/books.json
+
 # Misc
 task_result.txt
 perf-run.log
