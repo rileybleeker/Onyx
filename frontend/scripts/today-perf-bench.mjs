@@ -62,8 +62,9 @@ const LATENCY = Math.max(0, Number(opt('latency', 50)));
 const WIDTH = Number(opt('width', 390));
 
 const cssDir = 'frontend/.next/static/css';
-const css = fs.existsSync(cssDir) ? fs.readdirSync(cssDir).filter(x => x.endsWith('.css')).map(x => fs.readFileSync(path.join(cssDir, x), 'utf8')).join('\n') : '';
+let css = fs.existsSync(cssDir) ? fs.readdirSync(cssDir).filter(x => x.endsWith('.css')).map(x => fs.readFileSync(path.join(cssDir, x), 'utf8')).join('\n') : '';
 if (!css.trim()) { console.error('Compile the frontend before benchmarking: cd frontend && npx next build --experimental-build-mode compile'); process.exit(2); }
+css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8');
 
 // Same bundling approach as tests/today-regression.cjs: transpile the component and its
 // local libs, stub next/link, lucide-react and agents-api, bundle react + react-dom.
@@ -83,6 +84,10 @@ component = 'const React=require(' + react + ');\n' + component
   .replace(/require\("next\/link"\)/g, `({__esModule:true,default:({children,href,...props})=>React.createElement('a',{...props,href,onClick:e=>e.preventDefault()},children)})`)
   .replace(/require\("lucide-react"\)/g, `new Proxy({},{get:()=>props=>React.createElement('svg',{...props,viewBox:'0 0 24 24'})})`)
   .replace(/require\("@\/lib\/agents-api"\)/g, `({agentsApi:{inbox:()=>window.synth('inbox'),dismiss:()=>Promise.resolve({ok:true,codes:[],badge:0})},clearDeviceNotifications:()=>Promise.resolve(),setBadge:()=>{}})`);
+// Render the actual route CSS in this synthetic fixture; identity class names
+// replace Next's production hash mapping, not the stylesheet or its rules.
+component = component.replace(/require\("\.\/Today\.module\.css"\)/g,
+  '({__esModule:true,default:new Proxy({},{get:(_,key)=>key})})');
 for (const lib of ['urgent-email', 'experiments', 'calendar-events', 'today-clear']) {
   const id = ids.size; ids.set('frontend/src/lib/' + lib + '.ts', id);
   modules[id] = ts.transpileModule(fs.readFileSync('frontend/src/lib/' + lib + '.ts', 'utf8'), tsOpts).outputText;
