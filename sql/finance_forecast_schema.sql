@@ -33,3 +33,7 @@ create table if not exists pds.finance_plan_drivers (
 alter table pds.finance_plan_items enable row level security;
 alter table pds.finance_plan_drivers enable row level security;
 revoke all on pds.finance_plan_items, pds.finance_plan_drivers from anon, authenticated;
+
+-- 2026-11-15 (migration finance_plan_items_account): the investment account on the other side of a planned
+-- transfer, so net worth counts money moved into (or out of) it instead of only seeing cash leave.
+alter table pds.finance_plan_items add column if not exists account_key text check (account_key is null or account_key ~ '^[A-Za-z0-9_-]{1,64}$');

@@ -269,3 +269,13 @@ test("the engine is pure: no clock, no network, no Supabase", () => {
   assert.ok(!/new Date\(\)/.test(src));
   assert.ok(!/fetch\(|from\s+["'][^"']*supabase|["']server-only["']/i.test(src));
 });
+
+test("a planned transfer into an investment account moves the money there in net worth", () => {
+  const planned = [{ id: "xfer", label: "To brokerage", date: "2030-07-10", amountCents: -1_000_000, certainty: "confirmed", account: "inv" }];
+  const withX = run({ planned, growth: [{ account_key: "inv", returnPct: 0 }] });
+  const without = run({ growth: [{ account_key: "inv", returnPct: 0 }] });
+  const m = withX.netWorth.find((x) => x.month === "2030-08");
+  const m0 = without.netWorth.find((x) => x.month === "2030-08");
+  assert.equal(m.investments - m0.investments, 1_000_000);
+  assert.ok(Math.abs(m.netWorth - m0.netWorth) <= 1, "net worth unchanged by moving money between own accounts");
+});

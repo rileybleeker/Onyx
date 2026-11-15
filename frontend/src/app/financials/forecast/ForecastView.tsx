@@ -249,7 +249,16 @@ export default function ForecastView({
 
       <PlanConfig move={move} drivers={drivers} accounts={accounts} netWorth={result.netWorth} busy={busy} run={run} />
       <TaxSection tax={tax} profile={profile} busy={busy} run={run} />
-      <PlannedItems items={items} statuses={result.planned} busy={busy} run={run} />
+      <PlannedItems
+        items={items}
+        statuses={result.planned}
+        busy={busy}
+        run={run}
+        accountOptions={[
+          ...accounts.filter((a) => a.type === "investment").map((a) => ({ key: a.account_key, label: a.label })),
+          ...drivers.filter((d) => d.key.startsWith("growth:virtual-")).map((d) => ({ key: d.key.slice(7), label: String((d.value as { label?: unknown }).label ?? d.key.slice(7)) })),
+        ]}
+      />
       <Cards result={result} drivers={drivers} accounts={accounts} busy={busy} run={run} />
 
       {/* Detected */}
@@ -305,7 +314,7 @@ export default function ForecastView({
   );
 }
 
-function PlannedItems({ items, statuses, busy, run }: { items: PlanItemView[]; statuses: ForecastResult["planned"]; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
+function PlannedItems({ items, statuses, busy, run, accountOptions }: { items: PlanItemView[]; statuses: ForecastResult["planned"]; busy: boolean; run: (fn: () => Promise<string | null>) => void; accountOptions: { key: string; label: string }[] }) {
   const [label, setLabel] = useState("");
   const [date, setDate] = useState("");
   const [amount, setAmount] = useState("");
@@ -313,6 +322,7 @@ function PlannedItems({ items, statuses, busy, run }: { items: PlanItemView[]; s
   const [certainty, setCertainty] = useState("likely");
   const [months, setMonths] = useState("1");
   const [unit, setUnit] = useState<"once" | "month" | "year">("once");
+  const [account, setAccount] = useState("");
   const statusOf = (id: string) => statuses.filter((s) => s.id === id || s.id.startsWith(`${id}#`));
   const add = () => {
     const dollars = Number(amount.replace(/[$,\s]/g, ""));
@@ -325,6 +335,7 @@ function PlannedItems({ items, statuses, busy, run }: { items: PlanItemView[]; s
         amountCents: Math.round(dollars * 100) * (dir === "in" ? 1 : -1),
         certainty,
         ...(unit !== "once" && count > 1 ? { repeatUnit: "month", repeatEvery: unit === "year" ? 12 : 1, repeatCount: count } : {}),
+        ...(account ? { accountKey: account } : {}),
       }).then((e) => {
         if (!e) {
           setLabel("");
@@ -350,6 +361,7 @@ function PlannedItems({ items, statuses, busy, run }: { items: PlanItemView[]; s
                 <td className="py-1 pr-3">
                   {it.label}
                   {it.repeat && <span className="text-text-tertiary"> · {it.repeat}</span>}
+                  {it.account && <span className="text-text-tertiary"> · {it.amountCents < 0 ? "into" : "from"} {it.account}</span>}
                   {it.note && <div className="text-[12px] text-text-tertiary">{it.note}</div>}
                 </td>
                 <td className={`py-1 pr-3 text-right ${it.amountCents > 0 ? "text-up" : ""}`}>{signed(it.amountCents)}</td>
@@ -388,6 +400,17 @@ function PlannedItems({ items, statuses, busy, run }: { items: PlanItemView[]; s
             <option value="year">every year</option>
           </select>{" "}
           times <input className={`${input} w-14`} inputMode="numeric" value={months} onChange={(e) => setMonths(e.target.value)} />
+        </label>
+        <label className="text-[12px] text-text-secondary">
+          {dir === "out" ? "into" : "from"}{" "}
+          <select className={input} value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Investment account on the other side">
+            <option value="">(spent / received)</option>
+            {accountOptions.map((a) => (
+              <option key={a.key} value={a.key}>
+                {a.label}
+              </option>
+            ))}
+          </select>
         </label>
         <button className={button} disabled={busy} onClick={add}>
           Add

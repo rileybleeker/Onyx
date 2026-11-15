@@ -60,6 +60,8 @@ export interface PlannedItem {
   repeat?: { unit: "month" | "week" | "day"; every?: number; count: number };
   matchWindowDays?: number;
   matchTolerance?: number;
+  /** The other side of a transfer: money out of cash goes INTO this investment account, money in comes FROM it (net worth neutral). */
+  account?: string;
 }
 /** Changes a detected stream (or a card's payments) from a date on: stop it, or change each amount. */
 export interface StreamAdjustment {
@@ -836,6 +838,7 @@ interface PlannedOcc {
   certainty: Certainty;
   window: number;
   tolerance: number;
+  account?: string;
 }
 function expandPlanned(items: readonly PlannedItem[]): PlannedOcc[] {
   const out: PlannedOcc[] = [];
@@ -858,6 +861,7 @@ function expandPlanned(items: readonly PlannedItem[]): PlannedOcc[] {
         certainty: it.certainty,
         window: it.matchWindowDays ?? FORECAST.matchWindowDays,
         tolerance: it.matchTolerance ?? FORECAST.matchTolerance,
+        account: it.account,
       });
     }
   }
@@ -1196,7 +1200,11 @@ export function forecastCash(input: ForecastInput): ForecastResult {
 
   // Net worth side.
   const cards = projectCards(input, latest, cardRows, streamPlans, today);
-  const netWorth = projectNetWorth(input, latest, cards, days, today);
+  // Planned transfers into (or out of) an investment account move the money there, so net worth sees both sides.
+  const transfers = projectedPlanned
+    .filter((o) => o.account && inVariant(o, "likely") && dayIdx(o.date) >= 0 && dayIdx(o.date) < H)
+    .map((o) => ({ account_key: o.account!, date: o.date, cents: -o.amount }));
+  const netWorth = projectNetWorth(input, latest, cards, days, today, transfers);
   const milestones = promoMilestones(cards, today, horizonEnd);
   headlines.nextPromoEnd = milestones.find((m) => !m.ended) ?? null;
 
@@ -1391,6 +1399,7 @@ function projectNetWorth(
   cards: CardProjection[],
   days: DayPoint[],
   today: string,
+  transfers: readonly { account_key: string; date: string; cents: number }[] = [],
 ): NetWorthMonth[] {
   const growth = new Map((input.growth ?? []).map((g) => [g.account_key, g]));
   const ledgerInv = input.accounts.filter((a) => isInvestmentType(a.account_type));
@@ -1411,6 +1420,7 @@ function projectNetWorth(
       const r = (g?.returnPct ?? FORECAST.defaultReturnPct) / 100;
       let b = (invBal.get(a.account_key) ?? 0) * Math.pow(1 + r, 1 / 12);
       if (g?.monthlyContributionCents && (!g.contributionStarts || `${key}-01` >= g.contributionStarts.slice(0, 7) + "-01")) b += g.monthlyContributionCents;
+      for (const t of transfers) if (t.account_key === a.account_key && (monthKeyOf(t.date) === key || (k === 1 && monthKeyOf(t.date) < key))) b += t.cents;
       invBal.set(a.account_key, b);
       inv += b;
       byAccount[a.label] = Math.round(b);
