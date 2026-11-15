@@ -12,9 +12,9 @@ interface Props {
   destBreakdown: Array<{ iana: string; count: number; days: number }>;
 }
 
-export default function TravelCharts({ meanTrajectory, destBreakdown }: Props) {
+// Two separate charts, so Personalize can move each one on its own (TravelView renders each in a part).
+export function TrajectoryChart({ meanTrajectory }: Pick<Props, "meanTrajectory">) {
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <ChartCard
         title="Mean HRV trajectory around trip start"
         subtitle="Day 0 = trip start; averaged across all trips"
@@ -43,7 +43,11 @@ export default function TravelCharts({ meanTrajectory, destBreakdown }: Props) {
           </LineChart>
         </ResponsiveContainer>
       </ChartCard>
+  );
+}
 
+export function DestinationChart({ destBreakdown }: Pick<Props, "destBreakdown">) {
+  return (
       <ChartCard title="Trips by destination" subtitle="Days abroad per IANA zone">
         <ResponsiveContainer width="100%" height={260}>
           <BarChart data={destBreakdown} margin={{ top: 10, right: 30, bottom: 30, left: 10 }}>
@@ -69,6 +73,5 @@ export default function TravelCharts({ meanTrajectory, destBreakdown }: Props) {
           </BarChart>
         </ResponsiveContainer>
       </ChartCard>
-    </div>
   );
 }

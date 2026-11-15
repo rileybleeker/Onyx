@@ -4,6 +4,7 @@ import Link from "next/link";
 import { ArrowUpRight, CircleCheck, Info, Sparkles } from "lucide-react";
 import StatCard from "@/components/StatCard";
 import InfoHint from "@/components/InfoHint";
+import { Part, PartGrid } from "@/components/personalize/PartGrid";
 import { groupByStage, labels, stageNotes, type Board, type Win, type WinState } from "@/lib/wins";
 
 const filters = ["All", "Delivered", "In progress"] as const;
@@ -62,24 +63,9 @@ export default function WinsBoard({ board, headingTestId = "page-heading" }: { b
 
   return (
     <div className="mx-auto max-w-5xl space-y-8">
-      <header className="space-y-5">
-        <div>
-          <div className="mb-2 flex items-center gap-2 text-text-secondary"><Sparkles size={16} aria-hidden="true" /><span className="text-xs font-medium">Small wins. Better Onyx.</span></div>
-          <h1 data-testid={headingTestId} className="text-3xl font-semibold tracking-tight text-text-primary sm:text-4xl">Worth celebrating</h1>
-        </div>
-        <div role="group" aria-label="Progress overview" className="grid grid-cols-3 gap-2 sm:gap-4">
-          <StatCard label="Live on the site" value={live} className="flex flex-col justify-between" />
-          <StatCard label="Merged" value={merged} className="flex flex-col justify-between" />
-          <StatCard label="In progress" value={proposed} className="flex flex-col justify-between" />
-        </div>
-        <div className="space-y-2 text-xs leading-relaxed text-text-secondary">
-          {/* Disclosure, not the popover: it holds no state, so the board still renders to static markup. */}
-          <InfoHint variant="disclosure" label="Worth celebrating" summary="About this board">
-            <p>Real improvements to Onyx, work still taking shape, and the evidence behind each one.</p>
-            <p>Each stage is kept apart: proposals and drafts are not merged, and merged is not the same as live on the site.</p>
-          </InfoHint>
-          {(closed > 0 || unknown > 0) && <p>{closed > 0 && `${closed} closed without merging.`}{closed > 0 && unknown > 0 && " "}{unknown > 0 && `${unknown} with status unavailable.`} Included in All.</p>}
-        </div>
+      <header>
+        <div className="mb-2 flex items-center gap-2 text-text-secondary"><Sparkles size={16} aria-hidden="true" /><span className="text-xs font-medium">Small wins. Better Onyx.</span></div>
+        <h1 data-testid={headingTestId} className="text-3xl font-semibold tracking-tight text-text-primary sm:text-4xl">Worth celebrating</h1>
       </header>
 
       <section aria-label="Progress board" className="space-y-6">
@@ -103,25 +89,56 @@ export default function WinsBoard({ board, headingTestId = "page-heading" }: { b
           </div>
         </div>
 
-        {unknown > 0 && <p role="status" className="rounded-card border border-border-subtle bg-surface-card p-4 text-sm leading-relaxed text-text-secondary">Some statuses could not be verified. Those cards are not counted as delivered. Follow the evidence link for the latest status.</p>}
-
-        {groups.map((group) => (
-          <section key={group.state} aria-labelledby={`stage-${group.state}`} className="grid min-w-0 gap-4 border-t border-border-subtle pt-6 first-of-type:border-t-0 first-of-type:pt-0 xl:grid-cols-[220px_minmax(0,1fr)] xl:gap-6">
-            <div className="min-w-0">
-              <h2 id={`stage-${group.state}`} className="flex items-start gap-2 text-base font-semibold text-text-primary">
-                {delivered(group.state) && <CircleCheck size={18} aria-hidden="true" className="mt-0.5 shrink-0 text-up" />}
-                <span>{labels[group.state]} <span className="font-mono text-sm font-normal text-text-secondary">({group.wins.length})</span></span>
-              </h2>
-              <p className="mt-2 max-w-2xl text-xs leading-relaxed text-text-secondary">{stageNotes[group.state]}</p>
+        {/* Personalize: each count tile, the about note and each stage list is its own part. The page is rendered on the
+            server (ISR), so it uses CSS mode: the saved order and hidden parts are painted before React runs; parts move
+            and hide anywhere on the board, no resize. */}
+        <PartGrid page="/wins" title="Worth celebrating" mode="css" gap={16}>
+          <Part id="live" title="Live on the site" width="quarter">
+            <StatCard label="Live on the site" value={live} className="flex flex-col justify-between" />
+          </Part>
+          <Part id="merged" title="Merged" width="quarter">
+            <StatCard label="Merged" value={merged} className="flex flex-col justify-between" />
+          </Part>
+          <Part id="in-progress" title="In progress" width="quarter">
+            <StatCard label="In progress" value={proposed} className="flex flex-col justify-between" />
+          </Part>
+          <Part id="about" title="About this board">
+            <div className="space-y-2 text-xs leading-relaxed text-text-secondary">
+              {/* Disclosure, not the popover: it holds no state, so the board still renders to static markup. */}
+              <InfoHint variant="disclosure" label="Worth celebrating" summary="About this board">
+                <p>Real improvements to Onyx, work still taking shape, and the evidence behind each one.</p>
+                <p>Each stage is kept apart: proposals and drafts are not merged, and merged is not the same as live on the site.</p>
+              </InfoHint>
+              {(closed > 0 || unknown > 0) && <p>{closed > 0 && `${closed} closed without merging.`}{closed > 0 && unknown > 0 && " "}{unknown > 0 && `${unknown} with status unavailable.`} Included in All.</p>}
             </div>
-            <div className="min-w-0 space-y-4">{group.wins.map((win) => <WinCard key={win.pr} win={win} />)}</div>
-          </section>
-        ))}
+          </Part>
 
-        {visible.length === 0 && <div className="rounded-card border border-border-subtle bg-surface-card p-6 text-sm text-text-secondary">
-          <p>No verified highlights in this view yet. Try All to see the full board.</p>
-          {filter !== "All" && <button type="button" onClick={() => setFilter("All")} className={`mt-3 inline-flex min-h-11 items-center rounded-control px-3 text-accent underline underline-offset-4 ${focusRing}`}>Show all highlights</button>}
-        </div>}
+          {unknown > 0 && <Part id="unverified" title="Unverified statuses">
+            <p role="status" className="rounded-card border border-border-subtle bg-surface-card p-4 text-sm leading-relaxed text-text-secondary">Some statuses could not be verified. Those cards are not counted as delivered. Follow the evidence link for the latest status.</p>
+          </Part>}
+
+          {groups.map((group) => (
+            <Part key={group.state} id={`stage-${group.state}`} title={labels[group.state]}>
+              <section aria-labelledby={`stage-${group.state}`} className="grid min-w-0 gap-4 border-t border-border-subtle pt-6 xl:grid-cols-[220px_minmax(0,1fr)] xl:gap-6">
+                <div className="min-w-0">
+                  <h2 id={`stage-${group.state}`} className="flex items-start gap-2 text-base font-semibold text-text-primary">
+                    {delivered(group.state) && <CircleCheck size={18} aria-hidden="true" className="mt-0.5 shrink-0 text-up" />}
+                    <span>{labels[group.state]} <span className="font-mono text-sm font-normal text-text-secondary">({group.wins.length})</span></span>
+                  </h2>
+                  <p className="mt-2 max-w-2xl text-xs leading-relaxed text-text-secondary">{stageNotes[group.state]}</p>
+                </div>
+                <div className="min-w-0 space-y-4">{group.wins.map((win) => <WinCard key={win.pr} win={win} />)}</div>
+              </section>
+            </Part>
+          ))}
+
+          {visible.length === 0 && <Part id="empty" title="No highlights in this view">
+            <div className="rounded-card border border-border-subtle bg-surface-card p-6 text-sm text-text-secondary">
+              <p>No verified highlights in this view yet. Try All to see the full board.</p>
+              {filter !== "All" && <button type="button" onClick={() => setFilter("All")} className={`mt-3 inline-flex min-h-11 items-center rounded-control px-3 text-accent underline underline-offset-4 ${focusRing}`}>Show all highlights</button>}
+            </div>
+          </Part>}
+        </PartGrid>
       </section>
 
       <footer className="flex flex-wrap gap-x-6 gap-y-1 border-t border-border-subtle pt-4 text-sm text-text-secondary">
