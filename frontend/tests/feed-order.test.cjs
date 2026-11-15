@@ -4,7 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { loadTs } = require('./helpers/load-ts.cjs');
 
-const { areaOrder, feedSequence, feedRouteOf, isFeedExcluded, neighbourOf, parseAreaOrder, feedTitle } = loadTs('lib/feed-order.ts');
+const { areaOrder, feedSequence, feedRouteOf, isFeedExcluded, keepInOrder, neighbourOf, parseAreaOrder, feedTitle } = loadTs('lib/feed-order.ts');
 
 const NAV = ['/today', '/activities', '/nutrition', '/log', '/sleep', '/analytics/hrv', '/agents', '/financials', '/chat', '/status'];
 const all = () => true;
@@ -79,4 +79,17 @@ test('neighbours and titles', () => {
   assert.equal(neighbourOf(seq, '/sleep', 1), null);
   assert.equal(neighbourOf(seq, '/nope', 1), null);
   assert.equal(feedTitle('Sleep & Recovery'), 'Sleep & Recovery - Onyx');
+});
+
+test('a new order keeps the pages around the routed one that still follow each other', () => {
+  const seq = ['/today', '/log', '/sleep', '/activities', '/nutrition'];
+  const same = ['/today', '/log', '/sleep'];
+  assert.equal(keepInOrder(same, seq, '/today'), same, 'all still in order: the same list (no re-render)');
+  // Sleep pinned between Log and Activities: Today and Log stay, Activities goes (the scroll grows to Sleep next).
+  assert.deepEqual(keepInOrder(['/today', '/log', '/activities'], seq, '/today'), ['/today', '/log']);
+  // Routed in the middle: both sides are trimmed at the first page out of place.
+  assert.deepEqual(keepInOrder(['/nutrition', '/log', '/sleep', '/today'], seq, '/sleep'), ['/log', '/sleep']);
+  // A page hidden from the scroll (no longer in the sequence) is dropped with everything past it.
+  assert.deepEqual(keepInOrder(['/today', '/log', '/sleep', '/activities'], ['/today', '/log', '/activities'], '/today'), ['/today', '/log']);
+  assert.deepEqual(keepInOrder(['/log', '/sleep'], seq, '/today'), ['/today'], 'routed page missing: start again from it');
 });

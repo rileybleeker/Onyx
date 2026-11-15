@@ -23,6 +23,18 @@ export const AREAS_KEY = "layout.areas";
 export const AREAS_STORAGE = "onyx.layout.areas";
 /** Fired on window (detail: the layout key) when Personalize saves or adopts a layout on this tab. */
 export const LAYOUT_EVENT = "onyx:layout";
+/**
+ * Fired on window while Personalize mode edits `layout.areas` on this tab: `detail.layout` = the unsaved draft after
+ * each change, null when the session ends (Done, Cancel, Clear; the saved copy applies again). The continuous scroll
+ * follows it, so it changes as the side panel does instead of on Done (2026-11-15).
+ */
+export const LAYOUT_DRAFT_EVENT = "onyx:layout-draft";
+/** Fired on window by a continuous scroll that starts listening: an open session answers with LAYOUT_DRAFT_EVENT. */
+export const LAYOUT_DRAFT_REQUEST_EVENT = "onyx:layout-draft-request";
+export interface LayoutDraftDetail {
+  key: string;
+  layout: unknown;
+}
 export const NAV_BOOT_STYLE_ID = "onyx-nav-boot";
 /** The sidebar's "Quick access" group by default (the side panel's pinned pages). Keep equal to DEFAULT_PINNED in feed-order.ts. */
 export const QUICK_ACCESS: readonly string[] = ["/today", "/log"];

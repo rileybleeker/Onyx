@@ -214,6 +214,23 @@ export function feedSequence(
   return order.filter((r) => r === here || (!hidden.has(r) && hasSection(r)));
 }
 
+/**
+ * The order changed under a scroll that shows `list`: the run of pages around the routed page that still follow each
+ * other in the new `sequence` (the same array when all of them do). Pages past the first one out of place are
+ * dropped, and the scroll grows again from that end in the new order, so the pages next to the routed one stay on
+ * screen while Riley rearranges the side panel. Just the routed page when it is not in `list` or `sequence`.
+ */
+export function keepInOrder(list: string[], sequence: readonly string[], routed: string): string[] {
+  const at = list.indexOf(routed);
+  const s = sequence.indexOf(routed);
+  if (at === -1 || s === -1) return [routed];
+  let lo = at;
+  let hi = at;
+  while (lo > 0 && sequence[s - (at - lo) - 1] === list[lo - 1]) lo--;
+  while (hi < list.length - 1 && sequence[s + (hi - at) + 1] === list[hi + 1]) hi++;
+  return lo === 0 && hi === list.length - 1 ? list : list.slice(lo, hi + 1);
+}
+
 /** The page before / after `route` in the sequence, or null at either end. */
 export function neighbourOf(sequence: readonly string[], route: string, step: -1 | 1): string | null {
   const i = sequence.indexOf(route);
