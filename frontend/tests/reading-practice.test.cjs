@@ -114,6 +114,30 @@ test("lost answer: the same key answers the stored receipt again and nothing new
   assert.equal(f.calls.rpc.filter((c) => c.name === "reading_grade_review").length, 1);
 });
 
+test("day boundary: a retry after midnight sends the same key, and the grade's identity excludes the day", async () => {
+  const k = key();
+  const tomorrow = "2026-03-11";
+  // First try before midnight: no answer reached the screen. Retry after midnight: the receipt of the first try.
+  const f = fakeClient({ rows: [highlight(), highlight({ review_count: 1, interval_days: 1 })], answers: [applied(), { ...applied(), highlight: undefined, replayed: true }] });
+  await R.gradeHighlight(f.client, { highlight_id: 41, grade: "good", op_key: k, expected_review_count: 0, date: TODAY });
+  const r = await R.gradeHighlight(f.client, { highlight_id: 41, grade: "good", op_key: k, expected_review_count: 0, date: tomorrow });
+  const [p1, p2] = f.calls.rpc.filter((c) => c.name === "reading_grade_review").map((c) => c.args.p);
+  assert.equal(p1.op_key, p2.op_key);
+  assert.notEqual(p1.review_date, p2.review_date, "the server's day moved on between the tries");
+  assert.equal(r.ok && r.replayed, true);
+  assert.equal(r.receipt.review_date, TODAY, "the stored grade keeps the day it was made, no second review on the new day");
+  const review = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_grade_review"), sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_record_quiz"));
+  assert.match(
+    review,
+    /v_hash := encode\(sha256\(convert_to\(jsonb_build_object\('highlight_id', v_hid, 'grade', v_grade\)::text, 'UTF8'\)\), 'hex'\);/,
+    "the request identity is the highlight and the grade only, so the replay is not refused as another request",
+  );
+  // A quiz without an explicit date hashes a null day, so its retry after midnight also replays.
+  const quiz = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_record_quiz"));
+  assert.match(quiz, /'quiz_date', v_date\)::text/);
+  assert.match(quiz, /v_date := NULLIF\(p->>'quiz_date', ''\)::date;/);
+});
+
 test("a write landing between the read and the lock: re-read and recompute, at most three tries", async () => {
   const raced = { ok: false, http: 409, code: "raced" };
   const once = fakeClient({ rows: [highlight(), highlight({ review_count: 1, interval_days: 1 })], answers: [raced, applied({ review_count: 2, interval_days: 3 })] });
