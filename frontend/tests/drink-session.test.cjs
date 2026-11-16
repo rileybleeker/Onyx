@@ -8,9 +8,10 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { loadTs } = require("./helpers/load-ts.cjs");
 
-const S = loadTs("lib/drink-session.ts");
+const autosave = loadTs("lib/autosave.ts");
+const S = loadTs("lib/drink-session.ts", { "./autosave": autosave });
 const C = loadTs("lib/drink-capture.ts");
-const { AutosaveRefused } = loadTs("lib/autosave.ts");
+const { AutosaveRefused } = autosave;
 const WG = "gorilla-mind-energy-wild-grape-16oz";
 const NY = "America/New_York";
 const KEY = "0b8f2a6e-5d1c-4f3e-9a7b-2c4d6e8f0a1b";
